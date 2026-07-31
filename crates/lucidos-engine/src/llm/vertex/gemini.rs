@@ -954,14 +954,23 @@ mod tests {
         // Flash supports the full set: minimal/low/medium/high.
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "none"), "minimal");
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "low"), "low");
-        assert_eq!(gemini_thinking_level("gemini-3.5-flash", "medium"), "medium");
+        assert_eq!(
+            gemini_thinking_level("gemini-3.5-flash", "medium"),
+            "medium"
+        );
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "high"), "high");
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "xhigh"), "high");
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "max"), "high");
         // Pro accepts only low/high: minimal floors to low, medium rounds to high.
         assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "none"), "low");
-        assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "medium"), "high");
-        assert_eq!(gemini_thinking_level("gemini-3-pro-preview", "high"), "high");
+        assert_eq!(
+            gemini_thinking_level("gemini-3-pro-preview", "medium"),
+            "high"
+        );
+        assert_eq!(
+            gemini_thinking_level("gemini-3-pro-preview", "high"),
+            "high"
+        );
         // Unknown falls back to "high" — the model default.
         assert_eq!(gemini_thinking_level("gemini-3.5-flash", "bogus"), "high");
     }

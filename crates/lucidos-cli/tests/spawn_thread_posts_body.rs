@@ -25,7 +25,9 @@ async fn start_capture_server() -> (u16, Captured) {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
     (port, captured)
 }
 
@@ -56,17 +58,35 @@ async fn spawn_thread_posts_caller_fields_in_body() {
     let thread_id = uuid::Uuid::new_v4().to_string();
     let event_id = uuid::Uuid::new_v4().to_string();
     let output = std::process::Command::new(bin)
-        .args(["spawn-thread", "--to", "dev", "--message", "do the thing", "--title", "Test", "--insecure-http"])
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--message",
+            "do the thing",
+            "--title",
+            "Test",
+            "--insecure-http",
+        ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", &thread_id)
         .env("LUCIDOS_EVENT_ID", &event_id)
         .env_remove("LUCIDOS_REPO")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .output().expect("spawn cli");
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        .output()
+        .expect("spawn cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
     assert_eq!(body["message"], "do the thing");
     assert_eq!(body["title"], "Test");
     assert_eq!(body["mode"], "agent");
@@ -75,7 +95,10 @@ async fn spawn_thread_posts_caller_fields_in_body() {
     assert_eq!(body["caller_event_id"], event_id);
     assert!(body.get("parent_thread_id").is_none());
     assert!(body.get("spawning_event_id").is_none());
-    assert!(body.get("repo_id").is_none(), "no --repo and no $LUCIDOS_REPO ⇒ repo_id absent");
+    assert!(
+        body.get("repo_id").is_none(),
+        "no --repo and no $LUCIDOS_REPO ⇒ repo_id absent"
+    );
 
     // The body must carry the same thread_id the CLI prints in the markdown
     // link — that's the whole point of generating it client-side.
@@ -101,17 +124,33 @@ async fn spawn_thread_with_parent_posts_parent_fields_in_body() {
     let thread_id = uuid::Uuid::new_v4().to_string();
     let event_id = uuid::Uuid::new_v4().to_string();
     let status = std::process::Command::new(bin)
-        .args(["spawn-thread", "--parent", "--to", "dev", "--cc", "--message", "spawn cc subtask", "--title", "Sub", "--insecure-http"])
+        .args([
+            "spawn-thread",
+            "--parent",
+            "--to",
+            "dev",
+            "--cc",
+            "--message",
+            "spawn cc subtask",
+            "--title",
+            "Sub",
+            "--insecure-http",
+        ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", &thread_id)
         .env("LUCIDOS_EVENT_ID", &event_id)
         .env_remove("LUCIDOS_REPO")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
+        .status()
+        .expect("spawn cli");
     assert!(status.success());
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
     assert_eq!(body["message"], "spawn cc subtask");
     assert_eq!(body["title"], "Sub");
     assert_eq!(body["mode"], "agent");
@@ -132,16 +171,31 @@ async fn spawn_thread_codex_shortcut_posts_coding_agent_body() {
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
-        .args(["spawn-thread", "--to", "dev", "--codex", "--message", "spawn codex subtask", "--title", "Codex", "--insecure-http"])
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--codex",
+            "--message",
+            "spawn codex subtask",
+            "--title",
+            "Codex",
+            "--insecure-http",
+        ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         .env_remove("LUCIDOS_REPO")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
+        .status()
+        .expect("spawn cli");
     assert!(status.success());
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
     assert_eq!(body["use_coding_agent"], true);
     assert_eq!(body["coding_agent"], "codex");
 }
@@ -157,16 +211,32 @@ async fn spawn_thread_coding_agent_flag_posts_codex_body() {
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
-        .args(["spawn-thread", "--to", "dev", "--coding-agent", "codex", "--message", "spawn codex top", "--title", "Codex Top", "--insecure-http"])
+        .args([
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--coding-agent",
+            "codex",
+            "--message",
+            "spawn codex top",
+            "--title",
+            "Codex Top",
+            "--insecure-http",
+        ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         .env_remove("LUCIDOS_REPO")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
+        .status()
+        .expect("spawn cli");
     assert!(status.success());
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
     assert_eq!(body["use_coding_agent"], true);
     assert_eq!(body["coding_agent"], "codex");
 }
@@ -183,13 +253,25 @@ async fn spawn_thread_with_parent_rejects_different_target() {
 
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
-        .args(["spawn-thread", "--parent", "--to", "other", "--message", "x", "--insecure-http"])
+        .args([
+            "spawn-thread",
+            "--parent",
+            "--to",
+            "other",
+            "--message",
+            "x",
+            "--insecure-http",
+        ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
-    assert!(!status.success(), "CLI must error on --parent with mismatched target");
+        .status()
+        .expect("spawn cli");
+    assert!(
+        !status.success(),
+        "CLI must error on --parent with mismatched target"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -204,9 +286,17 @@ async fn spawn_thread_explicit_repo_flag_lands_in_body() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "myws", "--cc",
-            "--repo", "example-repo",
-            "--message", "fix bug", "--title", "Fix", "--insecure-http",
+            "spawn-thread",
+            "--to",
+            "myws",
+            "--cc",
+            "--repo",
+            "example-repo",
+            "--message",
+            "fix bug",
+            "--title",
+            "Fix",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
@@ -214,11 +304,19 @@ async fn spawn_thread_explicit_repo_flag_lands_in_body() {
         .env("LUCIDOS_REPO", "lucidos")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
+        .status()
+        .expect("spawn cli");
     assert!(status.success());
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
-    assert_eq!(body["repo_id"], "example-repo", "explicit --repo wins over env var");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert_eq!(
+        body["repo_id"], "example-repo",
+        "explicit --repo wins over env var"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -231,8 +329,16 @@ async fn spawn_thread_defaults_repo_from_lucidos_repo_env() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--parent", "--to", "myws", "--cc",
-            "--message", "sidequest", "--title", "Side", "--insecure-http",
+            "spawn-thread",
+            "--parent",
+            "--to",
+            "myws",
+            "--cc",
+            "--message",
+            "sidequest",
+            "--title",
+            "Side",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
@@ -240,11 +346,19 @@ async fn spawn_thread_defaults_repo_from_lucidos_repo_env() {
         .env("LUCIDOS_REPO", "example-repo")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
+        .status()
+        .expect("spawn cli");
     assert!(status.success());
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
-    assert_eq!(body["repo_id"], "example-repo", "$LUCIDOS_REPO is the default");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert_eq!(
+        body["repo_id"], "example-repo",
+        "$LUCIDOS_REPO is the default"
+    );
 }
 
 /// `--relation top` on a same-workspace target must produce the
@@ -265,8 +379,16 @@ async fn same_workspace_relation_top_omits_parent_fields() {
     let event_id = uuid::Uuid::new_v4().to_string();
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "dev", "--relation", "top",
-            "--message", "fire and forget", "--title", "Top", "--insecure-http",
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--relation",
+            "top",
+            "--message",
+            "fire and forget",
+            "--title",
+            "Top",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", &thread_id)
@@ -274,12 +396,23 @@ async fn same_workspace_relation_top_omits_parent_fields() {
         .env_remove("LUCIDOS_REPO")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
+        .status()
+        .expect("spawn cli");
     assert!(status.success());
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
-    assert!(body.get("parent_thread_id").is_none(), "top must NOT emit parent_thread_id");
-    assert!(body.get("spawning_event_id").is_none(), "top must NOT emit spawning_event_id");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert!(
+        body.get("parent_thread_id").is_none(),
+        "top must NOT emit parent_thread_id"
+    );
+    assert!(
+        body.get("spawning_event_id").is_none(),
+        "top must NOT emit spawning_event_id"
+    );
     assert_eq!(body["caller_workspace"], "dev");
     assert_eq!(body["caller_thread_id"], thread_id);
     assert_eq!(body["caller_event_id"], event_id);
@@ -299,18 +432,29 @@ async fn cross_workspace_relation_child_errors() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "other", "--relation", "child",
-            "--message", "x", "--insecure-http",
+            "spawn-thread",
+            "--to",
+            "other",
+            "--relation",
+            "child",
+            "--message",
+            "x",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .output().expect("spawn cli");
-    assert!(!output.status.success(), "CLI must error on --relation child with cross-workspace target");
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "CLI must error on --relation child with cross-workspace target"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("relation") && (stderr.contains("same-workspace") || stderr.contains("$LUCIDOS_WORKSPACE")),
+        stderr.contains("relation")
+            && (stderr.contains("same-workspace") || stderr.contains("$LUCIDOS_WORKSPACE")),
         "stderr must explain that child requires same-workspace, got: {}",
         stderr
     );
@@ -333,8 +477,16 @@ async fn relation_sub_alias_still_accepted_as_child() {
     let event_id = uuid::Uuid::new_v4().to_string();
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "dev", "--relation", "sub",
-            "--message", "compat alias", "--title", "Alias", "--insecure-http",
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--relation",
+            "sub",
+            "--message",
+            "compat alias",
+            "--title",
+            "Alias",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", &thread_id)
@@ -342,13 +494,30 @@ async fn relation_sub_alias_still_accepted_as_child() {
         .env_remove("LUCIDOS_REPO")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
-    assert!(status.success(), "--relation sub must remain accepted as the back-compat alias");
+        .status()
+        .expect("spawn cli");
+    assert!(
+        status.success(),
+        "--relation sub must remain accepted as the back-compat alias"
+    );
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
-    assert_eq!(body["parent_thread_id"], thread_id, "sub alias must wire parent_thread_id like child");
-    assert_eq!(body["spawning_event_id"], event_id, "sub alias must wire spawning_event_id like child");
-    assert!(body.get("caller_workspace").is_none(), "sub alias must not emit caller_* (those are top-only)");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert_eq!(
+        body["parent_thread_id"], thread_id,
+        "sub alias must wire parent_thread_id like child"
+    );
+    assert_eq!(
+        body["spawning_event_id"], event_id,
+        "sub alias must wire spawning_event_id like child"
+    );
+    assert!(
+        body.get("caller_workspace").is_none(),
+        "sub alias must not emit caller_* (those are top-only)"
+    );
 }
 
 /// `--parent` is the deprecated alias for `--relation child`. It must still
@@ -367,8 +536,16 @@ async fn parent_flag_still_works_with_deprecation_warning() {
     let event_id = uuid::Uuid::new_v4().to_string();
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--parent", "--to", "dev", "--cc",
-            "--message", "compat", "--title", "Compat", "--insecure-http",
+            "spawn-thread",
+            "--parent",
+            "--to",
+            "dev",
+            "--cc",
+            "--message",
+            "compat",
+            "--title",
+            "Compat",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", &thread_id)
@@ -376,12 +553,27 @@ async fn parent_flag_still_works_with_deprecation_warning() {
         .env_remove("LUCIDOS_REPO")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .output().expect("spawn cli");
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        .output()
+        .expect("spawn cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
-    assert_eq!(body["parent_thread_id"], thread_id, "--parent must still set parent_thread_id");
-    assert_eq!(body["spawning_event_id"], event_id, "--parent must still set spawning_event_id");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert_eq!(
+        body["parent_thread_id"], thread_id,
+        "--parent must still set parent_thread_id"
+    );
+    assert_eq!(
+        body["spawning_event_id"], event_id,
+        "--parent must still set spawning_event_id"
+    );
 
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -408,9 +600,19 @@ async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "dev", "--relation", "top", "--cc",
-            "--folder", "data/apps/habit-tracker",
-            "--message", "run a research session", "--title", "Research", "--insecure-http",
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--relation",
+            "top",
+            "--cc",
+            "--folder",
+            "data/apps/habit-tracker",
+            "--message",
+            "run a research session",
+            "--title",
+            "Research",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
@@ -420,10 +622,19 @@ async fn spawn_thread_with_folder_posts_folder_and_omits_repo() {
         .env("LUCIDOS_REPO", "Lucidos")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .output().expect("spawn cli");
-    assert!(output.status.success(), "stderr: {}", String::from_utf8_lossy(&output.stderr));
+        .output()
+        .expect("spawn cli");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
     assert_eq!(body["folder"], "data/apps/habit-tracker");
     assert_eq!(body["use_coding_agent"], true);
     assert!(
@@ -444,16 +655,30 @@ async fn spawn_thread_folder_and_repo_are_mutually_exclusive() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "dev", "--relation", "top", "--cc",
-            "--folder", "data/apps/foo", "--repo", "Lucidos",
-            "--message", "x", "--insecure-http",
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--relation",
+            "top",
+            "--cc",
+            "--folder",
+            "data/apps/foo",
+            "--repo",
+            "Lucidos",
+            "--message",
+            "x",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .output().expect("spawn cli");
-    assert!(!output.status.success(), "CLI must reject --folder together with --repo");
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "CLI must reject --folder together with --repo"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("folder") && stderr.contains("repo"),
@@ -475,16 +700,27 @@ async fn spawn_thread_folder_requires_cc() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let output = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--to", "dev", "--relation", "top",
-            "--folder", "data/apps/foo",
-            "--message", "x", "--insecure-http",
+            "spawn-thread",
+            "--to",
+            "dev",
+            "--relation",
+            "top",
+            "--folder",
+            "data/apps/foo",
+            "--message",
+            "x",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .output().expect("spawn cli");
-    assert!(!output.status.success(), "CLI must reject --folder without --cc");
+        .output()
+        .expect("spawn cli");
+    assert!(
+        !output.status.success(),
+        "CLI must reject --folder without --cc"
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("--folder") && stderr.contains("--cc"),
@@ -505,18 +741,35 @@ async fn spawn_thread_empty_repo_flag_overrides_env_to_workspace_default() {
     let bin = env!("CARGO_BIN_EXE_lucidos");
     let status = std::process::Command::new(bin)
         .args([
-            "spawn-thread", "--parent", "--to", "myws", "--cc",
-            "--repo", "",
-            "--message", "default repo", "--title", "Def", "--insecure-http",
+            "spawn-thread",
+            "--parent",
+            "--to",
+            "myws",
+            "--cc",
+            "--repo",
+            "",
+            "--message",
+            "default repo",
+            "--title",
+            "Def",
+            "--insecure-http",
         ])
         .env("LUCIDOS_WORKSPACE", &caller)
         .env("LUCIDOS_THREAD_ID", uuid::Uuid::new_v4().to_string())
         .env("LUCIDOS_REPO", "example-repo")
         .env("LUCIDOS_WORKSPACES_ROOT", tmp.path())
         .current_dir(&caller)
-        .status().expect("spawn cli");
+        .status()
+        .expect("spawn cli");
     assert!(status.success());
 
-    let body = captured.lock().unwrap().clone().expect("server received body");
-    assert!(body.get("repo_id").is_none(), "--repo \"\" must drop the env-var default");
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("server received body");
+    assert!(
+        body.get("repo_id").is_none(),
+        "--repo \"\" must drop the env-var default"
+    );
 }

@@ -51,8 +51,8 @@ pub use executor::{ExecutableEntry, ThreadQueueExecutor};
 pub use policy::{
     AdmissionCounts, AdmissionDecision, CapacityPolicy, OverflowPolicy, ThreadQueueKind,
 };
-pub use request::ThreadQueueRequest;
 pub(crate) use request::truncate_summary;
+pub use request::ThreadQueueRequest;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, OnceLock, Weak};
@@ -362,7 +362,10 @@ impl ThreadQueue {
         .fetch_optional(pool)
         .await
         .unwrap_or_else(|e| {
-            log!("[ThreadQueue] load_policy query failed: {} — using defaults", e);
+            log!(
+                "[ThreadQueue] load_policy query failed: {}, using defaults",
+                e
+            );
             None
         });
         match row {
@@ -538,7 +541,10 @@ impl ThreadQueue {
                 // than hanging on a fire that will never run.
                 log!(
                     "[ThreadQueue] Coalesced redundant cron fire for trigger '{}'",
-                    trigger_name.as_deref().or(trigger_id.as_deref()).unwrap_or("?")
+                    trigger_name
+                        .as_deref()
+                        .or(trigger_id.as_deref())
+                        .unwrap_or("?")
                 );
                 if let Some(tx) = entry.completion_tx.take() {
                     let _ = tx.send(());
@@ -584,9 +590,8 @@ impl ThreadQueue {
                     if let Some(tx) = old.completion_tx.take() {
                         let _ = tx.send(());
                     }
-                    let reason = format!(
-                        "per-trigger queue cap ({cap}) reached — oldest entry dropped"
-                    );
+                    let reason =
+                        format!("per-trigger queue cap ({cap}) reached, oldest entry dropped");
                     self.emit_dropped(old.id, &reason, None).await;
                     self.notify(
                         format!("{trigger_label} queue overflowed"),

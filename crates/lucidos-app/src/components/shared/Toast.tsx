@@ -109,6 +109,15 @@ function handleToastKeyDown(e: KeyboardEvent): void {
   }
 }
 
+/** CSS width for a toast's determinate progress fill. Clamps to [0, 1] and
+ *  rejects a non-finite fraction, so a bad value paints an empty track rather
+ *  than `NaN%` or a bar running past its own container. Exported for the unit
+ *  test that pins that. */
+export function toastProgressWidth(fraction: number): string {
+  if (!Number.isFinite(fraction)) return '0%';
+  return `${Math.min(1, Math.max(0, fraction)) * 100}%`;
+}
+
 function renderMessage(message: string) {
   if (!message.includes('\n')) return linkifyText(message);
   const { heading, sections } = parseToastMessage(message);
@@ -230,6 +239,15 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
                 onClick={t.onClick}
               >{renderMessage(t.message)}</span>
             </div>
+            {/* Determinate progress for a long operation (a packaged update's
+                download). Absent when the operation has no honest percentage —
+                the spinner and the message carry it instead. `toastProgressWidth`
+                clamps, so a bad fraction can never paint outside the track. */}
+            {t.progress != null && (
+              <div class="progress-bar toast-progress">
+                <div class="progress-bar-fill" style={{ width: toastProgressWidth(t.progress) }} />
+              </div>
+            )}
             {(t.action || t.secondaryAction) && (
               <div class="toast-actions">
                 {t.secondaryAction && (

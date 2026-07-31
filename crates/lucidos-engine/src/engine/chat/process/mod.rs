@@ -33,6 +33,53 @@ pub(crate) use context_build::{build_capture_sections, build_loaded_knowhow_bloc
 #[cfg(test)]
 pub(crate) use system_prompt::{ASK_USER_QUESTION_RULE, REPEATED_ACTION_RULE};
 
+/// A turn's exchange-starter event that the CALLER already persisted, so
+/// `process_message_with_steps_internal` must not emit its own
+/// `MessageReceived`.
+///
+/// The variant is load-bearing, and it is a second fact rather than a
+/// consequence of the first. "The event is already on the wire" says nothing
+/// about whether the input is a message the person sent, yet a live thread
+/// routes the two differently: a message is injected as `UserText` and
+/// acknowledged with a `UserPromptInjected`, and it arms the Codex redirect
+/// interrupt; an engine re-entry is injected as `WakeFromChild`, silently.
+///
+/// Modelling both as one nullable id made every reader infer the second from
+/// the first (`pre_emitted_origin.is_none()` == "genuine user follow-up").
+/// That held only because no pre-emitting caller could reach the follow-up
+/// fast-paths: each one either starts a NEW thread or genuinely is an engine
+/// re-entry. The moment a caller pre-emits a real message on a LIVE thread,
+/// the inference misclassifies it as a wake, so the user's queued message is
+/// ingested with no visible acknowledgment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreEmittedOrigin {
+    /// A message from a person or an agent whose `MessageReceived` the caller
+    /// persisted before dispatch: the chat API boundary's emit-before-ack, or
+    /// the Thread Queue executor's eager child `MessageReceived`. Routes
+    /// exactly like a message this function emitted itself.
+    Message(Uuid),
+    /// An engine-internal re-entry on an existing thread, anchored to an event
+    /// the UI already renders: a child thread's completion waking its parent
+    /// (`notify_parent_of_child_completion`), a continuation rerun's note
+    /// (`chat::rerun`), or the re-processing of an orphaned injection. Not
+    /// something the person just typed, so it must not surface as one.
+    EngineReentry(Uuid),
+}
+
+impl PreEmittedOrigin {
+    /// The `events.id` of the already-persisted event.
+    pub(crate) fn event_id(self) -> Uuid {
+        match self {
+            PreEmittedOrigin::Message(id) | PreEmittedOrigin::EngineReentry(id) => id,
+        }
+    }
+
+    /// True for an engine-internal re-entry, false for a real message.
+    pub(crate) fn is_engine_reentry(self) -> bool {
+        matches!(self, PreEmittedOrigin::EngineReentry(_))
+    }
+}
+
 impl LucidosEngine {
     /// Process a trigger prompt (emits TriggerStarted instead of MessageReceived).
     /// `invocation` records which path fired this run (cron schedule or matched event).
@@ -92,7 +139,7 @@ impl LucidosEngine {
     // images / steps_tx / cancel) at the call boundary so triggers and HTTP
     // handlers can wire them through without re-creating a builder struct.
     #[allow(clippy::too_many_arguments)]
-    pub async fn process_message_with_steps(
+    pub(crate) async fn process_message_with_steps(
         &self,
         user_message: &str,
         model_override: Option<&str>,
@@ -112,7 +159,7 @@ impl LucidosEngine {
         mode: ActorMode,
         cc_model: Option<&str>,
         coding_agent: Option<crate::runtime::CodingAgent>,
-        pre_emitted_origin: Option<Uuid>,
+        pre_emitted_origin: Option<PreEmittedOrigin>,
         title: Option<&str>,
         origin: Option<MessageOrigin>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {

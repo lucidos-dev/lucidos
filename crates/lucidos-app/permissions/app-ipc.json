@@ -27,6 +27,7 @@
           "take_pending_native_taps",
           "check_app_update",
           "install_app_update_and_restart",
+          "cancel_app_update",
           "set_titlebar_color",
           "start_window_drag",
           "toggle_window_maximize",

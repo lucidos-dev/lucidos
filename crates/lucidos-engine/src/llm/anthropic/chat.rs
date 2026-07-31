@@ -126,9 +126,16 @@ impl AnthropicProvider {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     let err_str = e.to_string();
-                    if crate::llm::is_retryable_error(&err_str) && attempt <= crate::llm::MAX_RETRIES {
+                    if crate::llm::is_retryable_error(&err_str)
+                        && attempt <= crate::llm::MAX_RETRIES
+                    {
                         let delay = crate::llm::retry_delay(attempt, 2); // longer for stream errors
-                        crate::llm::log_retry(model, &format!("Stream error: {}", err_str), attempt, delay);
+                        crate::llm::log_retry(
+                            model,
+                            &format!("Stream error: {}", err_str),
+                            attempt,
+                            delay,
+                        );
                         tokio::time::sleep(delay).await;
                         continue;
                     }

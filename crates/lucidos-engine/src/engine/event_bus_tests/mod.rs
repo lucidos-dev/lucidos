@@ -302,7 +302,11 @@ fn drain_aggregate_broadcasts(
             thread_id, event, ..
         } = &emitted.typed
         {
-            out.push((*thread_id, event.event_type().to_string(), emitted.aggregate.clone()));
+            out.push((
+                *thread_id,
+                event.event_type().to_string(),
+                emitted.aggregate.clone(),
+            ));
         }
     }
     out
@@ -347,10 +351,7 @@ async fn emit_cc_message_received(
 /// `status='running'` post-`SessionStarted` — the parent's
 /// `blocking_descendant_count` equals `n` on return. Used by the
 /// blocking-count regression tests below.
-async fn spawn_cc_parent_with_n_running_cc_children(
-    bus: &EventBus,
-    n: usize,
-) -> (Uuid, Vec<Uuid>) {
+async fn spawn_cc_parent_with_n_running_cc_children(bus: &EventBus, n: usize) -> (Uuid, Vec<Uuid>) {
     let parent_id = Uuid::new_v4();
     emit_cc_message_received(bus, parent_id, None, "parent").await;
     emit_cc_session_started(bus, parent_id).await;
@@ -398,24 +399,24 @@ async fn emit_cc_recovery_pair(bus: &EventBus, child_id: Uuid) {
     .unwrap();
 }
 
-mod serialization_sse;
-mod serialization_persistence;
-mod fan_out_callback;
-mod session_lifecycle;
 mod active_children_count;
-mod idle_reconcile_counts;
-mod section_review;
-mod recursion_guard;
-mod has_response;
-mod origin_and_resume;
-mod change_apply_archive;
-mod proposed_apply_cycle;
-mod initiator_actor;
-mod review_presence_status;
-mod thread_state_and_eviction;
-mod has_diff_and_actor;
-mod blocking_attention_counts;
 mod ancestor_rebroadcast;
+mod blocking_attention_counts;
+mod change_apply_archive;
 mod command_permission;
+mod fan_out_callback;
+mod has_diff_and_actor;
+mod has_response;
+mod idle_reconcile_counts;
+mod initiator_actor;
+mod origin_and_resume;
+mod proposed_apply_cycle;
 mod recovery_and_pipeline;
+mod recursion_guard;
 mod repo_names_projection;
+mod review_presence_status;
+mod section_review;
+mod serialization_persistence;
+mod serialization_sse;
+mod session_lifecycle;
+mod thread_state_and_eviction;

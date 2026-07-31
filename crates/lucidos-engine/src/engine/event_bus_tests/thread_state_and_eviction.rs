@@ -120,13 +120,12 @@ async fn thread_discarded_sets_archive_state_to_archived() {
     .await
     .unwrap();
 
-    let archive_state_before: String = sqlx::query_scalar(
-        "SELECT archive_state FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let archive_state_before: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(archive_state_before, "inbox");
 
     bus.emit(BusEvent::Thread {
@@ -137,13 +136,12 @@ async fn thread_discarded_sets_archive_state_to_archived() {
     .await
     .unwrap();
 
-    let archive_state_after: String = sqlx::query_scalar(
-        "SELECT archive_state FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let archive_state_after: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(archive_state_after, "archived");
 
     pool.close().await;
@@ -276,7 +274,10 @@ async fn message_received_overrides_stale_compose_source_on_composing_to_active(
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(pre_source, "claude_code", "draft source seeded as claude_code");
+    assert_eq!(
+        pre_source, "claude_code",
+        "draft source seeded as claude_code"
+    );
 
     // User toggled back to Lucidos and sent — MessageReceived arrives on the
     // chat channel. The projection must overwrite the stale source.
@@ -598,9 +599,7 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
     let huge_error = "X".repeat(5000);
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
-        event: ThreadEvent::ResponseFailed {
-            error: huge_error,
-        },
+        event: ThreadEvent::ResponseFailed { error: huge_error },
         meta: EventMeta::NONE,
     })
     .await
@@ -627,7 +626,10 @@ async fn child_thread_completed_failure_summary_capped_at_200_chars() {
         .and_then(|v| v.as_str())
         .expect("status field present");
 
-    assert_eq!(status, "failure", "status must be failure for ResponseFailed");
+    assert_eq!(
+        status, "failure",
+        "status must be failure for ResponseFailed"
+    );
     // 200 chars of payload + "… (truncated)" suffix.
     assert!(
         summary.ends_with("… (truncated)"),
@@ -746,7 +748,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
         thread_id,
         event: ThreadEvent::ToolResult {
             name: "run_python".into(),
-            result: "[Tool execution interrupted by engine restart — original ToolCalled event_id: \
+            result: "[Tool execution interrupted by engine restart, original ToolCalled event_id: \
                      00000000-0000-0000-0000-000000000000]"
                 .into(),
             images: vec![],
@@ -1275,13 +1277,12 @@ async fn thread_discarded_clears_compose_selection() {
     .await
     .unwrap();
 
-    let compose_selection: Option<serde_json::Value> = sqlx::query_scalar(
-        "SELECT compose_selection FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let compose_selection: Option<serde_json::Value> =
+        sqlx::query_scalar("SELECT compose_selection FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         compose_selection, None,
         "compose_selection must be cleared on discard, in lockstep with the other compose fields"
@@ -1336,11 +1337,13 @@ async fn seed_thread_awaiting_answer(bus: &EventBus, pool: &PgPool, draft: &str)
 
 /// Read the compose fields the answer arm is allowed to touch.
 async fn read_compose(pool: &PgPool, thread_id: Uuid) -> (String, Option<serde_json::Value>) {
-    sqlx::query_as("SELECT compose_text, compose_selection FROM thread_summaries WHERE thread_id = $1")
-        .bind(thread_id)
-        .fetch_one(pool)
-        .await
-        .unwrap()
+    sqlx::query_as(
+        "SELECT compose_text, compose_selection FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 /// Typed text answering a question IS a submitted draft, but it never becomes a
@@ -1352,7 +1355,8 @@ async fn read_compose(pool: &PgPool, thread_id: Uuid) -> (String, Option<serde_j
 async fn free_text_answer_clears_the_draft_it_submitted() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "night has passed by, any progress?\n").await;
+    let thread_id =
+        seed_thread_awaiting_answer(&bus, &pool, "night has passed by, any progress?\n").await;
 
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -1393,7 +1397,8 @@ async fn free_text_answer_clears_the_draft_it_submitted() {
 async fn free_text_answer_broadcasts_the_cleared_compose_state() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "night has passed by, any progress?").await;
+    let thread_id =
+        seed_thread_awaiting_answer(&bus, &pool, "night has passed by, any progress?").await;
     let mut rx = bus.subscribe();
 
     bus.emit(BusEvent::Thread {
@@ -1510,7 +1515,8 @@ async fn sending_without_a_draft_broadcasts_no_compose_change() {
 async fn answer_that_clears_nothing_broadcasts_nothing() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
+    let thread_id =
+        seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
     let mut rx = bus.subscribe();
 
     bus.emit(BusEvent::Thread {
@@ -1547,7 +1553,8 @@ async fn answer_that_clears_nothing_broadcasts_nothing() {
 async fn answer_leaves_a_different_stored_draft_alone() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
-    let thread_id = seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
+    let thread_id =
+        seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
 
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -1582,11 +1589,13 @@ async fn answer_leaves_an_image_bearing_draft_alone() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = seed_thread_awaiting_answer(&bus, &pool, "look at this").await;
-    sqlx::query("UPDATE thread_summaries SET compose_images = '[\"hash-a\"]'::jsonb WHERE thread_id = $1")
-        .bind(thread_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE thread_summaries SET compose_images = '[\"hash-a\"]'::jsonb WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     bus.emit(BusEvent::Thread {
         thread_id,

@@ -1,5 +1,5 @@
-use super::*;
 use super::common::make_test_repo;
+use super::*;
 
 /// Helper: create a branch ref pointing at main with no extra commits
 /// (simulates the corrupted state where CC never committed its work).
@@ -216,12 +216,7 @@ async fn find_worktree_for_branch_returns_path_when_branch_is_checked_out() {
     let _ = git_cmd(&["branch", "claude-code/feat"], &repo).await;
     let wt = _tmp.path().join("some/nested/worktree-path");
     let add = git_cmd(
-        &[
-            "worktree",
-            "add",
-            wt.to_str().unwrap(),
-            "claude-code/feat",
-        ],
+        &["worktree", "add", wt.to_str().unwrap(), "claude-code/feat"],
         &repo,
     )
     .await
@@ -274,12 +269,18 @@ async fn read_exclude_file(wt_path: &std::path::Path) -> String {
 async fn add_paths_to_worktree_exclude_writes_each_path_to_empty_file() {
     let (_tmp, repo) = make_test_repo().await;
 
-    add_paths_to_worktree_exclude(&repo, &[".lucidos-workspace", ".claude/skills/lucidos-cli/"])
-        .await;
+    add_paths_to_worktree_exclude(
+        &repo,
+        &[".lucidos-workspace", ".claude/skills/lucidos-cli/"],
+    )
+    .await;
 
     let body = read_exclude_file(&repo).await;
     let lines: Vec<&str> = body.lines().filter(|l| !l.is_empty()).collect();
-    assert!(lines.contains(&".lucidos-workspace"), "missing marker: {body}");
+    assert!(
+        lines.contains(&".lucidos-workspace"),
+        "missing marker: {body}"
+    );
     assert!(
         lines.contains(&".claude/skills/lucidos-cli/"),
         "missing skill dir: {body}"
@@ -380,9 +381,13 @@ async fn add_paths_to_worktree_exclude_makes_git_status_honor_paths_in_worktree(
     .await
     .unwrap();
 
-    let status_before =
-        String::from_utf8_lossy(&git_cmd(&["status", "--porcelain"], &wt).await.unwrap().stdout)
-            .into_owned();
+    let status_before = String::from_utf8_lossy(
+        &git_cmd(&["status", "--porcelain"], &wt)
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
     assert!(
         status_before.contains(".lucidos-workspace"),
         "test setup: marker should be untracked before exclude write: {status_before}"
@@ -402,9 +407,13 @@ async fn add_paths_to_worktree_exclude_makes_git_status_honor_paths_in_worktree(
         "skill dir missing in resolved exclude file: {body}"
     );
 
-    let status_after =
-        String::from_utf8_lossy(&git_cmd(&["status", "--porcelain"], &wt).await.unwrap().stdout)
-            .into_owned();
+    let status_after = String::from_utf8_lossy(
+        &git_cmd(&["status", "--porcelain"], &wt)
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .into_owned();
     assert!(
         !status_after.contains(".lucidos-workspace"),
         "marker still untracked after exclude write — git is not honoring our exclude entries: {status_after}"
@@ -456,9 +465,7 @@ async fn worktree_exclude_paths_hide_deep_app_lucidos_cli_skill_from_git_status(
     )
     .into_owned();
     assert!(
-        status_before.contains(
-            "data/apps/habit-tracker/.claude/skills/lucidos-cli/SKILL.md"
-        ),
+        status_before.contains("data/apps/habit-tracker/.claude/skills/lucidos-cli/SKILL.md"),
         "test setup: deep skill file should be untracked before exclude write: {status_before}"
     );
 
@@ -516,14 +523,18 @@ async fn branch_changed_files_filters_lucidos_runtime_paths() {
     // Branch with a real change AND every engine-injected path committed:
     // `.lucidos-workspace` (marker), `.lucidos/bin/lucidos` (CLI symlink),
     // and `.claude/skills/lucidos-cli/SKILL.md` (skill).
-    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await.unwrap();
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo)
+        .await
+        .unwrap();
     tokio::fs::write(repo.join("real.txt"), "real change")
         .await
         .unwrap();
     tokio::fs::write(repo.join(".lucidos-workspace"), "ws-marker")
         .await
         .unwrap();
-    tokio::fs::create_dir_all(repo.join(".lucidos/bin")).await.unwrap();
+    tokio::fs::create_dir_all(repo.join(".lucidos/bin"))
+        .await
+        .unwrap();
     tokio::fs::write(repo.join(".lucidos/bin/lucidos"), "")
         .await
         .unwrap();
@@ -565,10 +576,7 @@ async fn install_failing_pre_commit_hook(repo: &std::path::Path) {
     )
     .await
     .unwrap();
-    let mut perms = tokio::fs::metadata(&hook_path)
-        .await
-        .unwrap()
-        .permissions();
+    let mut perms = tokio::fs::metadata(&hook_path).await.unwrap().permissions();
     perms.set_mode(0o755);
     tokio::fs::set_permissions(&hook_path, perms).await.unwrap();
 }
@@ -645,7 +653,9 @@ async fn commit_worktree_or_err_commits_dirty_worktree() {
 async fn make_repo_with_pending_merge() -> (tempfile::TempDir, std::path::PathBuf) {
     let (tmp, repo) = make_test_repo().await;
 
-    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await.unwrap();
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo)
+        .await
+        .unwrap();
     tokio::fs::write(repo.join("feature.txt"), "feature work")
         .await
         .unwrap();
@@ -663,12 +673,9 @@ async fn make_repo_with_pending_merge() -> (tempfile::TempDir, std::path::PathBu
         .await
         .unwrap();
 
-    let _ = git_cmd(
-        &["merge", "--no-ff", "--no-commit", "feature"],
-        &repo,
-    )
-    .await
-    .unwrap();
+    let _ = git_cmd(&["merge", "--no-ff", "--no-commit", "feature"], &repo)
+        .await
+        .unwrap();
 
     (tmp, repo)
 }
@@ -711,9 +718,7 @@ async fn git_commit_no_edit_finalises_pending_merge() {
         result
     );
 
-    let head_parents = git_cmd(&["log", "-1", "--pretty=%P"], &repo)
-        .await
-        .unwrap();
+    let head_parents = git_cmd(&["log", "-1", "--pretty=%P"], &repo).await.unwrap();
     let parents = String::from_utf8_lossy(&head_parents.stdout);
     assert_eq!(
         parents.split_whitespace().count(),
@@ -769,8 +774,12 @@ async fn hide_phantom_tracked_skill_hides_modified_tracked_skill() {
         .await
         .unwrap();
     // Stale copy committed in a prior session (simulates the auto-commit).
-    tokio::fs::write(&skill, "stale skill body\n").await.unwrap();
-    let _ = git_cmd(&["add", "--", PHANTOM_SKILL_REL], &wt).await.unwrap();
+    tokio::fs::write(&skill, "stale skill body\n")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "--", PHANTOM_SKILL_REL], &wt)
+        .await
+        .unwrap();
     let _ = git_cmd(&["commit", "-m", "auto-committed skill"], &wt)
         .await
         .unwrap();
@@ -809,7 +818,9 @@ async fn hide_phantom_tracked_skill_leaves_clean_tracked_skill_editable() {
         .await
         .unwrap();
     tokio::fs::write(&skill, "skill body\n").await.unwrap();
-    let _ = git_cmd(&["add", "--", PHANTOM_SKILL_REL], &wt).await.unwrap();
+    let _ = git_cmd(&["add", "--", PHANTOM_SKILL_REL], &wt)
+        .await
+        .unwrap();
     let _ = git_cmd(&["commit", "-m", "tracked skill"], &wt)
         .await
         .unwrap();
@@ -818,7 +829,9 @@ async fn hide_phantom_tracked_skill_leaves_clean_tracked_skill_editable() {
     hide_phantom_tracked_skill(&wt, PHANTOM_SKILL_REL).await;
 
     // A subsequent real edit must remain visible to git.
-    tokio::fs::write(&skill, "edited skill body\n").await.unwrap();
+    tokio::fs::write(&skill, "edited skill body\n")
+        .await
+        .unwrap();
     let status = porcelain_for(&wt, PHANTOM_SKILL_REL).await;
     assert!(
         status.contains("SKILL.md"),
@@ -841,7 +854,9 @@ async fn hide_phantom_tracked_skill_hides_deep_app_skill_from_subdir_cwd() {
     tokio::fs::create_dir_all(skill.parent().unwrap())
         .await
         .unwrap();
-    tokio::fs::write(&skill, "stale skill body\n").await.unwrap();
+    tokio::fs::write(&skill, "stale skill body\n")
+        .await
+        .unwrap();
     // Commit from the worktree root with the full deep path.
     let deep_rel = "data/apps/habit-tracker/.claude/skills/lucidos-cli/SKILL.md";
     let _ = git_cmd(&["add", "--", deep_rel], &wt).await.unwrap();

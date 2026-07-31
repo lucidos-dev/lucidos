@@ -39,7 +39,9 @@ pub(crate) fn parse_temp_change_id(dir_name: &str) -> Option<Uuid> {
 /// (e.g. the path no longer exists), which is fine for the worktree-removal
 /// path because the failure case is "child doesn't exist" → no harm done.
 pub(crate) fn is_safe_subpath(parent: &Path, child: &Path) -> bool {
-    let parent_canon = parent.canonicalize().unwrap_or_else(|_| parent.to_path_buf());
+    let parent_canon = parent
+        .canonicalize()
+        .unwrap_or_else(|_| parent.to_path_buf());
     let child_canon = child.canonicalize().unwrap_or_else(|_| child.to_path_buf());
     child_canon.starts_with(&parent_canon) && child_canon != parent_canon
 }
@@ -94,7 +96,9 @@ pub(crate) fn directory_size_bytes(path: &Path) -> u64 {
 /// the user manually deleted `.git/worktrees/<name>` so the worktree is now
 /// stranded). Tier 2 callers fall back to a `remove_dir_all` in that case.
 pub(crate) async fn resolve_repo_root_from_worktree(worktree: &Path) -> Option<PathBuf> {
-    let out = git_cmd(&["rev-parse", "--git-common-dir"], worktree).await.ok()?;
+    let out = git_cmd(&["rev-parse", "--git-common-dir"], worktree)
+        .await
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -497,14 +501,13 @@ pub(crate) async fn lookup_thread_summary(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
 ) -> (Option<String>, bool) {
-    let row: Option<(Option<String>, bool)> = sqlx::query_as(
-        "SELECT title, is_saved FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_optional(pool)
-    .await
-    .ok()
-    .flatten();
+    let row: Option<(Option<String>, bool)> =
+        sqlx::query_as("SELECT title, is_saved FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
     match row {
         Some((title, saved)) => (title, saved),
         None => (None, false),

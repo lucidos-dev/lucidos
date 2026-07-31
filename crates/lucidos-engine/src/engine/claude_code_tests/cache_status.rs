@@ -1,6 +1,5 @@
 use super::*;
 
-
 fn cache_with(entries: &[(&str, &[&str])]) -> HashMap<String, CcCommandsInfo> {
     entries
         .iter()
@@ -72,4 +71,3 @@ fn change_applied_concurrently_only_true_for_applied_status() {
     assert!(!change_applied_concurrently(Some("discarded")));
     assert!(!change_applied_concurrently(None));
 }
-

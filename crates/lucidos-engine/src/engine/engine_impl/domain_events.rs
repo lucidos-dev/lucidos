@@ -100,5 +100,4 @@ impl LucidosEngine {
             log!("[Triggers] Failed to persist TriggerExecuted event: {}", e);
         }
     }
-
 }

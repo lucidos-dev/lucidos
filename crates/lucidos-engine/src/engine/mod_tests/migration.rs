@@ -55,4 +55,3 @@ fn migration_does_not_clobber_when_both_exist() {
 
     let _ = std::fs::remove_dir_all(&ws);
 }
-

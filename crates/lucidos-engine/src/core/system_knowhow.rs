@@ -110,7 +110,11 @@ mod tests {
     #[test]
     fn load_summaries_lists_all_docs() {
         let tmp = tempfile::tempdir().unwrap();
-        write_doc(&tmp.path().join("best-practices.md"), "Best Practices", "Body.");
+        write_doc(
+            &tmp.path().join("best-practices.md"),
+            "Best Practices",
+            "Body.",
+        );
         write_doc(&tmp.path().join("lucidos-cli.md"), "Lucidos CLI", "Body.");
 
         let ids: Vec<String> = SystemKnowhowStore::load_summaries(tmp.path())
@@ -182,7 +186,10 @@ mod tests {
 
         let (dir, warning) =
             resolve_system_knowhow_dir(Some(missing.to_str().unwrap()), &repo, true);
-        assert_eq!(dir, None, "a set-but-missing env var never falls back to repo_root");
+        assert_eq!(
+            dir, None,
+            "a set-but-missing env var never falls back to repo_root"
+        );
         let warning = warning.expect("a set-but-missing env dir must warn");
         assert!(warning.contains("LUCIDOS_SYSTEM_KNOWHOW_DIR"));
     }
@@ -196,7 +203,10 @@ mod tests {
 
         for packaged in [false, true] {
             let (dir, warning) = resolve_system_knowhow_dir(None, tmp.path(), packaged);
-            assert_eq!(dir.as_deref(), Some(tmp.path().join("system-knowhow").as_path()));
+            assert_eq!(
+                dir.as_deref(),
+                Some(tmp.path().join("system-knowhow").as_path())
+            );
             assert_eq!(warning, None, "repo-root hit warns nothing");
         }
     }
@@ -206,7 +216,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("system-knowhow")).unwrap();
         let (dir, warning) = resolve_system_knowhow_dir(Some("   "), tmp.path(), false);
-        assert_eq!(dir.as_deref(), Some(tmp.path().join("system-knowhow").as_path()));
+        assert_eq!(
+            dir.as_deref(),
+            Some(tmp.path().join("system-knowhow").as_path())
+        );
         assert_eq!(warning, None);
     }
 

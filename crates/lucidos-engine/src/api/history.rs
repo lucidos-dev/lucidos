@@ -13,10 +13,7 @@ const SSE_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// bound memory if a client stalls.
 const GZIP_PIPE_BUF_BYTES: usize = 64 * 1024;
 
-pub(super) async fn global_events(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+pub(super) async fn global_events(State(state): State<AppState>, headers: HeaderMap) -> Response {
     // Register this connection in the live SSE-connection count. The guard is
     // moved into the stream's map closure below so it's dropped — and the count
     // decremented — exactly when the stream is dropped (client disconnects).
@@ -481,7 +478,7 @@ async fn restart_via_gateway(
                 log!(
                     "[Restart] {}{}",
                     msg,
-                    if more { " — retrying other scheme" } else { "" }
+                    if more { ", retrying other scheme" } else { "" }
                 );
                 last_err = Some(msg);
             }

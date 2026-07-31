@@ -4,15 +4,21 @@ use super::*;
 #[tokio::test]
 async fn root_commit_sha_is_the_initial_commit_and_stable() {
     let (_tmp, repo) = make_test_repo().await;
-    let first = root_commit_sha(&repo).await.expect("root commit resolvable");
+    let first = root_commit_sha(&repo)
+        .await
+        .expect("root commit resolvable");
     assert_eq!(first.len(), 40, "full SHA-1 hex");
 
     // A later commit must NOT change the root-commit SHA — repo identity is
     // intrinsic to the FIRST commit, so it survives ongoing history.
-    tokio::fs::write(repo.join("more.txt"), "more").await.unwrap();
+    tokio::fs::write(repo.join("more.txt"), "more")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(&["commit", "-m", "second"], &repo).await;
-    let after = root_commit_sha(&repo).await.expect("root commit still resolvable");
+    let after = root_commit_sha(&repo)
+        .await
+        .expect("root commit still resolvable");
     assert_eq!(first, after, "root commit unaffected by later commits");
 }
 
@@ -56,7 +62,9 @@ async fn branch_changed_files_checked_reports_empty_for_a_commit_and_revert() {
     tokio::fs::write(repo.join("stray.txt"), "").await.unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(&["commit", "-m", "add stray"], &repo).await;
-    tokio::fs::remove_file(repo.join("stray.txt")).await.unwrap();
+    tokio::fs::remove_file(repo.join("stray.txt"))
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "-A"], &repo).await;
     let _ = git_cmd(&["commit", "-m", "drop stray"], &repo).await;
     let _ = git_cmd(&["checkout", "main"], &repo).await;
@@ -85,5 +93,7 @@ async fn branch_changed_files_checked_errors_on_a_missing_branch() {
     );
     // The forgiving wrapper still degrades to empty for the "is there anything
     // to propose?" callers.
-    assert!(branch_changed_files(&repo, "no-such-branch").await.is_empty());
+    assert!(branch_changed_files(&repo, "no-such-branch")
+        .await
+        .is_empty());
 }

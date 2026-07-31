@@ -10,7 +10,6 @@
 //! Splitting is purely structural — `OpenAiProvider` stays reachable at
 //! `crate::llm::openai::OpenAiProvider` (and re-exported from `crate::llm`).
 
-
 use crate::core::AuthType;
 use crate::llm::provider::{
     LlmProvider, LlmResponse, Message, TokenCallback, ToolCall, ToolDefinition,
@@ -343,7 +342,8 @@ impl StreamMeta {
             .and_then(|v| v.as_u64())
         {
             if cached > 0 {
-                self.cache_read_tokens = Some(crate::llm::clamp_provider_token_count(cached, "OpenAI"));
+                self.cache_read_tokens =
+                    Some(crate::llm::clamp_provider_token_count(cached, "OpenAI"));
             }
         }
     }
@@ -366,7 +366,8 @@ impl StreamMeta {
                 .and_then(|v| v.as_u64())
             {
                 if cached > 0 {
-                    self.cache_read_tokens = Some(crate::llm::clamp_provider_token_count(cached, "OpenAI"));
+                    self.cache_read_tokens =
+                        Some(crate::llm::clamp_provider_token_count(cached, "OpenAI"));
                 }
             }
         }
@@ -485,8 +486,11 @@ mod tests {
     /// wins over the Codex key (env is an explicit launch choice).
     #[test]
     fn falls_back_to_env_when_no_credential() {
-        let resolved =
-            resolve_openai_api_key(None, Some("sk-env".to_string()), Some("sk-codex".to_string()));
+        let resolved = resolve_openai_api_key(
+            None,
+            Some("sk-env".to_string()),
+            Some("sk-codex".to_string()),
+        );
         assert_eq!(resolved, Some(("sk-env".to_string(), OpenAiKeySource::Env)));
     }
 
@@ -515,8 +519,11 @@ mod tests {
     /// A `bearer` credential carries a usable OpenAI key just like `api_key`.
     #[test]
     fn bearer_credential_is_accepted() {
-        let resolved =
-            resolve_openai_api_key(Some((AuthType::Bearer, "sk-bearer".to_string())), None, None);
+        let resolved = resolve_openai_api_key(
+            Some((AuthType::Bearer, "sk-bearer".to_string())),
+            None,
+            None,
+        );
         assert_eq!(
             resolved,
             Some(("sk-bearer".to_string(), OpenAiKeySource::Credential))
@@ -529,7 +536,10 @@ mod tests {
     #[test]
     fn unsupported_auth_type_falls_back_to_env() {
         let resolved = resolve_openai_api_key(
-            Some((AuthType::Password, r#"{"username":"a","password":"b"}"#.to_string())),
+            Some((
+                AuthType::Password,
+                r#"{"username":"a","password":"b"}"#.to_string(),
+            )),
             Some("sk-env".to_string()),
             None,
         );
@@ -599,7 +609,10 @@ mod tests {
     #[test]
     fn base_url_derives_chat_and_responses_endpoints() {
         let openai = OpenAiProvider::new("k".to_string(), "gpt-4o".to_string()).unwrap();
-        assert_eq!(openai.chat_url, "https://api.openai.com/v1/chat/completions");
+        assert_eq!(
+            openai.chat_url,
+            "https://api.openai.com/v1/chat/completions"
+        );
         assert_eq!(openai.responses_url, "https://api.openai.com/v1/responses");
 
         let local = OpenAiProvider::new_with_base_url(
@@ -658,7 +671,10 @@ mod tests {
             "z-ai/glm-5.2".to_string(),
             "https://openrouter.ai/api/v1",
             vec![
-                ("HTTP-Referer".to_string(), "https://lucidos.dev".to_string()),
+                (
+                    "HTTP-Referer".to_string(),
+                    "https://lucidos.dev".to_string(),
+                ),
                 ("X-Title".to_string(), "Lucidos".to_string()),
             ],
             true,
@@ -671,6 +687,8 @@ mod tests {
         assert!(headers
             .iter()
             .any(|(n, v)| n == "HTTP-Referer" && v == "https://lucidos.dev"));
-        assert!(headers.iter().any(|(n, v)| n == "X-Title" && v == "Lucidos"));
+        assert!(headers
+            .iter()
+            .any(|(n, v)| n == "X-Title" && v == "Lucidos"));
     }
 }

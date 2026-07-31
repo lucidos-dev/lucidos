@@ -29,7 +29,17 @@ fn declarative_envelope_has_web_push_magic_and_notification_object() {
     // spec — Safari 18.5+ keys off `web_push: 8030` to read the declarative
     // `notification.navigate` tap target. The iOS SW `push` handler may still
     // run to render the visible banner, so the declarative URL has to be right.
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None, None);
+    let payload = build_push_payload(
+        "Hi",
+        "There",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert_eq!(payload["web_push"], 8030);
     assert!(payload["notification"].is_object());
     assert!(
@@ -53,13 +63,11 @@ fn payload_app_badge_reflects_unread_count() {
     // it in its parent process without running the SW, the only badge path for
     // a closed iOS PWA. It carries the workspace's OWN unread count, so a
     // per-workspace PWA badges its own workspace.
-    let payload =
-        build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(3));
+    let payload = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(3));
     assert_eq!(payload["app_badge"], 3);
 
     // 0 is emitted (clears the badge when everything is read), not omitted.
-    let cleared =
-        build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(0));
+    let cleared = build_push_payload("T", "B", None, None, None, None, &Tap::Modal, None, Some(0));
     assert_eq!(cleared["app_badge"], 0);
 
     // None → field omitted entirely (count unreadable; don't touch the badge).
@@ -72,7 +80,17 @@ fn payload_minimal_has_title_body_and_modal_tap() {
     // Hard cut: `tap` is always present in `notification.data` — the SW
     // routes off it and the wake-push payload must match byte-for-byte
     // for tag-replace to dedupe cleanly.
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None, None);
+    let payload = build_push_payload(
+        "Hi",
+        "There",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert_eq!(payload["notification"]["title"], "Hi");
     assert_eq!(payload["notification"]["body"], "There");
     let data = &payload["notification"]["data"];
@@ -177,7 +195,17 @@ fn payload_omits_event_id_when_not_provided() {
 
 #[test]
 fn payload_always_includes_tap_even_when_modal_default() {
-    let payload = build_push_payload("Hi", "There", None, None, None, None, &Tap::Modal, None, None);
+    let payload = build_push_payload(
+        "Hi",
+        "There",
+        None,
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert_eq!(
         payload["notification"]["data"]["tap"],
         serde_json::json!({"kind": "modal"})
@@ -287,7 +315,17 @@ fn declarative_navigate_falls_back_to_scope_relative_query_when_scope_missing() 
     let tid = uuid::Uuid::new_v4();
     let eid = uuid::Uuid::new_v4();
     let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
-    let payload = build_push_payload("T", "B", Some(nid), None, Some(tid), Some(eid), &tap, None, None);
+    let payload = build_push_payload(
+        "T",
+        "B",
+        Some(nid),
+        None,
+        Some(tid),
+        Some(eid),
+        &tap,
+        None,
+        None,
+    );
     let nav = payload["notification"]["navigate"].as_str().unwrap();
     assert!(
         nav.starts_with('?') && !nav.starts_with('/'),
@@ -362,7 +400,17 @@ fn declarative_navigate_omits_tap_param_for_modal_kind() {
     // `notification=…`, but the `tap=` param is redundant: the page-side
     // dispatcher defaults missing tap to modal. Keeps URLs short.
     let nid = uuid::Uuid::new_v4();
-    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None, None);
+    let payload = build_push_payload(
+        "T",
+        "B",
+        Some(nid),
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     let nav = payload["notification"]["navigate"].as_str().unwrap();
     assert!(nav.contains(&format!("notification={}", nid)));
     assert!(
@@ -410,7 +458,17 @@ fn declarative_notification_tag_carries_notification_id_for_dedup() {
     // duplicates. Engine produces the tag now so Safari's declarative path
     // gets the same dedup as the SW path.
     let nid = uuid::Uuid::new_v4();
-    let payload = build_push_payload("T", "B", Some(nid), None, None, None, &Tap::Modal, None, None);
+    let payload = build_push_payload(
+        "T",
+        "B",
+        Some(nid),
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        None,
+    );
     assert_eq!(payload["notification"]["tag"], nid.to_string());
 }
 

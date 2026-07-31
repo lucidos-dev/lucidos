@@ -148,7 +148,10 @@ mod tests {
         }
     }
 
-    async fn next_todo_items(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid) -> Vec<super::super::thread_events::TodoItem> {
+    async fn next_todo_items(
+        rx: &mut Receiver<EmittedEvent>,
+        thread_id: Uuid,
+    ) -> Vec<super::super::thread_events::TodoItem> {
         loop {
             let ev = rx.recv().await.expect("broadcast channel should not close");
             if let BusEvent::Thread {

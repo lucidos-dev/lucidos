@@ -1,6 +1,7 @@
 use uuid::Uuid;
 
 use super::title::emit_generated_title;
+use super::PreEmittedOrigin;
 use crate::engine::thread_events::ActorMode;
 use crate::engine::LucidosEngine;
 
@@ -32,8 +33,7 @@ impl LucidosEngine {
         caller_title: Option<&str>,
         model: Option<String>,
         reasoning_effort: Option<String>,
-    ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
         let explicit_title = caller_title
             .map(str::trim)
             .filter(|t| !t.is_empty())
@@ -118,7 +118,10 @@ impl LucidosEngine {
                     ActorMode::Agent,
                     None,
                     None,
-                    pre_emitted_origin,
+                    // The Thread Queue executor persists the child's
+                    // MessageReceived at admission time; it is a real message,
+                    // just one this task didn't emit.
+                    pre_emitted_origin.map(PreEmittedOrigin::Message),
                     None,
                     None,
                 )

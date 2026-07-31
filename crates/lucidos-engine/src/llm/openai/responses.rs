@@ -2,7 +2,6 @@
 //! The struct, shared stream types, and dispatch live in the parent `openai`
 //! module.
 
-
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
@@ -411,7 +410,9 @@ impl OpenAiProvider {
             if !status.is_success() {
                 let error_body = resp.text().await.unwrap_or_default();
 
-                if crate::llm::is_retryable_status(status.as_u16()) && attempt <= crate::llm::MAX_RETRIES {
+                if crate::llm::is_retryable_status(status.as_u16())
+                    && attempt <= crate::llm::MAX_RETRIES
+                {
                     let delay = crate::llm::retry_delay(attempt, 1);
                     crate::llm::log_retry(model, &format!("HTTP {}", status), attempt, delay);
                     tokio::time::sleep(delay).await;
@@ -449,7 +450,9 @@ impl OpenAiProvider {
                 }
                 Err(e) => {
                     let err_str = e.to_string();
-                    if crate::llm::is_retryable_error(&err_str) && attempt <= crate::llm::MAX_RETRIES {
+                    if crate::llm::is_retryable_error(&err_str)
+                        && attempt <= crate::llm::MAX_RETRIES
+                    {
                         let delay = crate::llm::retry_delay(attempt, 2);
                         crate::llm::log_retry(
                             model,

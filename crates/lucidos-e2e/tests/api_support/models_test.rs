@@ -12,11 +12,7 @@ use crate::support::{base_url, http_client, unique_marker};
 use serde_json::json;
 
 /// Fetch one model from `GET /models`, or `None` if absent.
-async fn find_model(
-    client: &reqwest::Client,
-    api: &str,
-    id: &str,
-) -> Option<serde_json::Value> {
+async fn find_model(client: &reqwest::Client, api: &str, id: &str) -> Option<serde_json::Value> {
     let resp = client
         .get(format!("{}/api/v1/models", api))
         .send()
@@ -61,7 +57,10 @@ async fn context_window_round_trips_over_http() {
         .await
         .expect("create failed");
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], true);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
 
     let listed = find_model(&client, &api, &id).await.expect("model listed");
     assert_eq!(
@@ -78,7 +77,10 @@ async fn context_window_round_trips_over_http() {
         .await
         .expect("update failed");
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], true);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
     let listed = find_model(&client, &api, &id).await.expect("model listed");
     assert_eq!(listed["context_window"], 262_144);
 
@@ -288,7 +290,10 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
         .await
         .expect("update failed");
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], true);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
 
     let listed = find_model(&client, &api, id).await.expect("model listed");
     assert_eq!(
@@ -308,9 +313,15 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
         .send()
         .await
         .expect("update failed");
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], false);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        false
+    );
     let listed = find_model(&client, &api, id).await.expect("model listed");
-    assert_eq!(listed["context_window"], 1_048_576, "rejected edit changes nothing");
+    assert_eq!(
+        listed["context_window"], 1_048_576,
+        "rejected edit changes nothing"
+    );
 
     // Put the seeded value back (an explicit null clears the declaration).
     let resp = client
@@ -320,7 +331,10 @@ async fn builtin_accepts_context_window_but_keeps_its_identity() {
         .send()
         .await
         .expect("restore failed");
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], true);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
     let listed = find_model(&client, &api, id).await.expect("model listed");
     assert_eq!(
         listed["context_window"], seeded_window,

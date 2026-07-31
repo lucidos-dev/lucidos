@@ -320,24 +320,40 @@ mod tests {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
 
         // Push-enabled + old → returned
-        DeviceStore::register(&pool, "old-on", Some("UA")).await.unwrap();
-        DeviceStore::set_push_enabled(&pool, "old-on", true).await.unwrap();
+        DeviceStore::register(&pool, "old-on", Some("UA"))
+            .await
+            .unwrap();
+        DeviceStore::set_push_enabled(&pool, "old-on", true)
+            .await
+            .unwrap();
         backdate_last_seen(&pool, "old-on", 45).await;
 
         // Push-enabled + recent → excluded (last_seen is today)
-        DeviceStore::register(&pool, "fresh-on", Some("UA")).await.unwrap();
-        DeviceStore::set_push_enabled(&pool, "fresh-on", true).await.unwrap();
+        DeviceStore::register(&pool, "fresh-on", Some("UA"))
+            .await
+            .unwrap();
+        DeviceStore::set_push_enabled(&pool, "fresh-on", true)
+            .await
+            .unwrap();
 
         // Push-disabled + old → excluded (filtered at SELECT to avoid no-op events)
-        DeviceStore::register(&pool, "old-off", Some("UA")).await.unwrap();
+        DeviceStore::register(&pool, "old-off", Some("UA"))
+            .await
+            .unwrap();
         backdate_last_seen(&pool, "old-off", 45).await;
 
         // Right on the cutoff (29 days) → excluded
-        DeviceStore::register(&pool, "almost-on", Some("UA")).await.unwrap();
-        DeviceStore::set_push_enabled(&pool, "almost-on", true).await.unwrap();
+        DeviceStore::register(&pool, "almost-on", Some("UA"))
+            .await
+            .unwrap();
+        DeviceStore::set_push_enabled(&pool, "almost-on", true)
+            .await
+            .unwrap();
         backdate_last_seen(&pool, "almost-on", 29).await;
 
-        let stale = DeviceStore::list_stale_push_enabled(&pool, 30).await.unwrap();
+        let stale = DeviceStore::list_stale_push_enabled(&pool, 30)
+            .await
+            .unwrap();
         assert_eq!(stale, vec!["old-on".to_string()]);
 
         crate::test_support::teardown_test_db(&db_name).await;
@@ -346,10 +362,16 @@ mod tests {
     #[tokio::test]
     async fn list_stale_push_enabled_returns_empty_when_nothing_stale() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
-        DeviceStore::register(&pool, "fresh", Some("UA")).await.unwrap();
-        DeviceStore::set_push_enabled(&pool, "fresh", true).await.unwrap();
+        DeviceStore::register(&pool, "fresh", Some("UA"))
+            .await
+            .unwrap();
+        DeviceStore::set_push_enabled(&pool, "fresh", true)
+            .await
+            .unwrap();
 
-        let stale = DeviceStore::list_stale_push_enabled(&pool, 30).await.unwrap();
+        let stale = DeviceStore::list_stale_push_enabled(&pool, 30)
+            .await
+            .unwrap();
         assert!(stale.is_empty());
 
         crate::test_support::teardown_test_db(&db_name).await;

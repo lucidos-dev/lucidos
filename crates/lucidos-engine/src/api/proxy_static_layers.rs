@@ -33,7 +33,11 @@ impl StaticHeaderLayer {
 
     /// Custom header (e.g. `X-API-Key`) with the credential as the bare
     /// value. `header_name_str` is validated and lowercased by `HeaderName`.
-    pub fn api_key(namespace: String, header_name_str: &str, value: String) -> Result<Self, String> {
+    pub fn api_key(
+        namespace: String,
+        header_name_str: &str,
+        value: String,
+    ) -> Result<Self, String> {
         let header_name = HeaderName::try_from(header_name_str)
             .map_err(|e| format!("invalid header name '{header_name_str}': {e}"))?;
         Ok(Self {
@@ -46,8 +50,8 @@ impl StaticHeaderLayer {
     /// `Authorization: Basic base64(user:password)`.
     pub fn basic(namespace: String, username: &str, password: &str) -> Self {
         use base64::Engine;
-        let encoded = base64::engine::general_purpose::STANDARD
-            .encode(format!("{username}:{password}"));
+        let encoded =
+            base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
         Self {
             namespace,
             header_name: HeaderName::from_static("authorization"),
@@ -61,10 +65,7 @@ impl AuthLayer for StaticHeaderLayer {
     fn output_namespace(&self) -> &str {
         &self.namespace
     }
-    async fn apply(
-        &self,
-        _input: &LayerInput<'_>,
-    ) -> Result<AuthMutation, (StatusCode, String)> {
+    async fn apply(&self, _input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         Ok(AuthMutation {
             add_headers: vec![(self.header_name.clone(), self.value.clone())],
             outputs: serde_json::json!({}),
@@ -94,10 +95,7 @@ impl AuthLayer for QueryParamLayer {
     fn output_namespace(&self) -> &str {
         &self.namespace
     }
-    async fn apply(
-        &self,
-        input: &LayerInput<'_>,
-    ) -> Result<AuthMutation, (StatusCode, String)> {
+    async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         // Credentials in query strings must be redacted before logs/error
         // bodies — publish a redacted `log_url` for the pipeline runner to
         // swap into `PipelineOutcome.log_url`.

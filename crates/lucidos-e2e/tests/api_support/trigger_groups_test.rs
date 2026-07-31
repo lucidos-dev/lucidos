@@ -27,11 +27,7 @@ async fn create_group(
 
 async fn delete_group(client: &reqwest::Client, id: &str) -> reqwest::Response {
     client
-        .delete(format!(
-            "{}/api/v1/trigger-groups?id={}",
-            base_url(),
-            id
-        ))
+        .delete(format!("{}/api/v1/trigger-groups?id={}", base_url(), id))
         .send()
         .await
         .expect("DELETE /trigger-groups failed")
@@ -136,7 +132,11 @@ async fn concurrent_creates_with_same_name_yield_one_group() {
         }
     }
     assert!(other.is_empty(), "Unexpected status codes: {:?}", other);
-    assert_eq!(ok, 1, "Exactly one POST must succeed (got ok={} conflict={})", ok, conflict);
+    assert_eq!(
+        ok, 1,
+        "Exactly one POST must succeed (got ok={} conflict={})",
+        ok, conflict
+    );
     assert_eq!(conflict, 7, "All other POSTs must return 409");
 
     // Projection must agree: only one group with that name (the api-level
@@ -222,7 +222,11 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
         .await
         .expect("POST /triggers failed");
     let res: serde_json::Value = resp.json().await.expect("Invalid JSON");
-    assert_eq!(res["success"], true, "Trigger create must succeed: {:?}", res);
+    assert_eq!(
+        res["success"], true,
+        "Trigger create must succeed: {:?}",
+        res
+    );
 
     // Find the trigger id via the list endpoint so we can clean up afterwards.
     // POST /triggers returns once the event is persisted; the list-endpoint
@@ -287,17 +291,17 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
 
     // Move trigger out of the group via PUT /triggers, then retry delete.
     let resp = client
-        .put(format!(
-            "{}/api/v1/triggers?id={}",
-            base_url(),
-            trigger_id
-        ))
+        .put(format!("{}/api/v1/triggers?id={}", base_url(), trigger_id))
         .json(&json!({ "group_id": null }))
         .send()
         .await
         .expect("PUT /triggers failed");
     let res: serde_json::Value = resp.json().await.expect("Invalid JSON");
-    assert_eq!(res["success"], true, "Clearing group_id must succeed: {:?}", res);
+    assert_eq!(
+        res["success"], true,
+        "Clearing group_id must succeed: {:?}",
+        res
+    );
 
     // Clearing group_id rides the same async projection as the create above:
     // PUT /triggers returns once the TriggerUpdated event is persisted, but the
@@ -325,11 +329,7 @@ async fn delete_blocks_when_non_empty_and_returns_members() {
     // Cleanup: delete the trigger so other tests' /triggers polls aren't
     // polluted by stale entries.
     let _ = client
-        .delete(format!(
-            "{}/api/v1/triggers?id={}",
-            base_url(),
-            trigger_id
-        ))
+        .delete(format!("{}/api/v1/triggers?id={}", base_url(), trigger_id))
         .send()
         .await;
 }

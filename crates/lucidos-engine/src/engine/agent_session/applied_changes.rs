@@ -100,10 +100,7 @@ pub(crate) async fn compute_applied_change_note(
     })
     .ok()?;
 
-    let applied: Vec<AppliedChange> = rows
-        .into_iter()
-        .map(parse_applied_change)
-        .collect();
+    let applied: Vec<AppliedChange> = rows.into_iter().map(parse_applied_change).collect();
 
     if applied.is_empty() {
         return None;

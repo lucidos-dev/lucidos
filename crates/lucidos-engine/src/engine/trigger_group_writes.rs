@@ -259,14 +259,19 @@ mod tests {
                 Ok(_) => ok += 1,
                 Err(CreateTriggerGroupError::DuplicateName { .. }) => dup += 1,
                 Err(CreateTriggerGroupError::EmptyName) => panic!("unexpected EmptyName"),
-                Err(CreateTriggerGroupError::EmitFailed(m)) => panic!("unexpected EmitFailed: {}", m),
+                Err(CreateTriggerGroupError::EmitFailed(m)) => {
+                    panic!("unexpected EmitFailed: {}", m)
+                }
             }
         }
         assert_eq!(ok, 1, "Exactly one create must succeed");
         assert_eq!(dup, 15, "Every other create must hit DuplicateName");
 
         let registry_snapshot = groups.read().unwrap();
-        let matching: Vec<_> = registry_snapshot.values().filter(|g| g.name == name).collect();
+        let matching: Vec<_> = registry_snapshot
+            .values()
+            .filter(|g| g.name == name)
+            .collect();
         assert_eq!(
             matching.len(),
             1,
@@ -333,7 +338,10 @@ mod tests {
             .values()
             .filter(|g| g.name == "Target")
             .count();
-        assert_eq!(target_count, 1, "Exactly one group named 'Target' must exist");
+        assert_eq!(
+            target_count, 1,
+            "Exactly one group named 'Target' must exist"
+        );
         let loser_name = if beta_ok { "Gamma" } else { "Beta" };
         assert!(
             registry_snapshot.values().any(|g| g.name == loser_name),

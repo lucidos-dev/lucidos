@@ -53,6 +53,9 @@ pub struct ThreadImage {
 pub trait HasEventPayload {
     fn event_type(&self) -> &str;
     fn payload(&self) -> &serde_json::Value;
+    /// Mutable access, so a read path can rewrite an oversized payload before
+    /// serving it without caring which of the two row types it holds.
+    fn payload_mut(&mut self) -> &mut serde_json::Value;
 }
 
 impl HasEventPayload for EventRow {
@@ -61,6 +64,9 @@ impl HasEventPayload for EventRow {
     }
     fn payload(&self) -> &serde_json::Value {
         &self.payload
+    }
+    fn payload_mut(&mut self) -> &mut serde_json::Value {
+        &mut self.payload
     }
 }
 
@@ -144,19 +150,16 @@ pub fn walk_thread_images<E: HasEventPayload>(
         .enumerate()
         .map(|(i, (source, image_ref))| {
             let (base64, mime_type) = match image_ref {
-                ImageRef::BlobHash(hash) => crate::core::blobs::read_blob_as_base64(
-                    workspace, hash,
-                )
-                .unwrap_or_else(|| {
-                    crate::log!(
+                ImageRef::BlobHash(hash) => {
+                    crate::core::blobs::read_blob_as_base64(workspace, hash).unwrap_or_else(|| {
+                        crate::log!(
                         "[walk_thread_images] Blob {} missing or unreadable, yielding empty entry",
                         hash
                     );
-                    (String::new(), GENERATED_IMAGE_MIME.to_string())
-                }),
-                ImageRef::InlineBase64(b64) => {
-                    (b64.to_string(), GENERATED_IMAGE_MIME.to_string())
+                        (String::new(), GENERATED_IMAGE_MIME.to_string())
+                    })
                 }
+                ImageRef::InlineBase64(b64) => (b64.to_string(), GENERATED_IMAGE_MIME.to_string()),
             };
             ThreadImage {
                 index: i + 1,

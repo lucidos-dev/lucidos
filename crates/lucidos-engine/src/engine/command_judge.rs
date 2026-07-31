@@ -337,7 +337,9 @@ mod tests {
         // Irreversible with a missing/unknown category → Other (trigger must
         // explicitly grant `other`).
         let v = judge_with_provider(
-            &stub(r#"{"lane":"irreversible","summary":"Does something irreversible.","reason":"?"}"#),
+            &stub(
+                r#"{"lane":"irreversible","summary":"Does something irreversible.","reason":"?"}"#,
+            ),
             &ji(tn::RUN_BASH, "weird-tool --send", false),
         )
         .await
@@ -373,23 +375,33 @@ mod tests {
     #[test]
     fn parses_each_lane() {
         assert_eq!(
-            parse_judge_response(r#"{"lane":"safe","summary":"reads a file","reason":"read"}"#).lane,
+            parse_judge_response(r#"{"lane":"safe","summary":"reads a file","reason":"read"}"#)
+                .lane,
             RiskLane::Safe
         );
         assert_eq!(
-            parse_judge_response(r#"{"lane":"reversible","summary":"deletes data/x","reason":"in-ws"}"#).lane,
+            parse_judge_response(
+                r#"{"lane":"reversible","summary":"deletes data/x","reason":"in-ws"}"#
+            )
+            .lane,
             RiskLane::ReversibleDanger
         );
         assert_eq!(
-            parse_judge_response(r#"{"lane":"irreversible","summary":"sends mail","reason":"email"}"#)
-                .lane,
+            parse_judge_response(
+                r#"{"lane":"irreversible","summary":"sends mail","reason":"email"}"#
+            )
+            .lane,
             RiskLane::IrreversibleDanger
         );
     }
 
     #[test]
     fn lane_aliases_and_case() {
-        for s in ["IRREVERSIBLE", " Irreversible_Danger ", "irreversibledanger"] {
+        for s in [
+            "IRREVERSIBLE",
+            " Irreversible_Danger ",
+            "irreversibledanger",
+        ] {
             assert_eq!(parse_lane(s), RiskLane::IrreversibleDanger, "{s}");
         }
         for s in ["reversible_danger", "ReversibleDanger"] {

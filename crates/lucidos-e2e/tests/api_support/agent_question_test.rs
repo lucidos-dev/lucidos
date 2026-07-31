@@ -47,11 +47,7 @@ async fn insert_user_question_asked(pool: &sqlx::PgPool, thread_id: Uuid, tool_u
 /// Same shape as `insert_user_question_asked`, but on a chat thread with
 /// `channel: "chat"` so the answer endpoint exercises the in-process path
 /// (no `CodingAgentPromptSent` marker, no `ContinuationRequested` spawn).
-async fn insert_chat_user_question_asked(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-    tool_use_id: &str,
-) {
+async fn insert_chat_user_question_asked(pool: &sqlx::PgPool, thread_id: Uuid, tool_use_id: &str) {
     seed_chat_thread_summary(pool, thread_id, "waiting_for_user_answer").await;
 
     let payload = serde_json::json!({
@@ -77,7 +73,11 @@ async fn insert_chat_user_question_asked(
 }
 
 fn answer_question_url(thread_id: Uuid) -> String {
-    format!("{}/api/v1/threads/{}/answer-question", base_url(), thread_id)
+    format!(
+        "{}/api/v1/threads/{}/answer-question",
+        base_url(),
+        thread_id
+    )
 }
 
 async fn count_answered(pool: &sqlx::PgPool, thread_id: Uuid, tool_use_id: &str) -> i64 {
@@ -361,13 +361,13 @@ async fn chat_freeform_followup_on_chat_thread_routes_to_pending_question() {
         .expect("Failed to connect to E2E workspace database");
 
     let thread_id = Uuid::new_v4();
-    let tool_use_id = format!(
-        "tu-chatft-{}",
-        &Uuid::new_v4().as_simple().to_string()[..8]
-    );
+    let tool_use_id = format!("tu-chatft-{}", &Uuid::new_v4().as_simple().to_string()[..8]);
     insert_chat_user_question_asked(&pool, thread_id, &tool_use_id).await;
 
-    let followup_text = format!("free-text follow-up {}", &Uuid::new_v4().as_simple().to_string()[..6]);
+    let followup_text = format!(
+        "free-text follow-up {}",
+        &Uuid::new_v4().as_simple().to_string()[..6]
+    );
     let body = serde_json::json!({
         "message": followup_text,
         "mode": "human",
@@ -415,7 +415,11 @@ async fn chat_freeform_followup_on_chat_thread_routes_to_pending_question() {
     .fetch_one(&pool)
     .await
     .expect("answer event must exist");
-    assert_eq!(kind.as_deref(), Some("FreeText"), "must be a FreeText answer");
+    assert_eq!(
+        kind.as_deref(),
+        Some("FreeText"),
+        "must be a FreeText answer"
+    );
     assert_eq!(
         text.as_deref(),
         Some(followup_text.as_str()),
@@ -529,12 +533,11 @@ async fn cancel_chat_idle_thread_reports_not_canceled() {
     // Idle chat thread, no pending question, no live session.
     seed_chat_thread_summary(&pool, thread_id, "idle").await;
 
-    let before: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(0);
+    let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
 
     let resp = client
         .post(format!(
@@ -553,12 +556,11 @@ async fn cancel_chat_idle_thread_reports_not_canceled() {
     );
 
     // No junk terminal event fabricated on an already-idle thread.
-    let after: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap_or(0);
+    let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap_or(0);
     assert_eq!(
         after, before,
         "a no-op cancel must not emit any event on an idle thread"

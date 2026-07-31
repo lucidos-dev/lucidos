@@ -53,6 +53,32 @@ describe('normalizeDataPath', () => {
   it('handles bare filename without directory', () => {
     expect(normalizeDataPath('readme.md')).toBe('artifacts/readme.md');
   });
+
+  it('still prefixes a plain path with artifacts/', () => {
+    expect(normalizeDataPath('notes.md')).toBe('artifacts/notes.md');
+  });
+
+  // A repo-encoded preview path addresses a registered local repo clone, not
+  // the workspace data tree — prefixing it would make parseRepoPath reject it
+  // and ContentPane would dead-end it in the /data/* mount.
+  it('leaves a repo-encoded file path unchanged', () => {
+    const encoded = 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:file:src/main/resources/transforms/x.jslt';
+    expect(normalizeDataPath(encoded)).toBe(encoded);
+  });
+
+  it('leaves a repo-encoded file path at the clone root unchanged', () => {
+    expect(normalizeDataPath('repo:r1:file:pom.xml')).toBe('repo:r1:file:pom.xml');
+  });
+
+  it('leaves a repo-encoded diff path (with its change id) unchanged', () => {
+    expect(normalizeDataPath('repo:r1:diff#change-7:src/a.rs')).toBe('repo:r1:diff#change-7:src/a.rs');
+  });
+
+  // Keyed off parseRepoPath, not a bare `repo:` prefix test: a string that only
+  // LOOKS repo-encoded is an ordinary data path and still normalizes.
+  it('normalizes a malformed repo: path like any other data path', () => {
+    expect(normalizeDataPath('repo:r1:weird:a.md')).toBe('artifacts/repo:r1:weird:a.md');
+  });
 });
 
 const PDF = 'artifacts/projects/reports/cover-letter.pdf';

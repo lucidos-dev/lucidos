@@ -13,13 +13,9 @@
 //    against the loaded snapshot. This validates that the SQL + the parser
 //    correctly round-trip every column the decision consults.
 
-use super::{
-    classify_archive_decision, load_family_for_archive, ArchiveDecision, FamilyRow,
-};
+use super::{classify_archive_decision, load_family_for_archive, ArchiveDecision, FamilyRow};
 use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::thread_events::{
-    ActorMode, EventChannel, EventMeta, ThreadEvent,
-};
+use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use axum::http::StatusCode;
 use sqlx::PgPool;
@@ -190,11 +186,7 @@ async fn spawn_child(bus: &EventBus, parent_id: Uuid, bring_to_idle: bool) -> Uu
 /// Spawn a CC child of `parent_id`, bring its session to Idle. Drop a
 /// `ChangeProposed` if `with_pending_changes` so the row exits Idle into
 /// Waiting + coding_agent_proposed=true.
-async fn spawn_cc_child(
-    bus: &EventBus,
-    parent_id: Uuid,
-    with_pending_changes: bool,
-) -> Uuid {
+async fn spawn_cc_child(bus: &EventBus, parent_id: Uuid, with_pending_changes: bool) -> Uuid {
     let child_id = Uuid::new_v4();
     bus.emit(BusEvent::Thread {
         thread_id: child_id,
@@ -361,8 +353,7 @@ async fn archive_rejects_when_descendant_running() {
     let running_child = spawn_child(&bus, parent_id, false).await; // status='running'
 
     let family = load_family(&pool, parent_id).await;
-    let ArchiveDecision::Reject { status, body } =
-        classify_archive_decision(&family, parent_id)
+    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
     else {
         panic!("expected Reject when a descendant is running");
     };
@@ -386,8 +377,7 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     let cc_child = spawn_cc_child(&bus, parent_id, true).await;
 
     let family = load_family(&pool, parent_id).await;
-    let ArchiveDecision::Reject { status, body } =
-        classify_archive_decision(&family, parent_id)
+    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
     else {
         panic!("expected Reject when a CC descendant has pending changes");
     };
@@ -409,8 +399,7 @@ async fn archive_rejects_when_parent_running() {
     // doesn't care how the rows arrived.
     let parent_id = Uuid::new_v4();
     let family = vec![running_chat(parent_id)];
-    let ArchiveDecision::Reject { status, body } =
-        classify_archive_decision(&family, parent_id)
+    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
     else {
         panic!("expected Reject when parent is running");
     };
@@ -484,8 +473,7 @@ async fn archive_rejects_parent_cc_with_pending_changes() {
     // state.
     let parent_id = Uuid::new_v4();
     let family = vec![cc_with_pending(parent_id)];
-    let ArchiveDecision::Reject { status, body } =
-        classify_archive_decision(&family, parent_id)
+    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
     else {
         panic!("expected Reject when parent CC has its own pending changes");
     };
@@ -521,7 +509,14 @@ async fn archive_allows_parent_waiting_for_user_answer() {
     // loop's per-thread cancel-stamp resolves the dangling QuestionCard
     // before ThreadArchived fires.
     let parent_id = Uuid::new_v4();
-    let family = vec![row(parent_id, true, "waiting_for_user_answer", "inbox", false, false)];
+    let family = vec![row(
+        parent_id,
+        true,
+        "waiting_for_user_answer",
+        "inbox",
+        false,
+        false,
+    )];
     let ArchiveDecision::Proceed {
         to_archive,
         external_repo_pending,
@@ -576,8 +571,7 @@ async fn archive_target_not_found_returns_404() {
     // The CTE returns an empty Vec when the target doesn't exist.
     let missing = Uuid::new_v4();
     let family: Vec<FamilyRow> = vec![];
-    let ArchiveDecision::Reject { status, body } =
-        classify_archive_decision(&family, missing)
+    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, missing)
     else {
         panic!("expected Reject for missing target");
     };
@@ -728,7 +722,9 @@ async fn orphaned_question_does_not_block_cascade_and_is_lookup_visible() {
         external_repo_pending,
     } = classify_archive_decision(&family, parent_id)
     else {
-        panic!("cascade must admit the orphaned-question child — otherwise the helper would never run");
+        panic!(
+            "cascade must admit the orphaned-question child, otherwise the helper would never run"
+        );
     };
     assert!(external_repo_pending.is_empty());
     assert_eq!(to_archive.len(), 2);
@@ -799,8 +795,7 @@ async fn archive_rejects_when_fresh_cc_child_is_running_without_idle() {
     .unwrap();
 
     let family = load_family(&pool, parent_id).await;
-    let ArchiveDecision::Reject { status, body } =
-        classify_archive_decision(&family, parent_id)
+    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
     else {
         panic!("cascade must reject when a fresh CC child is actively running");
     };
@@ -827,8 +822,7 @@ async fn archive_rejects_legacy_running_archived_descendant() {
         idle_chat(parent_id),
         row(legacy_child, true, "running", "archived", false, false),
     ];
-    let ArchiveDecision::Reject { status, body } =
-        classify_archive_decision(&family, parent_id)
+    let ArchiveDecision::Reject { status, body } = classify_archive_decision(&family, parent_id)
     else {
         panic!("cascade must reject a legacy Running+Archived descendant");
     };

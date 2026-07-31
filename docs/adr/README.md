@@ -58,3 +58,5 @@ Keep entries scannable. A decision log nobody reads is just more drift.
 - [0026 — A coding-agent session is never owned by a request future, and a map entry always implies a live loop](0026-a-session-is-never-owned-by-a-request-future.md)
 - [0027 — A release does not wait on Apple: the DMG is deferred, labelled, and swapped in place](0027-a-release-does-not-wait-on-apple.md)
 - [0028 — The packaged window is a *remote* origin to Tauri's ACL, and is granted it explicitly](0028-the-packaged-window-is-a-remote-origin.md)
+- [0029 — A release tag names the main-line commit; the mirror's tag of the same name names the orphan (and the bump is *landed* on main, never skipped)](0029-a-release-tag-names-the-main-line-commit.md)
+- [0030: `make lint` gates rustfmt, and the tree was swept once to make that possible (no `rustfmt.toml`; generated Rust emits itself formatted)](0030-rustfmt-gate-after-a-one-time-sweep.md)

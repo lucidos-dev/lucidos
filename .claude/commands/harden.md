@@ -202,6 +202,18 @@ Commit any fixes from this phase before proceeding to Phase 4.5.
 
 ## Phase 4.5: Verify Tests Pass
 
+### Always first: the em-dash gate
+
+```bash
+./scripts/check-em-dashes.sh
+```
+
+Runs for **every** diff, with no fast path: the docs-only and CSS-only skips below do NOT apply to it, because prose is exactly where em dashes come from. It is diff-scoped and added-lines-only, so the ~29,000 pre-existing ones in the tree never fire it (see `.claude/rules/no-em-dashes.md`). A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
+
+This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
+
+### Then the test suites
+
 Run the test suites for the layers touched on this branch.
 
 Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-selection table:
@@ -220,9 +232,10 @@ marker is missing. Until 2026-07-29 this table said `cargo check`, which
 compiles but runs **no clippy lints**, so the only thing that ever ran the
 warnings-as-errors gate was the nightly — and the 2026-07-26 nightly duly found
 NINETEEN lints accumulated across three weeks of ordinary commits. `make lint`
-(ShellCheck, then clippy with `CLIPPY_FLAGS` — see the `Makefile`) strictly
-supersedes `cargo check`: same compile, plus the lint set, plus every tracked
-`*.sh`. It is the single canonical invocation; never restate its flags here.
+(ShellCheck, then `cargo fmt --all --check`, then clippy with `CLIPPY_FLAGS`;
+see the `Makefile`) strictly supersedes `cargo check`: same compile, plus the
+lint set, plus every tracked `*.sh`, plus a rustfmt-clean tree. It is the single
+canonical invocation; never restate its flags here.
 
 When the diff is mixed, kick the Rust and TS suites off concurrently — they're independent toolchains (cargo vs npm) with no shared state, so running them serially wastes wall-clock. Use the Bash tool's `run_in_background: true` for each, then `TaskOutput` to join. (Codex / any agent without a background-Bash + `TaskOutput` tool: run the two suites **sequentially** instead — `cargo …` then `npm …`. Parallelism is only a wall-clock optimization; sequential gives identical correctness.) Pattern:
 

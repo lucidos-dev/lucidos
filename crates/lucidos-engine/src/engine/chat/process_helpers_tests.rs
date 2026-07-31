@@ -60,10 +60,7 @@ async fn returns_true_when_session_populates_within_deadline() {
     let agent_sessions_clone = agent_sessions.clone();
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(100)).await;
-        agent_sessions_clone
-            .lock()
-            .await
-            .insert(thread_id, session);
+        agent_sessions_clone.lock().await.insert(thread_id, session);
     });
 
     let started = std::time::Instant::now();
@@ -207,7 +204,10 @@ async fn returns_true_immediately_when_session_already_alive() {
     )
     .await;
 
-    assert!(result, "expected immediate true for an already-alive session");
+    assert!(
+        result,
+        "expected immediate true for an already-alive session"
+    );
     assert!(
         started.elapsed() < Duration::from_millis(50),
         "expected sub-poll-interval return for fast path"
@@ -223,7 +223,11 @@ use crate::runtime::CodingAgent;
 fn redirect_fires_for_codex_user_followup_mid_turn() {
     // The reported bug: a Codex turn in flight + a genuine user follow-up must
     // interrupt-and-redirect rather than queue invisibly behind the long turn.
-    assert!(should_redirect_codex_followup(CodingAgent::Codex, true, true));
+    assert!(should_redirect_codex_followup(
+        CodingAgent::Codex,
+        true,
+        true
+    ));
 }
 
 #[test]
@@ -346,7 +350,10 @@ async fn arm_redirect_skips_claude_code_mid_turn() {
 
     let idle = arm_codex_redirect(&mut sessions, thread_id, true, &None);
 
-    assert!(idle.is_none(), "CC must never be interrupted on a follow-up");
+    assert!(
+        idle.is_none(),
+        "CC must never be interrupted on a follow-up"
+    );
     assert!(
         !sessions.get(&thread_id).unwrap().redirect_followup,
         "CC must not be flagged for redirect — it steers via stdin, never cancels"

@@ -149,10 +149,7 @@ pub(super) async fn post_blob(
 /// Stream `path` with the given `mime` and the immutable cache header
 /// shared by both blob endpoints. Content-addressed = the bytes never
 /// change for a hash, so once fetched the browser never re-requests.
-async fn stream_immutable(
-    path: std::path::PathBuf,
-    mime: String,
-) -> Result<Response, ApiError> {
+async fn stream_immutable(path: std::path::PathBuf, mime: String) -> Result<Response, ApiError> {
     let file = tokio::fs::File::open(&path)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;

@@ -3761,7 +3761,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     log!("\n[Populate] === Done ===");
     log!("[Populate]   PostgreSQL events: {}", db_events[0].0);
-    log!("[Populate]   PostgreSQL notifications: {}", db_notifications[0].0);
+    log!(
+        "[Populate]   PostgreSQL notifications: {}",
+        db_notifications[0].0
+    );
     log!(
         "[Populate]   Memory index entries: {}",
         memory_index.len().await.unwrap_or(0)

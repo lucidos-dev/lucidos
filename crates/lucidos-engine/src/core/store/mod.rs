@@ -111,6 +111,9 @@ impl crate::core::events::HasEventPayload for ThreadEventRow {
     fn payload(&self) -> &serde_json::Value {
         &self.payload
     }
+    fn payload_mut(&mut self) -> &mut serde_json::Value {
+        &mut self.payload
+    }
 }
 
 #[derive(Clone)]

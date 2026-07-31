@@ -195,3 +195,75 @@ Implementation: `engine/cc_permission.rs` (`AttendMode`, `resolve_attend_mode`,
 `RequestVerdict`, `classify_coding_agent_request`, `decide_unattended`). Plan:
 `docs/plans/2026-06-25-trigger-coding-agent-inherited-grant.md`. See also ADR 0005
 (the Codex app-server approval bridge this rides on).
+
+## Addendum (2026-07-30): in-worktree writes auto-allow; session allows are durable
+
+**Context.** Two defects made the coding-agent permission card fire constantly on
+a Lucidos-source thread, and the ADR's own thesis — *spend a user interruption
+only on the dangerous slice* — is what they violated.
+
+1. Claude Code auto-approves in-cwd writes under `acceptEdits` **except** under
+   `.claude/` and `.git/`, which it routes through `--permission-prompt-tool` in
+   every mode and regardless of `--allowedTools`. Lucidos keeps all of its own
+   agent configuration in `.claude/`, so editing a rule or a skill cost a click
+   every time — and `BROAD_ALLOW_INEFFECTIVE` already hides the persisted
+   "Always allow" button for those tools precisely because CC ignores the
+   pattern. In ten days of a dev workspace, **every** card raised was an
+   `Edit`/`Write` under `.claude/`. That is the "cries wolf" failure ADR 0001
+   names and this ADR's Rationale explicitly rejects.
+2. `PermissionState::session_allows` lived only in memory, so every
+   Apply-with-restart wiped it while the thread itself resumed. Observed: a
+   grant at 06:16, a `ChangeApplied` at 06:18, the same file re-asking at 06:23.
+   That also breaks the `CLAUDE.md` statelessness rule — a user-visible grant
+   held only in a `Mutex`.
+
+**Decision.**
+
+1. **An in-worktree file write needs no card.** At the shared chokepoint
+   `prompt_coding_agent_permission`, a request in the `coding_agent_file_target`
+   vocabulary whose target resolves inside the session's *own* worktree resolves
+   immediately, emitting no card events (the silent fast path session-allow and
+   the unattended path already use). Justified by the worktree being disposable
+   and every change in it being reviewed in the Diff before Apply. Stated as
+   "in-worktree", not "`.claude/`", so Lucidos does not encode CC's undocumented
+   heuristic; the only observable delta *is* CC's protected paths. Containment
+   is **resolved**, not lexical — both the root and the longest existing prefix
+   of the target are canonicalized, because a lexical prefix check is escapable
+   through a symlink inside the worktree pointing at an external directory
+   (caught in review of this very change). Four limits: a `..` component fails
+   containment; a relative path fails closed (resolving one needs the agent's
+   cwd, which differs between repo-rooted and app coding-agent threads; both
+   backends send absolute paths); any `.git` component still asks, checked
+   before *and* after resolution (git metadata is the one in-worktree location
+   absent from the reviewed diff — a written hook runs on the next commit);
+   commands are never covered, so a `Bash` touching `.claude/` still asks. An
+   unknown or unresolvable worktree root ⇒ fail closed.
+2. **`AllowScope::Session` is durable.** `hydrate_session_allows` refills a
+   thread's set from the persisted `CodingAgentPermissionRequest`/`Resolved`
+   pair on the first prompt after a restart, re-deriving each pattern through
+   the same `derive_allow_pattern` the grant used so the two sites cannot drift.
+   Lazy (one query per thread per engine lifetime, on a path that was about to
+   block on a human anyway) rather than a boot sweep. Only `allowed: true` **and**
+   `persist_scope: "session"` hydrate. A query error leaves the thread
+   unhydrated and the card renders — it fails toward asking.
+
+**Alternative rejected: `--permission-mode bypassPermissions`.** The user asked
+about "auto mode"; `acceptEdits` already *is* CC's auto-accept-edits mode, and
+the only mode that silences these cards is `bypassPermissions`. It was rejected
+because CC then stops calling the permission tool at all: no card for Bash, for
+out-of-workspace writes, or for external side-effects, and the Phase 5 unattended
+trigger grant above goes dark with it. That trades this ADR's entire selectivity
+argument for a click on rules files.
+
+**Non-goals.** No `--permission-mode` change. No change to Bash gating, to
+out-of-worktree writes, to `resolve_attend_mode` / `decide_unattended`, or to
+Narrow/Broad persistence. The chat command lane
+(`Engine::pending_command_permission`) shares `PermissionState` and has the same
+in-memory weakness, but persists a `command` string rather than a tool `input`,
+so it needs its own extractor before it can adopt hydration — deferred. No new
+event type, no migration, no UI change.
+
+Implementation: `engine/cc_permission.rs` (`worktree_write_auto_allowed`,
+`path_inside_worktree`, `lookup_session_worktree`, `hydrate_session_allows`,
+`WORKTREE_WRITE_ALLOW_REASON`, `PermissionState::hydrated_threads`). Plan:
+`docs/plans/2026-07-30-cc-permission-worktree-writes-and-durable-session-allows.md`.

@@ -15,7 +15,8 @@ use crate::core::changes::{Change, RestartGroup};
 /// Column projection used by every `query_as::<_, Change>` call. The table has
 /// no `thread_title` column — it's enriched per-response from `thread_summaries`
 /// (see `crate::core::changes::enrich_thread_titles`).
-const SELECT_CHANGE: &str = "SELECT id, request_id, thread_id, branch_name, repo_root, description, \
+const SELECT_CHANGE: &str =
+    "SELECT id, request_id, thread_id, branch_name, repo_root, description, \
      file_count, files, requires_restart, status, created_at, resolved_at, \
      merge_worktree_path, merge_temp_branch, hardened, pre_merge_sha, \
      post_merge_sha, NULL::text AS thread_title, commits, incomplete FROM changes";
@@ -482,7 +483,9 @@ impl ChangesProjection {
              ORDER BY resolved_at DESC NULLS LAST LIMIT $2"
         );
         let (pending_r, applied_r) = tokio::join!(
-            sqlx::query_as(&pending_sql).bind(repo_root).fetch_all(&self.pool),
+            sqlx::query_as(&pending_sql)
+                .bind(repo_root)
+                .fetch_all(&self.pool),
             sqlx::query_as(&applied_sql)
                 .bind(repo_root)
                 .bind(fetch_limit)
@@ -636,11 +639,7 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     // upstream by the uuid regex), so any ChangeProposed reaching us here is
     // an aggregate. The `commit_sha` guard is defense in depth.
     let is_aggregate_proposed = |r: &(String, serde_json::Value, Option<Uuid>, DateTime<Utc>)| {
-        r.0 == "ChangeProposed"
-            && r.1
-                .get("commit_sha")
-                .map(|v| v.is_null())
-                .unwrap_or(true)
+        r.0 == "ChangeProposed" && r.1.get("commit_sha").map(|v| v.is_null()).unwrap_or(true)
     };
 
     let Some(first) = rows.iter().find(|r| is_aggregate_proposed(r)) else {
@@ -663,13 +662,16 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
     let str_field = |p: &serde_json::Value, k: &str| {
         p.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
     };
-    let bool_field = |p: &serde_json::Value, k: &str| {
-        p.get(k).and_then(|v| v.as_bool()).unwrap_or(false)
-    };
+    let bool_field =
+        |p: &serde_json::Value, k: &str| p.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
     let str_array = |p: &serde_json::Value, k: &str| -> Vec<String> {
         p.get(k)
             .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default()
     };
 
@@ -687,10 +689,12 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
         }
     }
 
-    let terminal = rows
-        .iter()
-        .rev()
-        .find(|r| matches!(r.0.as_str(), "ChangeApplied" | "ChangeDiscarded" | "ChangeReverted"));
+    let terminal = rows.iter().rev().find(|r| {
+        matches!(
+            r.0.as_str(),
+            "ChangeApplied" | "ChangeDiscarded" | "ChangeReverted"
+        )
+    });
 
     // Active merge worktree state: the latest unpaired MergeResolutionStarted.
     // Without this, a recovered change with a half-finished merge is invisible
@@ -726,8 +730,14 @@ async fn rebuild_one_from_events(pool: &PgPool, change_id: Uuid) -> sqlx::Result
                 requires_restart = bool_field(&t.1, "requires_restart") || requires_restart;
             }
             let commits = str_array(&t.1, "commits");
-            let pre = t.1.get("pre_merge_sha").and_then(|v| v.as_str()).map(String::from);
-            let post = t.1.get("post_merge_sha").and_then(|v| v.as_str()).map(String::from);
+            let pre =
+                t.1.get("pre_merge_sha")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+            let post =
+                t.1.get("post_merge_sha")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
             (status, Some(t.3), commits, pre, post)
         }
         None => ("pending", None, Vec::new(), None, None),

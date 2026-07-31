@@ -41,8 +41,8 @@ use tokio_util::sync::CancellationToken;
 use super::agent_runtime::{
     AgentEvent, AgentInput, AgentRuntime, CodingAgent, ControlRequest, RunningAgent, SpawnArgs,
 };
-use super::claude_code::{CcMenuOption, format_exit_status};
-use super::codex_parse::{TurnTracker, parse_codex_line};
+use super::claude_code::{format_exit_status, CcMenuOption};
+use super::codex_parse::{parse_codex_line, TurnTracker};
 use super::lucidos_cli::{ensure_workspace_bin_symlink, lucidos_cli_dir};
 use super::spawn_env::{apply_lucidos_env, drain_stderr};
 
@@ -193,7 +193,10 @@ pub(super) struct CodexConfig {
 /// codex lives — a bare `Command::new("codex")` then ENOENTs even though the
 /// CLI is installed. `home` is injected to keep the function pure and
 /// testable.
-pub(crate) fn resolve_codex_binary(home: Option<&Path>, override_path: Option<&Path>) -> std::ffi::OsString {
+pub(crate) fn resolve_codex_binary(
+    home: Option<&Path>,
+    override_path: Option<&Path>,
+) -> std::ffi::OsString {
     if let Some(p) = override_path {
         return p.as_os_str().to_os_string();
     }

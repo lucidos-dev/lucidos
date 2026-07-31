@@ -211,8 +211,14 @@ mod tests {
         let json = r#"{"type":"authorized_user","client_id":"id","client_secret":"sshh","refresh_token":"1//rt"}"#;
         let c = parse_authorized_user(json).unwrap();
         let dbg = format!("{c:?}");
-        assert!(!dbg.contains("sshh"), "client_secret must be redacted: {dbg}");
-        assert!(!dbg.contains("1//rt"), "refresh_token must be redacted: {dbg}");
+        assert!(
+            !dbg.contains("sshh"),
+            "client_secret must be redacted: {dbg}"
+        );
+        assert!(
+            !dbg.contains("1//rt"),
+            "refresh_token must be redacted: {dbg}"
+        );
         assert!(!dbg.contains("\"id\""), "client_id must be redacted: {dbg}");
     }
 
@@ -235,8 +241,12 @@ mod tests {
 
     #[test]
     fn parses_project_from_core_section() {
-        let ini = "[core]\naccount = me@example.com\nproject = my-gcp-project\n[compute]\nzone = us\n";
-        assert_eq!(parse_ini_core_project(ini).as_deref(), Some("my-gcp-project"));
+        let ini =
+            "[core]\naccount = me@example.com\nproject = my-gcp-project\n[compute]\nzone = us\n";
+        assert_eq!(
+            parse_ini_core_project(ini).as_deref(),
+            Some("my-gcp-project")
+        );
     }
 
     #[test]

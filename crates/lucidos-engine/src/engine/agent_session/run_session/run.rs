@@ -17,15 +17,17 @@ use uuid::Uuid;
 
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_result, idle_action, is_definitive_session_not_found,
-    is_silent_resume, is_stale_resume_signal, may_touch_change_state_at_idle,
-    reset_per_turn_flags, should_auto_commit_on_cleanup,
-    terminal_clears_user_hit_stop, terminate_decision, watchdog_gate, IdleAction, StaleResumeInputs,
-    TerminalKind,
-    TerminateDecision, WatchdogGate, WATCHDOG_DIAG_LOG_THRESHOLD_MS,
-    WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS, WATCHDOG_TICK_INTERVAL_SECS,
+    classify_result, idle_action, is_definitive_session_not_found, is_silent_resume,
+    is_stale_resume_signal, may_touch_change_state_at_idle, reset_per_turn_flags,
+    should_auto_commit_on_cleanup, terminal_clears_user_hit_stop, terminate_decision,
+    watchdog_gate, IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, WatchdogGate,
+    WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
+    WATCHDOG_TICK_INTERVAL_SECS,
 };
-use crate::engine::agent_session::resume::{change_description_fallback, default_claude_config_dir, resolve_resume_context, CC_TURN_CLOSER_EVENTS};
+use crate::engine::agent_session::resume::{
+    change_description_fallback, default_claude_config_dir, resolve_resume_context,
+    CC_TURN_CLOSER_EVENTS,
+};
 use crate::engine::agent_session::spawn::spawn_or_resume;
 
 /// Decrement the paired-tool counter, flooring at 0. An unpaired decrement
@@ -66,7 +68,9 @@ fn drain_startup_failure_reason(
             AgentEvent::Result { error: Some(e), .. } if !e.trim().is_empty() => {
                 reason = Some(e);
             }
-            AgentEvent::Exited { killed_by_signal: k } => killed_by_signal = k,
+            AgentEvent::Exited {
+                killed_by_signal: k,
+            } => killed_by_signal = k,
             _ => {}
         }
     }
@@ -129,11 +133,10 @@ impl LucidosEngine {
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::Thread {
                     thread_id,
-                    event:
-                        crate::engine::thread_events::ThreadEvent::CodingAgentThoughtStreamed {
-                            text: delta.to_string(),
-                            coding_agent,
-                        },
+                    event: crate::engine::thread_events::ThreadEvent::CodingAgentThoughtStreamed {
+                        text: delta.to_string(),
+                        coding_agent,
+                    },
                     meta: meta.clone(),
                 },
                 "[AgentSession] CodingAgentThoughtStreamed",
@@ -216,7 +219,10 @@ impl LucidosEngine {
         // existing app thread still routes correctly after the pending
         // stash was cleared by the initial spawn.
         let app_spawn_id: Option<String> = {
-            let mut guard = self.pending_app_spawn.lock().expect("pending_app_spawn poisoned");
+            let mut guard = self
+                .pending_app_spawn
+                .lock()
+                .expect("pending_app_spawn poisoned");
             guard.remove(&thread_id)
         };
         let app_spawn_id = if app_spawn_id.is_some() {
@@ -329,9 +335,7 @@ impl LucidosEngine {
                         });
                     }
                     drop(guard);
-                    return Err(
-                        crate::engine::claude_code::AGENT_ALREADY_RUNNING_ERROR.into()
-                    );
+                    return Err(crate::engine::claude_code::AGENT_ALREADY_RUNNING_ERROR.into());
                 }
                 had_dead_session = true;
             }
@@ -433,7 +437,8 @@ impl LucidosEngine {
             .await?
         };
 
-        let (repo_id, repo_root, is_external_repo, external_repo_name, repo_name) = if is_app_spawn {
+        let (repo_id, repo_root, is_external_repo, external_repo_name, repo_name) = if is_app_spawn
+        {
             // App coding-agent thread: the worktree's git root is the
             // workspace itself, not any registered repo. Skip the repo
             // lookup entirely — apps aren't in the repo registry.
@@ -466,8 +471,11 @@ impl LucidosEngine {
         };
 
         let workspace_name = self.workspace_name();
-        let last_idle_sha =
-            crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(self.pool(), thread_id).await;
+        let last_idle_sha = crate::engine::agent_session::resume::lookup_latest_worktree_head_sha(
+            self.pool(),
+            thread_id,
+        )
+        .await;
         let SpawnWorktreeContext {
             cwd,
             system_prompt,
@@ -568,15 +576,16 @@ impl LucidosEngine {
             (None, None)
         };
         let cc_model = cc_model.or(prev_model).or(event_model);
-        let cc_reasoning_effort = cc_reasoning_effort.or(prev_effort).or(event_effort).or_else(
-            || {
+        let cc_reasoning_effort = cc_reasoning_effort
+            .or(prev_effort)
+            .or(event_effort)
+            .or_else(|| {
                 // The Claude Code settings files are a CC-only fallback —
                 // their effort vocabulary must not leak into other backends.
                 (coding_agent == CodingAgent::ClaudeCode)
                     .then(crate::runtime::claude_code::read_cc_default_effort)
                     .flatten()
-            },
-        );
+            });
 
         // Acquire startup semaphore — limits concurrent CC process initializations.
         // Hold the permit until Init event is received (process is initialized and mostly idle).
@@ -637,7 +646,11 @@ impl LucidosEngine {
                 .iter()
                 .find(|(k, _)| k == "CLAUDE_CONFIG_DIR")
                 .map(|(_, v)| v.clone())
-                .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok().filter(|v| !v.is_empty()))
+                .or_else(|| {
+                    std::env::var("CLAUDE_CONFIG_DIR")
+                        .ok()
+                        .filter(|v| !v.is_empty())
+                })
                 .or_else(default_claude_config_dir)
         });
         // User-configured agent binary path (Settings → System → Coding agents).
@@ -814,13 +827,15 @@ impl LucidosEngine {
         let mut normalized_model = cc_model.clone();
         // Initial input (when has_content) produces one expected `Result` event;
         // see AgentSession.pending_followups for the full rationale.
-        let pending_followups = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(
-            if has_content { 1 } else { 0 },
-        ));
+        let pending_followups =
+            std::sync::Arc::new(std::sync::atomic::AtomicU32::new(if has_content {
+                1
+            } else {
+                0
+            }));
         // Cloned into the session struct so the external watchdog reads
         // the same atomic the loop below mutates.
-        let tools_in_flight_shared =
-            std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
+        let tools_in_flight_shared = std::sync::Arc::new(std::sync::atomic::AtomicI32::new(0));
         {
             let mut sessions = self.agent_sessions.lock().await;
             let session = AgentSession {
@@ -1017,8 +1032,8 @@ impl LucidosEngine {
         let mut is_waiting = false;
         let mut proposed_change = false;
         let mut emitted_terminal_event = false; // Track whether ResponseGenerated/ResponseCanceled was emitted
-        // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
-        // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
+                                                // user_hit_stop: when true, the next Result emits ResponseCanceled (exchange:
+                                                // "Canceled") instead of ResponseGenerated. Reset on next user follow-up.
         let mut user_hit_stop = false;
         // interrupt_is_redirect: set alongside user_hit_stop when the interrupt
         // came from a Codex mid-turn follow-up redirect (drained from the session
@@ -2099,6 +2114,13 @@ impl LucidosEngine {
                             // decide (see `cc_permission::resolve_attend_mode`).
                             let trigger_configs = self.trigger_configs.clone();
                             let workspace_path = self.workspace_path.clone();
+                            // A file write landing inside this session's own
+                            // worktree skips the card entirely. This local IS
+                            // what seeded `AgentSession.worktree_path`, so it
+                            // matches what the CC MCP path resolves via
+                            // `cc_permission::lookup_session_worktree` — and
+                            // reading it directly keeps this arm lock-free.
+                            let session_worktree = worktree_path.clone();
                             // Disarm the watchdog while the card waits — the
                             // approval may arrive BEFORE the item's ToolUse
                             // (codex raises it pre-execution), so the paired
@@ -2115,6 +2137,7 @@ impl LucidosEngine {
                                         &pending,
                                         &trigger_configs,
                                         &workspace_path,
+                                        session_worktree.as_deref(),
                                         crate::engine::cc_permission::CodingAgentPermissionInput {
                                             thread_id,
                                             tool_use_id: req.id,
@@ -2587,7 +2610,8 @@ mod unregistered_lucidos_root_tests {
     fn keeps_the_early_startup_fallback_on_a_dev_build() {
         let dev_root = PathBuf::from("/Users/me/src/lucidos");
         assert_eq!(
-            unregistered_lucidos_root(dev_root.clone(), true).expect("dev build must still resolve"),
+            unregistered_lucidos_root(dev_root.clone(), true)
+                .expect("dev build must still resolve"),
             dev_root
         );
     }

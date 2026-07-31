@@ -1,5 +1,5 @@
-use super::*;
 use super::cp_helpers::*;
+use super::*;
 
 #[tokio::test]
 async fn pending_for_thread_filters_by_thread() {
@@ -48,11 +48,23 @@ async fn get_pending_by_branch_returns_only_pending() {
     )
     .await;
     let proj = ChangesProjection::new(pool.clone());
-    assert!(proj.get_pending_by_branch("branch-a").await.unwrap().is_some());
-    assert!(proj.get_pending_by_branch("branch-b").await.unwrap().is_none());
+    assert!(proj
+        .get_pending_by_branch("branch-a")
+        .await
+        .unwrap()
+        .is_some());
+    assert!(proj
+        .get_pending_by_branch("branch-b")
+        .await
+        .unwrap()
+        .is_none());
 
     emit(&bus, thread, applied_event(change_id, &[], false)).await;
-    assert!(proj.get_pending_by_branch("branch-a").await.unwrap().is_none());
+    assert!(proj
+        .get_pending_by_branch("branch-a")
+        .await
+        .unwrap()
+        .is_none());
 
     teardown_test_db(&db).await;
 }
@@ -106,7 +118,10 @@ async fn other_pending_for_branch_returns_false_when_only_one_pending() {
     )
     .await;
     assert!(!proj.other_pending_for_branch("branch-x", id).await.unwrap());
-    assert!(!proj.other_pending_for_branch("branch-y", other_id).await.unwrap());
+    assert!(!proj
+        .other_pending_for_branch("branch-y", other_id)
+        .await
+        .unwrap());
 
     teardown_test_db(&db).await;
 }
@@ -170,7 +185,10 @@ async fn list_recently_applied_orders_newest_first_with_limit_and_cursor() {
     assert_eq!(two[1].branch_name, "b");
 
     let before_b = all[1].resolved_at.unwrap();
-    let older = proj.list_recently_applied(10, Some(before_b)).await.unwrap();
+    let older = proj
+        .list_recently_applied(10, Some(before_b))
+        .await
+        .unwrap();
     assert_eq!(older.len(), 1);
     assert_eq!(older[0].branch_name, "a");
 

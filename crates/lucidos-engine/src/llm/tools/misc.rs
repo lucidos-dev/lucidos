@@ -6,7 +6,6 @@
 //! (manage_repositories / manage_models moved to the capability parity manifest —
 //! domains `repositories` / `models` — and are built by `capability_manifest`.)
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
@@ -190,7 +189,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "auth_type": {
                         "type": "string",
                         "enum": ["api_key", "bearer", "basic", "password", "oauth_client"],
-                        "description": "Type of authentication. Use 'password' for username+password (injected as Basic auth), 'oauth_client' for OAuth client_id+client_secret. For oauth_client, first load_knowhow('system-knowhow/oauth-providers') and pass auth_url/token_url/userinfo_url (+ optional scopes) so the modal pre-fills them and the user only enters client_id+client_secret. Omit the endpoint args only for a provider not yet in that knowhow (then the user types the URLs by hand once). Default: api_key"
+                        "description": "Type of authentication. Use 'password' for username+password (injected as Basic auth), 'oauth_client' for OAuth client_id (+ client_secret for a confidential client). For oauth_client, first load_knowhow('system-knowhow/oauth-providers') and pass auth_url/token_url/userinfo_url (+ optional scopes/redirect_uri) so the modal pre-fills them and the user only enters client_id+client_secret. The client secret is OPTIONAL: leaving it blank makes Lucidos a public client that authenticates with PKCE instead — the right shape when the provider's app registration is a desktop/native app. Omit the endpoint args only for a provider not yet in that knowhow (then the user types the URLs by hand once). Default: api_key"
                     },
                     "auth_url": {
                         "type": "string",
@@ -207,6 +206,10 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "scopes": {
                         "type": "string",
                         "description": "oauth_client only, optional. Default OAuth scopes (space-separated) to pre-fill the modal's scopes field."
+                    },
+                    "redirect_uri": {
+                        "type": "string",
+                        "description": "oauth_client only, optional. Loopback callback URI the user must register with the provider. Omit for the default 'http://127.0.0.1:14981/oauth/callback'. Only pass one when the oauth-providers knowhow says this provider needs a different host form (e.g. 'http://localhost:14981/oauth/callback'). Must be one of: http://127.0.0.1:14981/oauth/callback, http://localhost:14981/oauth/callback, http://[::1]:14981/oauth/callback."
                     },
                     "env_var_name": {
                         "type": "string",
@@ -250,6 +253,10 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
                     "base_url": {
                         "type": "string",
                         "description": "Optional. API base URL to pre-fill in the credential modal when it opens (e.g. 'https://healthcare.googleapis.com')."
+                    },
+                    "redirect_uri": {
+                        "type": "string",
+                        "description": "Optional. Loopback callback URI the user registers with the provider — pre-fills the credential modal when it opens. Omit for the default 'http://127.0.0.1:14981/oauth/callback'. Pass 'http://localhost:14981/oauth/callback' only when the oauth-providers knowhow says this provider needs the name form instead of the IP."
                     }
                 },
                 "required": ["provider", "scopes"]
@@ -433,7 +440,12 @@ mod navigate_targets_codegen {
         out.push_str(
             "// derives from this file, so the LLM tool schema and the SDK can never drift.\n\n",
         );
-        push_const(&mut out, "NAVIGATE_TARGETS", "NavigateTarget", NAVIGATE_TARGETS);
+        push_const(
+            &mut out,
+            "NAVIGATE_TARGETS",
+            "NavigateTarget",
+            NAVIGATE_TARGETS,
+        );
         out.push('\n');
         push_const(
             &mut out,

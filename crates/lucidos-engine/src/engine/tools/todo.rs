@@ -193,9 +193,9 @@ pub async fn mark_abandoned_todos(
     // Nothing to flip if every non-completed slot is already abandoned (or
     // every item is completed). `Pending` / `InProgress` are the only states
     // the helper rewrites.
-    let needs_flip = items.iter().any(|item| {
-        matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress)
-    });
+    let needs_flip = items
+        .iter()
+        .any(|item| matches!(item.status, TodoStatus::Pending | TodoStatus::InProgress));
     if !needs_flip {
         return;
     }
@@ -241,10 +241,7 @@ mod tests {
 
     async fn next_todo_event(rx: &mut Receiver<EmittedEvent>, thread_id: Uuid) -> Vec<TodoItem> {
         loop {
-            let ev = rx
-                .recv()
-                .await
-                .expect("broadcast channel should not close");
+            let ev = rx.recv().await.expect("broadcast channel should not close");
             match ev.typed {
                 BusEvent::Thread {
                     thread_id: tid,
@@ -270,7 +267,11 @@ mod tests {
         });
 
         let out = todo_write_impl(&bus, &args, thread_id).await;
-        assert!(matches!(&out, Ok(s) if s.contains("3 items")), "got: {:?}", out);
+        assert!(
+            matches!(&out, Ok(s) if s.contains("3 items")),
+            "got: {:?}",
+            out
+        );
 
         let items = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(items.len(), 3);
@@ -290,7 +291,11 @@ mod tests {
         let thread_id = Uuid::new_v4();
 
         let out = todo_write_impl(&bus, &json!({"todos": []}), thread_id).await;
-        assert!(matches!(&out, Ok(s) if s.contains("0 items")), "got: {:?}", out);
+        assert!(
+            matches!(&out, Ok(s) if s.contains("0 items")),
+            "got: {:?}",
+            out
+        );
 
         let items = next_todo_event(&mut rx, thread_id).await;
         assert!(items.is_empty());
@@ -566,7 +571,11 @@ mod tests {
         let flipped = next_todo_event(&mut rx, thread_id).await;
         assert_eq!(flipped.len(), 3, "list preserved, got {:?}", flipped);
         assert_eq!(flipped[0].status, TodoStatus::Completed, "completed kept");
-        assert_eq!(flipped[1].status, TodoStatus::Abandoned, "in_progress flipped");
+        assert_eq!(
+            flipped[1].status,
+            TodoStatus::Abandoned,
+            "in_progress flipped"
+        );
         assert_eq!(flipped[2].status, TodoStatus::Abandoned, "pending flipped");
         assert_eq!(flipped[0].content, "a");
         assert_eq!(flipped[1].content, "b");
@@ -689,12 +698,13 @@ mod tests {
         // Pretend turn A's terminator was assigned a sequence value — capture
         // the current max-sequence as our terminator marker. Anything written
         // AFTER that should be treated as turn B's fresh state.
-        let terminator_seq: i64 =
-            sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM events WHERE thread_id = $1")
-                .bind(thread_id)
-                .fetch_one(&pool)
-                .await
-                .expect("max seq");
+        let terminator_seq: i64 = sqlx::query_scalar(
+            "SELECT COALESCE(MAX(sequence), 0) FROM events WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_one(&pool)
+        .await
+        .expect("max seq");
 
         // Now turn B writes a fresh list AFTER the terminator.
         let fresh = json!({

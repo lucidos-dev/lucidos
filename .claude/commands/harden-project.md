@@ -136,7 +136,7 @@ Then sweep the engine + gateway + CLI (`crates/lucidos-engine/src/`, `crates/luc
 
 Run tests based on which file types changed:
 
-- `.rs` files changed → `make lint && make test` (`make lint` is the canonical gate — ShellCheck + clippy over both feature sets; it supersedes a bare `cargo check`. `make test` = `./scripts/test-engine.sh`, which provisions the Postgres the integration tests need — a bare `cargo test -p lucidos-engine` panics every DB-backed test)
+- `.rs` files changed → `make lint && make test` (`make lint` is the canonical gate: ShellCheck, a rustfmt-clean check over the tree, and clippy over both feature sets; it supersedes a bare `cargo check`. `make test` = `./scripts/test-engine.sh`, which provisions the Postgres the integration tests need (a bare `cargo test -p lucidos-engine` panics every DB-backed test))
 - `.sh` / `.shellcheckrc` / `Makefile` changed → `make lint`
 - `.ts`/`.tsx` files changed → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
 - Both → run both

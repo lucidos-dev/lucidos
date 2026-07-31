@@ -1,11 +1,10 @@
 //! LLM-facing schemas for the code/command execution tools
 //! (run_python / run_bash family). Handlers live in `engine::tools::{python,bash}`.
 
-
+use super::{BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;
-use super::{BG_DEFAULT_TIMEOUT_SECS, BG_MAX_TIMEOUT_SECS, DEFAULT_TIMEOUT_SECS, MAX_TIMEOUT_SECS};
 
 pub(super) fn exec_tools() -> Vec<ToolDefinition> {
     vec![

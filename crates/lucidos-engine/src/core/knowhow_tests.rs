@@ -24,9 +24,9 @@ fn parse_knowhow_derives_description_skips_headings() {
     let text = "---\nname: Calendar\n---\n# Google Calendar\n\n## Purpose\n- Show events from imported calendars";
     let (name, description, _) = parse_frontmatter(text).unwrap();
     assert_eq!(name, "Calendar");
-        assert_eq!(
-            description,
-            "Calendar: - Show events from imported calendars"
+    assert_eq!(
+        description,
+        "Calendar: - Show events from imported calendars"
     );
 }
 
@@ -152,49 +152,46 @@ fn load_summary_uses_frontmatter_description() {
     assert_eq!(
         summaries[0].description,
         "Custom description from frontmatter"
-        );
+    );
+}
+
+fn dirs(shared: Option<&std::path::Path>, local: &std::path::Path) -> KnowhowDirs {
+    KnowhowDirs {
+        shared: shared.map(|p| p.to_path_buf()),
+        local: local.to_path_buf(),
+        apps: None,
+        triggers: None,
     }
+}
 
-    fn dirs(shared: Option<&std::path::Path>, local: &std::path::Path) -> KnowhowDirs {
-        KnowhowDirs {
-            shared: shared.map(|p| p.to_path_buf()),
-            local: local.to_path_buf(),
-            apps: None,
-            triggers: None,
-        }
+fn dirs_with_apps(
+    shared: Option<&std::path::Path>,
+    local: &std::path::Path,
+    apps: &std::path::Path,
+) -> KnowhowDirs {
+    KnowhowDirs {
+        shared: shared.map(|p| p.to_path_buf()),
+        local: local.to_path_buf(),
+        apps: Some(apps.to_path_buf()),
+        triggers: None,
     }
+}
 
-    fn dirs_with_apps(
-        shared: Option<&std::path::Path>,
-        local: &std::path::Path,
-        apps: &std::path::Path,
-    ) -> KnowhowDirs {
-        KnowhowDirs {
-            shared: shared.map(|p| p.to_path_buf()),
-            local: local.to_path_buf(),
-            apps: Some(apps.to_path_buf()),
-            triggers: None,
-        }
+fn dirs_with_triggers(local: &std::path::Path, triggers: &std::path::Path) -> KnowhowDirs {
+    KnowhowDirs {
+        shared: None,
+        local: local.to_path_buf(),
+        apps: None,
+        triggers: Some(triggers.to_path_buf()),
     }
+}
 
-    fn dirs_with_triggers(
-        local: &std::path::Path,
-        triggers: &std::path::Path,
-    ) -> KnowhowDirs {
-        KnowhowDirs {
-            shared: None,
-            local: local.to_path_buf(),
-            apps: None,
-            triggers: Some(triggers.to_path_buf()),
-        }
-    }
+// --- Task 1: load_merged_summaries ---
 
-    // --- Task 1: load_merged_summaries ---
-
-    #[test]
-    fn load_merged_summaries_local_overrides_shared() {
-        let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("shared");
+#[test]
+fn load_merged_summaries_local_overrides_shared() {
+    let tmp = tempfile::tempdir().unwrap();
+    let shared = tmp.path().join("shared");
     let local = tmp.path().join("local");
 
     write_knowhow_file(
@@ -225,15 +222,15 @@ fn load_summary_uses_frontmatter_description() {
         ids
     );
     assert!(ids.contains(&"google-calendar"));
-        assert!(ids.contains(&"lucidos"));
+    assert!(ids.contains(&"lucidos"));
     assert!(ids.contains(&"heatpump"));
 
     let gc = summaries
         .iter()
         .find(|s| s.id == "google-calendar")
-            .unwrap();
-        assert!(
-            gc.name.contains("local"),
+        .unwrap();
+    assert!(
+        gc.name.contains("local"),
         "local should override shared, got: {}",
         gc.name
     );
@@ -278,8 +275,7 @@ fn load_with_fallback_falls_back_to_shared() {
         "Shared content.",
     );
 
-    let kh = KnowhowStore::load_with_fallback(&dirs(Some(&shared), &local), "only-shared")
-        .unwrap();
+    let kh = KnowhowStore::load_with_fallback(&dirs(Some(&shared), &local), "only-shared").unwrap();
     assert_eq!(kh.name, "Only Shared");
 }
 
@@ -363,8 +359,7 @@ fn load_knowhow_sections_merged_loads_system_knowhow_with_prefix() {
     );
 
     let ids = vec!["system-knowhow/best-practices".to_string()];
-    let sections =
-        load_knowhow_sections_merged(&dirs(None, &local), Some(&system), &ids);
+    let sections = load_knowhow_sections_merged(&dirs(None, &local), Some(&system), &ids);
     assert!(
         sections.contains("[SYSTEM-KNOWHOW: Best Practices]"),
         "should tag with SYSTEM-KNOWHOW, got: {}",
@@ -382,10 +377,7 @@ fn load_knowhow_sections_merged_mixes_system_and_user_knowhow() {
     write_knowhow_file(&local.join("user-doc.md"), "User Doc", "User body.");
     write_knowhow_file(&system.join("sys-doc.md"), "Sys Doc", "Sys body.");
 
-    let ids = vec![
-        "system-knowhow/sys-doc".to_string(),
-        "user-doc".to_string(),
-    ];
+    let ids = vec!["system-knowhow/sys-doc".to_string(), "user-doc".to_string()];
     let sections = load_knowhow_sections_merged(&dirs(None, &local), Some(&system), &ids);
     assert!(sections.contains("[SYSTEM-KNOWHOW: Sys Doc]"));
     assert!(sections.contains("[KNOW-HOW: User Doc]"));
@@ -404,12 +396,9 @@ fn load_one_knowhow_section_returns_system_or_user_format() {
     assert!(user.contains("[KNOW-HOW: User Doc]"));
     assert!(user.contains("User body."));
 
-    let sys = load_one_knowhow_section(
-        &dirs(None, &local),
-        Some(&system),
-        "system-knowhow/sys-doc",
-    )
-    .expect("system knowhow should resolve");
+    let sys =
+        load_one_knowhow_section(&dirs(None, &local), Some(&system), "system-knowhow/sys-doc")
+            .expect("system knowhow should resolve");
     assert!(sys.contains("[SYSTEM-KNOWHOW: Sys Doc]"));
     assert!(sys.contains("Sys body."));
 
@@ -425,7 +414,10 @@ fn load_knowhow_sections_merged_handles_missing_system_dir() {
 
     let ids = vec!["system-knowhow/anything".to_string()];
     let sections = load_knowhow_sections_merged(&dirs(None, &local), None, &ids);
-    assert_eq!(sections, "", "missing system_dir should drop system ids silently");
+    assert_eq!(
+        sections, "",
+        "missing system_dir should drop system ids silently"
+    );
 }
 
 // --- App-scoped knowhow resolution ---
@@ -442,17 +434,16 @@ fn load_knowhow_sections_merged_loads_app_scoped_knowhow() {
     std::fs::create_dir_all(&local).unwrap();
     let apps = tmp.path().join("apps");
     write_knowhow_file(
-        &apps.join("morning-log").join("knowhow").join("morning-log-data.md"),
+        &apps
+            .join("morning-log")
+            .join("knowhow")
+            .join("morning-log-data.md"),
         "Morning log data",
         "Data layout for morning log.",
     );
 
     let ids = vec!["morning-log/morning-log-data".to_string()];
-    let sections = load_knowhow_sections_merged(
-        &dirs_with_apps(None, &local, &apps),
-        None,
-        &ids,
-    );
+    let sections = load_knowhow_sections_merged(&dirs_with_apps(None, &local, &apps), None, &ids);
     assert!(
         !sections.is_empty(),
         "app-scoped section should be loaded, got empty"
@@ -478,33 +469,31 @@ fn load_with_fallback_loads_app_scoped_knowhow() {
     write_knowhow_file(
         &apps.join("foo").join("knowhow").join("bar.md"),
         "Foo Bar",
-            "Body.",
+        "Body.",
     );
 
-    let kh =
-        KnowhowStore::load_with_fallback(&dirs_with_apps(None, &local, &apps), "foo/bar")
-                .expect("app-scoped id should load");
+    let kh = KnowhowStore::load_with_fallback(&dirs_with_apps(None, &local, &apps), "foo/bar")
+        .expect("app-scoped id should load");
     assert_eq!(kh.name, "Foo Bar");
-    }
+}
 
-    #[test]
-    fn load_with_fallback_prefers_local_over_app_scoped() {
-        // If a top-level knowhow file shares the same id-shape as an app-scoped
-        // one (e.g. local has `foo/bar.md`, apps also has `foo/knowhow/bar.md`),
-        // the bare-id local match wins per the documented lookup order.
-        let tmp = tempfile::tempdir().unwrap();
-        let local = tmp.path().join("local");
+#[test]
+fn load_with_fallback_prefers_local_over_app_scoped() {
+    // If a top-level knowhow file shares the same id-shape as an app-scoped
+    // one (e.g. local has `foo/bar.md`, apps also has `foo/knowhow/bar.md`),
+    // the bare-id local match wins per the documented lookup order.
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local");
     let apps = tmp.path().join("apps");
     write_knowhow_file(&local.join("foo").join("bar.md"), "Local Foo Bar", "Local.");
     write_knowhow_file(
         &apps.join("foo").join("knowhow").join("bar.md"),
         "App Foo Bar",
-            "App.",
+        "App.",
     );
 
-    let kh =
-        KnowhowStore::load_with_fallback(&dirs_with_apps(None, &local, &apps), "foo/bar")
-                .expect("should load");
+    let kh = KnowhowStore::load_with_fallback(&dirs_with_apps(None, &local, &apps), "foo/bar")
+        .expect("should load");
     assert_eq!(kh.name, "Local Foo Bar", "local must win over app-scoped");
 }
 
@@ -517,10 +506,10 @@ fn load_with_fallback_loads_app_scoped_knowhow() {
 #[test]
 fn app_scoped_path_rejects_double_slash_escape() {
     // `foo//bar` splits to ("foo", "/bar"); `/bar.md` is absolute on Unix.
-        let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
+    let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
     assert!(
         app_scoped_knowhow_path(&apps, "foo//bar").is_none(),
-            "double-slash id must not produce a path",
+        "double-slash id must not produce a path",
     );
 }
 
@@ -539,12 +528,12 @@ fn app_scoped_path_rejects_traversal_in_rest() {
     // contract directly so a future refactor doesn't lose this behavior.
     let apps = std::path::PathBuf::from("/tmp/lucidos-test/apps");
     assert!(app_scoped_knowhow_path(&apps, "foo/../bar").is_none());
-    }
+}
 
-    #[test]
-    fn knowhow_not_found_body_branches_on_prefix() {
-        let user = knowhow_not_found_body("foo/bar");
-        assert!(user.starts_with("Know-how 'foo/bar' not found."));
+#[test]
+fn knowhow_not_found_body_branches_on_prefix() {
+    let user = knowhow_not_found_body("foo/bar");
+    assert!(user.starts_with("Know-how 'foo/bar' not found."));
     assert!(user.contains("Use the know-how list"));
 
     let sys = knowhow_not_found_body("system-knowhow/baz");
@@ -620,20 +609,20 @@ fn trigger_scoped_path_rejects_traversal() {
     let triggers = std::path::PathBuf::from("/tmp/lucidos-test/triggers");
     // outer is_safe_id catches `..`
     assert!(trigger_scoped_knowhow_path(&triggers, "triggers/foo/../bar").is_none());
-        // empty slug
-        assert!(trigger_scoped_knowhow_path(&triggers, "triggers//bar").is_none());
-        // empty rest
-        assert!(trigger_scoped_knowhow_path(&triggers, "triggers/foo/").is_none());
+    // empty slug
+    assert!(trigger_scoped_knowhow_path(&triggers, "triggers//bar").is_none());
+    // empty rest
+    assert!(trigger_scoped_knowhow_path(&triggers, "triggers/foo/").is_none());
     // missing prefix
     assert!(trigger_scoped_knowhow_path(&triggers, "foo/bar").is_none());
-    }
+}
 
-    // --- Per-trigger knowhow summaries ---
+// --- Per-trigger knowhow summaries ---
 
-    #[test]
-    fn load_trigger_summaries_reads_files_under_slug_knowhow_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let triggers = tmp.path().join("triggers");
+#[test]
+fn load_trigger_summaries_reads_files_under_slug_knowhow_dir() {
+    let tmp = tempfile::tempdir().unwrap();
+    let triggers = tmp.path().join("triggers");
     let kh_dir = triggers.join("nightly-build").join("knowhow");
     write_knowhow_file(
         &kh_dir.join("orchestration.md"),
@@ -671,8 +660,6 @@ fn app_scoped_path_builds_well_formed_path_for_safe_id() {
         .expect("safe id should produce a path");
     assert_eq!(
         p,
-        std::path::PathBuf::from(
-            "/ws/data/apps/finn-jobs/knowhow/finn-search-workflow.md"
-        )
+        std::path::PathBuf::from("/ws/data/apps/finn-jobs/knowhow/finn-search-workflow.md")
     );
 }

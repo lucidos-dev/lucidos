@@ -1,10 +1,8 @@
 //! Plugin uninstall flow tests: confirm-flow delete, conflict/overwrite/
 //! uninstall round-trip, path-safety + empty-parent pruning, cancel paths.
 
-
 use super::helpers::*;
 use super::*;
-
 
 use crate::engine::event_bus::{EventBus, MockEventBus};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -35,8 +33,8 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
 
     let pending_uninstalls: std::sync::Arc<PendingUninstallsMap> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let sentinel = prepare_uninstall_plugin(&scratch, &pool, &pending_uninstalls, "fixture-plugin")
-        .await;
+    let sentinel =
+        prepare_uninstall_plugin(&scratch, &pool, &pending_uninstalls, "fixture-plugin").await;
     assert!(
         sentinel.starts_with(PLUGIN_UNINSTALL_REQUEST_PREFIX),
         "expected uninstall sentinel, got: {}",
@@ -69,7 +67,9 @@ async fn e2e_uninstall_plugin_deletes_files_after_confirm() {
         .expect("uninstall_with_bus");
 
     assert!(
-        outcome.summary.contains("Uninstalled Fixture Plugin v0.1.0"),
+        outcome
+            .summary
+            .contains("Uninstalled Fixture Plugin v0.1.0"),
         "summary: {}",
         outcome.summary
     );
@@ -276,14 +276,19 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
         .await
         .expect("uninstall should succeed");
     assert!(
-        outcome.summary.contains("Uninstalled Fixture Plugin v0.1.0"),
+        outcome
+            .summary
+            .contains("Uninstalled Fixture Plugin v0.1.0"),
         "uninstall summary: {}",
         outcome.summary
     );
     assert_eq!(outcome.files_deleted.len(), 2);
     // Files actually deleted now.
     assert!(!kn_path.exists(), "uninstall must delete the knowhow file");
-    assert!(!trig_path.exists(), "uninstall must delete the trigger file");
+    assert!(
+        !trig_path.exists(),
+        "uninstall must delete the trigger file"
+    );
 
     let final_events = bus.emitted_events();
     assert_eq!(final_events.len(), 3);
@@ -308,7 +313,10 @@ async fn install_then_conflict_then_overwrite_then_uninstall() {
                 ]
             );
             assert_eq!(files_deleted.len(), 2);
-            assert!(files_missing.is_empty(), "all files were present at confirm");
+            assert!(
+                files_missing.is_empty(),
+                "all files were present at confirm"
+            );
         }
         other => panic!("expected PluginUninstalled, got {:?}", other),
     }
@@ -470,8 +478,14 @@ fn prune_empty_parents_stops_at_content_dir_root() {
     std::fs::remove_file(&nested).unwrap();
     super::prune_empty_parents(&data_dir, "apps/myapp/sub/leaf.html");
 
-    assert!(!data_dir.join("apps/myapp/sub").exists(), "sub must be pruned");
-    assert!(!data_dir.join("apps/myapp").exists(), "myapp must be pruned");
+    assert!(
+        !data_dir.join("apps/myapp/sub").exists(),
+        "sub must be pruned"
+    );
+    assert!(
+        !data_dir.join("apps/myapp").exists(),
+        "myapp must be pruned"
+    );
     assert!(
         data_dir.join("apps").is_dir(),
         "content-dir root must NOT be pruned even when empty"
@@ -637,7 +651,9 @@ async fn uninstall_with_bus_handles_file_disappearing_between_prepare_and_confir
 
     assert_eq!(outcome.files_deleted, vec!["knowhow/stays.md"]);
     assert!(
-        outcome.files_missing.contains(&"knowhow/already-gone.md".to_string()),
+        outcome
+            .files_missing
+            .contains(&"knowhow/already-gone.md".to_string()),
         "raced-missing file must end up in files_missing"
     );
     assert!(!data_dir.join("knowhow/stays.md").exists());

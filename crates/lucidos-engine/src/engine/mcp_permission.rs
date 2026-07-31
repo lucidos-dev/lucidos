@@ -73,11 +73,7 @@ pub const DEFAULT_MCP_ALLOWED_TOOLS: &[&str] = &[];
 ///
 /// Always derivable for a non-empty `(server_id, tool)`; returns `None` only
 /// when either is empty (a malformed MCP tool name).
-pub fn derive_mcp_allow_pattern(
-    server_id: &str,
-    tool: &str,
-    scope: AllowScope,
-) -> Option<String> {
+pub fn derive_mcp_allow_pattern(server_id: &str, tool: &str, scope: AllowScope) -> Option<String> {
     if server_id.is_empty() || tool.is_empty() {
         return None;
     }
@@ -604,8 +600,16 @@ mod tests {
     #[test]
     fn broad_grant_covers_every_tool_narrow_only_the_exact() {
         // A broad grant covers any tool on the server.
-        assert!(mcp_is_allowed("slack", "channels_list", allowed_in(&["Mcp(slack:*)"])));
-        assert!(mcp_is_allowed("slack", "post_message", allowed_in(&["Mcp(slack:*)"])));
+        assert!(mcp_is_allowed(
+            "slack",
+            "channels_list",
+            allowed_in(&["Mcp(slack:*)"])
+        ));
+        assert!(mcp_is_allowed(
+            "slack",
+            "post_message",
+            allowed_in(&["Mcp(slack:*)"])
+        ));
         // A narrow grant covers only the exact tool.
         assert!(mcp_is_allowed(
             "slack",
@@ -691,7 +695,10 @@ mod tests {
         let patterns = mcp_allowed_tools_patterns(Some(dir.path()));
         assert_eq!(
             patterns,
-            vec!["Mcp(slack:channels_list)".to_string(), "Mcp(github:*)".to_string()]
+            vec![
+                "Mcp(slack:channels_list)".to_string(),
+                "Mcp(github:*)".to_string()
+            ]
         );
     }
 }

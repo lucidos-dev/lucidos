@@ -1,5 +1,5 @@
-use super::*;
 use super::test_helpers::*;
+use super::*;
 
 #[tokio::test]
 async fn get_saved_threads_resolves_parent_title() {
@@ -104,7 +104,10 @@ async fn get_saved_threads_sorts_by_last_user_action_not_last_activity() {
     let order: Vec<&str> = saved.iter().map(|t| t.thread_id.as_str()).collect();
     let acted_s = acted.to_string();
     let churned_s = churned.to_string();
-    let acted_pos = order.iter().position(|id| *id == acted_s).expect("acted present");
+    let acted_pos = order
+        .iter()
+        .position(|id| *id == acted_s)
+        .expect("acted present");
     let churned_pos = order
         .iter()
         .position(|id| *id == churned_s)
@@ -132,8 +135,8 @@ async fn get_recent_threads_archive_window_selects_by_created_at() {
 
     let newest_created = Uuid::new_v4(); // created last, never touched again
     let touched_later = Uuid::new_v4(); // created first, but user acted later
-    // Same source + both archived idle, so only the rn<=per_source window decides
-    // inclusion. created_at is the ONLY axis under which `newest_created` wins.
+                                        // Same source + both archived idle, so only the rn<=per_source window decides
+                                        // inclusion. created_at is the ONLY axis under which `newest_created` wins.
     sqlx::query(
         "INSERT INTO thread_summaries \
              (thread_id, title, source, message_count, has_response, archive_state, \
@@ -150,7 +153,10 @@ async fn get_recent_threads_archive_window_selects_by_created_at() {
     .await
     .expect("insert thread_summaries");
 
-    let recent = store.get_recent_threads(1).await.expect("get_recent_threads");
+    let recent = store
+        .get_recent_threads(1)
+        .await
+        .expect("get_recent_threads");
     let returned: std::collections::HashSet<&str> =
         recent.iter().map(|t| t.thread_id.as_str()).collect();
     assert!(
@@ -308,7 +314,12 @@ async fn get_recent_threads_excludes_actionable_threads_beyond_window() {
     // per actionable signal.
     let actionable: [(Uuid, &str, bool, i64); 3] = [
         (Uuid::new_v4(), ThreadStatus::Idle.as_str(), true, 100), // coding_agent_proposed
-        (Uuid::new_v4(), ThreadStatus::WaitingForUserAnswer.as_str(), false, 101),
+        (
+            Uuid::new_v4(),
+            ThreadStatus::WaitingForUserAnswer.as_str(),
+            false,
+            101,
+        ),
         (Uuid::new_v4(), ThreadStatus::Failed.as_str(), false, 102),
     ];
     for (id, status, proposed, secs) in actionable {
@@ -522,7 +533,10 @@ async fn get_recent_threads_archive_window_is_global_not_per_source() {
     .expect("insert thread_summaries");
 
     // archive_limit=2 → the two newest-CREATED archived rows GLOBALLY = both chats.
-    let recent = store.get_recent_threads(2).await.expect("get_recent_threads");
+    let recent = store
+        .get_recent_threads(2)
+        .await
+        .expect("get_recent_threads");
     let returned: std::collections::HashSet<&str> =
         recent.iter().map(|t| t.thread_id.as_str()).collect();
     assert!(
@@ -576,11 +590,15 @@ async fn get_recent_threads_archive_window_seam_is_gap_free() {
     .expect("insert thread_summaries");
 
     // Window of 2 = the two newest (d1, d2).
-    let window = store.get_recent_threads(2).await.expect("get_recent_threads");
+    let window = store
+        .get_recent_threads(2)
+        .await
+        .expect("get_recent_threads");
     let window_ids: std::collections::HashSet<&str> =
         window.iter().map(|t| t.thread_id.as_str()).collect();
     assert!(
-        window_ids.contains(d1.to_string().as_str()) && window_ids.contains(d2.to_string().as_str()),
+        window_ids.contains(d1.to_string().as_str())
+            && window_ids.contains(d2.to_string().as_str()),
         "window must be the two newest-created archived rows"
     );
 
@@ -933,7 +951,10 @@ async fn fetch_family_extension_loads_ancestors_and_descendants() {
 
     let ids: std::collections::HashSet<String> =
         extension.iter().map(|t| t.thread_id.clone()).collect();
-    assert!(ids.contains(&grandparent.to_string()), "ancestor not loaded");
+    assert!(
+        ids.contains(&grandparent.to_string()),
+        "ancestor not loaded"
+    );
     assert!(ids.contains(&child.to_string()), "descendant not loaded");
     assert!(
         !ids.contains(&parent.to_string()),

@@ -59,7 +59,8 @@ fn user_question_asked_surfaces_cc_to_inbox() {
         true,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));
+}
 
 #[test]
 fn user_question_asked_surfaces_chat_to_inbox() {
@@ -268,7 +269,8 @@ fn cc_settings_changed_accepted_for_cc_threads() {
     assert_eq!(
         result.new_section, None,
         "CodingAgentSettingsChanged must not change section"
-    );}
+    );
+}
 
 #[test]
 fn cc_settings_changed_rejected_for_chat_threads() {
@@ -359,4 +361,3 @@ fn message_count_events_are_valid_persisted_events() {
         );
     }
 }
-

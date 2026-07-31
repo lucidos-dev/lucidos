@@ -144,4 +144,3 @@ fn session_ended_reason_serialization() {
         }
     }
 }
-

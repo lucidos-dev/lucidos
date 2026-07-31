@@ -273,7 +273,8 @@ mod tests {
         {
             let mut g = tracker.inner.lock().unwrap();
             let slot = g.pending.get_mut(&stale_nid).unwrap();
-            slot.inserted_at = Instant::now() - STALE_SLOT_AFTER - std::time::Duration::from_secs(1);
+            slot.inserted_at =
+                Instant::now() - STALE_SLOT_AFTER - std::time::Duration::from_secs(1);
         }
 
         // The next expect() sweeps stale entries.

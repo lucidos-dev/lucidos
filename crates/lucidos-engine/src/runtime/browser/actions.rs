@@ -39,12 +39,19 @@ impl BrowserRuntime {
                 if let Some(reason) = detect_bot_block(content) {
                     // Record for future fast-fail
                     if let Some(ref domain) = domain {
-                        if let Err(e) =
-                            HeadlessBlocklist::block(&self.pool, domain, &reason).await
+                        if let Err(e) = HeadlessBlocklist::block(&self.pool, domain, &reason).await
                         {
-                            log!("[Browser] Failed to record headless block for {}: {}", domain, e);
+                            log!(
+                                "[Browser] Failed to record headless block for {}: {}",
+                                domain,
+                                e
+                            );
                         } else {
-                            log!("[Browser] Recorded headless block for {}: {}", domain, reason);
+                            log!(
+                                "[Browser] Recorded headless block for {}: {}",
+                                domain,
+                                reason
+                            );
                         }
                     }
                     return Err(format!(

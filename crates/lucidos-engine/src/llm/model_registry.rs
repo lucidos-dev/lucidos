@@ -265,7 +265,10 @@ mod tests {
         assert_eq!(provider_kind_for(&reg, "llama3.1"), ProviderKind::Local);
         // Absent from the table → prefix heuristic, which has no rule for these
         // shapes, so it falls back to Vertex (documented limitation).
-        assert_eq!(provider_kind_for(&empty(), "z-ai/glm-5.2"), ProviderKind::Vertex);
+        assert_eq!(
+            provider_kind_for(&empty(), "z-ai/glm-5.2"),
+            ProviderKind::Vertex
+        );
     }
 
     #[test]
@@ -275,7 +278,10 @@ mod tests {
             ("claude-opus-4-8@default", ProviderKind::Vertex),
             ("gpt-5.5", ProviderKind::OpenAi),
         ]);
-        assert_eq!(provider_kind_for(&reg, "claude-fable-5"), ProviderKind::Anthropic);
+        assert_eq!(
+            provider_kind_for(&reg, "claude-fable-5"),
+            ProviderKind::Anthropic
+        );
         assert_eq!(
             provider_kind_for(&reg, "claude-opus-4-8@default"),
             ProviderKind::Vertex

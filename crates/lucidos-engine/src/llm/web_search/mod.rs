@@ -269,10 +269,7 @@ mod tests {
     /// chain treats as a terminal success rather than an availability failure.
     #[test]
     fn formatter_renders_the_no_results_line_when_wholly_empty() {
-        assert_eq!(
-            format_search_result("   ", &[]),
-            "No search results found."
-        );
+        assert_eq!(format_search_result("   ", &[]), "No search results found.");
     }
 
     /// Sources with no answer text still render, without a leading blank line.
@@ -292,7 +289,11 @@ mod tests {
         let chain = WebSearchChain::new(vec![first.clone(), second.clone()]);
 
         assert_eq!(chain.search("q", 5).await.unwrap(), "from vertex");
-        assert_eq!(second.calls(), 0, "the second backend must not be consulted");
+        assert_eq!(
+            second.calls(),
+            0,
+            "the second backend must not be consulted"
+        );
     }
 
     /// An availability failure falls through to the next backend — the fallback
@@ -334,7 +335,12 @@ mod tests {
             .await
             .expect_err("an empty chain must error");
         let msg = err.to_string();
-        for needle in ["Vertex AI", "Anthropic", "OpenAI", "Settings → Models → Providers"] {
+        for needle in [
+            "Vertex AI",
+            "Anthropic",
+            "OpenAI",
+            "Settings → Models → Providers",
+        ] {
             assert!(msg.contains(needle), "missing {needle:?} in: {msg}");
         }
     }
@@ -349,6 +355,9 @@ mod tests {
         ]);
         let msg = chain.search("q", 5).await.unwrap_err().to_string();
         assert!(msg.contains("vertex-grounding: 404 Not Found"), "{msg}");
-        assert!(msg.contains("anthropic-server-tool: 401 Unauthorized"), "{msg}");
+        assert!(
+            msg.contains("anthropic-server-tool: 401 Unauthorized"),
+            "{msg}"
+        );
     }
 }

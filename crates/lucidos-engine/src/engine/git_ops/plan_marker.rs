@@ -175,18 +175,13 @@ pub(crate) async fn approve_plan(
 
 /// Delete the plan record. Call after successful merge, alongside
 /// `consume_harden_marker`.
-pub(crate) async fn consume_plan_marker(
-    pool: &sqlx::PgPool,
-    repo_root: &Path,
-    branch_name: &str,
-) {
-    if let Err(e) = sqlx::query(
-        "DELETE FROM planned_branches WHERE repo_root = $1 AND branch_name = $2",
-    )
-    .bind(canonical_repo_root(repo_root))
-    .bind(branch_name)
-    .execute(pool)
-    .await
+pub(crate) async fn consume_plan_marker(pool: &sqlx::PgPool, repo_root: &Path, branch_name: &str) {
+    if let Err(e) =
+        sqlx::query("DELETE FROM planned_branches WHERE repo_root = $1 AND branch_name = $2")
+            .bind(canonical_repo_root(repo_root))
+            .bind(branch_name)
+            .execute(pool)
+            .await
     {
         log!(
             "[Plan] Failed to delete planned_branches row for {}: {}",

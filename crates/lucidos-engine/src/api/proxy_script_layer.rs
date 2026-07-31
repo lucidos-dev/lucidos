@@ -200,10 +200,7 @@ impl AuthLayer for ScriptHandshakeLayer {
         self.token_cache.invalidate(&self.proxy_name).await;
     }
 
-    async fn apply(
-        &self,
-        _input: &LayerInput<'_>,
-    ) -> Result<AuthMutation, (StatusCode, String)> {
+    async fn apply(&self, _input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         let (headers, was_hit) = self.resolve_headers().await?;
 
         // Convert to (name, String) once. A non-ASCII HeaderValue can't
@@ -372,7 +369,10 @@ mod tests {
         let input = input_for(&body, "https://upstream.example/x", &prior);
         let m = layer.apply(&input).await.unwrap();
 
-        assert!(m.cache_was_hit, "cache hit should set the AuthMutation flag");
+        assert!(
+            m.cache_was_hit,
+            "cache hit should set the AuthMutation flag"
+        );
         assert_eq!(m.add_headers.len(), 1);
         assert_eq!(m.add_headers[0].0.as_str(), "authorization");
         assert_eq!(m.add_headers[0].1, "Bearer cached-token");
@@ -458,7 +458,11 @@ print(json.dumps({
         let (pool, db_name) = setup_test_db().await;
 
         // (auth_type, auth_value, expected env-vars seen by script)
-        type AuthCase = (AuthType, &'static str, &'static [(&'static str, &'static str)]);
+        type AuthCase = (
+            AuthType,
+            &'static str,
+            &'static [(&'static str, &'static str)],
+        );
         let cases: &[AuthCase] = &[
             (AuthType::ApiKey, "ak-123", &[("x-cred-bare", "ak-123")]),
             (AuthType::Bearer, "bear-456", &[("x-cred-bare", "bear-456")]),

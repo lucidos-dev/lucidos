@@ -26,9 +26,7 @@ fn load_signer(name: &str) -> (Arc<Engine>, Arc<CompiledModule>) {
         .ancestors()
         .find(|p| p.join(&wasm_rel).exists())
         .unwrap_or_else(|| {
-            panic!(
-                "couldn't find {wasm_rel} — did you run `./signers/build-all.sh {name}`?"
-            )
+            panic!("couldn't find {wasm_rel}: did you run `./signers/build-all.sh {name}`?")
         })
         .to_path_buf();
 

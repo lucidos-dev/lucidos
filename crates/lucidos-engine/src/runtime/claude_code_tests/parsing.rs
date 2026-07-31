@@ -162,7 +162,11 @@ fn parse_assistant_usage_skipped_when_all_zero() {
     // snapshot — no real API call happened.
     let line = r#"{"type":"assistant","message":{"role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"continuing"}],"usage":{"input_tokens":0,"output_tokens":0,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}"#;
     let events = parse_line(line);
-    assert_eq!(events.len(), 1, "all-zero usage frames must produce only the Message");
+    assert_eq!(
+        events.len(),
+        1,
+        "all-zero usage frames must produce only the Message"
+    );
     assert!(matches!(&events[0], AgentEvent::Message { .. }));
 }
 
@@ -434,7 +438,8 @@ fn parse_result_success_with_subtype_has_no_error() {
 /// A turn that produced no content still fails, via the empty-response branch.
 #[test]
 fn parse_result_is_error_with_success_subtype_yields_no_error() {
-    let line = r#"{"type":"result","subtype":"success","is_error":true,"result":"","duration_ms":100}"#;
+    let line =
+        r#"{"type":"result","subtype":"success","is_error":true,"result":"","duration_ms":100}"#;
     let events = parse_line(line);
     match &events[0] {
         AgentEvent::Result { error, .. } => {

@@ -54,9 +54,10 @@ pub struct AgentBinaryStatus {
 pub fn detect_agent_binary(agent: CodingAgent, override_path: Option<&str>) -> AgentBinaryStatus {
     if let Some(raw) = override_path {
         let (label, pref_key) = match agent {
-            CodingAgent::ClaudeCode => {
-                ("Claude Code (`claude`)", crate::core::PREF_CODING_AGENT_CLAUDE_PATH)
-            }
+            CodingAgent::ClaudeCode => (
+                "Claude Code (`claude`)",
+                crate::core::PREF_CODING_AGENT_CLAUDE_PATH,
+            ),
             CodingAgent::Codex => ("Codex (`codex`)", crate::core::PREF_CODING_AGENT_CODEX_PATH),
         };
         return match spawn_env::resolve_binary_override(raw, label, pref_key) {
@@ -105,4 +106,3 @@ pub fn detect_agent_binary(agent: CodingAgent, override_path: Option<&str>) -> A
         },
     }
 }
-

@@ -257,7 +257,7 @@ impl LucidosEngine {
             if (200..300).contains(&status) {
                 if crate::api::is_path_traversal(path) {
                     return Ok(
-                        "Error: temp_path must be relative with no '..' components".to_string(),
+                        "Error: temp_path must be relative with no '..' components".to_string()
                     );
                 }
                 let tmp_dir = self.workspace_path.join(".lucidos").join("tmp");
@@ -399,11 +399,7 @@ mod tests {
         let elapsed = start.elapsed();
 
         let err = result.expect_err("hung server must surface as Err");
-        assert!(
-            err.is_timeout(),
-            "expected timeout error, got: {:?}",
-            err
-        );
+        assert!(err.is_timeout(), "expected timeout error, got: {:?}", err);
         assert!(
             elapsed < Duration::from_secs(1),
             "timeout fired but took {:?} — should be near {:?}",

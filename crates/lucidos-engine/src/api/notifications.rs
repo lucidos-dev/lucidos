@@ -195,12 +195,15 @@ pub(super) async fn mark_notification_read(
         state
             .engine
             .event_bus
-            .emit_user_system(&headers, &state.pool, "[Notifications] NotificationRead", |actor| {
-                crate::engine::event_bus::SystemEvent::NotificationRead {
+            .emit_user_system(
+                &headers,
+                &state.pool,
+                "[Notifications] NotificationRead",
+                |actor| crate::engine::event_bus::SystemEvent::NotificationRead {
                     id: id.to_string(),
                     actor,
-                }
-            })
+                },
+            )
             .await;
         // Cross-device dismiss (macOS desktop only): tell any connected Tauri
         // app to REMOVE the already-delivered native banner for this id. The
@@ -236,18 +239,18 @@ pub(super) async fn mark_all_notifications_read(
         state
             .engine
             .event_bus
-            .emit_user_system(&headers, &state.pool, "[Notifications] NotificationsAllRead", |actor| {
-                crate::engine::event_bus::SystemEvent::NotificationsAllRead { actor }
-            })
+            .emit_user_system(
+                &headers,
+                &state.pool,
+                "[Notifications] NotificationsAllRead",
+                |actor| crate::engine::event_bus::SystemEvent::NotificationsAllRead { actor },
+            )
             .await;
         // Cross-device dismiss (macOS desktop only): `None` = remove ALL
         // delivered native banners on connected Tauri apps. Web / PWA banners
         // persist (no silent Web Push removal). See notifications.md §4.
-        crate::scheduler::push::emit_native_push_dismiss_requested(
-            &state.engine.event_bus,
-            None,
-        )
-        .await;
+        crate::scheduler::push::emit_native_push_dismiss_requested(&state.engine.event_bus, None)
+            .await;
     }
 
     Ok(Json(MarkReadResponse { success: count > 0 }))
@@ -420,7 +423,6 @@ pub(super) async fn get_push_log(
     Ok(Json(rows))
 }
 
-
 /// Routes for the `/notifications*`, `/notification*`, and `/push/*`
 /// surfaces (push subscriptions are part of the notification fan-out and
 /// their handlers live here).
@@ -428,19 +430,10 @@ pub(super) fn router() -> Router<AppState> {
     let router = Router::new()
         .route("/notifications", get(get_notifications))
         .route("/notifications", post(create_notification))
-        .route(
-            "/notifications/before",
-            get(get_notifications_at_timestamp),
-        )
-        .route(
-            "/notifications/read-all",
-            post(mark_all_notifications_read),
-        )
+        .route("/notifications/before", get(get_notifications_at_timestamp))
+        .route("/notifications/read-all", post(mark_all_notifications_read))
         .route("/notification", get(get_notification))
-        .route(
-            "/notification/read",
-            post(mark_notification_read),
-        )
+        .route("/notification/read", post(mark_notification_read))
         // Push notification endpoints
         .route("/push/vapid-key", get(get_vapid_key))
         .route("/push/subscribe", post(push_subscribe))

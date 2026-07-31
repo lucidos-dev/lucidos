@@ -27,7 +27,10 @@ impl LucidosEngine {
             "enable" => self.manage_models_set_enabled(args, true).await,
             "disable" => self.manage_models_set_enabled(args, false).await,
             "remove" => self.manage_models_remove(args).await,
-            "" => Ok("Error: action is required (one of: list, add, enable, disable, remove)".to_string()),
+            "" => Ok(
+                "Error: action is required (one of: list, add, enable, disable, remove)"
+                    .to_string(),
+            ),
             other => Ok(format!(
                 "Error: unknown action '{}'. Use one of: list, add, enable, disable, remove.",
                 other
@@ -196,7 +199,10 @@ impl LucidosEngine {
                         actor: None,
                     }))
                     .await?;
-                Ok(format!("[ACTION COMPLETED] Model '{}' removed from the registry.", id))
+                Ok(format!(
+                    "[ACTION COMPLETED] Model '{}' removed from the registry.",
+                    id
+                ))
             }
             Err(e) => Ok(format!("Error: failed to remove model '{}': {}", id, e)),
         }

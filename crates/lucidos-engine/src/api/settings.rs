@@ -1,10 +1,10 @@
 use super::*;
 
+use crate::core::environment_variables::validate_name;
 use crate::core::{
     AuthType, CredentialStore, EnvironmentVariable, EnvironmentVariableStore, ModelStore,
     OAuthStore, PinnedAppStore, PreferenceStore,
 };
-use crate::core::environment_variables::validate_name;
 use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_file};
 use crate::engine::command_permission::{
     read_agent_allowed_commands_file, write_agent_allowed_commands_file,
@@ -168,13 +168,16 @@ pub(super) async fn create_credential(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] CredentialCreated", |actor| {
-                    SystemEvent::CredentialCreated {
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] CredentialCreated",
+                    |actor| SystemEvent::CredentialCreated {
                         service_name: request.service_name.clone(),
                         auth_type,
                         actor,
-                    }
-                })
+                    },
+                )
                 .await;
             ApiResult::ok()
         }
@@ -251,7 +254,10 @@ pub(super) async fn update_credential(
                         )
                         .await
                         {
-                            return ApiResult::err(format!("Failed to update email account: {}", e));
+                            return ApiResult::err(format!(
+                                "Failed to update email account: {}",
+                                e
+                            ));
                         }
                     }
                     if let Some(value) = new_secret {
@@ -269,12 +275,15 @@ pub(super) async fn update_credential(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] CredentialUpdated", |actor| {
-                    SystemEvent::CredentialUpdated {
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] CredentialUpdated",
+                    |actor| SystemEvent::CredentialUpdated {
                         service_name: service.clone(),
                         actor,
-                    }
-                })
+                    },
+                )
                 .await;
             ApiResult::ok()
         }
@@ -336,12 +345,15 @@ pub(super) async fn delete_credential(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] CredentialDeleted", |actor| {
-                    SystemEvent::CredentialDeleted {
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] CredentialDeleted",
+                    |actor| SystemEvent::CredentialDeleted {
                         service_name: service.clone(),
                         actor,
-                    }
-                })
+                    },
+                )
                 .await;
             ApiResult::ok()
         }
@@ -376,12 +388,14 @@ pub(super) struct UpdateEnvVarRequest {
 pub(super) async fn list_env_vars(
     State(state): State<AppState>,
 ) -> Result<Json<EnvVarsListResponse>, (StatusCode, String)> {
-    let env_vars = EnvironmentVariableStore::list(&state.pool).await.map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            format!("Failed to list environment variables: {}", e),
-        )
-    })?;
+    let env_vars = EnvironmentVariableStore::list(&state.pool)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to list environment variables: {}", e),
+            )
+        })?;
     Ok(Json(EnvVarsListResponse { env_vars }))
 }
 
@@ -500,8 +514,7 @@ fn valid_provider(p: &str) -> bool {
     )
 }
 
-const PROVIDER_ERR: &str =
-    "Provider must be one of: vertex, anthropic, openai, openrouter, local";
+const PROVIDER_ERR: &str = "Provider must be one of: vertex, anthropic, openai, openrouter, local";
 
 const CONTEXT_WINDOW_ERR: &str =
     "context_window must be a positive number of tokens (omit it to infer from the model id)";
@@ -577,7 +590,10 @@ pub(super) async fn create_model(
                 .await;
             ApiResult::ok()
         }
-        Err(e) => ApiResult::err(format!("Failed to create model (id may already exist): {}", e)),
+        Err(e) => ApiResult::err(format!(
+            "Failed to create model (id may already exist): {}",
+            e
+        )),
     }
 }
 
@@ -620,7 +636,9 @@ pub(super) async fn update_model(
         .await
     } else {
         let label = request.label.unwrap_or_else(|| existing.label.clone());
-        let provider = request.provider.unwrap_or_else(|| existing.provider.clone());
+        let provider = request
+            .provider
+            .unwrap_or_else(|| existing.provider.clone());
         if !valid_provider(&provider) {
             return ApiResult::err(PROVIDER_ERR);
         }
@@ -726,12 +744,15 @@ pub(super) async fn delete_oauth_account(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] OAuthAccountDeleted", |actor| {
-                    SystemEvent::OAuthAccountDeleted {
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] OAuthAccountDeleted",
+                    |actor| SystemEvent::OAuthAccountDeleted {
                         account_id: id.to_string(),
                         actor,
-                    }
-                })
+                    },
+                )
                 .await;
             ApiResult::ok()
         }
@@ -867,13 +888,16 @@ pub(super) async fn delete_preference(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] PreferencesChanged", |actor| {
-                    crate::engine::event_bus::SystemEvent::PreferencesChanged {
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] PreferencesChanged",
+                    |actor| crate::engine::event_bus::SystemEvent::PreferencesChanged {
                         key: key.clone(),
                         value: None,
                         actor,
-                    }
-                })
+                    },
+                )
                 .await;
             ApiResult::ok()
         }
@@ -948,7 +972,12 @@ pub(super) async fn put_network_config(
     // PreferencesChanged like every other settings write.
     match state
         .engine
-        .apply_preference_write(crate::net_config::NETWORK_BIND_PREF_KEY, &value, None, actor)
+        .apply_preference_write(
+            crate::net_config::NETWORK_BIND_PREF_KEY,
+            &value,
+            None,
+            actor,
+        )
         .await
     {
         Ok(_) => Ok(ApiResult::ok()),
@@ -1152,13 +1181,16 @@ pub(super) async fn set_device_push(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] DevicePushChanged", |actor| {
-                    SystemEvent::DevicePushChanged {
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Settings] DevicePushChanged",
+                    |actor| SystemEvent::DevicePushChanged {
                         device_id: device_id.clone(),
                         push_enabled: request.push_enabled,
                         actor,
-                    }
-                })
+                    },
+                )
                 .await;
             Json(serde_json::json!({ "success": true }))
         }
@@ -1219,9 +1251,7 @@ pub(super) async fn send_email_confirmed(
     let subject = match body["subject"].as_str() {
         Some(s) => s,
         None => {
-            return Json(
-                serde_json::json!({ "success": false, "error": "`subject` is required" }),
-            )
+            return Json(serde_json::json!({ "success": false, "error": "`subject` is required" }))
         }
     };
     let body_text = match body["body"].as_str() {
@@ -1252,9 +1282,7 @@ pub(super) async fn send_email_confirmed(
     let account_name = match body["account"].as_str() {
         Some(s) if !s.is_empty() => s,
         _ => {
-            return Json(
-                serde_json::json!({ "success": false, "error": "`account` is required" }),
-            )
+            return Json(serde_json::json!({ "success": false, "error": "`account` is required" }))
         }
     };
 
@@ -1461,10 +1489,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/oauth/complete", post(complete_oauth))
         // Short-lived OAuth access-token for in-browser SDKs (e.g. Spotify
         // Web Playback SDK). Refresh token never leaves the engine.
-        .route(
-            "/oauth/:provider/access-token",
-            get(get_oauth_access_token),
-        )
+        .route("/oauth/:provider/access-token", get(get_oauth_access_token))
         // Preferences endpoints
         .route(
             "/preferences",
@@ -1487,15 +1512,10 @@ pub(super) fn router() -> Router<AppState> {
         .route("/devices", get(list_devices))
         .route("/devices/:device_id/name", put(rename_device))
         .route("/devices/:device_id/push", put(set_device_push))
-        .route(
-            "/devices/:device_id",
-            axum::routing::delete(delete_device),
-        )
+        .route("/devices/:device_id", axum::routing::delete(delete_device))
         .route(
             "/pinned-apps",
-            get(get_pinned_apps)
-                .post(pin_app)
-                .delete(unpin_app),
+            get(get_pinned_apps).post(pin_app).delete(unpin_app),
         )
         // Email endpoints
         .route("/email/send", post(send_email_confirmed))

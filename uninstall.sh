@@ -9,12 +9,25 @@
 #   ./uninstall.sh --list           # list instances + ports (no changes)
 #   ./uninstall.sh --name test --purge   # also delete that instance's data
 #   ./uninstall.sh --all --purge         # also delete every instance's data + the shared runtime
-#   curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/uninstall.sh | sh
+#   curl -fsSL https://lucidos.dev/uninstall.sh | sh   # NOT PUBLISHED YET (see below)
+#
+# The one-liner above is the intended front door, but the site publisher does not
+# upload uninstall.sh beside install.sh yet, so that URL currently returns the
+# landing page at status 200. Until it does, run this script from a checkout (or
+# a downloaded copy). Tracked in docs/temporary-measures.md § "'not published
+# yet' hedge on the front-door uninstall one-liner".
 #
 # This is step 4 of docs/plans/2026-06-30-installer-step4-service-mode.md. It is
 # DATA-SAFE by default: it stops the service, gracefully stops the engines +
 # embedded Postgres the gateway spawned, removes the plist/unit, and then prints
 # exactly what it left on disk. It deletes data ONLY with --purge.
+#
+# --purge is IRREVERSIBLE and prompts for nothing. What it takes is not installer
+# scratch: the instance data dir holds the embedded PostgreSQL cluster (every
+# thread, message, memory and setting of every workspace this gateway serves) and,
+# for a picker-created workspace with no explicit path, the workspace directory
+# itself (<prefix>/<slug>/workspaces/<id>/). --all --purge does that for every
+# instance and drops the shared runtime as well.
 #
 # Instances are SLUG-KEYED (see scripts/lib/service.sh): each is `<prefix>/<slug>/`
 # with a slug-suffixed service id; the runtime at `<prefix>/runtime` is SHARED. It
@@ -34,6 +47,18 @@ if [ -z "${BASH_VERSION:-}" ]; then
                 echo "       Re-run explicitly under bash:  curl -fsSL $LUCIDOS_UNINSTALL_SELF_URL | bash" >&2
                 exit 1
             fi
+            # Shebang sniff before `exec bash -c`: a soft-404 origin returns its
+            # landing page at status 200, so neither the curl nor the non-empty
+            # test above can tell HTML from shell. Mirrors install.sh's guard
+            # (and _source_libs). POSIX sh only, like the rest of this block.
+            case "$_lucidos_payload" in
+                '#!'*) : ;;
+                *)
+                    echo "ERROR: $LUCIDOS_UNINSTALL_SELF_URL did not return a shell script." >&2
+                    echo "       The origin likely served its 404/SPA fallback page with a 200 status." >&2
+                    echo "       Download uninstall.sh from the repository and run it directly." >&2
+                    exit 1 ;;
+            esac
             exec bash -c "$_lucidos_payload" bash "$@"
         fi
     else
@@ -93,6 +118,21 @@ source_service_lib() {
     info "$base/service.sh"
     curl -fsSL "$base/service.sh" -o "$tmp/service.sh" || die "Could not fetch service.sh from $base"
     [ -s "$tmp/service.sh" ] || die "Fetched service.sh from $base is empty."
+    # Shebang sniff before `.` runs, the twin of install.sh's _source_libs check:
+    # a soft-404 origin answers an unknown path with its landing page at status
+    # 200, so `curl -fsSL` succeeds, the non-empty test passes, and the shell
+    # then executes HTML. This is the standalone `curl … /uninstall.sh | sh`
+    # path, which derives its lib base from the same origin that already
+    # soft-404s uninstall.sh itself, so it is the likeliest of all these sites to
+    # meet one. Asserting `#!` rather than rejecting a leading '<' is the
+    # stricter, fail-closed half of the pair; _source_libs keeps its own wording
+    # because its message and tests name the lib being refused.
+    case "$(head -c 2 "$tmp/service.sh")" in
+        '#!') : ;;
+        *) die "service.sh fetched from $base is not a shell script.
+       The origin likely served its 404/SPA fallback page with a 200 status.
+       Run uninstall.sh from a checkout of the repo instead." ;;
+    esac
     # The fetched copy IS scripts/lib/service.sh from the same ref, so point
     # ShellCheck at the in-repo original rather than the runtime temp path.
     # shellcheck source=scripts/lib/service.sh
@@ -341,6 +381,15 @@ Flags:
   --prefix DIR   install prefix (default: \$HOME/.lucidos)
   --purge        also delete the instance data (with --all, also the shared runtime)
   -h, --help     this help
+
+--purge is IRREVERSIBLE and asks for no confirmation. The instance data dir is
+not installer scratch: it holds the embedded PostgreSQL cluster (every thread,
+message, memory and setting of every workspace this gateway serves) and, for a
+workspace created through the picker without an explicit path, the workspace
+directory itself (<prefix>/<slug>/workspaces/<id>/ = your artifacts, apps,
+triggers, knowhow). A bare run is not a dry run either: it stops the gateway and
+removes its service, keeping only your data (and printing where it left it).
+--list is the one command that changes nothing.
 
 Environment variables:
   LUCIDOS_PREFIX         same as --prefix

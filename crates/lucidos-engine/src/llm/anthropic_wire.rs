@@ -342,7 +342,10 @@ pub(crate) async fn parse_claude_stream(
                     serde_json::json!({})
                 } else {
                     serde_json::from_str(&json_parts).map_err(|e| {
-                        format!("Failed to parse tool arguments: {} (json: {})", e, json_parts)
+                        format!(
+                            "Failed to parse tool arguments: {} (json: {})",
+                            e, json_parts
+                        )
                     })?
                 };
                 tool_calls.push(ToolCall {
@@ -480,15 +483,20 @@ fn process_sse_data(
             // clamp_provider_token_count clamps it to u32::MAX.
             let total = input.saturating_add(cache_write).saturating_add(cache_read);
             if total > 0 {
-                meta.input_tokens = Some(crate::llm::clamp_provider_token_count(total, provider_tag));
+                meta.input_tokens =
+                    Some(crate::llm::clamp_provider_token_count(total, provider_tag));
             }
             if cache_write > 0 {
-                meta.cache_creation_tokens =
-                    Some(crate::llm::clamp_provider_token_count(cache_write, provider_tag));
+                meta.cache_creation_tokens = Some(crate::llm::clamp_provider_token_count(
+                    cache_write,
+                    provider_tag,
+                ));
             }
             if cache_read > 0 {
-                meta.cache_read_tokens =
-                    Some(crate::llm::clamp_provider_token_count(cache_read, provider_tag));
+                meta.cache_read_tokens = Some(crate::llm::clamp_provider_token_count(
+                    cache_read,
+                    provider_tag,
+                ));
             }
         }
         "message_delta" => {
@@ -546,9 +554,9 @@ fn system_with_cache_control(system: Option<&str>) -> Option<serde_json::Value> 
     if s.is_empty() {
         return None;
     }
-    Some(serde_json::Value::Array(vec![text_block_with_cache_control(
-        s.to_string(),
-    )]))
+    Some(serde_json::Value::Array(vec![
+        text_block_with_cache_control(s.to_string()),
+    ]))
 }
 
 fn apply_cache_control_to_last_tool(tools: &mut [ClaudeTool]) {
@@ -862,7 +870,10 @@ mod tests {
         ];
         apply_cache_control_to_last_tool(&mut tools);
         assert!(tools[0].cache_control.is_none());
-        assert_eq!(tools[1].cache_control.as_ref().unwrap()["type"], "ephemeral");
+        assert_eq!(
+            tools[1].cache_control.as_ref().unwrap()["type"],
+            "ephemeral"
+        );
     }
 
     #[test]

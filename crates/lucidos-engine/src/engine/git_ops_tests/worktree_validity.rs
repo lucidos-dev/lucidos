@@ -25,7 +25,11 @@ async fn strand(wt: &std::path::Path) {
         .trim();
     let admin = {
         let p = std::path::PathBuf::from(target);
-        if p.is_absolute() { p } else { wt.join(p) }
+        if p.is_absolute() {
+            p
+        } else {
+            wt.join(p)
+        }
     };
     tokio::fs::remove_dir_all(&admin)
         .await
@@ -94,7 +98,10 @@ async fn is_live_worktree_at_false_for_stranded_admin_dir() {
         .await
         .unwrap();
     assert!(out.status.success(), "fixture worktree_add failed");
-    assert!(is_live_worktree_at(&wt).await, "precondition: live before stranding");
+    assert!(
+        is_live_worktree_at(&wt).await,
+        "precondition: live before stranding"
+    );
 
     strand(&wt).await;
 
@@ -150,8 +157,13 @@ async fn clear_stranded_worktree_dir_removes_leftover_nested_in_enclosing_repo()
     let (_tmp, repo) = make_test_repo().await;
     let inside = repo.join(".lucidos").join("worktrees").join("thread-x");
     tokio::fs::create_dir_all(&inside).await.unwrap();
-    tokio::fs::write(inside.join("leftover.txt"), b"x").await.unwrap();
-    assert!(!is_live_worktree_at(&inside).await, "precondition: not live");
+    tokio::fs::write(inside.join("leftover.txt"), b"x")
+        .await
+        .unwrap();
+    assert!(
+        !is_live_worktree_at(&inside).await,
+        "precondition: not live"
+    );
 
     clear_stranded_worktree_dir(&repo, &inside).await;
     assert!(
@@ -176,7 +188,10 @@ async fn clear_stranded_worktree_dir_refuses_a_live_worktree() {
     tokio::fs::write(wt.join("uncommitted.txt"), b"work in progress")
         .await
         .unwrap();
-    assert!(is_live_worktree_at(&wt).await, "precondition: live worktree");
+    assert!(
+        is_live_worktree_at(&wt).await,
+        "precondition: live worktree"
+    );
 
     clear_stranded_worktree_dir(&repo, &wt).await;
 
@@ -202,7 +217,9 @@ async fn clear_stranded_worktree_dir_never_deletes_the_branch() {
         .await
         .unwrap();
     // Put a commit on the branch so it carries real work.
-    tokio::fs::write(wt.join("work.txt"), b"committed").await.unwrap();
+    tokio::fs::write(wt.join("work.txt"), b"committed")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &wt).await;
     let _ = git_cmd(&["commit", "-m", "work"], &wt).await;
     strand(&wt).await;
@@ -272,7 +289,9 @@ async fn install_coding_agent_diff_hook_sets_worktree_local_hooks_and_chains_com
         "Lucidos hook must chain the repo's existing common post-commit hook"
     );
 
-    tokio::fs::write(wt.join("change.txt"), "committed").await.unwrap();
+    tokio::fs::write(wt.join("change.txt"), "committed")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "change.txt"], &wt).await.unwrap();
     let empty_env = std::ffi::OsStr::new("");
     let commit = git_cmd_env(
@@ -307,7 +326,9 @@ async fn install_coding_agent_diff_hook_preserves_prior_custom_hooks_path() {
     let custom_dir = wt.join(".custom-hooks");
     let custom_hook = custom_dir.join("post-commit");
     tokio::fs::create_dir_all(&custom_dir).await.unwrap();
-    tokio::fs::write(&custom_hook, "#!/bin/sh\nexit 0\n").await.unwrap();
+    tokio::fs::write(&custom_hook, "#!/bin/sh\nexit 0\n")
+        .await
+        .unwrap();
     #[cfg(unix)]
     make_executable(&custom_hook);
 
@@ -315,9 +336,12 @@ async fn install_coding_agent_diff_hook_preserves_prior_custom_hooks_path() {
         .await
         .unwrap();
     assert!(enable.status.success());
-    let set_custom = git_cmd(&["config", "--worktree", "core.hooksPath", ".custom-hooks"], &wt)
-        .await
-        .unwrap();
+    let set_custom = git_cmd(
+        &["config", "--worktree", "core.hooksPath", ".custom-hooks"],
+        &wt,
+    )
+    .await
+    .unwrap();
     assert!(set_custom.status.success());
 
     install_coding_agent_diff_hook(&repo, &wt).await.unwrap();
@@ -331,7 +355,8 @@ async fn install_coding_agent_diff_hook_preserves_prior_custom_hooks_path() {
         "reinstall must preserve the originally chained custom hooksPath"
     );
     assert!(
-        !hook_script.contains(".lucidos/git-hooks/post-commit\nCHAIN='.lucidos/git-hooks/post-commit'"),
+        !hook_script
+            .contains(".lucidos/git-hooks/post-commit\nCHAIN='.lucidos/git-hooks/post-commit'"),
         "reinstall must not chain the Lucidos hook to itself"
     );
 }

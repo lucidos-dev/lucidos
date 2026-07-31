@@ -31,9 +31,15 @@
 # the "Assert portability floor" step fails the build if any staged binary ever
 # references a versioned symbol above that floor.
 #
-# macOS note: CI tarballs are UNSIGNED (no Developer ID on the runner). The SIGNED
-# macOS tarball ships from the local `build-dmg.sh --emit-tarball` path; the macOS
-# entries here exist for cross-platform parity + verification, not for release.
+# macOS note: these tarballs are UNSIGNED (no Developer ID on the runner) — and they
+# ARE what a Mac's `curl … | sh` downloads. build-dmg.sh uploads only the DMG +
+# Lucidos.app.tar.gz + .sig + latest.json, and release.sh never passes
+# --emit-tarball, so the local SIGNED headless tarball is a capability nothing
+# attaches. Acceptable, not accidental: a curl-fetched file gets no
+# com.apple.quarantine xattr, so Gatekeeper never assesses the runtime (the same
+# reasoning ADR 0027 uses to defer notarization), and install.sh's
+# verify_runtime_executes runs the gateway once at install time so any refusal is
+# loud. Wire --emit-tarball into the release flow if that ever stops holding.
 
 name: release-tarballs
 
@@ -203,12 +209,13 @@ jobs:
             dist/headless/*.tar.gz.sha256
           if-no-files-found: error
 
-      # ── OPTIONAL, OPT-IN ONLY — never fires automatically ──────────────────────
-      # Attach the built tarballs to an EXISTING GitHub Release. Requires BOTH a
-      # manual workflow_dispatch with attach_to_release=true AND dispatching against
-      # a tag ref (the tag names the Release to attach to). It only ADDS assets to a
-      # Release someone already cut — it never publishes one. This is the structural
-      # hook for a future release flow; it stays inert by default.
+      # ── ATTACH TO AN EXISTING RELEASE — automatic on a real release ────────────
+      # Attach the built tarballs to an EXISTING GitHub Release. Two ways in: a
+      # PUBLISHED non-prerelease Release (the normal release flow — this is what
+      # makes install.sh's default download path work), or a manual
+      # workflow_dispatch with attach_to_release=true against a tag. It only ADDS
+      # assets to a Release someone already cut — it never publishes or tags one,
+      # and rc-<version> prereleases are excluded so the RC gate never sees these.
       #
       # Upload is done via the raw GitHub REST API (curl), NOT `gh release upload`,
       # because the Linux matrix entries run inside the ubuntu:22.04 container which

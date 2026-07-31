@@ -159,15 +159,7 @@ pub fn err_no_lucidos_source() -> FolderResolutionError {
 /// Forbidden system roots. Lookups are anchored at start so a `/etcetera`
 /// folder isn't accidentally captured.
 const FORBIDDEN_SYSTEM_ROOTS: &[&str] = &[
-    "/etc",
-    "/System",
-    "/usr",
-    "/bin",
-    "/sbin",
-    "/var",
-    "/private",
-    "/dev",
-    "/Library",
+    "/etc", "/System", "/usr", "/bin", "/sbin", "/var", "/private", "/dev", "/Library",
 ];
 
 /// True if `path_under_data` matches `apps/<id>/` exactly (no subpath after).
@@ -237,8 +229,7 @@ where
         workspace_root.join(trimmed)
     };
 
-    let canonical = std::fs::canonicalize(&candidate)
-        .unwrap_or_else(|_| candidate.clone());
+    let canonical = std::fs::canonicalize(&candidate).unwrap_or_else(|_| candidate.clone());
 
     if !canonical.exists() {
         let shown = crate::core::home_path::abbreviate(&candidate);
@@ -252,11 +243,7 @@ where
 /// are clearly path-shaped. Also rejects strings starting with `data/` for
 /// safety (workspace-relative paths often start with `data/`).
 fn looks_like_repo_name(s: &str) -> bool {
-    !s.contains('/')
-        && !s.contains('\\')
-        && !s.contains('~')
-        && !s.contains('.')
-        && !s.is_empty()
+    !s.contains('/') && !s.contains('\\') && !s.contains('~') && !s.contains('.') && !s.is_empty()
 }
 
 /// Outcome of [`classify_resolved_folder`]: which `CodingAgentKind` the path
@@ -356,7 +343,9 @@ where
     // system-root refusal — reuse that result rather than calling the
     // FnOnce closure twice.
     if let Some(ext_root) = external_repo_root_for_path {
-        return Ok(FolderClassification::External { repo_root: ext_root });
+        return Ok(FolderClassification::External {
+            repo_root: ext_root,
+        });
     }
 
     Err(err_unrecognised_path(folder_abs, workspace_root))
@@ -367,17 +356,22 @@ where
 impl std::fmt::Debug for FolderClassification {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Lucidos { repo_root } => {
-                f.debug_struct("Lucidos").field("repo_root", repo_root).finish()
-            }
-            Self::App { workspace_root, app_id } => f
+            Self::Lucidos { repo_root } => f
+                .debug_struct("Lucidos")
+                .field("repo_root", repo_root)
+                .finish(),
+            Self::App {
+                workspace_root,
+                app_id,
+            } => f
                 .debug_struct("App")
                 .field("workspace_root", workspace_root)
                 .field("app_id", app_id)
                 .finish(),
-            Self::External { repo_root } => {
-                f.debug_struct("External").field("repo_root", repo_root).finish()
-            }
+            Self::External { repo_root } => f
+                .debug_struct("External")
+                .field("repo_root", repo_root)
+                .finish(),
         }
     }
 }
@@ -453,7 +447,10 @@ mod tests {
     #[test]
     fn match_app_id_refuses_subpaths() {
         assert_eq!(match_app_id(Path::new("apps/habit-tracker/ui")), None);
-        assert_eq!(match_app_id(Path::new("apps/habit-tracker/index.html")), None);
+        assert_eq!(
+            match_app_id(Path::new("apps/habit-tracker/index.html")),
+            None
+        );
         assert_eq!(
             match_app_id(Path::new("apps/habit-tracker/knowhow/intent.md")),
             None
@@ -522,11 +519,17 @@ mod tests {
         let _ = std::fs::create_dir_all(&lucidos_root);
         let res = classify_resolved_folder(&target, &ws, Some(&lucidos_root), |_| None);
         match res {
-            Ok(FolderClassification::App { workspace_root, app_id }) => {
+            Ok(FolderClassification::App {
+                workspace_root,
+                app_id,
+            }) => {
                 assert_eq!(workspace_root, ws);
                 assert_eq!(app_id, "habit-tracker");
             }
-            other => panic!("expected App, got {:?}", other.as_ref().err().map(|e| e.to_string())),
+            other => panic!(
+                "expected App, got {:?}",
+                other.as_ref().err().map(|e| e.to_string())
+            ),
         }
     }
 
@@ -627,11 +630,17 @@ mod tests {
         let _ = std::fs::create_dir_all(&target);
         let res = classify_resolved_folder(&target, &ws, None, |_| None);
         match res {
-            Ok(FolderClassification::App { workspace_root, app_id }) => {
+            Ok(FolderClassification::App {
+                workspace_root,
+                app_id,
+            }) => {
                 assert_eq!(workspace_root, ws);
                 assert_eq!(app_id, "habit-tracker");
             }
-            other => panic!("expected App, got {:?}", other.as_ref().err().map(|e| e.to_string())),
+            other => panic!(
+                "expected App, got {:?}",
+                other.as_ref().err().map(|e| e.to_string())
+            ),
         }
     }
 
@@ -643,7 +652,11 @@ mod tests {
         let _ = std::fs::create_dir_all(&ext);
         let ext_ref = ext.clone();
         let res = classify_resolved_folder(&ext, &ws, None, |p| {
-            if p == ext_ref { Some(ext_ref.clone()) } else { None }
+            if p == ext_ref {
+                Some(ext_ref.clone())
+            } else {
+                None
+            }
         });
         match res {
             Ok(FolderClassification::External { repo_root }) => assert_eq!(repo_root, ext),
@@ -662,7 +675,9 @@ mod tests {
         let would_be_source = ws.join("lucidos");
         let _ = std::fs::create_dir_all(&would_be_source);
         let res = classify_resolved_folder(&would_be_source, &ws, None, |_| None);
-        let err = res.expect_err("expected refusal with no Lucidos source").to_string();
+        let err = res
+            .expect_err("expected refusal with no Lucidos source")
+            .to_string();
         assert!(
             err.contains("not the Lucidos source repo"),
             "would-be source must fall through to the unrecognised-path refusal: {err}",

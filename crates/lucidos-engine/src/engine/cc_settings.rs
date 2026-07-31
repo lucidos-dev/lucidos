@@ -199,9 +199,7 @@ mod tests {
                 .unwrap_or_else(|| panic!("must register a {tool} matcher"));
             let hooks = entry["hooks"].as_array().expect("hooks array");
             assert!(
-                hooks
-                    .iter()
-                    .any(|h| h["command"] == "lucidos cc-plan-gate"),
+                hooks.iter().any(|h| h["command"] == "lucidos cc-plan-gate"),
                 "{tool} matcher must include the cc-plan-gate hook so the \
                  implementation-plan marker is enforced before edits",
             );

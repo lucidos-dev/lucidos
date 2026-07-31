@@ -42,7 +42,11 @@ async fn create_trigger_with_grant(client: &reqwest::Client, name: &str, grant: 
         .await
         .expect("POST /triggers failed");
     let res: serde_json::Value = resp.json().await.expect("Invalid JSON");
-    assert_eq!(res["success"], true, "Trigger create must succeed: {:?}", res);
+    assert_eq!(
+        res["success"], true,
+        "Trigger create must succeed: {:?}",
+        res
+    );
 }
 
 /// Replace the side-effect grant of an existing trigger.
@@ -54,7 +58,11 @@ async fn update_trigger_grant(client: &reqwest::Client, trigger_id: &str, grant:
         .await
         .expect("PUT /triggers failed");
     let res: serde_json::Value = resp.json().await.expect("Invalid JSON");
-    assert_eq!(res["success"], true, "Trigger update must succeed: {:?}", res);
+    assert_eq!(
+        res["success"], true,
+        "Trigger update must succeed: {:?}",
+        res
+    );
 }
 
 async fn delete_trigger(client: &reqwest::Client, trigger_id: &str) {
@@ -70,7 +78,11 @@ async fn delete_trigger(client: &reqwest::Client, trigger_id: &str) {
 fn grant_of(trigger: &serde_json::Value) -> Vec<String> {
     let mut v: Vec<String> = trigger["side_effect_grant"]
         .as_array()
-        .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+        .map(|a| {
+            a.iter()
+                .filter_map(|x| x.as_str().map(String::from))
+                .collect()
+        })
         .unwrap_or_default();
     v.sort();
     v

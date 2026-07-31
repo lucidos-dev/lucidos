@@ -1,7 +1,6 @@
 //! LLM-facing schemas for workspace file tools (read/write/edit, search,
 //! import). Handlers live in `engine::tools::files`.
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

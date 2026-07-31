@@ -247,7 +247,13 @@ pub(crate) async fn reset_worktree_to_main_after_apply(
     // Refuse to reset if the worktree is dirty — would silently discard work.
     let status = git_cmd(&["status", "--porcelain"], worktree_path)
         .await
-        .map_err(|e| format!("git status failed in worktree {}: {}", worktree_path.display(), e))?;
+        .map_err(|e| {
+            format!(
+                "git status failed in worktree {}: {}",
+                worktree_path.display(),
+                e
+            )
+        })?;
     if !status.status.success() {
         return Err(format!(
             "git status returned non-zero in worktree {}: {}",
@@ -287,13 +293,15 @@ pub(crate) async fn reset_worktree_to_main_after_apply(
     // `git clean -fd` removes untracked files (e.g. half-written merge
     // artifacts). Untracked-but-gitignored build outputs (target/, node_modules/)
     // are preserved — only `clean -fdx` would touch them, which we don't want.
-    let clean = git_cmd(&["clean", "-fd"], worktree_path).await.map_err(|e| {
-        format!(
-            "git clean -fd failed in worktree {}: {}",
-            worktree_path.display(),
-            e
-        )
-    })?;
+    let clean = git_cmd(&["clean", "-fd"], worktree_path)
+        .await
+        .map_err(|e| {
+            format!(
+                "git clean -fd failed in worktree {}: {}",
+                worktree_path.display(),
+                e
+            )
+        })?;
     if !clean.status.success() {
         return Err(format!(
             "git clean -fd failed in worktree {}: {}",
@@ -345,13 +353,15 @@ pub(crate) async fn reset_worktree_to_main_after_discard(
     // `git clean -fd` removes untracked files. Untracked-but-gitignored build
     // outputs (`target/`, `node_modules/`) are preserved — `clean -fdx` would
     // touch them, which we don't want.
-    let clean = git_cmd(&["clean", "-fd"], worktree_path).await.map_err(|e| {
-        format!(
-            "git clean -fd failed in worktree {}: {}",
-            worktree_path.display(),
-            e
-        )
-    })?;
+    let clean = git_cmd(&["clean", "-fd"], worktree_path)
+        .await
+        .map_err(|e| {
+            format!(
+                "git clean -fd failed in worktree {}: {}",
+                worktree_path.display(),
+                e
+            )
+        })?;
     if !clean.status.success() {
         return Err(format!(
             "git clean -fd failed in worktree {}: {}",

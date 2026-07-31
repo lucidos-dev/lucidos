@@ -357,10 +357,14 @@ pub enum SystemEvent {
     /// cross-device push suppression: if any device is visible we skip the
     /// push to ALL devices and rely on the active device's `NotificationCreated`
     /// SSE channel to render the in-app toast.
-    DeviceVisible { device_id: String },
+    DeviceVisible {
+        device_id: String,
+    },
     /// A device has no more visible Lucidos tabs (last one hidden / blurred /
     /// unloaded). Transient — removes the projection row.
-    DeviceHidden { device_id: String },
+    DeviceHidden {
+        device_id: String,
+    },
     /// SSE-only, never persisted. Pure pong trigger — see
     /// `system-knowhow/notifications.md` §3 (protocol, freshness gate). The
     /// page answers with a pong; the engine then decides whether to fan out
@@ -817,7 +821,9 @@ pub enum SystemEvent {
     /// An admitted Thread Queue entry's work finished (any outcome — the
     /// thread's own terminal events carry success/failure). Frees the
     /// capacity slot; projection deletes the row.
-    ThreadQueueCompleted { entry_id: Uuid },
+    ThreadQueueCompleted {
+        entry_id: Uuid,
+    },
     /// Transient panel-refresh signal — broadcast, never persisted, no
     /// projection. Emitted when only the in-memory user-initiated occupants of
     /// the shared pool change (a user response admitted / queued / released);
@@ -1229,7 +1235,9 @@ impl SystemEvent {
                 notification_id, ..
             } => notification_id.to_string(),
             // `None` = dismiss-all; there is no single notification to key on.
-            Self::NativePushDismissRequested { notification_id, .. } => notification_id
+            Self::NativePushDismissRequested {
+                notification_id, ..
+            } => notification_id
                 .map(|id| id.to_string())
                 .unwrap_or_else(|| "all".to_string()),
             // Raw manifest is nested one layer in — see `InstalledRecord` for the path.

@@ -766,3 +766,13 @@ html[data-theme="dark"] .split-button.open::before {
 .empty-state-action {
     margin-top: 0.5rem;
 }
+
+/* The same shortcut closing out a status-filter view that DID have rows. Reads
+   as a footer rather than one more row: centered like its empty-state twin, at
+   the empty state's own font size, and set off from the last row by more space
+   above than below. Host-chrome only. */
+.filtered-view-footer {
+    padding: 1rem 1rem 0.75rem;
+    text-align: center;
+    font-size: var(--font-size-md);
+}

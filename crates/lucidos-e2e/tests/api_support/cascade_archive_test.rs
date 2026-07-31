@@ -48,7 +48,11 @@ async fn seed_thread(
     )
     .bind(thread_id)
     .bind(parent_thread_id)
-    .bind(if is_coding_agent { "claude_code" } else { "chat" })
+    .bind(if is_coding_agent {
+        "claude_code"
+    } else {
+        "chat"
+    })
     .bind(is_coding_agent)
     .bind(status)
     .bind(archive_state)
@@ -124,13 +128,17 @@ async fn archive_cascade_archives_idle_descendants() {
     let child_id = Uuid::new_v4();
 
     // Parent chat thread, idle, in inbox so the parent-gate admits Archive.
-    seed_thread(
-        &pool, parent_id, None, false, "idle", "inbox", false, false,
-    )
-    .await;
+    seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
     // Idle CC sub-thread, inbox, no pending changes — fully cascadable.
     seed_thread(
-        &pool, child_id, Some(parent_id), true, "idle", "inbox", false, false,
+        &pool,
+        child_id,
+        Some(parent_id),
+        true,
+        "idle",
+        "inbox",
+        false,
+        false,
     )
     .await;
 
@@ -256,13 +264,17 @@ async fn archive_rejects_when_descendant_running() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    seed_thread(
-        &pool, parent_id, None, false, "idle", "inbox", false, false,
-    )
-    .await;
+    seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
     // Running CC sub-thread — the exact blocking combo per `is_blocking`.
     seed_thread(
-        &pool, child_id, Some(parent_id), true, "running", "inbox", false, false,
+        &pool,
+        child_id,
+        Some(parent_id),
+        true,
+        "running",
+        "inbox",
+        false,
+        false,
     )
     .await;
 
@@ -326,15 +338,19 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     let parent_id = Uuid::new_v4();
     let child_id = Uuid::new_v4();
 
-    seed_thread(
-        &pool, parent_id, None, false, "idle", "inbox", false, false,
-    )
-    .await;
+    seed_thread(&pool, parent_id, None, false, "idle", "inbox", false, false).await;
     // CC sub-thread with a pending change: status=waiting,
     // coding_agent_proposed=true. is_external_repo=false so the carve-out for
     // external-repo pending CC doesn't bypass the blocking predicate.
     seed_thread(
-        &pool, child_id, Some(parent_id), true, "waiting", "inbox", true, false,
+        &pool,
+        child_id,
+        Some(parent_id),
+        true,
+        "waiting",
+        "inbox",
+        true,
+        false,
     )
     .await;
 
@@ -362,9 +378,7 @@ async fn archive_rejects_when_descendant_has_pending_changes() {
     let entry = blocking
         .iter()
         .find(|b| b["thread_id"].as_str() == Some(&child_id.to_string()))
-        .unwrap_or_else(|| {
-            panic!("blocking list must name CC child {child_id}: {blocking:?}")
-        });
+        .unwrap_or_else(|| panic!("blocking list must name CC child {child_id}: {blocking:?}"));
     assert_eq!(
         entry["has_pending_changes"], true,
         "blocking entry must surface has_pending_changes=true: {entry:?}"

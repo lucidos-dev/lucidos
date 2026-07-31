@@ -132,11 +132,7 @@ mod tests {
         }"#;
         let cfg: PipelineConfig = serde_json::from_str(json).unwrap();
         match &cfg.pipeline[0] {
-            LayerConfig::StaticCredential {
-                kind,
-                header,
-                ..
-            } => {
+            LayerConfig::StaticCredential { kind, header, .. } => {
                 assert_eq!(*kind, StaticKind::ApiKey);
                 assert_eq!(header.as_deref(), Some("X-API-Key"));
             }
@@ -297,7 +293,10 @@ mod tests {
         }"#;
         let cfg: PipelineConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.pipeline.len(), 2);
-        assert!(matches!(cfg.pipeline[0], LayerConfig::ScriptHandshake { .. }));
+        assert!(matches!(
+            cfg.pipeline[0],
+            LayerConfig::ScriptHandshake { .. }
+        ));
         assert!(matches!(cfg.pipeline[1], LayerConfig::WasmSigner { .. }));
     }
 }

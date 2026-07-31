@@ -68,7 +68,10 @@ vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
 vi.mock('./devices', () => ({ getDeviceId, toggleDevicePush: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
-vi.mock('./repositories', () => ({ refreshRepoView: vi.fn() }));
+// Mirrors the real predicate: a repo-encoded path is handled here, anything
+// else declines so the 'file' branch falls back to openFilePreview.
+const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));
+vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview }));
 vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
 
 const { handleNavigationRequest, handleThreadEvent } = await import('./thread-sync');

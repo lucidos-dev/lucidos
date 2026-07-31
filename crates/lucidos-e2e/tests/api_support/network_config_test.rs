@@ -30,7 +30,10 @@ async fn network_config_roundtrips_and_rejects_garbage() {
     assert!(body.get("inherit").and_then(Value::as_bool).is_some());
     assert!(body.get("gateway_bind").and_then(Value::as_str).is_some());
     // Present as null or a string — just assert the key exists (best-effort hint).
-    assert!(body.as_object().unwrap().contains_key("detected_tailscale_ip"));
+    assert!(body
+        .as_object()
+        .unwrap()
+        .contains_key("detected_tailscale_ip"));
 
     // PUT garbage → 400 (server-side validation, fail-safe).
     let resp = client

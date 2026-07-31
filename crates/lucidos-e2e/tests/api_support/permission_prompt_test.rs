@@ -448,9 +448,8 @@ async fn agent_allowed_commands_settings_roundtrip() {
     // Snapshot, write a known body with a unique sentinel, read it back, restore.
     let snapshot = read_agent_allowed_commands(&client).await;
     let sentinel = format!("Bash(e2e-{}:*)", Uuid::new_v4().simple());
-    let body = format!(
-        "# Lucidos Agent command allowlist — one pattern per line.\n{sentinel}\nPython\n"
-    );
+    let body =
+        format!("# Lucidos Agent command allowlist: one pattern per line.\n{sentinel}\nPython\n");
 
     let put = client
         .put(format!("{}/api/v1/agent-allowed-commands", base_url()))

@@ -42,7 +42,11 @@ pub(super) fn per_commit_proposed(
     }
 }
 
-pub(super) fn applied_event(change_id: Uuid, commits: &[&str], requires_restart: bool) -> ThreadEvent {
+pub(super) fn applied_event(
+    change_id: Uuid,
+    commits: &[&str],
+    requires_restart: bool,
+) -> ThreadEvent {
     ThreadEvent::ChangeApplied {
         change_id: change_id.to_string(),
         requires_restart,

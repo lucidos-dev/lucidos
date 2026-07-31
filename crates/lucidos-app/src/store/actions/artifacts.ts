@@ -7,6 +7,7 @@ import {
   filePreviewSource,
   showToast,
   dismissToast,
+  parseRepoPath,
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
 import { listArtifacts, uploadFile } from '../../api/client';
@@ -122,8 +123,19 @@ const DATA_PREFIXES = ['artifacts/', 'knowhow/', 'apps/', 'triggers/', 'system-k
 
 /** Ensure a data path starts with a known directory prefix.
  *  The navigate_ui tool may receive paths without the prefix — normalize
- *  to match the format expected by the /data/* static mount. */
+ *  to match the format expected by the /data/* static mount.
+ *
+ *  A repo-encoded preview path (`repo:<repoId>:file:<path>`, built by
+ *  `encodeRepoPath`) is NOT a data path: it addresses a file inside a
+ *  registered local repo clone, served by `/api/v1/repositories/:id/file`,
+ *  and `ContentPane` routes it to `RepoFilePreview` instead of the /data/*
+ *  mount. Prefixing it with `artifacts/` would make `parseRepoPath` reject it
+ *  and dead-end the preview, so it passes through untouched — that's what lets
+ *  an app iframe open a repo file via `lucidos.ui.navigate('file', …)`.
+ *  Keyed off the same parser ContentPane routes on (not a bare `repo:` test),
+ *  so a malformed `repo:` string still normalizes like any other data path. */
 export function normalizeDataPath(path: string): string {
+  if (parseRepoPath(path)) return path;
   if (DATA_PREFIXES.some(p => path.startsWith(p))) return path;
   return `artifacts/${path}`;
 }

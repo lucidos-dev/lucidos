@@ -42,7 +42,10 @@ struct CodexAuthFile {
 /// set and non-empty), else `$HOME/.codex`. Pure over its inputs so the env
 /// resolution is testable without mutating process env. `None` when neither is
 /// available.
-fn resolve_codex_home(codex_home_env: Option<OsString>, home_env: Option<OsString>) -> Option<PathBuf> {
+fn resolve_codex_home(
+    codex_home_env: Option<OsString>,
+    home_env: Option<OsString>,
+) -> Option<PathBuf> {
     if let Some(dir) = codex_home_env.filter(|v| !v.is_empty()) {
         return Some(PathBuf::from(dir));
     }
@@ -54,10 +57,7 @@ fn resolve_codex_home(codex_home_env: Option<OsString>, home_env: Option<OsStrin
 /// path only when it exists as a file (so a machine without Codex, or with a
 /// keyring-backed store, resolves to `None`).
 pub fn codex_auth_path() -> Option<PathBuf> {
-    let dir = resolve_codex_home(
-        std::env::var_os("CODEX_HOME"),
-        std::env::var_os("HOME"),
-    )?;
+    let dir = resolve_codex_home(std::env::var_os("CODEX_HOME"), std::env::var_os("HOME"))?;
     let path = dir.join("auth.json");
     path.is_file().then_some(path)
 }
@@ -138,15 +138,18 @@ mod tests {
 
     #[test]
     fn codex_home_env_overrides_home() {
-        let dir = resolve_codex_home(Some(OsString::from("/custom/codex")), Some(OsString::from("/home/u")))
-            .expect("resolves from CODEX_HOME");
+        let dir = resolve_codex_home(
+            Some(OsString::from("/custom/codex")),
+            Some(OsString::from("/home/u")),
+        )
+        .expect("resolves from CODEX_HOME");
         assert_eq!(dir, PathBuf::from("/custom/codex"));
     }
 
     #[test]
     fn falls_back_to_home_dot_codex() {
-        let dir = resolve_codex_home(None, Some(OsString::from("/home/u")))
-            .expect("resolves from HOME");
+        let dir =
+            resolve_codex_home(None, Some(OsString::from("/home/u"))).expect("resolves from HOME");
         assert_eq!(dir, PathBuf::from("/home/u/.codex"));
     }
 
@@ -160,6 +163,9 @@ mod tests {
     #[test]
     fn none_when_no_home_and_no_codex_home() {
         assert_eq!(resolve_codex_home(None, None), None);
-        assert_eq!(resolve_codex_home(Some(OsString::new()), Some(OsString::new())), None);
+        assert_eq!(
+            resolve_codex_home(Some(OsString::new()), Some(OsString::new())),
+            None
+        );
     }
 }

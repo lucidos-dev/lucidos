@@ -16,9 +16,17 @@
 //! channel. When the user clicks once, every blocked waiter receives the same
 //! answer and the agent continues all of its parallel calls.
 //!
-//! Lives entirely in memory; on engine restart, in-flight waiters are dropped
-//! (CC's MCP client returns deny; a chat command waiter dies with its turn),
-//! so there's nothing to recover beyond the orphan-resolution sweeps.
+//! In-flight waiters live entirely in memory; on engine restart they are
+//! dropped (CC's MCP client returns deny; a chat command waiter dies with its
+//! turn), so there's nothing to recover beyond the orphan-resolution sweeps.
+//!
+//! The per-thread session-allow set is different: it is a **cache** over
+//! durable state. The grants are persisted as
+//! `CodingAgentPermissionResolved { allowed: true, persist_scope: "session" }`,
+//! and [`hydrate_session_allows`] refills a thread's set from the event store
+//! on the first prompt after a restart — otherwise an Apply-with-restart would
+//! silently drop grants the user had already clicked while the thread itself
+//! resumed.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -72,6 +80,15 @@ pub const SESSION_ENDED_REASON: &str =
 /// auto-allow path, so this string never reaches the chat UI.
 pub const SESSION_ALLOW_REASON: &str = "Allowed for this thread";
 
+/// Reason returned when the request is a file write landing inside the
+/// session's own worktree (see [`worktree_write_auto_allowed`]). Like the
+/// session-allow and unattended fast paths, this emits NO
+/// `CodingAgentPermissionRequest`/`Resolved` event, so the string never reaches
+/// the chat UI — it only rides the response body so the agent's tool log
+/// records *why* the prompt was bypassed.
+pub const WORKTREE_WRITE_ALLOW_REASON: &str =
+    "Auto-allowed: file write inside this session's own worktree";
+
 /// Reason on an unattended auto-ALLOW of a benign in-workspace request (a read,
 /// an in-workspace write/edit, git, `lucidos data write`, …). The coding-agent
 /// session was launched by a trigger with no human to answer a card, so the
@@ -114,14 +131,28 @@ pub struct PermissionEntry {
 /// Two-way index: lookup by `DedupKey` when a new request arrives, lookup by
 /// `request_id` when the user submits consent. `session_allows` remembers the
 /// user's "Allow for this thread" choices so subsequent identical-pattern
-/// requests skip the prompt entirely. In-memory only — engine restart wipes
-/// it (sessions resume but the user re-approves once, matching the
-/// engine-statelessness rule).
+/// requests skip the prompt entirely.
+///
+/// `session_allows` is a **cache, not the source of truth** — the grants are
+/// durable in the event store (`CodingAgentPermissionResolved` with
+/// `persist_scope: "session"`), and [`hydrate_session_allows`] refills a
+/// thread's set from there on the first prompt after an engine restart. Before
+/// that existed, an Apply-with-restart silently dropped every grant the user
+/// had clicked while the thread itself resumed, so the same file re-asked
+/// minutes later.
+///
+/// `hydrated_threads` is that cache's per-thread "already refilled" marker. It
+/// is set only after a SUCCESSFUL read, so a transient DB failure retries on
+/// the next prompt instead of pinning an empty set. Only the coding-agent lane
+/// hydrates today; the command lane (`Engine::pending_command_permission`)
+/// shares this struct but persists a `command` string rather than a tool
+/// `input`, so it needs its own extractor before it can adopt the same shape.
 #[derive(Default)]
 pub struct PermissionState {
     pub by_dedup_key: HashMap<DedupKey, PermissionEntry>,
     pub by_request_id: HashMap<String, DedupKey>,
     pub session_allows: HashMap<Uuid, HashSet<String>>,
+    pub hydrated_threads: HashSet<Uuid>,
 }
 
 impl PermissionState {
@@ -261,10 +292,7 @@ pub fn build_permission_summary(tool_name: &str, input: &serde_json::Value) -> S
 /// engine-stamped event (e.g. `CodingAgentSettingsChanged`) doesn't overwrite
 /// the human actor. Returns `None` if no such event carries an actor —
 /// caller falls back to `EventMeta::NONE`.
-pub async fn lookup_thread_actor(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-) -> Option<MessageOrigin> {
+pub async fn lookup_thread_actor(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<MessageOrigin> {
     let row: Result<Option<(serde_json::Value,)>, sqlx::Error> = sqlx::query_as(
         "SELECT payload->'actor' FROM events \
          WHERE thread_id = $1 \
@@ -287,6 +315,110 @@ pub async fn lookup_thread_actor(
             );
             None
         }
+    }
+}
+
+/// Refill `thread_id`'s in-memory session-allow set from the event store, once
+/// per thread per engine lifetime.
+///
+/// "Allow for this thread" is durable in the events (a
+/// `CodingAgentPermissionResolved` carrying `allowed: true` and
+/// `persist_scope: "session"`), but `PermissionState::session_allows` is only a
+/// cache — so before this existed, an engine restart between the click and the
+/// next matching request re-asked the user. Threads survive a restart and
+/// resume; the grant the user gave them must too.
+///
+/// Deliberately **lazy** rather than a boot sweep: the work lands on the one
+/// path that was about to block on a human anyway, costs a single query per
+/// thread, and never scans threads that don't prompt.
+///
+/// Two properties make this safe:
+///
+///   * **Only genuine session grants hydrate.** The `allowed` + `persist_scope`
+///     filter excludes Allow-once (no scope), Deny, the `narrow`/`broad` scopes
+///     (which live in `cc-allowed-tools`, not here), and every engine-emitted
+///     resolution — supersession, session-ended, and boot orphan-recovery all
+///     write `allowed: false`.
+///   * **The pattern is re-derived, never re-stored.** `derive_allow_pattern`
+///     is the same call `api::mcp::record_allow_grant` used to record the
+///     grant, so the two sites cannot drift; a stored string could.
+///
+/// `r.thread_id = $1` is a **trust boundary, not just a scope filter** — keep
+/// it. This query turns persisted rows into standing permission grants, so it
+/// must only read rows the engine itself wrote through `BusEvent::Thread`.
+/// `POST /api/v1/events/emit` (reachable from an app UI, and from a
+/// coding-agent session via `lucidos data emit`) lets a caller choose an
+/// arbitrary `event_type`, and its `is_reserved_type_name` guard covers
+/// `SystemEvent` names only — `CodingAgentPermissionResolved` is a
+/// `ThreadEvent`, so the name itself is not refused. What closes the hole is
+/// that a domain event is persisted with a NULL `thread_id`, so a forged row
+/// can never satisfy this predicate. Widening the join to match on
+/// `request_id` alone would let an agent grant itself a standing allow for any
+/// tool.
+///
+/// Fails toward asking: a query error logs and leaves the thread unhydrated, so
+/// the card renders and the next prompt retries.
+async fn hydrate_session_allows(
+    pool: &sqlx::PgPool,
+    pending: &Mutex<PermissionState>,
+    thread_id: Uuid,
+) {
+    use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
+
+    {
+        let state = pending.lock().unwrap();
+        if state.hydrated_threads.contains(&thread_id) {
+            return;
+        }
+    } // Lock released before the await — never hold it across one.
+
+    let rows: Vec<(Option<String>, Option<serde_json::Value>)> = match sqlx::query_as(
+        "SELECT q.payload->>'tool_name', q.payload->'input' \
+         FROM events r \
+         JOIN events q \
+           ON q.event_type = 'CodingAgentPermissionRequest' \
+          AND q.payload->>'request_id' = r.payload->>'request_id' \
+         WHERE r.event_type = 'CodingAgentPermissionResolved' \
+           AND r.thread_id = $1 \
+           AND (r.payload->>'allowed')::boolean IS TRUE \
+           AND r.payload->>'persist_scope' = 'session'",
+    )
+    .bind(thread_id)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            crate::log!(
+                "[CCPermission] session-allow hydration failed for thread {}: {} \
+                 — the card will render and the next prompt retries",
+                thread_id,
+                e
+            );
+            return;
+        }
+    };
+
+    let patterns: Vec<String> = rows
+        .into_iter()
+        .filter_map(|(tool_name, input)| {
+            derive_allow_pattern(&tool_name?, &input?, AllowScope::Session)
+        })
+        .collect();
+
+    let mut state = pending.lock().unwrap();
+    let count = patterns.len();
+    for pattern in patterns {
+        state.allow_session(thread_id, pattern);
+    }
+    // Marked only on the success path, so a failed read above retries.
+    state.hydrated_threads.insert(thread_id);
+    if count > 0 {
+        crate::log!(
+            "[CCPermission] rehydrated {} session-allow pattern(s) for thread {}",
+            count,
+            thread_id
+        );
     }
 }
 
@@ -556,6 +688,114 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     !p.starts_with(workspace_path)
 }
 
+/// A path component that disqualifies a target from the in-worktree fast path:
+/// `..` (can't be proven contained lexically) or `.git` (git metadata — see
+/// [`path_inside_worktree`]).
+fn has_rejected_component(p: &Path) -> bool {
+    p.components().any(|c| match c {
+        std::path::Component::ParentDir => true,
+        std::path::Component::Normal(name) => name == ".git",
+        _ => false,
+    })
+}
+
+/// Canonicalize the longest existing prefix of `p`. A `Write` names a file that
+/// doesn't exist yet, so canonicalizing the target itself would fail on exactly
+/// the case we most need to classify — walk up to the nearest ancestor that
+/// does resolve. `None` when nothing along the chain resolves.
+fn canonical_existing_prefix(p: &Path) -> Option<std::path::PathBuf> {
+    let mut current = Some(p);
+    while let Some(candidate) = current {
+        if let Ok(real) = std::fs::canonicalize(candidate) {
+            return Some(real);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// True when `path` provably resolves INSIDE `worktree_root` — the session's own
+/// disposable worktree — and is therefore covered by the reviewed-before-Apply
+/// guarantee that makes [`worktree_write_auto_allowed`] safe.
+///
+/// "Provably" is load-bearing: a false positive here skips a security card, so
+/// every branch that can't *prove* containment returns false.
+///
+///   * **Symlinks are resolved, not trusted lexically.** A lexical prefix check
+///     is escapable — a symlink inside the worktree pointing at an external
+///     directory makes `<worktree>/link/.claude/settings.json` look contained
+///     while the write lands outside, invisible to the reviewed diff. So both
+///     sides are canonicalized: the root, and the longest existing prefix of
+///     the target (see [`canonical_existing_prefix`]). Canonicalizing the
+///     target also catches the case where the target file is itself a symlink
+///     out of the tree. If either side fails to resolve, containment is
+///     unproven → false.
+///   * **A `..` component** (checked lexically before resolution) → false.
+///   * **A `.git` component** → false, checked BOTH on the input path and on
+///     the resolved worktree-relative path, so a symlink pointing into git
+///     metadata is caught too. Writes there (a `.git/hooks/pre-commit` that
+///     runs on the worktree's next commit) do not appear in the diff the user
+///     reviews before Apply, so they don't inherit the justification for
+///     auto-allowing everything else in here.
+///   * **A relative path** → false. Resolving one needs the agent's cwd, which
+///     is the worktree for a repo-rooted spawn but `data/apps/<id>` beneath it
+///     for an app coding-agent thread — so the worktree root alone can't
+///     resolve it. Costs nothing in practice: Claude Code's file tools require
+///     an absolute `file_path` and Codex's `grant_root` is absolute, and the
+///     fallback is just the card that rendered before this fast path existed.
+fn path_inside_worktree(path: &str, worktree_root: &Path) -> bool {
+    let p = Path::new(path);
+    if !p.is_absolute() || has_rejected_component(p) {
+        return false;
+    }
+    let Ok(root) = std::fs::canonicalize(worktree_root) else {
+        return false;
+    };
+    let Some(resolved) = canonical_existing_prefix(p) else {
+        return false;
+    };
+    let Ok(relative) = resolved.strip_prefix(&root) else {
+        return false;
+    };
+    !has_rejected_component(relative)
+}
+
+/// True when this coding-agent permission request is a file write landing
+/// inside the session's own worktree, and can therefore be auto-allowed without
+/// rendering a card.
+///
+/// Why this exists: Claude Code auto-approves in-cwd writes under
+/// `--permission-mode acceptEdits` **except** under `.claude/` and `.git/`,
+/// which it routes through `--permission-prompt-tool` in every mode and
+/// regardless of `--allowedTools` (see `CC_PROTECTED_PATH_MARKERS` in
+/// `engine::claude_code`). Lucidos keeps all of its own agent configuration in
+/// `.claude/`, so editing a rule or a skill cost a card on every single edit,
+/// and the persisted "Always allow" scopes can't suppress it. The engine's
+/// policy is stated as the simpler invariant — *an in-worktree file write needs
+/// no card* — whose only observable delta is exactly CC's protected paths.
+///
+/// It is safe because the worktree is disposable and every change in it is
+/// reviewed in the Diff before Apply. `.git` is carved out of
+/// [`path_inside_worktree`] precisely because it is the one in-worktree
+/// location that ISN'T in that diff.
+///
+/// Scope is the file-write vocabulary of [`coding_agent_file_target`] —
+/// commands (`Bash` / `command_execution`) are deliberately NOT covered: a
+/// command can do anything, so it stays on the card path even when it merely
+/// mentions a `.claude/` file. `None` for `worktree_root` (no live session
+/// entry, or the session never recorded one) fails closed.
+pub fn worktree_write_auto_allowed(
+    tool_name: &str,
+    input: &serde_json::Value,
+    worktree_root: Option<&Path>,
+) -> bool {
+    let Some(root) = worktree_root else {
+        return false;
+    };
+    coding_agent_file_target(tool_name, input)
+        .is_some_and(|target| path_inside_worktree(&target, root))
+}
+
 /// Classify one coding-agent permission request for the unattended decision.
 ///
 /// * Command requests (`command_execution` / `Bash`): reuse the command guard's
@@ -639,6 +879,26 @@ pub struct CodingAgentPermissionInput {
     pub input: serde_json::Value,
 }
 
+/// Read the worktree root of `thread_id`'s live agent session, if any.
+///
+/// For the **out-of-process** raise path (CC's MCP permission server POSTing to
+/// `api::internal::permission_prompt`) the registry is the only way in — the
+/// request carries a thread id and a tool call, nothing about the worktree. The
+/// **in-process** Codex bridge instead reads `run_session`'s own
+/// `worktree_path` local, which is the value that seeded this registry entry,
+/// so both paths see the same root without the bridge taking a lock in the
+/// engine's highest-traffic loop.
+///
+/// `None` — no live session entry, or a session that never recorded a worktree
+/// — makes [`worktree_write_auto_allowed`] fail closed.
+pub async fn lookup_session_worktree(
+    agent_sessions: &tokio::sync::Mutex<HashMap<Uuid, crate::engine::types::AgentSession>>,
+    thread_id: Uuid,
+) -> Option<std::path::PathBuf> {
+    let sessions = agent_sessions.lock().await;
+    sessions.get(&thread_id)?.worktree_path.clone()
+}
+
 /// One blocking permission round-trip — the shared core both permission
 /// raise paths drive:
 ///
@@ -648,8 +908,12 @@ pub struct CodingAgentPermissionInput {
 ///     `run_session/run.rs`, fed by `item/*/requestApproval` JSON-RPC
 ///     requests)
 ///
-/// Flow: session-allow pre-check (an earlier "Allow for this thread" click
-/// whose pattern matches skips the prompt entirely) → **unattended fast path**
+/// Flow: **in-worktree write fast path** (a file write landing inside the
+/// session's own worktree needs no card — see [`worktree_write_auto_allowed`];
+/// checked first because it is pure, lock-free and DB-free) → session-allow
+/// pre-check (an earlier "Allow for this thread" click whose pattern matches
+/// skips the prompt entirely, rehydrated from persisted events so it survives
+/// an engine restart) → **unattended fast path**
 /// (a trigger/engine-rooted session has no human to answer a card, so
 /// [`resolve_attend_mode`] + [`classify_coding_agent_request`] +
 /// [`decide_unattended`] resolve it immediately — benign in-workspace work
@@ -668,6 +932,7 @@ pub async fn prompt_coding_agent_permission(
     pending: &Mutex<PermissionState>,
     trigger_configs: &Arc<RwLock<HashMap<String, TriggerConfig>>>,
     workspace_path: &Path,
+    worktree_path: Option<&Path>,
     request: CodingAgentPermissionInput,
 ) -> PermissionPromptOutcome {
     use crate::engine::claude_code::{derive_allow_pattern, AllowScope};
@@ -678,6 +943,19 @@ pub async fn prompt_coding_agent_permission(
         tool_name,
         input,
     } = request;
+
+    // Cheapest gate first: a pure path check, no lock and no DB.
+    if worktree_write_auto_allowed(&tool_name, &input, worktree_path) {
+        return PermissionPromptOutcome {
+            allowed: true,
+            reason: Some(WORKTREE_WRITE_ALLOW_REASON.to_string()),
+        };
+    }
+
+    // Rebuild this thread's "Allow for this thread" grants from persisted
+    // events if we haven't yet in this engine lifetime, so a restart between
+    // the click and the next matching request doesn't re-ask.
+    hydrate_session_allows(pool, pending, thread_id).await;
 
     let session_pattern = derive_allow_pattern(&tool_name, &input, AllowScope::Session);
     let is_session_allowed = match session_pattern.as_deref() {
@@ -1231,7 +1509,10 @@ mod tests {
             &serde_json::json!({"command": "curl -X POST https://example.com/api -d @data"}),
             Path::new("/ws"),
         );
-        assert_eq!(v, RequestVerdict::SideEffect(SideEffectCategory::ExternalApi));
+        assert_eq!(
+            v,
+            RequestVerdict::SideEffect(SideEffectCategory::ExternalApi)
+        );
     }
 
     #[test]
@@ -1328,7 +1609,10 @@ mod tests {
             &serde_json::json!({"command": "/bin/zsh -lc 'curl -X POST https://example.com -d @x'"}),
             Path::new("/ws"),
         );
-        assert_eq!(v, RequestVerdict::SideEffect(SideEffectCategory::ExternalApi));
+        assert_eq!(
+            v,
+            RequestVerdict::SideEffect(SideEffectCategory::ExternalApi)
+        );
     }
 
     #[test]
@@ -1353,6 +1637,228 @@ mod tests {
         assert_eq!(v, RequestVerdict::Catastrophic);
     }
 
+    // --- in-worktree write fast path (pure, but real paths on disk) ---------
+
+    /// A worktree-shaped fixture: `<tmp>/wt` holding `.claude/rules/`, `.git/`,
+    /// a `vendor/dep/.git/` nested repo, plus a sibling `<tmp>/outside` and a
+    /// symlink `<tmp>/wt/escape` pointing at it. Containment is resolved
+    /// against the real filesystem, so these have to exist.
+    struct WorktreeFixture {
+        _tmp: tempfile::TempDir,
+        root: std::path::PathBuf,
+        outside: std::path::PathBuf,
+    }
+
+    fn worktree_fixture() -> WorktreeFixture {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().join("wt");
+        let outside = tmp.path().join("outside");
+        for dir in [
+            root.join(".claude/rules"),
+            root.join(".git/hooks"),
+            root.join("vendor/dep/.git"),
+            root.join("crates/lucidos-engine/src"),
+            outside.join(".claude"),
+        ] {
+            std::fs::create_dir_all(&dir).expect("create fixture dir");
+        }
+        std::fs::write(root.join(".gitignore"), "target\n").expect("write .gitignore");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, root.join("escape")).expect("symlink");
+        WorktreeFixture {
+            _tmp: tmp,
+            root,
+            outside,
+        }
+    }
+
+    /// Render an absolute path under the fixture root as a `&str`-able String.
+    fn under(root: &Path, rel: &str) -> String {
+        root.join(rel).to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn path_inside_worktree_accepts_targets_under_the_root() {
+        let f = worktree_fixture();
+        assert!(path_inside_worktree(
+            &under(&f.root, ".claude/rules/frontend.md"),
+            &f.root
+        ));
+        // A file that doesn't exist yet (a `Write`) — resolution walks up to
+        // the nearest existing ancestor.
+        assert!(path_inside_worktree(
+            &under(&f.root, "crates/lucidos-engine/src/brand_new.rs"),
+            &f.root
+        ));
+        // A directory that doesn't exist yet either.
+        assert!(path_inside_worktree(
+            &under(&f.root, ".claude/skills/run-tests/SKILL.md"),
+            &f.root
+        ));
+    }
+
+    #[test]
+    fn path_inside_worktree_rejects_targets_outside_the_root() {
+        let f = worktree_fixture();
+        // The real out-of-worktree case from the event stream: the user's
+        // global CC config. Must keep rendering a card.
+        assert!(!path_inside_worktree(
+            &under(&f.outside, ".claude/settings.json"),
+            &f.root
+        ));
+        assert!(!path_inside_worktree("/etc/cron.d/evil", &f.root));
+    }
+
+    /// The escape a purely lexical prefix check would have allowed: a symlink
+    /// inside the worktree pointing at an external directory. The write lands
+    /// outside and never shows up in the reviewed diff, so it must still ask.
+    #[cfg(unix)]
+    #[test]
+    fn path_inside_worktree_rejects_symlink_escapes() {
+        let f = worktree_fixture();
+        // Through the symlinked directory, into an existing external dir…
+        assert!(!path_inside_worktree(
+            &under(&f.root, "escape/.claude/settings.json"),
+            &f.root
+        ));
+        // …and to a file that doesn't exist yet beyond it (the `Write` case,
+        // where resolution has to walk up through the symlink).
+        assert!(!path_inside_worktree(
+            &under(&f.root, "escape/.claude/brand_new.json"),
+            &f.root
+        ));
+    }
+
+    /// A symlink pointing INTO the worktree's own git metadata must be caught
+    /// by the post-resolution `.git` check, not just the lexical one.
+    #[cfg(unix)]
+    #[test]
+    fn path_inside_worktree_rejects_symlink_into_git_metadata() {
+        let f = worktree_fixture();
+        std::os::unix::fs::symlink(f.root.join(".git"), f.root.join("gitlink"))
+            .expect("symlink into .git");
+        assert!(!path_inside_worktree(
+            &under(&f.root, "gitlink/hooks/pre-commit"),
+            &f.root
+        ));
+    }
+
+    #[test]
+    fn path_inside_worktree_rejects_prefix_sibling_of_the_root() {
+        let f = worktree_fixture();
+        let sibling = f.root.with_file_name("wt-sibling");
+        std::fs::create_dir_all(sibling.join("src")).expect("create sibling");
+        assert!(!path_inside_worktree(
+            &sibling.join("src/main.rs").to_string_lossy(),
+            &f.root
+        ));
+    }
+
+    #[test]
+    fn path_inside_worktree_rejects_parent_dir_escapes() {
+        let f = worktree_fixture();
+        assert!(!path_inside_worktree("../../etc/cron.d/evil", &f.root));
+        assert!(!path_inside_worktree(
+            &under(&f.root, "../outside/.claude/settings.json"),
+            &f.root
+        ));
+    }
+
+    #[test]
+    fn path_inside_worktree_rejects_relative_paths() {
+        // Resolving a relative path needs the agent's cwd, which differs
+        // between repo-rooted and app coding-agent threads — so it fails
+        // closed rather than guessing the worktree root.
+        let f = worktree_fixture();
+        assert!(!path_inside_worktree(".claude/rules/frontend.md", &f.root));
+    }
+
+    #[test]
+    fn path_inside_worktree_rejects_git_metadata_at_any_depth() {
+        // Git metadata is the one in-worktree location that does NOT show up
+        // in the diff the user reviews before Apply, so it keeps its card.
+        let f = worktree_fixture();
+        assert!(!path_inside_worktree(
+            &under(&f.root, ".git/hooks/pre-commit"),
+            &f.root
+        ));
+        assert!(!path_inside_worktree(
+            &under(&f.root, "vendor/dep/.git/config"),
+            &f.root
+        ));
+        // A file merely NAMED like it is fine — the check is component-wise.
+        assert!(path_inside_worktree(&under(&f.root, ".gitignore"), &f.root));
+    }
+
+    #[test]
+    fn path_inside_worktree_fails_closed_on_an_unresolvable_root() {
+        // A worktree that has been removed (stale session entry) can't prove
+        // containment of anything.
+        let f = worktree_fixture();
+        let gone = f.root.join("never-existed");
+        assert!(!path_inside_worktree(
+            &under(&f.root, ".claude/rules/frontend.md"),
+            &gone
+        ));
+    }
+
+    #[test]
+    fn worktree_write_auto_allowed_covers_the_file_write_tools() {
+        let f = worktree_fixture();
+        for tool in ["Edit", "Write", "MultiEdit", "NotebookEdit"] {
+            let key = if tool == "NotebookEdit" {
+                "notebook_path"
+            } else {
+                "file_path"
+            };
+            let input = serde_json::json!({ key: under(&f.root, ".claude/rules/db.md") });
+            assert!(
+                worktree_write_auto_allowed(tool, &input, Some(&f.root)),
+                "{tool} on an in-worktree .claude/ path must skip the card"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_write_auto_allowed_ignores_commands() {
+        // A command can do anything — it stays on the card path even when it
+        // only mentions a `.claude/` file.
+        let f = worktree_fixture();
+        for tool in ["Bash", "command_execution"] {
+            let input = serde_json::json!({
+                "command": format!("rm -rf {}", under(&f.root, ".claude/rules"))
+            });
+            assert!(
+                !worktree_write_auto_allowed(tool, &input, Some(&f.root)),
+                "{tool} must never take the worktree fast path"
+            );
+        }
+    }
+
+    #[test]
+    fn worktree_write_auto_allowed_fails_closed_without_a_known_worktree() {
+        let input = serde_json::json!({ "file_path": "/anything/x.md" });
+        assert!(
+            !worktree_write_auto_allowed("Edit", &input, None),
+            "an unknown worktree root must render the card"
+        );
+    }
+
+    #[test]
+    fn worktree_write_auto_allowed_rejects_out_of_worktree_and_git_targets() {
+        let f = worktree_fixture();
+        assert!(!worktree_write_auto_allowed(
+            "Edit",
+            &serde_json::json!({ "file_path": under(&f.outside, ".claude/settings.json") }),
+            Some(&f.root)
+        ));
+        assert!(!worktree_write_auto_allowed(
+            "Write",
+            &serde_json::json!({ "file_path": under(&f.root, ".git/hooks/pre-commit") }),
+            Some(&f.root)
+        ));
+    }
+
     #[test]
     fn path_outside_workspace_cases() {
         let ws = Path::new("/ws");
@@ -1360,8 +1866,8 @@ mod tests {
         assert!(!path_outside_workspace("relative/path", ws)); // relative, no .. → inside
         assert!(path_outside_workspace("/etc/passwd", ws));
         assert!(path_outside_workspace("/ws/../etc", ws)); // absolute .. → outside
-        // Relative `..` escapes the worktree too — must be caught (the gate is
-        // checked before the relative-is-inside shortcut).
+                                                           // Relative `..` escapes the worktree too, so it must be caught (the gate is
+                                                           // checked before the relative-is-inside shortcut).
         assert!(path_outside_workspace("../../etc/cron.d/evil", ws));
     }
 
@@ -1425,7 +1931,13 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let trigger_id = "trig-1";
         let thread_id = Uuid::new_v4();
-        insert_origin_event(&pool, thread_id, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "TriggerStarted",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
         let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::ExternalApi]);
         let mode = resolve_attend_mode(&pool, &cfgs, thread_id).await;
         assert_eq!(
@@ -1503,7 +2015,13 @@ mod tests {
         let trigger_id = "trig-benign";
         let thread_id = Uuid::new_v4();
         seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(&pool, thread_id, "MessageReceived", &scheduler_origin(trigger_id)).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "MessageReceived",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
         let cfgs = trigger_configs_with(trigger_id, vec![]);
 
         // No broadcast is ever fired — if the call WAITED for a card, the timeout
@@ -1516,6 +2034,8 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
+                // Command requests — the worktree fast path never covers them.
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i".into(),
@@ -1553,7 +2073,13 @@ mod tests {
         let trigger_id = "trig-nogrant";
         let thread_id = Uuid::new_v4();
         seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(&pool, thread_id, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "TriggerStarted",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
         let cfgs = trigger_configs_with(trigger_id, vec![]); // grants nothing
 
         let outcome = tokio::time::timeout(
@@ -1564,6 +2090,8 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
+                // Command requests — the worktree fast path never covers them.
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i".into(),
@@ -1589,7 +2117,13 @@ mod tests {
         let trigger_id = "trig-grant";
         let thread_id = Uuid::new_v4();
         seed_cc_thread(&bus, thread_id).await;
-        insert_origin_event(&pool, thread_id, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        insert_origin_event(
+            &pool,
+            thread_id,
+            "TriggerStarted",
+            &scheduler_origin(trigger_id),
+        )
+        .await;
         let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::ExternalApi]);
 
         let outcome = tokio::time::timeout(
@@ -1600,6 +2134,8 @@ mod tests {
                 &pending,
                 &cfgs,
                 Path::new("/ws"),
+                // Command requests — the worktree fast path never covers them.
+                None,
                 CodingAgentPermissionInput {
                     thread_id,
                     tool_use_id: "i".into(),
@@ -1611,7 +2147,10 @@ mod tests {
         .await
         .expect("must not hang");
         assert!(outcome.allowed, "granted external API auto-allows");
-        assert_eq!(outcome.reason.as_deref(), Some(UNATTENDED_ALLOW_GRANTED_REASON));
+        assert_eq!(
+            outcome.reason.as_deref(),
+            Some(UNATTENDED_ALLOW_GRANTED_REASON)
+        );
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -1643,6 +2182,7 @@ mod tests {
                     &pending,
                     &trigger_configs,
                     Path::new("/tmp"),
+                    None,
                     CodingAgentPermissionInput {
                         thread_id,
                         tool_use_id: "i1".to_string(),
@@ -1721,6 +2261,7 @@ mod tests {
             &pending,
             &empty_trigger_configs(),
             Path::new("/tmp"),
+            None,
             CodingAgentPermissionInput {
                 thread_id,
                 tool_use_id: "i2".to_string(),
@@ -1746,6 +2287,327 @@ mod tests {
         teardown_test_db(&db_name).await;
     }
 
+    /// Count the thread's persisted permission cards.
+    async fn card_count(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events \
+             WHERE thread_id = $1 AND event_type = 'CodingAgentPermissionRequest'",
+        )
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .expect("count cards")
+    }
+
+    /// A file write inside the session's own worktree resolves with no card —
+    /// the `.claude/rules/*.md` edit that used to cost a click on every save.
+    #[tokio::test]
+    async fn prompt_skips_card_for_in_worktree_write() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        let f = worktree_fixture();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &empty_trigger_configs(),
+                Path::new("/ws"),
+                Some(&f.root),
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i-wt".into(),
+                    tool_name: "Edit".into(),
+                    input: serde_json::json!({
+                        "file_path": under(&f.root, ".claude/rules/frontend.md"),
+                        "old_string": "x",
+                        "new_string": "y"
+                    }),
+                },
+            ),
+        )
+        .await
+        .expect("in-worktree write must not wait for a card");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.reason.as_deref(), Some(WORKTREE_WRITE_ALLOW_REASON));
+        assert_eq!(
+            card_count(&pool, thread_id).await,
+            0,
+            "the worktree fast path must not render a card"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The negative half: a write OUTSIDE the worktree (the user's global CC
+    /// config is the real-world case) still blocks on a card.
+    #[tokio::test]
+    async fn prompt_renders_card_for_out_of_worktree_write() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+
+        let waiter = {
+            let (pool, bus, pending) = (pool.clone(), bus.clone(), pending.clone());
+            let cfgs = empty_trigger_configs();
+            tokio::spawn(async move {
+                prompt_coding_agent_permission(
+                    &pool,
+                    &bus,
+                    &pending,
+                    &cfgs,
+                    Path::new("/ws"),
+                    Some(Path::new("/ws/.lucidos/worktrees/thread-abc")),
+                    CodingAgentPermissionInput {
+                        thread_id,
+                        tool_use_id: "i-out".into(),
+                        tool_name: "Edit".into(),
+                        input: serde_json::json!({ "file_path": "/home/u/.claude/settings.json" }),
+                    },
+                )
+                .await
+            })
+        };
+
+        let request_id = await_canonical_request(&pending).await;
+        let entry = pending
+            .lock()
+            .unwrap()
+            .take(&request_id)
+            .expect("canonical entry present");
+        let _ = entry.tx.send(true);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("resolves within 10s")
+            .expect("task ok");
+        assert!(outcome.allowed);
+        assert_eq!(
+            outcome.reason, None,
+            "an out-of-worktree write must be answered by the user, not a fast path"
+        );
+        assert_eq!(card_count(&pool, thread_id).await, 1, "one card rendered");
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Spin until the canonical entry lands, then hand back its request_id.
+    async fn await_canonical_request(pending: &Mutex<PermissionState>) -> String {
+        loop {
+            let id = {
+                let state = pending.lock().unwrap();
+                state.by_request_id.keys().next().cloned()
+            };
+            if let Some(id) = id {
+                return id;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    }
+
+    /// Persist one request + resolution pair the way the MCP consent endpoint
+    /// does, so hydration has something to read.
+    async fn seed_resolved_permission(
+        bus: &EventBus,
+        thread_id: Uuid,
+        request_id: &str,
+        tool_name: &str,
+        input: serde_json::Value,
+        allowed: bool,
+        persist_scope: Option<crate::engine::claude_code::AllowScope>,
+    ) {
+        for event in [
+            ThreadEvent::CodingAgentPermissionRequest {
+                request_id: request_id.to_string(),
+                tool_use_id: format!("tu-{request_id}"),
+                tool_name: tool_name.to_string(),
+                input: input.clone(),
+                summary: build_permission_summary(tool_name, &input),
+            },
+            ThreadEvent::CodingAgentPermissionResolved {
+                request_id: request_id.to_string(),
+                allowed,
+                reason: None,
+                persist_scope,
+            },
+        ] {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta: EventMeta::NONE,
+            })
+            .await
+            .expect("seed emit")
+            .expect("seed persisted");
+        }
+    }
+
+    /// The restart case: the grant is durable in the events, so a FRESH
+    /// `PermissionState` (what an engine restart leaves behind) must still
+    /// suppress the prompt. Before hydration existed, every Apply-with-restart
+    /// re-asked for a file the user had already approved on that thread.
+    #[tokio::test]
+    async fn session_allow_survives_a_fresh_permission_state() {
+        use crate::engine::claude_code::AllowScope;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        seed_resolved_permission(
+            &bus,
+            thread_id,
+            "req-granted",
+            "Bash",
+            serde_json::json!({ "command": "git status" }),
+            true,
+            Some(AllowScope::Session),
+        )
+        .await;
+
+        // Fresh state — no in-memory grant survives an engine restart.
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            prompt_coding_agent_permission(
+                &pool,
+                &bus,
+                &pending,
+                &empty_trigger_configs(),
+                Path::new("/ws"),
+                None,
+                CodingAgentPermissionInput {
+                    thread_id,
+                    tool_use_id: "i-after-restart".into(),
+                    // Same first token as the grant, different command — the
+                    // session pattern is `Bash(git:*)`.
+                    tool_name: "Bash".into(),
+                    input: serde_json::json!({ "command": "git commit -m wip" }),
+                },
+            ),
+        )
+        .await
+        .expect("a rehydrated grant must not wait for a card");
+
+        assert!(outcome.allowed);
+        assert_eq!(outcome.reason.as_deref(), Some(SESSION_ALLOW_REASON));
+        assert_eq!(
+            card_count(&pool, thread_id).await,
+            1,
+            "only the seeded card exists — no new one was rendered"
+        );
+        assert!(
+            pending
+                .lock()
+                .unwrap()
+                .hydrated_threads
+                .contains(&thread_id),
+            "the thread is marked hydrated so later prompts skip the query"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Hydration must be narrow: an Allow-once (no scope) and a Deny are NOT
+    /// standing grants, so a fresh state must still render a card for them.
+    #[tokio::test]
+    async fn allow_once_and_deny_do_not_hydrate() {
+        use crate::engine::claude_code::AllowScope;
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+        seed_cc_thread(&bus, thread_id).await;
+        // Allow-once: allowed, but no scope.
+        seed_resolved_permission(
+            &bus,
+            thread_id,
+            "req-once",
+            "Bash",
+            serde_json::json!({ "command": "git status" }),
+            true,
+            None,
+        )
+        .await;
+        // Denied WITH a session scope — the endpoint never writes this pair,
+        // but the filter must reject it on `allowed` regardless.
+        seed_resolved_permission(
+            &bus,
+            thread_id,
+            "req-denied",
+            "Bash",
+            serde_json::json!({ "command": "git push" }),
+            false,
+            Some(AllowScope::Session),
+        )
+        .await;
+
+        let pending = Arc::new(Mutex::new(PermissionState::default()));
+        let waiter = {
+            let (pool, bus, pending) = (pool.clone(), bus.clone(), pending.clone());
+            let cfgs = empty_trigger_configs();
+            tokio::spawn(async move {
+                prompt_coding_agent_permission(
+                    &pool,
+                    &bus,
+                    &pending,
+                    &cfgs,
+                    Path::new("/ws"),
+                    None,
+                    CodingAgentPermissionInput {
+                        thread_id,
+                        tool_use_id: "i-again".into(),
+                        tool_name: "Bash".into(),
+                        input: serde_json::json!({ "command": "git status" }),
+                    },
+                )
+                .await
+            })
+        };
+
+        let request_id = await_canonical_request(&pending).await;
+        let entry = pending
+            .lock()
+            .unwrap()
+            .take(&request_id)
+            .expect("a card must be rendered");
+        let _ = entry.tx.send(true);
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(10), waiter)
+            .await
+            .expect("resolves within 10s")
+            .expect("task ok");
+        assert_eq!(
+            outcome.reason, None,
+            "answered by the user, not short-circuited by a bogus hydration"
+        );
+        assert!(
+            !pending
+                .lock()
+                .unwrap()
+                .session_allows
+                .contains_key(&thread_id),
+            "neither an Allow-once nor a Deny may become a standing grant"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     #[test]
     fn gc_dead_entries_removes_orphans_with_no_receivers() {
         let mut state = PermissionState::default();
@@ -1760,7 +2622,9 @@ mod tests {
 
         // A dead entry — no subscriber.
         let dead_key: DedupKey = (Uuid::nil(), "Edit".into(), "{\"b\":2}".into());
-        state.by_dedup_key.insert(dead_key.clone(), entry("req-dead"));
+        state
+            .by_dedup_key
+            .insert(dead_key.clone(), entry("req-dead"));
         state
             .by_request_id
             .insert("req-dead".into(), dead_key.clone());

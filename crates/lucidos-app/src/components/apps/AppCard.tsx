@@ -30,6 +30,13 @@ interface AppRowProps {
 export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: Partial<AppRowProps>) {
   const sk = useSkeleton();
   const pinned = app ? isAppPinned(app.id) : false;
+  // One label for both the tooltip and the accessible name: the pin is
+  // icon-only, so a sighted user and a screen-reader user must be told the
+  // same thing about what it does. It names the ACTION (what the click will
+  // do), which is why there's no `aria-pressed` alongside it: a toggle-state
+  // attribute paired with an action name announces "Unpin from the menu,
+  // pressed", which reads as the opposite of the truth.
+  const pinLabel = pinned ? 'Unpin from the menu' : 'Pin to the menu';
   return (
     <div class={`list-row app-row${sk ? '' : ' clickable'}`} onClick={sk ? undefined : onOpen}>
       <div class="list-row-info">
@@ -56,7 +63,8 @@ export function AppRow({ app, onOpen, onEdit, onDelete, pluginInfo, onUpdate }: 
           <button
             class={`icon-btn ${pinned ? 'pinned' : ''}`}
             onClick={(e) => { e.stopPropagation(); if (app) togglePinApp(app.id); }}
-            aria-label={pinned ? 'Unpin from menu' : 'Pin to menu'}
+            aria-label={pinLabel}
+            data-tooltip={pinLabel}
           >
             <PinIcon filled={pinned} />
           </button>

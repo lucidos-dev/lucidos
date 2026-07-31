@@ -168,6 +168,7 @@ function CredentialFormInner({
   const initialTokenUrl = initialFields.tokenUrl || oauthDefaults?.token_url || '';
   const initialUserinfoUrl = initialFields.userinfoUrl || oauthDefaults?.userinfo_url || '';
   const initialScopes = initialFields.scopes || oauthDefaults?.scopes || '';
+  const initialRedirectUri = initialFields.redirectUri || oauthDefaults?.redirect_uri || '';
 
   const [selectedAuthType, setSelectedAuthType] = useState<AuthType>(initialAuthType);
 
@@ -184,6 +185,7 @@ function CredentialFormInner({
   const tokenUrlRef = useRef<HTMLInputElement>(null);
   const userinfoUrlRef = useRef<HTMLInputElement>(null);
   const scopesRef = useRef<HTMLInputElement>(null);
+  const redirectUriRef = useRef<HTMLInputElement>(null);
   // Email server settings
   const emailAddressRef = useRef<HTMLInputElement>(null);
   const imapHostRef = useRef<HTMLInputElement>(null);
@@ -242,6 +244,7 @@ function CredentialFormInner({
       tokenUrl: tokenUrlRef.current?.value.trim() || '',
       userinfoUrl: userinfoUrlRef.current?.value.trim() || '',
       scopes: scopesRef.current?.value.trim() || '',
+      redirectUri: redirectUriRef.current?.value.trim() || '',
     };
   }
 
@@ -260,7 +263,11 @@ function CredentialFormInner({
         showToast('Authorization URL and Token URL must both be provided for a custom OAuth provider.', 'error');
         return;
       }
-      if (!editing && (!fields.clientId || !fields.clientSecret)) return;
+      // Only the client ID is mandatory. A blank client secret is a valid
+      // choice, not an omission: it makes Lucidos a public client that
+      // authenticates with PKCE — the correct shape when the provider's app
+      // registration is a desktop/native app rather than a web app.
+      if (!editing && !fields.clientId) return;
     } else if (authType === 'password') {
       if (!editing && (!fields.username || !fields.password)) return;
     }
@@ -414,13 +421,16 @@ function CredentialFormInner({
               />
             </div>
             <div class="form-group">
-              <label>Client Secret</label>
+              <label>Client Secret <span class="form-hint">(optional)</span></label>
               <SecretInput
                 inputRef={clientSecretRef}
                 defaultValue={initialFields.clientSecret}
-                placeholder="Enter your OAuth Client Secret"
-                required={!editing}
+                placeholder="Leave blank for a desktop/native app"
               />
+              <div class="form-hint">
+                Leave blank when the provider's app registration is a desktop or native app —
+                Lucidos then connects as a public client using PKCE instead of a secret.
+              </div>
             </div>
             <details class="credential-oauth-endpoints" open={!hasPrefilledEndpoints}>
               <summary>
@@ -443,6 +453,20 @@ function CredentialFormInner({
               <div class="form-group">
                 <label>Default Scopes <span class="form-hint">(optional, space-separated)</span></label>
                 <input ref={scopesRef} type="text" defaultValue={initialScopes} placeholder="read write user.read" />
+              </div>
+              <div class="form-group">
+                <label>Redirect URI <span class="form-hint">(optional)</span></label>
+                <input
+                  ref={redirectUriRef}
+                  type="url"
+                  defaultValue={initialRedirectUri}
+                  placeholder="http://127.0.0.1:14981/oauth/callback"
+                />
+                <div class="form-hint">
+                  Register this exact URI with the provider. Leave blank for the default
+                  loopback-IP form; use <code>http://localhost:14981/oauth/callback</code> only
+                  for a provider that won't accept the IP literal.
+                </div>
               </div>
             </details>
           </>

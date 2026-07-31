@@ -86,8 +86,13 @@ async fn tick_fires_for_stuck_session_emits_continuation_requested_and_drops_ent
     let cancel = session.agent_cancel.clone();
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     let count = count_continuation_requests(&pool, thread_id).await;
@@ -124,8 +129,13 @@ async fn tick_leaves_healthy_session_alone() {
     let cancel = session.agent_cancel.clone();
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
@@ -158,8 +168,13 @@ async fn tick_recovers_exited_stale_session_when_running() {
     session.process_exited = true;
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert_eq!(
@@ -194,8 +209,13 @@ async fn tick_leaves_fresh_exited_session_alone() {
     session.process_exited = true;
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
@@ -223,8 +243,13 @@ async fn tick_recovers_hung_tool_past_ceiling_when_running() {
         .store(3, std::sync::atomic::Ordering::Relaxed);
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert_eq!(
@@ -251,8 +276,8 @@ async fn tick_skips_hung_tool_past_ceiling_when_not_running() {
     let limit_ms = 50;
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await; // status='running'…
-    // …then settle it so the projection is no longer `running` (stands in for
-    // `waiting_for_user_answer`, which `thread_is_running` also treats as not-running).
+                                           // …then settle it so the projection is no longer `running` (stands in for
+                                           // `waiting_for_user_answer`, which `thread_is_running` also treats as not-running).
     crate::engine::claude_code::settle_stuck_running_thread(&pool, &bus, thread_id, None)
         .await
         .expect("settle");
@@ -264,8 +289,13 @@ async fn tick_skips_hung_tool_past_ceiling_when_not_running() {
         .store(3, std::sync::atomic::Ordering::Relaxed);
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert_eq!(
@@ -298,8 +328,13 @@ async fn tick_leaves_session_with_tool_in_flight_alone() {
         .store(2, std::sync::atomic::Ordering::Relaxed);
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
@@ -323,8 +358,13 @@ async fn tick_leaves_waiting_session_alone() {
     session.is_waiting = true;
     sessions.lock().await.insert(thread_id, session);
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert_eq!(count_continuation_requests(&pool, thread_id).await, 0);
@@ -385,8 +425,13 @@ async fn tick_flips_external_terminal_emitted_before_dropping_stuck_session() {
         "precondition: continuation flag starts unset"
     );
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.tick().await;
 
     assert!(
@@ -444,8 +489,13 @@ async fn recover_stuck_skips_session_that_recovered_since_snapshot() {
         needs_running_check: false,
     };
 
-    let watchdog =
-        ExternalWatchdog::new(sessions.clone(), bus.clone(), pool.clone(), limit_ms, CEILING_MS);
+    let watchdog = ExternalWatchdog::new(
+        sessions.clone(),
+        bus.clone(),
+        pool.clone(),
+        limit_ms,
+        CEILING_MS,
+    );
     watchdog.recover_stuck(vec![candidate]).await;
 
     assert!(

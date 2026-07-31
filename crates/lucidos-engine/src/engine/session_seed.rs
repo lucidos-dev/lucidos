@@ -67,13 +67,12 @@ pub(crate) async fn seed_coding_agent_has_diff(
         .await
         .is_some();
 
-    if let Err(e) = sqlx::query(
-        "UPDATE thread_summaries SET coding_agent_has_diff = $2 WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .bind(has_diff)
-    .execute(pool)
-    .await
+    if let Err(e) =
+        sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = $2 WHERE thread_id = $1")
+            .bind(thread_id)
+            .bind(has_diff)
+            .execute(pool)
+            .await
     {
         log!(
             "[SessionSeed] Failed to seed coding_agent_has_diff for thread {} branch {}: {}",

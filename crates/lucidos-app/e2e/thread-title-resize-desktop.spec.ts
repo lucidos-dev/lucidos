@@ -28,16 +28,37 @@ function isTitleOneLine(page: import('@playwright/test').Page) {
   });
 }
 
+/** How the visible desktop title display truncates: whether its text overflows
+ *  its OWN box (the precondition for text-overflow to fire at all) and what
+ *  `text-overflow` computes to. A hard clip reads as `overflows: false` no
+ *  matter how much title is missing, because the box was sized to the text and
+ *  an ancestor did the cutting. */
+function titleTruncation(page: import('@playwright/test').Page) {
+  return page.evaluate(() => {
+    const el = Array.from(document.querySelectorAll('.thread-view-header .thread-title-display'))
+      .find((e) => e.getBoundingClientRect().width > 0) as HTMLElement;
+    const header = el.closest('.thread-view-header') as HTMLElement;
+    return {
+      overflows: el.scrollWidth > el.clientWidth + 1,
+      textOverflow: getComputedStyle(el).textOverflow,
+      visibleWidth: el.clientWidth,
+      // The row itself must never overflow: the title shrinks, it doesn't push.
+      headerOverflow: header.scrollWidth - header.clientWidth,
+    };
+  });
+}
+
 test.describe('Thread title editing — desktop resize', () => {
   test.beforeEach(async ({ page }) => {
     await assertHealthy(page);
   });
 
   test('title field hugs its text so the action icons sit beside it (no premature wrap)', async ({ page }) => {
-    // The display <div> uses white-space:nowrap + width:max-content so it hugs the
-    // title on one line and the copy/export icons sit right beside it — not pushed
-    // to the row's far edge, and not wrapped early. Guards the regression where a
-    // <textarea>/intrinsic sizing collapsed the field and wrapped with room to spare.
+    // The display <div> uses white-space:nowrap + align-self:stretch against a
+    // content-sized wrapper, so it hugs the title on one line and the copy/export
+    // icons sit right beside it, not pushed to the row's far edge and not wrapped
+    // early. Guards the regression where a <textarea>/intrinsic sizing collapsed
+    // the field and wrapped with room to spare.
     await page.setViewportSize({ width: 1600, height: 800 });
     await navigateToApp(page);
 
@@ -81,6 +102,12 @@ test.describe('Thread title editing — desktop resize', () => {
     expect(m.displayWidth, 'title field hugs its text').toBeLessThan(m.headerWidth * 0.6);
     // Icons sit right beside the title, not at the row's far edge.
     expect(m.actionsLeft - m.displayRight, 'action icons sit just right of the title').toBeLessThan(40);
+
+    // No ellipsis on a title that fits. The leaf's negative horizontal margins
+    // make a naive `max-width: 100%` land 0.5rem short of the text, which
+    // ellipsises EVERY title ~1 char early; `align-self: stretch` doesn't.
+    expect((await titleTruncation(page)).overflows, 'a title that fits is not truncated at all')
+      .toBe(false);
   });
 
   test('long title stays on one line (truncates) at narrow widths instead of wrapping', async ({ page }) => {
@@ -113,10 +140,28 @@ test.describe('Thread title editing — desktop resize', () => {
     await page.waitForTimeout(150);
     expect(await isTitleOneLine(page), 'still one line (truncated, not wrapped) at 820px').toBe(true);
 
-    // Widen again — still one line.
+    // Regression: the overflowing title was hard-cut mid-word with no ellipsis.
+    // The display leaf was `width: max-content`, so its text never overflowed
+    // its OWN box (text-overflow can only fire on self-overflow) and the wrapper
+    // clipped it with a bare `overflow: hidden`. Both halves are asserted: the
+    // text must overflow the leaf, AND the leaf must be the one truncating.
+    const narrow = await titleTruncation(page);
+    expect(narrow.overflows, 'the title overflows its own box, so text-overflow applies').toBe(true);
+    expect(narrow.textOverflow, 'the overflow renders as an ellipsis, not a hard clip').toBe('ellipsis');
+    expect(narrow.headerOverflow, 'the title shrinks rather than pushing the row wider')
+      .toBeLessThanOrEqual(1);
+
+    // Widen again: still one line, and more of the title is visible. Asserted as
+    // a width recovery rather than "no longer truncated" on purpose: whether an
+    // 84-char title fits the thread pane at a 1600px viewport depends on the
+    // split ratio and the font, so a no-ellipsis assertion here would be a
+    // coin-flip. The fits-with-no-ellipsis case is covered by the medium-title
+    // test above, which pins the title at under 60% of the row.
     await page.setViewportSize({ width: 1600, height: 800 });
     await page.waitForTimeout(150);
     expect(await isTitleOneLine(page), 'one line again at 1600px').toBe(true);
+    expect((await titleTruncation(page)).visibleWidth, 'the title re-expands with the pane')
+      .toBeGreaterThan(narrow.visibleWidth);
   });
 
   test('transcript top fades out under the header on desktop', async ({ page }) => {

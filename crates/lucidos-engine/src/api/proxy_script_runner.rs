@@ -141,7 +141,9 @@ pub async fn run_handshake_script(
     let expires_in = parsed
         .get("expires_in")
         .and_then(|v| v.as_u64())
-        .ok_or_else(|| RunError::InvalidOutput("missing or non-integer 'expires_in'".to_string()))?;
+        .ok_or_else(|| {
+            RunError::InvalidOutput("missing or non-integer 'expires_in'".to_string())
+        })?;
     Ok(HandshakeOutput {
         headers,
         expires_in,
@@ -205,7 +207,10 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
             .await
             .unwrap();
         let names: Vec<&str> = out.headers.iter().map(|(n, _)| n.as_str()).collect();
-        assert!(names.contains(&"x-where"), "data/-relative script should run");
+        assert!(
+            names.contains(&"x-where"),
+            "data/-relative script should run"
+        );
     }
 
     #[tokio::test]
@@ -224,9 +229,7 @@ print(json.dumps({"headers": {"Authorization": "Bearer abc", "X-Client-Id": "xyz
             "both.py",
             r#"import json; print(json.dumps({"headers": {"X-Src": "root"}, "expires_in": 60}))"#,
         );
-        let out = run_handshake_script(tmp.path(), rel, vec![])
-            .await
-            .unwrap();
+        let out = run_handshake_script(tmp.path(), rel, vec![]).await.unwrap();
         let src = out
             .headers
             .iter()
@@ -315,7 +318,10 @@ sys.exit(3)
             tmp.path(),
             &rel,
             vec![
-                ("CRED_SVC".to_string(), "sk-live-supersecret-value".to_string()),
+                (
+                    "CRED_SVC".to_string(),
+                    "sk-live-supersecret-value".to_string(),
+                ),
                 (
                     "OAUTH_GOOGLE_ACCESS_TOKEN".to_string(),
                     "ya29.oauth-access-token".to_string(),

@@ -61,9 +61,8 @@ pub fn report(phase: &str) {
         // readiness; a dropped phase report only costs a slightly less specific
         // splash label, and the next phase (or the healthy probe) supersedes it.
         for scheme in crate::net_config::peer_scheme_order() {
-            let url = format!(
-                "{scheme}://127.0.0.1:{port}/~/api/v1/control/workspaces/{id}/boot-phase"
-            );
+            let url =
+                format!("{scheme}://127.0.0.1:{port}/~/api/v1/control/workspaces/{id}/boot-phase");
             if client
                 .post(&url)
                 .json(&serde_json::json!({ "phase": phase }))

@@ -3,7 +3,6 @@
 //! scratch dir, and the per-file atomic copy used by the writer. Pure
 //! filesystem/network helpers — no engine or event-bus coupling.
 
-
 use std::path::{Path, PathBuf};
 
 use crate::core::plugins::{
@@ -108,8 +107,8 @@ pub(crate) fn fetch_source(
 ) -> Result<(tempfile::TempDir, PathBuf, SourceType), String> {
     let parent = workspace.join(".lucidos").join("tmp").join("plugins");
     std::fs::create_dir_all(&parent).map_err(|e| format!("create scratch dir: {}", e))?;
-    let scratch = tempfile::TempDir::new_in(&parent)
-        .map_err(|e| format!("create scratch dir: {}", e))?;
+    let scratch =
+        tempfile::TempDir::new_in(&parent).map_err(|e| format!("create scratch dir: {}", e))?;
 
     match source {
         Source::Git {
@@ -197,9 +196,7 @@ pub(crate) fn copy_atomic(src: &Path, dst: &Path) -> Result<(), String> {
     }
     let tmp = dst.with_extension(format!(
         "{}.{}.tmp",
-        dst.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("plugin"),
+        dst.extension().and_then(|s| s.to_str()).unwrap_or("plugin"),
         uuid::Uuid::new_v4().simple()
     ));
     std::fs::copy(src, &tmp).map_err(|e| format!("copy {:?} → {:?}: {}", src, tmp, e))?;

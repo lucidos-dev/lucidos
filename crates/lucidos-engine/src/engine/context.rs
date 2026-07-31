@@ -179,7 +179,9 @@ pub(crate) fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefiniti
     tools
         .iter()
         .map(|t| {
-            t.name.len() + t.description.len() + t.parameters.to_string().len()
+            t.name.len()
+                + t.description.len()
+                + t.parameters.to_string().len()
                 + TOOL_DEF_OVERHEAD_CHARS
         })
         .sum()
@@ -321,8 +323,9 @@ pub(super) fn trim_context_if_needed(
             continue;
         }
         if let MessageContent::Blocks(blocks) = &mut msg.content {
-            image_bytes_stripped +=
-                replace_image_blocks(blocks, || "[image from earlier in conversation]".to_string());
+            image_bytes_stripped += replace_image_blocks(blocks, || {
+                "[image from earlier in conversation]".to_string()
+            });
         }
     }
     if image_bytes_stripped > 0 {
@@ -530,9 +533,7 @@ pub(super) fn truncate_large_json_strings(value: &mut serde_json::Value) -> usiz
             .iter_mut()
             .map(|(_k, v)| truncate_large_json_strings(v))
             .sum(),
-        serde_json::Value::Array(arr) => {
-            arr.iter_mut().map(truncate_large_json_strings).sum()
-        }
+        serde_json::Value::Array(arr) => arr.iter_mut().map(truncate_large_json_strings).sum(),
         _ => 0,
     }
 }
@@ -680,7 +681,9 @@ impl LucidosEngine {
         classification: &QueryClassification,
     ) -> (String, usize) {
         const MAX_CONTEXT_CHARS: usize = 50_000;
-        use crate::memory::{RETRIEVAL_MIN_IMPORTANCE as MIN_IMPORTANCE, RETRIEVAL_MIN_SIMILARITY as MIN_SIMILARITY};
+        use crate::memory::{
+            RETRIEVAL_MIN_IMPORTANCE as MIN_IMPORTANCE, RETRIEVAL_MIN_SIMILARITY as MIN_SIMILARITY,
+        };
         const RESULTS_PER_QUERY: usize = 50;
         const MAX_FACTS: usize = 25;
         const KEYWORD_SIMILARITY_PROXY: f64 = 0.6;
@@ -984,7 +987,8 @@ mod context_window_tests {
     #[test]
     fn opus_1m_budget_is_much_larger_than_default_claude() {
         let opus_1m = agent_context_char_budget(context_window_from_prefix("claude-opus-4-7[1m]"));
-        let default_claude = agent_context_char_budget(context_window_from_prefix("claude-opus-4-7"));
+        let default_claude =
+            agent_context_char_budget(context_window_from_prefix("claude-opus-4-7"));
         assert!(
             opus_1m >= default_claude * 4,
             "1M Opus budget ({}) must be ≥ 4× default Claude budget ({})",

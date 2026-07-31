@@ -1,5 +1,7 @@
 mod failure_breaker_tests {
-    use super::super::{generic_breaker_action, next_failure_streak, BreakerAction, MAX_ITERATIONS};
+    use super::super::{
+        generic_breaker_action, next_failure_streak, BreakerAction, MAX_ITERATIONS,
+    };
 
     /// Simulate a run of single-tool-call iterations on the SAME (tool, key),
     /// returning the breaker action observed on each iteration BEFORE the
@@ -38,7 +40,11 @@ mod failure_breaker_tests {
         let actions = run_same_key(&[true, true, true]);
         assert_eq!(
             actions,
-            vec![BreakerAction::None, BreakerAction::None, BreakerAction::Warn]
+            vec![
+                BreakerAction::None,
+                BreakerAction::None,
+                BreakerAction::Warn
+            ]
         );
     }
 

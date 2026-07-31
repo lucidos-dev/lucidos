@@ -140,9 +140,8 @@ pub fn render_network_toml(gateway_bind: &str, engine_inherit: bool) -> String {
 /// Write `network.toml` atomically (temp + rename), creating `~/.lucidos` if
 /// needed. Values are assumed already validated by [`validate_bind_input`].
 pub fn write_network_toml(gateway_bind: &str, engine_inherit: bool) -> std::io::Result<()> {
-    let path = network_toml_path().ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set")
-    })?;
+    let path = network_toml_path()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "HOME is not set"))?;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -298,7 +297,9 @@ mod tests {
     #[test]
     fn default_is_loopback() {
         assert_eq!(resolve_gateway_bind(None, None, None), BindChoice::Loopback);
-        assert!(bind_socket_addr(&BindChoice::Loopback, 5251).ip().is_loopback());
+        assert!(bind_socket_addr(&BindChoice::Loopback, 5251)
+            .ip()
+            .is_loopback());
     }
 
     #[test]

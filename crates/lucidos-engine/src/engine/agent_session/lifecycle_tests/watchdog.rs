@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// Bool wrapper kept for the legacy fire/no-fire tests below. Takes the ceiling
 /// explicitly; callers pass `WATCHDOG_HUNG_TOOL_CEILING_MS` (these tests exercise
 /// the normal limit — their elapsed gaps are well under the ceiling — so it's
@@ -27,7 +26,6 @@ fn should_trigger_watchdog(
         WatchdogGate::Fire,
     )
 }
-
 
 /// Idle CC sits silent waiting for the next user input — that silence is
 /// the resting state, not a hang. The watchdog must NOT fire here, even
@@ -133,11 +131,25 @@ fn watchdog_boundary_is_strictly_greater_than_limit() {
     let limit = WATCHDOG_INACTIVITY_LIMIT_MS;
     let now = 10_000_000;
     assert!(
-        !should_trigger_watchdog(false, now - limit, now, limit, WATCHDOG_HUNG_TOOL_CEILING_MS, 0),
+        !should_trigger_watchdog(
+            false,
+            now - limit,
+            now,
+            limit,
+            WATCHDOG_HUNG_TOOL_CEILING_MS,
+            0
+        ),
         "exactly at the limit must not fire (strict-greater check)"
     );
     assert!(
-        should_trigger_watchdog(false, now - limit - 1, now, limit, WATCHDOG_HUNG_TOOL_CEILING_MS, 0),
+        should_trigger_watchdog(
+            false,
+            now - limit - 1,
+            now,
+            limit,
+            WATCHDOG_HUNG_TOOL_CEILING_MS,
+            0
+        ),
         "1ms past the limit must fire"
     );
 }

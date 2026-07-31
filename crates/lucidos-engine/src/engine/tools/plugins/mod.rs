@@ -648,8 +648,13 @@ pub async fn confirm_pending_uninstall(
         // a half-written repo, and so this commit can't race a concurrent
         // write_file/edit_file commit. Mirrors the install confirm flow.
         let _repo_guard = engine.lock_workspace_repo().await;
-        uninstall_with_bus(&engine.workspace_path, &engine.event_bus, &pending, actor.clone())
-            .await?
+        uninstall_with_bus(
+            &engine.workspace_path,
+            &engine.event_bus,
+            &pending,
+            actor.clone(),
+        )
+        .await?
     };
 
     // Auto-delete the plugin's auto-registered triggers (ADR 0019) — scoped by
@@ -899,7 +904,11 @@ async fn resync_plugin_triggers(
         // plugin (author error) — keeping it would mint two triggers writing one
         // shared data/triggers/<slug>/ projection.
         if resolved.iter().any(|(s, _)| s == &slug) {
-            log!("[Plugins] skip duplicate plugin trigger slug '{}' ({})", slug, rel);
+            log!(
+                "[Plugins] skip duplicate plugin trigger slug '{}' ({})",
+                slug,
+                rel
+            );
             continue;
         }
         resolved.push((slug, def));
@@ -1333,7 +1342,10 @@ pub(crate) async fn install_from_unpacked_with_bus(
     payload.insert("manifest".into(), manifest.raw.clone());
     payload.insert("files".into(), serde_json::json!(installed_files));
     payload.insert("installed_at".into(), serde_json::json!(installed_at));
-    payload.insert("source_type".into(), serde_json::json!(source_type.as_str()));
+    payload.insert(
+        "source_type".into(),
+        serde_json::json!(source_type.as_str()),
+    );
     payload.insert("commit".into(), serde_json::json!(install_commit));
     if let Some(tid) = setup_thread_id {
         payload.insert("setup_thread_id".into(), serde_json::json!(tid.to_string()));

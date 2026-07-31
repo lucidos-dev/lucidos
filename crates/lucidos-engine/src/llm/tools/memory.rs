@@ -5,7 +5,6 @@
 //! the flat `correct_memory` / `correct_memory_by_id` names stay wired as
 //! back-compat aliases in `execute_tool`.
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

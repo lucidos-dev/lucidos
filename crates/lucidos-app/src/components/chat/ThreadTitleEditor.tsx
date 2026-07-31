@@ -156,11 +156,10 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
   return (
     <div class={`thread-title-edit${editing ? ' is-editing' : ''}`}>
       {/* Read-only display is a div element, deliberately not a textarea: in the
-          desktop header CSS gives it white-space:nowrap + width:max-content so it
-          hugs the title on one line (a textarea would size to its cols attribute
-          and wrap early; nowrap is what lets max-content survive the flex
-          max-width cap without collapsing). A title too long for the row is
-          clipped at the row's right edge by the wrapper. */}
+          desktop header CSS gives it white-space:nowrap + align-self:stretch so
+          it hugs the title on one line (a textarea would size to its cols
+          attribute and wrap early), and a title too long for the row truncates
+          with a CSS text-overflow ellipsis at the row's right edge. */}
       <div
         class="thread-title-input thread-title-display"
         onClick={startEditing}

@@ -43,8 +43,12 @@ pub fn dispatch_notifications(ws: &Workspace, cmd: NotificationsCmd) -> Result<(
         NotificationsCmd::List { filter, limit } => {
             let url = format!("{}/api/v1/notifications", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
-            if let Some(v) = filter { query.push(("filter", v.to_string())); }
-            if let Some(v) = limit { query.push(("limit", v.to_string())); }
+            if let Some(v) = filter {
+                query.push(("filter", v.to_string()));
+            }
+            if let Some(v) = limit {
+                query.push(("limit", v.to_string()));
+            }
             let req = client()?.get(&url).query(&query);
             send_and_print("GET", &url, req)
         }
@@ -52,7 +56,10 @@ pub fn dispatch_notifications(ws: &Workspace, cmd: NotificationsCmd) -> Result<(
             let url = format!("{}/api/v1/notification/read", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
-            let req = client()?.post(&url).query(&query).json(&serde_json::json!({}));
+            let req = client()?
+                .post(&url)
+                .query(&query)
+                .json(&serde_json::json!({}));
             send_and_print("POST", &url, req)
         }
         NotificationsCmd::ReadAll => {
@@ -92,18 +99,29 @@ pub fn dispatch_preferences(ws: &Workspace, cmd: PreferencesCmd) -> Result<(), B
         PreferencesCmd::Get { device_id } => {
             let url = format!("{}/api/v1/preferences", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
-            if let Some(v) = device_id { query.push(("device_id", v.to_string())); }
+            if let Some(v) = device_id {
+                query.push(("device_id", v.to_string()));
+            }
             let req = client()?.get(&url).query(&query);
             send_and_print("GET", &url, req)
         }
-        PreferencesCmd::Set { key, value, device_id } => {
+        PreferencesCmd::Set {
+            key,
+            value,
+            device_id,
+        } => {
             let url = format!("{}/api/v1/preferences", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("key", key.to_string()));
             let mut body = serde_json::Map::new();
             body.insert("value".into(), serde_json::json!(value));
-            if let Some(v) = device_id { body.insert("device_id".into(), serde_json::json!(v)); }
-            let req = client()?.put(&url).query(&query).json(&serde_json::Value::Object(body));
+            if let Some(v) = device_id {
+                body.insert("device_id".into(), serde_json::json!(v));
+            }
+            let req = client()?
+                .put(&url)
+                .query(&query)
+                .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
     }
@@ -191,18 +209,58 @@ pub enum TriggersCmd {
 /// Execute a `lucidos triggers <op>` command against the parent workspace.
 pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxError> {
     match cmd {
-        TriggersCmd::Create { name, run, cron_expressions, on, app_id, go_to_review, group_id, side_effect_grant, slug } => {
+        TriggersCmd::Create {
+            name,
+            run,
+            cron_expressions,
+            on,
+            app_id,
+            go_to_review,
+            group_id,
+            side_effect_grant,
+            slug,
+        } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(name));
-            body.insert("run".into(), serde_json::from_str::<serde_json::Value>(&run).map_err(|e| format!("--run must be valid JSON: {}", e))?);
-            if let Some(v) = cron_expressions { body.insert("cron_expressions".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!("--cron_expressions must be valid JSON: {}", e))?); }
-            if let Some(v) = on { body.insert("on".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!("--on must be valid JSON: {}", e))?); }
-            if let Some(v) = app_id { body.insert("app_id".into(), serde_json::json!(v)); }
-            if let Some(v) = go_to_review { body.insert("go_to_review".into(), serde_json::json!(v)); }
-            if let Some(v) = group_id { body.insert("group_id".into(), serde_json::json!(v)); }
-            if let Some(v) = side_effect_grant { body.insert("side_effect_grant".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!("--side_effect_grant must be valid JSON: {}", e))?); }
-            if let Some(v) = slug { body.insert("slug".into(), serde_json::json!(v)); }
+            body.insert(
+                "run".into(),
+                serde_json::from_str::<serde_json::Value>(&run)
+                    .map_err(|e| format!("--run must be valid JSON: {}", e))?,
+            );
+            if let Some(v) = cron_expressions {
+                body.insert(
+                    "cron_expressions".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--cron_expressions must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = on {
+                body.insert(
+                    "on".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--on must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = app_id {
+                body.insert("app_id".into(), serde_json::json!(v));
+            }
+            if let Some(v) = go_to_review {
+                body.insert("go_to_review".into(), serde_json::json!(v));
+            }
+            if let Some(v) = group_id {
+                body.insert("group_id".into(), serde_json::json!(v));
+            }
+            if let Some(v) = side_effect_grant {
+                body.insert(
+                    "side_effect_grant".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--side_effect_grant must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = slug {
+                body.insert("slug".into(), serde_json::json!(v));
+            }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
@@ -211,29 +269,83 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             let req = client()?.get(&url);
             send_and_print("GET", &url, req)
         }
-        TriggersCmd::Update { id, name, run, cron_expressions, on, paused, app_id, go_to_review, group_id, side_effect_grant, slug } => {
+        TriggersCmd::Update {
+            id,
+            name,
+            run,
+            cron_expressions,
+            on,
+            paused,
+            app_id,
+            go_to_review,
+            group_id,
+            side_effect_grant,
+            slug,
+        } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
-            if let Some(v) = name { body.insert("name".into(), serde_json::json!(v)); }
-            if let Some(v) = run { body.insert("run".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!("--run must be valid JSON: {}", e))?); }
-            if let Some(v) = cron_expressions { body.insert("cron_expressions".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!("--cron_expressions must be valid JSON: {}", e))?); }
-            if let Some(v) = on { body.insert("on".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!("--on must be valid JSON: {}", e))?); }
-            if let Some(v) = paused { body.insert("paused".into(), serde_json::json!(v)); }
-            if let Some(v) = app_id { body.insert("app_id".into(), serde_json::json!(v)); }
-            if let Some(v) = go_to_review { body.insert("go_to_review".into(), serde_json::json!(v)); }
-            if let Some(v) = group_id { body.insert("group_id".into(), serde_json::json!(v)); }
-            if let Some(v) = side_effect_grant { body.insert("side_effect_grant".into(), serde_json::from_str::<serde_json::Value>(&v).map_err(|e| format!("--side_effect_grant must be valid JSON: {}", e))?); }
-            if let Some(v) = slug { body.insert("slug".into(), serde_json::json!(v)); }
-            let req = client()?.put(&url).query(&query).json(&serde_json::Value::Object(body));
+            if let Some(v) = name {
+                body.insert("name".into(), serde_json::json!(v));
+            }
+            if let Some(v) = run {
+                body.insert(
+                    "run".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--run must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = cron_expressions {
+                body.insert(
+                    "cron_expressions".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--cron_expressions must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = on {
+                body.insert(
+                    "on".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--on must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = paused {
+                body.insert("paused".into(), serde_json::json!(v));
+            }
+            if let Some(v) = app_id {
+                body.insert("app_id".into(), serde_json::json!(v));
+            }
+            if let Some(v) = go_to_review {
+                body.insert("go_to_review".into(), serde_json::json!(v));
+            }
+            if let Some(v) = group_id {
+                body.insert("group_id".into(), serde_json::json!(v));
+            }
+            if let Some(v) = side_effect_grant {
+                body.insert(
+                    "side_effect_grant".into(),
+                    serde_json::from_str::<serde_json::Value>(&v)
+                        .map_err(|e| format!("--side_effect_grant must be valid JSON: {}", e))?,
+                );
+            }
+            if let Some(v) = slug {
+                body.insert("slug".into(), serde_json::json!(v));
+            }
+            let req = client()?
+                .put(&url)
+                .query(&query)
+                .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
         TriggersCmd::Delete { id } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
-            let req = client()?.delete(&url).query(&query).json(&serde_json::json!({}));
+            let req = client()?
+                .delete(&url)
+                .query(&query)
+                .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
     }
@@ -288,7 +400,9 @@ pub fn dispatch_trigger_groups(ws: &Workspace, cmd: TriggerGroupsCmd) -> Result<
             let url = format!("{}/api/v1/trigger-groups", ws.base_url());
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(name));
-            if let Some(v) = order { body.insert("order".into(), serde_json::json!(v)); }
+            if let Some(v) = order {
+                body.insert("order".into(), serde_json::json!(v));
+            }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
@@ -298,13 +412,20 @@ pub fn dispatch_trigger_groups(ws: &Workspace, cmd: TriggerGroupsCmd) -> Result<
             query.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(name));
-            let req = client()?.put(&url).query(&query).json(&serde_json::Value::Object(body));
+            let req = client()?
+                .put(&url)
+                .query(&query)
+                .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
         TriggerGroupsCmd::Reorder { ordering } => {
             let url = format!("{}/api/v1/trigger-groups/reorder", ws.base_url());
             let mut body = serde_json::Map::new();
-            body.insert("ordering".into(), serde_json::from_str::<serde_json::Value>(&ordering).map_err(|e| format!("--ordering must be valid JSON: {}", e))?);
+            body.insert(
+                "ordering".into(),
+                serde_json::from_str::<serde_json::Value>(&ordering)
+                    .map_err(|e| format!("--ordering must be valid JSON: {}", e))?,
+            );
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
@@ -312,7 +433,10 @@ pub fn dispatch_trigger_groups(ws: &Workspace, cmd: TriggerGroupsCmd) -> Result<
             let url = format!("{}/api/v1/trigger-groups", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
-            let req = client()?.delete(&url).query(&query).json(&serde_json::json!({}));
+            let req = client()?
+                .delete(&url)
+                .query(&query)
+                .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
     }
@@ -364,21 +488,33 @@ pub fn dispatch_apps(ws: &Workspace, cmd: AppsCmd) -> Result<(), BoxError> {
             let req = client()?.get(&url).query(&query);
             send_and_print("GET", &url, req)
         }
-        AppsCmd::Update { id, name, description } => {
+        AppsCmd::Update {
+            id,
+            name,
+            description,
+        } => {
             let url = format!("{}/api/v1/app", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
             body.insert("name".into(), serde_json::json!(name));
-            if let Some(v) = description { body.insert("description".into(), serde_json::json!(v)); }
-            let req = client()?.put(&url).query(&query).json(&serde_json::Value::Object(body));
+            if let Some(v) = description {
+                body.insert("description".into(), serde_json::json!(v));
+            }
+            let req = client()?
+                .put(&url)
+                .query(&query)
+                .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
         AppsCmd::Delete { id } => {
             let url = format!("{}/api/v1/app", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
-            let req = client()?.delete(&url).query(&query).json(&serde_json::json!({}));
+            let req = client()?
+                .delete(&url)
+                .query(&query)
+                .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
     }
@@ -432,24 +568,53 @@ pub fn dispatch_memory(ws: &Workspace, cmd: MemoryCmd) -> Result<(), BoxError> {
             let req = client()?.get(&url);
             send_and_print("GET", &url, req)
         }
-        MemoryCmd::Entries { limit, offset, source_type, sort, importance } => {
+        MemoryCmd::Entries {
+            limit,
+            offset,
+            source_type,
+            sort,
+            importance,
+        } => {
             let url = format!("{}/api/v1/memory/entries", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
-            if let Some(v) = limit { query.push(("limit", v.to_string())); }
-            if let Some(v) = offset { query.push(("offset", v.to_string())); }
-            if let Some(v) = source_type { query.push(("source_type", v.to_string())); }
-            if let Some(v) = sort { query.push(("sort", v.to_string())); }
-            if let Some(v) = importance { query.push(("importance", v.to_string())); }
+            if let Some(v) = limit {
+                query.push(("limit", v.to_string()));
+            }
+            if let Some(v) = offset {
+                query.push(("offset", v.to_string()));
+            }
+            if let Some(v) = source_type {
+                query.push(("source_type", v.to_string()));
+            }
+            if let Some(v) = sort {
+                query.push(("sort", v.to_string()));
+            }
+            if let Some(v) = importance {
+                query.push(("importance", v.to_string()));
+            }
             let req = client()?.get(&url).query(&query);
             send_and_print("GET", &url, req)
         }
-        MemoryCmd::Source { source_id, source_type, path, commit } => {
+        MemoryCmd::Source {
+            source_id,
+            source_type,
+            path,
+            commit,
+        } => {
             let url = format!("{}/api/v1/memory/source", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
-            if let Some(v) = source_id { query.push(("source_id", v.to_string())); }
-            if let Some(v) = source_type { query.push(("source_type", v.to_string())); }
-            if let Some(v) = path { query.push(("path", v.to_string())); }
-            if let Some(v) = commit { query.push(("commit", v.to_string())); }
+            if let Some(v) = source_id {
+                query.push(("source_id", v.to_string()));
+            }
+            if let Some(v) = source_type {
+                query.push(("source_type", v.to_string()));
+            }
+            if let Some(v) = path {
+                query.push(("path", v.to_string()));
+            }
+            if let Some(v) = commit {
+                query.push(("commit", v.to_string()));
+            }
             let req = client()?.get(&url).query(&query);
             send_and_print("GET", &url, req)
         }
@@ -542,7 +707,10 @@ pub fn dispatch_env_vars(ws: &Workspace, cmd: EnvVarsCmd) -> Result<(), BoxError
             let url = format!("{}/api/v1/env-vars", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("name", name.to_string()));
-            let req = client()?.delete(&url).query(&query).json(&serde_json::json!({}));
+            let req = client()?
+                .delete(&url)
+                .query(&query)
+                .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
     }
@@ -608,37 +776,71 @@ pub fn dispatch_models(ws: &Workspace, cmd: ModelsCmd) -> Result<(), BoxError> {
             let req = client()?.get(&url);
             send_and_print("GET", &url, req)
         }
-        ModelsCmd::Add { id, label, provider, sort_order, context_window } => {
+        ModelsCmd::Add {
+            id,
+            label,
+            provider,
+            sort_order,
+            context_window,
+        } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut body = serde_json::Map::new();
             body.insert("id".into(), serde_json::json!(id));
-            if let Some(v) = label { body.insert("label".into(), serde_json::json!(v)); }
+            if let Some(v) = label {
+                body.insert("label".into(), serde_json::json!(v));
+            }
             body.insert("provider".into(), serde_json::json!(provider));
-            if let Some(v) = sort_order { body.insert("sort_order".into(), serde_json::json!(v)); }
-            if let Some(v) = context_window { body.insert("context_window".into(), serde_json::json!(v)); }
+            if let Some(v) = sort_order {
+                body.insert("sort_order".into(), serde_json::json!(v));
+            }
+            if let Some(v) = context_window {
+                body.insert("context_window".into(), serde_json::json!(v));
+            }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
-        ModelsCmd::Update { id, label, provider, sort_order, enabled, context_window } => {
+        ModelsCmd::Update {
+            id,
+            label,
+            provider,
+            sort_order,
+            enabled,
+            context_window,
+        } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
             let mut body = serde_json::Map::new();
-            if let Some(v) = label { body.insert("label".into(), serde_json::json!(v)); }
-            if let Some(v) = provider { body.insert("provider".into(), serde_json::json!(v)); }
-            if let Some(v) = sort_order { body.insert("sort_order".into(), serde_json::json!(v)); }
-            if let Some(v) = enabled { body.insert("enabled".into(), serde_json::json!(v)); }
-            if let Some(v) = context_window { body.insert("context_window".into(), serde_json::json!(v)); }
-            let req = client()?.put(&url).query(&query).json(&serde_json::Value::Object(body));
+            if let Some(v) = label {
+                body.insert("label".into(), serde_json::json!(v));
+            }
+            if let Some(v) = provider {
+                body.insert("provider".into(), serde_json::json!(v));
+            }
+            if let Some(v) = sort_order {
+                body.insert("sort_order".into(), serde_json::json!(v));
+            }
+            if let Some(v) = enabled {
+                body.insert("enabled".into(), serde_json::json!(v));
+            }
+            if let Some(v) = context_window {
+                body.insert("context_window".into(), serde_json::json!(v));
+            }
+            let req = client()?
+                .put(&url)
+                .query(&query)
+                .json(&serde_json::Value::Object(body));
             send_and_print("PUT", &url, req)
         }
         ModelsCmd::Delete { id } => {
             let url = format!("{}/api/v1/models", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
             query.push(("id", id.to_string()));
-            let req = client()?.delete(&url).query(&query).json(&serde_json::json!({}));
+            let req = client()?
+                .delete(&url)
+                .query(&query)
+                .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
         }
     }
 }
-

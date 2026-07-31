@@ -344,21 +344,20 @@ pub fn ensure_workspace_gitignore_entries(workspace: &std::path::Path) -> std::i
     Ok(true)
 }
 
+pub use device_presence::DevicePresenceStore;
 pub use events::EventRow;
 pub use mcp_servers::{McpServer, McpServerStore};
 pub use models::{Model, ModelStore};
 pub use preferences::{
     PreferenceStore, DEFAULT_CHAT_MODEL, DEFAULT_COMMAND_JUDGE_MODEL, DEFAULT_LOCAL_BASE_URL,
     PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT, PREF_CODING_AGENT_CLAUDE_PATH,
-    PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL, PREF_LOCAL_BASE_URL,
-    PREF_MODEL_COMMAND_JUDGE, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE,
-    PREF_VERTEX_REGION,
+    PREF_CODING_AGENT_CODEX_PATH, PREF_IMAGE_MODEL, PREF_LOCAL_BASE_URL, PREF_MODEL_COMMAND_JUDGE,
+    PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY, PREF_MODEL_TITLE, PREF_VERTEX_REGION,
 };
 pub use store::{
     ConversationMessage, ConversationSnapshot, EventStore, ResponseEvent, SessionMessage, Step,
     ThreadEventRow, ThreadSummary,
 };
-pub use device_presence::DevicePresenceStore;
 
 /// Reset the index to match HEAD's tree before staging — drops any entries
 /// left behind by a previous `commit_*` call that staged but didn't commit
@@ -580,13 +579,19 @@ pub(crate) fn split_md_frontmatter(text: &str) -> Option<(&str, String)> {
     if parts.len() < 3 {
         return None;
     }
-    Some((parts[1].trim(), parts[2].trim_start_matches('\n').to_string()))
+    Some((
+        parts[1].trim(),
+        parts[2].trim_start_matches('\n').to_string(),
+    ))
 }
 
 /// Parse YAML frontmatter from a markdown file.
 /// Extracts `name:` and a configurable list field (e.g., `knowhow:`).
 /// Returns (name, list_values, body) or None if no valid frontmatter.
-pub(crate) fn parse_md_frontmatter(text: &str, list_field: &str) -> Option<(String, Vec<String>, String)> {
+pub(crate) fn parse_md_frontmatter(
+    text: &str,
+    list_field: &str,
+) -> Option<(String, Vec<String>, String)> {
     let (frontmatter, body) = split_md_frontmatter(text)?;
 
     let mut name = None;
@@ -655,6 +660,15 @@ mod format_byte_size_tests {
     }
 }
 
+/// Head-truncate `s` to `max` bytes, appending `...` when it actually cuts.
+/// Returns `s` unchanged when it already fits. UTF-8-safe.
+///
+/// **The appended `...` is part of the return value**, so a caller must not
+/// also wrap the result in a `"{}..."` format string: a truncated value then
+/// renders as six dots, which the frontend accents as two separate markers
+/// (`highlightEllipsis` marks only the trailing three). A `describe_tool` arm
+/// that wants the trailing in-progress `...` should elide with
+/// `middle_truncate`, which marks its cut with `…` and appends nothing.
 fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max {
         s.to_string()
@@ -689,6 +703,19 @@ fn middle_truncate(s: &str, max: usize) -> String {
         return ELLIPSIS.to_string();
     }
     format!("{}{}{}", &s[..head_end], ELLIPSIS, &s[tail_start..])
+}
+
+/// First non-empty line of a command, trimmed; the whole string when it has no
+/// non-empty line. A step label is one line of HTML, where a newline collapses
+/// to a space, so a multi-line script (a heredoc, a `&&` chain split across
+/// lines) must condense to its opening line rather than elide across newlines
+/// and render as a garbled run-on. Shared by the engine and coding-agent
+/// description paths so both condense a command the same way.
+fn first_command_line(cmd: &str) -> &str {
+    cmd.lines()
+        .find(|l| !l.trim().is_empty())
+        .map(|l| l.trim())
+        .unwrap_or(cmd)
 }
 
 /// Summarize a `glob_files` / `grep_files` JSON result as "N items[, truncated]".
@@ -769,12 +796,18 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
         }
         "run_bash" => {
             let cmd = args["command"].as_str().unwrap_or("command");
-            format!("Running: {}...", truncate(cmd, 60))
+            format!(
+                "Running: {}...",
+                middle_truncate(first_command_line(cmd), 60)
+            )
         }
         "run_python_background" => "Running Python in background...".to_string(),
         "run_bash_background" => {
             let cmd = args["command"].as_str().unwrap_or("command");
-            format!("Running in background: {}...", truncate(cmd, 60))
+            format!(
+                "Running in background: {}...",
+                middle_truncate(first_command_line(cmd), 60)
+            )
         }
         "bash_output" => "Checking background task output...".to_string(),
         "bash_kill" => "Stopping background task...".to_string(),
@@ -1016,7 +1049,7 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
         ),
         "generate_image" => format!(
             "Generating image: {}...",
-            truncate(args["prompt"].as_str().unwrap_or("image"), 50)
+            middle_truncate(args["prompt"].as_str().unwrap_or("image"), 50)
         ),
         "git_clone" => format!(
             "Cloning {}...",
@@ -1028,7 +1061,7 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
         ),
         "run_thread" => format!(
             "Running thread: {}...",
-            truncate(args["prompt"].as_str().unwrap_or("task"), 50)
+            middle_truncate(args["prompt"].as_str().unwrap_or("task"), 50)
         ),
         "list_threads" => "Listing threads...".to_string(),
         "count_threads" => "Counting threads...".to_string(),
@@ -1109,10 +1142,22 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             _ => "Managing repositories...".to_string(),
         },
         "manage_models" => match args["action"].as_str() {
-            Some("add") => format!("Adding model '{}'...", args["id"].as_str().unwrap_or("model")),
-            Some("remove") => format!("Removing model '{}'...", args["id"].as_str().unwrap_or("model")),
-            Some("enable") => format!("Enabling model '{}'...", args["id"].as_str().unwrap_or("model")),
-            Some("disable") => format!("Disabling model '{}'...", args["id"].as_str().unwrap_or("model")),
+            Some("add") => format!(
+                "Adding model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("remove") => format!(
+                "Removing model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("enable") => format!(
+                "Enabling model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
+            Some("disable") => format!(
+                "Disabling model '{}'...",
+                args["id"].as_str().unwrap_or("model")
+            ),
             Some("list") => "Listing models...".to_string(),
             _ => "Managing models...".to_string(),
         },
@@ -1274,12 +1319,7 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             if cmd.is_empty() {
                 "Run command".into()
             } else {
-                let first_line = cmd
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .map(|l| l.trim())
-                    .unwrap_or(cmd);
-                format!("Run {}", middle_truncate(first_line, 60))
+                format!("Run {}", middle_truncate(first_command_line(cmd), 60))
             }
         }
         "WebFetch" => {
@@ -1330,12 +1370,7 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             if cmd.is_empty() {
                 "Run command".into()
             } else {
-                let first_line = cmd
-                    .lines()
-                    .find(|l| !l.trim().is_empty())
-                    .map(|l| l.trim())
-                    .unwrap_or(cmd);
-                format!("Run {}", middle_truncate(first_line, 60))
+                format!("Run {}", middle_truncate(first_command_line(cmd), 60))
             }
         }
         "file_change" => {

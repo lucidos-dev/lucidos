@@ -6,14 +6,14 @@
 //! `MessageReceived` row on `events_pkey` because the optimistic
 //! client UUID was reused as the persisted `UserPromptInjected` id.
 
-use super::{
-    append_injected_prompts_to_messages, emit_iteration_cap_response_generated,
-    emit_user_prompt_injected_event, filter_removed_queued_prompts,
-    ensure_terminator_emitted, MAX_ITERATIONS,
-};
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::thread_events::{ActorMode, EventMeta, ThreadEvent};
 use super::super::{InjectedPrompt, InjectedPromptKind};
+use super::{
+    append_injected_prompts_to_messages, emit_iteration_cap_response_generated,
+    emit_user_prompt_injected_event, ensure_terminator_emitted, filter_removed_queued_prompts,
+    MAX_ITERATIONS,
+};
 use crate::llm::{Message, MessageContent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
@@ -77,8 +77,8 @@ async fn iteration_cap_emits_response_generated_terminator() {
     let origin_id = Uuid::new_v4();
     let meta = anchor_request(&bus, thread_id, origin_id, "long task").await;
 
-    let msg = emit_iteration_cap_response_generated(&bus, thread_id, &meta, vec![], None, None)
-        .await;
+    let msg =
+        emit_iteration_cap_response_generated(&bus, thread_id, &meta, vec![], None, None).await;
 
     assert!(
         msg.contains("[ENGINE-LIMIT]"),
@@ -162,13 +162,12 @@ async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
         "UserPromptInjected must get a fresh id, not the optimistic MessageReceived id"
     );
 
-    let request_link: Option<String> = sqlx::query_scalar(
-        "SELECT payload->>'request_event_id' FROM events WHERE id = $1",
-    )
-    .bind(upi_id)
-    .fetch_one(&pool)
-    .await
-    .expect("query");
+    let request_link: Option<String> =
+        sqlx::query_scalar("SELECT payload->>'request_event_id' FROM events WHERE id = $1")
+            .bind(upi_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query");
     assert_eq!(
         request_link.as_deref(),
         Some(client_event_id.to_string().as_str()),
@@ -178,13 +177,12 @@ async fn user_prompt_injected_does_not_collide_with_optimistic_id() {
     // injected_message_id carries the MessageReceived id forward so the
     // renderer can collapse the duplicate "Auto-prompt sent" panel into the
     // existing user message.
-    let injected_link: Option<String> = sqlx::query_scalar(
-        "SELECT payload->>'injected_message_id' FROM events WHERE id = $1",
-    )
-    .bind(upi_id)
-    .fetch_one(&pool)
-    .await
-    .expect("query");
+    let injected_link: Option<String> =
+        sqlx::query_scalar("SELECT payload->>'injected_message_id' FROM events WHERE id = $1")
+            .bind(upi_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query");
     assert_eq!(
         injected_link.as_deref(),
         Some(client_event_id.to_string().as_str()),
@@ -228,7 +226,10 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
     let mut messages = Vec::<Message>::new();
     let appended =
         append_injected_prompts_to_messages(&bus, thread_id, &meta, &mut messages, prompts).await;
-    assert!(appended.appended, "coalescing should append one LLM message");
+    assert!(
+        appended.appended,
+        "coalescing should append one LLM message"
+    );
     assert!(
         appended.image_message_idxs.is_empty(),
         "text-only injections must not be pinned against image trimming"
@@ -250,7 +251,10 @@ async fn append_injected_prompts_coalesces_messages_but_emits_each_audit_row() {
     .expect("UserPromptInjected rows must persist");
     assert_eq!(
         injected_links,
-        vec![first_followup_id.to_string(), second_followup_id.to_string()]
+        vec![
+            first_followup_id.to_string(),
+            second_followup_id.to_string()
+        ]
     );
 
     teardown_test_db(&db_name).await;
@@ -578,7 +582,10 @@ async fn emit_response_canceled_lands_when_no_prior_terminator() {
     .fetch_one(&pool)
     .await
     .expect("query");
-    assert_eq!(canceled_count, 1, "emit must land when no prior terminator exists");
+    assert_eq!(
+        canceled_count, 1,
+        "emit must land when no prior terminator exists"
+    );
 
     teardown_test_db(&db_name).await;
 }

@@ -460,7 +460,8 @@ const TRIGGER_CRON_EXPRESSIONS_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "JSON array of 6-field cron strings in the user's local time, e.g. [\"0 0 8 * * *\"].",
+    description:
+        "JSON array of 6-field cron strings in the user's local time, e.g. [\"0 0 8 * * *\"].",
 };
 const TRIGGER_ON_ARG: Arg = Arg {
     name: "on",
@@ -468,7 +469,8 @@ const TRIGGER_ON_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "JSON array of event subscriptions, e.g. [{\"event_type\":\"X\",\"condition\":{...}}].",
+    description:
+        "JSON array of event subscriptions, e.g. [{\"event_type\":\"X\",\"condition\":{...}}].",
 };
 const TRIGGER_PAUSED_ARG: Arg = Arg {
     name: "paused",
@@ -484,7 +486,8 @@ const TRIGGER_APP_ID_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Owning app directory name (e.g. 'trigger-workflow'); deep-links notifications to that app.",
+    description:
+        "Owning app directory name (e.g. 'trigger-workflow'); deep-links notifications to that app.",
 };
 const TRIGGER_GO_TO_REVIEW_ARG: Arg = Arg {
     name: "go_to_review",
@@ -1067,7 +1070,7 @@ const CHANGES_OPS: &[Operation] = &[
 const CHANGES_DOMAIN: Domain = Domain {
     name: "changes",
     tool_name: "changes",
-    tool_summary: "Inspect and apply *changes* — coding-agent-proposed branches awaiting the Apply \
+    tool_summary: "Inspect and apply *changes*: coding-agent-proposed branches awaiting the Apply \
         button. 'list' returns pending + recently-applied changes (find a change's id here before \
         applying); 'apply' merges one into the workspace's main exactly as the Apply button does \
         (Lucidos-source applies run /harden and may need a restart; app applies ff-merge). Only \
@@ -1218,7 +1221,8 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "disable",
-        summary: "Disable an existing model (hide it from the picker; builtins disable, never delete).",
+        summary:
+            "Disable an existing model (hide it from the picker; builtins disable, never delete).",
         method: Method::Put,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1303,7 +1307,8 @@ const REPO_NAME_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "Repository display name (required for 'add'; used to find the repo for 'remove').",
+    description:
+        "Repository display name (required for 'add'; used to find the repo for 'remove').",
 };
 const REPO_PATH_ARG: Arg = Arg {
     name: "path",
@@ -1969,7 +1974,7 @@ const MCP_OPS: &[Operation] = &[
 const MCP_DOMAIN: Domain = Domain {
     name: "mcp",
     tool_name: "mcp",
-    tool_summary: "Manage MCP (Model Context Protocol) servers — 'setup' (register + connect a new \
+    tool_summary: "Manage MCP (Model Context Protocol) servers: 'setup' (register + connect a new \
         server, spawning the process and discovering its tools), 'list' configured servers with \
         their status, and 'start'/'stop'/'remove' an existing one by id. Use web_search first to \
         find the right package + install command for the server the user wants.",
@@ -2128,9 +2133,9 @@ pub fn domains() -> &'static [Domain] {
 /// Look up a domain by its grouped LLM tool name, including back-compat aliases
 /// (the per-operation `llm_alias` values and any domain-level `llm_aliases`).
 pub fn domain_for_tool(tool_name: &str) -> Option<&'static Domain> {
-    DOMAINS.iter().find(|d| {
-        (d.llm && d.tool_name == tool_name) || d.alias_names().contains(&tool_name)
-    })
+    DOMAINS
+        .iter()
+        .find(|d| (d.llm && d.tool_name == tool_name) || d.alias_names().contains(&tool_name))
 }
 
 // ---------------------------------------------------------------------------
@@ -2141,11 +2146,16 @@ pub fn domain_for_tool(tool_name: &str) -> Option<&'static Domain> {
 /// map. Panics on malformed JSON — it's static manifest data covered by
 /// [`tests::every_llm_domain_builds`].
 fn parse_llm_schema(op: &Operation) -> Map<String, Value> {
-    let raw = op.llm_schema.expect("parse_llm_schema called without llm_schema");
+    let raw = op
+        .llm_schema
+        .expect("parse_llm_schema called without llm_schema");
     match serde_json::from_str::<Value>(raw) {
         Ok(Value::Object(m)) => m,
         Ok(_) => panic!("llm_schema for action '{}' is not a JSON object", op.action),
-        Err(e) => panic!("llm_schema for action '{}' is invalid JSON: {}", op.action, e),
+        Err(e) => panic!(
+            "llm_schema for action '{}' is invalid JSON: {}",
+            op.action, e
+        ),
     }
 }
 
@@ -2272,7 +2282,10 @@ mod tests {
         let d = domain_for_tool("read_notifications").expect("alias resolves");
         assert_eq!(d.name, "notifications");
         // The canonical tool name resolves too.
-        assert_eq!(domain_for_tool("notifications").unwrap().name, "notifications");
+        assert_eq!(
+            domain_for_tool("notifications").unwrap().name,
+            "notifications"
+        );
         // An unknown name does not.
         assert!(domain_for_tool("nope").is_none());
     }
@@ -2303,8 +2316,16 @@ mod tests {
             for op in d.operations {
                 for a in op.args {
                     if let Some((ty, ev)) = seen.get(a.name) {
-                        assert_eq!(*ty, a.ty, "arg '{}' type differs across ops in '{}'", a.name, d.name);
-                        assert_eq!(*ev, a.enum_values, "arg '{}' enum differs across ops in '{}'", a.name, d.name);
+                        assert_eq!(
+                            *ty, a.ty,
+                            "arg '{}' type differs across ops in '{}'",
+                            a.name, d.name
+                        );
+                        assert_eq!(
+                            *ev, a.enum_values,
+                            "arg '{}' enum differs across ops in '{}'",
+                            a.name, d.name
+                        );
                     } else {
                         seen.insert(a.name, (a.ty, a.enum_values));
                     }
@@ -2381,7 +2402,11 @@ mod tests {
                 if let Some(alias) = op.llm_alias {
                     let resolved = domain_for_tool(alias)
                         .unwrap_or_else(|| panic!("alias '{}' resolves to a domain", alias));
-                    assert_eq!(resolved.name, d.name, "alias '{}' resolved to wrong domain", alias);
+                    assert_eq!(
+                        resolved.name, d.name,
+                        "alias '{}' resolved to wrong domain",
+                        alias
+                    );
                     assert_eq!(
                         d.legacy_tool_for_action(op.action),
                         Some(alias),
@@ -2425,10 +2450,17 @@ mod tests {
             vec!["create", "list", "update", "delete", "pause", "resume"]
         );
         // pause/resume are LLM-only (no dedicated HTTP route).
-        let pause = triggers.operations.iter().find(|o| o.action == "pause").unwrap();
+        let pause = triggers
+            .operations
+            .iter()
+            .find(|o| o.action == "pause")
+            .unwrap();
         assert!(pause.on_llm(triggers) && !pause.on_cli(triggers) && !pause.on_sdk(triggers));
 
-        let groups = domains().iter().find(|d| d.name == "trigger_groups").unwrap();
+        let groups = domains()
+            .iter()
+            .find(|d| d.name == "trigger_groups")
+            .unwrap();
         assert_eq!(
             groups.actions(),
             vec!["list", "create", "rename", "reorder", "delete"]
@@ -2442,7 +2474,11 @@ mod tests {
         // list/get are on the SDK; update/delete are CLI-only.
         let get = apps.operations.iter().find(|o| o.action == "get").unwrap();
         assert!(get.on_cli(apps) && get.on_sdk(apps));
-        let delete = apps.operations.iter().find(|o| o.action == "delete").unwrap();
+        let delete = apps
+            .operations
+            .iter()
+            .find(|o| o.action == "delete")
+            .unwrap();
         assert!(delete.on_cli(apps) && !delete.on_sdk(apps));
     }
 
@@ -2450,16 +2486,28 @@ mod tests {
     fn phase5a_domains_declared() {
         // mcp — grouped LLM tool only (in-process management; no CLI/SDK).
         let mcp = domains().iter().find(|d| d.name == "mcp").unwrap();
-        assert_eq!(mcp.actions(), vec!["setup", "list", "start", "stop", "remove"]);
+        assert_eq!(
+            mcp.actions(),
+            vec!["setup", "list", "start", "stop", "remove"]
+        );
         assert!(mcp.llm && !mcp.cli && !mcp.sdk);
         assert_eq!(domain_for_tool("setup_mcp_server").unwrap().name, "mcp");
-        assert_eq!(mcp.legacy_tool_for_action("remove"), Some("remove_mcp_server"));
+        assert_eq!(
+            mcp.legacy_tool_for_action("remove"),
+            Some("remove_mcp_server")
+        );
 
         // plugins — grouped LLM tool only (confirm-panel handshake; no CLI/SDK).
         let plugins = domains().iter().find(|d| d.name == "plugins").unwrap();
         assert_eq!(
             plugins.actions(),
-            vec!["install", "register_marketplace", "check_updates", "update", "uninstall"]
+            vec![
+                "install",
+                "register_marketplace",
+                "check_updates",
+                "update",
+                "uninstall"
+            ]
         );
         assert!(plugins.llm && !plugins.cli && !plugins.sdk);
         assert_eq!(domain_for_tool("install_plugin").unwrap().name, "plugins");
@@ -2499,7 +2547,10 @@ mod tests {
             .map(|o| o.cli_name)
             .collect();
         assert_eq!(cli_ops, vec!["list", "run-now", "drop"]);
-        assert_eq!(domain_for_tool("list_thread_queue").unwrap().name, "thread_queue");
+        assert_eq!(
+            domain_for_tool("list_thread_queue").unwrap().name,
+            "thread_queue"
+        );
         assert_eq!(
             tq.legacy_tool_for_action("update_policy"),
             Some("update_thread_queue_policy")
@@ -2533,7 +2584,10 @@ mod tests {
         assert_eq!(threads.actions(), vec!["list", "count"]);
         assert!(threads.llm && !threads.cli && !threads.sdk);
         assert_eq!(domain_for_tool("list_threads").unwrap().name, "threads");
-        assert_eq!(threads.legacy_tool_for_action("count"), Some("count_threads"));
+        assert_eq!(
+            threads.legacy_tool_for_action("count"),
+            Some("count_threads")
+        );
         // run_thread / run_coding_agent stay standalone — NOT folded here.
         assert!(domain_for_tool("run_thread").is_none());
         assert!(domain_for_tool("run_coding_agent").is_none());
@@ -2592,7 +2646,10 @@ mod tests {
         assert_eq!(tool.name, "manage_models");
         let props = &tool.parameters["properties"];
         for p in ["action", "id", "label", "provider", "sort_order"] {
-            assert!(props.get(p).is_some(), "manage_models missing property `{p}`");
+            assert!(
+                props.get(p).is_some(),
+                "manage_models missing property `{p}`"
+            );
         }
         assert_eq!(
             props["provider"]["enum"],
@@ -2613,6 +2670,9 @@ mod tests {
                 "manage_repositories missing property `{p}`"
             );
         }
-        assert_eq!(domain_for_tool("manage_repositories").unwrap().name, "repositories");
+        assert_eq!(
+            domain_for_tool("manage_repositories").unwrap().name,
+            "repositories"
+        );
     }
 }

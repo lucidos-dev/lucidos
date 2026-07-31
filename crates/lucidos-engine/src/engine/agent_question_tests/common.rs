@@ -171,8 +171,10 @@ pub(crate) async fn emit_user_question(bus: &EventBus, thread_id: Uuid, tool_use
 ///     CC stop endpoint can still cancel-stamp the QuestionCard, which
 ///     otherwise leaves clickable answer buttons dangling on the
 ///     archived thread).
-pub(crate) async fn assert_terminator_orphans_only_active_lookup<F, Fut>(tool_use_id: &str, emit_terminator: F)
-where
+pub(crate) async fn assert_terminator_orphans_only_active_lookup<F, Fut>(
+    tool_use_id: &str,
+    emit_terminator: F,
+) where
     F: FnOnce(EventBus, Uuid) -> Fut,
     Fut: std::future::Future<Output = ()>,
 {
@@ -228,4 +230,3 @@ pub(crate) fn three_questions() -> serde_json::Value {
         },
     ])
 }
-

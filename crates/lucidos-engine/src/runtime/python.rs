@@ -255,16 +255,14 @@ impl PythonRuntime {
             let site_packages = path.join("site-packages");
             if site_packages.is_dir() {
                 let module = site_packages.join("_lucidos_agent_origin.py");
-                fs::write(&module, AGENT_ORIGIN_SHIM_PY).map_err(|e| {
-                    format!("write {}: {}", module.display(), e)
-                })?;
+                fs::write(&module, AGENT_ORIGIN_SHIM_PY)
+                    .map_err(|e| format!("write {}: {}", module.display(), e))?;
                 // `.pth` lines that start with `import` are exec'd by `site`
                 // for every `.pth` in the dir — not subject to the single
                 // `sitecustomize` name shadow.
                 let pth = site_packages.join("_lucidos_agent_origin.pth");
-                fs::write(&pth, "import _lucidos_agent_origin\n").map_err(|e| {
-                    format!("write {}: {}", pth.display(), e)
-                })?;
+                fs::write(&pth, "import _lucidos_agent_origin\n")
+                    .map_err(|e| format!("write {}: {}", pth.display(), e))?;
                 // Remove any stale sitecustomize.py from a pre-.pth install so
                 // we don't leave a shadowed, misleading copy behind.
                 let _ = fs::remove_file(site_packages.join("sitecustomize.py"));
@@ -277,11 +275,29 @@ impl PythonRuntime {
         ))
     }
 
+    /// Fresh per-run directory under `.lucidos/exhaust/` — the audit sink for
+    /// this run's `stdout.txt` / `stderr.txt` (and, for string-code runs, the
+    /// `script.py` copy itself).
+    fn new_run_dir(&self) -> Result<PathBuf, String> {
+        let task_id = uuid::Uuid::new_v4().to_string();
+        let task_dir = self.exhaust_path.join(&task_id);
+        fs::create_dir_all(&task_dir).map_err(|e| e.to_string())?;
+        Ok(task_dir)
+    }
+
     /// Shared execution core: writes preamble + user code to a script, runs it, returns output.
     /// The preamble is empty for `execute_with_env` (no monkey-patching) and the staging-redirect
     /// `builtins.open` shim for `execute_staged`. Scripts run with full host write access — the
     /// previous outside-workspace write-guard was removed for consistency with `run_bash`,
     /// `run_bash_background`, and `run_python_background`, none of which sandbox writes.
+    ///
+    /// This is the *string-code* path (`run_python`, via `execute_staged`),
+    /// where the LLM supplies code that has no home on disk — so the copy under
+    /// `<exhaust>/<uuid>/script.py` IS the script and `__file__` legitimately
+    /// points there. (`run_python_background` doesn't come through here; it
+    /// writes its own copy under the same exhaust layout and hands the
+    /// invocation to `BackgroundBashRegistry::spawn`.) A script that already
+    /// exists on disk must go through `execute_file_with_env` instead.
     async fn run_script(
         &self,
         preamble: &str,
@@ -289,16 +305,55 @@ impl PythonRuntime {
         env_vars: Vec<(String, String)>,
     ) -> Result<String, String> {
         self.ensure_venv().await?;
-        let task_id = uuid::Uuid::new_v4().to_string();
-        let task_dir = self.exhaust_path.join(&task_id);
-        fs::create_dir_all(&task_dir).map_err(|e| e.to_string())?;
+        let run_dir = self.new_run_dir()?;
 
         let full_code = format!("{}\n{}", preamble, code);
-        let script_path = task_dir.join("script.py");
+        let script_path = run_dir.join("script.py");
         fs::write(&script_path, &full_code).map_err(|e| e.to_string())?;
 
+        self.spawn_python(&script_path, &run_dir, env_vars).await
+    }
+
+    /// Execute an EXISTING Python file **in place**, from its real on-disk path.
+    ///
+    /// This is the path for a *script* — code that already lives on disk beside
+    /// its consumer, invoked by a script trigger's
+    /// `run = { type = "script", path = "triggers/<slug>/scripts/run.py" }`.
+    /// The difference from `run_script` is the whole point: the interpreter
+    /// reads the code from where the human wrote it, so `__file__` resolves to
+    /// the real file and a script can reach its siblings the ordinary way
+    /// (`os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "state")`).
+    /// Running a copy out of the exhaust dir silently redirects every such path
+    /// into a phantom `.lucidos/exhaust/...` directory — reads return defaults,
+    /// writes land where nobody looks, and nothing errors. That is exactly how
+    /// the 2026-07-29 `notary-verdict-watch` trigger missed the user's DMG
+    /// approval while the approval sat in the real `state/` dir.
+    ///
+    /// Identical to `run_script` in every other respect (venv, cwd, kill_on_drop,
+    /// env, output sanitizing, exhaust audit logs, error shaping).
+    pub async fn execute_file_with_env(
+        &self,
+        script_path: &std::path::Path,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<String, String> {
+        self.ensure_venv().await?;
+        let run_dir = self.new_run_dir()?;
+        self.spawn_python(script_path, &run_dir, env_vars).await
+    }
+
+    /// Spawn `python <script_path>` in the workspace, capture output, drop the
+    /// audit logs in `run_dir`, and shape a non-zero exit into an `Err`.
+    /// `script_path` is either the exhaust copy written by `run_script` or an
+    /// on-disk script run in place (`execute_file_with_env`) — the spawn is the
+    /// same either way, only the provenance of the file differs.
+    async fn spawn_python(
+        &self,
+        script_path: &std::path::Path,
+        run_dir: &std::path::Path,
+        env_vars: Vec<(String, String)>,
+    ) -> Result<String, String> {
         let mut cmd = tokio::process::Command::new(&self.python_bin);
-        cmd.arg(&script_path)
+        cmd.arg(script_path)
             .current_dir(&self.workspace_path)
             .stdin(std::process::Stdio::null())
             // Without kill_on_drop, dropping this command future on cancel
@@ -319,10 +374,10 @@ impl PythonRuntime {
         let stdout = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stdout));
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stderr));
 
-        if let Err(e) = fs::write(task_dir.join("stdout.txt"), &stdout) {
+        if let Err(e) = fs::write(run_dir.join("stdout.txt"), &stdout) {
             log!("[Python] Failed to write stdout debug log: {}", e);
         }
-        if let Err(e) = fs::write(task_dir.join("stderr.txt"), &stderr) {
+        if let Err(e) = fs::write(run_dir.join("stderr.txt"), &stderr) {
             log!("[Python] Failed to write stderr debug log: {}", e);
         }
 

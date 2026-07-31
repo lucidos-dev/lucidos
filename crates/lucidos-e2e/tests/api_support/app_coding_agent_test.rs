@@ -138,7 +138,10 @@ fn create_app_worktree(app_id: &str, branch: &str) -> PathBuf {
         "main",
     ]);
     git_in(&wt, &["sparse-checkout", "init", "--cone"]);
-    git_in(&wt, &["sparse-checkout", "set", &format!("data/apps/{}", app_id)]);
+    git_in(
+        &wt,
+        &["sparse-checkout", "set", &format!("data/apps/{}", app_id)],
+    );
     git_in(&wt, &["checkout", branch]);
     wt
 }
@@ -170,7 +173,9 @@ async fn await_sse_line(
         .await
         .expect("SSE connect");
     tokio::spawn(async move {
-        let byte_stream = resp.bytes_stream().map(|r| r.map_err(std::io::Error::other));
+        let byte_stream = resp
+            .bytes_stream()
+            .map(|r| r.map_err(std::io::Error::other));
         let mut lines = BufReader::new(StreamReader::new(byte_stream)).lines();
         let deadline = tokio::time::sleep(max);
         tokio::pin!(deadline);
@@ -250,7 +255,12 @@ async fn app_coding_agent_lifecycle() {
 
     let thread_id = Uuid::new_v4();
     let change_id = Uuid::new_v4();
-    let branch = format!("claude-code/app/{}/{}-{}", app_id, suffix, change_id.as_simple());
+    let branch = format!(
+        "claude-code/app/{}/{}-{}",
+        app_id,
+        suffix,
+        change_id.as_simple()
+    );
 
     seed_app_cc_thread_summary(&pool, thread_id, &app_id, "idle").await;
 
@@ -260,8 +270,11 @@ async fn app_coding_agent_lifecycle() {
     // + manifest under the app folder).
     let edited_rel = format!("data/apps/{}/index.html", app_id);
     let edited_abs = wt.join(&edited_rel);
-    std::fs::write(&edited_abs, format!("<!doctype html><title>edited {}</title>", suffix))
-        .expect("write edited file");
+    std::fs::write(
+        &edited_abs,
+        format!("<!doctype html><title>edited {}</title>", suffix),
+    )
+    .expect("write edited file");
     git_in(&wt, &["add", &edited_rel]);
     git_in(&wt, &["commit", "-m", "e2e app coding-agent edit"]);
 
@@ -283,7 +296,15 @@ async fn app_coding_agent_lifecycle() {
     // response headers have arrived, and the engine subscribes to the event
     // broadcast before sending them — so the subscription is already live.
 
-    seed_change(&client, change_id, thread_id, &branch, &repo_root, &[&edited_rel]).await;
+    seed_change(
+        &client,
+        change_id,
+        thread_id,
+        &branch,
+        &repo_root,
+        &[&edited_rel],
+    )
+    .await;
 
     let apply_url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
     let resp = client.post(&apply_url).send().await.expect("apply");
@@ -416,7 +437,11 @@ async fn app_coding_agent_concurrent_apply() {
             .current_dir(&ws)
             .status()
             .expect("git cat-file");
-        assert!(out.success(), "{} should exist on main after both applies", f);
+        assert!(
+            out.success(),
+            "{} should exist on main after both applies",
+            f
+        );
     }
 
     cleanup(

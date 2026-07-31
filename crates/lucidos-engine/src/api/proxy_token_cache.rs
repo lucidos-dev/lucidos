@@ -204,9 +204,7 @@ impl ProxyTokenCache {
     fn finish(&self, name: &str, slot: &Arc<InflightSlot>, succeeded: bool) {
         {
             let mut inflight = self.inflight.lock().expect("inflight mutex poisoned");
-            let still_ours = inflight
-                .get(name)
-                .is_some_and(|cur| Arc::ptr_eq(cur, slot));
+            let still_ours = inflight.get(name).is_some_and(|cur| Arc::ptr_eq(cur, slot));
             if still_ours {
                 if succeeded {
                     inflight.remove(name);
@@ -372,9 +370,7 @@ mod tests {
     #[tokio::test]
     async fn get_or_refresh_propagates_error_to_caller() {
         let c = ProxyTokenCache::new();
-        let result: Result<_, &'static str> = c
-            .get_or_refresh("x", || async { Err("boom") })
-            .await;
+        let result: Result<_, &'static str> = c.get_or_refresh("x", || async { Err("boom") }).await;
         assert_eq!(result.unwrap_err(), "boom");
     }
 
@@ -451,7 +447,10 @@ mod tests {
         );
         let oks = results.iter().filter(|r| r.is_ok()).count();
         let errs = results.iter().filter(|r| r.is_err()).count();
-        assert_eq!(errs, k, "expected K={k} Errs (one per failed round), got {errs}");
+        assert_eq!(
+            errs, k,
+            "expected K={k} Errs (one per failed round), got {errs}"
+        );
         assert_eq!(oks, n - k);
     }
 
@@ -545,7 +544,10 @@ mod tests {
             "cancelled leader leaked its inflight slot — follower hung forever"
         );
         let (token, was_hit) = result.unwrap().expect("recovery refresh should succeed");
-        assert!(!was_hit, "recovery refresh must mint a new token, not report a hit");
+        assert!(
+            !was_hit,
+            "recovery refresh must mint a new token, not report a hit"
+        );
         assert_eq!(token.headers[0].1, "Bearer ok");
     }
 

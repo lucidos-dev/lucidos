@@ -120,7 +120,10 @@ mod tests {
     async fn empty_slot_errors_descriptively() {
         let slot = EmbedderSlot::empty();
         assert!(!slot.is_ready());
-        let err = slot.embed("hello").await.expect_err("empty slot must error");
+        let err = slot
+            .embed("hello")
+            .await
+            .expect_err("empty slot must error");
         assert!(
             err.to_string().contains("embedding model is not available"),
             "error must explain the degraded state: {err}"
@@ -129,7 +132,10 @@ mod tests {
             .embed_batch(&["a", "b"])
             .await
             .expect_err("empty slot must error");
-        assert!(err.to_string().contains("retrying in the background"), "{err}");
+        assert!(
+            err.to_string().contains("retrying in the background"),
+            "{err}"
+        );
         // model_id stays the configured id so memory rows written later (after
         // install) match what reembed/stale checks expect.
         assert!(!slot.model_id().is_empty());

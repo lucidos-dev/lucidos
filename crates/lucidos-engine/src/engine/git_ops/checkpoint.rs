@@ -252,9 +252,7 @@ mod tests {
         assert!(root.join("data/artifacts/new.txt").exists());
 
         // The snapshot left the repo's real HEAD untouched (commit still "init").
-        let head_subject = git_cmd(&["log", "-1", "--format=%s"], root)
-            .await
-            .unwrap();
+        let head_subject = git_cmd(&["log", "-1", "--format=%s"], root).await.unwrap();
         assert_eq!(
             String::from_utf8_lossy(&head_subject.stdout).trim(),
             "init",

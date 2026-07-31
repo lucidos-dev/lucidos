@@ -733,9 +733,7 @@ fn tier2_merge_session_is_detached_from_the_caller_future() {
     // the caller a Conflict result rather than waiting for the merge. The
     // outcome reaches the user through ChangeApplied / ChangeApplyFailed.
     let tail = &source[call..];
-    let window_end = tail
-        .find("// Tier 3: No worktree")
-        .unwrap_or(tail.len());
+    let window_end = tail.find("// Tier 3: No worktree").unwrap_or(tail.len());
     let after_spawn = &tail[..window_end];
     assert!(
         after_spawn.contains("ApplyResult::conflict("),

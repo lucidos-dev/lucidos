@@ -104,6 +104,7 @@ pub use engine::LucidosEngine;
 /// of a `pub(crate)` module is rejected (E0365).
 #[doc(hidden)]
 pub mod __wasm_test_internals {
+    pub use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, BodyView, LayerInput};
     pub use crate::api::proxy_pipeline_builder::{build_pipeline, PipelineBuildContext};
     pub use crate::api::proxy_pipeline_config::{
         CredentialHandleConfig, LayerConfig, PipelineConfig, StaticKind,
@@ -115,7 +116,6 @@ pub mod __wasm_test_internals {
         SecretResolver, SignInput, SignInputBody, SignOutput, WasmManifest, WasmSignerLayer,
         CAP_REPLACE_BODY,
     };
-    pub use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, BodyView, LayerInput};
     pub use wasmtime::Engine;
 
     use std::collections::HashMap;

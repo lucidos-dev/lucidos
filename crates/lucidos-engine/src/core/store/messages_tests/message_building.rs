@@ -1,5 +1,5 @@
-use super::*;
 use super::msg_helpers::*;
+use super::*;
 
 // === Thread-aware tests ===
 
@@ -381,8 +381,9 @@ fn orchestrator_resume_history_preserves_tool_calls() {
 
     // The fix: format_history_steps must surface a non-empty summary for an
     // assistant turn whose entire output was tool calls.
-    let summary = crate::engine::format_history_steps(&assistant.steps, &std::collections::HashSet::new())
-        .expect("orchestrator turn with tool calls must produce a history summary");
+    let summary =
+        crate::engine::format_history_steps(&assistant.steps, &std::collections::HashSet::new())
+            .expect("orchestrator turn with tool calls must produce a history summary");
     assert!(
         summary.contains("load_knowhow") || summary.contains("know-how"),
         "summary should mention load_knowhow, got: {}",
@@ -416,7 +417,10 @@ fn build_session_messages_marks_tool_step_success_from_payload() {
         make_event("ResponseGenerated", json!({"text": "ok"}), 2),
     ];
     let msgs = build_session_messages(&events);
-    let assistant = msgs.iter().find(|m| m.role == "assistant").expect("assistant");
+    let assistant = msgs
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("assistant");
     assert_eq!(assistant.steps.len(), 1);
     assert!(assistant.steps[0].success, "step.success should be true");
 }
@@ -436,6 +440,12 @@ fn build_session_messages_legacy_tool_result_without_success_defaults_to_true() 
         make_event("ResponseGenerated", json!({"text": "ok"}), 2),
     ];
     let msgs = build_session_messages(&events);
-    let assistant = msgs.iter().find(|m| m.role == "assistant").expect("assistant");
-    assert!(assistant.steps[0].success, "missing success defaults to true");
+    let assistant = msgs
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("assistant");
+    assert!(
+        assistant.steps[0].success,
+        "missing success defaults to true"
+    );
 }

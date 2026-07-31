@@ -294,7 +294,11 @@ impl LucidosEngine {
         if disk == crate::ENGINE_BUILD_ID {
             return false; // identical build — no update, no git needed
         }
-        disk_upgrade_verdict(Some(disk), crate::ENGINE_BUILD_ID, self.disk_is_older(disk).await)
+        disk_upgrade_verdict(
+            Some(disk),
+            crate::ENGINE_BUILD_ID,
+            self.disk_is_older(disk).await,
+        )
     }
 
     /// Cached `git merge-base --is-ancestor <disk-commit> <running-commit>`:
@@ -309,7 +313,10 @@ impl LucidosEngine {
                 return cache.is_strict_ancestor;
             }
         }
-        let verdict = match (build_id_commit(disk_id), build_id_commit(crate::ENGINE_BUILD_ID)) {
+        let verdict = match (
+            build_id_commit(disk_id),
+            build_id_commit(crate::ENGINE_BUILD_ID),
+        ) {
             (Some(disk_commit), Some(running_commit)) if disk_commit != running_commit => {
                 match crate::paths::repo_root() {
                     Ok(root) => commit_is_strict_ancestor(&root, disk_commit, running_commit).await,
@@ -357,15 +364,18 @@ impl LucidosEngine {
         }
         {
             let cache = self.source_behind_cache.lock().unwrap();
-            if cache.checked_at.is_some_and(|at| at.elapsed() < SOURCE_BEHIND_TTL) {
+            if cache
+                .checked_at
+                .is_some_and(|at| at.elapsed() < SOURCE_BEHIND_TTL)
+            {
                 return cache.behind;
             }
         }
         // `Some(false)` = a restart-requiring change is pending between the running
         // engine's commit and HEAD (a new engine version). `Some(true)`/`None`
         // (frontend-only / git unavailable) → not behind.
-        let behind =
-            self.engine_source_matches_head().await == Some(false) && !self.running_is_ahead_of_head().await;
+        let behind = self.engine_source_matches_head().await == Some(false)
+            && !self.running_is_ahead_of_head().await;
         let mut cache = self.source_behind_cache.lock().unwrap();
         cache.checked_at = Some(Instant::now());
         cache.behind = behind;
@@ -909,8 +919,7 @@ mod tests {
     /// mirrors the cross-engine (cross-process) case that serializes rebuilds.
     #[test]
     fn build_lock_admits_a_single_holder_and_releases_on_drop() {
-        let dir =
-            std::env::temp_dir().join(format!("lucidos-buildlock-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lucidos-buildlock-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".lucidos-engine-build.lock");
 
@@ -946,8 +955,7 @@ mod tests {
     /// "Rebuild" escape hatch behind a phantom spinner.
     #[test]
     fn lock_held_at_reports_held_only_while_genuinely_locked() {
-        let dir =
-            std::env::temp_dir().join(format!("lucidos-heldprobe-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("lucidos-heldprobe-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join(".lucidos-engine-build.lock");
 
@@ -978,7 +986,10 @@ mod tests {
     fn build_id_commit_takes_the_sha_and_rejects_the_no_git_forms() {
         assert_eq!(build_id_commit("aa7075ee2"), Some("aa7075ee2"));
         // Dirty tree: `<sha>-<diffhash>` — only the sha is comparable.
-        assert_eq!(build_id_commit("aa7075ee2-0badc0ffee123456"), Some("aa7075ee2"));
+        assert_eq!(
+            build_id_commit("aa7075ee2-0badc0ffee123456"),
+            Some("aa7075ee2")
+        );
         // No git (shipped build) / unstamped → nothing to compare.
         assert_eq!(build_id_commit("src-0123456789abcdef"), None);
         assert_eq!(build_id_commit(""), None);
@@ -996,9 +1007,17 @@ mod tests {
             "an older on-disk binary is a DOWNGRADE and must not be offered"
         );
         // The normal case: a newer binary was built (not an ancestor).
-        assert!(disk_upgrade_verdict(Some("bb1122334"), "aa7075ee2", Some(false)));
+        assert!(disk_upgrade_verdict(
+            Some("bb1122334"),
+            "aa7075ee2",
+            Some(false)
+        ));
         // Same id → nothing to switch onto, whatever git says.
-        assert!(!disk_upgrade_verdict(Some("aa7075ee2"), "aa7075ee2", Some(false)));
+        assert!(!disk_upgrade_verdict(
+            Some("aa7075ee2"),
+            "aa7075ee2",
+            Some(false)
+        ));
         // Unreadable disk id (packaged / mid-rewrite) → no update.
         assert!(!disk_upgrade_verdict(None, "aa7075ee2", None));
         // Indeterminate ancestry (unrelated commits, no repo, unknown object) →
@@ -1030,7 +1049,10 @@ mod tests {
         // predicate stays hot on every later tick. That is WHY the caller checks
         // the spent budget FIRST — otherwise the give-up line would re-log every
         // 10s instead of once. Reordering those two checks reintroduces a log storm.
-        assert!(self_heal_is_wedged(super::SELF_HEAL_MAX_ATTEMPTS_PER_HEAD, &BuildState::Ready));
+        assert!(self_heal_is_wedged(
+            super::SELF_HEAL_MAX_ATTEMPTS_PER_HEAD,
+            &BuildState::Ready
+        ));
     }
 
     /// The real git probe behind the direction check, against a throwaway repo:

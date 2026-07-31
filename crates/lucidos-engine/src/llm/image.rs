@@ -379,7 +379,11 @@ pub async fn build_image_provider(
         match OpenAiImageProvider::new(key.to_string(), model.to_string()) {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
-                crate::log!("[Image] Failed to build OpenAI {} HTTP client: {}", model, e);
+                crate::log!(
+                    "[Image] Failed to build OpenAI {} HTTP client: {}",
+                    model,
+                    e
+                );
                 None
             }
         }
@@ -508,8 +512,7 @@ mod tests {
         PreferenceStore::set(&pool, crate::core::PREF_IMAGE_MODEL, "imagen-4")
             .await
             .unwrap();
-        let p1 =
-            build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;
+        let p1 = build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;
         assert_eq!(
             p1.expect("provider should be built").name(),
             "Vertex AI Imagen 4"
@@ -518,8 +521,7 @@ mod tests {
         PreferenceStore::set(&pool, crate::core::PREF_IMAGE_MODEL, "gpt-image-2")
             .await
             .unwrap();
-        let p2 =
-            build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;
+        let p2 = build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;
         assert_eq!(
             p2.expect("provider should be built").name(),
             "OpenAI gpt-image-2"
@@ -536,17 +538,21 @@ mod tests {
         let token_cache: Option<TokenCache> = Some(Arc::new(std::sync::Mutex::new(None)));
 
         // No preference set → auto. Vertex configured → Imagen.
-        let p1 =
-            build_image_provider(&pool, Some("sk-test"), "test-project", &location, &token_cache)
-                .await;
+        let p1 = build_image_provider(
+            &pool,
+            Some("sk-test"),
+            "test-project",
+            &location,
+            &token_cache,
+        )
+        .await;
         assert_eq!(
             p1.expect("provider should be built").name(),
             "Vertex AI Imagen 4"
         );
 
         // Auto with no Vertex → falls back to OpenAI gpt-image-1.
-        let p2 =
-            build_image_provider(&pool, Some("sk-test"), "", &location, &token_cache).await;
+        let p2 = build_image_provider(&pool, Some("sk-test"), "", &location, &token_cache).await;
         assert_eq!(
             p2.expect("provider should be built").name(),
             "OpenAI gpt-image-1"

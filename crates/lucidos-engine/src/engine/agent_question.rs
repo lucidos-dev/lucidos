@@ -231,11 +231,12 @@ impl LucidosEngine {
         channel: crate::engine::thread_events::EventChannel,
     ) -> Result<QuestionWalkOutcome, QuestionWalkError> {
         let parser_input = serde_json::json!({ "questions": questions });
-        let parsed =
-            crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+        let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
         let total = parsed.len();
         if total == 0 {
-            return Ok(QuestionWalkOutcome { answer_kinds: vec![] });
+            return Ok(QuestionWalkOutcome {
+                answer_kinds: vec![],
+            });
         }
 
         // Strict enforcement: every question MUST carry a non-empty
@@ -287,15 +288,16 @@ impl LucidosEngine {
                 }
             }
 
-            let already_asked =
-                match user_question_already_asked(self.pool(), thread_id, &sub_id).await {
-                    Ok(b) => b,
-                    Err(e) => {
-                        self.question_wait_registry.forget(&sub_id).await;
-                        log!("[QuestionWalk] already-asked lookup failed {thread_id}/{sub_id}: {e}");
-                        return Err(format!("DB lookup for question state failed: {e}").into());
-                    }
-                };
+            let already_asked = match user_question_already_asked(self.pool(), thread_id, &sub_id)
+                .await
+            {
+                Ok(b) => b,
+                Err(e) => {
+                    self.question_wait_registry.forget(&sub_id).await;
+                    log!("[QuestionWalk] already-asked lookup failed {thread_id}/{sub_id}: {e}");
+                    return Err(format!("DB lookup for question state failed: {e}").into());
+                }
+            };
             if !already_asked {
                 if let Err(e) = self
                     .event_bus
@@ -633,8 +635,7 @@ pub(crate) fn validate_answer(
     if !multi_select {
         return Err("MultiSelected answer for single-select question".into());
     }
-    let known: std::collections::HashSet<&str> =
-        options.iter().map(|o| o.id.as_str()).collect();
+    let known: std::collections::HashSet<&str> = options.iter().map(|o| o.id.as_str()).collect();
     for id in option_ids {
         if !known.contains(id.as_str()) {
             return Err(format!("MultiSelected contains unknown option_id: {id}"));
@@ -664,8 +665,7 @@ async fn lookup_question_options(
     .fetch_optional(pool)
     .await?;
     Ok(row.map(|(opts_json, multi)| {
-        let options: Vec<QuestionOption> =
-            serde_json::from_value(opts_json).unwrap_or_default();
+        let options: Vec<QuestionOption> = serde_json::from_value(opts_json).unwrap_or_default();
         (options, multi.unwrap_or(false))
     }))
 }
@@ -743,20 +743,19 @@ pub async fn answer_pending_question(
     // whether to fire the CC-specific resume side-effects below. Legacy
     // rows without a channel field default to today's CC behaviour, both
     // here and in `should_emit_cc_resume_side_effects`.
-    let original_channel = match lookup_question_channel(engine.pool(), thread_id, &tool_use_id)
-        .await
-    {
-        Ok(ch) => ch,
-        Err(e) => {
-            log!(
-                "[CCQuestion] DB lookup for question channel failed {}/{}: {}",
-                thread_id,
-                tool_use_id,
-                e
-            );
-            return AnswerResult::Conflict("Database lookup failed".into());
-        }
-    };
+    let original_channel =
+        match lookup_question_channel(engine.pool(), thread_id, &tool_use_id).await {
+            Ok(ch) => ch,
+            Err(e) => {
+                log!(
+                    "[CCQuestion] DB lookup for question channel failed {}/{}: {}",
+                    thread_id,
+                    tool_use_id,
+                    e
+                );
+                return AnswerResult::Conflict("Database lookup failed".into());
+            }
+        };
     let answer_channel = original_channel.unwrap_or(EventChannel::ClaudeCode);
 
     if let Err(e) = engine
@@ -813,15 +812,27 @@ pub async fn answer_pending_question(
             // be misclassified as chat. `answer_channel` is the persisted
             // question's channel (Chat or Trigger here; the CC/None case took
             // the branch below).
-            resume_chat_after_answer(engine, thread_id, &tool_use_id, answer_channel, actor.clone())
-                .await;
+            resume_chat_after_answer(
+                engine,
+                thread_id,
+                &tool_use_id,
+                answer_channel,
+                actor.clone(),
+            )
+            .await;
         }
         return AnswerResult::Resumed;
     }
 
     let coding_agent = engine.thread_coding_agent(thread_id).await;
-    emit_resume_marker_for_cc_answer(&engine.event_bus, thread_id, &answer, actor.clone(), coding_agent)
-        .await;
+    emit_resume_marker_for_cc_answer(
+        &engine.event_bus,
+        thread_id,
+        &answer,
+        actor.clone(),
+        coding_agent,
+    )
+    .await;
 
     // Arm the run-loop resume signal on a live subprocess BEFORE waking its hook.
     // The answer reaches CC through the PreToolUse hook (notify below), not via

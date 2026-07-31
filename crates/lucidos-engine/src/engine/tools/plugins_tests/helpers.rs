@@ -2,7 +2,6 @@
 //! monolithic `plugins_tests.rs`; the concern modules pull these in via
 //! `use super::helpers::*`.
 
-
 use super::*;
 use std::io::Write;
 
@@ -97,7 +96,11 @@ pub(super) fn fresh_workspace() -> std::path::PathBuf {
 
 /// Fetch the persisted payload(s) for an aggregate id, oldest first, so
 /// tests can index by emit order.
-pub(super) async fn read_events(pool: &sqlx::PgPool, event_type: &str, id: &str) -> Vec<serde_json::Value> {
+pub(super) async fn read_events(
+    pool: &sqlx::PgPool,
+    event_type: &str,
+    id: &str,
+) -> Vec<serde_json::Value> {
     let rows: Vec<(serde_json::Value,)> = sqlx::query_as(
         r#"SELECT payload FROM events
            WHERE event_type = $1 AND aggregate_id = $2

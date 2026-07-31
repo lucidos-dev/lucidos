@@ -294,10 +294,12 @@ impl SpawnDispatcher {
                     text: text.clone(),
                 })
             }
-            ThreadEvent::ContinuationRequested { .. } => Some(SpawnTrigger::ContinuationRequested {
-                thread_id: *thread_id,
-                event_id,
-            }),
+            ThreadEvent::ContinuationRequested { .. } => {
+                Some(SpawnTrigger::ContinuationRequested {
+                    thread_id: *thread_id,
+                    event_id,
+                })
+            }
             // PermissionAnswer is blocked by Phase 3 (see module docs).
             _ => None,
         }
@@ -566,10 +568,7 @@ pub(crate) async fn thread_has_unactuated_continuation(pool: &PgPool, thread_id:
 /// sequence is greater than the trigger event's sequence (same thread).
 /// Implies the trigger has already been picked up by an earlier dispatcher
 /// or the legacy direct-call path.
-async fn has_cc_event_after(
-    pool: &PgPool,
-    trigger_event_id: Uuid,
-) -> Result<bool, sqlx::Error> {
+async fn has_cc_event_after(pool: &PgPool, trigger_event_id: Uuid) -> Result<bool, sqlx::Error> {
     let row: Option<(bool,)> = sqlx::query_as(&format!(
         "SELECT EXISTS ( \
              SELECT 1 FROM events e2 \

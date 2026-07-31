@@ -10,7 +10,9 @@ use std::time::Duration;
 use tokio::sync::Mutex as TokioMutex;
 use uuid::Uuid;
 
-use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent, TriggerInvocation};
+use crate::engine::thread_events::{
+    EventChannel, EventMeta, MessageOrigin, ThreadEvent, TriggerInvocation,
+};
 use crate::engine::types::AgentSession;
 use crate::engine::ThreadHandle;
 
@@ -170,7 +172,10 @@ where
             c
         }
         Ok(Err(e)) => {
-            log!("[Chat] Query classification failed (defaulting to all): {}", e);
+            log!(
+                "[Chat] Query classification failed (defaulting to all): {}",
+                e
+            );
             crate::memory::QueryClassification::default()
         }
         Err(_) => {
@@ -191,10 +196,7 @@ where
 /// IDs use the global `triggers/<slug>/<file>` namespace so the listed
 /// `load_knowhow` calls resolve via the same fallback resolution
 /// (`load_with_fallback`) regular ids do.
-pub(super) fn build_trigger_knowhow_section(
-    triggers_dir: &std::path::Path,
-    slug: &str,
-) -> String {
+pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug: &str) -> String {
     let summaries = crate::core::KnowhowStore::load_trigger_summaries(triggers_dir, slug);
     if summaries.is_empty() {
         return String::new();

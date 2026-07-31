@@ -154,6 +154,16 @@ Bad candidates for `script` (keep these as `intent`):
 - Anything where the message wording should adapt to context (the LLM's judgement is the feature).
 - Multi-step workflows whose branches depend on prior results — the LLM-as-coordinator is what makes them work.
 
+### Scripts run in place — `__file__` is the real path
+
+The engine executes a registered script **from its real location on disk**, with the workspace root as the working directory. So `__file__` is `<workspace>/data/triggers/<slug>/scripts/run.py`, and the ordinary way of reaching a sibling directory works:
+
+```python
+_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "state")
+```
+
+That resolves to the real `data/triggers/<slug>/state/` — the natural home for a script trigger's own state (a last-seen id, a per-version marker, a cursor). Prefer `__file__`-relative paths over paths relative to the working directory: they keep the script correct no matter who invokes it, and they keep its state beside the script that owns it, per the ownership rule in `docs/taxonomy.md`.
+
 ### Script trigger env vars
 
 When the engine fires a script trigger that subscribes to a domain event, it sets the following env vars before exec'ing the script. Schedule fires emit none of them — the script has no source event to point at.

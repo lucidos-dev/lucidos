@@ -521,8 +521,13 @@ async fn ensure_embedded_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<
         );
         stop_cluster_robustly(bin, lib, data);
         match move_data_dir_aside(data, data_major) {
-            Ok(moved) => crate::log!("[Gateway] moved foreign-version data dir to {}", moved.display()),
-            Err(e) => return Err(format!("could not move foreign-version data dir aside: {e}").into()),
+            Ok(moved) => crate::log!(
+                "[Gateway] moved foreign-version data dir to {}",
+                moved.display()
+            ),
+            Err(e) => {
+                return Err(format!("could not move foreign-version data dir aside: {e}").into())
+            }
         }
     }
 
@@ -597,8 +602,13 @@ fn bundled_major(bin: &Path, lib: &Path) -> Result<u16, BoxError> {
         .into());
     }
     let text = String::from_utf8_lossy(&out.stdout);
-    parse_pg_major(&text)
-        .ok_or_else(|| format!("could not parse bundled Postgres version from '{}'", text.trim()).into())
+    parse_pg_major(&text).ok_or_else(|| {
+        format!(
+            "could not parse bundled Postgres version from '{}'",
+            text.trim()
+        )
+        .into()
+    })
 }
 
 /// Major version recorded in the data dir's `PG_VERSION` file (the authoritative
@@ -1285,7 +1295,9 @@ mod tests {
     #[tokio::test]
     async fn gated_stale_lock_recovers_and_preserves_data() {
         let Some((bin, lib)) = gated_pg_dirs() else {
-            eprintln!("SKIP gated_stale_lock_recovers_and_preserves_data: no LUCIDOS_PG_BIN_DIR/LIB");
+            eprintln!(
+                "SKIP gated_stale_lock_recovers_and_preserves_data: no LUCIDOS_PG_BIN_DIR/LIB"
+            );
             return;
         };
         let (parent, data) = gated_temp("lucidos-pg-stale");
@@ -1314,7 +1326,8 @@ mod tests {
 
         // Recover: restart the SAME data dir (crash recovery), row survives.
         let port2 = ensure_embedded_cluster(&bin, &lib, &data).await.unwrap();
-        let got = psql_query_embedded(&bin, &lib, port2, "lucidos_gated", "SELECT x FROM t").unwrap();
+        let got =
+            psql_query_embedded(&bin, &lib, port2, "lucidos_gated", "SELECT x FROM t").unwrap();
         assert_eq!(got.trim(), "7", "data must survive a stale-lock recovery");
         // The data dir was NOT moved aside.
         assert!(

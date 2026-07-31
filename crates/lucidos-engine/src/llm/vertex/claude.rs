@@ -63,7 +63,9 @@ impl VertexProvider {
                 let error_body = resp.text().await.unwrap_or_default();
 
                 if status.as_u16() == 401 && !retried_auth {
-                    if let Some(new_token) = self.handle_auth_refresh(model, &mut retried_auth).await {
+                    if let Some(new_token) =
+                        self.handle_auth_refresh(model, &mut retried_auth).await
+                    {
                         access_token = new_token;
                         continue;
                     }
@@ -90,9 +92,16 @@ impl VertexProvider {
                 Err(e) => {
                     let err_str = e.to_string();
 
-                    if crate::llm::is_retryable_error(&err_str) && attempt <= crate::llm::MAX_RETRIES {
+                    if crate::llm::is_retryable_error(&err_str)
+                        && attempt <= crate::llm::MAX_RETRIES
+                    {
                         let delay = crate::llm::retry_delay(attempt, 2); // longer for stream errors
-                        crate::llm::log_retry(model, &format!("Stream error: {}", err_str), attempt, delay);
+                        crate::llm::log_retry(
+                            model,
+                            &format!("Stream error: {}", err_str),
+                            attempt,
+                            delay,
+                        );
                         tokio::time::sleep(delay).await;
                         continue;
                     }

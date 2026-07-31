@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, repoSource, repoSelectedChangeId, selectedLines } from '../store';
+import { panelOverlay, repoSource, repoSelectedChangeId, selectedLines, repoDiff, repoPending } from '../store';
 
 // Spy on nav helpers so we can verify push-vs-replace without touching the
 // real localStorage-backed nav stack.
@@ -24,7 +24,7 @@ vi.mock('../../api/client', async (importOriginal) => {
   };
 });
 
-const { openRepoFilePreview } = await import('./repositories');
+const { openRepoFilePreview, openEncodedRepoFilePreview } = await import('./repositories');
 
 describe('openRepoFilePreview push-vs-replace', () => {
   beforeEach(() => {
@@ -104,5 +104,78 @@ describe('openRepoFilePreview push-vs-replace', () => {
       type: 'file-preview',
       path: 'repo:repo-1:file:src/a.rs',
     });
+  });
+});
+
+// The app-iframe / NavigationRequested entry point: the path arrives ALREADY
+// encoded and the caller has no repo context, so the action binds one.
+describe('openEncodedRepoFilePreview (navigate bridge)', () => {
+  const ENCODED = 'repo:repo-2:file:src/main/resources/transforms/x.jslt';
+
+  beforeEach(() => {
+    pushNavState.mockClear();
+    replaceNavState.mockClear();
+    revealContentPane.mockClear();
+    panelOverlay.value = null;
+    repoSource.value = null;
+    repoSelectedChangeId.value = null;
+    repoDiff.value = { status: 'not-loaded' };
+    repoPending.value = null;
+    selectedLines.value = null;
+    localStorage.clear();
+  });
+
+  it('declines a workspace data path so the caller falls back to the /data preview', () => {
+    expect(openEncodedRepoFilePreview('artifacts/notes.md')).toBe(false);
+    expect(panelOverlay.value).toBeNull();
+    expect(repoSource.value).toBeNull();
+  });
+
+  it('declines a malformed repo: path', () => {
+    expect(openEncodedRepoFilePreview('artifacts/repo:r1:weird:a.md')).toBe(false);
+    expect(panelOverlay.value).toBeNull();
+  });
+
+  it('opens the encoded path and binds the repo from a cold start', () => {
+    expect(openEncodedRepoFilePreview(ENCODED)).toBe(true);
+
+    expect(panelOverlay.value).toEqual({ type: 'file-preview', path: ENCODED });
+    expect(repoSource.value).toBe('repo-2');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+
+  it('rebinds off another repo and drops its diff, so the sidebar cannot mix repos', () => {
+    repoSource.value = 'repo-1';
+    repoSelectedChangeId.value = 'change-7';
+    repoDiff.value = { status: 'loaded', data: { files: [{ path: 'other.rs', status: 'modified', hunks: [] }] } };
+    repoPending.value = { branch_name: 'b', files: ['other.rs'], description: 'd', thread_id: null };
+
+    openEncodedRepoFilePreview(ENCODED);
+
+    expect(repoSource.value).toBe('repo-2');
+    expect(repoDiff.value.status).toBe('not-loaded');
+    expect(repoPending.value).toBeNull();
+    expect(repoSelectedChangeId.value).toBeNull();
+  });
+
+  it('keeps the change selection when already on that repo', () => {
+    repoSource.value = 'repo-2';
+    repoSelectedChangeId.value = 'change-7';
+
+    openEncodedRepoFilePreview(ENCODED);
+
+    expect(repoSource.value).toBe('repo-2');
+    expect(repoSelectedChangeId.value).toBe('change-7');
+    expect(panelOverlay.value).toEqual({ type: 'file-preview', path: ENCODED });
+  });
+
+  it('clears selectedLines so a prior file\'s highlighted range does not leak', () => {
+    repoSource.value = 'repo-2';
+    selectedLines.value = { start: 5, end: 10 };
+
+    openEncodedRepoFilePreview(ENCODED);
+
+    expect(selectedLines.value).toBeNull();
   });
 });

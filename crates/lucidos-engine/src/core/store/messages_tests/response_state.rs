@@ -1,5 +1,5 @@
-use super::*;
 use super::msg_helpers::*;
+use super::*;
 
 /// Normal flow: user message -> streaming -> ResponseGenerated.
 /// The response should have completed = Some(true), not interrupted.

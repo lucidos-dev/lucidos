@@ -4,7 +4,6 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-
 /// Regression: the spawn consumer's Continue path must hand CC a non-empty
 /// `user_message`. `claude --print --resume` parks indefinitely on stdin
 /// when no input is sent (verified empirically against claude 2.1.123),
@@ -63,7 +62,9 @@ async fn startup_proposes_held_back_change_for_eligible_thread() {
     std::fs::write(wt.join("a.txt"), "held-back content").unwrap();
     use crate::engine::git_ops::git_cmd;
     git_cmd(&["add", "."], &wt).await.unwrap();
-    git_cmd(&["commit", "-m", "held-back commit"], &wt).await.unwrap();
+    git_cmd(&["commit", "-m", "held-back commit"], &wt)
+        .await
+        .unwrap();
 
     let thread_id = Uuid::new_v4();
 
@@ -116,14 +117,8 @@ async fn startup_proposes_held_back_change_for_eligible_thread() {
     // Lucidos-kind thread → lucidos_repo_root is the test repo. workspace_path
     // is irrelevant for this thread (only routed for App-kind); pass the same
     // tempdir to keep the test self-contained.
-    propose_held_back_changes_on_startup_with_roots(
-        &pool,
-        &bus,
-        &repo_root,
-        &repo_root,
-        &selected,
-    )
-    .await;
+    propose_held_back_changes_on_startup_with_roots(&pool, &bus, &repo_root, &repo_root, &selected)
+        .await;
 
     // The contract: coding_agent_proposed is TRUE — the ChangeProposed event
     // landed and its projection arm ran.
@@ -158,7 +153,10 @@ async fn startup_proposes_held_back_change_for_eligible_thread() {
         "exactly one ChangeProposed must be emitted by the recovery helper"
     );
     let payload = &cp_rows[0].0;
-    assert_eq!(payload["branch_name"], serde_json::Value::String(branch.into()));
+    assert_eq!(
+        payload["branch_name"],
+        serde_json::Value::String(branch.into())
+    );
     let files = payload["files"].as_array().expect("files is array");
     assert!(
         files.iter().any(|f| f.as_str() == Some("a.txt")),
@@ -334,7 +332,9 @@ async fn startup_proposes_held_back_change_for_app_kind_thread() {
     std::fs::write(app_wt.join("a.txt"), "app held-back content").unwrap();
     use crate::engine::git_ops::git_cmd;
     git_cmd(&["add", "."], &app_wt).await.unwrap();
-    git_cmd(&["commit", "-m", "app commit"], &app_wt).await.unwrap();
+    git_cmd(&["commit", "-m", "app commit"], &app_wt)
+        .await
+        .unwrap();
 
     // Separate Lucidos main repo. The App branch is intentionally absent
     // here — if the helper mis-routes to lucidos_repo_root, the branch
@@ -381,7 +381,11 @@ async fn startup_proposes_held_back_change_for_app_kind_thread() {
     .expect("stamp App-kind stuck shape");
 
     let selected = select_unproposed_idle_cc_threads(&pool).await;
-    assert_eq!(selected, vec![thread_id], "selection must include App-kind too");
+    assert_eq!(
+        selected,
+        vec![thread_id],
+        "selection must include App-kind too"
+    );
 
     propose_held_back_changes_on_startup_with_roots(
         &pool,
@@ -416,9 +420,16 @@ async fn startup_proposes_held_back_change_for_app_kind_thread() {
     .fetch_all(&pool)
     .await
     .unwrap();
-    assert_eq!(cp_rows.len(), 1, "exactly one ChangeProposed for the App thread");
+    assert_eq!(
+        cp_rows.len(),
+        1,
+        "exactly one ChangeProposed for the App thread"
+    );
     let payload = &cp_rows[0].0;
-    assert_eq!(payload["branch_name"], serde_json::Value::String(branch.into()));
+    assert_eq!(
+        payload["branch_name"],
+        serde_json::Value::String(branch.into())
+    );
     assert_eq!(
         payload["repo_root"],
         serde_json::Value::String(workspace_path.to_string_lossy().to_string()),

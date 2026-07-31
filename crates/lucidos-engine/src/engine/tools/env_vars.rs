@@ -21,7 +21,11 @@ use crate::llm::tool_names as tn;
 impl LucidosEngine {
     /// Grouped `env_vars` tool dispatcher. `name` is the tool name as called so
     /// the retired `set_environment_variable` alias can default its action.
-    pub(crate) async fn execute_env_vars(&self, name: &str, args: &serde_json::Value) -> ToolOutcome {
+    pub(crate) async fn execute_env_vars(
+        &self,
+        name: &str,
+        args: &serde_json::Value,
+    ) -> ToolOutcome {
         // The retired flat tool only ever set, and callers pass no `action`.
         let default_action = if name == tn::SET_ENVIRONMENT_VARIABLE {
             "set"
@@ -39,9 +43,7 @@ impl LucidosEngine {
             "list" => super::to_outcome(self.env_vars_list().await),
             "set" => super::to_outcome(self.execute_environment_variable_tool(args).await),
             "delete" => super::to_outcome(self.env_vars_delete(args).await),
-            "" => {
-                Err("Error: action is required (one of: list, set, delete)".to_string())
-            }
+            "" => Err("Error: action is required (one of: list, set, delete)".to_string()),
             other => Err(format!(
                 "Error: unknown action '{}'. Use one of: list, set, delete.",
                 other
@@ -50,12 +52,15 @@ impl LucidosEngine {
     }
 
     /// `list` — every user env var as name+value pairs (non-secret by design).
-    async fn env_vars_list(
-        &self,
-    ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    async fn env_vars_list(&self) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let vars = match EnvironmentVariableStore::list(&self.pool).await {
             Ok(v) => v,
-            Err(e) => return Ok(format!("Error: Failed to list environment variables: {}", e)),
+            Err(e) => {
+                return Ok(format!(
+                    "Error: Failed to list environment variables: {}",
+                    e
+                ))
+            }
         };
         if vars.is_empty() {
             return Ok("No environment variables set.".to_string());
@@ -93,7 +98,10 @@ impl LucidosEngine {
                 ))
             }
             Ok(false) => Ok(format!("Environment variable '{}' not found.", name)),
-            Err(e) => Ok(format!("Error: Failed to delete environment variable: {}", e)),
+            Err(e) => Ok(format!(
+                "Error: Failed to delete environment variable: {}",
+                e
+            )),
         }
     }
 

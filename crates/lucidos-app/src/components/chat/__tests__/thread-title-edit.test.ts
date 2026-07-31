@@ -31,7 +31,8 @@ describe('ThreadTitleEditor — display vs edit fields', () => {
 
   it('renders a read-only <div> for display — the only <textarea> is the edit field', () => {
     // The display is a <div>: in the desktop header CSS gives it
-    // white-space:nowrap + width:max-content so it hugs the title on one line.
+    // white-space:nowrap + align-self:stretch so it hugs the title on one line
+    // (and ellipsises it when the row is too narrow).
     // A <textarea> sizes to its cols attribute instead and wraps early — it's
     // the mobile EDIT field, never the display.
     expect(code).toMatch(/<div\b[\s\S]*?thread-title-display/);

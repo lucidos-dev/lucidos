@@ -249,5 +249,4 @@ mod tests {
         let h = parse_headers(&["X-Empty:".to_string()]).unwrap();
         assert_eq!(h, vec![("X-Empty".to_string(), "".to_string())]);
     }
-
 }

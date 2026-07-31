@@ -188,8 +188,10 @@ impl BackgroundBashRegistry {
         cwd: &Path,
         env: &[(String, String)],
         thread_id: Option<Uuid>,
-    ) -> Result<(String, tokio::sync::oneshot::Receiver<()>), Box<dyn std::error::Error + Send + Sync>>
-    {
+    ) -> Result<
+        (String, tokio::sync::oneshot::Receiver<()>),
+        Box<dyn std::error::Error + Send + Sync>,
+    > {
         let task_id = Uuid::new_v4().to_string();
 
         // Built through `command_shell()` so the command runs under `pipefail`
@@ -506,7 +508,10 @@ mod tests {
             .expect("spawn");
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
         assert!(finished, "task did not finish in time");
-        let snap = reg.read_output_in_memory_wait(&task_id, Duration::ZERO).await.expect("snapshot");
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
         assert!(snap.stdout.contains("hi"), "stdout was: {:?}", snap.stdout);
         assert_eq!(snap.outcome, Some(TaskOutcome::Exited(0)));
         assert!(snap.finished);
@@ -528,17 +533,39 @@ mod tests {
 
         // Wait for "a" to flush.
         tokio::time::sleep(Duration::from_millis(150)).await;
-        let first = reg.read_output_in_memory_wait(&task_id, Duration::ZERO).await.expect("first");
-        assert!(first.stdout.contains('a'), "first stdout: {:?}", first.stdout);
-        assert!(!first.stdout.contains('b'), "first stdout leaked b: {:?}", first.stdout);
+        let first = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("first");
+        assert!(
+            first.stdout.contains('a'),
+            "first stdout: {:?}",
+            first.stdout
+        );
+        assert!(
+            !first.stdout.contains('b'),
+            "first stdout leaked b: {:?}",
+            first.stdout
+        );
         assert!(!first.finished);
 
         // Wait for finish, then drain again — only "b" should remain.
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
         assert!(finished);
-        let second = reg.read_output_in_memory_wait(&task_id, Duration::ZERO).await.expect("second");
-        assert!(second.stdout.contains('b'), "second stdout: {:?}", second.stdout);
-        assert!(!second.stdout.contains('a'), "second stdout returned a again: {:?}", second.stdout);
+        let second = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("second");
+        assert!(
+            second.stdout.contains('b'),
+            "second stdout: {:?}",
+            second.stdout
+        );
+        assert!(
+            !second.stdout.contains('a'),
+            "second stdout returned a again: {:?}",
+            second.stdout
+        );
         assert!(second.finished);
     }
 
@@ -559,7 +586,10 @@ mod tests {
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
         assert!(finished, "killed task did not transition to finished");
 
-        let snap = reg.read_output_in_memory_wait(&task_id, Duration::ZERO).await.expect("snapshot");
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
         assert!(snap.finished);
         assert!(snap.killed, "killed flag should be true");
         assert!(!snap.timed_out);
@@ -586,7 +616,10 @@ mod tests {
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
         assert!(finished, "timeout did not fire");
 
-        let snap = reg.read_output_in_memory_wait(&task_id, Duration::ZERO).await.expect("snapshot");
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
         assert!(snap.finished);
         assert!(snap.timed_out, "timed_out flag should be true");
         assert!(!snap.killed);
@@ -615,7 +648,10 @@ mod tests {
         assert!(taken.stdout.all().0.contains("done"));
 
         // Second read should now miss — task evicted.
-        assert!(reg.read_output_in_memory_wait(&task_id, Duration::ZERO).await.is_none());
+        assert!(reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .is_none());
         assert!(reg.take_finished(&task_id).await.is_none());
     }
 
@@ -864,7 +900,12 @@ mod tests {
         // Now overrun. Everything trimmed is behind the cursor.
         s.push(&vec![b'b'; 4096]);
         let (second, dropped) = s.drain();
-        assert_eq!(second.len(), 4096, "the new bytes survive: {}", second.len());
+        assert_eq!(
+            second.len(),
+            4096,
+            "the new bytes survive: {}",
+            second.len()
+        );
         assert_eq!(dropped, 0, "already-read bytes are not a reportable loss");
         // The lifetime total still records the trim, for the final record.
         assert!(s.all().1 > 0, "trimmed_total must track every cut byte");
@@ -918,13 +959,7 @@ mod tests {
         // registers before re-reading `finished_at`.
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn(
-                "sleep 0.3",
-                5,
-                std::path::Path::new("/tmp"),
-                &[],
-                None,
-            )
+            .spawn("sleep 0.3", 5, std::path::Path::new("/tmp"), &[], None)
             .await
             .expect("spawn");
 
@@ -1047,7 +1082,8 @@ mod tests {
         assert!(
             combined.contains("first") || combined.contains("second"),
             "at least one waiter must see output across the race: a={:?} b={:?}",
-            snap_a.stdout, snap_b.stdout
+            snap_a.stdout,
+            snap_b.stdout
         );
     }
 
@@ -1059,7 +1095,13 @@ mod tests {
         // depend on.
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn("echo a; sleep 30", 60, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                "echo a; sleep 30",
+                60,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+            )
             .await
             .expect("spawn");
 
@@ -1106,7 +1148,13 @@ mod tests {
     async fn run_to_completion(command: &str, timeout_secs: u64) -> OutputSnapshot {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
-            .spawn(command, timeout_secs, std::path::Path::new("/tmp"), &[], None)
+            .spawn(
+                command,
+                timeout_secs,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+            )
             .await
             .expect("spawn");
         assert!(
@@ -1138,8 +1186,7 @@ mod tests {
     /// clean build. Asserting 101 here is the whole point of the change.
     #[tokio::test]
     async fn pipeline_exit_101_is_not_masked_by_tee() {
-        let snap =
-            run_to_completion("sh -c 'echo lints; exit 101' 2>&1 | tee /dev/null", 10).await;
+        let snap = run_to_completion("sh -c 'echo lints; exit 101' 2>&1 | tee /dev/null", 10).await;
         assert_eq!(
             snap.outcome,
             Some(TaskOutcome::Exited(101)),

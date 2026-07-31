@@ -155,7 +155,10 @@ fn remove_keeps_dir_with_sibling_knowhow() {
     remove_trigger_definition(&ws, "keeper");
     assert!(!ws.join("data/triggers/keeper/trigger.toml").exists());
     // Sibling knowhow → the dir must survive (only trigger.toml is pruned).
-    assert!(knowhow.join("notes.md").exists(), "sibling knowhow must remain");
+    assert!(
+        knowhow.join("notes.md").exists(),
+        "sibling knowhow must remain"
+    );
 }
 
 #[test]

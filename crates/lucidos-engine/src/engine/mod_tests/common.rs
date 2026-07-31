@@ -118,4 +118,3 @@ pub(crate) async fn register_queued(
     )
     .await
 }
-

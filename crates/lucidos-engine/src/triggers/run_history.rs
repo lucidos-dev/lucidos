@@ -132,9 +132,7 @@ pub async fn load_trigger_run_history(
 
     let last_run = rows
         .iter()
-        .map(|(payload_last_run, created)| {
-            recorded_run_time(payload_last_run.as_deref(), *created)
-        })
+        .map(|(payload_last_run, created)| recorded_run_time(payload_last_run.as_deref(), *created))
         .max();
 
     Ok(TriggerRunHistory {

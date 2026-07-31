@@ -57,7 +57,10 @@ impl BrowserRuntime {
                         .await;
                 }
                 state.handler_task.abort();
-                log!("[Browser] Closed browser for session {} (profile lock)", key);
+                log!(
+                    "[Browser] Closed browser for session {} (profile lock)",
+                    key
+                );
             }
         }
 
@@ -81,7 +84,10 @@ impl BrowserRuntime {
                     || e.contains("websocket") =>
             {
                 // Stale state from a previous crash — clean up and retry
-                log!("[Browser] Launch failed ({}), cleaning up and retrying...", e);
+                log!(
+                    "[Browser] Launch failed ({}), cleaning up and retrying...",
+                    e
+                );
                 Self::cleanup_stale_profile(&profile_dir);
                 Self::kill_zombie_browsers(&profile_dir);
                 let (browser, handler_task) = Self::launch_browser(visible, &profile_dir)
@@ -413,7 +419,11 @@ impl BrowserRuntime {
 
         for domain in &auth_domains {
             if let Err(e) = BrowserLogins::record(pool, domain, domain).await {
-                log!("[Browser] Failed to record browser login for {}: {}", domain, e);
+                log!(
+                    "[Browser] Failed to record browser login for {}: {}",
+                    domain,
+                    e
+                );
             }
         }
 

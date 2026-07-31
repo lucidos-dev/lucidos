@@ -67,12 +67,11 @@ impl LucidosEngine {
             .unwrap_or(20)
             .clamp(1, 50);
 
-        let notifications = match NotificationStore::get_filtered(&self.pool, filter, limit, None)
-            .await
-        {
-            Ok(n) => n,
-            Err(e) => return Err(format!("Error: failed to read notifications: {}", e)),
-        };
+        let notifications =
+            match NotificationStore::get_filtered(&self.pool, filter, limit, None).await {
+                Ok(n) => n,
+                Err(e) => return Err(format!("Error: failed to read notifications: {}", e)),
+            };
 
         if notifications.is_empty() {
             return Ok(format!("No {} notifications.", filter));
@@ -107,9 +106,9 @@ impl LucidosEngine {
                 Ok(id) => id,
                 Err(_) => {
                     return Err(format!(
-                        "Error: 'id' must be a notification UUID (from the 'list' action), got '{}'.",
-                        s
-                    ))
+                    "Error: 'id' must be a notification UUID (from the 'list' action), got '{}'.",
+                    s
+                ))
                 }
             },
             None => {
@@ -137,13 +136,21 @@ impl LucidosEngine {
             }))
             .await
             .map_err(|e| format!("Error: failed to emit NotificationRead: {}", e))?;
-        Ok(format!("[ACTION COMPLETED] Notification {} marked read.", id))
+        Ok(format!(
+            "[ACTION COMPLETED] Notification {} marked read.",
+            id
+        ))
     }
 
     async fn notifications_mark_all_read(&self) -> ToolOutcome {
         let count = match NotificationStore::mark_all_read(&self.pool).await {
             Ok(c) => c,
-            Err(e) => return Err(format!("Error: failed to mark all notifications read: {}", e)),
+            Err(e) => {
+                return Err(format!(
+                    "Error: failed to mark all notifications read: {}",
+                    e
+                ))
+            }
         };
         if count == 0 {
             return Ok("No unread notifications to mark read.".to_string());

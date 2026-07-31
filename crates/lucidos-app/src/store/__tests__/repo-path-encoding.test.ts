@@ -35,4 +35,17 @@ describe('encodeRepoPath / parseRepoPath', () => {
   it('returns null for repo path with unknown mode segment', () => {
     expect(parseRepoPath('repo:r:weird:a.md')).toBeNull();
   });
+
+  // `file_path` reaches this parser from outside the app (an app iframe's
+  // lucidos.ui.navigate, an LLM navigate_ui), so a structurally incomplete
+  // encoding must be rejected rather than yielding an empty repoId (a repo
+  // selection that is neither null nor a real id) or an empty path.
+  it('returns null when a segment is empty', () => {
+    expect(parseRepoPath('repo::file:src/a.rs')).toBeNull();   // no repo id
+    expect(parseRepoPath('repo:r1:file:')).toBeNull();         // no path
+    expect(parseRepoPath('repo:r1:file')).toBeNull();          // no path segment at all
+    expect(parseRepoPath('repo:r1:diff:')).toBeNull();
+    expect(parseRepoPath('repo:r1:diff#:a.md')).toBeNull();    // empty change id
+    expect(parseRepoPath('repo:')).toBeNull();
+  });
 });

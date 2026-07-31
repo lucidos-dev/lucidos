@@ -14,4 +14,3 @@ pub(crate) async fn make_test_repo() -> (tempfile::TempDir, std::path::PathBuf) 
     let _ = git_cmd(&["commit", "-m", "initial commit"], &repo).await;
     (tmp, repo)
 }
-

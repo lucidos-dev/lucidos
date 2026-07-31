@@ -407,7 +407,9 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn spawn_sleeper(configure: impl FnOnce(&mut tokio::process::Command)) -> tokio::process::Child {
+    fn spawn_sleeper(
+        configure: impl FnOnce(&mut tokio::process::Command),
+    ) -> tokio::process::Child {
         let mut cmd = tokio::process::Command::new("sleep");
         cmd.arg("60");
         configure(&mut cmd);
@@ -464,11 +466,13 @@ mod tests {
         let mut survivor = spawn_sleeper(isolate_in_process_group);
 
         assert_eq!(
-            pgid_of(victim_pid), engine_group as i32,
+            pgid_of(victim_pid),
+            engine_group as i32,
             "victim must share the synthetic engine group"
         );
         assert_ne!(
-            pgid_of(survivor.id().expect("survivor pid")), engine_group as i32,
+            pgid_of(survivor.id().expect("survivor pid")),
+            engine_group as i32,
             "survivor must be isolated from the engine group"
         );
 
@@ -510,7 +514,10 @@ mod tests {
         let reaped = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait())
             .await
             .is_ok();
-        assert!(reaped, "graceful_kill must terminate a normal process group");
+        assert!(
+            reaped,
+            "graceful_kill must terminate a normal process group"
+        );
     }
 
     /// The SIGKILL fallback is load-bearing: a group leader that IGNORES SIGTERM

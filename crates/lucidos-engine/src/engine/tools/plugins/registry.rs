@@ -3,7 +3,6 @@
 //! canonical ids, find the plugin owning a given file, and run the
 //! `check_plugin_updates` survey. Read-only over the event store.
 
-
 use std::collections::BTreeSet;
 use std::path::Path;
 
@@ -50,8 +49,10 @@ fn uninstall_canonical_id(payload: &serde_json::Value, aggregate_id: &str) -> St
 /// rather than re-projecting per id.
 async fn project_installs(
     pool: &sqlx::PgPool,
-) -> Result<std::collections::BTreeMap<String, serde_json::Value>, Box<dyn std::error::Error + Send + Sync>>
-{
+) -> Result<
+    std::collections::BTreeMap<String, serde_json::Value>,
+    Box<dyn std::error::Error + Send + Sync>,
+> {
     let rows: Vec<(String, String, serde_json::Value)> = sqlx::query_as(
         r#"SELECT event_type, aggregate_id, payload
            FROM events
@@ -90,8 +91,9 @@ pub(crate) async fn installed_plugin_summaries(
             let rec = InstalledRecord { payload };
             let files = rec.files();
             let app_id = primary_app_id(&files, &id);
-            let content =
-                crate::core::plugin_marketplaces::content_dirs_from_files(files.iter().map(String::as_str));
+            let content = crate::core::plugin_marketplaces::content_dirs_from_files(
+                files.iter().map(String::as_str),
+            );
             let status = plugin_modification_status(workspace_path, &rec);
             InstalledPluginSummary {
                 id: id.clone(),
@@ -691,8 +693,8 @@ pub(crate) async fn fetch_remote_manifest(
     let source = detect_source(source_str)?;
     let (_scratch, plugin_root, _source_type) = fetch_source(workspace_path, &source)?;
     let manifest_path = plugin_root.join("manifest.toml");
-    let text = std::fs::read_to_string(&manifest_path)
-        .map_err(|e| format!("read manifest: {}", e))?;
+    let text =
+        std::fs::read_to_string(&manifest_path).map_err(|e| format!("read manifest: {}", e))?;
     plugins::parse_manifest(&text).map_err(|e| e.to_string())
 }
 
@@ -848,9 +850,13 @@ mod modification_status_tests {
         write_data(&ws, "apps/demo/index.html", "<h1>hi</h1>");
         let sha = install_commit(&ws, &["apps/demo/index.html"]);
         write_data(&ws, "apps/demo/index.html", "<h1>EDITED</h1>");
-        let status = plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
+        let status =
+            plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
         assert!(status.modified);
-        assert_eq!(status.modified_paths, vec!["apps/demo/index.html".to_string()]);
+        assert_eq!(
+            status.modified_paths,
+            vec!["apps/demo/index.html".to_string()]
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -861,9 +867,16 @@ mod modification_status_tests {
         let sha = install_commit(&ws, &["apps/demo/index.html"]);
         // User adds a new (untracked) file inside the plugin's app dir.
         write_data(&ws, "apps/demo/extra.js", "console.log(1)");
-        let status = plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
-        assert!(status.modified, "an added file in the plugin app dir must count");
-        assert!(status.modified_paths.iter().any(|p| p == "apps/demo/extra.js"));
+        let status =
+            plugin_modification_status(&ws, &record(Some(&sha), &["apps/demo/index.html"]));
+        assert!(
+            status.modified,
+            "an added file in the plugin app dir must count"
+        );
+        assert!(status
+            .modified_paths
+            .iter()
+            .any(|p| p == "apps/demo/extra.js"));
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -902,7 +915,9 @@ mod modification_status_tests {
         let sha = install_commit(&ws, &["knowhow/demo.md"]);
         write_data(&ws, "knowhow/demo.md", "EDITED");
         write_data(&ws, "knowhow/demo.md", "notes"); // revert to installed content
-        assert!(!plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"])).modified);
+        assert!(
+            !plugin_modification_status(&ws, &record(Some(&sha), &["knowhow/demo.md"])).modified
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 
@@ -912,7 +927,7 @@ mod modification_status_tests {
         write_data(&ws, "knowhow/demo.md", "notes");
         install_commit(&ws, &["knowhow/demo.md"]);
         write_data(&ws, "knowhow/demo.md", "EDITED"); // even with an edit on disk...
-        // ...a record with no baseline commit cannot be judged → not modified.
+                                                      // ...a record with no baseline commit cannot be judged → not modified.
         assert!(!plugin_modification_status(&ws, &record(None, &["knowhow/demo.md"])).modified);
         let _ = std::fs::remove_dir_all(&ws);
     }
@@ -954,7 +969,10 @@ mod modification_status_tests {
         write_data(&ws, "triggers/watch/trigger.toml", &def.to_toml().unwrap());
         let status =
             plugin_modification_status(&ws, &record(Some(&sha), &["triggers/watch/trigger.toml"]));
-        assert!(status.modified, "an edited trigger intent must flag modified");
+        assert!(
+            status.modified,
+            "an edited trigger intent must flag modified"
+        );
         let _ = std::fs::remove_dir_all(&ws);
     }
 }

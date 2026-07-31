@@ -121,8 +121,8 @@ pub(super) async fn post_thread(
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
     if let Some((state_str, archive_state_str, existing_mode)) = row {
-        let existing_state = ThreadState::from_db_str(&state_str)
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let existing_state =
+            ThreadState::from_db_str(&state_str).map_err(|e| ApiError::internal(e.to_string()))?;
         // Each arm fully handles its state — no spatial-ordering dependency
         // between an early-return and a later match. Discarded returns 410
         // unconditionally (the `ThreadDiscarded` projection sets BOTH
@@ -217,7 +217,9 @@ pub(super) async fn put_compose(
                 let blob = write_blob_from_base64(state.engine.workspace_path(), &img.base64)
                     .map_err(|e| {
                         let status = match e {
-                            crate::core::blobs::BlobError::BadEncoding(_) => StatusCode::BAD_REQUEST,
+                            crate::core::blobs::BlobError::BadEncoding(_) => {
+                                StatusCode::BAD_REQUEST
+                            }
                             crate::core::blobs::BlobError::UnsupportedMime => {
                                 StatusCode::UNSUPPORTED_MEDIA_TYPE
                             }
@@ -237,7 +239,10 @@ pub(super) async fn put_compose(
 
     if let Some(ref h) = new_image_hashes {
         if h.len() > MAX_COMPOSE_IMAGES {
-            return Err(ApiError::new(StatusCode::PAYLOAD_TOO_LARGE, "too many compose images"));
+            return Err(ApiError::new(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "too many compose images",
+            ));
         }
     }
 
@@ -301,13 +306,12 @@ pub(super) async fn put_compose(
             // Cold path: UPDATE matched zero rows. Distinguish "no row" from
             // "wrong state" / "mode-locked" with a follow-up read so the e2e
             // contract (404/410/409) stays specific.
-            let lookup: Option<(String,)> = sqlx::query_as(
-                "SELECT state FROM thread_summaries WHERE thread_id = $1",
-            )
-            .bind(id)
-            .fetch_optional(state.engine.pool())
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?;
+            let lookup: Option<(String,)> =
+                sqlx::query_as("SELECT state FROM thread_summaries WHERE thread_id = $1")
+                    .bind(id)
+                    .fetch_optional(state.engine.pool())
+                    .await
+                    .map_err(|e| ApiError::internal(e.to_string()))?;
             let st = lookup
                 .map(|(s,)| ThreadState::from_db_str(&s))
                 .transpose()
@@ -381,18 +385,17 @@ pub(super) async fn delete_thread(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    let lookup: Option<(String, String)> = sqlx::query_as(
-        "SELECT state, archive_state FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(id)
-    .fetch_optional(state.engine.pool())
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    let lookup: Option<(String, String)> =
+        sqlx::query_as("SELECT state, archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(id)
+            .fetch_optional(state.engine.pool())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
     let Some((state_str, archive_state_str)) = lookup else {
         return Ok(StatusCode::NO_CONTENT);
     };
-    let current_state = ThreadState::from_db_str(&state_str)
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let current_state =
+        ThreadState::from_db_str(&state_str).map_err(|e| ApiError::internal(e.to_string()))?;
     // Each arm fully handles its state — no spatial-ordering dependency.
     // Discarded is idempotent (204). Active is rejected; the
     // already-archived sub-case takes the more specific 409 message
@@ -404,7 +407,10 @@ pub(super) async fn delete_thread(
         ThreadState::Discarded => return Ok(StatusCode::NO_CONTENT),
         ThreadState::Active => {
             if archive_state_str == "archived" {
-                return Err(ApiError::new(StatusCode::CONFLICT, "thread already archived"));
+                return Err(ApiError::new(
+                    StatusCode::CONFLICT,
+                    "thread already archived",
+                ));
             }
             return Err(ApiError::new(
                 StatusCode::CONFLICT,

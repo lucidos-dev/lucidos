@@ -476,7 +476,9 @@ mod tests {
         let ext = MemoryExtractor::new("proj".into(), "europe-west1".into())
             .expect("extractor builds")
             .with_openai_key(Some("sk-test".into()));
-        let provider = ext.provider_for_model("gpt-5.4").expect("openai provider builds");
+        let provider = ext
+            .provider_for_model("gpt-5.4")
+            .expect("openai provider builds");
         assert_eq!(provider.default_model(), "gpt-5.4");
     }
 
@@ -484,7 +486,8 @@ mod tests {
     /// falling through to Vertex (which can't serve it).
     #[test]
     fn provider_for_model_gpt_without_key_errors() {
-        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
+        let ext =
+            MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
         assert!(ext.provider_for_model("gpt-5.4").is_err());
     }
 
@@ -504,7 +507,8 @@ mod tests {
     /// extraction model on Vertex), unchanged from the pre-routing behavior.
     #[test]
     fn provider_for_model_default_uses_base_model() {
-        let ext = MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
+        let ext =
+            MemoryExtractor::new("proj".into(), "europe-west1".into()).expect("extractor builds");
         let provider = ext.provider_for_model("").expect("base provider");
         assert_eq!(provider.default_model(), default_extraction_model());
     }

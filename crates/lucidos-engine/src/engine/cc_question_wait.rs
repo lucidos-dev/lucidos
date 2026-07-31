@@ -89,9 +89,13 @@ mod tests {
         let r2 = registry.clone();
         tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(50)).await;
-            r2.notify("toolu_test_1", AnswerPayload {
-                answers: serde_json::json!({"q?": "Red"}),
-            }).await;
+            r2.notify(
+                "toolu_test_1",
+                AnswerPayload {
+                    answers: serde_json::json!({"q?": "Red"}),
+                },
+            )
+            .await;
         });
 
         let got = timeout(Duration::from_secs(1), waiter.recv())
@@ -105,9 +109,14 @@ mod tests {
     #[tokio::test]
     async fn notify_unknown_id_is_noop() {
         let registry = QuestionWaitRegistry::new();
-        registry.notify("never-registered", AnswerPayload {
-            answers: serde_json::json!({}),
-        }).await;
+        registry
+            .notify(
+                "never-registered",
+                AnswerPayload {
+                    answers: serde_json::json!({}),
+                },
+            )
+            .await;
     }
 
     /// `notify` reports whether a LIVE in-process waiter received the wake — the

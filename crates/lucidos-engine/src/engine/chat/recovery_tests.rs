@@ -588,13 +588,7 @@ mod switch_resume {
         let settle = Uuid::new_v4();
         seed_turn(&bus, settle, None).await;
         tick().await;
-        emit_abort(
-            &bus,
-            settle,
-            Some(device_actor()),
-            AbortCause::StaleSettle,
-        )
-        .await;
+        emit_abort(&bus, settle, Some(device_actor()), AbortCause::StaleSettle).await;
 
         // No abort at all — the shape of a question-parked thread, which the
         // preserve guard keeps abort-free. It must never be auto-resumed;

@@ -293,7 +293,10 @@ fn change_discarded_serializes_and_persists() {
 fn email_sent_persists_envelope_metadata_without_body() {
     let event = SystemEvent::EmailSent {
         account: "primary".to_string(),
-        to: vec!["alice@example.com".to_string(), "bob@example.com".to_string()],
+        to: vec![
+            "alice@example.com".to_string(),
+            "bob@example.com".to_string(),
+        ],
         cc: vec!["carol@example.com".to_string()],
         bcc: vec![],
         subject: "Q3 numbers".to_string(),

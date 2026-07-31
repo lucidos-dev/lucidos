@@ -87,6 +87,11 @@ pub struct OAuthClientOverrides {
     pub token_url: Option<String>,
     pub userinfo_url: Option<String>,
     pub scopes: Option<String>,
+    /// Loopback callback URI to register with this provider. Omit for the
+    /// default (`127.0.0.1`); supply the `localhost` form only for a provider
+    /// that won't accept the IP literal. See `default_redirect_uri` and the
+    /// oauth-providers knowhow.
+    pub redirect_uri: Option<String>,
 }
 
 /// Build the credential-request JSON the frontend modal opens for an
@@ -111,6 +116,7 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
         ("token_url", &overrides.token_url),
         ("userinfo_url", &overrides.userinfo_url),
         ("scopes", &overrides.scopes),
+        ("redirect_uri", &overrides.redirect_uri),
     ] {
         if let Some(v) = value {
             defaults.insert(key.to_string(), serde_json::Value::String(v.clone()));
@@ -398,6 +404,230 @@ pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
 }
 
 // ---------------------------------------------------------------------------
+// Loopback callback endpoint — the single source of the redirect URI
+// ---------------------------------------------------------------------------
+//
+// The authorization request and the token exchange MUST send a byte-identical
+// `redirect_uri` (OAuth 2.0 §4.1.3), and it must match what the provider has
+// registered. Both legs therefore read the ONE value `resolve_redirect_uri`
+// returns — never a rebuilt literal.
+
+/// Port the temporary callback listener binds. Fixed (not ephemeral) because
+/// the URI has to be registered with the provider ahead of time.
+const CALLBACK_PORT: u16 = 14981;
+/// Path the callback listener answers on.
+const CALLBACK_PATH: &str = "/oauth/callback";
+/// Host form advertised unless the credential overrides it. The loopback IP is
+/// the default because some providers reject the name `localhost` outright.
+const DEFAULT_CALLBACK_HOST: &str = "127.0.0.1";
+/// Every loopback host form the listener can actually receive on — it binds
+/// both IPv4 and IPv6 loopback, and `localhost` resolves to one of them. These
+/// are the only values a credential's `redirect_uri` may take: the port and
+/// path belong to the listener, so any other value can only produce a flow that
+/// hangs until the timeout.
+///
+/// Which form a provider will accept is a *provider* fact and lives in
+/// `system-knowhow/oauth-providers.md`, not here.
+const CALLBACK_HOSTS: [&str; 3] = ["127.0.0.1", "localhost", "[::1]"];
+
+fn callback_uri_for_host(host: &str) -> String {
+    format!("http://{}:{}{}", host, CALLBACK_PORT, CALLBACK_PATH)
+}
+
+/// The redirect URI advertised when a credential doesn't override it.
+fn default_redirect_uri() -> String {
+    callback_uri_for_host(DEFAULT_CALLBACK_HOST)
+}
+
+/// Every redirect URI the local listener can serve, in preference order.
+fn accepted_redirect_uris() -> Vec<String> {
+    CALLBACK_HOSTS
+        .iter()
+        .copied()
+        .map(callback_uri_for_host)
+        .collect()
+}
+
+/// Resolve the redirect URI for a flow from the credential JSON.
+///
+/// Absent or blank `redirect_uri` => the default loopback-IP form, so every
+/// already-connected provider keeps the exact URI it was registered with. A
+/// supplied value must be one of `accepted_redirect_uris()`; anything else is
+/// rejected here rather than producing a browser redirect the listener never
+/// receives.
+fn resolve_redirect_uri(client_config: &serde_json::Value) -> Result<String, BoxError> {
+    let configured = client_config["redirect_uri"]
+        .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(uri) = configured else {
+        return Ok(default_redirect_uri());
+    };
+    let accepted = accepted_redirect_uris();
+    if accepted.iter().any(|candidate| candidate == uri) {
+        return Ok(uri.to_string());
+    }
+    Err(format!(
+        "redirect_uri '{}' is not one of Lucidos's own callback URLs — the local listener \
+         only receives on port {} at {}. Use one of: {}",
+        uri,
+        CALLBACK_PORT,
+        CALLBACK_PATH,
+        accepted.join(", ")
+    )
+    .into())
+}
+
+// ---------------------------------------------------------------------------
+// Client authentication — confidential vs public
+// ---------------------------------------------------------------------------
+
+/// A PKCE verifier/challenge pair (RFC 7636).
+///
+/// The verifier is a one-time secret: it is the only thing standing between an
+/// intercepted authorization code and a token, so it must never be logged.
+struct Pkce {
+    verifier: String,
+    challenge: String,
+}
+
+// Manual `Debug` so the verifier can't leak through `{:?}`, matching the
+// treatment of access/refresh tokens elsewhere in this module.
+impl std::fmt::Debug for Pkce {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Pkce")
+            .field("verifier", &"<redacted>")
+            .field("challenge", &self.challenge)
+            .finish()
+    }
+}
+
+impl Pkce {
+    /// 32 random bytes base64url-encoded — 43 characters, all from RFC 7636's
+    /// unreserved set, which is the low end of the spec's 43..=128 range and
+    /// the recommended entropy.
+    fn generate() -> Self {
+        use rand::RngCore;
+        let mut bytes = [0u8; 32];
+        rand::thread_rng().fill_bytes(&mut bytes);
+        let verifier = base64_url_nopad(&bytes);
+        let challenge = Self::challenge_for(&verifier);
+        Self {
+            verifier,
+            challenge,
+        }
+    }
+
+    /// `BASE64URL-NOPAD(SHA256(ASCII(verifier)))` — the `S256` method.
+    fn challenge_for(verifier: &str) -> String {
+        use sha2::{Digest, Sha256};
+        base64_url_nopad(&Sha256::digest(verifier.as_bytes()))
+    }
+}
+
+fn base64_url_nopad(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// How the client proves itself when redeeming the authorization code.
+///
+/// Derived SOLELY from whether the credential carries a `client_secret` — this
+/// is OAuth's own confidential/public distinction, and keying on it means the
+/// engine never needs to know which provider it is talking to.
+///
+/// A desktop app that ships no secret is a *public* client (RFC 8252), and the
+/// redemption is authenticated with PKCE instead. Providers reject a secret
+/// from a public client and reject a secret-less redemption from a confidential
+/// one, so the two shapes must not be mixed.
+enum ClientAuth {
+    /// The credential has a `client_secret`: send it, and send no PKCE. This is
+    /// the shape every existing Lucidos connection uses.
+    Confidential(String),
+    /// No `client_secret`: omit it and authenticate with PKCE.
+    Public(Pkce),
+}
+
+// Manual `Debug` so neither the client secret nor the PKCE verifier leaks.
+impl std::fmt::Debug for ClientAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Confidential(_) => f.write_str("Confidential(<redacted>)"),
+            Self::Public(pkce) => f.debug_tuple("Public").field(pkce).finish(),
+        }
+    }
+}
+
+impl ClientAuth {
+    fn from_secret(client_secret: Option<&str>) -> Self {
+        match client_secret.map(str::trim).filter(|s| !s.is_empty()) {
+            Some(secret) => Self::Confidential(secret.to_string()),
+            None => Self::Public(Pkce::generate()),
+        }
+    }
+
+    fn client_secret(&self) -> Option<&str> {
+        match self {
+            Self::Confidential(secret) => Some(secret),
+            Self::Public(_) => None,
+        }
+    }
+
+    fn code_challenge(&self) -> Option<&str> {
+        match self {
+            Self::Confidential(_) => None,
+            Self::Public(pkce) => Some(&pkce.challenge),
+        }
+    }
+
+    fn code_verifier(&self) -> Option<&str> {
+        match self {
+            Self::Confidential(_) => None,
+            Self::Public(pkce) => Some(&pkce.verifier),
+        }
+    }
+
+    /// Label for logs — never includes the secret or the verifier.
+    fn kind(&self) -> &'static str {
+        match self {
+            Self::Confidential(_) => "confidential",
+            Self::Public(_) => "public+PKCE",
+        }
+    }
+}
+
+/// Build the provider's authorization URL.
+///
+/// `code_challenge` is appended only for a public client, so a confidential
+/// flow produces exactly the URL it always has.
+fn build_authorize_url(
+    auth_url: &str,
+    client_id: &str,
+    redirect_uri: &str,
+    scopes: &str,
+    auth: &ClientAuth,
+) -> String {
+    // Some authorization endpoints already carry a query (Azure AD B2C pins its
+    // user flow with `?p=…`), so appending a second `?` would corrupt the URL.
+    let separator = if auth_url.contains('?') { '&' } else { '?' };
+    let mut url = format!(
+        "{}{}client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
+        auth_url,
+        separator,
+        urlencoding::encode(client_id),
+        urlencoding::encode(redirect_uri),
+        urlencoding::encode(scopes),
+    );
+    if let Some(challenge) = auth.code_challenge() {
+        url.push_str(&format!(
+            "&code_challenge={}&code_challenge_method=S256",
+            urlencoding::encode(challenge)
+        ));
+    }
+    url
+}
+
+// ---------------------------------------------------------------------------
 // Token exchange & refresh (HTTP)
 // ---------------------------------------------------------------------------
 
@@ -446,66 +676,151 @@ fn bounded_http_client() -> &'static reqwest::Client {
     &CLIENT
 }
 
-/// Exchange an authorization code for tokens.
-async fn exchange_code(
+/// Longest raw provider body echoed into an error. A token endpoint that fails
+/// behind a proxy can answer with a whole HTML page; the first couple of
+/// kilobytes always carry the useful part.
+const MAX_ERROR_BODY_CHARS: usize = 2000;
+
+/// Render a non-success token-endpoint response into one human-readable line.
+///
+/// OAuth 2.0 §5.2 error bodies are JSON with `error` / `error_description`;
+/// Microsoft adds a numeric `error_codes` array (the `AADSTS…` numbers). Pulling
+/// those out is the difference between "Token exchange failed (400)" and
+/// "invalid_request — AADSTS90023: The provided value for the input parameter
+/// 'redirect_uri' is not valid", which is the only thing that makes this flow
+/// debuggable from the UI. A body that isn't an OAuth error object (HTML error
+/// page, empty response) falls back to the raw text rather than being dropped.
+///
+/// `operation` names the leg ("Token exchange" / "Token refresh") so the caller
+/// does NOT re-wrap the result — a second prefix produced the unreadable
+/// "Token exchange failed: Token exchange failed (400): {…}".
+fn describe_token_error(operation: &str, status: reqwest::StatusCode, body: &str) -> String {
+    let body = body.trim();
+    let mut parts: Vec<String> = Vec::new();
+    if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+        if let Some(error) = json["error"].as_str() {
+            parts.push(error.to_string());
+        }
+        if let Some(description) = json["error_description"].as_str() {
+            parts.push(description.to_string());
+        }
+        if let Some(codes) = json["error_codes"].as_array().filter(|c| !c.is_empty()) {
+            let codes: Vec<String> = codes.iter().map(|c| c.to_string()).collect();
+            parts.push(format!("error_codes: [{}]", codes.join(", ")));
+        }
+    }
+    if !parts.is_empty() {
+        return format!("{} failed ({}): {}", operation, status, parts.join(" — "));
+    }
+    if body.is_empty() {
+        return format!(
+            "{} failed ({}) with an empty response body",
+            operation, status
+        );
+    }
+    format!(
+        "{} failed ({}): {}",
+        operation,
+        status,
+        &body[..body.floor_char_boundary(MAX_ERROR_BODY_CHARS)]
+    )
+}
+
+/// POST a token-endpoint form and parse the response, surfacing the provider's
+/// own error text on failure. Shared by the code exchange and the refresh so
+/// both legs report failures identically.
+async fn post_token_request(
+    operation: &str,
     token_url: &str,
-    client_id: &str,
-    client_secret: &str,
-    code: &str,
-    redirect_uri: &str,
+    form: &[(&str, &str)],
 ) -> Result<TokenResponse, BoxError> {
     let client = bounded_http_client();
     let resp = client
         .post(token_url)
         .header("Accept", "application/json")
-        .form(&[
-            ("grant_type", "authorization_code"),
-            ("code", code),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-            ("redirect_uri", redirect_uri),
-        ])
+        .form(form)
         .send()
         .await?;
 
     let status = resp.status();
     if !status.is_success() {
         let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Token exchange failed ({}): {}", status, body).into());
+        return Err(describe_token_error(operation, status, &body).into());
     }
 
     let token: TokenResponse = resp.json().await?;
     Ok(token)
 }
 
+/// Form pairs for the authorization-code redemption (OAuth 2.0 §4.1.3).
+///
+/// The confidential ordering (grant_type, code, client_id, client_secret,
+/// redirect_uri) is preserved exactly as it has always been sent; the public
+/// variant drops `client_secret` and appends `code_verifier`.
+fn exchange_form<'a>(
+    code: &'a str,
+    client_id: &'a str,
+    redirect_uri: &'a str,
+    auth: &'a ClientAuth,
+) -> Vec<(&'static str, &'a str)> {
+    let mut form = vec![
+        ("grant_type", "authorization_code"),
+        ("code", code),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = auth.client_secret() {
+        form.push(("client_secret", secret));
+    }
+    form.push(("redirect_uri", redirect_uri));
+    if let Some(verifier) = auth.code_verifier() {
+        form.push(("code_verifier", verifier));
+    }
+    form
+}
+
+/// Form pairs for a refresh-token grant (OAuth 2.0 §6).
+///
+/// PKCE has no role here — it authenticates the one-time code redemption, not
+/// later refreshes — so this takes the secret directly. A public client must
+/// omit `client_secret` on the refresh too, or the provider rejects the request
+/// the same way it would reject the redemption.
+fn refresh_form<'a>(
+    refresh_token: &'a str,
+    client_id: &'a str,
+    client_secret: Option<&'a str>,
+) -> Vec<(&'static str, &'a str)> {
+    let mut form = vec![
+        ("grant_type", "refresh_token"),
+        ("refresh_token", refresh_token),
+        ("client_id", client_id),
+    ];
+    if let Some(secret) = client_secret {
+        form.push(("client_secret", secret));
+    }
+    form
+}
+
+/// Exchange an authorization code for tokens.
+async fn exchange_code(
+    token_url: &str,
+    client_id: &str,
+    auth: &ClientAuth,
+    code: &str,
+    redirect_uri: &str,
+) -> Result<TokenResponse, BoxError> {
+    let form = exchange_form(code, client_id, redirect_uri, auth);
+    post_token_request("Token exchange", token_url, &form).await
+}
+
 /// Refresh an access token using a refresh token.
 async fn refresh_access_token(
     token_url: &str,
     client_id: &str,
-    client_secret: &str,
+    client_secret: Option<&str>,
     refresh_token: &str,
 ) -> Result<TokenResponse, BoxError> {
-    let client = bounded_http_client();
-    let resp = client
-        .post(token_url)
-        .header("Accept", "application/json")
-        .form(&[
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token),
-            ("client_id", client_id),
-            ("client_secret", client_secret),
-        ])
-        .send()
-        .await?;
-
-    let status = resp.status();
-    if !status.is_success() {
-        let body = resp.text().await.unwrap_or_default();
-        return Err(format!("Token refresh failed ({}): {}", status, body).into());
-    }
-
-    let token: TokenResponse = resp.json().await?;
-    Ok(token)
+    let form = refresh_form(refresh_token, client_id, client_secret);
+    post_token_request("Token refresh", token_url, &form).await
 }
 
 /// Returns true if the account's token needs refreshing (expired, expiring
@@ -546,10 +861,15 @@ pub async fn refresh_oauth_if_needed(
     let config: serde_json::Value = serde_json::from_str(&client_cred.auth_value)?;
     let cid = config["client_id"]
         .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or_else(|| format!("Missing client_id in {} credentials", cred_service))?;
+    // Blank/absent => public client: the refresh must omit `client_secret` too,
+    // exactly as the code redemption did.
     let csec = config["client_secret"]
         .as_str()
-        .ok_or_else(|| format!("Missing client_secret in {} credentials", cred_service))?;
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let turl = config["token_url"]
         .as_str()
         .ok_or_else(|| format!("Missing token_url in {} credentials", cred_service))?
@@ -608,41 +928,234 @@ fn merge_scopes(existing: &str, requested: &str) -> String {
     all.join(" ")
 }
 
-/// Wait for an OAuth callback on the given listener, extract the authorization code.
-async fn wait_for_oauth_callback(
-    listener: tokio::net::TcpListener,
-) -> Result<String, BoxError> {
-    let (stream, _) = listener.accept().await?;
-    let mut buf = vec![0u8; 4096];
-    stream.readable().await?;
-    let n = stream.try_read(&mut buf)?;
-    let request = String::from_utf8_lossy(&buf[..n]);
+/// Temporary loopback listener for the OAuth callback.
+///
+/// Binds **both** loopback families on the same port. IPv4 is required; IPv6 is
+/// best-effort so a host with IPv6 disabled still completes the flow. Both are
+/// needed because `localhost` resolves to `::1` first on an IPv6-enabled host,
+/// so an IPv4-only socket silently never receives a `localhost` callback.
+struct CallbackListener {
+    listeners: Vec<tokio::net::TcpListener>,
+}
 
-    // Parse the GET request line to extract the code parameter
-    let first_line = request.lines().next().unwrap_or("");
-    let path = first_line.split_whitespace().nth(1).unwrap_or("");
-    let code = path
-        .split('?')
-        .nth(1)
-        .and_then(|q| {
-            q.split('&')
-                .find(|p| p.starts_with("code="))
-                .map(|p| p.trim_start_matches("code=").to_string())
-        })
-        .ok_or("No authorization code in callback")?;
-
-    // Best-effort browser response — token already exchanged downstream, so a
-    // disconnected browser must not fail the caller. Log so regressions surface.
-    let response = "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nConnection: close\r\n\r\n<html><body><h2>Authorization successful!</h2><p>You can close this tab and return to Lucidos.</p></body></html>";
-    stream.writable().await?;
-    if let Err(e) = stream.try_write(response.as_bytes()) {
-        crate::log!("[OAuth] Failed to write success response to browser: {}", e);
+impl CallbackListener {
+    async fn bind(port: u16) -> Result<Self, BoxError> {
+        let v4 = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
+        // Resolve the port actually bound before adding the second socket — the
+        // caller may pass 0 (tests), and both families must land on one port.
+        let port = v4.local_addr()?.port();
+        let mut listeners = vec![v4];
+        match tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, port)).await {
+            Ok(v6) => listeners.push(v6),
+            Err(e) => crate::log!(
+                "[OAuth] IPv6 loopback [::1]:{} unavailable, listening on IPv4 only: {}",
+                port,
+                e
+            ),
+        }
+        Ok(Self { listeners })
     }
 
-    // URL-decode the code
-    let code = urlencoding::decode(&code)?.into_owned();
+    /// Addresses actually bound — lets the tests drive each loopback family.
+    #[cfg(test)]
+    fn local_addrs(&self) -> Vec<std::net::SocketAddr> {
+        self.listeners
+            .iter()
+            .filter_map(|listener| listener.local_addr().ok())
+            .collect()
+    }
 
-    Ok(code)
+    /// Accept the next connection on whichever family it arrives.
+    /// `TcpListener::accept` is cancel-safe, so dropping the losing futures is fine.
+    async fn accept(&self) -> std::io::Result<tokio::net::TcpStream> {
+        let accepts: Vec<_> = self
+            .listeners
+            .iter()
+            .map(|listener| Box::pin(listener.accept()))
+            .collect();
+        let (result, _, _) = futures::future::select_all(accepts).await;
+        result.map(|(stream, _)| stream)
+    }
+}
+
+/// Cap on the buffered request line. Authorization codes run to kilobytes
+/// (Microsoft's especially), so the ceiling is generous — it exists only to
+/// stop a client that never sends a newline from growing the buffer forever.
+const MAX_REQUEST_LINE_BYTES: usize = 64 * 1024;
+
+/// How long one connection gets to send its request line before we abandon it
+/// and go back to waiting.
+///
+/// A browser sends immediately after connecting, but a speculative preconnect
+/// can open a socket and hold it idle. Without this bound, that idle socket
+/// would block the real redirect sitting behind it in the accept queue until
+/// the caller's 120s timeout killed the whole flow.
+const CALLBACK_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Read the HTTP request line — everything before the first newline.
+///
+/// This MUST loop: a single read returns only whatever has arrived so far, and
+/// the authorization code sits in the request line, so a code split across TCP
+/// reads (or one longer than a fixed buffer) is silently truncated by a
+/// read-once implementation. A truncated code is then rejected by the provider
+/// as a malformed request, long after the browser reported success.
+async fn read_request_line(stream: &mut tokio::net::TcpStream) -> Result<String, BoxError> {
+    use tokio::io::AsyncReadExt;
+
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    let mut chunk = [0u8; 4096];
+    loop {
+        if let Some(newline) = buf.iter().position(|byte| *byte == b'\n') {
+            buf.truncate(newline);
+            break;
+        }
+        if buf.len() > MAX_REQUEST_LINE_BYTES {
+            return Err(format!(
+                "OAuth callback request line exceeded {} bytes",
+                MAX_REQUEST_LINE_BYTES
+            )
+            .into());
+        }
+        let read = stream.read(&mut chunk).await?;
+        if read == 0 {
+            break; // EOF without a newline — use whatever arrived.
+        }
+        buf.extend_from_slice(&chunk[..read]);
+    }
+    if buf.last() == Some(&b'\r') {
+        buf.pop();
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Look up a query parameter and percent-decode it.
+///
+/// `plus_is_space` decides how `+` is treated. Providers form-encode
+/// human-readable text (`error_description`) with `+` for space, but an
+/// authorization code is an opaque RFC 3986 query value where `+` is a literal
+/// character — decoding it as a space would corrupt the code.
+fn query_param(query: &str, key: &str, plus_is_space: bool) -> Option<String> {
+    let raw = query
+        .split('&')
+        .find_map(|pair| pair.strip_prefix(key)?.strip_prefix('='))?;
+    let raw = if plus_is_space {
+        raw.replace('+', " ")
+    } else {
+        raw.to_string()
+    };
+    // A malformed escape shouldn't hide the value — fall back to the raw text.
+    Some(
+        urlencoding::decode(&raw)
+            .map(|decoded| decoded.into_owned())
+            .unwrap_or(raw),
+    )
+}
+
+/// Turn a callback query string into the authorization code, or into the
+/// provider's own reason for refusing.
+///
+/// A denial arrives as `?error=…&error_description=…` with no `code`. Reporting
+/// that as "no authorization code" hides the one piece of information the user
+/// needs (OAuth 2.0 §4.1.2.1).
+fn parse_callback_query(query: &str) -> Result<String, BoxError> {
+    if let Some(code) = query_param(query, "code", false).filter(|c| !c.is_empty()) {
+        return Ok(code);
+    }
+    if let Some(error) = query_param(query, "error", true).filter(|e| !e.is_empty()) {
+        let description = query_param(query, "error_description", true).filter(|d| !d.is_empty());
+        return Err(match description {
+            Some(description) => {
+                format!(
+                    "provider refused authorization: {} ({})",
+                    error, description
+                )
+            }
+            None => format!("provider refused authorization: {}", error),
+        }
+        .into());
+    }
+    Err("No authorization code in callback".into())
+}
+
+/// Best-effort browser response. The flow's outcome reaches the user through
+/// the engine, so a browser that has already navigated away must not fail the
+/// caller — but log it, so a regression here surfaces.
+async fn respond_to_browser(stream: &mut tokio::net::TcpStream, status: &str, body: &str) {
+    use tokio::io::AsyncWriteExt;
+
+    let response = format!(
+        "HTTP/1.1 {}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\n\
+         Connection: close\r\n\r\n{}",
+        status,
+        body.len(),
+        body
+    );
+    let write = async {
+        stream.write_all(response.as_bytes()).await?;
+        stream.shutdown().await
+    };
+    if let Err(e) = write.await {
+        crate::log!(
+            "[OAuth] Failed to write callback response to browser: {}",
+            e
+        );
+    }
+}
+
+/// Wait for the provider's redirect and extract the authorization code.
+async fn wait_for_oauth_callback(listener: CallbackListener) -> Result<String, BoxError> {
+    loop {
+        let mut stream = listener.accept().await?;
+        // A connection that misbehaves is discarded, never fatal — a reset or
+        // idle preconnect must not fail an authorization the user completed.
+        let request_line =
+            match tokio::time::timeout(CALLBACK_READ_TIMEOUT, read_request_line(&mut stream)).await
+            {
+                Ok(Ok(line)) => line,
+                Ok(Err(e)) => {
+                    crate::log!("[OAuth] Discarding unreadable callback connection: {}", e);
+                    continue;
+                }
+                Err(_) => {
+                    crate::log!(
+                        "[OAuth] Callback connection sent nothing within {}s, discarding",
+                        CALLBACK_READ_TIMEOUT.as_secs()
+                    );
+                    continue;
+                }
+            };
+        let target = request_line.split_whitespace().nth(1).unwrap_or("");
+        let (path, query) = target.split_once('?').unwrap_or((target, ""));
+
+        // Browsers open extra connections to the callback origin (favicon
+        // probes, speculative preconnects). Treating one of those as the
+        // callback would consume the accept and strand the flow until it times
+        // out, so answer them and keep waiting — the caller's timeout bounds
+        // this loop.
+        if path != CALLBACK_PATH || query.is_empty() {
+            respond_to_browser(&mut stream, "404 Not Found", "<html><body></body></html>").await;
+            continue;
+        }
+
+        let result = parse_callback_query(query);
+        let (status, body) = match result {
+            Ok(_) => (
+                "200 OK",
+                "<html><body><h2>Authorization successful!</h2>\
+                 <p>You can close this tab and return to Lucidos.</p></body></html>",
+            ),
+            // The provider's reason goes to the engine, not into this page —
+            // echoing an attacker-controllable query value into HTML we serve
+            // would be an injection sink for no benefit.
+            Err(_) => (
+                "400 Bad Request",
+                "<html><body><h2>Authorization failed</h2>\
+                 <p>Return to Lucidos for the details.</p></body></html>",
+            ),
+        };
+        respond_to_browser(&mut stream, status, body).await;
+        return result;
+    }
 }
 
 /// Outcome of an OAuth token exchange: (email, display_name, scopes).
@@ -686,12 +1199,14 @@ pub async fn prepare_oauth_flow(
         .map_err(|e| format!("Invalid OAuth client credentials JSON: {}", e))?;
     let client_id = client_config["client_id"]
         .as_str()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
         .ok_or("Missing client_id in OAuth credentials")?
         .to_string();
-    let client_secret = client_config["client_secret"]
-        .as_str()
-        .ok_or("Missing client_secret in OAuth credentials")?
-        .to_string();
+    // A blank/absent client_secret is not an error — it is how a *public*
+    // client is expressed (see `ClientAuth`). A desktop app that can't keep a
+    // secret authenticates the redemption with PKCE instead.
+    let auth = ClientAuth::from_secret(client_config["client_secret"].as_str());
 
     // Endpoints come from the per-credential JSON — the single source of truth.
     // The agent pre-fills them from `system-knowhow/oauth-providers.md` at
@@ -708,22 +1223,26 @@ pub async fn prepare_oauth_flow(
         .as_str()
         .map(|s| s.to_string());
 
-    // Start temporary localhost listener for callback BEFORE returning the URL
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:14981").await?;
-    let redirect_uri = "http://127.0.0.1:14981/oauth/callback".to_string();
+    // The ONE redirect URI for this flow. Resolved before anything else so a
+    // bad override fails fast instead of producing a browser redirect the
+    // listener never receives.
+    let redirect_uri = resolve_redirect_uri(&client_config)?;
 
-    // Build authorization URL with merged scopes
-    let auth_request_url = format!(
-        "{}?client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
-        auth_url,
-        urlencoding::encode(&client_id),
-        urlencoding::encode(&redirect_uri),
-        urlencoding::encode(&merged_scopes),
-    );
+    // Start the temporary loopback listener BEFORE returning the URL, so the
+    // callback can't arrive before we're listening.
+    let listener = CallbackListener::bind(CALLBACK_PORT).await?;
+
+    // Build authorization URL with merged scopes, from the same redirect_uri
+    // the exchange below will send.
+    let auth_request_url =
+        build_authorize_url(&auth_url, &client_id, &redirect_uri, &merged_scopes, &auth);
 
     crate::log!(
-        "[OAuth] Prepared {} authorization URL, listener on port 14981",
-        provider
+        "[OAuth] Prepared {} authorization URL ({} client), listener on port {}, redirect_uri {}",
+        provider,
+        auth.kind(),
+        CALLBACK_PORT,
+        redirect_uri
     );
 
     // Spawn background task to wait for callback and complete the exchange
@@ -742,11 +1261,11 @@ pub async fn prepare_oauth_flow(
             .map_err(|_| "OAuth authorization timed out after 120 seconds".to_string())?
             .map_err(|e| format!("OAuth callback error: {}", e))?;
 
-            // Exchange code for tokens
-            let token_resp =
-                exchange_code(&token_url, &client_id, &client_secret, &code, &redirect_uri)
-                    .await
-                    .map_err(|e| format!("Token exchange failed: {}", e))?;
+            // Exchange code for tokens. `exchange_code` already names the leg
+            // and carries the provider's own error text, so it is NOT re-wrapped.
+            let token_resp = exchange_code(&token_url, &client_id, &auth, &code, &redirect_uri)
+                .await
+                .map_err(|e| e.to_string())?;
 
             // Fetch userinfo (best-effort — failures downgrade to None inside)
             let (email, display_name) = if let Some(ref url) = userinfo_url {

@@ -141,7 +141,11 @@ async fn backup_key_reveal_is_read_only_and_generate_never_overwrites() {
     // --- Generate again: idempotent, NEVER overwrites ---
     // This is the core guarantee the user asked about: pressing the button a
     // second time (or a scheduled backup racing it) must not replace the key.
-    let regen = client.post(&key_url).send().await.expect("re-generate failed");
+    let regen = client
+        .post(&key_url)
+        .send()
+        .await
+        .expect("re-generate failed");
     assert_eq!(regen.status().as_u16(), 200);
     let regen_body: serde_json::Value = regen.json().await.expect("re-generate JSON");
     assert_eq!(

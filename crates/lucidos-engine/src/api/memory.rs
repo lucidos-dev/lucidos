@@ -227,7 +227,9 @@ pub(super) async fn rebuild_memory(
     let bus = state.engine.event_bus.clone();
 
     tokio::spawn(async move {
-        engine.rebuild_memory(force, re_extract_stale, Some(bus)).await;
+        engine
+            .rebuild_memory(force, re_extract_stale, Some(bus))
+            .await;
     });
     let mode = if force {
         "full_rebuild"

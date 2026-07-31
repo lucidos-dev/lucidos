@@ -183,10 +183,16 @@ users download, and the *commit* CI gated on is the very object that lands on
 #     recorded, the mirror's rc/<version> must still point at exactly it (a moved
 #     rc means CI's verdict belongs to a different commit), manifest.source_commit
 #     must equal the worktree HEAD, and every staged sha256 must still match;
-#   → force-pushes THAT SAME COMMIT OBJECT to main → tags it → Release → uploads
-#     the staged artifacts (via build-dmg.sh --release-attach, which generates
-#     latest.json from the staged .sig) → fast-forwards main → deletes the rc
-#     branch + the rc-<version> prerelease → cleans up the worktree + staging.
+#   → force-pushes THAT SAME COMMIT OBJECT to the mirror's main → tags it there
+#     BY SHA → Release → uploads the staged artifacts (via build-dmg.sh
+#     --release-attach, which generates latest.json from the staged .sig) →
+#     LANDS the bump on local main (fast-forward, else cherry-pick, else a hard
+#     failure — never a skipped bump) → tags THAT commit locally → pushes main +
+#     the tag to `origin`, unforced → deletes the rc branch + the rc-<version>
+#     prerelease → cleans up the worktree + staging.
+#     The same tag name means a different object per remote, deliberately: the
+#     mirror's names the orphan (the Release + download URLs resolve through
+#     it), the local/origin one names the release commit on main. See ADR 0029.
 
 # Re-arm the gate without a rebuild (rc push failed, or the rc was replaced):
 ./scripts/release.sh --push-rc <version>
@@ -390,9 +396,9 @@ manifest looks like this — `signature` is the verbatim contents of the
 the running client.
 
 **How an update is surfaced + applied.** Detection lives in
-`crates/lucidos-app/src/updater.rs` (two Tauri commands, packaged-only):
-`check_app_update` (checks the endpoint, returns the new version or none) and
-`install_app_update_and_restart`. The web app — running inside the packaged Tauri
+`crates/lucidos-app/src/updater.rs` (three Tauri commands, packaged-only):
+`check_app_update` (checks the endpoint, returns the new version or none),
+`install_app_update_and_restart`, and `cancel_app_update`. The web app — running inside the packaged Tauri
 client — polls `check_app_update` on startup AND on an interval (the client is
 long-resident: the window can be closed while it stays alive in the menu bar, so a
 launch-only check would miss a mid-session Release) and, when an update exists,
@@ -404,8 +410,8 @@ launch dialog (the old blocking dialog was removed). A plain browser / mobile PW
 dev build shows nothing (they can't update the desktop app).
 
 Clicking the toast runs `install_app_update_and_restart`, which restarts the WHOLE
-stack onto the new version, not just the window: `download_and_install` (swap the
-bundle) → `desktop::restart_service()` (launchd `kickstart -k` → the service
+stack onto the new version, not just the window: `Update::download` + `install`
+(swap the bundle) → `desktop::restart_service()` (launchd `kickstart -k` → the service
 supervisor tears down the gateway, engines, then embedded Postgres → launchd
 respawns `--service` onto the NEW binaries → the fresh gateway re-spawns the
 engines) → `app.restart()` (the GUI client onto its new bytes). Order is
@@ -413,6 +419,45 @@ load-bearing — install first (new bytes on disk), then the service restart, th
 the never-returning client restart. Without the service restart the window would
 run new code against a still-old gateway/engine (the launchd service keeps the old
 images until something restarts it).
+
+**The install narrates itself, phase by phase.** All of that takes long enough —
+a ~100 MB download, a signature check, a bundle swap, a service restart — that a
+silent `await` reads as a frozen app, which is exactly how it behaved while the
+plugin's progress callbacks were discarded. Every step now emits an
+`app-update-progress` Tauri event carrying an `AppUpdatePhase` frame, and the page
+turns it into a live toast (message + spinner + a determinate `.progress-bar`) and
+mirrors it in **Settings → System**, which shares one derivation
+(`appUpdateNarration`) so the two surfaces cannot disagree:
+
+| Phase | Shown as | Cancellable |
+|---|---|---|
+| `checking` | Checking for updates… | yes |
+| `downloading` | Downloading Lucidos `<v>` — 50 MB of 100 MB | yes |
+| `verifying` | Verifying Lucidos `<v>`… | no (see below) |
+| `installing` | Installing Lucidos `<v>`… | no |
+| `restarting-services` | Restarting background services… | no |
+| `relaunching` | Relaunching Lucidos… | no |
+| `cancelled` | *(re-offers the update)* | — |
+| `failed` | Update failed: `<reason>` | — |
+
+Two properties are load-bearing rather than cosmetic. **Frames are throttled at
+the source** — one per whole percentage point (or per MiB when the server sends no
+`Content-Length`), always including the first chunk and the final byte count — so
+a bundle that arrives as thousands of network chunks does not become thousands of
+IPC messages. And **`total` may legitimately be absent**, in which case the UI
+shows bytes with no percentage and no bar; fabricating one would be a lie about
+progress we don't have.
+
+`cancel_app_update` aborts the spawned download task. Only the check + download
+can be cancelled: until the bytes are verified they exist solely in memory, so
+abandoning them changes nothing on disk, whereas a half-swapped bundle has nowhere
+to return to. The `AppUpdateRun` state machine in `updater.rs` enforces that
+structurally (a run past `commit()` refuses cancellation) rather than relying on
+timing. `verifying` is technically still abortable but withholds the button: it
+lasts a few hundred milliseconds, and a control that appears and vanishes is
+noise. The last phases also suppress ordinary toasts the way an engine restart
+does — restarting the service kills the gateway serving the page, and the
+resulting connection failures would otherwise bury the narration explaining them.
 
 ### 4. CI
 

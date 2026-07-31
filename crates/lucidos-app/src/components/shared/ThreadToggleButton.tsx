@@ -1,6 +1,8 @@
 import { toggleThreads } from '../../store/actions/pane';
 import { tooltipWithShortcut } from '../../store/actions/keybindings';
 import { shortcutDef } from '../../utils/shortcuts';
+import { attentionThreadCount, mobileView, threadDrawerOpen, type MobileView } from '../../store/store';
+import { viewportIsMobile } from '../../utils/viewport';
 import { ThreadsIcon } from './icons';
 
 interface Props {
@@ -12,7 +14,33 @@ interface Props {
  *  tooltip and aria-label on the old name while Settings shows the new one. */
 const LABEL = shortcutDef('toggleThreadDrawer').label;
 
+/** Whether the thread list is on screen right now: the threads pane on mobile
+ *  (where the list is a swipe pane, not a drawer), the thread drawer on desktop.
+ *  Pure so the badge rule below is testable without a DOM. */
+export function threadListVisible(mobile: boolean, view: MobileView, drawerOpen: boolean): boolean {
+  return mobile ? view === 'threads' : drawerOpen;
+}
+
+/** The needs-attention count the toggle should badge (0 means no badge). It
+ *  rides this toggle only while the thread list is HIDDEN: with the list on
+ *  screen its own header's Filter button already carries the same count, and two
+ *  badges for one number read as two separate problems. Same rule on both
+ *  layouts, which is what makes the mobile thread pane header (where the list is
+ *  always a pane away) badge whenever anything needs the user. */
+export function threadToggleBadgeCount(
+  attentionCount: number, mobile: boolean, view: MobileView, drawerOpen: boolean,
+): number {
+  return threadListVisible(mobile, view, drawerOpen) ? 0 : attentionCount;
+}
+
 export function ThreadToggleButton({ class: cls }: Props) {
+  const badgeCount = threadToggleBadgeCount(
+    attentionThreadCount.value, viewportIsMobile.value, mobileView.value, threadDrawerOpen.value,
+  );
+  // The badge is decorative markup, so the count has to reach assistive tech
+  // through the label or it's invisible there.
+  const label = badgeCount > 0 ? `${LABEL} (${badgeCount} needing attention)` : LABEL;
+
   return (
     <button
       class={`icon-btn header-icon thread-toggle${cls ? ` ${cls}` : ''}`}
@@ -25,10 +53,11 @@ export function ThreadToggleButton({ class: cls }: Props) {
       // outside-dismiss still closes any open popover (see useAnchoredPopover).
       onPointerDown={(e) => e.stopPropagation()}
       onClick={(e) => { e.stopPropagation(); toggleThreads(); }}
-      aria-label={LABEL}
-      data-tooltip={tooltipWithShortcut(LABEL, 'toggleThreadDrawer')}
+      aria-label={label}
+      data-tooltip={tooltipWithShortcut(label, 'toggleThreadDrawer')}
     >
       <ThreadsIcon />
+      {badgeCount > 0 && <span class="badge">{badgeCount}</span>}
     </button>
   );
 }

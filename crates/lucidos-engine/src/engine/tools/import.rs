@@ -1,7 +1,5 @@
 use super::super::LucidosEngine;
-use super::bulk_limits::{
-    bulk_threshold_error, BulkContext, MAX_BULK_BYTES, MAX_BULK_FILE_COUNT,
-};
+use super::bulk_limits::{bulk_threshold_error, BulkContext, MAX_BULK_BYTES, MAX_BULK_FILE_COUNT};
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::memory::MemorySource;
 use chrono::Utc;

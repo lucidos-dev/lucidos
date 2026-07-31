@@ -13,6 +13,13 @@ import { RENDERABLE_EXTS, TEXT_EXTS, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isEdita
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
+import {
+  bridgePreviewIframeLinks,
+  documentDeclaresBase,
+  handlePreviewLinkClick,
+  previewBaseHref,
+  withPreviewBase,
+} from './previewIframeLinks';
 
 // SVG is text (XML) but the data-file preview shows it as an <img> by default —
 // the source view is the opt-in (sourceMode), handled by the TextContent branch.
@@ -169,8 +176,44 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
     return <pre class="file-preview-code" dangerouslySetInnerHTML={{ __html: syntaxHighlightCode(content, lang) }} />;
   }
 
-  if (ext === 'html' || ext === 'htm') return <iframe srcDoc={content} style="width:100%;height:100%;border:none;background:#fff;" onLoad={(e) => bridgePreviewIframeShortcuts(e.currentTarget)} />;
-  if (ext === 'md') return <div class="response-content markdown-content" dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }} />;
+  // An `about:srcdoc` document resolves relative and fragment hrefs against the
+  // HOST page's URL, so an artifact's own `#section` link or `img/chart.png` ref
+  // would reach for the app shell. `withPreviewBase` re-anchors resolution at the
+  // artifact's folder; `bridgePreviewIframeLinks` routes the clicks the browser
+  // would otherwise use to navigate this iframe. See previewIframeLinks.ts.
+  if (ext === 'html' || ext === 'htm') {
+    return (
+      <iframe
+        srcDoc={withPreviewBase(content, previewBaseHref(url))}
+        style="width:100%;height:100%;border:none;background:#fff;"
+        onLoad={(e) => {
+          bridgePreviewIframeShortcuts(e.currentTarget);
+          bridgePreviewIframeLinks(e.currentTarget, {
+            artifactPath: path,
+            declaresOwnBase: documentDeclaresBase(content),
+          });
+        }}
+      />
+    );
+  }
+  // A markdown artifact renders into the HOST document, so its links resolve
+  // against the engine-stamped `<base href="/<slug>/">`: a plain sibling link
+  // like `notes.md` becomes `/<slug>/notes.md`, the SPA fallback serves the
+  // shell, and the whole workspace reloads. Same routing as the HTML preview,
+  // minus the fragment arm (see `PreviewLinkHost.claimFragments`).
+  if (ext === 'md') {
+    return (
+      <div
+        class="response-content markdown-content"
+        onClick={(e) => handlePreviewLinkClick(e as unknown as MouseEvent, {
+          doc: document,
+          artifactPath: path,
+          claimFragments: false,
+        })}
+        dangerouslySetInnerHTML={{ __html: renderMarkdown(content) }}
+      />
+    );
+  }
   if (ext === 'json') {
     try {
       const formatted = JSON.stringify(JSON.parse(content), null, 2);

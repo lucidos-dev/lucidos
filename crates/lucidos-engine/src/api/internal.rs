@@ -59,12 +59,21 @@ pub(super) async fn permission_prompt(
         .into_response();
     }
 
+    // A file write landing inside this thread's own worktree skips the card —
+    // resolve the root the same way the Codex bridge does.
+    let worktree_path = crate::engine::cc_permission::lookup_session_worktree(
+        &state.engine.agent_sessions,
+        thread_id,
+    )
+    .await;
+
     let outcome = prompt_coding_agent_permission(
         state.engine.pool(),
         &state.engine.event_bus,
         &state.engine.pending_cc_permission,
         &state.engine.trigger_configs,
         &state.workspace_path,
+        worktree_path.as_deref(),
         CodingAgentPermissionInput {
             thread_id,
             tool_use_id: body.tool_use_id,
@@ -100,7 +109,9 @@ const CLIENT_LOG_MAX_BATCH: usize = 100;
 /// `Err(reason)` on a cap violation (the caller maps it to a 400). Pure — does
 /// NOT log, so a batch can validate every entry before committing any line.
 fn validate_client_entry(entry: &ClientLogRequest) -> Result<String, &'static str> {
-    if entry.category.len() > CLIENT_LOG_MAX_FIELD_LEN || entry.message.len() > CLIENT_LOG_MAX_FIELD_LEN {
+    if entry.category.len() > CLIENT_LOG_MAX_FIELD_LEN
+        || entry.message.len() > CLIENT_LOG_MAX_FIELD_LEN
+    {
         return Err("category/message too long");
     }
     // Value's Display is infallible — it serializes through a String buffer.
@@ -127,7 +138,13 @@ pub(super) async fn client_log(
 ) -> impl IntoResponse {
     match validate_client_entry(&body) {
         Ok(data_str) => {
-            crate::log!("[Client/{}] {} {} ua={}", body.category, body.message, data_str, user_agent(&headers));
+            crate::log!(
+                "[Client/{}] {} {} ua={}",
+                body.category,
+                body.message,
+                data_str,
+                user_agent(&headers)
+            );
             StatusCode::NO_CONTENT.into_response()
         }
         Err(reason) => (StatusCode::BAD_REQUEST, reason).into_response(),
@@ -156,7 +173,13 @@ pub(super) async fn client_logs(
     }
     let ua = user_agent(&headers);
     for (entry, data_str) in body.iter().zip(serialized) {
-        crate::log!("[Client/{}] {} {} ua={}", entry.category, entry.message, data_str, ua);
+        crate::log!(
+            "[Client/{}] {} {} ua={}",
+            entry.category,
+            entry.message,
+            data_str,
+            ua
+        );
     }
     StatusCode::NO_CONTENT.into_response()
 }
@@ -356,7 +379,10 @@ pub(super) async fn query_planned(
 ) -> impl IntoResponse {
     use crate::engine::git_ops::PlanMarkerState;
     let repo_root = std::path::PathBuf::from(&q.repo_root);
-    let marker = state.engine.plan_marker_state(&repo_root, &q.branch_name).await;
+    let marker = state
+        .engine
+        .plan_marker_state(&repo_root, &q.branch_name)
+        .await;
     let (label, kind) = match marker {
         PlanMarkerState::Present(k) if k.satisfies_gate() => ("SATISFIED", Some(k.as_db())),
         PlanMarkerState::Present(k) => ("PROPOSED", Some(k.as_db())),
@@ -395,7 +421,11 @@ pub(super) async fn approve_plan(
     Json(body): Json<ApprovePlanRequest>,
 ) -> impl IntoResponse {
     let repo_root = std::path::PathBuf::from(&body.repo_root);
-    match state.engine.approve_plan(&repo_root, &body.branch_name).await {
+    match state
+        .engine
+        .approve_plan(&repo_root, &body.branch_name)
+        .await
+    {
         Ok(approved) => Json(ApprovePlanResponse { approved }).into_response(),
         Err(e) => {
             crate::log!(
@@ -559,7 +589,10 @@ pub(super) async fn seed_change_for_test(
             )
             .await
         {
-            crate::log!("[Internal] seed-change-for-test record_planned failed: {}", e);
+            crate::log!(
+                "[Internal] seed-change-for-test record_planned failed: {}",
+                e
+            );
         }
     }
 
@@ -682,8 +715,7 @@ pub(super) async fn ask_user_question(
         .into_response();
     }
 
-    let answers =
-        crate::engine::agent_question::build_hook_answers(&answer_kinds, &body.questions);
+    let answers = crate::engine::agent_question::build_hook_answers(&answer_kinds, &body.questions);
     Json(AskUserQuestionResponse {
         questions: body.questions,
         answers,
@@ -695,14 +727,8 @@ pub(super) async fn ask_user_question(
 /// sessions and the e2e harness).
 pub(super) fn router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/internal/permission-prompt",
-            post(permission_prompt),
-        )
-        .route(
-            "/internal/ask-user-question",
-            post(ask_user_question),
-        )
+        .route("/internal/permission-prompt", post(permission_prompt))
+        .route("/internal/ask-user-question", post(ask_user_question))
         .route("/internal/mark-hardened", post(mark_hardened))
         .route(
             "/internal/coding-agent-diff-refresh",
@@ -714,10 +740,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/internal/approve-plan", post(approve_plan))
         .route("/internal/client-log", post(client_log))
         .route("/internal/client-logs", post(client_logs))
-        .route(
-            "/internal/seed-change-for-test",
-            post(seed_change_for_test),
-        )
+        .route("/internal/seed-change-for-test", post(seed_change_for_test))
 }
 
 #[cfg(test)]
@@ -749,14 +772,25 @@ mod tests {
     }
 
     fn entry(category: &str, message: &str, data: serde_json::Value) -> ClientLogRequest {
-        ClientLogRequest { category: category.into(), message: message.into(), data }
+        ClientLogRequest {
+            category: category.into(),
+            message: message.into(),
+            data,
+        }
     }
 
     #[test]
     fn validate_client_entry_accepts_normal_breadcrumb_and_returns_serialized_data() {
-        let e = entry("perf", "open", serde_json::json!({ "eventCount": 7847, "openMs": 1234 }));
+        let e = entry(
+            "perf",
+            "open",
+            serde_json::json!({ "eventCount": 7847, "openMs": 1234 }),
+        );
         let data = validate_client_entry(&e).expect("normal entry valid");
-        assert!(data.contains("7847") && data.contains("openMs"), "returns serialized data for logging");
+        assert!(
+            data.contains("7847") && data.contains("openMs"),
+            "returns serialized data for logging"
+        );
     }
 
     #[test]
@@ -767,6 +801,9 @@ mod tests {
             Err("category/message too long")
         );
         let big = serde_json::json!({ "blob": "y".repeat(CLIENT_LOG_MAX_DATA_LEN) });
-        assert_eq!(validate_client_entry(&entry("perf", "m", big)), Err("data too large"));
+        assert_eq!(
+            validate_client_entry(&entry("perf", "m", big)),
+            Err("data too large")
+        );
     }
 }

@@ -230,7 +230,9 @@ pub fn ensure_trigger_toml_gitignored(workspace_path: &Path) {
     if existing.lines().any(|l| l.trim() == TRIGGER_TOML_EXCLUDE) {
         return;
     }
-    let Some(parent) = exclude.parent() else { return };
+    let Some(parent) = exclude.parent() else {
+        return;
+    };
     if std::fs::create_dir_all(parent).is_err() {
         return;
     }

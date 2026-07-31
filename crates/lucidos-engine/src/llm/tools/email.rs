@@ -1,7 +1,6 @@
 //! LLM-facing schemas for email tools (configure/send/read/save attachment).
 //! Handlers live in `core::email` + `engine::tools`.
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

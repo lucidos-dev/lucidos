@@ -30,8 +30,12 @@ static READ_PREFIX_ERR: LazyLock<String> = LazyLock::new(|| {
             .join(", ")
     )
 });
-static MUTATE_PREFIX_ERR: LazyLock<String> =
-    LazyLock::new(|| format!("Path must start with one of: {}", MUTABLE_PREFIXES.join(", ")));
+static MUTATE_PREFIX_ERR: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "Path must start with one of: {}",
+        MUTABLE_PREFIXES.join(", ")
+    )
+});
 
 fn validate_path_basics(path: &str) -> Result<(), (StatusCode, String)> {
     if path.is_empty() {
@@ -167,14 +171,15 @@ pub(super) async fn read_data(State(state): State<AppState>, Path(path): Path<St
         return (code, msg).into_response();
     }
 
-    let file_path = if let Some(rel) = path.strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX) {
-        let Some(dir) = state.engine.system_knowhow_dir() else {
-            return (StatusCode::NOT_FOUND, "System knowhow not available").into_response();
+    let file_path =
+        if let Some(rel) = path.strip_prefix(crate::core::knowhow::SYSTEM_KNOWHOW_PREFIX) {
+            let Some(dir) = state.engine.system_knowhow_dir() else {
+                return (StatusCode::NOT_FOUND, "System knowhow not available").into_response();
+            };
+            dir.join(rel)
+        } else {
+            state.workspace_path.join(crate::core::DATA_DIR).join(&path)
         };
-        dir.join(rel)
-    } else {
-        state.workspace_path.join(crate::core::DATA_DIR).join(&path)
-    };
     let ext = path.rsplit('.').next().unwrap_or("").to_lowercase();
     let content_type = content_type_for_ext(&ext);
 
@@ -226,11 +231,13 @@ pub(super) async fn write_data(
                 Json(serde_json::json!({ "success": true, "path": path, "commit": commit }))
                     .into_response(),
             ),
-            Err(e) => return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
         }
     } else {
         let file_path = state.workspace_path.join(crate::core::DATA_DIR).join(&path);
@@ -279,13 +286,16 @@ pub(super) async fn write_data(
     state
         .engine
         .event_bus
-        .emit_user_system(&headers, &state.pool, "[DataApi] DataFileWritten", |actor| {
-            crate::engine::event_bus::SystemEvent::DataFileWritten {
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[DataApi] DataFileWritten",
+            |actor| crate::engine::event_bus::SystemEvent::DataFileWritten {
                 path: path.clone(),
                 commit: commit_opt,
                 actor,
-            }
-        })
+            },
+        )
         .await;
     response
 }
@@ -317,11 +327,13 @@ pub(super) async fn delete_data(
                 Json(serde_json::json!({ "success": true, "path": path, "commit": commit }))
                     .into_response(),
             ),
-            Err(e) => return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
         }
     } else {
         match am
@@ -333,24 +345,29 @@ pub(super) async fn delete_data(
                 Json(serde_json::json!({ "success": true, "path": path, "commit": commit }))
                     .into_response(),
             ),
-            Err(e) => return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({ "error": e.to_string() })),
-            )
-                .into_response(),
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
         }
     };
 
     state
         .engine
         .event_bus
-        .emit_user_system(&headers, &state.pool, "[DataApi] DataFileDeleted", |actor| {
-            crate::engine::event_bus::SystemEvent::DataFileDeleted {
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[DataApi] DataFileDeleted",
+            |actor| crate::engine::event_bus::SystemEvent::DataFileDeleted {
                 path: path.clone(),
                 commit: commit_opt,
                 actor,
-            }
-        })
+            },
+        )
         .await;
     response
 }
@@ -477,9 +494,7 @@ pub(super) fn router() -> Router<AppState> {
         .route("/data/upload", post(upload_data))
         .route(
             "/data/*path",
-            get(read_data)
-                .put(write_data)
-                .delete(delete_data),
+            get(read_data).put(write_data).delete(delete_data),
         )
 }
 

@@ -193,9 +193,7 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         "CodingAgentPromptSent" => EventClass::Activity,
         "CredentialRequested" | "McpConsentRequested" => EventClass::Activity,
         // Terminal
-        "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => {
-            EventClass::Terminal
-        }
+        "ResponseGenerated" | "ResponseCanceled" | "ResponseAborted" => EventClass::Terminal,
         "SessionEnded" | "ThreadArchived" | "TriggerCompleted" => EventClass::Terminal,
         "ChangeApplied" | "ChangeDiscarded" | "ChangeReverted" | "ChangeApplyFailed" => {
             EventClass::Terminal
@@ -744,8 +742,7 @@ pub fn available_thread_actions(
     is_saved: bool,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
-    let live =
-        status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer;
+    let live = status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer;
     let coding_agent_pending = has_pending_changes && thread_type == ThreadType::CodingAgent;
 
     // Layer 1 — draft discard. Orthogonal to run state: an unsent draft can be

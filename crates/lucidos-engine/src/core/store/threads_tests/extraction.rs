@@ -1,5 +1,5 @@
-use super::*;
 use super::test_helpers::*;
+use super::*;
 
 #[tokio::test]
 async fn recent_thread_messages_for_extraction_returns_oldest_first() {

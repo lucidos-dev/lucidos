@@ -10,11 +10,14 @@ export interface CredentialFields {
   password: string;
   // oauth_client type
   clientId: string;
+  /** Blank means a PUBLIC client: the engine omits the secret and uses PKCE. */
   clientSecret: string;
   authUrl: string;
   tokenUrl: string;
   userinfoUrl: string;
   scopes: string;
+  /** Blank means the default loopback callback URI. */
+  redirectUri: string;
 }
 
 export function emptyFields(): CredentialFields {
@@ -28,6 +31,7 @@ export function emptyFields(): CredentialFields {
     tokenUrl: '',
     userinfoUrl: '',
     scopes: '',
+    redirectUri: '',
   };
 }
 
@@ -45,6 +49,7 @@ export function parseSecret(authType: AuthType, authValue: string): CredentialFi
     f.tokenUrl = pick(p, 'token_url');
     f.userinfoUrl = pick(p, 'userinfo_url');
     f.scopes = pick(p, 'scopes');
+    f.redirectUri = pick(p, 'redirect_uri');
   } else if (authType === 'password') {
     const p = safeJson(authValue);
     f.username = pick(p, 'username');
@@ -65,17 +70,28 @@ export function parseSecret(authType: AuthType, authValue: string): CredentialFi
  *  single-value case) rather than overwriting it with empty values. */
 export function buildSecret(authType: AuthType, f: CredentialFields): string {
   if (authType === 'oauth_client') {
-    if (!f.clientId && !f.clientSecret && !f.authUrl && !f.tokenUrl && !f.userinfoUrl && !f.scopes) {
+    if (
+      !f.clientId &&
+      !f.clientSecret &&
+      !f.authUrl &&
+      !f.tokenUrl &&
+      !f.userinfoUrl &&
+      !f.scopes &&
+      !f.redirectUri
+    ) {
       return '';
     }
-    const blob: Record<string, string> = {
-      client_id: f.clientId,
-      client_secret: f.clientSecret,
-    };
+    const blob: Record<string, string> = { client_id: f.clientId };
+    // A blank client secret is meaningful, not missing: the engine reads its
+    // absence as "public client" and authenticates the exchange with PKCE
+    // instead. Clearing the field on an existing credential is how you switch a
+    // confidential connection to a public one.
+    if (f.clientSecret) blob.client_secret = f.clientSecret;
     if (f.authUrl) blob.auth_url = f.authUrl;
     if (f.tokenUrl) blob.token_url = f.tokenUrl;
     if (f.userinfoUrl) blob.userinfo_url = f.userinfoUrl;
     if (f.scopes) blob.scopes = f.scopes;
+    if (f.redirectUri) blob.redirect_uri = f.redirectUri;
     return JSON.stringify(blob);
   }
   if (authType === 'password') {

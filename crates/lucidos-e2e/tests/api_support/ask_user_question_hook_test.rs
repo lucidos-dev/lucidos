@@ -52,19 +52,26 @@ async fn long_poll_returns_answer_when_user_responds() {
             sleep(Duration::from_millis(50)).await;
         }
         let resp = client_bg
-            .post(format!("{}/api/v1/threads/{}/answer-question", base_url(), thread_id))
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
             .json(&json!({
                 "tool_use_id": q0_id_bg,
                 "answer": { "kind": "Selected", "option_id": "opt-0" }
             }))
-            .send().await.expect("answer post");
+            .send()
+            .await
+            .expect("answer post");
         assert_eq!(resp.status().as_u16(), 200, "answer-question should accept");
     });
 
     // Hook side — blocks until the answer arrives (or test timeout).
     let resp = tokio::time::timeout(
         Duration::from_secs(5),
-        client.post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+        client
+            .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
             .json(&json!({
                 "thread_id": thread_id.to_string(),
                 "tool_use_id": tool_use_id,
@@ -79,21 +86,33 @@ async fn long_poll_returns_answer_when_user_responds() {
                     ]
                 }]
             }))
-            .send()
-    ).await.expect("did not time out").expect("hook post");
+            .send(),
+    )
+    .await
+    .expect("did not time out")
+    .expect("hook post");
 
     answerer.await.unwrap();
     assert_eq!(resp.status().as_u16(), 200, "hook should get 200");
 
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["answers"], json!({"Fav color?": "Red"}),
-               "hook output should contain {{question: label}}");
+    assert_eq!(
+        body["answers"],
+        json!({"Fav color?": "Red"}),
+        "hook output should contain {{question: label}}"
+    );
 
     // Cleanup
     sqlx::query("DELETE FROM events WHERE thread_id = $1")
-        .bind(thread_id).execute(&pool).await.unwrap();
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
-        .bind(thread_id).execute(&pool).await.ok();
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .ok();
 }
 
 #[tokio::test]
@@ -130,7 +149,11 @@ async fn multi_select_question_returns_joined_answer() {
             sleep(Duration::from_millis(50)).await;
         }
         let resp = client_bg
-            .post(format!("{}/api/v1/threads/{}/answer-question", base_url(), thread_id))
+            .post(format!(
+                "{}/api/v1/threads/{}/answer-question",
+                base_url(),
+                thread_id
+            ))
             .json(&json!({
                 "tool_use_id": q0_id_bg,
                 "answer": { "kind": "MultiSelected", "option_ids": ["opt-0", "opt-1"] }
@@ -138,7 +161,11 @@ async fn multi_select_question_returns_joined_answer() {
             .send()
             .await
             .expect("answer post");
-        assert_eq!(resp.status().as_u16(), 200, "MultiSelected answer should accept");
+        assert_eq!(
+            resp.status().as_u16(),
+            200,
+            "MultiSelected answer should accept"
+        );
     });
 
     let resp = tokio::time::timeout(
@@ -222,7 +249,11 @@ async fn multi_select_empty_answer_is_rejected() {
     .expect("insert UserQuestionAsked");
 
     let resp = client
-        .post(format!("{}/api/v1/threads/{}/answer-question", base_url(), thread_id))
+        .post(format!(
+            "{}/api/v1/threads/{}/answer-question",
+            base_url(),
+            thread_id
+        ))
         .json(&json!({
             "tool_use_id": q0_id,
             "answer": { "kind": "MultiSelected", "option_ids": [] }
@@ -271,19 +302,22 @@ async fn returns_immediately_when_answer_already_persisted() {
     // restarted; the user already answered before crash".
     sqlx::query(
         "INSERT INTO events (id, thread_id, event_type, payload, created, aggregate, aggregate_id)
-         VALUES ($1, $2, 'UserQuestionAnswered', $3, NOW(), 'thread', $4)"
+         VALUES ($1, $2, 'UserQuestionAnswered', $3, NOW(), 'thread', $4)",
     )
-        .bind(Uuid::new_v4())
-        .bind(thread_id)
-        .bind(json!({
-            "tool_use_id": q0_id,
-            "answer": { "kind": "Selected", "option_id": "opt-1" }
-        }))
-        .bind(thread_id.to_string())
-        .execute(&pool).await.expect("insert event");
+    .bind(Uuid::new_v4())
+    .bind(thread_id)
+    .bind(json!({
+        "tool_use_id": q0_id,
+        "answer": { "kind": "Selected", "option_id": "opt-1" }
+    }))
+    .bind(thread_id.to_string())
+    .execute(&pool)
+    .await
+    .expect("insert event");
 
     let start = std::time::Instant::now();
-    let resp = client.post(format!("{}/api/v1/internal/ask-user-question", base_url()))
+    let resp = client
+        .post(format!("{}/api/v1/internal/ask-user-question", base_url()))
         .json(&json!({
             "thread_id": thread_id.to_string(),
             "tool_use_id": tool_use_id,
@@ -298,17 +332,25 @@ async fn returns_immediately_when_answer_already_persisted() {
                 ]
             }]
         }))
-        .send().await.expect("hook post");
+        .send()
+        .await
+        .expect("hook post");
 
     // Fast path = "no long-poll", not "sub-1s round-trip" — under parallel
     // test load HTTPS handshake + DB lookup can take ~1s. Long-poll timeout
     // is much higher; 5s leaves headroom while still catching regressions.
-    assert!(start.elapsed() < Duration::from_secs(5),
-            "should not block when answer already exists; took {:?}", start.elapsed());
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "should not block when answer already exists; took {:?}",
+        start.elapsed()
+    );
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["answers"], json!({"Fav color?": "Blue"}));
 
     sqlx::query("DELETE FROM events WHERE thread_id = $1")
-        .bind(thread_id).execute(&pool).await.unwrap();
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 }

@@ -99,7 +99,11 @@ pub(crate) fn cmd_mark(ws: &Workspace) -> Result<(), BoxError> {
             .map_err(|e| format!("POST {} returned {}, body read failed: {}", url, status, e))?;
         return Err(format!("POST {} returned {}: {}", url, status, text).into());
     }
-    println!("Hardening recorded: {} {}", branch, &head_sha[..head_sha.len().min(12)]);
+    println!(
+        "Hardening recorded: {} {}",
+        branch,
+        &head_sha[..head_sha.len().min(12)]
+    );
     Ok(())
 }
 

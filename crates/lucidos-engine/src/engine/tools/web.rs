@@ -132,11 +132,7 @@ impl LucidosEngine {
                 // tool still searches via another configured one. The chain
                 // itself owns backend selection, fallthrough, and the
                 // nothing-configured message; see `llm::web_search`.
-                match self
-                    .current_web_search()
-                    .search(query, max_results)
-                    .await
-                {
+                match self.current_web_search().search(query, max_results).await {
                     Ok(result) => Ok(result),
                     Err(e) => Ok(format!("Error: Search failed: {}", e)),
                 }

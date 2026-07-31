@@ -117,8 +117,7 @@ async fn settle_stuck_running_thread_emits_aborted_stale_settle_with_user_actor(
         "cause must be stale_settle so the summary reads 'Settled stuck response'"
     );
     assert_eq!(
-        payload["actor"]["kind"],
-        "device",
+        payload["actor"]["kind"], "device",
         "actor.kind must be 'device' (user from a known device) so the chip reads 'You'"
     );
     assert_eq!(payload["actor"]["device_id"], "test-device");
@@ -226,4 +225,3 @@ async fn settle_stuck_running_thread_no_op_for_unknown_thread() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
-

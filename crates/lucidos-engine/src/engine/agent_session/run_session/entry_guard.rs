@@ -262,7 +262,9 @@ mod tests {
         sessions.lock().await.insert(thread_id, replacement);
 
         assert!(
-            reap_entry(&sessions, thread_id, &outgoing_tx).await.is_none(),
+            reap_entry(&sessions, thread_id, &outgoing_tx)
+                .await
+                .is_none(),
             "the outgoing run must not claim an entry it does not own"
         );
         let guard = sessions.lock().await;

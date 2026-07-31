@@ -216,5 +216,4 @@ mod tests {
         // `--user-ui-scale` set, letting the stylesheet default apply.
         assert!(SDK_PREFS_JS.contains("if (scale)"));
     }
-
 }

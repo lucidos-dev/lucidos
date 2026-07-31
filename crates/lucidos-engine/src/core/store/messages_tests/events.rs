@@ -1,5 +1,5 @@
-use super::*;
 use super::msg_helpers::*;
+use super::*;
 
 // ---------------------------------------------------------------
 // Events (ResponseEvent) tests

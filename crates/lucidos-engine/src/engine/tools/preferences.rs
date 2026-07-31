@@ -69,10 +69,7 @@ impl LucidosEngine {
                 if let Ok(schedule) = crate::engine::tools::scheduler::parse_standard_cron(c) {
                     let now = chrono::Utc::now().with_timezone(&tz);
                     if let Some(next) = schedule.after(&now).next() {
-                        out.push_str(&format!(
-                            "Next run: {}\n",
-                            next.format("%Y-%m-%d %H:%M %Z")
-                        ));
+                        out.push_str(&format!("Next run: {}\n", next.format("%Y-%m-%d %H:%M %Z")));
                     }
                 }
                 match provider.as_deref() {
@@ -167,7 +164,9 @@ impl LucidosEngine {
         let key = args["key"].as_str().unwrap_or("").trim();
         let value = args["value"].as_str().unwrap_or("");
         if key.is_empty() {
-            return Ok("Error: key is required. Call get_preferences to see settable keys.".to_string());
+            return Ok(
+                "Error: key is required. Call get_preferences to see settable keys.".to_string(),
+            );
         }
 
         // Catalog gate: only agent-settable keys, with validated values. Internal
@@ -262,7 +261,10 @@ impl LucidosEngine {
             "Settable preferences — set with set_preference(key, value). Device-scoped keys apply to the calling device only.\n",
         );
         for spec in preference_catalog::CATALOG {
-            let current = effective.get(spec.key).map(String::as_str).unwrap_or("(unset)");
+            let current = effective
+                .get(spec.key)
+                .map(String::as_str)
+                .unwrap_or("(unset)");
             let scope = match spec.scope {
                 PrefScope::Device => "device",
                 PrefScope::Global => "global",

@@ -169,9 +169,7 @@ impl Default for CcSpawnCoalescer {
 /// completed) into orphaned injections so the chat handler can re-route them
 /// instead of dropping them. Internal messages without `origin_event_id` are
 /// dropped — they have no user-visible exchange to recover.
-pub(crate) fn queued_to_orphans(
-    queued: Vec<QueuedMessage>,
-) -> Vec<crate::engine::InjectedPrompt> {
+pub(crate) fn queued_to_orphans(queued: Vec<QueuedMessage>) -> Vec<crate::engine::InjectedPrompt> {
     queued
         .into_iter()
         .filter_map(|q| {
@@ -374,11 +372,7 @@ mod tests {
 
     #[test]
     fn combine_joins_messages_with_separator() {
-        let (text, _images) = combine_messages(
-            "first",
-            None,
-            vec![msg("second"), msg("third")],
-        );
+        let (text, _images) = combine_messages("first", None, vec![msg("second"), msg("third")]);
         assert_eq!(text, "first\n\n---\n\nsecond\n\n---\n\nthird");
     }
 
@@ -402,8 +396,7 @@ mod tests {
 
     #[test]
     fn combine_preserves_message_order() {
-        let (text, _images) =
-            combine_messages("L", None, vec![msg("Q1"), msg("Q2"), msg("Q3")]);
+        let (text, _images) = combine_messages("L", None, vec![msg("Q1"), msg("Q2"), msg("Q3")]);
         // Leader text must be first.
         assert!(text.starts_with("L"));
         // Queued messages must follow in arrival order.
@@ -457,7 +450,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(100));
         let r2 = c.try_become_leader(tid, msg("msg2"));
         assert_eq!(
-            r2, LeaderElection::Queued,
+            r2,
+            LeaderElection::Queued,
             "second rapid message must be queued, not spawn its own CC"
         );
 
@@ -482,5 +476,4 @@ mod tests {
             "no residual messages should remain after a clean leader cycle"
         );
     }
-
 }

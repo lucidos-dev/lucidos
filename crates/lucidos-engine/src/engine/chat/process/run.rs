@@ -25,6 +25,7 @@ use super::super::process_helpers::{
     build_trigger_started_event, classify_or_fallback, TriggerContext,
 };
 use super::context_build::{build_capture_sections, build_loaded_knowhow_block};
+use super::PreEmittedOrigin;
 
 pub(super) async fn resolve_route_overrides(
     pool: &sqlx::PgPool,
@@ -66,12 +67,24 @@ pub(super) async fn resolve_route_overrides(
 /// through to the injection fast-path below, which queues it as `WakeFromChild`
 /// so the question stays live for the user and the completion is processed
 /// right after they answer it.
+///
+/// A message whose starter event is ALREADY persisted is likewise not eligible:
+/// answering consumes the text as `UserQuestionAnswered` and emits no
+/// `MessageReceived`, so a pre-emitted message routed here would leave both
+/// events in the thread for one thing the user said. The API boundary skips its
+/// pre-emit when a question is open, so this only catches the narrow race where
+/// one opened in between, plus the orphan re-process path, which carries a
+/// persisted `MessageReceived` for the same reason.
 pub(super) fn message_can_answer_pending_question(
     is_new_thread: bool,
     user_message: &str,
     mode: ActorMode,
+    pre_emitted_origin: Option<PreEmittedOrigin>,
 ) -> bool {
-    !is_new_thread && !user_message.is_empty() && mode == ActorMode::Human
+    !is_new_thread
+        && !user_message.is_empty()
+        && mode == ActorMode::Human
+        && pre_emitted_origin.is_none()
 }
 
 impl LucidosEngine {
@@ -88,7 +101,7 @@ impl LucidosEngine {
         reasoning_effort: Option<&str>,  // unified reasoning level: none/low/medium/high/xhigh/max
         user_images: Option<&[crate::api::ChatImage]>, // base64-encoded images pasted by user
         device_id: Option<&str>,         // device that sent this message
-        use_coding_agent: Option<bool>,   // bypass LLM and spawn a coding agent directly
+        use_coding_agent: Option<bool>,  // bypass LLM and spawn a coding agent directly
         event_id: Option<&str>,          // client-generated UUID for reliable matching
         thread_id: Option<Uuid>,         // None = new thread, Some = follow-up
         conflict_change_id: Option<Uuid>, // change ID for merge conflict resolution
@@ -99,8 +112,8 @@ impl LucidosEngine {
         mode: ActorMode,
         cc_model: Option<&str>, // CC-specific model override (from compose view pre-session selection)
         coding_agent: Option<crate::runtime::CodingAgent>, // backend for a NEW coding-agent thread; stored value wins on follow-ups
-        pre_emitted_origin: Option<Uuid>, // skip MessageReceived if already emitted by spawn_thread
-        title: Option<&str>,    // caller-provided title (skips async LLM title gen)
+        pre_emitted_origin: Option<PreEmittedOrigin>, // skip MessageReceived: the caller already persisted it
+        title: Option<&str>, // caller-provided title (skips async LLM title gen)
         origin: Option<MessageOrigin>,
         external_cancel: Option<CancellationToken>, // forwarded into the per-thread cancel_token (used by triggers)
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -131,7 +144,7 @@ impl LucidosEngine {
             &self.pool,
             use_coding_agent,
             thread_id,
-            pre_emitted_origin,
+            pre_emitted_origin.map(PreEmittedOrigin::event_id),
             model_override,
             reasoning_effort,
         )
@@ -225,7 +238,12 @@ impl LucidosEngine {
         // `CodingAgentIdled` doesn't intercept the follow-up — otherwise the
         // typed text would be silently consumed as the dead question's answer
         // and `MessageReceived` would never be emitted.
-        if message_can_answer_pending_question(is_new_thread, user_message, mode) {
+        if message_can_answer_pending_question(
+            is_new_thread,
+            user_message,
+            mode,
+            pre_emitted_origin,
+        ) {
             if let Some(pending_tool_use_id) =
                 crate::engine::agent_question::lookup_active_question_tool_use_id(
                     self.pool(),
@@ -371,8 +389,9 @@ impl LucidosEngine {
                         &mut sessions,
                         thread_id,
                         // Genuine user follow-up, not an engine-internal
-                        // child-wake (which sets pre_emitted_origin).
-                        pre_emitted_origin.is_none(),
+                        // child-wake. A pre-emitted USER message is still a
+                        // user follow-up and must keep arming the redirect.
+                        !pre_emitted_origin.is_some_and(PreEmittedOrigin::is_engine_reentry),
                         &origin,
                     )
                 };
@@ -428,11 +447,8 @@ impl LucidosEngine {
                             );
                             break;
                         }
-                        let _ = tokio::time::timeout(
-                            std::time::Duration::from_secs(2),
-                            notified,
-                        )
-                        .await;
+                        let _ =
+                            tokio::time::timeout(std::time::Duration::from_secs(2), notified).await;
                     }
                 }
 
@@ -443,10 +459,17 @@ impl LucidosEngine {
                 // wrong exchange, causing a brief "interrupted" flash and incorrect
                 // thread section placement.
                 //
-                // Skip the emit on a child-wake (`pre_emitted_origin` set) — see
-                // `AgentInputKind::WakeFromChild` docs.
-                let (origin_event_id, input_kind) = if let Some(id) = pre_emitted_origin {
-                    (Some(id), AgentInputKind::WakeFromChild)
+                // Skip the emit whenever the caller already persisted the
+                // event. Only a CHILD WAKE also changes how the input routes
+                // (see `AgentInputKind::WakeFromChild` docs); a pre-emitted
+                // user message is an ordinary follow-up.
+                let (origin_event_id, input_kind) = if let Some(pre) = pre_emitted_origin {
+                    let kind = if pre.is_engine_reentry() {
+                        AgentInputKind::WakeFromChild
+                    } else {
+                        AgentInputKind::User
+                    };
+                    (Some(pre.event_id()), kind)
                 } else {
                     use crate::engine::thread_events::EventMeta;
                     let emit_result = self
@@ -481,10 +504,11 @@ impl LucidosEngine {
                     // non-CC injection fast-path. On the success path we return
                     // before the slow path reads it, so this is harmless there.
                     if let Some(result) = emit_result {
-                        pre_emitted_origin = Some(result.event_id);
+                        pre_emitted_origin = Some(PreEmittedOrigin::Message(result.event_id));
                     }
                     (
                         pre_emitted_origin
+                            .map(PreEmittedOrigin::event_id)
                             .or_else(|| event_id.and_then(|s| uuid::Uuid::parse_str(s).ok())),
                         AgentInputKind::User,
                     )
@@ -573,12 +597,18 @@ impl LucidosEngine {
                 // picks up the injection; without this ordering, UserPromptInjected
                 // can race ahead and create a duplicate exchange boundary.
                 //
-                // Skip the emit on a child-wake (`pre_emitted_origin` set) and
-                // inject as `WakeFromChild` instead — see
-                // `InjectedPromptKind::WakeFromChild` docs.
+                // Skip the emit whenever the caller already persisted the
+                // event. Only a CHILD WAKE also injects as `WakeFromChild`
+                // (see `InjectedPromptKind::WakeFromChild` docs). A
+                // pre-emitted user message still injects as `UserText`, so the
+                // loop acknowledges it with a `UserPromptInjected`.
                 use crate::engine::thread_events::EventMeta;
-                let inject_kind = if pre_emitted_origin.is_some() {
-                    crate::engine::InjectedPromptKind::WakeFromChild
+                let inject_kind = if let Some(pre) = pre_emitted_origin {
+                    if pre.is_engine_reentry() {
+                        crate::engine::InjectedPromptKind::WakeFromChild
+                    } else {
+                        crate::engine::InjectedPromptKind::UserText
+                    }
                 } else {
                     let emit_result = self
                         .event_bus
@@ -606,13 +636,14 @@ impl LucidosEngine {
                         .await?;
                     // Stash the emit for the race-recovery handoff below.
                     if let Some(result) = emit_result {
-                        pre_emitted_origin = Some(result.event_id);
+                        pre_emitted_origin = Some(PreEmittedOrigin::Message(result.event_id));
                     }
                     crate::engine::InjectedPromptKind::UserText
                 };
 
-                let origin_event_id =
-                    pre_emitted_origin.or_else(|| event_id.and_then(|s| Uuid::parse_str(s).ok()));
+                let origin_event_id = pre_emitted_origin
+                    .map(PreEmittedOrigin::event_id)
+                    .or_else(|| event_id.and_then(|s| Uuid::parse_str(s).ok()));
                 let images = user_images.map(|imgs| imgs.to_vec());
                 let injected = {
                     let threads = self.active_threads.lock().unwrap();
@@ -721,8 +752,8 @@ impl LucidosEngine {
         // spawn_thread — skip to avoid double-emitting (and double-incrementing
         // the parent's active_children_count).
         use crate::engine::thread_events::EventMeta;
-        let origin_id = if let Some(id) = pre_emitted_origin {
-            id
+        let origin_id = if let Some(pre) = pre_emitted_origin {
+            pre.event_id()
         } else {
             let (user_thread_event, user_meta) = if let Some(ref tc) = trigger {
                 build_trigger_started_event(
@@ -1197,7 +1228,6 @@ impl LucidosEngine {
                 reasoning_effort,
                 &cancel_token,
                 &mut injection_rx,
-
                 guard.generation(),
                 &mut terminator_emitted,
                 crate::engine::agentic_loop::ContextCaptureSeed {

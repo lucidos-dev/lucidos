@@ -18,8 +18,11 @@
  *
  *  Idempotent: the function strips the consumed hash params via
  *  `window.history.replaceState`, so a second call with the same URL sees
- *  no deep-link and returns. Safe to wire to multiple events. */
-import { focusThreadOrBootstrap } from './threads';
+ *  no deep-link and returns. Safe to wire to multiple events. The `#thread=`
+ *  branch is asynchronous (it keeps the hash until the focus lands, see
+ *  `landThreadHash`), so it holds an in-flight guard for the same purpose while
+ *  its hash is still in the URL. */
+import { focusThreadOrBootstrapResult } from './threads';
 import { THREAD_HASH_RE } from './cross-workspace';
 import {
   parseDeepLinkFromUrl,
@@ -28,16 +31,95 @@ import {
 } from './notification-deeplink';
 import { dispatchDeepLink } from './in-app-notification-toast';
 import { postClientLog } from '../../utils/liveness';
+import { showToast } from '../store';
+import { errorDetail } from '../../utils/errorDetail';
+
+/** Backoff between landing attempts, in ms. One attempt runs before the first
+ *  delay, so this is `length + 1` attempts over ~11.75s.
+ *
+ *  Sized for the case that made the hash durable in the first place: the peer
+ *  workspace is reached through the gateway, which LAZY-STARTS a stopped engine
+ *  on the proxy hit. The shell is served (and this code runs) while that engine
+ *  is still coming up, so the landing's very first `GET /api/v1/threads` can lose
+ *  the race outright. Bounded rather than open-ended so a genuinely unreachable
+ *  engine reports an error instead of spinning forever. */
+const THREAD_HASH_RETRY_DELAYS_MS = [250, 500, 1000, 2000, 3000, 5000];
+
+const sleep = (ms: number) => new Promise<void>(resolve => { setTimeout(resolve, ms); });
+
+/** The thread id whose landing is currently in flight, or null. `handleHashLocation`
+ *  is wired to cold start, `hashchange` and all three resume events, and the hash
+ *  now SURVIVES until the focus lands, so without this guard every resume during
+ *  the retry window would start a competing landing for the same thread. */
+let landingThreadId: string | null = null;
+/** Bumped per landing so a superseded one (the user clicked a different
+ *  cross-workspace link mid-retry) neither focuses its stale thread nor strips
+ *  the newer hash. */
+let landingToken = 0;
+
+function stripConsumedHash(): void {
+  window.history.replaceState({}, '', window.location.pathname + window.location.search);
+}
+
+/** Drive the bare `#thread=<uuid>` landing to a verdict, then consume the hash.
+ *
+ *  The ordering is the whole point: the hash is the ONLY durable record of where
+ *  the user asked to go, so it is stripped on success (or on a terminal failure
+ *  the user is told about), never merely on dispatch. Stripping first is what
+ *  made a cross-workspace link need two clicks: the first landing raced the peer
+ *  engine's lazy start, lost, and had nothing left to retry from. */
+async function landThreadHash(threadId: string): Promise<void> {
+  const token = ++landingToken;
+  landingThreadId = threadId;
+  try {
+    for (let attempt = 0; ; attempt++) {
+      const outcome = await focusThreadOrBootstrapResult(threadId);
+      if (token !== landingToken) return; // superseded by a newer landing
+      if (outcome.kind === 'focused') {
+        postClientLog('deeplink', 'route_thread_hash_landed', {
+          thread: threadId,
+          attempts: attempt + 1,
+        });
+        stripConsumedHash();
+        return;
+      }
+      if (outcome.kind === 'not-found') {
+        postClientLog('deeplink', 'route_thread_hash_not_found', { thread: threadId });
+        stripConsumedHash();
+        showToast(`Thread ${threadId} is not in this workspace`, 'error');
+        return;
+      }
+      if (attempt >= THREAD_HASH_RETRY_DELAYS_MS.length) {
+        postClientLog('deeplink', 'route_thread_hash_failed', {
+          thread: threadId,
+          attempts: attempt + 1,
+        });
+        stripConsumedHash();
+        showToast(`Failed to open thread ${threadId}: ${errorDetail(outcome.error)}`, 'error');
+        return;
+      }
+      await sleep(THREAD_HASH_RETRY_DELAYS_MS[attempt]);
+      if (token !== landingToken) return;
+    }
+  } finally {
+    if (token === landingToken) landingThreadId = null;
+  }
+}
 
 export function handleHashLocation(): void {
   const hashMatch = THREAD_HASH_RE.exec(window.location.hash);
   if (hashMatch) {
+    if (landingThreadId === hashMatch[1]) return; // already landing this one
     // Diagnostic breadcrumb (best-effort telemetry, no user intent): records that
     // the bare cross-workspace `#thread=` channel routed. Lets a "push tap opened
     // the app but went nowhere" report be traced to the exact router branch.
     postClientLog('deeplink', 'route_thread_hash', { thread: hashMatch[1] });
-    window.history.replaceState({}, '', window.location.pathname + window.location.search);
-    focusThreadOrBootstrap(hashMatch[1]);
+    void landThreadHash(hashMatch[1]).catch(err => {
+      // `landThreadHash` folds a failed bootstrap into its retry loop, so this
+      // only fires if the focus itself threw. Surface it instead of leaving an
+      // unhandled rejection (frontend.md, no hidden errors).
+      showToast(`Failed to open thread: ${errorDetail(err)}`, 'error');
+    });
     return;
   }
   const target = parseDeepLinkFromUrl(window.location);
@@ -100,4 +182,12 @@ export function setupHashDeeplinkRouting(): () => void {
     window.removeEventListener('focus', onResume);
     window.removeEventListener('pageshow', onResume);
   };
+}
+
+/** Test-only: drop the in-flight landing state. The guard is module-level so
+ *  production holds it for the life of the page; tests that run several landings
+ *  need a clean slate between cases. */
+export function _resetThreadHashLandingForTesting(): void {
+  landingThreadId = null;
+  landingToken++;
 }

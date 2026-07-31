@@ -298,7 +298,11 @@ impl GatewayState {
         if let Ok(mut f) = self.inner.boot_failures.write() {
             f.insert(id.to_string(), message.to_string());
         }
-        crate::log!("[Gateway] '{}' reported a terminal boot failure: {}", id, message);
+        crate::log!(
+            "[Gateway] '{}' reported a terminal boot failure: {}",
+            id,
+            message
+        );
     }
 
     /// Drop any terminal boot failure for `id`. Called ONLY when the workspace
@@ -1331,8 +1335,8 @@ impl GatewayState {
         // probe, so unhealthy/booting engines cost no extra request). This is the
         // sole unread-count path — the gateway holds no DB handle (ADR 0014 §1) —
         // so a stopped workspace yields `None` and shows no badge.
-        let outcomes: Vec<(ProbeOutcome, Option<u64>)> = futures::future::join_all(
-            candidates.iter().map(|t| async move {
+        let outcomes: Vec<(ProbeOutcome, Option<u64>)> =
+            futures::future::join_all(candidates.iter().map(|t| async move {
                 let outcome = stack::probe_health(client, scheme, t.port).await;
                 let unread = if outcome == ProbeOutcome::Healthy {
                     stack::fetch_unread_count(client, scheme, t.port).await
@@ -1340,9 +1344,8 @@ impl GatewayState {
                     None
                 };
                 (outcome, unread)
-            }),
-        )
-        .await;
+            }))
+            .await;
 
         // Apply phase: re-acquire each stack briefly to write the result back.
         for (t, (outcome, unread)) in candidates.into_iter().zip(outcomes) {
@@ -1632,7 +1635,11 @@ fn validate_engine_bin(path: &Path) -> Result<(), BoxError> {
         )
     })?;
     if !meta.is_file() {
-        return Err(format!("LUCIDOS_ENGINE_BIN is not a regular file: {}", path.display()).into());
+        return Err(format!(
+            "LUCIDOS_ENGINE_BIN is not a regular file: {}",
+            path.display()
+        )
+        .into());
     }
     #[cfg(unix)]
     {
@@ -2311,7 +2318,10 @@ mod tests {
         let err = validate_engine_bin(path).expect_err("worktree engine bin must error");
         let msg = err.to_string();
         assert!(msg.contains("coding-agent worktree"), "{msg}");
-        assert!(msg.contains("web-dev.sh"), "message must be actionable: {msg}");
+        assert!(
+            msg.contains("web-dev.sh"),
+            "message must be actionable: {msg}"
+        );
         // Fires before the existence check, so an already-deleted orphaned
         // worktree still reports the real reason rather than "does not exist".
         assert!(!msg.contains("does not exist"), "{msg}");
@@ -2324,7 +2334,10 @@ mod tests {
         let err = validate_engine_bin(&missing).expect_err("missing engine must error");
         let msg = err.to_string();
         assert!(msg.contains("does not exist"), "{msg}");
-        assert!(msg.contains(missing.to_str().unwrap()), "names the path: {msg}");
+        assert!(
+            msg.contains(missing.to_str().unwrap()),
+            "names the path: {msg}"
+        );
     }
 
     #[test]
@@ -2520,10 +2533,14 @@ mod tests {
         assert!(!boot_window_stalled(None));
         // Within budget → still the auto-refreshing starting splash.
         assert!(!boot_window_stalled(Some(Duration::from_secs(0))));
-        assert!(!boot_window_stalled(Some(BOOT_ESCAPE_BUDGET - Duration::from_secs(1))));
+        assert!(!boot_window_stalled(Some(
+            BOOT_ESCAPE_BUDGET - Duration::from_secs(1)
+        )));
         // At/past budget → escape to the manual "Back to workspaces" page.
         assert!(boot_window_stalled(Some(BOOT_ESCAPE_BUDGET)));
-        assert!(boot_window_stalled(Some(BOOT_ESCAPE_BUDGET + Duration::from_secs(60))));
+        assert!(boot_window_stalled(Some(
+            BOOT_ESCAPE_BUDGET + Duration::from_secs(60)
+        )));
     }
 
     #[test]
@@ -2769,7 +2786,12 @@ mod tests {
         // A concurrent stop/delete removed the stack from the map → never apply
         // (never resurrect a stopped/deleted engine), regardless of generation.
         let t0 = Instant::now();
-        assert!(probe_result_is_stale(false, Some(t0), Some(t0), Health::Booting));
+        assert!(probe_result_is_stale(
+            false,
+            Some(t0),
+            Some(t0),
+            Health::Booting
+        ));
         assert!(probe_result_is_stale(false, None, None, Health::Healthy));
     }
 
@@ -2779,7 +2801,12 @@ mod tests {
         // engine; applying it would bounce a just-restarted workspace.
         let t0 = Instant::now();
         let t1 = t0 + Duration::from_secs(1);
-        assert!(probe_result_is_stale(true, Some(t0), Some(t1), Health::Booting));
+        assert!(probe_result_is_stale(
+            true,
+            Some(t0),
+            Some(t1),
+            Health::Booting
+        ));
         // A re-adopted engine (None) that respawned during the probe (Some) too.
         assert!(probe_result_is_stale(true, None, Some(t1), Health::Booting));
     }
@@ -2788,15 +2815,30 @@ mod tests {
     fn capped_unhealthy_result_is_stale() {
         // Capped Unhealthy while the probe was in flight → left for manual retry.
         let t0 = Instant::now();
-        assert!(probe_result_is_stale(true, Some(t0), Some(t0), Health::Unhealthy));
+        assert!(probe_result_is_stale(
+            true,
+            Some(t0),
+            Some(t0),
+            Health::Unhealthy
+        ));
     }
 
     #[test]
     fn unchanged_present_result_applies() {
         // Still present, same generation, not capped → apply the probe result.
         let t0 = Instant::now();
-        assert!(!probe_result_is_stale(true, Some(t0), Some(t0), Health::Healthy));
-        assert!(!probe_result_is_stale(true, Some(t0), Some(t0), Health::Booting));
+        assert!(!probe_result_is_stale(
+            true,
+            Some(t0),
+            Some(t0),
+            Health::Healthy
+        ));
+        assert!(!probe_result_is_stale(
+            true,
+            Some(t0),
+            Some(t0),
+            Health::Booting
+        ));
     }
 
     #[test]

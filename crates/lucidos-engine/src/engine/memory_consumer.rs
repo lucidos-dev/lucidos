@@ -72,7 +72,9 @@ pub fn spawn(engine: Arc<LucidosEngine>) -> tokio::task::JoinHandle<()> {
                             Some(emitted.event_id),
                         )
                         .await;
-                    engine.index_text(text, ctx.as_deref(), emitted.event_id).await;
+                    engine
+                        .index_text(text, ctx.as_deref(), emitted.event_id)
+                        .await;
                 }
                 BusEvent::System(SystemEvent::ArtifactCreated {
                     artifact_path,

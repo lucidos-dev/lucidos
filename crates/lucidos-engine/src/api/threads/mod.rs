@@ -123,18 +123,12 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:thread_id/answer-question",
             post(answer_thread_question),
         )
-        .route(
-            "/threads/:thread_id/messages",
-            get(get_thread_messages),
-        )
+        .route("/threads/:thread_id/messages", get(get_thread_messages))
         .route(
             "/threads/:thread_id/events",
             get(get_thread_events_snapshot),
         )
-        .route(
-            "/threads/:thread_id/continue",
-            post(continue_thread),
-        )
+        .route("/threads/:thread_id/continue", post(continue_thread))
         .route(
             "/threads/:thread_id/cc-diff",
             get(super::repositories::get_thread_cc_diff),
@@ -156,7 +150,10 @@ pub(super) fn router() -> Router<super::AppState> {
             "/threads/:id",
             get(get_thread_summary).delete(super::threads_compose::delete_thread),
         )
-        .route("/threads/:id/compose", put(super::threads_compose::put_compose))
+        .route(
+            "/threads/:id/compose",
+            put(super::threads_compose::put_compose),
+        )
         .route("/threads/:id/blobs", post(super::blobs::post_blob))
 }
 

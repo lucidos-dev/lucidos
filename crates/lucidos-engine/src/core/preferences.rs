@@ -627,7 +627,8 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let tid = Uuid::new_v4();
         insert_message_received(&pool, tid, Some("prior-model"), Some("low")).await;
-        let current = insert_message_received(&pool, tid, Some("current-model"), Some("high")).await;
+        let current =
+            insert_message_received(&pool, tid, Some("current-model"), Some("high")).await;
         let (model, effort) =
             PreferenceStore::last_thread_chat_settings(&pool, tid, Some(current)).await;
         assert_eq!(model.as_deref(), Some("prior-model"));

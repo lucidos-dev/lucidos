@@ -49,7 +49,9 @@ impl WebSearchProvider for VertexGroundingSearch {
         query: &str,
         max_results: usize,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        self.provider.search_with_grounding(query, max_results).await
+        self.provider
+            .search_with_grounding(query, max_results)
+            .await
     }
 
     fn id(&self) -> &'static str {

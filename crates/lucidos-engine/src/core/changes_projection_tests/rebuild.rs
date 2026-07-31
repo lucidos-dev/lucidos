@@ -1,5 +1,5 @@
-use super::*;
 use super::cp_helpers::*;
+use super::*;
 
 /// Simulates the historical write-through gap: events exist in the store
 /// but their `changes` row was never written. `rebuild_missing_from_events`
@@ -41,7 +41,11 @@ async fn rebuild_missing_from_events_recovers_applied_change() {
     let n = proj.rebuild_missing_from_events().await.unwrap();
     assert_eq!(n, 1, "one row recovered");
 
-    let row = proj.get_by_id(change_id).await.unwrap().expect("rebuilt row");
+    let row = proj
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("rebuilt row");
     assert_eq!(row.status, "applied");
     assert_eq!(row.branch_name, "branch-rebuild");
     assert_eq!(
@@ -82,7 +86,11 @@ async fn rebuild_missing_from_events_recovers_discarded_change() {
     let proj = ChangesProjection::new(pool.clone());
 
     assert_eq!(proj.rebuild_missing_from_events().await.unwrap(), 1);
-    let row = proj.get_by_id(change_id).await.unwrap().expect("rebuilt row");
+    let row = proj
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("rebuilt row");
     assert_eq!(row.status, "discarded");
     assert!(row.resolved_at.is_some());
 
@@ -131,7 +139,11 @@ async fn rebuild_missing_from_events_uses_latest_proposed_payload() {
     let proj = ChangesProjection::new(pool.clone());
 
     proj.rebuild_missing_from_events().await.unwrap();
-    let row = proj.get_by_id(change_id).await.unwrap().expect("rebuilt row");
+    let row = proj
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("rebuilt row");
     assert_eq!(row.description, "latest desc", "latest proposed wins");
     assert_eq!(row.file_count, 3);
     assert!(row.requires_restart);
@@ -191,7 +203,11 @@ async fn rebuild_missing_from_events_applies_change_hardened_after_proposed() {
     let proj = ChangesProjection::new(pool.clone());
 
     proj.rebuild_missing_from_events().await.unwrap();
-    let row = proj.get_by_id(change_id).await.unwrap().expect("rebuilt row");
+    let row = proj
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("rebuilt row");
     assert!(
         row.hardened,
         "ChangeHardened after ChangeProposed flips hardened on"
@@ -236,7 +252,11 @@ async fn rebuild_missing_from_events_carries_active_merge_worktree() {
     let proj = ChangesProjection::new(pool.clone());
 
     proj.rebuild_missing_from_events().await.unwrap();
-    let row = proj.get_by_id(change_id).await.unwrap().expect("rebuilt row");
+    let row = proj
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("rebuilt row");
     assert_eq!(row.merge_worktree_path.as_deref(), Some("/tmp/wt-rebuild"));
     assert_eq!(row.merge_temp_branch.as_deref(), Some("merge-tmp/rebuild"));
     assert!(proj
@@ -292,7 +312,11 @@ async fn rebuild_missing_from_events_clears_resolved_merge_worktree() {
     let proj = ChangesProjection::new(pool.clone());
 
     proj.rebuild_missing_from_events().await.unwrap();
-    let row = proj.get_by_id(change_id).await.unwrap().expect("rebuilt row");
+    let row = proj
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("rebuilt row");
     assert!(row.merge_worktree_path.is_none());
     assert!(row.merge_temp_branch.is_none());
 
@@ -329,7 +353,10 @@ async fn rebuild_one_from_events_does_not_panic_when_only_aggregate_proposed_exi
     let proj = ChangesProjection::new(pool.clone());
 
     let recovered = proj.rebuild_missing_from_events().await.unwrap();
-    assert_eq!(recovered, 1, "single aggregate ChangeProposed → one rebuilt row");
+    assert_eq!(
+        recovered, 1,
+        "single aggregate ChangeProposed → one rebuilt row"
+    );
     let row = proj
         .get_by_id(change_id)
         .await

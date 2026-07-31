@@ -431,4 +431,3 @@ fn is_per_token_streaming_allows_per_action_lifecycle_and_blocking_request_varia
 // list. Replace-whole-list semantics: each emission carries the full new
 // state, so the projection / frontend just takes the latest.
 // ──────────────────────────────────────────────────────────────────────────
-

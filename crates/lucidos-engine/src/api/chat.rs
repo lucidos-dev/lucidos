@@ -3,6 +3,7 @@ use super::*;
 use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
 use crate::engine::thread_state::ThreadState;
 use crate::engine::InjectedPrompt;
+use crate::engine::PreEmittedOrigin;
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
@@ -112,8 +113,11 @@ pub(crate) async fn process_orphan_chain(
                     None,
                     None,
                     // The first orphan was already emitted as MessageReceived
-                    // before it entered the injection channel.
-                    origin_event_id,
+                    // before it entered the injection channel. Flagged as an
+                    // engine re-entry, not a message: this is the engine
+                    // replaying work the user already saw acknowledged, so a
+                    // second acknowledgment would double up.
+                    origin_event_id.map(PreEmittedOrigin::EngineReentry),
                     None,
                     None,
                 )
@@ -320,9 +324,8 @@ pub(super) fn validate_thread_continuity(
         // would silently lose the whole conversation context. NULL stored
         // value = legacy Claude Code thread (CodingAgent::parse semantics).
         if let Some(req_agent) = requested_coding_agent {
-            let existing_agent = crate::runtime::CodingAgent::parse(
-                existing_coding_agent.unwrap_or("claude-code"),
-            );
+            let existing_agent =
+                crate::runtime::CodingAgent::parse(existing_coding_agent.unwrap_or("claude-code"));
             if req_agent != existing_agent {
                 return Err((
                     StatusCode::CONFLICT,
@@ -553,7 +556,12 @@ pub(super) async fn chat_submit(
         if let crate::api::actor::SubprocessOrigin::Subprocess { source_thread_id } =
             crate::api::actor::subprocess_origin(&headers)
         {
-            if !subprocess_chat_legitimate(mode, source_thread_id, target_thread_id, parent_thread_id) {
+            if !subprocess_chat_legitimate(
+                mode,
+                source_thread_id,
+                target_thread_id,
+                parent_thread_id,
+            ) {
                 log!(
                     "[Chat] Rejecting subprocess chat POST: mode={:?}, source_thread={:?}, target_thread={:?}, parent_thread={:?}",
                     mode,
@@ -717,7 +725,11 @@ pub(super) async fn chat_submit(
     // Mutual exclusion with `repo_id`: the back-compat path keeps the old
     // wire field; new callers send `folder` exclusively. Both set is a 400 so
     // a half-migrated frontend can't silently win one but lose the other.
-    let folder_in = request.folder.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    let folder_in = request
+        .folder
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     let (repo_id, thread_id, app_id_to_stash) = if let Some(folder_str) = folder_in {
         if repo_id.as_deref().is_some_and(|s| !s.is_empty()) {
             log!("[Chat] chat_submit received both `folder` and `repo_id` — rejecting");
@@ -752,13 +764,14 @@ pub(super) async fn chat_submit(
         // closure inside `resolve_folder_input`) and `external_repo_match`
         // (sync closure inside `classify_resolved_folder`). Sync closures keep
         // both helpers free of `async` plumbing.
-        let registered_repos = match crate::core::repositories::RepositoryStore::list(state.engine.pool()).await {
-            Ok(v) => v,
-            Err(e) => {
-                log!("[Chat] failed to list repos for folder resolution: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
-            }
-        };
+        let registered_repos =
+            match crate::core::repositories::RepositoryStore::list(state.engine.pool()).await {
+                Ok(v) => v,
+                Err(e) => {
+                    log!("[Chat] failed to list repos for folder resolution: {}", e);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                }
+            };
         // Canonicalize each registered path once. Both `resolve_folder_input`
         // and `classify_resolved_folder` canonicalize their working
         // `folder_abs`; without symmetric canonicalization here, a
@@ -819,9 +832,13 @@ pub(super) async fn chat_submit(
             }
         };
         let external_repo_match = |path: &std::path::Path| -> Option<PathBuf> {
-            registered_canonical
-                .iter()
-                .find_map(|(_, canon)| if canon == path { Some(canon.clone()) } else { None })
+            registered_canonical.iter().find_map(|(_, canon)| {
+                if canon == path {
+                    Some(canon.clone())
+                } else {
+                    None
+                }
+            })
         };
         use crate::engine::agent_session::coding_agent_kind::{
             classify_resolved_folder, FolderClassification,
@@ -834,7 +851,11 @@ pub(super) async fn chat_submit(
         ) {
             Ok(c) => c,
             Err(e) => {
-                log!("[Chat] folder `{}` classification failed: {}", folder_str, e);
+                log!(
+                    "[Chat] folder `{}` classification failed: {}",
+                    folder_str,
+                    e
+                );
                 return Err(StatusCode::BAD_REQUEST);
             }
         };
@@ -1003,6 +1024,29 @@ pub(super) async fn chat_submit(
         .clone()
         .unwrap_or_else(|| Uuid::new_v4().to_string());
 
+    // Persist the follow-up's MessageReceived BEFORE this handler acks, so the
+    // 200 means "recorded, with its sequence assigned" and a client that sends
+    // one message at a time per thread gets its order preserved end to end.
+    // Self-gating (mode, channel, thread state, open question) and non-fatal:
+    // see `pre_emit_chat_message_received`. Runs after every validation gate
+    // above, so a request that 4xx'd can't leave an orphaned message behind.
+    let pre_emitted_origin = state
+        .engine
+        .pre_emit_chat_message_received(
+            thread_id,
+            thread_exists,
+            mode,
+            use_coding_agent,
+            &message,
+            chat_images.as_deref(),
+            device_id.as_deref(),
+            model.as_deref(),
+            reasoning_effort.as_deref(),
+            event_id.as_deref(),
+            origin.clone(),
+        )
+        .await;
+
     // Spawn task to process message — all events flow through EventBus now.
     // The JoinHandle is monitored so panics emit ResponseFailed + SessionEnded
     // instead of silently dropping the thread into a stuck "running" state.
@@ -1017,8 +1061,7 @@ pub(super) async fn chat_submit(
         // (the person sees "requesting" until then). Released on task end —
         // even on panic — by the guard's Drop.
         let _user_slot = {
-            let summary =
-                crate::engine::thread_queue::truncate_summary(message.trim());
+            let summary = crate::engine::thread_queue::truncate_summary(message.trim());
             engine_clone
                 .thread_queue
                 .acquire_user_slot(thread_id, summary)
@@ -1044,7 +1087,7 @@ pub(super) async fn chat_submit(
                 mode,
                 cc_model.as_deref(),
                 coding_agent,
-                None,
+                pre_emitted_origin,
                 title.as_deref(),
                 origin,
             )
@@ -1189,7 +1232,11 @@ pub(super) async fn chat_submit(
     if let Some(tid) = thread_id_for_panic {
         // Fire-and-forget: the watcher cleans up on panic; nobody awaits it.
         // Dropping the JoinHandle detaches the already-spawned watcher (it keeps running).
-        drop(LucidosEngine::monitor_cc_task(engine_for_panic, tid, handle));
+        drop(LucidosEngine::monitor_cc_task(
+            engine_for_panic,
+            tid,
+            handle,
+        ));
     } else {
         tokio::spawn(async move {
             if let Err(join_err) = handle.await {

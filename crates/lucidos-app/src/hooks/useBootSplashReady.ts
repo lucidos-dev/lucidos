@@ -20,7 +20,7 @@ export const BOOT_SPLASH_MIN_REVEAL_MS = 1_200;
  *  cold start so a typical launch shows ONLY the baked "Opening your workspace…"
  *  until it fades (no text swap mid-launch); the update appears only on a
  *  genuinely slow/stuck load, where a phase word is actually informative. */
-const STATUS_DELAY_MS = 3_000;
+export const STATUS_DELAY_MS = 3_000;
 
 /** Elapsed ms since this document started loading (≈ when the inline reveal
  *  began at first paint). `performance.now()` is time-since-navigation-start. */
@@ -39,17 +39,53 @@ export function isWorkspaceReady(connection: ConnectionStatus, threads: boolean)
  *  — i.e. the launch is slow or stuck. Pure so it can be tested without the
  *  DOM/signals.
  *
- *  A **direct** engine port (`isDirect`, `WORKSPACE_ID === null`) does not
- *  auto-start: only the gateway lazy-starts a workspace on access, so a still-
- *  unconnected direct context means the workspace simply isn't running — say so
- *  rather than the misleading "Opening your workspace…". Behind the gateway the
- *  frontend only loads after the engine is already up (the gateway serves its own
- *  "Starting engine…" splash until then), so a stall there is a genuine
- *  connection hiccup — keep "Connecting…". */
-export function delayedBootStatus(connected: boolean, isDirect: boolean): string {
-  if (connected) return 'Loading…';
-  if (isDirect) return 'Workspace not started';
+ *  Takes the whole {@link ConnectionStatus}, not a bare `connected` boolean,
+ *  because the two not-connected states carry very different evidence.
+ *  `'connecting'` means no health probe has come back yet — we know nothing, so
+ *  the only honest line is "Connecting…". `'disconnected'` means a probe
+ *  actually FAILED.
+ *
+ *  Only on that failed-probe evidence do we name a cause, and only for a
+ *  **direct** engine port (`isDirect`, `WORKSPACE_ID === null`): nothing
+ *  lazy-starts a workspace there the way the gateway does on access, so an
+ *  unreachable engine really does mean the workspace isn't running. Behind the
+ *  gateway the frontend only loads after the engine is already up (the gateway
+ *  serves its own "Starting engine…" splash until then), so a failed probe is a
+ *  connection hiccup — keep "Connecting…".
+ *
+ *  Deriving "Workspace not started" from the mere ABSENCE of a connection was a
+ *  false claim: the engine served this very document, and on an iOS PWA cold
+ *  start the first health round-trip routinely lands after STATUS_DELAY_MS, so
+ *  the splash accused a perfectly healthy workspace of being down. */
+export function delayedBootStatus(connection: ConnectionStatus, isDirect: boolean): string {
+  if (connection === 'connected') return 'Loading…';
+  if (connection === 'disconnected' && isDirect) return 'Workspace not started';
   return 'Connecting…';
+}
+
+/** Wire the splash's delayed status line and return its (idempotent) teardown.
+ *  Nothing is written for the first {@link STATUS_DELAY_MS}; past it the line
+ *  SUBSCRIBES to the connection rather than sampling it once — a one-shot read
+ *  froze whichever state happened to be live at the delay, so a probe landing a
+ *  moment later left the splash still claiming the workspace was unreachable for
+ *  the rest of its life. Subscribed, the line retracts itself the instant the
+ *  evidence moves.
+ *
+ *  Factory-shaped (same convention as `makeLongPressHandlers` /
+ *  `makeDismissHandlers`) so the timing and the retraction are testable without
+ *  rendering the hook. */
+export function startDelayedBootStatus(isDirect: boolean): () => void {
+  let stop: (() => void) | null = null;
+  const timer = window.setTimeout(() => {
+    stop = effect(() => {
+      setBootStatus(delayedBootStatus(connectionStatus.value, isDirect));
+    });
+  }, STATUS_DELAY_MS);
+  return () => {
+    clearTimeout(timer);
+    stop?.();
+    stop = null;
+  };
 }
 
 /**
@@ -64,22 +100,24 @@ export function useBootSplashReady(): void {
   useEffect(() => {
     if (!bootSplashPresent()) return;
 
-    const cap = window.setTimeout(dismissBootSplash, BOOT_SPLASH_SAFETY_MS);
-    const statusTimer = window.setTimeout(() => {
-      setBootStatus(
-        delayedBootStatus(connectionStatus.value === 'connected', WORKSPACE_ID === null),
-      );
-    }, STATUS_DELAY_MS);
+    const stopStatus = startDelayedBootStatus(WORKSPACE_ID === null);
     // Set once the readiness gate first fires, so the min-reveal delay isn't
     // re-armed on every subsequent signal change.
     let dismissArmed = false;
     let revealTimer: ReturnType<typeof setTimeout> | undefined;
 
-    const finish = () => {
+    // Declared as a hoisted function so the safety cap below can be wired to it
+    // while `finish` still clears that cap's own timer.
+    function finish() {
       clearTimeout(cap);
-      clearTimeout(statusTimer);
+      stopStatus();
       dismissBootSplash();
-    };
+    }
+
+    // The safety cap goes through `finish` so it also tears down the status
+    // subscription — left running it would keep writing into a splash that is
+    // already gone.
+    const cap = window.setTimeout(finish, BOOT_SPLASH_SAFETY_MS);
 
     const stop = effect(() => {
       if (dismissArmed) return;
@@ -93,8 +131,8 @@ export function useBootSplashReady(): void {
 
     return () => {
       clearTimeout(cap);
-      clearTimeout(statusTimer);
       if (revealTimer !== undefined) clearTimeout(revealTimer);
+      stopStatus();
       stop();
     };
   }, []);

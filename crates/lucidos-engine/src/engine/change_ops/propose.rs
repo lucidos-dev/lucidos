@@ -186,24 +186,20 @@ impl LucidosEngine {
             return;
         }
 
-        let hardened = crate::engine::git_ops::is_harden_marker_present(
+        let hardened =
+            crate::engine::git_ops::is_harden_marker_present(&self.pool, repo_root, branch_name)
+                .await;
+        let fallback = crate::engine::agent_session::change_description_fallback(
             &self.pool,
-            repo_root,
+            thread_id,
             branch_name,
         )
         .await;
-        let fallback =
-            crate::engine::agent_session::change_description_fallback(&self.pool, thread_id, branch_name)
-                .await;
         let base = crate::engine::git_ops::default_local_branch(repo_root).await;
         let log_range = format!("{}..{}", base, branch_name);
-        let description = crate::engine::git_ops::describe_branch_changes(
-            repo_root,
-            &log_range,
-            &fallback,
-            None,
-        )
-        .await;
+        let description =
+            crate::engine::git_ops::describe_branch_changes(repo_root, &log_range, &fallback, None)
+                .await;
 
         log!(
             "[Changes] Branch {} has no diff left — change {} reconciled to 0 files (was {})",

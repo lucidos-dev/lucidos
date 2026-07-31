@@ -37,8 +37,11 @@ fn build_resume_tool_blocks_emits_synthetic_stub_for_orphan_tool_called() {
             sequence: Some(2),
         },
     ];
-    let (blocks, skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
 
     assert_eq!(
         blocks.len(),
@@ -59,7 +62,10 @@ fn build_resume_tool_blocks_emits_synthetic_stub_for_orphan_tool_called() {
     };
     match &blocks[1].content {
         MessageContent::Blocks(b) => match &b[0] {
-            ContentBlock::ToolResult { tool_use_id, content } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
                 assert_eq!(tool_use_id, &use_id, "stub must reference the orphan's id");
                 assert!(
                     content.contains("orphan") || content.contains("unavailable"),
@@ -111,8 +117,11 @@ fn build_resume_tool_blocks_pairs_across_intervening_thinking_event() {
             sequence: Some(3),
         },
     ];
-    let (blocks, _skip) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, _skip) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     assert_eq!(blocks.len(), 2, "Thinking between must not break pairing");
     use crate::llm::{ContentBlock, MessageContent};
     let use_id = match &blocks[0].content {
@@ -124,7 +133,10 @@ fn build_resume_tool_blocks_pairs_across_intervening_thinking_event() {
     };
     match &blocks[1].content {
         MessageContent::Blocks(b) => match &b[0] {
-            ContentBlock::ToolResult { tool_use_id, content } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
                 assert_eq!(tool_use_id, &use_id);
                 assert!(content.contains("file body"));
             }
@@ -161,8 +173,11 @@ fn build_resume_tool_blocks_emits_block_for_empty_result_content() {
             sequence: Some(2),
         },
     ];
-    let (blocks, _skip) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, _skip) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     assert_eq!(blocks.len(), 2, "empty content still emits a valid pair");
     use crate::llm::{ContentBlock, MessageContent};
     let use_id = match &blocks[0].content {
@@ -228,8 +243,11 @@ fn build_resume_tool_blocks_pairs_parallel_same_name_calls_into_valid_payload() 
             sequence: Some(4),
         },
     ];
-    let (blocks, _skip) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, _skip) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     assert_eq!(blocks.len(), 4, "two pairs => 4 messages");
 
     use crate::llm::{ContentBlock, MessageContent};
@@ -320,8 +338,11 @@ fn b101c3d7_shape_orphan_tool_use_repaired_end_to_end() {
 
     // Build the resume blocks the way `chat::process` does, then append the
     // user prompt as plain Text content (the no-images path).
-    let (resume_blocks, _skip) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (resume_blocks, _skip) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     let mut messages = resume_blocks;
     messages.push(crate::llm::Message {
         role: "user".to_string(),
@@ -606,7 +627,11 @@ fn resume_blocks_orphan_load_knowhow_emits_orphan_stub_even_when_id_in_loaded_se
     loaded.insert("my-doc".to_string());
     let (messages, _skip) =
         crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &loaded);
-    assert_eq!(messages.len(), 2, "orphan still produces ToolUse + stub ToolResult");
+    assert_eq!(
+        messages.len(),
+        2,
+        "orphan still produces ToolUse + stub ToolResult"
+    );
 
     use crate::llm::{ContentBlock, MessageContent};
     let result_msg = messages

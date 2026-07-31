@@ -56,5 +56,9 @@ mod failure_breaker_unit_tests;
 mod image_pins_unit_tests;
 
 #[cfg(test)]
+#[path = "../agentic_loop_unit_tests/tool_result_split.rs"]
+mod tool_result_split_unit_tests;
+
+#[cfg(test)]
 #[path = "../agentic_loop_tests.rs"]
 mod agentic_loop_db_tests;

@@ -104,9 +104,7 @@ impl EventBus {
                     .await?;
                 Ok(())
             }
-            SystemEvent::RepositoryAdded {
-                repo_id, name, ..
-            } => {
+            SystemEvent::RepositoryAdded { repo_id, name, .. } => {
                 // Durable repo-name projection: retain the name so a later
                 // RepositoryRemoved (which deliberately does NOT touch this
                 // table) can't erase it — the filter / thread rows keep

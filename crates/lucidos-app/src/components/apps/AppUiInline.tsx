@@ -1,9 +1,20 @@
-import { useRef, useLayoutEffect, useState } from 'preact/hooks';
+import { useRef, useLayoutEffect, useState, useEffect } from 'preact/hooks';
 import { currentApp, appPseudoFullscreen, appRefreshKey, showToast } from '../../store/store';
 import { getAppFrameSrc, exitPseudoFullscreen } from '../../store/actions/apps';
 import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
+import { useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { navigateAppIframe } from './iframeNav';
+
+/** How long the load cover lingers, fading out, after the frame's `load`. A
+ *  little longer than its CSS opacity transition (var(--duration-normal) =
+ *  200ms) so it stays mounted until the fade finishes, the same way the
+ *  LoadingFade component holds a clearing skeleton. */
+const COVER_FADE_MS = 250;
+
+/** Reveal fuse for a frame whose `load` never arrives (a hung request). A pane
+ *  covered forever is worse than whatever the frame managed to paint. */
+const COVER_MAX_MS = 3000;
 
 /** Append a cache-busting query param to a URL. */
 function cacheBust(url: string, key: number): string {
@@ -19,10 +30,27 @@ function cacheBust(url: string, key: number): string {
  *  joint session history (WebKit #9166), and the edge-swipe-back gesture in
  *  the PWA then surfaces a snapshot of a previous app state mid-swipe. App
  *  switches go through navigateAppIframe (location.replace) instead. */
-function AppFrame({ src, refreshing }: { src: string; refreshing: boolean }) {
+function AppFrame({ src }: { src: string }) {
   const iframeRef = useRef<HTMLIFrameElement>(null);
   const [initialSrc] = useState(src);
   const lastSrcRef = useRef(initialSrc);
+
+  // A frame with no document yet paints its base canvas, which WKWebView fills
+  // WHITE: on a dark theme every app open flashed white before the app's own
+  // stylesheet (and `/api/v1/sdk-prefs.js`, a second request, which is what
+  // actually applies the theme) landed. Both gaps are inside a document the
+  // host does not author, so the host hides the frame instead: an opaque
+  // theme-coloured cover from mount, crossfaded out once the frame has
+  // something to show. See AppUiInline.test.ts for why the cover is a sibling
+  // element rather than an opacity on the iframe itself.
+  const [loaded, setLoaded] = useState(false);
+  const coverMounted = useLingeringFlag(!loaded, COVER_FADE_MS);
+
+  useEffect(() => {
+    if (loaded) return;
+    const fuse = setTimeout(() => setLoaded(true), COVER_MAX_MS);
+    return () => clearTimeout(fuse);
+  }, [loaded]);
 
   useLayoutEffect(() => {
     const iframe = iframeRef.current;
@@ -37,20 +65,28 @@ function AppFrame({ src, refreshing }: { src: string; refreshing: boolean }) {
       return;
     }
     lastSrcRef.current = src;
+    // An app switch reuses this frame, so the incoming app reopens the same
+    // white-canvas gap the initial mount had: cover it again until the new
+    // document's `load`. Only after a navigation actually started, so a frame
+    // that failed to navigate keeps showing the app it still has.
+    setLoaded(false);
   }, [src]);
 
   return (
-    <iframe
-      ref={iframeRef}
-      data-role="app-ui-frame"
-      class={`app-ui-iframe${refreshing ? ' app-iframe-refreshing' : ''}`}
-      src={initialSrc}
-      sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox"
-      allow="autoplay; fullscreen; encrypted-media"
-      onLoad={() => {
-        iframeRef.current?.classList.remove('app-iframe-refreshing');
-      }}
-    />
+    <>
+      <iframe
+        ref={iframeRef}
+        data-role="app-ui-frame"
+        class="app-ui-iframe"
+        src={initialSrc}
+        sandbox="allow-scripts allow-same-origin allow-popups allow-forms allow-modals allow-popups-to-escape-sandbox"
+        allow="autoplay; fullscreen; encrypted-media"
+        onLoad={() => setLoaded(true)}
+      />
+      {coverMounted && (
+        <div class={`app-ui-cover${loaded ? ' is-clearing' : ''}`} aria-hidden="true" />
+      )}
+    </>
   );
 }
 
@@ -88,7 +124,7 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
           <ExitFullscreenIcon />
         </button>
       )}
-      {frameSrc && <AppFrame key={refreshKey} src={frameSrc} refreshing={refreshKey > 0} />}
+      {frameSrc && <AppFrame key={refreshKey} src={frameSrc} />}
     </div>
   );
 }

@@ -55,7 +55,6 @@ pub(crate) async fn root_commit_sha(repo_root: &Path) -> Option<String> {
     roots.into_iter().next()
 }
 
-
 /// Auto-commit harmless dirty files (docs/plans), then return whether the repo
 /// is still dirty. This prevents apply/revert from blocking on safe changes.
 /// Also re-attaches HEAD to main if detached (a precondition for accurate
@@ -99,7 +98,6 @@ pub(crate) async fn auto_commit_safe_files_if_dirty(repo_root: &Path) -> bool {
     }
     true
 }
-
 
 /// Subjects we never surface to the user — internal auto-commits.
 fn is_internal_auto_commit(subject: &str) -> bool {
@@ -172,7 +170,6 @@ pub(crate) async fn describe_branch_changes(
     }
 }
 
-
 /// Check if a branch has commits vs main (i.e., the branch has diverged from the default branch).
 /// Returns `true` if there are commits on the branch not on main, or on error (safe default).
 ///
@@ -198,7 +195,6 @@ pub(crate) async fn has_branch_commits(repo_root: &Path, branch_name: &str) -> b
         }
     }
 }
-
 
 /// Get the list of changed files between the branch's diff base and the branch
 /// (three-dot merge-base diff). The base is `default_diff_base` — the SAME ref
@@ -295,7 +291,8 @@ pub(crate) async fn has_unmerged_authored_commits(repo_root: &Path, branch_name:
         Err(e) => {
             log!(
                 "[Git] git rev-list --no-merges failed for branch {}: {}",
-                branch_name, e
+                branch_name,
+                e
             );
             true
         }
@@ -324,7 +321,6 @@ pub(crate) async fn proposal_files_for_branch(
         Some(files)
     }
 }
-
 
 /// Auto-commit uncommitted changes in a worktree with a generic message.
 pub(crate) async fn auto_commit_worktree(worktree_path: &Path, message: &str) {
@@ -537,4 +533,3 @@ pub(crate) async fn recover_no_commits_branch(
     )
     .into())
 }
-

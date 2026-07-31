@@ -150,7 +150,10 @@ fn apply_recency_boosts(items: Vec<SearchResultItem>) -> Vec<SearchResultItem> {
     boosted
 }
 
-fn thread_summary_to_item(info: &crate::core::store::ThreadSummary, score: f64) -> SearchResultItem {
+fn thread_summary_to_item(
+    info: &crate::core::store::ThreadSummary,
+    score: f64,
+) -> SearchResultItem {
     SearchResultItem {
         id: info.thread_id.clone(),
         title: info.title.clone(),
@@ -346,7 +349,8 @@ async fn search_changes_internal(
     limit: usize,
 ) -> Result<Vec<SearchResultItem>, String> {
     let proj = state.engine.changes();
-    let (pending_r, applied_r) = tokio::join!(proj.list_pending(), proj.list_recently_applied(15, None));
+    let (pending_r, applied_r) =
+        tokio::join!(proj.list_pending(), proj.list_recently_applied(15, None));
     let pending = pending_r.map_err(|e| format!("DB error listing pending changes: {e}"))?;
     let applied = applied_r.map_err(|e| format!("DB error listing applied changes: {e}"))?;
     let all_changes = pending.into_iter().chain(applied.into_iter());

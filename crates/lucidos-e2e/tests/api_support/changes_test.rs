@@ -122,7 +122,11 @@ async fn apply_unhardened_change_emits_missing_hardening_detected() {
         "MissingHardeningDetected must be emitted before ChangeApplyFailed: {:?}",
         rows
     );
-    assert_eq!(rows[1].0, "ChangeApplyFailed", "second event order: {:?}", rows);
+    assert_eq!(
+        rows[1].0, "ChangeApplyFailed",
+        "second event order: {:?}",
+        rows
+    );
 
     // Cleanup
     let _ = sqlx::query("DELETE FROM events WHERE aggregate_id = $1::text")
@@ -183,7 +187,11 @@ async fn apply_unplanned_change_is_blocked() {
     assert!(seed.status().is_success(), "seed failed: {}", seed.status());
 
     let url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
-    let resp = client.post(&url).send().await.expect("Apply request failed");
+    let resp = client
+        .post(&url)
+        .send()
+        .await
+        .expect("Apply request failed");
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.expect("Invalid JSON from apply");
 
@@ -247,7 +255,10 @@ async fn plan_marker_proposed_then_approved_round_trip() {
         async move {
             let resp = client
                 .get(&state_url)
-                .query(&[("repo_root", repo_root.as_str()), ("branch_name", branch.as_str())])
+                .query(&[
+                    ("repo_root", repo_root.as_str()),
+                    ("branch_name", branch.as_str()),
+                ])
                 .send()
                 .await
                 .expect("planned-state GET failed");
@@ -375,13 +386,27 @@ async fn sequential_apply_two_changes_succeeds() {
     seed_cc_thread_summary(&pool, thread2_id, "idle").await;
 
     seed_change_for_test(
-        &client, change1_id, thread1_id, &branch1, repo_root,
-        "E2E test change 1", &[&file1], false, true,
+        &client,
+        change1_id,
+        thread1_id,
+        &branch1,
+        repo_root,
+        "E2E test change 1",
+        &[&file1],
+        false,
+        true,
     )
     .await;
     seed_change_for_test(
-        &client, change2_id, thread2_id, &branch2, repo_root,
-        "E2E test change 2", &[&file2], false, true,
+        &client,
+        change2_id,
+        thread2_id,
+        &branch2,
+        repo_root,
+        "E2E test change 2",
+        &[&file2],
+        false,
+        true,
     )
     .await;
 
@@ -712,7 +737,11 @@ async fn apply_change_with_no_files_is_rejected_409() {
     .await;
 
     let url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
-    let resp = client.post(&url).send().await.expect("apply request failed");
+    let resp = client
+        .post(&url)
+        .send()
+        .await
+        .expect("apply request failed");
     assert_eq!(
         resp.status().as_u16(),
         409,

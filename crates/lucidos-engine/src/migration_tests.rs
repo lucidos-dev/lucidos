@@ -12,9 +12,8 @@ const FIX_INVOCATION_SQL: &str =
 const RENAME_TRIGGER_RUN_TEXT_TO_INTENT_SQL: &str =
     include_str!("../migrations/20260429213500_rename_trigger_run_text_to_intent.sql");
 
-const MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL: &str = include_str!(
-    "../migrations/20260516195912_migrate_trigger_on_to_subscription_list.sql"
-);
+const MIGRATE_TRIGGER_ON_TO_SUBSCRIPTION_LIST_SQL: &str =
+    include_str!("../migrations/20260516195912_migrate_trigger_on_to_subscription_list.sql");
 
 /// Which payload field naming a `TriggerStarted` row uses.
 #[derive(Clone, Copy)]
@@ -486,12 +485,11 @@ async fn rename_trigger_run_text_to_intent_leaves_other_shapes_alone() {
         json!({ "type": "intent", "intent": "Already canonical", "knowhow": [] }),
         "already-canonical runs must be untouched",
     );
-    let chat_text: String =
-        sqlx::query_scalar("SELECT payload->>'text' FROM events WHERE id = $1")
-            .bind(unrelated_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read chat text");
+    let chat_text: String = sqlx::query_scalar("SELECT payload->>'text' FROM events WHERE id = $1")
+        .bind(unrelated_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read chat text");
     assert_eq!(
         chat_text, "this is the chat text field, not a trigger run",
         "non-trigger event types' top-level `text` must be untouched",

@@ -26,7 +26,10 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
         .await
         .expect("create failed");
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], true);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
 
     // Update base_url + auth_type + auth_header + secret.
     let resp = client
@@ -42,7 +45,10 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
         .await
         .expect("update failed");
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], true);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
 
     // List reflects the new non-secret fields.
     let listed = find_credential(&client, &api, &service).await;
@@ -140,7 +146,10 @@ async fn update_email_credential_syncs_email_accounts_row() {
         .await
         .expect("update failed");
     assert_eq!(resp.status(), 200);
-    assert_eq!(resp.json::<serde_json::Value>().await.unwrap()["success"], true);
+    assert_eq!(
+        resp.json::<serde_json::Value>().await.unwrap()["success"],
+        true
+    );
 
     // The email_accounts row IMAP reads must carry the new password + settings.
     let row: (String, String, String, String, i32, bool) = sqlx::query_as(
@@ -151,7 +160,10 @@ async fn update_email_credential_syncs_email_accounts_row() {
     .fetch_one(&pool)
     .await
     .expect("fetch email account");
-    assert_eq!(row.0, "newpass", "email_accounts.password must be updated on edit");
+    assert_eq!(
+        row.0, "newpass",
+        "email_accounts.password must be updated on edit"
+    );
     assert_eq!(row.1, new_email);
     assert_eq!(row.2, "imap.new.example.com");
     assert_eq!(row.3, "smtp.new.example.com");

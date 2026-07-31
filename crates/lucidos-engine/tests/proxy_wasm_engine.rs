@@ -231,7 +231,10 @@ fn loader_rejects_invalid_wasm() {
     let tmp = tempfile::tempdir().unwrap();
     std::fs::write(tmp.path().join("garbage.wasm"), b"not wasm at all").unwrap();
     match load_wasm_modules(tmp.path(), &engine) {
-        Err(err) => assert!(err.contains("compile"), "expected compile error, got: {err}"),
+        Err(err) => assert!(
+            err.contains("compile"),
+            "expected compile error, got: {err}"
+        ),
         Ok(_) => panic!("loader must reject invalid WASM bytes"),
     }
 }

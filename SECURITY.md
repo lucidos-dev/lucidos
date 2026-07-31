@@ -5,14 +5,15 @@ versions receive security fixes and how to report a vulnerability privately.
 
 ## Supported Versions
 
-Lucidos is **pre-1.0** (currently the **0.9.x** line). While we're under 1.0, only
-the **latest release** receives security fixes — there are no long-term support
-branches yet, and older releases are not patched. Please reproduce on the latest
-release before reporting.
+Lucidos is **pre-1.0**. While we're under 1.0, only the **latest release**
+receives security fixes: there are no long-term support branches yet, and older
+releases are not patched. The latest release is the newest `v*` tag on
+[GitHub Releases](https://github.com/lucidos-dev/lucidos/releases). Please
+reproduce there before reporting.
 
 | Version | Supported |
 |---------|-----------|
-| Latest release (0.9.x) | ✅ |
+| Latest release | ✅ |
 | Any earlier release | ❌ |
 
 Once Lucidos reaches 1.0 this policy will be revisited and a longer support window
@@ -36,10 +37,9 @@ This is the preferred channel because it keeps the report confidential, gives us
 private space to discuss and fix the issue, and lets us coordinate disclosure and
 credit through a GitHub security advisory.
 
-> **Secondary channel (not yet available):** an email fallback at
-> `security@lucidos.dev` is planned and will be added once the `lucidos.dev`
-> domain and mailbox exist. **It does not work yet** — until then, use the GitHub
-> private reporting path above.
+> **There is no email channel.** Use the GitHub private reporting path above.
+> A `security@lucidos.dev` fallback may be added later; until it is listed here
+> as working, do not assume mail to that address reaches anyone.
 
 ### What to include
 

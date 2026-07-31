@@ -334,7 +334,11 @@ fn scan_one_marketplace(
                 error: format!(
                     "plugin '{}': ignored unknown categor{} [{}] (allowed: {})",
                     manifest.id,
-                    if unknown_categories.len() == 1 { "y" } else { "ies" },
+                    if unknown_categories.len() == 1 {
+                        "y"
+                    } else {
+                        "ies"
+                    },
                     unknown_categories.join(", "),
                     crate::core::plugins::PLUGIN_CATEGORIES.join(", "),
                 ),
@@ -371,7 +375,9 @@ fn scan_one_marketplace(
             setup_complete: false,
             app_id: installed.and_then(|p| p.app_id.clone()),
             modified: installed.map(|p| p.modified).unwrap_or(false),
-            modified_paths: installed.map(|p| p.modified_paths.clone()).unwrap_or_default(),
+            modified_paths: installed
+                .map(|p| p.modified_paths.clone())
+                .unwrap_or_default(),
         });
     }
 
@@ -460,9 +466,11 @@ fn normalize_tree_subpath(raw: &str) -> Result<Option<String>, String> {
     if trimmed.is_empty() {
         return Ok(None);
     }
-    if trimmed.contains('\\') || trimmed.split('/').any(|part| {
-        part.is_empty() || part == "." || part == ".."
-    }) {
+    if trimmed.contains('\\')
+        || trimmed
+            .split('/')
+            .any(|part| part.is_empty() || part == "." || part == "..")
+    {
         return Err("GitHub tree subpath must stay inside the repository".to_string());
     }
     Ok(Some(trimmed.to_string()))

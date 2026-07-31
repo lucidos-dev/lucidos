@@ -1,7 +1,6 @@
 //! LLM-facing schemas for the proxy / HTTP tools
 //! (reload_proxy_modules, proxy_request, http_request).
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

@@ -116,7 +116,10 @@ fn pin_generation_inner(
 pub(crate) fn remove_snapshot_dir(dir: &Path) {
     if let Err(e) = std::fs::remove_dir_all(dir) {
         if e.kind() != std::io::ErrorKind::NotFound {
-            crate::log!("[Frontend] failed to remove old snapshot {}: {e}", dir.display());
+            crate::log!(
+                "[Frontend] failed to remove old snapshot {}: {e}",
+                dir.display()
+            );
         }
     }
 }
@@ -219,7 +222,10 @@ mod tests {
         write(&dist.join("assets/app.js"), "OLD-JS");
 
         let served = resolve_served_dir_inner(dist.clone(), &tmp, /* packaged */ false);
-        assert_ne!(served, dist, "dev must serve a pinned snapshot, not the live dir");
+        assert_ne!(
+            served, dist,
+            "dev must serve a pinned snapshot, not the live dir"
+        );
         assert_eq!(served, generation_dir(&tmp, 0), "boot pins generation 0");
         assert_eq!(
             std::fs::read_to_string(served.join("index.html")).unwrap(),
@@ -288,7 +294,10 @@ mod tests {
         );
 
         remove_snapshot_dir(&gen0);
-        assert!(!gen0.exists(), "remove_snapshot_dir drops the superseded snapshot");
+        assert!(
+            !gen0.exists(),
+            "remove_snapshot_dir drops the superseded snapshot"
+        );
         assert!(gen1.exists(), "and leaves the current one");
         std::fs::remove_dir_all(&tmp).ok();
     }

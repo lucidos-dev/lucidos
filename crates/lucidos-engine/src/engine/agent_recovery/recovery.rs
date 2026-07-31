@@ -7,15 +7,14 @@ use super::super::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKE
 use super::super::git_ops::{
     add_paths_to_worktree_exclude, auto_commit_worktree, default_local_branch,
     describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd,
-    is_external_repo_path, main_worktree, proposal_files_for_branch, worktree_add,
-    worktrees_dir,
+    is_external_repo_path, main_worktree, proposal_files_for_branch, worktree_add, worktrees_dir,
 };
 use super::super::thread_events::{EngineReason, EventChannel, MessageOrigin};
 use super::super::LucidosEngine;
+use super::*;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
-use super::*;
 
 impl LucidosEngine {
     /// Gather branch metadata and propose a Change record. Callers must pass a
@@ -56,7 +55,8 @@ impl LucidosEngine {
         // the worktree under us. Without this check, propose_change downgrades
         // hardened=true → false and Apply re-runs `/harden` on already-hardened
         // work.
-        let hardened = branch_is_hardened(self.pool(), self.changes(), repo_root, branch_name).await;
+        let hardened =
+            branch_is_hardened(self.pool(), self.changes(), repo_root, branch_name).await;
         let incomplete = !last_turn_ended_cleanly(self.pool(), thread_id).await;
         self.propose_change(crate::engine::change_ops::ProposeChangeInput {
             thread_id,
@@ -152,8 +152,7 @@ impl LucidosEngine {
                 auto_commit_worktree(wt, "Coding agent changes (auto-committed)").await;
             }
             if let Some(wt_str) = wt.to_str() {
-                let _ =
-                    git_cmd(&["worktree", "remove", "--force", wt_str], &repo_root).await;
+                let _ = git_cmd(&["worktree", "remove", "--force", wt_str], &repo_root).await;
             } else {
                 log!(
                     "[Recovery] skipped worktree remove (non-UTF8 path): {}",
@@ -177,13 +176,10 @@ impl LucidosEngine {
                 "[Recovery] Discarding stale session changes (branch {})",
                 branch_name
             );
-            self.discard_pending_for_thread(thread_id, actor.clone()).await;
+            self.discard_pending_for_thread(thread_id, actor.clone())
+                .await;
             if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
-                log!(
-                    "[Recovery] Failed to delete branch {}: {}",
-                    branch_name,
-                    e
-                );
+                log!("[Recovery] Failed to delete branch {}: {}", branch_name, e);
             }
         } else if let Some(changed_files) = proposal_files {
             let is_external = match self.is_external_repo_thread(thread_id).await {
@@ -716,8 +712,9 @@ impl LucidosEngine {
                     // background WorktreeCleanup worker is the SOLE deleter of a
                     // valid worktree. This replaced an unconditional `remove_dir_all`
                     // that nuked a live worktree out from under recovery — 2026-07-02.
-                    let is_live_worktree = matches!(tokio::fs::try_exists(&wt_path).await, Ok(true))
-                        && crate::engine::git_ops::is_live_worktree_at(&wt_path).await;
+                    let is_live_worktree =
+                        matches!(tokio::fs::try_exists(&wt_path).await, Ok(true))
+                            && crate::engine::git_ops::is_live_worktree_at(&wt_path).await;
                     let on_our_branch = is_live_worktree
                         && crate::engine::git_ops::worktree_current_branch(&wt_path)
                             .await
@@ -750,7 +747,8 @@ impl LucidosEngine {
                         // `clear_stranded_worktree_dir` removes the dir ONLY when
                         // genuinely stranded (git admin gone); a valid worktree is
                         // left untouched (and can't reach here — handled above).
-                        crate::engine::git_ops::clear_stranded_worktree_dir(&repo_root, &wt_path).await;
+                        crate::engine::git_ops::clear_stranded_worktree_dir(&repo_root, &wt_path)
+                            .await;
                         match worktree_add(&repo_root, &wt_path, &[branch]).await {
                             Ok(o) if o.status.success() => {
                                 log!("[Recovery] Created fresh worktree for lost session: {} (branch {})", wt_path.display(), branch);
@@ -765,7 +763,11 @@ impl LucidosEngine {
                                 false
                             }
                             Err(e) => {
-                                log!("[Recovery] git worktree add failed for branch {}: {}", branch, e);
+                                log!(
+                                    "[Recovery] git worktree add failed for branch {}: {}",
+                                    branch,
+                                    e
+                                );
                                 false
                             }
                         }
@@ -791,7 +793,10 @@ impl LucidosEngine {
                         add_paths_to_worktree_exclude(&wt_path, WORKTREE_EXCLUDE_PATHS).await;
                         to_recover.push((wt_path, branch.clone(), repo_id, repo_root));
                     } else if let Some(&thread_id) = branch_to_thread.get(branch) {
-                        log!("[Recovery] Ending stuck session for thread {} — worktree unavailable", thread_id);
+                        log!(
+                            "[Recovery] Ending stuck session for thread {}: worktree unavailable",
+                            thread_id
+                        );
                         end_stuck_session(self, thread_id).await;
                     }
                 }
@@ -846,12 +851,7 @@ impl LucidosEngine {
                     // re-emits with `incomplete: false` and clears the flag.
                     log!("[Recovery] Resuming active session with pending change for branch {} — marking change incomplete", branch_name);
                     if let Some(&tid) = branch_to_thread.get(&branch_name) {
-                        mark_pending_change_incomplete(
-                            &self.event_bus,
-                            tid,
-                            pending_change,
-                        )
-                        .await;
+                        mark_pending_change_incomplete(&self.event_bus, tid, pending_change).await;
                     }
                 } else {
                     log!(
@@ -933,11 +933,8 @@ impl LucidosEngine {
             // interrupted before its first idle still resumes instead of falling
             // back to a fresh session + reconstructed summary.
             let cc_session_id: Option<String> =
-                crate::engine::agent_session::lookup_latest_cc_session_id(
-                    self.pool(),
-                    thread_id,
-                )
-                .await;
+                crate::engine::agent_session::lookup_latest_cc_session_id(self.pool(), thread_id)
+                    .await;
 
             let is_external_repo = is_external_repo_path(&repo_root, &lucidos_repo_root);
             // Phase 5.3: do NOT auto-spawn CC for mid-turn-crashed sessions.
@@ -1233,7 +1230,10 @@ pub(crate) async fn settle_orphaned_running_coding_agent_threads(
     {
         Ok(rows) => rows,
         Err(e) => {
-            log!("[Recovery] orphaned-running settle sweep query failed: {}", e);
+            log!(
+                "[Recovery] orphaned-running settle sweep query failed: {}",
+                e
+            );
             return;
         }
     };

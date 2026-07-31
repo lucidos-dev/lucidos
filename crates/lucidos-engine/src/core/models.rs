@@ -153,11 +153,7 @@ impl ModelStore {
 
     /// Toggle a model's enabled flag without touching its other fields. Works on
     /// builtin rows too (the disable-only path). Returns whether a row existed.
-    pub async fn set_enabled(
-        pool: &PgPool,
-        id: &str,
-        enabled: bool,
-    ) -> Result<bool, sqlx::Error> {
+    pub async fn set_enabled(pool: &PgPool, id: &str, enabled: bool) -> Result<bool, sqlx::Error> {
         let result =
             sqlx::query("UPDATE models SET enabled = $2, updated_at = NOW() WHERE id = $1")
                 .bind(id)
@@ -187,13 +183,15 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
         let models = ModelStore::list(&pool).await.unwrap();
         assert!(
-            models.iter().any(|m| m.id == "claude-fable-5"
-                && m.provider == "anthropic"
-                && m.is_builtin()),
+            models
+                .iter()
+                .any(|m| m.id == "claude-fable-5" && m.provider == "anthropic" && m.is_builtin()),
             "Fable 5 builtin must be seeded on the anthropic provider"
         );
         assert!(
-            models.iter().any(|m| m.id == "claude-opus-4-8@default" && m.provider == "vertex"),
+            models
+                .iter()
+                .any(|m| m.id == "claude-opus-4-8@default" && m.provider == "vertex"),
             "existing Vertex builtins must be seeded"
         );
         assert!(
@@ -205,7 +203,10 @@ mod tests {
         );
         // Ordered by sort_order — Fable 5 (0) sorts before Opus 5 (5) before
         // Opus 4.8 (10).
-        let fable = models.iter().position(|m| m.id == "claude-fable-5").unwrap();
+        let fable = models
+            .iter()
+            .position(|m| m.id == "claude-fable-5")
+            .unwrap();
         let opus5 = models
             .iter()
             .position(|m| m.id == "claude-opus-5@default")
@@ -214,7 +215,10 @@ mod tests {
             .iter()
             .position(|m| m.id == "claude-opus-4-8@default")
             .unwrap();
-        assert!(fable < opus5 && opus5 < opus, "sort_order must drive display order");
+        assert!(
+            fable < opus5 && opus5 < opus,
+            "sort_order must drive display order"
+        );
         pool.close().await;
         teardown_test_db(&db_name).await;
     }
@@ -412,7 +416,10 @@ mod tests {
         assert!(ModelStore::set_enabled(&pool, "claude-fable-5", false)
             .await
             .unwrap());
-        let m = ModelStore::get(&pool, "claude-fable-5").await.unwrap().unwrap();
+        let m = ModelStore::get(&pool, "claude-fable-5")
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!m.enabled);
         assert_eq!(m.label, "Fable 5", "toggle must not touch the label");
         assert!(m.is_builtin(), "toggle must not change source");
@@ -426,7 +433,8 @@ mod tests {
         // Colliding with a seeded builtin id must fail (unique PK violation) so
         // the API can return a clear "already exists" rather than silently
         // overwriting a builtin.
-        let result = ModelStore::create(&pool, "claude-fable-5", "Dupe", "anthropic", 1, None).await;
+        let result =
+            ModelStore::create(&pool, "claude-fable-5", "Dupe", "anthropic", 1, None).await;
         assert!(result.is_err(), "duplicate id must error");
         pool.close().await;
         teardown_test_db(&db_name).await;

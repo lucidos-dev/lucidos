@@ -59,7 +59,7 @@ vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
 vi.mock('./devices', () => ({ getDeviceId: vi.fn(), toggleDevicePush: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
-vi.mock('./repositories', () => ({ refreshRepoView: vi.fn() }));
+vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
 vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));
 vi.mock('./thread-loading', () => ({
   loadAllThreads: vi.fn(async () => {}),

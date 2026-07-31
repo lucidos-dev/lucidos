@@ -391,7 +391,8 @@ mod tests {
             body
         );
         // Empty strings are treated as absent so the receiver doesn't see "".
-        let body = build_cross_workspace_coding_agent_body(tid, "x", Some(""), Some(""), Some(""), None);
+        let body =
+            build_cross_workspace_coding_agent_body(tid, "x", Some(""), Some(""), Some(""), None);
         assert!(
             body.get("title").is_none(),
             "empty title must be omitted: {:?}",

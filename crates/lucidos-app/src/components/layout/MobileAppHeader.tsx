@@ -7,6 +7,7 @@ import { ComposeIcon, SearchIcon } from '../shared/icons';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { ThreadNav } from '../shared/ThreadNav';
+import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
@@ -112,13 +113,21 @@ function MobileThreadsHeader() {
   );
 }
 
-/** Mobile thread header — brand mode. Pane navigation is swipe-only (no
- *  threads/content toggle icons); the dot indicator remains as a tappable cue. */
+/** Mobile thread header (brand mode). The leading control is the same thread
+ *  drawer toggle desktop puts here (ThreadToggleButton: same glyph, and
+ *  `toggleThreads` navigates to the threads pane on mobile), so the
+ *  needs-attention badge that rides it is visible from the conversation rather
+ *  than only from the threads pane's own Filter button. The hamburger keeps its
+ *  place on this row but moves to the far TRAILING edge, mirroring the toggle
+ *  across the row: both drawers stay one tap from the conversation, and the menu
+ *  drawer slides out from under it on the right (drawerSideFor in Drawer.tsx).
+ *  Pane navigation is otherwise swipe-only; the dot indicator remains as a
+ *  tappable cue. */
 function MobileThreadHeader() {
   return (
     <div class="mobile-thread-header">
       <div class="mobile-header-row">
-        <HamburgerButton />
+        <ThreadToggleButton />
         <div class="mobile-nav-slot"><ThreadNav /></div>
         {/* Brand is absolutely centered on the row middle (see
             .mobile-header-title); the spacer pins the trailing icons right. */}
@@ -146,6 +155,7 @@ function MobileThreadHeader() {
           <ComposeIcon />
         </button>
         <SearchEverywhereButton />
+        <HamburgerButton />
       </div>
     </div>
   );

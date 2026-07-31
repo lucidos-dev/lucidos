@@ -16,13 +16,17 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     start_cc_session(&bus, thread_id, "claude-code/fix", None).await;
     emit_cc_idle(&bus, thread_id, true, None).await;
 
-    let (status, has_changes): (String, bool) =
-        sqlx::query_as("SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert_eq!(status, "idle", "CodingAgentIdled+ChangeProposed settle to 'idle' (Option B)");
+    let (status, has_changes): (String, bool) = sqlx::query_as(
+        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        status, "idle",
+        "CodingAgentIdled+ChangeProposed settle to 'idle' (Option B)"
+    );
     assert!(has_changes);
 
     bus.emit(BusEvent::Thread {
@@ -64,12 +68,13 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     .await
     .unwrap();
 
-    let (status, has_changes): (String, bool) =
-        sqlx::query_as("SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (status, has_changes): (String, bool) = sqlx::query_as(
+        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(status, "idle", "ChangeApplied → idle");
     assert!(!has_changes, "ChangeApplied clears coding_agent_proposed");
 
@@ -77,12 +82,13 @@ async fn change_applied_then_idle_no_changes_stays_idle() {
     // THIS IS THE REGRESSION SCENARIO: previously this set status back to 'waiting'
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
 
-    let (status, has_changes): (String, bool) =
-        sqlx::query_as("SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (status, has_changes): (String, bool) = sqlx::query_as(
+        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         status, "idle",
         "CodingAgentIdled(no changes) after ChangeApplied must stay idle"
@@ -167,13 +173,17 @@ async fn change_applied_keeps_inbox_shows_archive() {
     );
 
     // CC flags should be cleared (ClearAll)
-    let coding_agent_proposed: bool =
-        sqlx::query_scalar("SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
-    assert!(!coding_agent_proposed, "ChangeApplied must clear coding_agent_proposed");
+    let coding_agent_proposed: bool = sqlx::query_scalar(
+        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        !coding_agent_proposed,
+        "ChangeApplied must clear coding_agent_proposed"
+    );
 
     // A subsequent CodingAgentIdled(no changes) keeps section as 'inbox' (idempotent)
     emit_cc_idle(&bus, thread_id, false, Some("sid-1")).await;
@@ -248,7 +258,10 @@ async fn change_discarded_keeps_inbox_shows_archive() {
         section, "inbox",
         "ChangeDiscarded must NOT clear inbox — Archive button needs to appear"
     );
-    assert!(!coding_agent_proposed, "ChangeDiscarded must clear coding_agent_proposed");
+    assert!(
+        !coding_agent_proposed,
+        "ChangeDiscarded must clear coding_agent_proposed"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -537,7 +550,11 @@ async fn typed_message_supersedes_pending_permission() {
     let mut rx = {
         let mut state = pending.lock().unwrap();
         let (tx, rx) = tokio::sync::broadcast::channel(1);
-        let key = (thread_id, "Bash".to_string(), "{\"command\":\"ls\"}".to_string());
+        let key = (
+            thread_id,
+            "Bash".to_string(),
+            "{\"command\":\"ls\"}".to_string(),
+        );
         state.by_dedup_key.insert(
             key.clone(),
             PermissionEntry {
@@ -562,19 +579,21 @@ async fn typed_message_supersedes_pending_permission() {
     );
 
     // Exactly one Resolved emitted, carrying allowed=false + the superseded reason.
-    let (resolved_count, allowed, reason): (i64, Option<bool>, Option<String>) =
-        sqlx::query_as(
-            "SELECT COUNT(*), \
+    let (resolved_count, allowed, reason): (i64, Option<bool>, Option<String>) = sqlx::query_as(
+        "SELECT COUNT(*), \
                     bool_and((payload->>'allowed')::bool), \
                     max(payload->>'reason') \
              FROM events \
              WHERE event_type = 'CodingAgentPermissionResolved' \
                AND payload->>'request_id' = 'req-super'",
-        )
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(resolved_count, 1, "exactly one Resolved per superseded request");
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        resolved_count, 1,
+        "exactly one Resolved per superseded request"
+    );
     assert_eq!(allowed, Some(false), "superseded resolution must be a deny");
     assert_eq!(reason.as_deref(), Some(SUPERSEDED_REASON));
 
@@ -585,7 +604,10 @@ async fn typed_message_supersedes_pending_permission() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(status, "running", "Resolved must clear waiting_for_user_answer");
+    assert_eq!(
+        status, "running",
+        "Resolved must clear waiting_for_user_answer"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -596,7 +618,9 @@ async fn typed_message_supersedes_pending_permission() {
 /// amplify the event log with spurious Resolved rows.
 #[tokio::test]
 async fn supersede_is_noop_when_no_pending_permission() {
-    use crate::engine::cc_permission::{resolve_pending_permissions_as_superseded, PermissionState};
+    use crate::engine::cc_permission::{
+        resolve_pending_permissions_as_superseded, PermissionState,
+    };
     use std::sync::Mutex;
 
     let (pool, db_name) = setup_test_db().await;
@@ -693,7 +717,10 @@ async fn permission_resolution_resumes_waiting_thread() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(status, "waiting_for_user_answer", "request parks the thread");
+    assert_eq!(
+        status, "waiting_for_user_answer",
+        "request parks the thread"
+    );
 
     bus.emit(BusEvent::Thread {
         thread_id,
@@ -846,7 +873,11 @@ async fn idle_sweep_clears_pending_permission_without_resurrecting() {
     let mut rx = {
         let mut state = pending.lock().unwrap();
         let (tx, rx) = tokio::sync::broadcast::channel(1);
-        let key = (thread_id, "Bash".to_string(), "{\"command\":\"sed x\"}".to_string());
+        let key = (
+            thread_id,
+            "Bash".to_string(),
+            "{\"command\":\"sed x\"}".to_string(),
+        );
         state.by_dedup_key.insert(
             key.clone(),
             PermissionEntry {
@@ -880,7 +911,10 @@ async fn idle_sweep_clears_pending_permission_without_resurrecting() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(resolved_count, 1, "exactly one Resolved for the dangling card");
+    assert_eq!(
+        resolved_count, 1,
+        "exactly one Resolved for the dangling card"
+    );
     assert_eq!(allowed, Some(false), "the idle sweep resolves as a deny");
     assert_eq!(reason.as_deref(), Some(SESSION_ENDED_REASON));
 
@@ -990,7 +1024,10 @@ async fn startup_resets_orphaned_waiting_threads_without_changes() {
         "Legacy sweep must NOT touch rows with coding_agent_proposed=true"
     );
     assert!(has_changes_b, "coding_agent_proposed preserved");
-    assert!(requires_restart_b, "coding_agent_requires_restart preserved");
+    assert!(
+        requires_restart_b,
+        "coding_agent_requires_restart preserved"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -1027,12 +1064,13 @@ async fn thread_archived_clears_cc_flags_and_goes_idle() {
     // coding_agent_proposed.
     emit_change_proposed(&bus, thread_id, "claude-code/feat", true).await;
 
-    let (status, has_changes): (String, bool) =
-        sqlx::query_as("SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (status, has_changes): (String, bool) = sqlx::query_as(
+        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(status, "idle");
     assert!(has_changes);
 
@@ -1059,7 +1097,10 @@ async fn thread_archived_clears_cc_flags_and_goes_idle() {
     .await
     .unwrap();
     assert_eq!(status, "idle", "ThreadArchived must set idle");
-    assert!(!has_changes, "ThreadArchived must clear coding_agent_proposed");
+    assert!(
+        !has_changes,
+        "ThreadArchived must clear coding_agent_proposed"
+    );
     assert!(
         !requires_restart,
         "ThreadArchived must clear coding_agent_requires_restart"
@@ -1090,13 +1131,12 @@ async fn thread_archived_clears_is_saved() {
     .await
     .unwrap();
 
-    let saved: bool = sqlx::query_scalar(
-        "SELECT is_saved FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let saved: bool =
+        sqlx::query_scalar("SELECT is_saved FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(saved, "ThreadSaved must set is_saved=true");
 
     bus.emit(BusEvent::Thread {
@@ -1107,13 +1147,12 @@ async fn thread_archived_clears_is_saved() {
     .await
     .unwrap();
 
-    let (saved, archive_state): (bool, String) = sqlx::query_as(
-        "SELECT is_saved, archive_state FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (saved, archive_state): (bool, String) =
+        sqlx::query_as("SELECT is_saved, archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert!(
         !saved,
         "ThreadArchived must clear is_saved so the row leaves the Saved section"
@@ -1139,7 +1178,14 @@ async fn thread_archived_preserves_children_counters() {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
     let (parent_id, _child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
-    assert_children_counters(&pool, parent_id, 1, 1, "precondition: parent has 1 active/1 total child").await;
+    assert_children_counters(
+        &pool,
+        parent_id,
+        1,
+        1,
+        "precondition: parent has 1 active/1 total child",
+    )
+    .await;
 
     bus.emit(BusEvent::Thread {
         thread_id: parent_id,

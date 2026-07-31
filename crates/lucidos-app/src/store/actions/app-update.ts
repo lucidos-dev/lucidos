@@ -1,15 +1,37 @@
-import { showToast, latestTauriAppVersion, appUpdateCheckError } from '../store';
+import { showToast, removeToast, latestTauriAppVersion, appUpdateCheckError, appUpdateProgress } from '../store';
 import { isTauri } from '../../utils/platform';
 import { isNewerVersion } from '../../utils/version';
-import { checkAppUpdate, installAppUpdateAndRestart } from '../../utils/tauri';
+import { formatBytes } from '../../utils/formatBytes';
+import {
+  checkAppUpdate,
+  installAppUpdateAndRestart,
+  cancelAppUpdate,
+  listen,
+  APP_UPDATE_PROGRESS_EVENT,
+  type AppUpdateProgress,
+  type AppUpdateRunning,
+} from '../../utils/tauri';
 
 /** How often the packaged client re-checks for an app update. The client is
  *  long-resident (the window can be closed while it stays alive in the menu bar),
  *  so a launch-only check would miss an update published mid-session. */
 const APP_UPDATE_POLL_MS = 6 * 60 * 60 * 1000; // 6h
 
+/** ONE key for the whole packaged-update surface: the "Lucidos <v> available"
+ *  offer, the live progress narration, and a failure. Keyed toasts update in
+ *  place, so the offer MORPHS into the progress readout instead of a second toast
+ *  stacking on top of it — the same single-surface discipline
+ *  `initiateEngineRestart` applies to the engine switch. */
+const UPDATE_TOAST_KEY = 'app-update-available';
+
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 let installing = false;
+/** Unsubscribe for the progress event, or `null` when not subscribed. */
+let unlistenProgress: (() => void) | null = null;
+/** Guards the async gap in {@link subscribeToAppUpdateProgress} so remounting
+ *  (reload, workspace switch, restart-reconnect) can't register a second
+ *  listener while the first `listen` call is still in flight. */
+let subscribing = false;
 /** Whether {@link latestTauriAppVersion} currently holds a value THIS module
  *  wrote. Gates the clear-on-no-update path so the updater never wipes a value
  *  it did not put there: in a Tauri DEV client `check_app_update` is a no-op
@@ -18,6 +40,144 @@ let installing = false;
  *  engine's `/health`, which is the only source dev has. The two would then
  *  fight on every poll. */
 let updaterOwnsLatestVersion = false;
+
+/** How the update surface should read for a given progress frame: the sentence,
+ *  the determinate fraction (or `null` when there is no honest one), and whether
+ *  the run can still be abandoned.
+ *
+ *  Pure, and the SINGLE derivation behind both the toast and Settings → System —
+ *  the two must never disagree about what the update is doing. Terminal frames
+ *  (`cancelled` / `failed`) are deliberately absent: they end the run rather than
+ *  describe it, so their callers replace the toast instead of updating it. */
+export interface AppUpdateNarration {
+  message: string;
+  /** Determinate fraction in [0, 1], or `null` when there is no honest one.
+   *  Clamped HERE rather than at each renderer: the toast and the System page
+   *  both paint it, and a server whose `Content-Length` undercounts the body
+   *  would otherwise send one of them past the end of its own track. */
+  progress: number | null;
+  cancellable: boolean;
+}
+
+/** `Lucidos 2026.7.30`, or a version-less fallback for the window before the
+ *  check has resolved one. */
+function updateLabel(version: string | null): string {
+  return version ? `Lucidos ${version}` : 'the update';
+}
+
+export function appUpdateNarration(frame: AppUpdateRunning): AppUpdateNarration {
+  const name = updateLabel(frame.version);
+  switch (frame.phase) {
+    case 'checking':
+      // Cancellable: the check is a network round-trip that can hang on a bad
+      // connection, and the Rust side races it against the cancel signal too.
+      return { message: 'Checking for updates…', progress: null, cancellable: true };
+    case 'downloading': {
+      // No `Content-Length` means no honest percentage — show the bytes moving
+      // and let the spinner carry the rest. Never a fabricated bar.
+      const { downloaded, total } = frame;
+      const sized = total !== null && total > 0;
+      return {
+        message: `Downloading ${name} — ${formatBytes(downloaded)}${sized ? ` of ${formatBytes(total)}` : ''}`,
+        progress: sized ? Math.min(1, downloaded / total) : null,
+        cancellable: true,
+      };
+    }
+    case 'verifying':
+      // Signature check over the buffered bytes — sub-second, and nothing has
+      // touched the disk yet. A cancel WOULD still land here (Rust runs the check
+      // inside the abortable download), but a button that appears and vanishes
+      // within a few hundred ms is noise, so it is withheld. Hiding a working
+      // affordance is safe; the rule is only never to OFFER one that can't work.
+      // Full bar: the transfer really is complete.
+      return { message: `Verifying ${name}…`, progress: 1, cancellable: false };
+    case 'installing':
+      return { message: `Installing ${name}…`, progress: null, cancellable: false };
+    case 'restarting-services':
+      return { message: 'Restarting background services…', progress: null, cancellable: false };
+    case 'relaunching':
+      return { message: 'Relaunching Lucidos…', progress: null, cancellable: false };
+  }
+}
+
+/** Surface the "Lucidos <v> available → Update & restart" offer. Extracted so
+ *  the cancel path can put it straight back: abandoning a download abandons the
+ *  attempt, not the update, and dropping the user back to no affordance at all
+ *  would strand them until the next 6h poll. */
+function offerAppUpdate(version: string): void {
+  showToast(`Lucidos ${version} available`, 'info', {
+    key: UPDATE_TOAST_KEY,
+    action: {
+      label: 'Update & restart',
+      onClick: () => { void installAppUpdate(); },
+    },
+  });
+}
+
+/** Render one progress frame onto the update surface. Terminal frames end the
+ *  run (clearing {@link appUpdateProgress}, which is what re-enables ordinary
+ *  toasts) and replace the narration; the rest update it in place. */
+function handleAppUpdateProgress(frame: AppUpdateProgress): void {
+  if (frame.phase === 'cancelled') {
+    appUpdateProgress.value = null;
+    installing = false;
+    // Nothing was written to disk, so the update is still available — re-offer it
+    // rather than leaving the user with a silently vanished toast.
+    const version = frame.version ?? latestTauriAppVersion.value;
+    if (version) offerAppUpdate(version);
+    else removeToast(UPDATE_TOAST_KEY);
+    return;
+  }
+  if (frame.phase === 'failed') {
+    // Clear the run BEFORE toasting: `appUpdateCommitted` suppresses ordinary
+    // toasts while an update is past the point of no return, and this error is
+    // exactly the thing that must get through.
+    appUpdateProgress.value = null;
+    installing = false;
+    showToast(`Update failed: ${frame.message}`, 'error', { key: UPDATE_TOAST_KEY });
+    return;
+  }
+  appUpdateProgress.value = frame;
+  const narration = appUpdateNarration(frame);
+  showToast(narration.message, 'info', {
+    key: UPDATE_TOAST_KEY,
+    spinning: true,
+    progress: narration.progress,
+    // The last phases restart the launchd service, which kills the gateway
+    // serving this page; without this the narration would be suppressed by the
+    // very disconnection it is explaining.
+    showDuringRestart: true,
+    // Cancel IS the escape hatch while one exists, and once it doesn't there is
+    // nothing to escape to — an X beside "Cancel" would just read as a second,
+    // differently-behaved cancel.
+    dismissable: false,
+    secondaryAction: narration.cancellable
+      ? { label: 'Cancel', onClick: () => { void cancelAppUpdate(); } }
+      : undefined,
+  });
+}
+
+/** Subscribe to the Rust updater's progress stream. Idempotent across remounts;
+ *  Tauri-only.
+ *
+ *  Best-effort (frontend.md carve-out): this runs at startup without user intent,
+ *  and a failed subscription costs the narration, not the update — the install
+ *  action's own error toast and Settings → System still report outcomes. It
+ *  leaves itself unsubscribed on failure, so the next mount retries. */
+async function subscribeToAppUpdateProgress(): Promise<void> {
+  if (unlistenProgress || subscribing) return;
+  subscribing = true;
+  try {
+    unlistenProgress = await listen<AppUpdateProgress>(
+      APP_UPDATE_PROGRESS_EVENT,
+      (e) => { handleAppUpdateProgress(e.payload); },
+    );
+  } catch (e) {
+    console.warn('[app-update] progress subscription failed; retried on next mount', e);
+  } finally {
+    subscribing = false;
+  }
+}
 
 /** Check for a newer packaged build and, if one exists, surface the in-app
  *  "Update & restart" toast inside the workspace. Tauri-only — a plain browser /
@@ -35,6 +195,10 @@ let updaterOwnsLatestVersion = false;
  *  and the install action's own toast, which does run on user intent. */
 export async function checkForAppUpdate(): Promise<void> {
   if (!isTauri()) return;
+  // An update already running owns the shared toast key and has a far more
+  // specific answer to "is there an update?" than a fresh poll would — re-running
+  // one here would overwrite the live narration with a stale offer.
+  if (appUpdateProgress.value) return;
   let version: string | null;
   try {
     version = await checkAppUpdate();
@@ -58,13 +222,7 @@ export async function checkForAppUpdate(): Promise<void> {
     updaterOwnsLatestVersion = false;
   }
   if (!version) return;
-  showToast(`Lucidos ${version} available`, 'info', {
-    key: 'app-update-available',
-    action: {
-      label: 'Update & restart',
-      onClick: () => { void installAppUpdate(); },
-    },
-  });
+  offerAppUpdate(version);
 }
 
 /** The newer packaged version available to install, or `null`. Single derivation
@@ -78,42 +236,72 @@ export function packagedUpdateVersion(): string | null {
 }
 
 /** Install the available packaged update and restart the whole stack. This runs on
- *  USER intent (the toast action), so a failure is surfaced as an error toast. On
- *  success the client re-execs and this page is torn down — no further code runs. */
+ *  USER intent (the toast action / the System page button), so a failure is
+ *  surfaced as an error toast. On success the client re-execs and this page is
+ *  torn down — no further code runs.
+ *
+ *  The invoke resolves only when the whole thing is OVER; everything the user sees
+ *  in between arrives on the progress event (see {@link handleAppUpdateProgress}).
+ *  Awaiting it silently is precisely what made the update look like a freeze. */
 export async function installAppUpdate(): Promise<void> {
   if (installing) return;
   installing = true;
+  // React on the CLICK, not on the first event: the IPC hop plus the updater's own
+  // network check take long enough that the button would otherwise look dead.
+  handleAppUpdateProgress({ version: latestTauriAppVersion.value, phase: 'checking' });
   try {
     await installAppUpdateAndRestart();
-    // Reached only if the command resolved WITHOUT restarting (it normally never
-    // returns) — allow a retry.
+    // Reached only if the command resolved WITHOUT restarting — a cancel (whose
+    // event already reset the surface) or a no-op. Allow a retry either way.
     installing = false;
+    // The command has returned, so by definition nothing is running any more: a
+    // still-set run here would be a spinner with nothing behind it. Normally the
+    // cancel frame has already cleared it, but the event and the command reply
+    // travel on different channels and can land in either order.
+    if (appUpdateProgress.value) {
+      appUpdateProgress.value = null;
+      removeToast(UPDATE_TOAST_KEY);
+    }
   } catch (e) {
     installing = false;
-    showToast(`Update failed: ${String(e)}`, 'error');
+    // Rust emits a `failed` frame for everything it can attribute, and that
+    // handler has already cleared the run and shown the reason. This covers what
+    // it cannot reach — a rejected invoke, an ACL denial, a dead bridge — so a
+    // failed update can never leave the toast spinning forever.
+    if (appUpdateProgress.value) {
+      appUpdateProgress.value = null;
+      showToast(`Update failed: ${String(e)}`, 'error', { key: UPDATE_TOAST_KEY });
+    }
   }
 }
 
 /** Start the periodic packaged app-update check (immediately + every
- *  {@link APP_UPDATE_POLL_MS}). Tauri-only.
+ *  {@link APP_UPDATE_POLL_MS}) and subscribe to the updater's progress stream.
+ *  Tauri-only.
  *
  *  The immediate check runs on EVERY call, not just the first. The client process
  *  is long-resident while the workspace app remounts (reload, workspace switch,
  *  restart-reconnect), and the previous "return early if the timer exists" guard
  *  meant only the very first mount of a process ever checked — with a 6h interval
  *  behind it, an update published mid-session stayed invisible until the app was
- *  fully quit. Only the TIMER is idempotent, so remounting cannot stack intervals. */
+ *  fully quit. Only the TIMER and the SUBSCRIPTION are idempotent, so remounting
+ *  cannot stack intervals or listeners. */
 export function startAppUpdateChecks(): void {
   if (!isTauri()) return;
+  void subscribeToAppUpdateProgress();
   void checkForAppUpdate();
   if (pollTimer !== null) return;
   pollTimer = setInterval(() => { void checkForAppUpdate(); }, APP_UPDATE_POLL_MS);
 }
 
-/** Stop the periodic check (startup cleanup). */
+/** Stop the periodic check and drop the progress subscription (startup cleanup). */
 export function stopAppUpdateChecks(): void {
   if (pollTimer !== null) {
     clearInterval(pollTimer);
     pollTimer = null;
+  }
+  if (unlistenProgress) {
+    unlistenProgress();
+    unlistenProgress = null;
   }
 }

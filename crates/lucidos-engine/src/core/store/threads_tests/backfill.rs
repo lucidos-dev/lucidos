@@ -1,5 +1,5 @@
-use super::*;
 use super::test_helpers::*;
+use super::*;
 
 #[tokio::test]
 async fn backfill_trigger_id_rewrites_v5_hashes_to_config_ids() {
@@ -268,7 +268,10 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
         .backfill_repo_names_from_changes()
         .await
         .expect("backfill_repo_names_from_changes");
-    assert_eq!(inserted, 1, "only the deleted pre-event repo gets a scavenged name");
+    assert_eq!(
+        inserted, 1,
+        "only the deleted pre-event repo gets a scavenged name"
+    );
 
     async fn name_of(pool: &PgPool, id: Uuid) -> Option<String> {
         sqlx::query_scalar::<_, String>("SELECT name FROM repo_names WHERE id = $1")
@@ -288,7 +291,11 @@ async fn backfill_repo_names_from_changes_recovers_basename() {
         Some("Canonical Name"),
         "a repo already in repo_names is never clobbered by the path basename"
     );
-    assert_eq!(name_of(&pool, nameless_repo).await, None, "no change = no name invented");
+    assert_eq!(
+        name_of(&pool, nameless_repo).await,
+        None,
+        "no change = no name invented"
+    );
     assert_eq!(
         name_of(&pool, app_repo).await,
         None,
@@ -367,8 +374,7 @@ async fn backfill_repoints_lucidos_and_legacy_threads_to_deterministic_id() {
     // LEGACY external-repo thread: created before the kind column, so
     // coding_agent_kind IS NULL but the durable external flag is set. The
     // `kind IS NULL` arm must NOT mis-repoint it (the regression guard).
-    let legacy_external =
-        insert_ca_thread(&pool, None, true, Some(&legacy_external_id)).await;
+    let legacy_external = insert_ca_thread(&pool, None, true, Some(&legacy_external_id)).await;
     // A NULL-kind thread whose cc_repo_id is still a LIVE repository (not
     // orphaned) — must be left alone even without the external flag.
     insert_repository(&pool, live_external_id, "other", "/tmp/other").await;
@@ -384,10 +390,19 @@ async fn backfill_repoints_lucidos_and_legacy_threads_to_deterministic_id() {
         .backfill_cc_repo_id_to_deterministic(det)
         .await
         .expect("backfill");
-    assert_eq!(updated, 2, "exactly the lucidos + legacy Lucidos rows were re-pointed");
+    assert_eq!(
+        updated, 2,
+        "exactly the lucidos + legacy Lucidos rows were re-pointed"
+    );
 
-    assert_eq!(fetch_cc_repo_id(&pool, lucidos).await.as_deref(), Some(det_s.as_str()));
-    assert_eq!(fetch_cc_repo_id(&pool, legacy).await.as_deref(), Some(det_s.as_str()));
+    assert_eq!(
+        fetch_cc_repo_id(&pool, lucidos).await.as_deref(),
+        Some(det_s.as_str())
+    );
+    assert_eq!(
+        fetch_cc_repo_id(&pool, legacy).await.as_deref(),
+        Some(det_s.as_str())
+    );
     assert_eq!(
         fetch_cc_repo_id(&pool, external).await.as_deref(),
         Some(external_id.as_str()),
@@ -403,7 +418,11 @@ async fn backfill_repoints_lucidos_and_legacy_threads_to_deterministic_id() {
         Some(live_external_id.to_string().as_str()),
         "thread bound to a live repository untouched (live-binding guard)"
     );
-    assert_eq!(fetch_cc_repo_id(&pool, app).await, None, "app thread cc_repo_id stays NULL");
+    assert_eq!(
+        fetch_cc_repo_id(&pool, app).await,
+        None,
+        "app thread cc_repo_id stays NULL"
+    );
 
     // Idempotent — a second boot re-points nothing (marker set).
     let again = store

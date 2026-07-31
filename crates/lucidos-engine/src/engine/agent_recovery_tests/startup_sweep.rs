@@ -31,7 +31,9 @@ mod startup_sweep_coding_agent_has_diff {
         // update the projection naturally.
         std::fs::write(wt.join("a.txt"), "hello").unwrap();
         git_cmd(&["add", "a.txt"], &wt).await.unwrap();
-        git_cmd(&["commit", "-m", "feat: add a"], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "feat: add a"], &wt)
+            .await
+            .unwrap();
 
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
@@ -116,10 +118,8 @@ mod startup_sweep_coding_agent_has_diff {
         // refresh_coding_agent_has_diff_for_active_cc_threads with a repo whose
         // branch has commits — if the gate didn't filter, the column would
         // flip to TRUE.
-        let workspace_path = std::env::temp_dir().join(format!(
-            "lucidos-sweep-test-{}",
-            Uuid::new_v4().simple()
-        ));
+        let workspace_path =
+            std::env::temp_dir().join(format!("lucidos-sweep-test-{}", Uuid::new_v4().simple()));
         std::fs::create_dir_all(&workspace_path).unwrap();
         crate::engine::agent_recovery::refresh_coding_agent_has_diff_for_active_cc_threads(
             &pool,
@@ -164,7 +164,9 @@ mod startup_sweep_coding_agent_has_diff {
         // Branch has commits — so seed_coding_agent_has_diff would say TRUE.
         std::fs::write(wt.join("a.txt"), "hello").unwrap();
         git_cmd(&["add", "a.txt"], &wt).await.unwrap();
-        git_cmd(&["commit", "-m", "feat: add a"], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "feat: add a"], &wt)
+            .await
+            .unwrap();
 
         // Remove the worktree directory from disk (simulate cleanup) but
         // leave the branch ref intact in the main repo.
@@ -185,11 +187,13 @@ mod startup_sweep_coding_agent_has_diff {
 
         // Pre-seed the column to TRUE so we can assert the sweep actively
         // resets it (not just leaves it at the default).
-        sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1")
-            .bind(thread_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         reconcile_thread_coding_agent_has_diff(&pool, thread_id, &repo_root, branch, &wt).await;
 
@@ -260,7 +264,9 @@ mod startup_sweep_coding_agent_has_diff {
         // sweep should detect.
         std::fs::write(wt.join("a.txt"), "hello").unwrap();
         git_cmd(&["add", "a.txt"], &wt).await.unwrap();
-        git_cmd(&["commit", "-m", "feat: add a"], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "feat: add a"], &wt)
+            .await
+            .unwrap();
 
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
@@ -349,8 +355,7 @@ mod startup_sweep_coding_agent_has_diff {
         // beyond main. `make_repo_and_worktree` returns
         // `(tmp, repo_root, wt_path)`; this is the repo the sweep MUST
         // resolve via `cc_repo_id`.
-        let (_external_tmp, external_repo, external_wt) =
-            make_repo_and_worktree(branch).await;
+        let (_external_tmp, external_repo, external_wt) = make_repo_and_worktree(branch).await;
         std::fs::write(external_wt.join("a.txt"), "hello").unwrap();
         git_cmd(&["add", "a.txt"], &external_wt).await.unwrap();
         git_cmd(&["commit", "-m", "feat: add a"], &external_wt)
@@ -364,7 +369,9 @@ mod startup_sweep_coding_agent_has_diff {
         // doesn't exist), and the helper writes FALSE.
         let lucidos_tmp = tempfile::tempdir().unwrap();
         let lucidos_repo = lucidos_tmp.path().to_path_buf();
-        git_cmd(&["init", "-b", "main"], &lucidos_repo).await.unwrap();
+        git_cmd(&["init", "-b", "main"], &lucidos_repo)
+            .await
+            .unwrap();
         git_cmd(&["config", "user.email", "test@example.com"], &lucidos_repo)
             .await
             .unwrap();
@@ -373,7 +380,9 @@ mod startup_sweep_coding_agent_has_diff {
             .unwrap();
         std::fs::write(lucidos_repo.join("seed.txt"), "x").unwrap();
         git_cmd(&["add", "."], &lucidos_repo).await.unwrap();
-        git_cmd(&["commit", "-m", "init"], &lucidos_repo).await.unwrap();
+        git_cmd(&["commit", "-m", "init"], &lucidos_repo)
+            .await
+            .unwrap();
 
         let (pool, db_name) = setup_test_db().await;
 
@@ -399,11 +408,13 @@ mod startup_sweep_coding_agent_has_diff {
         // `reconcile_thread_coding_agent_has_diff` writes FALSE; if the sweep
         // mistakenly resolves against the wrong repo, the column flips to
         // FALSE and the assertion below fails loudly.
-        sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1")
-            .bind(thread_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE thread_summaries SET coding_agent_has_diff = TRUE WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         refresh_coding_agent_has_diff_for_active_cc_threads(&pool, &workspace, &lucidos_repo).await;
 
@@ -472,11 +483,7 @@ mod startup_sweep_coding_agent_has_diff {
         )
         .await
         .unwrap();
-        std::fs::write(
-            wt.join("data/apps/habit-tracker/index.html"),
-            "<h1>v2</h1>",
-        )
-        .unwrap();
+        std::fs::write(wt.join("data/apps/habit-tracker/index.html"), "<h1>v2</h1>").unwrap();
         git_cmd(&["add", "."], &wt).await.unwrap();
         git_cmd(&["commit", "-m", "edit app"], &wt).await.unwrap();
 
@@ -485,7 +492,9 @@ mod startup_sweep_coding_agent_has_diff {
         // and the column is wiped to FALSE.
         let lucidos_tmp = tempfile::tempdir().unwrap();
         let lucidos_repo = lucidos_tmp.path().to_path_buf();
-        git_cmd(&["init", "-b", "main"], &lucidos_repo).await.unwrap();
+        git_cmd(&["init", "-b", "main"], &lucidos_repo)
+            .await
+            .unwrap();
         git_cmd(&["config", "user.email", "test@example.com"], &lucidos_repo)
             .await
             .unwrap();
@@ -494,7 +503,9 @@ mod startup_sweep_coding_agent_has_diff {
             .unwrap();
         std::fs::write(lucidos_repo.join("seed.txt"), "x").unwrap();
         git_cmd(&["add", "."], &lucidos_repo).await.unwrap();
-        git_cmd(&["commit", "-m", "init"], &lucidos_repo).await.unwrap();
+        git_cmd(&["commit", "-m", "init"], &lucidos_repo)
+            .await
+            .unwrap();
 
         let (pool, db_name) = setup_test_db().await;
         let (bus, _rx) = EventBus::new(pool.clone());
@@ -549,11 +560,13 @@ mod startup_sweep_coding_agent_has_diff {
 
         // Pre-seed FALSE so the assertion proves the sweep actively flips it to
         // TRUE via the workspace_path route (the bug leaves it FALSE).
-        sqlx::query("UPDATE thread_summaries SET coding_agent_has_diff = FALSE WHERE thread_id = $1")
-            .bind(thread_id)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "UPDATE thread_summaries SET coding_agent_has_diff = FALSE WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         refresh_coding_agent_has_diff_for_active_cc_threads(&pool, &workspace, &lucidos_repo).await;
 
@@ -636,7 +649,10 @@ mod settle_orphaned_running_sweep {
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
         start_cc_session(&bus, thread_id, "claude-code/orphan", None).await;
-        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("running"));
+        assert_eq!(
+            status_of(&pool, thread_id).await.as_deref(),
+            Some("running")
+        );
 
         settle_orphaned_running_coding_agent_threads(&pool, &bus, &HashSet::new()).await;
 
@@ -687,7 +703,10 @@ mod settle_orphaned_running_sweep {
         let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
         seed_running_chat_thread(&bus, thread_id).await;
-        assert_eq!(status_of(&pool, thread_id).await.as_deref(), Some("running"));
+        assert_eq!(
+            status_of(&pool, thread_id).await.as_deref(),
+            Some("running")
+        );
 
         settle_orphaned_running_coding_agent_threads(&pool, &bus, &HashSet::new()).await;
 
@@ -906,4 +925,3 @@ mod switch_classification {
 }
 
 // -- end_stale_waiting_session branch-deletion regression ----------------------
-

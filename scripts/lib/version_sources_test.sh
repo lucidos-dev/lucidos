@@ -124,8 +124,16 @@ fi
 # correct precisely because it does not move. What rots is a doc asserting the
 # CURRENT version, because nobody re-reads prose at release time — that is how
 # CONTRIBUTING.md came to announce the 0.9.x line while main was on 0.16.0.
+#
+# "currently the" / "currently at" are in the alternation because CONTRIBUTING.md
+# was not the only file making that claim: SECURITY.md said "pre-1.0 (currently
+# the 0.9.x line)" and sailed through this scan until the 2026-07-30 docs audit
+# read it by hand, because the first cut only knew the preposition "on". Match
+# the ADVERB plus any of its prepositions, not one fixed phrase. Bare "currently"
+# is deliberately NOT accepted: it would fire on ordinary prose that happens to
+# mention a version-shaped token ("gpt-5.5") within 40 characters.
 echo "test: no prose announces which release line the project is currently on"
-git grep -nIiE "(currently on|is now on|we are on|latest release is|current version is)[^.]{0,40}[0-9]+\.[0-9]+\.?[0-9x]*" \
+git grep -nIiE "(currently (on|at|the)|is now on|we are on|latest release is|current version is)[^.]{0,40}[0-9]+\.[0-9]+\.?[0-9x]*" \
   -- '*.md' \
   ':(exclude)CHANGELOG.md' ':(exclude)docs/plans' ':(exclude)docs/adr' \
   ':(exclude)scripts/lib/version_sources_test.sh' \

@@ -35,8 +35,7 @@ impl Workspace {
 }
 
 pub(crate) fn resolve_from_env() -> Result<Workspace, BoxError> {
-    let pwd = std::env::current_dir()
-        .map_err(|e| format!("Failed to read current dir: {}", e))?;
+    let pwd = std::env::current_dir().map_err(|e| format!("Failed to read current dir: {}", e))?;
     let env_ws = std::env::var("LUCIDOS_WORKSPACE").ok().map(PathBuf::from);
     // Read the engine-provided base URL here, not in the resolver, to keep the
     // pure helpers free of env reads so tests can drive them deterministically
@@ -85,7 +84,11 @@ pub(crate) fn resolve_with_override(
     // a missing/unreadable ports file. Derive the fallback proto from the
     // override's scheme purely for internal consistency.
     let (api_port, proto) = read_ports(&root.join(".lucidos/ports")).unwrap_or_else(|_| {
-        let proto = if base.starts_with("https") { "https" } else { "http" };
+        let proto = if base.starts_with("https") {
+            "https"
+        } else {
+            "http"
+        };
         (0, proto.to_string())
     });
     Ok(Workspace {
@@ -107,16 +110,14 @@ pub(crate) fn resolve_with_override(
 /// started inside a CC worktree dropped its own `.lucidos/ports` file, so every
 /// `lucidos hardened mark` from CC POSTed to the wrong DB. The parent engine
 /// then saw Missing at apply time and triggered an unnecessary auto-/harden.
-pub(crate) fn resolve(start_dir: &Path, env_workspace: Option<&Path>) -> Result<Workspace, BoxError> {
+pub(crate) fn resolve(
+    start_dir: &Path,
+    env_workspace: Option<&Path>,
+) -> Result<Workspace, BoxError> {
     if let Some(root) = env_workspace {
         let ports_path = root.join(".lucidos/ports");
-        let (api_port, proto) = read_ports(&ports_path).map_err(|e| {
-            format!(
-                "LUCIDOS_WORKSPACE={}: {}",
-                root.display(),
-                e
-            )
-        })?;
+        let (api_port, proto) = read_ports(&ports_path)
+            .map_err(|e| format!("LUCIDOS_WORKSPACE={}: {}", root.display(), e))?;
         return Ok(Workspace {
             root: root.to_path_buf(),
             api_port,

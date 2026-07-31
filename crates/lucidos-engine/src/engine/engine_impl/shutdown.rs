@@ -20,8 +20,7 @@ impl LucidosEngine {
     /// shutdown-cleanup event would spawn a script that calls back into the
     /// HTTP API being torn down, producing a spurious "<trigger> failed" push.
     pub fn is_shutting_down(&self) -> bool {
-        self.shutting_down
-            .load(std::sync::atomic::Ordering::SeqCst)
+        self.shutting_down.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     /// Teardown-time boundary emission for the *Switch to new version* flow.
@@ -332,7 +331,6 @@ impl LucidosEngine {
 
         log!("[Shutdown] Coding-agent sessions stopped.");
     }
-
 }
 
 /// Teardown boundary emit for one in-flight thread — coding-agent OR chat:

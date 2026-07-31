@@ -4,7 +4,6 @@ use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{EventChannel, EventMeta, ThreadEvent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 
-
 /// Regression: orphan recovery for a branch that was mid-CC-turn at engine
 /// restart must flag its pending change as `incomplete: true`. The pending
 /// row was populated by per-commit emits during the dying turn — its

@@ -361,7 +361,14 @@ mod tests {
 
     #[test]
     fn explicit_env_addr_wins_over_bool_and_config() {
-        let c = resolve_engine_bind(false, Some(TAILNET), Some("1"), true, Some("loopback"), None);
+        let c = resolve_engine_bind(
+            false,
+            Some(TAILNET),
+            Some("1"),
+            true,
+            Some("loopback"),
+            None,
+        );
         assert_eq!(c, BindChoice::Address(TAILNET.parse().unwrap()));
     }
 
@@ -383,7 +390,10 @@ mod tests {
     fn bind_all_env_yields_all() {
         let c = resolve_engine_bind(false, None, Some("true"), true, None, None);
         assert_eq!(c, BindChoice::All);
-        assert_eq!(bind_socket_addr(&c, 5173).ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
+        assert_eq!(
+            bind_socket_addr(&c, 5173).ip(),
+            IpAddr::V6(Ipv6Addr::UNSPECIFIED)
+        );
     }
 
     #[test]
@@ -441,7 +451,10 @@ mod tests {
         assert!(parse_network_toml(partial).engine_inherit);
 
         // Malformed → safe defaults.
-        assert_eq!(parse_network_toml("this is not toml = ="), NetworkToml::default());
+        assert_eq!(
+            parse_network_toml("this is not toml = ="),
+            NetworkToml::default()
+        );
     }
 
     #[test]
@@ -458,7 +471,10 @@ mod tests {
     #[test]
     fn tls_scheme_from_requires_both_nonempty() {
         // https only when BOTH cert and key are present and non-empty.
-        assert_eq!(tls_scheme_from(Some("/c.pem"), Some("/k.pem")), SCHEME_HTTPS);
+        assert_eq!(
+            tls_scheme_from(Some("/c.pem"), Some("/k.pem")),
+            SCHEME_HTTPS
+        );
         // Missing either → http (the packaged-gateway posture, TLS stripped).
         assert_eq!(tls_scheme_from(None, Some("/k.pem")), SCHEME_HTTP);
         assert_eq!(tls_scheme_from(Some("/c.pem"), None), SCHEME_HTTP);

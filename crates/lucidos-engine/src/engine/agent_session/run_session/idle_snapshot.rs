@@ -51,7 +51,8 @@ impl LucidosEngine {
                         cc_session_id,
                         coding_agent,
                         reason: None,
-                        worktree_path: snapshot.worktree_path
+                        worktree_path: snapshot
+                            .worktree_path
                             .map(|p| p.to_string_lossy().into_owned()),
                         worktree_head_sha,
                         bg_bash_pending: snapshot.bg_bash_pending,

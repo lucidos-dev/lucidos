@@ -287,14 +287,16 @@ async fn notify_creates_inbox_notification_against_running_workspace() {
     let returned_id = body["notification_id"]
         .as_str()
         .expect("notification_id must be a string");
-    let returned_id =
-        uuid::Uuid::parse_str(returned_id).expect("notification_id must be a UUID");
+    let returned_id = uuid::Uuid::parse_str(returned_id).expect("notification_id must be a UUID");
 
     // Verify via the public list endpoint that the notification is in the
     // inbox. The CLI's returned id is the source of truth — match by id, not
     // by title scan, so a colliding marker can never produce a false positive.
     let client = crate::support::http_client();
-    let url = format!("{}/api/v1/notifications?limit=100", crate::support::base_url());
+    let url = format!(
+        "{}/api/v1/notifications?limit=100",
+        crate::support::base_url()
+    );
     let resp: serde_json::Value = client
         .get(&url)
         .send()
@@ -370,10 +372,7 @@ fn notify_rejects_empty_title_at_engine() {
 #[tokio::test]
 async fn notify_endpoint_rejects_whitespace_only_title() {
     let client = crate::support::http_client();
-    let url = format!(
-        "{}/api/v1/notifications",
-        crate::support::base_url()
-    );
+    let url = format!("{}/api/v1/notifications", crate::support::base_url());
     let resp = client
         .post(&url)
         .json(&serde_json::json!({

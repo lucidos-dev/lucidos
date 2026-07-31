@@ -180,10 +180,7 @@ pub(super) fn parse_codex_line(line: &str) -> CodexLine {
                         .get("result")
                         .cloned()
                         .unwrap_or(serde_json::Value::Null),
-                    error: item
-                        .get("error")
-                        .and_then(|v| v.as_str())
-                        .map(String::from),
+                    error: item.get("error").and_then(|v| v.as_str()).map(String::from),
                     status: str_field(item, "status"),
                 },
                 "web_search" => ItemKind::WebSearch {

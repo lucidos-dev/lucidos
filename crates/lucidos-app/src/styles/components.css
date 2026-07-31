@@ -456,6 +456,17 @@
     color: var(--text-primary);
 }
 
+/* Determinate progress for a long operation the toast is narrating (a packaged
+   update's download). Uses the shared .progress-bar track and sits between the
+   message and the actions in the toast's flex column. `flex-shrink: 0` keeps the
+   thin track from being squeezed away when a long message fills the capped
+   height; the right margin mirrors .toast-body's reservation for the
+   absolutely-positioned close-X so the bar ends level with the text above it. */
+.toast-progress {
+    flex-shrink: 0;
+    margin-right: 1.375rem;
+}
+
 .toast-actions {
     display: flex;
     justify-content: flex-end;

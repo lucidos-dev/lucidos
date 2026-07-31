@@ -278,8 +278,7 @@ mod tests {
     #[test]
     fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
         assert_eq!(
-            parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc")
-                .as_deref(),
+            parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc").as_deref(),
             Some("myws")
         );
         // Hyphenated name — only the timestamp tail is stripped.
@@ -291,9 +290,7 @@ mod tests {
         // Not archive-shaped → None (picker then requires a typed name).
         assert!(parse_workspace_name_from_archive("random.enc").is_none());
         assert!(parse_workspace_name_from_archive("lucidos-backup-myws.enc").is_none());
-        assert!(
-            parse_workspace_name_from_archive("lucidos-backup-myws-20260601.enc").is_none()
-        );
+        assert!(parse_workspace_name_from_archive("lucidos-backup-myws-20260601.enc").is_none());
         assert!(parse_workspace_name_from_archive("lucidos-backup-20260601-040254.enc").is_none());
         assert!(parse_workspace_name_from_archive("backup.tar.gz").is_none());
     }

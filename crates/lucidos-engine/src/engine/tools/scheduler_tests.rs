@@ -272,10 +272,7 @@ fn trigger_description_hybrid() {
 fn trigger_description_multi_event_lists_all() {
     // The create-confirmation message must surface every subscribed event
     // so the LLM can read it back to the user.
-    let desc = trigger_description(
-        "",
-        &[sub("OuraSleepImported"), sub("EmailReceived")],
-    );
+    let desc = trigger_description("", &[sub("OuraSleepImported"), sub("EmailReceived")]);
     assert_eq!(desc, "event 'OuraSleepImported, EmailReceived'");
 }
 
@@ -429,12 +426,8 @@ fn guard_blocks_cross_delete_during_fire() {
 fn guard_allows_self_pause_during_fire() {
     // Symmetric to self-delete: pausing oneself is the polite version of
     // self-delete and must be allowed.
-    let result = check_scheduling_tool_in_trigger(
-        tn::PAUSE_TRIGGER,
-        Some("self-id"),
-        Some("self-id"),
-        None,
-    );
+    let result =
+        check_scheduling_tool_in_trigger(tn::PAUSE_TRIGGER, Some("self-id"), Some("self-id"), None);
     assert!(result.is_none());
 }
 
@@ -469,7 +462,6 @@ fn guard_passes_unrelated_tool_names_through() {
     // tool name (including list_triggers, which is read-only) must always
     // be allowed. Defensive: the dispatcher should never call us for those,
     // but the guard returning None for them keeps it honest.
-    let result =
-        check_scheduling_tool_in_trigger(tn::LIST_TRIGGERS, None, Some("self-id"), None);
+    let result = check_scheduling_tool_in_trigger(tn::LIST_TRIGGERS, None, Some("self-id"), None);
     assert!(result.is_none());
 }

@@ -152,8 +152,11 @@ impl LucidosEngine {
         // Load referenced know-how (general + app-specific if this is an app intent)
         let kh_dirs = self.knowhow_dirs();
         let system_dir = self.system_knowhow_dir();
-        let mut knowhow_context =
-            crate::core::knowhow::load_knowhow_sections_merged(&kh_dirs, system_dir, &intent.knowhow);
+        let mut knowhow_context = crate::core::knowhow::load_knowhow_sections_merged(
+            &kh_dirs,
+            system_dir,
+            &intent.knowhow,
+        );
 
         // If this is an app intent (id contains '/'), also load that app's knowhow
         if let Some((app_id, _)) = intent_id.split_once('/') {
@@ -246,7 +249,10 @@ mod tests {
         // The guard must allow normal (un-nested / shallowly nested) execution
         // and refuse once the nesting reaches the cap — that refusal is what
         // turns a runaway into a clean error instead of a stack-overflow abort.
-        assert!(!intent_nesting_exceeded(0), "top-level execute_intent allowed");
+        assert!(
+            !intent_nesting_exceeded(0),
+            "top-level execute_intent allowed"
+        );
         assert!(
             !intent_nesting_exceeded(MAX_INTENT_DEPTH - 1),
             "one below the cap still allowed"
@@ -288,11 +294,7 @@ mod tests {
     async fn load_knowhow_inserts_into_store_on_hit() {
         let tmp = tempfile::tempdir().unwrap();
         let local = tmp.path().join("local");
-        write_knowhow_file(
-            &local.join("my-doc.md"),
-            "My Doc",
-            "Body of my doc.",
-        );
+        write_knowhow_file(&local.join("my-doc.md"), "My Doc", "Body of my doc.");
 
         let store = LoadedKnowhowStore::new();
         let thread_id = Uuid::new_v4();
@@ -312,7 +314,12 @@ mod tests {
 
         // And the per-thread loaded set now contains exactly this doc.
         let loaded = store.for_thread(thread_id).await;
-        assert_eq!(loaded.len(), 1, "expected one loaded doc, got: {:?}", loaded);
+        assert_eq!(
+            loaded.len(),
+            1,
+            "expected one loaded doc, got: {:?}",
+            loaded
+        );
         assert_eq!(loaded[0].id, "my-doc");
         assert_eq!(loaded[0].body, body);
     }
@@ -363,25 +370,11 @@ mod tests {
         let err = load_knowhow_impl(&dirs(&local), None, &store, thread_id, &json!({}))
             .await
             .expect_err("missing id must error");
-        assert!(
-            err.to_string().contains("id is required"),
-            "got: {}",
-            err
-        );
+        assert!(err.to_string().contains("id is required"), "got: {}", err);
 
-        let err = load_knowhow_impl(
-            &dirs(&local),
-            None,
-            &store,
-            thread_id,
-            &json!({ "id": "" }),
-        )
-        .await
-        .expect_err("empty id must error");
-        assert!(
-            err.to_string().contains("id is required"),
-            "got: {}",
-            err
-        );
+        let err = load_knowhow_impl(&dirs(&local), None, &store, thread_id, &json!({ "id": "" }))
+            .await
+            .expect_err("empty id must error");
+        assert!(err.to_string().contains("id is required"), "got: {}", err);
     }
 }

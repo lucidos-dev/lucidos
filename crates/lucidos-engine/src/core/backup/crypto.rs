@@ -88,7 +88,11 @@ pub fn decrypt(key: &[u8], mut input: impl Read, output: &mut impl Write) -> Res
     input.read_exact(&mut header)?;
 
     if &header != MAGIC && &header != LEGACY_MAGIC {
-        return Err(format!("invalid magic header: expected {:?}, got {:?}", MAGIC, header).into());
+        return Err(format!(
+            "invalid magic header: expected {:?}, got {:?}",
+            MAGIC, header
+        )
+        .into());
     }
     decrypt_chunked(key, &mut input, output)
 }
@@ -393,7 +397,10 @@ mod tests {
 
         // First call generates + persists: is_new is true, never a skip.
         let (key, is_new) = ensure_key(workspace.path()).unwrap();
-        assert!(is_new, "first ensure_key must report a freshly generated key");
+        assert!(
+            is_new,
+            "first ensure_key must report a freshly generated key"
+        );
         assert_eq!(key.len(), 32, "generated key must be a 32-byte AES-256 key");
 
         // The key landed at the same path the manual path writes to, in the

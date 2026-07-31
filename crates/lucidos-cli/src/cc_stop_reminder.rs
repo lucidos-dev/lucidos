@@ -638,8 +638,7 @@ mod tests {
 
     #[test]
     fn reminder_json_uses_block_decision_with_permissive_reason() {
-        let parsed: serde_json::Value =
-            serde_json::from_str(&build_reminder_json()).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&build_reminder_json()).unwrap();
         assert_eq!(parsed["decision"], "block");
         let reason = parsed["reason"].as_str().expect("reason must be a string");
         assert!(

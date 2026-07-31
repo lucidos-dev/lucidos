@@ -465,8 +465,14 @@ impl LucidosEngine {
                 // branches are the same tool call to the LLM and must never
                 // disagree. Legacy rows have no `signal` key.
                 let outcome = TaskOutcome::from_persisted(
-                    payload.get("exit_code").and_then(|v| v.as_i64()).map(|c| c as i32),
-                    payload.get("signal").and_then(|v| v.as_i64()).map(|s| s as i32),
+                    payload
+                        .get("exit_code")
+                        .and_then(|v| v.as_i64())
+                        .map(|c| c as i32),
+                    payload
+                        .get("signal")
+                        .and_then(|v| v.as_i64())
+                        .map(|s| s as i32),
                 );
                 Ok(serde_json::json!({
                     "stdout": payload.get("stdout").cloned().unwrap_or(serde_json::Value::String(String::new())),
@@ -740,9 +746,18 @@ mod tests {
             false,
             false,
         );
-        assert!(text.contains("task-123"), "task_id must appear so CC can refer to it");
-        assert!(text.contains("exit code 0"), "clean exit must say 'exit code 0'");
-        assert!(text.contains("cargo test --lib"), "command prefix gives CC context");
+        assert!(
+            text.contains("task-123"),
+            "task_id must appear so CC can refer to it"
+        );
+        assert!(
+            text.contains("exit code 0"),
+            "clean exit must say 'exit code 0'"
+        );
+        assert!(
+            text.contains("cargo test --lib"),
+            "command prefix gives CC context"
+        );
         assert!(
             text.contains("bash_output(\"task-123\")"),
             "must instruct CC to read the result via bash_output"
@@ -781,7 +796,10 @@ mod tests {
             false,
         );
         assert!(e2e.contains("exit code 1"), "got: {e2e}");
-        assert!(!e2e.contains("exit code 0"), "the masking trap is back: {e2e}");
+        assert!(
+            !e2e.contains("exit code 0"),
+            "the masking trap is back: {e2e}"
+        );
     }
 
     /// A signal death is named, never rendered as an exit code and never as
@@ -799,15 +817,17 @@ mod tests {
         );
 
         let segv = format_bash_wake_text("t6", "./crash", TaskOutcome::Signaled(11), false, false);
-        assert!(segv.contains("killed by SIGSEGV (signal 11)"), "got: {segv}");
+        assert!(
+            segv.contains("killed by SIGSEGV (signal 11)"),
+            "got: {segv}"
+        );
     }
 
     /// `bash_kill` leads with the cause so CC can't read the line as a
     /// completion, and still reports how the child actually died.
     #[test]
     fn format_bash_wake_text_killed_leads_with_the_cause() {
-        let text =
-            format_bash_wake_text("t2", "sleep 30", TaskOutcome::Signaled(9), true, false);
+        let text = format_bash_wake_text("t2", "sleep 30", TaskOutcome::Signaled(9), true, false);
         assert!(
             text.contains("stopped by bash_kill"),
             "the kill must be the leading fact: {text}"

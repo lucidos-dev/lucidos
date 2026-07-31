@@ -1,6 +1,5 @@
 use super::*;
 
-
 /// `EndSession` must translate to a plain `break` at the call site, not
 /// `stop.notify_one()` — the stop arm would emit a phantom
 /// `ResponseCanceled` on top of the natural `ResponseGenerated`.
@@ -164,12 +163,7 @@ fn conflict_session_never_proposes_change_at_idle() {
     // Not external, not shutdown, conflict session: must refuse — even on a
     // Generated terminal, because the merge result is the original change.
     assert!(
-        !may_touch_change_state_at_idle(
-            false,
-            false,
-            true,
-            &Some(TerminalKind::Generated)
-        ),
+        !may_touch_change_state_at_idle(false, false, true, &Some(TerminalKind::Generated)),
         "conflict-resolution sessions must NOT propose a phantom change at idle"
     );
 }
@@ -179,12 +173,7 @@ fn conflict_session_never_proposes_change_at_idle() {
 #[test]
 fn normal_generated_session_may_touch_change_state() {
     assert!(
-        may_touch_change_state_at_idle(
-            false,
-            false,
-            false,
-            &Some(TerminalKind::Generated)
-        ),
+        may_touch_change_state_at_idle(false, false, false, &Some(TerminalKind::Generated)),
         "normal Generated session must reach the propose/reconcile branch"
     );
 }
@@ -200,12 +189,7 @@ fn normal_generated_session_may_touch_change_state() {
 #[test]
 fn generated_proposes_regardless_of_background_bash() {
     assert!(
-        may_touch_change_state_at_idle(
-            false,
-            false,
-            false,
-            &Some(TerminalKind::Generated)
-        ),
+        may_touch_change_state_at_idle(false, false, false, &Some(TerminalKind::Generated)),
         "Generated idle with changes must propose immediately — background \
          bash no longer gates the proposal (harden-at-apply is the net)"
     );
@@ -221,12 +205,8 @@ fn generated_proposes_regardless_of_background_bash() {
 /// existing pending row to zero when empty.
 #[test]
 fn gate_is_blind_to_whether_the_branch_has_a_diff() {
-    let clean_idle = may_touch_change_state_at_idle(
-        false,
-        false,
-        false,
-        &Some(TerminalKind::Generated),
-    );
+    let clean_idle =
+        may_touch_change_state_at_idle(false, false, false, &Some(TerminalKind::Generated));
     assert!(
         clean_idle,
         "an empty-diff Generated idle must still reach the reconcile arm"
@@ -236,12 +216,7 @@ fn gate_is_blind_to_whether_the_branch_has_a_diff() {
 #[test]
 fn external_repo_does_not_propose() {
     assert!(
-        !may_touch_change_state_at_idle(
-            true,
-            false,
-            false,
-            &Some(TerminalKind::Generated)
-        ),
+        !may_touch_change_state_at_idle(true, false, false, &Some(TerminalKind::Generated)),
         "external repos manage their own push/PR — no Lucidos change row"
     );
 }
@@ -249,12 +224,7 @@ fn external_repo_does_not_propose() {
 #[test]
 fn shutdown_does_not_propose() {
     assert!(
-        !may_touch_change_state_at_idle(
-            false,
-            true,
-            false,
-            &Some(TerminalKind::Generated)
-        ),
+        !may_touch_change_state_at_idle(false, true, false, &Some(TerminalKind::Generated)),
         "shutdown is mid-work, not a genuine idle — would create a spurious panel on resume"
     );
 }

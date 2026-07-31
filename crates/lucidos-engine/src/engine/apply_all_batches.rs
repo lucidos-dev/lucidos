@@ -325,7 +325,10 @@ mod tests {
             "non-member must not signal change"
         );
         assert!(batch.record_failed(ids[1], "real failure".into()));
-        assert!(!batch.record_applied(ids[1]), "applied-after-failed is no-op");
+        assert!(
+            !batch.record_applied(ids[1]),
+            "applied-after-failed is no-op"
+        );
     }
 
     /// Cross-state guard: a change can't be both applied AND failed. The
@@ -433,7 +436,10 @@ mod tests {
         batch.record_failed(ids[1], "Apply All canceled".into());
         batch.record_failed(ids[3], "Apply All canceled".into());
         assert!(batch.pending_members().is_empty());
-        assert!(batch.is_complete(), "canceling all pending completes the batch");
+        assert!(
+            batch.is_complete(),
+            "canceling all pending completes the batch"
+        );
     }
 
     /// `batch_ids` lists every live batch so cancel-all can drain them.

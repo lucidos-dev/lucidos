@@ -269,7 +269,10 @@ mod derive_call_key_tests {
                 "code": "# header\nimport os\nfrom pathlib import Path\n\n# body\ny = 2\nprint(y)"
             }),
         );
-        assert_eq!(a, "x = 1", "first actionable line must drive the key, got: {a:?}");
+        assert_eq!(
+            a, "x = 1",
+            "first actionable line must drive the key, got: {a:?}"
+        );
         assert_eq!(b, "y = 2");
         assert_ne!(a, b);
     }
@@ -317,7 +320,10 @@ mod derive_call_key_tests {
         let long = format!("x = {}", "a".repeat(200));
         let key = derive_call_key(tn::RUN_PYTHON, &json!({ "code": long }));
         assert!(key.starts_with("x = "));
-        assert!(key.contains('#'), "long-line key must carry hash suffix: {key:?}");
+        assert!(
+            key.contains('#'),
+            "long-line key must carry hash suffix: {key:?}"
+        );
         assert!(
             key.chars().count() <= 89,
             "key was {} chars (expected ≤89): {key:?}",
@@ -341,14 +347,21 @@ mod derive_call_key_tests {
             "deep/nested/dir".repeat(3)
         );
         // Sanity: the differing byte (A vs B) must actually be past 80.
-        assert!(a_code.len() > 90, "test setup wrong, line too short: len={}", a_code.len());
+        assert!(
+            a_code.len() > 90,
+            "test setup wrong, line too short: len={}",
+            a_code.len()
+        );
         let a = derive_call_key(tn::RUN_PYTHON, &json!({ "code": a_code }));
         let b = derive_call_key(tn::RUN_PYTHON, &json!({ "code": b_code }));
         // Both lines are > 80 chars; both should carry hash suffixes
         // that differ since the inputs differ.
         assert!(a.contains('#'), "expected hash suffix on long line: {a:?}");
         assert!(b.contains('#'), "expected hash suffix on long line: {b:?}");
-        assert_ne!(a, b, "long-line scripts diverging past char 80 must bucket separately ({a:?} vs {b:?})");
+        assert_ne!(
+            a, b,
+            "long-line scripts diverging past char 80 must bucket separately ({a:?} vs {b:?})"
+        );
     }
 
     #[test]

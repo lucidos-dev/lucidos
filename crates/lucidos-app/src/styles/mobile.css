@@ -87,6 +87,44 @@
     to { transform: translateX(-100%); }
 }
 
+@keyframes drawer-slide-in-right {
+    from { transform: translateX(100%); }
+    to { transform: translateX(0); }
+}
+
+@keyframes drawer-slide-out-right {
+    from { transform: translateX(0); }
+    to { transform: translateX(100%); }
+}
+
+/* Right-edge variant. The drawer emerges from under the hamburger that opened
+   it (drawerSideFor in Drawer.tsx), which on the mobile thread pane header sits
+   at the row's trailing edge. Scoped to the mobile breakpoint (isMobile() is the
+   same 768px line) so the class can never fight the desktop block below, which
+   positions the panel against the split divider rather than a viewport edge.
+   Only the animation NAME is overridden, so the duration / easing / fill of the
+   base shorthands above still apply. */
+@media (max-width: 768px) {
+    .drawer.drawer-right {
+        left: auto;
+        right: 0;
+        border-right: none;
+        border-left: 1px solid var(--border-color);
+        animation-name: drawer-slide-in-right;
+    }
+
+    .drawer.drawer-right.closing {
+        animation-name: drawer-slide-out-right;
+    }
+
+    /* The base row padding puts its wide gutter (and the safe-area inset) on the
+       LEFT, which is the drawer's open edge only in the left variant. Mirror it
+       so a landscape notch can't clip a row against the right edge either. */
+    .drawer.drawer-right .drawer-item {
+        padding-right: max(1.5rem, env(safe-area-inset-right, 0px));
+    }
+}
+
 .drawer-backdrop.closing {
     animation: backdrop-fade-out 0.2s ease-in forwards;
 }
@@ -423,14 +461,22 @@
        icons — the brand's own no-overlap guarantee.
 
        Wider reserve than the shared default, because THIS row's leading cluster
-       is wider: hamburger + the two nav chevrons, ending at 5.75rem (measured;
+       is wider: thread-drawer toggle + the two nav chevrons, ending at 5.75rem (measured;
        constant across ui-scale and both engines, since every part of it is
        rem-sized). The shared 10.5rem only insets to 5.25rem, so the no-overlap
        guarantee inverted exactly when it engaged — a brand long enough to hit
        the clamp painted 0.5rem under the chevrons. 12rem lands the clamped edge
        at 6rem, one row gap (0.25rem) clear, and matches the
-       `.mobile-content-title` pre-measure fallback below. Scoped to the brand so
-       the Threads row (hamburger + one Filter button) keeps its full title
+       `.mobile-content-title` pre-measure fallback below. The 6rem per side has
+       to clear this row's TRAILING cluster too, now that the hamburger sits at
+       that edge (menu drawer, mirroring the thread-drawer toggle at the leading
+       edge): compose + search + menu span 5.75rem in from the row's right edge
+       (3 buttons at 1.75rem, 2 gaps at 0.25rem), the same one-row-gap clearance
+       the leading side gets. Both sides are tight now, so a fourth button on
+       either one needs the reserve widened;
+       `e2e/mobile-threads-title-alignment.spec.ts` pins both edges. Scoped to
+       the brand so
+       the Threads row (just the one Filter button) keeps its full title
        width. */
     .pane-header-brand.mobile-header-title {
         overflow: visible;

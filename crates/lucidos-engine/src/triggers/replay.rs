@@ -251,7 +251,11 @@ mod tests {
 
     /// Build a `TriggerExecuted` row whose DB-clock `created` and engine-clock
     /// `payload.last_run` deliberately disagree.
-    fn executed_with_clocks(id: &str, created: &str, payload_last_run: Option<&str>) -> TriggerEventRow {
+    fn executed_with_clocks(
+        id: &str,
+        created: &str,
+        payload_last_run: Option<&str>,
+    ) -> TriggerEventRow {
         let mut payload = json!({ "trigger_id": id, "status": "ok" });
         if let Some(lr) = payload_last_run {
             payload["last_run"] = json!(lr);

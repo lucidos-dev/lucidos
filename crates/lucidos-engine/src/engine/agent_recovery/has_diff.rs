@@ -10,11 +10,12 @@ use super::super::git_ops::{
     default_local_branch, describe_branch_changes, files_require_restart, main_worktree,
     proposal_files_for_branch, worktrees_dir,
 };
-use super::super::thread_events::{EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent};
+use super::super::thread_events::{
+    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+};
+use super::helpers::*;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-use super::helpers::*;
-
 
 /// Re-emit `CodingAgentPermissionResolved` for every persisted
 /// `CodingAgentPermissionRequest` that has no paired resolution.
@@ -66,14 +67,16 @@ pub async fn recover_orphan_cc_permission_requests(
             .emit_or_log(
                 crate::engine::event_bus::BusEvent::Thread {
                     thread_id,
-                    event: crate::engine::thread_events::ThreadEvent::CodingAgentPermissionResolved {
-                        request_id,
-                        allowed: false,
-                        reason: Some(
-                            "Coding agent terminated before answering — request expired".to_string(),
-                        ),
-                        persist_scope: None,
-                    },
+                    event:
+                        crate::engine::thread_events::ThreadEvent::CodingAgentPermissionResolved {
+                            request_id,
+                            allowed: false,
+                            reason: Some(
+                                "Coding agent terminated before answering: request expired"
+                                    .to_string(),
+                            ),
+                            persist_scope: None,
+                        },
                     meta: crate::engine::thread_events::EventMeta::NONE,
                 },
                 "[Recovery] CodingAgentPermissionResolved (orphan)",
@@ -150,8 +153,13 @@ pub(crate) async fn reconcile_thread_coding_agent_has_diff(
         }
         return;
     }
-    crate::engine::session_seed::seed_coding_agent_has_diff(pool, thread_id, repo_root, branch_name)
-        .await;
+    crate::engine::session_seed::seed_coding_agent_has_diff(
+        pool,
+        thread_id,
+        repo_root,
+        branch_name,
+    )
+    .await;
 }
 
 /// Engine-startup sweep that walks every active CC thread in
@@ -257,7 +265,12 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
     let mut missing_worktree = 0usize;
     let started = std::time::Instant::now();
 
-    for ActiveCcThread { thread_id, cc_repo_id, coding_agent_kind } in active_threads {
+    for ActiveCcThread {
+        thread_id,
+        cc_repo_id,
+        coding_agent_kind,
+    } in active_threads
+    {
         // Look up the latest SessionStarted's branch. Most-recent wins because
         // a thread may have multiple SessionStarted events (initial + resume +
         // hardening); the last one names the live branch.
@@ -333,9 +346,14 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
         // worktree lives at a non-deterministic path
         // (e.g. `.lucidos/worktrees/cc-<random>` from before Phase 6.1) —
         // exactly the population the sweep is supposed to recover for.
-        let worktree_path =
-            resolve_worktree_path(pool, thread_id, workspace_path, &repo_root, Some(&branch_name))
-                .await;
+        let worktree_path = resolve_worktree_path(
+            pool,
+            thread_id,
+            workspace_path,
+            &repo_root,
+            Some(&branch_name),
+        )
+        .await;
         if !worktree_path.exists() {
             missing_worktree += 1;
         }
@@ -372,12 +390,10 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
 /// keeping it standalone matches the shape of
 /// `recover_orphan_cc_permission_requests` which is also called free-form
 /// from `main.rs`.
-pub async fn refresh_coding_agent_has_diff_on_startup(
-    pool: &sqlx::PgPool,
-    workspace_path: &Path,
-) {
+pub async fn refresh_coding_agent_has_diff_on_startup(pool: &sqlx::PgPool, workspace_path: &Path) {
     let lucidos_repo_root = main_worktree().await;
-    refresh_coding_agent_has_diff_for_active_cc_threads(pool, workspace_path, &lucidos_repo_root).await;
+    refresh_coding_agent_has_diff_for_active_cc_threads(pool, workspace_path, &lucidos_repo_root)
+        .await;
 }
 
 /// Engine-startup sweep that re-proposes any change that was never surfaced
@@ -608,7 +624,13 @@ async fn propose_one_held_back_change(
     let base = default_local_branch(repo_root).await;
     let log_range = format!("{}..{}", base, &branch_name);
     let description = describe_branch_changes(repo_root, &log_range, &fallback, None).await;
-    let hardened = branch_is_hardened(pool, event_bus.changes_projection(), repo_root, &branch_name).await;
+    let hardened = branch_is_hardened(
+        pool,
+        event_bus.changes_projection(),
+        repo_root,
+        &branch_name,
+    )
+    .await;
     // We only reach here when the last turn ended cleanly (checked above), so
     // the proposed change is never flagged incomplete.
     let incomplete = false;
@@ -672,7 +694,10 @@ pub async fn reconcile_emptied_changes_on_startup(engine: &crate::engine::Lucido
     let pending = match engine.changes().list_pending().await {
         Ok(p) => p,
         Err(e) => {
-            log!("[Recovery] emptied-change sweep: list_pending: {} — skipping", e);
+            log!(
+                "[Recovery] emptied-change sweep: list_pending: {}, skipping",
+                e
+            );
             return;
         }
     };
@@ -698,4 +723,3 @@ pub async fn reconcile_emptied_changes_on_startup(engine: &crate::engine::Lucido
         started.elapsed().as_millis()
     );
 }
-

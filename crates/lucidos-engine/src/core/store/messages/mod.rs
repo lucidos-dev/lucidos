@@ -6,8 +6,8 @@ use chrono::{DateTime, Utc};
 mod build;
 mod resume;
 
-pub use build::format_child_thread_completed_block;
 pub(crate) use build::build_session_messages;
+pub use build::format_child_thread_completed_block;
 pub(crate) use resume::{
     build_resume_tool_blocks_with_skip_ids, collect_tool_pairs_chronological,
     find_orphan_tool_called_ids, RESUME_VERBATIM_TOOL_TAIL,

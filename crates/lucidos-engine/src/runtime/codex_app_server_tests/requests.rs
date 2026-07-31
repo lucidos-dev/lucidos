@@ -99,8 +99,7 @@ fn sandbox_writable_roots_reach_the_thread_request() {
     // workspace's data/ it blocks `lucidos data write` to the parent workspace
     // (the 2026-07-26 nightly's EPERM, which lost two security findings).
     let mut config = test_config();
-    config.sandbox_writable_roots =
-        vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
+    config.sandbox_writable_roots = vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
     let (_, params) = build_thread_request(&config, None);
     assert_eq!(
         params["config"]["sandbox_workspace_write"]["writable_roots"],
@@ -169,19 +168,12 @@ fn turn_start_params_omit_empty_text_and_default_model() {
 
 #[test]
 fn turn_start_params_scope_max_effort_to_gpt_5_6() {
-    let params = build_turn_start_params(
-        "t-1",
-        "go",
-        &[],
-        Some("gpt-5.6-luna"),
-        Some("max"),
-    );
+    let params = build_turn_start_params("t-1", "go", &[], Some("gpt-5.6-luna"), Some("max"));
     assert_eq!(params["effort"], "max", "GPT-5.6 models support Max");
 
     // Older models reject Max. A stale selection is dropped so Codex applies
     // its own default instead of failing the whole turn.
-    let params =
-        build_turn_start_params("t-1", "go", &[], Some("gpt-5.5"), Some("max"));
+    let params = build_turn_start_params("t-1", "go", &[], Some("gpt-5.5"), Some("max"));
     assert!(
         params.get("effort").is_none(),
         "Max must be omitted for pre-5.6 models"

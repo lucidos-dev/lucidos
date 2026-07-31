@@ -257,7 +257,6 @@ URL: {}\n\
             String::new()
         };
 
-
         ChatContextSections {
             file_list_context,
             profile_context,
@@ -350,7 +349,9 @@ mod tests {
         assert!(section.contains("DEFAULT TO THIS APP"));
         assert!(section.contains("a tooltip"));
         // Overlapping Lucidos vocabulary is explicitly NOT a cue to edit source.
-        assert!(section.contains("NOT by themselves a signal to read or edit Lucidos's source code"));
+        assert!(
+            section.contains("NOT by themselves a signal to read or edit Lucidos's source code")
+        );
         // But it's a default, not a lock — other work stays possible.
         assert!(section.contains("DEFAULT, not a restriction"));
         assert!(section.contains("work on Lucidos the product itself"));
@@ -364,7 +365,9 @@ mod tests {
         assert!(section.contains("DEFAULT TO THIS FILE"));
         assert!(section.contains("Edit THIS file."));
         assert!(section.contains("DEFAULT, not a restriction"));
-        assert!(section.contains("NOT by themselves a signal to read or edit Lucidos's source code"));
+        assert!(
+            section.contains("NOT by themselves a signal to read or edit Lucidos's source code")
+        );
     }
 
     #[test]

@@ -14,21 +14,30 @@ pub(super) async fn broadcast_changes(state: &AppState) {
     let mut pending = match pending_r {
         Ok(v) => v,
         Err(e) => {
-            crate::log!("[Changes] broadcast: list_pending: {} — skipping broadcast", e);
+            crate::log!(
+                "[Changes] broadcast: list_pending: {}, skipping broadcast",
+                e
+            );
             return;
         }
     };
     let mut applied = match applied_r {
         Ok(v) => v,
         Err(e) => {
-            crate::log!("[Changes] broadcast: list_recently_applied: {} — skipping broadcast", e);
+            crate::log!(
+                "[Changes] broadcast: list_recently_applied: {}, skipping broadcast",
+                e
+            );
             return;
         }
     };
     let restart_groups = match restart_r {
         Ok(v) => v,
         Err(e) => {
-            crate::log!("[Changes] broadcast: restart_groups_since: {} — skipping broadcast", e);
+            crate::log!(
+                "[Changes] broadcast: restart_groups_since: {}, skipping broadcast",
+                e
+            );
             return;
         }
     };
@@ -349,10 +358,9 @@ pub(super) async fn apply_all_changes(
                 .notify_apply_all(ApplyAllDriveMsg::Applied(first.id));
         }
         Err(e) => {
-            state.engine.notify_apply_all(ApplyAllDriveMsg::Failed(
-                first.id,
-                e.to_string(),
-            ));
+            state
+                .engine
+                .notify_apply_all(ApplyAllDriveMsg::Failed(first.id, e.to_string()));
         }
         _ => {}
     }
@@ -533,15 +541,18 @@ pub(super) fn router() -> Router<AppState> {
         .route("/changes/apply-all", post(apply_all_changes))
         .route("/changes/apply-all/cancel", post(cancel_apply_all_changes))
         .route("/changes/discard-all", post(discard_all_changes))
-        .route(
-            "/changes/for-repo/:repo_id",
-            get(list_changes_for_repo),
-        )
+        .route("/changes/for-repo/:repo_id", get(list_changes_for_repo))
         .route("/changes/:id/apply", post(apply_change))
         .route("/changes/:id/discard", post(discard_change))
         .route("/changes/:id/revert", post(revert_change))
-        .route("/changes/:id/diff", get(super::repositories::get_change_diff))
-        .route("/changes/:id/file", get(super::repositories::get_change_file))
+        .route(
+            "/changes/:id/diff",
+            get(super::repositories::get_change_diff),
+        )
+        .route(
+            "/changes/:id/file",
+            get(super::repositories::get_change_file),
+        )
         .route("/changes/:id", get(get_change))
 }
 

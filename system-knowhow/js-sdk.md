@@ -909,7 +909,24 @@ discoverable and type-checked (§ Types, under lucidos.notifications).
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap lands on the plugin that has the pending update. |
 | `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |
-| _other panels_ | — | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `file` (`file_path`), `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
+| `file` | `file_path` | Open a file in the preview pane — see the two accepted path forms below. |
+| _other panels_ | — | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
+
+#### `file_path` — workspace data vs a registered repository
+
+`file_path` takes one of two forms:
+
+- **A workspace data path** — `artifacts/…`, `knowhow/…`, `apps/…`, `triggers/…`, or `system-knowhow/…`. A path with none of those prefixes is treated as an artifact, so `notes.md` opens `artifacts/notes.md`.
+- **A repo-encoded path** — `repo:<repoId>:file:<repo-relative path>`, which opens a file from a **registered repository** (a local clone added under Settings → Repositories) instead of the workspace data tree. `<repoId>` is that Repository's id, as returned by `GET /api/v1/repositories`; the file is read at the clone's current `HEAD`.
+
+```js
+// Open src/main/resources/transforms/order.jslt from a registered repo clone.
+await lucidos.ui.navigate('file', {
+  file_path: `repo:${repoId}:file:src/main/resources/transforms/order.jslt`,
+});
+```
+
+The preview pane binds itself to that repository, so the Files panel behind it and the preview's changed-files sidebar stay on the same repo. A malformed `repo:…` string is not a repo path — it falls back to the artifact rule above.
 
 ### Starting a fresh chat with a prefilled prompt
 

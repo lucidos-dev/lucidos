@@ -272,7 +272,10 @@ impl LucidosEngine {
         ) else {
             return; // frontend not served (headless) — nothing to advance
         };
-        let generation = self.frontend_refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self
+            .frontend_refresh_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
         // Coalesce: abort any in-flight refresh; the new generation supersedes it.
         if let Some(old) = self.frontend_refresh_task.lock().unwrap().take() {
             old.abort();
@@ -527,7 +530,10 @@ impl LucidosEngine {
         }
         // Advance under a fresh generation so a concurrent applying refresh
         // coalesces (only the latest generation swaps).
-        let generation = self.frontend_refresh_generation.fetch_add(1, Ordering::SeqCst) + 1;
+        let generation = self
+            .frontend_refresh_generation
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
         if let Some(old) = self.frontend_refresh_task.lock().unwrap().take() {
             old.abort();
         }
@@ -619,18 +625,38 @@ mod tests {
     #[test]
     fn frontend_advance_is_safe_only_when_no_engine_change_is_pending() {
         // Clean engine: idle, on-disk binary matches the running one → safe.
-        assert!(frontend_advance_is_safe(&BuildState::Idle, Some("engine1"), "engine1"));
+        assert!(frontend_advance_is_safe(
+            &BuildState::Idle,
+            Some("engine1"),
+            "engine1"
+        ));
         // Idle + no readable disk id (packaged / unreadable) → treat as current.
         assert!(frontend_advance_is_safe(&BuildState::Idle, None, "engine1"));
 
         // A mixed Apply's rebuild is in flight/ready → NOT safe (dist is for the
         // new engine; the Switch must advance client + engine together).
-        assert!(!frontend_advance_is_safe(&BuildState::Building, Some("engine1"), "engine1"));
-        assert!(!frontend_advance_is_safe(&BuildState::Ready, Some("engine1"), "engine1"));
-        assert!(!frontend_advance_is_safe(&BuildState::Failed, Some("engine1"), "engine1"));
+        assert!(!frontend_advance_is_safe(
+            &BuildState::Building,
+            Some("engine1"),
+            "engine1"
+        ));
+        assert!(!frontend_advance_is_safe(
+            &BuildState::Ready,
+            Some("engine1"),
+            "engine1"
+        ));
+        assert!(!frontend_advance_is_safe(
+            &BuildState::Failed,
+            Some("engine1"),
+            "engine1"
+        ));
 
         // A newer engine binary is already on disk (e.g. an external/peer rebuild)
         // even though this engine is Idle → NOT safe.
-        assert!(!frontend_advance_is_safe(&BuildState::Idle, Some("engine2"), "engine1"));
+        assert!(!frontend_advance_is_safe(
+            &BuildState::Idle,
+            Some("engine2"),
+            "engine1"
+        ));
     }
 }

@@ -48,10 +48,7 @@ pub(crate) const THREAD_WORKTREE_ID_LEN: usize = 8;
 /// is the responsibility of the per-workspace scope (the namespace is
 /// effectively `(workspace, thread)`), and the full `thread_id` is recorded
 /// in `CodingAgentIdled.worktree_path` so lookups are unambiguous.
-pub(crate) fn deterministic_worktree_path(
-    workspace_path: &Path,
-    thread_id: uuid::Uuid,
-) -> PathBuf {
+pub(crate) fn deterministic_worktree_path(workspace_path: &Path, thread_id: uuid::Uuid) -> PathBuf {
     let id_str = thread_id.simple().to_string();
     let short = &id_str[..THREAD_WORKTREE_ID_LEN.min(id_str.len())];
     worktrees_dir(workspace_path).join(format!("thread-{}", short))
@@ -353,7 +350,9 @@ pub(crate) async fn latest_originating_event_id(
     thread_id: uuid::Uuid,
     event_types: &[&str],
 ) -> Option<uuid::Uuid> {
-    let placeholders: Vec<String> = (2..=event_types.len() + 1).map(|i| format!("${}", i)).collect();
+    let placeholders: Vec<String> = (2..=event_types.len() + 1)
+        .map(|i| format!("${}", i))
+        .collect();
     let q = format!(
         "SELECT id FROM events \
          WHERE aggregate_id = $1 \

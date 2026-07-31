@@ -94,10 +94,9 @@ pub async fn build_pipeline(
                 script,
                 oauth_providers,
             } => {
-                let oauth_lookup: Arc<dyn crate::api::proxy_script_layer::OAuthLookup> =
-                    Arc::new(crate::api::proxy_script_layer::DbOAuthLookup::new(
-                        ctx.pool.clone(),
-                    ));
+                let oauth_lookup: Arc<dyn crate::api::proxy_script_layer::OAuthLookup> = Arc::new(
+                    crate::api::proxy_script_layer::DbOAuthLookup::new(ctx.pool.clone()),
+                );
                 layers.push(Arc::new(ScriptHandshakeLayer::new(
                     namespace,
                     ctx.proxy_name.to_string(),
@@ -144,8 +143,9 @@ pub async fn build_pipeline(
                         ),
                     )
                 })?;
-                let resolver: Arc<dyn SecretResolver> =
-                    Arc::new(PgPoolSecretResolver { pool: ctx.pool.clone() });
+                let resolver: Arc<dyn SecretResolver> = Arc::new(PgPoolSecretResolver {
+                    pool: ctx.pool.clone(),
+                });
                 let handles = credential_handles
                     .iter()
                     .map(|h| WasmCredentialHandle {

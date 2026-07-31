@@ -66,13 +66,7 @@ fn git_short_head(project_root: &Path) -> Option<String> {
 /// dirty marker.
 fn gateway_diff(project_root: &Path) -> Option<String> {
     let out = Command::new("git")
-        .args([
-            "diff",
-            "HEAD",
-            "--",
-            "crates/lucidos-gateway",
-            "Cargo.lock",
-        ])
+        .args(["diff", "HEAD", "--", "crates/lucidos-gateway", "Cargo.lock"])
         .current_dir(project_root)
         .output()
         .ok()?;

@@ -1,5 +1,5 @@
-use super::*;
 use super::test_helpers::*;
+use super::*;
 
 /// `list_historical_triggers` returns one entry per distinct trigger_id with
 /// the most-recent thread's snapshot name and last_activity (covers the
@@ -97,7 +97,14 @@ async fn get_older_threads_returns_trigger_threads_with_no_response() {
 
     let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
     let hits = store
-        .get_older_threads(cutoff, 10, None, Some(&["trig-orphan".to_string()]), None, None)
+        .get_older_threads(
+            cutoff,
+            10,
+            None,
+            Some(&["trig-orphan".to_string()]),
+            None,
+            None,
+        )
         .await
         .expect("get_older_threads filtered");
 
@@ -160,7 +167,14 @@ async fn get_older_threads_returns_null_repo_name_for_unknown_repo() {
 
     let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
     let hits = store
-        .get_older_threads(cutoff, 10, None, None, Some(&[orphan_repo.to_string()]), None)
+        .get_older_threads(
+            cutoff,
+            10,
+            None,
+            None,
+            Some(&[orphan_repo.to_string()]),
+            None,
+        )
         .await
         .expect("get_older_threads filtered");
 
@@ -268,7 +282,14 @@ async fn get_older_threads_channels_plus_facet_returns_union() {
 
     let cutoff = chrono::Utc::now() + chrono::Duration::hours(1);
     let hits = store
-        .get_older_threads(cutoff, 10, None, Some(&["trig-keep".to_string()]), None, None)
+        .get_older_threads(
+            cutoff,
+            10,
+            None,
+            Some(&["trig-keep".to_string()]),
+            None,
+            None,
+        )
         .await
         .expect("get_older_threads channels + facet");
 
@@ -279,9 +300,18 @@ async fn get_older_threads_channels_plus_facet_returns_union() {
         3,
         "chat + claude_code + trig-keep — NOT just the trigger (pre-fix bug)"
     );
-    assert!(returned.contains(chat.to_string().as_str()), "chat thread must page in");
-    assert!(returned.contains(cc.to_string().as_str()), "claude_code thread must page in");
-    assert!(returned.contains(trig_keep.to_string().as_str()), "selected trigger pages in");
+    assert!(
+        returned.contains(chat.to_string().as_str()),
+        "chat thread must page in"
+    );
+    assert!(
+        returned.contains(cc.to_string().as_str()),
+        "claude_code thread must page in"
+    );
+    assert!(
+        returned.contains(trig_keep.to_string().as_str()),
+        "selected trigger pages in"
+    );
 
     teardown_test_db(&db).await;
 }
@@ -306,7 +336,11 @@ async fn get_older_threads_filters_by_app_ids() {
 
     let returned: std::collections::HashSet<&str> =
         hits.iter().map(|t| t.thread_id.as_str()).collect();
-    assert_eq!(hits.len(), 2, "both habit threads (active + archived) match");
+    assert_eq!(
+        hits.len(),
+        2,
+        "both habit threads (active + archived) match"
+    );
     assert!(returned.contains(habit_active.to_string().as_str()));
     assert!(
         returned.contains(habit_archived.to_string().as_str()),
@@ -354,8 +388,11 @@ async fn get_filter_facets_returns_distinct_sessions() {
 
     let facets = store.get_filter_facets().await.expect("get_filter_facets");
 
-    let repo_ids: std::collections::HashSet<&str> =
-        facets.repos.iter().filter_map(|f| f.id.as_deref()).collect();
+    let repo_ids: std::collections::HashSet<&str> = facets
+        .repos
+        .iter()
+        .filter_map(|f| f.id.as_deref())
+        .collect();
     assert_eq!(repo_ids.len(), 1, "duplicate repo collapses to one facet");
     assert!(repo_ids.contains(repo_a.to_string().as_str()));
 

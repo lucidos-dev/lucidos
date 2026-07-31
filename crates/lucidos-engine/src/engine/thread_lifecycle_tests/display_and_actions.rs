@@ -4,7 +4,14 @@ use super::*;
 #[test]
 fn running_status_maps_to_current() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Running, false, false, false, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Running,
+            false,
+            false,
+            false,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -13,7 +20,14 @@ fn running_status_maps_to_current() {
 #[test]
 fn inbox_maps_to_current() {
     assert_eq!(
-        display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, false, false, false),
+        display_section(
+            ArchiveState::Inbox,
+            ThreadStatus::Idle,
+            false,
+            false,
+            false,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -22,7 +36,14 @@ fn inbox_maps_to_current() {
 #[test]
 fn saved_default_idle_maps_to_saved() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Idle, true, false, false, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Idle,
+            true,
+            false,
+            false,
+            false
+        ),
         DisplaySection::Saved
     );
 }
@@ -31,7 +52,14 @@ fn saved_default_idle_maps_to_saved() {
 #[test]
 fn saved_overrides_running_to_saved() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Running, true, false, false, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Running,
+            true,
+            false,
+            false,
+            false
+        ),
         DisplaySection::Saved
     );
 }
@@ -40,7 +68,14 @@ fn saved_overrides_running_to_saved() {
 #[test]
 fn archived_idle_not_saved_maps_to_archive() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Idle, false, false, false, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Idle,
+            false,
+            false,
+            false,
+            false
+        ),
         DisplaySection::Archive
     );
 }
@@ -49,7 +84,14 @@ fn archived_idle_not_saved_maps_to_archive() {
 #[test]
 fn active_children_idle_maps_to_current() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Idle, false, true, false, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Idle,
+            false,
+            true,
+            false,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -58,7 +100,14 @@ fn active_children_idle_maps_to_current() {
 #[test]
 fn active_children_saved_still_saved() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Idle, true, true, false, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Idle,
+            true,
+            true,
+            false,
+            false
+        ),
         DisplaySection::Saved
     );
 }
@@ -67,7 +116,14 @@ fn active_children_saved_still_saved() {
 #[test]
 fn running_with_active_children_stays_current() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Running, false, true, false, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Running,
+            false,
+            true,
+            false,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -76,7 +132,14 @@ fn running_with_active_children_stays_current() {
 #[test]
 fn inbox_with_active_children_maps_to_current() {
     assert_eq!(
-        display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, true, false, false),
+        display_section(
+            ArchiveState::Inbox,
+            ThreadStatus::Idle,
+            false,
+            true,
+            false,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -85,7 +148,14 @@ fn inbox_with_active_children_maps_to_current() {
 #[test]
 fn inbox_idle_no_children_maps_to_current() {
     assert_eq!(
-        display_section(ArchiveState::Inbox, ThreadStatus::Idle, false, false, false, false),
+        display_section(
+            ArchiveState::Inbox,
+            ThreadStatus::Idle,
+            false,
+            false,
+            false,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -97,7 +167,14 @@ fn inbox_idle_no_children_maps_to_current() {
 #[test]
 fn archived_with_pending_changes_routes_to_current() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Idle, false, false, true, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Idle,
+            false,
+            false,
+            true,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -108,7 +185,14 @@ fn archived_with_pending_changes_routes_to_current() {
 #[test]
 fn saved_overrides_pending() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Idle, true, false, true, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Idle,
+            true,
+            false,
+            true,
+            false
+        ),
         DisplaySection::Saved
     );
 }
@@ -118,7 +202,14 @@ fn saved_overrides_pending() {
 #[test]
 fn running_overrides_pending() {
     assert_eq!(
-        display_section(ArchiveState::Archived, ThreadStatus::Running, false, false, true, false),
+        display_section(
+            ArchiveState::Archived,
+            ThreadStatus::Running,
+            false,
+            false,
+            true,
+            false
+        ),
         DisplaySection::Current
     );
 }
@@ -235,7 +326,7 @@ fn is_attention_needing_archived_short_circuits_pending_changes() {
             ThreadType::CodingAgent,
             ThreadStatus::Idle,
             ArchiveState::Archived,
-            true, // has_pending_changes
+            true,  // has_pending_changes
             false, // is_external_repo
         ),
         "Archived + pending_changes must return false — matches is_blocking"
@@ -530,7 +621,10 @@ fn draft_is_front_most_close_layer() {
         true, // has_unsent_draft
         false,
     );
-    assert_eq!(actions, vec![Action::DiscardDraft, Action::Archive, Action::Save]);
+    assert_eq!(
+        actions,
+        vec![Action::DiscardDraft, Action::Archive, Action::Save]
+    );
 }
 
 #[test]
@@ -564,7 +658,12 @@ fn full_cascade_draft_change_then_save() {
     );
     assert_eq!(
         actions,
-        vec![Action::DiscardDraft, Action::Discard, Action::Apply, Action::Save]
+        vec![
+            Action::DiscardDraft,
+            Action::Discard,
+            Action::Apply,
+            Action::Save
+        ]
     );
 }
 
@@ -593,6 +692,8 @@ fn saved_cc_pending_shows_unsave() {
         false,
         true, // is_saved
     );
-    assert_eq!(actions, vec![Action::Discard, Action::Apply, Action::Unsave]);
+    assert_eq!(
+        actions,
+        vec![Action::Discard, Action::Apply, Action::Unsave]
+    );
 }
-

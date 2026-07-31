@@ -10,12 +10,12 @@ pub use config::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
     EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
-pub use summary::{ensure_non_empty_error, ensure_non_empty_summary, script_fallback_summary};
 pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
 };
 pub use replay::{replay_trigger_events, TriggerEventRow};
 pub use run_history::{load_trigger_run_history, TriggerRunHistory};
+pub use summary::{ensure_non_empty_error, ensure_non_empty_summary, script_fallback_summary};
 
 use std::collections::HashMap;
 
@@ -246,8 +246,7 @@ mod tests {
         )
         .is_empty());
         assert_eq!(
-            find_matching_event_triggers(&configs, "EmailReceived", &json!({"from": "a@b"}))
-                .len(),
+            find_matching_event_triggers(&configs, "EmailReceived", &json!({"from": "a@b"})).len(),
             1
         );
     }

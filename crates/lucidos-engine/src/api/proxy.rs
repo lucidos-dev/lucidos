@@ -453,8 +453,7 @@ pub(crate) async fn reload_proxy_modules_into(
     workspace_path: &FsPath,
 ) -> Result<Vec<String>, String> {
     let dir = workspace_path.join("data/auth-modules");
-    let new_modules =
-        crate::api::proxy_wasm_signer::load_wasm_modules(&dir, engine.wasm_engine())?;
+    let new_modules = crate::api::proxy_wasm_signer::load_wasm_modules(&dir, engine.wasm_engine())?;
     let mut names: Vec<String> = new_modules.keys().cloned().collect();
     names.sort();
     *engine.proxy_modules().write().await = new_modules;
@@ -608,8 +607,17 @@ async fn proxy_handle_inner(
 
     let result = match resolved {
         ResolvedProxy::Config(config) => {
-            dispatch_proxy_request(&state.engine, &name, &config, method, path, query, headers, body)
-                .await
+            dispatch_proxy_request(
+                &state.engine,
+                &name,
+                &config,
+                method,
+                path,
+                query,
+                headers,
+                body,
+            )
+            .await
         }
         ResolvedProxy::Builtin { base_url, layers } => {
             dispatch_with_layers(&name, &base_url, layers, method, path, query, headers, body).await
@@ -642,7 +650,17 @@ pub async fn dispatch_proxy_request(
     // every credential and re-instantiating WASM signers would be wasted
     // work.
     let layers = build_pipeline_layers(engine, name, config).await?;
-    dispatch_with_layers(name, &config.base_url, layers, method, path, query, headers, body).await
+    dispatch_with_layers(
+        name,
+        &config.base_url,
+        layers,
+        method,
+        path,
+        query,
+        headers,
+        body,
+    )
+    .await
 }
 
 /// Forward through a pre-built layer pipeline (with same-host redirect
@@ -823,7 +841,9 @@ async fn forward_with_redirects(
         let target_origin = origin_of(target.as_str()).ok_or_else(|| {
             (
                 StatusCode::BAD_GATEWAY,
-                format!("proxy '{name}' upstream redirected to a Location with no host: {location}"),
+                format!(
+                    "proxy '{name}' upstream redirected to a Location with no host: {location}"
+                ),
             )
         })?;
         if target_origin != initial_origin {

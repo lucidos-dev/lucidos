@@ -504,7 +504,11 @@ mod tests {
         let mut cred = make_cred("github", AuthType::Bearer, "ghp_xxx");
         cred.env_var_name = Some("CRED_GITHUB".to_string());
         let pairs = credential_env_vars(vec![cred]);
-        assert_eq!(pairs.len(), 1, "custom name equal to the default must not double-emit");
+        assert_eq!(
+            pairs.len(),
+            1,
+            "custom name equal to the default must not double-emit"
+        );
         assert_eq!(pairs[0].0, "CRED_GITHUB");
     }
 
@@ -627,10 +631,7 @@ mod tests {
         );
         let dbg = format!("{:?}", cred);
         // The secret `auth_value` must never appear in a `{:?}` rendering.
-        assert!(
-            !dbg.contains("super-secret-value"),
-            "secret leaked: {dbg}"
-        );
+        assert!(!dbg.contains("super-secret-value"), "secret leaked: {dbg}");
         assert!(
             dbg.contains("auth_value: \"<redacted>\""),
             "expected redacted auth_value: {dbg}"

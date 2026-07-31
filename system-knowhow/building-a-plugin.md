@@ -143,6 +143,114 @@ Marketplace LLM surface:
 
 For GitHub monorepo marketplaces, register either the repo URL (`https://github.com/lucidos-dev/plugins`) or a tree URL (`https://github.com/lucidos-dev/plugins/tree/main/community`). The scanner turns discovered subdirectory plugins into installable GitHub tree URLs. For non-GitHub monorepos, use one repo per plugin or provide a GitHub tree URL equivalent; the install tool only knows how to install a subdirectory when it has a GitHub tree URL.
 
+## Authoring a marketplace
+
+A marketplace is not its own artifact type -- there is no marketplace manifest,
+no schema, no validation step. It is **a git repository whose subdirectories
+contain plugin roots**. Everything above about authoring a plugin still applies
+verbatim; this section only covers the repo that holds them.
+
+### Repo layout and how the scanner finds plugins
+
+`collect_manifest_roots` (`core/plugin_marketplaces.rs`) walks the cloned repo
+looking for `manifest.toml`:
+
+- **A directory containing `manifest.toml` is a plugin root, and the walk stops
+  there.** It never descends into a plugin, so a nested `manifest.toml` inside
+  an app's own tree is not mistaken for a second plugin.
+- **Maximum depth is 3.** A plugin at `a/b/c/d/manifest.toml` is never found.
+  Flat (`<plugin-id>/manifest.toml`) or one grouping level
+  (`plugins/<plugin-id>/manifest.toml`) both work; flat is preferred because the
+  generated install URL is shorter.
+- **At depth 0, the five content-dir names (`apps`, `knowhow`, `triggers`,
+  `scripts`, `auth-modules`) are skipped** -- that guard stops a single-plugin
+  repo (manifest at the root) from also reporting its own `apps/` as a
+  candidate.
+- **Duplicate plugin `id`s are de-duplicated** -- first root wins, later ones are
+  silently dropped. Keep directory name == manifest `id` to make collisions
+  obvious.
+- A repo where the scan finds nothing fails with `no plugin manifest.toml files
+  found`.
+
+**Root-level files that are not plugin directories are ignored.** A README,
+`CODEOWNERS`, `.github/`, `LICENSE`, `.gitignore` at the *marketplace* root are
+fine -- the strict "only `manifest.toml` + the five content dirs" validation
+applies **inside a plugin root**, not to the marketplace repo. Use the root
+README as the human discovery index (this is what `lucidos-dev/plugins` does).
+
+### Install URLs are generated, not authored
+
+For a GitHub marketplace the scanner rewrites each discovered plugin root into a
+tree URL (`install_source`): `https://github.com/<owner>/<repo>/tree/<branch>/<plugin-dir>`,
+with the marketplace's own subpath prefixed when it was registered as a tree URL.
+The branch is the one registered, else the cloned repo's actual HEAD shorthand.
+
+Consequences worth designing around:
+
+- **Subdirectory install only works for GitHub.** For a non-GitHub host, the
+  fallback is the marketplace's own clone URL -- which is only correct if the
+  repo *is* a single plugin. Multi-plugin marketplaces on GitLab / Bitbucket /
+  an enterprise host do not produce installable per-plugin URLs in v1. Use one
+  repo per plugin there.
+- **Renaming a plugin directory changes its install URL** and orphans the
+  `source` recorded in existing installs. Treat the directory name as stable.
+- Each plugin's own `manifest.toml` `source` should still be set to its tree URL
+  -- that is what `check_plugin_updates` / `update_plugin` re-fetch after
+  install, independent of the marketplace.
+
+### Registering and the scan cycle
+
+Register the repo URL (`https://github.com/owner/repo`) or a tree URL to scope
+the scan to a subdirectory (`.../tree/main/community`). `.lucidos-plugin`
+archive paths are rejected -- marketplaces must be git. The clone is shallow
+(`depth 1`), lands in `.lucidos/tmp/plugin-marketplaces/`, and `.git` is removed
+before the scan, so nothing about the marketplace persists in the workspace
+except the registry entry in `data/config/plugin-marketplaces.json`.
+
+Scans run at startup, on registration/rename, whenever the Plugins panel is
+shown or "Installed only" is unchecked, and every five minutes. A scan **never
+installs** -- it notifies about newer versions and the user clicks Update.
+
+### Private and internal repos do NOT work (v1)
+
+**The clone is anonymous.** Both clone paths -- the marketplace scan
+(`clone_marketplace`) and the plugin install (`tools/plugins/source.rs`) --
+build a `git2::RepoBuilder` with no `RemoteCallbacks` credential handler
+anywhere in the crate. There is no git-credential-helper fallback, no
+`GITHUB_TOKEN` lookup, no SSH agent hookup.
+
+A private or internal repo therefore **registers successfully and then fails
+every scan**, surfacing in the catalog's `errors` as:
+
+```
+git clone failed: remote authentication required but no callback set; class=Http (34); code=Auth (-16)
+```
+
+This is easy to misdiagnose as a bad token or a `gh auth` problem -- it is
+neither; the engine never presents a credential at all. Being logged in with
+`gh` on the same machine does not help, because git2 does not consult it.
+
+Implications for a team that wants a private marketplace:
+
+- A public repo is the only shape that works today. Do not put anything
+  workspace-private in plugins there -- and note that every plugin authoring
+  rule about excluding personal data becomes a hard requirement.
+- `file://` URLs are accepted as a marketplace source (and skip the shallow-clone
+  depth), so a local bare clone of a private repo, refreshed out-of-band, is a
+  workable stopgap.
+- Fixing this properly means adding `RemoteCallbacks` with
+  `git2::Cred::credential_helper` (or a token env var) to both clone sites.
+
+### Org permissions can block repo creation independently
+
+Creating the marketplace repo is a GitHub-side concern and fails separately from
+anything Lucidos does. An org with `members_can_create_repositories: false`
+rejects `gh repo create` for a plain member with
+`does not have the correct permissions to execute CreateRepository` -- for
+public, private, **and** internal alike. Check with
+`gh api orgs/<org> --jq '{members_can_create_repositories, members_can_create_internal_repositories}'`
+before assuming the CLI or the token is at fault.
+
 ## Shipping triggers (auto-registration)
 
 A plugin ships a trigger by declaring it in a **`trigger.toml`** at

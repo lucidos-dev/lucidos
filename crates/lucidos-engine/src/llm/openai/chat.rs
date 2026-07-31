@@ -2,7 +2,6 @@
 //! The struct, shared stream types, and dispatch live in the parent `openai`
 //! module.
 
-
 use crate::llm::provider::{
     ContentBlock, LlmResponse, Message, MessageContent, TokenCallback, ToolDefinition,
 };
@@ -383,7 +382,9 @@ impl OpenAiProvider {
             if !status.is_success() {
                 let error_body = resp.text().await.unwrap_or_default();
 
-                if crate::llm::is_retryable_status(status.as_u16()) && attempt <= crate::llm::MAX_RETRIES {
+                if crate::llm::is_retryable_status(status.as_u16())
+                    && attempt <= crate::llm::MAX_RETRIES
+                {
                     let delay = crate::llm::retry_delay(attempt, 1);
                     crate::llm::log_retry(model, &format!("HTTP {}", status), attempt, delay);
                     tokio::time::sleep(delay).await;
@@ -401,7 +402,9 @@ impl OpenAiProvider {
                 Ok(response) => return Ok(response),
                 Err(e) => {
                     let err_str = e.to_string();
-                    if crate::llm::is_retryable_error(&err_str) && attempt <= crate::llm::MAX_RETRIES {
+                    if crate::llm::is_retryable_error(&err_str)
+                        && attempt <= crate::llm::MAX_RETRIES
+                    {
                         let delay = crate::llm::retry_delay(attempt, 2);
                         crate::llm::log_retry(
                             model,
@@ -539,8 +542,7 @@ mod tests {
                         content: "…knowhow body…".to_string(),
                     },
                     ContentBlock::Text {
-                        text: "Results above. Do NOT repeat analysis you already gave."
-                            .to_string(),
+                        text: "Results above. Do NOT repeat analysis you already gave.".to_string(),
                     },
                 ]),
             },
@@ -550,7 +552,12 @@ mod tests {
 
         // Exactly three wire messages, in order:
         //   assistant(tool_calls) → tool(result) → user(text)
-        assert_eq!(wire.len(), 3, "expected assistant, tool, user — got {:?}", wire);
+        assert_eq!(
+            wire.len(),
+            3,
+            "expected assistant, tool, user; got {:?}",
+            wire
+        );
         assert_eq!(wire[0]["role"], "assistant");
         assert_eq!(wire[0]["tool_calls"][0]["id"], "load_knowhow:0");
         assert_eq!(wire[1]["role"], "tool");

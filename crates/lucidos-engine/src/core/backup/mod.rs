@@ -442,8 +442,8 @@ pub async fn restore_archive_into(
                     inner: input,
                     bytes_read: 0,
                     callback: |done| {
-                        let pct = (decrypt_end as f64 * done as f64
-                            / total_bytes.max(1) as f64) as usize;
+                        let pct =
+                            (decrypt_end as f64 * done as f64 / total_bytes.max(1) as f64) as usize;
                         let pct = pct.min(decrypt_end);
                         if pct > last_pct {
                             last_pct = pct;
@@ -1021,9 +1021,7 @@ fn pg_dbname(database_url: &str) -> Result<String, BoxError> {
 /// older ones. When restoring a dump created by a newer pg_dump into an older
 /// server, these SET statements cause a fatal error. We strip them from the SQL
 /// before piping to psql.
-const CROSS_VERSION_SET_PARAMS: &[&str] = &[
-    "transaction_timeout",
-];
+const CROSS_VERSION_SET_PARAMS: &[&str] = &["transaction_timeout"];
 
 /// Returns true if `line` is a `SET <param> = ...;` for a parameter in
 /// [`CROSS_VERSION_SET_PARAMS`]. Pure for testability.

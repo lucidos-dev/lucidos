@@ -280,18 +280,18 @@ pub(in crate::api) async fn archive_thread(
         .await
         .map_err(internal_json)?;
 
-    let (to_archive, external_repo_pending) =
-        match classify_archive_decision(&family, thread_uuid) {
-            ArchiveDecision::Proceed {
-                to_archive,
-                external_repo_pending,
-            } => (to_archive, external_repo_pending),
-            ArchiveDecision::Reject { status, body } => {
-                // Release the FOR UPDATE lock before bouncing.
-                let _ = tx.rollback().await;
-                return Err((status, axum::Json(body)));
-            }
-        };
+    let (to_archive, external_repo_pending) = match classify_archive_decision(&family, thread_uuid)
+    {
+        ArchiveDecision::Proceed {
+            to_archive,
+            external_repo_pending,
+        } => (to_archive, external_repo_pending),
+        ArchiveDecision::Reject { status, body } => {
+            // Release the FOR UPDATE lock before bouncing.
+            let _ = tx.rollback().await;
+            return Err((status, axum::Json(body)));
+        }
+    };
 
     // Commit the FOR UPDATE lock first; emits go through EventBus, each in
     // its own transaction with projection updates. The race window between

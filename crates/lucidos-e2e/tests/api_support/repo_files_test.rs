@@ -12,7 +12,11 @@ async fn list_repo_files_returns_file_list() {
     let repo_id = register_test_repo(&client).await;
 
     let resp = client
-        .get(format!("{}/api/v1/repositories/{}/files", base_url(), repo_id))
+        .get(format!(
+            "{}/api/v1/repositories/{}/files",
+            base_url(),
+            repo_id
+        ))
         .send()
         .await
         .expect("List files failed");
@@ -272,12 +276,20 @@ async fn list_repo_files_returns_raw_utf8_paths() {
         files.iter().any(|f| f == &file),
         "Expected raw UTF-8 path {:?} in file list; got entries with emoji-related bytes: {:?}",
         file,
-        files.iter().filter(|f| f.contains("🧮") || f.contains("\\360")).collect::<Vec<_>>()
+        files
+            .iter()
+            .filter(|f| f.contains("🧮") || f.contains("\\360"))
+            .collect::<Vec<_>>()
     );
     assert!(
-        files.iter().all(|f| !f.starts_with('"') && !f.ends_with('"') && !f.contains("\\360")),
+        files
+            .iter()
+            .all(|f| !f.starts_with('"') && !f.ends_with('"') && !f.contains("\\360")),
         "No path should be C-quoted; offenders: {:?}",
-        files.iter().filter(|f| f.starts_with('"') || f.ends_with('"') || f.contains("\\360")).collect::<Vec<_>>()
+        files
+            .iter()
+            .filter(|f| f.starts_with('"') || f.ends_with('"') || f.contains("\\360"))
+            .collect::<Vec<_>>()
     );
 
     cleanup_utf8_branch(&branch, &wt_dir);
@@ -316,7 +328,9 @@ async fn get_repo_diff_returns_raw_utf8_paths() {
         paths
     );
     assert!(
-        paths.iter().all(|p| !p.starts_with('"') && !p.ends_with('"') && !p.contains("\\360")),
+        paths
+            .iter()
+            .all(|p| !p.starts_with('"') && !p.ends_with('"') && !p.contains("\\360")),
         "Diff path must not be C-quoted; got: {:?}",
         paths
     );
@@ -330,7 +344,11 @@ async fn repo_not_found_returns_404() {
     let fake_id = Uuid::new_v4();
 
     let resp = client
-        .get(format!("{}/api/v1/repositories/{}/files", base_url(), fake_id))
+        .get(format!(
+            "{}/api/v1/repositories/{}/files",
+            base_url(),
+            fake_id
+        ))
         .send()
         .await
         .expect("Request failed");

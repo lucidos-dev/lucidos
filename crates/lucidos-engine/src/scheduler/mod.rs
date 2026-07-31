@@ -138,8 +138,13 @@ impl SchedulerManager {
         // happened while the engine was down. Best-effort (logs on failure).
         {
             let ws = self.engine.workspace_path().to_path_buf();
-            let configs: Vec<crate::triggers::TriggerConfig> =
-                self.trigger_configs.read().unwrap().values().cloned().collect();
+            let configs: Vec<crate::triggers::TriggerConfig> = self
+                .trigger_configs
+                .read()
+                .unwrap()
+                .values()
+                .cloned()
+                .collect();
             tokio::task::spawn_blocking(move || {
                 crate::triggers::definition::ensure_trigger_toml_gitignored(&ws);
                 crate::triggers::definition::rebuild_trigger_definitions(&ws, &configs);
@@ -209,7 +214,10 @@ impl SchedulerManager {
             })
         })?;
         self.scheduler.add(prune_job).await?;
-        log!("[Scheduler] Registered system task: disable_push_on_stale_devices (daily 3am, >{}d)", STALE_DEVICE_DAYS);
+        log!(
+            "[Scheduler] Registered system task: disable_push_on_stale_devices (daily 3am, >{}d)",
+            STALE_DEVICE_DAYS
+        );
 
         // Also run once at startup so accumulated stale rows get caught
         // immediately after deploy without waiting for the first 3am tick.
@@ -1128,14 +1136,21 @@ pub(crate) async fn disable_push_on_stale_devices(
     let stale = match crate::core::DeviceStore::list_stale_push_enabled(&pool, cutoff_days).await {
         Ok(ids) => ids,
         Err(e) => {
-            log!("[Scheduler] disable_push_on_stale_devices: list failed: {}", e);
+            log!(
+                "[Scheduler] disable_push_on_stale_devices: list failed: {}",
+                e
+            );
             return;
         }
     };
     if stale.is_empty() {
         return;
     }
-    log!("[Scheduler] Disabling push on {} stale device(s) (>{}d)", stale.len(), cutoff_days);
+    log!(
+        "[Scheduler] Disabling push on {} stale device(s) (>{}d)",
+        stale.len(),
+        cutoff_days
+    );
 
     for device_id in stale {
         match crate::core::DeviceStore::set_push_enabled(&pool, &device_id, false).await {
@@ -1189,8 +1204,7 @@ fn find_matching_script(data_dir: &std::path::Path, trigger_name: &str) -> Optio
                 // everything, so require at least one keyword.
                 let dir_keywords: Vec<&str> =
                     dir_name.split('-').filter(|kw| !kw.is_empty()).collect();
-                if !dir_keywords.is_empty()
-                    && dir_keywords.iter().all(|kw| name_lower.contains(kw))
+                if !dir_keywords.is_empty() && dir_keywords.iter().all(|kw| name_lower.contains(kw))
                 {
                     return Some(format!("{}/{}/scripts/run.py", prefix, dir_name));
                 }

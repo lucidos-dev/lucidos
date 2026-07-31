@@ -43,13 +43,12 @@ async fn fresh_running_cc_child_blocks_parent_before_first_idle() {
         .unwrap();
     }
 
-    let stored_section: String = sqlx::query_scalar(
-        "SELECT archive_state FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(child_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let stored_section: String =
+        sqlx::query_scalar("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(stored_section, "inbox");
     assert_eq!(read_blocking_descendant_count(&pool, parent_id).await, 1);
 
@@ -279,9 +278,7 @@ async fn user_question_lifecycle_propagates_count() {
         thread_id: child_id,
         event: ThreadEvent::UserQuestionAnswered {
             tool_use_id: "tu-1".into(),
-            answer: AnswerKind::FreeText {
-                text: "yes".into(),
-            },
+            answer: AnswerKind::FreeText { text: "yes".into() },
         },
         meta: EventMeta::NONE,
     })

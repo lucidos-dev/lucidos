@@ -1,7 +1,6 @@
 //! LLM-facing schemas for notification tools (send/read notifications,
 //! enable push). Handlers live in `engine::tools` + the scheduler push path.
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

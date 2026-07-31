@@ -9,7 +9,9 @@ use uuid::Uuid;
 
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::git_ops::git_cmd;
-use crate::engine::thread_events::{EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent};
+use crate::engine::thread_events::{
+    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+};
 use crate::engine::LucidosEngine;
 
 impl LucidosEngine {
@@ -32,9 +34,21 @@ impl LucidosEngine {
         let (mut pending, mut applied, restart) = match (pending_r, applied_r, restart_r) {
             (Ok(p), Ok(a), Ok(r)) => (p, a, r),
             (perr, aerr, rerr) => {
-                if let Err(e) = perr { log!("[Changes] broadcast_changes_updated: list_pending: {}", e); }
-                if let Err(e) = aerr { log!("[Changes] broadcast_changes_updated: list_recently_applied: {}", e); }
-                if let Err(e) = rerr { log!("[Changes] broadcast_changes_updated: requires_restart_since: {}", e); }
+                if let Err(e) = perr {
+                    log!("[Changes] broadcast_changes_updated: list_pending: {}", e);
+                }
+                if let Err(e) = aerr {
+                    log!(
+                        "[Changes] broadcast_changes_updated: list_recently_applied: {}",
+                        e
+                    );
+                }
+                if let Err(e) = rerr {
+                    log!(
+                        "[Changes] broadcast_changes_updated: requires_restart_since: {}",
+                        e
+                    );
+                }
                 log!("[Changes] broadcast_changes_updated: skipping ChangesUpdated emit");
                 return;
             }
@@ -51,14 +65,12 @@ impl LucidosEngine {
         }
         self.event_bus
             .emit_or_log(
-                BusEvent::System(
-                    SystemEvent::ChangesUpdated {
-                        total_pending: pending.len(),
-                        pending,
-                        applied,
-                        restart_required: restart,
-                    },
-                ),
+                BusEvent::System(SystemEvent::ChangesUpdated {
+                    total_pending: pending.len(),
+                    pending,
+                    applied,
+                    restart_required: restart,
+                }),
                 "[Changes] ChangesUpdated",
             )
             .await;
@@ -98,7 +110,8 @@ impl LucidosEngine {
         actor: Option<MessageOrigin>,
         log_tag: &str,
     ) {
-        let error_msg = "Hardening did not complete (no marker recorded). Click Apply again to retry.";
+        let error_msg =
+            "Hardening did not complete (no marker recorded). Click Apply again to retry.";
         self.event_bus
             .emit_or_log(
                 BusEvent::Thread {
@@ -116,12 +129,10 @@ impl LucidosEngine {
         // Feed the Apply-All driver — without this an Apply All batch with
         // an unhardened member would stall when hardening fails.
         if let Ok(id) = Uuid::parse_str(change_id) {
-            self.notify_apply_all(
-                crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
-                    id,
-                    error_msg.to_string(),
-                ),
-            );
+            self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
+                id,
+                error_msg.to_string(),
+            ));
         }
     }
 
@@ -225,9 +236,9 @@ impl LucidosEngine {
         // member status is first-write-wins, so a duplicate `Applied` is already
         // idempotent here — while withholding it on a suppressed duplicate could
         // strand a batch whose only signal was that duplicate.
-        self.notify_apply_all(
-            crate::engine::apply_all_driver::ApplyAllDriveMsg::Applied(change_id),
-        );
+        self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Applied(
+            change_id,
+        ));
         if accepted {
             self.post_apply_dev_refresh(thread_id, requires_restart, client_update)
                 .await;
@@ -286,9 +297,7 @@ impl LucidosEngine {
         );
         match decision {
             PostApplyRefresh::RebuildEngine => engine.trigger_background_rebuild(),
-            PostApplyRefresh::ReSnapshotFrontend => {
-                engine.refresh_served_frontend_after_rebuild()
-            }
+            PostApplyRefresh::ReSnapshotFrontend => engine.refresh_served_frontend_after_rebuild(),
             PostApplyRefresh::Nothing => {}
         }
     }
@@ -397,9 +406,7 @@ impl LucidosEngine {
                 BusEvent::Thread {
                     thread_id,
                     event: ThreadEvent::MissingHardeningDetected {
-                        origin: Some(MessageOrigin::engine(
-                            EngineReason::MissingHardening,
-                        )),
+                        origin: Some(MessageOrigin::engine(EngineReason::MissingHardening)),
                     },
                     meta: EventMeta {
                         channel: Some(EventChannel::ClaudeCode),
@@ -428,9 +435,7 @@ impl LucidosEngine {
                     event: ThreadEvent::MergeConflictDetected {
                         change_id: change_id.to_string(),
                         files,
-                        origin: Some(MessageOrigin::engine(
-                            EngineReason::MergeConflict,
-                        )),
+                        origin: Some(MessageOrigin::engine(EngineReason::MergeConflict)),
                     },
                     meta: EventMeta {
                         channel: Some(EventChannel::ClaudeCode),
@@ -469,9 +474,10 @@ impl LucidosEngine {
         // App threads get an app-appropriate merge prompt (no `/harden`, no
         // Lucidos-source test suites). Resolved here from the thread so every
         // merge call site (in-session apply, Tier-2/Tier-3 spawn) inherits it.
-        let is_app = crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
-            .await
-            .is_app();
+        let is_app =
+            crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
+                .await
+                .is_app();
         crate::engine::agent_session::build_merge_prompt(
             target_branch,
             body_intro,
@@ -744,9 +750,13 @@ mod tests {
         git_cmd(&["config", "user.email", "test@example.com"], path)
             .await
             .unwrap();
-        git_cmd(&["config", "user.name", "Test"], path).await.unwrap();
+        git_cmd(&["config", "user.name", "Test"], path)
+            .await
+            .unwrap();
         git_cmd(&["add", "-A"], path).await.unwrap();
-        git_cmd(&["commit", "-q", "-m", "init"], path).await.unwrap();
+        git_cmd(&["commit", "-q", "-m", "init"], path)
+            .await
+            .unwrap();
         let out = git_cmd(&["rev-parse", "HEAD"], path).await.unwrap();
         String::from_utf8(out.stdout).unwrap().trim().to_string()
     }
@@ -793,7 +803,12 @@ mod tests {
         )
         .await;
 
-        assert_eq!(events.len(), 1, "expected exactly one app event, got {:?}", events);
+        assert_eq!(
+            events.len(),
+            1,
+            "expected exactly one app event, got {:?}",
+            events
+        );
         match &events[0] {
             SystemEvent::AppCreated { app_id, name, .. } => {
                 assert_eq!(app_id, "habit-tracker");
@@ -810,19 +825,23 @@ mod tests {
         // Pre-state already has the app.
         write_app_manifest(ws, "habit-tracker", "Habit Tracker");
         git_cmd(&["init", "-q", "-b", "main"], ws).await.unwrap();
-        git_cmd(&["config", "user.email", "t@e.com"], ws).await.unwrap();
+        git_cmd(&["config", "user.email", "t@e.com"], ws)
+            .await
+            .unwrap();
         git_cmd(&["config", "user.name", "T"], ws).await.unwrap();
         git_cmd(&["add", "-A"], ws).await.unwrap();
         git_cmd(&["commit", "-q", "-m", "seed"], ws).await.unwrap();
-        let pre_sha = String::from_utf8(
-            git_cmd(&["rev-parse", "HEAD"], ws).await.unwrap().stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let pre_sha = String::from_utf8(git_cmd(&["rev-parse", "HEAD"], ws).await.unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
 
         // CC rewrote index.html — manifest still present, name unchanged.
-        std::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<html>v2</html>").unwrap();
+        std::fs::write(
+            ws.join("data/apps/habit-tracker/index.html"),
+            "<html>v2</html>",
+        )
+        .unwrap();
         let post_sha = commit_all(ws, "Edit habit-tracker").await;
 
         let events = compute_entity_events_for_change_apply(
@@ -848,16 +867,16 @@ mod tests {
         let ws = tmp.path();
         write_app_manifest(ws, "going-away", "Going Away");
         git_cmd(&["init", "-q", "-b", "main"], ws).await.unwrap();
-        git_cmd(&["config", "user.email", "t@e.com"], ws).await.unwrap();
+        git_cmd(&["config", "user.email", "t@e.com"], ws)
+            .await
+            .unwrap();
         git_cmd(&["config", "user.name", "T"], ws).await.unwrap();
         git_cmd(&["add", "-A"], ws).await.unwrap();
         git_cmd(&["commit", "-q", "-m", "seed"], ws).await.unwrap();
-        let pre_sha = String::from_utf8(
-            git_cmd(&["rev-parse", "HEAD"], ws).await.unwrap().stdout,
-        )
-        .unwrap()
-        .trim()
-        .to_string();
+        let pre_sha = String::from_utf8(git_cmd(&["rev-parse", "HEAD"], ws).await.unwrap().stdout)
+            .unwrap()
+            .trim()
+            .to_string();
 
         std::fs::remove_dir_all(ws.join("data/apps/going-away")).unwrap();
         let post_sha = commit_all(ws, "Delete going-away").await;
@@ -905,7 +924,11 @@ mod tests {
 
         assert_eq!(events.len(), 1, "got {:?}", events);
         match &events[0] {
-            SystemEvent::ArtifactCreated { artifact_path, commit, source } => {
+            SystemEvent::ArtifactCreated {
+                artifact_path,
+                commit,
+                source,
+            } => {
                 assert_eq!(artifact_path, "notes.md");
                 assert_eq!(commit, &post_sha);
                 assert_eq!(source.as_deref(), Some("change_apply"));

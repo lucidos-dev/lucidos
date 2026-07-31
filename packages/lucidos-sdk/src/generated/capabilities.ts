@@ -2,7 +2,7 @@
 // Regenerate: cargo test -p lucidos-engine --lib generate_sdk_capabilities_file -- --ignored
 //
 // Source of truth: the capability parity manifest. The hand-written SDK facade
-// (e.g. notifications.ts) must expose every `sdkName` listed here for its domain —
+// (e.g. notifications.ts) must expose every `sdkName` listed here for its domain,
 // enforced by capabilities.test.ts so the SDK can't drift behind the manifest.
 
 export interface CapabilityOp {

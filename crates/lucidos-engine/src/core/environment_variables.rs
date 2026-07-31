@@ -373,14 +373,14 @@ mod tests {
     #[test]
     fn invalid_names_rejected() {
         for name in [
-            "",            // empty
-            "1ABC",        // leading digit
-            "lower",       // lowercase
-            "Mixed",       // mixed case
-            "WITH-DASH",   // dash
-            "WITH SPACE",  // space
-            "WITH.DOT",    // dot
-            "TRAILING\n",  // newline
+            "",           // empty
+            "1ABC",       // leading digit
+            "lower",      // lowercase
+            "Mixed",      // mixed case
+            "WITH-DASH",  // dash
+            "WITH SPACE", // space
+            "WITH.DOT",   // dot
+            "TRAILING\n", // newline
         ] {
             assert!(!is_valid_name(name), "{name:?} should be invalid");
         }
@@ -482,11 +482,9 @@ mod tests {
                 .expect("update missing"),
             "update of missing row returns false"
         );
-        assert!(
-            EnvironmentVariableStore::delete(&pool, "FOO")
-                .await
-                .expect("delete"),
-        );
+        assert!(EnvironmentVariableStore::delete(&pool, "FOO")
+            .await
+            .expect("delete"),);
         assert!(EnvironmentVariableStore::get(&pool, "FOO")
             .await
             .expect("get after delete")

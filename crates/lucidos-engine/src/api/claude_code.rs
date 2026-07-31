@@ -286,7 +286,6 @@ pub(super) async fn claude_code_interrupt(
     }
 }
 
-
 /// Response of `GET /api/v1/coding-agents/binaries` — effective CLI binary
 /// resolution per coding agent, for the Settings → System → Coding agents surface.
 /// Live detection (see `runtime::detect_agent_binary`); the override itself is
@@ -333,24 +332,9 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/coding-agents/binaries", get(coding_agent_binaries))
         .route("/claude-code/stop", post(claude_code_stop))
-        .route(
-            "/claude-code/interrupt",
-            post(claude_code_interrupt),
-        )
-        .route(
-            "/claude-code/control",
-            post(claude_code_control),
-        )
-        .route(
-            "/claude-code/commands",
-            get(claude_code_commands),
-        )
-        .route(
-            "/claude-code/apply-now",
-            post(claude_code_apply_now),
-        )
-        .route(
-            "/claude-code/discard",
-            post(claude_code_discard),
-        )
+        .route("/claude-code/interrupt", post(claude_code_interrupt))
+        .route("/claude-code/control", post(claude_code_control))
+        .route("/claude-code/commands", get(claude_code_commands))
+        .route("/claude-code/apply-now", post(claude_code_apply_now))
+        .route("/claude-code/discard", post(claude_code_discard))
 }

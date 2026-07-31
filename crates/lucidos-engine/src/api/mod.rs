@@ -1,9 +1,9 @@
 pub mod actor;
 mod app_ui;
 mod apps;
-pub(crate) mod base_path;
 mod artifacts;
 pub(crate) mod backup;
+pub(crate) mod base_path;
 mod blobs;
 mod changes;
 pub(crate) mod chat;
@@ -12,8 +12,8 @@ mod command_checkpoint;
 mod command_permission;
 mod data_api;
 mod disk_usage;
-pub(crate) mod frontend_snapshot;
 pub(crate) mod error;
+pub(crate) mod frontend_snapshot;
 mod history;
 mod images;
 pub(crate) mod internal;
@@ -913,7 +913,11 @@ fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
             let stamped = base_path::inject_base_href(&html, prefix);
             let stamped =
                 base_path::inject_gateway_port(&stamped, base_path::gateway_port().as_deref());
-            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], stamped).into_response()
+            (
+                [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                stamped,
+            )
+                .into_response()
         }
         Err(_) => (StatusCode::NOT_FOUND, "frontend not built").into_response(),
     }

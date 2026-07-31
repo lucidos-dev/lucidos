@@ -653,7 +653,9 @@ impl BackupProvider for GoogleDriveBackupProvider {
         // omit the link rather than point at a search the user didn't ask for.
         let token = self.get_token().await.ok()?;
         let folder_id = self.find_folder(&token).await.ok()??;
-        Some(format!("https://drive.google.com/drive/folders/{folder_id}"))
+        Some(format!(
+            "https://drive.google.com/drive/folders/{folder_id}"
+        ))
     }
 
     async fn preflight(&self, estimated_upload_bytes: u64) -> Result<(), BoxError> {

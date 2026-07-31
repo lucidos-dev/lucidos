@@ -2,10 +2,8 @@
 //! setup-text handling, and end-to-end install / update / check via local
 //! git + archive fixtures.
 
-
 use super::helpers::*;
 use super::*;
-
 
 use crate::engine::event_bus::{EventBus, MockEventBus};
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -86,10 +84,17 @@ async fn install_without_source_succeeds_and_omits_from_in_summary() {
     let unpacked = extract_to(&archive_dir, &archive);
 
     let bus = MockEventBus::new();
-    let (msg, _files) =
-        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
-            .await
-            .expect("install must succeed even with no source field");
+    let (msg, _files) = install_from_unpacked_with_bus(
+        &scratch,
+        &bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("install must succeed even with no source field");
     assert_eq!(msg, "Installed Sourceless Plugin v0.1.0 (1 files).");
 
     let events = bus.emitted_events();
@@ -310,10 +315,17 @@ setup = "Create a daily trigger that loads `knowhow/with-setup/run.md`. Suggeste
     let unpacked = extract_to(&archive_dir, &archive);
 
     let bus = MockEventBus::new();
-    let (msg, _files) =
-        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
-            .await
-            .expect("install must succeed");
+    let (msg, _files) = install_from_unpacked_with_bus(
+        &scratch,
+        &bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("install must succeed");
 
     assert!(
         msg.starts_with("Installed With Setup v0.1.0 (1 files)."),
@@ -343,10 +355,17 @@ async fn install_omits_setup_section_when_manifest_has_no_setup() {
     let unpacked = extract_to(&archive_dir, &archive);
 
     let bus = MockEventBus::new();
-    let (msg, _files) =
-        install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
-            .await
-            .expect("install must succeed");
+    let (msg, _files) = install_from_unpacked_with_bus(
+        &scratch,
+        &bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("install must succeed");
 
     assert_eq!(msg, "Installed Fixture Plugin v0.1.0 (2 files).");
 
@@ -381,7 +400,10 @@ fn setup_is_new_spawns_on_fresh_install_with_setup() {
 #[test]
 fn setup_is_new_skips_unchanged_update_but_spawns_on_change() {
     // Identical setup (incl. whitespace-only diffs) → no re-run on update.
-    assert!(!setup_is_new(Some("wire up the key"), Some("wire up the key")));
+    assert!(!setup_is_new(
+        Some("wire up the key"),
+        Some("wire up the key")
+    ));
     assert!(!setup_is_new(
         Some("  wire up the key  "),
         Some("wire up the key")
@@ -411,7 +433,10 @@ fn setup_thread_request_is_a_subthread_bound_to_the_advertised_id() {
             pre_emitted_origin,
             ..
         } => {
-            assert_eq!(child_thread_id, tid, "must bind the advertised setup_thread_id");
+            assert_eq!(
+                child_thread_id, tid,
+                "must bind the advertised setup_thread_id"
+            );
             assert_eq!(title.as_deref(), Some("Set up Super Slides"));
             assert!(pre_emitted_origin.is_none());
             // The seed is the SHORT, user-facing line only — the how-to lives in
@@ -544,9 +569,17 @@ async fn latest_install_round_trips_id_version_source_and_files() {
     let archive = build_fixture_archive(&archive_dir, "v1");
     let unpacked = extract_to(&archive_dir, &archive);
 
-    install_from_unpacked_with_bus(&scratch, &bus, &unpacked, SourceType::Archive, false, None, None)
-        .await
-        .expect("install must succeed");
+    install_from_unpacked_with_bus(
+        &scratch,
+        &bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("install must succeed");
 
     // Install record must be findable by the manifest id (not "unknown").
     let installed = latest_install(&pool, "fixture-plugin")
@@ -852,7 +885,10 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
         GIT_TRACK_MANIFEST,
         &[
             ("apps/git-track-plugin/index.html", b"<h1>hi</h1>"),
-            ("apps/git-track-plugin/manifest.json", b"{\"name\":\"Git Track\"}"),
+            (
+                "apps/git-track-plugin/manifest.json",
+                b"{\"name\":\"Git Track\"}",
+            ),
             ("knowhow/git-track.md", b"# how"),
         ],
     );
@@ -919,4 +955,3 @@ async fn install_commits_written_files_so_working_tree_is_clean() {
 
     let _ = std::fs::remove_dir_all(&scratch);
 }
-

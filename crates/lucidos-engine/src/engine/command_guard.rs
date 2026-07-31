@@ -233,7 +233,10 @@ pub fn fallback_classify(ji: &JudgeInput) -> JudgedClassification {
             category: Some(cat),
         };
     }
-    let is_bash = matches!(ji.tool_name.as_str(), tn::RUN_BASH | tn::RUN_BASH_BACKGROUND);
+    let is_bash = matches!(
+        ji.tool_name.as_str(),
+        tn::RUN_BASH | tn::RUN_BASH_BACKGROUND
+    );
     let scope = if is_bash {
         bash_destruction_scope(&ji.command)
     } else {
@@ -335,13 +338,11 @@ fn segment_destruction_scope(segment: &str) -> Option<DestructionScope> {
         });
     }
     if DESTRUCTIVE_DEST_HEADS.contains(&base) && args.len() >= 2 {
-        return Some(
-            if args.last().is_some_and(|a| token_escapes_workspace(a)) {
-                DestructionScope::OutOfWorkspace
-            } else {
-                DestructionScope::InWorkspace
-            },
-        );
+        return Some(if args.last().is_some_and(|a| token_escapes_workspace(a)) {
+            DestructionScope::OutOfWorkspace
+        } else {
+            DestructionScope::InWorkspace
+        });
     }
     None
 }
@@ -360,9 +361,17 @@ fn truncating_redirect_escapes(segment: &str) -> bool {
 /// delete, move, or truncate files. Split out of the judge-routing signal list
 /// so the fallback can derive a lane from them.
 static PY_DESTRUCTION_CALLS: &[&str] = &[
-    "os.remove(", "os.unlink(", "os.rmdir(", "os.removedirs(", "os.rename(",
-    "os.replace(", "os.truncate(", "shutil.rmtree(", "shutil.move(",
-    ".unlink(", ".rmdir(",
+    "os.remove(",
+    "os.unlink(",
+    "os.rmdir(",
+    "os.removedirs(",
+    "os.rename(",
+    "os.replace(",
+    "os.truncate(",
+    "shutil.rmtree(",
+    "shutil.move(",
+    ".unlink(",
+    ".rmdir(",
 ];
 
 /// Destruction scope of Python `code`, or `None`. A destruction call paired
@@ -390,7 +399,11 @@ fn python_string_literal_escapes(code: &str) -> bool {
     static LITERAL: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r#"'([^']*)'|"([^"]*)""#).unwrap());
     LITERAL.captures_iter(code).any(|c| {
-        let s = c.get(1).or_else(|| c.get(2)).map(|m| m.as_str()).unwrap_or("");
+        let s = c
+            .get(1)
+            .or_else(|| c.get(2))
+            .map(|m| m.as_str())
+            .unwrap_or("");
         s.starts_with('/') || s.starts_with('~') || s == ".." || s.contains("../")
     })
 }
@@ -460,25 +473,103 @@ pub fn command_text<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
 /// their arguments (output redirects are validated separately by [`segment_is_safe`]).
 static READ_ONLY_HEADS: &[&str] = &[
     // Listing / inspection (`find` is NOT here — `find -delete`/`-exec` mutate)
-    "ls", "dir", "vdir", "tree", "stat", "file", "du", "df", "pwd", "realpath",
-    "readlink", "basename", "dirname",
+    "ls",
+    "dir",
+    "vdir",
+    "tree",
+    "stat",
+    "file",
+    "du",
+    "df",
+    "pwd",
+    "realpath",
+    "readlink",
+    "basename",
+    "dirname",
     // Reading / dumping file content
-    "cat", "tac", "nl", "head", "tail", "wc", "less", "more", "strings", "od",
-    "hexdump", "xxd", "look",
+    "cat",
+    "tac",
+    "nl",
+    "head",
+    "tail",
+    "wc",
+    "less",
+    "more",
+    "strings",
+    "od",
+    "hexdump",
+    "xxd",
+    "look",
     // Text search / transform to stdout
-    "grep", "egrep", "fgrep", "rg", "ag", "ack", "sort", "uniq", "cut", "tr",
-    "fold", "fmt", "expand", "unexpand", "column", "comm", "join", "paste",
-    "rev", "jq", "yq", "diff", "cmp", "base64",
+    "grep",
+    "egrep",
+    "fgrep",
+    "rg",
+    "ag",
+    "ack",
+    "sort",
+    "uniq",
+    "cut",
+    "tr",
+    "fold",
+    "fmt",
+    "expand",
+    "unexpand",
+    "column",
+    "comm",
+    "join",
+    "paste",
+    "rev",
+    "jq",
+    "yq",
+    "diff",
+    "cmp",
+    "base64",
     // Hashing
-    "md5", "md5sum", "sha1sum", "sha256sum", "sha512sum", "shasum", "cksum",
+    "md5",
+    "md5sum",
+    "sha1sum",
+    "sha256sum",
+    "sha512sum",
+    "shasum",
+    "cksum",
     "b2sum",
     // System info (read-only)
-    "echo", "printf", "printenv", "date", "cal", "whoami", "who", "id",
-    "groups", "hostname", "uname", "arch", "uptime", "which", "type", "whereis",
-    "getconf", "locale", "free", "vm_stat", "sw_vers", "ps", "pgrep", "uuidgen",
-    "tput", "clear", "tty",
+    "echo",
+    "printf",
+    "printenv",
+    "date",
+    "cal",
+    "whoami",
+    "who",
+    "id",
+    "groups",
+    "hostname",
+    "uname",
+    "arch",
+    "uptime",
+    "which",
+    "type",
+    "whereis",
+    "getconf",
+    "locale",
+    "free",
+    "vm_stat",
+    "sw_vers",
+    "ps",
+    "pgrep",
+    "uuidgen",
+    "tput",
+    "clear",
+    "tty",
     // Trivial builtins / no-ops
-    "true", "false", "sleep", "seq", "test", "[", "expr",
+    "true",
+    "false",
+    "sleep",
+    "seq",
+    "test",
+    "[",
+    "expr",
 ];
 
 /// Command heads that create or extend in-workspace paths — safe when every
@@ -489,9 +580,26 @@ static CREATE_HEADS: &[&str] = &["mkdir", "touch"];
 /// `branch -D`, `config <k> <v>`, `tag <name>`, `remote add`, …) is absent and
 /// falls through to the judge.
 static GIT_READ_ONLY_SUBCOMMANDS: &[&str] = &[
-    "status", "log", "diff", "show", "blame", "reflog", "rev-parse", "rev-list",
-    "ls-files", "ls-tree", "cat-file", "show-ref", "describe", "shortlog",
-    "whatchanged", "grep", "var", "count-objects", "fsck", "version",
+    "status",
+    "log",
+    "diff",
+    "show",
+    "blame",
+    "reflog",
+    "rev-parse",
+    "rev-list",
+    "ls-files",
+    "ls-tree",
+    "cat-file",
+    "show-ref",
+    "describe",
+    "shortlog",
+    "whatchanged",
+    "grep",
+    "var",
+    "count-objects",
+    "fsck",
+    "version",
 ];
 
 /// True when every shell segment of `command` is an obviously-safe shape. One
@@ -583,14 +691,30 @@ fn python_side_effect_signal(code: &str) -> bool {
         // client (`s = requests.Session(); s.post(…)`, an httpx client, an SDK
         // wrapper) is caught regardless of the variable name. A false positive
         // (e.g. `queue.put(`) only costs one judge call, never a wrong verdict.
-        ".post(", ".put(", ".patch(", ".delete(",
-        "urllib.request.urlopen(", "aiohttp", "pycurl",
+        ".post(",
+        ".put(",
+        ".patch(",
+        ".delete(",
+        "urllib.request.urlopen(",
+        "aiohttp",
+        "pycurl",
         // Mail / remote-execution / cloud SDKs — side-effect-capable libraries
         // whose mere mention is a strong talk-to-the-world signal.
-        "smtplib", "boto3", "google.cloud", "paramiko", "ftplib", "telnetlib",
+        "smtplib",
+        "boto3",
+        "google.cloud",
+        "paramiko",
+        "ftplib",
+        "telnetlib",
         // Arbitrary shell-out / eval (incl. dynamic-import indirection)
-        "subprocess", "os.system(", "os.popen(", "os.exec", "pty.spawn(",
-        "eval(", "exec(", "__import__(",
+        "subprocess",
+        "os.system(",
+        "os.popen(",
+        "os.exec",
+        "pty.spawn(",
+        "eval(",
+        "exec(",
+        "__import__(",
     ];
     // Filesystem destruction / move (PY_DESTRUCTION_CALLS) also routes to the
     // judge — it reads the path to decide the lane (in-workspace → reversible,
@@ -763,17 +887,13 @@ fn formats_or_overwrites_disk(command: &str) -> bool {
     static MKFS: LazyLock<regex::Regex> =
         LazyLock::new(|| regex::Regex::new(r"\bmkfs(\.[A-Za-z0-9]+)?\b").unwrap());
     static OF: LazyLock<regex::Regex> = LazyLock::new(|| regex::Regex::new(r"\bof=(\S+)").unwrap());
-    static REDIRECT_DEV: LazyLock<regex::Regex> = LazyLock::new(|| {
-        regex::Regex::new(r#">>?\s*['"]?(/dev/[^\s'"|&;]+)"#).unwrap()
-    });
+    static REDIRECT_DEV: LazyLock<regex::Regex> =
+        LazyLock::new(|| regex::Regex::new(r#">>?\s*['"]?(/dev/[^\s'"|&;]+)"#).unwrap());
 
     if MKFS.is_match(command) && mentions_disk_device(command) {
         return true;
     }
-    if OF
-        .captures_iter(command)
-        .any(|c| is_disk_device(&c[1]))
-    {
+    if OF.captures_iter(command).any(|c| is_disk_device(&c[1])) {
         return true;
     }
     REDIRECT_DEV
@@ -1128,17 +1248,17 @@ mod tests {
             "rm -fr /",
             "rm -r -f /",
             "rm --recursive --force /",
-            "rm  -rf   /",          // collapsed whitespace
-            "rm -rf \"/\"",         // quoted target
+            "rm  -rf   /",  // collapsed whitespace
+            "rm -rf \"/\"", // quoted target
             "rm -rf '/'",
-            "rm -rf -- /",          // end-of-options
-            "sudo rm -rf /",        // privilege prefix
+            "rm -rf -- /",   // end-of-options
+            "sudo rm -rf /", // privilege prefix
             "rm -rf ~",
             "rm -rf ~/",
             "rm -rf $HOME",
             "rm -rf ${HOME}",
-            "cd /tmp && rm -rf /",  // chained segment
-            "/bin/rm -rf /",        // absolute path to rm
+            "cd /tmp && rm -rf /", // chained segment
+            "/bin/rm -rf /",       // absolute path to rm
         ] {
             assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
         }
@@ -1238,7 +1358,10 @@ mod tests {
         }
         // `dd` is not a read-only head — even an in-workspace target goes to the
         // judge (dd can also overwrite devices).
-        assert_needs_judge(bash("dd if=/dev/zero of=data/zeros.bin bs=1M count=10"), "dd to file");
+        assert_needs_judge(
+            bash("dd if=/dev/zero of=data/zeros.bin bs=1M count=10"),
+            "dd to file",
+        );
     }
 
     // --- Static safe-list -------------------------------------------------
@@ -1256,7 +1379,7 @@ mod tests {
             "wc -l data/x.csv",
             "head -n 5 data/y",
             "jq '.a' data/z.json",
-            "cat /etc/hosts",                // out-of-workspace READ is safe (wanted)
+            "cat /etc/hosts", // out-of-workspace READ is safe (wanted)
         ] {
             assert_settled(bash(cmd), RiskLane::Safe, cmd);
         }
@@ -1335,7 +1458,11 @@ mod tests {
         // A read-only head with an out-of-workspace write redirect is NOT safe.
         assert_needs_judge(bash("grep x data/f > /etc/out"), "redirect outside ws");
         // Same head redirecting in-workspace stays safe.
-        assert_settled(bash("grep x data/f > data/out"), RiskLane::Safe, "redirect in ws");
+        assert_settled(
+            bash("grep x data/f > data/out"),
+            RiskLane::Safe,
+            "redirect in ws",
+        );
     }
 
     // --- Safe-list evasion regressions (harden findings) -------------------
@@ -1344,13 +1471,28 @@ mod tests {
     fn leading_redirect_does_not_mask_the_command() {
         // A redirect BEFORE the command must not be taken for the command word.
         // The real command after it is classified, in both lanes:
-        assert_settled(bash("2>data/log rm -rf /"), RiskLane::Catastrophic, "leading-redirect catastrophic");
-        assert_settled(bash(">out.txt rm -rf /"), RiskLane::Catastrophic, "leading-redirect catastrophic 2");
-        assert_needs_judge(bash("2>data/log curl -X POST https://x"), "leading-redirect side-effect");
+        assert_settled(
+            bash("2>data/log rm -rf /"),
+            RiskLane::Catastrophic,
+            "leading-redirect catastrophic",
+        );
+        assert_settled(
+            bash(">out.txt rm -rf /"),
+            RiskLane::Catastrophic,
+            "leading-redirect catastrophic 2",
+        );
+        assert_needs_judge(
+            bash("2>data/log curl -X POST https://x"),
+            "leading-redirect side-effect",
+        );
         assert_needs_judge(bash("2>data/log make deploy"), "leading-redirect unknown");
         // A genuinely redirect-only segment is still safe.
         assert_settled(bash("command 2>/dev/null"), RiskLane::Safe, "redirect-only");
-        assert_settled(bash("2>/dev/null ls -la"), RiskLane::Safe, "leading harmless redirect + read");
+        assert_settled(
+            bash("2>/dev/null ls -la"),
+            RiskLane::Safe,
+            "leading harmless redirect + read",
+        );
     }
 
     #[test]
@@ -1381,7 +1523,11 @@ mod tests {
             assert_needs_judge(bash(cmd), cmd);
         }
         // In-workspace download targets stay safe.
-        assert_settled(bash("curl -o data/out.json https://x/d"), RiskLane::Safe, "download in ws");
+        assert_settled(
+            bash("curl -o data/out.json https://x/d"),
+            RiskLane::Safe,
+            "download in ws",
+        );
     }
 
     #[test]
@@ -1396,7 +1542,11 @@ mod tests {
             assert_needs_judge(bash(cmd), cmd);
         }
         // Benign global flags (`-C <dir>`) on a read-only subcommand stay safe.
-        assert_settled(bash("git -C some/repo log"), RiskLane::Safe, "git -C read-only");
+        assert_settled(
+            bash("git -C some/repo log"),
+            RiskLane::Safe,
+            "git -C read-only",
+        );
     }
 
     #[test]
@@ -1485,12 +1635,18 @@ mod tests {
         let StaticVerdict::NeedsJudge(ji) = bash("rm -rf /etc/nginx") else {
             panic!("expected NeedsJudge");
         };
-        assert!(ji.out_of_workspace, "out-of-workspace target must be flagged");
+        assert!(
+            ji.out_of_workspace,
+            "out-of-workspace target must be flagged"
+        );
 
         let StaticVerdict::NeedsJudge(ji) = bash("rm -rf data/tmp") else {
             panic!("expected NeedsJudge");
         };
-        assert!(!ji.out_of_workspace, "in-workspace target must not be flagged");
+        assert!(
+            !ji.out_of_workspace,
+            "in-workspace target must not be flagged"
+        );
     }
 
     #[test]
@@ -1535,7 +1691,12 @@ mod tests {
             let c = fb_bash(cmd);
             assert_eq!(c.lane, RiskLane::IrreversibleDanger, "{cmd}");
             assert!(c.category.is_some(), "{cmd}");
-            assert!(c.summary.as_deref().is_some_and(|s| s.starts_with("May perform")), "{cmd}");
+            assert!(
+                c.summary
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with("May perform")),
+                "{cmd}"
+            );
         }
         for code in [
             "import requests; requests.post(url)",
@@ -1574,7 +1735,9 @@ mod tests {
                 "{cmd}"
             );
             assert!(
-                c.summary.as_deref().is_some_and(|s| s.contains("outside the workspace")),
+                c.summary
+                    .as_deref()
+                    .is_some_and(|s| s.contains("outside the workspace")),
                 "{cmd}"
             );
         }
@@ -1641,7 +1804,10 @@ mod tests {
 
     #[test]
     fn permission_summary_describes_the_risk() {
-        let s = permission_summary(tn::RUN_BASH, &json!({ "command": "curl -X POST https://x" }));
+        let s = permission_summary(
+            tn::RUN_BASH,
+            &json!({ "command": "curl -X POST https://x" }),
+        );
         assert!(s.contains("mutating HTTP"), "summary was: {s}");
         // A Python outbound write is the ExternalApi category — same HTTP phrasing.
         let s = permission_summary(tn::RUN_PYTHON, &json!({ "code": "requests.post(u)" }));
@@ -1748,8 +1914,14 @@ mod tests {
             static_side_effect_category("osascript -e 'tell application \"Mail\" to send'"),
             Some(Email)
         );
-        assert_eq!(static_side_effect_category("gh pr create --fill"), Some(CloudCli));
-        assert_eq!(static_side_effect_category("aws s3 rm s3://b/k"), Some(CloudCli));
+        assert_eq!(
+            static_side_effect_category("gh pr create --fill"),
+            Some(CloudCli)
+        );
+        assert_eq!(
+            static_side_effect_category("aws s3 rm s3://b/k"),
+            Some(CloudCli)
+        );
         // Python shapes.
         assert_eq!(
             static_side_effect_category("import requests; requests.post(u)"),

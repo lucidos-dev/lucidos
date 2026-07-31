@@ -100,7 +100,8 @@ async fn pending_change_after_session_ended_resumes_branch() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(sid, None);
     assert_eq!(resume_branch, Some(branch.to_string()));
 
@@ -164,7 +165,8 @@ async fn pending_change_branch_with_idled_session_recovers_sid() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(sid, Some("wrong-session".to_string()));
     assert_eq!(resume_branch, Some(canonical_branch.to_string()));
 
@@ -208,7 +210,8 @@ async fn pending_change_with_idled_session_recovers_cc_session_id() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(
         sid,
         Some(session_id.to_string()),
@@ -254,7 +257,8 @@ async fn applied_change_falls_through_to_fresh_start() {
     )
     .await;
 
-    let (sid, resume_branch) = resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
+    let (sid, resume_branch) =
+        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, None).await;
     assert_eq!(sid, None);
     assert_eq!(resume_branch, None);
 
@@ -379,15 +383,20 @@ async fn no_pending_change_with_session_ended_after_idle_recovers_via_caller_sid
         Some(session_id.to_string()),
         "lookup_latest_cc_session_id must surface the sid from CodingAgentIdled \
          so the chat handler has something to pass to the resolver"
-        );
+    );
 
-        let (sid_with_caller, branch_with_caller) =
-            resolve_resume_context(&pool, bus.changes_projection(), thread_id, recovered_sid, None)
-                .await;
-        assert_eq!(
-            sid_with_caller,
-            Some(session_id.to_string()),
-            "caller-supplied sid must win — this is what preserves CC \
+    let (sid_with_caller, branch_with_caller) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        recovered_sid,
+        None,
+    )
+    .await;
+    assert_eq!(
+        sid_with_caller,
+        Some(session_id.to_string()),
+        "caller-supplied sid must win: this is what preserves CC \
          conversation memory across the in-memory session being torn down"
     );
     assert_eq!(branch_with_caller, Some(branch.to_string()));
@@ -488,8 +497,13 @@ async fn lookup_pinned_config_dir_prefers_first() {
     let thread_id = Uuid::new_v4();
 
     seed_session_started(&bus, thread_id, "sess-1", "claude-code/multi-cfg").await;
-    emit_settings_with_config_dir(&bus, thread_id, Some("sess-1"), Some("/home/u/.claude-personal"))
-        .await;
+    emit_settings_with_config_dir(
+        &bus,
+        thread_id,
+        Some("sess-1"),
+        Some("/home/u/.claude-personal"),
+    )
+    .await;
     // A settings-only change (model switch) carries no config dir — must not shadow.
     emit_settings_with_config_dir(&bus, thread_id, None, None).await;
 
@@ -601,7 +615,8 @@ async fn lookup_session_id_for_config_dir_scopes_to_account() {
     )
     .await;
     // A LATER session recorded under a different account (the mis-pin flip).
-    emit_settings_with_config_dir(&bus, thread_id, Some("sess-work"), Some("/home/u/.claude")).await;
+    emit_settings_with_config_dir(&bus, thread_id, Some("sess-work"), Some("/home/u/.claude"))
+        .await;
 
     assert_eq!(
         lookup_latest_cc_session_id_for_config_dir(&pool, thread_id, "/home/u/.claude-personal")
@@ -639,8 +654,13 @@ async fn resolve_resume_context_resumes_session_under_pinned_account() {
 
     // Turn 1: session A under the personal account, then idled.
     seed_session_started(&bus, thread_id, "sess-A", branch).await;
-    emit_settings_with_config_dir(&bus, thread_id, Some("sess-A"), Some("/home/u/.claude-personal"))
-        .await;
+    emit_settings_with_config_dir(
+        &bus,
+        thread_id,
+        Some("sess-A"),
+        Some("/home/u/.claude-personal"),
+    )
+    .await;
     emit_idled(&bus, thread_id, Some("sess-A"), None).await;
     // Toggle flip: a later session B recorded under a DIFFERENT account, then idled
     // (this is the globally-newest session + lifecycle event).
@@ -652,9 +672,14 @@ async fn resolve_resume_context_resumes_session_under_pinned_account() {
     assert_eq!(pinned.as_deref(), Some("/home/u/.claude-personal"));
 
     // Auto-detect resume (no caller sid), scoped to the pin: resumes session A, not B.
-    let (sid, resume_branch) =
-        resolve_resume_context(&pool, bus.changes_projection(), thread_id, None, pinned.as_deref())
-            .await;
+    let (sid, resume_branch) = resolve_resume_context(
+        &pool,
+        bus.changes_projection(),
+        thread_id,
+        None,
+        pinned.as_deref(),
+    )
+    .await;
     assert_eq!(
         sid,
         Some("sess-A".to_string()),
@@ -719,8 +744,7 @@ async fn emit_idled(
 #[test]
 fn deterministic_path_is_short_thread_prefix_under_workspace_worktrees() {
     let workspace = std::path::PathBuf::from("/tmp/ws");
-    let thread_id =
-        Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
+    let thread_id = Uuid::parse_str("01234567-89ab-cdef-0123-456789abcdef").unwrap();
     let path = deterministic_worktree_path(&workspace, thread_id);
     assert_eq!(
         path,
@@ -735,8 +759,7 @@ async fn first_turn_creates_deterministic_worktree_path() {
     let workspace = tempfile::tempdir().unwrap();
     let thread_id = Uuid::new_v4();
 
-    let path = resolve_worktree_path(&pool, thread_id, workspace.path(), &repo_root, None)
-        .await;
+    let path = resolve_worktree_path(&pool, thread_id, workspace.path(), &repo_root, None).await;
     let expected_suffix = format!(
         "thread-{}",
         &thread_id.simple().to_string()[..THREAD_WORKTREE_ID_LEN]
@@ -765,9 +788,7 @@ async fn subsequent_turns_reuse_recorded_worktree_path() {
     seed_session_started(&bus, thread_id, "sid-1", "claude-code/test").await;
 
     // Simulate Phase-6.1 idle that recorded a path.
-    let recorded = workspace
-        .path()
-        .join(".lucidos/worktrees/thread-deadbeef");
+    let recorded = workspace.path().join(".lucidos/worktrees/thread-deadbeef");
     emit_idled(&bus, thread_id, Some("sid-1"), Some(&recorded)).await;
 
     let resolved =
@@ -805,13 +826,7 @@ async fn legacy_threads_resolve_via_git_worktree_list_fallback() {
     let wt_tmp = tempfile::tempdir().unwrap();
     let wt_path = wt_tmp.path().join("legacy-wt");
     let out = git_cmd(
-        &[
-            "worktree",
-            "add",
-            wt_path.to_str().unwrap(),
-            "-b",
-            branch,
-        ],
+        &["worktree", "add", wt_path.to_str().unwrap(), "-b", branch],
         &repo_root,
     )
     .await
@@ -822,20 +837,12 @@ async fn legacy_threads_resolve_via_git_worktree_list_fallback() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    let resolved = resolve_worktree_path(
-        &pool,
-        thread_id,
-        workspace.path(),
-        &repo_root,
-        Some(branch),
-    )
-    .await;
+    let resolved =
+        resolve_worktree_path(&pool, thread_id, workspace.path(), &repo_root, Some(branch)).await;
     // `git worktree list` may canonicalize symlinks (macOS resolves
     // `/var/folders/...` → `/private/var/folders/...`), so compare
     // canonicalized paths to make the assertion symlink-tolerant.
-    let canon = |p: &std::path::Path| {
-        std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf())
-    };
+    let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
     assert_eq!(
         canon(&resolved),
         canon(&wt_path),
@@ -866,8 +873,7 @@ async fn legacy_thread_with_no_on_disk_worktree_falls_through_to_deterministic_p
         Some("claude-code/no-worktree"),
     )
     .await;
-    let expected =
-        deterministic_worktree_path(workspace.path(), thread_id);
+    let expected = deterministic_worktree_path(workspace.path(), thread_id);
     assert_eq!(
         resolved, expected,
         "must fall through to deterministic path when branch has no worktree on disk"
@@ -1097,15 +1103,15 @@ async fn spawn_refuses_when_user_checked_out_different_branch() {
     // … but the user externally jumped to a different branch.
     let _ = git_cmd(&["checkout", "-b", "user-detour"], &repo_root).await;
 
-        let err = super::super::external_edits::verify_branch(&repo_root, expected_branch)
-            .await
-            .expect_err("branch mismatch must refuse the spawn");
+    let err = super::super::external_edits::verify_branch(&repo_root, expected_branch)
+        .await
+        .expect_err("branch mismatch must refuse the spawn");
     assert_eq!(err.expected, expected_branch);
     assert_eq!(err.found.as_deref(), Some("user-detour"));
-        let msg = format!("{}", err);
+    let msg = format!("{}", err);
     assert!(msg.contains("user-detour"));
-        assert!(msg.contains(expected_branch));
-        assert!(msg.contains("Resolve manually"));
+    assert!(msg.contains(expected_branch));
+    assert!(msg.contains("Resolve manually"));
 
     _pool.close().await;
     teardown_test_db(&_db_name).await;

@@ -29,11 +29,11 @@ pub use provider_build::{
 };
 pub use provider_selection::{select_provider, ProviderSelection, ProviderSelectionInputs};
 pub use routing::RoutingProvider;
-pub use unconfigured::{UnconfiguredProvider, NO_PROVIDER_MESSAGE};
 pub use tools::{
     get_default_tools, get_image_generation_tool, get_navigate_ui_tool, get_notification_tool,
     get_save_thread_image_tool, get_view_image_tool,
 };
+pub use unconfigured::{UnconfiguredProvider, NO_PROVIDER_MESSAGE};
 pub use vertex::VertexProvider;
 pub use web_search::{WebSearchChain, WebSearchProvider, NO_SEARCH_BACKEND};
 

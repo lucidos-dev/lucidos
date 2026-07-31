@@ -227,5 +227,8 @@ fn reconcile_cc_model_passes_through_when_no_1m() {
         reconcile_cc_model(Some("sonnet"), "claude-sonnet-4-6"),
         "sonnet"
     );
-    assert_eq!(reconcile_cc_model(None, "claude-opus-4-7"), "claude-opus-4-7");
+    assert_eq!(
+        reconcile_cc_model(None, "claude-opus-4-7"),
+        "claude-opus-4-7"
+    );
 }

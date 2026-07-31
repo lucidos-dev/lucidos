@@ -13,8 +13,8 @@ fn from_created_event_prompt() {
 
     let config = TriggerConfig::from_created_payload(&payload).unwrap();
     assert_eq!(config.id, "sleep-reminder");
-        assert_eq!(config.name, "Sleep Reminder");
-        assert_eq!(config.schedule, vec!["0 0 22 * * 1-5"]);
+    assert_eq!(config.name, "Sleep Reminder");
+    assert_eq!(config.schedule, vec!["0 0 22 * * 1-5"]);
     assert_eq!(config.timezone, "Europe/Oslo");
     assert!(matches!(config.run, TriggerRun::Intent { .. }));
     assert!(!config.paused);
@@ -116,11 +116,11 @@ fn apply_update_partial() {
     config.apply_update(&update);
     assert_eq!(config.schedule, vec!["0 0 23 * * *"]);
     assert_eq!(config.name, "Sleep Reminder"); // unchanged
-    }
+}
 
-    #[test]
-    fn apply_update_name_only() {
-        let payload = json!({
+#[test]
+fn apply_update_name_only() {
+    let payload = json!({
             "trigger_id": "test",
         "name": "Old Name",
         "schedule": ["0 0 8 * * *"],
@@ -771,7 +771,7 @@ fn derive_app_id_rejects_traversal_and_dotfile_dirs() {
     // A malformed `apps/..` or `apps/.git` path must not become a fake app
     // id on the frontend popover.
     assert_eq!(derive_app_id_from_script_path("apps/../foo/bar"), None);
-        assert_eq!(derive_app_id_from_script_path("apps/./foo"), None);
+    assert_eq!(derive_app_id_from_script_path("apps/./foo"), None);
     assert_eq!(derive_app_id_from_script_path("apps/.git/x/y"), None);
     assert_eq!(derive_app_id_from_script_path("apps//foo"), None);
 }
@@ -849,7 +849,10 @@ fn apply_update_ignores_invalid_slug() {
     let before = config.slug.clone();
 
     config.apply_update(&json!({ "trigger_id": "t1", "slug": "Has Spaces" }));
-    assert_eq!(config.slug, before, "invalid slug must not clobber existing");
+    assert_eq!(
+        config.slug, before,
+        "invalid slug must not clobber existing"
+    );
 }
 
 #[test]
@@ -989,7 +992,9 @@ fn from_created_payload_side_effect_grant_defaults_empty_and_skips_unknown() {
         "side_effect_grant": ["email", "email", "future_category", "cloud_cli"],
     });
     assert_eq!(
-        TriggerConfig::from_created_payload(&payload).unwrap().side_effect_grant,
+        TriggerConfig::from_created_payload(&payload)
+            .unwrap()
+            .side_effect_grant,
         vec![SideEffectCategory::Email, SideEffectCategory::CloudCli]
     );
 }

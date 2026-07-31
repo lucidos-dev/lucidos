@@ -4,6 +4,8 @@
     display: flex;
     flex-direction: column;
     height: 100%;
+    /* Containing block for .app-ui-cover below. */
+    position: relative;
 }
 
 .app-ui-iframe {
@@ -13,8 +15,30 @@
     background: var(--bg-primary);
 }
 
-.app-iframe-refreshing {
-    opacity: 0.4;
+/* Opaque theme surface over a frame that has nothing to show yet, crossfaded
+   out on the frame's `load`. Without it the iOS PWA flashes WHITE on every app
+   open: WKWebView paints the frame's base canvas white, and both things that
+   would say otherwise arrive late over the network (the app's own stylesheet,
+   and `/api/v1/sdk-prefs.js`, which is what applies the theme). Neither is
+   reachable from the host, so the host hides the frame until it is ready
+   instead. Mounted by AppUiInline.tsx; rationale in AppUiInline.test.ts. */
+.app-ui-cover {
+    position: absolute;
+    inset: 0;
+    background: var(--bg-primary);
+    pointer-events: none;
+    opacity: 1;
+    transition: opacity var(--duration-normal) ease;
+}
+
+.app-ui-cover.is-clearing {
+    opacity: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+    .app-ui-cover {
+        transition: none;
+    }
 }
 
 /* --- Pseudo-fullscreen (CSS fallback when native Fullscreen API is unavailable, e.g. iOS Safari) --- */

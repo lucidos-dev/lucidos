@@ -68,10 +68,7 @@ mod tests {
 
     #[test]
     fn apply_url_targets_changes_endpoint() {
-        let url = apply_url(
-            &workspace(5173),
-            "00000000-0000-0000-0000-000000000001",
-        );
+        let url = apply_url(&workspace(5173), "00000000-0000-0000-0000-000000000001");
         assert_eq!(
             url,
             "https://localhost:5173/api/v1/changes/00000000-0000-0000-0000-000000000001/apply"

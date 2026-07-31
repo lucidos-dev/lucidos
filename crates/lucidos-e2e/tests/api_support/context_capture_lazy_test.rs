@@ -126,7 +126,11 @@ async fn context_endpoint_returns_full_sections_and_tools() {
 
     let client = http_client();
     let url = format!("{}/api/v1/events/{}/context", base_url(), event_id);
-    let resp = client.get(&url).send().await.expect("context request failed");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("context request failed");
     assert_eq!(resp.status(), 200);
 
     let body: Value = resp.json().await.expect("invalid JSON");
@@ -169,7 +173,11 @@ async fn context_endpoint_rejects_non_context_captured_event() {
 
     let client = http_client();
     let url = format!("{}/api/v1/events/{}/context", base_url(), msg_event);
-    let resp = client.get(&url).send().await.expect("context request failed");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("context request failed");
     assert_eq!(resp.status(), 404);
 }
 
@@ -180,7 +188,11 @@ async fn context_endpoint_404_on_unknown_event_id() {
     let client = http_client();
     let unknown = Uuid::new_v4();
     let url = format!("{}/api/v1/events/{}/context", base_url(), unknown);
-    let resp = client.get(&url).send().await.expect("context request failed");
+    let resp = client
+        .get(&url)
+        .send()
+        .await
+        .expect("context request failed");
     assert_eq!(resp.status(), 404);
 }
 

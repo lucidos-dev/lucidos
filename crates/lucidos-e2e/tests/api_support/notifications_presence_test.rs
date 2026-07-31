@@ -253,9 +253,7 @@ async fn s3_notification_with_connected_sse_but_no_candidate_runs_presence_check
     // SSE stream may also carry a sibling notification's frame.
     lines
         .iter()
-        .find(|l| {
-            l.contains("\"type\":\"PresenceCheck\"") && l.contains(&notification_id)
-        })
+        .find(|l| l.contains("\"type\":\"PresenceCheck\"") && l.contains(&notification_id))
         .unwrap_or_else(|| {
             panic!(
                 "Expected a PresenceCheck SSE event carrying notification_id={} from a connected \
@@ -456,8 +454,11 @@ async fn s4_active_pong_emits_toast_request_and_suppresses_push() {
     // notification.
     tokio::time::sleep(Duration::from_millis(500)).await;
 
-    let notification_id =
-        create_notification(&format!("Test active-pong {}", suffix), "should toast, not push").await;
+    let notification_id = create_notification(
+        &format!("Test active-pong {}", suffix),
+        "should toast, not push",
+    )
+    .await;
 
     let lines = sse_handle.await.expect("SSE task panicked");
 

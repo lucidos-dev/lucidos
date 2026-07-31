@@ -202,8 +202,7 @@ mod tests {
 
     #[test]
     fn detect_empty_cleaned_text_when_block_is_whole_message() {
-        let text =
-            r#"<invoke name="bash_output"><parameter name="task_id">t</parameter></invoke>"#;
+        let text = r#"<invoke name="bash_output"><parameter name="task_id">t</parameter></invoke>"#;
         let d = detect_inline_tool_call(text, KNOWN).expect("should detect");
         assert_eq!(d.cleaned_text, "");
     }

@@ -84,8 +84,7 @@ async fn dismiss_from_context_rejects_missing_event_id() {
     );
 
     // Whitespace-only also counts as missing.
-    let out =
-        dismiss_from_context_impl(&pool, &bus, &json!({"event_id": "   "}), thread_id).await;
+    let out = dismiss_from_context_impl(&pool, &bus, &json!({"event_id": "   "}), thread_id).await;
     assert!(
         matches!(&out, Err(msg) if msg.contains("event_id is required")),
         "whitespace-only event_id should error, got: {:?}",
@@ -297,13 +296,8 @@ async fn dismiss_from_context_accepts_evt_prefixed_form() {
     .await;
 
     let prefixed = format!("evt-{}", event_id.simple());
-    let out = dismiss_from_context_impl(
-        &pool,
-        &bus,
-        &json!({"event_id": prefixed}),
-        thread_id,
-    )
-    .await;
+    let out =
+        dismiss_from_context_impl(&pool, &bus, &json!({"event_id": prefixed}), thread_id).await;
     assert!(out.is_ok(), "evt-<uuid> form must succeed, got: {:?}", out);
 
     // And the bare hyphenated form should also still work (regression
@@ -466,7 +460,12 @@ mod build_query_events_response_tests {
 #[test]
 fn apply_change_rejects_missing_change_id() {
     // Missing, null, empty, and whitespace-only all collapse to "required".
-    for bad in [json!({}), json!({"change_id": null}), json!({"change_id": ""}), json!({"change_id": "   "})] {
+    for bad in [
+        json!({}),
+        json!({"change_id": null}),
+        json!({"change_id": ""}),
+        json!({"change_id": "   "}),
+    ] {
         let out = parse_apply_change_id(&bad);
         assert!(
             matches!(&out, Err(msg) if msg.contains("change_id is required")),
@@ -557,8 +556,7 @@ fn thread_queue_policy_patch_rejects_empty_or_bad_fields() {
 
 #[test]
 fn thread_queue_policy_patch_rejects_unknown_fields() {
-    let out =
-        merge_thread_queue_policy_patch(CapacityPolicy::default(), &json!({"max_total": 12}));
+    let out = merge_thread_queue_policy_patch(CapacityPolicy::default(), &json!({"max_total": 12}));
     assert!(
         matches!(&out, Err(msg) if msg.contains("unknown Thread Queue policy field")),
         "unknown field should error, got: {out:?}"

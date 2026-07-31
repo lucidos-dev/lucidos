@@ -292,7 +292,13 @@ impl EmailClient {
     ) -> Result<(String, String, Vec<u8>), BoxError> {
         tokio::time::timeout(
             IMAP_OP_TIMEOUT,
-            Self::fetch_attachment_unbounded(account, uid, attachment_index, folder, oauth_access_token),
+            Self::fetch_attachment_unbounded(
+                account,
+                uid,
+                attachment_index,
+                folder,
+                oauth_access_token,
+            ),
         )
         .await
         .map_err(|_| imap_op_timed_out(account, "attachment fetch"))?

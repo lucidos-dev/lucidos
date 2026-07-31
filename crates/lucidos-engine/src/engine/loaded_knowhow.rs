@@ -237,7 +237,11 @@ mod tests {
 
         store.recover_for_thread(tid, &events).await;
         let out = store.for_thread(tid).await;
-        assert_eq!(out.len(), 2, "should recover exactly the two load_knowhow docs");
+        assert_eq!(
+            out.len(),
+            2,
+            "should recover exactly the two load_knowhow docs"
+        );
         // BTreeMap preserves id-sorted order: alpha then beta.
         assert_eq!(out[0].id, "alpha");
         assert_eq!(out[0].body, "ALPHA BODY");

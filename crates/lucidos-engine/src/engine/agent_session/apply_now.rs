@@ -435,14 +435,14 @@ impl LucidosEngine {
         // App threads skip the /harden + test gate entirely (apps own their
         // hardening). Probe the marker only for non-app threads — mirrors the
         // `is_app()` skip in `change_ops::apply_change`.
-        let is_app = crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
-            .await
-            .is_app();
-        let branch_hardened = !is_app
-            && branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await;
+        let is_app =
+            crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
+                .await
+                .is_app();
+        let branch_hardened =
+            !is_app && branch_is_hardened(&self.pool, self.changes(), repo_root, branch_name).await;
         if should_run_in_session_hardening(is_app, branch_hardened) {
-            self.request_hardening_in_session(thread_id, msg_tx)
-                .await?;
+            self.request_hardening_in_session(thread_id, msg_tx).await?;
             self.wait_and_commit(
                 thread_id,
                 idle_notify,
@@ -514,11 +514,8 @@ impl LucidosEngine {
                 .next();
             if let Some(change) = pending_change {
                 let already_on_main = change.files.is_empty()
-                    || crate::engine::git_ops::main_history_touches_files(
-                        repo_root,
-                        &change.files,
-                    )
-                    .await;
+                    || crate::engine::git_ops::main_history_touches_files(repo_root, &change.files)
+                        .await;
                 if already_on_main {
                     log!(
                         "[ApplyNow] Branch {} already present on main — marking pending change {} applied (no-op)",
@@ -744,8 +741,7 @@ impl LucidosEngine {
             return Err(e);
         }
 
-        if !crate::engine::agent_recovery::last_turn_ended_cleanly(&self.pool, thread_id).await
-        {
+        if !crate::engine::agent_recovery::last_turn_ended_cleanly(&self.pool, thread_id).await {
             let _ = git_cmd(&["merge", "--abort"], worktree_path).await;
             return Err(
                 "Conflict resolution did not finish cleanly — merge aborted. The change is still pending; try applying again.".into(),
@@ -762,7 +758,8 @@ impl LucidosEngine {
         .unwrap_or(false);
         if !main_merged {
             return Err(
-                "Coding agent session ended without completing the merge. Try applying again.".into(),
+                "Coding agent session ended without completing the merge. Try applying again."
+                    .into(),
             );
         }
 
@@ -1018,11 +1015,9 @@ impl LucidosEngine {
                 // pair `maybe_emit_app_ui_refresh` next to `emit_change_applied`
                 // — this in-CC in-place merge path used to skip it, leaving
                 // the iframe stale after a same-thread Apply.
-                let kind_ctx = crate::engine::change_ops::load_apply_kind_context(
-                    &self.pool,
-                    Some(thread_id),
-                )
-                .await;
+                let kind_ctx =
+                    crate::engine::change_ops::load_apply_kind_context(&self.pool, Some(thread_id))
+                        .await;
                 self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref())
                     .await;
                 self.emit_entity_events_for_change_apply(

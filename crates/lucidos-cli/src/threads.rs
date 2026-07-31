@@ -22,7 +22,11 @@ pub(crate) fn cmd_list(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), B
     send_and_print("GET", &url, req)
 }
 
-pub(crate) fn cmd_count(ws: &Workspace, active: Option<bool>, source: Option<&str>) -> Result<(), BoxError> {
+pub(crate) fn cmd_count(
+    ws: &Workspace,
+    active: Option<bool>,
+    source: Option<&str>,
+) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/threads/count", ws.base_url());
     let params = build_query_params(active, source, None);
     let mut req = http_client()?.get(&url);

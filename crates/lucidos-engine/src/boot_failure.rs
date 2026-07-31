@@ -228,7 +228,10 @@ mod tests {
 
         assert!(msg.contains("newer version of Lucidos"), "{msg}");
         assert!(msg.contains("5 migrations"), "{msg}");
-        assert!(msg.contains("20260728091039"), "newest unknown version: {msg}");
+        assert!(
+            msg.contains("20260728091039"),
+            "newest unknown version: {msg}"
+        );
         assert!(msg.contains(VERSION), "names this build: {msg}");
         // The invariant that keeps the message honest — migrations carry no
         // app-version tag, so no upgrade target may be invented.
@@ -251,9 +254,13 @@ mod tests {
     /// still name the version sqlx reported rather than claiming "0 migrations".
     #[test]
     fn unreadable_migration_table_falls_back_to_the_reported_version() {
-        let msg =
-            terminal_migration_message(&MigrateError::VersionMissing(20260713144403), &[], &[], VERSION)
-                .expect("terminal");
+        let msg = terminal_migration_message(
+            &MigrateError::VersionMissing(20260713144403),
+            &[],
+            &[],
+            VERSION,
+        )
+        .expect("terminal");
         assert!(msg.contains("1 migration this version"), "{msg}");
         assert!(msg.contains("20260713144403"), "{msg}");
     }
@@ -263,7 +270,10 @@ mod tests {
         let mismatch =
             terminal_migration_message(&MigrateError::VersionMismatch(42), &[], &[], VERSION)
                 .expect("terminal");
-        assert!(mismatch.contains("differs from the one already applied"), "{mismatch}");
+        assert!(
+            mismatch.contains("differs from the one already applied"),
+            "{mismatch}"
+        );
 
         let dirty = terminal_migration_message(&MigrateError::Dirty(42), &[], &[], VERSION)
             .expect("terminal");

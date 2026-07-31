@@ -12,9 +12,7 @@ pub(crate) struct ParsedQuestion {
 /// ids are synthesized from the array index because CC doesn't supply stable
 /// ids; they stay stable across reloads because the `UserQuestionAsked` event
 /// is persisted intact.
-pub(crate) fn parse_ask_user_question_inputs(
-    input: &serde_json::Value,
-) -> Vec<ParsedQuestion> {
+pub(crate) fn parse_ask_user_question_inputs(input: &serde_json::Value) -> Vec<ParsedQuestion> {
     let Some(arr) = input.get("questions").and_then(|q| q.as_array()) else {
         return Vec::new();
     };
@@ -105,7 +103,10 @@ mod tests {
         assert_eq!(q.options.len(), 2);
         assert_eq!(q.options[0].id, "opt-0");
         assert_eq!(q.options[0].label, "Postgres");
-        assert_eq!(q.options[0].description.as_deref(), Some("Production-grade"));
+        assert_eq!(
+            q.options[0].description.as_deref(),
+            Some("Production-grade")
+        );
         assert_eq!(q.options[1].id, "opt-1");
         assert_eq!(q.options[1].label, "SQLite");
         assert!(
@@ -266,7 +267,10 @@ mod tests {
         assert_eq!(parsed[0].options[0].label, "New page");
 
         assert_eq!(parsed[1].question, "Pick filters");
-        assert!(parsed[1].multi_select, "second question's multiSelect must be honored independently");
+        assert!(
+            parsed[1].multi_select,
+            "second question's multiSelect must be honored independently"
+        );
         assert_eq!(parsed[1].options.len(), 2);
         // Per-question option ids restart at opt-0 — the answer-resolution
         // layer keys on (question_index, option_id), so this is correct.
@@ -274,7 +278,10 @@ mod tests {
         assert_eq!(parsed[1].options[1].id, "opt-1");
 
         assert_eq!(parsed[2].question, "Commit strategy?");
-        assert!(!parsed[2].multi_select, "absent multiSelect on third defaults to false");
+        assert!(
+            !parsed[2].multi_select,
+            "absent multiSelect on third defaults to false"
+        );
         assert_eq!(parsed[2].options.len(), 1);
     }
 }

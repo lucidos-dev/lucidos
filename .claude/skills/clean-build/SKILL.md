@@ -25,12 +25,14 @@ re-run until every phase is clean.
    Covers lib, bins, tests, and examples — catches `dead_code` / `unused`
    that a release-only build misses.
 
-2. **ShellCheck + clippy, deny warnings, all targets, all features:**
+2. **ShellCheck + rustfmt + clippy, deny warnings, all targets, all features:**
    ```sh
    make lint
    ```
    `make lint` IS the canonical lint gate: `lint-shell` (ShellCheck over every
-   tracked `*.sh`) then `lint-rust` (clippy). The clippy flag list lives in
+   tracked `*.sh`), then `lint-fmt` (`cargo fmt --all --check`, which fails if
+   any tracked Rust file is not rustfmt-clean; `make fmt` is the fix), then
+   `lint-rust` (clippy). The clippy flag list lives in
    exactly one place — `CLIPPY_FLAGS` in the `Makefile`, where each flag is
    justified inline. This skill and `/harden` Phase 4.5 — the gate that runs
    per change — both *call* `make lint` rather than restating the flags, so it cannot mean

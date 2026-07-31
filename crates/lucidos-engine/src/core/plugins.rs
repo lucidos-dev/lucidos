@@ -247,8 +247,8 @@ pub fn validate_tree(root: &Path) -> Result<(PluginManifest, Vec<PlannedFile>), 
         .map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
     let manifest = parse_manifest(&toml_text)?;
 
-    let entries = std::fs::read_dir(root)
-        .map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
+    let entries =
+        std::fs::read_dir(root).map_err(|e| ValidationError::ManifestParseError(e.to_string()))?;
     for entry in entries.flatten() {
         let name = entry.file_name();
         let name_str = name.to_string_lossy();

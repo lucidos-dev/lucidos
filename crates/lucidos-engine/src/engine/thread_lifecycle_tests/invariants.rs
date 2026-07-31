@@ -1,8 +1,6 @@
 use super::*;
 
-const SECTION_TRANSITION_EVENTS: &[(&str, &str)] = &[
-    ("ThreadArchived", "archived"),
-];
+const SECTION_TRANSITION_EVENTS: &[(&str, &str)] = &[("ThreadArchived", "archived")];
 
 // 25. start_events_set_status_running
 #[test]
@@ -214,7 +212,13 @@ fn is_blocking_definition() {
     assert!(is_blocking(chat, Running, Archived, false, false));
     assert!(is_blocking(cc, Running, Archived, true, false));
     assert!(is_blocking(cc, Running, Archived, true, true));
-    assert!(is_blocking(cc, WaitingForUserAnswer, Archived, false, false));
+    assert!(is_blocking(
+        cc,
+        WaitingForUserAnswer,
+        Archived,
+        false,
+        false
+    ));
 
     // Archived + Idle does NOT block — the user dismissed the thread and
     // it isn't stranding active work. Holds even with pending changes (the

@@ -179,10 +179,7 @@ impl LucidosEngine {
         // which is generated inside spawn and unavailable until after the
         // script file is written.
         let run_id = uuid::Uuid::new_v4().to_string();
-        let script_dir = self
-            .workspace_path()
-            .join(".lucidos/exhaust")
-            .join(&run_id);
+        let script_dir = self.workspace_path().join(".lucidos/exhaust").join(&run_id);
         if let Err(e) = std::fs::create_dir_all(&script_dir) {
             return Err(format!(
                 "Error: failed to create script staging dir {}: {}",
@@ -200,7 +197,8 @@ impl LucidosEngine {
         }
 
         let env_vars = self.build_script_env_vars(Some(thread_id)).await;
-        let command = build_python_background_command(self.python_runtime.python_bin(), &script_path);
+        let command =
+            build_python_background_command(self.python_runtime.python_bin(), &script_path);
         // The constructed command embeds absolute paths only — no user
         // secrets — but stay consistent with bash.rs and redact through
         // the same helper before logging.
@@ -234,10 +232,7 @@ impl LucidosEngine {
                 // startup sweep wipes `.lucidos/staging` but preserves
                 // exhaust for audit.
                 std::fs::remove_dir_all(&script_dir).ok();
-                return Err(format!(
-                    "Error: failed to spawn background python: {}",
-                    e
-                ));
+                return Err(format!("Error: failed to spawn background python: {}", e));
             }
         };
 
@@ -265,12 +260,7 @@ impl LucidosEngine {
         // wake text refers to "Background task" (language-agnostic, not
         // "Background bash task") so the LLM sees the right framing for
         // both bash- and python-spawned tasks.
-        self.spawn_bash_completion_watcher(
-            thread_id,
-            task_id.clone(),
-            safe_command,
-            finish_rx,
-        );
+        self.spawn_bash_completion_watcher(thread_id, task_id.clone(), safe_command, finish_rx);
 
         Ok(serde_json::json!({
             "task_id": task_id,
@@ -419,7 +409,11 @@ mod tests {
 
         commit_staged_file(&src, &dst).unwrap();
 
-        assert_eq!(mode_of(&dst), 0o644, "destination mode must survive a commit");
+        assert_eq!(
+            mode_of(&dst),
+            0o644,
+            "destination mode must survive a commit"
+        );
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "{\"new\":true}");
         assert_eq!(mode_of(&src), 0o600, "the staged copy is left alone");
     }

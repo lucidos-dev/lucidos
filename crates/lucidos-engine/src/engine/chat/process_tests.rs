@@ -569,7 +569,24 @@ fn build_capture_sections_tags_existing_sections_with_role_and_group() {
 #[test]
 fn build_capture_sections_filters_empty_sections() {
     let sections = run_build(
-        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &[],
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &[],
     );
     let names: Vec<_> = sections.iter().map(|s| s.name.as_str()).collect();
     assert_eq!(names, vec!["System Instructions", "User Message"]);
@@ -591,7 +608,24 @@ fn build_capture_sections_emits_one_row_per_loaded_knowhow_doc() {
         },
     ];
     let sections = run_build(
-        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &docs, &[],
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &docs,
+        &[],
     );
 
     let knowhow: Vec<_> = sections
@@ -651,7 +685,24 @@ fn build_capture_sections_emits_one_row_per_resume_tool_pair() {
         },
     ];
     let sections = run_build(
-        "", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user msg", &[], &resume,
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user msg",
+        &[],
+        &resume,
     );
 
     let prior: Vec<_> = sections
@@ -712,13 +763,52 @@ fn build_capture_sections_honors_capture_body_flag() {
         body: "BODY".into(),
     }];
     let on = build_capture_sections(
-        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], true,
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user",
+        &docs,
+        &[],
+        true,
     );
     let off = build_capture_sections(
-        "sys", "", "", "", "", "", "", "", "", "", "", "", "", "", "", "user", &docs, &[], false,
+        "sys",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "",
+        "user",
+        &docs,
+        &[],
+        false,
     );
     let sys_on = on.iter().find(|s| s.name == "System Instructions").unwrap();
-    let sys_off = off.iter().find(|s| s.name == "System Instructions").unwrap();
+    let sys_off = off
+        .iter()
+        .find(|s| s.name == "System Instructions")
+        .unwrap();
     assert_eq!(sys_on.content.as_deref(), Some("sys"));
     assert!(sys_off.content.is_none());
     let kh_on = on.iter().find(|s| s.name == "knowhow: doc").unwrap();
@@ -838,9 +928,11 @@ fn chat_prompt_forbids_faking_repeated_actions() {
 
 use super::run::message_can_answer_pending_question;
 use super::run::resolve_route_overrides;
+use super::PreEmittedOrigin;
 use crate::core::{PreferenceStore, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT};
 use crate::engine::thread_events::ActorMode;
 use crate::test_support::{setup_test_db, teardown_test_db};
+use uuid::Uuid;
 
 /// Coding-agent requests use the same HTTP `reasoning_effort` field for an
 /// explicit agent pick, but an omitted field means "fall through to agent
@@ -856,9 +948,15 @@ async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
         .await
         .unwrap();
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, Some(true), None, None, Some("claude-opus-4-8[1m]"), None)
-            .await;
+    let (model, effort) = resolve_route_overrides(
+        &pool,
+        Some(true),
+        None,
+        None,
+        Some("claude-opus-4-8[1m]"),
+        None,
+    )
+    .await;
 
     assert_eq!(model, None);
     assert_eq!(effort, None);
@@ -925,8 +1023,7 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
     .await
     .unwrap();
 
-    let (model, effort) =
-        resolve_route_overrides(&pool, None, Some(tid), None, None, None).await;
+    let (model, effort) = resolve_route_overrides(&pool, None, Some(tid), None, None, None).await;
 
     assert_eq!(model.as_deref(), Some("thread-model"));
     assert_eq!(effort.as_deref(), Some("low"));
@@ -942,6 +1039,22 @@ fn human_follow_up_can_answer_pending_question() {
         false,
         "repo is private, not public",
         ActorMode::Human,
+        None,
+    ));
+}
+
+/// Regression guard for the emit-before-ack path: a human follow-up whose
+/// `MessageReceived` the API boundary already persisted must NOT also be
+/// consumed as the answer. Answering emits `UserQuestionAnswered` and no
+/// `MessageReceived`, so routing a pre-emitted message here would leave two
+/// events in the thread for one thing the user said.
+#[test]
+fn pre_emitted_message_cannot_also_answer_pending_question() {
+    assert!(!message_can_answer_pending_question(
+        false,
+        "repo is private, not public",
+        ActorMode::Human,
+        Some(PreEmittedOrigin::Message(Uuid::new_v4())),
     ));
 }
 
@@ -958,6 +1071,7 @@ fn child_completion_wake_cannot_answer_pending_question() {
         false,
         "[CHILD THREAD COMPLETED] 59328631… success\nSession summary…",
         ActorMode::Agent,
+        None,
     ));
 }
 
@@ -969,6 +1083,7 @@ fn engine_driven_message_cannot_answer_pending_question() {
         false,
         "engine recovery note",
         ActorMode::Engine,
+        None,
     ));
 }
 
@@ -980,6 +1095,12 @@ fn new_thread_or_empty_message_cannot_answer_pending_question() {
         true,
         "first message on a brand-new thread",
         ActorMode::Human,
+        None,
     ));
-    assert!(!message_can_answer_pending_question(false, "", ActorMode::Human));
+    assert!(!message_can_answer_pending_question(
+        false,
+        "",
+        ActorMode::Human,
+        None,
+    ));
 }

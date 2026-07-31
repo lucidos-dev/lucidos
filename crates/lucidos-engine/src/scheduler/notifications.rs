@@ -53,7 +53,9 @@ use uuid::Uuid;
 pub enum Tap {
     #[default]
     Modal,
-    Navigate { to: NavigateUi },
+    Navigate {
+        to: NavigateUi,
+    },
 }
 
 // Custom Deserialize (not derived) so the RETIRED `{"kind":"none"}` kind coerces
@@ -579,13 +581,19 @@ mod tests {
     #[test]
     fn tap_rejects_legacy_bare_string_modal() {
         let r: Result<Tap, _> = serde_json::from_str("\"modal\"");
-        assert!(r.is_err(), "expected legacy bare-string `\"modal\"` to be rejected");
+        assert!(
+            r.is_err(),
+            "expected legacy bare-string `\"modal\"` to be rejected"
+        );
     }
 
     #[test]
     fn tap_rejects_legacy_bare_string_open_thread() {
         let r: Result<Tap, _> = serde_json::from_str("\"open_thread\"");
-        assert!(r.is_err(), "expected legacy bare-string `\"open_thread\"` to be rejected");
+        assert!(
+            r.is_err(),
+            "expected legacy bare-string `\"open_thread\"` to be rejected"
+        );
     }
 
     #[test]
@@ -595,9 +603,16 @@ mod tests {
         // `"none"` must still be rejected loudly (the migrate-tap-shape guard) —
         // the two must never be conflated.
         let bare: Result<Tap, _> = serde_json::from_str("\"none\"");
-        assert!(bare.is_err(), "expected legacy bare-string `\"none\"` to be rejected");
+        assert!(
+            bare.is_err(),
+            "expected legacy bare-string `\"none\"` to be rejected"
+        );
         let obj: Tap = serde_json::from_str(r#"{"kind":"none"}"#).unwrap();
-        assert_eq!(obj, Tap::Modal, "the `{{kind:none}}` object must coerce to Modal");
+        assert_eq!(
+            obj,
+            Tap::Modal,
+            "the `{{kind:none}}` object must coerce to Modal"
+        );
     }
 
     #[test]

@@ -262,9 +262,7 @@ pub(crate) async fn prepend_reconstruction(
 mod tests {
     use super::*;
     use crate::engine::event_bus::{BusEvent, EventBus};
-    use crate::engine::thread_events::{
-        ActorMode, EventChannel, EventMeta, ThreadEvent,
-    };
+    use crate::engine::thread_events::{ActorMode, EventChannel, EventMeta, ThreadEvent};
     use crate::test_support::{setup_test_db, teardown_test_db};
     use serde_json::json;
 
@@ -344,14 +342,19 @@ mod tests {
         let thread_id = Uuid::new_v4();
 
         emit(&bus, thread_id, user_msg("add a feature flag for X")).await;
-        emit(&bus, thread_id, cc_text("Sure — let me look at the flag system.")).await;
         emit(
             &bus,
             thread_id,
-            cc_tool_called("Read", "Read src/flags.rs"),
+            cc_text("Sure, let me look at the flag system."),
         )
         .await;
-        emit(&bus, thread_id, cc_tool_result("pub fn enabled(name) -> bool")).await;
+        emit(&bus, thread_id, cc_tool_called("Read", "Read src/flags.rs")).await;
+        emit(
+            &bus,
+            thread_id,
+            cc_tool_result("pub fn enabled(name) -> bool"),
+        )
+        .await;
         emit(&bus, thread_id, user_msg("now write the migration")).await;
 
         let summary = reconstruct_summary(&pool, thread_id, 50_000).await;
@@ -359,7 +362,7 @@ mod tests {
         assert!(summary.contains(HEADER));
         assert!(summary.contains(FOOTER));
         assert!(summary.contains("User: add a feature flag for X"));
-        assert!(summary.contains("You (assistant): Sure — let me look at the flag system."));
+        assert!(summary.contains("You (assistant): Sure, let me look at the flag system."));
         assert!(summary.contains("You called tool: Read — Read src/flags.rs"));
         assert!(summary.contains("Tool result: pub fn enabled(name) -> bool"));
         assert!(summary.contains("User: now write the migration"));
@@ -487,12 +490,7 @@ mod tests {
         // 30 short turns; budget that holds maybe 10.
         for i in 0..30 {
             emit(&bus, thread_id, user_msg(&format!("ask number {}", i))).await;
-            emit(
-                &bus,
-                thread_id,
-                cc_text(&format!("answer number {}", i)),
-            )
-            .await;
+            emit(&bus, thread_id, cc_text(&format!("answer number {}", i))).await;
         }
 
         // Generous per-event truncation so the budget is the only force at

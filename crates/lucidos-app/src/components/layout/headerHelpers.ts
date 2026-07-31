@@ -42,6 +42,15 @@ function getHostname(url: string): string {
   try { return new URL(url).hostname; } catch { return url; }
 }
 
+/** Base name of a file-preview overlay path. A repo-encoded path
+ *  (`repo:<repoId>:file:<path>`) is unwrapped first — a repo file at the clone
+ *  root has no `/` to split on, so the raw encoding would surface the repo id
+ *  and mode as the header title. */
+function previewFileName(path: string): string {
+  const repoRelative = parseRepoPath(path)?.path ?? path;
+  return repoRelative.split('/').pop() || repoRelative;
+}
+
 export function getContentTitle(): string {
   const overlay = panelOverlay.value;
   const form = activeInlineForm.value;
@@ -62,7 +71,7 @@ export function getContentTitle(): string {
     return overlay.app.name;
   }
   if (overlay?.type === 'file-preview') {
-    const fileName = overlay.path.split('/').pop() || '';
+    const fileName = previewFileName(overlay.path);
     const desc = getDiffDescription();
     if (desc) return `${fileName} — ${desc}`;
     return fileName;
@@ -94,7 +103,7 @@ export function navEntryTitle(entry: NavEntry): string {
     }
     return overlay.app.name;
   }
-  if (overlay?.type === 'file-preview') return overlay.path.split('/').pop() || overlay.path;
+  if (overlay?.type === 'file-preview') return previewFileName(overlay.path);
   if (overlay?.type === 'url-preview') return getHostname(overlay.url);
   if (overlay?.type === 'notification-detail') return overlay.notification.title || 'Notification';
   if (!overlay && entry.menuItem === 'settings' && entry.settingsSubview !== 'main') {

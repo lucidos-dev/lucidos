@@ -138,8 +138,11 @@ if ! grep -q 'exec bash -c' "$GUARD_DIR/guard.sh"; then
 else
     cat > "$GUARD_DIR/curl" <<'SH'
 #!/bin/sh
-# Stand in for the re-fetch: the payload just reports what it inherited.
-echo 'echo "SEEN=${LUCIDOS_VERSION:-unset}"'
+# Stand in for the re-fetch: the payload just reports what it inherited. The
+# leading shebang is load-bearing, not decoration: the guard sniffs for it
+# before exec'ing (a soft-404 origin returns its landing page at status 200),
+# so a stub without one is refused exactly like HTML would be.
+printf '#!/usr/bin/env bash\necho "SEEN=${LUCIDOS_VERSION:-unset}"\n'
 SH
     chmod +x "$GUARD_DIR/curl"
     baked_now="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$INSTALL" | head -1)"
@@ -156,6 +159,20 @@ SH
         pass "explicit LUCIDOS_VERSION still beats the baked default"
     else
         fail "explicit LUCIDOS_VERSION lost across the re-exec: $out"
+    fi
+    # Soft-404 on the installer ITSELF. The lib sniff cannot help here: this runs
+    # before a single lib is fetched, and the payload goes to `exec bash -c`.
+    cat > "$GUARD_DIR/curl" <<'SH'
+#!/bin/sh
+printf '<!DOCTYPE html>\n<html><head><title>Lucidos</title></head></html>\n'
+SH
+    chmod +x "$GUARD_DIR/curl"
+    out="$(PATH="$GUARD_DIR:$PATH" sh -c 'unset BASH_VERSION; . '"$GUARD_DIR"'/guard.sh' 2>&1 || true)"
+    if echo "$out" | grep -q "did not return a shell script" \
+       && ! echo "$out" | grep -qiE "syntax error|unexpected token"; then
+        pass "an HTML re-fetch is refused before it reaches exec bash -c"
+    else
+        fail "expected the re-exec guard to refuse an HTML payload: $out"
     fi
 fi
 rm -rf "$GUARD_DIR"
@@ -415,6 +432,105 @@ else
     fail "expected the fetch path to install cleanly (rc=$rc): $out"
 fi
 rm -rf "$LIBDIR" "$PREFIX" "$REL" "$NOCHECKOUT"
+
+# ── uninstall_hint: never name a file the user does not have ─────────────────
+echo ""
+echo "test: uninstall_hint adapts to whether install.sh ran from a checkout"
+# The success banner used to hardcode `./uninstall.sh --name <slug>`, which is a
+# file that exists only in a checkout. The default audience pipes the installer
+# and the runtime tarball ships no uninstaller, so that line named nothing on
+# disk. Extracted and exercised directly (install.sh runs main at the bottom, so
+# it cannot simply be sourced), against both self-dir outcomes.
+HINT_DIR="$(mktemp -d)"
+sed -n '/^installer_self_dir()/,/^}/p;/^uninstall_hint()/,/^}/p' "$INSTALL" > "$HINT_DIR/hint.sh"
+if ! grep -q '^uninstall_hint()' "$HINT_DIR/hint.sh"; then
+    fail "could not extract uninstall_hint from install.sh (shape changed)"
+else
+    # No sibling uninstall.sh in $HINT_DIR = the piped case.
+    got="$(cd "$HINT_DIR" && bash -c '. ./hint.sh; LUCIDOS_REPO_URL=https://example.invalid/repo.git; uninstall_hint demo')"
+    if [ "${got#uninstall.sh --name demo}" != "$got" ] && echo "$got" | grep -qF "https://example.invalid/repo"; then
+        pass "no checkout: points at the repository copy ($got)"
+    else
+        fail "expected a downloadable-uninstaller hint, got: $got"
+    fi
+    : > "$HINT_DIR/uninstall.sh"
+    got="$(cd "$HINT_DIR" && bash -c '. ./hint.sh; LUCIDOS_REPO_URL=https://example.invalid/repo.git; uninstall_hint demo')"
+    if [ "$got" = "./uninstall.sh --name demo" ]; then
+        pass "checkout: points at the sibling script ($got)"
+    else
+        fail "expected the ./uninstall.sh form from a checkout, got: $got"
+    fi
+fi
+rm -rf "$HINT_DIR"
+
+# ── INTEGRATION: the FETCHED UNINSTALLER gets the same soft-404 treatment ─────
+echo ""
+echo "test: a fetched uninstaller that is HTML is refused and never exec'd"
+# The lib sniff above guards `.` (source). dispatch_uninstall guards the OTHER
+# place unknown remote content reaches a shell: `exec bash -c "$payload"`. It was
+# unguarded until the 2026-07-30 docs audit, and it was NOT hypothetical: the
+# site publisher uploads install.sh and scripts/lib/*.sh but not uninstall.sh, so
+# <origin>/uninstall.sh soft-404s and a piped `install.sh --uninstall` handed the
+# landing page to bash. Same shape as the lib test: a checkout-less install.sh
+# (so the sibling-uninstall.sh branch is skipped) against a file:// "origin".
+NOCHECKOUT="$(mktemp -d)"
+cp "$INSTALL" "$NOCHECKOUT/install.sh"
+for flag in --uninstall --list; do
+    UDIR="$(mktemp -d)"; PREFIX="$(mktemp -d)"
+    printf '<!DOCTYPE html>\n<html><head><title>Lucidos</title></head></html>\n' > "$UDIR/uninstall.sh"
+    out="$(LUCIDOS_UNINSTALL_URL="file://$UDIR/uninstall.sh" \
+            bash "$NOCHECKOUT/install.sh" "$flag" --prefix "$PREFIX" 2>&1)"; rc=$?
+    if [ $rc -ne 0 ] && echo "$out" | grep -q "did not return a shell script" \
+       && echo "$out" | grep -qF "file://$UDIR/uninstall.sh"; then
+        pass "$flag refuses an HTML uninstaller, naming the origin"
+    else
+        fail "expected an HTML refusal naming the origin for $flag (rc=$rc): $out"
+    fi
+    # Positive proof it never reached `exec bash -c`: that is what turns the
+    # landing page into shell syntax errors.
+    if echo "$out" | grep -qiE "syntax error|unexpected token"; then
+        fail "the HTML uninstaller was exec'd anyway ($flag): $out"
+    else
+        pass "$flag payload never reached the shell"
+    fi
+    rm -rf "$UDIR" "$PREFIX"
+done
+
+echo ""
+echo "test: the real uninstaller fetched over file:// is exec'd and runs"
+# Fail-closed's other half: the sniff must not reject legitimate shell. --list on
+# an empty prefix is read-only (it touches no service, no data dir), so this is
+# the safe end-to-end proof that the fetch+exec path still works.
+UDIR="$(mktemp -d)"; PREFIX="$(mktemp -d)"; LIBDIR="$(mktemp -d)"
+cp "$PROJECT_DIR/uninstall.sh" "$UDIR/uninstall.sh"
+cp "$SCRIPT_DIR/service.sh" "$SCRIPT_DIR/install_common.sh" "$LIBDIR/"
+out="$(LUCIDOS_UNINSTALL_URL="file://$UDIR/uninstall.sh" LUCIDOS_LIB_BASE_URL="file://$LIBDIR" \
+        bash "$NOCHECKOUT/install.sh" --list --prefix "$PREFIX" 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && echo "$out" | grep -qi "Lucidos uninstaller"; then
+    pass "the fetched uninstaller was exec'd and produced its own banner"
+else
+    fail "expected the fetched uninstaller to run (rc=$rc): $out"
+fi
+rm -rf "$PREFIX" "$LIBDIR"
+
+echo ""
+echo "test: uninstall.sh refuses a soft-404 service.sh instead of sourcing it"
+# uninstall.sh has its own lib fetch (source_service_lib), separate from
+# install.sh's _source_libs, and it is the likeliest of all these sites to meet a
+# soft-404: the standalone `curl … /uninstall.sh | sh` path derives its lib base
+# from the same origin that already soft-404s uninstall.sh itself. Reached here
+# through install.sh --list, which execs the fetched uninstaller.
+PREFIX="$(mktemp -d)"; LIBDIR="$(mktemp -d)"
+printf '<!DOCTYPE html>\n<html><head><title>Lucidos</title></head></html>\n' > "$LIBDIR/service.sh"
+out="$(LUCIDOS_UNINSTALL_URL="file://$UDIR/uninstall.sh" LUCIDOS_LIB_BASE_URL="file://$LIBDIR" \
+        bash "$NOCHECKOUT/install.sh" --list --prefix "$PREFIX" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "is not a shell script" \
+   && ! echo "$out" | grep -qiE "syntax error|unexpected token"; then
+    pass "an HTML service.sh is refused before it reaches the shell"
+else
+    fail "expected uninstall.sh to refuse an HTML service.sh (rc=$rc): $out"
+fi
+rm -rf "$UDIR" "$PREFIX" "$LIBDIR" "$NOCHECKOUT"
 
 # ── INTEGRATION: --dev routing (no compile — just assert the branch is taken) ─
 echo ""

@@ -1,5 +1,5 @@
-use super::*;
 use super::common::*;
+use super::*;
 use uuid::Uuid;
 
 fn test_prompt(text: &str) -> InjectedPrompt {
@@ -40,7 +40,9 @@ async fn inject_wakes_a_tool_blocked_on_this_thread() {
 
     let injected = {
         let map = threads.lock().unwrap();
-        map.get(&tid).unwrap().inject(test_prompt("also open the site"))
+        map.get(&tid)
+            .unwrap()
+            .inject(test_prompt("also open the site"))
     };
     assert!(injected);
     assert!(waiter.await.unwrap(), "a parked tool must wake on inject");
@@ -80,7 +82,12 @@ fn pending_count_survives_an_injection_with_nobody_listening() {
         }
         n
     };
-    threads.lock().unwrap().get(&tid).unwrap().injections_drained(drained);
+    threads
+        .lock()
+        .unwrap()
+        .get(&tid)
+        .unwrap()
+        .injections_drained(drained);
     assert_eq!(
         pending.load(std::sync::atomic::Ordering::Acquire),
         0,

@@ -3,6 +3,7 @@
 //! Part of the `LucidosEngine` inherent impl, split from engine_impl.rs.
 
 use super::super::*;
+use crate::engine::chat::PreEmittedOrigin;
 
 impl LucidosEngine {
     /// Get a reference to the embedder for sharing with read-only handlers
@@ -59,7 +60,10 @@ impl LucidosEngine {
     pub fn injection_wakeup(
         &self,
         thread_id: Uuid,
-    ) -> Option<(Arc<tokio::sync::Notify>, Arc<std::sync::atomic::AtomicUsize>)> {
+    ) -> Option<(
+        Arc<tokio::sync::Notify>,
+        Arc<std::sync::atomic::AtomicUsize>,
+    )> {
         self.active_threads
             .lock()
             .unwrap()
@@ -279,7 +283,7 @@ impl LucidosEngine {
             thread_events::ActorMode::Agent,
             None,
             None,
-            Some(child_completed_event_id),
+            Some(PreEmittedOrigin::EngineReentry(child_completed_event_id)),
             None,
             callback_origin,
         )
@@ -425,5 +429,4 @@ impl LucidosEngine {
         }
         any
     }
-
 }

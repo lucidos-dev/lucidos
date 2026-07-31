@@ -33,6 +33,7 @@ use std::sync::Arc;
 
 use uuid::Uuid;
 
+use super::PreEmittedOrigin;
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
     ActorMode, EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
@@ -368,7 +369,7 @@ impl LucidosEngine {
                         ActorMode::Engine,
                         None,
                         None,
-                        Some(anchor_event_id),
+                        Some(PreEmittedOrigin::EngineReentry(anchor_event_id)),
                         None,
                         Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
                     )
@@ -400,7 +401,10 @@ impl LucidosEngine {
 /// to `Chat`, matching the previous behavior. Parsing goes through
 /// `EventChannel::from_wire`, the shared wire decoder — which also accepts the legacy
 /// `scheduled_trigger` alias, so an old trigger row resolves too.
-fn resolve_resume_channel(abort_channel: Option<&str>, thread_source: Option<&str>) -> EventChannel {
+fn resolve_resume_channel(
+    abort_channel: Option<&str>,
+    thread_source: Option<&str>,
+) -> EventChannel {
     abort_channel
         .and_then(EventChannel::from_wire)
         .or_else(|| thread_source.and_then(EventChannel::from_wire))
@@ -514,7 +518,10 @@ mod tests {
             resolve_resume_channel(None, Some("trigger")),
             EventChannel::Trigger
         );
-        assert_eq!(resolve_resume_channel(None, Some("chat")), EventChannel::Chat);
+        assert_eq!(
+            resolve_resume_channel(None, Some("chat")),
+            EventChannel::Chat
+        );
         // Legacy source spelling still resolves via the shared wire decoder.
         assert_eq!(
             resolve_resume_channel(None, Some("scheduled_trigger")),

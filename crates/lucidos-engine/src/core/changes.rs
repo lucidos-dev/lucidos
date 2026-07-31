@@ -60,7 +60,13 @@ pub async fn enrich_thread_titles(
     pool: &PgPool,
     changes: &mut [Change],
 ) -> Result<(), sqlx::Error> {
-    enrich_titles(pool, changes, |c| c.thread_id, |c, t| c.thread_title = Some(t)).await
+    enrich_titles(
+        pool,
+        changes,
+        |c| c.thread_id,
+        |c, t| c.thread_title = Some(t),
+    )
+    .await
 }
 
 /// The two thread statuses in which the coding agent is mid-turn, so Apply must
@@ -165,7 +171,13 @@ pub async fn enrich_restart_group_titles(
     pool: &PgPool,
     groups: &mut [RestartGroup],
 ) -> Result<(), sqlx::Error> {
-    enrich_titles(pool, groups, |g| g.thread_id, |g, t| g.thread_title = Some(t)).await
+    enrich_titles(
+        pool,
+        groups,
+        |g| g.thread_id,
+        |g, t| g.thread_title = Some(t),
+    )
+    .await
 }
 
 async fn enrich_titles<T>(
@@ -196,12 +208,11 @@ async fn fetch_titles_for(
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let rows: Vec<(Uuid, Option<String>)> = sqlx::query_as(
-        "SELECT thread_id, title FROM thread_summaries WHERE thread_id = ANY($1)",
-    )
-    .bind(&ids)
-    .fetch_all(pool)
-    .await?;
+    let rows: Vec<(Uuid, Option<String>)> =
+        sqlx::query_as("SELECT thread_id, title FROM thread_summaries WHERE thread_id = ANY($1)")
+            .bind(&ids)
+            .fetch_all(pool)
+            .await?;
     Ok(rows
         .into_iter()
         .filter_map(|(id, title)| title.map(|t| (id, t)))
@@ -248,11 +259,7 @@ mod tests {
         }
     }
 
-    async fn insert_thread_summary_with_status(
-        pool: &PgPool,
-        thread_id: Uuid,
-        status: &str,
-    ) {
+    async fn insert_thread_summary_with_status(pool: &PgPool, thread_id: Uuid, status: &str) {
         sqlx::query(
             "INSERT INTO thread_summaries (thread_id, title, source, message_count, last_activity, has_response, is_saved, status) \
              VALUES ($1, 'T', 'chat', 0, NOW(), false, false, $2)",
@@ -298,7 +305,10 @@ mod tests {
             .expect("enrich");
 
         assert!(changes[0].thread_active, "running thread blocks apply");
-        assert!(changes[1].thread_active, "waiting-for-answer thread blocks apply");
+        assert!(
+            changes[1].thread_active,
+            "waiting-for-answer thread blocks apply"
+        );
         assert!(!changes[2].thread_active, "idle thread allows apply");
         assert!(!changes[3].thread_active, "no thread_id stays false");
         assert!(
@@ -336,10 +346,7 @@ mod tests {
             changes[1].thread_title, None,
             "thread without summary stays None"
         );
-        assert_eq!(
-            changes[2].thread_title, None,
-            "no thread_id stays None"
-        );
+        assert_eq!(changes[2].thread_title, None, "no thread_id stays None");
 
         // Empty input is a no-op (and doesn't issue any query)
         let mut empty: Vec<Change> = vec![];

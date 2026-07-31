@@ -208,11 +208,16 @@ fn stream_error_is_recorded_but_not_terminal() {
     // turn terminal.
     let (events, tracker) = track(&[REAL_THREAD_STARTED, REAL_STREAM_ERROR]);
     assert!(
-        !events.iter().any(|e| matches!(e, AgentEvent::Result { .. })),
+        !events
+            .iter()
+            .any(|e| matches!(e, AgentEvent::Result { .. })),
         "stream error alone must not produce a Result"
     );
     assert!(!tracker.turn_terminal_seen);
-    assert_eq!(tracker.last_error.as_deref(), Some("stream error: broken pipe"));
+    assert_eq!(
+        tracker.last_error.as_deref(),
+        Some("stream error: broken pipe")
+    );
 }
 
 #[test]
@@ -223,8 +228,12 @@ fn file_change_synthesizes_balanced_tool_pair() {
     let line = r#"{"type":"item.completed","item":{"id":"item_4","type":"file_change","changes":[{"path":"src/a.rs","kind":"update"}],"status":"completed"}}"#;
     let (events, _) = track(&[line]);
     assert_eq!(events.len(), 2);
-    assert!(matches!(&events[0], AgentEvent::ToolUse { name, id, .. } if name == "file_change" && id == "item_4"));
-    assert!(matches!(&events[1], AgentEvent::ToolResult { status, id, .. } if status == "success" && id == "item_4"));
+    assert!(
+        matches!(&events[0], AgentEvent::ToolUse { name, id, .. } if name == "file_change" && id == "item_4")
+    );
+    assert!(
+        matches!(&events[1], AgentEvent::ToolResult { status, id, .. } if status == "success" && id == "item_4")
+    );
 }
 
 #[test]
@@ -234,7 +243,10 @@ fn failed_command_maps_to_error_status() {
     match &events[0] {
         AgentEvent::ToolResult { output, status, .. } => {
             assert_eq!(status, "error");
-            assert_eq!(output, "exit_code: 1", "empty output falls back to the exit code");
+            assert_eq!(
+                output, "exit_code: 1",
+                "empty output falls back to the exit code"
+            );
         }
         other => panic!("expected ToolResult, got {:?}", other),
     }
@@ -246,7 +258,9 @@ fn mcp_tool_call_uses_cc_naming_convention() {
     let completed = r#"{"type":"item.completed","item":{"id":"item_5","type":"mcp_tool_call","server":"docs","tool":"search","arguments":{"q":"x"},"result":{"matches":3},"error":null,"status":"completed"}}"#;
     let (events, _) = track(&[started, completed]);
     assert!(matches!(&events[0], AgentEvent::ToolUse { name, .. } if name == "mcp__docs__search"));
-    assert!(matches!(&events[1], AgentEvent::ToolResult { output, .. } if output.contains("\"matches\":3")));
+    assert!(
+        matches!(&events[1], AgentEvent::ToolResult { output, .. } if output.contains("\"matches\":3"))
+    );
 }
 
 #[test]
@@ -277,7 +291,8 @@ fn reasoning_item_completed_emits_thought() {
 // Codex exec sends the full summary on completion, mirroring agent_message.
 #[test]
 fn reasoning_item_started_emits_nothing() {
-    let line = r#"{"type":"item.started","item":{"id":"item_0","type":"reasoning","text":"partial"}}"#;
+    let line =
+        r#"{"type":"item.started","item":{"id":"item_0","type":"reasoning","text":"partial"}}"#;
     let (events, _) = track(&[line]);
     assert!(events.is_empty());
 }
@@ -287,13 +302,18 @@ fn error_item_records_last_error_without_events() {
     let line = r#"{"type":"item.completed","item":{"id":"item_9","type":"error","message":"command output truncated"}}"#;
     let (events, tracker) = track(&[line]);
     assert!(events.is_empty());
-    assert_eq!(tracker.last_error.as_deref(), Some("command output truncated"));
+    assert_eq!(
+        tracker.last_error.as_deref(),
+        Some("command output truncated")
+    );
 }
 
 #[test]
 fn multiple_agent_messages_join_in_result_text() {
-    let msg1 = r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"first"}}"#;
-    let msg2 = r#"{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"second"}}"#;
+    let msg1 =
+        r#"{"type":"item.completed","item":{"id":"i1","type":"agent_message","text":"first"}}"#;
+    let msg2 =
+        r#"{"type":"item.completed","item":{"id":"i2","type":"agent_message","text":"second"}}"#;
     let (events, _) = track(&[msg1, msg2, REAL_TURN_COMPLETED]);
     match events.last() {
         Some(AgentEvent::Result { text, .. }) => assert_eq!(text, "first\n\nsecond"),
@@ -324,7 +344,10 @@ fn begin_turn_resets_per_turn_state_but_keeps_session() {
 fn unknown_item_type_degrades_to_no_events() {
     let line = r#"{"type":"item.completed","item":{"id":"i9","type":"hologram","payload":{}}}"#;
     let (events, _) = track(&[line]);
-    assert!(events.is_empty(), "a new Codex item type must not wedge the turn");
+    assert!(
+        events.is_empty(),
+        "a new Codex item type must not wedge the turn"
+    );
 }
 
 #[test]

@@ -183,7 +183,10 @@ mod tests {
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
 
         assert_eq!(repo_root_above(&exe).as_deref(), Some(dir.as_path()));
-        assert_eq!(repo_root_above(Path::new("/tmp/nowhere/lucidos-gateway")), None);
+        assert_eq!(
+            repo_root_above(Path::new("/tmp/nowhere/lucidos-gateway")),
+            None
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }

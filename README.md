@@ -13,13 +13,26 @@ The integrated environment makes for a smooth user experience, where researching
 ---
 
 <!--quickstart-start-->
-## One-click install
+## Install
 
-On a clean macOS or Linux machine:
+Two ways in, both first-class.
+
+**macOS: the desktop app.** Download the latest
+[**`Lucidos_<version>_aarch64.dmg`**](https://github.com/lucidos-dev/lucidos/releases/latest)
+from the releases page, open it, and drag Lucidos to Applications. It is signed
+and notarized by Apple (no Gatekeeper warning, no `xattr` dance), bundles
+PostgreSQL 18 + pgvector, the engine, and the UI, and auto-updates from GitHub
+Releases. Nothing else to install: no terminal, no Docker, no Rust or Node.
+Apple Silicon only today.
+
+**macOS or Linux: the one-liner.** On a clean machine:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | sh
+curl -fsSL https://lucidos.dev/install.sh | sh
 ```
+
+This is the headless path: the same engine and UI served in your browser, plus
+an always-on background service. It is also the only path on Linux.
 
 By **default** the installer DOWNLOADS the prebuilt headless runtime for your
 platform — the engine, the gateway, the frontend, and a relocatable PostgreSQL 18
@@ -32,26 +45,29 @@ the embedded Postgres and supervises the engine, the same model as the macOS
 minutes. It opens at <http://localhost:5252>. Pass `--no-service` to run it in the
 foreground instead (Ctrl-C to stop).
 
-> **No prebuilt release is published yet**, so the default download will **404
-> today**. The runtime tarballs are produced by CI but are not yet attached to a
-> GitHub Release. Until they are, use one of the two working paths below:
->
-> - **Build from source** (the original behavior):
->   ```bash
->   curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | sh -s -- --dev
->   ```
->   `--dev` (alias `--source`, or `LUCIDOS_FROM_SOURCE=1`) bootstraps the
->   toolchain (Rust, Node, Docker, build deps), clones the repo to `~/lucidos`,
->   compiles the engine from source (a **release** build, typically **10–20+
->   minutes** on a clean machine; `LUCIDOS_DEBUG_BUILD=1` for a faster debug
->   build), and starts the stack via `scripts/run.sh`.
-> - **Install a tarball you built yourself** with
->   [`scripts/build-headless.sh`](https://github.com/lucidos-dev/lucidos/blob/main/scripts/build-headless.sh):
->   ```bash
->   ./install.sh --from-tarball /path/to/lucidos-<version>-<triple>.tar.gz
->   ```
->   It verifies the adjacent `.sha256` (fail-closed on mismatch), extracts, and
->   launches — fully offline.
+Two more ways to get the headless runtime:
+
+- **Build from source** (the original behavior):
+  ```bash
+  curl -fsSL https://lucidos.dev/install.sh | sh -s -- --dev
+  ```
+  `--dev` (alias `--source`, or `LUCIDOS_FROM_SOURCE=1`) bootstraps the
+  toolchain (Rust, Node, Docker, build deps), clones the repo to `~/lucidos`,
+  compiles the engine from source (a **release** build, typically **10–20+
+  minutes** on a clean machine; `LUCIDOS_DEBUG_BUILD=1` for a faster debug
+  build), and starts the stack via `scripts/run.sh`.
+- **Install a tarball you built yourself** with
+  [`scripts/build-headless.sh`](https://github.com/lucidos-dev/lucidos/blob/main/scripts/build-headless.sh):
+  ```bash
+  ./install.sh --from-tarball /path/to/lucidos-<version>-<triple>.tar.gz
+  ```
+  It verifies the adjacent `.sha256` (fail-closed on mismatch), extracts, and
+  launches — fully offline.
+
+> **On a brand-new release**, the per-platform tarballs are attached by CI about
+> 30 minutes *after* the GitHub Release is published, so a download started in
+> that window can still 404. Retry shortly, pass `--version <previous-version>`,
+> or use one of the two paths above.
 
 The installer is idempotent — safe to re-run. The download/tarball paths skip an
 already-extracted runtime for the same version unless you pass `--force`; `--dev`
@@ -59,9 +75,10 @@ reuses an existing checkout, build, and workspace.
 
 **Linux prerequisites.** The prebuilt Linux tarballs are built against the
 Ubuntu 22.04 baseline, so they run on glibc 2.35+ distros (Ubuntu 22.04+,
-Debian 12+, RHEL/Rocky/Alma 9+, Fedora 36+). The installer runs the extracted
-gateway once and refuses older hosts at install time with a clear message —
-build from source there instead (`--dev`). Two host packages are expected at
+Debian 12+, Fedora 36+, RHEL/Rocky/Alma 10+). RHEL 9 and its rebuilds are
+**below** the floor: EL9 pins glibc 2.34 for its whole lifecycle. The installer
+runs the extracted gateway once and refuses any too-old host at install time
+with a clear message; build from source there instead (`--dev`). Two host packages are expected at
 runtime and warned about when missing: `git` (coding-agent threads + repository
 features) and `ca-certificates` (outbound TLS: LLM providers, the
 embedding-model download, web push). `python3` is optional (script tooling).
@@ -118,6 +135,33 @@ and the packaged `.app`.
 `./install.sh --uninstall [--name <name>] [--all] [--purge]` is the same thing
 (it delegates to `uninstall.sh`).
 
+> **`--purge` is irreversible and asks for no confirmation.** An instance's data
+> dir (`<prefix>/<name>/`) is not installer scratch: it holds the **embedded
+> PostgreSQL cluster** (every thread, message, memory and setting of every
+> workspace that gateway serves) and, for any workspace you created through the
+> picker without choosing a path of your own, the **workspace directory itself**
+> (`<prefix>/<name>/workspaces/<id>/`, i.e. your artifacts, apps, triggers and
+> knowhow). `--all --purge` does that for every instance and deletes the shared
+> runtime too. Back up anything you want to keep before adding the flag. Note
+> that a *bare* uninstall is not a dry run either: it stops the gateway and
+> removes its service, and only your **data** survives (it prints where it left
+> it). The one command that changes nothing is `--list`, so start there.
+
+Installed via the one-liner, so you have no checkout? Both are the repo's own
+scripts and the runtime lays no copy down (nothing under `~/.lucidos/` is an
+uninstaller), so download
+[`uninstall.sh`](https://github.com/lucidos-dev/lucidos/blob/main/uninstall.sh)
+and run it with the same flags:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/uninstall.sh -o uninstall.sh
+sh uninstall.sh --list
+```
+
+The matching `https://lucidos.dev/uninstall.sh` front door is not served yet, so
+piping *that* URL would feed you the landing page instead of a script. Tracked in
+[`docs/temporary-measures.md`](https://github.com/lucidos-dev/lucidos/blob/main/docs/temporary-measures.md).
+
 **Pick your LLM provider** (optional). With no credentials the runtime boots into
 a clear no-provider onboarding state (`--dev` boots in `mock` mode); configure a
 real provider in **Settings → Providers** afterwards. To wire one up at install
@@ -125,10 +169,10 @@ time, pass it through the pipe:
 
 ```bash
 # OpenAI (GPT models)
-curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | OPENAI_API_KEY=sk-… sh
+curl -fsSL https://lucidos.dev/install.sh | OPENAI_API_KEY=sk-… sh
 
 # Vertex AI (Claude / Gemini) — also run `gcloud auth application-default login`
-curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | VERTEX_PROJECT_ID=my-gcp-project sh
+curl -fsSL https://lucidos.dev/install.sh | VERTEX_PROJECT_ID=my-gcp-project sh
 ```
 
 Knobs (all optional; flags or environment variables — see `install.sh --help`):
@@ -147,17 +191,15 @@ Knobs (all optional; flags or environment variables — see `install.sh --help`)
 | `LUCIDOS_GATEWAY_DATA` | override the instance data dir (registry + embedded Postgres; default `<prefix>/<name>`) |
 | `--dev`-only | `LUCIDOS_HOME` (clone dir, default `~/lucidos`), `LUCIDOS_WORKSPACE`, `LUCIDOS_REF`, `LUCIDOS_DEBUG_BUILD`, `LUCIDOS_SKIP_DEPS` |
 
-Once the domain lands the installer will also be served from
-`https://lucidos.dev/install.sh`.
-
 Prefer to drive the setup yourself? The manual path is below.
 <!--quickstart-end-->
 
-### Desktop app (.dmg)
+### Desktop app (.dmg) — building it yourself
 
-A self-contained macOS app is in progress: a `.dmg` that bundles PostgreSQL +
-pgvector, the engine, and the UI — no terminal, Docker, or dev tools — and
-auto-updates from GitHub Releases ("update available → restart"). Build it
+The shipped `.dmg` is on the [releases page](https://github.com/lucidos-dev/lucidos/releases/latest)
+(see **Install** above); this section is for building your own. It is a
+self-contained macOS app bundling PostgreSQL + pgvector, the engine, and the UI,
+with auto-update from GitHub Releases ("update available → restart"). Build it
 locally with `./scripts/build-dmg.sh` (needs `cargo install tauri-cli`); see
 [`docs/desktop-app.md`](docs/desktop-app.md) for the build + signing +
 notarization + release runbook, and [ADR 0012](docs/adr/0012-self-contained-desktop-app.md)
@@ -170,7 +212,9 @@ for the architecture.
 - **Rust** (stable toolchain)
 - **Docker** (for PostgreSQL + pgvector)
 - **Node.js** (for Vite frontend dev server)
-- **Vertex AI access** or **OpenAI API key** (for the LLM)
+- **An LLM provider** (Anthropic, OpenAI, OpenRouter, Vertex AI, or a local
+  OpenAI-compatible endpoint such as Ollama / LM Studio / vLLM). Configure it in
+  **Settings → Models → Providers**, or via the environment variables below.
 
 ## Dev Setup
 
@@ -264,23 +308,31 @@ After this, Safari and Chrome on iOS will trust your dev server's HTTPS certific
 ## Architecture
 
 ```
-┌──────────────────┐     ┌─────────────────────────┐
-│   Tauri App      │────▶│   Docker Container      │
-│   (Desktop UI)   │◀────│   (Workspace + Engine)  │
-└──────────────────┘     └─────────────────────────┘
+┌──────────────────┐     ┌──────────────────┐     ┌─────────────────────────┐
+│  Browser / PWA   │────▶│                  │────▶│  Engine (per workspace) │
+│  or Tauri window │◀────│     Gateway      │◀────│  + PostgreSQL/pgvector  │
+└──────────────────┘     └──────────────────┘     └─────────────────────────┘
 ```
+
+A gateway fronts one or more workspaces: it provisions Postgres and
+spawns/supervises one engine per workspace ([ADR 0014](docs/adr/0014-multi-workspace-redesign.md)).
+Several gateways can run side by side as named instances (see **Install** above),
+each with its own port, data dir, and service.
+A packaged install (`.dmg` or the `curl … | sh` runtime) bundles a relocatable
+PostgreSQL and needs no Docker; the dev setup above runs Postgres in Docker
+instead.
 
 ### Tech Stack
 
 | Component | Choice |
 |-----------|--------|
 | Language | Rust |
-| UI | Tauri (Rust + web frontend) |
-| LLM | Vertex AI / OpenAI (configurable) |
+| UI | Web frontend, wrapped by Tauri on the desktop |
+| LLM | Anthropic / OpenAI / OpenRouter / Vertex AI / local (configurable) |
 | Event Store | PostgreSQL + pgvector |
 | Embeddings | fastembed (in-process, local) |
 | Execution | Lucidos-managed Python |
-| Packaging | Docker + Tauri desktop app |
+| Packaging | Headless tarball + user service, macOS `.dmg`, Docker image |
 
 ### Workspace Structure
 
@@ -288,16 +340,22 @@ After this, Safari and Chrome on iOS will trust your dev server's HTTPS certific
 /workspace/
   .lucidos/            # Ephemeral runtime (deletable)
   data/
-    artifacts/        # Git-tracked user files
-    skills/           # Skill definitions + UIs
-    postgres/         # Event store (gitignored)
+    artifacts/         # Git-tracked user files
+    apps/              # App UIs + their knowhow, intents, scripts, triggers
+    knowhow/           # General domain reference docs
+    triggers/          # Standalone scheduled/event triggers
+    scripts/           # Scripts shared across consumers
+    postgres/          # Event store (gitignored)
 ```
+
+The full placement and ownership rules are in [`docs/taxonomy.md`](docs/taxonomy.md).
 
 ### Core Concepts
 
 - **Events** — Immutable, append-only records of confirmed outcomes. The single source of truth.
 - **Artifacts** — Versioned outputs (code, documents, apps) stored in Git. Addressable, with provenance.
-- **Skills** — Interactive plugins combining LLM instructions with optional web UIs.
+- **Apps**: persistent UIs you open repeatedly, described in chat rather than scaffolded by hand.
+- **Knowhow**: how-to docs the agent discovers semantically and loads when relevant.
 - **Prompt-first UI** — Everything doable in apps must be doable via the prompt.
 
 <!--invariants-start-->

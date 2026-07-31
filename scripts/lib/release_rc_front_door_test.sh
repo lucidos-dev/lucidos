@@ -3,7 +3,7 @@
 # the RC front-door gate meaningful.
 #
 # The property under test is narrow and load-bearing: rc/<version> must not be
-# pushed until https://lucidos.dev/rc serves THIS candidate's installer. CI's
+# pushed until https://rc.lucidos.dev serves THIS candidate's installer. CI's
 # payload-mode rung 1 parses LUCIDOS_DEFAULT_VERSION out of that origin and fails
 # on a mismatch, so pushing first produces a red that means nothing.
 #
@@ -47,7 +47,7 @@ write_installer() { # <version>
 #!/bin/sh
 set -eu
 LUCIDOS_DEFAULT_VERSION="$1"
-LUCIDOS_INSTALL_URL="\${LUCIDOS_INSTALL_URL:-https://lucidos.dev/rc/install.sh}"
+LUCIDOS_INSTALL_URL="\${LUCIDOS_INSTALL_URL:-https://rc.lucidos.dev/install.sh}"
 echo installing
 EOF
 }
@@ -184,6 +184,71 @@ if ( set +e; PATH=/usr/bin:/bin rc_front_door_request_publish "/nonexistent" "0.
   pass "a bad RC tree returns rather than aborting the shell"
 else
   fail "rc_front_door_request_publish aborted its shell"
+fi
+
+echo "== 3b. Cloudflare Access headers (the gated RC origin) =="
+
+# The RC origin is behind Access, so every fetch must carry a service token.
+# These run against the file:// origin — curl ignores the headers there, which
+# is exactly the point: what is under test is that BUILDING the header array
+# does not blow up, on either branch. macOS ships bash 3.2, where expanding an
+# empty array under `set -u` is an unbound-variable ABORT, so the credential-less
+# path died instead of returning 1 (observed 2026-07-30). Both outcomes are
+# non-zero, so the bug hid inside a passing test until stderr was read.
+
+write_installer "9.9.9"
+
+# Each case runs in its own subshell so the credentials it sets cannot leak into
+# the next one — the credential-less cases only mean anything if nothing earlier
+# exported a token. That deliberate scoping is what SC2030/SC2031 flag, hence the
+# disables below; they are the mechanism under test, not an accident. Written as
+# `if ( … ); then` rather than `( … ) && pass || fail`, which would run BOTH arms
+# if `pass` ever returned non-zero.
+
+# shellcheck disable=SC2030 # scoping the credentials to this case is the point
+if (
+  unset RC_ACCESS_CLIENT_ID RC_ACCESS_CLIENT_SECRET
+  export RC_ACCESS_ENV_FILE=/nonexistent/rc-access.env
+  err="$(rc_front_door_serves_version "9.9.9" "$ORIGIN" 2>&1 >/dev/null)"
+  [ -z "$err" ]
+); then
+  pass "no credentials: builds an empty header array without an unbound-variable abort"
+else
+  fail "no credentials: wrote to stderr (bash 3.2 empty-array expansion under set -u)"
+fi
+
+# shellcheck disable=SC2030,SC2031 # ditto: per-case credentials, deliberately not shared
+if (
+  export RC_ACCESS_CLIENT_ID=test-id RC_ACCESS_CLIENT_SECRET=test-secret
+  err="$(rc_front_door_serves_version "9.9.9" "$ORIGIN" 2>&1 >/dev/null)"
+  [ -z "$err" ]
+); then
+  pass "with credentials: builds the header array cleanly"
+else
+  fail "with credentials: wrote to stderr"
+fi
+
+# shellcheck disable=SC2031 # ditto: per-case credentials, deliberately not shared
+if (
+  export RC_ACCESS_CLIENT_ID=test-id RC_ACCESS_CLIENT_SECRET=test-secret
+  rc_front_door_serves_version "9.9.9" "$ORIGIN"
+); then
+  pass "with credentials: still parses the served version correctly"
+else
+  fail "with credentials: header array broke the fetch"
+fi
+
+# The env file is the operator's convenience path (release.sh runs on the Mac,
+# not in CI). An unreadable one must be inert, not fatal.
+# shellcheck disable=SC2031 # ditto: per-case credentials, deliberately not shared
+if (
+  unset RC_ACCESS_CLIENT_ID RC_ACCESS_CLIENT_SECRET
+  export RC_ACCESS_ENV_FILE=/nonexistent/rc-access.env
+  rc_access_headers >/dev/null 2>&1
+); then
+  fail "a missing env file reported credentials as available"
+else
+  pass "a missing env file yields no headers rather than erroring"
 fi
 
 echo "== 4. release.sh wiring: publish /rc BEFORE pushing rc/ =="

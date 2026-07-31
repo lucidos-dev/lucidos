@@ -156,12 +156,18 @@ fn write_bytes(
 /// corresponding `func_wrap` call below — none defined yet.
 pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmtime::Error> {
     // current_time_ns / current_time_secs — wall-clock from the host.
-    linker.func_wrap("env", "current_time_ns", |_caller: Caller<'_, HostState>| -> i64 {
-        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
-    })?;
-    linker.func_wrap("env", "current_time_secs", |_caller: Caller<'_, HostState>| -> i64 {
-        chrono::Utc::now().timestamp()
-    })?;
+    linker.func_wrap(
+        "env",
+        "current_time_ns",
+        |_caller: Caller<'_, HostState>| -> i64 {
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+        },
+    )?;
+    linker.func_wrap(
+        "env",
+        "current_time_secs",
+        |_caller: Caller<'_, HostState>| -> i64 { chrono::Utc::now().timestamp() },
+    )?;
 
     // random_bytes(out_ptr, out_len) -> i32  (returns bytes written, -1 on error)
     linker.func_wrap(
@@ -224,9 +230,14 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
          data_len: i32,
          out_ptr: i32|
          -> i32 {
-            run_hmac(&mut caller, secret_id, data_ptr, data_len, out_ptr, |s, d| {
-                hmac_sha1_digest(s, d).to_vec()
-            })
+            run_hmac(
+                &mut caller,
+                secret_id,
+                data_ptr,
+                data_len,
+                out_ptr,
+                |s, d| hmac_sha1_digest(s, d).to_vec(),
+            )
         },
     )?;
     linker.func_wrap(
@@ -238,9 +249,14 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
          data_len: i32,
          out_ptr: i32|
          -> i32 {
-            run_hmac(&mut caller, secret_id, data_ptr, data_len, out_ptr, |s, d| {
-                hmac_sha256_digest(s, d).to_vec()
-            })
+            run_hmac(
+                &mut caller,
+                secret_id,
+                data_ptr,
+                data_len,
+                out_ptr,
+                |s, d| hmac_sha256_digest(s, d).to_vec(),
+            )
         },
     )?;
     linker.func_wrap(
@@ -252,9 +268,14 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
          data_len: i32,
          out_ptr: i32|
          -> i32 {
-            run_hmac(&mut caller, secret_id, data_ptr, data_len, out_ptr, |s, d| {
-                hmac_sha512_digest(s, d).to_vec()
-            })
+            run_hmac(
+                &mut caller,
+                secret_id,
+                data_ptr,
+                data_len,
+                out_ptr,
+                |s, d| hmac_sha512_digest(s, d).to_vec(),
+            )
         },
     )?;
 

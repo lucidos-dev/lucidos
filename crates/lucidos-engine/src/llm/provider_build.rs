@@ -36,7 +36,12 @@ pub const PROVIDER_CREDENTIAL_SERVICES: [&str; 4] = ["openai", "anthropic", "ope
 /// the subscriber (so a runtime swap-back to unconfigured mirrors boot).
 pub fn boot_without_provider_enabled() -> bool {
     std::env::var("LUCIDOS_BOOT_WITHOUT_PROVIDER")
-        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(false)
 }
 
@@ -312,7 +317,9 @@ pub async fn build_active_provider(
 ) -> Result<ProviderBuildOutcome, Box<dyn std::error::Error + Send + Sync>> {
     if ctx.model_is_mock {
         return Ok(ProviderBuildOutcome::Install {
-            llm: Arc::new(crate::llm::mock::MockProvider::new(ctx.default_model.clone())),
+            llm: Arc::new(crate::llm::mock::MockProvider::new(
+                ctx.default_model.clone(),
+            )),
             // Mock is the E2E opt-in; there is no credential to search with, so
             // web_search reports the unconfigured error rather than reaching the
             // network from a test run.
@@ -418,7 +425,9 @@ pub async fn build_active_provider(
         // returns Mock when that input is true. Guarded above regardless.
         ProviderSelection::Mock => {
             return Ok(ProviderBuildOutcome::Install {
-                llm: Arc::new(crate::llm::mock::MockProvider::new(ctx.default_model.clone())),
+                llm: Arc::new(crate::llm::mock::MockProvider::new(
+                    ctx.default_model.clone(),
+                )),
                 web_search: Arc::new(WebSearchChain::empty()),
                 selection: ProviderSelection::Mock,
             });
@@ -477,7 +486,10 @@ fn build_openrouter_provider(
 ) -> Option<OpenAiProvider> {
     let key = resolve_bearer_key(credential, env_key)?;
     let extra_headers = vec![
-        ("HTTP-Referer".to_string(), "https://lucidos.dev".to_string()),
+        (
+            "HTTP-Referer".to_string(),
+            "https://lucidos.dev".to_string(),
+        ),
         ("X-Title".to_string(), "Lucidos".to_string()),
     ];
     match OpenAiProvider::new_with_base_url(
@@ -649,7 +661,11 @@ mod tests {
             ProviderSelection::Real,
             "a provider credential must select the real RoutingProvider"
         );
-        assert_ne!(selection, ProviderSelection::Mock, "must never swap to mock");
+        assert_ne!(
+            selection,
+            ProviderSelection::Mock,
+            "must never swap to mock"
+        );
         assert!(
             provider.is_configured(),
             "after adding a credential, llm_configured() must flip true"

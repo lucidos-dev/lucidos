@@ -100,6 +100,6 @@ description, and loads it when it's relevant. Adding a new recipe just works; th
 no command to register and no menu to wire up.
 
 !!! note "Why you'll still see \"Skills\" in a few places"
-    Some older material (including parts of the project README) uses *Skills* for
-    what is now split into *apps* and *knowhow*. The vocabulary moved on — the
-    canonical terms are the ones in the table above.
+    Some older material (release notes, design records) uses *Skills* for what is
+    now split into *apps* and *knowhow*. The vocabulary moved on: the canonical
+    terms are the ones in the table above.

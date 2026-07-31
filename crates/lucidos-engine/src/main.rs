@@ -486,9 +486,9 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // the credential subscriber's rebuilds — reusing warm access tokens. `Some`
     // exactly when a real Vertex build is possible (non-mock + project
     // configured), matching the old per-selection storage.
-    let vertex_token_cache: Option<lucidos_engine::llm::vertex::TokenCache> =
-        (!model_is_mock && !project_id.is_empty())
-            .then(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
+    let vertex_token_cache: Option<lucidos_engine::llm::vertex::TokenCache> = (!model_is_mock
+        && !project_id.is_empty())
+    .then(|| std::sync::Arc::new(std::sync::Mutex::new(None)));
 
     // One throwaway pool for the initial registry load + provider build — the
     // engine's own pool doesn't exist until `LucidosEngine::new` below. `None`
@@ -748,11 +748,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `descendants_block_archive` predicate in `resolve_actions` keys off
     // `blocking_descendant_count > 0`), and `archive_thread`'s cascade never
     // runs even though every descendant is genuinely idle.
-    if let Err(e) =
-        lucidos_engine::engine::event_bus::EventBus::rebuild_blocking_descendant_count(
-            shared_engine.pool(),
-        )
-        .await
+    if let Err(e) = lucidos_engine::engine::event_bus::EventBus::rebuild_blocking_descendant_count(
+        shared_engine.pool(),
+    )
+    .await
     {
         log!(
             "[Startup] Failed to reconcile blocking_descendant_count: {}",
@@ -1085,7 +1084,11 @@ mod runtime_tests {
         let idx = depth % buf.len();
         buf[idx] = depth as u8;
         std::hint::black_box(&buf);
-        let deeper = if depth == 0 { 0 } else { consume_stack(depth - 1) };
+        let deeper = if depth == 0 {
+            0
+        } else {
+            consume_stack(depth - 1)
+        };
         deeper.wrapping_add(buf[idx] as u64)
     }
 
@@ -1118,6 +1121,9 @@ mod runtime_tests {
                 .expect("deep-stack task joins without overflowing the worker stack")
         });
         let expected: u64 = (0..=64).sum();
-        assert_eq!(sum, expected, "deep recursion ran every level to completion");
+        assert_eq!(
+            sum, expected,
+            "deep recursion ran every level to completion"
+        );
     }
 }

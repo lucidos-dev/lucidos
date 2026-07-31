@@ -143,7 +143,9 @@ pub(super) enum TerminalKind {
     /// `error_max_turns`, etc.). Carries the user-facing reason so
     /// `make_terminal_event` can populate `ResponseFailed.error` —
     /// without this the partial response renders as a complete answer.
-    Failed { error: String },
+    Failed {
+        error: String,
+    },
 }
 
 /// True when CC was woken up with no user-initiated content — engine-internal
@@ -294,7 +296,9 @@ pub(super) fn should_auto_commit_on_cleanup(
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ConflictResolutionCleanupAction {
     Apply,
-    Abort { message: &'static str },
+    Abort {
+        message: &'static str,
+    },
     /// The safety net just emitted `ContinuationRequested` for this session —
     /// the auto-recovery continuation resumes the SAME merge turn via
     /// `--resume`, so the merge duty transfers instead of failing: leave the

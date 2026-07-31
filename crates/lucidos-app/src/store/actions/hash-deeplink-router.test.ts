@@ -81,13 +81,28 @@ function setUrl(href: string) {
 
 // Mock the two dispatchers the router calls. Replaces the real focus/dispatch
 // side-effect chain with vi.fn so the test owns assertion of "did it fire?".
-const focusThreadOrBootstrap = vi.fn();
+type Outcome = { kind: 'focused' } | { kind: 'not-found' } | { kind: 'failed'; error: unknown };
+const focusThreadOrBootstrapResult = vi.fn<(id: string) => Promise<Outcome>>();
 const dispatchDeepLink = vi.fn();
+const showToast = vi.fn();
 
-vi.mock('./threads', () => ({ focusThreadOrBootstrap: (...args: unknown[]) => focusThreadOrBootstrap(...args) }));
+vi.mock('./threads', () => ({
+  focusThreadOrBootstrapResult: (...args: [string]) => focusThreadOrBootstrapResult(...args),
+}));
 vi.mock('./in-app-notification-toast', () => ({ dispatchDeepLink: (...args: unknown[]) => dispatchDeepLink(...args) }));
+// Partial store mock: only the toast is stubbed. A narrow stub would break the
+// modules that pull other store exports in transitively (wipPreview reads
+// `wipPreviewThreadId` at import time).
+vi.mock('../store', async () => {
+  const actual = await vi.importActual<typeof import('../store')>('../store');
+  return { ...actual, showToast: (...args: unknown[]) => showToast(...args) };
+});
 
-const { handleHashLocation, setupHashDeeplinkRouting } = await import('./hash-deeplink-router');
+const { handleHashLocation, setupHashDeeplinkRouting, _resetThreadHashLandingForTesting } =
+  await import('./hash-deeplink-router');
+
+/** Let queued microtasks (the landing's awaits) run to completion. */
+const flush = () => new Promise<void>(resolve => { setTimeout(resolve, 0); });
 
 const NOTIF_ID = '5d8c4d96-8df1-4243-a43d-35449f689bda';
 const THREAD_ID = '80012b3a-b3cf-4a89-bd23-a35363db4177';
@@ -113,12 +128,15 @@ function buildNavigateQuery(): string {
 
 describe('hash-deeplink-router', () => {
   beforeEach(() => {
-    focusThreadOrBootstrap.mockClear();
+    focusThreadOrBootstrapResult.mockReset();
+    focusThreadOrBootstrapResult.mockResolvedValue({ kind: 'focused' });
     dispatchDeepLink.mockClear();
+    showToast.mockClear();
     documentListeners.clear();
     windowListeners.clear();
     visibilityValue = 'visible';
     setUrl('http://localhost/');
+    _resetThreadHashLandingForTesting();
   });
 
   describe('handleHashLocation', () => {
@@ -157,11 +175,12 @@ describe('hash-deeplink-router', () => {
       expect(dispatchDeepLink).toHaveBeenCalledTimes(1);
     });
 
-    it('s4_5_handle_hash_location_routes_bare_thread_hash_via_focus_thread_or_bootstrap', () => {
+    it('s4_5_handle_hash_location_routes_bare_thread_hash_via_focus_thread_or_bootstrap', async () => {
       setUrl(`http://localhost/#thread=${THREAD_ID}`);
       handleHashLocation();
-      expect(focusThreadOrBootstrap).toHaveBeenCalledTimes(1);
-      expect(focusThreadOrBootstrap.mock.calls[0][0]).toBe(THREAD_ID);
+      expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
+      expect(focusThreadOrBootstrapResult.mock.calls[0][0]).toBe(THREAD_ID);
+      await flush();
       expect(window.location.hash).toBe('');
       expect(dispatchDeepLink).not.toHaveBeenCalled();
     });
@@ -170,9 +189,98 @@ describe('hash-deeplink-router', () => {
       setUrl('http://localhost/#some-other-anchor');
       handleHashLocation();
       expect(dispatchDeepLink).not.toHaveBeenCalled();
-      expect(focusThreadOrBootstrap).not.toHaveBeenCalled();
+      expect(focusThreadOrBootstrapResult).not.toHaveBeenCalled();
       // Unrecognized anchor is preserved — only deep-link params are stripped.
       expect(window.location.hash).toBe('#some-other-anchor');
+    });
+  });
+
+  // The cross-workspace landing: `openThreadInWorkspace` sends the user to
+  // `<peer>/#thread=<uuid>`, and the gateway lazy-starts a stopped peer engine on
+  // that proxy hit. The shell therefore boots while the engine is still coming up,
+  // so the first bootstrap can lose the race. Before this suite the router stripped
+  // the hash BEFORE dispatching, which turned that lost race into a permanently
+  // lost deep link (the "first click reloads, second click navigates" report).
+  describe('bare #thread= landing durability', () => {
+    it('keeps the hash while a failed bootstrap is retried, and strips it on success', async () => {
+      vi.useFakeTimers();
+      try {
+        focusThreadOrBootstrapResult
+          .mockResolvedValueOnce({ kind: 'failed', error: new Error('engine booting') })
+          .mockResolvedValueOnce({ kind: 'failed', error: new Error('engine booting') })
+          .mockResolvedValue({ kind: 'focused' });
+
+        setUrl(`http://localhost/#thread=${THREAD_ID}`);
+        handleHashLocation();
+
+        // First attempt has failed: the hash MUST still be there to retry from.
+        await vi.advanceTimersByTimeAsync(0);
+        expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
+        expect(window.location.hash).toBe(`#thread=${THREAD_ID}`);
+
+        await vi.advanceTimersByTimeAsync(5000);
+        expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(3);
+        expect(window.location.hash).toBe('');
+        expect(showToast).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not retry a not-found verdict, and tells the user which thread', async () => {
+      focusThreadOrBootstrapResult.mockResolvedValue({ kind: 'not-found' });
+      setUrl(`http://localhost/#thread=${THREAD_ID}`);
+      handleHashLocation();
+      await flush();
+      // A verdict from the engine, not a race: one attempt, no backoff.
+      expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
+      expect(window.location.hash).toBe('');
+      expect(showToast).toHaveBeenCalledTimes(1);
+      expect(showToast.mock.calls[0][0]).toContain(THREAD_ID);
+      expect(showToast.mock.calls[0][1]).toBe('error');
+    });
+
+    it('gives up after a bounded number of attempts and surfaces the error', async () => {
+      vi.useFakeTimers();
+      try {
+        focusThreadOrBootstrapResult.mockResolvedValue({
+          kind: 'failed',
+          error: new Error('peer unreachable'),
+        });
+        setUrl(`http://localhost/#thread=${THREAD_ID}`);
+        handleHashLocation();
+
+        await vi.advanceTimersByTimeAsync(60_000);
+        // Bounded: the retry budget is exhausted rather than looping forever.
+        expect(focusThreadOrBootstrapResult.mock.calls.length).toBeLessThan(20);
+        expect(window.location.hash).toBe('');
+        expect(showToast).toHaveBeenCalledTimes(1);
+        expect(showToast.mock.calls[0][0]).toContain('peer unreachable');
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not start a second landing while one is in flight for the same thread', async () => {
+      vi.useFakeTimers();
+      try {
+        focusThreadOrBootstrapResult.mockResolvedValue({
+          kind: 'failed',
+          error: new Error('engine booting'),
+        });
+        setUrl(`http://localhost/#thread=${THREAD_ID}`);
+        handleHashLocation();
+        await vi.advanceTimersByTimeAsync(0);
+        expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
+
+        // The hash still being in the URL is exactly what makes every resume
+        // event (visibilitychange / focus / pageshow) re-enter here.
+        handleHashLocation();
+        handleHashLocation();
+        expect(focusThreadOrBootstrapResult).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
     });
   });
 

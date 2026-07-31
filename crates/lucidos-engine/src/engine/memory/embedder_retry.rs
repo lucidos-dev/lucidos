@@ -80,7 +80,8 @@ impl LucidosEngine {
                 }
                 attempt += 1;
                 let id = model_id.clone();
-                match tokio::task::spawn_blocking(move || FastEmbedProvider::with_model(&id)).await {
+                match tokio::task::spawn_blocking(move || FastEmbedProvider::with_model(&id)).await
+                {
                     Ok(Ok(provider)) => {
                         engine.embedder().install(provider);
                         log!(

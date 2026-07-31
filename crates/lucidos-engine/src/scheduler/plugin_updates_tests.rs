@@ -35,8 +35,14 @@ fn single_candidate_uses_singular_phrasing_with_name_and_version() {
     assert!(message.contains("Weather"), "message: {message}");
     assert!(message.contains("1.2.0"), "message: {message}");
     // Points at Plugins, not the old "Apps" / app store wording.
-    assert!(message.contains("Open Plugins to review."), "message: {message}");
-    assert!(!message.contains("Apps"), "should not mention Apps: {message}");
+    assert!(
+        message.contains("Open Plugins to review."),
+        "message: {message}"
+    );
+    assert!(
+        !message.contains("Apps"),
+        "should not mention Apps: {message}"
+    );
 }
 
 #[test]
@@ -51,7 +57,10 @@ fn multiple_candidates_use_plural_phrasing_with_sorted_names_and_count() {
     let habit = message.find("Habit Tracker").expect("habit listed");
     let weather = message.find("Weather").expect("weather listed");
     assert!(habit < weather, "names should be sorted: {message}");
-    assert!(message.contains("Open Plugins to review."), "message: {message}");
+    assert!(
+        message.contains("Open Plugins to review."),
+        "message: {message}"
+    );
 }
 
 #[test]
@@ -100,10 +109,9 @@ fn new_update_is_detected_against_an_existing_marker() {
     write_notified_signature(dir.path(), &notified);
 
     // A freshly bumped version is "new" relative to what was already notified.
-    let current: BTreeSet<String> =
-        ["weather@1.2.0".to_string(), "weather@1.3.0".to_string()]
-            .into_iter()
-            .collect();
+    let current: BTreeSet<String> = ["weather@1.2.0".to_string(), "weather@1.3.0".to_string()]
+        .into_iter()
+        .collect();
     let already = read_notified_signature(dir.path());
     assert!(current.difference(&already).next().is_some());
 }
@@ -111,10 +119,9 @@ fn new_update_is_detected_against_an_existing_marker() {
 #[test]
 fn shrinking_set_after_an_apply_is_not_treated_as_new() {
     let dir = tempfile::tempdir().unwrap();
-    let notified: BTreeSet<String> =
-        ["weather@1.2.0".to_string(), "habit@2.0.0".to_string()]
-            .into_iter()
-            .collect();
+    let notified: BTreeSet<String> = ["weather@1.2.0".to_string(), "habit@2.0.0".to_string()]
+        .into_iter()
+        .collect();
     write_notified_signature(dir.path(), &notified);
 
     // User applied "habit"; only "weather" remains — no new entry, so no

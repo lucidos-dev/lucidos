@@ -125,9 +125,7 @@ impl LucidosEngine {
                 to_outcome(self.execute_import_tool(name, args, extraction_ctx).await)
             }
             // Grouped manifest tools (consolidated surface the model sees).
-            tn::TRIGGERS | tn::TRIGGER_GROUPS => {
-                self.execute_scheduler_grouped(name, args).await
-            }
+            tn::TRIGGERS | tn::TRIGGER_GROUPS => self.execute_scheduler_grouped(name, args).await,
             tn::PREFERENCES => self.execute_preferences_grouped(args, device_id).await,
             // Flat per-verb names: back-compat aliases that still dispatch to the
             // same handlers (consolidated into the grouped tools above, but kept
@@ -149,9 +147,7 @@ impl LucidosEngine {
             tn::GET_BACKUP_STATUS => to_outcome(self.execute_get_backup_status().await),
             // Grouped env-var tool (list/set/delete). `set_environment_variable`
             // stays wired as a back-compat alias → dispatched as action "set".
-            tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => {
-                self.execute_env_vars(name, args).await
-            }
+            tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => self.execute_env_vars(name, args).await,
             tn::MANAGE_MODELS => to_outcome(self.execute_manage_models(args).await),
             tn::WEB_SEARCH | tn::FETCH_NEWS => to_outcome(self.execute_web_tool(name, args).await),
             tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => {
@@ -172,17 +168,13 @@ impl LucidosEngine {
                 .await,
             ),
             tn::RUN_PYTHON => to_outcome(self.execute_python_tool(args, thread_id).await),
-            tn::RUN_PYTHON_BACKGROUND => {
-                self.execute_python_background_tool(args, thread_id).await
-            }
+            tn::RUN_PYTHON_BACKGROUND => self.execute_python_background_tool(args, thread_id).await,
             tn::RUN_BASH => to_outcome(self.execute_bash_tool(args, thread_id).await),
             tn::RUN_BASH_BACKGROUND => self.execute_bash_background_tool(args, thread_id).await,
             tn::BASH_OUTPUT => self.execute_bash_output_tool(args, thread_id).await,
             tn::BASH_KILL => self.execute_bash_kill_tool(args).await,
             tn::CORRECT_MEMORY => to_outcome(self.execute_memory_tool(args).await),
-            tn::CORRECT_MEMORY_BY_ID => {
-                to_outcome(self.execute_correct_memory_by_id(args).await)
-            }
+            tn::CORRECT_MEMORY_BY_ID => to_outcome(self.execute_correct_memory_by_id(args).await),
             tn::GENERATE_IMAGE => to_outcome(self.execute_generate_image(args, thread_id).await),
             tn::SAVE_THREAD_IMAGE => {
                 to_outcome(self.execute_save_thread_image(args, thread_id).await)
@@ -315,13 +307,15 @@ impl LucidosEngine {
                 .to_string());
         }
         if target == "settings" && settings_view == Some("environment-variables") {
-            return Ok("Navigated to Settings → System → Environment variables. The UI shows:\n\
+            return Ok(
+                "Navigated to Settings → System → Environment variables. The UI shows:\n\
                 - The user's environment variables as NAME = value rows\n\
                 - Buttons to add, edit, or delete a variable\n\
                 These are non-secret values injected into every subprocess Lucidos spawns \
                 (run_bash, run_python, scheduled scripts, coding agents). For secrets like API \
                 keys, the user should use credentials instead."
-                .to_string());
+                    .to_string(),
+            );
         }
 
         if target == "url" {
@@ -611,7 +605,11 @@ impl LucidosEngine {
                 let root_commit_sha =
                     crate::engine::git_ops::root_commit_sha(std::path::Path::new(&expanded)).await;
                 match crate::core::repositories::RepositoryStore::add(
-                    &self.pool, name, &expanded, desc, root_commit_sha.as_deref(),
+                    &self.pool,
+                    name,
+                    &expanded,
+                    desc,
+                    root_commit_sha.as_deref(),
                 )
                 .await
                 {
@@ -954,11 +952,7 @@ pub(crate) fn merge_thread_queue_policy_patch(
         "max_queued_per_trigger",
         &mut policy.max_queued_per_trigger,
     )?;
-    apply_usize_policy_field(
-        args,
-        "reserved_background",
-        &mut policy.reserved_background,
-    )?;
+    apply_usize_policy_field(args, "reserved_background", &mut policy.reserved_background)?;
 
     if let Some(value) = args.get("overflow") {
         policy.overflow =
@@ -1011,8 +1005,7 @@ pub(crate) fn parse_apply_change_id(args: &serde_json::Value) -> Result<uuid::Uu
         Some(s) if !s.trim().is_empty() => s.trim(),
         _ => return Err("Error: change_id is required".to_string()),
     };
-    uuid::Uuid::parse_str(raw)
-        .map_err(|_| format!("Error: change_id is not a valid UUID: {}", raw))
+    uuid::Uuid::parse_str(raw).map_err(|_| format!("Error: change_id is not a valid UUID: {}", raw))
 }
 
 /// Default + inclusive `[min, max]` bounds for an optional numeric tool

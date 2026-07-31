@@ -56,10 +56,21 @@ pub(super) async fn submit_command_consent(
     } else {
         Some(DENIAL_REASON.to_string())
     };
-    let persist_scope = if body.allowed { body.persist_scope } else { None };
+    let persist_scope = if body.allowed {
+        body.persist_scope
+    } else {
+        None
+    };
     if let Some(scope) = persist_scope {
-        let command = command_guard::command_text(&entry.tool_name, &entry.input).unwrap_or_default();
-        record_command_allow_grant(&state.engine, entry.thread_id, &entry.tool_name, command, scope);
+        let command =
+            command_guard::command_text(&entry.tool_name, &entry.input).unwrap_or_default();
+        record_command_allow_grant(
+            &state.engine,
+            entry.thread_id,
+            &entry.tool_name,
+            command,
+            scope,
+        );
     }
 
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
@@ -80,10 +91,7 @@ pub(super) async fn submit_command_consent(
 /// Route for the command-guard permission consent (ADR 0002) — chat mirror
 /// of `/mcp/consent`.
 pub(super) fn router() -> Router<AppState> {
-    Router::new().route(
-        "/command-permission/consent",
-        post(submit_command_consent),
-    )
+    Router::new().route("/command-permission/consent", post(submit_command_consent))
 }
 
 #[cfg(test)]

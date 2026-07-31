@@ -484,7 +484,11 @@ impl LucidosEngine {
                     None => return Ok(format!("Error: No trigger found with ID {}", trigger_id)),
                 };
                 if existing.paused == paused {
-                    let state = if paused { "already paused" } else { "already active" };
+                    let state = if paused {
+                        "already paused"
+                    } else {
+                        "already active"
+                    };
                     return Ok(format!("Trigger '{}' is {}.", existing.name, state));
                 }
                 let payload = serde_json::json!({ "trigger_id": &trigger_id, "paused": paused });
@@ -496,7 +500,10 @@ impl LucidosEngine {
                     }))
                     .await?;
                 let action = if paused { "Paused" } else { "Resumed" };
-                Ok(format!("[ACTION COMPLETED] {} trigger '{}' (ID: {}).", action, existing.name, trigger_id))
+                Ok(format!(
+                    "[ACTION COMPLETED] {} trigger '{}' (ID: {}).",
+                    action, existing.name, trigger_id
+                ))
             }
             "list_trigger_groups" => {
                 let mut groups: Vec<crate::triggers::TriggerGroup> = {
@@ -534,10 +541,7 @@ impl LucidosEngine {
             "create_trigger_group" => {
                 use crate::engine::trigger_group_writes::CreateTriggerGroupError;
                 let raw_name = args["name"].as_str().unwrap_or("");
-                let explicit_order = args
-                    .get("order")
-                    .and_then(|v| v.as_i64())
-                    .map(|n| n as i32);
+                let explicit_order = args.get("order").and_then(|v| v.as_i64()).map(|n| n as i32);
                 match self
                     .create_trigger_group_serialized(raw_name, explicit_order, None)
                     .await
@@ -549,15 +553,11 @@ impl LucidosEngine {
                     Err(CreateTriggerGroupError::EmptyName) => {
                         Ok("Error: name is required".to_string())
                     }
-                    Err(CreateTriggerGroupError::DuplicateName { existing_name }) => {
-                        Ok(format!(
-                            "Error: A group named '{}' already exists",
-                            existing_name
-                        ))
-                    }
-                    Err(CreateTriggerGroupError::EmitFailed(msg)) => {
-                        Err(msg.into())
-                    }
+                    Err(CreateTriggerGroupError::DuplicateName { existing_name }) => Ok(format!(
+                        "Error: A group named '{}' already exists",
+                        existing_name
+                    )),
+                    Err(CreateTriggerGroupError::EmitFailed(msg)) => Err(msg.into()),
                 }
             }
             "rename_trigger_group" => {
@@ -582,12 +582,10 @@ impl LucidosEngine {
                     Err(RenameTriggerGroupError::NotFound) => {
                         Ok(format!("Error: No group found with ID {}", group_id))
                     }
-                    Err(RenameTriggerGroupError::DuplicateName { existing_name }) => {
-                        Ok(format!(
-                            "Error: A group named '{}' already exists",
-                            existing_name
-                        ))
-                    }
+                    Err(RenameTriggerGroupError::DuplicateName { existing_name }) => Ok(format!(
+                        "Error: A group named '{}' already exists",
+                        existing_name
+                    )),
                     Err(RenameTriggerGroupError::EmitFailed(msg)) => Err(msg.into()),
                 }
             }
@@ -601,7 +599,10 @@ impl LucidosEngine {
                     let mut acc = Vec::with_capacity(ordering.len());
                     for entry in &ordering {
                         let id = entry.get("id").and_then(|v| v.as_str()).unwrap_or("");
-                        let order = entry.get("order").and_then(|v| v.as_i64()).map(|n| n as i32);
+                        let order = entry
+                            .get("order")
+                            .and_then(|v| v.as_i64())
+                            .map(|n| n as i32);
                         if id.is_empty() || order.is_none() {
                             return Ok(
                                 "Error: each ordering entry needs string id and integer order"
@@ -623,8 +624,7 @@ impl LucidosEngine {
                 };
                 let n = to_change.len();
                 for (group_id, order) in to_change {
-                    let payload =
-                        serde_json::json!({ "group_id": group_id, "order": order });
+                    let payload = serde_json::json!({ "group_id": group_id, "order": order });
                     self.event_bus
                         .emit(BusEvent::System(SystemEvent::TriggerGroupReordered {
                             group_id,
@@ -718,7 +718,9 @@ fn trigger_description(cron_display: &str, subscriptions: &[EventSubscription]) 
 ///
 /// Returns the parsed Vec on success; otherwise an `Error: ...` string the
 /// LLM can read directly. Blank `event_type` strings are dropped.
-pub(crate) fn parse_on_arg(value: Option<&serde_json::Value>) -> Result<Vec<EventSubscription>, String> {
+pub(crate) fn parse_on_arg(
+    value: Option<&serde_json::Value>,
+) -> Result<Vec<EventSubscription>, String> {
     let Some(value) = value.filter(|v| !v.is_null()) else {
         return Ok(Vec::new());
     };
@@ -738,8 +740,7 @@ pub(crate) fn parse_on_arg(value: Option<&serde_json::Value>) -> Result<Vec<Even
     }
     if let Some(obj) = value.as_object() {
         let sub = EventSubscription::from_object_entry(obj).ok_or_else(|| {
-            "Error: 'on' object must carry an 'event_type' (and optional 'condition')"
-                .to_string()
+            "Error: 'on' object must carry an 'event_type' (and optional 'condition')".to_string()
         })?;
         subscriptions.push(sub);
         return Ok(subscriptions);

@@ -635,7 +635,9 @@ impl EventBus {
                     // aggregate) run while the row is still pending or absent and
                     // therefore `Proceed`, emitting exactly once.
                     if let ThreadEvent::ChangeApplied { change_id, .. } = te {
-                        use crate::core::changes_projection::{ChangeApplyDedup, ChangesProjection};
+                        use crate::core::changes_projection::{
+                            ChangeApplyDedup, ChangesProjection,
+                        };
                         if ChangesProjection::change_apply_dedup(&mut tx, change_id).await?
                             == ChangeApplyDedup::Suppress
                         {
@@ -684,20 +686,21 @@ impl EventBus {
                     // A failed fetch logs and broadcasts without aggregate
                     // (frontend tolerates absence with a warning, but it
                     // indicates a backend bug).
-                    let aggregate =
-                        match crate::core::store::fetch_thread_aggregate(&mut *tx, *thread_id)
-                            .await
-                        {
-                            Ok(agg) => agg,
-                            Err(e) => {
-                                crate::log!(
-                                    "[EventBus] Failed to fetch ThreadAggregate for {}: {}",
-                                    thread_id,
-                                    e
-                                );
-                                None
-                            }
-                        };
+                    let aggregate = match crate::core::store::fetch_thread_aggregate(
+                        &mut *tx, *thread_id,
+                    )
+                    .await
+                    {
+                        Ok(agg) => agg,
+                        Err(e) => {
+                            crate::log!(
+                                "[EventBus] Failed to fetch ThreadAggregate for {}: {}",
+                                thread_id,
+                                e
+                            );
+                            None
+                        }
+                    };
                     // Ancestor aggregates fetched inside the same tx so each
                     // rebroadcast sees the post-projection state (read-your-write)
                     // with the bumped `blocking_descendant_count`. Empty when the
@@ -933,7 +936,6 @@ impl EventBus {
         }
         Ok(())
     }
-
 }
 
 #[async_trait]

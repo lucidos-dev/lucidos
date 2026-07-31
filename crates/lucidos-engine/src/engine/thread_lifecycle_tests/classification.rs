@@ -21,19 +21,15 @@ fn every_persisted_event_is_classified() {
 fn every_persisted_event_resolves_in_lifecycle() {
     for event_type in all_persisted_event_types() {
         for thread_type in [ThreadType::Chat, ThreadType::CodingAgent] {
-            let result = resolve_transition(
-                event_type,
-                thread_type,
-                ArchiveState::Archived,
-                true,
-            );
+            let result = resolve_transition(event_type, thread_type, ArchiveState::Archived, true);
             if let Err(err) = &result {
                 assert!(
                     !err.reason.contains("Unknown event type"),
                     "'{}' on {:?} hits the catch-all 'Unknown event type' arm — \
                      add it to the no_change list (or a more specific arm) in \
                      thread_lifecycle.rs::resolve_transition",
-                    event_type, thread_type
+                    event_type,
+                    thread_type
                 );
             }
         }
@@ -105,7 +101,8 @@ fn response_generated_surfaces_chat_to_inbox() {
         true,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));
+}
 
 // 6. response_generated_does_not_surface_cc
 #[test]
@@ -130,7 +127,8 @@ fn claude_code_idled_surfaces_cc_to_inbox() {
         true,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));
+}
 
 // 8. claude_code_idled_rejected_for_chat
 #[test]
@@ -198,10 +196,7 @@ fn thread_archived_clears_inbox_both_types() {
 // 13. thread_archived_is_terminal
 #[test]
 fn thread_archived_is_terminal() {
-    assert_eq!(
-        classify_event("ThreadArchived"),
-        Some(EventClass::Terminal)
-    );
+    assert_eq!(classify_event("ThreadArchived"), Some(EventClass::Terminal));
 }
 
 // 14. chat_sub_threads_route_to_archived
@@ -310,7 +305,7 @@ fn cc_sub_threads_always_go_to_inbox() {
         false,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(ArchiveState::Inbox));    // ResponseAborted for sub-thread CC → inbox
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox)); // ResponseAborted for sub-thread CC → inbox
     let result = resolve_transition(
         "ResponseAborted",
         ThreadType::CodingAgent,
@@ -318,7 +313,7 @@ fn cc_sub_threads_always_go_to_inbox() {
         false,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(ArchiveState::Inbox));    // ChangeProposed for sub-thread CC → inbox
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox)); // ChangeProposed for sub-thread CC → inbox
     let result = resolve_transition(
         "ChangeProposed",
         ThreadType::CodingAgent,
@@ -326,7 +321,8 @@ fn cc_sub_threads_always_go_to_inbox() {
         false,
     )
     .unwrap();
-    assert_eq!(result.new_section, Some(ArchiveState::Inbox));}
+    assert_eq!(result.new_section, Some(ArchiveState::Inbox));
+}
 
 // 15. no_transition_produces_illegal_section
 #[test]
@@ -356,4 +352,3 @@ fn no_transition_produces_illegal_section() {
         }
     }
 }
-

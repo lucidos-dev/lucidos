@@ -1,6 +1,5 @@
 //! Source-string detection + `short_source` + archive-entry validation tests.
 
-
 use super::source::Source;
 use super::*;
 use crate::core::plugins::validate_archive_entry_path;

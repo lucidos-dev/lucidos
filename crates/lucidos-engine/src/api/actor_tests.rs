@@ -38,12 +38,7 @@ fn build_origin_user_with_caller_yields_workspace() {
         None,
         None,
         None,
-        caller(
-            "dev",
-            Some(src_thread),
-            Some(src_event),
-            ActorMode::Human,
-        ),
+        caller("dev", Some(src_thread), Some(src_event), ActorMode::Human),
     );
     match origin {
         Some(MessageOrigin::Workspace {
@@ -319,7 +314,7 @@ fn user_actor_falls_back_to_header_device_id_when_no_explicit_id() {
 #[test]
 fn user_actor_explicit_id_takes_precedence_over_header() {
     let h = headers_with(&[("x-lucidos-device-id", "dev-from-header")]);
-        let actor = user_actor(&h, Some("dev-from-arg"), Some("Chrome".into()));
+    let actor = user_actor(&h, Some("dev-from-arg"), Some("Chrome".into()));
     match actor {
         Some(MessageOrigin::Device { device_id, label }) => {
             assert_eq!(device_id, "dev-from-arg");
@@ -370,11 +365,11 @@ async fn user_actor_resolved_uses_explicit_device_id_override() {
         .unwrap();
 
     let h = headers_with(&[("x-lucidos-device-id", "from-header")]);
-        let actor = user_actor_resolved(&h, &pool, Some("from-body")).await;
+    let actor = user_actor_resolved(&h, &pool, Some("from-body")).await;
     match actor {
         Some(MessageOrigin::Device { device_id, label }) => {
             assert_eq!(device_id, "from-body", "explicit override beats header");
-                assert_eq!(label, "Body Device");
+            assert_eq!(label, "Body Device");
         }
         other => panic!("expected Device using override, got {:?}", other),
     }
@@ -532,10 +527,7 @@ fn subprocess_origin_env_vars_without_thread_id_emits_token_only() {
 // otherwise get its own mutex and they would race each other.
 static API_PORT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-fn host_pid_var<'a>(
-    vars: &'a [(&'static str, String)],
-    key: &str,
-) -> Option<&'a str> {
+fn host_pid_var<'a>(vars: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
     vars.iter()
         .find(|(k, _)| *k == key)
         .map(|(_, v)| v.as_str())
@@ -545,9 +537,9 @@ fn host_pid_var<'a>(
 fn host_protection_env_vars_always_sets_host_pid() {
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().expect("tempdir");
-        let vars = host_protection_env_vars(workspace.path());
-        assert_eq!(
-            host_pid_var(&vars, "LUCIDOS_HOST_PID"),
+    let vars = host_protection_env_vars(workspace.path());
+    assert_eq!(
+        host_pid_var(&vars, "LUCIDOS_HOST_PID"),
         Some(std::process::id().to_string().as_str()),
         "LUCIDOS_HOST_PID must equal the engine's own pid"
     );
@@ -575,9 +567,9 @@ fn host_protection_env_vars_omits_frontend_pid_when_pidfile_missing() {
     // in some shells and confuse the guard).
     let _guard = API_PORT_ENV_LOCK.lock().unwrap();
     let workspace = tempfile::tempdir().expect("tempdir");
-        let vars = host_protection_env_vars(workspace.path());
-        assert!(
-            host_pid_var(&vars, "LUCIDOS_FRONTEND_PID").is_none(),
+    let vars = host_protection_env_vars(workspace.path());
+    assert!(
+        host_pid_var(&vars, "LUCIDOS_FRONTEND_PID").is_none(),
         "LUCIDOS_FRONTEND_PID must be unset when no pidfile exists"
     );
 }
@@ -629,10 +621,7 @@ fn host_protection_env_vars_includes_api_port_when_engine_has_one() {
     unsafe {
         std::env::remove_var("LUCIDOS_API_PORT");
     }
-    assert_eq!(
-        host_pid_var(&vars, "LUCIDOS_API_PORT"),
-        Some("3007"),
-    );
+    assert_eq!(host_pid_var(&vars, "LUCIDOS_API_PORT"), Some("3007"),);
 }
 
 #[test]

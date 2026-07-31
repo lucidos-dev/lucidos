@@ -86,13 +86,7 @@ async fn emit_failure_notification(
             emit_err
         );
     }
-    crate::scheduler::push::send_push_to_all(
-        engine,
-        &title,
-        &message,
-        Some(notification_id),
-    )
-    .await;
+    crate::scheduler::push::send_push_to_all(engine, &title, &message, Some(notification_id)).await;
 }
 
 pub async fn execute_user_task(
@@ -730,8 +724,7 @@ mod tests {
         // The sanitizer must not be so aggressive that it mangles legitimate
         // names — emoji, accents, and CJK are fine and common in user-facing
         // labels. Only control chars and the few delimiters need to go.
-        let out =
-            build_trigger_user_message("朝のニュース ☀️ — résumé", "id", "body", None, None);
+        let out = build_trigger_user_message("朝のニュース ☀️ – résumé", "id", "body", None, None);
         assert!(out.contains("朝のニュース"));
         assert!(out.contains("☀️"));
         assert!(out.contains("résumé"));
@@ -857,6 +850,9 @@ mod tests {
         assert_eq!(a.as_ptr(), b.as_ptr(), "addendum must be a static const");
         // Sanity: nothing that looks like an interpolated id/timestamp slipped
         // through (UUIDs contain '-', formatted args use '{').
-        assert!(!a.contains("{"), "addendum should not contain format placeholders");
+        assert!(
+            !a.contains("{"),
+            "addendum should not contain format placeholders"
+        );
     }
 }

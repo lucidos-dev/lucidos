@@ -19,7 +19,7 @@
 
 #[path = "event_bus_projection_propagation.rs"]
 mod propagation;
-#[path = "event_bus_projection_thread.rs"]
-mod thread;
 #[path = "event_bus_projection_system.rs"]
 mod system;
+#[path = "event_bus_projection_thread.rs"]
+mod thread;

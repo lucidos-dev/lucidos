@@ -259,8 +259,7 @@ async fn count_matches_list_length_under_same_filter() {
         ThreadStatus::WaitingForUserAnswer,
     )
     .await;
-    let _idle =
-        seed_summary_row(&pool, &format!("{marker}-i"), "chat", ThreadStatus::Idle).await;
+    let _idle = seed_summary_row(&pool, &format!("{marker}-i"), "chat", ThreadStatus::Idle).await;
 
     // count and list must agree for the same filter set. Run against the
     // global active filter (no source narrowing) since other tests may also
@@ -333,7 +332,13 @@ async fn get_by_id_returns_the_seeded_thread_summary() {
     let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
     let marker = unique_marker("api-threads-get-by-id");
 
-    let id = seed_summary_row(&pool, &format!("{marker}-title"), "chat", ThreadStatus::Idle).await;
+    let id = seed_summary_row(
+        &pool,
+        &format!("{marker}-title"),
+        "chat",
+        ThreadStatus::Idle,
+    )
+    .await;
 
     let url = format!("{}/api/v1/threads/{}", base_url(), id);
     let resp = client.get(&url).send().await.expect("get-by-id request");
@@ -341,7 +346,10 @@ async fn get_by_id_returns_the_seeded_thread_summary() {
     let body: serde_json::Value = resp.json().await.expect("invalid JSON");
 
     assert_eq!(body["thread_id"].as_str(), Some(id.to_string().as_str()));
-    assert_eq!(body["title"].as_str(), Some(format!("{marker}-title").as_str()));
+    assert_eq!(
+        body["title"].as_str(),
+        Some(format!("{marker}-title").as_str())
+    );
 }
 
 #[tokio::test]

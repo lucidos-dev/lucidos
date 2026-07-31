@@ -123,14 +123,11 @@ fn plan_update_emits_normalized_todo_list_pair() {
         }),
     );
     match &evs[..] {
-        [
-            AgentEvent::ToolUse { name, input, id },
-            AgentEvent::ToolResult {
-                status,
-                id: result_id,
-                ..
-            },
-        ] => {
+        [AgentEvent::ToolUse { name, input, id }, AgentEvent::ToolResult {
+            status,
+            id: result_id,
+            ..
+        }] => {
             assert_eq!(name, "todo_list");
             assert_eq!(id, result_id, "pair must share an id");
             assert_eq!(status, "success");
@@ -182,14 +179,12 @@ fn plan_update_dedupes_identical_snapshots_across_turns() {
     );
     assert_ne!(first_id, second_id, "each emission gets a unique id");
     // An empty or missing plan emits nothing.
-    assert!(
-        note(
-            &mut t,
-            "turn/plan/updated",
-            serde_json::json!({"threadId": "t", "turnId": "u", "plan": []}),
-        )
-        .is_empty()
-    );
+    assert!(note(
+        &mut t,
+        "turn/plan/updated",
+        serde_json::json!({"threadId": "t", "turnId": "u", "plan": []}),
+    )
+    .is_empty());
 }
 
 // Reasoning deltas (raw `textDelta` and summary `summaryTextDelta`) surface as
@@ -216,7 +211,10 @@ fn reasoning_deltas_emit_thoughts() {
         "item/reasoning/textDelta",
         serde_json::json!({"itemId": "r1", "delta": "", "threadId": "t", "turnId": "u", "contentIndex": 1}),
     );
-    assert!(evs.is_empty(), "empty reasoning delta emits nothing; got {evs:?}");
+    assert!(
+        evs.is_empty(),
+        "empty reasoning delta emits nothing; got {evs:?}"
+    );
 }
 
 #[test]

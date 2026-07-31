@@ -1,5 +1,6 @@
 @import './settings/base.css';
 @import './settings/ui-scale-modal.css';
+@import './settings/accounts.css';
 @import './settings/memory-inspector.css';
 @import './settings/backup.css';
 @import './settings/toggle.css';

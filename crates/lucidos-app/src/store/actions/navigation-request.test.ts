@@ -50,7 +50,14 @@ vi.mock('./compose', () => ({ ensureFocusedComposeThread, updateCompose }));
 const focusPromptNow = vi.fn();
 vi.mock('../../components/chat/promptFocus', () => ({ focusPromptNow }));
 
-const { handleNavigationRequest } = await import('./navigation-request');
+// Mirrors the real predicate (`parseRepoPath(path) !== null` → handled here):
+// the router's only job is to hand a repo-encoded path to this action and fall
+// back to openFilePreview when it declines. Its own repo-binding behavior is
+// covered in repositories-nav.test.ts.
+const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));
+vi.mock('./repositories', () => ({ openEncodedRepoFilePreview }));
+
+const { handleNavigationRequest, describeNavTarget } = await import('./navigation-request');
 
 describe('handleNavigationRequest — settings sub-sections', () => {
   beforeEach(() => {
@@ -100,6 +107,47 @@ describe('handleNavigationRequest — plugins update deep-link', () => {
     expect(setPluginsInstalledOnly).toHaveBeenCalledWith(true);
     expect(switchMenuItem).toHaveBeenCalledWith('plugins');
     expect(pluginScrollTarget.value).toBeNull();
+  });
+});
+
+describe('handleNavigationRequest — file target', () => {
+  const REPO_ID = '3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03';
+  const ENCODED = `repo:${REPO_ID}:file:src/main/resources/transforms/x.jslt`;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it('routes a data-tree path to the workspace file preview', () => {
+    handleNavigationRequest({ target: 'file', file_path: 'artifacts/notes.md' });
+    expect(openFilePreview).toHaveBeenCalledWith('artifacts/notes.md');
+  });
+
+  it('routes a repo-encoded path to the repo preview, intact', () => {
+    handleNavigationRequest({ target: 'file', file_path: ENCODED });
+    // The encoded path is handed over verbatim — ContentPane parses it and
+    // mounts RepoFilePreview instead of the /data/* preview.
+    expect(openEncodedRepoFilePreview).toHaveBeenCalledWith(ENCODED);
+    expect(openFilePreview).not.toHaveBeenCalled();
+  });
+
+  it('toasts and opens nothing when file_path is missing', () => {
+    handleNavigationRequest({ target: 'file' });
+    expect(openFilePreview).not.toHaveBeenCalled();
+    expect(openEncodedRepoFilePreview).not.toHaveBeenCalled();
+    expect(showToast).toHaveBeenCalledWith('Navigation target missing file_path', 'error');
+  });
+
+  // The off-focus jump offer ("Thread X wants to open …") labels the
+  // destination — it must read as the file, not as the encoding.
+  it('describes a repo-encoded destination by its repo-relative path', () => {
+    expect(describeNavTarget({ target: 'file', file_path: ENCODED }))
+      .toBe('file "src/main/resources/transforms/x.jslt"');
+  });
+
+  it('describes a data-tree destination by its path', () => {
+    expect(describeNavTarget({ target: 'file', file_path: 'artifacts/notes.md' }))
+      .toBe('file "artifacts/notes.md"');
   });
 });
 

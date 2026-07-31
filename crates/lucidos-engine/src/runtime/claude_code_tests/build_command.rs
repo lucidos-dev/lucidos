@@ -114,7 +114,8 @@ fn build_command_injects_user_env_vars_and_engine_wins() {
     let cmd = build_command(&args, None);
     let env = collect_envs(&cmd);
     assert_eq!(
-        env.get(std::ffi::OsStr::new("MY_FLAG")).map(|v| v.as_os_str()),
+        env.get(std::ffi::OsStr::new("MY_FLAG"))
+            .map(|v| v.as_os_str()),
         Some(std::ffi::OsStr::new("1")),
         "user env var must be injected into the spawned subprocess"
     );
@@ -263,9 +264,7 @@ fn build_command_omits_lucidos_session_kind_when_not_interactive() {
     let args = test_spawn_args(p, p, thread_id); // interactive=false by default
     let cmd = build_command(&args, None);
     let env = collect_envs(&cmd);
-    assert!(
-        !env.contains_key(std::ffi::OsStr::new("LUCIDOS_SESSION_KIND")),
-    );
+    assert!(!env.contains_key(std::ffi::OsStr::new("LUCIDOS_SESSION_KIND")),);
 }
 
 #[test]
@@ -399,8 +398,8 @@ fn resolve_lucidos_binary_falls_back_to_path() {
     let bin = dir.path().join(LUCIDOS_BIN_NAME);
     std::fs::write(&bin, b"#!/bin/sh\n").expect("write fake lucidos");
     let path_env = dir.path().as_os_str().to_owned();
-    let resolved = resolve_lucidos_binary_in(None, Some(path_env.as_os_str()))
-        .expect("must resolve via PATH");
+    let resolved =
+        resolve_lucidos_binary_in(None, Some(path_env.as_os_str())).expect("must resolve via PATH");
     assert_eq!(resolved, bin);
 }
 
@@ -532,9 +531,9 @@ fn build_command_sets_mcp_timeout_to_effective_infinity() {
     let p = std::path::Path::new("/tmp");
     let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
-    let raw = env
-        .get(std::ffi::OsStr::new("MCP_TIMEOUT"))
-        .expect("MCP_TIMEOUT must be set so CC's MCP client doesn't cancel the permission RPC at 30s");
+    let raw = env.get(std::ffi::OsStr::new("MCP_TIMEOUT")).expect(
+        "MCP_TIMEOUT must be set so CC's MCP client doesn't cancel the permission RPC at 30s",
+    );
     let ms: u64 = raw
         .to_string_lossy()
         .parse()
@@ -714,15 +713,15 @@ fn build_command_gates_rustc_wrapper_on_sccache_presence() {
     let p = std::path::Path::new("/tmp");
     let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
     let env = collect_envs(&cmd);
-    let wrapper = env
-        .get(std::ffi::OsStr::new("RUSTC_WRAPPER"))
-        .expect("RUSTC_WRAPPER must always be set (sccache, or empty to override .cargo/config.toml)");
-    let expected = if crate::runtime::spawn_env::sccache_on_path(std::env::var_os("PATH").as_deref())
-    {
-        std::ffi::OsString::from("sccache")
-    } else {
-        std::ffi::OsString::from("")
-    };
+    let wrapper = env.get(std::ffi::OsStr::new("RUSTC_WRAPPER")).expect(
+        "RUSTC_WRAPPER must always be set (sccache, or empty to override .cargo/config.toml)",
+    );
+    let expected =
+        if crate::runtime::spawn_env::sccache_on_path(std::env::var_os("PATH").as_deref()) {
+            std::ffi::OsString::from("sccache")
+        } else {
+            std::ffi::OsString::from("")
+        };
     assert_eq!(
         wrapper.as_os_str(),
         expected.as_os_str(),

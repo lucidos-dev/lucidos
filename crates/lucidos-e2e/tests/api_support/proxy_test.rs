@@ -41,4 +41,3 @@ async fn proxy_returns_404_for_root_path_when_name_not_configured() {
     let resp = client.get(&url).send().await.expect("request failed");
     assert_eq!(resp.status().as_u16(), 404);
 }
-

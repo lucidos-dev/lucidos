@@ -106,7 +106,12 @@ async fn one_turn_emits_init_message_usage_result_then_exited_on_close() {
     ));
     assert!(matches!(
         next_event(&mut s.agent).await,
-        AgentEvent::Usage { input_tokens: 6, cache_read_tokens: 4, output_tokens: 2, .. }
+        AgentEvent::Usage {
+            input_tokens: 6,
+            cache_read_tokens: 4,
+            output_tokens: 2,
+            ..
+        }
     ));
     assert!(matches!(
         next_event(&mut s.agent).await,
@@ -263,8 +268,14 @@ async fn abandoned_tool_call_is_closed_at_synthesized_turn_end() {
         })
         .unwrap();
 
-    assert!(matches!(next_event(&mut s.agent).await, AgentEvent::Init { .. }));
-    assert!(matches!(next_event(&mut s.agent).await, AgentEvent::ToolUse { .. }));
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::ToolUse { .. }
+    ));
     match next_event(&mut s.agent).await {
         AgentEvent::ToolResult { status, id, .. } => {
             assert_eq!(status, "error");
@@ -285,7 +296,10 @@ async fn cancellation_kills_session_and_emits_exited() {
     let mut s = stub_driver(HAPPY_TURN, None, false);
     // Cancel while idle (no turn running).
     s.cancel.cancel();
-    assert!(matches!(next_event(&mut s.agent).await, AgentEvent::Exited { .. }));
+    assert!(matches!(
+        next_event(&mut s.agent).await,
+        AgentEvent::Exited { .. }
+    ));
 }
 
 #[tokio::test]
@@ -343,8 +357,14 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
             .expect("event within 10s")
             .expect("channel open")
     }
-    assert!(matches!(recv(&mut events_rx).await, AgentEvent::Init { .. }));
-    assert!(matches!(recv(&mut events_rx).await, AgentEvent::ToolUse { .. }));
+    assert!(matches!(
+        recv(&mut events_rx).await,
+        AgentEvent::Init { .. }
+    ));
+    assert!(matches!(
+        recv(&mut events_rx).await,
+        AgentEvent::ToolUse { .. }
+    ));
 
     // Queue a follow-up BEFORE interrupting. The engine counted it in
     // pending_followups and expects a Result for it — the driver must run

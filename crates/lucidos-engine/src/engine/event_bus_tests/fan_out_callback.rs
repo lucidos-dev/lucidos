@@ -835,7 +835,11 @@ async fn refire_reinjects_unprocessed_child_completion_after_restart() {
     while let Ok(cb) = rx1.try_recv() {
         live.push(cb);
     }
-    assert_eq!(live.len(), 1, "the live wake must have fired before the restart");
+    assert_eq!(
+        live.len(),
+        1,
+        "the live wake must have fired before the restart"
+    );
     let card_event_id = live[0].child_completed_event_id;
     drop(rx1);
     drop(bus1);

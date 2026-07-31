@@ -7,6 +7,7 @@ import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
 import { isTauri } from '../../utils/platform';
+import { isMobile } from '../../utils/viewport';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
 import type { MenuItem } from '../../store/types';
@@ -20,16 +21,40 @@ const menuItems: Array<{ id: MenuItem; label: string }> = [
 
 export const drawerOpen = signal(false);
 export const drawerClosing = signal(false);
-/** Hamburger button that opened the drawer. Two `.hamburger-panel` buttons
- *  exist (dual-layout pattern); only the visible one fires openDrawer(), so
- *  this captures the right element for the dismiss hook's anchor exemption. */
+/** Hamburger button that opened the drawer. Several `.hamburger-panel` buttons
+ *  exist (a per-layout copy, plus one per mobile pane header); only the one the
+ *  user actually pressed fires openDrawer(), so this captures the right element
+ *  for the dismiss hook's anchor exemption. */
 export const drawerAnchor = signal<HTMLElement | null>(null);
+
+export type DrawerSide = 'left' | 'right';
+
+/** Which edge the drawer slides out from. */
+export const drawerSide = signal<DrawerSide>('left');
+
+/** The drawer emerges from under the button that opened it: the mobile thread
+ *  pane header keeps its hamburger at the row's trailing edge (mirroring the
+ *  thread drawer toggle at the leading edge), and a panel sliding in from the
+ *  far side of the screen would read as unrelated to the tap.
+ *
+ *  Desktop is always `left`: its single hamburger sits at the content pane's
+ *  leading edge and the panel is positioned to emerge from the split divider,
+ *  not from a viewport edge, so the anchor's absolute x says nothing useful
+ *  there. Pure so the rule is testable without a DOM. */
+export function drawerSideFor(anchorCenterX: number, viewportWidth: number, mobile: boolean): DrawerSide {
+  if (!mobile) return 'left';
+  return anchorCenterX > viewportWidth / 2 ? 'right' : 'left';
+}
 
 /** Open the drawer, resetting any stuck closing state */
 export function openDrawer(anchor?: HTMLElement) {
   drawerClosing.value = false;
   drawerOpen.value = true;
-  if (anchor) drawerAnchor.value = anchor;
+  if (anchor) {
+    drawerAnchor.value = anchor;
+    const rect = anchor.getBoundingClientRect();
+    drawerSide.value = drawerSideFor(rect.left + rect.width / 2, window.innerWidth, isMobile());
+  }
 }
 
 /** Close the drawer; returns `false` when already closed/closing so the
@@ -113,7 +138,7 @@ export function Drawer() {
         onClose={closeDrawer}
         anchor={drawerAnchor.value}
         backdrop={false}
-        panelClass={`drawer ${drawerClosing.value ? 'closing' : ''}`}
+        panelClass={`drawer drawer-${drawerSide.value} ${drawerClosing.value ? 'closing' : ''}`}
         panelRef={drawerRef}
         panelProps={{
           onAnimationEnd: (e) => {

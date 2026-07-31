@@ -91,7 +91,10 @@ fn bullet_renders_full_uuid_so_the_agent_can_target_it() {
 
     // Date + summary preserved, plus a copyable full-UUID id the
     // correct_memory_by_id tool can parse verbatim.
-    assert!(bullet.starts_with("- "), "bullet keeps its dash prefix: {bullet:?}");
+    assert!(
+        bullet.starts_with("- "),
+        "bullet keeps its dash prefix: {bullet:?}"
+    );
     assert!(
         bullet.contains("Config dir is at gws-personal"),
         "summary preserved: {bullet:?}"
@@ -100,7 +103,10 @@ fn bullet_renders_full_uuid_so_the_agent_can_target_it() {
         bullet.contains(&format!("[id: {}]", id)),
         "bullet must carry the entry's full uuid: {bullet:?}"
     );
-    assert!(bullet.ends_with("\n"), "bullet stays newline-terminated: {bullet:?}");
+    assert!(
+        bullet.ends_with("\n"),
+        "bullet stays newline-terminated: {bullet:?}"
+    );
 }
 
 // --- Scoring tests ---

@@ -360,7 +360,9 @@ mod imp {
 }
 
 #[cfg(target_os = "macos")]
-pub use imp::{activate_app, dismiss, set_dock_badge, set_tray_title, setup, show, take_pending_taps};
+pub use imp::{
+    activate_app, dismiss, set_dock_badge, set_tray_title, setup, show, take_pending_taps,
+};
 
 /// Non-macOS desktop has no native notification path (the engine still
 /// web-pushes browser / PWA clients); these are no-ops so call sites stay

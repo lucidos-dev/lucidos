@@ -52,7 +52,7 @@ artifact**, and that is the complete list of what belongs there:
 | workflow | fires on | verifies |
 |---|---|---|
 | `docs.yml` | `release: published`, manual | the mkdocs site deploy (`mkdocs build --strict`) |
-| `install-smoke.yml` | push to `rc/**`, `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door, and the RC front door's payloads |
+| `install-smoke.yml` | push to `rc/**`, `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, and the RC front door's payloads |
 | `release-tarballs.yml` | `v*` tag push, `release: published`, manual | the per-triple headless tarball build |
 
 **Never add a workflow that compiles, lints, type-checks or tests the tree per
@@ -73,16 +73,18 @@ local run and no per-change gate could substitute:
 
 - **weekly** (`0 4 * * 1`) re-runs the clean-machine install to catch drift in
   external toolchains (rustup, apt, Homebrew).
-- **daily** (`0 6 * * *`) runs the `front-door` job: the advertised
-  `curl -fsSL https://lucidos.dev/install.sh | sh` against the **live deployed
-  origin**, on a fresh `ubuntu:22.04`. Every other job tests a tree or an
+- **daily** (`0 6 * * *`) runs the `front-door` **and `front-door-macos`** jobs:
+  the advertised `curl -fsSL https://lucidos.dev/install.sh | sh` against the
+  **live deployed origin**, on a fresh `ubuntu:22.04` and on fresh macOS runners
+  (both architectures). Every other job tests a tree or an
   artifact built from one; this tests what the site is serving right now, which
   regresses independently of any commit — on 2026-07-29 the Pages deploy
   published `install.sh` but not the `scripts/lib/*.sh` helpers a piped install
   sources, and because Pages soft-404s (landing-page HTML at status **200**)
   `curl -fsSL` succeeded and the installer sourced HTML as shell. Its first rung
-  asserts every helper lib resolves to a payload with a `#!` shebang rather than
-  `<`, with the lib names parsed out of the served `install.sh`.
+  asserts every helper lib **and `uninstall.sh`** resolves to a payload with a
+  `#!` shebang rather than `<`, with the lib names and both URLs parsed out of
+  the served `install.sh`.
 
 A schedule trigger fires the whole workflow, so **every job guards on
 `github.event.schedule`** to claim exactly one cron. Adding a cron without that
@@ -90,12 +92,13 @@ guard silently multiplies the run frequency of every other job in the file.
 
 Both are still delivery verification, not build gates.
 
-#### `front-door` — one job, a parameterised origin, two modes
+#### `front-door` — a parameterised origin, two modes, two host families
 
 The origin is **not** hardcoded. `FD_MODE` + `FRONT_DOOR` are resolved from the
-event, and the rung logic is written once:
+event, and the rung logic is written once per host family:
 
-- **`full`** — all four rungs, ending in a real `curl … | sh` on a bare box.
+- **`full`** covers all eight rungs: a real `curl … | sh` on a bare box
+  (rungs 1-4), then the advertised **uninstall** paths (rungs 5-8, below).
   Fires on the daily cron and on `workflow_dispatch` (input `origin`, default
   `https://lucidos.dev`). The **post-publish** caller is a dispatch *by the site
   publisher*, not the `release: published` webhook: the Pages deploy does not run
@@ -107,7 +110,71 @@ event, and the rung logic is written once:
 - **`payload`** — rung 1 only, then stop green. Auto-runs on every push to
   `rc/**` against the **RC front door** (`https://lucidos.dev/rc`, libs at
   `/rc/scripts/lib/`), so the soft-404 class is caught before anything reaches
-  the real path. Also selectable on a dispatch.
+  the real path. Also selectable on a dispatch. Rung 1 sniffs the served
+  **uninstaller** too, so an RC is gated on both halves of the advertised
+  experience being real shell, not just its installer.
+
+**`front-door-macos` is the same ladder on a Mac, and it is not the `smoke`
+job's macOS exclusion sneaking back in.** The landing page shows the
+Apple-Silicon DMG directly above the one-liner and routes **Intel** Mac users to
+the one-liner outright (the DMG is aarch64-only), so `install.sh` on Darwin is a
+first-class advertised path — and it was gated by nothing: `smoke` is
+ubuntu-only, `tarball-smoke` and `front-door` are Linux, and `dmg-verify` covers
+a different artifact. `smoke` skips macOS because it installs **from source**
+(`--dev`), which needs Docker → Colima → nested virtualization a hosted runner
+does not expose. The front door tests the **download** path — curl a prebuilt
+tarball with its own relocatable Postgres and run it — so none of that applies
+and it runs fine on a hosted runner. Same guards, same modes, same origin
+validation, same RC payload-only rule; a `fail-fast: false` matrix over
+`macos-latest` (aarch64) and `macos-15-intel` (x86_64, the **last** Intel image,
+retiring with macos-15 in Fall 2027), each asserting its own `uname -m` so a
+re-pointed label cannot leave two legs testing one triple. The one substantive
+difference is the **launch shape**: the Linux job runs in a container with no
+service manager, so `install.sh` degrades to a foreground launch and an exited
+installer is always a failure; on macOS `launchctl` exists, so it registers a
+launchd job and **exits 0** with the gateway detached. The macOS job therefore
+must NOT fast-fail on the installer exiting — it polls health to the deadline
+and reports the recorded exit status alongside a failure, and **warns** when the
+gateway is healthy but the installer exited non-zero (a one-liner the user
+watched fail, which `KeepAlive` then papered over; a warning rather than a
+failure because the likeliest cause is `install.sh`'s own 120 s health wait
+expiring on a cold runner). Its teardown is now **cleanup only**: it kills the
+installer pid and `launchctl bootout`s any leftover agent, so no LaunchAgent
+outlives a run whose rungs failed early. It used to be the file's only uninstall,
+piping `--uninstall --all --purge` behind a `|| true` (so it could not red the
+job) with a canary branch that printed "does not serve uninstall.sh yet … Not a
+regression" on the soft-404. Both are gone: a step that cannot fail is not a
+test, and that branch would have swallowed the exact regression rungs 5-8 exist
+to catch.
+
+**Uninstall is a real gate as of 2026-07-30 (rungs 5-8, full mode, both jobs).**
+Four asserting rungs after rung 4, alternating the two advertised entry points so
+each is exercised for both a listing and a mutation:
+
+| rung | command | asserts |
+|---|---|---|
+| 5 | `install.sh \| sh -s -- --list` | the DELEGATION path: `dispatch_uninstall` fetched `<origin>/uninstall.sh` (its printed URL is checked), the uninstaller's own banner is in the output, no HTML or shell-parse cascade, exit 0, and the instance is listed. macOS also asserts `--list` reports it as `(launchd loaded)`. |
+| 6 | `uninstall.sh \| sh -s -- --list` | the DIRECT piped path, same floor. On Linux this is also what exercises `uninstall.sh`'s dash re-exec (`/bin/sh` is bash on macOS, so only the Linux leg reaches that branch). |
+| 7 | `install.sh \| sh -s -- --uninstall --all` | the **data-safe** promise from `uninstall.sh --help`: the data dir survives. macOS additionally asserts the launchd agent is booted out and its plist deleted. |
+| 8 | `uninstall.sh \| sh -s -- --all --purge` | the instance data dir **and** the shared runtime are actually gone. The runtime is the large half and is deleted only by this branch, so nothing else in the file covers it. |
+
+Two properties of the sequence are load-bearing. The **order saves a reinstall**:
+a data-safe rung 7 keeps the data dir *and* its port marker, so rung 8 still has
+a target. And the rungs **accumulate** rather than exiting at the first failure,
+so one run reports all four verdicts instead of hiding 6-8 behind a rung-5 red.
+
+What the **Linux** leg cannot cover, and does not pretend to: the container has
+no launchd and no systemd, so `install.sh` registered nothing for a removal to
+remove, and `remove_instance` stops the embedded runtime only when it actually
+unregistered a service. The foreground gateway therefore survives the uninstall
+by design. The macOS legs carry the service half.
+
+**These rungs are RED until the publisher ships `/uninstall.sh`**, which
+soft-404s today (the gap deferred in
+`docs/plans/2026-07-29-front-door-origin-and-rc-gate.md` § non-goals). That is
+fail-closed behaviour, not a bug to paper over: the failure message names the
+publisher and says the deploy runs on the maintainer's machine off the
+`SitePublished` chain, so no change in this repo can turn it green.
 
 **Payload mode must never run the install, and this is not a gap to close.** An
 RC `install.sh` bakes `LUCIDOS_DEFAULT_VERSION=<rc version>` and resolves its
@@ -120,18 +187,28 @@ catch is the soft-404, and rung 1 catches it entirely by fetching and sniffing
 payloads. Rung 2 cannot substitute — it asserts over the *log of a real install*,
 so it needs exactly the tarball that does not exist.
 
-Three properties keep a payload-mode green honest, and all three are load-bearing:
+Four properties keep a payload-mode green honest, and all four are load-bearing:
 
 - the lib base derived from the served installer must equal **exactly**
   `$FRONT_DOOR/scripts/lib` — a prefix match let the apex vacuously satisfy an
   `/rc` base — and a mismatch is **fatal** in payload mode (where rung 1 is the
-  only rung) while staying a warning in full mode (where rungs 2–4 still drive
+  only rung) while staying a warning in full mode (where rungs 2-8 still drive
   the origin);
+- the served **uninstaller** must pin its own two URLs at the same origin, with
+  the same fatal/warning asymmetry, through the shared `pin_mismatch` helper:
+  `LUCIDOS_UNINSTALL_SELF_URL` (where a piped run re-fetches itself, since
+  `curl … | sh` leaves no readable `$0` to re-exec) and the lib base derived
+  from its own baked `LUCIDOS_INSTALL_URL` (where its `service.sh` comes from).
+  Both matter because `install.sh` does **not** export its copy of
+  `LUCIDOS_INSTALL_URL` before `exec bash -c "$payload"`, so even the *delegated*
+  uninstaller re-resolves these defaults: an unpinned copy runs GitHub main's
+  script, and the rung would pass having touched nothing at this origin;
 - on an `rc/**` push the served installer's baked `LUCIDOS_DEFAULT_VERSION` must
   equal the version in `rc/<version>`, so the previous RC's copy sitting at the
   same URL cannot pass the gate;
-- the lib-name scrape, the `LUCIDOS_INSTALL_URL` parse and the version parse all
-  **fail closed** — a parser that finds nothing must never report green.
+- the lib-name scrape, the `LUCIDOS_INSTALL_URL` parse, the version parse and
+  both uninstaller-pin parses all **fail closed**. A parser that finds nothing
+  must never report green.
 
 The **full** mode is still deliberately **not** on the `rc/**` push: it tests
 production, not the RC tree, so a live-site outage must never be able to block
@@ -161,11 +238,16 @@ source produces the same result on a dev box, in CI, and in the nightly. It
 matters most for **lint** — clippy's lint set is a property of the toolchain, so
 without the pin the clean-build gate's definition of "clean" drifts with
 whatever rustup default a machine happens to have (the 2026-07-26 nightly's
-`CleanBuildPassed` concern 4).
+`CleanBuildPassed` concern 4). The pin carries the same weight for **formatting**
+since ADR 0030: rustfmt's output is a property of the toolchain too, and it is
+what lets the fmt gate be stock defaults with no `rustfmt.toml`.
 
 - **Bumping the pin is its own commit.** Change `channel`, run `make lint` plus
   the engine suite, and fix everything the new lint set surfaces *in that same
-  change* — never let a stable bump red an unrelated branch.
+  change* (never let a stable bump red an unrelated branch). Since ADR 0030,
+  `make lint` also runs `cargo fmt --all --check`, so a bump that moves rustfmt's
+  output reds the gate too: run `make fmt` and carry the reformat in the same
+  commit. Keep it separable from the channel change if the sweep is large.
 - **Don't install a toolchain ahead of the pin in CI.** A `rustup … --default-toolchain stable`
   step that runs before checkout downloads a toolchain the pin then discards.
   `release-tarballs.yml`'s container step installs rustup with
@@ -211,7 +293,9 @@ Pure helpers are offline-tested by `scripts/lib/stage_runtime_test.sh`. The `luc
 
 **Headless tarball — Linux + macOS unsigned (`build-headless.sh`).** The Tauri-free build path (step 2 of `docs/plans/2026-06-30-installer-step2-linux-tarball.md`). Runs the shared staging for the **host** triple — no `cargo tauri build`, no `.app`, no DMG, no codesigning — then reuses `headless_tarball_emit` for the same `lucidos-<version>-<triple>.tar.gz` + `.sha256`. On **Linux** this is THE release build path; on **macOS** it produces an UNSIGNED tarball (use `build-dmg.sh --emit-tarball` for the signed one). It compiles natively, so `--triple` must equal the host — cross-arch artifacts come from the CI matrix's per-arch runners. Flags: `--triple`, `--out-dir` (default `.lucidos/release-staging/<version>/`), `--version` (default RELEASE → tauri.conf.json → 0.0.0), `--check`. Offline-tested by `scripts/lib/build_headless_test.sh`.
 
-**Linux tarballs via CI (`.github/workflows/release-tarballs.yml`).** A `workflow_dispatch` + `v*`-tag-`push` matrix over the four target triples (`x86_64-unknown-linux-gnu` is the must-work entry; macOS x86_64 + Linux aarch64 are best-effort; `fail-fast: false`). Each entry runs `build-headless.sh` on a **native** runner — the Linux entries INSIDE an `ubuntu:22.04` container (the **glibc 2.35 floor**: a binary built on the raw 24.04 runner image refuses to start on Ubuntu 22.04 / Debian 12 / RHEL 9 with `GLIBC_2.3x not found`, and the same-machine tarball-smoke can't see it), guarded by an "Assert portability floor" step that fails the build if any staged binary references a `GLIBC`/`GLIBCXX`/`CXXABI` symbol version above that floor. Uploads the tarball + `.sha256` as **workflow artifacts only**. It does **NOT** auto-publish: never creates a Release/tag; the optional "attach to an existing Release" step is gated behind a manual `attach_to_release` input (default off) **and** a tag ref, and uses `gh release upload` (never `gh release create`). The signed macOS tarball still ships from the local `build-dmg.sh --emit-tarball` path; the macOS CI entries are unsigned, for parity/verification.
+**Linux tarballs via CI (`.github/workflows/release-tarballs.yml`).** A `workflow_dispatch` + `v*`-tag-`push` matrix over the four target triples (`x86_64-unknown-linux-gnu` is the must-work entry; macOS x86_64 + Linux aarch64 are best-effort; `fail-fast: false`). Each entry runs `build-headless.sh` on a **native** runner — the Linux entries INSIDE an `ubuntu:22.04` container (the **glibc 2.35 floor**: a binary built on the raw 24.04 runner image refuses to start on Ubuntu 22.04 / Debian 12 / RHEL 9 with `GLIBC_2.3x not found`, and the same-machine tarball-smoke can't see it), guarded by an "Assert portability floor" step that fails the build if any staged binary references a `GLIBC`/`GLIBCXX`/`CXXABI` symbol version above that floor. Every entry uploads the tarball + `.sha256` as a **workflow artifact**. It never creates or tags a Release — but the "attach to an existing Release" step **does fire automatically** for a PUBLISHED, non-prerelease Release (`rc-<version>` prereleases are excluded by the `prerelease == false` guard, so the RC gate never sees these), which is what makes `install.sh`'s default download path work at all: `release.sh --publish-verified` cuts the Release with the DMG, and this run ADDS the Linux + macOS headless tarballs to it **~30 min later**. That lag is user-visible — a `curl … | sh` started inside the window 404s — so the installer's failure message names it first. A manual `workflow_dispatch` with `attach_to_release=true` (+ `attach_tag`, or a tag ref) is the backfill arm. Upload goes through the raw GitHub REST API with `curl`, NOT `gh release upload`: the Linux matrix entries run inside the `ubuntu:22.04` container, which has no `gh`.
+
+**The macOS headless tarballs on a Release are the UNSIGNED CI ones** — including the one a Mac's `curl … | sh` downloads. `build-dmg.sh`'s upload attaches exactly the DMG + `Lucidos.app.tar.gz` + `.sig` + `latest.json`, and `release.sh` never passes `--emit-tarball`, so the local SIGNED headless tarball exists as a capability but is never attached to anything — there is no signed macOS tarball for CI to clobber, and none for a user to download. That is acceptable rather than accidental: a `curl`-fetched file carries no `com.apple.quarantine` xattr, so Gatekeeper never assesses the runtime (the same reasoning ADR 0027 relies on to defer notarization), and `install.sh`'s `verify_runtime_executes` runs the gateway once at install time so any refusal is loud and immediate. Wiring `--emit-tarball` into the release flow would be the fix if that ever stops holding; asset timings on v0.17.0 (DMG trio 04:08, all eight headless assets 04:19–04:51) are how to confirm which path produced which asset.
 
 Packaging lives in `scripts/lib/headless_tarball.sh` (offline-tested by `headless_tarball_test.sh`); it copies with `ditto` on macOS (preserves embedded Mach-O signatures) and `cp -a` elsewhere (Linux runners have no `ditto`).
 
@@ -261,15 +345,64 @@ the mirror, the mirror's rc **moved** (someone re-pushed ⇒ the gate result is
 stale), `manifest.source_commit` ≠ the worktree HEAD, or any staged artifact's
 sha256 drifted. Then `release-to-lucidos.sh --promote-rc <sha>` re-asserts the
 unmoved rc, re-scans that commit's tree (the deterministic floor at the
-irreversible push), and force-pushes **that same object** to `main` + tags it
-`v<version>`, attaches the staged artifacts, and the rc branch + prerelease are
-deleted.
+irreversible push), and force-pushes **that same object** to the mirror's `main`
++ tags it `v<version>` **by SHA**, attaches the staged artifacts, and the rc
+branch + prerelease are deleted.
 
 The legacy one-shot (`release.sh <version>`, no phase flag) still builds its own
 tree from HEAD through the same lib and has no rc gate. Offline-tested by
 `scripts/lib/release_tree_test.sh` (strip coverage, self-exclusion, guard
 fail-closed on both arms, commit determinism, all five preflight refusals, and
 the wiring that keeps the promotion a promotion).
+
+### The source side: main gets the bump, and the tag names it (ADR 0029)
+
+The same tag name means a **different object per remote**, deliberately: the
+mirror's `v<version>` names the stripped **orphan** (the Release and every
+download URL resolve through it), while the **local** and **`origin`** tag names
+the release commit on **`main`**. So the mirror tag is pushed **by SHA**
+(`push --force <remote> <commit>:refs/tags/<tag>`), touching no local ref —
+creating it locally first is what left 26 of 27 `v*` tags outside main's history,
+made `git describe --tags main` report `v0.9.6-4946-gfb4b344cf`, and rendered
+every `PREV_TAG` guard in `release.sh` vacuous.
+
+`scripts/lib/release_main_sync.sh` owns the source side, wired in through ONE
+`settle_source_side` entry point that both Phase B and the one-shot call:
+
+- **The bump is LANDED on main, not attempted.** Fast-forward when possible;
+  **cherry-pick** the single release commit when `main` moved during the build;
+  **hard-fail** (after `cherry-pick --abort`, so nothing is left wedged) on a
+  conflict. Only operator state — not on `main`, or dirty — still skips. The old
+  `advance_local_main` warned-and-continued instead, which is how **v0.17.0**
+  published while `main` never learned its own version and the site kept serving
+  the previous DMG (the site publisher reads the local checkout's `RELEASE`).
+- **Skips and failures are reprinted at the END of the run**, in a `STILL OWED`
+  block with the exact recovery commands. A warning buried mid-build-log is a
+  warning nobody reads — that is the actual v0.17.0 failure.
+- **`origin` is pushed at publish time and NEVER forced** (`main` + the tag). A
+  failure there is a loud post-release warning with a retry command, never an
+  unwind: the release is already public, and a non-fast-forward `origin/main`
+  means the maintainer has work this checkout has not fetched.
+- **The tag is idempotent.** An already-correct tag is left byte-identical (so
+  the `origin` push stays a no-op rather than needing a force); one left on the
+  orphan by an older release is force-moved onto the main-line commit.
+
+**The `PREV_TAG` drift guards are honest again — with two adjustments.** They now
+gate on real ancestry (`release_tag_is_ancestor`), and when `PREV_TAG` is a
+legacy orphan they *degrade to advisory* with a one-line note rather than
+exploding — the FIRST release after this change still sees one. And because the
+deleted-files gate finally diffs two full **internal** trees, it filters out
+paths withheld from the public tree via `release_tree_path_is_excluded`;
+otherwise ordinary `docs/plans/**` churn would start refusing releases over files
+that can never reach a user. `PREV_TAG` resolution stays a **semver sort**, not
+`git describe` — describe answers "nearest *reachable* tag" and so silently picks
+an older one exactly when the newest is an orphan.
+
+Offline-tested by `scripts/lib/release_main_sync_test.sh`: every landing state
+against throwaway repos, the conflict-abort, the by-SHA mirror push into a local
+bare repo (asserting no local tag appears), the unforced `origin` push and its
+non-fast-forward rejection, behaviour under `release.sh`'s `-Eeuo pipefail` +
+exiting ERR trap, and the wiring in both release scripts.
 
 ### Notarization is resumable — never a foreground `--wait`
 
@@ -323,9 +456,23 @@ Banner + changelog-section text live in `scripts/lib/release_notes.sh` — **one
 
 **Uninstall.** `uninstall.sh` (and `install.sh --uninstall`, which delegates to it): `--name <slug>` removes one instance (a bare uninstall removes the sole instance, else lists), `--all` removes every instance, `--list` shows instances + ports. It stops + unregisters the service (both launchd + systemd artifacts that exist), gracefully stops that instance's engines + embedded Postgres, and **keeps all data unless `--purge`** (prints what it left). `--purge` deletes the instance data dir; `--all --purge` also deletes the shared runtime. The systemd unit FILE is removed **even when the user D-Bus session is unreachable** (bare ssh, no `XDG_RUNTIME_DIR`) so an "uninstalled" service can't resurrect at the next boot; in that case the possibly-running stack is left alone (a bus-less shell can't stop the gateway, and killing its engines would only make it respawn them).
 
+**Discovery is the `<prefix>/<slug>/port` marker, and BOTH launch shapes write it.** `service_list_instance_names` lists exactly the `<prefix>/*/` dirs carrying one, so that file is the whole of "is this instance installed": no marker means invisible to `--list`, no target for `--all`, and `run_uninstall` returning before the purge, which leaves the data dir *and* the shared runtime on disk. Until 2026-07-30 only `register_service` wrote it, so a `--no-service` run or the no-manager degrade (a container) finished uninstallable. Both paths now go through `record_instance_port`, and the **orderings stay deliberately different**: `register_service` writes *after* its unit, so a failed registration leaves no marker, while `launch_runtime` writes *before* an `exec` that never returns. `service_test.sh` asserts the marker and `service_list_instance_names` discoverability on both foreground paths, and `install-smoke.yml`'s front-door rungs 5-8 assert the end-to-end consequence against the live origin.
+
 **Shared logic, one source of truth.** install.sh **sources** `scripts/lib/{stage_runtime,headless_tarball,install_common}.sh` (triple/stem/URL) and `scripts/lib/service.sh` (service templating/detection) from `<self>/scripts/lib` when run from a checkout; when piped it **fetches** those small pure libs from the same ref (`${LUCIDOS_INSTALL_URL%/install.sh}/scripts/lib`, overridable via `LUCIDOS_LIB_BASE_URL`) — never re-implementing any map.
 
-**A fetched lib is content-sniffed before it is sourced, fail-closed.** `curl -fsSL` plus a non-empty test cannot see a **soft-404**: an origin that answers an unknown path with its landing page and a **200** makes both checks pass, and `.` then executes HTML as shell. That shipped — a clean `ubuntu:22.04` running the advertised one-liner on 2026-07-29 died on ``stage_runtime.sh: line 1: `<!DOCTYPE html>` `` because the Cloudflare Pages SPA fallback served the landing page for `scripts/lib/*.sh`. `_source_libs` therefore rejects a payload whose first non-blank line opens a tag (`<!DOCTYPE`, `<html`, `<?xml`), naming the lib + origin and pointing at a checkout or `--dev`. The missing-file half was fixed at the publisher (it now uploads the libs beside `install.sh`); **the sniff is the defence in depth and stays** — a wrong or hijacked origin can still soft-404, and this is the one place unknown remote content reaches `source`. Covered by `install_test.sh` in both directions: an HTML payload for every lib is refused and never reaches the shell, and the real libs fetched over `file://` still install cleanly.
+**A fetched lib is content-sniffed before it is sourced, fail-closed.** `curl -fsSL` plus a non-empty test cannot see a **soft-404**: an origin that answers an unknown path with its landing page and a **200** makes both checks pass, and `.` then executes HTML as shell. That shipped: a clean `ubuntu:22.04` running the advertised one-liner on 2026-07-29 died on ``stage_runtime.sh: line 1: `<!DOCTYPE html>` `` because the Cloudflare Pages SPA fallback served the landing page for `scripts/lib/*.sh`. `_source_libs` therefore rejects a payload whose first non-blank line opens a tag (`<!DOCTYPE`, `<html`, `<?xml`), naming the lib + origin and pointing at a checkout or `--dev`. The missing-file half was fixed at the publisher (it now uploads the libs beside `install.sh`); **the sniff is the defence in depth and stays**, because a wrong or hijacked origin can still soft-404. Covered by `install_test.sh` in both directions: an HTML payload for every lib is refused and never reaches the shell, and the real libs fetched over `file://` still install cleanly.
+
+**Every place a fetched payload reaches a shell is sniffed, and there are five.** `_source_libs` was long described here as "the one place unknown remote content reaches `source`", which was never true and hid its siblings until the 2026-07-30 docs audit. The full set, all fail-closed, all covered by `install_test.sh`:
+
+| site | file | reaches the shell via | test |
+|---|---|---|---|
+| helper libs | `install.sh` `_source_libs` | `.` (source) | HTML payload per lib, plus the real libs over `file://` |
+| dash re-exec | `install.sh` bootstrap guard | `exec bash -c` | HTML re-fetch refused; the version-pinning stub carries a shebang |
+| fetched uninstaller | `install.sh` `dispatch_uninstall` | `exec bash -c` | `--uninstall` and `--list` against an HTML origin, plus the real uninstaller over `file://` |
+| fetched `service.sh` | `uninstall.sh` `source_service_lib` | `.` (source) | HTML `service.sh` refused |
+| dash re-exec | `uninstall.sh` bootstrap guard | `exec bash -c` | mirror of install.sh's; same shape |
+
+The four added on 2026-07-30 assert the payload **starts with `#!`** (fail-closed, and the same test the front-door CI rung applies to what the origin serves); `_source_libs` keeps its leading-`<` rejection because its message and tests name the individual lib being refused. Both re-exec guards must stay POSIX sh: they run before bash is guaranteed. **`uninstall.sh`'s lib fetch is the likeliest of the five to actually meet a soft-404**, because it derives its lib base from `${LUCIDOS_INSTALL_URL%/install.sh}/scripts/lib`, i.e. from the same origin whose `uninstall.sh` the publisher does not serve yet.
 
 `install_common.sh` holds the pure URL/version/dir helpers; `service.sh` splits **PURE** helpers (identity, paths, plist/unit templating, manager DECISION + compose decision, env pairs, slug/port validation, port candidates, uninstall paths) from thin **EFFECTFUL** wrappers (launchctl/systemctl/curl/kill/pg_ctl calls, port probing, instance listing) — the offline tests exercise the pure ones and never the effectful ones.
 
@@ -337,4 +484,4 @@ Banner + changelog-section text live in `scripts/lib/release_notes.sh` — **one
 
 **Env/flags:** `--name`/`LUCIDOS_INSTANCE`, `--version`/`LUCIDOS_VERSION`, `--base-url`/`LUCIDOS_RELEASE_BASE_URL` (default `https://github.com/lucidos-dev/lucidos/releases/download/v<version>`), `--prefix`/`LUCIDOS_PREFIX`, `--port`/`LUCIDOS_PORT` (default 5252), `--bind`/`LUCIDOS_BIND`, `--tls-cert`/`LUCIDOS_TLS_CERT` + `--tls-key`/`LUCIDOS_TLS_KEY` (https opt-in), `--no-service`/`LUCIDOS_NO_SERVICE`, `--force`/`LUCIDOS_FORCE`, `--no-launch`/`LUCIDOS_NO_LAUNCH`, `--uninstall`/`--list`/`--all`/`--purge`, `LUCIDOS_HEALTH_TIMEOUT`. Provider creds (`OPENAI_API_KEY`/`VERTEX_PROJECT_ID`/`VERTEX_REGION`) are exported into the foreground gateway and **baked into the service env (mode 600)** when supplied. The env-as-flag contract means a dev shell that exports `LUCIDOS_TLS_CERT/KEY` — every engine-spawned subprocess does — silently configures TLS on a manual install run; the offline test suites `unset` them.
 
-**Caveat (nothing published yet):** the CI workflow is artifact-only, so the default download **404s today** — the failure message points at `--dev` / `--from-tarball`. Offline-tested by `scripts/lib/install_test.sh` (download/extract path) and `scripts/lib/service_test.sh` (service.sh pure helpers + the foreground/degrade/register/uninstall wiring, all faked — no real launchd/systemd).
+**Caveat (the ~30 min attach window):** every published Release carries the four per-platform tarballs, but `release-tarballs.yml` attaches them **after** the Release is cut, so a default download of a brand-new version 404s until it lands — the failure message names that window first and offers `--version <older>` / `--dev` / `--from-tarball`. Offline-tested by `scripts/lib/install_test.sh` (download/extract path) and `scripts/lib/service_test.sh` (service.sh pure helpers + the foreground/degrade/register/uninstall wiring, all faked — no real launchd/systemd).

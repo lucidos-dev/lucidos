@@ -92,6 +92,9 @@ mod snapshot_compression_test;
 #[path = "api_support/trigger_groups_test.rs"]
 mod trigger_groups_test;
 
+#[path = "api_support/script_trigger_in_place_test.rs"]
+mod script_trigger_in_place_test;
+
 #[path = "api_support/command_safety_test.rs"]
 mod command_safety_test;
 

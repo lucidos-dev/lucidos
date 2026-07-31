@@ -33,9 +33,9 @@ fn looks_like_description_prompt(prompt: &str) -> bool {
         b"tell me what ",
     ];
     let trimmed = prompt.trim_start().as_bytes();
-    PREFIXES
-        .iter()
-        .any(|needle| trimmed.len() >= needle.len() && trimmed[..needle.len()].eq_ignore_ascii_case(needle))
+    PREFIXES.iter().any(|needle| {
+        trimmed.len() >= needle.len() && trimmed[..needle.len()].eq_ignore_ascii_case(needle)
+    })
 }
 
 pub(crate) fn resolve_thread_image_refs<E: HasEventPayload>(
@@ -180,9 +180,7 @@ impl LucidosEngine {
         for reference in &input_refs {
             match self.resolve_image_reference(reference, thread_id).await {
                 Ok(bytes) => input_images.push(bytes),
-                Err(e) => {
-                    return Err(format!("resolving image '{}': {}", reference, e).into())
-                }
+                Err(e) => return Err(format!("resolving image '{}': {}", reference, e).into()),
             }
         }
 
@@ -294,9 +292,11 @@ impl LucidosEngine {
             .ok_or("image is required (e.g. 'thread:1')")?;
 
         if !reference.starts_with("thread:") {
-            return Err("image must be a thread reference like 'thread:1'. To view an \
+            return Err(
+                "image must be a thread reference like 'thread:1'. To view an \
                  image file saved under data/artifacts/, use read_file instead."
-                .into());
+                    .into(),
+            );
         }
 
         let events = self
@@ -450,10 +450,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
         let events = vec![event];
-        let err =
-            resolve_thread_image_refs(tmp.path(), &events, &["thread:5".to_string()])
-                .unwrap_err()
-                .to_string();
+        let err = resolve_thread_image_refs(tmp.path(), &events, &["thread:5".to_string()])
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("thread:5") || err.contains("not found"),
             "error should mention missing index, got: {}",
@@ -466,10 +465,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
         let events = vec![event];
-        let err =
-            resolve_thread_image_refs(tmp.path(), &events, &["thread:0".to_string()])
-                .unwrap_err()
-                .to_string();
+        let err = resolve_thread_image_refs(tmp.path(), &events, &["thread:0".to_string()])
+            .unwrap_err()
+            .to_string();
         assert!(
             err.to_lowercase().contains("1 or greater") || err.contains("thread:0"),
             "error should reject zero, got: {}",
@@ -482,13 +480,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let (_hashes, event) = message_event_with_blobs(tmp.path(), 1);
         let events = vec![event];
-        let err = resolve_thread_image_refs(
-            tmp.path(),
-            &events,
-            &["artifacts/foo.png".to_string()],
-        )
-        .unwrap_err()
-        .to_string();
+        let err =
+            resolve_thread_image_refs(tmp.path(), &events, &["artifacts/foo.png".to_string()])
+                .unwrap_err()
+                .to_string();
         assert!(
             err.contains("thread:"),
             "error should explain expected format, got: {}",
@@ -543,7 +538,11 @@ mod tests {
             &sentinel[..sentinel.len().min(60)]
         );
         let (media_type, b64) = parsed.unwrap();
-        assert!(media_type.starts_with("image/"), "media type: {}", media_type);
+        assert!(
+            media_type.starts_with("image/"),
+            "media type: {}",
+            media_type
+        );
         assert!(!b64.is_empty(), "sentinel must carry base64 image data");
     }
 

@@ -318,7 +318,12 @@ pub fn get_or_create_preview(
         use image::codecs::jpeg::JpegEncoder;
         use image::{ColorType, ImageEncoder};
         JpegEncoder::new_with_quality(&mut buf, PREVIEW_JPEG_QUALITY)
-            .write_image(rgb.as_raw(), rgb.width(), rgb.height(), ColorType::Rgb8.into())
+            .write_image(
+                rgb.as_raw(),
+                rgb.width(),
+                rgb.height(),
+                ColorType::Rgb8.into(),
+            )
             .map_err(|e| BlobError::Io(std::io::Error::other(e)))?;
     }
 
@@ -341,7 +346,10 @@ pub fn get_or_create_preview(
 /// Same idempotency guarantees as `write_blob`. Used by HTTP compat shims
 /// (legacy `[{base64, mime_type}]` bodies) and by the chat send path that
 /// hashes inline `ChatImage` payloads at MessageReceived emit time.
-pub fn write_blob_from_base64(workspace: &Path, base64_str: &str) -> Result<ResolvedBlob, BlobError> {
+pub fn write_blob_from_base64(
+    workspace: &Path,
+    base64_str: &str,
+) -> Result<ResolvedBlob, BlobError> {
     use base64::Engine as _;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(base64_str)
@@ -401,7 +409,9 @@ mod tests {
     fn compute_hash_returns_64_hex_chars_for_arbitrary_input() {
         let h = compute_hash(b"any random bytes here");
         assert_eq!(h.len(), 64);
-        assert!(h.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
+        assert!(h
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()));
     }
 
     #[test]
@@ -584,7 +594,10 @@ mod tests {
             .expect("Ok for known large image")
             .expect("Some for known large image");
 
-        assert_ne!(preview.path, written.path, "large image: distinct preview file");
+        assert_ne!(
+            preview.path, written.path,
+            "large image: distinct preview file"
+        );
         assert_eq!(preview.mime, "image/jpeg", "preview is always JPEG");
         assert!(preview.path.exists(), "preview file must exist on disk");
         assert!(

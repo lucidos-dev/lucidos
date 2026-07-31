@@ -204,6 +204,32 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   converge. (`agent_session/run_session/run.rs`, `chat/process_cc.rs`,
   `claude_code/merge_session.rs`.)
 
+- **The packaged updater's `let _ = app.emit(PROGRESS_EVENT, …)` is a deliberate
+  best-effort, not a swallowed error.** A reviewer will read the discarded
+  `Result` in `updater.rs::emit` as the "no hidden errors" rule being broken. It
+  isn't, for two reasons that hold at every one of its call sites: a progress
+  frame is *telemetry about* an operation, never the operation, so failing an
+  update because a webview didn't receive a percentage would invert the
+  priority; and the last two frames (`restarting-services`, `relaunching`)
+  deliberately race the client teardown — `app.restart()` is next, and by then
+  there may be no webview left to receive anything. Every path that can actually
+  fail the update still surfaces a `Failed` frame AND returns `Err` to the
+  caller's `catch` (`fail()` does both, precisely so the reason survives whichever
+  channel dies first). Re-flag only if `emit` gains a caller where delivery is
+  load-bearing rather than narrative.
+
+- **`install_app_update_and_restart` calling `run.commit()` BEFORE inspecting the
+  download result is ordering, not an oversight.** It looks backwards — why mark a
+  run committed before knowing whether it succeeded? Because winning the commit is
+  what proves no cancel took the slot, and that is the precondition for the
+  `release()` on the error path being *ours* to make. Checking the result first
+  would let a failed download call `release()` after a cancel had already returned
+  the slot to `Idle` and a replacement run had claimed it — the exact
+  whoever-transitions-to-Idle-owns-it hazard `AppUpdateRun::release` documents.
+  `commit()` is a pure state transition with no side effect on the bytes, so
+  committing a run that then fails costs nothing. Pinned by
+  `a_cancel_that_lands_before_the_commit_wins`.
+
 ## Frontend
 
 - **`serverDraft` letting an inbound compose report overwrite a newer PUT ack is
@@ -500,7 +526,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `.mobile-header-title` (`styles/mobile.css`) is `position:absolute; left:50%;
   transform:translate(-50%,-50%); max-width:calc(100% - 10.5rem)` so it sits on
   the viewport/row axis (like the pane dots + desktop header) regardless of the
-  leading (hamburger + nav / filter) and trailing (actions) cluster widths. The
+  leading (thread-drawer toggle or hamburger + nav, or filter) and trailing
+  (actions) cluster widths. The
   requirement was stated as *"they should be centered, as long as they don't
   overlap the left-side icons; if centering would overlap, move them right so the
   left edge clears the rightmost left icon."* The symmetric reserve delivers both:
@@ -591,6 +618,40 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Scripts (bash)
 
+- **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though
+  the marker it writes is load-bearing.** `install.sh`'s helper carries a long
+  comment saying the `<data>/port` marker is the whole of instance discovery
+  (no marker means invisible to `uninstall.sh --list` and unremovable by
+  `--all --purge`), and then tolerates its own write failing, which reads like
+  the silent-degrade the comment argues against. Three reasons it stays. Both
+  call sites write it immediately after a `mkdir -p "$data"` that is itself
+  `|| die`, so the directory provably exists and is writable a line earlier;
+  the only remaining failure is a filesystem going read-only mid-install, which
+  the very next step (`exec`ing the gateway, or health-checking the service)
+  fails on anyway. The tolerance is inherited from `register_service`, where it
+  is load-bearing in the other direction: a marker write must never abort an
+  otherwise-successful registration. And the observable consequence is now
+  asserted end to end rather than assumed, by `install-smoke.yml`'s front-door
+  rungs 5-8 (`--list` must show the instance; `--all --purge` must remove the
+  data dir and the shared runtime) and by `service_test.sh`'s marker +
+  `service_list_instance_names` assertions on both foreground paths. Re-flag
+  only with evidence of a real path where the write fails while the install
+  otherwise succeeds. (`install.sh` `record_instance_port`.)
+
+- **The em-dash hook's four `jq` calls must NOT be short-circuited by grepping
+  the raw payload first.** `.claude/hooks/no-em-dashes.sh` spawns `jq` up to
+  four times per `Edit` (tool_name, file_path, old_string, new_string), and the
+  obvious optimization is to `grep -qF` the banned characters over the raw stdin
+  and `exit 0` when absent, since a field cannot carry what the payload does not.
+  It is not safe as written: JSON may encode the character as a `\uXXXX` escape
+  rather than as raw UTF-8 bytes (`JSON.stringify` does not escape non-ASCII,
+  but nothing in the hook contract promises it never will), and a raw-bytes grep
+  would then wave the write straight through, silently disarming the primary
+  gate. Decoding is exactly what the `jq` calls are for. A fast path would have
+  to match the escape forms too, and the few milliseconds saved per edit do not
+  pay for that coupling. Re-flag only with evidence that the payload encoding is
+  contractually raw UTF-8. (`.claude/hooks/no-em-dashes.sh`.)
+
 - **`dev-runtime.md` / `build-release.md` list scripts in `paths:` that their
   bodies never name — that over-match is deliberate.** Reviewers flag that
   `dev-runtime.md` matches `scripts/lib/{sleep,preflight,host_load_guard*,webkit_reaper*}.sh`
@@ -676,8 +737,12 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   soft-404s and rung 1 still reds at the HTML sniff; (2) fail-closed is the only
   correct posture for a gate, since a gate that cannot see its artifact must not
   pass, and the diagnosis names the likely cause verbatim ("the site publisher
-  has not published this RC's installer yet"); (3) the leg is independent — it
-  reds alone, and `smoke` / `dmg-verify` / `tarball-smoke` are unaffected. The
+  has not published this RC's installer yet"); (3) the payload legs are
+  independent of the rest — they red alone, and `smoke` / `dmg-verify` /
+  `tarball-smoke` are unaffected. (Since `front-door-macos` was added there are
+  three payload legs — `front-door` plus its two macOS matrix legs — reading the
+  *same* origin, so an unpublished RC reds all three at once. That is one
+  failure reported three times, not three independent findings.) The
   "trigger after publication" alternative IS what the *production* front door
   does (a publisher-fired `workflow_dispatch` after `SitePublished`); the RC
   gate deliberately runs earlier so nothing reaches the real path unchecked.
@@ -686,6 +751,29 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   version, NOT dropping the assertion.
   (`.github/workflows/install-smoke.yml` § front-door, `scripts/release.sh`
   § `print_rc_gate_handoff`.)
+
+- **`release-tarballs.yml`'s delete-then-upload attach loop cannot clobber a
+  signed macOS tarball.** Reviewers read the automatic `release: published`
+  attach — which runs for all four matrix entries, macOS included, and deletes
+  any same-named asset before uploading — next to the claim that the signed
+  macOS tarball comes from `build-dmg.sh --emit-tarball`, and conclude that CI
+  overwrites a signed asset with an unsigned one. It cannot: **nothing else
+  ever attaches a headless tarball.** `build-dmg.sh`'s only `gh release upload`
+  sends exactly the DMG + `Lucidos.app.tar.gz` + `.sig` + `latest.json`, and
+  `release.sh` never passes `--emit-tarball` — so `--emit-tarball` is a
+  capability no release flow invokes, and every `lucidos-<ver>-<triple>.tar.gz`
+  on a Release came from this workflow. (Confirm on any release by asset
+  timestamps: on v0.17.0 the DMG trio landed at 04:08:53 and all eight headless
+  assets at 04:19–04:51.) The macOS tarballs a user downloads are therefore
+  unsigned, which is accepted rather than accidental — a `curl`-fetched file
+  carries no `com.apple.quarantine` xattr so Gatekeeper never assesses the
+  runtime (ADR 0027's reasoning), and `install.sh`'s `verify_runtime_executes`
+  runs the gateway once at install time so a refusal is loud and immediate.
+  Re-flag only if a release path starts attaching a signed headless tarball
+  (then the clobber ordering becomes real), or if macOS begins quarantining
+  curl-fetched files.
+  (`.github/workflows/release-tarballs.yml` § attach step, `scripts/build-dmg.sh`
+  `gh release upload`, `.claude/rules/build-release.md` § Linux tarballs via CI.)
 
 ## Plugins & triggers (ADR 0019)
 
@@ -851,6 +939,36 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if the cross-workspace early return moves below the guard.
   (`crates/lucidos-engine/src/engine/agentic_loop_special_tool.rs`,
   `crates/lucidos-engine/src/engine/agent_session/run_session/run.rs`.)
+
+- **A blank `client_secret` on an `oauth_client` credential is a deliberate
+  choice, not a missing validation.** Reviewers see `prepare_oauth_flow` and
+  `refresh_oauth_if_needed` accept an absent/blank `client_secret` where they
+  used to `ok_or("Missing client_secret")`, and the modal no longer marking the
+  field `required`, and flag it as a dropped guard that will produce a broken
+  half-configured credential. It is the feature: `ClientAuth::from_secret`
+  reads a blank secret as OAuth's *public client* (RFC 8252) and authenticates
+  the redemption with PKCE (`S256`) instead — the correct shape for a desktop
+  app, and the only way a Microsoft Entra "Mobile and desktop applications"
+  registration can be redeemed at all (a secret there fails with
+  `AADSTS90023`). The confidential path is unchanged and pinned by snapshot
+  tests over the authorize query params and the exchange form pairs. Re-flag
+  only if a code path starts sending PKCE *and* a secret together, or omits
+  the secret on the refresh leg while sending it on the exchange leg (the two
+  legs must agree on client type).
+  (`crates/lucidos-engine/src/core/oauth.rs`,
+  `crates/lucidos-app/src/components/credentials/CredentialModal.tsx`.)
+
+- **`CALLBACK_HOSTS` accepts `[::1]` even though the IPv6 bind is
+  best-effort.** `resolve_redirect_uri` runs before `CallbackListener::bind`,
+  so it cannot know whether `::1` actually bound, and a reviewer will flag the
+  window where an IPv6 override is accepted on a host that then falls back to
+  IPv4-only. Accepted: no provider is known to require the IPv6 literal (it is
+  documented as the last-resort form), the fallback logs
+  `IPv6 loopback [::1]:… unavailable`, and the flow still fails inside the
+  existing 120s timeout rather than silently succeeding wrong. Re-flag with a
+  provider that actually needs `[::1]`, or if the bind result becomes available
+  before the resolve.
+  (`crates/lucidos-engine/src/core/oauth.rs`.)
 
 ## Settled architecture questions
 

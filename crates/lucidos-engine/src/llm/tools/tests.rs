@@ -185,8 +185,7 @@ fn ask_user_question_per_question_schema_matches_cc() {
         .get("required")
         .and_then(|v| v.as_array())
         .expect("each question item must declare `required`");
-    let item_required_names: Vec<&str> =
-        item_required.iter().filter_map(|v| v.as_str()).collect();
+    let item_required_names: Vec<&str> = item_required.iter().filter_map(|v| v.as_str()).collect();
     for must in ["question", "options"] {
         assert!(
             item_required_names.contains(&must),
@@ -414,7 +413,8 @@ fn send_notification_schema_tap_documents_object_shape() {
         assert!(
             desc.contains(kind),
             "tap description must mention the `{}` kind so the LLM knows it's valid: got {}",
-            kind, desc
+            kind,
+            desc
         );
     }
     assert!(
@@ -563,8 +563,14 @@ fn consolidated_flat_tools_are_not_advertised() {
         tn::MCP,
         tn::PLUGINS,
     ] {
-        let n = grouped_names.iter().filter(|g| g.as_str() == grouped).count();
-        assert_eq!(n, 1, "grouped tool {grouped} must be contributed exactly once, got {n}");
+        let n = grouped_names
+            .iter()
+            .filter(|g| g.as_str() == grouped)
+            .count();
+        assert_eq!(
+            n, 1,
+            "grouped tool {grouped} must be contributed exactly once, got {n}"
+        );
     }
 
     // The hot single-purpose tools the guardrail protects stay standalone.

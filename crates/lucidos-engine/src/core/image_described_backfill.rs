@@ -594,16 +594,15 @@ mod tests {
         // the same task, so a small bounded recv is enough — no flake risk.
         let mut observed_hashes: std::collections::HashSet<String> = Default::default();
         for _ in 0..2 {
-            let emitted = tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                rx.recv(),
-            )
-            .await
-            .expect("subscriber must observe the replay within 200ms")
-            .expect("recv ok");
+            let emitted = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                .await
+                .expect("subscriber must observe the replay within 200ms")
+                .expect("recv ok");
             match emitted.typed {
                 BusEvent::System(SystemEvent::DomainEvent {
-                    event_type, payload, ..
+                    event_type,
+                    payload,
+                    ..
                 }) => {
                     assert_eq!(event_type, "ImageDescribed");
                     let h = payload["hash"].as_str().unwrap().to_string();
@@ -624,11 +623,7 @@ mod tests {
             .unwrap();
         assert_eq!(second, 0);
         // No further events on the bus.
-        let no_more = tokio::time::timeout(
-            std::time::Duration::from_millis(50),
-            rx.recv(),
-        )
-        .await;
+        let no_more = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
         assert!(
             no_more.is_err(),
             "re-run with ON CONFLICT skip must not re-broadcast"

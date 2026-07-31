@@ -1,5 +1,5 @@
-use super::*;
 use super::common::make_test_repo;
+use super::*;
 
 #[tokio::test]
 async fn detect_origin_returns_none_for_repo_without_remote() {
@@ -101,7 +101,10 @@ async fn worktree_add_works_without_git_crypt() {
         "checkout step failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    assert!(wt_path.join("init.txt").exists(), "init.txt not checked out");
+    assert!(
+        wt_path.join("init.txt").exists(),
+        "init.txt not checked out"
+    );
     assert!(wt_path.join(".git").exists(), "worktree .git missing");
 }
 
@@ -130,7 +133,10 @@ async fn worktree_add_recovers_from_missing_but_registered_path() {
     // Simulate the residue: the directory is wiped but `git worktree remove`
     // was never run, so git keeps the registration as "missing".
     tokio::fs::remove_dir_all(&wt_path).await.unwrap();
-    assert!(!wt_path.exists(), "precondition: worktree dir should be gone");
+    assert!(
+        !wt_path.exists(),
+        "precondition: worktree dir should be gone"
+    );
 
     // Second spawn reuses the same deterministic path with a fresh branch.
     let out = worktree_add(&repo, &wt_path, &["-b", "claude-code/new"])
@@ -145,7 +151,10 @@ async fn worktree_add_recovers_from_missing_but_registered_path() {
         wt_path.join("init.txt").exists(),
         "init.txt not checked out on re-add"
     );
-    assert!(wt_path.join(".git").exists(), "worktree .git missing on re-add");
+    assert!(
+        wt_path.join(".git").exists(),
+        "worktree .git missing on re-add"
+    );
 }
 
 #[cfg(unix)]
@@ -155,7 +164,9 @@ async fn worktree_add_links_git_crypt_dir_when_present() {
 
     let parent_gc = repo.join(".git/git-crypt");
     tokio::fs::create_dir_all(&parent_gc).await.unwrap();
-    tokio::fs::write(parent_gc.join("keys"), b"stub").await.unwrap();
+    tokio::fs::write(parent_gc.join("keys"), b"stub")
+        .await
+        .unwrap();
 
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
@@ -172,19 +183,28 @@ async fn worktree_add_links_git_crypt_dir_when_present() {
     let per_wt_git = git_cmd(&["rev-parse", "--absolute-git-dir"], &wt_path)
         .await
         .unwrap();
-    let per_wt_git =
-        std::path::PathBuf::from(String::from_utf8_lossy(&per_wt_git.stdout).trim().to_string());
+    let per_wt_git = std::path::PathBuf::from(
+        String::from_utf8_lossy(&per_wt_git.stdout)
+            .trim()
+            .to_string(),
+    );
     let link = per_wt_git.join("git-crypt");
     let meta = tokio::fs::symlink_metadata(&link)
         .await
         .expect("git-crypt symlink missing in per-worktree git dir");
-    assert!(meta.file_type().is_symlink(), "git-crypt entry is not a symlink");
+    assert!(
+        meta.file_type().is_symlink(),
+        "git-crypt entry is not a symlink"
+    );
 
     // macOS resolves /var/folders/... → /private/var/folders/..., so
     // read_link's raw output won't compare equal to the source path.
     let resolved = std::fs::canonicalize(tokio::fs::read_link(&link).await.unwrap()).unwrap();
     let expected = std::fs::canonicalize(&parent_gc).unwrap();
-    assert_eq!(resolved, expected, "symlink does not point at parent git-crypt");
+    assert_eq!(
+        resolved, expected,
+        "symlink does not point at parent git-crypt"
+    );
 }
 
 /// A branch with commit + revert has zero net diff but non-zero commits.
@@ -245,11 +265,10 @@ async fn branch_changed_files_uses_origin_base_when_local_default_diverged() {
     let _ = git_cmd(&["init", "-q", "--bare", "-b", "main"], &origin).await;
 
     let (_tmp, repo) = make_test_repo().await;
-    let c_root = String::from_utf8_lossy(
-        &git_cmd(&["rev-parse", "HEAD"], &repo).await.unwrap().stdout,
-    )
-    .trim()
-    .to_string();
+    let c_root =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "HEAD"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
 
     // A commit on main that the PR branch forks from, then publish so
     // `origin/main` holds that fork point.
@@ -257,8 +276,16 @@ async fn branch_changed_files_uses_origin_base_when_local_default_diverged() {
         .await
         .unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
-    let _ = git_cmd(&["commit", "-m", "feature on main (branch forks here)"], &repo).await;
-    let _ = git_cmd(&["remote", "add", "origin", origin.to_str().unwrap()], &repo).await;
+    let _ = git_cmd(
+        &["commit", "-m", "feature on main (branch forks here)"],
+        &repo,
+    )
+    .await;
+    let _ = git_cmd(
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+        &repo,
+    )
+    .await;
     let _ = git_cmd(&["push", "-q", "origin", "main"], &repo).await;
     let _ = git_cmd(&["remote", "set-head", "origin", "main"], &repo).await;
 
@@ -273,7 +300,11 @@ async fn branch_changed_files_uses_origin_base_when_local_default_diverged() {
         .await
         .unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
-    let _ = git_cmd(&["commit", "-m", "migration: secrets transfer (automated)"], &repo).await;
+    let _ = git_cmd(
+        &["commit", "-m", "migration: secrets transfer (automated)"],
+        &repo,
+    )
+    .await;
 
     // Against local `main` the three-dot diff would surface `fork-point.txt`
     // (and miss `MIGRATION.md`); against `origin/main` (the branch's true fork
@@ -585,10 +616,16 @@ async fn default_diff_base_falls_back_to_origin_when_local_default_branch_missin
     let seed_tmp = tempfile::tempdir().unwrap();
     let seed = seed_tmp.path().to_path_buf();
     let _ = git_cmd(&["init", "-q", "-b", "develop"], &seed).await;
-    tokio::fs::write(seed.join("base.txt"), "base\n").await.unwrap();
+    tokio::fs::write(seed.join("base.txt"), "base\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &seed).await;
     let _ = git_cmd(&["commit", "-q", "-m", "base"], &seed).await;
-    let _ = git_cmd(&["remote", "add", "origin", remote.to_str().unwrap()], &seed).await;
+    let _ = git_cmd(
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+        &seed,
+    )
+    .await;
     let _ = git_cmd(&["push", "-q", "origin", "develop"], &seed).await;
 
     // The repo-under-test: has `origin` + `origin/HEAD` -> origin/develop, but
@@ -596,9 +633,15 @@ async fn default_diff_base_falls_back_to_origin_when_local_default_branch_missin
     let repo_tmp = tempfile::tempdir().unwrap();
     let repo = repo_tmp.path().to_path_buf();
     let _ = git_cmd(&["init", "-q"], &repo).await;
-    let _ = git_cmd(&["remote", "add", "origin", remote.to_str().unwrap()], &repo).await;
+    let _ = git_cmd(
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+        &repo,
+    )
+    .await;
     let _ = git_cmd(&["fetch", "-q", "origin"], &repo).await;
-    let o = git_cmd(&["remote", "set-head", "origin", "-a"], &repo).await.unwrap();
+    let o = git_cmd(&["remote", "set-head", "origin", "-a"], &repo)
+        .await
+        .unwrap();
     assert!(
         o.status.success(),
         "remote set-head -a failed: {}",
@@ -610,7 +653,9 @@ async fn default_diff_base_falls_back_to_origin_when_local_default_branch_missin
     // ever creating a local `develop` branch.
     let branch = "claude-code/20260701-083109-27b2c5";
     let _ = git_cmd(&["checkout", "-q", "-b", branch, "origin/develop"], &repo).await;
-    tokio::fs::write(repo.join("feature.txt"), "feature\n").await.unwrap();
+    tokio::fs::write(repo.join("feature.txt"), "feature\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(&["commit", "-q", "-m", "cc work"], &repo).await;
 
@@ -636,7 +681,9 @@ async fn default_diff_base_falls_back_to_origin_when_local_default_branch_missin
     // The user-visible symptom: the three-dot diff range must resolve (this is
     // the exact command the Diff button runs).
     let range = format!("{base}...{branch}");
-    let diff = git_cmd(&["diff", &range, "--no-color"], &repo).await.unwrap();
+    let diff = git_cmd(&["diff", &range, "--no-color"], &repo)
+        .await
+        .unwrap();
     assert!(
         diff.status.success(),
         "diff range `{range}` must resolve, got: {}",
@@ -659,7 +706,9 @@ async fn default_diff_base_falls_back_to_primary_worktree_head_when_no_default_r
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     let _ = git_cmd(&["init", "-q", "-b", "trunk"], &repo).await;
-    tokio::fs::write(repo.join("base.txt"), "base\n").await.unwrap();
+    tokio::fs::write(repo.join("base.txt"), "base\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(&["commit", "-q", "-m", "base"], &repo).await;
 
@@ -667,7 +716,9 @@ async fn default_diff_base_falls_back_to_primary_worktree_head_when_no_default_r
     // then return the primary checkout to `trunk` so the diff base != branch tip.
     let branch = "claude-code/20260701-090000-abcdef";
     let _ = git_cmd(&["checkout", "-q", "-b", branch], &repo).await;
-    tokio::fs::write(repo.join("feature.txt"), "feature\n").await.unwrap();
+    tokio::fs::write(repo.join("feature.txt"), "feature\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(&["commit", "-q", "-m", "cc work"], &repo).await;
     let _ = git_cmd(&["checkout", "-q", "trunk"], &repo).await;
@@ -683,7 +734,9 @@ async fn default_diff_base_falls_back_to_primary_worktree_head_when_no_default_r
     );
 
     let range = format!("{base}...{branch}");
-    let diff = git_cmd(&["diff", &range, "--no-color"], &repo).await.unwrap();
+    let diff = git_cmd(&["diff", &range, "--no-color"], &repo)
+        .await
+        .unwrap();
     assert!(
         diff.status.success(),
         "diff range `{range}` must resolve, got: {}",
@@ -706,7 +759,9 @@ async fn default_diff_base_in_linked_worktree_never_uses_own_head() {
     let tmp = tempfile::tempdir().unwrap();
     let repo = tmp.path().to_path_buf();
     let _ = git_cmd(&["init", "-q", "-b", "trunk"], &repo).await;
-    tokio::fs::write(repo.join("base.txt"), "base\n").await.unwrap();
+    tokio::fs::write(repo.join("base.txt"), "base\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(&["commit", "-q", "-m", "base"], &repo).await;
 
@@ -716,7 +771,14 @@ async fn default_diff_base_in_linked_worktree_never_uses_own_head() {
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
     let out = git_cmd(
-        &["worktree", "add", "-b", branch, wt_path.to_str().unwrap(), "trunk"],
+        &[
+            "worktree",
+            "add",
+            "-b",
+            branch,
+            wt_path.to_str().unwrap(),
+            "trunk",
+        ],
         &repo,
     )
     .await
@@ -726,7 +788,9 @@ async fn default_diff_base_in_linked_worktree_never_uses_own_head() {
         "worktree add failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    tokio::fs::write(wt_path.join("feature.txt"), "feature\n").await.unwrap();
+    tokio::fs::write(wt_path.join("feature.txt"), "feature\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &wt_path).await;
     let _ = git_cmd(&["commit", "-q", "-m", "cc work"], &wt_path).await;
 
@@ -738,7 +802,9 @@ async fn default_diff_base_in_linked_worktree_never_uses_own_head() {
     );
 
     let range = format!("{base}...HEAD");
-    let diff = git_cmd(&["diff", &range, "--no-color"], &wt_path).await.unwrap();
+    let diff = git_cmd(&["diff", &range, "--no-color"], &wt_path)
+        .await
+        .unwrap();
     assert!(
         diff.status.success(),
         "diff range `{range}` must resolve, got: {}",
@@ -903,4 +969,3 @@ async fn worktree_add_succeeds_while_config_lock_is_held() {
         "worktree not checked out"
     );
 }
-

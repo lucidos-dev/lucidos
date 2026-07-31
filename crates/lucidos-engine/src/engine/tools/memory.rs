@@ -303,15 +303,14 @@ If NONE should be deleted, reply with "none"."#,
 /// surrounding whitespace. Returns the tool-facing error string on failure so
 /// the caller can hand it straight back to the model.
 pub(crate) fn parse_memory_entry_id(args: &serde_json::Value) -> Result<uuid::Uuid, String> {
-    let raw = match args.get("id").and_then(|v| v.as_str()) {
-        Some(s) if !s.trim().is_empty() => s.trim(),
-        _ => {
-            return Err(
-                "Error: id is required — copy it from the `[id: <uuid>]` shown on the memory bullet"
+    let raw =
+        match args.get("id").and_then(|v| v.as_str()) {
+            Some(s) if !s.trim().is_empty() => s.trim(),
+            _ => return Err(
+                "Error: id is required. Copy it from the `[id: <uuid>]` shown on the memory bullet"
                     .to_string(),
-            )
-        }
-    };
+            ),
+        };
     let stripped = raw.strip_prefix("mem-").unwrap_or(raw);
     uuid::Uuid::parse_str(stripped).map_err(|_| {
         format!("Error: id must be a memory entry UUID as shown in `[id: <uuid>]` (got '{raw}')")
@@ -502,7 +501,10 @@ mod tests {
         .await
         .unwrap();
         assert!(out.contains("Deleted memory entry"), "{out}");
-        assert!(out.contains("gws-personal"), "echoes the deleted summary: {out}");
+        assert!(
+            out.contains("gws-personal"),
+            "echoes the deleted summary: {out}"
+        );
 
         assert!(
             index.get_by_id(target).await.unwrap().is_none(),

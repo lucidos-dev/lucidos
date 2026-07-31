@@ -15,6 +15,8 @@ paths:
   - "scripts/dev-codesign-setup.sh"
   - "scripts/dev-refresh-app-frontend.sh"
   - "scripts/test-engine.sh"
+  - "scripts/lint-shell.sh"
+  - "scripts/check-em-dashes.sh"
   - "scripts/e2e*.sh"
   - "scripts/lib/workspace*.sh"
   - "scripts/lib/ports*.sh"
@@ -28,6 +30,7 @@ paths:
   - "scripts/lib/webkit_reaper*.sh"
   - "scripts/lib/sigterm_contract_test.sh"
   - "scripts/lib/wait_for_engine_shutdown_test.sh"
+  - "scripts/lib/em_dash*.sh"
   - "Makefile"
 ---
 
@@ -76,13 +79,14 @@ opt-in itself, and never starts a gateway.
 ./scripts/test-engine.sh [--full|--fresh] # Engine tests against a dedicated Docker PG
 ./scripts/e2e-packaged.sh [--rebuild]     # macOS-only: boot the packaged .app (service + embedded PG) and smoke-test the chain (heavy: builds the .app)
 ./scripts/lint-shell.sh                   # ShellCheck over every tracked *.sh (= make lint-shell; part of make lint / make check)
+./scripts/check-em-dashes.sh [--base <ref>]  # Fail if the branch ADDS a U+2014 / U+2015 (diff-scoped; /harden Phase 4.5 runs it for every diff). Rule + rationale: .claude/rules/no-em-dashes.md
 ```
 
 ### Shell lint (`make lint-shell`)
 
 Every tracked `*.sh` in the repo is ShellCheck-clean and stays that way: `lint`
-depends on `lint-shell` + `lint-rust`, so `make check` covers it — and
-`/harden` Phase 4.5 runs `make lint` for any diff touching `*.sh`,
+depends on `lint-shell`, `lint-fmt` and `lint-rust`, so `make check` covers it,
+and `/harden` Phase 4.5 runs `make lint` for any diff touching `*.sh`,
 `.shellcheckrc`, the `Makefile`, or Rust, so the gate holds on every change
 rather than only when someone thinks to run it.
 
@@ -111,6 +115,31 @@ rather than only when someone thinks to run it.
 - **`mapfile` does not exist on macOS bash 3.2**, and `${#arr[@]}` on an EMPTY array
   trips `set -u` there. `lint-shell.sh` reads its file list with a `while read` loop
   and counts as it goes for exactly that reason.
+
+### Rust formatting (`make lint-fmt`, ADR 0030)
+
+Every tracked `.rs` file is rustfmt-clean and stays that way. `lint-fmt` runs
+`cargo fmt --all --check` and fails with a pointer at `make fmt`; the tree was
+brought clean in one mechanical sweep first (424 of 614 files at the time).
+
+- **The fix is `make fmt`**, which takes the same `--all` as the check so the
+  advertised remediation covers exactly what the gate inspects.
+- **There is deliberately no `rustfmt.toml`.** Stock defaults are reproducible
+  because `rust-toolchain.toml` pins the toolchain and rustfmt with it. A config
+  file would be a footgun: on a stable channel rustfmt WARNS and continues on a
+  nightly-only key rather than failing, so an inert setting reads as an active
+  one. That same nightly-only limitation is why the `ignore` key cannot be used
+  to exclude a path.
+- **This one cargo call carries no `--locked`**, against ADR 0020's blanket rule.
+  `cargo fmt` rejects the flag outright and resolves no dependencies, so there is
+  no lockfile for it to drift against. Do not "fix" the inconsistency.
+- **Generated Rust must be emitted already-formatted.** A tracked generated file
+  is squeezed between its staleness test (bytes must equal the emitter's output)
+  and this gate (bytes must be rustfmt-clean), and it cannot be excluded. See
+  `capability_manifest/codegen.rs`, which pipes its output through `rustfmt`.
+- **A toolchain bump can now reformat the tree**, so a `rust-toolchain.toml`
+  channel bump may have to carry a sweep. See `.claude/rules/build-release.md`
+  § "Toolchain pin".
 
 ### Workspace gateway + dev topology (ADR 0014 — Dev ≠ packaged!)
 

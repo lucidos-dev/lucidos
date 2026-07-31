@@ -203,9 +203,50 @@ export function checkAppUpdate(): Promise<string | null> {
  *  launchd background service (gateway + engines + embedded Postgres) AND the GUI
  *  client — onto the new version. On success the client re-execs and this promise
  *  never resolves; it rejects with a string error otherwise (no update, download
- *  failure). Only call when isTauri() is true. */
+ *  failure). Progress arrives out-of-band on {@link APP_UPDATE_PROGRESS_EVENT} —
+ *  this promise says nothing until it is over. Only call when isTauri() is true. */
 export function installAppUpdateAndRestart(): Promise<void> {
   return invoke('install_app_update_and_restart');
+}
+
+/** Tauri event carrying {@link AppUpdateProgress} frames while an update runs.
+ *  Emitted by `src/updater.rs`; the name must match `PROGRESS_EVENT` there. */
+export const APP_UPDATE_PROGRESS_EVENT = 'app-update-progress';
+
+/** Where a packaged update run currently is — the TypeScript mirror of Rust's
+ *  `AppUpdatePhase` (`src/updater.rs`), serialized internally-tagged on `phase`.
+ *
+ *  A discriminated union rather than a bare string so the phase's data travels
+ *  with it (only `downloading` has byte counts, only `failed` has a message) and
+ *  `tsc` forces every consumer to handle every phase. `total` is null when the
+ *  server declared no `Content-Length`: there is then no honest percentage, and
+ *  the UI must show bytes alone rather than invent one. */
+interface AppUpdateFrame {
+  /** The version being installed; null until the check resolves one. */
+  version: string | null;
+}
+
+export type AppUpdateProgress =
+  | (AppUpdateFrame & { phase: 'checking' })
+  | (AppUpdateFrame & { phase: 'downloading'; downloaded: number; total: number | null })
+  | (AppUpdateFrame & { phase: 'verifying' })
+  | (AppUpdateFrame & { phase: 'installing' })
+  | (AppUpdateFrame & { phase: 'restarting-services' })
+  | (AppUpdateFrame & { phase: 'relaunching' })
+  | (AppUpdateFrame & { phase: 'cancelled' })
+  | (AppUpdateFrame & { phase: 'failed'; message: string });
+
+/** A frame describing a run still IN FLIGHT. `cancelled` and `failed` END a run
+ *  rather than describe one, so surfaces replace themselves on those instead of
+ *  updating — which is why the narration helper takes only these. */
+export type AppUpdateRunning = Exclude<AppUpdateProgress, { phase: 'cancelled' | 'failed' }>;
+
+/** Abandon an in-flight packaged-update download. Only the check + download can
+ *  be cancelled — once the bundle swap has started the run has committed and this
+ *  is a no-op. The outcome arrives as a `cancelled` progress frame, not as this
+ *  promise's resolution. Only call when isTauri() is true. */
+export function cancelAppUpdate(): Promise<void> {
+  return invoke('cancel_app_update');
 }
 
 // --- Mobile access (packaged desktop app; macOS) ---

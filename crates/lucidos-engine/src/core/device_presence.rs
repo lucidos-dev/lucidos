@@ -111,7 +111,10 @@ mod tests {
             .await
             .unwrap();
         assert!(changed, "first record_visible must report a state change");
-        assert!(!DevicePresenceStore::candidates(&pool).await.unwrap().is_empty());
+        assert!(!DevicePresenceStore::candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty());
         teardown_test_db(&db).await;
     }
 
@@ -141,14 +144,20 @@ mod tests {
             .await
             .unwrap();
         assert!(removed, "hide on a visible row must report removal");
-        assert!(DevicePresenceStore::candidates(&pool).await.unwrap().is_empty());
+        assert!(DevicePresenceStore::candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty());
         teardown_test_db(&db).await;
     }
 
     #[tokio::test]
     async fn candidates_empty_when_no_devices() {
         let (pool, db) = setup_test_db().await;
-        assert!(DevicePresenceStore::candidates(&pool).await.unwrap().is_empty());
+        assert!(DevicePresenceStore::candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty());
         teardown_test_db(&db).await;
     }
 
@@ -161,12 +170,18 @@ mod tests {
         DevicePresenceStore::record_visible(&pool, "dev-2")
             .await
             .unwrap();
-        assert!(!DevicePresenceStore::candidates(&pool).await.unwrap().is_empty());
+        assert!(!DevicePresenceStore::candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty());
         // Hide one; the other still keeps the candidate list non-empty.
         DevicePresenceStore::record_hidden(&pool, "dev-1")
             .await
             .unwrap();
-        assert!(!DevicePresenceStore::candidates(&pool).await.unwrap().is_empty());
+        assert!(!DevicePresenceStore::candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty());
         teardown_test_db(&db).await;
     }
 
@@ -183,7 +198,10 @@ mod tests {
         .await
         .unwrap();
         assert!(
-            DevicePresenceStore::candidates(&pool).await.unwrap().is_empty(),
+            DevicePresenceStore::candidates(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
             "stale rows must not count as visible"
         );
         teardown_test_db(&db).await;
@@ -205,7 +223,10 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            !DevicePresenceStore::candidates(&pool).await.unwrap().is_empty(),
+            !DevicePresenceStore::candidates(&pool)
+                .await
+                .unwrap()
+                .is_empty(),
             "heartbeat should refresh visible_at so the row is no longer stale"
         );
         teardown_test_db(&db).await;

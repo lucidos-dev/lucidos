@@ -221,8 +221,10 @@ pub fn grep_files(
                 let before_start = idx.saturating_sub(context_lines);
                 let after_end = (idx + 1 + context_lines).min(lines.len());
                 let capped_line = cap_line(line);
-                let context_before: Vec<String> =
-                    lines[before_start..idx].iter().map(|s| cap_line(s)).collect();
+                let context_before: Vec<String> = lines[before_start..idx]
+                    .iter()
+                    .map(|s| cap_line(s))
+                    .collect();
                 let context_after: Vec<String> = lines[idx + 1..after_end]
                     .iter()
                     .map(|s| cap_line(s))
@@ -289,7 +291,10 @@ mod tests {
         let r = glob_files(ws.path(), "artifacts/*.md", Some(200)).unwrap();
         assert_eq!(
             r.paths,
-            vec!["artifacts/notes.md".to_string(), "artifacts/todo.md".to_string()]
+            vec![
+                "artifacts/notes.md".to_string(),
+                "artifacts/todo.md".to_string()
+            ]
         );
         assert!(!r.truncated);
     }
@@ -378,7 +383,8 @@ mod tests {
     #[test]
     fn grep_rejects_path_traversal_in_pattern_glob() {
         let ws = make_workspace();
-        let err = grep_files(ws.path(), "x", Some("../../*"), false, Some(100), Some(0)).unwrap_err();
+        let err =
+            grep_files(ws.path(), "x", Some("../../*"), false, Some(100), Some(0)).unwrap_err();
         assert!(err.contains("rejected"), "got: {}", err);
     }
 
@@ -391,11 +397,8 @@ mod tests {
             let ws = make_workspace();
             let outside = tempdir().unwrap();
             fs::write(outside.path().join("secret.md"), "leaked").unwrap();
-            std::os::unix::fs::symlink(
-                outside.path(),
-                ws.path().join("data/artifacts/escape"),
-            )
-            .unwrap();
+            std::os::unix::fs::symlink(outside.path(), ws.path().join("data/artifacts/escape"))
+                .unwrap();
 
             let r = glob_files(ws.path(), "**/*.md", Some(200)).unwrap();
             assert!(
@@ -489,7 +492,15 @@ mod tests {
         write(ws.path(), "apps/bar/page.md", "Hello there");
         write(ws.path(), "artifacts/notes.md", "Hello world");
 
-        let r = grep_files(ws.path(), "Hello", Some("apps/**/*.html"), false, Some(100), Some(0)).unwrap();
+        let r = grep_files(
+            ws.path(),
+            "Hello",
+            Some("apps/**/*.html"),
+            false,
+            Some(100),
+            Some(0),
+        )
+        .unwrap();
         assert_eq!(r.matches.len(), 1);
         assert_eq!(r.matches[0].path, "apps/foo/index.html");
     }
@@ -539,7 +550,15 @@ mod tests {
         let ws = make_workspace();
         write(ws.path(), "artifacts/a.md", "x");
         // Should clamp without erroring
-        let r = grep_files(ws.path(), "x", None, false, Some(GREP_MAX_MATCHES.max * 10), Some(0)).unwrap();
+        let r = grep_files(
+            ws.path(),
+            "x",
+            None,
+            false,
+            Some(GREP_MAX_MATCHES.max * 10),
+            Some(0),
+        )
+        .unwrap();
         assert_eq!(r.matches.len(), 1);
     }
 
@@ -556,8 +575,14 @@ mod tests {
         let m = &r.matches[0];
         assert_eq!(m.line_number, 3);
         assert_eq!(m.line, "line3 MATCH");
-        assert_eq!(m.context_before, vec!["line1".to_string(), "line2".to_string()]);
-        assert_eq!(m.context_after, vec!["line4".to_string(), "line5".to_string()]);
+        assert_eq!(
+            m.context_before,
+            vec!["line1".to_string(), "line2".to_string()]
+        );
+        assert_eq!(
+            m.context_after,
+            vec!["line4".to_string(), "line5".to_string()]
+        );
     }
 
     #[test]
@@ -594,7 +619,10 @@ mod tests {
         let ws = make_workspace();
         // Contents are set up by make_workspace; nothing under artifacts/apps/knowhow/triggers
         let r = grep_files(ws.path(), "secret", None, false, Some(100), Some(0)).unwrap();
-        assert!(r.matches.is_empty(), "must not search postgres/ or .lucidos/");
+        assert!(
+            r.matches.is_empty(),
+            "must not search postgres/ or .lucidos/"
+        );
     }
 
     #[test]
@@ -614,8 +642,15 @@ mod tests {
     #[test]
     fn grep_invalid_path_glob_returns_error() {
         let ws = make_workspace();
-        let err =
-            grep_files(ws.path(), "x", Some("apps/[unclosed"), false, Some(100), Some(0)).unwrap_err();
+        let err = grep_files(
+            ws.path(),
+            "x",
+            Some("apps/[unclosed"),
+            false,
+            Some(100),
+            Some(0),
+        )
+        .unwrap_err();
         assert!(err.contains("Invalid path_glob"));
     }
 
@@ -674,7 +709,11 @@ mod tests {
     #[test]
     fn grep_short_lines_not_truncated() {
         let ws = make_workspace();
-        write(ws.path(), "artifacts/a.md", "short MATCH line\nbefore\nMATCH again");
+        write(
+            ws.path(),
+            "artifacts/a.md",
+            "short MATCH line\nbefore\nMATCH again",
+        );
         let r = grep_files(ws.path(), "MATCH", None, false, Some(100), Some(1)).unwrap();
         for m in &r.matches {
             assert!(
@@ -683,7 +722,11 @@ mod tests {
                 m.line
             );
             for c in m.context_before.iter().chain(m.context_after.iter()) {
-                assert!(!c.ends_with('…'), "short context should not be truncated: {}", c);
+                assert!(
+                    !c.ends_with('…'),
+                    "short context should not be truncated: {}",
+                    c
+                );
             }
         }
     }

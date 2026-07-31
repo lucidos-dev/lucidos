@@ -980,10 +980,7 @@ fn continue_resume_exchange_gate_opens_for_user_continue_and_auto_recovery() {
 fn stale_resume_on_a_continuation_retries_fresh() {
     use super::{continue_recovery, ContinueRecovery};
     assert_eq!(
-        continue_recovery(
-            Some(crate::engine::claude_code::STALE_RESUME_ERROR),
-            false
-        ),
+        continue_recovery(Some(crate::engine::claude_code::STALE_RESUME_ERROR), false),
         ContinueRecovery::RetryFresh
     );
 }
@@ -1084,4 +1081,3 @@ fn coding_agent_idled_without_reason_skips_field_in_wire_format() {
         json
     );
 }
-

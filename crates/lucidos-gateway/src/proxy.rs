@@ -116,12 +116,19 @@ pub async fn proxy(
 
     // Stream the request body straight through — never buffer it (a 100 MB
     // `PUT /data/*` upload must not sit in gateway memory).
-    builder = builder.body(reqwest::Body::wrap_stream(req.into_body().into_data_stream()));
+    builder = builder.body(reqwest::Body::wrap_stream(
+        req.into_body().into_data_stream(),
+    ));
 
     let upstream = match builder.send().await {
         Ok(r) => r,
         Err(e) => {
-            crate::log!("[Gateway] proxy {} -> {} failed: {}", path_and_query, url, e);
+            crate::log!(
+                "[Gateway] proxy {} -> {} failed: {}",
+                path_and_query,
+                url,
+                e
+            );
             // Boot-window UX (ADR 0014 §11): an engine cold boot (pgvector init,
             // migrations, embedding warmup, ~20 CC sessions resuming) can take
             // tens of seconds, during which a connect fails. Serve a lightweight
@@ -136,7 +143,8 @@ pub async fn proxy(
         }
     };
 
-    let status = StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+    let status =
+        StatusCode::from_u16(upstream.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
     let mut resp = Response::builder().status(status);
     for (name, value) in upstream.headers() {
         // Forward everything except hop-by-hop framing — content-length,
@@ -219,7 +227,10 @@ pub fn stalled_page() -> Response {
 /// navigation as an error and serving the cached app shell.
 fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
     let mut resp = Response::builder().status(StatusCode::SERVICE_UNAVAILABLE);
-    resp = resp.header(header::CONTENT_TYPE, HeaderValue::from_static("text/html; charset=utf-8"));
+    resp = resp.header(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
     resp = resp.header(header::RETRY_AFTER, HeaderValue::from_static(retry_after));
     resp = resp.header(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     resp = resp.header("x-lucidos-boot-splash", HeaderValue::from_static("1"));
@@ -314,8 +325,7 @@ label's size/spacing, underlined so it reads as a tap target. */
 <p class="mark-label">"##;
     // The picker link stands down the cold-start auto-open (`?pick`), so a manual
     // tap can't loop back into the unreachable workspace.
-    const ESCAPE_LINK: &str =
-        r##"<a class="mark-escape" href="/~/?pick">Back to workspaces</a>"##;
+    const ESCAPE_LINK: &str = r##"<a class="mark-escape" href="/~/?pick">Back to workspaces</a>"##;
     let escape_html = if escape { ESCAPE_LINK } else { "" };
     // Omitted entirely (not `content="0"`) when there is nothing to wait for.
     let refresh_html = match refresh_secs {
@@ -323,9 +333,15 @@ label's size/spacing, underlined so it reads as a tap target. */
         None => String::new(),
     };
     // A page with nothing to wait for is not "Starting…".
-    let title = if refresh_secs.is_some() { "Starting…" } else { "Cannot open workspace" };
+    let title = if refresh_secs.is_some() {
+        "Starting…"
+    } else {
+        "Cannot open workspace"
+    };
     let label = escape_html_text(label);
-    format!("{HEAD_A}{refresh_html}{HEAD_B}{title}{HEAD_C}{label}</p>\n{escape_html}\n</body></html>")
+    format!(
+        "{HEAD_A}{refresh_html}{HEAD_B}{title}{HEAD_C}{label}</p>\n{escape_html}\n</body></html>"
+    )
 }
 
 /// Escape text for interpolation into HTML element content or a quoted attribute.
@@ -383,9 +399,13 @@ mod tests {
 
     #[test]
     fn starting_splash_renders_the_phase_label_and_has_no_escape_link() {
-        let html = splash_page_html("Downloading memory model — first run, this can take a minute…", Some(2), false);
+        let html = splash_page_html(
+            "Downloading memory model: first run, this can take a minute…",
+            Some(2),
+            false,
+        );
         // The current boot-phase label is shown beneath the mark.
-        assert!(html.contains("Downloading memory model — first run, this can take a minute…"));
+        assert!(html.contains("Downloading memory model: first run, this can take a minute…"));
         // The 2s auto-refresh that advances the label / drives the happy-path
         // transition is preserved.
         assert!(html.contains(r#"http-equiv="refresh" content="2""#));
@@ -420,7 +440,9 @@ mod tests {
         let resp = stalled_page();
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            resp.headers().get("x-lucidos-boot-splash").map(|v| v.to_str().unwrap()),
+            resp.headers()
+                .get("x-lucidos-boot-splash")
+                .map(|v| v.to_str().unwrap()),
             Some("1")
         );
     }
@@ -435,11 +457,17 @@ mod tests {
             None,
             true,
         );
-        assert!(html.contains("its database was created by a newer version"), "{html}");
+        assert!(
+            html.contains("its database was created by a newer version"),
+            "{html}"
+        );
         // No meta-refresh AT ALL — not `content="0"`, not a long interval.
         assert!(!html.contains("http-equiv=\"refresh\""), "{html}");
         // ...and the tab must not claim the workspace is still starting.
-        assert!(html.contains("<title>Cannot open workspace</title>"), "{html}");
+        assert!(
+            html.contains("<title>Cannot open workspace</title>"),
+            "{html}"
+        );
         assert!(!html.contains("Starting…"), "{html}");
         // The escape to the picker is the only action left.
         assert!(html.contains(r##"href="/~/?pick""##));
@@ -450,11 +478,7 @@ mod tests {
     /// it is not trusted-static like the phase labels are.
     #[test]
     fn splash_escapes_html_in_the_label() {
-        let html = splash_page_html(
-            r#"<script>alert("x")</script> & 'quoted'"#,
-            None,
-            false,
-        );
+        let html = splash_page_html(r#"<script>alert("x")</script> & 'quoted'"#, None, false);
         assert!(!html.contains("<script>"), "raw tag survived: {html}");
         assert!(html.contains("&lt;script&gt;"), "{html}");
         assert!(html.contains("&amp;"), "{html}");
@@ -467,7 +491,9 @@ mod tests {
         let resp = failed_page("Lucidos 0.15.0 cannot open this workspace.");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(
-            resp.headers().get("x-lucidos-boot-splash").map(|v| v.to_str().unwrap()),
+            resp.headers()
+                .get("x-lucidos-boot-splash")
+                .map(|v| v.to_str().unwrap()),
             Some("1")
         );
     }
@@ -506,7 +532,9 @@ mod proxy_tests {
                 let n = sock.read(&mut buf).await.unwrap_or(0);
                 *c.lock().await = String::from_utf8_lossy(&buf[..n]).into_owned();
                 let _ = sock
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+                    )
                     .await;
                 let _ = sock.flush().await;
             }
@@ -616,10 +644,7 @@ mod proxy_tests {
         )
         .await;
         assert_eq!(resp.status(), StatusCode::TEMPORARY_REDIRECT);
-        assert_eq!(
-            resp.headers().get(header::LOCATION).unwrap(),
-            "/dev/"
-        );
+        assert_eq!(resp.headers().get(header::LOCATION).unwrap(), "/dev/");
     }
 
     #[tokio::test]
@@ -640,7 +665,7 @@ mod proxy_tests {
             &build_client(),
             &target,
             "dev",
-            "Downloading memory model — first run, this can take a minute…",
+            "Downloading memory model: first run, this can take a minute…",
             request("GET", "/dev/", Body::empty()),
         )
         .await;
@@ -654,7 +679,7 @@ mod proxy_tests {
             .unwrap();
         let html = String::from_utf8_lossy(&body);
         assert!(
-            html.contains("Downloading memory model — first run, this can take a minute…"),
+            html.contains("Downloading memory model: first run, this can take a minute…"),
             "the connect-failure splash must render the passed boot phase label"
         );
     }

@@ -11,19 +11,19 @@ pub(crate) mod cc_settings;
 mod change_ops;
 mod chat;
 pub(crate) mod claude_code;
-pub mod engine_version;
-mod frontend_refresh;
 pub(crate) mod command_guard;
 pub(crate) mod command_judge;
 pub mod command_permission;
 mod context;
-pub mod mcp_permission;
+pub mod engine_version;
 pub mod event_bus;
-pub(crate) mod loaded_knowhow;
+mod frontend_refresh;
 pub(crate) mod git_ops;
 pub mod http;
 pub(crate) mod inline_question_repair;
 pub(crate) mod inline_tool_call_repair;
+pub(crate) mod loaded_knowhow;
+pub mod mcp_permission;
 mod memory;
 pub mod memory_consumer;
 mod pending_apply_actors;
@@ -43,10 +43,11 @@ pub mod worktree_cleanup;
 
 pub(crate) use agentic_loop::{
     coalesced_images_for_reprocess, coalesced_user_text_for_reprocess,
-    emit_user_prompt_injected_event, filter_removed_queued_prompts,
+    emit_user_prompt_injected_event, filter_removed_queued_prompts, strip_app_capture_marker,
 };
-pub(crate) use chat::generate_thread_title;
 pub(crate) use change_ops::now_epoch_millis;
+pub(crate) use chat::generate_thread_title;
+pub(crate) use chat::PreEmittedOrigin;
 #[cfg(test)]
 pub(crate) use context::format_history_steps;
 pub use types::*;
@@ -65,7 +66,7 @@ use crate::core::{
 use crate::llm::LlmProvider;
 use crate::memory::{EmbedderSlot, MemoryExtractor, PgVectorIndex};
 use crate::runtime::{
-    CodingAgent, AgentRuntime, BrowserLogins, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime,
+    AgentRuntime, BrowserLogins, BrowserRuntime, ClaudeCodeRuntime, CodexRuntime, CodingAgent,
     HeadlessBlocklist, PythonRuntime,
 };
 use git_ops::{auto_commit_safe_files_if_dirty, git_cmd};
@@ -397,10 +398,7 @@ pub struct LucidosEngine {
     /// in `RwLock` so the Phase-9 reload endpoint can swap the map atomically.
     proxy_modules: Arc<
         tokio::sync::RwLock<
-            std::collections::HashMap<
-                String,
-                Arc<crate::api::proxy_wasm_signer::CompiledModule>,
-            >,
+            std::collections::HashMap<String, Arc<crate::api::proxy_wasm_signer::CompiledModule>>,
         >,
     >,
     /// Shared wasmtime engine. Module compilation + per-request
@@ -505,8 +503,7 @@ pub struct LucidosEngine {
     /// suspension+resume happens organically: the recovery CC's eventual
     /// `ChangeApplied` for the conflict member triggers the next apply
     /// via the same hook the happy path uses.
-    pub(crate) apply_all_batches:
-        Arc<tokio::sync::Mutex<apply_all_batches::ApplyAllRegistry>>,
+    pub(crate) apply_all_batches: Arc<tokio::sync::Mutex<apply_all_batches::ApplyAllRegistry>>,
     /// Sender for the apply-all driver task. `emit_change_applied` /
     /// `emit_apply_failed` push `Applied` / `Failed` messages here; the
     /// driver task (spawned at engine startup via `start_apply_all_driver`)
@@ -671,9 +668,16 @@ fn spawn_vertex_region_subscriber(
             match location.write() {
                 Ok(mut guard) => {
                     let old = std::mem::replace(&mut *guard, new_region.clone());
-                    log!("[Preferences] vertex_region updated live: {} → {}", old, new_region);
+                    log!(
+                        "[Preferences] vertex_region updated live: {} → {}",
+                        old,
+                        new_region
+                    );
                 }
-                Err(e) => log!("[Preferences] vertex_region update skipped (lock poisoned): {}", e),
+                Err(e) => log!(
+                    "[Preferences] vertex_region update skipped (lock poisoned): {}",
+                    e
+                ),
             }
         }
     });

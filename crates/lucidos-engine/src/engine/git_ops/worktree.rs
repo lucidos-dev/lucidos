@@ -94,10 +94,7 @@ pub(crate) async fn resolve_main_worktree(path: &Path) -> PathBuf {
         );
         match std::env::current_dir() {
             Ok(cwd) if cwd.join(".git").exists() => {
-                log!(
-                    "[Git] Using cwd as fallback repo root: {}",
-                    cwd.display()
-                );
+                log!("[Git] Using cwd as fallback repo root: {}", cwd.display());
                 cwd
             }
             _ => {
@@ -198,8 +195,7 @@ pub(crate) async fn create_sparse_app_worktree(
     // default branch is `master` / `trunk` / a custom name still spawn
     // correctly — with `--no-track` so concurrent spawns can't race on the
     // shared `.git/config` upstream write (same rationale as `worktree_add`).
-    let branch_exists =
-        git_ref_exists(workspace_root, &format!("refs/heads/{branch_name}")).await;
+    let branch_exists = git_ref_exists(workspace_root, &format!("refs/heads/{branch_name}")).await;
     let add = if branch_exists {
         worktree_add_pruning_stale(
             workspace_root,
@@ -559,7 +555,9 @@ pub(crate) async fn install_coding_agent_diff_hook(
 }
 
 async fn prior_post_commit_hook(wt_path: &Path) -> Result<PathBuf, String> {
-    let hook_path = wt_path.join(LUCIDOS_HOOKS_PATH).join(LUCIDOS_POST_COMMIT_HOOK);
+    let hook_path = wt_path
+        .join(LUCIDOS_HOOKS_PATH)
+        .join(LUCIDOS_POST_COMMIT_HOOK);
     if let Some(current) = current_hooks_path(wt_path).await {
         if !is_lucidos_hooks_path(&current) {
             return Ok(resolve_hooks_path(wt_path, &current).join(LUCIDOS_POST_COMMIT_HOOK));
@@ -622,7 +620,11 @@ async fn common_post_commit_hook(wt_path: &Path) -> Result<PathBuf, String> {
     }
     let common_dir = {
         let p = PathBuf::from(raw);
-        if p.is_absolute() { p } else { wt_path.join(p) }
+        if p.is_absolute() {
+            p
+        } else {
+            wt_path.join(p)
+        }
     };
     Ok(common_dir.join("hooks").join(LUCIDOS_POST_COMMIT_HOOK))
 }
@@ -705,7 +707,10 @@ pub(crate) async fn clear_stranded_worktree_dir(repo_root: &Path, wt_path: &Path
         let _ = git_cmd(&["worktree", "remove", "--force", s], repo_root).await;
     }
     if !wt_path.exists() {
-        log!("[Git] cleared stranded worktree {} via git", wt_path.display());
+        log!(
+            "[Git] cleared stranded worktree {} via git",
+            wt_path.display()
+        );
         return;
     }
     match tokio::fs::remove_dir_all(wt_path).await {

@@ -98,6 +98,13 @@
     line-height: 1.4;
 }
 
+/* Determinate progress under a .system-notice narrating a live packaged update.
+   The notice is a card, so this is internal component spacing, not a structural
+   gutter. */
+.system-update-progress {
+    margin-top: 0.5rem;
+}
+
 .system-actions {
     display: flex;
     gap: 0.5rem;

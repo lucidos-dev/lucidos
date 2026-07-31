@@ -1,5 +1,5 @@
-use super::*;
 use super::test_helpers::*;
+use super::*;
 
 /// Multi-token text queries must match threads where every token appears
 /// somewhere — title or any event payload — even if no single string contains

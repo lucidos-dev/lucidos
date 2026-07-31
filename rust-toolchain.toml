@@ -9,9 +9,16 @@
 # and a lint removed by a new stable stops catching a real defect. Flagged by
 # the 2026-07-26 nightly (CleanBuildPassed concern 4).
 #
+# The same reasoning now covers rustfmt (ADR 0030). `make lint` runs
+# `cargo fmt --all --check`, so this pin is also what makes "formatted" mean one
+# thing across every machine, and rustfmt's output is as much a property of the
+# toolchain as clippy's lint set.
+#
 # Bumping the pin is a deliberate, reviewable commit: change `channel`, run
 # `make lint` + the engine suite, and fix whatever the new lint set surfaces in
-# that same change — rather than discovering it on an unrelated branch.
+# that same change, rather than discovering it on an unrelated branch. A bump can
+# also change rustfmt's output, in which case the same commit carries a
+# `make fmt` sweep.
 #
 # `targets` is load-bearing, not decoration: signers/build-all.sh builds every
 # signer to wasm32-unknown-unknown, and rustup resolves THIS file from
@@ -19,8 +26,10 @@
 # fails that build with "can't find crate for `core`".
 #
 # `profile = "minimal"` keeps CI installs lean; the two components the repo
-# actually invokes are listed explicitly (clippy via `make lint`, rustfmt via
-# `make fmt` / `make fix`). rust-docs is deliberately not pulled in.
+# actually invokes are listed explicitly. Both are now gate components rather
+# than conveniences: clippy via `make lint`'s `lint-rust`, rustfmt via its
+# `lint-fmt` (and via `make fmt` / `make fix`, the remediation). rust-docs is
+# deliberately not pulled in.
 
 [toolchain]
 channel = "1.94.1"

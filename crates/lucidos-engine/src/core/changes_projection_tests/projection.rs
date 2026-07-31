@@ -1,5 +1,5 @@
-use super::*;
 use super::cp_helpers::*;
+use super::*;
 
 #[tokio::test]
 async fn empty_projection_has_no_pending_changes() {
@@ -252,7 +252,11 @@ async fn re_emitted_aggregate_updates_existing_row() {
     .await;
 
     let proj = ChangesProjection::new(pool);
-    let row = proj.get_by_id(change_id).await.unwrap().expect("change exists");
+    let row = proj
+        .get_by_id(change_id)
+        .await
+        .unwrap()
+        .expect("change exists");
     assert_eq!(row.description, "updated");
     assert_eq!(row.files, vec!["a.rs".to_string()]);
     assert_eq!(row.file_count, 1);

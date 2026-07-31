@@ -302,9 +302,7 @@ pub(super) async fn create_trigger(
     let subscriptions = EventSubscription::normalize_list(request.on);
     let has_event = !subscriptions.is_empty();
     if !has_cron && !has_event {
-        return ApiResult::err(
-            "At least one cron expression or an event subscription is required",
-        );
+        return ApiResult::err("At least one cron expression or an event subscription is required");
     }
 
     // Validate cron expressions if provided
@@ -365,7 +363,12 @@ pub(super) async fn create_trigger(
     if let Some(ref gid) = request.group_id {
         let trimmed = gid.trim();
         if !trimmed.is_empty() {
-            let known = state.engine.trigger_groups.read().unwrap().contains_key(trimmed);
+            let known = state
+                .engine
+                .trigger_groups
+                .read()
+                .unwrap()
+                .contains_key(trimmed);
             if !known {
                 return ApiResult::err(format!("Unknown group_id '{}'", trimmed));
             }
@@ -382,13 +385,16 @@ pub(super) async fn create_trigger(
     state
         .engine
         .event_bus
-        .emit_user_system(&headers, &state.pool, "[Triggers] TriggerCreated", |actor| {
-            SystemEvent::TriggerCreated {
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[Triggers] TriggerCreated",
+            |actor| SystemEvent::TriggerCreated {
                 trigger_id: trigger_id_str.clone(),
                 payload,
                 actor,
-            }
-        })
+            },
+        )
         .await;
 
     ApiResult::ok()
@@ -465,8 +471,8 @@ pub(super) async fn update_trigger(
     // The new shape always serializes as an array — apply_update reads it back
     // via parse_event_subscriptions and treats `[]` as clear.
     if let Some(ref subs) = normalized_on {
-        update_payload["on"] = serde_json::to_value(subs)
-            .expect("EventSubscription serialization is infallible");
+        update_payload["on"] =
+            serde_json::to_value(subs).expect("EventSubscription serialization is infallible");
     }
     // Same null-vs-absent semantics for app_id: explicit null clears the link
     // (e.g. trigger moved out of an app), absent leaves it alone.
@@ -495,7 +501,12 @@ pub(super) async fn update_trigger(
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
         if let Some(ref gid) = normalized {
-            let known = state.engine.trigger_groups.read().unwrap().contains_key(gid);
+            let known = state
+                .engine
+                .trigger_groups
+                .read()
+                .unwrap()
+                .contains_key(gid);
             if !known {
                 return ApiResult::err(format!("Unknown group_id '{}'", gid));
             }
@@ -505,8 +516,8 @@ pub(super) async fn update_trigger(
     // Side-effect grant (Phase 5): full replacement when present. Some(empty)
     // serializes to `[]`, which `apply_update` reads back as "clear all grants".
     if let Some(ref grant) = request.side_effect_grant {
-        update_payload["side_effect_grant"] = serde_json::to_value(grant)
-            .expect("SideEffectCategory serialization is infallible");
+        update_payload["side_effect_grant"] =
+            serde_json::to_value(grant).expect("SideEffectCategory serialization is infallible");
     }
 
     // Ensure trigger still has at least one firing mechanism after update
@@ -524,13 +535,16 @@ pub(super) async fn update_trigger(
     state
         .engine
         .event_bus
-        .emit_user_system(&headers, &state.pool, "[Triggers] TriggerUpdated", |actor| {
-            SystemEvent::TriggerUpdated {
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[Triggers] TriggerUpdated",
+            |actor| SystemEvent::TriggerUpdated {
                 trigger_id: trigger_id_str.clone(),
                 payload: update_payload,
                 actor,
-            }
-        })
+            },
+        )
         .await;
 
     ApiResult::ok()
@@ -558,13 +572,16 @@ pub(super) async fn delete_trigger(
     state
         .engine
         .event_bus
-        .emit_user_system(&headers, &state.pool, "[Triggers] TriggerDeleted", |actor| {
-            SystemEvent::TriggerDeleted {
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[Triggers] TriggerDeleted",
+            |actor| SystemEvent::TriggerDeleted {
                 trigger_id: task_id.clone(),
                 payload: serde_json::json!({ "trigger_id": &task_id }),
                 actor,
-            }
-        })
+            },
+        )
         .await;
 
     ApiResult::ok()
@@ -580,10 +597,7 @@ pub(super) fn router() -> Router<AppState> {
                 .put(update_trigger)
                 .delete(delete_trigger),
         )
-        .route(
-            "/triggers/historical",
-            get(list_historical_triggers),
-        )
+        .route("/triggers/historical", get(list_historical_triggers))
 }
 
 #[cfg(test)]

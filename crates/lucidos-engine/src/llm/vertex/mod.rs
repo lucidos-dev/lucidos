@@ -12,7 +12,6 @@
 //! `read_location` / `vertex_host` / `get_cached_access_token` helpers) is
 //! unchanged and still reachable at `crate::llm::vertex::*`.
 
-
 use crate::llm::provider::{LlmProvider, LlmResponse, Message, TokenCallback, ToolDefinition};
 use async_trait::async_trait;
 use serde::Serialize;
@@ -396,12 +395,9 @@ mod tests {
         // Every shape `vertex_host` distinguishes: the two multi-regions (which
         // serve no Gemini models at all), a specific region, and global itself.
         for region in ["eu", "us", "europe-west1", "global"] {
-            let provider = VertexProvider::new(
-                "my-project".into(),
-                region.into(),
-                "claude-opus-5".into(),
-            )
-            .unwrap();
+            let provider =
+                VertexProvider::new("my-project".into(), region.into(), "claude-opus-5".into())
+                    .unwrap();
             assert_eq!(
                 provider.global_gemini_endpoint("gemini-2.5-flash-lite"),
                 "https://aiplatform.googleapis.com/v1/projects/my-project/locations/global\

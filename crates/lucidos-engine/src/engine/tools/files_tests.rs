@@ -27,10 +27,16 @@ fn data_path_app_manifest_id_only_matches_the_manifest() {
         Some("demo-director")
     );
     // Any other app file (the bulk of writes during a build) → no event.
-    assert_eq!(data_path_app_manifest_id("apps/demo-director/index.html"), None);
+    assert_eq!(
+        data_path_app_manifest_id("apps/demo-director/index.html"),
+        None
+    );
     assert_eq!(data_path_app_manifest_id("apps/foo/scripts/x.py"), None);
     // A manifest.json nested below the app root is not the app manifest.
-    assert_eq!(data_path_app_manifest_id("apps/foo/sub/manifest.json"), None);
+    assert_eq!(
+        data_path_app_manifest_id("apps/foo/sub/manifest.json"),
+        None
+    );
     // Non-app paths and malformed paths.
     assert_eq!(data_path_app_manifest_id("artifacts/manifest.json"), None);
     assert_eq!(data_path_app_manifest_id("apps/manifest.json"), None);
@@ -110,9 +116,9 @@ fn test_read_image_file_returns_base64_marker() {
         0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, // PNG signature
         0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, // IHDR chunk
         0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, // 1x1
-        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49,
-        0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27,
-        0xDE, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44,
+        0x41, 0x54, 0x78, 0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC,
+        0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
     std::fs::write(&img_path, &png_bytes).unwrap();
 
@@ -135,7 +141,11 @@ fn test_read_image_file_returns_base64_marker() {
 fn strip_image_content_marker_png() {
     let input = "[IMAGE_CONTENT:image/png]\niVBORw0KGgo=";
     let stub = strip_image_content_marker(input).expect("should match marker");
-        assert!(stub.contains("image/png"), "stub mentions media type: {}", stub);
+    assert!(
+        stub.contains("image/png"),
+        "stub mentions media type: {}",
+        stub
+    );
     assert!(stub.contains("omitted"), "stub flags omission: {}", stub);
     assert!(stub.len() < 100, "stub is small: {} chars", stub.len());
 }
@@ -289,11 +299,11 @@ fn read_small_image_is_not_recompressed() {
     // A small image stays in its original format/media type — compression only
     // kicks in when the payload would exceed the LLM target.
     let png_bytes: Vec<u8> = vec![
-        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-        0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00,
-        0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
-        0x9C, 0x62, 0x00, 0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC, 0x00, 0x00,
-        0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F,
+        0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x62, 0x00,
+        0x00, 0x00, 0x02, 0x00, 0x01, 0xE5, 0x27, 0xDE, 0xFC, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+        0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
     ];
     let result = encode_image_for_read(png_bytes.clone(), "image/png");
     let (media_type, b64) = parse_image_content_marker(&result).unwrap();
@@ -373,8 +383,7 @@ fn test_json_set_value_nested() {
 
 #[test]
 fn test_json_set_value_replace_object() {
-    let mut doc: serde_json::Value =
-        serde_json::from_str(r#"{"meta": {"version": 1}}"#).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_str(r#"{"meta": {"version": 1}}"#).unwrap();
     let new_val = serde_json::json!({"version": 2, "author": "test"});
     let result = json_set_value(&mut doc, "/meta", new_val.clone());
     assert!(result.is_ok());
@@ -383,8 +392,7 @@ fn test_json_set_value_replace_object() {
 
 #[test]
 fn test_json_set_value_replace_array_element() {
-    let mut doc: serde_json::Value =
-        serde_json::from_str(r#"{"items": ["a", "b", "c"]}"#).unwrap();
+    let mut doc: serde_json::Value = serde_json::from_str(r#"{"items": ["a", "b", "c"]}"#).unwrap();
     let new_val = serde_json::Value::String("B".to_string());
     let result = json_set_value(&mut doc, "/items/1", new_val);
     assert!(result.is_ok());
@@ -430,16 +438,13 @@ fn test_dot_path_to_pointer_quoted_key_in_chain() {
 
 #[test]
 fn test_dot_path_to_pointer_quoted_key_with_dot() {
-    assert_eq!(
-        dot_path_to_pointer(r#"data["foo.bar"]"#),
-        "/data/foo.bar"
-        );
-    }
+    assert_eq!(dot_path_to_pointer(r#"data["foo.bar"]"#), "/data/foo.bar");
+}
 
-    #[test]
-    fn test_dot_path_to_pointer_quoted_key_pointer_escapes() {
-        // RFC 6901: '~' → '~0', '/' → '~1'.
-        assert_eq!(dot_path_to_pointer(r#"data["a/b"]"#), "/data/a~1b");
+#[test]
+fn test_dot_path_to_pointer_quoted_key_pointer_escapes() {
+    // RFC 6901: '~' → '~0', '/' → '~1'.
+    assert_eq!(dot_path_to_pointer(r#"data["a/b"]"#), "/data/a~1b");
     assert_eq!(dot_path_to_pointer(r#"data["a~b"]"#), "/data/a~0b");
 }
 
@@ -465,7 +470,12 @@ fn test_json_set_value_with_quoted_key_path() {
         serde_json::from_str(r#"{"habits":[{"dailyLog":{"2026-05-04":2}}]}"#).unwrap();
     let pointer = dot_path_to_pointer(r#"habits[0].dailyLog["2026-05-04"]"#);
     let result = json_set_value(&mut doc, &pointer, serde_json::json!(3));
-    assert!(result.is_ok(), "Failed to set value at {}: {:?}", pointer, result);
+    assert!(
+        result.is_ok(),
+        "Failed to set value at {}: {:?}",
+        pointer,
+        result
+    );
     assert_eq!(doc["habits"][0]["dailyLog"]["2026-05-04"], 3);
 }
 
@@ -574,15 +584,18 @@ fn read_text_from_zip_returns_entry_content() {
     let zip_path = dir.path().join("test.zip");
     let file = std::fs::File::create(&zip_path).unwrap();
     let mut zw = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zw.start_file("inner/hello.txt", opts).unwrap();
     zw.write_all(b"hello world").unwrap();
     zw.finish().unwrap();
 
-    let got =
-        read_text_from_zip(&zip_path, "inner/hello.txt", READ_FILE_FROM_ARCHIVE_MAX_BYTES)
-            .unwrap();
+    let got = read_text_from_zip(
+        &zip_path,
+        "inner/hello.txt",
+        READ_FILE_FROM_ARCHIVE_MAX_BYTES,
+    )
+    .unwrap();
     assert_eq!(got, "hello world");
 }
 
@@ -596,8 +609,8 @@ fn read_text_from_zip_rejects_oversized_entry() {
     let zip_path = dir.path().join("big.zip");
     let file = std::fs::File::create(&zip_path).unwrap();
     let mut zw = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zw.start_file("big.txt", opts).unwrap();
     zw.write_all(&[b'x'; 200]).unwrap();
     zw.finish().unwrap();
@@ -609,7 +622,11 @@ fn read_text_from_zip_rejects_oversized_entry() {
         err
     );
     // Cap is reported so the LLM knows the limit.
-    assert!(err.contains("100"), "error should mention the cap, got: {}", err);
+    assert!(
+        err.contains("100"),
+        "error should mention the cap, got: {}",
+        err
+    );
 }
 
 // --- line_window_from_args -------------------------------------------
@@ -702,8 +719,8 @@ fn read_text_from_zip_rejects_empty_inner_path() {
     let zip_path = dir.path().join("test.zip");
     let file = std::fs::File::create(&zip_path).unwrap();
     let mut zw = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zw.start_file("a.txt", opts).unwrap();
     zw.write_all(b"a").unwrap();
     zw.finish().unwrap();
@@ -725,15 +742,19 @@ fn read_text_from_zip_rejects_zip_slip_inner_path() {
     let zip_path = dir.path().join("test.zip");
     let file = std::fs::File::create(&zip_path).unwrap();
     let mut zw = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zw.start_file("a.txt", opts).unwrap();
     zw.write_all(b"a").unwrap();
     zw.finish().unwrap();
 
-    for bad in ["../a.txt", "/etc/passwd", "foo/../../etc/passwd", "\\windows"] {
-        let err = read_text_from_zip(&zip_path, bad, READ_FILE_FROM_ARCHIVE_MAX_BYTES)
-            .unwrap_err();
+    for bad in [
+        "../a.txt",
+        "/etc/passwd",
+        "foo/../../etc/passwd",
+        "\\windows",
+    ] {
+        let err = read_text_from_zip(&zip_path, bad, READ_FILE_FROM_ARCHIVE_MAX_BYTES).unwrap_err();
         assert!(
             err.contains("unsafe"),
             "rejected `{}` must surface the validation error (not a generic \
@@ -751,15 +772,14 @@ fn read_text_from_zip_missing_entry_errors() {
     let zip_path = dir.path().join("test.zip");
     let file = std::fs::File::create(&zip_path).unwrap();
     let mut zw = zip::ZipWriter::new(file);
-    let opts = zip::write::SimpleFileOptions::default()
-        .compression_method(zip::CompressionMethod::Stored);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
     zw.start_file("a.txt", opts).unwrap();
     zw.write_all(b"a").unwrap();
     zw.finish().unwrap();
 
     let err =
-        read_text_from_zip(&zip_path, "missing.txt", READ_FILE_FROM_ARCHIVE_MAX_BYTES)
-            .unwrap_err();
+        read_text_from_zip(&zip_path, "missing.txt", READ_FILE_FROM_ARCHIVE_MAX_BYTES).unwrap_err();
     assert!(
         err.contains("missing.txt"),
         "error should name the missing entry, got: {}",

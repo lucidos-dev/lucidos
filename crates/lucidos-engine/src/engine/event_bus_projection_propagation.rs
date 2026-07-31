@@ -114,13 +114,12 @@ pub(crate) async fn reconcile_parent_active_children_count(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let parent_id: Option<Uuid> = sqlx::query_scalar(
-        "SELECT parent_thread_id FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(child_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .flatten();
+    let parent_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_thread_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(child_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
     let Some(pid) = parent_id else {
         return Ok(None);
     };
@@ -365,9 +364,7 @@ impl EventBus {
     /// and `20260522091904_add_attention_descendant_count.sql`) perform.
     /// Predicates match `is_blocking` / `is_attention_needing` in
     /// `thread_lifecycle.rs`.
-    pub async fn rebuild_blocking_descendant_count(
-        pool: &sqlx::PgPool,
-    ) -> Result<(), sqlx::Error> {
+    pub async fn rebuild_blocking_descendant_count(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
         sqlx::query(
             "WITH RECURSIVE descendants AS ( \
                 SELECT t.thread_id AS root_id, \

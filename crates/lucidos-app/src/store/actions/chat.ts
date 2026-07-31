@@ -45,6 +45,89 @@ import { errorDetail } from '../../utils/errorDetail';
  *  stuck indefinitely when SSE drops after submitChat() succeeds. */
 export const PENDING_MESSAGE_SAFETY_MS = 30_000;
 
+/** How long a send waits for the thread's previous send to settle before going
+ *  out anyway. `mutatingFetch` deliberately has no client-side timeout (a chat
+ *  POST is not idempotent, so it must never be retried behind the user's back),
+ *  which means a POST stalled on a half-open mobile connection can stay pending
+ *  forever. Without a ceiling here, that one hung request would silently
+ *  swallow every later message on the thread, which is far worse than the
+ *  reordering the chain exists to prevent. Sized above a slow-but-alive
+ *  cellular round trip and below `PENDING_MESSAGE_SAFETY_MS`, so a released
+ *  send still gets its own safety sweep. */
+export const SEND_CHAIN_MAX_WAIT_MS = 15_000;
+
+/** Per-thread tail of the send chain: a promise that settles when the thread's
+ *  most recently issued `submitChat` settles. It NEVER rejects, so one failed
+ *  send cannot poison the chain for the rest of the thread.
+ *
+ *  This is what keeps a device's messages in the order the user pressed send.
+ *  `MessageReceived.created` is stamped when the engine emits the event, and
+ *  the request carries no client-side ordering data, so two POSTs in flight at
+ *  once can be delivered out of order and the reversal is then unrecoverable:
+ *  the later message wins the race, starts the turn, and the earlier one is
+ *  queued and injected into it as a follow-up. See
+ *  `docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`.
+ *
+ *  Keyed per thread: two different threads are independent conversations and
+ *  must not queue behind each other. */
+const sendChains = new Map<string, Promise<void>>();
+
+/** Resolve when `p` settles, or after `ms`, whichever comes first. `p` never
+ *  rejects (see `sendChains`), so the success arm alone covers both outcomes. */
+function settledOrTimedOut(p: Promise<void>, ms: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    void p.then(() => {
+      clearTimeout(timer);
+      resolve();
+    });
+  });
+}
+
+/** This send's place in its thread's chain: what to await before POSTing, and
+ *  the release that lets the next send go. */
+interface SendSlot {
+  /** `null` when nothing was ahead of this send. The caller must then skip the
+   *  await entirely rather than await an already-resolved promise: awaiting one
+   *  still defers a microtask, which would push the POST out of the caller's
+   *  synchronous turn. `sendMessage` dispatches `submitChat` synchronously on
+   *  the ordinary single-send path, and callers observe that (the compose
+   *  suite asserts on the fetch mock right after calling `sendFollowup`,
+   *  without awaiting). Serializing sends must not change when a lone send
+   *  goes out. */
+  waitForTurn: Promise<void> | null;
+  release: () => void;
+}
+
+/** Claim the thread's next chain slot. **Synchronous, and that is the point:**
+ *  the slot must be taken in the order `sendMessage` is CALLED, not in the
+ *  order each call happens to reach its POST.
+ *
+ *  `sendMessage` can await before it gets there (`getWebviewContent()` on the
+ *  Tauri panel path), and two of those awaits resolve in whatever order the
+ *  webview answers. Claiming the slot at POST time would let the second send
+ *  overtake the first there and hand the chain its slots reversed, reproducing
+ *  the exact bug the chain exists to prevent, just one layer up. Claiming it
+ *  here makes the guarantee independent of whatever awaits get added above. */
+function enterSendChain(threadId: string): SendSlot {
+  const predecessor = sendChains.get(threadId);
+  let release!: () => void;
+  const link = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  sendChains.set(threadId, link);
+  // Drop the entry once the chain drains, so the map doesn't grow one
+  // permanent promise per thread the user has ever sent to. Guarded on
+  // identity: a send that chained behind this one owns the slot now.
+  void link.then(() => {
+    if (sendChains.get(threadId) === link) sendChains.delete(threadId);
+  });
+  return {
+    waitForTurn: predecessor ? settledOrTimedOut(predecessor, SEND_CHAIN_MAX_WAIT_MS) : null,
+    release,
+  };
+}
+
 type RemovedPendingMessage = {
   index: number;
   message: {
@@ -289,6 +372,10 @@ export async function sendMessage(
   const shouldFocus = options?.focus ?? true;
   const isNewThread = explicitThreadId === undefined && focusedThreadId.value === null;
   const threadId = explicitThreadId || focusedThreadId.value || eventId;
+  // Claim the chain slot before ANY await below, so this send's place in the
+  // thread's order is the order the user pressed send. Released in the
+  // `finally` around the POST.
+  const sendSlot = enterSendChain(threadId);
 
   if (shouldFocus) {
     setFocusedThread(threadId);
@@ -435,6 +522,10 @@ export async function sendMessage(
     };
   }
   try {
+    // Serialized per thread: the optimistic row is already on screen, so
+    // waiting for the thread's previous POST costs the user nothing visible and
+    // is what keeps the engine's record in the order they pressed send.
+    if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
     await submitChat(body);
     schedulePendingCleanup(threadId, eventId);
     // The pick (if any) is now stamped on the sent message and becomes the
@@ -483,6 +574,11 @@ export async function sendMessage(
       removePendingMessage(threadId, eventId);
     }
     showToast(`Failed to send message: ${errorDetail(error)}`, 'error');
+  } finally {
+    // Whatever happened to this POST, the next send on the thread may go. A
+    // throw between `enterSendChain` and here would skip this, which is why
+    // the wait is bounded rather than open-ended.
+    sendSlot.release();
   }
 }
 

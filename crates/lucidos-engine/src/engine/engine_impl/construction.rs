@@ -256,9 +256,10 @@ impl LucidosEngine {
                             // actuates it.
                             use crate::engine::agent_recovery::ContinueRecovery;
                             let mut retried = false;
-                            let err_text = |r: &Result<_, Box<dyn std::error::Error + Send + Sync>>| {
-                                r.as_ref().err().map(|e| e.to_string())
-                            };
+                            let err_text =
+                                |r: &Result<_, Box<dyn std::error::Error + Send + Sync>>| {
+                                    r.as_ref().err().map(|e| e.to_string())
+                                };
 
                             if crate::engine::agent_recovery::continue_recovery(
                                 err_text(&result).as_deref(),
@@ -523,11 +524,9 @@ impl LucidosEngine {
         // harmless no-op when this is the same path as `merge_worktree`.
         if let (Some(wt), Some(tb)) = (&change.merge_worktree_path, &change.merge_temp_branch) {
             let repo = std::path::Path::new(&change.repo_root);
-            let _ = crate::engine::git_ops::git_cmd(
-                &["merge", "--abort"],
-                std::path::Path::new(wt),
-            )
-            .await;
+            let _ =
+                crate::engine::git_ops::git_cmd(&["merge", "--abort"], std::path::Path::new(wt))
+                    .await;
             match crate::engine::git_ops::git_cmd(&["worktree", "remove", "--force", wt], repo)
                 .await
             {
@@ -911,12 +910,11 @@ impl LucidosEngine {
         // env var (mis-staged bundle) resolves to unavailable with a loud warning
         // rather than a bogus repo-root fallback. See
         // docs/plans/2026-07-07-package-system-knowhow-resource.md.
-        let (system_knowhow_dir, system_knowhow_warning) =
-            crate::core::resolve_system_knowhow_dir(
-                std::env::var("LUCIDOS_SYSTEM_KNOWHOW_DIR").ok().as_deref(),
-                &repo_root,
-                crate::runtime::is_packaged(),
-            );
+        let (system_knowhow_dir, system_knowhow_warning) = crate::core::resolve_system_knowhow_dir(
+            std::env::var("LUCIDOS_SYSTEM_KNOWHOW_DIR").ok().as_deref(),
+            &repo_root,
+            crate::runtime::is_packaged(),
+        );
         if let Some(warning) = &system_knowhow_warning {
             log!("{}", warning);
         }
@@ -1142,8 +1140,9 @@ impl LucidosEngine {
 
         // Shared with SchedulerManager AND the Thread Queue (drain consults
         // trigger pause/deletion state), so all three see one registry.
-        let trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>> =
-            Arc::new(std::sync::RwLock::new(HashMap::new()));
+        let trigger_configs: Arc<
+            std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>,
+        > = Arc::new(std::sync::RwLock::new(HashMap::new()));
 
         // Thread Queue admission control. Policy is event-sourced — the
         // latest CapacityPolicyChanged event is the configuration.
@@ -1302,5 +1301,4 @@ impl LucidosEngine {
             Err(_) => HashMap::new(),
         }
     }
-
 }

@@ -74,9 +74,17 @@ mod tests {
         let g2 = counter.connect();
         assert_eq!(counter.count(), 2);
         drop(g1);
-        assert_eq!(counter.count(), 1, "dropping one connection decrements by one");
+        assert_eq!(
+            counter.count(),
+            1,
+            "dropping one connection decrements by one"
+        );
         drop(g2);
-        assert_eq!(counter.count(), 0, "dropping the last connection returns to zero");
+        assert_eq!(
+            counter.count(),
+            0,
+            "dropping the last connection returns to zero"
+        );
     }
 
     #[test]

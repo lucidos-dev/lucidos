@@ -183,9 +183,7 @@ fn require_string(provider_name: &str, auth: &Value, field: &str) -> Result<Stri
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
         .ok_or_else(|| {
-            format!(
-                "provider '{provider_name}': auth missing required string field '{field}'"
-            )
+            format!("provider '{provider_name}': auth missing required string field '{field}'")
         })
 }
 
@@ -223,8 +221,7 @@ pub fn migrate_apis_json_if_needed(workspace_path: &Path) -> Result<MigrationOut
             .map_err(|e| format!("serialize migrated apis.json: {e}"))?,
     )
     .map_err(|e| format!("write tmp apis.json: {e}"))?;
-    std::fs::rename(&tmp_path, &path)
-        .map_err(|e| format!("rename tmp apis.json -> live: {e}"))?;
+    std::fs::rename(&tmp_path, &path).map_err(|e| format!("rename tmp apis.json -> live: {e}"))?;
 
     Ok(MigrationOutcome::Migrated { backup_path })
 }
@@ -276,7 +273,10 @@ mod tests {
             .unwrap()
             .filter_map(|e| e.ok())
             .any(|e| e.file_name().to_string_lossy().contains(".bak."));
-        assert!(!any_backup, "no backup should be made for already-migrated configs");
+        assert!(
+            !any_backup,
+            "no backup should be made for already-migrated configs"
+        );
     }
 
     #[test]
@@ -438,7 +438,10 @@ mod tests {
         let migrated = read_apis_json(tmp.path());
         assert!(migrated["x"]["auth"]["pipeline"].is_array());
         let tmp_left = tmp.path().join("data/config/apis.json.tmp");
-        assert!(!tmp_left.exists(), "atomic rename should leave no .tmp file");
+        assert!(
+            !tmp_left.exists(),
+            "atomic rename should leave no .tmp file"
+        );
     }
 
     #[test]

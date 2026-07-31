@@ -385,8 +385,7 @@ async fn check_and_execute_missed(
         // update/enable, and the health monitor's crash restart — funnels its
         // catch-up through here, so this is the single choke point for all of
         // them.
-        let history =
-            crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
+        let history = crate::triggers::load_trigger_run_history(engine.pool(), trigger_id).await;
         if let Err(e) = &history {
             log!(
                 "[Scheduler] Task '{}' run-history lookup failed: {}",
@@ -948,9 +947,7 @@ mod tests {
 
     /// Run history with a creation time well before any slot under test, so a
     /// case that isn't about creation isn't accidentally decided by it.
-    fn history(
-        last_run: Option<&str>,
-    ) -> Result<crate::triggers::TriggerRunHistory, sqlx::Error> {
+    fn history(last_run: Option<&str>) -> Result<crate::triggers::TriggerRunHistory, sqlx::Error> {
         Ok(crate::triggers::TriggerRunHistory {
             last_run: last_run.map(utc),
             created_at: Some(utc("2026-04-08T07:00:52Z")),

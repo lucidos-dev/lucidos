@@ -536,10 +536,16 @@ mod tests {
             TaskOutcome::from_persisted(Some(101), None),
             TaskOutcome::Exited(101)
         );
-        assert_eq!(TaskOutcome::from_persisted(Some(0), None), TaskOutcome::Exited(0));
+        assert_eq!(
+            TaskOutcome::from_persisted(Some(0), None),
+            TaskOutcome::Exited(0)
+        );
         // Legacy row (pre-`signal`) with a null exit_code: watchdog timeout or
         // bash_kill. "We recorded no status" reads as Unknown, not as success.
-        assert_eq!(TaskOutcome::from_persisted(None, None), TaskOutcome::Unknown);
+        assert_eq!(
+            TaskOutcome::from_persisted(None, None),
+            TaskOutcome::Unknown
+        );
     }
 
     #[tokio::test]

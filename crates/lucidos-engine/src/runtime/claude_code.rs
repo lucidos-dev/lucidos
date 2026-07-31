@@ -323,7 +323,10 @@ impl AgentRuntime for ClaudeCodeRuntime {
 /// PATH lookup for everything else (npm globals, custom symlinks). `home` is
 /// injected to keep the function pure and testable; production callers pass
 /// `std::env::var_os("HOME")`.
-pub(crate) fn resolve_claude_binary(home: Option<&Path>, override_path: Option<&Path>) -> std::ffi::OsString {
+pub(crate) fn resolve_claude_binary(
+    home: Option<&Path>,
+    override_path: Option<&Path>,
+) -> std::ffi::OsString {
     if let Some(p) = override_path {
         return p.as_os_str().to_os_string();
     }

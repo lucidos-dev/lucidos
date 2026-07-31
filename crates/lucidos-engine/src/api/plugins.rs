@@ -316,7 +316,10 @@ async fn mark_setup_complete(pool: &sqlx::PgPool, catalog: &mut MarketplaceCatal
     if ids.is_empty() {
         return;
     }
-    let status_by_id: std::collections::HashMap<Uuid, String> = match sqlx::query_as::<_, (Uuid, String)>(
+    let status_by_id: std::collections::HashMap<Uuid, String> = match sqlx::query_as::<
+        _,
+        (Uuid, String),
+    >(
         "SELECT thread_id, status FROM thread_summaries WHERE thread_id = ANY($1)",
     )
     .bind(&ids)
@@ -707,7 +710,10 @@ mod tests {
     fn resolve_setup_complete_present_pending_gone() {
         // Present → lifecycle status decides.
         assert!(!resolve_setup_complete(Some("running"), false));
-        assert!(!resolve_setup_complete(Some("waiting_for_user_answer"), false));
+        assert!(!resolve_setup_complete(
+            Some("waiting_for_user_answer"),
+            false
+        ));
         assert!(resolve_setup_complete(Some("idle"), false));
         // Absent but queued → still pending (card keeps Setup, no flicker).
         assert!(!resolve_setup_complete(None, true));

@@ -119,7 +119,8 @@ mod tests {
         // JSON object (single question without array wrapper) — out of
         // scope. The schema the parser consumes is `{"questions": [...]}`
         // wrapping an ARRAY. A bare object falls through.
-        let text = r#"<ask_user_question>{"question":"x","options":[{"label":"a"}]}</ask_user_question>"#;
+        let text =
+            r#"<ask_user_question>{"question":"x","options":[{"label":"a"}]}</ask_user_question>"#;
         assert!(detect_inline_ask_user_question(text).is_none());
     }
 
@@ -140,8 +141,7 @@ mod tests {
         let text = r#"<ask_user_question>[{"question":"Continue?","options":[{"label":"Yes","description":"go ahead"},{"label":"No"}]}]</ask_user_question>"#;
         let d = detect_inline_ask_user_question(text).expect("should detect");
         let parser_input = serde_json::json!({ "questions": d.questions_json });
-        let parsed =
-            crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+        let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].question, "Continue?");
         assert_eq!(parsed[0].options.len(), 2);
@@ -185,8 +185,7 @@ mod tests {
         assert!(d.cleaned_text.starts_with("#1 fixes today's instance."));
         assert!(!d.cleaned_text.contains("<ask_user_question"));
         let parser_input = serde_json::json!({ "questions": d.questions_json });
-        let parsed =
-            crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
+        let parsed = crate::engine::agent_session::parse_ask_user_question_inputs(&parser_input);
         assert_eq!(parsed.len(), 1);
         assert!(parsed[0].question.starts_with("How do you want"));
         assert_eq!(parsed[0].options.len(), 4);

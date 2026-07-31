@@ -1,5 +1,5 @@
-use super::*;
 use super::common::make_test_repo;
+use super::*;
 
 #[tokio::test]
 async fn harden_marker_missing_when_no_db_row() {
@@ -160,7 +160,9 @@ async fn harden_marker_state_distinguishes_missing_stale_fresh() {
     );
 
     let _ = git_cmd(&["checkout", "-b", "feature"], &repo_path).await;
-    tokio::fs::write(repo_path.join("a.txt"), "a").await.unwrap();
+    tokio::fs::write(repo_path.join("a.txt"), "a")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo_path).await;
     let _ = git_cmd(&["commit", "-m", "initial feature"], &repo_path).await;
 
@@ -173,7 +175,9 @@ async fn harden_marker_state_distinguishes_missing_stale_fresh() {
         HardenMarkerState::Fresh,
     );
 
-    tokio::fs::write(repo_path.join("b.txt"), "b").await.unwrap();
+    tokio::fs::write(repo_path.join("b.txt"), "b")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo_path).await;
     let _ = git_cmd(&["commit", "-m", "new commit after harden"], &repo_path).await;
     assert_eq!(
@@ -274,4 +278,3 @@ fn floor_char_boundary_truncation_handles_multibyte() {
     let truncated = &short[..safe_end];
     assert_eq!(truncated, short);
 }
-

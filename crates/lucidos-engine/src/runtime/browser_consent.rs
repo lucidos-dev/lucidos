@@ -211,9 +211,17 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
     for attempt in 1..=3 {
         if let Ok(result) = page.evaluate(consent_js).await {
             if let Ok(msg) = result.into_value::<String>() {
-                log!("[BrowserConsent] Consent search attempt {}: {}", attempt, msg);
+                log!(
+                    "[BrowserConsent] Consent search attempt {}: {}",
+                    attempt,
+                    msg
+                );
                 if msg.starts_with("clicked") {
-                    log!("[BrowserConsent] Cookie consent dismissed (attempt {}): {}", attempt, msg);
+                    log!(
+                        "[BrowserConsent] Cookie consent dismissed (attempt {}): {}",
+                        attempt,
+                        msg
+                    );
                     // Wait longer for dialog to close
                     tokio::time::sleep(Duration::from_millis(1000)).await;
                     return;
@@ -299,7 +307,12 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
             if let Ok(coords) = serde_json::from_str::<serde_json::Value>(&json_str) {
                 if let (Some(x), Some(y)) = (coords["x"].as_f64(), coords["y"].as_f64()) {
                     let text = coords["text"].as_str().unwrap_or("unknown");
-                    log!("[BrowserConsent] Found consent button at ({}, {}): {}", x, y, text);
+                    log!(
+                        "[BrowserConsent] Found consent button at ({}, {}): {}",
+                        x,
+                        y,
+                        text
+                    );
 
                     // Click at coordinates using CDP
                     if click_at_coordinates(page, x, y).await {
@@ -408,7 +421,11 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
                 };
 
                 for (click_x, click_y) in click_positions {
-                    log!("[BrowserConsent] Trying CDP click at ({:.0}, {:.0})", click_x, click_y);
+                    log!(
+                        "[BrowserConsent] Trying CDP click at ({:.0}, {:.0})",
+                        click_x,
+                        click_y
+                    );
                     click_at_coordinates(page, click_x, click_y).await;
                     tokio::time::sleep(Duration::from_millis(300)).await;
 
@@ -436,13 +453,21 @@ pub(super) async fn dismiss_cookie_consent(page: &Page) {
     // Retry a few times with increasing wait to allow iframes to load
     for attempt in 1..=3 {
         if attempt > 1 {
-            log!("[BrowserConsent] Waiting for iframes to load (attempt {})...", attempt);
+            log!(
+                "[BrowserConsent] Waiting for iframes to load (attempt {})...",
+                attempt
+            );
             tokio::time::sleep(Duration::from_millis(1000)).await;
         }
 
         log!("[BrowserConsent] Trying to find button in all frames via CDP...");
         if let Some((x, y, text)) = find_consent_button_in_frames(page).await {
-            log!("[BrowserConsent] Found consent button '{}' at ({}, {})", text, x, y);
+            log!(
+                "[BrowserConsent] Found consent button '{}' at ({}, {})",
+                text,
+                x,
+                y
+            );
             if click_at_coordinates(page, x, y).await {
                 log!("[BrowserConsent] Clicked consent button via CDP");
                 tokio::time::sleep(Duration::from_millis(1000)).await;
@@ -463,7 +488,10 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
     let mut frame_ids = Vec::new();
     let mut frame_urls = Vec::new();
     collect_frame_ids_with_urls(&frame_tree.frame_tree, &mut frame_ids, &mut frame_urls);
-    log!("[BrowserConsent] Found {} frames to search", frame_ids.len());
+    log!(
+        "[BrowserConsent] Found {} frames to search",
+        frame_ids.len()
+    );
 
     // Sort frames: consent-related iframes first, skip main frame (index 0)
     let mut frame_indices: Vec<usize> = (0..frame_ids.len()).collect();

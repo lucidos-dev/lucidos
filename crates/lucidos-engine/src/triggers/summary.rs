@@ -136,7 +136,10 @@ mod tests {
 
     #[test]
     fn ensure_non_empty_error_empty_uses_failed_line() {
-        assert_eq!(ensure_non_empty_error("", "Oura import"), "Oura import failed");
+        assert_eq!(
+            ensure_non_empty_error("", "Oura import"),
+            "Oura import failed"
+        );
         assert_eq!(
             ensure_non_empty_error("   ", "Oura import"),
             "Oura import failed"
@@ -155,7 +158,11 @@ mod tests {
         // the summary stays a one-liner regardless of script output.
         let huge = "x".repeat(10_000);
         let s = script_fallback_summary(&format!("noise\n{huge}"), "T", 0);
-        assert!(s.chars().count() <= FALLBACK_SUMMARY_MAX_CHARS + 1, "len {}", s.chars().count());
+        assert!(
+            s.chars().count() <= FALLBACK_SUMMARY_MAX_CHARS + 1,
+            "len {}",
+            s.chars().count()
+        );
         assert!(s.ends_with('…'));
         assert!(!s.contains('\n'));
     }

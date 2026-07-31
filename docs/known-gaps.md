@@ -122,16 +122,16 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Status:** Open by design — reload to pick up a change (rebuild is typically sub-second).
 
 ### The default `curl | sh` installer 404s today
-- **Where:** `install.sh` (download-and-run default), `.github/workflows/release-tarballs.yml` (artifact-only, `attach_to_release` gated off), `.claude/rules/build-release.md` § Installer "Caveat"
-- **Gap:** The default installer path downloads `lucidos-<version>-<triple>.tar.gz` from GitHub Releases, but no release asset is published yet, so the download returns 404.
-- **Why:** The release workflow uploads tarballs as **workflow artifacts only** and never auto-creates a Release; attaching to a Release is behind a manual `workflow_dispatch` + tag ref + opt-in flag. Nothing has been published.
-- **Status:** Open — use `install.sh --dev` (build from source) or `install.sh --from-tarball <path>` until releases are published; the failure message points at these.
+- **Where:** `install.sh` (download-and-run default), `.github/workflows/release-tarballs.yml` (the attach step), `.claude/rules/build-release.md` § Installer "Caveat"
+- **Gap:** The default installer path downloads `lucidos-<version>-<triple>.tar.gz` from GitHub Releases, but no release asset was published, so the download returned 404.
+- **Why:** The release workflow uploaded tarballs as **workflow artifacts only** and never auto-attached them; attaching to a Release was behind a manual `workflow_dispatch` + tag ref + opt-in flag.
+- **Status:** **Closed (2026-07-30)** — `release-tarballs.yml`'s attach step now fires automatically on a PUBLISHED, non-prerelease Release, and every release from v0.16.0 on carries all four per-platform tarballs + `.sha256` sidecars. One residual timing edge, not a gap: the attach lands ~30 min after the Release is cut, so a download started inside that window still 404s — `download_failed` names it and offers `--version <older>` / `--dev` / `--from-tarball`.
 
 ### Linux / cross-arch releases come only from the CI matrix
 - **Where:** `scripts/build-headless.sh` (native-only; `--triple` must equal the host), `.github/workflows/release-tarballs.yml` (per-arch runners, `ubuntu:22.04` container, "Assert portability floor")
 - **Gap:** You cannot locally produce a Linux (or cross-architecture) release tarball for a triple other than the build host's, and the resulting binaries won't start on distros older than the glibc 2.35 floor (pre Ubuntu 22.04 / Debian 12 / RHEL 9).
 - **Why:** `build-headless.sh` compiles natively (relocatable Postgres + pgvector are fetched/compiled per platform), so cross-arch artifacts must come from CI's per-arch native runners; the Linux entries build inside `ubuntu:22.04` to pin the glibc floor, and a symbol above it fails the build.
-- **Status:** Open — non-host Linux/arch users wait for CI artifacts or use `--dev` (build from source on the target). Older-glibc distros are unsupported by the prebuilt tarballs.
+- **Status:** Open — it constrains the *build*, not the install: CI attaches all four triples to every published Release, so a non-host Linux/arch user installs normally. What you cannot do is produce that tarball locally for another triple; on an older-glibc distro use `--dev` (build from source on the target), since the prebuilt tarballs don't support it.
 
 ## Testing & automation
 

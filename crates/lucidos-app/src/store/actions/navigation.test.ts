@@ -670,4 +670,17 @@ describe('restoreState suppresses transient request-backed form overlays on relo
     const store = await restoreWithOverlay(overlay);
     expect(store.panelOverlay.value).toEqual(overlay);
   });
+
+  // A repo-encoded preview path must survive a reload byte-for-byte: restoreState
+  // writes the overlay path straight through (no re-normalization), so ContentPane
+  // re-parses it and re-mounts RepoFilePreview on the same repo file.
+  it('restores a repo-encoded file preview verbatim', async () => {
+    const overlay: PanelOverlay = {
+      type: 'file-preview',
+      path: 'repo:3f9c1b2e-0d44-4a71-9f6d-2e5b8c7a1d03:file:src/main/resources/transforms/x.jslt',
+    };
+    const store = await restoreWithOverlay(overlay);
+    expect(store.panelOverlay.value).toEqual(overlay);
+    expect(localStorage.getItem('file-preview-open')).toBe(overlay.path);
+  });
 });

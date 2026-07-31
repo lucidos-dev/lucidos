@@ -25,9 +25,7 @@ type McpServerRow = (
 
 pub struct McpServerStore;
 
-fn row_to_server(
-    row: McpServerRow,
-) -> Result<McpServer, Box<dyn std::error::Error + Send + Sync>> {
+fn row_to_server(row: McpServerRow) -> Result<McpServer, Box<dyn std::error::Error + Send + Sync>> {
     let (id, name, command, args, env, auto_approve, created_at) = row;
     Ok(McpServer {
         id,
@@ -164,10 +162,9 @@ mod tests {
         // touch auto_approve. The returned struct must reflect the real DB value
         // (true), not a hardcoded false — this is the regression guard for the
         // bug where a re-register silently disabled auto-approve in memory.
-        let reinserted =
-            McpServerStore::insert(&pool, "srv", "Srv Renamed", "cmd2", &args, &env)
-                .await
-                .unwrap();
+        let reinserted = McpServerStore::insert(&pool, "srv", "Srv Renamed", "cmd2", &args, &env)
+            .await
+            .unwrap();
         assert!(
             reinserted.auto_approve,
             "re-registering an auto-approved server must keep auto_approve = true"

@@ -516,8 +516,7 @@ fn repo_name_expr(id_text_expr: &str) -> String {
 
 /// Default `thread_cols("t")` for the common `FROM thread_summaries t` shape.
 /// Cached because every list/get query path formats SQL with it.
-static THREAD_COLS: std::sync::LazyLock<String> =
-    std::sync::LazyLock::new(|| thread_cols("t"));
+static THREAD_COLS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| thread_cols("t"));
 
 impl EventStore {
     fn rows_to_thread_summaries(

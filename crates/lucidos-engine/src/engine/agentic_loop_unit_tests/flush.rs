@@ -279,7 +279,10 @@ mod classify_empty_completion_tests {
         // Model thought (visibly) but produced no text on a clean stop — benign
         // intentional silence, with a hint that distinguishes it.
         let class = classify_empty_completion("end_turn", 100, 4096, 0);
-        assert!(!class.is_error, "thinking-then-silence on a clean stop is benign");
+        assert!(
+            !class.is_error,
+            "thinking-then-silence on a clean stop is benign"
+        );
         assert!(
             class.hint.contains("thought but produced no text"),
             "thinking-only must mention the thought, got: {}",
@@ -307,8 +310,14 @@ mod classify_empty_completion_tests {
     fn normalize_is_case_insensitive() {
         assert_eq!(normalize_finish_reason("STOP"), FinishClass::Clean);
         assert_eq!(normalize_finish_reason("end_turn"), FinishClass::Clean);
-        assert_eq!(normalize_finish_reason("MAX_TOKENS"), FinishClass::Truncated);
+        assert_eq!(
+            normalize_finish_reason("MAX_TOKENS"),
+            FinishClass::Truncated
+        );
         assert_eq!(normalize_finish_reason("safety"), FinishClass::Blocked);
-        assert_eq!(normalize_finish_reason("stop_sequence"), FinishClass::Unknown);
+        assert_eq!(
+            normalize_finish_reason("stop_sequence"),
+            FinishClass::Unknown
+        );
     }
 }

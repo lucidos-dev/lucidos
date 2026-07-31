@@ -217,7 +217,8 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// hardening and merge-conflict sessions don't dialogue with the user. The
 /// regression test `chat_style_prompts_nudge_use_of_ask_user_question` pins both
 /// halves.
-const ASK_USER_QUESTION_RULE: &str = "ASKING USERS: Use the `AskUserQuestion` tool when you need a DECISION from the \
+const ASK_USER_QUESTION_RULE: &str =
+    "ASKING USERS: Use the `AskUserQuestion` tool when you need a DECISION from the \
      user to move forward — which of two approaches to take, an ambiguous requirement, a \
      judgment call you can't make yourself — and ask it BEFORE or WHILE you do the work, \
      when you actually need the answer to proceed. The Lucidos UI renders its options as \
@@ -865,8 +866,14 @@ mod tests {
     #[test]
     fn merge_prompt_app_omits_harden_and_tests() {
         let prompt = build_merge_prompt("main", None, Some("desc"), true);
-        assert!(prompt.contains("git merge main"), "still a real merge prompt");
-        assert!(prompt.contains("desc"), "still carries the change description");
+        assert!(
+            prompt.contains("git merge main"),
+            "still a real merge prompt"
+        );
+        assert!(
+            prompt.contains("desc"),
+            "still carries the change description"
+        );
         assert!(
             !prompt.contains("/harden"),
             "app merge prompt must not mention /harden; got: {prompt}",
@@ -1293,8 +1300,7 @@ mod tests {
             ("override", "HARDENING SESSION: run /harden".to_string()),
         ];
         for (label, base) in flavors {
-            let codex =
-                append_backend_rules(base.clone(), crate::runtime::CodingAgent::Codex);
+            let codex = append_backend_rules(base.clone(), crate::runtime::CodingAgent::Codex);
             for needle in [
                 "SLASH COMMANDS:",
                 ".claude/commands/harden.md",
@@ -1440,7 +1446,11 @@ mod tests {
         ] {
             for (label, base) in external {
                 let full = append_backend_rules(base.clone(), agent);
-                for banned in ["BLOCKS the Apply button", "click Apply", "the change be proposed"] {
+                for banned in [
+                    "BLOCKS the Apply button",
+                    "click Apply",
+                    "the change be proposed",
+                ] {
                     assert!(
                         !full.contains(banned),
                         "{label} ({agent:?}) must NOT carry Apply-specific wording \

@@ -73,7 +73,11 @@ pub fn resolve_workspace(
 /// Parse `API_PORT=` and `PROTO=` out of a `.lucidos/ports` KEY=VALUE file.
 /// `PROTO` defaults to `"https"` for backward compatibility with ports files
 /// written before it was added. Maps `NotFound` to a friendly hint.
-fn read_ports(workspace_name: &str, workspace_path: &Path, ports_file: &Path) -> Result<(u16, String), String> {
+fn read_ports(
+    workspace_name: &str,
+    workspace_path: &Path,
+    ports_file: &Path,
+) -> Result<(u16, String), String> {
     let text = std::fs::read_to_string(ports_file).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound {
             format!(
@@ -98,9 +102,8 @@ fn read_ports(workspace_name: &str, workspace_path: &Path, ports_file: &Path) ->
             proto = Some(rest.trim().to_string());
         }
     }
-    let port = port.ok_or_else(|| {
-        format!("API_PORT= line not found in {}", ports_file.display())
-    })?;
+    let port =
+        port.ok_or_else(|| format!("API_PORT= line not found in {}", ports_file.display()))?;
     Ok((port, proto.unwrap_or_else(|| "https".to_string())))
 }
 
@@ -129,7 +132,11 @@ mod tests {
     #[test]
     fn reads_proto_from_ports_file() {
         let tmp = TempDir::new().unwrap();
-        write_ports(tmp.path(), "dev", "API_PORT=5177\nVITE_PORT=5177\nPROTO=http\n");
+        write_ports(
+            tmp.path(),
+            "dev",
+            "API_PORT=5177\nVITE_PORT=5177\nPROTO=http\n",
+        );
         let target = resolve_workspace("dev", Some(tmp.path())).unwrap();
         assert_eq!(target.proto, "http");
     }
@@ -138,7 +145,11 @@ mod tests {
     fn errors_when_workspace_dir_missing() {
         let tmp = TempDir::new().unwrap();
         let err = resolve_workspace("nope", Some(tmp.path())).unwrap_err();
-        assert!(err.contains("nope"), "error must name the workspace: {}", err);
+        assert!(
+            err.contains("nope"),
+            "error must name the workspace: {}",
+            err
+        );
         assert!(
             err.contains(".lucidos/ports"),
             "error must mention the ports file we looked for: {}",

@@ -16,21 +16,20 @@ impl LucidosEngine {
     /// callers (event stamping on engine-internal flows) prefer a default
     /// stamp over a hard failure.
     pub(crate) async fn thread_coding_agent(&self, thread_id: Uuid) -> crate::runtime::CodingAgent {
-        let stored: Option<String> = sqlx::query_scalar(
-            "SELECT coding_agent FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await
-        .unwrap_or_else(|e| {
-            crate::log!(
+        let stored: Option<String> =
+            sqlx::query_scalar("SELECT coding_agent FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_optional(&self.pool)
+                .await
+                .unwrap_or_else(|e| {
+                    crate::log!(
                 "[AgentSession] thread_coding_agent({}) DB error: {} — defaulting to ClaudeCode",
                 thread_id,
                 e
             );
-            None
-        })
-        .flatten();
+                    None
+                })
+                .flatten();
         stored
             .map(|s| crate::runtime::CodingAgent::parse(&s))
             .unwrap_or(crate::runtime::CodingAgent::ClaudeCode)
@@ -57,10 +56,11 @@ impl LucidosEngine {
                     .emit_or_log(
                         crate::engine::event_bus::BusEvent::Thread {
                             thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
-                                text: delta.to_string(),
-                                coding_agent,
-                            },
+                            event:
+                                crate::engine::thread_events::ThreadEvent::CodingAgentTextStreamed {
+                                    text: delta.to_string(),
+                                    coding_agent,
+                                },
                             meta: meta.clone(),
                         },
                         "[AgentSession] CodingAgentTextStreamed flush on cancel",

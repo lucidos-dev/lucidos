@@ -20,11 +20,7 @@ fn record_allow_grant(state: &AppState, entry: &PermissionEntry, scope: AllowSco
         }
         AllowScope::Narrow | AllowScope::Broad => {
             if let Err(e) = append_allowed_tool_pattern(state.engine.user_dir(), &pattern) {
-                crate::log!(
-                    "[MCP] Failed to persist allow pattern {:?}: {}",
-                    pattern,
-                    e
-                );
+                crate::log!("[MCP] Failed to persist allow pattern {:?}: {}", pattern, e);
             }
         }
     }
@@ -79,7 +75,11 @@ pub(super) async fn submit_mcp_consent(
     } else {
         Some(DENIAL_REASON.to_string())
     };
-    let persist_scope = if body.allowed { body.persist_scope } else { None };
+    let persist_scope = if body.allowed {
+        body.persist_scope
+    } else {
+        None
+    };
     if let Some(scope) = persist_scope {
         record_allow_grant(&state, &entry, scope);
     }

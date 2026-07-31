@@ -22,7 +22,9 @@ async fn session_bootstrap_seeds_coding_agent_has_diff_true_when_branch_has_comm
     // state we want the seed to detect.
     std::fs::write(wt.join("a.txt"), "hello").unwrap();
     git_cmd(&["add", "a.txt"], &wt).await.unwrap();
-    git_cmd(&["commit", "-m", "feat: add a"], &wt).await.unwrap();
+    git_cmd(&["commit", "-m", "feat: add a"], &wt)
+        .await
+        .unwrap();
 
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());

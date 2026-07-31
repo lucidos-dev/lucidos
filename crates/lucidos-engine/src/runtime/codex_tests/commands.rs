@@ -82,14 +82,7 @@ fn fresh_turn_command_layout() {
 #[test]
 fn max_effort_is_model_scoped_in_exec_driver() {
     let config = test_config(Path::new("/tmp/wt"));
-    let cmd = build_codex_turn_command(
-        &config,
-        Some("gpt-5.6-sol"),
-        Some("max"),
-        None,
-        "go",
-        &[],
-    );
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.6-sol"), Some("max"), None, "go", &[]);
     let args = collect_args(&cmd);
     assert!(
         args.windows(2)
@@ -99,14 +92,7 @@ fn max_effort_is_model_scoped_in_exec_driver() {
 
     // Older models reject Max. A stale selection must be omitted so Codex
     // applies its own default instead of failing the whole turn.
-    let cmd = build_codex_turn_command(
-        &config,
-        Some("gpt-5.5"),
-        Some("max"),
-        None,
-        "go",
-        &[],
-    );
+    let cmd = build_codex_turn_command(&config, Some("gpt-5.5"), Some("max"), None, "go", &[]);
     let args = collect_args(&cmd);
     assert!(
         !args
@@ -199,11 +185,9 @@ fn turn_command_wires_lucidos_mcp_server() {
 fn ask_user_question_tool_name_matches_server_config() {
     let config = test_config(Path::new("/tmp/wt"));
     let overrides = lucidos_mcp_server_config_overrides(&config.env);
-    assert!(
-        overrides
-            .iter()
-            .any(|o| o.starts_with("mcp_servers.lucidos."))
-    );
+    assert!(overrides
+        .iter()
+        .any(|o| o.starts_with("mcp_servers.lucidos.")));
     assert!(overrides.iter().any(|o| o.contains("ask_user_question")));
     assert_eq!(
         CODEX_ASK_USER_QUESTION_TOOL,
@@ -247,8 +231,7 @@ fn every_sandbox_writable_root_becomes_an_add_dir() {
     //                 EPERM (os error 1) — the 2026-07-26 nightly's Codex
     //                 security pass lost two findings exactly this way.
     let mut config = test_config(Path::new("/tmp/wt"));
-    config.sandbox_writable_roots =
-        vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
+    config.sandbox_writable_roots = vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
     let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);
     let args = collect_args(&cmd);
     let dirs: Vec<&String> = args
@@ -318,10 +301,12 @@ async fn writable_roots_are_canonicalized_not_taken_verbatim() {
     let link = link_parent.path().join("ws-link");
     std::os::unix::fs::symlink(real.path(), &link).unwrap();
 
-    let roots =
-        super::super::codex::sandbox_writable_roots(&link.join("wt"), &link).await;
+    let roots = super::super::codex::sandbox_writable_roots(&link.join("wt"), &link).await;
 
-    assert_eq!(roots, vec![std::fs::canonicalize(real.path().join("data")).unwrap()]);
+    assert_eq!(
+        roots,
+        vec![std::fs::canonicalize(real.path().join("data")).unwrap()]
+    );
     assert_ne!(
         roots[0],
         link.join("data"),
@@ -402,8 +387,7 @@ async fn a_data_symlink_may_relocate_the_tree_but_never_widen_it() {
 #[tokio::test]
 async fn writable_roots_skip_a_missing_data_dir_rather_than_creating_it() {
     let ws = tempfile::tempdir().unwrap();
-    let roots =
-        super::super::codex::sandbox_writable_roots(&ws.path().join("wt"), ws.path()).await;
+    let roots = super::super::codex::sandbox_writable_roots(&ws.path().join("wt"), ws.path()).await;
     assert!(roots.is_empty());
     assert!(
         !ws.path().join("data").exists(),
@@ -504,11 +488,7 @@ fn codex_command_definitions_shape() {
         .collect();
     assert_eq!(
         supported_models,
-        std::collections::HashSet::from([
-            "gpt-5.6-sol",
-            "gpt-5.6-terra",
-            "gpt-5.6-luna",
-        ]),
+        std::collections::HashSet::from(["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",]),
         "Max is supported by exactly the three GPT-5.6 Codex models"
     );
     assert!(
@@ -565,11 +545,9 @@ fn resolve_codex_binary_falls_back_to_bare_name() {
     // host; otherwise the bare name. Either way it must be non-empty and not
     // point inside the empty temp home.
     assert!(!resolved.is_empty());
-    assert!(
-        !resolved
-            .to_string_lossy()
-            .starts_with(&*tmp.path().to_string_lossy())
-    );
+    assert!(!resolved
+        .to_string_lossy()
+        .starts_with(&*tmp.path().to_string_lossy()));
 }
 
 #[test]

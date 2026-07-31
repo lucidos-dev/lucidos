@@ -4,10 +4,11 @@
 
 use super::super::event_bus::{BusEvent, EventBus};
 use super::super::git_ops::git_cmd;
-use super::super::thread_events::{EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent};
+use super::super::thread_events::{
+    EngineReason, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
-
 
 /// Re-emit `ChangeProposed` flipping the row to `incomplete: true`. Called
 /// by orphan recovery for branches that were mid-CC-turn at engine restart
@@ -287,10 +288,7 @@ pub(crate) fn orphan_recovery_target(
 ///
 /// Pure DB query — exposed at module scope so tests can exercise it without
 /// instantiating a full `LucidosEngine`.
-pub(crate) async fn last_turn_ended_cleanly(
-    pool: &sqlx::PgPool,
-    thread_id: Uuid,
-) -> bool {
+pub(crate) async fn last_turn_ended_cleanly(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
     let row: Option<String> = sqlx::query_scalar(
         "SELECT event_type FROM events \
          WHERE thread_id = $1 \
@@ -446,19 +444,30 @@ mod tests {
             &workspace, thread_id,
         );
         git_cmd(
-            &["worktree", "add", "-b", branch, &wt.to_string_lossy(), "main"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &wt.to_string_lossy(),
+                "main",
+            ],
             &workspace,
         )
         .await
         .unwrap();
-        let head_before = rev_parse(&wt, "HEAD").await.expect("worktree HEAD resolves");
+        let head_before = rev_parse(&wt, "HEAD")
+            .await
+            .expect("worktree HEAD resolves");
 
         // Simulate the branch-ref loss while the worktree dir survives: detach
         // the worktree's HEAD (so it still resolves to a commit), then delete
         // the branch ref. This is exactly the "branch not found in any repo,
         // worktree survives" state recovery's last-resort arm guards against.
         git_cmd(&["checkout", "--detach"], &wt).await.unwrap();
-        git_cmd(&["branch", "-D", branch], &workspace).await.unwrap();
+        git_cmd(&["branch", "-D", branch], &workspace)
+            .await
+            .unwrap();
         assert!(
             rev_parse(&workspace, &format!("refs/heads/{}", branch))
                 .await
@@ -521,7 +530,14 @@ mod tests {
             &workspace, thread_id,
         );
         git_cmd(
-            &["worktree", "add", "-b", branch, &wt.to_string_lossy(), "main"],
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                &wt.to_string_lossy(),
+                "main",
+            ],
             &workspace,
         )
         .await
@@ -531,16 +547,10 @@ mod tests {
         let ref_path = workspace
             .join(".git/refs/heads")
             .join(branch.strip_prefix("claude-code/").unwrap());
-        let _ = tokio::fs::remove_file(
-            workspace.join(format!(".git/refs/heads/{}", branch)),
-        )
-        .await;
+        let _ = tokio::fs::remove_file(workspace.join(format!(".git/refs/heads/{}", branch))).await;
         let _ = tokio::fs::remove_file(&ref_path).await;
         git_cmd(&["pack-refs", "--all"], &workspace).await.ok();
-        let _ = tokio::fs::remove_file(
-            workspace.join(format!(".git/refs/heads/{}", branch)),
-        )
-        .await;
+        let _ = tokio::fs::remove_file(workspace.join(format!(".git/refs/heads/{}", branch))).await;
 
         let recovered = recover_branch_ref_from_worktree(&workspace, thread_id, branch).await;
         assert!(
@@ -572,4 +582,3 @@ mod tests {
         );
     }
 }
-

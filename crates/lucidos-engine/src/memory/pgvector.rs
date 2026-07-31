@@ -438,10 +438,9 @@ impl PgVectorIndex {
     /// row, so this stays O(1) on a populated table rather than scanning to
     /// compute `COUNT(*)` like [`Self::len`].
     pub async fn is_empty(&self) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let exists: (bool,) =
-            sqlx::query_as("SELECT EXISTS (SELECT 1 FROM memory_entries)")
-                .fetch_one(&self.pool)
-                .await?;
+        let exists: (bool,) = sqlx::query_as("SELECT EXISTS (SELECT 1 FROM memory_entries)")
+            .fetch_one(&self.pool)
+            .await?;
         Ok(!exists.0)
     }
 
@@ -924,7 +923,10 @@ mod get_by_id_tests {
         assert_eq!(found.entities, vec!["gws-personal".to_string()]);
 
         let missing = index.get_by_id(Uuid::new_v4()).await.unwrap();
-        assert!(missing.is_none(), "unknown id must return None, not an entry");
+        assert!(
+            missing.is_none(),
+            "unknown id must return None, not an entry"
+        );
 
         teardown_test_db(&db_name).await;
     }

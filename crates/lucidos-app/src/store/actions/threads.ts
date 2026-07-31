@@ -77,18 +77,58 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // No auto-read — user must explicitly click Archive, Apply, or Discard.
 }
 
+/** Why a bootstrap-and-focus attempt ended. The distinction is load-bearing for
+ *  the cross-workspace `#thread=` landing (see `hash-deeplink-router`): a
+ *  `not-found` is a verdict from the engine and must not be retried, while a
+ *  `failed` is a transport / server error that a peer engine still lazy-starting
+ *  behind the gateway routinely produces on the first request. */
+export type FocusBootstrapOutcome =
+  | { kind: 'focused' }
+  | { kind: 'not-found' }
+  | { kind: 'failed'; error: unknown };
+
 /** Focus a thread by id, fetching its metadata first if it's not already in
  *  the loaded list (e.g. an old archived thread beyond the Archive per-source
- *  window, or a thread reached via cross-workspace deep link). */
-export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOptions): void {
+ *  window, or a thread reached via cross-workspace deep link), and report how it
+ *  went. Toast-free by design: the caller owns the user-facing message, because
+ *  a caller holding durable navigation state (the landing hash) wants to retry a
+ *  `failed` before saying anything.
+ *
+ *  Focuses SYNCHRONOUSLY when the thread is already in the map (that branch runs
+ *  before the first `await`), so a caller that only cares about the common case
+ *  can ignore the promise without a behavior change. */
+export async function focusThreadOrBootstrapResult(
+  threadId: string,
+  options?: FocusThreadOptions,
+): Promise<FocusBootstrapOutcome> {
   if (threadMap.value.has(threadId)) {
     focusThread(threadId, options);
-    return;
+    return { kind: 'focused' };
   }
-  ensureThreadByIdInMap(threadId).then(found => {
-    if (found) focusThread(threadId, options);
-    else showToast('Thread not found', 'error');
+  let found: boolean;
+  try {
+    found = await ensureThreadByIdInMap(threadId);
+  } catch (error) {
+    return { kind: 'failed', error };
+  }
+  if (!found) return { kind: 'not-found' };
+  focusThread(threadId, options);
+  return { kind: 'focused' };
+}
+
+/** Fire-and-forget {@link focusThreadOrBootstrapResult} that surfaces the
+ *  failure itself. The entry point for every caller with no retry state of its
+ *  own (thread-link clicks, notification taps, search results). */
+export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOptions): void {
+  void focusThreadOrBootstrapResult(threadId, options).then(outcome => {
+    if (outcome.kind === 'not-found') showToast('Thread not found', 'error');
+    else if (outcome.kind === 'failed') {
+      showToast(`Failed to open thread: ${errorDetail(outcome.error)}`, 'error');
+    }
   }).catch(err => {
+    // `focusThreadOrBootstrapResult` converts a fetch failure into a `failed`
+    // outcome, so reaching here means `focusThread` itself threw. Surface it
+    // rather than leave an unhandled rejection (frontend.md, no hidden errors).
     showToast(`Failed to open thread: ${errorDetail(err)}`, 'error');
   });
 }

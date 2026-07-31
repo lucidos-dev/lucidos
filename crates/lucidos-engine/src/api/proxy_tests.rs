@@ -29,7 +29,7 @@ fn strips_hop_by_hop_headers() {
         "Proxy-Authorization",
         "TE",
         "Trailer",
-            "Transfer-Encoding",
+        "Transfer-Encoding",
         "Upgrade",
     ] {
         assert!(
@@ -43,9 +43,9 @@ fn strips_hop_by_hop_headers() {
 #[test]
 fn strips_host_cookie_origin_referer() {
     for h in ["Host", "Cookie", "Origin", "Referer"] {
-            assert!(
-                should_strip_request_header(&name(h)),
-                "expected {} to be stripped",
+        assert!(
+            should_strip_request_header(&name(h)),
+            "expected {} to be stripped",
             h
         );
     }
@@ -66,10 +66,10 @@ fn keeps_safe_headers() {
         "Accept-Language",
         "User-Agent",
         "X-Custom-Header",
-        ] {
-            assert!(
-                !should_strip_request_header(&name(h)),
-                "expected {} to be kept",
+    ] {
+        assert!(
+            !should_strip_request_header(&name(h)),
+            "expected {} to be kept",
             h
         );
     }
@@ -94,124 +94,139 @@ fn filter_request_headers_drops_stripped_keeps_others() {
     assert!(!out.contains_key("host"));
     assert!(!out.contains_key("origin"));
     assert!(!out.contains_key("referer"));
-    }
+}
 
-    // ---- Browser-origin guard ---------------------------------------------
+// ---- Browser-origin guard ---------------------------------------------
 
-    #[test]
-    fn browser_proxy_guard_allows_non_browser_clients() {
-        assert!(browser_proxy_request_allowed(&HeaderMap::new()));
-    }
+#[test]
+fn browser_proxy_guard_allows_non_browser_clients() {
+    assert!(browser_proxy_request_allowed(&HeaderMap::new()));
+}
 
-    #[test]
-    fn browser_proxy_guard_allows_same_origin_browser_requests() {
-        let h = hm(&[
-            ("Host", "localhost:5251"),
-            ("Origin", "http://localhost:5251"),
-            ("Sec-Fetch-Site", "same-origin"),
-        ]);
-        assert!(browser_proxy_request_allowed(&h));
-    }
+#[test]
+fn browser_proxy_guard_allows_same_origin_browser_requests() {
+    let h = hm(&[
+        ("Host", "localhost:5251"),
+        ("Origin", "http://localhost:5251"),
+        ("Sec-Fetch-Site", "same-origin"),
+    ]);
+    assert!(browser_proxy_request_allowed(&h));
+}
 
-    #[test]
-    fn browser_proxy_guard_rejects_cross_site_fetch_metadata() {
-        let h = hm(&[
-            ("Host", "localhost:5251"),
-            ("Origin", "https://evil.example"),
-            ("Sec-Fetch-Site", "cross-site"),
-        ]);
-        assert!(!browser_proxy_request_allowed(&h));
-    }
+#[test]
+fn browser_proxy_guard_rejects_cross_site_fetch_metadata() {
+    let h = hm(&[
+        ("Host", "localhost:5251"),
+        ("Origin", "https://evil.example"),
+        ("Sec-Fetch-Site", "cross-site"),
+    ]);
+    assert!(!browser_proxy_request_allowed(&h));
+}
 
-    #[test]
-    fn browser_proxy_guard_rejects_foreign_origin_without_fetch_metadata() {
-        // Older browsers may omit Sec-Fetch-* but still send Origin on POSTs.
-        // A hostile page can issue the request even though CORS prevents reading
-        // the response, so Origin must still match Host for credentialed proxy
-        // routes.
-        let h = hm(&[
-            ("Host", "localhost:5251"),
-            ("Origin", "https://evil.example"),
-        ]);
-        assert!(!browser_proxy_request_allowed(&h));
-    }
+#[test]
+fn browser_proxy_guard_rejects_foreign_origin_without_fetch_metadata() {
+    // Older browsers may omit Sec-Fetch-* but still send Origin on POSTs.
+    // A hostile page can issue the request even though CORS prevents reading
+    // the response, so Origin must still match Host for credentialed proxy
+    // routes.
+    let h = hm(&[
+        ("Host", "localhost:5251"),
+        ("Origin", "https://evil.example"),
+    ]);
+    assert!(!browser_proxy_request_allowed(&h));
+}
 
-    #[test]
-    fn browser_proxy_guard_rejects_same_site_but_not_same_origin() {
-        let h = hm(&[
-            ("Host", "localhost:5251"),
-            ("Origin", "http://localhost:5252"),
-            ("Sec-Fetch-Site", "same-site"),
-        ]);
-        assert!(!browser_proxy_request_allowed(&h));
-    }
+#[test]
+fn browser_proxy_guard_rejects_same_site_but_not_same_origin() {
+    let h = hm(&[
+        ("Host", "localhost:5251"),
+        ("Origin", "http://localhost:5252"),
+        ("Sec-Fetch-Site", "same-site"),
+    ]);
+    assert!(!browser_proxy_request_allowed(&h));
+}
 
-    #[test]
-    fn browser_proxy_guard_allows_http2_same_origin_without_host_header() {
-        // The bug being fixed: a direct-to-engine HTTP/2 request (iOS PWA, no
-        // gateway) carries the authority in the `:authority` pseudo-header, so
-        // there's NO Host header — and no x-forwarded-host either. Sec-Fetch-Site
-        // = same-origin already proves it's safe, so it must be ALLOWED even with
-        // nothing to reconstruct a host from.
-        let h = hm(&[
-            ("Origin", "https://localhost:5174"),
-            ("Sec-Fetch-Site", "same-origin"),
-        ]);
-        assert!(browser_proxy_request_allowed(&h));
-    }
+#[test]
+fn browser_proxy_guard_allows_http2_same_origin_without_host_header() {
+    // The bug being fixed: a direct-to-engine HTTP/2 request (iOS PWA, no
+    // gateway) carries the authority in the `:authority` pseudo-header, so
+    // there's NO Host header, and no x-forwarded-host either. Sec-Fetch-Site
+    // = same-origin already proves it's safe, so it must be ALLOWED even with
+    // nothing to reconstruct a host from.
+    let h = hm(&[
+        ("Origin", "https://localhost:5174"),
+        ("Sec-Fetch-Site", "same-origin"),
+    ]);
+    assert!(browser_proxy_request_allowed(&h));
+}
 
-    #[test]
-    fn browser_proxy_guard_sec_fetch_same_origin_wins_over_mismatched_origin() {
-        // Sec-Fetch-Site is authoritative and unforgeable: when it says
-        // same-origin, the request is allowed even if Origin/Host would NOT match
-        // (behind a reverse proxy the engine's Host is the internal address, so
-        // Origin != Host is normal). No host comparison is performed at all.
-        let h = hm(&[
-            ("Host", "127.0.0.1:51811"),
-            ("Origin", "https://localhost:5251"),
-            ("Sec-Fetch-Site", "same-origin"),
-        ]);
-        assert!(browser_proxy_request_allowed(&h));
-    }
+#[test]
+fn browser_proxy_guard_sec_fetch_same_origin_wins_over_mismatched_origin() {
+    // Sec-Fetch-Site is authoritative and unforgeable: when it says
+    // same-origin, the request is allowed even if Origin/Host would NOT match
+    // (behind a reverse proxy the engine's Host is the internal address, so
+    // Origin != Host is normal). No host comparison is performed at all.
+    let h = hm(&[
+        ("Host", "127.0.0.1:51811"),
+        ("Origin", "https://localhost:5251"),
+        ("Sec-Fetch-Site", "same-origin"),
+    ]);
+    assert!(browser_proxy_request_allowed(&h));
+}
 
-    #[test]
-    fn browser_proxy_guard_legacy_allows_origin_matching_host() {
-        // Pre-Fetch-Metadata browser (no Sec-Fetch-*) still sends Origin on a
-        // same-origin POST. Those are HTTP/1.1 with a Host header, so the legacy
-        // Origin == Host comparison allows it.
-        let h = hm(&[
-            ("Host", "localhost:5173"),
-            ("Origin", "http://localhost:5173"),
-        ]);
-        assert!(browser_proxy_request_allowed(&h));
-    }
+#[test]
+fn browser_proxy_guard_legacy_allows_origin_matching_host() {
+    // Pre-Fetch-Metadata browser (no Sec-Fetch-*) still sends Origin on a
+    // same-origin POST. Those are HTTP/1.1 with a Host header, so the legacy
+    // Origin == Host comparison allows it.
+    let h = hm(&[
+        ("Host", "localhost:5173"),
+        ("Origin", "http://localhost:5173"),
+    ]);
+    assert!(browser_proxy_request_allowed(&h));
+}
 
-    #[test]
-    fn origin_authority_matches_host_normalizes_default_ports() {
-        assert!(origin_authority_matches_host("https://localhost", "localhost:443"));
-        assert!(origin_authority_matches_host("https://localhost", "localhost"));
-        assert!(origin_authority_matches_host("http://LOCALHOST:80", "localhost:80"));
-        assert!(origin_authority_matches_host("http://LOCALHOST:80", "localhost"));
-        assert!(!origin_authority_matches_host("https://localhost", "localhost:444"));
-    }
+#[test]
+fn origin_authority_matches_host_normalizes_default_ports() {
+    assert!(origin_authority_matches_host(
+        "https://localhost",
+        "localhost:443"
+    ));
+    assert!(origin_authority_matches_host(
+        "https://localhost",
+        "localhost"
+    ));
+    assert!(origin_authority_matches_host(
+        "http://LOCALHOST:80",
+        "localhost:80"
+    ));
+    assert!(origin_authority_matches_host(
+        "http://LOCALHOST:80",
+        "localhost"
+    ));
+    assert!(!origin_authority_matches_host(
+        "https://localhost",
+        "localhost:444"
+    ));
+}
 
-    // Auth header building (Bearer/ApiKey/Basic) moved to AuthLayer impls
-    // — see proxy_static_layers tests for equivalent coverage.
+// Auth header building (Bearer/ApiKey/Basic) moved to AuthLayer impls
+// See proxy_static_layers tests for equivalent coverage.
 
-    // ---- Path traversal ---------------------------------------------------
+// ---- Path traversal ---------------------------------------------------
 
-    #[test]
-    fn has_traversal_flags_dot_dot_segments() {
-        assert!(has_traversal("../etc/passwd"));
+#[test]
+fn has_traversal_flags_dot_dot_segments() {
+    assert!(has_traversal("../etc/passwd"));
     assert!(has_traversal("foo/../bar"));
-        assert!(has_traversal("a/b/../../c"));
+    assert!(has_traversal("a/b/../../c"));
     assert!(has_traversal("/.."));
 }
 
 #[test]
 fn has_traversal_flags_backslashes() {
     assert!(has_traversal("foo\\..\\bar"));
-        assert!(has_traversal("a\\b"));
+    assert!(has_traversal("a\\b"));
 }
 
 // ---- Redirect helpers --------------------------------------------
@@ -220,7 +235,11 @@ fn has_traversal_flags_backslashes() {
 fn origin_of_extracts_lowercased_scheme_host_and_default_port() {
     assert_eq!(
         origin_of("https://API.Example.com/path"),
-        Some(("https".to_string(), "api.example.com".to_string(), Some(443)))
+        Some((
+            "https".to_string(),
+            "api.example.com".to_string(),
+            Some(443)
+        ))
     );
     assert_eq!(
         origin_of("http://localhost:8080/x"),
@@ -258,11 +277,8 @@ fn origin_of_distinguishes_port() {
 
 #[test]
 fn resolve_redirect_handles_absolute_target() {
-    let url = resolve_redirect_location(
-        "https://example.com/a/b",
-        "https://example.com/c/d?q=1",
-    )
-    .unwrap();
+    let url = resolve_redirect_location("https://example.com/a/b", "https://example.com/c/d?q=1")
+        .unwrap();
     assert_eq!(url.as_str(), "https://example.com/c/d?q=1");
 }
 
@@ -298,14 +314,14 @@ fn has_traversal_passes_normal_paths() {
     assert!(!has_traversal("api/v1/items?id=42"));
     // A literal segment that *contains* `..` but isn't `..` is fine.
     assert!(!has_traversal("foo..bar"));
-    }
+}
 
-    // ---- URL building -----------------------------------------------------
+// ---- URL building -----------------------------------------------------
 
-    #[test]
-    fn build_url_handles_no_trailing_no_leading() {
-        assert_eq!(
-            build_target_url("http://localhost:5005", "Spisestua/play", None),
+#[test]
+fn build_url_handles_no_trailing_no_leading() {
+    assert_eq!(
+        build_target_url("http://localhost:5005", "Spisestua/play", None),
         "http://localhost:5005/Spisestua/play"
     );
 }
@@ -724,8 +740,15 @@ async fn forwards_arbitrary_auth_headers_to_upstream() {
             HeaderValue::from_static("secret-key"),
         ),
     ];
-    let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), auth_vec, Bytes::new())
-        .await;
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        auth_vec,
+        Bytes::new(),
+    )
+    .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
     let authz = recorded
         .headers
@@ -745,7 +768,15 @@ async fn forwards_arbitrary_auth_headers_to_upstream() {
 async fn forwards_query_param_auth_to_upstream() {
     let (base, slot) = spawn_recording_upstream(200, "ok").await;
     let url = append_query_param(&format!("{}/v1/items", base), "api-key", "secret-123");
-    let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), Vec::new(), Bytes::new()).await;
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+    )
+    .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
     assert_eq!(recorded.path, "/v1/items");
     assert_eq!(recorded.query, "api-key=secret-123");
@@ -759,7 +790,15 @@ async fn forwards_query_param_auth_preserves_existing_query() {
         "api-key",
         "secret-123",
     );
-    let _ = forward_request(Method::GET, &url, &url, HeaderMap::new(), Vec::new(), Bytes::new()).await;
+    let _ = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+    )
+    .await;
     let recorded = slot.lock().unwrap().clone().unwrap();
     assert_eq!(recorded.query, "limit=10&api-key=secret-123");
 }
@@ -768,7 +807,15 @@ async fn forwards_query_param_auth_preserves_existing_query() {
 async fn upstream_5xx_passes_through() {
     let (base, _slot) = spawn_recording_upstream(503, "down").await;
     let url = format!("{}/x", base);
-    let resp = forward_request(Method::GET, &url, &url, HeaderMap::new(), Vec::new(), Bytes::new()).await;
+    let resp = forward_request(
+        Method::GET,
+        &url,
+        &url,
+        HeaderMap::new(),
+        Vec::new(),
+        Bytes::new(),
+    )
+    .await;
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(body_text(resp).await, "down");
 }
@@ -810,7 +857,6 @@ async fn spawn_redirecting_upstream(status: u16, location: &'static str) -> Stri
     });
     format!("http://{}", addr)
 }
-
 
 #[tokio::test]
 async fn forward_request_does_not_auto_follow_30x() {

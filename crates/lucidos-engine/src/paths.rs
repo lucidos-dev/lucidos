@@ -171,7 +171,10 @@ mod tests {
                 "repo root must resolve from {rel}"
             );
         }
-        assert_eq!(repo_root_above(Path::new("/tmp/elsewhere/lucidos-engine")), None);
+        assert_eq!(
+            repo_root_above(Path::new("/tmp/elsewhere/lucidos-engine")),
+            None
+        );
 
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -266,5 +269,4 @@ mod tests {
             "/gone/.lucidos/worktrees/thread-x/crates"
         )));
     }
-
 }

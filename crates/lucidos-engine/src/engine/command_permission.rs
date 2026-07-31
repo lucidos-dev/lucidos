@@ -49,7 +49,7 @@ pub const CANCELED_REASON: &str = "Canceled by user";
 /// of `cc-allowed-tools`. Separate file because chat command patterns
 /// (`Bash(git:*)`, `Python`) are not CC `--allowedTools` patterns.
 const AGENT_ALLOWED_COMMANDS_FILE: &str = "agent-allowed-commands";
-const AGENT_ALLOWED_COMMANDS_HEADER: &str = "# Lucidos Agent command allowlist — one pattern per line. Lines starting with '#' are ignored.\n# Patterns: Bash(<head>:*) e.g. Bash(git:*) · Bash (any bash) · Python (any python).\n# A chained command (&&, |, ;) auto-allows only when EVERY segment's head is covered.\n";
+const AGENT_ALLOWED_COMMANDS_HEADER: &str = "# Lucidos Agent command allowlist: one pattern per line. Lines starting with '#' are ignored.\n# Patterns: Bash(<head>:*) e.g. Bash(git:*) · Bash (any bash) · Python (any python).\n# A chained command (&&, |, ;) auto-allows only when EVERY segment's head is covered.\n";
 
 /// Compiled-in default allowlist — empty so the feature ships dark; users build
 /// their list via the per-prompt "Always allow" buttons (which append to the
@@ -77,7 +77,9 @@ pub fn derive_command_allow_pattern(
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => match scope {
             AllowScope::Broad => Some("Bash".to_string()),
             AllowScope::Narrow => bash_narrow_pattern(command),
-            AllowScope::Session => bash_narrow_pattern(command).or_else(|| Some("Bash".to_string())),
+            AllowScope::Session => {
+                bash_narrow_pattern(command).or_else(|| Some("Bash".to_string()))
+            }
         },
         tn::RUN_PYTHON | tn::RUN_PYTHON_BACKGROUND => Some("Python".to_string()),
         _ => None,
@@ -94,11 +96,7 @@ pub fn derive_command_allow_pattern(
 /// `Bash(git:*)` grant. A command with no derivable head is never auto-allowed
 /// (the card is shown). Python: the coarse `Python` pattern (the python tool
 /// has no finer sub-scope).
-pub fn command_is_allowed(
-    tool_name: &str,
-    command: &str,
-    allowed: impl Fn(&str) -> bool,
-) -> bool {
+pub fn command_is_allowed(tool_name: &str, command: &str, allowed: impl Fn(&str) -> bool) -> bool {
     match tool_name {
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
             if allowed("Bash") {
@@ -967,7 +965,11 @@ mod tests {
     fn derive_pattern_strips_privilege_prefix_and_path() {
         // sudo + absolute path → the real command head.
         assert_eq!(
-            derive_command_allow_pattern(tn::RUN_BASH, "sudo /usr/bin/aws s3 rm x", AllowScope::Narrow),
+            derive_command_allow_pattern(
+                tn::RUN_BASH,
+                "sudo /usr/bin/aws s3 rm x",
+                AllowScope::Narrow
+            ),
             Some("Bash(aws:*)".to_string())
         );
     }
@@ -1005,7 +1007,11 @@ mod tests {
             allowed_in(&[stored.as_str()])
         ));
         // A broad grant covers any bash command.
-        assert!(command_is_allowed(tn::RUN_BASH, "git pull", allowed_in(&["Bash"])));
+        assert!(command_is_allowed(
+            tn::RUN_BASH,
+            "git pull",
+            allowed_in(&["Bash"])
+        ));
     }
 
     #[test]
@@ -1013,7 +1019,11 @@ mod tests {
         // The permission-audit regression: a first-head grant must NOT cover a
         // chained command whose later segment has a different head.
         let cmd = "git status && curl -X POST https://api.example.com/pay";
-        assert!(!command_is_allowed(tn::RUN_BASH, cmd, allowed_in(&["Bash(git:*)"])));
+        assert!(!command_is_allowed(
+            tn::RUN_BASH,
+            cmd,
+            allowed_in(&["Bash(git:*)"])
+        ));
         // Covering every head (or going broad) does allow it.
         assert!(command_is_allowed(
             tn::RUN_BASH,
@@ -1022,7 +1032,11 @@ mod tests {
         ));
         assert!(command_is_allowed(tn::RUN_BASH, cmd, allowed_in(&["Bash"])));
         // A command that runs nothing derivable is never auto-allowed.
-        assert!(!command_is_allowed(tn::RUN_BASH, "", allowed_in(&["Bash(git:*)"])));
+        assert!(!command_is_allowed(
+            tn::RUN_BASH,
+            "",
+            allowed_in(&["Bash(git:*)"])
+        ));
     }
 
     #[test]
@@ -1038,7 +1052,11 @@ mod tests {
             allowed_in(&["Bash"])
         ));
         // Non-command tools never auto-allow.
-        assert!(!command_is_allowed("read_file", "x", allowed_in(&["Bash", "Python"])));
+        assert!(!command_is_allowed(
+            "read_file",
+            "x",
+            allowed_in(&["Bash", "Python"])
+        ));
     }
 
     #[test]
@@ -1086,7 +1104,10 @@ mod tests {
         // … and the guard's pattern reader sees the edited entries (a delete in
         // the editor removes a line; here we confirm what's written is read).
         let patterns = agent_allowed_commands_patterns(Some(dir.path()));
-        assert_eq!(patterns, vec!["Bash(git:*)".to_string(), "Python".to_string()]);
+        assert_eq!(
+            patterns,
+            vec!["Bash(git:*)".to_string(), "Python".to_string()]
+        );
     }
 
     // --- action_for_lane: resolved-lane + channel gate + trigger grant ------
@@ -1131,7 +1152,12 @@ mod tests {
             GuardAction::Ask
         );
         assert_eq!(
-            action_for_lane(RiskLane::IrreversibleDanger, Some(EventChannel::Chat), cat, NO_GRANT),
+            action_for_lane(
+                RiskLane::IrreversibleDanger,
+                Some(EventChannel::Chat),
+                cat,
+                NO_GRANT
+            ),
             GuardAction::Ask
         );
     }

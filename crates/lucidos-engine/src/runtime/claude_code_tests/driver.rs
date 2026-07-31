@@ -214,10 +214,7 @@ fn format_exit_status_decodes_sigterm_via_exit_code_143() {
     // SIGTERM and exits cleanly. The decoder MUST flag the probable
     // signal so debugging doesn't require manual 128+N arithmetic.
     let s = std::process::ExitStatus::from_raw(36608);
-    assert_eq!(
-        format_exit_status(&Ok(s)),
-        "exit=143 (probable SIGTERM)",
-    );
+    assert_eq!(format_exit_status(&Ok(s)), "exit=143 (probable SIGTERM)",);
 }
 
 #[cfg(unix)]
@@ -227,10 +224,7 @@ fn format_exit_status_decodes_sigkill_via_exit_code_137() {
     // Raw 35072 = 0x8900 = exit 137 = 128 + 9 (SIGKILL) — macOS Jetsam /
     // OOM-killer convention.
     let s = std::process::ExitStatus::from_raw(35072);
-    assert_eq!(
-        format_exit_status(&Ok(s)),
-        "exit=137 (probable SIGKILL)",
-    );
+    assert_eq!(format_exit_status(&Ok(s)), "exit=137 (probable SIGKILL)",);
 }
 
 #[cfg(unix)]

@@ -1,4 +1,3 @@
-
 /// Validates that idle_notify (using notify_waiters) wakes a registered waiter.
 /// This is the contract that send_and_wait and apply_now_inner depend on:
 /// the Result handler must call idle_notify.notify_waiters() so that

@@ -122,10 +122,15 @@ fn budget_or(
     if let Some(wasmtime::Trap::Interrupt) = e.downcast_ref::<wasmtime::Trap>() {
         return (
             StatusCode::BAD_GATEWAY,
-            format!("signer {signer} exceeded its execution budget during {stage} and was terminated"),
+            format!(
+                "signer {signer} exceeded its execution budget during {stage} and was terminated"
+            ),
         );
     }
-    (default_status, format!("signer {signer} {stage} failed: {e}"))
+    (
+        default_status,
+        format!("signer {signer} {stage} failed: {e}"),
+    )
 }
 
 /// Build the set of sensitive substrings to scrub from a signer's `log()`
@@ -210,8 +215,8 @@ pub fn load_wasm_modules(
             continue;
         }
         let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-        let module = Module::new(engine, &bytes)
-            .map_err(|e| format!("compile {}: {e}", path.display()))?;
+        let module =
+            Module::new(engine, &bytes).map_err(|e| format!("compile {}: {e}", path.display()))?;
         let manifest_path = path.with_file_name(format!("{stem}.manifest.json"));
         let manifest = if manifest_path.exists() {
             let m = std::fs::read_to_string(&manifest_path)
@@ -264,13 +269,8 @@ pub struct SignInput {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SignInputBody {
-    Raw {
-        bytes: serde_bytes::ByteBuf,
-    },
-    HashOnly {
-        sha256_hex: String,
-        length: u64,
-    },
+    Raw { bytes: serde_bytes::ByteBuf },
+    HashOnly { sha256_hex: String, length: u64 },
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -369,10 +369,7 @@ impl AuthLayer for WasmSignerLayer {
         &self.namespace
     }
 
-    async fn apply(
-        &self,
-        input: &LayerInput<'_>,
-    ) -> Result<AuthMutation, (StatusCode, String)> {
+    async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         // 0. Manifest-declared body_mode validation.
         //   - Raw    → fail with 413 if the pipeline handed us a hash
         //              (body was over the 1MB threshold).
@@ -437,14 +434,12 @@ impl AuthLayer for WasmSignerLayer {
                 .map(|(n, v)| (n.as_str().to_string(), v.clone()))
                 .collect(),
             body: body_field,
-            prior_layer_outputs: serde_json::to_value(input.prior_layer_outputs).map_err(
-                |e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("serialize prior_layer_outputs: {e}"),
-                    )
-                },
-            )?,
+            prior_layer_outputs: serde_json::to_value(input.prior_layer_outputs).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("serialize prior_layer_outputs: {e}"),
+                )
+            })?,
             secret_handles: handles,
             current_time_ns: chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
         };
@@ -475,22 +470,31 @@ impl AuthLayer for WasmSignerLayer {
         store.set_epoch_deadline(epoch_deadline_ticks(self.budget));
         store.epoch_deadline_trap();
         let mut linker: Linker<HostState> = Linker::new(&self.engine);
-        register_host_imports(&mut linker)
-            .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("linker init: {e}")))?;
+        register_host_imports(&mut linker).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("linker init: {e}"),
+            )
+        })?;
         let instance = linker
             .instantiate_async(&mut store, &self.module.module)
             .await
-            .map_err(|e| budget_or(&self.module.name, "instantiate", StatusCode::INTERNAL_SERVER_ERROR, e))?;
-
-        // 4. Find module memory + sign export. `alloc` is optional.
-        let memory = instance
-            .get_memory(&mut store, "memory")
-            .ok_or_else(|| {
-                (
+            .map_err(|e| {
+                budget_or(
+                    &self.module.name,
+                    "instantiate",
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    format!("module {} did not export `memory`", self.module.name),
+                    e,
                 )
             })?;
+
+        // 4. Find module memory + sign export. `alloc` is optional.
+        let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("module {} did not export `memory`", self.module.name),
+            )
+        })?;
         let alloc = instance
             .get_typed_func::<i32, i32>(&mut store, "alloc")
             .ok();
@@ -509,10 +513,14 @@ impl AuthLayer for WasmSignerLayer {
         // 5. Reserve space for input bytes and write them.
         let in_len = in_bytes.len() as i32;
         let in_ptr = if let Some(alloc) = &alloc {
-            alloc
-                .call_async(&mut store, in_len)
-                .await
-                .map_err(|e| budget_or(&self.module.name, "alloc", StatusCode::INTERNAL_SERVER_ERROR, e))?
+            alloc.call_async(&mut store, in_len).await.map_err(|e| {
+                budget_or(
+                    &self.module.name,
+                    "alloc",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    e,
+                )
+            })?
         } else {
             FIXED_INPUT_OFFSET
         };
@@ -532,27 +540,27 @@ impl AuthLayer for WasmSignerLayer {
         //    by itself interrupt a tight CPU loop, since that never yields back
         //    to be polled. Grace > one epoch tick so the epoch trap wins first.
         let sign_call = sign.call_async(&mut store, (in_ptr, in_len));
-        let packed = match tokio::time::timeout(self.budget + Duration::from_secs(2), sign_call).await
-        {
-            Ok(Ok(packed)) => packed,
-            Ok(Err(e)) => {
-                return Err(budget_or(
-                    &self.module.name,
-                    "sign",
-                    StatusCode::BAD_GATEWAY,
-                    e,
-                ))
-            }
-            Err(_elapsed) => {
-                return Err((
-                    StatusCode::BAD_GATEWAY,
-                    format!(
-                        "signer {} exceeded its execution budget and was terminated",
-                        self.module.name
-                    ),
-                ))
-            }
-        };
+        let packed =
+            match tokio::time::timeout(self.budget + Duration::from_secs(2), sign_call).await {
+                Ok(Ok(packed)) => packed,
+                Ok(Err(e)) => {
+                    return Err(budget_or(
+                        &self.module.name,
+                        "sign",
+                        StatusCode::BAD_GATEWAY,
+                        e,
+                    ))
+                }
+                Err(_elapsed) => {
+                    return Err((
+                        StatusCode::BAD_GATEWAY,
+                        format!(
+                            "signer {} exceeded its execution budget and was terminated",
+                            self.module.name
+                        ),
+                    ))
+                }
+            };
         let out_ptr = ((packed >> 32) & 0xFFFF_FFFF) as usize;
         let out_len = (packed & 0xFFFF_FFFF) as usize;
 

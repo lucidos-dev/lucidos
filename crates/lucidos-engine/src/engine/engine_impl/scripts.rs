@@ -205,14 +205,21 @@ impl LucidosEngine {
         env_vars.extend(extra_env.iter().cloned());
 
         let output = match extension {
-            "py" => {
-                let code = std::fs::read_to_string(&full_path)
-                    .map_err(|e| format!("Failed to read script {}: {}", script_path, e))?;
-                self.python_runtime
-                    .execute_with_env(&code, env_vars)
-                    .await
-                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?
-            }
+            // A script runs IN PLACE, from its real on-disk path — never from
+            // a copy. `__file__`-relative resolution is the whole
+            // point: a trigger script reaching its sibling `../state/` dir the
+            // ordinary way must land in the real `data/triggers/<slug>/state/`.
+            // Executing a copy under `.lucidos/exhaust/<uuid>/` silently
+            // redirects every such path into a phantom dir that no human writes
+            // to, and nothing errors (the 2026-07-29 notary-verdict-watch
+            // incident). Mirrors the `.sh` branch, which has always run the real
+            // path. The copy mechanism stays for `run_python` — there the LLM
+            // supplies code as a string with no home on disk.
+            "py" => self
+                .python_runtime
+                .execute_file_with_env(&full_path, env_vars)
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?,
             "sh" => self.execute_shell_script(&full_path, env_vars).await?,
             _ => {
                 let msg = match crate::triggers::validate_script_extension(script_path) {
@@ -344,7 +351,11 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sentinel = dir.join("sentinel");
         let script = dir.join("slow.sh");
-        std::fs::write(&script, format!("sleep 3\ntouch '{}'\n", sentinel.display())).unwrap();
+        std::fs::write(
+            &script,
+            format!("sleep 3\ntouch '{}'\n", sentinel.display()),
+        )
+        .unwrap();
 
         let err = run_shell_script_with_timeout(
             &script,

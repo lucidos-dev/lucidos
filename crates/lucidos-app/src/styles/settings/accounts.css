@@ -1,0 +1,123 @@
+/* ===== Settings → Accounts (Credentials + OAuth) =====
+ *
+ * The Apps and Triggers panels are the reference for a list-of-rows view: their
+ * `.content-view` has no padding of its own, so each `.list-row` supplies the
+ * shared --space-lg (1rem) gutter itself and its hover wash runs edge to edge.
+ * Accounts renders inside `.settings-panel`, which adds that same 1rem as
+ * container padding — so the rows used to sit at 2rem with their hover wash
+ * inset by 1rem, out of line with both the Apps panel and the `.settings-row`
+ * controls on Settings' own other subviews. The rules below put it back on the
+ * gold-standard geometry. */
+
+/* Pull the row list back out through the panel's horizontal gutter. `.list-row`
+   then re-establishes it as its OWN padding, which is what makes the content
+   land at 1rem while the hover wash reaches the pane edges — exactly the Apps /
+   Triggers rendering. Horizontal only: the panel's vertical padding is real
+   spacing above the first section title. */
+.accounts-section .list-rows {
+    margin-inline: calc(-1 * var(--space-lg));
+}
+
+/* `.list-row-name` ellipsizes on one nowrap line by default. Every comparable
+   row overrides that to wrap (`.app-row` / `.trigger-row` in skills.css), and
+   both Accounts titles can be long and arbitrary — a credential service name,
+   or a provider typed into the connect field — so wrap them too rather than
+   truncating a name the user chose. */
+.credential-row .list-row-name,
+.oauth-account-row .list-row-name {
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+    overflow-wrap: anywhere;
+}
+
+/* Credential rows: when the row is too narrow to fit name + actions
+   side-by-side, the actions stack below the info column. flex-basis on
+   .list-row-info promotes the wrap; .list-row already has flex-wrap: wrap. */
+.credential-row .list-row-info {
+    flex: 1 1 18rem;
+}
+
+/* At ≤600px `.list-row` flips to flex-direction: column (mobile.css), so the
+   18rem flex-basis above stops being a WIDTH floor and becomes a HEIGHT along
+   the new vertical main axis — inflating the info block to 18rem tall. Combined
+   with the row's inherited justify-content: space-between, that shoved the
+   Copy/Edit/Delete actions to the bottom of an 18rem-tall row (the "weird
+   spacing" on mobile). In the column layout the info already spans the full row
+   width, so the basis serves no purpose — reset it to content height. */
+@media (max-width: 600px) {
+    .credential-row .list-row-info {
+        flex-basis: auto;
+    }
+}
+
+/* Both Accounts rows carry a multi-line info column (name, details, date)
+   against a single line of buttons, and `.list-row` top-aligns its children —
+   so the actions sat at the row's TOP edge whenever the pane was wide enough to
+   keep them beside the info instead of wrapping/stacking below it. Pin them to
+   the bottom edge at every width, the same way `.app-row` / `.trigger-row` do
+   in skills.css. */
+.credential-row .list-row-actions,
+.oauth-account-row .list-row-actions {
+    align-self: flex-end;
+}
+
+/* The connect form is a row of the same list, so it keeps `.list-row`'s gutter
+   and stacks its two control groups. */
+.oauth-connect-row {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+}
+
+.oauth-quick-providers {
+    display: flex;
+    gap: 0.375rem;
+}
+
+.oauth-quick-btn {
+    background: none;
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    padding: 0.1875rem 0.625rem;
+    font-family: var(--font-ui);
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    cursor: pointer;
+    transition: all 0.15s;
+}
+
+@media (hover: hover) {
+    .oauth-quick-btn:hover {
+        color: var(--accent);
+        border-color: var(--accent);
+    }
+}
+
+.oauth-quick-btn.active {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: color-mix(in srgb, var(--accent) 10%, transparent);
+}
+
+.oauth-connect-controls {
+    display: flex;
+    gap: 0.5rem;
+    align-items: center;
+}
+
+.oauth-provider-input {
+    flex: 1;
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+    font-size: var(--font-size-sm);
+    padding: 0.25rem 0.5rem;
+    outline: none;
+}
+
+.oauth-provider-input:focus {
+    border-color: var(--accent);
+}

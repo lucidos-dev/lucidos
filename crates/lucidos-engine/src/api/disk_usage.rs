@@ -69,8 +69,7 @@ pub(super) async fn cleanup_worktree(
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {}", e)))?;
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    let worktree =
-        deterministic_worktree_for(state.engine.workspace_path(), thread_uuid);
+    let worktree = deterministic_worktree_for(state.engine.workspace_path(), thread_uuid);
     if !worktree.exists() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -98,12 +97,13 @@ pub(super) async fn cleanup_worktree(
             if worktree_git_admin_missing(&worktree) {
                 let dir = worktrees_dir(state.engine.workspace_path());
                 let pre_size = directory_size_bytes(&worktree);
-                let freed = remove_stranded_worktree(&dir, &worktree, pre_size).ok_or_else(|| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "Failed to remove stranded worktree".to_string(),
-                    )
-                })?;
+                let freed =
+                    remove_stranded_worktree(&dir, &worktree, pre_size).ok_or_else(|| {
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "Failed to remove stranded worktree".to_string(),
+                        )
+                    })?;
                 (freed, false)
             } else {
                 let outcome = remove_worktree_and_optionally_delete_branch(&worktree, None)
@@ -171,7 +171,9 @@ pub(super) async fn summary(
     let workspace = state.engine.workspace_path();
     let dir = worktrees_dir(workspace);
     let free_bytes = available_disk_bytes(&dir).or_else(|| available_disk_bytes(workspace));
-    let total_bytes = fs2::total_space(&dir).ok().or_else(|| fs2::total_space(workspace).ok());
+    let total_bytes = fs2::total_space(&dir)
+        .ok()
+        .or_else(|| fs2::total_space(workspace).ok());
     // The walk can hit a multi-GB postgres data dir with many files — keep it
     // off the tokio worker thread so other requests aren't stalled.
     let data_dir = workspace.join(crate::core::DATA_DIR);

@@ -157,10 +157,7 @@ async fn test_last_user_and_agent_action_attributed_separately() {
         u3 > u2,
         "a human follow-up must bump last_user_action (u3={u3} u2={u2})"
     );
-    assert_eq!(
-        a3, a2,
-        "a user action must NOT bump last_agent_action"
-    );
+    assert_eq!(a3, a2, "a user action must NOT bump last_agent_action");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

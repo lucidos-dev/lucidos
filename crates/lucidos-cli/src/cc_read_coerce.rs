@@ -59,7 +59,9 @@ fn coerce_numeric_string(input: &mut Value, key: &str) -> bool {
     let Some(s) = input.get(key).and_then(Value::as_str) else {
         return false;
     };
-    let Ok(n) = s.parse::<u64>() else { return false };
+    let Ok(n) = s.parse::<u64>() else {
+        return false;
+    };
     input[key] = Value::from(n);
     true
 }

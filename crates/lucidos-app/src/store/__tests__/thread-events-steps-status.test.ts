@@ -509,13 +509,14 @@ describe('tool description from event', () => {
   });
 
   it('exchangeResponseEvents stamps full command on engine ToolCalled steps for hover tooltip', () => {
-    // The engine truncates run_bash descriptions to ~60 chars (`Running: cd /Users/...`).
+    // The engine middle-truncates run_bash descriptions to ~60 chars, marking the
+    // cut with `…` and keeping the command's tail (`Running: cd /Users/…head -20...`).
     // The full command is preserved on the step so the UI can show it on mouseover.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     const fullCmd = 'cd /Users/alex/IdeaProjects/lucidos && git log --oneline -50 | head -20';
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'show recent commits' } as ThreadEvent, '2026-04-30T10:00:00Z');
-    handleEvent(map, 't', 2, { type: 'ToolCalled', name: 'run_bash', args: { command: fullCmd }, description: 'Running: cd /Users/alex/IdeaProjects/lucidos && git......' } as ThreadEvent, '2026-04-30T10:00:01Z');
+    handleEvent(map, 't', 2, { type: 'ToolCalled', name: 'run_bash', args: { command: fullCmd }, description: 'Running: cd /Users/alex/IdeaProjects/l…log --oneline -50 | head -20...' } as ThreadEvent, '2026-04-30T10:00:01Z');
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
     const respEvents = exchangeResponseEvents(exchanges[0]);

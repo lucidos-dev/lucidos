@@ -32,7 +32,9 @@ mod end_stale_session_branch_preservation {
         // is what trips `proposal_files_for_branch` into returning None.
         std::fs::write(wt.join("scratch.txt"), "v1").unwrap();
         git_cmd(&["add", "."], &wt).await.unwrap();
-        git_cmd(&["commit", "-m", "add scratch"], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "add scratch"], &wt)
+            .await
+            .unwrap();
         git_cmd(&["revert", "--no-edit", "HEAD"], &wt)
             .await
             .unwrap();
@@ -95,10 +97,14 @@ mod end_stale_session_branch_preservation {
 
         std::fs::write(wt.join("a.txt"), "hello").unwrap();
         git_cmd(&["add", "."], &wt).await.unwrap();
-        git_cmd(&["commit", "-m", "feat: add a"], &wt).await.unwrap();
+        git_cmd(&["commit", "-m", "feat: add a"], &wt)
+            .await
+            .unwrap();
 
         assert!(
-            proposal_files_for_branch(&repo_root, branch).await.is_some(),
+            proposal_files_for_branch(&repo_root, branch)
+                .await
+                .is_some(),
             "test setup: real-changes branch yields Some(files)"
         );
 

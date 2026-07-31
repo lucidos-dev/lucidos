@@ -1,4 +1,4 @@
-.PHONY: build check lint lint-rust lint-shell fix test clean run start stop restart status logs
+.PHONY: build check lint lint-fmt lint-rust lint-shell fix test clean run start stop restart status logs
 
 # Default workspace for development
 WORKSPACE ?= ./test-workspace
@@ -33,10 +33,40 @@ build-local:
 check: lint
 	cargo check --locked
 
-# Run every linter — THE clean-build lint gate. Shell first: it takes under a
-# second, so a shell finding surfaces immediately instead of after a full
-# clippy pass.
-lint: lint-shell lint-rust
+# Run every linter. THE clean-build lint gate, ordered cheapest first so a
+# finding surfaces immediately instead of after a full clippy pass: shell takes
+# under a second, the fmt check a few seconds, clippy minutes.
+lint: lint-shell lint-fmt lint-rust
+
+# Fail if any tracked Rust file is not rustfmt-clean.
+#
+# The tree was swept clean in one mechanical commit and this keeps it that way.
+# Formatting was pure convention before, enforced by nothing, and 424 of 614
+# tracked .rs files had drifted.
+#
+#   --all     Explicit rather than relying on the virtual-manifest default, for
+#             the same reason CLIPPY_FLAGS spells out --workspace.
+#   --check   Report and exit non-zero; never rewrite. `make fmt` is the fix.
+#
+# No --locked here, and that is not an oversight in ADR 0020's "every cargo call
+# is --locked" rule: `cargo fmt` REJECTS the flag (`error: unexpected argument
+# '--locked' found`) because it resolves no dependencies, so there is no
+# lockfile for it to drift against.
+#
+# There is deliberately NO rustfmt.toml. Stock defaults are reproducible because
+# rust-toolchain.toml pins the toolchain (and rustfmt with it), and a config file
+# would be a live footgun: on a stable channel rustfmt WARNS and continues on a
+# nightly-only key rather than failing, so an inert setting reads as an active
+# one.
+# The recipe is `@`-quiet and echoes the bare command itself, so the log reads
+# like the other targets' instead of printing the `||` failure-hint wrapper.
+lint-fmt:
+	@echo "cargo fmt --all --check"
+	@cargo fmt --all --check || { \
+		echo ""; \
+		echo "Not rustfmt-clean. Run \`make fmt\` (or \`make fix\`) and commit the result."; \
+		exit 1; \
+	}
 
 # Run clippy linter — TWICE, once per feature configuration, because neither
 # one alone lints the whole tree (see CLIPPY_FLAGS for the shared flags).
@@ -67,11 +97,13 @@ lint-shell:
 # Auto-fix linting issues
 fix:
 	cargo fix --allow-dirty --allow-staged
-	cargo fmt
+	cargo fmt --all
 
-# Format code
+# Format code. The remediation for a `lint-fmt` failure, so it takes the same
+# --all as the check: a `make fmt` that formatted less than the gate inspects
+# would leave `make lint` red with nothing left to do about it.
 fmt:
-	cargo fmt
+	cargo fmt --all
 
 # Run tests
 test:

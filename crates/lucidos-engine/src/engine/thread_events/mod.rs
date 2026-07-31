@@ -31,29 +31,29 @@ pub(crate) use emit::{
 };
 
 #[cfg(test)]
-#[path = "../thread_events_tests/message_origin.rs"]
-mod message_origin_tests;
-#[cfg(test)]
-#[path = "../thread_events_tests/event_type.rs"]
-mod event_type_tests;
-#[cfg(test)]
-#[path = "../thread_events_tests/event_payload.rs"]
-mod event_payload_tests;
+#[path = "../thread_events_tests/cause_session.rs"]
+mod cause_session_tests;
 #[cfg(test)]
 #[path = "../thread_events_tests/event_meta.rs"]
 mod event_meta_tests;
 #[cfg(test)]
-#[path = "../thread_events_tests/question.rs"]
-mod question_tests;
+#[path = "../thread_events_tests/event_payload.rs"]
+mod event_payload_tests;
 #[cfg(test)]
-#[path = "../thread_events_tests/cause_session.rs"]
-mod cause_session_tests;
+#[path = "../thread_events_tests/event_type.rs"]
+mod event_type_tests;
+#[cfg(test)]
+#[path = "../thread_events_tests/message_origin.rs"]
+mod message_origin_tests;
 #[cfg(test)]
 #[path = "../thread_events_tests/origin_fields.rs"]
 mod origin_fields_tests;
 #[cfg(test)]
-#[path = "../thread_events_tests/variants.rs"]
-mod variant_tests;
+#[path = "../thread_events_tests/question.rs"]
+mod question_tests;
 #[cfg(test)]
 #[path = "../thread_events_tests/todo.rs"]
 mod todo_tests;
+#[cfg(test)]
+#[path = "../thread_events_tests/variants.rs"]
+mod variant_tests;

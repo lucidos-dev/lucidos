@@ -73,7 +73,10 @@ name = "X"
 description = "Y"
 source = "https://github.com/a/b"
 "#;
-    assert_eq!(parse_manifest(toml), Err(ValidationError::MissingField("id")));
+    assert_eq!(
+        parse_manifest(toml),
+        Err(ValidationError::MissingField("id"))
+    );
 }
 
 #[test]
@@ -343,10 +346,7 @@ fn detects_conflicts_against_data_dir() {
 
 #[test]
 fn compare_versions_update_when_remote_newer() {
-    assert_eq!(
-        compare_versions("0.1.0", "0.2.0"),
-        UpdateDecision::Update
-    );
+    assert_eq!(compare_versions("0.1.0", "0.2.0"), UpdateDecision::Update);
 }
 
 #[test]
@@ -367,10 +367,7 @@ fn compare_versions_already_when_remote_older() {
 
 #[test]
 fn compare_versions_treats_garbage_as_update() {
-    assert_eq!(
-        compare_versions("garbage", "1.0.0"),
-        UpdateDecision::Update
-    );
+    assert_eq!(compare_versions("garbage", "1.0.0"), UpdateDecision::Update);
 }
 
 // --- categories (controlled vocabulary) ---

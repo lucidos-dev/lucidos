@@ -1145,9 +1145,11 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
 .thread-view-header .thread-title-edit {
     flex: 0 1 auto;
     min-width: 0;
-    /* Cap + clip the title to the row. max-width:100% here resolves against the
-     * header (a stable width), so it doesn't feed back into the field's size the
-     * way a cap on the field itself would. */
+    /* Cap the title to the row. max-width:100% here resolves against the header
+     * (a stable width), so it doesn't feed back into the field's size the way a
+     * cap on the field itself would. overflow:hidden is only a backstop now: the
+     * display below ellipsises itself, and this trims the 0.25rem its negative
+     * margin hangs over the wrapper's right edge. */
     max-width: 100%;
     overflow: hidden;
     align-items: flex-start;
@@ -1157,16 +1159,29 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     min-width: 4ch;
 }
 
-/* The read-only display hugs its title on ONE line: white-space:nowrap +
- * width:max-content sizes it to the true one-line text width, auto-updating when
- * a web font loads (a JS measurement can't time that reliably). It deliberately
- * has NO max-width — capping the field itself is circular with its content-based
- * flex basis and collapses it ~1 char short; the wrapper above caps and clips
- * (overflow:hidden) instead, so a title too long for the row is clipped at the
- * row's right edge. */
+/* The read-only display hugs its title on ONE line and ellipsises when the row
+ * is too narrow for it. `align-self: stretch` (overriding the wrapper's
+ * flex-start) with `width: auto` is what makes both true at once: the wrapper's
+ * own width is content-based, so stretch resolves to exactly the title's
+ * one-line width while it fits (and re-resolves when a web font loads, which a
+ * JS measurement can't time reliably), and to the shrunken wrapper's width once
+ * it doesn't, which is when text-overflow can finally fire.
+ *
+ * The two shapes that look equivalent and aren't:
+ *   - `width: max-content` (what this was) makes the box as wide as the text
+ *     ALWAYS, so the text never overflows its own box, text-overflow never
+ *     applies, and the wrapper's overflow:hidden hard-cuts the title mid-word
+ *     with no ellipsis.
+ *   - `max-width: 100%` ellipsises, but ~1 char early on EVERY title: this
+ *     element carries negative horizontal margins (-0.25rem a side, to cancel
+ *     the field's padding), so the wrapper's content box is 0.5rem narrower
+ *     than the title's own max-content width. Stretch resolves against the same
+ *     box but adds the margins back, so it lands exactly on the text. */
 .thread-view-header .thread-title-input.thread-title-display {
-    width: max-content;
+    width: auto;
+    align-self: stretch;
     white-space: nowrap;
+    text-overflow: ellipsis;
 }
 
 /* While editing, the <input> hugs its value via its size attribute (set in JS);

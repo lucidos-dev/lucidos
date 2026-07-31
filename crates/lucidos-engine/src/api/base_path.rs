@@ -146,7 +146,10 @@ mod tests {
     #[test]
     fn inject_base_href_prepends_without_head() {
         let html = "<p>x</p>";
-        assert_eq!(inject_base_href(html, "/dev/"), "<base href=\"/dev/\"><p>x</p>");
+        assert_eq!(
+            inject_base_href(html, "/dev/"),
+            "<base href=\"/dev/\"><p>x</p>"
+        );
     }
 
     #[test]

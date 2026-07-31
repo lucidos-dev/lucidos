@@ -533,14 +533,26 @@ export function SettingsView() {
     }
     return (
       <div class="list-rows">
-        {oauthLoadable.data.map(account => (
-          <div class="list-row" key={account.id}>
+        {oauthLoadable.data.map(account => {
+          // formatScopes drops the always-present openid/email/profile scopes,
+          // so an account connected with only those (what the Connect button
+          // requests) formats to "". Gate on the LABEL, not on account.scopes —
+          // an empty span is still a flex item, and .list-row-details' 0.75rem
+          // gap would render it as a trailing hole after the email.
+          const scopeLabel = account.scopes ? formatScopes(account.scopes) : '';
+          return (
+          <div class="list-row oauth-account-row" key={account.id}>
             <div class="list-row-info">
-              <div class="title">{account.provider}</div>
+              <div class="title list-row-name">{account.provider}</div>
+              {/* .list-row-details is a flex row whose 0.75rem gap IS the
+                  separator — same as the credential row's url/type pair and the
+                  app row's description. Each field is its own element; manual
+                  "·" glue would be double-spaced by that gap. */}
               <div class="list-row-details">
-                {account.email || 'No email'}
-                {account.scopes && <> &middot; {formatScopes(account.scopes)}</>}
-                {' '}&middot;{' '}
+                <span>{account.email || 'No email'}</span>
+                {scopeLabel && <span>{scopeLabel}</span>}
+              </div>
+              <div class="list-row-date">
                 <span data-tooltip={formatDateTime(new Date(account.created_at))}>
                   Connected {formatShortDateWithYear(new Date(account.created_at))}
                 </span>
@@ -557,7 +569,8 @@ export function SettingsView() {
               >Disconnect</button>
             </div>
           </div>
-        ))}
+          );
+        })}
         <div class="list-row oauth-connect-row">
           <div class="oauth-quick-providers">
             {['Google', 'Microsoft', 'GitHub'].map(name => (
@@ -590,14 +603,17 @@ export function SettingsView() {
     );
   }
 
+  // `accounts-section` full-bleeds the list rows out of .settings-panel's
+  // gutter so they sit flush like the Apps and Triggers panels — see
+  // styles/settings/accounts.css.
   function accountsSection() {
     return (
       <>
-        <div class="settings-section">
+        <div class="settings-section accounts-section">
           <div class="settings-section-title" data-search-anchor="accounts:credentials">Credentials</div>
           {credentialsSection()}
         </div>
-        <div class="settings-section">
+        <div class="settings-section accounts-section">
           <div class="settings-section-title" data-search-anchor="accounts:oauth">OAuth</div>
           {oauthSection()}
         </div>

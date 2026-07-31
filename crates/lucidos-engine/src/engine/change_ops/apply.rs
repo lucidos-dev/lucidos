@@ -1,11 +1,12 @@
 use super::*;
-use crate::engine::git_ops::{
-    auto_commit_safe_files_if_dirty, auto_commit_worktree, catchup_and_ff_to_main, commits_in_range,
-    ff_main_to, files_have_client_update, find_branch_merge_in_main, find_worktree_for_branch,
-    has_branch_commits, is_harden_marker_present, push_main_in_background,
-    recover_no_commits_branch, worktree_add, worktrees_dir, NoCommitsRecovery, MERGE_MUTEX,
-};
 use crate::engine::agent_session::InPlaceMergeStart;
+use crate::engine::git_ops::{
+    auto_commit_safe_files_if_dirty, auto_commit_worktree, catchup_and_ff_to_main,
+    commits_in_range, ff_main_to, files_have_client_update, find_branch_merge_in_main,
+    find_worktree_for_branch, has_branch_commits, is_harden_marker_present,
+    push_main_in_background, recover_no_commits_branch, worktree_add, worktrees_dir,
+    NoCommitsRecovery, MERGE_MUTEX,
+};
 use crate::engine::{ApplyResult, ApplyStatus};
 
 impl LucidosEngine {
@@ -42,7 +43,6 @@ impl LucidosEngine {
             result_message,
         )
     }
-
 
     /// Apply a single pending change: merge its branch into main.
     /// `actor` identifies who initiated the apply. HTTP callers construct via
@@ -174,7 +174,8 @@ impl LucidosEngine {
                         Some(post_sha.clone()),
                     )
                     .await;
-                    self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref()).await;
+                    self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref())
+                        .await;
                     self.emit_entity_events_for_change_apply(
                         &change.files,
                         Some(&pre_sha),
@@ -302,7 +303,9 @@ impl LucidosEngine {
             // Live session: route harden through it (emit + send). If send fails
             // the boundary is already up — fall through to the worktree spawn
             // without re-emitting. No live session: emit boundary now.
-            if let Some(session) = CodingAgentChangeOps::live_session_info(self.as_ref(), thread_id).await {
+            if let Some(session) =
+                CodingAgentChangeOps::live_session_info(self.as_ref(), thread_id).await
+            {
                 match self
                     .request_hardening_in_session(thread_id, &session.msg_tx)
                     .await
@@ -628,7 +631,8 @@ impl LucidosEngine {
         if let Some(thread_id) = change.thread_id {
             if let Some(wt_path) = find_worktree_for_branch(&repo_root, &change.branch_name).await {
                 // Auto-commit any uncommitted CC work before merging
-                auto_commit_worktree(&wt_path, "Coding agent changes (pre-merge auto-commit)").await;
+                auto_commit_worktree(&wt_path, "Coding agent changes (pre-merge auto-commit)")
+                    .await;
 
                 // Fast path: try ff directly
                 match catchup_and_ff_to_main(&repo_root, &wt_path, &change.branch_name).await {
@@ -670,7 +674,8 @@ impl LucidosEngine {
                             Some(post_sha.clone()),
                         )
                         .await;
-                        self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref()).await;
+                        self.maybe_emit_app_ui_refresh(&kind_ctx, &change.files, actor.as_ref())
+                            .await;
                         self.emit_entity_events_for_change_apply(
                             &change.files,
                             Some(&pre_sha),
@@ -701,7 +706,8 @@ impl LucidosEngine {
 
                 // Look up resume token for potential resume
                 let resume_token =
-                    CodingAgentChangeOps::lookup_session_id_for_resume(self.as_ref(), thread_id).await;
+                    CodingAgentChangeOps::lookup_session_id_for_resume(self.as_ref(), thread_id)
+                        .await;
 
                 // Park the actor by change_id so the conflict-recovery cleanup
                 // in `run_session.rs` (the `if let Some(change) = conflict_change`
@@ -910,7 +916,8 @@ impl LucidosEngine {
                     Some(shas.1.clone()),
                 )
                 .await;
-                self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref()).await;
+                self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref())
+                    .await;
                 self.emit_entity_events_for_change_apply(
                     &change.files,
                     Some(&shas.0),
@@ -946,8 +953,7 @@ impl LucidosEngine {
             );
 
             if add_ok {
-                let result =
-                    catchup_and_ff_to_main(repo_root, &temp_wt, &change.branch_name).await;
+                let result = catchup_and_ff_to_main(repo_root, &temp_wt, &change.branch_name).await;
                 let _ = git_cmd(&["worktree", "remove", "--force", &temp_wt_str], repo_root).await;
 
                 if let Ok((pre_sha, post_sha)) = result {
@@ -970,7 +976,8 @@ impl LucidosEngine {
                         Some(post_sha.clone()),
                     )
                     .await;
-                    self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref()).await;
+                    self.maybe_emit_app_ui_refresh(kind_ctx, &change.files, actor.as_ref())
+                        .await;
                     self.emit_entity_events_for_change_apply(
                         &change.files,
                         Some(&pre_sha),
@@ -1055,7 +1062,12 @@ impl LucidosEngine {
         if let Some(a) = actor.as_ref() {
             self.pending_apply_actors.stash(change_id, a.clone());
         }
-        CodingAgentChangeOps::spawn_merge_session(self.as_ref(), thread_id, change_id, &change.description);
+        CodingAgentChangeOps::spawn_merge_session(
+            self.as_ref(),
+            thread_id,
+            change_id,
+            &change.description,
+        );
         Ok(ApplyResult::conflict(
             change_id,
             thread_id,

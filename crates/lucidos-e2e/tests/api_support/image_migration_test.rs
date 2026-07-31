@@ -54,12 +54,11 @@ async fn migration_rewrites_legacy_message_received_payload_to_hashes() {
         .await
         .expect("migration");
 
-    let (rewritten,): (Value,) =
-        sqlx::query_as("SELECT payload FROM events WHERE id = $1")
-            .bind(event_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read back");
+    let (rewritten,): (Value,) = sqlx::query_as("SELECT payload FROM events WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back");
     assert!(
         rewritten.get("user_images").is_none(),
         "legacy user_images must be removed, got: {rewritten}"
@@ -114,12 +113,11 @@ async fn migration_rewrites_production_images_field_to_hashes() {
         .await
         .expect("migration");
 
-    let (rewritten,): (Value,) =
-        sqlx::query_as("SELECT payload FROM events WHERE id = $1")
-            .bind(event_id)
-            .fetch_one(&pool)
-            .await
-            .expect("read back");
+    let (rewritten,): (Value,) = sqlx::query_as("SELECT payload FROM events WHERE id = $1")
+        .bind(event_id)
+        .fetch_one(&pool)
+        .await
+        .expect("read back");
     assert!(
         rewritten.get("images").is_none(),
         "legacy images field must be removed, got: {rewritten}"
@@ -179,7 +177,10 @@ async fn migration_skips_non_legacy_images_arrays() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(after, response_payload, "ResponseGenerated must not be touched");
+    assert_eq!(
+        after, response_payload,
+        "ResponseGenerated must not be touched"
+    );
 
     sqlx::query("DELETE FROM events WHERE id = $1")
         .bind(response_id)
@@ -262,13 +263,12 @@ async fn migration_preserves_already_migrated_compose_images() {
         .await
         .expect("migration");
 
-    let (after,): (Value,) = sqlx::query_as(
-        "SELECT compose_images FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let (after,): (Value,) =
+        sqlx::query_as("SELECT compose_images FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         after, hashes,
         "already-migrated compose_images hash array must survive intact"

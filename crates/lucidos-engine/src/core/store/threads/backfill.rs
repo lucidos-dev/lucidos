@@ -48,12 +48,8 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set(
-            &self.pool,
-            BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER,
-            "1",
-        )
-        .await?;
+        crate::core::PreferenceStore::set(&self.pool, BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER, "1")
+            .await?;
         Ok(updated)
     }
 
@@ -168,12 +164,8 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set(
-            &self.pool,
-            BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER,
-            "1",
-        )
-        .await?;
+        crate::core::PreferenceStore::set(&self.pool, BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER, "1")
+            .await?;
         Ok(inserted)
     }
 
@@ -210,12 +202,9 @@ impl EventStore {
         &self,
         default_repo_det_id: uuid::Uuid,
     ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-        if crate::core::PreferenceStore::get(
-            &self.pool,
-            BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER,
-        )
-        .await?
-        .is_some()
+        if crate::core::PreferenceStore::get(&self.pool, BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER)
+            .await?
+            .is_some()
         {
             return Ok(0);
         }

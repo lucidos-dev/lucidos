@@ -26,6 +26,7 @@ import type {
   PluginUninstallRequest,
 } from './types';
 import { MENU_ITEMS } from './types';
+import type { AppUpdateRunning } from '../utils/tauri';
 import type { ThreadState, ThreadStatus, Exchange } from './thread-events';
 import { computeExchanges, isExcludedFromSections } from './thread-events';
 import { getThreadEventsBump } from './threadActivity';
@@ -209,6 +210,26 @@ export const latestTauriAppVersion = signal<string | null>(null);
  *  DIAGNOSABLE instead of silent — swallowing it is what made a stranded 0.15.0
  *  install indistinguishable from an up-to-date one. */
 export const appUpdateCheckError = signal<string | null>(null);
+/** Live phase of a packaged app-update run, or `null` when none is in flight.
+ *  Fed by the `app-update-progress` Tauri event (store/actions/app-update.ts);
+ *  the engine has no part in it, so this stays null in a browser / PWA / dev
+ *  client. Read by BOTH the progress toast and Settings → System so the two can
+ *  never disagree about what the update is doing.
+ *
+ *  Typed to the IN-FLIGHT frames only: `cancelled` / `failed` end a run, and the
+ *  handler clears this signal on them rather than storing them, so "a terminal
+ *  frame parked as live state" is not representable and no reader has to
+ *  re-narrow for it. */
+export const appUpdateProgress = signal<AppUpdateRunning | null>(null);
+/** True when the packaged update has passed the point of no return: the bundle
+ *  is being swapped or the stack restarted, which kills the gateway under the
+ *  page. The resulting connection/SSE failures would bury the narration, so —
+ *  exactly as `engineRestarting` does for a restart — they are suppressed and
+ *  only the update's own toast (`showDuringRestart`) stays on screen. */
+export const appUpdateCommitted = computed(() => {
+  const phase = appUpdateProgress.value?.phase;
+  return phase === 'installing' || phase === 'restarting-services' || phase === 'relaunching';
+});
 /** True when the connected engine is a packaged desktop build. Routes the
  *  "Restart" control (LaunchAgent kickstart vs. dev rebuild script) and gates
  *  the Tauri-only Mobile Access settings page. Set from /health. */
@@ -950,19 +971,32 @@ export function encodeRepoPath(repoId: string, mode: 'file' | 'diff', path: stri
 
 /** Decode a repo file path from the panel overlay. Returns null if not a repo path.
  *  Accepts both new (`diff#<changeId>`) and legacy (`diff`) encodings — legacy
- *  entries from older nav histories degrade to changeId-less but still parse. */
+ *  entries from older nav histories degrade to changeId-less but still parse.
+ *
+ *  Every segment must be non-empty: this is the single predicate that decides
+ *  "is this a repo path" for `normalizeDataPath`, `ContentPane`'s routing, and
+ *  `openEncodedRepoFilePreview`, and `file_path` reaches it from outside the app
+ *  (an app iframe's `lucidos.ui.navigate`, an LLM `navigate_ui`). A structurally
+ *  incomplete encoding like `repo::file:x` or `repo:r1:file:` would otherwise
+ *  parse into an empty repoId (an "is a repo selected?" state that is neither
+ *  null nor a real id) or an empty path, and open a preview that can only 404 —
+ *  instead of falling back to the data-path preview. */
 export function parseRepoPath(encoded: string): { repoId: string; mode: 'file' | 'diff'; changeId?: string; path: string } | null {
   if (!encoded.startsWith('repo:')) return null;
   const [, repoId, modeSeg, ...rest] = encoded.split(':');
+  const path = rest.join(':');
+  if (!repoId || !path) return null;
   if (modeSeg === 'file') {
-    return { repoId, mode: 'file', path: rest.join(':') };
+    return { repoId, mode: 'file', path };
   }
   if (modeSeg === 'diff') {
-    return { repoId, mode: 'diff', path: rest.join(':') };
+    return { repoId, mode: 'diff', path };
   }
   const DIFF_PREFIX = 'diff#';
   if (modeSeg?.startsWith(DIFF_PREFIX)) {
-    return { repoId, mode: 'diff', changeId: modeSeg.slice(DIFF_PREFIX.length), path: rest.join(':') };
+    const changeId = modeSeg.slice(DIFF_PREFIX.length);
+    if (!changeId) return null;
+    return { repoId, mode: 'diff', changeId, path };
   }
   return null;
 }
@@ -1351,8 +1385,8 @@ export const TOAST_AUTO_DISMISS_MS = 5_000;
  *  Map entry would survive until the setTimeout fires. */
 const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; autoDismissMs?: number; dismissable?: boolean; showDuringRestart?: boolean; noAutofocus?: boolean }) {
-  const { key, action, secondaryAction, onClick, spinning, autoDismissMs, dismissable, showDuringRestart, noAutofocus } = opts ?? {};
+export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; progress?: number | null; autoDismissMs?: number; dismissable?: boolean; showDuringRestart?: boolean; noAutofocus?: boolean }) {
+  const { key, action, secondaryAction, onClick, spinning, progress, autoDismissMs, dismissable, showDuringRestart, noAutofocus } = opts ?? {};
   // While the engine is restarting the UiBlockingOverlay covers the screen and
   // every in-flight request fails as the engine goes down (changes fetch, SSE,
   // health poll). Suppress the resulting failure/info toasts — including the
@@ -1362,12 +1396,18 @@ export function showToast(message: string, type: ToastType = 'info', opts?: { ke
   // restart completes (engineRestarting flips back to false — e.g. the "Engine
   // restarted" / "Restart failed" / "Engine restart timed out" toasts, each set
   // after clearing the flag) show normally.
-  if (engineRestarting.value && !showDuringRestart) return;
+  //
+  // A COMMITTED packaged update is the same situation reached a different way:
+  // installing the new bundle restarts the launchd service, which kills the
+  // gateway serving this page, so the same wave of connection/SSE failures
+  // arrives. Suppress it identically, or it buries the update's own narration in
+  // the seconds before the client re-execs.
+  if ((engineRestarting.value || appUpdateCommitted.value) && !showDuringRestart) return;
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);
     if (existing) {
-      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, secondaryAction, onClick, spinning, dismissable, noAutofocus } : t);
+      toasts.value = toasts.value.map((t) => t.key === key ? { ...t, message, type, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus } : t);
       scheduleAutoDismiss(key, autoDismissMs);
       return;
     }
@@ -1381,7 +1421,7 @@ export function showToast(message: string, type: ToastType = 'info', opts?: { ke
   // Prepend so the newest toast renders at the top of the column-stacked
   // container and pushes existing ones down (the container is pinned to the
   // top of the viewport, so array order is top→bottom).
-  toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, dismissable, noAutofocus, pane }, ...toasts.value];
+  toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, pane }, ...toasts.value];
   if (key) {
     scheduleAutoDismiss(key, autoDismissMs);
     return;

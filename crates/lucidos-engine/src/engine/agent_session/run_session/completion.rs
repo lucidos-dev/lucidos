@@ -413,7 +413,14 @@ impl LucidosEngine {
             if should_auto_commit_on_cleanup(should_discard, &last_terminal_kind) {
                 self.commit_dirty_logged("Coding agent changes", "coding agent cleanup")
                     .await;
-                auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Coding agent changes (auto-committed)").await;
+                auto_commit_preserving_marker(
+                    &self.pool,
+                    wt,
+                    &repo_root,
+                    &branch_name,
+                    "Coding agent changes (auto-committed)",
+                )
+                .await;
             }
 
             if should_discard {
@@ -483,7 +490,9 @@ impl LucidosEngine {
                     branch_name.as_str()
                 };
 
-                let was_hardened = branch_is_hardened(&self.pool, self.changes(), &repo_root, effective_branch).await;
+                let was_hardened =
+                    branch_is_hardened(&self.pool, self.changes(), &repo_root, effective_branch)
+                        .await;
                 let has_commits = has_branch_commits(&repo_root, effective_branch).await;
                 let changed_files = if has_commits {
                     branch_changed_files(&repo_root, effective_branch).await
@@ -560,7 +569,8 @@ impl LucidosEngine {
                         let repo_root_str = repo_root.to_string_lossy().to_string();
 
                         let fallback =
-                            change_description_fallback(self.pool(), thread_id, effective_branch).await;
+                            change_description_fallback(self.pool(), thread_id, effective_branch)
+                                .await;
                         let base = default_local_branch(&repo_root).await;
                         let log_range = format!("{}..{}", base, effective_branch);
                         let description =
@@ -590,7 +600,8 @@ impl LucidosEngine {
                             Ok(_change_id) => {
                                 proposed_change = true;
                                 if was_hardened {
-                                    consume_harden_marker(&self.pool, &repo_root, effective_branch).await;
+                                    consume_harden_marker(&self.pool, &repo_root, effective_branch)
+                                        .await;
                                 }
                                 if !last_emitted_idle {
                                     // Session-end cleanup path: by the time we reach this

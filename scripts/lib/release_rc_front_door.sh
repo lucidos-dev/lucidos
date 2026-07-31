@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 # release_rc_front_door.sh — publish the release candidate's OWN installer to
-# https://lucidos.dev/rc, and wait until that origin actually serves it, BEFORE
+# https://rc.lucidos.dev, and wait until that origin actually serves it, BEFORE
 # the rc/<version> branch is pushed.
 #
 # WHY THE ORDER MATTERS (this file exists for exactly one reason)
 #
 # The front-door gate for a release candidate runs in CI on `push: rc/**`, in
-# payload mode, against https://lucidos.dev/rc. Its rung-1 check parses
+# payload mode, against https://rc.lucidos.dev. Its rung-1 check parses
 # LUCIDOS_DEFAULT_VERSION out of the installer that origin serves and FAILS
 # unless it matches rc/<version> — deliberately, so the gate can never pass by
 # verifying the previous candidate.
 #
-# But /rc is not published by CI. It is published from this Mac, by the Site
+# But the RC origin is not published by CI. It is published from this Mac, by the Site
 # Publisher trigger chain. So if the branch goes up first, GitHub starts the job
 # against an origin that still holds the LAST RC (or nothing at all) and the leg
 # reds for a pure ordering reason — a red that says nothing about the candidate.
 #
-# Hence: publish /rc, prove it is live, THEN push the branch. By the time the
+# Hence: publish the RC, prove it is live, THEN push the branch. By the time the
 # push event reaches GitHub the origin already serves this candidate, so the
 # gate tests what it claims to test. This is the same "publish before you check"
 # rule the production front door follows (see the verify-front-door-after-publish
@@ -28,7 +28,29 @@
 # is not armed, and the source-install and DMG-verify legs still gate the RC.
 
 # rc_front_door_url — the origin the RC front door is served from.
-rc_front_door_url() { printf 'https://lucidos.dev/rc'; }
+rc_front_door_url() { printf 'https://rc.lucidos.dev'; }
+
+# The RC origin is gated by Cloudflare Access, so every fetch of it must present
+# the `lucidos-ci-front-door` service token. CI gets it from repo secrets; this
+# script gets it from the environment, optionally sourced from a local env file
+# so the operator does not have to export it by hand every release.
+#
+# Fails SOFT when absent: without credentials the gate answers 302 to the login
+# page, rc_front_door_serves_version sees HTML and returns 1, and the arm step
+# reports "not serving this candidate" rather than exploding. That is the same
+# non-fatal shape as every other failure in this file.
+RC_ACCESS_ENV_FILE="${RC_ACCESS_ENV_FILE:-$HOME/.config/lucidos/rc-access.env}"
+
+rc_access_headers() {
+    if [[ -z "${RC_ACCESS_CLIENT_ID:-}" && -f "$RC_ACCESS_ENV_FILE" ]]; then
+        # shellcheck disable=SC1090
+        . "$RC_ACCESS_ENV_FILE"
+    fi
+    [[ -n "${RC_ACCESS_CLIENT_ID:-}" && -n "${RC_ACCESS_CLIENT_SECRET:-}" ]] || return 1
+    printf '%s\n%s\n' \
+        "CF-Access-Client-Id: ${RC_ACCESS_CLIENT_ID}" \
+        "CF-Access-Client-Secret: ${RC_ACCESS_CLIENT_SECRET}"
+}
 
 # rc_front_door_request_publish <rc-tree> <version>
 #
@@ -81,7 +103,17 @@ rc_front_door_request_publish() {
 rc_front_door_serves_version() {
     local version="$1" url="${2:-$(rc_front_door_url)}" body served
 
-    body="$(curl -fsSL --max-time 20 "$url/install.sh" 2>/dev/null)" || return 1
+    local -a hdr=()
+    local line
+    while IFS= read -r line; do
+        [[ -n "$line" ]] && hdr+=(-H "$line")
+    done < <(rc_access_headers || true)
+
+    # ${hdr[@]+"${hdr[@]}"} rather than "${hdr[@]}": macOS ships bash 3.2, where
+    # expanding an EMPTY array under `set -u` is an unbound-variable abort. That
+    # made the no-credentials path die instead of returning 1 — which still
+    # looked like a pass, because both are non-zero.
+    body="$(curl -fsSL --max-time 20 ${hdr[@]+"${hdr[@]}"} "$url/install.sh" 2>/dev/null)" || return 1
     [[ -n "$body" ]] || return 1
 
     # HTML means the route is not there yet, whatever the status said.

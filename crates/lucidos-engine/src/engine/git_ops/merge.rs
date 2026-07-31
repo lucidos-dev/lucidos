@@ -260,7 +260,6 @@ pub(crate) fn is_merge_of_branch_into_main(line: &str, branch_name: &str) -> boo
     true
 }
 
-
 /// Clean up stale git state and re-attach HEAD to main if needed.
 ///
 /// A Claude Code session (or any git operation) can leave behind:
@@ -366,11 +365,7 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
                 local_branch,
                 remote_ref
             ),
-            Err(e) => log!(
-                "[Changes] Failed to fast-forward {}: {}",
-                local_branch,
-                e
-            ),
+            Err(e) => log!("[Changes] Failed to fast-forward {}: {}", local_branch, e),
         }
     } else {
         // Not on the default branch -- update the local ref directly (local-only, no network)
@@ -386,11 +381,7 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
                 local_branch,
                 remote_ref
             ),
-            Err(e) => log!(
-                "[Changes] Failed to update local {}: {}",
-                local_branch,
-                e
-            ),
+            Err(e) => log!("[Changes] Failed to update local {}: {}", local_branch, e),
         }
     }
 
@@ -465,7 +456,6 @@ pub(crate) async fn find_branch_merge_in_main(
 
     Some((parent1, merge_sha))
 }
-
 
 /// Detect the local default branch name (e.g. `main`, `master`, `develop`, `trunk`).
 ///

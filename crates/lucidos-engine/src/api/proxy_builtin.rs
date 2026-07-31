@@ -161,7 +161,10 @@ async fn resolve_anthropic(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (Status
         // the app can't add it (it doesn't know the credential is OAuth), so the
         // engine injects it here too.
         AuthType::Bearer => vec![
-            Arc::new(StaticHeaderLayer::bearer("anthropic-auth".to_string(), value)),
+            Arc::new(StaticHeaderLayer::bearer(
+                "anthropic-auth".to_string(),
+                value,
+            )),
             Arc::new(
                 StaticHeaderLayer::api_key(
                     "anthropic-oauth-beta".to_string(),
@@ -388,8 +391,10 @@ mod tests {
     /// without minting a real ADC token.
     #[tokio::test]
     async fn vertex_layer_attaches_bearer_from_cached_token() {
-        let cache: TokenCache =
-            Arc::new(std::sync::Mutex::new(Some(("tok-123".to_string(), Instant::now()))));
+        let cache: TokenCache = Arc::new(std::sync::Mutex::new(Some((
+            "tok-123".to_string(),
+            Instant::now(),
+        ))));
         let layer = VertexAdcLayer::new(cache.clone());
         let body = Bytes::new();
         let prior = HashMap::new();
@@ -402,7 +407,10 @@ mod tests {
 
         // invalidate_cache clears the cached token so the next apply re-mints.
         layer.invalidate_cache().await;
-        assert!(cache.lock().unwrap().is_none(), "cache cleared on invalidate");
+        assert!(
+            cache.lock().unwrap().is_none(),
+            "cache cleared on invalidate"
+        );
     }
 
     // ---- DB-backed resolver tests (need Postgres via test-engine.sh) --------
@@ -448,7 +456,10 @@ mod tests {
         assert_eq!(target.0, OPENAI_DEFAULT_BASE_URL);
         assert_eq!(
             injected_headers(&target).await,
-            vec![("authorization".to_string(), "Bearer sk-test-openai".to_string())]
+            vec![(
+                "authorization".to_string(),
+                "Bearer sk-test-openai".to_string()
+            )]
         );
         teardown_test_db(&db).await;
     }
@@ -470,7 +481,9 @@ mod tests {
         .await
         .expect("seed openrouter credential");
 
-        let target = resolve_openrouter(&pool).await.expect("openrouter resolves");
+        let target = resolve_openrouter(&pool)
+            .await
+            .expect("openrouter resolves");
         assert_eq!(target.0, OPENROUTER_BASE_URL);
         assert_eq!(
             injected_headers(&target).await,
@@ -526,7 +539,10 @@ mod tests {
         let target = resolve_anthropic(&pool).await.expect("anthropic resolves");
         let headers = injected_headers(&target).await;
         assert!(
-            headers.contains(&("authorization".to_string(), "Bearer oauth-token-xyz".to_string())),
+            headers.contains(&(
+                "authorization".to_string(),
+                "Bearer oauth-token-xyz".to_string()
+            )),
             "must inject the OAuth bearer token: {headers:?}"
         );
         assert!(

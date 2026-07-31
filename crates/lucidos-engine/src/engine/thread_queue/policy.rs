@@ -188,7 +188,8 @@ impl CapacityPolicy {
         // it instead of stacking a duplicate (the restart-storm pile-up fix).
         // Cron only; event triggers carry a per-fire `event_payload` and keep
         // strict FIFO.
-        if kind == ThreadQueueKind::Cron && (counts.trigger_active >= 1 || counts.trigger_queued >= 1)
+        if kind == ThreadQueueKind::Cron
+            && (counts.trigger_active >= 1 || counts.trigger_queued >= 1)
         {
             return AdmissionDecision::Coalesce;
         }

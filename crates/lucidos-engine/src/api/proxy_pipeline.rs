@@ -445,15 +445,9 @@ mod tests {
         });
         let layers: Vec<Arc<dyn AuthLayer>> = vec![layer.clone()];
         let body = bytes::Bytes::from(b"small body".to_vec());
-        run_pipeline(
-            &layers,
-            &axum::http::Method::POST,
-            "https://x",
-            &[],
-            &body,
-        )
-        .await
-        .unwrap();
+        run_pipeline(&layers, &axum::http::Method::POST, "https://x", &[], &body)
+            .await
+            .unwrap();
         let captured = layer.captured.lock().unwrap();
         match captured.as_ref().unwrap() {
             BodyViewSnapshot::Raw(len) => assert_eq!(*len, 10),
@@ -472,15 +466,9 @@ mod tests {
         let body = bytes::Bytes::from(vec![0xABu8; body_size]);
         let expected_hash = body_hash(&body);
         let expected_hex = hex_lower(&expected_hash);
-        run_pipeline(
-            &layers,
-            &axum::http::Method::POST,
-            "https://x",
-            &[],
-            &body,
-        )
-        .await
-        .unwrap();
+        run_pipeline(&layers, &axum::http::Method::POST, "https://x", &[], &body)
+            .await
+            .unwrap();
         let captured = layer.captured.lock().unwrap();
         match captured.as_ref().unwrap() {
             BodyViewSnapshot::HashOnly { sha256_hex, length } => {

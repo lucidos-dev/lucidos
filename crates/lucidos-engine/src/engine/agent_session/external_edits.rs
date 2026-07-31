@@ -92,7 +92,12 @@ async fn git_status_lines(worktree_path: &Path) -> Vec<String> {
 /// if the range is empty or the command fails.
 async fn git_log_oneline(worktree_path: &Path, last_sha: &str) -> String {
     let range = format!("{}..HEAD", last_sha);
-    match git_cmd(&["log", "--oneline", "--no-decorate", &range], worktree_path).await {
+    match git_cmd(
+        &["log", "--oneline", "--no-decorate", &range],
+        worktree_path,
+    )
+    .await
+    {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => String::new(),
     }
@@ -140,7 +145,9 @@ pub(crate) async fn compute_external_edit_note(
     if head_moved {
         let log = git_log_oneline(worktree_path, last_sha).await;
         if log.is_empty() {
-            note.push_str("\nCommitted changes since your last action: HEAD moved (no log available).");
+            note.push_str(
+                "\nCommitted changes since your last action: HEAD moved (no log available).",
+            );
         } else {
             note.push_str("\nCommitted changes since your last action:\n");
             note.push_str(&log);

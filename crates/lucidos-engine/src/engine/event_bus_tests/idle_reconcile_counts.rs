@@ -19,13 +19,11 @@ async fn test_change_applied_reconciles_parent_active_children_count() {
     // Simulate the runtime drift: force parent's active_children_count back
     // up to 1 (as if the CodingAgentIdled decrement failed). The reconcile on
     // ChangeApplied must heal it.
-    sqlx::query(
-        "UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1",
-    )
-    .bind(parent_id)
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_active_children(&pool, parent_id, 1, "drift seeded").await;
 
     bus.emit(BusEvent::Thread {
@@ -87,13 +85,11 @@ async fn test_change_discarded_reconciles_parent_active_children_count() {
     emit_cc_idle(&bus, child_id, true, None).await;
 
     // Seed the same drift as the Apply test.
-    sqlx::query(
-        "UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1",
-    )
-    .bind(parent_id)
-    .execute(&pool)
-    .await
-    .unwrap();
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 1 WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
     assert_active_children(&pool, parent_id, 1, "drift seeded").await;
 
     bus.emit(BusEvent::Thread {
@@ -264,7 +260,13 @@ async fn test_cc_idle_multi_sibling_parent_count_remains_at_running_count() {
         .unwrap();
         emit_cc_session_started(&bus, cid).await;
     }
-    assert_active_children(&pool, parent_id, 2, "two CC children running, parent count = 2").await;
+    assert_active_children(
+        &pool,
+        parent_id,
+        2,
+        "two CC children running, parent count = 2",
+    )
+    .await;
 
     // Drain setup events.
     while rx.try_recv().is_ok() {}
@@ -378,7 +380,13 @@ async fn test_cc_idle_with_waiting_for_user_answer_sibling_keeps_count() {
         .unwrap();
         emit_cc_session_started(&bus, cid).await;
     }
-    assert_active_children(&pool, parent_id, 2, "two CC children running, parent count = 2").await;
+    assert_active_children(
+        &pool,
+        parent_id,
+        2,
+        "two CC children running, parent count = 2",
+    )
+    .await;
 
     // child_paused asks a permission question → status='waiting_for_user_answer'.
     // No reincrement / decrement on the parent; parent.count stays at 2.

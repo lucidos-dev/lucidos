@@ -73,7 +73,9 @@ fn thread_url(id: &Uuid) -> String {
 #[tokio::test]
 async fn post_threads_creates_composing_thread_and_persists_row() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
 
     let resp = client
@@ -146,7 +148,9 @@ async fn post_threads_conflict_on_different_mode() {
 #[tokio::test]
 async fn put_compose_updates_text_images_and_mode() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -181,7 +185,9 @@ async fn put_compose_updates_text_images_and_mode() {
 #[tokio::test]
 async fn put_compose_mode_toggle_updates_source() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -189,7 +195,11 @@ async fn put_compose_mode_toggle_updates_source() {
         .send()
         .await
         .expect("POST /threads failed");
-    assert_eq!(fetch_source(&pool, id).await, "chat", "lucidos POST seeds source=chat");
+    assert_eq!(
+        fetch_source(&pool, id).await,
+        "chat",
+        "lucidos POST seeds source=chat"
+    );
 
     client
         .put(compose_url(&id))
@@ -221,7 +231,9 @@ async fn put_compose_mode_toggle_updates_source() {
 #[tokio::test]
 async fn put_compose_text_only_preserves_source() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -247,7 +259,9 @@ async fn put_compose_text_only_preserves_source() {
 #[tokio::test]
 async fn put_compose_text_only_preserves_mode() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -275,7 +289,9 @@ async fn put_compose_text_only_preserves_mode() {
 #[tokio::test]
 async fn put_compose_persists_and_surfaces_selection() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -298,7 +314,10 @@ async fn put_compose_persists_and_surfaces_selection() {
     assert_eq!(resp.status(), 204);
 
     // Column persisted.
-    assert_eq!(fetch_compose_selection(&pool, id).await.as_ref(), Some(&selection));
+    assert_eq!(
+        fetch_compose_selection(&pool, id).await.as_ref(),
+        Some(&selection)
+    );
 
     // Surfaced on the composing list so the frontend rehydrates on reload.
     let listed: serde_json::Value = client
@@ -314,7 +333,10 @@ async fn put_compose_persists_and_surfaces_selection() {
         .iter()
         .find(|t| t["thread_id"] == json!(id.to_string()))
         .expect("draft present in composing[]");
-    assert_eq!(row["compose_selection"], selection, "selection must be on the list row");
+    assert_eq!(
+        row["compose_selection"], selection,
+        "selection must be on the list row"
+    );
 }
 
 /// A text-only keystroke PUT (no `selection` field) must PRESERVE the stored
@@ -322,7 +344,9 @@ async fn put_compose_persists_and_surfaces_selection() {
 #[tokio::test]
 async fn put_compose_text_only_preserves_selection() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -357,7 +381,9 @@ async fn put_compose_text_only_preserves_selection() {
 #[tokio::test]
 async fn delete_thread_marks_discarded() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
     client
         .post(threads_url())
@@ -462,7 +488,9 @@ async fn delete_unknown_thread_is_idempotent_no_op() {
 #[tokio::test]
 async fn put_compose_on_archived_thread_returns_no_content() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
 
     client
@@ -524,7 +552,9 @@ async fn put_compose_on_archived_thread_returns_no_content() {
 #[tokio::test]
 async fn put_compose_on_archived_rejects_mode_change() {
     let client = http_client();
-    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect to e2e db");
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
     let id = Uuid::new_v4();
 
     client

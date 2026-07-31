@@ -6,8 +6,9 @@ import { focusThreadOrBootstrap, unfocusThread } from './threads';
 import { pushNavState } from './navigation';
 import { revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
+import { openEncodedRepoFilePreview } from './repositories';
 import { focusPromptNow } from '../../components/chat/promptFocus';
-import { showToast, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel } from '../store';
+import { showToast, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
 
@@ -55,8 +56,13 @@ export function describeNavTarget(nav: {
       return nav.app_id ? `app "${nav.app_id}"` : 'an app';
     case 'thread':
       return 'a thread';
-    case 'file':
-      return nav.file_path ? `file "${nav.file_path}"` : 'a file';
+    case 'file': {
+      if (!nav.file_path) return 'a file';
+      // A repo-encoded path (`repo:<repoId>:file:<path>`) names the repo file
+      // it points at — the raw encoding would read as a uuid soup in the toast.
+      const repo = parseRepoPath(nav.file_path);
+      return `file "${repo?.path ?? nav.file_path}"`;
+    }
     case 'trigger':
       return 'a trigger';
     case 'url':
@@ -166,15 +172,22 @@ export function handleNavigationRequest(nav: {
       // miss toast names the app id + where the navigate came from.
       void openAppById(navAppId, opts?.source);
       break;
-    case 'file':
+    case 'file': {
       // file_path existence is server-checked at preview time; the API surface
       // emits its own toast on miss. Up-front check is just for presence.
       if (!nav.file_path) {
         showToast('Navigation target missing file_path', 'error');
         break;
       }
-      openFilePreview(normalizeDataPath(nav.file_path));
+      const filePath = normalizeDataPath(nav.file_path);
+      // A repo-encoded path (`repo:<repoId>:file:<path>`) opens a file from a
+      // registered repository clone rather than the workspace data tree, and
+      // needs that repo bound before the panel mounts — see
+      // openEncodedRepoFilePreview, which returns false for anything else so a
+      // plain data path falls through to the /data/* preview.
+      if (!openEncodedRepoFilePreview(filePath)) openFilePreview(filePath);
       break;
+    }
     case 'trigger':
       if (!nav.id) {
         showToast('Navigation target missing trigger id', 'error');

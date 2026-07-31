@@ -18,11 +18,7 @@ fn threads_url() -> String {
 }
 
 fn blobs_url(thread_id: &Uuid) -> String {
-    format!(
-        "{}/api/v1/threads/{}/blobs",
-        base_url(),
-        thread_id
-    )
+    format!("{}/api/v1/threads/{}/blobs", base_url(), thread_id)
 }
 
 fn blob_url(hash: &str) -> String {
@@ -114,7 +110,11 @@ async fn post_blob_idempotent_on_same_bytes() {
         .send()
         .await
         .expect("first POST failed");
-    assert!(r1.status().is_success(), "first upload failed: {}", r1.status());
+    assert!(
+        r1.status().is_success(),
+        "first upload failed: {}",
+        r1.status()
+    );
     let h1: serde_json::Value = r1.json().await.unwrap();
 
     let r2 = client
@@ -123,13 +123,14 @@ async fn post_blob_idempotent_on_same_bytes() {
         .send()
         .await
         .expect("second POST failed");
-    assert!(r2.status().is_success(), "second upload failed: {}", r2.status());
+    assert!(
+        r2.status().is_success(),
+        "second upload failed: {}",
+        r2.status()
+    );
     let h2: serde_json::Value = r2.json().await.unwrap();
 
-    assert_eq!(
-        h1["hash"], h2["hash"],
-        "same bytes must produce same hash"
-    );
+    assert_eq!(h1["hash"], h2["hash"], "same bytes must produce same hash");
 }
 
 #[tokio::test]
@@ -167,7 +168,11 @@ async fn post_blob_rejects_missing_thread() {
         .send()
         .await
         .expect("POST failed");
-    assert_eq!(resp.status(), 404, "upload to nonexistent thread should be 404");
+    assert_eq!(
+        resp.status(),
+        404,
+        "upload to nonexistent thread should be 404"
+    );
 }
 
 #[tokio::test]
@@ -243,7 +248,11 @@ async fn get_blob_returns_bytes_with_mime_after_upload() {
         .unwrap()
         .to_string();
 
-    let resp = client.get(blob_url(&hash)).send().await.expect("GET failed");
+    let resp = client
+        .get(blob_url(&hash))
+        .send()
+        .await
+        .expect("GET failed");
     assert_eq!(resp.status(), 200, "GET should be 200");
     assert_eq!(
         resp.headers()
@@ -271,7 +280,11 @@ async fn get_blob_sets_immutable_cache_header() {
         .unwrap()
         .to_string();
 
-    let resp = client.get(blob_url(&hash)).send().await.expect("GET failed");
+    let resp = client
+        .get(blob_url(&hash))
+        .send()
+        .await
+        .expect("GET failed");
     let cache = resp
         .headers()
         .get("cache-control")
@@ -289,7 +302,11 @@ async fn get_blob_returns_404_for_unknown_hash() {
     let client = http_client();
     // Valid-shaped hash but unused.
     let bogus = "0".repeat(64);
-    let resp = client.get(blob_url(&bogus)).send().await.expect("GET failed");
+    let resp = client
+        .get(blob_url(&bogus))
+        .send()
+        .await
+        .expect("GET failed");
     assert_eq!(resp.status(), 404);
 }
 
@@ -297,9 +314,17 @@ async fn get_blob_returns_404_for_unknown_hash() {
 async fn get_blob_returns_404_for_malformed_hash() {
     let client = http_client();
     // Path traversal attempt + short string — must not 200.
-    let resp = client.get(blob_url("..%2F..%2Fetc%2Fpasswd")).send().await.expect("GET failed");
+    let resp = client
+        .get(blob_url("..%2F..%2Fetc%2Fpasswd"))
+        .send()
+        .await
+        .expect("GET failed");
     assert_ne!(resp.status(), 200);
-    let resp = client.get(blob_url("short")).send().await.expect("GET failed");
+    let resp = client
+        .get(blob_url("short"))
+        .send()
+        .await
+        .expect("GET failed");
     assert_eq!(resp.status(), 404);
 }
 
@@ -384,7 +409,10 @@ async fn get_blob_preview_serves_original_when_image_within_cap() {
         "small image: serve original mime"
     );
     let returned = resp.bytes().await.expect("read body").to_vec();
-    assert_eq!(returned, bytes, "small image: returned bytes match original");
+    assert_eq!(
+        returned, bytes,
+        "small image: returned bytes match original"
+    );
 }
 
 #[tokio::test]
@@ -449,7 +477,11 @@ async fn post_blob_pregenerates_preview_in_background_for_large_image() {
         .send()
         .await
         .expect("upload failed");
-    assert!(upload.status().is_success(), "upload failed: {}", upload.status());
+    assert!(
+        upload.status().is_success(),
+        "upload failed: {}",
+        upload.status()
+    );
     let hash = upload.json::<serde_json::Value>().await.unwrap()["hash"]
         .as_str()
         .unwrap()
@@ -458,7 +490,10 @@ async fn post_blob_pregenerates_preview_in_background_for_large_image() {
     let cache_path = workspace_path()
         .join(".lucidos/blob-previews")
         .join(&hash[..2])
-        .join(format!("{hash}-{}.jpg", lucidos_engine::core::blobs::PREVIEW_MAX_EDGE));
+        .join(format!(
+            "{hash}-{}.jpg",
+            lucidos_engine::core::blobs::PREVIEW_MAX_EDGE
+        ));
 
     // Background task starts after upload returns; poll for the cache file
     // to appear within a generous window (debug build, Lanczos3 4k→2k).

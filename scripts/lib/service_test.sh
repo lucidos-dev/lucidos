@@ -304,6 +304,26 @@ else
     fail "expected a foreground launch (rc=$rc): $out"
 fi
 if [ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ]; then pass "no launchd plist written under --no-service"; else fail "a plist was written under --no-service"; fi
+# The FOREGROUND shape has to record the port marker too. That marker is the
+# whole of instance discovery (service_list_instance_names keys on it), so
+# without it a --no-service or degraded install is invisible to
+# `uninstall.sh --list` and unremovable by `--all --purge`, which returns early
+# with no targets and leaves the data dir AND the shared runtime on disk.
+assert_foreground_marker() {   # <prefix> <label>
+    local pfx="$1" label="$2" marker="$1/default/port" listed
+    if [ -f "$marker" ] && grep -qE '^[0-9]+$' "$marker"; then
+        pass "$label recorded the instance port marker ($(tr -d '\n' < "$marker"))"
+    else
+        fail "$label left no usable port marker at $marker"
+    fi
+    listed="$(service_list_instance_names "$pfx")"
+    if [ "$listed" = "default" ]; then
+        pass "$label install is discoverable (service_list_instance_names finds it)"
+    else
+        fail "$label: service_list_instance_names '$pfx' = '$listed' (expected 'default')"
+    fi
+}
+assert_foreground_marker "$PREFIX" "--no-service"
 rm -rf "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: no service manager → graceful degrade to FOREGROUND ──────────
@@ -319,6 +339,10 @@ else
     fail "expected a no-manager degrade to foreground (rc=$rc): $out"
 fi
 if [ -z "$(ls "$FAKEHOME/Library/LaunchAgents/" 2>/dev/null)" ]; then pass "no plist written on the degrade path"; else fail "a plist was written on the degrade path"; fi
+# The degrade path is the shape a container takes (install-smoke.yml's front-door
+# job runs in a bare ubuntu:22.04 with no launchd and no systemd), and it is the
+# one that used to leave nothing behind for the uninstaller to find.
+assert_foreground_marker "$PREFIX" "the no-manager degrade"
 rm -rf "$FB" "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: register wiring (fake launchctl + fast health timeout) ───────

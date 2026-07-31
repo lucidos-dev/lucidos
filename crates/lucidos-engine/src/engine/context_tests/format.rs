@@ -257,7 +257,8 @@ fn strips_loaded_body_substring() {
     // with a pointer to the [LOADED KNOWHOW] section. Match is by exact body
     // substring — avoids the id-vs-name mismatch (loaded set is keyed by id,
     // marker uses name).
-    let body = "[SYSTEM-KNOWHOW: Nightly Ops]\nfull body line 1\nfull body line 2\n[END SYSTEM-KNOWHOW]";
+    let body =
+        "[SYSTEM-KNOWHOW: Nightly Ops]\nfull body line 1\nfull body line 2\n[END SYSTEM-KNOWHOW]";
     let content = format!("Before\n{body}\nAfter");
     let out = format_history_content(&content, "user", false, &[body]);
     assert!(
@@ -283,21 +284,21 @@ fn strips_loaded_body_substring() {
 fn keeps_block_when_body_not_loaded() {
     // If the body in the history doesn't match any currently-loaded body,
     // leave the block (markers and all) intact.
-    let unrelated_body =
-        "[SYSTEM-KNOWHOW: Some Other Doc]\nunrelated body\n[END SYSTEM-KNOWHOW]";
+    let unrelated_body = "[SYSTEM-KNOWHOW: Some Other Doc]\nunrelated body\n[END SYSTEM-KNOWHOW]";
     let content = format!("Before\n{unrelated_body}\nAfter");
     let loaded = ["[SYSTEM-KNOWHOW: Nightly Ops]\nfull body\n[END SYSTEM-KNOWHOW]"];
     let out = format_history_content(&content, "user", false, &loaded);
-    assert_eq!(out, content, "non-matching body must pass through unchanged");
+    assert_eq!(
+        out, content,
+        "non-matching body must pass through unchanged"
+    );
 }
 
 #[test]
 fn handles_multiple_blocks() {
     // Two blocks in history: one matches a loaded body (stripped), one doesn't (kept).
-    let body_a =
-        "[SYSTEM-KNOWHOW: Doc A]\nbody A line one\nbody A line two\n[END SYSTEM-KNOWHOW]";
-    let body_b =
-        "[SYSTEM-KNOWHOW: Doc B]\nbody B line one\nbody B line two\n[END SYSTEM-KNOWHOW]";
+    let body_a = "[SYSTEM-KNOWHOW: Doc A]\nbody A line one\nbody A line two\n[END SYSTEM-KNOWHOW]";
+    let body_b = "[SYSTEM-KNOWHOW: Doc B]\nbody B line one\nbody B line two\n[END SYSTEM-KNOWHOW]";
     let content = format!("{body_a}\nmiddle\n{body_b}");
     let out = format_history_content(&content, "user", false, &[body_a]);
     assert!(

@@ -4,9 +4,18 @@ use serde_json::json;
 #[test]
 fn todo_status_serializes_as_snake_case() {
     use crate::engine::thread_events::TodoStatus;
-    assert_eq!(serde_json::to_value(TodoStatus::Pending).unwrap(), json!("pending"));
-    assert_eq!(serde_json::to_value(TodoStatus::InProgress).unwrap(), json!("in_progress"));
-    assert_eq!(serde_json::to_value(TodoStatus::Completed).unwrap(), json!("completed"));
+    assert_eq!(
+        serde_json::to_value(TodoStatus::Pending).unwrap(),
+        json!("pending")
+    );
+    assert_eq!(
+        serde_json::to_value(TodoStatus::InProgress).unwrap(),
+        json!("in_progress")
+    );
+    assert_eq!(
+        serde_json::to_value(TodoStatus::Completed).unwrap(),
+        json!("completed")
+    );
 }
 
 #[test]

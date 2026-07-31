@@ -459,13 +459,17 @@ impl LucidosEngine {
                         .iter()
                         .find(|r| r.name == "Lucidos")
                         .map(|r| std::path::PathBuf::from(&r.path));
-                    let class =
-                        classify_resolved_folder(&folder_abs, &ws_root, lucidos_root.as_deref(), |p| {
+                    let class = classify_resolved_folder(
+                        &folder_abs,
+                        &ws_root,
+                        lucidos_root.as_deref(),
+                        |p| {
                             registered_repos
                                 .iter()
                                 .find(|r| std::path::Path::new(&r.path) == p)
                                 .map(|r| std::path::PathBuf::from(&r.path))
-                        });
+                        },
+                    );
                     match class {
                         Ok(FolderClassification::Lucidos { .. }) => {
                             // Existing flow — no repo_id, default folder.

@@ -23,9 +23,7 @@ fn is_false(b: &bool) -> bool {
 /// Skip-serializing predicate for the default `CodingAgentKind` (`Lucidos`)
 /// — keeps `SessionStarted` rows that have no app/external context wire-quiet
 /// so the diff against legacy rows stays minimal.
-fn is_default_coding_agent_kind(
-    k: &crate::engine::agent_session::CodingAgentKind,
-) -> bool {
+fn is_default_coding_agent_kind(k: &crate::engine::agent_session::CodingAgentKind) -> bool {
     matches!(k, crate::engine::agent_session::CodingAgentKind::Lucidos)
 }
 fn default_session_ended_reason() -> SessionEndReason {
@@ -949,7 +947,9 @@ pub enum ThreadEvent {
     /// resolved it). The workspace working tree was restored from the checkpoint
     /// ref and the ref deleted; the frontend renders the card as reverted.
     /// Persisted so the reverted state survives reload.
-    CommandCheckpointReverted { checkpoint_id: String },
+    CommandCheckpointReverted {
+        checkpoint_id: String,
+    },
 
     /// Background worktree cleanup happened on this thread (Phase 10.2).
     /// `tier=1` means build artifacts (`target/`, `node_modules/`,

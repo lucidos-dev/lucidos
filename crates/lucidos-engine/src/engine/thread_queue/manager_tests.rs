@@ -80,7 +80,7 @@ fn spawn_user_slot(queue: Arc<ThreadQueue>, thread_id: Uuid) -> oneshot::Sender<
             .acquire_user_slot(Some(thread_id), "user message".to_string())
             .await;
         let _ = release_rx.await; // hold the slot until the test releases it
-        // _guard drops here → slot released + drain.
+                                  // _guard drops here → slot released + drain.
     });
     release_tx
 }
@@ -304,7 +304,10 @@ async fn submit_over_capacity_queues_then_drains_in_fifo_order() {
     assert!(!c.admitted);
     assert_eq!(b.position, 1);
     assert_eq!(c.position, 2);
-    assert_eq!(row_status(&f.pool, b.entry_id).await.as_deref(), Some("queued"));
+    assert_eq!(
+        row_status(&f.pool, b.entry_id).await.as_deref(),
+        Some("queued")
+    );
 
     // A finishes → B (and only B) admits, FIFO.
     f.executor.release_one();
@@ -404,16 +407,28 @@ async fn per_trigger_fifo_and_drop_oldest_overflow() {
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
     // per-trigger concurrency 1: first fire admits, the rest queue.
-    let a = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
-    let b = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
-    let c = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
+    let a = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    let b = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    let c = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
     assert!(a.admitted);
     assert!(!b.admitted, "per-trigger cap of 1 → second fire queues");
     assert!(!c.admitted);
 
     // max_queued_per_trigger = 2 → the next fire overflows; DropOldest
     // drops B (the oldest queued) and keeps the newcomer.
-    let d = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
+    let d = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
     assert!(!d.admitted);
     let pool = f.pool.clone();
     let b_id = b.entry_id;
@@ -425,8 +440,14 @@ async fn per_trigger_fifo_and_drop_oldest_overflow() {
     b.completion
         .await
         .expect("dropped entry must resolve its completion channel");
-    assert_eq!(row_status(&f.pool, c.entry_id).await.as_deref(), Some("queued"));
-    assert_eq!(row_status(&f.pool, d.entry_id).await.as_deref(), Some("queued"));
+    assert_eq!(
+        row_status(&f.pool, c.entry_id).await.as_deref(),
+        Some("queued")
+    );
+    assert_eq!(
+        row_status(&f.pool, d.entry_id).await.as_deref(),
+        Some("queued")
+    );
 
     // A different trigger is unaffected by trig-a's backlog (cross-trigger
     // is best-effort, capacity allows it).
@@ -434,7 +455,10 @@ async fn per_trigger_fifo_and_drop_oldest_overflow() {
         .write()
         .unwrap()
         .insert("trig-b".to_string(), test_trigger_config("trig-b"));
-    let other = f.queue.submit(event_trigger_request("trig-b"), None, None).await;
+    let other = f
+        .queue
+        .submit(event_trigger_request("trig-b"), None, None)
+        .await;
     assert!(other.admitted, "other triggers admit independently");
 
     f.pool.close().await;
@@ -505,7 +529,10 @@ async fn cron_coalesces_against_a_queued_fire() {
     // First cron fire queues (pool full).
     let a = f.queue.submit(cron_request("trig-a"), None, None).await;
     assert!(!a.admitted);
-    assert_eq!(row_status(&f.pool, a.entry_id).await.as_deref(), Some("queued"));
+    assert_eq!(
+        row_status(&f.pool, a.entry_id).await.as_deref(),
+        Some("queued")
+    );
 
     // Second cron fire coalesces against the queued one — no second row.
     let b = f.queue.submit(cron_request("trig-a"), None, None).await;
@@ -556,7 +583,8 @@ async fn recover_collapses_duplicate_cron_rows_to_one() {
         "recovery collapses duplicate cron fires to a single entry"
     );
     assert!(
-        row_status(&f.pool, queued1).await.is_none() && row_status(&f.pool, queued2).await.is_none(),
+        row_status(&f.pool, queued1).await.is_none()
+            && row_status(&f.pool, queued2).await.is_none(),
         "the later duplicate cron rows are dropped"
     );
     assert_eq!(
@@ -589,7 +617,10 @@ async fn drain_skips_paused_triggers_and_drops_deleted_ones() {
         .queue
         .submit(sub_thread_request(Uuid::new_v4()), None, None)
         .await;
-    let fire = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
+    let fire = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
     assert!(blocker.admitted);
     assert!(!fire.admitted);
 
@@ -622,8 +653,14 @@ async fn drain_skips_paused_triggers_and_drops_deleted_ones() {
     );
 
     // A queued fire whose trigger was deleted gets dropped at drain time.
-    let orphan = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
-    assert!(!orphan.admitted, "per-trigger cap holds while the fire runs");
+    let orphan = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    assert!(
+        !orphan.admitted,
+        "per-trigger cap holds while the fire runs"
+    );
     f.trigger_configs.write().unwrap().remove("trig-a");
     f.queue.drain().await;
     assert_eq!(row_status(&f.pool, orphan.entry_id).await, None);
@@ -640,9 +677,15 @@ async fn recover_requeues_admitted_trigger_entries_after_restart() {
         .unwrap()
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
-    let a = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
+    let a = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
     assert!(a.admitted);
-    assert_eq!(row_status(&f.pool, a.entry_id).await.as_deref(), Some("admitted"));
+    assert_eq!(
+        row_status(&f.pool, a.entry_id).await.as_deref(),
+        Some("admitted")
+    );
 
     // "Restart": a fresh manager over the same DB (the old process's
     // in-flight execution died with it).
@@ -657,10 +700,16 @@ async fn recover_requeues_admitted_trigger_entries_after_restart() {
     queue2.recover_persisted_entries().await;
 
     // The admitted-but-dead fire re-queued (status back to 'queued')…
-    assert_eq!(row_status(&f.pool, a.entry_id).await.as_deref(), Some("queued"));
+    assert_eq!(
+        row_status(&f.pool, a.entry_id).await.as_deref(),
+        Some("queued")
+    );
     // …and a drain re-fires it.
     queue2.drain().await;
-    assert_eq!(row_status(&f.pool, a.entry_id).await.as_deref(), Some("admitted"));
+    assert_eq!(
+        row_status(&f.pool, a.entry_id).await.as_deref(),
+        Some("admitted")
+    );
     assert_eq!(executor2.executed_ids(), vec![a.entry_id]);
 
     f.pool.close().await;
@@ -749,14 +798,29 @@ async fn pause_trigger_overflow_pauses_via_bus_event() {
         .insert("trig-a".to_string(), test_trigger_config("trig-a"));
 
     let mut rx = f.bus.subscribe();
-    let _a = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
-    let _b = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
-    let _c = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
+    let _a = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    let _b = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
+    let _c = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
     // Fourth fire overflows (cap 2) → trigger paused through the bus, the
     // newcomer stays queued (nothing dropped).
-    let d = f.queue.submit(event_trigger_request("trig-a"), None, None).await;
+    let d = f
+        .queue
+        .submit(event_trigger_request("trig-a"), None, None)
+        .await;
     assert!(!d.admitted);
-    assert_eq!(row_status(&f.pool, d.entry_id).await.as_deref(), Some("queued"));
+    assert_eq!(
+        row_status(&f.pool, d.entry_id).await.as_deref(),
+        Some("queued")
+    );
 
     let disabled = tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
@@ -1053,12 +1117,14 @@ async fn assert_settle_releases(settle_event: crate::engine::thread_events::Thre
 
 #[tokio::test]
 async fn settle_releases_user_slot_on_response_completion() {
-    assert_settle_releases(crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-        text: String::new(),
-        images: vec![],
-        model: None,
-        reasoning_effort: None,
-    })
+    assert_settle_releases(
+        crate::engine::thread_events::ThreadEvent::ResponseGenerated {
+            text: String::new(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+    )
     .await;
 }
 
@@ -1134,8 +1200,8 @@ async fn reconcile_frees_the_pool_when_thread_leaves_running_under_a_held_guard(
     let f = fixture(1).await;
     let tid = Uuid::new_v4();
     emit_message_received(&f.bus, tid).await; // status='running', initiator='user'
-    // The guard stays held by the detached task for the whole test — exactly
-    // the parked-CC shape where the chat task can't release on its own.
+                                              // The guard stays held by the detached task for the whole test, exactly
+                                              // the parked-CC shape where the chat task can't release on its own.
     let _release = spawn_user_slot(f.queue.clone(), tid);
     let q = f.queue.clone();
     wait_until(|| {
@@ -1213,7 +1279,10 @@ async fn reconcile_converges_pool_to_thread_status() {
         .into_iter()
         .filter(|e| e.thread_id == Some(tid))
         .count();
-    assert_eq!(count, 1, "reconcile must not double-add a running user thread");
+    assert_eq!(
+        count, 1,
+        "reconcile must not double-add a running user thread"
+    );
 
     // Thread leaves running → reconcile removes the slot.
     f.bus

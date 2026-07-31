@@ -99,10 +99,13 @@ const CC_ALLOWED_TOOLS_HEADER: &str =
 ///   * `Narrow` / `Broad` — persisted to `~/.lucidos/cc-allowed-tools` and
 ///     handed to CC via `--allowedTools` on every spawn. Survives engine
 ///     restart, but only takes effect for tools/paths CC actually respects.
-///   * `Session` — kept in memory on `PermissionState::session_allows`,
-///     scoped to one thread. Lost on engine restart. Works for *every* tool
-///     and *every* path (including CC's own protected paths like `.claude/`
-///     and `.git/`), because the engine intercepts before the prompt fires.
+///   * `Session` — cached on `PermissionState::session_allows`, scoped to one
+///     thread, and durable: the grant is persisted as the resolution event's
+///     `persist_scope`, and `cc_permission::hydrate_session_allows` refills the
+///     cache from the event store on the first prompt after an engine restart.
+///     Works for *every* tool and *every* path (including CC's own protected
+///     paths like `.claude/` and `.git/`), because the engine intercepts before
+///     the prompt fires.
 ///
 /// Wire form: `"narrow"` / `"broad"` / `"session"` (snake_case enum).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

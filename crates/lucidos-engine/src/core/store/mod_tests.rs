@@ -212,7 +212,10 @@ async fn count_events_with_type_filter_returns_matching_count_and_byte_total() {
         .await
         .expect("count_events");
     assert_eq!(count, 3, "only the 3 Matching rows count");
-    assert!(byte_total > 0, "byte_total must be > 0 for non-empty payload");
+    assert!(
+        byte_total > 0,
+        "byte_total must be > 0 for non-empty payload"
+    );
     // The byte_total should be the sum across the 3 matching rows. Each row's
     // payload serializes to the same length (deterministic JSON), so the
     // total must be evenly divisible by the per-row size.
@@ -264,7 +267,11 @@ async fn count_events_by_type_returns_breakdown_sorted_by_count_desc() {
 
     let types: Vec<&str> = rows.iter().map(|(t, _, _)| t.as_str()).collect();
     let counts: Vec<i64> = rows.iter().map(|(_, c, _)| *c).collect();
-    assert_eq!(types, vec!["Noisy", "Quiet", "Singleton"], "count desc order");
+    assert_eq!(
+        types,
+        vec!["Noisy", "Quiet", "Singleton"],
+        "count desc order"
+    );
     assert_eq!(counts, vec![5, 2, 1]);
     for (_, _, byte_total) in &rows {
         assert!(*byte_total > 0, "byte_total per type must be > 0");

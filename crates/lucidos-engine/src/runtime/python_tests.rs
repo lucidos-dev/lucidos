@@ -62,7 +62,11 @@ async fn test_execute_writes_outside_workspace_succeed() {
     let code = format!("open('{}', 'w').write('hello'); print('done')", target_str);
 
     let result = runtime.execute(&code).await;
-    assert!(result.is_ok(), "outside-workspace write failed: {:?}", result);
+    assert!(
+        result.is_ok(),
+        "outside-workspace write failed: {:?}",
+        result
+    );
     assert_eq!(result.unwrap().trim(), "done");
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "hello");
 }
@@ -152,6 +156,232 @@ async fn test_staging_non_data_writes_go_to_workspace() {
     assert!(result.is_ok());
     // Non-data/ writes go directly to workspace
     assert!(ws.join("scratch.txt").exists());
+}
+
+// ── scripts execute in place ───────────────────────────────────────────
+//
+// Regression coverage for the 2026-07-29 `notary-verdict-watch` incident:
+// `execute_script`'s `.py` branch used to slurp the on-disk script into a
+// String and hand it to `execute_with_env`, which writes a COPY to
+// `.lucidos/exhaust/<uuid>/script.py` and runs that. `__file__` then pointed
+// into the exhaust dir, so every `__file__`-relative sibling path resolved to
+// a phantom `.lucidos/exhaust/<sibling>` — reads returned defaults, writes
+// created the phantom dir, and nothing errored. The trigger withheld a release
+// publish claiming no DMG approval existed while the approval sat in the real
+// `data/triggers/notary-verdict-watch/state/`.
+
+/// Create a realistic script-trigger layout inside `ws`:
+/// `data/triggers/<slug>/scripts/run.py` holding `body`. Returns the script's
+/// real absolute path.
+fn write_trigger_script(ws: &std::path::Path, slug: &str, body: &str) -> std::path::PathBuf {
+    let scripts_dir = ws.join("data/triggers").join(slug).join("scripts");
+    std::fs::create_dir_all(&scripts_dir).unwrap();
+    let script = scripts_dir.join("run.py");
+    std::fs::write(&script, body).unwrap();
+    script
+}
+
+/// `__file__` must be the script's REAL path, not a temp copy. This is the
+/// single assertion that would have caught the original bug.
+#[tokio::test]
+async fn execute_file_runs_the_real_path_not_a_copy() {
+    let dir = tempdir().unwrap();
+    // Canonicalize: PythonRuntime canonicalizes its workspace, and on macOS
+    // /var/folders/... is a symlink to /private/var/folders/..., so the path
+    // the interpreter is handed must be built from the same root we compare to.
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let script = write_trigger_script(
+        &ws,
+        "notary-verdict-watch",
+        "import os\nprint(os.path.abspath(__file__))\n",
+    );
+
+    let out = runtime
+        .execute_file_with_env(&script, vec![])
+        .await
+        .expect("execute_file_with_env");
+    let reported = out.trim();
+
+    assert_eq!(
+        reported,
+        script.to_string_lossy(),
+        "__file__ must resolve to the script's real on-disk path"
+    );
+    assert!(
+        !reported.contains("exhaust"),
+        "script ran from a copy under the exhaust dir: {reported}"
+    );
+}
+
+/// The consequence that actually bit: a script resolving a sibling directory
+/// via `__file__` must reach the REAL sibling, not a phantom one.
+#[tokio::test]
+async fn execute_file_resolves_sibling_dir_via_file() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let state_dir = ws.join("data/triggers/notary-verdict-watch/state");
+    std::fs::create_dir_all(&state_dir).unwrap();
+    std::fs::write(
+        state_dir.join("marker.json"),
+        // A sentinel, deliberately NOT a real release version: a literal equal to
+        // RELEASE would trip version_sources_test.sh's unmanaged-literal scan.
+        r#"{"approved_version": "0.0.0-fixture"}"#,
+    )
+    .unwrap();
+
+    // The exact shape from the incident: sibling dir via dirname(__file__)/...
+    let script = write_trigger_script(
+        &ws,
+        "notary-verdict-watch",
+        r#"
+import json, os
+_STATE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "state")
+try:
+    with open(os.path.join(_STATE, "marker.json")) as f:
+        data = json.load(f)
+except FileNotFoundError:
+    data = {"approved_version": None}
+print(data["approved_version"])
+"#,
+    );
+
+    let out = runtime
+        .execute_file_with_env(&script, vec![])
+        .await
+        .expect("execute_file_with_env");
+
+    assert_eq!(
+        out.trim(),
+        "0.0.0-fixture",
+        "script must read the REAL sibling state dir, not fall back to the default"
+    );
+    assert!(
+        !ws.join(".lucidos/exhaust/state").exists(),
+        "a phantom state dir was created under .lucidos/exhaust — the script ran from a copy"
+    );
+}
+
+/// stdout/stderr still land in a per-run exhaust dir for audit, and running in
+/// place must NOT drop a `script.py` copy beside them.
+#[tokio::test]
+async fn execute_file_writes_audit_logs_without_copying_the_script() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let script = write_trigger_script(
+        &ws,
+        "audit-probe",
+        "import sys\nprint('to-stdout')\nprint('to-stderr', file=sys.stderr)\n",
+    );
+
+    runtime
+        .execute_file_with_env(&script, vec![])
+        .await
+        .expect("execute_file_with_env");
+
+    let run_dirs: Vec<_> = std::fs::read_dir(ws.join(".lucidos/exhaust"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir())
+        .collect();
+    assert_eq!(
+        run_dirs.len(),
+        1,
+        "expected one exhaust run dir: {run_dirs:?}"
+    );
+    let run_dir = &run_dirs[0];
+
+    assert_eq!(
+        std::fs::read_to_string(run_dir.join("stdout.txt"))
+            .unwrap()
+            .trim(),
+        "to-stdout"
+    );
+    assert!(std::fs::read_to_string(run_dir.join("stderr.txt"))
+        .unwrap()
+        .contains("to-stderr"));
+    assert!(
+        !run_dir.join("script.py").exists(),
+        "in-place execution must not write a script.py copy into the exhaust dir"
+    );
+}
+
+/// A failing on-disk script surfaces the same shaped error as the string
+/// path — `Python error:` + the truncated traceback.
+#[tokio::test]
+async fn execute_file_shapes_errors_like_run_script() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let script = write_trigger_script(&ws, "boom", "raise ValueError('kaboom')\n");
+
+    let err = runtime
+        .execute_file_with_env(&script, vec![])
+        .await
+        .expect_err("script raises");
+    assert!(err.starts_with("Python error:"), "got: {err}");
+    assert!(err.contains("ValueError: kaboom"), "got: {err}");
+}
+
+/// Env vars reach an in-place script the same way they reach a string-code one
+/// — `execute_script` injects `LUCIDOS_*`, `CRED_*`, `OAUTH_*`, and the trigger
+/// event vars through exactly this argument.
+#[tokio::test]
+async fn execute_file_applies_env_vars() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let script = write_trigger_script(
+        &ws,
+        "env-probe",
+        "import os\nprint(os.environ['TRIGGER_EVENT_TYPE'])\n",
+    );
+
+    let out = runtime
+        .execute_file_with_env(
+            &script,
+            vec![(
+                "TRIGGER_EVENT_TYPE".to_string(),
+                "NotaryVerdictReceived".to_string(),
+            )],
+        )
+        .await
+        .expect("execute_file_with_env");
+    assert_eq!(out.trim(), "NotaryVerdictReceived");
+}
+
+/// The two paths must stay distinct: `run_python`-style string execution has no
+/// file on disk, so its `__file__` legitimately IS the exhaust copy, and that
+/// copy is the only record of what ran. A refactor that "unifies" them by
+/// making string code run from somewhere else would drop that audit copy.
+#[tokio::test]
+async fn execute_with_env_still_runs_from_the_exhaust_copy() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = PythonRuntime::new(ws.clone()).unwrap();
+
+    let out = runtime
+        .execute_with_env("import os\nprint(os.path.abspath(__file__))\n", vec![])
+        .await
+        .expect("execute_with_env");
+    let reported = out.trim();
+
+    assert!(
+        reported.starts_with(ws.join(".lucidos/exhaust").to_string_lossy().as_ref()),
+        "string-code execution must still run from the exhaust dir: {reported}"
+    );
+    assert!(
+        reported.ends_with("script.py"),
+        "string-code execution must still run a written script.py: {reported}"
+    );
 }
 
 /// `python_bin()` + `ensure_venv()` are the public API the
@@ -252,8 +482,8 @@ async fn execute_kills_subprocess_when_future_dropped() {
     // to overwrite the marker.
     tokio::time::sleep(std::time::Duration::from_secs(3)).await;
 
-    let content = std::fs::read_to_string(&marker)
-        .expect("marker should exist — step 1 ran before cancel");
+    let content =
+        std::fs::read_to_string(&marker).expect("marker should exist: step 1 ran before cancel");
     assert_eq!(
         content, "alive",
         "subprocess survived the dropped future and overwrote the marker — \
@@ -410,8 +640,14 @@ fn pure_stderr_noise_without_traceback_keeps_tail() {
         trimmed.contains("lines of stderr omitted"),
         "trim marker required: {trimmed:?}"
     );
-    assert!(trimmed.contains("warning 49"), "tail must be preserved: {trimmed:?}");
-    assert!(!trimmed.contains("warning 0\n"), "head should be dropped: {trimmed:?}");
+    assert!(
+        trimmed.contains("warning 49"),
+        "tail must be preserved: {trimmed:?}"
+    );
+    assert!(
+        !trimmed.contains("warning 0\n"),
+        "head should be dropped: {trimmed:?}"
+    );
 }
 
 #[test]
@@ -446,8 +682,14 @@ fn exception_preserved_when_last_frame_has_no_source_line() {
         trimmed.contains("ModuleNotFoundError: No module named 'strategy_params'"),
         "exception MUST be preserved even when no source line follows the last frame: {trimmed:?}"
     );
-    assert!(trimmed.contains("frozen importlib"), "frame line preserved: {trimmed:?}");
-    assert!(trimmed.contains("frames omitted"), "trim marker present: {trimmed:?}");
+    assert!(
+        trimmed.contains("frozen importlib"),
+        "frame line preserved: {trimmed:?}"
+    );
+    assert!(
+        trimmed.contains("frames omitted"),
+        "trim marker present: {trimmed:?}"
+    );
 }
 
 #[test]
@@ -491,10 +733,7 @@ async fn capture_one_request_headers(
     // hanging if the client sends an unexpected stream.
     loop {
         let mut chunk = [0u8; 1024];
-        let n = socket
-            .read(&mut chunk)
-            .await
-            .expect("read request bytes");
+        let n = socket.read(&mut chunk).await.expect("read request bytes");
         if n == 0 {
             break;
         }
@@ -556,10 +795,7 @@ print('done')
         port = port,
     );
 
-    let out = runtime
-        .execute_with_env(&code, env)
-        .await
-        .expect("execute");
+    let out = runtime.execute_with_env(&code, env).await.expect("execute");
     assert!(out.contains("done"), "python output was: {out}");
 
     let headers = capture.await.expect("capture task");
@@ -621,10 +857,7 @@ print('done')
         port = port,
     );
 
-    runtime
-        .execute_with_env(&code, env)
-        .await
-        .expect("execute");
+    runtime.execute_with_env(&code, env).await.expect("execute");
 
     let headers = capture.await.expect("capture task");
     assert!(

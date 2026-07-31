@@ -59,7 +59,9 @@ pub(crate) async fn fresh_workspace() -> (tempfile::TempDir, PathBuf) {
     git_cmd(&["config", "user.name", "Cleanup Test"], &root)
         .await
         .unwrap();
-    tokio::fs::write(root.join("seed.txt"), "seed").await.unwrap();
+    tokio::fs::write(root.join("seed.txt"), "seed")
+        .await
+        .unwrap();
     git_cmd(&["add", "."], &root).await.unwrap();
     git_cmd(&["commit", "-m", "seed"], &root).await.unwrap();
     let _ = worktrees_dir(&root); // ensure dir exists
@@ -115,8 +117,12 @@ pub(crate) async fn add_worktree_for_thread(
     tokio::fs::write(worktree.join("branch_marker.txt"), b"on branch")
         .await
         .unwrap();
-    git_cmd(&["add", "branch_marker.txt"], &worktree).await.unwrap();
-    git_cmd(&["commit", "-m", "branch work"], &worktree).await.unwrap();
+    git_cmd(&["add", "branch_marker.txt"], &worktree)
+        .await
+        .unwrap();
+    git_cmd(&["commit", "-m", "branch work"], &worktree)
+        .await
+        .unwrap();
 
     worktree
 }
@@ -386,9 +392,7 @@ pub(crate) async fn drain_notifications(
         let Ok(EmittedEvent { typed, .. }) = item else {
             continue;
         };
-        if let BusEvent::System(SystemEvent::NotificationCreated { title, message, .. }) =
-            typed
-        {
+        if let BusEvent::System(SystemEvent::NotificationCreated { title, message, .. }) = typed {
             out.push((title, message));
         }
     }
@@ -399,4 +403,3 @@ const ONE_DAY: i64 = 24 * 60 * 60;
 pub(crate) const TIER_2_AGE: i64 = 31 * ONE_DAY; // > 30 days
 pub(crate) const TIER_1_AGE: i64 = 25 * 60 * 60; // > 24 hours
 pub(crate) const TIER_0_AGE_SECS: i64 = 90 * 60; // > 1h grace
-

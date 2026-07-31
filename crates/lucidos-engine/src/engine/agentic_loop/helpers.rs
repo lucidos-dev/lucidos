@@ -641,7 +641,11 @@ pub(crate) fn python_call_key(code: &str) -> Option<String> {
         let mut hasher = DefaultHasher::new();
         line.hash(&mut hasher);
         let h = hasher.finish();
-        return Some(format!("{}#{:08x}", &line[..take], (h & 0xFFFF_FFFF) as u32));
+        return Some(format!(
+            "{}#{:08x}",
+            &line[..take],
+            (h & 0xFFFF_FFFF) as u32
+        ));
     }
     None
 }
@@ -770,6 +774,28 @@ pub(crate) fn format_capture_result(screenshot_b64: &str, dom: &str) -> String {
     }
 }
 
+/// If `s` is an `[APP_CAPTURE:<b64>]\n<dom>` sentinel, return a stub that names
+/// the screenshot's media type and approximate decoded size, followed by the
+/// DOM text unchanged. Returns `None` for non-matching input.
+///
+/// The mirror of [`crate::engine::tools::files::strip_image_content_marker`],
+/// and it exists for the same reason: the block builder lifts the screenshot
+/// into a proper image block before the model call, so persisting the base64
+/// too is dead weight. It is dead weight at a scale that matters, since a
+/// single retina capture reached 1.5 MB in one event row. The DOM survives
+/// because it is the part a human reading the step-detail modal wants, and it
+/// is already what the model gets as the tool-result body.
+pub(crate) fn strip_app_capture_marker(s: &str) -> Option<String> {
+    let (screenshot_b64, dom) = parse_app_capture_marker(s)?;
+    let approx_bytes = (screenshot_b64.len() * 3) / 4;
+    Some(format!(
+        "[screenshot {}, {} omitted, not embedded in event]\n{}",
+        sniff_image_media_type(screenshot_b64),
+        crate::core::format_byte_size(approx_bytes),
+        dom,
+    ))
+}
+
 /// Sniff a recognized image mime from a base64-encoded image. Decodes only the
 /// leading bytes (enough for any magic header in `core::blobs::sniff_image_mime`)
 /// so the multi-MB capture body isn't decoded twice. Falls back to PNG when the
@@ -787,6 +813,168 @@ pub(crate) fn sniff_image_media_type(b64: &str) -> &'static str {
         .as_deref()
         .and_then(crate::core::blobs::sniff_image_mime)
         .unwrap_or("image/png")
+}
+
+/// One raw tool result, split into the two texts that want different things.
+///
+/// The model needs the raw sentinel, because [`build_tool_result_blocks`] is
+/// what lifts its base64 into a real `ContentBlock::Image`. The event wants a
+/// small stub, because a megabyte of base64 in the events table is dead weight
+/// the frontend never reads. Collapsing both onto one value is what broke both
+/// directions at once; see [`split_tool_result`].
+pub(crate) struct ToolResultSplit {
+    /// Text handed to the LLM message builder.
+    pub llm_text: String,
+    /// The event's text when it must differ from `llm_text`, which is only ever
+    /// for the two image sentinels. `None` means the event records exactly what
+    /// the model saw, which is every other tool result. Modelling the override
+    /// rather than a second copy keeps the common path to a single allocation:
+    /// a `run_bash` result is routinely 150 kB and this runs per tool call.
+    event_stub: Option<String>,
+    /// Base64 images persisted alongside the event, for the frontend to render.
+    pub images: Vec<String>,
+}
+
+impl ToolResultSplit {
+    /// The model and the event see the same thing. The common case: any result
+    /// carrying no image sentinel at all.
+    fn shared(text: String) -> Self {
+        Self {
+            llm_text: text,
+            event_stub: None,
+            images: Vec::new(),
+        }
+    }
+
+    /// What gets persisted in the `ToolResult` event payload.
+    pub(crate) fn event_text(&self) -> &str {
+        self.event_stub.as_deref().unwrap_or(&self.llm_text)
+    }
+
+    /// Apply a confirm-flow sentinel redaction to both sides. The redaction
+    /// exists so the model sees a one-line wait notice instead of parseable
+    /// JSON it would act on, and the event should record what the model saw.
+    /// Clearing the stub is what makes both sides agree: a redacted result is
+    /// one short sentence, so there is nothing left worth stubbing.
+    pub(crate) fn redact(&mut self, redacted: String) {
+        self.llm_text = redacted;
+        self.event_stub = None;
+    }
+}
+
+/// Split a raw tool result into its model-facing and event-facing halves.
+///
+/// Four cases:
+/// - `[GENERATED_IMAGE:<b64>]`: the bytes go to the event's `images` array for
+///   the frontend to render, and both texts get the remainder. The model is not
+///   shown its own synthesised image back.
+/// - `[IMAGE_CONTENT:<type>]`: an image the model explicitly asked to see
+///   (`read_file` on an image file, `view_image`). The sentinel survives to the
+///   model so the block builder can lift it; the event gets a stub.
+/// - `[APP_CAPTURE:<b64>]`: an ambient capture (`capture_app`,
+///   `browser_screenshot`). Same treatment, and the event keeps the DOM text,
+///   which is the part worth persisting.
+/// - anything else: both sides get the result verbatim.
+///
+/// The two sentinel cases are the whole reason this function exists. Persisting
+/// the base64 bloats the events table (one 46 MB thread froze iOS PWAs, hence
+/// the stubs); stripping it before the block builder runs blinds the model.
+/// Both were true at once until this split existed, in opposite directions.
+pub(crate) fn split_tool_result(result: &str) -> ToolResultSplit {
+    if let Some(rest) = result.strip_prefix("[GENERATED_IMAGE:") {
+        let Some(end_bracket) = rest.find("]\n") else {
+            return ToolResultSplit::shared(result.to_string());
+        };
+        return ToolResultSplit {
+            llm_text: rest[end_bracket + 2..].to_string(),
+            event_stub: None,
+            images: vec![rest[..end_bracket].to_string()],
+        };
+    }
+    if let Some(stub) = crate::engine::tools::files::strip_image_content_marker(result) {
+        return ToolResultSplit {
+            llm_text: result.to_string(),
+            event_stub: Some(stub),
+            images: Vec::new(),
+        };
+    }
+    if let Some(stub) = strip_app_capture_marker(result) {
+        return ToolResultSplit {
+            llm_text: result.to_string(),
+            event_stub: Some(stub),
+            images: Vec::new(),
+        };
+    }
+    ToolResultSplit::shared(result.to_string())
+}
+
+/// Build the user message's content blocks from this iteration's tool outputs.
+///
+/// CRITICAL: every `ToolResult` block must come before any `Image` or `Text`
+/// block. The Claude API validates that tool_result blocks immediately follow
+/// the assistant's tool_use blocks; interleaving makes it miss the later
+/// results and return `tool_use ids were found without tool_result blocks`.
+/// Images are therefore collected separately and appended after the loop.
+///
+/// Extracted from the loop body so the sentinel-to-vision chain is testable
+/// end to end. It was inline and unreachable from any test for three months,
+/// which is precisely how the image lift below came to be dead code.
+pub(crate) fn build_tool_result_blocks(
+    tool_outputs: &[(String, String)],
+    instruction: &str,
+) -> Vec<ContentBlock> {
+    let mut result_blocks: Vec<ContentBlock> = Vec::new();
+    let mut trailing_blocks: Vec<ContentBlock> = Vec::new();
+    for (tool_use_id, result) in tool_outputs {
+        if let Some((screenshot_b64, dom_text)) = parse_app_capture_marker(result) {
+            result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: dom_text.to_string(),
+            });
+            // Fit the screenshot to the model size target (compress only if
+            // over) so a large retina capture can't trip the provider's
+            // per-image limit. fit_for_llm is the single gate for every
+            // chat-to-model image.
+            let fitted = crate::api::ChatImage {
+                base64: screenshot_b64.to_string(),
+                mime_type: sniff_image_media_type(screenshot_b64).to_string(),
+            }
+            .fit_for_llm();
+            trailing_blocks.push(ContentBlock::Image {
+                source_type: "base64".to_string(),
+                media_type: fitted.mime_type,
+                data: fitted.base64,
+            });
+            continue;
+        }
+        if let Some((media_type, image_b64)) =
+            crate::engine::tools::files::parse_image_content_marker(result)
+        {
+            result_blocks.push(ContentBlock::ToolResult {
+                tool_use_id: tool_use_id.clone(),
+                content: crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT.to_string(),
+            });
+            // No fit_for_llm here: read_file's encode_image_for_read already
+            // fit the image before emitting the IMAGE_CONTENT marker, so this
+            // payload is guaranteed within the model size target.
+            trailing_blocks.push(ContentBlock::Image {
+                source_type: "base64".to_string(),
+                media_type: media_type.to_string(),
+                data: image_b64.to_string(),
+            });
+            continue;
+        }
+        result_blocks.push(ContentBlock::ToolResult {
+            tool_use_id: tool_use_id.clone(),
+            content: result.clone(),
+        });
+    }
+    // Append images and instruction text AFTER all ToolResult blocks.
+    result_blocks.append(&mut trailing_blocks);
+    result_blocks.push(ContentBlock::Text {
+        text: instruction.to_string(),
+    });
+    result_blocks
 }
 
 /// Detect image descriptions that indicate the model couldn't see the image.
@@ -834,10 +1022,7 @@ pub(crate) const QUESTION_REASK_INSTRUCTION: &str = "Your previous `ask_user_que
 /// instead of finalizing the turn. True only when the previous iteration's
 /// `ask_user_question` call errored AND the per-response force budget isn't
 /// spent. Pure so the bound is unit-testable without driving the whole loop.
-pub(crate) fn should_force_question_reask(
-    ask_failed_last_iter: bool,
-    reask_forced: usize,
-) -> bool {
+pub(crate) fn should_force_question_reask(ask_failed_last_iter: bool, reask_forced: usize) -> bool {
     ask_failed_last_iter && reask_forced < MAX_QUESTION_REASK
 }
 

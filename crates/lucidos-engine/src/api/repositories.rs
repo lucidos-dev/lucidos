@@ -93,14 +93,17 @@ pub async fn add_repository(
     state
         .engine
         .event_bus
-        .emit_user_system(&headers, &state.pool, "[Repositories] RepositoryAdded", |actor| {
-            SystemEvent::RepositoryAdded {
+        .emit_user_system(
+            &headers,
+            &state.pool,
+            "[Repositories] RepositoryAdded",
+            |actor| SystemEvent::RepositoryAdded {
                 repo_id: repo.id.to_string(),
                 name: repo.name.clone(),
                 root_path: repo.path.clone(),
                 actor,
-            }
-        })
+            },
+        )
         .await;
     Ok((StatusCode::CREATED, Json(repo)))
 }
@@ -115,12 +118,15 @@ pub async fn remove_repository(
             state
                 .engine
                 .event_bus
-                .emit_user_system(&headers, &state.pool, "[Repositories] RepositoryRemoved", |actor| {
-                    SystemEvent::RepositoryRemoved {
+                .emit_user_system(
+                    &headers,
+                    &state.pool,
+                    "[Repositories] RepositoryRemoved",
+                    |actor| SystemEvent::RepositoryRemoved {
                         repo_id: id.to_string(),
                         actor,
-                    }
-                })
+                    },
+                )
                 .await;
             Ok(StatusCode::NO_CONTENT)
         }
@@ -783,8 +789,7 @@ pub async fn get_change_file(
         Ok(Some(c)) => c,
         Ok(None) => return (StatusCode::NOT_FOUND, "Change not found").into_response(),
         Err(e) => {
-            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}"))
-                .into_response();
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("DB error: {e}")).into_response();
         }
     };
 
@@ -793,9 +798,7 @@ pub async fn get_change_file(
     } else {
         match change.post_merge_sha.as_deref() {
             Some(sha) => sha.to_string(),
-            None => {
-                return (StatusCode::BAD_REQUEST, "No post-merge SHA recorded").into_response()
-            }
+            None => return (StatusCode::BAD_REQUEST, "No post-merge SHA recorded").into_response(),
         }
     };
 
@@ -889,19 +892,13 @@ pub async fn browse_directories(
 /// URL surface, not handler location.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
-        .route(
-            "/repositories",
-            get(list_repositories).post(add_repository),
-        )
+        .route("/repositories", get(list_repositories).post(add_repository))
         .route("/browse-directories", get(browse_directories))
         .route(
             "/repositories/:id",
             axum::routing::delete(remove_repository),
         )
-        .route(
-            "/repositories/:id/files",
-            get(list_repo_files),
-        )
+        .route("/repositories/:id/files", get(list_repo_files))
         .route("/repositories/:id/file", get(get_repo_file))
         .route("/repositories/:id/diff", get(get_repo_diff))
 }

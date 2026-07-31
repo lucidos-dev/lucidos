@@ -89,10 +89,7 @@ pub(crate) fn run() -> Result<(), BoxError> {
 /// `updatedInput` carrying the synthesized answers (CC then constructs a
 /// matching `tool_result` for its session). Echoes the questions array
 /// verbatim alongside the answers — both fields are required.
-fn build_hook_output(
-    questions: &serde_json::Value,
-    answers: &serde_json::Value,
-) -> String {
+fn build_hook_output(questions: &serde_json::Value, answers: &serde_json::Value) -> String {
     serde_json::json!({
         "hookSpecificOutput": {
             "hookEventName": "PreToolUse",
@@ -131,7 +128,10 @@ mod tests {
         assert_eq!(parsed.tool_use_id, "toolu_abc");
         assert_eq!(parsed.session_id, "sid-1");
         assert_eq!(parsed.tool_input.questions.len(), 1);
-        assert_eq!(parsed.tool_input.questions[0].question, "What is your favorite color?");
+        assert_eq!(
+            parsed.tool_input.questions[0].question,
+            "What is your favorite color?"
+        );
     }
 
     #[test]
@@ -147,7 +147,13 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
         assert_eq!(parsed["hookSpecificOutput"]["hookEventName"], "PreToolUse");
         assert_eq!(parsed["hookSpecificOutput"]["permissionDecision"], "allow");
-        assert_eq!(parsed["hookSpecificOutput"]["updatedInput"]["questions"], questions);
-        assert_eq!(parsed["hookSpecificOutput"]["updatedInput"]["answers"], answers);
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedInput"]["questions"],
+            questions
+        );
+        assert_eq!(
+            parsed["hookSpecificOutput"]["updatedInput"]["answers"],
+            answers
+        );
     }
 }

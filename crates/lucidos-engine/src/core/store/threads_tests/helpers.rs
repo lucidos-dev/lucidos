@@ -168,7 +168,11 @@ pub(super) async fn insert_null_trigger_thread(pool: &PgPool, minutes_ago: i64) 
 
 /// Insert a `TriggerStarted` event for the given thread with a raw payload.
 /// Lets the test mimic legacy (`task_id`) vs modern (`trigger_id`) shapes.
-pub(super) async fn insert_trigger_started_event(pool: &PgPool, thread_id: Uuid, payload: serde_json::Value) {
+pub(super) async fn insert_trigger_started_event(
+    pool: &PgPool,
+    thread_id: Uuid,
+    payload: serde_json::Value,
+) {
     sqlx::query(
         "INSERT INTO events (id, event_type, payload, aggregate, aggregate_id, thread_id) \
              VALUES ($1, 'TriggerStarted', $2, 'thread', $3, $4)",
@@ -182,7 +186,10 @@ pub(super) async fn insert_trigger_started_event(pool: &PgPool, thread_id: Uuid,
     .expect("insert TriggerStarted");
 }
 
-pub(super) async fn fetch_trigger_pair(pool: &PgPool, thread_id: Uuid) -> (Option<String>, Option<String>) {
+pub(super) async fn fetch_trigger_pair(
+    pool: &PgPool,
+    thread_id: Uuid,
+) -> (Option<String>, Option<String>) {
     sqlx::query_as::<_, (Option<String>, Option<String>)>(
         "SELECT trigger_id, trigger_name FROM thread_summaries WHERE thread_id = $1",
     )

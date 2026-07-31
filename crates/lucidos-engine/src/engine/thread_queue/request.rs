@@ -109,7 +109,11 @@ pub enum ThreadQueueRequest {
         model: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none", alias = "use_claude_code")]
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            alias = "use_claude_code"
+        )]
         use_coding_agent: Option<bool>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         repo_id: Option<String>,

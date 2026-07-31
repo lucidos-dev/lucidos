@@ -2,7 +2,7 @@
 #
 # install.sh — one-click installer for Lucidos.
 #
-#   curl -fsSL https://raw.githubusercontent.com/lucidos-dev/lucidos/main/install.sh | sh
+#   curl -fsSL https://lucidos.dev/install.sh | sh
 #
 # DEFAULT (download) path — the curl|sh experience: no Docker, no Rust/Node, no
 # clone, no compile. It detects your platform, DOWNLOADS the prebuilt headless
@@ -40,7 +40,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.17.0"
+LUCIDOS_DEFAULT_VERSION="0.18.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -69,6 +69,22 @@ if [ -z "${BASH_VERSION:-}" ]; then
                 echo "       Re-run explicitly under bash:  curl -fsSL $LUCIDOS_INSTALL_URL | bash" >&2
                 exit 1
             fi
+            # Shebang sniff BEFORE the payload reaches `exec bash -c`. Same
+            # soft-404 hazard the helper-lib fetch guards against (see
+            # _source_libs): an origin that answers an unknown path with its
+            # landing page and a 200 makes `curl -fsSL` succeed and the
+            # non-empty test pass, and bash then executes HTML. Assert the
+            # shebang rather than reject a leading '<': fail-closed, and it is
+            # the same test the front-door CI rung applies to what the origin
+            # serves. Must stay POSIX sh, like the rest of this guard.
+            case "$_lucidos_payload" in
+                '#!'*) : ;;
+                *)
+                    echo "ERROR: $LUCIDOS_INSTALL_URL did not return a shell script." >&2
+                    echo "       The origin likely served its 404/SPA fallback page with a 200 status." >&2
+                    echo "       Re-run against a known-good origin, or download install.sh and run it directly." >&2
+                    exit 1 ;;
+            esac
             exec bash -c "$_lucidos_payload" bash "$@"
         fi
     else
@@ -347,11 +363,17 @@ download_failed() {
     local url="$1"
     die "Download failed: $url
 
-       No prebuilt release is published yet — the tarballs are built by CI
-       (.github/workflows/release-tarballs.yml) but are not yet attached to a
-       GitHub Release, so the default download is expected to 404 today.
+       Likely causes:
+         • The release is brand new. CI attaches the per-platform tarballs
+           (.github/workflows/release-tarballs.yml) ~30 min AFTER the GitHub
+           Release is published, so a run started in that window still 404s.
+         • No tarball was published for this platform. The published triples are
+           macOS arm64/x86_64 and Linux x86_64/aarch64.
+         • The network / a proxy blocked github.com.
 
        Working alternatives:
+         • Install the previous release (or retry in a few minutes):
+             curl -fsSL $LUCIDOS_INSTALL_URL | sh -s -- --version <older-version>
          • Build from source:
              curl -fsSL $LUCIDOS_INSTALL_URL | sh -s -- --dev
          • Install a tarball you built with scripts/build-headless.sh:
@@ -420,8 +442,9 @@ verify_runtime_executes() {
        ${out:-<no output>}
 ${libc:+       This system reports: $libc
 }       Lucidos Linux tarballs are built against glibc 2.35 (the Ubuntu 22.04
-       floor). If your distro is older than Ubuntu 22.04 / Debian 12 / RHEL 9,
-       upgrade the OS — or build from source instead:
+       floor): Ubuntu 22.04+, Debian 12+, Fedora 36+, RHEL/Rocky/Alma 10+.
+       RHEL 9 and its rebuilds are BELOW it (EL9 pins glibc 2.34 for its whole
+       lifecycle). Upgrade the OS, or build from source instead:
          curl -fsSL $LUCIDOS_INSTALL_URL | sh -s -- --dev"
 }
 
@@ -598,6 +621,20 @@ port_is_ours() {
     [ -f "$portfile" ] && [ "$(tr -d '[:space:]' < "$portfile" 2>/dev/null || true)" = "$port" ]
 }
 
+# record_instance_port <data>: mark this instance as INSTALLED by recording its
+# current port at <data>/port. That marker is the whole of instance discovery.
+# service_list_instance_names lists exactly the <prefix>/*/ dirs carrying one, so
+# it is what makes an instance visible to `uninstall.sh --list` and removable by
+# `--all` / `--all --purge`, and what makes a bare re-run reuse this port.
+#
+# BOTH launch shapes must write it. Registering a service and launching in the
+# foreground are two ways to finish the same install, and an install that leaves
+# a data dir behind has to be uninstallable either way. Only the ORDERING differs
+# between the two call sites, and each has its own reason: see them.
+record_instance_port() {
+    printf '%s\n' "$LUCIDOS_PORT" > "$(service_instance_port_file "$1")" 2>/dev/null || true
+}
+
 # launch_runtime <runtime-dir> — run the bundled gateway in the FOREGROUND with
 # the same env crates/lucidos-app/src/desktop.rs::spawn_gateway sets (sourced from
 # the shared service_runtime_env_pairs — one source of truth). Uses the SHARED
@@ -607,6 +644,16 @@ port_is_ours() {
 launch_runtime() {
     local runtime_dir="$1" data="$LUCIDOS_GATEWAY_DATA" pair
     mkdir -p "$data" "$data/fastembed" || die "Could not create the gateway data dir $data"
+
+    # Record the instance port BEFORE the exec below, which never returns. The
+    # service path writes the same marker AFTER its unit, deliberately; here
+    # there is no registration that can fail, and the data dir already exists, so
+    # the only place left to write it is before we hand the process over.
+    # Without this a degraded/foreground install was invisible to
+    # `uninstall.sh --list` and unremovable by `--all --purge`, which returns
+    # early when no instance carries a marker: the data dir AND the shared
+    # runtime survived a full purge.
+    record_instance_port "$data"
 
     # Make supplied provider creds visible to the gateway (engines inherit them).
     [ -n "$OPENAI_API_KEY" ]    && export OPENAI_API_KEY
@@ -662,7 +709,7 @@ register_service() {
     esac
     # Record the instance's current port (marks it for listing; a bare re-run
     # reuses it). Written after the unit so a failed registration leaves no marker.
-    printf '%s\n' "$LUCIDOS_PORT" > "$(service_instance_port_file "$data")" 2>/dev/null || true
+    record_instance_port "$data"
 
     if have curl; then
         step "Waiting for the gateway to come up"
@@ -673,7 +720,7 @@ register_service() {
        $(install_url_scheme)://localhost:$LUCIDOS_PORT/ within ${LUCIDOS_HEALTH_TIMEOUT}s. It will keep retrying
        (KeepAlive / Restart=always). Check the logs:
 $(service_log_hint "$manager" "$data" "$slug")
-       then re-open the URL, or run ./uninstall.sh --name $slug to remove it."
+       then re-open the URL, or run $(uninstall_hint "$slug") to remove it."
         fi
     else
         info "curl not found — skipping the post-register health check."
@@ -846,7 +893,8 @@ print_service_running() {
     print_remote_access_hints
     printf '\n'
     printf '  It runs in the background now and starts at login.\n'
-    printf '  Stop + remove it:  ./uninstall.sh --name %s   (add --purge to also delete data)\n' "$slug"
+    printf '  Stop + remove it:  %s\n' "$(uninstall_hint "$slug")"
+    printf '                     (add --purge to also delete data; it prompts for nothing)\n'
     printf '  Change its port:   re-run with --name %s --port <new-port>\n' "$slug"
     printf '%s========================================%s\n\n' "$C_GREEN" "$C_RESET"
 }
@@ -873,6 +921,22 @@ print_installed() {
     printf '%s========================================%s\n\n' "$C_GREEN" "$C_RESET"
 }
 
+# uninstall_hint <slug>: the command that actually removes <slug> ON THIS RUN.
+# `./uninstall.sh` is only real when install.sh ran from a checkout. The default
+# audience pipes the installer (`curl … | sh`), and the runtime tarball lays down
+# no uninstaller, so printing the `./` form to them names a file they do not have
+# anywhere on disk. Branch on the same self-dir probe dispatch_uninstall uses.
+uninstall_hint() {
+    local slug="$1" self_dir
+    self_dir="$(installer_self_dir)"
+    if [ -n "$self_dir" ] && [ -f "$self_dir/uninstall.sh" ]; then
+        printf './uninstall.sh --name %s' "$slug"
+    else
+        printf 'uninstall.sh --name %s  (download it from %s)' \
+            "$slug" "${LUCIDOS_REPO_URL%.git}"
+    fi
+}
+
 # ── uninstall / list dispatch (--uninstall / --list) ─────────────────────────
 # install.sh --uninstall / --list are thin front doors for uninstall.sh (so the
 # uninstall + listing orchestration lives in ONE place). They exec the sibling
@@ -897,6 +961,22 @@ dispatch_uninstall() {
     info "$url"
     payload="$(curl -fsSL "$url")" || die "Could not fetch the uninstaller from $url"
     [ -n "$payload" ] || die "Fetched uninstaller from $url is empty."
+    # Shebang sniff before `exec bash -c`, for the same reason _source_libs
+    # sniffs a fetched helper lib: `curl -fsSL` plus a non-empty test cannot see
+    # a SOFT-404, and this line hands unknown remote content straight to bash.
+    # It is not hypothetical here: as of the 2026-07-30 docs audit the published
+    # front door serves install.sh and scripts/lib/*.sh but NOT uninstall.sh, so
+    # <origin>/uninstall.sh returns the landing page at status 200 and a piped
+    # `install.sh --uninstall` executed that HTML. Fail loud and name the
+    # fallback instead. Drop this only if you also want a hijacked or
+    # misconfigured origin to reach `exec`.
+    case "$payload" in
+        '#!'*) : ;;
+        *) die "$url did not return a shell script.
+       The origin likely served its 404/SPA fallback page with a 200 status.
+       Run the uninstaller directly from a checkout of the repo instead:
+         ./uninstall.sh ${fwd[*]}" ;;
+    esac
     exec bash -c "$payload" bash "${fwd[@]}"
 }
 
@@ -1362,7 +1442,13 @@ Flags:
   --list                list installed instances + ports
   --all                 with --uninstall: act on every instance
   --purge               with --uninstall: also delete the instance data (with --all,
-                        also the shared runtime)
+                        also the shared runtime). IRREVERSIBLE, no confirmation:
+                        the data dir holds the embedded PostgreSQL cluster (every
+                        thread, message, memory and setting of every workspace)
+                        and any picker-created workspace directory under it.
+                        A bare --uninstall is not a dry run either: it stops the
+                        gateway and removes its service, keeping only your data.
+                        --list is the one command that changes nothing.
   -h, --help            this help
 
 Environment variables:
@@ -1390,11 +1476,13 @@ Service: launchd agent com.lucidos.gateway.<slug> (~/Library/LaunchAgents/) or
 systemd --user unit lucidos-gateway-<slug>.service (~/.config/systemd/user/). Logs:
 <prefix>/<slug>/logs/ (launchd) or 'journalctl --user -u lucidos-gateway-<slug>'.
 Stop + remove with ./uninstall.sh --name <slug> (or ./install.sh --uninstall);
-add --purge to also delete data.
+add --purge to also delete data. Both are repo scripts and the runtime lays down
+no copy, so a piped install needs uninstall.sh downloaded from the repository.
 
-NOTE: no prebuilt release is published yet, so the DEFAULT download will 404
-today. Until then, use --dev (build from source) or --from-tarball <path>
-(a tarball built with scripts/build-headless.sh).
+NOTE: CI attaches the per-platform tarballs to each published GitHub Release
+~30 min after it is cut, so a download started in that window can still 404 on a
+brand-new version. Then use --version <older-version>, retry shortly, or fall
+back to --dev / --from-tarball <path>.
 EOF
 }
 

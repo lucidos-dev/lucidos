@@ -182,12 +182,8 @@ impl LucidosEngine {
                 mut branch_name,
                 reusing_branch,
                 resume_session_id: validated_sid,
-            } = resolve_branch_for_resume(
-                repo_root,
-                resume_session_id,
-                resume_branch.as_deref(),
-            )
-            .await;
+            } = resolve_branch_for_resume(repo_root, resume_session_id, resume_branch.as_deref())
+                .await;
             resume_session_id = validated_sid;
             // App coding-agent threads use a different branch shape so a
             // `git branch -a` on the workspace git is greppable by app id.
@@ -239,7 +235,11 @@ impl LucidosEngine {
                     thread_id,
                     self.workspace_path(),
                     repo_root,
-                    if reusing_branch { Some(&branch_name) } else { None },
+                    if reusing_branch {
+                        Some(&branch_name)
+                    } else {
+                        None
+                    },
                 )
                 .await
             };
@@ -252,18 +252,19 @@ impl LucidosEngine {
             // repo; reusing it would run Claude Code against that repo. If the
             // recorded path is missing or stranded, fall through to the create
             // branch below, which clears any dead residue first.
-            let existing_worktree =
-                if crate::engine::git_ops::is_live_worktree_at(&resolved_path).await {
-                    Some(resolved_path.clone())
-                } else {
-                    if resolved_path.exists() {
-                        log!(
+            let existing_worktree = if crate::engine::git_ops::is_live_worktree_at(&resolved_path)
+                .await
+            {
+                Some(resolved_path.clone())
+            } else {
+                if resolved_path.exists() {
+                    log!(
                             "[AgentSession] worktree path {} exists but is not a live linked worktree (stranded) — recreating instead of running against the enclosing repo",
                             resolved_path.display()
                         );
-                    }
-                    None
-                };
+                }
+                None
+            };
 
             let wt_path = if let Some(ref existing) = existing_worktree {
                 log!(
@@ -292,7 +293,12 @@ impl LucidosEngine {
             //    expectation to violate.
             let branch_name = if let Some(ref existing) = existing_worktree {
                 if reusing_branch {
-                    match crate::engine::agent_session::external_edits::verify_branch(existing, &branch_name).await {
+                    match crate::engine::agent_session::external_edits::verify_branch(
+                        existing,
+                        &branch_name,
+                    )
+                    .await
+                    {
                         Ok(()) => branch_name,
                         Err(mismatch) => {
                             // External repos: a skill may legitimately have
@@ -382,9 +388,8 @@ impl LucidosEngine {
             let mut app_branch_created: Option<bool> = None;
             if existing_worktree.is_none() {
                 if wt_path.exists()
-                    && wt_path.starts_with(crate::engine::git_ops::worktrees_dir(
-                        self.workspace_path(),
-                    ))
+                    && wt_path
+                        .starts_with(crate::engine::git_ops::worktrees_dir(self.workspace_path()))
                 {
                     crate::engine::git_ops::clear_stranded_worktree_dir(repo_root, &wt_path).await;
                 }
@@ -394,9 +399,7 @@ impl LucidosEngine {
                     // materialise the whole workspace tree, which is
                     // unnecessary and would expose other apps' folders to CC.
                     let Some(ref app_id) = app_spawn_id else {
-                        return Err(
-                            "Internal: is_app_spawn set without app_spawn_id".into()
-                        );
+                        return Err("Internal: is_app_spawn set without app_spawn_id".into());
                     };
                     match crate::engine::git_ops::create_sparse_app_worktree(
                         repo_root,
@@ -426,53 +429,53 @@ impl LucidosEngine {
                         }
                     }
                 } else {
-                let wt_extra: Vec<&str> = if reusing_branch {
-                    vec![&branch_name]
-                } else {
-                    let mut args = vec!["-b", &branch_name];
-                    if let Some(ref base_ref) = worktree_base_branch {
-                        args.push(base_ref);
-                    }
-                    args
-                };
-                match worktree_add(repo_root, &wt_path, &wt_extra).await {
-                    Ok(o) if o.status.success() => {
-                        if reusing_branch {
-                            log!(
-                                "[AgentSession] Resumed worktree at {} on existing branch {}",
-                                wt_path.display(),
-                                branch_name
-                            );
-                        } else {
-                            log!(
-                                "[AgentSession] Created worktree at {} on branch {}{}",
-                                wt_path.display(),
-                                branch_name,
-                                worktree_base_branch
-                                    .as_ref()
-                                    .map(|b| format!(" (from {})", b))
-                                    .unwrap_or_default()
-                            );
+                    let wt_extra: Vec<&str> = if reusing_branch {
+                        vec![&branch_name]
+                    } else {
+                        let mut args = vec!["-b", &branch_name];
+                        if let Some(ref base_ref) = worktree_base_branch {
+                            args.push(base_ref);
+                        }
+                        args
+                    };
+                    match worktree_add(repo_root, &wt_path, &wt_extra).await {
+                        Ok(o) if o.status.success() => {
+                            if reusing_branch {
+                                log!(
+                                    "[AgentSession] Resumed worktree at {} on existing branch {}",
+                                    wt_path.display(),
+                                    branch_name
+                                );
+                            } else {
+                                log!(
+                                    "[AgentSession] Created worktree at {} on branch {}{}",
+                                    wt_path.display(),
+                                    branch_name,
+                                    worktree_base_branch
+                                        .as_ref()
+                                        .map(|b| format!(" (from {})", b))
+                                        .unwrap_or_default()
+                                );
+                            }
+                        }
+                        Ok(o) => {
+                            let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
+                            log!("[AgentSession] Failed to create worktree: {}", stderr);
+                            return Err(format!(
+                                "Failed to create git worktree for coding-agent isolation: {}",
+                                stderr
+                            )
+                            .into());
+                        }
+                        Err(e) => {
+                            log!("[AgentSession] Failed to run git worktree: {}", e);
+                            return Err(format!(
+                                "Failed to create git worktree for coding-agent isolation: {}",
+                                e
+                            )
+                            .into());
                         }
                     }
-                    Ok(o) => {
-                        let stderr = String::from_utf8_lossy(&o.stderr).trim().to_string();
-                        log!("[AgentSession] Failed to create worktree: {}", stderr);
-                        return Err(format!(
-                            "Failed to create git worktree for coding-agent isolation: {}",
-                            stderr
-                        )
-                        .into());
-                    }
-                    Err(e) => {
-                        log!("[AgentSession] Failed to run git worktree: {}", e);
-                        return Err(format!(
-                            "Failed to create git worktree for coding-agent isolation: {}",
-                            e
-                        )
-                        .into());
-                    }
-                }
                 } // end non-app spawn branch
             }
 
@@ -538,9 +541,7 @@ impl LucidosEngine {
             // origin/main are already up to date and skip this.
             // App spawns skip catchup — the workspace git has no `origin` by
             // default, and catchup_with_main would noisily fail.
-            if !is_external_repo
-                && !is_app_spawn
-                && (reusing_branch || existing_worktree.is_some())
+            if !is_external_repo && !is_app_spawn && (reusing_branch || existing_worktree.is_some())
             {
                 if let Err(e) = catchup_with_main(&wt_path).await {
                     log!(
@@ -615,7 +616,9 @@ impl LucidosEngine {
                                 "[AgentSession] npm ci failed in worktree: {}",
                                 String::from_utf8_lossy(&o.stderr).trim()
                             ),
-                            Err(e) => log!("[AgentSession] Failed to run npm ci in worktree: {}", e),
+                            Err(e) => {
+                                log!("[AgentSession] Failed to run npm ci in worktree: {}", e)
+                            }
                         }
                     }
                 }
@@ -704,8 +707,7 @@ impl LucidosEngine {
             // (resume) or reused worktree must survive a failed spawn — see
             // `cleanup_failed_spawn`.
             let worktree_created = existing_worktree.is_none();
-            let branch_created = worktree_created
-                && app_branch_created.unwrap_or(!reusing_branch);
+            let branch_created = worktree_created && app_branch_created.unwrap_or(!reusing_branch);
             (
                 cwd,
                 system_prompt,

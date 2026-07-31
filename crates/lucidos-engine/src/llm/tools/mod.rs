@@ -92,11 +92,11 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     tools.extend(file::import_file_tools()); // import_file
     tools.extend(misc::git_clone_tools()); // git_clone
     tools.extend(misc::backup_status_tools()); // get_backup_status
-    // get_preferences/set_preference → grouped `preferences` tool; the trigger +
-    // trigger-group family → grouped `triggers`/`trigger_groups` tools; env-var
-    // management → grouped `env_vars` tool (set_environment_variable kept as a
-    // back-compat alias). All spliced from `capability_manifest::llm_tools()` by
-    // the chat/intent callers.
+                                               // get_preferences/set_preference → grouped `preferences` tool; the trigger +
+                                               // trigger-group family → grouped `triggers`/`trigger_groups` tools; env-var
+                                               // management → grouped `env_vars` tool (set_environment_variable kept as a
+                                               // back-compat alias). All spliced from `capability_manifest::llm_tools()` by
+                                               // the chat/intent callers.
     tools.extend(web::fetch_news_tools()); // fetch_news
     tools.extend(browser::browser_tools()); // browser_* family
     tools.extend(web::web_search_tools()); // web_search
@@ -105,18 +105,18 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     tools.extend(apps::app_tools()); // create_app, list_apps, load_knowhow, refresh_file, refresh_app, capture_app
     tools.extend(misc::connect_oauth_tools()); // connect_oauth_account
     tools.extend(threads::spawn_tools()); // run_thread, run_coding_agent
-    // correct_memory/correct_memory_by_id are the grouped `memory` manifest tool
-    // (spliced via capability_manifest::llm_tools()).
+                                          // correct_memory/correct_memory_by_id are the grouped `memory` manifest tool
+                                          // (spliced via capability_manifest::llm_tools()).
     tools.extend(misc::execute_intent_tools()); // execute_intent
-    // emit/query/count events and list/apply changes are the grouped `events` /
-    // `changes` manifest tools (spliced via capability_manifest::llm_tools()).
-    // list_threads/count_threads are the grouped `threads` manifest tool (spliced
-    // via capability_manifest::llm_tools()); run_thread/run_coding_agent stay
-    // standalone above (threads::spawn_tools()).
-    // list_thread_queue/update_thread_queue_policy are the grouped `thread_queue`
-    // manifest tool (spliced via capability_manifest::llm_tools()).
-    // plugin + MCP management are the grouped `plugins` / `mcp` manifest tools
-    // (spliced from capability_manifest::llm_tools() by the chat/intent callers).
+                                                // emit/query/count events and list/apply changes are the grouped `events` /
+                                                // `changes` manifest tools (spliced via capability_manifest::llm_tools()).
+                                                // list_threads/count_threads are the grouped `threads` manifest tool (spliced
+                                                // via capability_manifest::llm_tools()); run_thread/run_coding_agent stay
+                                                // standalone above (threads::spawn_tools()).
+                                                // list_thread_queue/update_thread_queue_policy are the grouped `thread_queue`
+                                                // manifest tool (spliced via capability_manifest::llm_tools()).
+                                                // plugin + MCP management are the grouped `plugins` / `mcp` manifest tools
+                                                // (spliced from capability_manifest::llm_tools() by the chat/intent callers).
     tools.extend(misc::ask_user_question_tools()); // ask_user_question
     tools.extend(memory::dismiss_from_context_tools()); // dismiss_from_context
     tools.extend(misc::todo_write_tools()); // todo_write

@@ -16,10 +16,10 @@
 # scripts/lib/headless_tarball.sh first (install.sh and the test both do).
 
 # install_default_base_url <version> — the default base URL where the per-platform
-# tarball + .sha256 live: the eventual GitHub Releases download path for the
-# umbrella version tag. Nothing is published there yet (the CI workflow is
-# artifact-only), so a default download 404s until a Release is cut — install.sh
-# surfaces that and points the user at --dev / --from-tarball.
+# tarball + .sha256 live: the GitHub Releases download path for the umbrella version
+# tag. CI attaches the assets ~30 min AFTER the Release is published, so a download
+# in that window still 404s — install.sh surfaces that and points the user at an
+# older --version / --dev / --from-tarball.
 install_default_base_url() {
     printf 'https://github.com/lucidos-dev/lucidos/releases/download/v%s' "$1"
 }

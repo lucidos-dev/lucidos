@@ -54,8 +54,14 @@ async fn coding_agent_idled_does_not_set_proposed_until_change_proposed() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(status, "idle", "CodingAgentIdled alone must NOT promote to 'waiting'");
-    assert!(!proposed, "CodingAgentIdled must NOT set coding_agent_proposed");
+    assert_eq!(
+        status, "idle",
+        "CodingAgentIdled alone must NOT promote to 'waiting'"
+    );
+    assert!(
+        !proposed,
+        "CodingAgentIdled must NOT set coding_agent_proposed"
+    );
     assert!(
         !requires_restart,
         "coding_agent_requires_restart must NOT come from CodingAgentIdled"
@@ -80,13 +86,19 @@ async fn coding_agent_idled_does_not_set_proposed_until_change_proposed() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(status, "idle", "ChangeProposed keeps status='idle' (review is an artifact, not a parked loop)");
+    assert_eq!(
+        status, "idle",
+        "ChangeProposed keeps status='idle' (review is an artifact, not a parked loop)"
+    );
     assert!(proposed, "ChangeProposed sets coding_agent_proposed");
     assert!(
         requires_restart,
         "coding_agent_requires_restart comes from the ChangeProposed payload"
     );
-    assert!(has_diff, "ChangeProposed also seeds the git-truth has_diff signal");
+    assert!(
+        has_diff,
+        "ChangeProposed also seeds the git-truth has_diff signal"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -128,7 +140,10 @@ async fn sse_thread_event_carries_aggregate() {
         .aggregate
         .as_ref()
         .expect("aggregate must be present on persisted thread events");
-    assert_eq!(agg.section, "inbox", "ResponseCanceled puts CC thread in inbox");
+    assert_eq!(
+        agg.section, "inbox",
+        "ResponseCanceled puts CC thread in inbox"
+    );
     assert_eq!(agg.status, "idle", "after cancel, status returns to idle");
     assert_eq!(agg.thread_id, thread_id.to_string());
 
@@ -158,12 +173,13 @@ async fn claude_code_idled_with_changes_sets_proposed_keeps_idle() {
     start_cc_session(&bus, thread_id, "claude-code/test", None).await;
     emit_cc_idle(&bus, thread_id, true, None).await;
 
-    let (status, has_changes): (String, bool) =
-        sqlx::query_as("SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let (status, has_changes): (String, bool) = sqlx::query_as(
+        "SELECT status, coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(
         status, "idle",
         "CodingAgentIdled(has_changes=true) + ChangeProposed settle to 'idle' under Option B"
@@ -212,9 +228,18 @@ async fn external_repo_idle_with_changes_never_shows_apply_discard() {
     let (status, has_changes, is_external): (String, bool, bool) = sqlx::query_as(
             "SELECT status, coding_agent_proposed, coding_agent_is_external_repo FROM thread_summaries WHERE thread_id = $1"
         ).bind(thread_id).fetch_one(&pool).await.unwrap();
-    assert_eq!(status, "idle", "no proposal → idle (Apply/Discard never appear)");
-    assert!(!has_changes, "no ChangeProposed → coding_agent_proposed stays false");
-    assert!(is_external, "coding_agent_is_external_repo reflects the payload");
+    assert_eq!(
+        status, "idle",
+        "no proposal → idle (Apply/Discard never appear)"
+    );
+    assert!(
+        !has_changes,
+        "no ChangeProposed → coding_agent_proposed stays false"
+    );
+    assert!(
+        is_external,
+        "coding_agent_is_external_repo reflects the payload"
+    );
 
     // The key invariant: no ChangeProposed event should exist for external repos.
     // The runtime skips propose_change, so no changes row is created.
@@ -350,7 +375,10 @@ async fn full_apply_cycle_ends_idle_not_waiting() {
         status, "idle",
         "After full apply cycle, thread must be idle"
     );
-    assert!(!has_changes, "coding_agent_proposed must be false after apply");
+    assert!(
+        !has_changes,
+        "coding_agent_proposed must be false after apply"
+    );
     assert!(!requires_restart);
     assert!(!is_external);
     assert!(!applying);
@@ -549,7 +577,10 @@ async fn change_applied_emits_once_on_sequential_reapply() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(status, "applied", "the change row is applied after the first emit");
+    assert_eq!(
+        status, "applied",
+        "the change row is applied after the first emit"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -780,7 +811,10 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
         "only the new-branch change may remain pending — the orphan blocks Archive; got {:?}",
         pending
     );
-    assert_eq!(pending[0].0, change_b, "the surviving pending change is branch B's");
+    assert_eq!(
+        pending[0].0, change_b,
+        "the surviving pending change is branch B's"
+    );
     assert_eq!(pending[0].1, "claude-code/new-B");
 
     // The orphan is discarded (not lingering as pending).
@@ -789,15 +823,19 @@ async fn propose_time_reconcile_keeps_single_pending_and_proposed_flag() {
         .fetch_one(&pool)
         .await
         .unwrap();
-    assert_eq!(a_status, "discarded", "the stale branch-A change must be discarded");
+    assert_eq!(
+        a_status, "discarded",
+        "the stale branch-A change must be discarded"
+    );
 
     // Invariant 2: coding_agent_proposed reflects the NEW change (discard-before-propose).
-    let proposed: bool =
-        sqlx::query_scalar("SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1")
-            .bind(thread_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let proposed: bool = sqlx::query_scalar(
+        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert!(
         proposed,
         "coding_agent_proposed must be TRUE after a cross-branch propose — the sibling \
@@ -902,7 +940,10 @@ fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
          every merge path performs exactly once"
     );
     for (label, src) in [
-        ("change_ops/apply.rs", include_str!("../change_ops/apply.rs")),
+        (
+            "change_ops/apply.rs",
+            include_str!("../change_ops/apply.rs"),
+        ),
         (
             "agent_session/apply_now.rs",
             include_str!("../agent_session/apply_now.rs"),

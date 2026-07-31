@@ -1,5 +1,5 @@
-use super::*;
 use super::msg_helpers::*;
+use super::*;
 
 // ----------------------------------------------------------------------------
 // build_resume_tool_blocks_with_skip_ids — Phase 3 of the
@@ -51,9 +51,16 @@ fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
             sequence: Some(4),
         },
     ];
-    let (blocks, _skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 3, &std::collections::HashSet::new());
-    assert_eq!(blocks.len(), 2, "expect assistant ToolUse + user ToolResult");
+    let (blocks, _skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        3,
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        blocks.len(),
+        2,
+        "expect assistant ToolUse + user ToolResult"
+    );
 
     use crate::llm::{ContentBlock, MessageContent};
     match &blocks[0].content {
@@ -71,7 +78,10 @@ fn build_resume_tool_blocks_emits_paired_tool_use_and_result_for_recent_tool() {
     }
     match &blocks[1].content {
         MessageContent::Blocks(b) => match &b[0] {
-            ContentBlock::ToolResult { tool_use_id, content } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
                 assert!(tool_use_id.starts_with("evt-"));
                 assert!(
                     content.contains("PROCEDURE BODY"),
@@ -98,8 +108,11 @@ fn build_resume_tool_blocks_returns_empty_when_no_tools() {
         thread_id: None,
         sequence: Some(1),
     }];
-    let (blocks, skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 3, &std::collections::HashSet::new());
+    let (blocks, skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        3,
+        &std::collections::HashSet::new(),
+    );
     assert!(blocks.is_empty());
     assert!(skip_ids.is_empty());
 }
@@ -129,8 +142,11 @@ fn build_resume_tool_blocks_caps_at_n_excluding_pinned() {
             sequence: Some(i * 2 + 2),
         });
     }
-    let (blocks, _skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 2, &std::collections::HashSet::new());
+    let (blocks, _skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        2,
+        &std::collections::HashSet::new(),
+    );
     assert_eq!(blocks.len(), 4, "2 pairs * 2 messages each");
 
     use crate::llm::{ContentBlock, MessageContent};
@@ -187,8 +203,11 @@ fn build_resume_tool_blocks_pins_load_knowhow_beyond_n() {
     }
 
     // N=2, but load_knowhow must be pinned even though it's older
-    let (blocks, _skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 2, &std::collections::HashSet::new());
+    let (blocks, _skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        2,
+        &std::collections::HashSet::new(),
+    );
     // Pinned load_knowhow pair + 2 most recent unrelated pairs = 3 pairs * 2 = 6
     assert_eq!(blocks.len(), 6);
 
@@ -219,7 +238,10 @@ fn build_resume_tool_blocks_pins_load_knowhow_beyond_n() {
         }
         false
     });
-    assert!(body_present, "load_knowhow body should be present in pinned pair");
+    assert!(
+        body_present,
+        "load_knowhow body should be present in pinned pair"
+    );
 }
 
 /// The skip set returned alongside the resume blocks must contain ONLY the
@@ -255,8 +277,11 @@ fn build_resume_tool_blocks_skip_set_contains_only_emitted_pairs() {
             sequence: Some(i * 2 + 2),
         });
     }
-    let (_blocks, skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 2, &std::collections::HashSet::new());
+    let (_blocks, skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        2,
+        &std::collections::HashSet::new(),
+    );
     // N=2 -> last two tool_called event ids only (tool_3, tool_4)
     assert_eq!(skip_ids.len(), 2);
     assert!(skip_ids.contains(&tool_called_ids[3].to_string()));
@@ -316,8 +341,11 @@ fn build_resume_tool_blocks_pairs_interleaved_tools_correctly() {
             sequence: Some(4),
         },
     ];
-    let (blocks, _skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, _skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     // Expect 4 messages (2 pairs).
     assert_eq!(blocks.len(), 4);
     use crate::llm::{ContentBlock, MessageContent};
@@ -337,7 +365,10 @@ fn build_resume_tool_blocks_pairs_interleaved_tools_correctly() {
     assert_eq!(use_a_input["x"], 1);
     let result_a_id = match &blocks[1].content {
         MessageContent::Blocks(b) => match &b[0] {
-            ContentBlock::ToolResult { tool_use_id, content } => {
+            ContentBlock::ToolResult {
+                tool_use_id,
+                content,
+            } => {
                 assert!(content.contains("result_a"));
                 tool_use_id.clone()
             }
@@ -404,8 +435,11 @@ fn build_resume_tool_blocks_with_skip_ids_excludes_dismissed_tool_pair() {
             sequence: Some(3),
         },
     ];
-    let (blocks, skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     assert!(blocks.is_empty(), "dismissed pair should be excluded");
     assert!(
         skip_ids.is_empty(),
@@ -464,8 +498,11 @@ fn build_resume_tool_blocks_with_skip_ids_keeps_undismissed_tool_pair() {
             sequence: Some(5),
         },
     ];
-    let (blocks, skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     // tool_b survives → 2 messages (ToolUse + ToolResult).
     assert_eq!(blocks.len(), 2, "undismissed pair should survive");
     assert_eq!(skip_ids.len(), 1, "skip set has only the surviving pair");
@@ -515,8 +552,11 @@ fn build_resume_tool_blocks_with_skip_ids_dismissal_works_regardless_of_order() 
             sequence: Some(3),
         },
     ];
-    let (blocks, skip_ids) =
-        crate::core::store::build_resume_tool_blocks_with_skip_ids(&events, 5, &std::collections::HashSet::new());
+    let (blocks, skip_ids) = crate::core::store::build_resume_tool_blocks_with_skip_ids(
+        &events,
+        5,
+        &std::collections::HashSet::new(),
+    );
     assert!(blocks.is_empty(), "dismissed pair should still be excluded");
     assert!(skip_ids.is_empty());
 }
@@ -564,7 +604,9 @@ fn build_session_messages_excludes_dismissed_child_thread_completed() {
     ];
     let msgs = build_session_messages(&events);
     assert!(
-        !msgs.iter().any(|m| m.content.contains("[CHILD THREAD COMPLETED]")),
+        !msgs
+            .iter()
+            .any(|m| m.content.contains("[CHILD THREAD COMPLETED]")),
         "dismissed ChildThreadCompleted must not appear in projected messages: {:?}",
         msgs.iter().map(|m| &m.content).collect::<Vec<_>>()
     );
@@ -578,22 +620,20 @@ fn build_session_messages_projects_undismissed_child_thread_completed() {
     let now = Utc::now();
     let child_id = Uuid::new_v4();
     let cc_event_id = Uuid::new_v4();
-    let events = vec![
-        EventRow {
-            id: cc_event_id,
-            event_type: "ChildThreadCompleted".into(),
-            payload: json!({
-                "child_thread_id": child_id.to_string(),
-                "child_thread_title": "Nightly",
-                "status": "success",
-                "summary": "all green",
-                "pending_change_ids": ["change-1"],
-            }),
-            created: now,
-            thread_id: None,
-            sequence: Some(1),
-        },
-    ];
+    let events = vec![EventRow {
+        id: cc_event_id,
+        event_type: "ChildThreadCompleted".into(),
+        payload: json!({
+            "child_thread_id": child_id.to_string(),
+            "child_thread_title": "Nightly",
+            "status": "success",
+            "summary": "all green",
+            "pending_change_ids": ["change-1"],
+        }),
+        created: now,
+        thread_id: None,
+        sequence: Some(1),
+    }];
     let msgs = build_session_messages(&events);
     let cc = msgs
         .iter()
@@ -617,8 +657,7 @@ fn build_session_messages_projects_undismissed_child_thread_completed() {
     // wake_text after the child-completion-card refactor). Keep a narrow
     // assertion so the rule stays load-bearing.
     assert!(
-        cc.content.contains("session can finish")
-            && cc.content.contains("child subprocess"),
+        cc.content.contains("session can finish") && cc.content.contains("child subprocess"),
         "projection must carry the 'session can finish' guard rail; got:\n{}",
         cc.content
     );

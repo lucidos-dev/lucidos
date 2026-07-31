@@ -188,6 +188,34 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `docs/plans/2026-07-01-cc-resume-config-dir-pin-and-session-not-found.md`; this row
   tracks only the string-match fragility)
 
+### "not published yet" hedge on the front-door uninstall one-liner
+
+- **Added:** 2026-07-30
+- **Lives in:** the usage comment at the top of `uninstall.sh` (the
+  `curl -fsSL https://lucidos.dev/uninstall.sh | sh` line, now annotated
+  `NOT PUBLISHED YET` with the explanation under it), and the paragraph in
+  `README.md` § "Manage / uninstall" that routes a one-liner installer to the
+  repository copy instead of to a front-door one-liner.
+- **Impermanent because:** the site publisher uploads `install.sh` and
+  `scripts/lib/*.sh` beside it, but **not** `uninstall.sh`, so
+  `https://lucidos.dev/uninstall.sh` returns the Cloudflare Pages landing page at
+  status **200**. The one-liner is the intended, correct front door; the docs
+  advertising it are right about the destination and wrong only about *today*. So
+  the hedge annotates the line rather than replacing the URL with a raw
+  `githubusercontent` one, which would undo commit b0421c862 and have to be
+  reverted the moment the publisher catches up.
+- **Removal / resolution condition:** when
+  `curl -fsSL https://lucidos.dev/uninstall.sh | head -c 2` prints `#!` rather than
+  `<!`. Then drop the annotation from `uninstall.sh` and give the README paragraph
+  the front-door one-liner instead of the repository link. The shebang sniffs added alongside it
+  in `install.sh` (`dispatch_uninstall`, the re-exec guard) and `uninstall.sh` are
+  **permanent** defence in depth, exactly like `_source_libs`, and do NOT come out
+  with this row.
+- **Status:** active
+- **Investigation:** n/a (publisher gap, recorded in
+  `docs/plans/2026-07-30-user-facing-docs-audit.md` and previously deferred in
+  `docs/plans/2026-07-29-front-door-origin-and-rc-gate.md`)
+
 ---
 
 ## 2. Model-tolerance measures

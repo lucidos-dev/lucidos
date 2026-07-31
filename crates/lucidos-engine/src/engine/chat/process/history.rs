@@ -3,7 +3,6 @@
 //! blocks, and the per-thread loaded-knowhow set from a single events fetch.
 //! Split out of `process_message_with_steps_internal`.
 
-use chrono::Utc;
 use crate::engine::context::{
     format_history_content, format_history_steps, HISTORY_COMPRESS_THRESHOLD,
     HISTORY_RECENT_MESSAGES, HISTORY_VERBATIM_TAIL,
@@ -11,6 +10,7 @@ use crate::engine::context::{
 use crate::engine::loaded_knowhow::LoadedKnowhow;
 use crate::engine::LucidosEngine;
 use crate::llm::Message;
+use chrono::Utc;
 use uuid::Uuid;
 
 use super::super::events::format_relative_age;
@@ -357,7 +357,6 @@ impl LucidosEngine {
         } else {
             (String::new(), user_message.to_string(), vec![])
         };
-
 
         ChatHistoryLoad {
             resume_tool_blocks,

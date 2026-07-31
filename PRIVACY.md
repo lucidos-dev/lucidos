@@ -110,6 +110,21 @@ behaviour:
   installs (`npm`, `cargo`, …) that reach the package registries those tools
   use.
 
+### Desktop-app update checks
+
+The macOS desktop app checks **GitHub Releases** for a newer signed build, on
+startup and then periodically, so it can offer the "update available → restart"
+prompt. The request goes to
+`github.com/lucidos-dev/lucidos/releases/latest/download/latest.json` and tells
+GitHub your IP address and the app version you are running, under GitHub's
+privacy policy. It carries no workspace data and no usage information, and there
+is no Lucidos-operated server involved, but it is recurring outbound traffic you
+did not configure, so it is listed here rather than left implied.
+
+This applies to the **`.dmg` desktop app only**. The headless install (the
+`curl … | sh` runtime) has no updater: neither the gateway nor the engine polls
+for releases, and you update it by re-running the installer.
+
 ### Plugins and plugin marketplaces
 
 Plugins live in **git repositories**. Installing a plugin clones or fetches from
@@ -127,10 +142,11 @@ install a plugin or add a marketplace yourself.
 Lucidos contains **no telemetry**. It does not collect analytics or usage
 statistics, does not send crash or error reports to us or any third party, and
 does not phone home — there is no Lucidos-operated server for it to report to.
-The only network traffic Lucidos originates is the activity described above —
-LLM, tool, coding-agent, and plugin calls, each either serving a task you
-initiated or polling a source you configured — plus the service worker's checks
-against **your own local engine** for a fresh frontend build.
+The only network traffic Lucidos originates is the activity described above:
+LLM, tool, coding-agent and plugin calls, each either serving a task you
+initiated or polling a source you configured; the desktop app's update check
+against GitHub Releases; and the service worker's checks against **your own
+local engine** for a fresh frontend build.
 
 ## Questions and reports
 

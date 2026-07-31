@@ -9,6 +9,7 @@ import {
 import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
 import { toFailed, loadedOr, setLoadingIfFresh } from '../types';
+import { openFilePreview } from './artifacts';
 import { revealContentPane } from './pane';
 import { loadRepositories } from './chat';
 import { pushNavState, replaceNavState } from './navigation';
@@ -305,6 +306,35 @@ export function openRepoFilePreview(path: string, mode: 'file' | 'diff'): void {
   revealContentPane();
   if (replaceInPlace) replaceNavState();
   else pushNavState();
+}
+
+/** Open an ALREADY-encoded repo preview path (`repo:<repoId>:file:<path>`, the
+ *  form `encodeRepoPath` produces) that arrived from OUTSIDE the Files panel —
+ *  an app iframe's `lucidos.ui.navigate('file', …)` or an engine
+ *  `NavigationRequested`. Returns false when the path isn't repo-encoded, so the
+ *  caller falls back to the workspace-data file preview.
+ *
+ *  `openRepoFilePreview` above is the in-panel sibling: it ENCODES a path against
+ *  the repo the user is already browsing. Here the path arrives encoded and the
+ *  caller has no repo context, so bind the repo first. The preview itself takes
+ *  repoId/path as props and renders with no repo state at all (that's what makes
+ *  a reload of a restored repo preview work) — but the panel's split sidebar
+ *  lists whatever `repoDiff` holds, and its rows re-open through
+ *  `openRepoFilePreview`, which targets `repoSource`. Landing on repo A while
+ *  repo B's diff is still loaded would list B's changed files beside A's file and
+ *  open B's on click. `switchRepoSource` wipes repoDiff/repoPending/repoFiles
+ *  synchronously, so the stale sidebar is gone before the overlay mounts.
+ *  Already on that repo → keep the user's change selection (mirrors
+ *  `loadChangeContext`). Either way the line selection is dropped, as
+ *  `openRepoFilePreview` does, so a prior file's highlighted range can't leak
+ *  onto this one. */
+export function openEncodedRepoFilePreview(encoded: string): boolean {
+  const parsed = parseRepoPath(encoded);
+  if (!parsed) return false;
+  selectedLines.value = null;
+  if (repoSource.value !== parsed.repoId) void switchRepoSource(parsed.repoId);
+  openFilePreview(encoded);
+  return true;
 }
 
 /** Open the Files panel on the 3-dot diff of a CC worktree's branch.

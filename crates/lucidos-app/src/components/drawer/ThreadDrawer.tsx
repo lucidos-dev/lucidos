@@ -1329,22 +1329,42 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
     );
 }
 
-/** Empty-state for the four status-filter views (Drafts / Needs attention /
- *  Review / Running). Below the "nothing here" message it offers a one-tap
- *  shortcut back to the unfiltered "All statuses" view, so a user who landed on
- *  an empty filter isn't stranded — the items they're after live under another
- *  status. The all-statuses and search views don't use this: "All statuses" IS
- *  the destination, and an empty search wants a different query, not a filter
- *  reset. */
+/** One-tap shortcut back to the unfiltered "All statuses" view, offered by every
+ *  status-filter view (Drafts / Needs attention / Review / Running) in both
+ *  states: under the "nothing here" message when the filter is empty, and under
+ *  the last row when it isn't. Either way the user has reached the end of what
+ *  this status holds, and what they're after lives under another one, so the way
+ *  out sits where they're already looking rather than back up in the filter
+ *  control. The all-statuses and search views don't use it: "All statuses" IS
+ *  the destination, and an exhausted search wants a different query, not a
+ *  filter reset. */
+function SeeAllStatusesLink() {
+    return (
+        <button type="button" class="accent-link" onClick={() => setDrawerView('all')}>
+            See all statuses
+        </button>
+    );
+}
+
+/** Empty-state for the four status-filter views: the "nothing here" message
+ *  plus the shared shortcut. */
 function EmptyFilteredView({ message }: { message: string }) {
     return (
         <div class="empty-state">
             {message}
             <div class="empty-state-action">
-                <button type="button" class="accent-link" onClick={() => setDrawerView('all')}>
-                    See all statuses
-                </button>
+                <SeeAllStatusesLink />
             </div>
+        </div>
+    );
+}
+
+/** Trailing twin of `EmptyFilteredView`'s shortcut, closing out a status-filter
+ *  view that DID have rows. */
+function FilteredViewFooter() {
+    return (
+        <div class="filtered-view-footer">
+            <SeeAllStatusesLink />
         </div>
     );
 }
@@ -1376,6 +1396,7 @@ function DraftsList() {
             {drafts.map(t => t.meta.state === 'composing'
                 ? <ComposingThreadRow key={t.meta.id} thread={t} />
                 : <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
+            <FilteredViewFooter />
         </div>
     );
 }
@@ -1405,6 +1426,7 @@ function AttentionList() {
                 <DrawerSectionHeader Icon={AttentionIcon} title="Needs attention" />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
+            <FilteredViewFooter />
         </div>
     );
 }
@@ -1432,6 +1454,7 @@ function ReviewList() {
                 <DrawerSectionHeader title="Review" />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
+            <FilteredViewFooter />
         </div>
     );
 }
@@ -1464,6 +1487,7 @@ function RunningList() {
                 <DrawerSectionHeader Icon={RunningIcon} title="Running" hasRunning />
             </div>
             {threads.map(t => <ThreadRow key={t.meta.id} threadId={t.meta.id} status={effectiveThreadStatus(t)} />)}
+            <FilteredViewFooter />
         </div>
     );
 }

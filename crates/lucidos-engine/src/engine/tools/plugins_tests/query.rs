@@ -1,10 +1,8 @@
 //! Plugin-query resolution, file-ownership guard, normalization, and
 //! check-plugin-updates survey tests.
 
-
 use super::helpers::*;
 use super::*;
-
 
 use crate::engine::event_bus::EventBus;
 use crate::test_support::{setup_test_db, teardown_test_db};
@@ -57,9 +55,17 @@ async fn install_app_fixture(scratch: &Path, bus: &dyn EventBusEmitter) {
     std::fs::create_dir_all(&archive_dir).unwrap();
     let archive = build_app_fixture_archive(&archive_dir);
     let unpacked = extract_to(&archive_dir, &archive);
-    install_from_unpacked_with_bus(scratch, bus, &unpacked, SourceType::Archive, false, None, None)
-        .await
-        .expect("install app fixture must succeed");
+    install_from_unpacked_with_bus(
+        scratch,
+        bus,
+        &unpacked,
+        SourceType::Archive,
+        false,
+        None,
+        None,
+    )
+    .await
+    .expect("install app fixture must succeed");
 }
 
 #[tokio::test]
@@ -87,7 +93,12 @@ async fn resolve_plugin_query_matches_manifest_name_case_insensitive() {
 
     // Manifest name is "No role playing" — same words, mixed casing,
     // and a trailing space all resolve to the canonical id.
-    for q in ["No role playing", "no role playing", "NO ROLE PLAYING ", "no-role-playing"] {
+    for q in [
+        "No role playing",
+        "no role playing",
+        "NO ROLE PLAYING ",
+        "no-role-playing",
+    ] {
         let id = super::resolve_plugin_query(&pool, q)
             .await
             .unwrap_or_else(|e| panic!("query {q:?} must resolve: {e:?}"));
@@ -157,9 +168,8 @@ async fn resolve_plugin_query_ambiguous_lists_candidates() {
     for id in ["demo-one", "demo-two"] {
         let archive_dir = scratch.join(format!("archive-{}", id));
         std::fs::create_dir_all(&archive_dir).unwrap();
-        let manifest = format!(
-            "id = \"{id}\"\nversion = \"0.1.0\"\nname = \"Demo\"\ndescription = \"x\"\n"
-        );
+        let manifest =
+            format!("id = \"{id}\"\nversion = \"0.1.0\"\nname = \"Demo\"\ndescription = \"x\"\n");
         let archive = build_archive(
             &archive_dir,
             &format!("{}.lucidos-plugin", id),
@@ -207,16 +217,23 @@ async fn resolve_plugin_query_ignores_uninstalled_plugin() {
 
     let pending: std::sync::Arc<PendingUninstallsMap> =
         std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
-    let sentinel = super::prepare_uninstall_plugin(&scratch, &pool, &pending, "no-role-playing")
-        .await;
-    assert!(sentinel.starts_with(PLUGIN_UNINSTALL_REQUEST_PREFIX), "sentinel: {sentinel}");
+    let sentinel =
+        super::prepare_uninstall_plugin(&scratch, &pool, &pending, "no-role-playing").await;
+    assert!(
+        sentinel.starts_with(PLUGIN_UNINSTALL_REQUEST_PREFIX),
+        "sentinel: {sentinel}"
+    );
     let uninstall_id = pending.lock().unwrap().keys().next().cloned().unwrap();
     let entry = pending.lock().unwrap().remove(&uninstall_id).unwrap();
     super::uninstall_with_bus(&scratch, &bus, &entry, None)
         .await
         .expect("uninstall must succeed");
 
-    for q in ["no-role-playing", "anti-sycophancy-critique", "No role playing"] {
+    for q in [
+        "no-role-playing",
+        "anti-sycophancy-critique",
+        "No role playing",
+    ] {
         let err = super::resolve_plugin_query(&pool, q)
             .await
             .expect_err("uninstalled plugin must not resolve");
@@ -297,7 +314,10 @@ async fn find_plugin_owning_file_returns_none_for_unrelated_paths() {
     let owner = super::find_plugin_owning_file(&pool, "artifacts/my-notes.md")
         .await
         .expect("query must succeed");
-    assert!(owner.is_none(), "unrelated paths must not resolve to an owner");
+    assert!(
+        owner.is_none(),
+        "unrelated paths must not resolve to an owner"
+    );
 
     let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
@@ -322,10 +342,9 @@ async fn find_plugin_owning_file_returns_none_after_uninstall() {
         .await
         .expect("uninstall must succeed");
 
-    let owner =
-        super::find_plugin_owning_file(&pool, "apps/anti-sycophancy-critique/index.html")
-            .await
-            .expect("query must succeed");
+    let owner = super::find_plugin_owning_file(&pool, "apps/anti-sycophancy-critique/index.html")
+        .await
+        .expect("query must succeed");
     assert!(
         owner.is_none(),
         "uninstalled plugin's files must no longer be guarded"
@@ -368,7 +387,10 @@ async fn find_plugin_owning_app_returns_none_for_standalone_app() {
     let owner = super::find_plugin_owning_app(&pool, "some-standalone-app")
         .await
         .expect("query must succeed");
-    assert!(owner.is_none(), "standalone apps must not resolve to an owner");
+    assert!(
+        owner.is_none(),
+        "standalone apps must not resolve to an owner"
+    );
 
     // Prefix-boundary: the trailing slash in `apps/<id>/` means a strict
     // prefix of an owned folder must NOT match. The plugin owns
@@ -697,7 +719,10 @@ async fn installed_summary_omits_setup_and_app_when_absent() {
         .find(|p| p.id == "fixture-plugin")
         .expect("installed plugin present");
     assert_eq!(plugin.setup_thread_id, None);
-    assert_eq!(plugin.app_id, None, "knowhow-only plugin has no app to open");
+    assert_eq!(
+        plugin.app_id, None,
+        "knowhow-only plugin has no app to open"
+    );
 
     let _ = std::fs::remove_dir_all(&scratch);
     teardown_test_db(&db_name).await;
@@ -707,7 +732,10 @@ async fn installed_summary_omits_setup_and_app_when_absent() {
 fn primary_app_id_prefers_plugin_id_then_first_app() {
     use super::registry::primary_app_id as p;
     // No app files → nothing to open.
-    assert_eq!(p(&["knowhow/x.md".into(), "triggers/t/run.md".into()], "plug"), None);
+    assert_eq!(
+        p(&["knowhow/x.md".into(), "triggers/t/run.md".into()], "plug"),
+        None
+    );
     // Single app, folder name differs from plugin id → that app.
     assert_eq!(
         p(&["apps/dashboard/index.html".into()], "plug"),
@@ -716,10 +744,7 @@ fn primary_app_id_prefers_plugin_id_then_first_app() {
     // Multiple apps, one matching the plugin id → prefer the matching one.
     assert_eq!(
         p(
-            &[
-                "apps/zeta/index.html".into(),
-                "apps/plug/index.html".into(),
-            ],
+            &["apps/zeta/index.html".into(), "apps/plug/index.html".into(),],
             "plug"
         ),
         Some("plug".to_string())

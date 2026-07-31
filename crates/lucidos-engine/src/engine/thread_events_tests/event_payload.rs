@@ -314,4 +314,3 @@ fn change_proposed_new_format() {
              new event payloads byte-compatible with pre-field DB rows"
     );
 }
-

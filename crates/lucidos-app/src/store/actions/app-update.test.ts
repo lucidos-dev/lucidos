@@ -1,10 +1,14 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import type { AppUpdateProgress, AppUpdateRunning } from '../../utils/tauri';
 
 const mocks = vi.hoisted(() => ({
   isTauri: vi.fn(() => true),
   checkAppUpdate: vi.fn(),
   installAppUpdateAndRestart: vi.fn(),
+  cancelAppUpdate: vi.fn(),
+  listen: vi.fn(),
   showToast: vi.fn(),
+  removeToast: vi.fn(),
 }));
 
 // The persistent Settings → System surface reads these, so the tests assert on
@@ -14,31 +18,266 @@ const mocks = vi.hoisted(() => ({
 const storeSignals = vi.hoisted(() => ({
   latestTauriAppVersion: { value: null as string | null },
   appUpdateCheckError: { value: null as string | null },
+  appUpdateProgress: { value: null as AppUpdateProgress | null },
 }));
 
 vi.mock('../../utils/platform', () => ({ isTauri: mocks.isTauri }));
 vi.mock('../../utils/tauri', () => ({
   checkAppUpdate: mocks.checkAppUpdate,
   installAppUpdateAndRestart: mocks.installAppUpdateAndRestart,
+  cancelAppUpdate: mocks.cancelAppUpdate,
+  listen: mocks.listen,
+  APP_UPDATE_PROGRESS_EVENT: 'app-update-progress',
 }));
 vi.mock('../store', () => ({
   showToast: mocks.showToast,
+  removeToast: mocks.removeToast,
   latestTauriAppVersion: storeSignals.latestTauriAppVersion,
   appUpdateCheckError: storeSignals.appUpdateCheckError,
+  appUpdateProgress: storeSignals.appUpdateProgress,
 }));
 
-const { checkForAppUpdate } = await import('./app-update');
+const {
+  appUpdateNarration,
+  checkForAppUpdate,
+  installAppUpdate,
+  startAppUpdateChecks,
+  stopAppUpdateChecks,
+} = await import('./app-update');
+
+/** Push a frame through the REAL subscription wiring — the handler is whatever
+ *  `startAppUpdateChecks` registered, so these tests exercise the actual path an
+ *  event takes rather than a private function called directly. */
+let emitProgress: (frame: AppUpdateProgress) => void = () => {
+  throw new Error('startAppUpdateChecks() must run before a frame can be emitted');
+};
+
+/** The options of the most recent `showToast` call. */
+function lastToastOpts(): Record<string, unknown> {
+  const calls = mocks.showToast.mock.calls;
+  return (calls[calls.length - 1]?.[2] ?? {}) as Record<string, unknown>;
+}
+
+function lastToast(): { message: string; type: string; opts: Record<string, unknown> } {
+  const call = mocks.showToast.mock.calls[mocks.showToast.mock.calls.length - 1];
+  return { message: call[0] as string, type: call[1] as string, opts: lastToastOpts() };
+}
 
 beforeEach(() => {
   mocks.isTauri.mockReturnValue(true);
   mocks.checkAppUpdate.mockReset();
   mocks.installAppUpdateAndRestart.mockReset();
+  mocks.cancelAppUpdate.mockReset();
+  mocks.cancelAppUpdate.mockResolvedValue(undefined);
   mocks.showToast.mockReset();
+  mocks.removeToast.mockReset();
+  mocks.listen.mockReset();
+  mocks.listen.mockImplementation((_event: string, handler: (e: { payload: AppUpdateProgress }) => void) => {
+    emitProgress = (frame) => handler({ payload: frame });
+    return Promise.resolve(() => {});
+  });
   storeSignals.latestTauriAppVersion.value = null;
   storeSignals.appUpdateCheckError.value = null;
+  storeSignals.appUpdateProgress.value = null;
 });
 
-afterEach(() => vi.restoreAllMocks());
+afterEach(() => {
+  // Drops the interval AND the progress subscription, so the next test's
+  // `startAppUpdateChecks` registers a fresh handler instead of being skipped by
+  // the idempotence guard.
+  stopAppUpdateChecks();
+  vi.restoreAllMocks();
+});
+
+describe('appUpdateNarration', () => {
+  it('names the version and both byte counts for a sized download', () => {
+    const narration = appUpdateNarration({
+      version: '2026.7.30',
+      phase: 'downloading',
+      downloaded: 52_428_800,
+      total: 104_857_600,
+    });
+    expect(narration.message).toContain('Lucidos 2026.7.30');
+    expect(narration.message).toContain('50 MB');
+    expect(narration.message).toContain('100 MB');
+    expect(narration.progress).toBeCloseTo(0.5);
+  });
+
+  // No `Content-Length` means there is no honest percentage. Inventing one (or
+  // rendering NaN%) is the failure this pins.
+  it('reports bytes without inventing a total when the size is unknown', () => {
+    const narration = appUpdateNarration({
+      version: '2026.7.30',
+      phase: 'downloading',
+      downloaded: 52_428_800,
+      total: null,
+    });
+    expect(narration.progress).toBeNull();
+    expect(narration.message).toContain('50 MB');
+    expect(narration.message).not.toContain('of');
+    expect(narration.message).not.toContain('NaN');
+  });
+
+  // Both the toast and the System page paint this fraction; an undercounted
+  // Content-Length would otherwise run one of their bars past its own track.
+  it('clamps a download that overruns the size the server declared', () => {
+    const narration = appUpdateNarration({
+      version: '2026.7.30',
+      phase: 'downloading',
+      downloaded: 120,
+      total: 100,
+    });
+    expect(narration.progress).toBe(1);
+  });
+
+  it('survives a zero total without dividing by it', () => {
+    const narration = appUpdateNarration({
+      version: '2026.7.30',
+      phase: 'downloading',
+      downloaded: 0,
+      total: 0,
+    });
+    expect(narration.progress).toBeNull();
+  });
+
+  // The cancellation contract: an affordance is offered only while abandoning the
+  // run is actually possible. Past the download there is no half-installed state
+  // to return to, so claiming otherwise would be a lie.
+  it('offers cancel only while the run can still be abandoned', () => {
+    const cancellableByPhase: Array<[AppUpdateRunning, boolean]> = [
+      [{ version: null, phase: 'checking' }, true],
+      [{ version: 'v', phase: 'downloading', downloaded: 1, total: 2 }, true],
+      [{ version: 'v', phase: 'verifying' }, false],
+      [{ version: 'v', phase: 'installing' }, false],
+      [{ version: 'v', phase: 'restarting-services' }, false],
+      [{ version: 'v', phase: 'relaunching' }, false],
+    ];
+    for (const [frame, cancellable] of cancellableByPhase) {
+      expect(appUpdateNarration(frame).cancellable, frame.phase).toBe(cancellable);
+    }
+  });
+
+  it('gives every in-flight phase a sentence', () => {
+    const frames: AppUpdateRunning[] = [
+      { version: null, phase: 'checking' },
+      { version: 'v', phase: 'downloading', downloaded: 1, total: 2 },
+      { version: 'v', phase: 'verifying' },
+      { version: 'v', phase: 'installing' },
+      { version: 'v', phase: 'restarting-services' },
+      { version: 'v', phase: 'relaunching' },
+    ];
+    for (const frame of frames) {
+      expect(appUpdateNarration(frame).message, frame.phase).not.toBe('');
+    }
+  });
+
+  it('falls back to a version-less label before the check resolves one', () => {
+    expect(appUpdateNarration({ version: null, phase: 'installing' }).message)
+      .toBe('Installing the update…');
+  });
+});
+
+describe('update progress narration', () => {
+  // The bug this whole surface exists to fix: the click used to produce nothing
+  // visible until the update was over.
+  it('narrates on the click rather than waiting for the first event', async () => {
+    storeSignals.latestTauriAppVersion.value = '2026.7.30';
+    mocks.installAppUpdateAndRestart.mockResolvedValue(undefined);
+    await installAppUpdate();
+    const first = mocks.showToast.mock.calls[0];
+    expect(first[0]).toBe('Checking for updates…');
+    expect((first[2] as Record<string, unknown>).spinning).toBe(true);
+  });
+
+  it('drives a spinning toast with a determinate bar while downloading', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 50, total: 200 });
+    const { message, opts } = lastToast();
+    expect(message).toContain('Downloading Lucidos 2026.7.30');
+    expect(opts.spinning).toBe(true);
+    expect(opts.progress).toBeCloseTo(0.25);
+    // The gateway dies under the page in the last phases; without this opt-in the
+    // narration would be suppressed by the disconnection it is explaining.
+    expect(opts.showDuringRestart).toBe(true);
+    expect((opts.secondaryAction as { label: string }).label).toBe('Cancel');
+  });
+
+  it('drops the cancel affordance once the run has committed', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'installing' });
+    expect(lastToastOpts().secondaryAction).toBeUndefined();
+    expect(lastToastOpts().progress).toBeNull();
+  });
+
+  it('routes the cancel button to the Rust command', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
+    (lastToastOpts().secondaryAction as { onClick: () => void }).onClick();
+    expect(mocks.cancelAppUpdate).toHaveBeenCalledTimes(1);
+  });
+
+  // A failure must end the run AND say why — this one runs on a click, so the
+  // best-effort console.warn carve-out does not apply.
+  it('reports a failure with its reason and leaves nothing spinning', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
+    emitProgress({ version: '2026.7.30', phase: 'failed', message: 'signature mismatch' });
+    const { message, type, opts } = lastToast();
+    expect(type).toBe('error');
+    expect(message).toContain('signature mismatch');
+    expect(opts.spinning).toBeFalsy();
+    expect(storeSignals.appUpdateProgress.value).toBeNull();
+  });
+
+  // Nothing was written to disk, so the update is still there to install —
+  // leaving the user with no affordance would strand them until the next 6h poll.
+  it('re-offers the update after a cancel', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
+    emitProgress({ version: '2026.7.30', phase: 'cancelled' });
+    const { message, opts } = lastToast();
+    expect(message).toBe('Lucidos 2026.7.30 available');
+    expect((opts.action as { label: string }).label).toBe('Update & restart');
+    expect(storeSignals.appUpdateProgress.value).toBeNull();
+  });
+
+  it('keeps one toast for the whole run instead of stacking a new one per phase', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'checking' });
+    emitProgress({ version: '2026.7.30', phase: 'downloading', downloaded: 1, total: 2 });
+    emitProgress({ version: '2026.7.30', phase: 'installing' });
+    const keys = new Set(mocks.showToast.mock.calls.map((c) => (c[2] as { key: string }).key));
+    expect(keys).toEqual(new Set(['app-update-available']));
+  });
+
+  // A rejected invoke (ACL denial, dead bridge) is the one failure Rust can't
+  // announce for itself.
+  it('never leaves the toast spinning when the invoke itself rejects', async () => {
+    storeSignals.latestTauriAppVersion.value = '2026.7.30';
+    mocks.installAppUpdateAndRestart.mockRejectedValue('ipc unavailable');
+    await installAppUpdate();
+    const { message, type } = lastToast();
+    expect(type).toBe('error');
+    expect(message).toContain('ipc unavailable');
+    expect(storeSignals.appUpdateProgress.value).toBeNull();
+  });
+
+  // Both surfaces share one key; a poll firing mid-download would otherwise
+  // replace the live readout with a stale "available" offer.
+  it('does not let the periodic check clobber a live run', async () => {
+    storeSignals.appUpdateProgress.value = { version: '2026.7.30', phase: 'installing' };
+    await checkForAppUpdate();
+    expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+    expect(mocks.showToast).not.toHaveBeenCalled();
+  });
+
+  it('subscribes once however many times the workspace remounts', () => {
+    startAppUpdateChecks();
+    startAppUpdateChecks();
+    startAppUpdateChecks();
+    expect(mocks.listen).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('checkForAppUpdate', () => {
   it('is a no-op outside the Tauri client (browser / PWA / dev)', async () => {
@@ -141,35 +380,25 @@ describe('startAppUpdateChecks', () => {
   // ever checked. With a 6h interval behind it, an update published mid-session
   // stayed invisible until the app was fully quit and relaunched.
   it('re-checks on every mount, not just the first of a client process', async () => {
-    const { startAppUpdateChecks, stopAppUpdateChecks } = await import('./app-update');
     mocks.checkAppUpdate.mockResolvedValue(null);
-    try {
-      startAppUpdateChecks();
-      startAppUpdateChecks();
-      startAppUpdateChecks();
-      expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(3);
-    } finally {
-      stopAppUpdateChecks();
-    }
+    startAppUpdateChecks();
+    startAppUpdateChecks();
+    startAppUpdateChecks();
+    expect(mocks.checkAppUpdate).toHaveBeenCalledTimes(3);
   });
 
   it('does not stack a second interval when called again', async () => {
-    const { startAppUpdateChecks, stopAppUpdateChecks } = await import('./app-update');
     mocks.checkAppUpdate.mockResolvedValue(null);
     const setInterval = vi.spyOn(globalThis, 'setInterval');
-    try {
-      startAppUpdateChecks();
-      startAppUpdateChecks();
-      expect(setInterval).toHaveBeenCalledTimes(1);
-    } finally {
-      stopAppUpdateChecks();
-    }
+    startAppUpdateChecks();
+    startAppUpdateChecks();
+    expect(setInterval).toHaveBeenCalledTimes(1);
   });
 
   it('stays a no-op outside the Tauri client', async () => {
-    const { startAppUpdateChecks } = await import('./app-update');
     mocks.isTauri.mockReturnValue(false);
     startAppUpdateChecks();
     expect(mocks.checkAppUpdate).not.toHaveBeenCalled();
+    expect(mocks.listen).not.toHaveBeenCalled();
   });
 });

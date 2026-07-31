@@ -1,6 +1,7 @@
 import { useCallback, useEffect } from 'preact/hooks';
 import {
   appUpdateCheckError,
+  appUpdateProgress,
   connectionStatus,
   engineStartedAt,
   engineVersion,
@@ -20,7 +21,8 @@ import {
   workspacePath,
 } from '../../store/store';
 import { initiateEngineRestart } from '../../store/actions/chat-changes';
-import { checkForAppUpdate, installAppUpdate, packagedUpdateVersion } from '../../store/actions/app-update';
+import { appUpdateNarration, checkForAppUpdate, installAppUpdate, packagedUpdateVersion } from '../../store/actions/app-update';
+import { cancelAppUpdate } from '../../utils/tauri';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
 import { isUnstampedBuildId } from '../../utils/buildId';
@@ -167,6 +169,12 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   // One derivation, shared with the button's action so the label and what the
   // click does can never disagree.
   const tauriHasUpdate = !!packagedUpdateVersion();
+  // An update in flight OWNS this control: the same derivation the progress toast
+  // renders, so the persistent surface and the transient one can never disagree
+  // about what the update is doing. Terminal frames clear the signal, so this is
+  // non-null exactly while a run is live.
+  const updateRun = appUpdateProgress.value;
+  const updateNarration = updateRun ? appUpdateNarration(updateRun) : null;
   const clientBehind = tauriClientVersion ? tauriHasUpdate : update;
   const clientBehindLabel = tauriClientVersion ? ` (latest: ${latestTauriVer})` : ' (update available)';
 
@@ -291,8 +299,18 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
           {/* The PERSISTENT route to a packaged update. The in-app toast is
               transient and dismissable, so it cannot be the only way to reach
               one — dismissing it used to strand the user until the next 6h poll
-              (or a full quit-and-relaunch). */}
-          {tauriHasUpdate && (
+              (or a full quit-and-relaunch). Once a run starts, the same live
+              phase the toast narrates replaces the offer here. */}
+          {updateNarration ? (
+            <div class="system-notice">
+              {updateNarration.message}
+              {updateNarration.progress !== null && (
+                <div class="progress-bar system-update-progress">
+                  <div class="progress-bar-fill" style={`width: ${Math.round(updateNarration.progress * 100)}%`} />
+                </div>
+              )}
+            </div>
+          ) : tauriHasUpdate && (
             <div class="system-notice">
               Lucidos {latestTauriVer} is available - update and restart to install
             </div>
@@ -307,11 +325,18 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
             <button class="action-btn" onClick={handleRefresh}>
               Refresh Client
             </button>
-            {tauriClientVersion && (
-              <button class="action-btn" onClick={handleAppUpdate}>
-                {tauriHasUpdate ? 'Update & Restart' : 'Check for Updates'}
-              </button>
-            )}
+            {/* While a run is live this button must not offer to start another —
+                it reports the phase instead, and turns into the same Cancel the
+                toast offers for exactly as long as one is honest. */}
+            {tauriClientVersion && (updateNarration
+              ? (updateNarration.cancellable
+                  ? <button class="action-btn action-btn-danger" onClick={() => { void cancelAppUpdate(); }}>Cancel Update</button>
+                  : <button class="action-btn" disabled>Updating…</button>)
+              : (
+                <button class="action-btn" onClick={handleAppUpdate}>
+                  {tauriHasUpdate ? 'Update & Restart' : 'Check for Updates'}
+                </button>
+              ))}
             <button class="action-btn" onClick={handleRestart}>
               Rebuild &amp; Restart
             </button>

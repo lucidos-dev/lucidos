@@ -517,9 +517,7 @@ pub(crate) fn split_archive_path(data_path: &str) -> Option<(String, String)> {
 /// Pull `start_line` / `line_count` from the LLM's `read_file` args. Returns `None` when the
 /// caller didn't ask for line slicing; otherwise `Some((start_line, line_count))` where a
 /// missing `start_line` defaults to `1` and a missing `line_count` means "to end of file".
-pub(crate) fn line_window_from_args(
-    args: &serde_json::Value,
-) -> Option<(usize, Option<usize>)> {
+pub(crate) fn line_window_from_args(args: &serde_json::Value) -> Option<(usize, Option<usize>)> {
     let start = args
         .get("start_line")
         .and_then(|v| v.as_u64())
@@ -619,7 +617,7 @@ pub(crate) fn strip_image_content_marker(s: &str) -> Option<String> {
     let (media_type, b64) = parse_image_content_marker(s)?;
     let approx_bytes = (b64.len() * 3) / 4;
     Some(format!(
-        "[image {} — {} omitted, not embedded in event]",
+        "[image {}, {} omitted, not embedded in event]",
         media_type,
         crate::core::format_byte_size(approx_bytes),
     ))
@@ -674,11 +672,10 @@ impl LucidosEngine {
                     return Ok(sanitize_file_content_for_llm(sliced, &display_path, 0));
                 }
 
-                let (data_path, full_path) =
-                    match self.resolve_data_path(raw_path) {
-                        Ok(p) => p,
-                        Err(e) => return Ok(format!("Error: {}", e)),
-                    };
+                let (data_path, full_path) = match self.resolve_data_path(raw_path) {
+                    Ok(p) => p,
+                    Err(e) => return Ok(format!("Error: {}", e)),
+                };
                 let path = data_path.as_str();
 
                 let extension = lowercase_extension(path);
@@ -741,9 +738,7 @@ impl LucidosEngine {
                         Ok(content) => {
                             // The slice is its own chunk, so sanitize from offset 0.
                             let (text, sanitize_offset) = match line_window {
-                                Some((start, count)) => {
-                                    (slice_lines(&content, start, count), 0)
-                                }
+                                Some((start, count)) => (slice_lines(&content, start, count), 0),
                                 None => (content, offset),
                             };
                             Ok(sanitize_file_content_for_llm(text, path, sanitize_offset))
@@ -1063,7 +1058,8 @@ impl LucidosEngine {
                 // Plugin-owned files route through uninstall_plugin so the
                 // user's confirm panel always fires and the registry stays
                 // in sync with disk.
-                match crate::engine::tools::plugins::find_plugin_owning_file(&self.pool, path).await {
+                match crate::engine::tools::plugins::find_plugin_owning_file(&self.pool, path).await
+                {
                     Ok(Some(owner)) => {
                         return Ok(format!(
                             "Error: Cannot delete '{}': it belongs to installed plugin '{}' (\"{}\"). \

@@ -60,10 +60,7 @@ async fn resolve_preview_root(
     // — the matching cwd inside the worktree lives at
     // `<worktree>/data/apps/<id>/`. Resolve the actual worktree via the
     // engine's `resolve_thread_app_worktree` helper.
-    let wt = state
-        .engine
-        .resolve_thread_app_worktree(tid)
-        .await?;
+    let wt = state.engine.resolve_thread_app_worktree(tid).await?;
     // Sparse-checkout worktrees mirror the workspace layout, so the served
     // root is `<wt>/data/apps/<id>/`.
     let app_root = wt.join("data").join("apps").join(expected_app_id);
@@ -591,12 +588,7 @@ pub(super) async fn serve_html2canvas() -> impl IntoResponse {
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/apps", get(list_apps))
-        .route(
-            "/app",
-            get(get_app)
-                .put(update_app)
-                .delete(delete_app),
-        )
+        .route("/app", get(get_app).put(update_app).delete(delete_app))
         .route(
             "/app/:app_id/source",
             get(read_app_source).put(write_app_source),

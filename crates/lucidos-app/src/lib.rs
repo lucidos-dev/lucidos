@@ -329,7 +329,9 @@ fn paint_title_bars(app: &tauri::AppHandle, color: tauri::utils::config::Color) 
 /// is colored.
 #[tauri::command]
 fn set_titlebar_color(app: tauri::AppHandle, color: String) -> Result<(), String> {
-    let parsed = color.parse().map_err(|e| format!("invalid color {color:?}: {e}"))?;
+    let parsed = color
+        .parse()
+        .map_err(|e| format!("invalid color {color:?}: {e}"))?;
     paint_title_bars(&app, parsed);
     Ok(())
 }
@@ -1274,6 +1276,7 @@ pub fn run() {
             last_change: Mutex::new(Instant::now()),
         })
         .manage(device_id_store::DeviceIdStore::default())
+        .manage(updater::AppUpdateRun::default())
         .manage(DockBadgeNudge(Mutex::new(dock_badge_nudge_tx)))
         .invoke_handler(tauri::generate_handler![
             create_panel_webview,
@@ -1301,6 +1304,7 @@ pub fn run() {
             take_pending_native_taps,
             updater::check_app_update,
             updater::install_app_update_and_restart,
+            updater::cancel_app_update,
             set_titlebar_color,
             start_window_drag,
             toggle_window_maximize,
@@ -1372,7 +1376,9 @@ pub fn run() {
                 {
                     let saver = app.state::<GeometrySaver>();
                     *saver.last_change.lock().unwrap() = Instant::now();
-                    saver.dirty.store(true, std::sync::atomic::Ordering::Release);
+                    saver
+                        .dirty
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
                 _ => {}
             }
@@ -1504,7 +1510,9 @@ pub fn run() {
                 let dirty = saver.dirty.load(std::sync::atomic::Ordering::Acquire);
                 let since = saver.last_change.lock().unwrap().elapsed();
                 if should_persist_geometry(dirty, since) {
-                    saver.dirty.store(false, std::sync::atomic::Ordering::Release);
+                    saver
+                        .dirty
+                        .store(false, std::sync::atomic::Ordering::Release);
                     persist_window_state_on_main(&geometry_handle);
                 }
             });
@@ -1590,8 +1598,13 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
             if last > 0 {
                 app_menu.remove_at(last - 1)?;
             }
-            let uninstall =
-                MenuItem::with_id(app, "uninstall_lucidos", "Uninstall Lucidos…", true, None::<&str>)?;
+            let uninstall = MenuItem::with_id(
+                app,
+                "uninstall_lucidos",
+                "Uninstall Lucidos…",
+                true,
+                None::<&str>,
+            )?;
             let close_to_menu_bar = MenuItem::with_id(
                 app,
                 "close_to_menu_bar",
@@ -1615,7 +1628,8 @@ fn install_app_menu(app: &tauri::App) -> tauri::Result<()> {
         }
 
         if let Some(MenuItemKind::Submenu(file_menu)) = items.get(1) {
-            let new_window = MenuItem::with_id(app, "new_window", "New Window", true, Some("Cmd+N"))?;
+            let new_window =
+                MenuItem::with_id(app, "new_window", "New Window", true, Some("Cmd+N"))?;
             file_menu.prepend(&new_window)?;
         }
     }
@@ -1756,7 +1770,10 @@ mod tests {
         assert!(watchdog.futile_reloads > 0, "expected to be backed off");
         // One heartbeat arrives, then silence again.
         let decision = watchdog
-            .on_tick(reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1), 1)
+            .on_tick(
+                reload_threshold(watchdog.futile_reloads) + Duration::from_secs(1),
+                1,
+            )
             .expect("silent past the threshold must reload");
         assert!(!decision.futile);
         assert_eq!(decision.next_threshold, HEARTBEAT_TIMEOUT);
@@ -2026,7 +2043,11 @@ mod acl_tests {
         let origin = Origin::Remote {
             url: gateway_origin(),
         };
-        for command in ["heartbeat", "show_native_notification", "plugin:event|listen"] {
+        for command in [
+            "heartbeat",
+            "show_native_notification",
+            "plugin:event|listen",
+        ] {
             assert!(
                 authority
                     .resolve_access(command, "main", "main", &origin)
@@ -2066,7 +2087,11 @@ mod acl_tests {
         // third-party page, so it is judged as (window: main, webview:
         // url-preview-N) on that page's origin.
         let previewed = remote("https://example.com");
-        for command in ["__panel_title_report", "__panel_url_report", "__panel_content_report"] {
+        for command in [
+            "__panel_title_report",
+            "__panel_url_report",
+            "__panel_content_report",
+        ] {
             assert!(
                 authority
                     .resolve_access(command, "main", "url-preview-3", &previewed)

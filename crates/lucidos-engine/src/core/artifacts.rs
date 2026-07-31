@@ -383,7 +383,10 @@ impl ArtifactManager {
             None => ("", relative_path),
         };
         let leaf_path = Path::new(leaf);
-        let stem = leaf_path.file_stem().and_then(|s| s.to_str()).unwrap_or(leaf);
+        let stem = leaf_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(leaf);
         let ext = leaf_path.extension().and_then(|e| e.to_str());
 
         for n in 1..=MAX_COLLISION_SUFFIX {
@@ -653,7 +656,9 @@ mod tests {
         let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
 
         // First collision → "(1)".
-        manager.write_artifact("imported/Brev.pdf", "first").unwrap();
+        manager
+            .write_artifact("imported/Brev.pdf", "first")
+            .unwrap();
         assert_eq!(
             manager
                 .resolve_collision_free_path("imported/Brev.pdf")

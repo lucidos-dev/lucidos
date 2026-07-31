@@ -184,14 +184,25 @@ mod tests {
 
     #[test]
     fn deterministic_id_differs_per_root_commit() {
-        assert_ne!(deterministic_id(Some("aaa"), "/p"), deterministic_id(Some("bbb"), "/p"));
+        assert_ne!(
+            deterministic_id(Some("aaa"), "/p"),
+            deterministic_id(Some("bbb"), "/p")
+        );
     }
 
     #[test]
     fn deterministic_id_falls_back_to_path_without_commit() {
         let a = deterministic_id(None, "/path/one");
-        assert_eq!(a, deterministic_id(None, "/path/one"), "path fallback is stable");
-        assert_ne!(a, deterministic_id(None, "/path/two"), "different path → different id");
+        assert_eq!(
+            a,
+            deterministic_id(None, "/path/one"),
+            "path fallback is stable"
+        );
+        assert_ne!(
+            a,
+            deterministic_id(None, "/path/two"),
+            "different path → different id"
+        );
         // An empty/whitespace SHA is treated as "no commit" → path fallback.
         assert_eq!(deterministic_id(Some("   "), "/path/one"), a);
     }
@@ -222,11 +233,13 @@ mod tests {
         let (pool, db) = setup_test_db().await;
         // Legacy state: a random-id row already occupies the path.
         let legacy = Uuid::new_v4();
-        sqlx::query("INSERT INTO repositories (id, name, path) VALUES ($1, 'Lucidos', '/tmp/lucidos')")
-            .bind(legacy)
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO repositories (id, name, path) VALUES ($1, 'Lucidos', '/tmp/lucidos')",
+        )
+        .bind(legacy)
+        .execute(&pool)
+        .await
+        .unwrap();
 
         let det = deterministic_id(Some("abc"), "/tmp/lucidos");
         let r = RepositoryStore::add(&pool, "Lucidos", "/tmp/lucidos", None, Some("abc"))
@@ -250,9 +263,13 @@ mod tests {
     async fn add_collapses_same_history_at_new_path() {
         let (pool, db) = setup_test_db().await;
         let sha = "deadbeefcafe";
-        let a = RepositoryStore::add(&pool, "R", "/tmp/old", None, Some(sha)).await.unwrap();
+        let a = RepositoryStore::add(&pool, "R", "/tmp/old", None, Some(sha))
+            .await
+            .unwrap();
         // Same history re-registered at a new path → same id, single row, path moved.
-        let b = RepositoryStore::add(&pool, "R", "/tmp/new", None, Some(sha)).await.unwrap();
+        let b = RepositoryStore::add(&pool, "R", "/tmp/new", None, Some(sha))
+            .await
+            .unwrap();
         assert_eq!(a.id, b.id);
         assert_eq!(b.path, "/tmp/new");
         let count: i64 = sqlx::query_scalar("SELECT count(*) FROM repositories WHERE id = $1")
@@ -297,7 +314,10 @@ mod tests {
             .fetch_one(&pool)
             .await
             .unwrap();
-        assert_eq!(count, 1, "exactly one row at the path after concurrent adds");
+        assert_eq!(
+            count, 1,
+            "exactly one row at the path after concurrent adds"
+        );
 
         teardown_test_db(&db).await;
     }
@@ -305,11 +325,19 @@ mod tests {
     #[tokio::test]
     async fn ensure_exists_preserves_existing_description() {
         let (pool, db) = setup_test_db().await;
-        RepositoryStore::add(&pool, "Lucidos", "/tmp/x", Some("Canonical checkout"), Some("s"))
+        RepositoryStore::add(
+            &pool,
+            "Lucidos",
+            "/tmp/x",
+            Some("Canonical checkout"),
+            Some("s"),
+        )
+        .await
+        .unwrap();
+        // ensure_exists passes no description, so it must not wipe the existing one.
+        RepositoryStore::ensure_exists(&pool, "Lucidos", "/tmp/x", Some("s"))
             .await
             .unwrap();
-        // ensure_exists passes no description — it must not wipe the existing one.
-        RepositoryStore::ensure_exists(&pool, "Lucidos", "/tmp/x", Some("s")).await.unwrap();
         let desc: Option<String> =
             sqlx::query_scalar("SELECT description FROM repositories WHERE path = '/tmp/x'")
                 .fetch_one(&pool)

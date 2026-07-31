@@ -64,9 +64,17 @@ pub(crate) fn credential_request_with_defaults(
 /// Collect the optional oauth endpoint + scopes args an agent passes (looked up
 /// from `system-knowhow/oauth-providers.md`) into a `defaults` map. Blank/absent
 /// args are dropped so they never pre-fill an empty field.
-fn oauth_defaults_from_args(args: &serde_json::Value) -> serde_json::Map<String, serde_json::Value> {
+fn oauth_defaults_from_args(
+    args: &serde_json::Value,
+) -> serde_json::Map<String, serde_json::Value> {
     let mut defaults = serde_json::Map::new();
-    for key in ["auth_url", "token_url", "userinfo_url", "scopes"] {
+    for key in [
+        "auth_url",
+        "token_url",
+        "userinfo_url",
+        "scopes",
+        "redirect_uri",
+    ] {
         if let Some(v) = args[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
             defaults.insert(key.to_string(), serde_json::Value::String(v.to_string()));
         }
@@ -100,7 +108,8 @@ impl LucidosEngine {
                     .map(str::trim)
                     .filter(|s| !s.is_empty());
                 if let Some(name) = env_var_name {
-                    if let Err(rejection) = crate::core::environment_variables::validate_name(name) {
+                    if let Err(rejection) = crate::core::environment_variables::validate_name(name)
+                    {
                         return Ok(format!("Error: {}", rejection.message(name)));
                     }
                 }
@@ -162,6 +171,7 @@ impl LucidosEngine {
                         token_url: str_arg("token_url"),
                         userinfo_url: str_arg("userinfo_url"),
                         scopes: Some(scopes.to_string()),
+                        redirect_uri: str_arg("redirect_uri"),
                     };
                     return Ok(credential_request_envelope(oauth::oauth_client_request(
                         &provider, &overrides,
@@ -196,12 +206,8 @@ mod tests {
     #[test]
     fn payload_is_valid_json_with_multiline_prompt() {
         let prompt = "1. Open dashboard\n2. Create API key\n3. Paste it below";
-        let result = credential_request_payload(
-            "binance",
-            prompt,
-            "https://api.binance.com",
-            "api_key",
-        );
+        let result =
+            credential_request_payload("binance", prompt, "https://api.binance.com", "api_key");
         let parsed = parse_payload(&result);
         assert_eq!(parsed["service"], "binance");
         assert_eq!(parsed["prompt"], prompt);
@@ -228,7 +234,10 @@ mod tests {
         );
         let parsed = parse_payload(&result);
         assert_eq!(parsed["service"], r#"weird"service"#);
-        assert_eq!(parsed["base_url"], r#"https://example.com/path with "quotes""#);
+        assert_eq!(
+            parsed["base_url"],
+            r#"https://example.com/path with "quotes""#
+        );
     }
 
     #[test]
@@ -271,7 +280,10 @@ mod tests {
             parsed["defaults"]["auth_url"],
             "https://accounts.google.com/o/oauth2/v2/auth"
         );
-        assert_eq!(parsed["defaults"]["token_url"], "https://oauth2.googleapis.com/token");
+        assert_eq!(
+            parsed["defaults"]["token_url"],
+            "https://oauth2.googleapis.com/token"
+        );
     }
 
     #[test]

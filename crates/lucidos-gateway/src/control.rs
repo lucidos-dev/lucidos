@@ -39,7 +39,10 @@ pub fn router() -> Router<GatewayState> {
         // Machine-global network bind (the gateway's own bind + the engine
         // inherit toggle) — the picker's Network access control writes
         // ~/.lucidos/network.toml here.
-        .route("/network-config", get(network_config).put(set_network_config))
+        .route(
+            "/network-config",
+            get(network_config).put(set_network_config),
+        )
         .route("/workspaces/:id/rename", post(rename))
         .route("/workspaces/:id/restart", post(restart))
         .route("/workspaces/:id/stop", post(stop))
@@ -424,9 +427,7 @@ async fn network_config() -> Json<Value> {
 /// PUT /~/api/v1/control/network-config — write the machine-global config.
 /// Validated server-side (loopback / all / a parseable IP); takes effect only
 /// after a gateway / engine restart (a live socket cannot be re-bound).
-async fn set_network_config(
-    Json(body): Json<NetworkConfigBody>,
-) -> Result<StatusCode, ApiError> {
+async fn set_network_config(Json(body): Json<NetworkConfigBody>) -> Result<StatusCode, ApiError> {
     net_config::validate_bind_input(&body.gateway_bind).map_err(ApiError::bad_request)?;
     // Normalize keyword case so the stored value is canonical.
     let gateway_bind = match body.gateway_bind.trim().to_ascii_lowercase().as_str() {
@@ -679,18 +680,32 @@ mod authz_tests {
 
     #[test]
     fn origin_matches_host_compares_authority() {
-        assert!(origin_matches_host("https://localhost:5251", "localhost:5251"));
-        assert!(origin_matches_host("http://Localhost:5251/", "localhost:5251"));
-        assert!(!origin_matches_host("https://localhost:5252", "localhost:5251"));
-        assert!(!origin_matches_host("https://evil.example", "localhost:5251"));
+        assert!(origin_matches_host(
+            "https://localhost:5251",
+            "localhost:5251"
+        ));
+        assert!(origin_matches_host(
+            "http://Localhost:5251/",
+            "localhost:5251"
+        ));
+        assert!(!origin_matches_host(
+            "https://localhost:5252",
+            "localhost:5251"
+        ));
+        assert!(!origin_matches_host(
+            "https://evil.example",
+            "localhost:5251"
+        ));
     }
 
     #[test]
     fn referer_is_app_iframe_detects_app_segment_only() {
         assert!(referer_is_app_iframe("https://h/dev/app/x/"));
-        assert!(referer_is_app_iframe("https://h:5251/myws/app/demo/index.html?a=1"));
+        assert!(referer_is_app_iframe(
+            "https://h:5251/myws/app/demo/index.html?a=1"
+        ));
         assert!(referer_is_app_iframe("/dev/app/x")); // bare path tolerated
-        // Not app-iframe documents:
+                                                      // Not app-iframe documents:
         assert!(!referer_is_app_iframe("https://h/~/")); // picker
         assert!(!referer_is_app_iframe("https://h/dev/")); // workspace shell
         assert!(!referer_is_app_iframe("https://h/dev/api/v1/threads")); // shell API

@@ -546,12 +546,7 @@ fn read_paused_field(payload: &Value) -> Option<bool> {
     payload
         .get("paused")
         .and_then(|v| v.as_bool())
-        .or_else(|| {
-            payload
-                .get("enabled")
-                .and_then(|v| v.as_bool())
-                .map(|e| !e)
-        })
+        .or_else(|| payload.get("enabled").and_then(|v| v.as_bool()).map(|e| !e))
 }
 
 #[cfg(test)]

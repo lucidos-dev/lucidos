@@ -135,7 +135,10 @@ fn redact_postgres_secrets_does_not_match_passwordless_url() {
 
 #[test]
 fn redact_secret_values_masks_each_secret_occurrence() {
-    let secrets = vec!["ya29.super-secret-token".to_string(), "hunter2pw".to_string()];
+    let secrets = vec![
+        "ya29.super-secret-token".to_string(),
+        "hunter2pw".to_string(),
+    ];
     let text = "Authorization: Bearer ya29.super-secret-token (pw=hunter2pw, again hunter2pw)";
     assert_eq!(
         redact_secret_values(text, &secrets),
@@ -286,6 +289,77 @@ fn test_describe_tool_background_exec() {
     );
 }
 
+/// Every `describe_tool` arm ends in a trailing "..." as an in-progress
+/// aesthetic. `truncate` appends its OWN "..." when it cuts, so an arm that
+/// elides a value AND wraps it in a `"{}..."` format string emitted six dots
+/// for any value long enough to truncate. The frontend accents only the
+/// trailing three (`highlightEllipsis` + `.ellipsis-marker`), so the run
+/// rendered as two separate markers: "Running: cd … && for ... ...".
+/// Eliding arms middle-truncate instead, leaving exactly one "…" cut marker
+/// and one trailing in-progress "...".
+#[test]
+fn describe_tool_never_doubles_the_trailing_ellipsis_on_an_elided_value() {
+    let long = "cd /Users/me/workspaces/example && for f in *.json; do jq . \"$f\"; done";
+    assert!(long.len() > 60, "fixture must exceed every elision budget");
+    let args = serde_json::json!({ "command": long, "prompt": long });
+
+    for (tool, prefix) in [
+        ("run_bash", "Running: "),
+        ("run_bash_background", "Running in background: "),
+        ("generate_image", "Generating image: "),
+        ("run_thread", "Running thread: "),
+    ] {
+        let desc = describe_tool(tool, &args);
+        assert!(desc.starts_with(prefix), "{tool} lost its label: {desc}");
+        assert!(
+            desc.ends_with("..."),
+            "{tool} lost the in-progress marker: {desc}"
+        );
+        assert!(
+            !desc.ends_with("......"),
+            "{tool} doubled the trailing ellipsis: {desc}"
+        );
+        assert_eq!(
+            desc.matches('…').count(),
+            1,
+            "{tool} should carry exactly one cut marker: {desc}"
+        );
+    }
+}
+
+/// Middle-truncating a command keeps its tail, which is where the meaning
+/// lives: the URL, the pipeline, the redirect. Head truncation spent the whole
+/// budget on a `cd` prefix. Mirrors `describe_cc_tool`'s Bash arm.
+#[test]
+fn describe_tool_run_bash_keeps_the_tail_of_a_long_command() {
+    let long = "cd /Users/me/workspaces/example && curl -s https://example.com/api/v1/items";
+    let desc = describe_tool("run_bash", &serde_json::json!({ "command": long }));
+    assert!(
+        desc.ends_with("/api/v1/items..."),
+        "the informative tail must survive: {desc}"
+    );
+}
+
+/// A step label is one line of HTML, where a newline collapses to a space, so
+/// a multi-line script condenses to its opening line instead of eliding across
+/// newlines into a run-on. Both description paths share `first_command_line`.
+#[test]
+fn describe_tool_condenses_a_multiline_command_to_its_first_line() {
+    let script = "\n  git status\ncat <<'EOF' > out.txt\nbody\nEOF\n";
+    let args = serde_json::json!({ "command": script });
+
+    assert_eq!(describe_tool("run_bash", &args), "Running: git status...");
+    assert_eq!(
+        describe_tool("run_bash_background", &args),
+        "Running in background: git status..."
+    );
+    assert_eq!(describe_cc_tool("Bash", &args), "Run git status");
+    assert_eq!(
+        describe_cc_tool("command_execution", &args),
+        "Run git status"
+    );
+}
+
 #[test]
 fn test_describe_tool_trigger_groups_and_state() {
     assert_eq!(
@@ -313,7 +387,10 @@ fn test_describe_grouped_tools_by_action() {
     // The consolidated `triggers` / `trigger_groups` / `preferences` tools label
     // by the `action` discriminator (the flat-name arms above stay for aliases).
     assert_eq!(
-        describe_tool("triggers", &serde_json::json!({ "action": "create", "name": "Daily" })),
+        describe_tool(
+            "triggers",
+            &serde_json::json!({ "action": "create", "name": "Daily" })
+        ),
         "Creating trigger 'Daily'..."
     );
     assert_eq!(
@@ -332,7 +409,10 @@ fn test_describe_grouped_tools_by_action() {
         "Creating trigger group 'Morning'..."
     );
     assert_eq!(
-        describe_tool("preferences", &serde_json::json!({ "action": "set", "key": "theme" })),
+        describe_tool(
+            "preferences",
+            &serde_json::json!({ "action": "set", "key": "theme" })
+        ),
         "Updating theme setting..."
     );
     assert_eq!(
@@ -400,7 +480,10 @@ fn test_describe_tool_threads_and_changes() {
         "Executing Codex..."
     );
     assert_eq!(
-        describe_tool("run_claude", &serde_json::json!({ "coding_agent": "codex" })),
+        describe_tool(
+            "run_claude",
+            &serde_json::json!({ "coding_agent": "codex" })
+        ),
         "Executing Codex..."
     );
 }
@@ -994,4 +1077,3 @@ fn pin_workspace_vite_port_noop_when_file_exists() {
         "no new commit should be made when file exists"
     );
 }
-

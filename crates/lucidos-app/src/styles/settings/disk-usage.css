@@ -104,34 +104,14 @@
     border: 1px solid var(--border-color);
 }
 
-/* Long titles ("Stopped thread: …", credential service names) should wrap
-   rather than ellipsis. */
-.disk-usage-row .list-row-name,
-.credential-row .list-row-name {
+/* Long "Stopped thread: …" titles should wrap rather than ellipsis. (The
+   credential rows want the same and used to share this selector — they live in
+   settings/accounts.css now, alongside the rest of the Accounts page.) */
+.disk-usage-row .list-row-name {
     white-space: normal;
     overflow: visible;
     text-overflow: clip;
     overflow-wrap: anywhere;
-}
-
-/* Credential rows: when the row is too narrow to fit name + actions
-   side-by-side, the actions stack below the info column. flex-basis on
-   .list-row-info promotes the wrap; .list-row already has flex-wrap: wrap. */
-.credential-row .list-row-info {
-    flex: 1 1 18rem;
-}
-
-/* At ≤600px `.list-row` flips to flex-direction: column (mobile.css), so the
-   18rem flex-basis above stops being a WIDTH floor and becomes a HEIGHT along
-   the new vertical main axis — inflating the info block to 18rem tall. Combined
-   with the row's inherited justify-content: space-between, that shoved the
-   Copy/Edit/Delete actions to the bottom of an 18rem-tall row (the "weird
-   spacing" on mobile). In the column layout the info already spans the full row
-   width, so the basis serves no purpose — reset it to content height. */
-@media (max-width: 600px) {
-    .credential-row .list-row-info {
-        flex-basis: auto;
-    }
 }
 
 /* On mobile, the row stacks; constrain actions to full width so the

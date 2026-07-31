@@ -1,7 +1,6 @@
 //! LLM-facing schemas for image tools (save_thread_image, generate_image,
 //! view_image).
 
-
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
 use serde_json::json;

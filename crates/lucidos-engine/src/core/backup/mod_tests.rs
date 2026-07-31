@@ -46,7 +46,10 @@ fn backup_run_from_event_parses_failed_and_bare_payload() {
     assert_eq!(run.status, BackupRunStatus::Failure);
     assert_eq!(run.error.as_deref(), Some("pg_dump failed"));
     assert!(run.started_at.is_none(), "no started_at in this payload");
-    assert_eq!(run.finished_at, created, "finished_at falls back to created");
+    assert_eq!(
+        run.finished_at, created,
+        "finished_at falls back to created"
+    );
 
     // An unrelated event type is not a backup run.
     assert!(backup_run_from_event("SomethingElse", &bare, created).is_none());
@@ -87,7 +90,10 @@ fn resolve_pg_tool_path_fails_fast_when_bundled_binary_missing() {
         .expect_err("missing bundled binary must error");
     let msg = err.to_string();
     assert!(msg.contains("pg_dump"), "names the tool: {msg}");
-    assert!(msg.contains(dir.path().to_str().unwrap()), "names the path: {msg}");
+    assert!(
+        msg.contains(dir.path().to_str().unwrap()),
+        "names the path: {msg}"
+    );
 }
 
 /// `is_cross_version_set` strips SET statements for parameters that exist in
@@ -157,13 +163,7 @@ fn test_tar_and_compress_excludes_lucidos_and_postgres() {
 
     // Tar and compress
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(
-        ws,
-        sql_dump.path(),
-        output.path(),
-        &BackupIgnore::default(),
-    )
-    .unwrap();
+    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
 
     // Decompress and verify contents (streaming from file)
     let file = std::fs::File::open(output.path()).unwrap();
@@ -229,13 +229,7 @@ fn test_tar_and_compress_includes_data_blobs() {
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
 
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(
-        ws,
-        sql_dump.path(),
-        output.path(),
-        &BackupIgnore::default(),
-    )
-    .unwrap();
+    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
 
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
@@ -283,13 +277,7 @@ fn test_tar_and_compress_excludes_postgres_migrated_archives() {
     std::fs::write(sql_dump.path(), "CREATE TABLE test;").unwrap();
 
     let output = tempfile::NamedTempFile::new().unwrap();
-    tar_and_compress(
-        ws,
-        sql_dump.path(),
-        output.path(),
-        &BackupIgnore::default(),
-    )
-    .unwrap();
+    tar_and_compress(ws, sql_dump.path(), output.path(), &BackupIgnore::default()).unwrap();
 
     let file = std::fs::File::open(output.path()).unwrap();
     let decoder = zstd::Decoder::new(file).unwrap();
@@ -694,11 +682,15 @@ fn backupignore_prefix_excludes_dir_and_descendants() {
     let ignore = BackupIgnore::parse("data/artifacts/habit-tracker/klines\n");
 
     assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines")));
-    assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines/2024/jan.parquet")));
+    assert!(ignore.matches(Path::new(
+        "data/artifacts/habit-tracker/klines/2024/jan.parquet"
+    )));
 
     // Component prefix, not string prefix: `klines-backup` is a different
     // component and must be kept.
-    assert!(!ignore.matches(Path::new("data/artifacts/habit-tracker/klines-backup/x.bin")));
+    assert!(!ignore.matches(Path::new(
+        "data/artifacts/habit-tracker/klines-backup/x.bin"
+    )));
     assert!(!ignore.matches(Path::new("data/artifacts/habit-tracker/strategy.md")));
 }
 
@@ -739,7 +731,9 @@ fn backupignore_supports_wildcard() {
     let ignore = BackupIgnore::parse("data/artifacts/*/klines\n");
 
     assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines")));
-    assert!(ignore.matches(Path::new("data/artifacts/habit-tracker/klines/2024.parquet")));
+    assert!(ignore.matches(Path::new(
+        "data/artifacts/habit-tracker/klines/2024.parquet"
+    )));
     assert!(ignore.matches(Path::new("data/artifacts/reversal/klines/x.bin")));
 
     // A different leaf under the same wildcard parent is kept.
@@ -842,7 +836,11 @@ fn tar_and_compress_honors_backupignore() {
     .unwrap();
 
     // Kept content alongside it.
-    std::fs::write(ws.join("data/artifacts/habit-tracker/strategy.md"), "# Strategy").unwrap();
+    std::fs::write(
+        ws.join("data/artifacts/habit-tracker/strategy.md"),
+        "# Strategy",
+    )
+    .unwrap();
 
     let ignore = BackupIgnore::load(ws);
     let sql_dump = tempfile::NamedTempFile::new().unwrap();
@@ -1018,8 +1016,8 @@ fn select_prunable_keeps_newest_n_of_own_workspace_only() {
         archive("p2", "lucidos-backup-myws-20260601-000002.enc", 80),
         archive("p3", "lucidos-backup-myws-20260601-000003.enc", 60),
         archive("p4", "lucidos-backup-myws-20260601-000004.enc", 40), // newest own
-        archive("w1", "lucidos-backup-otherws-20260601-000004.enc", 5),      // foreign workspace
-        archive("x1", "important-tax-document.pdf", 1),                   // unrelated file
+        archive("w1", "lucidos-backup-otherws-20260601-000004.enc", 5), // foreign workspace
+        archive("x1", "important-tax-document.pdf", 1),               // unrelated file
     ];
 
     let to_delete: Vec<String> = select_prunable(entries, "myws", 2)
@@ -1029,8 +1027,14 @@ fn select_prunable_keeps_newest_n_of_own_workspace_only() {
 
     // Newest two own (p4, p3) kept → delete p2 then p1, oldest-first.
     assert_eq!(to_delete, vec!["p1".to_string(), "p2".to_string()]);
-    assert!(!to_delete.contains(&"w1".to_string()), "never a foreign backup");
-    assert!(!to_delete.contains(&"x1".to_string()), "never an unrelated file");
+    assert!(
+        !to_delete.contains(&"w1".to_string()),
+        "never a foreign backup"
+    );
+    assert!(
+        !to_delete.contains(&"x1".to_string()),
+        "never an unrelated file"
+    );
 }
 
 /// With fewer own archives than the retention limit, nothing is pruned — even
@@ -1167,10 +1171,7 @@ async fn prune_old_backups_keep_zero_is_a_noop() {
     ];
     let provider = MockProvider::new(entries);
 
-    assert_eq!(
-        prune_old_backups(&provider, "myws", 0).await.unwrap(),
-        0
-    );
+    assert_eq!(prune_old_backups(&provider, "myws", 0).await.unwrap(), 0);
     assert!(provider.deleted_ids().is_empty());
 }
 
@@ -1232,14 +1233,12 @@ async fn get_retention_count_falls_back_to_default() {
 #[test]
 fn parse_workspace_name_from_archive_roundtrips_and_rejects_non_archives() {
     assert_eq!(
-        parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc")
-            .as_deref(),
+        parse_workspace_name_from_archive("lucidos-backup-myws-20260601-040254.enc").as_deref(),
         Some("myws")
     );
     // Hyphenated workspace name — the timestamp tail is stripped, not the name.
     assert_eq!(
-        parse_workspace_name_from_archive("lucidos-backup-e2e-test-20260601-040254.enc")
-            .as_deref(),
+        parse_workspace_name_from_archive("lucidos-backup-e2e-test-20260601-040254.enc").as_deref(),
         Some("e2e-test")
     );
     // This is `parse`/`workspace_archive_name`'s inverse: a name produced by the
@@ -1306,9 +1305,7 @@ async fn restore_archive_into_restores_workspace_but_drops_user_dir() {
         builder
             .append_dir_all("data", src.path().join("data"))
             .unwrap();
-        builder
-            .append_dir_all("user_dir", user_tmp.path())
-            .unwrap();
+        builder.append_dir_all("user_dir", user_tmp.path()).unwrap();
         let encoder = builder.into_inner().unwrap();
         encoder.finish().unwrap();
     }

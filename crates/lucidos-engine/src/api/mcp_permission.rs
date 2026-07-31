@@ -7,7 +7,9 @@
 
 use super::*;
 use crate::engine::claude_code::AllowScope;
-use crate::engine::mcp_permission::{emit_mcp_permission_resolved, record_mcp_allow_grant, DENIAL_REASON};
+use crate::engine::mcp_permission::{
+    emit_mcp_permission_resolved, record_mcp_allow_grant, DENIAL_REASON,
+};
 use crate::engine::thread_events::EventMeta;
 
 #[derive(Deserialize)]
@@ -53,7 +55,11 @@ pub(super) async fn submit_mcp_permission_consent(
     } else {
         Some(DENIAL_REASON.to_string())
     };
-    let persist_scope = if body.allowed { body.persist_scope } else { None };
+    let persist_scope = if body.allowed {
+        body.persist_scope
+    } else {
+        None
+    };
     if let Some(scope) = persist_scope {
         // `entry.tool_name` is the namespaced `mcp__<server>__<tool>` — recover
         // (server_id, tool) to derive the stored pattern. A malformed name (no

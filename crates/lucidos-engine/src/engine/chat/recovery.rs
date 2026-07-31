@@ -139,9 +139,7 @@ impl LucidosEngine {
     /// they should not be aborted here since CC recovery will handle them.
     pub async fn recover_orphaned_threads(self: &Arc<Self>, exclude_thread_ids: &[uuid::Uuid]) {
         use crate::engine::event_bus::BusEvent;
-        use crate::engine::thread_events::{
-            EventChannel, EventMeta, MessageOrigin, ThreadEvent,
-        };
+        use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 
         // Find threads where the LAST exchange boundary (MessageReceived or
         // TriggerStarted) has activity events after it but no terminal
@@ -449,8 +447,7 @@ impl LucidosEngine {
                 end += 1;
             }
 
-            let orphans =
-                crate::core::store::find_orphan_tool_called_ids(&rows[start..end]);
+            let orphans = crate::core::store::find_orphan_tool_called_ids(&rows[start..end]);
             for (orphan_id, tool_name) in orphans {
                 total_orphans += 1;
                 self.event_bus
@@ -460,7 +457,7 @@ impl LucidosEngine {
                             event: ThreadEvent::ToolResult {
                                 name: tool_name,
                                 result: format!(
-                                    "[Tool execution interrupted by engine restart — original ToolCalled event_id: {}]",
+                                    "[Tool execution interrupted by engine restart, original ToolCalled event_id: {}]",
                                     orphan_id
                                 ),
                                 images: vec![],

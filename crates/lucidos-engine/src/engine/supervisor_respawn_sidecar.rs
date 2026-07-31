@@ -76,10 +76,7 @@ fn take_sidecar(workspace: &Path) -> Option<RespawnInfo> {
 /// `EngineSupervisorRespawned` if it was present. Called from `main.rs`
 /// after the EventBus is wired but before recovery / spawn-dispatcher
 /// kick in, so the respawn event lands first in the audit timeline.
-pub async fn emit_if_present(
-    workspace: &Path,
-    bus: &crate::engine::event_bus::EventBus,
-) {
+pub async fn emit_if_present(workspace: &Path, bus: &crate::engine::event_bus::EventBus) {
     let Some(info) = take_sidecar(workspace) else {
         return;
     };

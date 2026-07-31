@@ -1,7 +1,7 @@
 use super::common::*;
-use crate::test_support::{setup_test_db, teardown_test_db};
 use crate::engine::event_bus::EventBus;
 use crate::engine::git_ops::{git_cmd, worktrees_dir};
+use crate::test_support::{setup_test_db, teardown_test_db};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -33,7 +33,10 @@ async fn tier_1_strips_build_artifacts_after_24h_idle() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert_eq!(cleaned.len(), 1, "exactly one Tier 1 event");
     let (_, tier, freed, branch_deleted) = cleaned[0];
     assert_eq!(tier, 1);
@@ -75,7 +78,10 @@ async fn tier_2_removes_worktree_after_30_days_clean_unsaved() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert_eq!(cleaned.len(), 1, "exactly one Tier 2 event");
     let (_, tier, _, _) = cleaned[0];
     assert_eq!(tier, 2);
@@ -105,7 +111,10 @@ async fn saved_threads_are_exempt_from_tier_2() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.iter().all(|(_, tier, _, _)| *tier != 2),
         "no Tier 2 event for a saved thread, got: {:?}",
@@ -141,7 +150,10 @@ async fn dirty_threads_are_exempt_from_tier_2_auto() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.iter().all(|(_, tier, _, _)| *tier != 2),
         "no Tier 2 event for a dirty thread, got: {:?}",
@@ -184,7 +196,12 @@ async fn soft_threshold_breach_emits_low_disk_notification() {
         .into_iter()
         .filter(|(t, _)| t == "Low disk space on your machine")
         .collect();
-    assert_eq!(alerts.len(), 1, "expected exactly one low-disk notification, got: {:?}", alerts);
+    assert_eq!(
+        alerts.len(),
+        1,
+        "expected exactly one low-disk notification, got: {:?}",
+        alerts
+    );
     let (_, body) = &alerts[0];
     assert!(
         !body.contains("Lucidos disk space"),
@@ -226,7 +243,9 @@ async fn soft_threshold_with_tiny_lucidos_footprint_blames_the_machine() {
     assert_eq!(alerts.len(), 1);
     let (_, body) = &alerts[0];
     assert!(
-        body.contains("other apps") || body.contains("not Lucidos") || body.contains("isn't Lucidos"),
+        body.contains("other apps")
+            || body.contains("not Lucidos")
+            || body.contains("isn't Lucidos"),
         "tiny-footprint body must point at the user's machine, not Lucidos: {}",
         body,
     );
@@ -301,10 +320,20 @@ async fn hard_threshold_breach_forces_tier_1_on_recently_idle_worktrees() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
-    assert_eq!(cleaned.len(), 1, "Tier 1 should have fired under hard pressure");
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(
+        cleaned.len(),
+        1,
+        "Tier 1 should have fired under hard pressure"
+    );
     assert_eq!(cleaned[0].1, 1, "must be Tier 1, not Tier 2");
-    assert!(!worktree.join("target").exists(), "target/ should be stripped");
+    assert!(
+        !worktree.join("target").exists(),
+        "target/ should be stripped"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -332,9 +361,19 @@ async fn hard_threshold_does_not_force_tier_1_on_active_worktrees() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
-    assert!(cleaned.is_empty(), "active worktree must not be touched: {:?}", cleaned);
-    assert!(worktree.join("target").exists(), "target/ must survive — only 5 min idle");
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert!(
+        cleaned.is_empty(),
+        "active worktree must not be touched: {:?}",
+        cleaned
+    );
+    assert!(
+        worktree.join("target").exists(),
+        "target/ must survive: only 5 min idle"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -363,7 +402,11 @@ async fn ample_free_disk_emits_no_notification() {
         .into_iter()
         .filter(|(t, _)| t.contains("disk") || t.contains("Disk") || t.contains("auto-cleanup"))
         .collect();
-    assert!(alerts.is_empty(), "no disk-related notifications when free disk is ample, got: {:?}", alerts);
+    assert!(
+        alerts.is_empty(),
+        "no disk-related notifications when free disk is ample, got: {:?}",
+        alerts
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -396,8 +439,15 @@ async fn tier_0_deletes_branch_if_fully_merged() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
-    assert_eq!(cleaned.len(), 1, "Tier 0 should fire on fully-merged worktree");
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
+    assert_eq!(
+        cleaned.len(),
+        1,
+        "Tier 0 should fire on fully-merged worktree"
+    );
     let (_, tier, _, branch_deleted) = cleaned[0];
     assert_eq!(tier, 0, "should be reclaimed by Tier 0, not Tier 2");
     assert!(branch_deleted, "fully-merged branch must be deleted");
@@ -442,7 +492,10 @@ async fn tier_2_preserves_branch_if_unmerged_commits_exist() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert_eq!(cleaned.len(), 1, "Tier 2 should fire");
     let (_, _, _, branch_deleted) = cleaned[0];
     assert!(
@@ -516,7 +569,10 @@ async fn recent_threads_are_exempt() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "no cleanup should happen for a recently-active thread, got: {:?}",
@@ -555,7 +611,10 @@ async fn ample_disk_keeps_non_archived_merged_worktree() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "non-archived worktree must be kept while disk is comfortable, got: {:?}",
@@ -596,7 +655,10 @@ async fn archived_thread_worktree_reclaimed_with_ample_disk() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert_eq!(
         cleaned.len(),
         1,
@@ -639,7 +701,10 @@ async fn fan_in_unprocessed_completion_keeps_archived_worktree() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == parent_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == parent_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "parent with an unprocessed child completion must keep its worktree, got: {:?}",
@@ -677,13 +742,19 @@ async fn fan_in_active_children_keeps_archived_worktree() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == parent_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == parent_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "parent with a running child must keep its worktree, got: {:?}",
         cleaned
     );
-    assert!(worktree.exists(), "worktree must remain while a child is running");
+    assert!(
+        worktree.exists(),
+        "worktree must remain while a child is running"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -709,13 +780,19 @@ async fn ample_disk_keeps_non_archived_worktree_artifacts() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "no stripping while disk is comfortable + thread non-archived, got: {:?}",
         cleaned
     );
-    assert!(worktree.join("target").exists(), "target/ must be kept warm");
+    assert!(
+        worktree.join("target").exists(),
+        "target/ must be kept warm"
+    );
     assert!(
         worktree.join("node_modules").exists(),
         "node_modules/ must be kept warm"
@@ -724,4 +801,3 @@ async fn ample_disk_keeps_non_archived_worktree_artifacts() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
-

@@ -88,11 +88,23 @@ pub struct PrefSpec {
 /// clamps to what each model supports, so the catalog only checks membership.
 const REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 /// Mirrors `ImageModel` in `crates/lucidos-app/src/store/actions/preferences.ts`.
-const IMAGE_MODELS: &[&str] = &["auto", "imagen-4", "gpt-image-1", "gpt-image-1.5", "gpt-image-2"];
+const IMAGE_MODELS: &[&str] = &[
+    "auto",
+    "imagen-4",
+    "gpt-image-1",
+    "gpt-image-1.5",
+    "gpt-image-2",
+];
 /// Mirrors `Theme` / `FontFamily` in the same frontend file.
 const THEMES: &[&str] = &["light", "dark", "system"];
-const FONT_FAMILIES: &[&str] =
-    &["monospace", "system", "inter", "jetbrains-mono", "ibm-plex-mono", "fira-code"];
+const FONT_FAMILIES: &[&str] = &[
+    "monospace",
+    "system",
+    "inter",
+    "jetbrains-mono",
+    "ibm-plex-mono",
+    "fira-code",
+];
 
 /// The catalog. Keep this in lockstep with `system-knowhow/preferences.md`
 /// (the sync test in this module's tests pins the doc's key table to these

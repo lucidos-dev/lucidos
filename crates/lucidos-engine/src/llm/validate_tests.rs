@@ -202,7 +202,11 @@ fn missing_tool_result_when_next_user_is_text_gets_stub() {
     };
 
     let injected_id = blocks.iter().find_map(|b| {
-        if let ContentBlock::ToolResult { tool_use_id, content } = b {
+        if let ContentBlock::ToolResult {
+            tool_use_id,
+            content,
+        } = b
+        {
             assert!(
                 content.contains("orphan") || content.contains("unavailable"),
                 "stub content should mark itself as unavailable: {:?}",

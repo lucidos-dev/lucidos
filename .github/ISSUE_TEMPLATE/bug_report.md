@@ -36,9 +36,11 @@ What you expected to happen instead.
 
 ## Environment
 
-- **Lucidos release / commit:** <!-- the `RELEASE` value, or the git commit -->
-- **OS:** <!-- e.g. macOS 15.5, Windows 11, Ubuntu 24.04 -->
-- **Install:** <!-- desktop app / dev setup via scripts/web-dev.sh -->
+- **Lucidos release / commit:** <!-- the `release` field of
+  http://localhost:5252/~/api/v1/health, the repo's `RELEASE` file, or the commit -->
+- **OS:** <!-- e.g. macOS 15.5, Ubuntu 24.04 -->
+- **Install:** <!-- one-liner (curl … | sh) / macOS .dmg / dev setup via
+  scripts/web-dev.sh -->
 - **LLM provider:** <!-- Vertex AI / OpenAI, and the model if it matters -->
 
 ## Logs / screenshots

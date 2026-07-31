@@ -1,5 +1,5 @@
-use super::*;
 use super::common::make_test_repo;
+use super::*;
 
 #[test]
 fn generate_app_branch_name_embeds_app_id() {
@@ -49,13 +49,27 @@ async fn create_sparse_app_worktree_materialises_only_app_folder() {
     // worktree narrowed to `data/apps/habit-tracker/` must contain only that
     // folder plus the workspace's top-level files (root .gitignore here).
     let (_tmp, ws) = make_test_repo().await;
-    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker")).await.unwrap();
-    tokio::fs::create_dir_all(ws.join("data/apps/other")).await.unwrap();
-    tokio::fs::create_dir_all(ws.join("data/knowhow")).await.unwrap();
-    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>m</h1>").await.unwrap();
-    tokio::fs::write(ws.join("data/apps/other/index.html"), "<h1>o</h1>").await.unwrap();
-    tokio::fs::write(ws.join("data/knowhow/x.md"), "k").await.unwrap();
-    tokio::fs::write(ws.join(".gitignore"), ".lucidos/\n").await.unwrap();
+    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(ws.join("data/apps/other"))
+        .await
+        .unwrap();
+    tokio::fs::create_dir_all(ws.join("data/knowhow"))
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>m</h1>")
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join("data/apps/other/index.html"), "<h1>o</h1>")
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join("data/knowhow/x.md"), "k")
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join(".gitignore"), ".lucidos/\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &ws).await;
     let _ = git_cmd(&["commit", "-m", "scaffold"], &ws).await;
 
@@ -85,7 +99,9 @@ async fn create_sparse_app_worktree_materialises_only_app_folder() {
     );
 
     // Confirm the branch was actually checked out.
-    let head = git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).await.unwrap();
+    let head = git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], &wt)
+        .await
+        .unwrap();
     let head_str = String::from_utf8_lossy(&head.stdout);
     assert_eq!(head_str.trim(), branch);
 }
@@ -98,8 +114,12 @@ async fn create_sparse_app_worktree_materialises_only_app_folder() {
 #[tokio::test]
 async fn create_sparse_app_worktree_reuses_surviving_branch_on_resume() {
     let (_tmp, ws) = make_test_repo().await;
-    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker")).await.unwrap();
-    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>v1</h1>").await.unwrap();
+    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker"))
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>v1</h1>")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &ws).await;
     let _ = git_cmd(&["commit", "-m", "scaffold"], &ws).await;
 
@@ -113,19 +133,28 @@ async fn create_sparse_app_worktree_reuses_surviving_branch_on_resume() {
     assert!(created, "first spawn must report the branch as created");
 
     // The session commits work on the branch.
-    tokio::fs::write(wt.join("data/apps/habit-tracker/index.html"), "<h1>v2</h1>").await.unwrap();
+    tokio::fs::write(wt.join("data/apps/habit-tracker/index.html"), "<h1>v2</h1>")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &wt).await;
     let _ = git_cmd(&["commit", "-m", "session work"], &wt).await;
 
     // Worktree torn down; branch survives.
-    let _ = git_cmd(&["worktree", "remove", "--force", wt.to_str().unwrap()], &ws).await;
+    let _ = git_cmd(
+        &["worktree", "remove", "--force", wt.to_str().unwrap()],
+        &ws,
+    )
+    .await;
     assert!(!wt.exists(), "precondition: worktree dir removed");
 
     // Resume: recreate the worktree on the SAME branch.
     let created = create_sparse_app_worktree(&ws, "habit-tracker", &branch, &wt)
         .await
         .expect("resume must reuse the surviving branch");
-    assert!(!created, "resume must report the branch as reused, not created");
+    assert!(
+        !created,
+        "resume must report the branch as reused, not created"
+    );
 
     let html = tokio::fs::read_to_string(wt.join("data/apps/habit-tracker/index.html"))
         .await
@@ -134,7 +163,9 @@ async fn create_sparse_app_worktree_reuses_surviving_branch_on_resume() {
         html, "<h1>v2</h1>",
         "resumed worktree must carry the branch's committed work",
     );
-    let head = git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], &wt).await.unwrap();
+    let head = git_cmd(&["rev-parse", "--abbrev-ref", "HEAD"], &wt)
+        .await
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&head.stdout).trim(), branch);
 }
 
@@ -148,8 +179,12 @@ async fn create_sparse_app_worktree_reuses_surviving_branch_on_resume() {
 #[tokio::test]
 async fn create_sparse_app_worktree_reuses_branch_after_dirty_teardown() {
     let (_tmp, ws) = make_test_repo().await;
-    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker")).await.unwrap();
-    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>v1</h1>").await.unwrap();
+    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker"))
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>v1</h1>")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &ws).await;
     let _ = git_cmd(&["commit", "-m", "scaffold"], &ws).await;
 
@@ -160,7 +195,9 @@ async fn create_sparse_app_worktree_reuses_branch_after_dirty_teardown() {
     create_sparse_app_worktree(&ws, "habit-tracker", &branch, &wt)
         .await
         .expect("first sparse worktree should succeed");
-    tokio::fs::write(wt.join("data/apps/habit-tracker/index.html"), "<h1>v2</h1>").await.unwrap();
+    tokio::fs::write(wt.join("data/apps/habit-tracker/index.html"), "<h1>v2</h1>")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &wt).await;
     let _ = git_cmd(&["commit", "-m", "session work"], &wt).await;
 
@@ -174,7 +211,10 @@ async fn create_sparse_app_worktree_reuses_branch_after_dirty_teardown() {
     let html = tokio::fs::read_to_string(wt.join("data/apps/habit-tracker/index.html"))
         .await
         .unwrap();
-    assert_eq!(html, "<h1>v2</h1>", "committed work must survive the dirty resume");
+    assert_eq!(
+        html, "<h1>v2</h1>",
+        "committed work must survive the dirty resume"
+    );
 }
 
 /// App spawns reuse the same deterministic `thread-<id>` worktree path as chat
@@ -184,9 +224,15 @@ async fn create_sparse_app_worktree_reuses_branch_after_dirty_teardown() {
 #[tokio::test]
 async fn create_sparse_app_worktree_recovers_from_missing_but_registered_path() {
     let (_tmp, ws) = make_test_repo().await;
-    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker")).await.unwrap();
-    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>m</h1>").await.unwrap();
-    tokio::fs::write(ws.join(".gitignore"), ".lucidos/\n").await.unwrap();
+    tokio::fs::create_dir_all(ws.join("data/apps/habit-tracker"))
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join("data/apps/habit-tracker/index.html"), "<h1>m</h1>")
+        .await
+        .unwrap();
+    tokio::fs::write(ws.join(".gitignore"), ".lucidos/\n")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &ws).await;
     let _ = git_cmd(&["commit", "-m", "scaffold"], &ws).await;
 
@@ -194,9 +240,14 @@ async fn create_sparse_app_worktree_recovers_from_missing_but_registered_path() 
     let wt = wt_tmp.path().join("thread-stale");
 
     // First spawn creates the worktree.
-    create_sparse_app_worktree(&ws, "habit-tracker", &generate_app_branch_name("habit-tracker"), &wt)
-        .await
-        .expect("first sparse worktree should succeed");
+    create_sparse_app_worktree(
+        &ws,
+        "habit-tracker",
+        &generate_app_branch_name("habit-tracker"),
+        &wt,
+    )
+    .await
+    .expect("first sparse worktree should succeed");
 
     // Residue: dir wiped, git registration kept.
     tokio::fs::remove_dir_all(&wt).await.unwrap();
@@ -212,4 +263,3 @@ async fn create_sparse_app_worktree_recovers_from_missing_but_registered_path() 
         "app folder not materialised on re-spawn",
     );
 }
-

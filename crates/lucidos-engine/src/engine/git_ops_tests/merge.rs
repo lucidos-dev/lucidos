@@ -1,5 +1,5 @@
-use super::*;
 use super::common::make_test_repo;
+use super::*;
 
 #[test]
 fn merge_direction_filter_rejects_main_into_branch() {
@@ -662,9 +662,12 @@ async fn lucidos_source_worktree_bases_off_main_not_parked_head() {
     let (_tmp, repo) = make_test_repo().await; // `main` + init.txt
 
     // A *different* session's in-flight branch with a commit of its own.
-    git_cmd(&["checkout", "-b", "claude-code/20260601-204403-parked"], &repo)
-        .await
-        .unwrap();
+    git_cmd(
+        &["checkout", "-b", "claude-code/20260601-204403-parked"],
+        &repo,
+    )
+    .await
+    .unwrap();
     tokio::fs::write(repo.join("phantom.txt"), "backup work from another session")
         .await
         .unwrap();
@@ -722,7 +725,11 @@ async fn lucidos_source_worktree_bases_off_main_not_parked_head() {
         "new branch carries commits beyond main — phantom 'pending changes' will appear"
     );
 
-    let _ = git_cmd(&["worktree", "remove", "--force", wt_path.to_str().unwrap()], &repo).await;
+    let _ = git_cmd(
+        &["worktree", "remove", "--force", wt_path.to_str().unwrap()],
+        &repo,
+    )
+    .await;
 }
 
 /// External-repo spawns keep their own contract: branch off the `origin` default
@@ -737,4 +744,3 @@ async fn external_repo_worktree_base_is_none_without_origin() {
         "external repo with no origin remote should branch from HEAD (None)"
     );
 }
-

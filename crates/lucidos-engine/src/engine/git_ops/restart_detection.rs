@@ -33,8 +33,8 @@ pub(crate) fn files_require_restart(files: &[String]) -> bool {
 /// File extensions an app's iframe directly serves (HTML / CSS / JS / static
 /// assets). Matches what `/api/v1/app/<id>/...` streams in `crates/lucidos-engine/src/api/apps.rs`.
 const APP_IFRAME_BUNDLED_EXTENSIONS: &[&str] = &[
-    "html", "htm", "css", "js", "svg", "png", "jpg", "jpeg", "gif", "webp", "ico",
-    "woff", "woff2", "ttf", "otf", "json",
+    "html", "htm", "css", "js", "svg", "png", "jpg", "jpeg", "gif", "webp", "ico", "woff", "woff2",
+    "ttf", "otf", "json",
 ];
 
 /// True if any of `files` is a path inside `data/apps/<app_id>/` that the
@@ -79,4 +79,3 @@ pub(crate) fn files_have_client_update(files: &[String]) -> bool {
             || f.ends_with(".jsx")
     })
 }
-

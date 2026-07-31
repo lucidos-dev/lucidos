@@ -21,7 +21,14 @@ async fn per_commit_change_proposed_does_not_change_has_diff() {
     .await
     .unwrap();
 
-    emit_change_proposed_per_commit(&bus, thread_id, "feat-branch", "abc123", Some("commit subject")).await;
+    emit_change_proposed_per_commit(
+        &bus,
+        thread_id,
+        "feat-branch",
+        "abc123",
+        Some("commit subject"),
+    )
+    .await;
 
     let after: bool = sqlx::query_scalar(
         "SELECT coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
@@ -65,7 +72,10 @@ async fn coding_agent_diff_refresh_sets_has_diff_and_broadcasts_aggregate() {
     assert!(stored, "projection flag must be updated in the DB");
 
     let emitted = rx.recv().await.unwrap();
-    assert_eq!(emitted.seq, None, "diff refresh is transient, not persisted");
+    assert_eq!(
+        emitted.seq, None,
+        "diff refresh is transient, not persisted"
+    );
     match emitted.typed {
         BusEvent::Thread {
             thread_id: emitted_thread_id,
@@ -278,13 +288,11 @@ async fn domain_event_persisted_payload_carries_actor_when_provided() {
         .unwrap()
         .expect("non-transient DomainEvent persists");
 
-    let payload: serde_json::Value = sqlx::query_scalar(
-        "SELECT payload FROM events WHERE id = $1",
-    )
-    .bind(result.event_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM events WHERE id = $1")
+        .bind(result.event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(payload["summary"], "hello", "original payload preserved");
     let payload_actor = payload
         .get("actor")
@@ -317,13 +325,11 @@ async fn domain_event_persisted_payload_unchanged_when_actor_none() {
         .unwrap()
         .expect("non-transient DomainEvent persists");
 
-    let payload: serde_json::Value = sqlx::query_scalar(
-        "SELECT payload FROM events WHERE id = $1",
-    )
-    .bind(result.event_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let payload: serde_json::Value = sqlx::query_scalar("SELECT payload FROM events WHERE id = $1")
+        .bind(result.event_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
     assert_eq!(payload, serde_json::json!({"summary": "x", "n": 7}));
     assert!(
         !payload.as_object().unwrap().contains_key("actor"),
@@ -626,7 +632,10 @@ async fn startup_clears_orphan_proposed_chip_without_pending_change() {
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert_eq!(status_b, "idle", "genuine pending change settles to 'idle' under Option B");
+    assert_eq!(
+        status_b, "idle",
+        "genuine pending change settles to 'idle' under Option B"
+    );
     assert!(proposed_b, "genuine chip on thread B must stay set");
 
     pool.close().await;

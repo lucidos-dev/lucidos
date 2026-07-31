@@ -40,17 +40,20 @@
 #     that can break on its own. It runs in one of two MODES:
 #
 #       - full    (dispatch + the daily cron, default origin https://lucidos.dev)
-#                 all four rungs, ending in a real install on a bare box.
-#       - payload (push to rc/**, origin https://lucidos.dev/rc; also selectable
+#                 all eight rungs: a real install on a bare box, then the
+#                 advertised UNINSTALL paths (--list through both front doors, a
+#                 data-safe removal, and --all --purge), each asserted.
+#       - payload (push to rc/**, origin https://rc.lucidos.dev; also selectable
 #                 on a dispatch) rung 1 ONLY — fetch the served installer, parse
-#                 its helper-lib list + lib base out of it, fetch those, and
-#                 assert every payload is shell rather than the soft-404 landing
-#                 page. Then STOP GREEN. See the job for why it must not install.
+#                 its helper-lib list + lib base out of it, fetch those AND the
+#                 served uninstaller, and assert every payload is shell rather
+#                 than the soft-404 landing page. Then STOP GREEN. See the job
+#                 for why it must not install.
 #
 #     The full mode is deliberately NOT on the rc/** push: it would gate an RC on
 #     the state of production, which the RC has not shipped to yet. The payload
 #     mode is the opposite — it gates the RC's OWN copy of the installer at
-#     /rc/install.sh, before anything reaches the real path.
+#     rc.lucidos.dev, before anything reaches the real path.
 #
 # NOTE: only effective once lucidos-dev is public. Before the public flip this
 # repo is still private, so runs bill against the private free tier (~2000
@@ -161,9 +164,16 @@ jobs:
         # macOS source-install is intentionally NOT run here: GitHub's hosted
         # Apple-Silicon macOS runners are themselves VMs with no nested
         # virtualization, so Colima/Docker (which install.sh needs for Postgres
-        # on the from-source dev path) cannot start. macOS end-users install via
-        # the signed DMG, which the dmg-verify job already gates clean-machine.
-        # install.sh's macOS path stays covered by local dev + dmg-verify.
+        # on the from-source dev path) cannot start. That exclusion is narrow:
+        # the signed DMG is gated by dmg-verify, and the advertised
+        # `curl ... | sh` DOWNLOAD path on macOS is gated by front-door-macos,
+        # on both aarch64-apple-darwin and x86_64-apple-darwin. That job runs on
+        # a hosted runner precisely because downloading needs no Docker, no
+        # Colima and no nested virtualization: it curls a prebuilt tarball and
+        # runs it. What stays uncovered on macOS is ONLY the --dev SOURCE
+        # install, which is what this exclusion is about. It does not mean
+        # "macOS can't be tested in CI", and is never a reason to delete
+        # front-door-macos.
         os: ${{ fromJSON(
           (github.event_name == 'workflow_dispatch' && inputs.os == 'macos-only') && '["ubuntu-latest"]'
           || '["ubuntu-latest"]') }}
@@ -407,18 +417,20 @@ jobs:
   # scripts/lib/service_test.sh) and never exercised on a real machine in CI.
   #
   # ARTIFACT SOURCE — build in-job, drive the DEFAULT path over a file:// base URL.
-  # We deliberately do NOT `gh release download` the tarball: release-tarballs.yml is
-  # ARTIFACT-ONLY (it never attaches tarballs to a GitHub Release — its attach step is
-  # manual + opt-in), so a release-asset download would 404 on every release until that
-  # flow is wired, redding this job. Instead we build the Linux x86_64 tarball with
-  # scripts/build-headless.sh (exactly as release-tarballs.yml does) and point
-  # LUCIDOS_RELEASE_BASE_URL at the local dist/headless over file://. install.sh's
-  # default path then runs its REAL codepath against it: resolve the host triple →
-  # curl lucidos-<ver>-<triple>.tar.gz + .sha256 → MANDATORY fail-closed checksum
-  # verify → extract → register the systemd --user service. (Same file:// technique
-  # install_test.sh uses offline; strictly higher-value than --from-tarball, whose
-  # checksum is only optional.) When Releases start carrying tarball assets, a
-  # `gh release download` arm on `release: published` can be added alongside this.
+  # We deliberately do NOT `gh release download` the tarball. Most of this job's
+  # triggers (a push to rc/**, a dispatch, the weekly cron) have NO matching Release
+  # at all; and on `release: published` this job starts CONCURRENTLY with
+  # release-tarballs.yml, which only finishes attaching the assets ~30 min later — so
+  # a release-asset download would 404 or race on every run. Instead we build the
+  # Linux x86_64 tarball with scripts/build-headless.sh (exactly as release-tarballs.yml
+  # does) and point LUCIDOS_RELEASE_BASE_URL at the local dist/headless over file://.
+  # install.sh's default path then runs its REAL codepath against it: resolve the host
+  # triple → curl lucidos-<ver>-<triple>.tar.gz + .sha256 → MANDATORY fail-closed
+  # checksum verify → extract → register the systemd --user service. (Same file://
+  # technique install_test.sh uses offline; strictly higher-value than --from-tarball,
+  # whose checksum is only optional.) What this job does NOT cover is the PUBLISHED
+  # asset itself — that needs a run after release-tarballs.yml has attached it, which
+  # is the `front-door` job's territory (it installs from the live origin).
   #
   # systemd --user ON ubuntu-latest: the hosted runner has no interactive login, so the
   # per-user systemd instance isn't running by default. `loginctl enable-linger` starts
@@ -670,15 +682,24 @@ jobs:
   # that broke. On the runner image /bin/sh is dash too, but a container also
   # gives us a machine with only curl + ca-certificates on it, like a real one.
   #
-  # Verification ladder (all four in full mode; rung 1 alone in payload mode):
-  #   1. BEFORE installing: every helper lib install.sh needs resolves to SHELL,
-  #      not HTML. The lib names are PARSED out of the fetched install.sh (never
-  #      hardcoded, or the list rots the day a lib is added). This is the rung
-  #      that would have caught the 2026-07-29 bug outright — and, because it
-  #      touches nothing but payloads, the only one an RC can run.
+  # Verification ladder (all eight in full mode; rung 1 alone in payload mode):
+  #   1. BEFORE installing: every payload the advertised commands fetch resolves
+  #      to SHELL rather than HTML, meaning install.sh, every helper lib it
+  #      declares, and uninstall.sh. The lib names and both URLs are PARSED out
+  #      of the fetched install.sh (never hardcoded, or the list rots the day a
+  #      lib is added, and a hardcoded origin could check one place while the
+  #      installer fetches another). This is the rung that would have caught the
+  #      2026-07-29 bug outright, and because it touches nothing but payloads it
+  #      is the only one an RC can run.
   #   2. the install runs with no DOCTYPE / shell syntax error in its log
   #   3. the gateway answers /~/api/v1/health with status: ok (polled)
   #   4. the frontend serves HTTP 200
+  #   5. `install.sh | sh -s -- --list` lists the instance (the DELEGATION path:
+  #      install.sh fetches uninstall.sh from this origin and execs the payload)
+  #   6. `uninstall.sh | sh -s -- --list` lists it too (the DIRECT piped path)
+  #   7. a data-safe removal (`--uninstall --all`, no --purge) unregisters the
+  #      service and KEEPS the data, which is what uninstall.sh --help promises
+  #   8. `--all --purge` really removes the instance data AND the shared runtime
   #
   # TWO MODES, because two different callers need these rungs pointed at two
   # different origins (FD_MODE, resolved below):
@@ -692,9 +713,11 @@ jobs:
   #               verify the previous origin. The publisher fires this dispatch
   #               itself once SitePublished lands.
   #   * payload — rung 1 only, then stop green. Auto-runs on every push to rc/**
-  #               against https://lucidos.dev/rc, where the RC copy of the
-  #               installer is published (libs at /rc/scripts/lib/), so the
+  #               against https://rc.lucidos.dev, where the RC copy of the
+  #               installer is published (libs at /scripts/lib/ on that host), so the
   #               soft-404 class is caught BEFORE anything reaches the real path.
+  #               Rung 1 covers the UNINSTALLER too, so an RC is gated on both
+  #               halves of the advertised experience being real shell.
   #
   # WHY PAYLOAD MODE MUST NOT INSTALL — do not "fix" this by re-enabling rungs
   # 2-4 for the RC. An RC install.sh bakes LUCIDOS_DEFAULT_VERSION=<rc version>
@@ -702,7 +725,7 @@ jobs:
   # https://github.com/lucidos-dev/lucidos/releases/download/v<ver>/… . During an
   # RC that tag DOES NOT EXIST: Phase A publishes only an `rc-<ver>` PRERELEASE
   # carrying the DMG + updater .sig, and headless tarballs live solely on real
-  # `v*` releases. A full `curl | sh` against /rc/install.sh would therefore 404
+  # `v*` releases. A full `curl | sh` against the RC origin's /install.sh would therefore 404
   # at the download step every single time and this job would be permanently red.
   # Nothing is lost: the bug class the RC gate exists to catch (the 2026-07-29
   # soft-404 — the origin answers a script path with the landing page at status
@@ -743,7 +766,14 @@ jobs:
       # first step validates + normalises it and exports the real FRONT_DOOR via
       # $GITHUB_ENV; every later step reads THAT, under `set -u`, so a validation
       # step that never ran leaves nothing usable behind.
-      FRONT_DOOR_INPUT: ${{ (github.event_name == 'push' && 'https://lucidos.dev/rc') || inputs.origin || 'https://lucidos.dev' }}
+      FRONT_DOOR_INPUT: ${{ (github.event_name == 'push' && 'https://rc.lucidos.dev') || inputs.origin || 'https://lucidos.dev' }}
+      # The RC origin sits behind Cloudflare Access. Every fetch of it must
+      # present the `lucidos-ci-front-door` service token or the gate answers
+      # 302 to a login page — which the payload sniff would correctly report as
+      # "not shell", but for the wrong reason. Empty for the production origin,
+      # which is public; the curl wrapper only adds the headers when both are set.
+      RC_ACCESS_CLIENT_ID: ${{ secrets.RC_ACCESS_CLIENT_ID }}
+      RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
       GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
       GW_HEALTH_TIMEOUT_SECS: '900'    # download + extract + embedded-PG first boot
       # A stranger's shell has no LUCIDOS_* set, but this workflow's top-level env
@@ -826,6 +856,27 @@ jobs:
           set -uo pipefail
           tmp="$(mktemp -d)"
 
+          # ── Cloudflare Access headers for the gated RC origin ────────────────
+          # rc.lucidos.dev is behind an Access app; the service token is the only
+          # non-interactive way past it. Production is public and gets no headers,
+          # so FD_HDR stays empty there and every curl below is unchanged.
+          #
+          # An unset FD_HDR would abort the step under `set -u`, so it is always
+          # declared. Bash 4.4+ (ubuntu:22.04 has 5.1) expands "${FD_HDR[@]}" of
+          # an empty array to nothing rather than an empty string.
+          FD_HDR=()
+          if [ -n "${RC_ACCESS_CLIENT_ID:-}" ] && [ -n "${RC_ACCESS_CLIENT_SECRET:-}" ]; then
+            FD_HDR=(-H "CF-Access-Client-Id: $RC_ACCESS_CLIENT_ID"
+                    -H "CF-Access-Client-Secret: $RC_ACCESS_CLIENT_SECRET")
+            echo "==> Cloudflare Access service token present (gated origin)"
+          elif [ "$FRONT_DOOR" != "${FRONT_DOOR#https://rc.}" ]; then
+            # Named explicitly rather than left to fail as "returned HTML": a
+            # missing secret and a broken deploy look identical in the payload
+            # sniff, and only one of them is an origin regression.
+            echo "::error::$FRONT_DOOR is behind Cloudflare Access but RC_ACCESS_CLIENT_ID/SECRET are not set. Every fetch will get the 302 login page and be reported as 'not shell'. Add both repo secrets (Cloudflare -> Access -> Service Tokens -> lucidos-ci-front-door)."
+            exit 1
+          fi
+
           # assert_shell_file <file> <url> — the payload must be a shell script.
           # Two distinct failures, because they mean different things: a body
           # starting with '<' is the soft-404 HTML (the origin is misconfigured),
@@ -863,7 +914,7 @@ jobs:
           }
 
           echo "==> Fetching the advertised installer"
-          curl -fsSL "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" \
+          curl -fsSL "${FD_HDR[@]}" "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" \
             || { echo "::error::could not fetch $FRONT_DOOR/install.sh"; exit 1; }
           assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh" || exit 1
 
@@ -931,56 +982,149 @@ jobs:
           echo "==> Helper libs the installer will fetch when piped"
           echo "    lib base: $lib_base"
           echo "    libs:     $(echo "$libs" | tr '\n' ' ')"
-          # The publisher is supposed to rewrite the baked URL to this origin. If
-          # it did not, the libs resolve to GitHub (which always has them) and
-          # rung 1 passes without having tested the front door at all — a hollow
-          # pass that must never read as coverage.
+
+          # Everything from here on accumulates into ONE verdict instead of
+          # exiting at the first problem. A run that reports "the libs are HTML"
+          # and stops, when the uninstaller is ALSO missing, costs a second round
+          # trip to learn the second half.
+          fail=0
+
+          # pin_mismatch <message>: a served script that points its own fetches
+          # somewhere other than this origin. The publisher is supposed to
+          # rewrite every baked URL to the origin it publishes to; if it did not,
+          # the fetch resolves to GitHub (which always has the file) and the rung
+          # passes without having tested the front door at all. That hollow pass
+          # must never read as coverage.
           #
+          # FATAL in payload mode, loud in full mode, and the asymmetry is the
+          # point rather than an oversight. In full mode rungs 2-8 still drive a
+          # real install AND a real uninstall against this origin, so the run has
+          # other teeth and a warning is proportionate. In payload mode rung 1 is
+          # the ONLY rung: a pin pointing somewhere else means the job verified
+          # nothing about the origin it was asked to gate.
+          #
+          # One helper for all three pin checks below, so their severity and
+          # their wording cannot drift apart.
+          pin_mismatch() {
+            if [ "$FD_MODE" = "payload" ]; then
+              echo "::error::$1, and payload mode has no other rung to fall back on. Refusing to report green on a check that never touched $FRONT_DOOR."
+              fail=1
+            else
+              echo "::warning::$1"
+            fi
+          }
+
           # EQUALITY, not a prefix match. `"$FRONT_DOOR"/*` was vacuous the moment
           # a second origin existed under the same apex: with FRONT_DOOR set to
           # https://lucidos.dev, an installer wrongly pinned to the RC copy gives
-          # lib_base=https://lucidos.dev/rc/scripts/lib, which prefix-matches and
+          # lib_base=https://rc.lucidos.dev/scripts/lib, which prefix-matches and
           # passes silently while rung 1 checks the RC's libs instead of
           # production's. Both real origins produce exactly "<origin>/scripts/lib",
           # so demand exactly that.
           expected_lib_base="$FRONT_DOOR/scripts/lib"
           if [ "$lib_base" != "$expected_lib_base" ]; then
-            # Fatal in payload mode, loud in full mode — and the asymmetry is the
-            # point, not an oversight. In full mode rungs 2-4 still drive a real
-            # install against this origin, so the run has other teeth and a
-            # warning is proportionate. In payload mode rung 1 is the ONLY rung:
-            # a lib base pointing somewhere else means the job verified nothing
-            # about the origin it was asked to gate, which must not be green.
-            msg="the served install.sh points its helper-lib fetch at $lib_base, NOT $expected_lib_base — rung 1 is not exercising this origin's script paths"
-            if [ "$FD_MODE" = "payload" ]; then
-              echo "::error::$msg, and payload mode has no other rung to fall back on. Refusing to report green on a check that never touched $FRONT_DOOR."
-              exit 1
-            fi
-            echo "::warning::$msg"
+            pin_mismatch "the served install.sh points its helper-lib fetch at $lib_base, NOT $expected_lib_base, so rung 1 is not exercising this origin's script paths"
           fi
 
-          fail=0
+          lib_fail=0
           for name in $libs; do
             url="$lib_base/$name"
-            if ! curl -fsSL "$url" -o "$tmp/$name"; then
+            if ! curl -fsSL "${FD_HDR[@]}" "$url" -o "$tmp/$name"; then
               echo "::error::could not fetch $url (HTTP error)"
-              fail=1
+              lib_fail=1
               continue
             fi
-            assert_shell_file "$tmp/$name" "$url" || fail=1
+            assert_shell_file "$tmp/$name" "$url" || lib_fail=1
           done
-          if [ "$fail" -ne 0 ]; then
+          if [ "$lib_fail" -ne 0 ]; then
             echo "::error::at least one helper lib does not resolve to a shell script — 'curl -fsSL $FRONT_DOOR/install.sh | sh' would source that payload as shell and die on a fresh machine"
-            exit 1
+            fail=1
           fi
-          echo "rung 1 OK — all $lib_count helper libs resolve to shell at $lib_base"
+
+          # ── the advertised UNINSTALLER is part of the front door too ──────────
+          # Both advertised uninstall paths EXECUTE what this URL serves:
+          #
+          #   curl -fsSL <origin>/install.sh | sh -s -- --uninstall
+          #       install.sh's dispatch_uninstall fetches
+          #       ${LUCIDOS_INSTALL_URL%/install.sh}/uninstall.sh and runs
+          #       `exec bash -c "$payload"` on it.
+          #   curl -fsSL <origin>/uninstall.sh | sh
+          #       the same payload, piped straight into a shell.
+          #
+          # So a soft-404 here is not "the uninstaller is missing", it is "the
+          # landing page runs as shell": the exact 2026-07-29 class, on a path
+          # that reaches `exec` rather than `source`. Checked in BOTH modes, so
+          # an RC is gated on its uninstaller being real shell and not only on
+          # its installer.
+          #
+          # The URL is DERIVED from the served installer the same way the code
+          # derives it, so it follows the pin instead of assuming the apex.
+          uninstall_url="${install_url%/install.sh}/uninstall.sh"
+          echo "==> The advertised uninstaller"
+          echo "    $uninstall_url"
+          if ! curl -fsSL "${FD_HDR[@]}" "$uninstall_url" -o "$tmp/uninstall.sh"; then
+            echo "::error::could not fetch $uninstall_url (HTTP error)"
+            fail=1
+          elif ! assert_shell_file "$tmp/uninstall.sh" "$uninstall_url"; then
+            echo "::error::$uninstall_url does not serve a shell script, so BOTH advertised uninstall paths would RUN that payload: 'curl -fsSL $FRONT_DOOR/install.sh | sh -s -- --uninstall' execs it via dispatch_uninstall, and 'curl -fsSL $uninstall_url | sh' pipes it into a shell directly."
+            echo "::error::FIX: the site publisher must publish the /uninstall.sh route beside /install.sh. That deploy runs on the maintainer's machine off the SitePublished trigger chain, NOT in CI, so no change in this repository can turn this green."
+            fail=1
+          else
+            # The served uninstaller must PIN ITSELF at this origin, for exactly
+            # the reason the lib base must, and it carries TWO pins:
+            #
+            #   * LUCIDOS_UNINSTALL_SELF_URL, where a PIPED run re-fetches itself
+            #     to get under bash. `curl … | sh` leaves no readable $0 to
+            #     re-exec, so on Linux (where /bin/sh is dash) uninstall.sh
+            #     re-downloads itself from this URL. Left on the GitHub default,
+            #     `curl <origin>/uninstall.sh | sh` silently runs main's
+            #     uninstaller and this rung proves nothing about the origin.
+            #   * LUCIDOS_INSTALL_URL, what its own scripts/lib/service.sh fetch
+            #     derives from. install.sh does NOT export its copy before
+            #     `exec bash -c "$payload"`, so even the DELEGATED uninstaller
+            #     re-resolves this default: an unpinned copy sources service.sh
+            #     from GitHub main although the uninstaller itself came from here.
+            #
+            # Both parses fail closed. A parser that finds nothing must never be
+            # read as "the pin is fine".
+            u_self="$(grep -m1 '^LUCIDOS_UNINSTALL_SELF_URL=' "$tmp/uninstall.sh" | sed -e 's/.*:-//' -e 's/}"$//')"
+            case "$u_self" in
+              http*://*/uninstall.sh) ;;
+              *)
+                echo "::error::could not parse LUCIDOS_UNINSTALL_SELF_URL out of the served $uninstall_url (got '$u_self'). This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_UNINSTALL_SELF_URL=' "$tmp/uninstall.sh" || true
+                fail=1
+                u_self=""
+                ;;
+            esac
+            if [ -n "$u_self" ] && [ "$u_self" != "$FRONT_DOOR/uninstall.sh" ]; then
+              pin_mismatch "the served uninstall.sh re-execs itself from $u_self, NOT $FRONT_DOOR/uninstall.sh, so a piped 'curl -fsSL $uninstall_url | sh' would run THAT copy instead of this origin's"
+            fi
+
+            u_install_url="$(grep -m1 '^LUCIDOS_INSTALL_URL=' "$tmp/uninstall.sh" | sed -e 's/.*:-//' -e 's/}"$//')"
+            case "$u_install_url" in
+              http*://*/install.sh) ;;
+              *)
+                echo "::error::could not parse LUCIDOS_INSTALL_URL out of the served $uninstall_url (got '$u_install_url'). This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_INSTALL_URL=' "$tmp/uninstall.sh" || true
+                fail=1
+                u_install_url=""
+                ;;
+            esac
+            if [ -n "$u_install_url" ] && [ "${u_install_url%/install.sh}/scripts/lib" != "$expected_lib_base" ]; then
+              pin_mismatch "the served uninstall.sh points its service.sh fetch at ${u_install_url%/install.sh}/scripts/lib, NOT $expected_lib_base, so an uninstall run from this origin would source its helper lib from somewhere else"
+            fi
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "rung 1 OK: the installer, all $lib_count helper libs at $lib_base, and the uninstaller at $uninstall_url all resolve to shell"
 
           # Be explicit about where a payload-mode run stops and what that green
           # does NOT mean, so nobody reads it as "the RC installs cleanly".
           if [ "$FD_MODE" = "payload" ]; then
             echo
             echo "PAYLOAD MODE — stopping here, green."
-            echo "  verified:     $FRONT_DOOR serves an installer and all $lib_count helper libs it declares as SHELL, not the landing page (the 2026-07-29 soft-404 class)."
+            echo "  verified:     $FRONT_DOOR serves an installer, an uninstaller, and all $lib_count helper libs the installer declares, every one of them as SHELL rather than the landing page (the 2026-07-29 soft-404 class)."
             echo "  NOT verified: that the install completes. It cannot be: an RC installer resolves its tarball to"
             echo "                https://github.com/lucidos-dev/lucidos/releases/download/v<version>/… and that tag does not"
             echo "                exist during an RC (Phase A publishes only an rc-<version> prerelease, DMG + .sig, no tarballs)."
@@ -1089,6 +1233,232 @@ jobs:
 
           echo "OK — 'curl -fsSL $FRONT_DOOR/install.sh | sh' works on a fresh ubuntu:22.04 box."
 
+      # ── rungs 5-8: the advertised UNINSTALL paths (FULL MODE ONLY) ────────────
+      # Uninstall is half of the advertised experience and was tested nowhere
+      # until 2026-07-30. These rungs ASSERT, and they can red the job. They are
+      # not a teardown: the teardown steps below still exist, and are cleanup.
+      #
+      # Four rungs, alternating the two advertised entry points so each is
+      # exercised for both a listing and a mutation:
+      #
+      #   5  curl … /install.sh   | sh -s -- --list              delegation, read-only
+      #   6  curl … /uninstall.sh | sh -s -- --list              direct pipe, read-only
+      #   7  curl … /install.sh   | sh -s -- --uninstall --all    data-safe removal
+      #   8  curl … /uninstall.sh | sh -s -- --all --purge        purge
+      #
+      # ORDER MATTERS AND SAVES A REINSTALL. A data-safe rung 7 keeps the data
+      # dir AND its port marker, so rung 8 still has a target to purge. Running
+      # the read-only rungs first also means they observe the installed state.
+      #
+      # WHAT THIS CONTAINER CANNOT COVER, so it is not asserted: there is no
+      # launchd and no systemd here, so install.sh registered no service, and
+      # uninstall.sh's remove_instance stops the embedded runtime only when it
+      # actually unregistered one. The gateway this job launched in the
+      # foreground therefore keeps running across the uninstall, by design. The
+      # macOS job covers the service half, where launchd exists.
+      - name: Verify the front door can uninstall what it installed
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # install.sh's defaults: this job passes no --prefix and no --name, so
+          # the slug is `default` and everything hangs off $HOME/.lucidos. Derived
+          # exactly as service_instance_data_dir / service_runtime_root do, and as
+          # uninstall.sh's own --all --purge shared-runtime branch does.
+          prefix="$HOME/.lucidos"
+          slug="default"
+          data="$prefix/$slug"
+          runtime="$prefix/runtime"
+          marker="$data/port"
+
+          fail=0
+          # The SHELL-PARSE signature, same pattern rung 2 uses: an HTML payload
+          # fed to a shell says DOCTYPE plus a bash/dash syntax error, and neither
+          # wording collides with Postgres's "syntax error at or near".
+          HTML_PAYLOAD_RE='DOCTYPE|syntax error near|syntax error:'
+
+          # marker_diagnosis: the ONE root cause that makes an instance invisible
+          # to --list and unremovable by --all --purge, named explicitly because
+          # from the outside it looks exactly like an origin regression.
+          # service_list_instance_names lists only <prefix>/<slug>/ dirs carrying
+          # a `port` marker. Until 2026-07-30 install.sh wrote that marker solely
+          # in register_service, so the FOREGROUND launch this container forces
+          # (no service manager) left none: --list said "(none)", resolve_targets
+          # found no targets, and run_uninstall returned before purging anything.
+          # The fix is record_instance_port, called from BOTH launch shapes.
+          marker_diagnosis() {
+            if [ -f "$marker" ]; then
+              echo "    (the port marker $marker exists, so this is NOT the known marker gap)"
+              return 0
+            fi
+            echo "::error::ROOT CAUSE: the port marker $marker does not exist. service_list_instance_names keys on it, so this instance is invisible to --list, resolve_targets resolves no targets, and run_uninstall returns before purging. install.sh must record it on BOTH launch shapes (record_instance_port, called from register_service AND launch_runtime); this container has no launchd or systemd, so it always takes the foreground shape. That is an INSTALLER defect, not an origin regression."
+          }
+
+          # assert_uninstaller_ran <label> <log> <status>: the floor every
+          # uninstall rung shares. `curl -f` cannot see a soft-404, so check the
+          # OUTPUT rather than the status alone: uninstall.sh's own banner must be
+          # present, no HTML or shell-parse cascade may be, and the command must
+          # exit 0.
+          assert_uninstaller_ran() {
+            local label="$1" log="$2" st="$3" bad=0
+            if grep -qiE "$HTML_PAYLOAD_RE" "$log" 2>/dev/null; then
+              echo "::error::$label executed a NON-SHELL payload: the origin answered a script path with HTML at status 200 (soft 404) and the shell tried to run it."
+              grep -inE "$HTML_PAYLOAD_RE" "$log" | head -n 5 | sed 's/^/      /'
+              bad=1
+            fi
+            if ! grep -q 'Lucidos uninstaller' "$log" 2>/dev/null; then
+              echo "::error::$label never reached uninstall.sh: its 'Lucidos uninstaller' banner is absent from the output, so nothing about the advertised uninstall path was exercised."
+              bad=1
+            fi
+            if [ "$st" != "0" ]; then
+              echo "::error::$label exited $st"
+              bad=1
+            fi
+            if [ "$bad" -ne 0 ]; then
+              echo "--- $label output (tail 40) ---"
+              tail -n 40 "$log" 2>/dev/null || true
+              return 1
+            fi
+            return 0
+          }
+
+          # assert_listed <label> <log>: do_list prints "<slug>  port <n>  <status>"
+          # per instance, or "(none)" when it finds nothing.
+          assert_listed() {
+            local label="$1" log="$2"
+            if grep -qE "(^|[[:space:]])${slug}[[:space:]]+port[[:space:]]+[0-9]+" "$log"; then
+              echo "    OK  $label lists instance '$slug'"
+              return 0
+            fi
+            echo "::error::$label ran the uninstaller but did not list the instance this job just installed ('$slug' under $prefix)."
+            marker_diagnosis
+            echo "--- $label output (tail 20) ---"
+            tail -n 20 "$log" 2>/dev/null || true
+            return 1
+          }
+
+          # Every command below passes the origin as an ARGUMENT rather than
+          # splicing it into the `sh -c` string: it can originate in a dispatch
+          # input, and a string-interpolated value would be parsed as shell by the
+          # very command being constructed. The single quotes are load-bearing so
+          # "$0" reaches the inner shell unexpanded. Same shape as the launch step.
+
+          # ── rung 5: --list through the DELEGATION front door ──────────────────
+          # install.sh --list is a thin front door for uninstall.sh: with no
+          # checkout, dispatch_uninstall fetches
+          # ${LUCIDOS_INSTALL_URL%/install.sh}/uninstall.sh and execs the payload.
+          log5="$RUNNER_TEMP/uninstall-rung5.log"
+          echo "==> rung 5: curl -fsSL $FRONT_DOOR/install.sh | sh -s -- --list"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/install.sh" | sh -s -- --list' "$FRONT_DOOR" > "$log5" 2>&1
+          st5=$?
+          if assert_uninstaller_ran "rung 5 (install.sh --list)" "$log5" "$st5"; then
+            # dispatch_uninstall prints the URL it fetched, so the delegation
+            # following the pin is directly observable rather than inferred.
+            if grep -qF "$FRONT_DOOR/uninstall.sh" "$log5"; then
+              echo "    OK  the delegation fetched $FRONT_DOOR/uninstall.sh"
+            else
+              echo "::error::rung 5: install.sh did not fetch the uninstaller from $FRONT_DOOR. Its baked LUCIDOS_INSTALL_URL points somewhere else, so a user's --uninstall would run another origin's uninstaller."
+              grep -i 'uninstall' "$log5" | head -n 5 | sed 's/^/      /'
+              fail=1
+            fi
+            assert_listed "rung 5 (install.sh --list)" "$log5" || fail=1
+          else
+            fail=1
+          fi
+
+          # ── rung 6: --list through the DIRECT piped uninstaller ───────────────
+          # On Linux /bin/sh is dash, so this also exercises uninstall.sh's own
+          # re-exec guard: with no readable $0 it re-downloads itself from
+          # LUCIDOS_UNINSTALL_SELF_URL to get under bash.
+          log6="$RUNNER_TEMP/uninstall-rung6.log"
+          echo "==> rung 6: curl -fsSL $FRONT_DOOR/uninstall.sh | sh -s -- --list"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/uninstall.sh" | sh -s -- --list' "$FRONT_DOOR" > "$log6" 2>&1
+          st6=$?
+          if assert_uninstaller_ran "rung 6 (uninstall.sh --list)" "$log6" "$st6"; then
+            assert_listed "rung 6 (uninstall.sh --list)" "$log6" || fail=1
+          else
+            fail=1
+          fi
+
+          # ── rung 7: DATA-SAFE removal (no --purge) ────────────────────────────
+          # The promise under test is uninstall.sh --help's: it "leaves your data
+          # on disk". A data-safe run that deletes anything is data loss, so that
+          # is the assertion here.
+          log7="$RUNNER_TEMP/uninstall-rung7.log"
+          echo "==> rung 7: curl -fsSL $FRONT_DOOR/install.sh | sh -s -- --uninstall --all   (no --purge)"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/install.sh" | sh -s -- --uninstall --all' "$FRONT_DOOR" > "$log7" 2>&1
+          st7=$?
+          if assert_uninstaller_ran "rung 7 (install.sh --uninstall --all)" "$log7" "$st7"; then
+            if [ -d "$data" ]; then
+              echo "    OK  rung 7 kept the instance data at $data"
+            else
+              echo "::error::rung 7: a data-safe uninstall (no --purge) DELETED $data. uninstall.sh --help promises it leaves your data on disk, so purging without --purge is data loss."
+              fail=1
+            fi
+            echo "    n/a rung 7: no service manager in this container, so there is no launchd/systemd artifact to assert removed, and remove_instance does not stop a foreground gateway (removed=0). The macOS job covers that half."
+          else
+            fail=1
+          fi
+
+          # ── rung 8: --all --purge ─────────────────────────────────────────────
+          # The instance data dir AND the shared runtime must actually be gone.
+          # The runtime is the multi-hundred-megabyte half, and it is deleted only
+          # by the --all --purge branch, so nothing else in this file covers it.
+          #
+          # THE GATEWAY IS STILL RUNNING while this purge happens, and that is
+          # faithful rather than sloppy: with no service manager the uninstall
+          # cannot stop it (see rung 7), so a real user on such a host purges
+          # from a second terminal exactly like this. Unlinking open files is
+          # fine on Linux. The one way it could mislead is a supervised engine
+          # re-creating a directory under $data in the moment after the rm, so
+          # the failure path below also reports whether the uninstaller SAID it
+          # deleted the path. Claimed-and-present means recreated; not-claimed
+          # means the purge genuinely did not run. Diagnosis only: neither
+          # weakens the assertion, because the promise is that the path is gone.
+          log8="$RUNNER_TEMP/uninstall-rung8.log"
+          echo "==> rung 8: curl -fsSL $FRONT_DOOR/uninstall.sh | sh -s -- --all --purge"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/uninstall.sh" | sh -s -- --all --purge' "$FRONT_DOOR" > "$log8" 2>&1
+          st8=$?
+          if assert_uninstaller_ran "rung 8 (uninstall.sh --all --purge)" "$log8" "$st8"; then
+            # claimed <path>: did the uninstaller report deleting this path? Match
+            # a line carrying BOTH the path and "Deleted", not the literal string
+            # "Deleted <path>". The two purge messages are worded differently
+            # ("Deleted <data>" for an instance, "Deleted the shared runtime
+            # <runtime>"), so a literal prefix match would answer "never reported"
+            # for the runtime every time, which is exactly the wrong diagnosis.
+            claimed() { grep -F -- "$1" "$log8" 2>/dev/null | grep -q 'Deleted' && echo "the uninstaller DID report deleting it, so something re-created it" || echo "the uninstaller never reported deleting it"; }
+            left=0
+            if [ -e "$data" ]; then
+              echo "::error::rung 8: --all --purge left the instance data behind at $data ($(claimed "$data"))"
+              left=1
+            fi
+            if [ -e "$runtime" ]; then
+              echo "::error::rung 8: --all --purge left the shared runtime behind at $runtime ($(claimed "$runtime"))"
+              left=1
+            fi
+            if [ "$left" -ne 0 ]; then
+              marker_diagnosis
+              echo "--- rung 8 output (tail 40) ---"
+              tail -n 40 "$log8" 2>/dev/null || true
+              fail=1
+            else
+              echo "    OK  rung 8 removed both $data and $runtime"
+            fi
+          else
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the advertised uninstall paths do not work against $FRONT_DOOR (see the per-rung errors above)"
+            exit 1
+          fi
+          echo "rungs 5-8 OK: --list through both front doors, a data-safe removal that kept $data, and --all --purge that removed the data and the shared runtime."
+
       # The cause is always in this log; make it readable in the Actions output
       # rather than only in an artifact (this job has no checkout and uploads none).
       # Full mode only: payload mode never launches an installer, so there is no
@@ -1112,5 +1482,908 @@ jobs:
         run: |
           if [ -n "${INSTALL_PID:-}" ]; then
             kill "$INSTALL_PID" 2>/dev/null || true
+          fi
+
+  # ── FRONT DOOR — macOS (the SAME live origin, on a real Mac) ─────────────────
+  # WHY THIS IS A SEPARATE JOB, AND WHY IT IS NOT "the smoke job's macOS leg
+  # sneaking back in". Read this before consolidating it away.
+  #
+  # The landing page shows "Download for Mac" (an Apple-Silicon DMG) directly
+  # above `curl -fsSL https://lucidos.dev/install.sh | sh`, and it now routes
+  # INTEL Mac users to the one-liner explicitly — the DMG is aarch64-only, so the
+  # shell installer is the ONLY advertised path for an Intel Mac. Yet until this
+  # job, install.sh's macOS path was gated by nothing at all: `dmg-verify` covers
+  # the DMG (a different artifact), `smoke` is ubuntu-only by design, and
+  # `tarball-smoke` + `front-door` are both Linux. The advertised one-liner had
+  # never been run on a Mac in CI.
+  #
+  # THE DISTINCTION FROM `smoke`'s macOS EXCLUSION — this is the part that gets
+  # pattern-matched away by someone reading only the matrix comment up top.
+  # `smoke` skips macOS because it installs FROM SOURCE (--dev), which needs a
+  # Docker daemon for Postgres, which on a hosted macOS runner needs Colima,
+  # which needs nested hardware virtualization that a runner (itself a VM) does
+  # not expose. NONE of that applies here, because this job tests the DOWNLOAD
+  # path: it curls a prebuilt tarball carrying its own relocatable PostgreSQL and
+  # runs it. No Docker, no Colima, no nested virtualization, no toolchain, no
+  # compile. That is exactly why it CAN run on a hosted macOS runner where the
+  # source install cannot. The two exclusions are not the same exclusion, and
+  # deleting this job because "macOS can't run install.sh in CI" would remove the
+  # only coverage the advertised Mac install has.
+  #
+  # Everything else is the `front-door` job's: the eight rungs, the two modes,
+  # the hostile-origin validation, the RC payload-only rule, the Cloudflare
+  # Access service token. The long block above THAT job is the canonical
+  # explanation of all of it and is not repeated here; only what genuinely
+  # DIFFERS on macOS is commented again below.
+  #
+  # THE ONE REAL DIFFERENCE — THE LAUNCH SHAPE (see the launch + verify steps):
+  # in the Linux job install.sh runs in a container with no service manager, so
+  # it degrades to a FOREGROUND launch that never returns, and "the installer
+  # exited" is therefore always a failure there. On a macOS runner `launchctl`
+  # exists, so install.sh registers a launchd job and EXITS 0 with the gateway
+  # still running detached. Both shapes are accepted here; only a missed health
+  # deadline fails.
+  front-door-macos:
+    name: front-door (${{ github.event_name == 'push' && 'rc, payload only' || 'live origin' }}, ${{ matrix.runner }})
+    # Identical guards to `front-door` — public mirror only (see the smoke job's
+    # repo guard), dispatch + the DAILY cron + the rc/** push, never the release
+    # events and never the weekly cron. Kept spelled out rather than factored
+    # into a `needs:` on front-door: this job must report independently of the
+    # Linux one, and a shared gate would make a Linux-only outage hide the Mac
+    # result (and vice versa).
+    if: >-
+      github.repository == 'lucidos-dev/lucidos'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'push'
+              && startsWith(github.ref, 'refs/heads/rc/'))
+          || (github.event_name == 'schedule'
+              && github.event.schedule == '0 6 * * *'))
+      && inputs.dmg_tag == ''
+    strategy:
+      # Both legs test the SAME origin and differ only in the host architecture,
+      # which is the whole point: install.sh resolves a DIFFERENT tarball per
+      # triple, so a green Apple-Silicon leg says nothing about the Intel one.
+      # fail-fast: false because each leg is an independent verdict about an
+      # independently-published artifact — cancelling the survivor would throw
+      # away the answer we came for.
+      fail-fast: false
+      matrix:
+        include:
+          # Apple Silicon. Resolves aarch64-apple-darwin — the same machines the
+          # DMG targets, taking the other advertised route onto them.
+          #
+          # `macos-latest`, NOT the `macos-15` that release-tarballs.yml pins
+          # for this same triple, and the difference is intentional both ways.
+          # That job pins because it BUILDS: the theseus-rs relocatable PG 18
+          # arm64 binary references a newer libSystem than macos-14 has, so
+          # staging aborts on an older image. This job only RUNS a prebuilt
+          # tarball, so a newer OS is never the hazard — and a front-door test
+          # should follow where users actually are, which is the current macOS.
+          # Do not "reconcile" the two: pinning here would freeze the test on a
+          # retiring image, and loosening release-tarballs.yml would bring the
+          # staging break back.
+          - { runner: macos-latest,   triple: aarch64-apple-darwin }
+          # Intel. Resolves x86_64-apple-darwin — the exact path the landing page
+          # now sends Intel Mac users down, since the DMG cannot serve them.
+          #
+          # KNOWN END DATE, not a surprise: per GitHub's runner deprecation
+          # notice `macos-15-intel` is the LAST Intel macOS image, planned to
+          # retire together with macos-15 in Fall 2027. When it goes, this leg
+          # goes with it — and so does CI coverage for Intel Macs, which is the
+          # decision to make consciously at that point (drop Intel from the
+          # landing page's one-liner routing, or self-host). Do not silently swap
+          # the label for another macos-* image: that would leave two legs
+          # testing the same triple while claiming to test two.
+          - { runner: macos-15-intel, triple: x86_64-apple-darwin }
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    # Same reasoning as `front-door`: this job pipes remote code into a shell by
+    # design, so it gets a token with no scopes at all.
+    permissions: {}
+    env:
+      # ── identical to `front-door` (see that job for the full reasoning) ──────
+      FD_MODE: ${{ (github.event_name == 'push' && 'payload') || inputs.mode || 'full' }}
+      FRONT_DOOR_INPUT: ${{ (github.event_name == 'push' && 'https://rc.lucidos.dev') || inputs.origin || 'https://lucidos.dev' }}
+      RC_ACCESS_CLIENT_ID: ${{ secrets.RC_ACCESS_CLIENT_ID }}
+      RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
+      GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
+      GW_HEALTH_TIMEOUT_SECS: '900'    # download + extract + embedded-PG first boot
+      # A stranger's Mac has no LUCIDOS_* set, but this workflow's top-level env
+      # block exports two for the --dev smoke job — and install.sh treats every
+      # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
+      # (install.sh resolves each with `${VAR:-default}`, so empty == unset).
+      LUCIDOS_HOME: ''
+      LUCIDOS_WORKSPACE: ''
+      # ── macOS-specific ───────────────────────────────────────────────────────
+      TRIPLE: ${{ matrix.triple }}
+      # The launchd label install.sh registers. The install below passes no
+      # --name, so the instance slug is `default` and the label is
+      # service_launchd_label(default) == com.lucidos.gateway.default. Teardown
+      # needs it to prove nothing was left bootstrapped on the runner.
+      GW_LAUNCHD_LABEL: 'com.lucidos.gateway.default'
+    steps:
+      # ── validate the origin BEFORE anything touches it ────────────────────────
+      # Verbatim from `front-door`, deliberately NOT weakened for this job: the
+      # origin can come from a workflow_dispatch input and this job pipes what it
+      # fetches straight into a shell, so it is hostile input here for exactly
+      # the same reasons. Accept ONLY https:// over a strict character allowlist,
+      # and export the validated value under a DIFFERENT name so a skipped or
+      # failed validation leaves FRONT_DOOR unset (every consumer runs under
+      # `set -u`, i.e. fail closed) rather than silently usable.
+      - name: Resolve and validate the origin under test
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$FD_MODE" in
+            full|payload) ;;
+            *) echo "::error::FD_MODE must be 'full' or 'payload' (got '$FD_MODE')"; exit 1 ;;
+          esac
+
+          # Be forgiving about a pasted trailing slash — every use site appends
+          # "/install.sh", and "…//install.sh" would soft-404 into a confusing
+          # HTML diagnosis rather than an obvious "you typed a trailing slash".
+          origin="$FRONT_DOOR_INPUT"
+          while [ "${origin%/}" != "$origin" ]; do origin="${origin%/}"; done
+
+          if ! [[ "$origin" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$ ]]; then
+            echo "::error::refusing origin '$FRONT_DOOR_INPUT' — it must be an https:// URL of the form https://host[:port][/path] using only [A-Za-z0-9._~-] in its path. This job pipes what the origin serves into a shell, so anything that is not plainly a URL is rejected."
+            exit 1
+          fi
+
+          # Writing to $GITHUB_ENV is only safe AFTER the allowlist: the file is
+          # parsed line-by-line, so a value carrying a newline could otherwise
+          # define a second, arbitrary variable for every later step.
+          echo "FRONT_DOOR=$origin" >> "$GITHUB_ENV"
+
+          echo "origin: $origin"
+          echo "mode:   $FD_MODE"
+          echo "triple: $TRIPLE"
+          if [ "$FD_MODE" = "full" ]; then
+            echo "rungs:  1 (payload sniff), 2 (no HTML sourced), 3 (gateway health), 4 (frontend 200)"
+          else
+            echo "rungs:  1 (payload sniff) ONLY — no install, no tarball, no gateway"
+          fi
+
+      # macOS ships curl + a CA store, so unlike the Linux job there is nothing
+      # to install and no container to build a bare machine out of — the runner
+      # image already has more on it than a stranger's Mac, which only ever makes
+      # this test weaker, never falsely green.
+      #
+      # This step exists for a different reason: PROVE the leg is the
+      # architecture it claims to be. Covering x86_64-apple-darwin is the entire
+      # justification for the second matrix entry, and if GitHub ever re-points
+      # `macos-15-intel` at Apple Silicon (or the label is swapped when it
+      # retires in 2027) both legs would quietly test the same triple while the
+      # matrix still advertised two. That is a pass for the wrong reason, so
+      # assert it. install.sh derives its triple from the same `uname -m`.
+      - name: Assert this leg really is ${{ matrix.triple }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            arm64|aarch64) got='aarch64-apple-darwin' ;;
+            x86_64)        got='x86_64-apple-darwin' ;;
+            *) echo "::error::unexpected machine type '$(uname -m)' on ${{ matrix.runner }} — install.sh would not resolve a triple for it either"; exit 1 ;;
+          esac
+          if [ "$got" != "$TRIPLE" ]; then
+            echo "::error::${{ matrix.runner }} resolved to $got, but this matrix leg exists to cover $TRIPLE. The runner label has changed architecture, so the matrix no longer tests what it claims — fix the matrix rather than the assertion."
+            exit 1
+          fi
+          echo "runner:      ${{ matrix.runner }}"
+          echo "uname -m:    $(uname -m)  ⇒  $got"
+          echo "macOS:       $(sw_vers -productVersion 2>/dev/null || echo unknown)"
+          # On macOS /bin/sh IS bash, so `| sh` never takes install.sh's dash
+          # re-exec branch — the opposite of the Linux job, whose whole point is
+          # to exercise that branch. Print it so the difference is visible in the
+          # log rather than assumed.
+          echo "/bin/sh:     $(readlink /bin/sh 2>/dev/null || echo '/bin/sh (not a symlink — bash in sh mode)')"
+          echo "bash:        $(bash --version | head -n 1)"
+
+      # ── rung 1 ────────────────────────────────────────────────────────────────
+      # The `front-door` job's payload sniff, unchanged in substance: `curl -fsSL`
+      # is NOT enough on a soft-404 origin (-f only fails on an HTTP error status,
+      # and Cloudflare Pages' SPA fallback returns the landing page at 200), so
+      # check the PAYLOAD. Every helper lib a piped install sources must resolve
+      # to shell, not HTML.
+      - name: Every helper lib the installer needs resolves to shell, not HTML
+        shell: bash
+        run: |
+          set -uo pipefail
+          tmp="$(mktemp -d)"
+
+          # ── Cloudflare Access headers for the gated RC origin ────────────────
+          # rc.lucidos.dev is behind an Access app; the service token is the only
+          # non-interactive way past it. Production is public and gets no headers.
+          #
+          # ONE macOS-only deviation from the Linux job, and it is load-bearing:
+          # the expansion is `${FD_HDR[@]+"${FD_HDR[@]}"}`, not a bare
+          # `"${FD_HDR[@]}"`. Expanding an EMPTY array to nothing under `set -u`
+          # is bash 4.4+ behavior; Apple still ships bash 3.2.57 as /bin/bash and
+          # a macOS runner can resolve `bash` to it, where the bare form aborts
+          # the step with "FD_HDR[@]: unbound variable" — on the PRODUCTION
+          # origin, which is the one that has no headers. (scripts/lint-shell.sh
+          # documents the same bash-3.2 array trap.) The guarded form is correct
+          # on both 3.2 and 5.x, so it costs nothing to always use it here.
+          FD_HDR=()
+          if [ -n "${RC_ACCESS_CLIENT_ID:-}" ] && [ -n "${RC_ACCESS_CLIENT_SECRET:-}" ]; then
+            FD_HDR=(-H "CF-Access-Client-Id: $RC_ACCESS_CLIENT_ID"
+                    -H "CF-Access-Client-Secret: $RC_ACCESS_CLIENT_SECRET")
+            echo "==> Cloudflare Access service token present (gated origin)"
+          elif [ "$FRONT_DOOR" != "${FRONT_DOOR#https://rc.}" ]; then
+            # Named explicitly rather than left to fail as "returned HTML": a
+            # missing secret and a broken deploy look identical in the payload
+            # sniff, and only one of them is an origin regression.
+            echo "::error::$FRONT_DOOR is behind Cloudflare Access but RC_ACCESS_CLIENT_ID/SECRET are not set. Every fetch will get the 302 login page and be reported as 'not shell'. Add both repo secrets (Cloudflare -> Access -> Service Tokens -> lucidos-ci-front-door)."
+            exit 1
+          fi
+
+          # assert_shell_file <file> <url> — the payload must be a shell script.
+          # Two distinct failures, because they mean different things: a body
+          # starting with '<' is the soft-404 HTML (the origin is misconfigured),
+          # while a missing shebang is "something else entirely is at this URL".
+          assert_shell_file() {
+            local f="$1" url="$2" first_line
+            if [ ! -s "$f" ]; then
+              echo "::error::$url returned an EMPTY body"
+              return 1
+            fi
+            if [ "$(head -c 1 "$f")" = "<" ]; then
+              echo "::error::$url returned HTML, not shell — the origin answered a script path with the landing page at status 200 (soft 404). A piped install sources this AS SHELL."
+              echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
+              # In payload mode the whole origin is a subpath the site publisher
+              # creates, so "HTML at 200" has a second, much likelier cause than
+              # a regressed deploy: the route simply does not exist yet.
+              if [ "${FD_MODE:-full}" = "payload" ]; then
+                echo "    NOTE: this is the RC front door. Every path under $FRONT_DOOR/ answers with the landing page at 200 when the RC copy of the installer has not been published there — check that the site publisher uploaded install.sh + scripts/lib/*.sh under $FRONT_DOOR/ for THIS release candidate before treating this as an origin regression."
+              fi
+              return 1
+            fi
+            first_line="$(head -n 1 "$f")"
+            case "$first_line" in
+              '#!'*) ;;
+              *)
+                echo "::error::$url has no '#!' shebang on line 1 — it is not a shell script"
+                echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
+                return 1
+                ;;
+            esac
+            printf '    OK  %-58s %8s bytes  %s\n' "$url" "$(wc -c < "$f" | tr -d ' ')" "$first_line"
+            return 0
+          }
+
+          echo "==> Fetching the advertised installer"
+          curl -fsSL ${FD_HDR[@]+"${FD_HDR[@]}"} "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" \
+            || { echo "::error::could not fetch $FRONT_DOOR/install.sh"; exit 1; }
+          assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh" || exit 1
+
+          # ── the RC origin must be serving THIS release candidate ──────────────
+          # Only on an rc/** push, where the branch name pins the version we are
+          # gating. Without this, the previous RC's copy — still sitting at the
+          # same URL — satisfies every payload check and the gate goes green
+          # having verified last release's installer.
+          if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
+            case "${GITHUB_REF_NAME:-}" in
+              rc/?*) rc_version="${GITHUB_REF_NAME#rc/}" ;;
+              *) echo "::error::this job only runs on a push for an rc/<version> branch, got '${GITHUB_REF_NAME:-}'"; exit 1 ;;
+            esac
+            served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+            if [ -z "$served_version" ]; then
+              echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the served $FRONT_DOOR/install.sh — this check must never silently pass, so it fails closed"
+              grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+              exit 1
+            fi
+            if [ "$served_version" != "$rc_version" ]; then
+              echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version) — the RC front door is serving a DIFFERENT release candidate. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree."
+              exit 1
+            fi
+            echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
+          fi
+
+          # Which libs, from where — both READ OUT of the installer we just
+          # fetched, so this stays correct when the set changes.
+          libs="$(grep -E '^LUCIDOS_LIBS=|_source_libs ' "$tmp/install.sh" \
+                  | grep -oE '[A-Za-z0-9_]+\.sh' | sort -u)"
+          lib_count="$(printf '%s\n' "$libs" | grep -c . || true)"
+          # Fail closed on a broken scrape: a parser that silently finds nothing
+          # would make this whole job report green against a dead front door.
+          if [ "${lib_count:-0}" -lt 2 ]; then
+            echo "::error::parsed only ${lib_count:-0} helper lib name(s) from install.sh — its lib declaration changed shape and this parser needs updating (it must never silently check nothing)"
+            grep -nE '^LUCIDOS_LIBS=|_source_libs ' "$tmp/install.sh" || true
+            exit 1
+          fi
+
+          # Base URL: the same expression _source_libs uses, resolved from the
+          # baked LUCIDOS_INSTALL_URL in the copy we were just served. Reading it
+          # instead of assuming keeps rung 1 pointed at the URLs a piped install
+          # will REALLY hit.
+          install_url="$(grep -m1 '^LUCIDOS_INSTALL_URL=' "$tmp/install.sh" | sed -e 's/.*:-//' -e 's/}"$//')"
+          case "$install_url" in
+            http*://*/install.sh) ;;
+            *) echo "::error::could not parse LUCIDOS_INSTALL_URL out of the served install.sh (got '$install_url')"; exit 1 ;;
+          esac
+          lib_base="${install_url%/install.sh}/scripts/lib"
+
+          echo "==> Helper libs the installer will fetch when piped"
+          echo "    lib base: $lib_base"
+          echo "    libs:     $(echo "$libs" | tr '\n' ' ')"
+
+          # Accumulate into ONE verdict rather than exiting at the first problem,
+          # so a run reports every broken payload it found (see the Linux job).
+          fail=0
+
+          # pin_mismatch <message>: a served script pointing its own fetches
+          # somewhere other than this origin, which would make the rung pass
+          # without having touched the front door. FATAL in payload mode (rung 1
+          # is the only rung there), loud in full mode (rungs 2-8 still drive
+          # this origin). One helper for all three pin checks below.
+          pin_mismatch() {
+            if [ "$FD_MODE" = "payload" ]; then
+              echo "::error::$1, and payload mode has no other rung to fall back on. Refusing to report green on a check that never touched $FRONT_DOOR."
+              fail=1
+            else
+              echo "::warning::$1"
+            fi
+          }
+
+          # EQUALITY, not a prefix match — with FRONT_DOOR set to the apex, an
+          # installer wrongly pinned to the RC copy would prefix-match and pass
+          # silently while rung 1 checked the RC's libs instead of production's.
+          expected_lib_base="$FRONT_DOOR/scripts/lib"
+          if [ "$lib_base" != "$expected_lib_base" ]; then
+            pin_mismatch "the served install.sh points its helper-lib fetch at $lib_base, NOT $expected_lib_base, so rung 1 is not exercising this origin's script paths"
+          fi
+
+          lib_fail=0
+          for name in $libs; do
+            url="$lib_base/$name"
+            if ! curl -fsSL ${FD_HDR[@]+"${FD_HDR[@]}"} "$url" -o "$tmp/$name"; then
+              echo "::error::could not fetch $url (HTTP error)"
+              lib_fail=1
+              continue
+            fi
+            assert_shell_file "$tmp/$name" "$url" || lib_fail=1
+          done
+          if [ "$lib_fail" -ne 0 ]; then
+            echo "::error::at least one helper lib does not resolve to a shell script — 'curl -fsSL $FRONT_DOOR/install.sh | sh' would source that payload as shell and die on a fresh Mac"
+            fail=1
+          fi
+
+          # ── the advertised UNINSTALLER is part of the front door too ──────────
+          # Same reasoning as the Linux job, which carries the full note: both
+          # advertised uninstall paths EXECUTE what this URL serves (install.sh's
+          # dispatch_uninstall runs `exec bash -c "$payload"` on it; the direct
+          # pipe feeds it to a shell), so a soft-404 here means the landing page
+          # RUNS. Checked in BOTH modes, and the URL is DERIVED from the served
+          # installer so it follows the pin.
+          uninstall_url="${install_url%/install.sh}/uninstall.sh"
+          echo "==> The advertised uninstaller"
+          echo "    $uninstall_url"
+          if ! curl -fsSL ${FD_HDR[@]+"${FD_HDR[@]}"} "$uninstall_url" -o "$tmp/uninstall.sh"; then
+            echo "::error::could not fetch $uninstall_url (HTTP error)"
+            fail=1
+          elif ! assert_shell_file "$tmp/uninstall.sh" "$uninstall_url"; then
+            echo "::error::$uninstall_url does not serve a shell script, so BOTH advertised uninstall paths would RUN that payload: 'curl -fsSL $FRONT_DOOR/install.sh | sh -s -- --uninstall' execs it via dispatch_uninstall, and 'curl -fsSL $uninstall_url | sh' pipes it into a shell directly."
+            echo "::error::FIX: the site publisher must publish the /uninstall.sh route beside /install.sh. That deploy runs on the maintainer's machine off the SitePublished trigger chain, NOT in CI, so no change in this repository can turn this green."
+            fail=1
+          else
+            # The served uninstaller carries TWO pins of its own, both of which
+            # must point here (the Linux job documents why in full):
+            # LUCIDOS_UNINSTALL_SELF_URL is where a piped run re-fetches itself,
+            # and LUCIDOS_INSTALL_URL is what its scripts/lib/service.sh fetch
+            # derives from. Both parses fail closed.
+            u_self="$(grep -m1 '^LUCIDOS_UNINSTALL_SELF_URL=' "$tmp/uninstall.sh" | sed -e 's/.*:-//' -e 's/}"$//')"
+            case "$u_self" in
+              http*://*/uninstall.sh) ;;
+              *)
+                echo "::error::could not parse LUCIDOS_UNINSTALL_SELF_URL out of the served $uninstall_url (got '$u_self'). This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_UNINSTALL_SELF_URL=' "$tmp/uninstall.sh" || true
+                fail=1
+                u_self=""
+                ;;
+            esac
+            if [ -n "$u_self" ] && [ "$u_self" != "$FRONT_DOOR/uninstall.sh" ]; then
+              pin_mismatch "the served uninstall.sh re-execs itself from $u_self, NOT $FRONT_DOOR/uninstall.sh, so a piped 'curl -fsSL $uninstall_url | sh' would run THAT copy instead of this origin's"
+            fi
+
+            u_install_url="$(grep -m1 '^LUCIDOS_INSTALL_URL=' "$tmp/uninstall.sh" | sed -e 's/.*:-//' -e 's/}"$//')"
+            case "$u_install_url" in
+              http*://*/install.sh) ;;
+              *)
+                echo "::error::could not parse LUCIDOS_INSTALL_URL out of the served $uninstall_url (got '$u_install_url'). This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_INSTALL_URL=' "$tmp/uninstall.sh" || true
+                fail=1
+                u_install_url=""
+                ;;
+            esac
+            if [ -n "$u_install_url" ] && [ "${u_install_url%/install.sh}/scripts/lib" != "$expected_lib_base" ]; then
+              pin_mismatch "the served uninstall.sh points its service.sh fetch at ${u_install_url%/install.sh}/scripts/lib, NOT $expected_lib_base, so an uninstall run from this origin would source its helper lib from somewhere else"
+            fi
+          fi
+
+          [ "$fail" -eq 0 ] || exit 1
+          echo "rung 1 OK: the installer, all $lib_count helper libs at $lib_base, and the uninstaller at $uninstall_url all resolve to shell"
+
+          # Be explicit about where a payload-mode run stops and what that green
+          # does NOT mean, so nobody reads it as "the RC installs cleanly".
+          if [ "$FD_MODE" = "payload" ]; then
+            echo
+            echo "PAYLOAD MODE — stopping here, green."
+            echo "  verified:     $FRONT_DOOR serves an installer, an uninstaller, and all $lib_count helper libs the installer declares, every one of them as SHELL rather than the landing page (the 2026-07-29 soft-404 class)."
+            echo "  NOT verified: that the install completes. It cannot be: an RC installer resolves its tarball to"
+            echo "                https://github.com/lucidos-dev/lucidos/releases/download/v<version>/… and that tag does not"
+            echo "                exist during an RC (Phase A publishes only an rc-<version> prerelease, DMG + .sig, no tarballs)."
+            echo "                Wiring the install here would 404 every single run. The full ladder runs against the real"
+            echo "                origin post-publish (dispatch) and daily (cron)."
+          fi
+
+      # ── rungs 2-4: FULL MODE ONLY ─────────────────────────────────────────────
+      # The RC payload-only rule applies here IDENTICALLY, and for the same
+      # reason — an RC install.sh bakes LUCIDOS_DEFAULT_VERSION=<rc version> and
+      # resolves its tarball to a v<version> tag that does not exist yet, so
+      # these steps would 404 on every single rc/** push. Do not "fix" that by
+      # re-enabling the install for the RC origin; it makes the gate permanently
+      # red, not stronger. See the long note on the `front-door` job.
+      #
+      # THE LAUNCH SHAPE DIFFERS FROM THE LINUX JOB — this is the substantive
+      # macOS difference and the verify step below depends on it:
+      #
+      #   * Linux (ubuntu:22.04 container): no service manager, so
+      #     service_detect_manager returns `none` and install.sh degrades to a
+      #     FOREGROUND launch that never returns. There, an installer that exits
+      #     is ALWAYS a failure.
+      #   * macOS runner: `launchctl` is present, so the manager resolves to
+      #     launchd and install.sh takes the register_service path — it writes a
+      #     LaunchAgent, health-waits the gateway itself, prints the banner, and
+      #     EXITS 0 with the gateway still running detached.
+      #
+      # On a macOS RUNNER only the launchd shape is actually reachable, and it
+      # is worth being precise about why rather than hand-waving "either may
+      # occur": service_decide_manager returns `launchd` for Darwin whenever
+      # launchctl exists (always here), service_compose_decision picks
+      # `foreground` only for manager `none` or --no-service (neither applies),
+      # and when the bootstrap DOES fail register_launchd dies rather than
+      # degrading. So a failed registration is an installer abort, not a
+      # foreground launch.
+      #
+      # We still background the command, for two reasons that survive that:
+      # backgrounding is free in the exit-0 shape, and it keeps this job's shape
+      # identical to the Linux one so the two stay comparable if install.sh ever
+      # does start degrading on Darwin. What must NOT be copied back from the
+      # Linux job is its fast-fail — see the verify step.
+      #
+      # The wrapper script exists ONLY to capture the installer's exit status:
+      # the background child is reparented once this step's shell exits, so the
+      # next step cannot `wait` for it. It records the status in a file instead,
+      # which the verify step folds into its failure message.
+      - name: Run the advertised command (background — launchd exit-0 or foreground, either is legal)
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "==> curl -fsSL $FRONT_DOOR/install.sh | sh"
+
+          # The origin is passed as an ARGUMENT, not spliced into the `sh -c`
+          # string: it can originate in a dispatch input, and a string-interpolated
+          # value would be parsed as shell by the very command we are constructing.
+          # The validation step already rejects anything that is not plainly a URL;
+          # this is the second lock on the same door. The single quotes around the
+          # inner command are load-bearing: "$0" must reach the inner shell
+          # UNEXPANDED so it resolves to the argument, which is the whole point of
+          # not interpolating the origin. The quoted heredoc delimiter keeps this
+          # true through the file write as well.
+          runner_script="$RUNNER_TEMP/front-door-run.sh"
+          cat > "$runner_script" <<'RUNNER'
+          #!/usr/bin/env bash
+          # $1 = the validated origin, $2 = where to record the exit status.
+          sh -c 'curl -fsSL "$0/install.sh" | sh' "$1"
+          status=$?
+          # PUBLISH THE STATUS ATOMICALLY. A plain `> "$2"` truncates-then-writes,
+          # so the verify step — which polls every 5s and treats the file's
+          # existence as "the installer has exited" — can catch it empty and
+          # report a blank exit status. Write beside it and rename, which is
+          # atomic on the same filesystem: the file either is not there or is
+          # complete.
+          printf '%s\n' "$status" > "$2.partial" && mv -f "$2.partial" "$2"
+          exit "$status"
+          RUNNER
+          chmod +x "$runner_script"
+
+          nohup "$runner_script" "$FRONT_DOOR" "$RUNNER_TEMP/install.status" \
+            > "$RUNNER_TEMP/install.log" 2>&1 &
+          echo "INSTALL_PID=$!" >> "$GITHUB_ENV"
+          echo "Installer started (pid $!). Log: $RUNNER_TEMP/install.log"
+
+      - name: Verify the front door installed a working Lucidos
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -uo pipefail
+          log="$RUNNER_TEMP/install.log"
+          status_file="$RUNNER_TEMP/install.status"
+          dump() { echo "--- installer log (tail 200) ---"; tail -n 200 "$log" 2>/dev/null || true; }
+
+          # installer_state — diagnostic context appended to a failure message,
+          # NOT a verdict. On this runner an exited installer is the SUCCESSFUL
+          # shape, so the status only helps tell the cases apart afterwards:
+          # non-zero ⇒ the installer itself aborted (a real regression), zero ⇒
+          # it registered the launchd job and left (so a red run means the
+          # gateway died or never bound), still running ⇒ we are inside
+          # install.sh's own post-register health wait.
+          # `-s`, not `-f`, at both read sites: the writer renames a complete
+          # file into place, so a zero-byte one should never exist — but if it
+          # ever did, "still running" is the honest reading of it, not an exit
+          # with a blank status.
+          installer_state() {
+            if [ -s "$status_file" ]; then
+              printf 'the installer process had already exited with status %s' "$(tr -d ' \t\r\n' < "$status_file")"
+            else
+              printf 'the installer process was still running'
+            fi
+          }
+
+          # ── rung 2: the installer must never source a NON-SHELL payload ───────
+          # The 2026-07-29 failure surfaces exactly here — '<!DOCTYPE html>' echoed
+          # by the shell plus a syntax error from the sourced lib. Terminal the
+          # moment it appears; there is nothing to wait for after it.
+          #
+          # The pattern is the SHELL-PARSE signature, not a bare 'syntax error':
+          # this log can also carry the gateway's own stdout, so a plain substring
+          # would red a perfectly healthy install the first time embedded Postgres
+          # logs "syntax error at or near". Both shells that can parse the payload
+          # are covered — bash says "syntax error near unexpected token", dash says
+          # "Syntax error: <what> unexpected" — and neither matches Postgres's
+          # wording.
+          HTML_PAYLOAD_RE='DOCTYPE|syntax error near|syntax error:'
+          assert_no_html_payload() {
+            grep -qiE "$HTML_PAYLOAD_RE" "$log" 2>/dev/null || return 0
+            echo "::error::the installer sourced a NON-SHELL payload — the origin answered a script path with HTML (soft 404)"
+            grep -inE "$HTML_PAYLOAD_RE" "$log" | head -n 10 | sed 's/^/      /'
+            dump
+            exit 1
+          }
+
+          # ── rung 3: the gateway answers /health (polled) ──────────────────────
+          # The gateway lives in the sigil namespace: a bare /api/v1/health would
+          # resolve as a workspace slug and 404. The port comes from the launch
+          # banner — install.sh auto-picks the first free port from its default
+          # upward, so read what it chose instead of assuming.
+          #
+          # NOTE THE ABSENCE OF A `kill -0 "$INSTALL_PID"` FAST-FAIL, and do not
+          # copy one back in from the Linux job. There it is correct: a container
+          # install is a foreground launch, so an exited installer can only mean
+          # failure. Here a successful launchd registration exits 0 BY DESIGN
+          # while the gateway keeps running detached, so that check would abort
+          # the poll on the healthy path. Worse, it would do so intermittently —
+          # only when the installer happened to finish before the first probe.
+          # An exited installer therefore proves nothing on macOS; we keep polling
+          # to the deadline and report its status alongside the failure instead.
+          #
+          # A NARROWER fast-fail IS available and is deliberately not taken: a
+          # non-zero status file plus no bootstrapped launchd job means nothing
+          # can ever become healthy, so the remaining poll is pure waiting. It
+          # would save up to ${GW_HEALTH_TIMEOUT_SECS}s on a genuinely broken
+          # run — but it would also turn any `launchctl print` hiccup into a
+          # false RED, and it cannot be allowed to fire on the case the warning
+          # below exists for (installer exits non-zero, KeepAlive brings the
+          # gateway up afterwards). A slow red is strictly better than a wrong
+          # one here, and public-repo macOS minutes are free (see the file
+          # header), so the wait is the cheaper mistake. Revisit only if these
+          # runs start timing out at the 30-minute job limit.
+          echo "Polling the gateway (timeout ${GW_HEALTH_TIMEOUT_SECS}s)…"
+          deadline=$(( $(date +%s) + GW_HEALTH_TIMEOUT_SECS ))
+          port="$GW_DEFAULT_PORT"
+          body=""
+          while [ "$(date +%s)" -lt "$deadline" ]; do
+            assert_no_html_payload
+            banner_port="$(sed -n 's|.*http://localhost:\([0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
+            [ -n "$banner_port" ] && port="$banner_port"
+            body="$(curl -fsS --max-time 5 "http://localhost:$port/~/api/v1/health" 2>/dev/null || true)"
+            echo "$body" | grep -q '"status":"ok"' && break
+            sleep 5
+          done
+          assert_no_html_payload
+          echo "$body" | grep -q '"status":"ok"' \
+            || { echo "::error::the gateway never reported healthy within ${GW_HEALTH_TIMEOUT_SECS}s ($(installer_state))"; dump; exit 1; }
+          echo "$body" | grep -q '"role":"gateway"' \
+            || { echo "::error::/~/api/v1/health did not answer as the gateway: $body"; dump; exit 1; }
+          echo "rung 2 + 3 OK — installed cleanly, gateway healthy on port $port ($(installer_state)): $body"
+
+          # Healthy — but did the advertised command itself SUCCEED? An exited
+          # installer is legal here (the launchd shape exits 0); a NON-ZERO exit
+          # is not. It means a user running the one-liner watched it fail, and
+          # only launchd's KeepAlive brought the gateway up afterwards, inside
+          # our much longer window. Without this the two outcomes are
+          # indistinguishable: installer_state() is otherwise consulted only on
+          # the failure path, so a real install failure that self-heals reports
+          # green with no signal at all.
+          #
+          # A WARNING, not a failure, and that is deliberate: the likeliest
+          # cause is install.sh's own health wait (LUCIDOS_HEALTH_TIMEOUT, 120s
+          # by default) expiring on a cold runner while the download, extract
+          # and embedded-PG initdb finish — a slow boot, not a broken front
+          # door. Reddening on it would make this job flaky for an environment
+          # artifact; a warning keeps the signal visible at no such cost. If it
+          # turns out to fire on real regressions rather than slow runners, the
+          # fix is to raise LUCIDOS_HEALTH_TIMEOUT for the run and THEN make it
+          # fatal.
+          if [ -s "$status_file" ]; then
+            st="$(tr -d ' \t\r\n' < "$status_file")"
+            [ "$st" = "0" ] || echo "::warning::the gateway is healthy, but the installer itself exited $st — a user running this one-liner would have seen it fail, and the gateway only came up afterwards. Check the log for install.sh's own health wait timing out."
+          fi
+
+          # ── rung 4: the frontend is served ────────────────────────────────────
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "http://localhost:$port/" || echo 000)"
+          [ "$code" = "200" ] \
+            || { echo "::error::frontend http://localhost:$port/ returned HTTP $code"; dump; exit 1; }
+          echo "rung 4 OK — frontend serves 200 at http://localhost:$port/"
+
+          echo "OK — 'curl -fsSL $FRONT_DOOR/install.sh | sh' works on a fresh ${{ matrix.runner }} ($TRIPLE)."
+
+      # ── rungs 5-8: the advertised UNINSTALL paths (FULL MODE ONLY) ────────────
+      # The `front-door` job carries the canonical note on why these exist, what
+      # the four rungs are, and why their ORDER saves a reinstall (a data-safe
+      # rung 7 keeps the data dir and its port marker, so rung 8 still has a
+      # target). Only the macOS differences are commented again here.
+      #
+      # THE MACOS DIFFERENCE IS THE SERVICE HALF, and it is what makes this leg
+      # strictly stronger than the Linux one for uninstall. The container has no
+      # service manager, so install.sh registered nothing there and a removal has
+      # no service to remove. Here launchd exists: install.sh bootstrapped
+      # com.lucidos.gateway.default with KeepAlive, so a data-safe uninstall must
+      # boot it out and delete its plist, and this job asserts exactly that. It is
+      # also the only leg where "uninstall actually stops the thing" is testable,
+      # because remove_instance stops the embedded runtime only when it really did
+      # unregister a service.
+      #
+      # SECOND MACOS DIFFERENCE: /bin/sh here is bash, not dash, so a piped
+      # uninstall does NOT take uninstall.sh's re-exec branch. The Linux leg is
+      # what covers that branch; this leg covers the launchd one.
+      - name: Verify the front door can uninstall what it installed
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # install.sh's defaults: this job passes no --prefix and no --name, so
+          # the slug is `default` and everything hangs off $HOME/.lucidos. The
+          # plist path is service_launchd_plist_path("$HOME", default).
+          prefix="$HOME/.lucidos"
+          slug="default"
+          data="$prefix/$slug"
+          runtime="$prefix/runtime"
+          marker="$data/port"
+          plist="$HOME/Library/LaunchAgents/$GW_LAUNCHD_LABEL.plist"
+          target="gui/$(id -u)/$GW_LAUNCHD_LABEL"
+
+          fail=0
+          HTML_PAYLOAD_RE='DOCTYPE|syntax error near|syntax error:'
+
+          # marker_diagnosis: the root cause that would make an instance invisible
+          # to --list and unremovable by --all --purge. service_list_instance_names
+          # keys on <prefix>/<slug>/port, which install.sh records via
+          # record_instance_port from BOTH launch shapes. If it is missing here,
+          # that is an INSTALLER defect, not an origin regression.
+          marker_diagnosis() {
+            if [ -f "$marker" ]; then
+              echo "    (the port marker $marker exists, so this is NOT the known marker gap)"
+              return 0
+            fi
+            echo "::error::ROOT CAUSE: the port marker $marker does not exist. service_list_instance_names keys on it, so this instance is invisible to --list, resolve_targets resolves no targets, and run_uninstall returns before purging. install.sh must record it on BOTH launch shapes (record_instance_port). That is an INSTALLER defect, not an origin regression."
+          }
+
+          # assert_uninstaller_ran <label> <log> <status>: the floor every rung
+          # shares. `curl -f` cannot see a soft-404, so check the OUTPUT.
+          assert_uninstaller_ran() {
+            local label="$1" log="$2" st="$3" bad=0
+            if grep -qiE "$HTML_PAYLOAD_RE" "$log" 2>/dev/null; then
+              echo "::error::$label executed a NON-SHELL payload: the origin answered a script path with HTML at status 200 (soft 404) and the shell tried to run it."
+              grep -inE "$HTML_PAYLOAD_RE" "$log" | head -n 5 | sed 's/^/      /'
+              bad=1
+            fi
+            if ! grep -q 'Lucidos uninstaller' "$log" 2>/dev/null; then
+              echo "::error::$label never reached uninstall.sh: its 'Lucidos uninstaller' banner is absent from the output, so nothing about the advertised uninstall path was exercised."
+              bad=1
+            fi
+            if [ "$st" != "0" ]; then
+              echo "::error::$label exited $st"
+              bad=1
+            fi
+            if [ "$bad" -ne 0 ]; then
+              echo "--- $label output (tail 40) ---"
+              tail -n 40 "$log" 2>/dev/null || true
+              return 1
+            fi
+            return 0
+          }
+
+          # assert_listed <label> <log>: do_list prints "<slug>  port <n>  <status>".
+          assert_listed() {
+            local label="$1" log="$2"
+            if grep -qE "(^|[[:space:]])${slug}[[:space:]]+port[[:space:]]+[0-9]+" "$log"; then
+              echo "    OK  $label lists instance '$slug'"
+              return 0
+            fi
+            echo "::error::$label ran the uninstaller but did not list the instance this job just installed ('$slug' under $prefix)."
+            marker_diagnosis
+            echo "--- $label output (tail 20) ---"
+            tail -n 20 "$log" 2>/dev/null || true
+            return 1
+          }
+
+          # The origin is an ARGUMENT to every command below, never spliced into
+          # the `sh -c` string, and the single quotes keeping "$0" unexpanded are
+          # load-bearing. Same shape as the launch step, for the same reason.
+
+          # ── rung 5: --list through the DELEGATION front door ──────────────────
+          log5="$RUNNER_TEMP/uninstall-rung5.log"
+          echo "==> rung 5: curl -fsSL $FRONT_DOOR/install.sh | sh -s -- --list"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/install.sh" | sh -s -- --list' "$FRONT_DOOR" > "$log5" 2>&1
+          st5=$?
+          if assert_uninstaller_ran "rung 5 (install.sh --list)" "$log5" "$st5"; then
+            if grep -qF "$FRONT_DOOR/uninstall.sh" "$log5"; then
+              echo "    OK  the delegation fetched $FRONT_DOOR/uninstall.sh"
+            else
+              echo "::error::rung 5: install.sh did not fetch the uninstaller from $FRONT_DOOR. Its baked LUCIDOS_INSTALL_URL points somewhere else, so a user's --uninstall would run another origin's uninstaller."
+              grep -i 'uninstall' "$log5" | head -n 5 | sed 's/^/      /'
+              fail=1
+            fi
+            assert_listed "rung 5 (install.sh --list)" "$log5" || fail=1
+            # Only reachable on this leg: the instance is registered, so --list
+            # must say so rather than reporting it stopped.
+            if grep -q 'launchd loaded' "$log5"; then
+              echo "    OK  rung 5 reports the launchd agent as loaded"
+            else
+              echo "::error::rung 5: --list did not report instance '$slug' as '(launchd loaded)', but install.sh bootstrapped $GW_LAUNCHD_LABEL and the gateway answered health. instance_status is misreading launchd state."
+              fail=1
+            fi
+          else
+            fail=1
+          fi
+
+          # ── rung 6: --list through the DIRECT piped uninstaller ───────────────
+          log6="$RUNNER_TEMP/uninstall-rung6.log"
+          echo "==> rung 6: curl -fsSL $FRONT_DOOR/uninstall.sh | sh -s -- --list"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/uninstall.sh" | sh -s -- --list' "$FRONT_DOOR" > "$log6" 2>&1
+          st6=$?
+          if assert_uninstaller_ran "rung 6 (uninstall.sh --list)" "$log6" "$st6"; then
+            assert_listed "rung 6 (uninstall.sh --list)" "$log6" || fail=1
+          else
+            fail=1
+          fi
+
+          # ── rung 7: DATA-SAFE removal (no --purge) ────────────────────────────
+          # Two promises at once, and both are documented in uninstall.sh --help:
+          # the SERVICE goes away, and the DATA does not.
+          log7="$RUNNER_TEMP/uninstall-rung7.log"
+          echo "==> rung 7: curl -fsSL $FRONT_DOOR/install.sh | sh -s -- --uninstall --all   (no --purge)"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/install.sh" | sh -s -- --uninstall --all' "$FRONT_DOOR" > "$log7" 2>&1
+          st7=$?
+          if assert_uninstaller_ran "rung 7 (install.sh --uninstall --all)" "$log7" "$st7"; then
+            if launchctl print "$target" >/dev/null 2>&1; then
+              echo "::error::rung 7: $GW_LAUNCHD_LABEL is STILL bootstrapped at $target after a data-safe uninstall. The agent carries KeepAlive, so a user who uninstalled would keep a gateway restarting forever."
+              fail=1
+            else
+              echo "    OK  rung 7 booted out $GW_LAUNCHD_LABEL"
+            fi
+            if [ -e "$plist" ]; then
+              echo "::error::rung 7: the LaunchAgent plist is still on disk at $plist, so the agent returns at the next login."
+              fail=1
+            else
+              echo "    OK  rung 7 removed $plist"
+            fi
+            if [ -d "$data" ]; then
+              echo "    OK  rung 7 kept the instance data at $data"
+            else
+              echo "::error::rung 7: a data-safe uninstall (no --purge) DELETED $data. uninstall.sh --help promises it leaves your data on disk, so purging without --purge is data loss."
+              fail=1
+            fi
+          else
+            fail=1
+          fi
+
+          # ── rung 8: --all --purge ─────────────────────────────────────────────
+          log8="$RUNNER_TEMP/uninstall-rung8.log"
+          echo "==> rung 8: curl -fsSL $FRONT_DOOR/uninstall.sh | sh -s -- --all --purge"
+          # shellcheck disable=SC2016
+          sh -c 'curl -fsSL "$0/uninstall.sh" | sh -s -- --all --purge' "$FRONT_DOOR" > "$log8" 2>&1
+          st8=$?
+          if assert_uninstaller_ran "rung 8 (uninstall.sh --all --purge)" "$log8" "$st8"; then
+            left=0
+            if [ -e "$data" ]; then
+              echo "::error::rung 8: --all --purge left the instance data behind at $data"
+              left=1
+            fi
+            if [ -e "$runtime" ]; then
+              echo "::error::rung 8: --all --purge left the shared runtime behind at $runtime"
+              left=1
+            fi
+            if [ "$left" -ne 0 ]; then
+              marker_diagnosis
+              echo "--- rung 8 output (tail 40) ---"
+              tail -n 40 "$log8" 2>/dev/null || true
+              fail=1
+            else
+              echo "    OK  rung 8 removed both $data and $runtime"
+            fi
+          else
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::the advertised uninstall paths do not work against $FRONT_DOOR (see the per-rung errors above)"
+            exit 1
+          fi
+          echo "rungs 5-8 OK: --list through both front doors, a data-safe removal that unregistered $GW_LAUNCHD_LABEL and kept $data, and --all --purge that removed the data and the shared runtime."
+
+      # The cause is always in this log; make it readable in the Actions output
+      # rather than only in an artifact (this job has no checkout and uploads none).
+      # Full mode only: payload mode never launches an installer, so there is no
+      # log — and an unconditional dump would answer a rung-1 failure with a
+      # misleading "(no installer log — it never started)".
+      - name: Dump the installer log
+        if: failure() && env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          echo "=== full installer log ==="
+          cat "$RUNNER_TEMP/install.log" 2>/dev/null || echo "(no installer log — it never started)"
+
+      # CLEANUP ONLY. THIS STEP IS NOT COVERAGE, and the distinction is the whole
+      # reason it looks the way it does.
+      #
+      # Until 2026-07-30 this step WAS the file's only uninstall: it piped
+      # `--uninstall --all --purge` from the origin behind a `|| true`, so it
+      # could not red the job, and it carried a canary branch that printed "does
+      # not serve uninstall.sh yet … Not a regression" whenever the origin
+      # soft-404ed. That branch would have swallowed exactly the regression the
+      # new rungs exist to catch. Both are gone. Uninstall is now asserted by
+      # rungs 5-8 above, which CAN fail the job.
+      #
+      # What is left is the last-resort tidy-up, and it is still needed because
+      # `if: always()` also covers the runs where an EARLIER rung failed and
+      # rung 7 never executed. A successful registration leaves a LaunchAgent
+      # with KeepAlive, so the gateway would restart forever, hold the port and
+      # outlive the job; killing $INSTALL_PID does nothing about it, because the
+      # installer process is not the gateway's parent in that shape.
+      #
+      # Do NOT re-add a piped uninstall here. On a rung-1 failure the origin is
+      # exactly the thing that is broken, so piping it into `sh` would bury the
+      # real diagnosis under a page of shell syntax errors while uninstalling
+      # nothing. `launchctl bootout` needs no origin and cannot lie.
+      #
+      # Nothing here may red the job: a teardown failure would hide the real one,
+      # and the runner is disposable either way.
+      - name: Tear down (kill the installer, unregister any leftover launchd job)
+        if: always() && env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          # Guard on a non-empty pid: a bare `kill 0` (which `${INSTALL_PID:-0}`
+          # would expand to) signals this shell's entire process group, killing
+          # the teardown step itself. In the launchd shape this pid is already
+          # gone, which is fine, it is the foreground shape this catches.
+          if [ -n "${INSTALL_PID:-}" ]; then
+            kill "$INSTALL_PID" 2>/dev/null || true
+          fi
+
+          # On a green run rung 7 already booted this out, so finding work here
+          # means an earlier rung failed. Not a ::warning:: on its own: the
+          # failure that mattered has already been reported by the rung that
+          # found it, and a second warning would only add noise to a red run. The
+          # genuine teardown failure, a job that could not be removed at all,
+          # keeps its warning below.
+          target="gui/$(id -u)/$GW_LAUNCHD_LABEL"
+          if launchctl print "$target" >/dev/null 2>&1; then
+            echo "    $GW_LAUNCHD_LABEL is still bootstrapped (rungs 5-8 did not run, or did not get that far). Booting it out directly."
+            launchctl bootout "$target" >/dev/null 2>&1 || true
+          fi
+          if launchctl print "$target" >/dev/null 2>&1; then
+            echo "::warning::could not remove $GW_LAUNCHD_LABEL from $target; the runner is disposable so this is noted, not fatal"
+          else
+            echo "no launchd job left behind ($GW_LAUNCHD_LABEL)"
           fi
 

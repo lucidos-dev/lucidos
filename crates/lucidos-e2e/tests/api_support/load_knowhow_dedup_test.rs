@@ -251,14 +251,7 @@ async fn load_knowhow_body_lives_once_after_first_call() {
     // Wait until the follow-up's MessageReceived has landed for this thread.
     // Once it's there the chat handler is well past the recovery + capture
     // step, so the ContextCaptured event is either persisted or about to be.
-    poll_event_payload_contains(
-        &pool,
-        thread_id,
-        "MessageReceived",
-        &follow_up_marker,
-        15,
-    )
-    .await;
+    poll_event_payload_contains(&pool, thread_id, "MessageReceived", &follow_up_marker, 15).await;
 
     // Walk to the latest ContextCaptured for this thread. The follow-up
     // produces exactly one new ContextCaptured (mock LLM, single turn).

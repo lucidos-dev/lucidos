@@ -485,7 +485,11 @@ fn test_view_image_result_stays_visible_across_later_tool_calls() {
     // Several more tool calls, so the view_image result is far from last.
     for i in 0..4 {
         let id = format!("later{}", i);
-        messages.push(tool_use_msg(&id, "grep_files", serde_json::json!({"pattern": "x"})));
+        messages.push(tool_use_msg(
+            &id,
+            "grep_files",
+            serde_json::json!({"pattern": "x"}),
+        ));
         messages.push(tool_result_msg(&id, "match"));
     }
 
@@ -514,7 +518,11 @@ fn test_capture_app_result_is_not_pinned() {
 
     let mut messages = vec![
         text_msg("user", "Request: check the app"),
-        tool_use_msg("c1", "capture_app", serde_json::json!({"app_id": "habit-tracker"})),
+        tool_use_msg(
+            "c1",
+            "capture_app",
+            serde_json::json!({"app_id": "habit-tracker"}),
+        ),
         capture_app_result_msg("c1", 100),
     ];
     let capture_idx = messages.len() - 1;
@@ -527,7 +535,11 @@ fn test_capture_app_result_is_not_pinned() {
         "an ambient capture must not be treated as an explicitly-requested image"
     );
 
-    messages.push(tool_use_msg("c2", "grep_files", serde_json::json!({"pattern": "x"})));
+    messages.push(tool_use_msg(
+        "c2",
+        "grep_files",
+        serde_json::json!({"pattern": "x"}),
+    ));
     messages.push(tool_result_msg("c2", "match"));
 
     // Pinning only the user message — exactly what the loop does for a capture.
@@ -556,13 +568,21 @@ fn test_pass2_floor_ignores_pins_above_the_lowest() {
         let mut messages = vec![text_msg("user", "workspace context")];
         for i in 0..10 {
             let id = format!("resume{}", i);
-            messages.push(tool_use_msg(&id, "read_file", serde_json::json!({"path": "x.rs"})));
+            messages.push(tool_use_msg(
+                &id,
+                "read_file",
+                serde_json::json!({"path": "x.rs"}),
+            ));
             messages.push(tool_result_msg(&id, &large));
         }
         messages.push(image_msg("user", "Request: what is this?", 100)); // the low pin
         for i in 0..4 {
             let id = format!("recent{}", i);
-            messages.push(tool_use_msg(&id, "grep", serde_json::json!({"pattern": "y"})));
+            messages.push(tool_use_msg(
+                &id,
+                "grep",
+                serde_json::json!({"pattern": "y"}),
+            ));
             messages.push(tool_result_msg(&id, "ok"));
         }
         messages
@@ -575,9 +595,13 @@ fn test_pass2_floor_ignores_pins_above_the_lowest() {
         trim_context_if_needed(&mut baseline, 1_000, Some(low_pin), &[low_pin]).messages_removed;
 
     let mut with_high_pin = build();
-    let with_high_removed =
-        trim_context_if_needed(&mut with_high_pin, 1_000, Some(low_pin), &[low_pin, high_pin])
-            .messages_removed;
+    let with_high_removed = trim_context_if_needed(
+        &mut with_high_pin,
+        1_000,
+        Some(low_pin),
+        &[low_pin, high_pin],
+    )
+    .messages_removed;
 
     assert!(
         baseline_removed > 0,
@@ -624,21 +648,33 @@ fn test_pass2_keeps_image_message_below_protected_after_injection() {
     // 10 resume tool pairs from turn 1 (20 messages).
     for i in 0..10 {
         let id = format!("resume{}", i);
-        messages.push(tool_use_msg(&id, "read_file", serde_json::json!({"path": "x.rs"})));
+        messages.push(tool_use_msg(
+            &id,
+            "read_file",
+            serde_json::json!({"path": "x.rs"}),
+        ));
         messages.push(tool_result_msg(&id, &large_resume));
     }
     // The current-turn image message — must survive with its image.
     let img_idx = messages.len();
     messages.push(image_msg("user", "Request: why won't this part fit?", 100));
     // A tool pair, then a mid-turn injected prompt (the new latest user input).
-    messages.push(tool_use_msg("mid", "grep", serde_json::json!({"pattern": "x"})));
+    messages.push(tool_use_msg(
+        "mid",
+        "grep",
+        serde_json::json!({"pattern": "x"}),
+    ));
     messages.push(tool_result_msg("mid", "match"));
     let injected_idx = messages.len();
     messages.push(text_msg("user", "actually also check the manual"));
     // Recent tail.
     for i in 0..3 {
         let id = format!("recent{}", i);
-        messages.push(tool_use_msg(&id, "grep", serde_json::json!({"pattern": "y"})));
+        messages.push(tool_use_msg(
+            &id,
+            "grep",
+            serde_json::json!({"pattern": "y"}),
+        ));
         messages.push(tool_result_msg(&id, "ok"));
     }
 
@@ -691,7 +727,11 @@ fn test_pass2_does_not_remove_protected_user_message() {
     // 10 resume tool pairs from turn 1 (20 messages)
     for i in 0..10 {
         let id = format!("resume{}", i);
-        messages.push(tool_use_msg(&id, "read_file", serde_json::json!({"path": "x.rs"})));
+        messages.push(tool_use_msg(
+            &id,
+            "read_file",
+            serde_json::json!({"path": "x.rs"}),
+        ));
         messages.push(tool_result_msg(&id, &large_resume));
     }
     // Current user message — the one we must protect
@@ -702,12 +742,17 @@ fn test_pass2_does_not_remove_protected_user_message() {
     // because it's no longer in the last 4.
     for i in 0..4 {
         let id = format!("recent{}", i);
-        messages.push(tool_use_msg(&id, "grep", serde_json::json!({"pattern": "x"})));
+        messages.push(tool_use_msg(
+            &id,
+            "grep",
+            serde_json::json!({"pattern": "x"}),
+        ));
         messages.push(tool_result_msg(&id, "match found"));
     }
 
     // Tight budget forces pass 2 to remove many messages.
-    let removed = trim_context_if_needed(&mut messages, 1_000, Some(protected), &[]).messages_removed;
+    let removed =
+        trim_context_if_needed(&mut messages, 1_000, Some(protected), &[]).messages_removed;
 
     // The user message must survive at its post-removal position.
     let post_protected = protected.saturating_sub(removed);
@@ -754,7 +799,10 @@ fn test_pass2_stops_when_protected_lands_at_index_one() {
         "protected message at index 1 must not be removed"
     );
     // Guard at index 1 fires before any removal, so removed must be exactly 0.
-    assert_eq!(removed, 0, "guard at index 1 must short-circuit before any removal");
+    assert_eq!(
+        removed, 0,
+        "guard at index 1 must short-circuit before any removal"
+    );
 }
 
 /// Regression for the May 25 `workspace-learning` trigger: a single turn
@@ -777,9 +825,17 @@ fn test_pass1_5_trims_large_tail_tool_results() {
         tool_result_msg("old2", "match"),
         // Preserved tail (last PRESERVE_RECENT_MESSAGES=4): two pairs of
         // huge tool-result dumps from query_events
-        tool_use_msg("recent1", "query_events", serde_json::json!({"event_type": "X"})),
+        tool_use_msg(
+            "recent1",
+            "query_events",
+            serde_json::json!({"event_type": "X"}),
+        ),
         tool_result_msg("recent1", &huge),
-        tool_use_msg("recent2", "query_events", serde_json::json!({"event_type": "Y"})),
+        tool_use_msg(
+            "recent2",
+            "query_events",
+            serde_json::json!({"event_type": "Y"}),
+        ),
         tool_result_msg("recent2", &huge),
     ];
 
@@ -840,7 +896,11 @@ fn test_pass1_5_preserves_very_last_message() {
                 !content.contains("truncated"),
                 "the very last message's ToolResult must NOT be truncated by pass 1.5 (it's the data the next turn will reason about)"
             );
-            assert_eq!(content.len(), huge.len(), "verbatim length must be preserved");
+            assert_eq!(
+                content.len(),
+                huge.len(),
+                "verbatim length must be preserved"
+            );
         }
     }
 }
@@ -970,7 +1030,11 @@ fn test_truncated_tool_arguments_count_as_trimmed() {
         text_msg("user", "initial"),
         // Old message with a huge tool ARGUMENT but a small result — only the
         // ToolUse branch of pass 1 can fire here.
-        tool_use_msg("t1", "write_file", serde_json::json!({ "content": big_arg })),
+        tool_use_msg(
+            "t1",
+            "write_file",
+            serde_json::json!({ "content": big_arg }),
+        ),
         tool_result_msg("t1", "ok"),
         text_msg("assistant", "a"),
         text_msg("user", "b"),

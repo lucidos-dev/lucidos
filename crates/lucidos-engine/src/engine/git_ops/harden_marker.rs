@@ -108,13 +108,12 @@ pub(crate) async fn consume_harden_marker(
     repo_root: &Path,
     branch_name: &str,
 ) {
-    if let Err(e) = sqlx::query(
-        "DELETE FROM hardened_branches WHERE repo_root = $1 AND branch_name = $2",
-    )
-    .bind(canonical_repo_root(repo_root))
-    .bind(branch_name)
-    .execute(pool)
-    .await
+    if let Err(e) =
+        sqlx::query("DELETE FROM hardened_branches WHERE repo_root = $1 AND branch_name = $2")
+            .bind(canonical_repo_root(repo_root))
+            .bind(branch_name)
+            .execute(pool)
+            .await
     {
         log!(
             "[Harden] Failed to delete hardened_branches row for {}: {}",
@@ -123,4 +122,3 @@ pub(crate) async fn consume_harden_marker(
         );
     }
 }
-

@@ -17,11 +17,7 @@ impl LucidosEngine {
     /// Discard all pending changes for a thread. `actor` flows into the
     /// resulting `ChangeDiscarded` events so the chip reads "You" rather than
     /// the engine fallback.
-    pub async fn discard_pending_for_thread(
-        &self,
-        thread_id: Uuid,
-        actor: Option<MessageOrigin>,
-    ) {
+    pub async fn discard_pending_for_thread(&self, thread_id: Uuid, actor: Option<MessageOrigin>) {
         let pending = match self.changes().pending_for_thread(thread_id).await {
             Ok(v) => v,
             Err(e) => {
@@ -169,12 +165,10 @@ impl LucidosEngine {
         // also a batch member) would leave the driver spawning `apply_change`
         // on a now-`discarded` row, which returns `Err` with no terminal event —
         // the batch never completes and the "Applying changes…" toast sticks.
-        self.notify_apply_all(
-            crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
-                change_id,
-                crate::engine::apply_all_driver::DISCARDED_MEMBER_REASON.to_string(),
-            ),
-        );
+        self.notify_apply_all(crate::engine::apply_all_driver::ApplyAllDriveMsg::Failed(
+            change_id,
+            crate::engine::apply_all_driver::DISCARDED_MEMBER_REASON.to_string(),
+        ));
 
         // Other pending changes on the same branch? If so, leave the branch
         // and worktree untouched — wiping the branch back to main would also
@@ -219,19 +213,16 @@ impl LucidosEngine {
             // No worktree on disk for this branch (legacy threads, or already
             // cleaned up). Reset the branch ref to main directly so the
             // commits don't linger as a phantom pending state.
-            let reset = git_cmd(
-                &["branch", "-f", &change.branch_name, "main"],
-                &repo_root,
-            )
-            .await
-            .map_err(|e| {
-                format!(
-                    "git branch -f {} main failed in repo {}: {}",
-                    change.branch_name,
-                    repo_root.display(),
-                    e
-                )
-            })?;
+            let reset = git_cmd(&["branch", "-f", &change.branch_name, "main"], &repo_root)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "git branch -f {} main failed in repo {}: {}",
+                        change.branch_name,
+                        repo_root.display(),
+                        e
+                    )
+                })?;
             if !reset.status.success() {
                 return Err(format!(
                     "git branch -f {} main failed in repo {}: {}",

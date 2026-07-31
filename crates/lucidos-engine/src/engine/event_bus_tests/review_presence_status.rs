@@ -192,8 +192,8 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
             }
         }
     }
-    let agg = response_generated_aggregate
-        .expect("ResponseGenerated must be broadcast with aggregate");
+    let agg =
+        response_generated_aggregate.expect("ResponseGenerated must be broadcast with aggregate");
     assert_eq!(
         agg.section, "inbox",
         "aggregate carries the new section='inbox' (no separate section-change event needed)"
@@ -202,7 +202,10 @@ async fn response_generated_on_parent_with_children_broadcasts_children_count() 
         agg.active_children_count, 2,
         "aggregate carries active_children_count=2 (replaces the legacy ChildrenCountChanged re-broadcast)"
     );
-    assert_eq!(agg.total_children_count, 2, "aggregate carries total_children_count=2");
+    assert_eq!(
+        agg.total_children_count, 2,
+        "aggregate carries total_children_count=2"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -220,7 +223,10 @@ async fn emit_device_visible_writes_to_device_presence_projection() {
     .unwrap();
 
     assert!(
-        !crate::core::DevicePresenceStore::candidates(&pool).await.unwrap().is_empty(),
+        !crate::core::DevicePresenceStore::candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
         "DeviceVisible should mark the device visible in device_presence"
     );
 
@@ -299,7 +305,10 @@ async fn emit_device_hidden_clears_presence_and_no_op_when_already_hidden() {
     .await
     .unwrap();
     assert!(
-        crate::core::DevicePresenceStore::candidates(&pool).await.unwrap().is_empty(),
+        crate::core::DevicePresenceStore::candidates(&pool)
+            .await
+            .unwrap()
+            .is_empty(),
         "DeviceHidden must remove the device_presence row"
     );
 
@@ -603,7 +612,10 @@ async fn cc_idle_after_failed_turn_preserves_failed_status() {
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(after_fail, "failed", "ResponseFailed must set status='failed'");
+    assert_eq!(
+        after_fail, "failed",
+        "ResponseFailed must set status='failed'"
+    );
 
     // The same turn's bookkeeping idle (no changes) follows.
     emit_cc_idle(&bus, thread_id, false, Some("sid-fail")).await;

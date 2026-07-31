@@ -523,6 +523,13 @@ export interface ToastItem {
   secondaryAction?: ToastAction;
   onClick?: () => void;
   spinning?: boolean;
+  /** Determinate progress for a long operation the toast is narrating, as a
+   *  fraction in [0, 1] — rendered as the shared `.progress-bar` under the
+   *  message. Omit (or pass `null`) when the operation has no honest
+   *  percentage: an unknown-size download must show a spinner and a byte count,
+   *  never a fabricated bar. Pairs with `spinning`, which stays the "something
+   *  is happening" signal while this is the "how far" one. */
+  progress?: number | null;
   /** false = suppress the close (X) button. Used for "Restarting engine…" so
    *  the user can't dismiss the toast while the dim restart overlay is still
    *  blocking the UI behind it. Defaults to true (close button shown). */
@@ -558,6 +565,9 @@ export interface CredentialRequest {
     token_url?: string;
     userinfo_url?: string | null;
     scopes?: string;
+    /** Loopback callback URI to register with the provider. Absent means the
+     *  engine's default (`http://127.0.0.1:14981/oauth/callback`). */
+    redirect_uri?: string;
   };
   /** Optional custom env var name the agent passed via `request_credential`.
    *  Pre-fills the modal's "Env var name" field so the secret also injects under

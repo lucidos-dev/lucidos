@@ -116,10 +116,7 @@ pub fn replay_trigger_group_events(
 
 /// Case-insensitive lookup for unique-name enforcement at the API boundary.
 /// Returns the matching group's id when one exists, otherwise None.
-pub fn find_group_by_name_ci(
-    groups: &HashMap<String, TriggerGroup>,
-    name: &str,
-) -> Option<String> {
+pub fn find_group_by_name_ci(groups: &HashMap<String, TriggerGroup>, name: &str) -> Option<String> {
     let needle = name.to_lowercase();
     groups
         .values()
@@ -146,7 +143,10 @@ mod tests {
 
     #[test]
     fn replay_created_builds_group() {
-        let events = vec![make_event("TriggerGroupCreated", created_payload("g1", "Morning Routine", 10))];
+        let events = vec![make_event(
+            "TriggerGroupCreated",
+            created_payload("g1", "Morning Routine", 10),
+        )];
         let groups = replay_trigger_group_events(events);
         let g = groups.get("g1").expect("group present");
         assert_eq!(g.name, "Morning Routine");
@@ -157,18 +157,28 @@ mod tests {
     fn replay_created_then_renamed() {
         let events = vec![
             make_event("TriggerGroupCreated", created_payload("g1", "Old Name", 10)),
-            make_event("TriggerGroupRenamed", json!({ "group_id": "g1", "name": "New Name" })),
+            make_event(
+                "TriggerGroupRenamed",
+                json!({ "group_id": "g1", "name": "New Name" }),
+            ),
         ];
         let groups = replay_trigger_group_events(events);
         assert_eq!(groups.get("g1").unwrap().name, "New Name");
-        assert_eq!(groups.get("g1").unwrap().order, 10, "rename preserves order");
+        assert_eq!(
+            groups.get("g1").unwrap().order,
+            10,
+            "rename preserves order"
+        );
     }
 
     #[test]
     fn replay_reordered_updates_order_only() {
         let events = vec![
             make_event("TriggerGroupCreated", created_payload("g1", "Group", 10)),
-            make_event("TriggerGroupReordered", json!({ "group_id": "g1", "order": 50 })),
+            make_event(
+                "TriggerGroupReordered",
+                json!({ "group_id": "g1", "order": 50 }),
+            ),
         ];
         let groups = replay_trigger_group_events(events);
         let g = groups.get("g1").unwrap();
@@ -212,8 +222,14 @@ mod tests {
         // converge on the final state regardless of intermediate operations.
         let events = vec![
             make_event("TriggerGroupCreated", created_payload("g1", "First", 0)),
-            make_event("TriggerGroupRenamed", json!({ "group_id": "g1", "name": "Renamed" })),
-            make_event("TriggerGroupReordered", json!({ "group_id": "g1", "order": 99 })),
+            make_event(
+                "TriggerGroupRenamed",
+                json!({ "group_id": "g1", "name": "Renamed" }),
+            ),
+            make_event(
+                "TriggerGroupReordered",
+                json!({ "group_id": "g1", "order": 99 }),
+            ),
             make_event("TriggerGroupCreated", created_payload("g2", "Second", 5)),
             make_event("TriggerGroupDeleted", json!({ "group_id": "g1" })),
         ];
@@ -225,8 +241,11 @@ mod tests {
 
     #[test]
     fn from_created_payload_defaults_order_to_zero() {
-        let g = TriggerGroup::from_created_payload(&json!({ "group_id": "g1", "name": "G" }), Utc::now())
-            .unwrap();
+        let g = TriggerGroup::from_created_payload(
+            &json!({ "group_id": "g1", "name": "G" }),
+            Utc::now(),
+        )
+        .unwrap();
         assert_eq!(g.order, 0);
     }
 
@@ -249,8 +268,14 @@ mod tests {
             },
         );
 
-        assert_eq!(find_group_by_name_ci(&groups, "morning routine"), Some("g1".to_string()));
-        assert_eq!(find_group_by_name_ci(&groups, "MORNING ROUTINE"), Some("g1".to_string()));
+        assert_eq!(
+            find_group_by_name_ci(&groups, "morning routine"),
+            Some("g1".to_string())
+        );
+        assert_eq!(
+            find_group_by_name_ci(&groups, "MORNING ROUTINE"),
+            Some("g1".to_string())
+        );
         assert_eq!(find_group_by_name_ci(&groups, "morning"), None);
     }
 }

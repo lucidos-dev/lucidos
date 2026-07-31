@@ -252,11 +252,11 @@ fn extract_app_id_matches_frontend_validation() {
     );
     assert_eq!(
         super::extract_app_id("data/apps/habit-tracker"),
-            Some("habit-tracker".to_string())
-        );
+        Some("habit-tracker".to_string())
+    );
 
-        // Refusals: same shapes the TS helper rejects.
-        assert_eq!(super::extract_app_id("/ws/data/artifacts/foo"), None);
+    // Refusals: same shapes the TS helper rejects.
+    assert_eq!(super::extract_app_id("/ws/data/artifacts/foo"), None);
     assert_eq!(super::extract_app_id("/ws/data/apps"), None);
     assert_eq!(super::extract_app_id("/ws/data/apps/"), None);
     assert_eq!(super::extract_app_id("/ws/data/apps/."), None);
@@ -268,19 +268,19 @@ fn extract_app_id_matches_frontend_validation() {
     // Nested: last data/apps/ wins, same as the TS helper.
     assert_eq!(
         super::extract_app_id("/ws/data/apps/outer/data/apps/inner"),
-            Some("inner".to_string())
-        );
-    }
+        Some("inner".to_string())
+    );
+}
 
-    // Defense-in-depth: even after we set `-c core.quotepath=false` on the
-    // git invocations, the parser must never let the raw `diff --git` header
-    // line bleed into the user-facing filename if a quoted path ever slips
-    // through (e.g. paths with literal quotes, control bytes, or a future
-    // git version that quotes for some other reason).
-    #[test]
-    fn parse_added_file_with_quoted_unicode_path() {
-        let input = concat!(
-            r#"diff --git "a/dir/7_\360\237\247\256_HLL.py" "b/dir/7_\360\237\247\256_HLL.py""#,
+// Defense-in-depth: even after we set `-c core.quotepath=false` on the
+// git invocations, the parser must never let the raw `diff --git` header
+// line bleed into the user-facing filename if a quoted path ever slips
+// through (e.g. paths with literal quotes, control bytes, or a future
+// git version that quotes for some other reason).
+#[test]
+fn parse_added_file_with_quoted_unicode_path() {
+    let input = concat!(
+        r#"diff --git "a/dir/7_\360\237\247\256_HLL.py" "b/dir/7_\360\237\247\256_HLL.py""#,
         "\n",
         "new file mode 100644\n",
         "--- /dev/null\n",
@@ -302,8 +302,7 @@ fn extract_app_id_matches_frontend_validation() {
 
 #[test]
 fn parse_diff_git_path_handles_quoted_form() {
-    let line =
-        r#"diff --git "a/dir/7_\360\237\247\256_HLL.py" "b/dir/7_\360\237\247\256_HLL.py""#;
+    let line = r#"diff --git "a/dir/7_\360\237\247\256_HLL.py" "b/dir/7_\360\237\247\256_HLL.py""#;
     assert_eq!(parse_diff_git_path(line), "dir/7_🧮_HLL.py");
 }
 
@@ -341,10 +340,7 @@ fn unquote_git_path_decodes_octal_to_utf8() {
 
 #[test]
 fn unquote_git_path_decodes_standard_escapes() {
-    assert_eq!(
-        unquote_git_path(r#""a\tb\nc\\d\"e""#),
-        "a\tb\nc\\d\"e"
-    );
+    assert_eq!(unquote_git_path(r#""a\tb\nc\\d\"e""#), "a\tb\nc\\d\"e");
 }
 
 #[test]
@@ -389,11 +385,7 @@ async fn worktree_diff_helpers_against_real_repo() {
     // user's git defaults differ (master vs main). Without it,
     // `git init` creates `master` and our subsequent `worktree add ... main`
     // fails with "invalid reference: main".
-    run(
-        &["-c", "init.defaultBranch=main", "init", "-q"],
-        main_path,
-    )
-    .await;
+    run(&["-c", "init.defaultBranch=main", "init", "-q"], main_path).await;
     run(&["config", "user.email", "test@example.com"], main_path).await;
     run(&["config", "user.name", "Test"], main_path).await;
     tokio::fs::write(main_path.join("README.md"), "init\n")
@@ -446,7 +438,7 @@ async fn worktree_diff_helpers_against_real_repo() {
     // 3-dot diff against the resolved base: exactly one modified file.
     let range = format!("{}...HEAD", base);
     let out = run(&["diff", &range, "--no-color"], &wt_path).await;
-        assert!(out.status.success(), "git diff failed: {:?}", out);
+    assert!(out.status.success(), "git diff failed: {:?}", out);
     let files = super::parse_diff_output(&String::from_utf8_lossy(&out.stdout));
     assert_eq!(files.len(), 1);
     assert_eq!(files[0].path, "README.md");
@@ -482,11 +474,7 @@ async fn diff_base_is_local_main_when_origin_is_behind() {
 
     let main_repo = tempfile::tempdir().unwrap();
     let main_path = main_repo.path();
-    run(
-        &["-c", "init.defaultBranch=main", "init", "-q"],
-        main_path,
-    )
-    .await;
+    run(&["-c", "init.defaultBranch=main", "init", "-q"], main_path).await;
     run(&["config", "user.email", "test@example.com"], main_path).await;
     run(&["config", "user.name", "Test"], main_path).await;
     tokio::fs::write(main_path.join("README.md"), "init\n")
@@ -509,7 +497,11 @@ async fn diff_base_is_local_main_when_origin_is_behind() {
         .await
         .unwrap();
     run(&["add", "."], main_path).await;
-    run(&["commit", "-q", "-m", "ship feature (not yet pushed)"], main_path).await;
+    run(
+        &["commit", "-q", "-m", "ship feature (not yet pushed)"],
+        main_path,
+    )
+    .await;
 
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
@@ -608,7 +600,11 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
         .await
         .unwrap();
     run(&["add", "."], main_path).await;
-    run(&["commit", "-q", "-m", "feature on main (PR forks here)"], main_path).await;
+    run(
+        &["commit", "-q", "-m", "feature on main (PR forks here)"],
+        main_path,
+    )
+    .await;
 
     // Publish to origin and record origin/HEAD → main. `origin/main` now holds
     // the fork point.
@@ -650,7 +646,12 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
         .unwrap();
     run(&["add", "."], main_path).await;
     run(
-        &["commit", "-q", "-m", "migration: secrets transfer (automated)"],
+        &[
+            "commit",
+            "-q",
+            "-m",
+            "migration: secrets transfer (automated)",
+        ],
         main_path,
     )
     .await;
@@ -680,11 +681,11 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
 /// workspace git. The cc-diff response must scope to that pathspec so
 /// the Diff button doesn't surface stray edits the agent made outside
 /// its scope (the user picked "diff scoped to the app folder" — files
-    /// in `data/artifacts/`, `data/knowhow/`, etc. must not appear).
-    #[tokio::test]
-    async fn diff_via_worktree_scopes_to_app_pathspec() {
-        async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
-            tokio::process::Command::new("git")
+/// in `data/artifacts/`, `data/knowhow/`, etc. must not appear).
+#[tokio::test]
+async fn diff_via_worktree_scopes_to_app_pathspec() {
+    async fn run(args: &[&str], cwd: &std::path::Path) -> std::process::Output {
+        tokio::process::Command::new("git")
             .args(args)
             .current_dir(cwd)
             .output()
@@ -698,7 +699,9 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     run(&["-c", "init.defaultBranch=main", "init", "-q"], ws_path).await;
     run(&["config", "user.email", "test@example.com"], ws_path).await;
     run(&["config", "user.name", "Test"], ws_path).await;
-    tokio::fs::write(ws_path.join("README.md"), "ws\n").await.unwrap();
+    tokio::fs::write(ws_path.join("README.md"), "ws\n")
+        .await
+        .unwrap();
     run(&["add", "."], ws_path).await;
     run(&["commit", "-q", "-m", "init"], ws_path).await;
 
@@ -707,7 +710,14 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     let wt_dir = tempfile::tempdir().unwrap();
     let wt_path = wt_dir.path().join("wt");
     run(
-        &["worktree", "add", "-b", "apps/habit-tracker", wt_path.to_str().unwrap(), "main"],
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "apps/habit-tracker",
+            wt_path.to_str().unwrap(),
+            "main",
+        ],
         ws_path,
     )
     .await;
@@ -745,8 +755,7 @@ async fn diff_base_falls_back_to_origin_when_local_main_diverged() {
     let unscoped = super::diff_via_worktree(&wt_path, None)
         .await
         .expect("diff_via_worktree should succeed without pathspec");
-    let unscoped_paths: Vec<&str> =
-        unscoped.files.iter().map(|f| f.path.as_str()).collect();
+    let unscoped_paths: Vec<&str> = unscoped.files.iter().map(|f| f.path.as_str()).collect();
     assert!(
         unscoped_paths.contains(&"data/artifacts/habit-tracker/notes.md"),
         "control: unscoped diff should include the out-of-scope file, \

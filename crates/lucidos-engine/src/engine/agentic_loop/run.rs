@@ -31,9 +31,7 @@ impl LucidosEngine {
     /// a no-op.
     async fn emit_image_descriptions_after_first_llm_call(
         &self,
-        image_description_handle: &mut Option<
-            tokio::task::JoinHandle<Option<(String, String)>>,
-        >,
+        image_description_handle: &mut Option<tokio::task::JoinHandle<Option<(String, String)>>>,
         origin_id: Uuid,
         thread_id: Uuid,
         meta: &crate::engine::thread_events::EventMeta,
@@ -65,9 +63,7 @@ impl LucidosEngine {
         extraction_ctx: &str,
         // `(description, model)` — the model name is needed so the
         // `ImageDescribed` event records which Flash model produced the text.
-        mut image_description_handle: Option<
-            tokio::task::JoinHandle<Option<(String, String)>>,
-        >,
+        mut image_description_handle: Option<tokio::task::JoinHandle<Option<(String, String)>>>,
         origin_id: Uuid,
         proposed_change: &mut bool,
         user_images: Option<&[crate::api::ChatImage]>,
@@ -247,7 +243,10 @@ impl LucidosEngine {
             // minimum over the pins), so none of them was removed — the uniform
             // shift stays exact and no pin can end up aliasing a different
             // message.
-            for idx in user_image_idxs.iter_mut().chain(explicit_image_idxs.iter_mut()) {
+            for idx in user_image_idxs
+                .iter_mut()
+                .chain(explicit_image_idxs.iter_mut())
+            {
                 *idx = idx.saturating_sub(removed_count);
             }
             // Safety net: validate tool_use/tool_result pairing after trimming.
@@ -458,8 +457,7 @@ impl LucidosEngine {
             // section instead carries the *delta* — bytes added by the
             // tool loop on iter 2+ — so the section list sums to the live
             // total: system_prompt + context_chars.
-            let static_total: usize =
-                capture_seed.sections.iter().map(|s| s.char_count).sum();
+            let static_total: usize = capture_seed.sections.iter().map(|s| s.char_count).sum();
             let system_chars: usize = capture_seed
                 .sections
                 .iter()
@@ -474,19 +472,14 @@ impl LucidosEngine {
             // — same cap chat::process applies to other section bodies) to
             // keep large tool outputs from bloating every events row.
             const CONVERSATION_PERSIST_MAX: usize = 8_000;
-            let conversation_body = capture_seed
-                .capture_body
-                .then(|| {
-                    let serialized = serialize_messages_for_capture(messages);
-                    if serialized.len() > CONVERSATION_PERSIST_MAX {
-                        super::super::context::truncate_head_tail(
-                            &serialized,
-                            CONVERSATION_PERSIST_MAX,
-                        )
-                    } else {
-                        serialized
-                    }
-                });
+            let conversation_body = capture_seed.capture_body.then(|| {
+                let serialized = serialize_messages_for_capture(messages);
+                if serialized.len() > CONVERSATION_PERSIST_MAX {
+                    super::super::context::truncate_head_tail(&serialized, CONVERSATION_PERSIST_MAX)
+                } else {
+                    serialized
+                }
+            });
             let conversation = crate::engine::ContextSection {
                 name: "Conversation".to_string(),
                 content: conversation_body,
@@ -520,14 +513,14 @@ impl LucidosEngine {
                 .chain(std::iter::once(tool_definitions))
                 .chain(std::iter::once(conversation))
                 .collect();
-            let usage = response.input_tokens.map(|input_tokens| {
-                crate::engine::ApiUsage {
+            let usage = response
+                .input_tokens
+                .map(|input_tokens| crate::engine::ApiUsage {
                     input_tokens,
                     output_tokens: response.output_tokens.unwrap_or(0),
                     cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
                     cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
-                }
-            });
+                });
             // Calibration breadcrumb for the chars/token assumption baked into
             // `estimate_tokens_from_chars`. The ratio is a single hardcoded 1.5
             // that has never been measured across models — and the one time it
@@ -691,9 +684,10 @@ impl LucidosEngine {
                     .emit_or_log(
                         crate::engine::event_bus::BusEvent::Thread {
                             thread_id,
-                            event: crate::engine::thread_events::ThreadEvent::CumulativeTextUpdated {
-                                text: flush,
-                            },
+                            event:
+                                crate::engine::thread_events::ThreadEvent::CumulativeTextUpdated {
+                                    text: flush,
+                                },
                             meta: crate::engine::thread_events::EventMeta::NONE,
                         },
                         "[AgenticLoop] CumulativeTextUpdated final flush",
@@ -767,8 +761,9 @@ impl LucidosEngine {
                             crate::engine::event_bus::BusEvent::Thread {
                                 thread_id,
                                 event: crate::engine::thread_events::ThreadEvent::LlmCallRetried {
-                                    reason: "ask_user_question had no question text — forcing re-ask"
-                                        .to_string(),
+                                    reason:
+                                        "ask_user_question had no question text, forcing re-ask"
+                                            .to_string(),
                                 },
                                 meta: crate::engine::thread_events::EventMeta::NONE,
                             },
@@ -789,7 +784,11 @@ impl LucidosEngine {
                 while let Ok(prompt) = injection_rx.try_recv() {
                     injected_prompts.push(prompt);
                 }
-                self.note_injections_drained(thread_id, injection_generation, injected_prompts.len());
+                self.note_injections_drained(
+                    thread_id,
+                    injection_generation,
+                    injected_prompts.len(),
+                );
                 let injected_prompts =
                     filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
                 if !injected_prompts.is_empty() {
@@ -1433,28 +1432,14 @@ impl LucidosEngine {
                     }
                 }
 
-                // Extract generated image base64 from tool result (if present)
-                let mut tool_result_images: Vec<String> = vec![];
-                let mut tool_result_text;
-                if let Some(rest) = result.strip_prefix("[GENERATED_IMAGE:") {
-                    if let Some(end_bracket) = rest.find("]\n") {
-                        let image_b64 = &rest[..end_bracket];
-                        tool_result_images.push(image_b64.to_string());
-                        tool_result_text = rest[end_bracket + 2..].to_string();
-                    } else {
-                        tool_result_text = result.clone();
-                    }
-                } else if let Some(stub) =
-                    crate::engine::tools::files::strip_image_content_marker(&result)
-                {
-                    // [IMAGE_CONTENT:type]\n<base64> from read_file: the agentic loop already lifted
-                    // the bytes into a proper image content block above, so persisting the base64
-                    // again would just bloat the events table (and the wire payload — frontend never
-                    // reads ToolResult.result for read_file). Strip to a small stub.
-                    tool_result_text = stub;
-                } else {
-                    tool_result_text = result.clone();
-                }
+                // Split the raw result into what the model sees and what gets
+                // persisted. They diverge for the image sentinels: the base64
+                // has to survive to `build_tool_result_blocks` below, which is
+                // what lifts it into a vision block, while the event stores a
+                // stub instead of megabytes the frontend never reads. Reading
+                // both off one value blinded the model and bloated the events
+                // table at the same time.
+                let mut split = split_tool_result(&result);
 
                 // Front-end confirm-flow sentinels (credentials, plugin install,
                 // plugin uninstall, email confirm): emit the transient
@@ -1464,9 +1449,9 @@ impl LucidosEngine {
                 // replace tool_result_text so the model only sees a one-line
                 // wait notice. EmailConfirm passes through unredacted because
                 // its tool description already explains the modal flow.
-                let sentinel_event = match_sentinel(&tool_result_text).map(|m| {
+                let sentinel_event = match_sentinel(split.event_text()).map(|m| {
                     if let Some(redacted) = m.redacted_text {
-                        tool_result_text = redacted;
+                        split.redact(redacted);
                     }
                     (m.label, m.event)
                 });
@@ -1478,8 +1463,8 @@ impl LucidosEngine {
                             thread_id,
                             event: crate::engine::thread_events::ThreadEvent::ToolResult {
                                 name: tool_call.name.clone(),
-                                result: crate::core::sanitize_for_jsonb(&tool_result_text),
-                                images: tool_result_images,
+                                result: crate::core::sanitize_for_jsonb(split.event_text()),
+                                images: std::mem::take(&mut split.images),
                                 success: !is_error,
                                 // Always stamp the originating ToolCalled's
                                 // event id so `groupIntoExchanges` (frontend)
@@ -1549,7 +1534,7 @@ impl LucidosEngine {
                         .await;
                 }
 
-                tool_outputs.push((tool_call.id.clone(), tool_result_text));
+                tool_outputs.push((tool_call.id.clone(), split.llm_text));
 
                 // A trigger hit an ungranted side-effect: its block is now
                 // recorded as a failed ToolResult — stop running the rest of
@@ -1644,64 +1629,7 @@ impl LucidosEngine {
                 "Results above. Do NOT repeat analysis you already gave — the user already read it. Proceed directly to your next action or final answer."
             };
 
-            // Build tool result blocks for the user message.
-            // CRITICAL: All ToolResult blocks must come before any Image/Text blocks.
-            // The Claude API validates that tool_result blocks immediately follow the
-            // assistant's tool_use blocks. Interleaving Image or Text blocks between
-            // ToolResult blocks causes the API to miss subsequent ToolResults, producing
-            // "tool_use ids were found without tool_result blocks" 400 errors.
-            let mut result_blocks: Vec<ContentBlock> = Vec::new();
-            let mut trailing_blocks: Vec<ContentBlock> = Vec::new();
-            for (tool_use_id, result) in &tool_outputs {
-                if let Some((screenshot_b64, dom_text)) = parse_app_capture_marker(result) {
-                    result_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: dom_text.to_string(),
-                    });
-                    // Fit the screenshot to the model size target (compress only
-                    // if over) so a large retina capture can't trip the provider's
-                    // per-image limit. fit_for_llm is the single gate for every
-                    // chat→model image.
-                    let fitted = crate::api::ChatImage {
-                        base64: screenshot_b64.to_string(),
-                        mime_type: sniff_image_media_type(screenshot_b64).to_string(),
-                    }
-                    .fit_for_llm();
-                    trailing_blocks.push(ContentBlock::Image {
-                        source_type: "base64".to_string(),
-                        media_type: fitted.mime_type,
-                        data: fitted.base64,
-                    });
-                    continue;
-                }
-                if let Some((media_type, image_b64)) =
-                    crate::engine::tools::files::parse_image_content_marker(result)
-                {
-                    result_blocks.push(ContentBlock::ToolResult {
-                        tool_use_id: tool_use_id.clone(),
-                        content: crate::engine::tools::files::EXPLICIT_IMAGE_RESULT_TEXT
-                            .to_string(),
-                    });
-                    // No fit_for_llm here: read_file's encode_image_for_read already
-                    // fit the image before emitting the IMAGE_CONTENT marker, so this
-                    // payload is guaranteed within the model size target.
-                    trailing_blocks.push(ContentBlock::Image {
-                        source_type: "base64".to_string(),
-                        media_type: media_type.to_string(),
-                        data: image_b64.to_string(),
-                    });
-                    continue;
-                }
-                result_blocks.push(ContentBlock::ToolResult {
-                    tool_use_id: tool_use_id.clone(),
-                    content: result.clone(),
-                });
-            }
-            // Append images and instruction text AFTER all ToolResult blocks
-            result_blocks.append(&mut trailing_blocks);
-            result_blocks.push(ContentBlock::Text {
-                text: instruction.to_string(),
-            });
+            let result_blocks = build_tool_result_blocks(&tool_outputs, instruction);
 
             // Pin before the move: an image the model explicitly asked to see
             // must stay in vision for the rest of the turn, not just until its
@@ -1722,7 +1650,11 @@ impl LucidosEngine {
                 while let Ok(prompt) = injection_rx.try_recv() {
                     injected_prompts.push(prompt);
                 }
-                self.note_injections_drained(thread_id, injection_generation, injected_prompts.len());
+                self.note_injections_drained(
+                    thread_id,
+                    injection_generation,
+                    injected_prompts.len(),
+                );
                 let injected_prompts =
                     filter_removed_queued_prompts(&self.pool, thread_id, injected_prompts).await;
                 let appended = append_injected_prompts_to_messages(

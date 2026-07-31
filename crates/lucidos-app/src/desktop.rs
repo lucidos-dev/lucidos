@@ -905,7 +905,10 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         .and_then(|exe| app_bundle_root_from_exe(&exe))
     {
         Some(bundle) => match trash_or_remove_bundle(&bundle) {
-            Ok(()) => eprintln!("[service] uninstall: moved app bundle {} to Trash", bundle.display()),
+            Ok(()) => eprintln!(
+                "[service] uninstall: moved app bundle {} to Trash",
+                bundle.display()
+            ),
             Err(e) => {
                 eprintln!("[service] uninstall: failed to remove app bundle: {e}");
                 failures.push(e);
@@ -913,7 +916,9 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         },
         None => {
             // Unbundled (e.g. `tauri dev`) — nothing to trash. Not a failure.
-            eprintln!("[service] uninstall: not running from a .app bundle; skipping bundle removal");
+            eprintln!(
+                "[service] uninstall: not running from a .app bundle; skipping bundle removal"
+            );
         }
     }
 

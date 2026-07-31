@@ -1,6 +1,6 @@
 use super::common::*;
-use crate::test_support::{setup_test_db, teardown_test_db};
 use crate::engine::event_bus::EventBus;
+use crate::test_support::{setup_test_db, teardown_test_db};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,7 +105,11 @@ async fn inventory_worktrees_returns_thread_metadata_sorted_by_size() {
     insert_old_event(&pool, small_id, 60).await;
 
     let rows = inventory_worktrees(&pool, &root).await;
-    assert!(rows.len() >= 2, "expected at least 2 rows, got {}", rows.len());
+    assert!(
+        rows.len() >= 2,
+        "expected at least 2 rows, got {}",
+        rows.len()
+    );
 
     let big_idx = rows
         .iter()
@@ -130,7 +134,10 @@ async fn inventory_worktrees_returns_thread_metadata_sorted_by_size() {
     assert!(!big.is_saved, "unsaved flag must be carried through");
     assert!(big.size_bytes > small.size_bytes);
     assert!(big.last_activity.is_some());
-    assert!(big.thread_title.is_some(), "thread_title must be carried through");
+    assert!(
+        big.thread_title.is_some(),
+        "thread_title must be carried through"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -141,8 +148,14 @@ fn available_disk_bytes_returns_some_for_existing_path() {
     use super::available_disk_bytes;
     let tmp = std::env::temp_dir();
     let bytes = available_disk_bytes(&tmp);
-    assert!(bytes.is_some(), "should return Some for an existing tempdir");
-    assert!(bytes.unwrap() > 0, "free space must be > 0 on a healthy host");
+    assert!(
+        bytes.is_some(),
+        "should return Some for an existing tempdir"
+    );
+    assert!(
+        bytes.unwrap() > 0,
+        "free space must be > 0 on a healthy host"
+    );
 }
 
 #[test]
@@ -317,7 +330,10 @@ async fn tier_0_removes_clean_worktree_with_no_commits_after_grace() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert_eq!(cleaned.len(), 1, "exactly one Tier 0 event");
     let (_, tier, _, branch_deleted) = cleaned[0];
     assert_eq!(tier, 0);
@@ -349,7 +365,10 @@ async fn tier_0_skips_branch_with_commits_ahead_of_main() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.iter().all(|(_, tier, _, _)| *tier != 0),
         "no Tier 0 event when branch has commits ahead, got: {:?}",
@@ -382,13 +401,19 @@ async fn tier_0_respects_one_hour_grace_window() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.iter().all(|(_, tier, _, _)| *tier != 0),
         "no Tier 0 event within grace, got: {:?}",
         cleaned
     );
-    assert!(worktree.exists(), "worktree must remain within grace window");
+    assert!(
+        worktree.exists(),
+        "worktree must remain within grace window"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -418,7 +443,10 @@ async fn tier_0_fires_within_grace_under_disk_pressure() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert_eq!(cleaned.len(), 1, "exactly one Tier 0 event under pressure");
     let (_, tier, _, _) = cleaned[0];
     assert_eq!(tier, 0);
@@ -469,13 +497,19 @@ async fn tier_0_skips_thread_with_pending_change() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.iter().all(|(_, tier, _, _)| *tier != 0),
         "Tier 0 must skip thread with pending change, got: {:?}",
         cleaned
     );
-    assert!(worktree.exists(), "worktree with pending change must remain");
+    assert!(
+        worktree.exists(),
+        "worktree with pending change must remain"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -519,7 +553,10 @@ async fn tier_0_skips_thread_with_live_agent_session() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "no cleanup events for a thread with a live agent session, got: {:?}",
@@ -537,4 +574,3 @@ async fn tier_0_skips_thread_with_live_agent_session() {
 // ---------------------------------------------------------------------------
 // `worktree_git_admin_missing` — stranded detection (pure, no DB).
 // ---------------------------------------------------------------------------
-

@@ -101,9 +101,7 @@ impl LucidosEngine {
                         engine.advance_apply_all_batch(change_id, Ok(())).await;
                     }
                     ApplyAllDriveMsg::Failed(change_id, error) => {
-                        engine
-                            .advance_apply_all_batch(change_id, Err(error))
-                            .await;
+                        engine.advance_apply_all_batch(change_id, Err(error)).await;
                     }
                 }
             }
@@ -409,7 +407,9 @@ impl LucidosEngine {
             let Some(batch_id) = reg.batch_for_change(change_id) else {
                 return;
             };
-            let batch = reg.get_mut(batch_id).expect("batch_for_change just found it");
+            let batch = reg
+                .get_mut(batch_id)
+                .expect("batch_for_change just found it");
             let state_changed = match result {
                 Ok(()) => batch.record_applied(change_id),
                 Err(error) => batch.record_failed(change_id, error),
@@ -428,9 +428,7 @@ impl LucidosEngine {
                 return;
             }
             if batch.is_complete() {
-                let final_state = reg
-                    .remove(batch_id)
-                    .expect("just confirmed via get_mut");
+                let final_state = reg.remove(batch_id).expect("just confirmed via get_mut");
                 NextStep::Complete {
                     batch_id,
                     applied: final_state.applied_ids(),
@@ -478,10 +476,7 @@ impl LucidosEngine {
                 self.persist_batch_removed(batch_id).await;
                 self.broadcast_changes_updated().await;
             }
-            NextStep::ApplyNext {
-                next_change,
-                actor,
-            } => {
+            NextStep::ApplyNext { next_change, actor } => {
                 log!(
                     "[ApplyAll] advancing batch to next change {} (after {})",
                     next_change,

@@ -87,10 +87,7 @@ impl LucidosEngine {
     /// on read — a resumed session must not carry a stale actor into its next
     /// turn. The `agent_sessions` analog of `take_cancel_actor` (the chat
     /// path's `ThreadHandle.cancel_actor` slot in `active_threads`).
-    pub(crate) async fn take_session_cancel_actor(
-        &self,
-        thread_id: Uuid,
-    ) -> Option<MessageOrigin> {
+    pub(crate) async fn take_session_cancel_actor(&self, thread_id: Uuid) -> Option<MessageOrigin> {
         self.agent_sessions
             .lock()
             .await

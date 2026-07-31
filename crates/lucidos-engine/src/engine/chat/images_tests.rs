@@ -47,8 +47,7 @@ fn no_images_returns_text_only() {
 fn current_image_only() {
     let tmp = tempfile::TempDir::new().unwrap();
     let imgs = vec![make_chat_img("AAAA", "image/jpeg")];
-    let result =
-        build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs));
+    let result = build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs));
     match result {
         MessageContent::Blocks(blocks) => {
             // Text with hint + 1 image = 2 blocks
@@ -70,12 +69,8 @@ fn history_images_labeled_as_earlier() {
     let tmp = tempfile::TempDir::new().unwrap();
     let hashes = write_blobs(tmp.path(), 1);
     let history = vec![hashes];
-    let result = build_user_content_with_images(
-        "what was in the image?".into(),
-        tmp.path(),
-        &history,
-        None,
-    );
+    let result =
+        build_user_content_with_images("what was in the image?".into(), tmp.path(), &history, None);
     match result {
         MessageContent::Blocks(blocks) => {
             assert_eq!(blocks.len(), 2);
@@ -94,7 +89,10 @@ fn history_images_labeled_as_earlier() {
 fn mixed_history_and_current_images_separated() {
     let tmp = tempfile::TempDir::new().unwrap();
     let hashes = write_blobs(tmp.path(), 3);
-    let history = vec![vec![hashes[0].clone()], vec![hashes[1].clone(), hashes[2].clone()]];
+    let history = vec![
+        vec![hashes[0].clone()],
+        vec![hashes[1].clone(), hashes[2].clone()],
+    ];
     let current = vec![make_chat_img("IMG4", "image/png")];
     let result = build_user_content_with_images(
         "summarize all".into(),
@@ -201,9 +199,7 @@ fn oversized_noisy_png_chat_image() -> crate::api::ChatImage {
             image::Rgba([b[0], b[1], b[2], 255])
         });
     let mut png = std::io::Cursor::new(Vec::new());
-    img_buf
-        .write_to(&mut png, image::ImageFormat::Png)
-        .unwrap();
+    img_buf.write_to(&mut png, image::ImageFormat::Png).unwrap();
     crate::api::ChatImage {
         base64: base64::engine::general_purpose::STANDARD.encode(png.into_inner()),
         mime_type: "image/png".to_string(),
@@ -319,8 +315,7 @@ fn history_images_include_staleness_warning() {
     let tmp = tempfile::TempDir::new().unwrap();
     let hashes = write_blobs(tmp.path(), 1);
     let history = vec![hashes];
-    let result =
-        build_user_content_with_images("what changed?".into(), tmp.path(), &history, None);
+    let result = build_user_content_with_images("what changed?".into(), tmp.path(), &history, None);
     match result {
         MessageContent::Blocks(blocks) => {
             let text = match &blocks[0] {
@@ -341,8 +336,7 @@ fn history_images_include_staleness_warning() {
 fn current_images_no_staleness_warning() {
     let tmp = tempfile::TempDir::new().unwrap();
     let imgs = vec![make_chat_img("NEW", "image/jpeg")];
-    let result =
-        build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs));
+    let result = build_user_content_with_images("check this".into(), tmp.path(), &[], Some(&imgs));
     match result {
         MessageContent::Blocks(blocks) => {
             let text = match &blocks[0] {
@@ -365,12 +359,8 @@ fn mixed_images_include_staleness_warning() {
     let hashes = write_blobs(tmp.path(), 1);
     let history = vec![hashes];
     let current = vec![make_chat_img("NEW", "image/png")];
-    let result = build_user_content_with_images(
-        "compare".into(),
-        tmp.path(),
-        &history,
-        Some(&current),
-    );
+    let result =
+        build_user_content_with_images("compare".into(), tmp.path(), &history, Some(&current));
     match result {
         MessageContent::Blocks(blocks) => {
             let text = match &blocks[0] {

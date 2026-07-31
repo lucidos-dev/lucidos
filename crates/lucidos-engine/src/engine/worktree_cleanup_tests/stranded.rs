@@ -1,7 +1,7 @@
 use super::common::*;
-use crate::test_support::{setup_test_db, teardown_test_db};
 use crate::engine::event_bus::EventBus;
 use crate::engine::git_ops::{git_cmd, worktrees_dir};
+use crate::test_support::{setup_test_db, teardown_test_db};
 use std::sync::Arc;
 use std::time::Duration;
 use uuid::Uuid;
@@ -92,7 +92,10 @@ async fn stranded_thread_worktree_removed_after_grace() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert_eq!(cleaned.len(), 1, "exactly one stranded-removal event");
     let (_, tier, _, branch_deleted) = cleaned[0];
     assert_eq!(tier, 2, "stranded removal reports full-removal tier 2");
@@ -121,13 +124,19 @@ async fn stranded_worktree_survives_within_grace() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "no stranded removal within grace, got: {:?}",
         cleaned
     );
-    assert!(worktree.exists(), "stranded worktree must remain within grace");
+    assert!(
+        worktree.exists(),
+        "stranded worktree must remain within grace"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -156,7 +165,10 @@ async fn stranded_removal_does_not_accelerate_under_disk_pressure() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "stranded grace must not drop under pressure, got: {:?}",
@@ -194,7 +206,10 @@ async fn stranded_worktree_skipped_when_session_active() {
     worker.run_once().await;
 
     let events = drain_cleaned_events(rx, Duration::from_millis(200)).await;
-    let cleaned: Vec<_> = events.into_iter().filter(|(t, ..)| *t == thread_id).collect();
+    let cleaned: Vec<_> = events
+        .into_iter()
+        .filter(|(t, ..)| *t == thread_id)
+        .collect();
     assert!(
         cleaned.is_empty(),
         "active session must be skipped even when stranded, got: {:?}",
@@ -231,7 +246,10 @@ async fn stranded_orphan_worktree_removed_without_event() {
         "orphan stranded removal emits no WorktreeCleaned, got: {:?}",
         events
     );
-    assert!(!worktree.exists(), "stranded orphan worktree must be removed");
+    assert!(
+        !worktree.exists(),
+        "stranded orphan worktree must be removed"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -407,4 +425,3 @@ async fn cc_worktree_not_treated_as_temp() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
-

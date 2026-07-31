@@ -11,6 +11,7 @@ use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::api::AppState;
+use crate::core::events::HasEventPayload;
 use crate::core::ThreadEventRow;
 
 #[derive(Deserialize)]
@@ -60,7 +61,7 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     })?;
 
     for row in &mut events {
-        strip_image_content_in_tool_result(row);
+        strip_inline_image_payloads(row);
         if !query.include_context {
             strip_context_capture_sections(row);
             strip_tool_result_content(row);
@@ -84,19 +85,44 @@ pub(in crate::api) async fn get_thread_events_snapshot(
     }))
 }
 
-/// Replace `[IMAGE_CONTENT:...]\n<base64>` payloads in `ToolResult.result` with a small stub.
-/// Rescues legacy threads (pre-write-time-strip) where `read_file` of an image inlined the
-/// full base64 into the event payload — those threads are otherwise unloadable on mobile.
-pub(super) fn strip_image_content_in_tool_result(row: &mut ThreadEventRow) {
-    if row.event_type != "ToolResult" {
+/// Rewrite `ToolResult.result` in place when `strip` recognises its sentinel.
+/// A no-op for any other event type, a missing `result`, or unrecognised text.
+///
+/// Generic over `HasEventPayload` because the two read paths hold different row
+/// types: the snapshot serves `ThreadEventRow`, the lazy fetch serves `EventRow`.
+fn rewrite_tool_result<E: HasEventPayload>(row: &mut E, strip: impl Fn(&str) -> Option<String>) {
+    if row.event_type() != "ToolResult" {
         return;
     }
-    let Some(result_str) = row.payload.get("result").and_then(|v| v.as_str()) else {
+    let Some(result_str) = row.payload().get("result").and_then(|v| v.as_str()) else {
         return;
     };
-    if let Some(stub) = crate::engine::tools::files::strip_image_content_marker(result_str) {
-        row.payload["result"] = serde_json::Value::String(stub);
+    if let Some(stub) = strip(result_str) {
+        row.payload_mut()["result"] = serde_json::Value::String(stub);
     }
+}
+
+/// Replace `[IMAGE_CONTENT:...]\n<base64>` payloads in `ToolResult.result` with a small stub.
+/// Rescues legacy threads (pre-write-time-strip) where `read_file` of an image inlined the
+/// full base64 into the event payload. Those threads are otherwise unloadable on mobile.
+pub(super) fn strip_image_content_in_tool_result<E: HasEventPayload>(row: &mut E) {
+    rewrite_tool_result(row, crate::engine::tools::files::strip_image_content_marker);
+}
+
+/// The same rescue for `[APP_CAPTURE:<base64>]\n<dom>` payloads, which the write
+/// path only started stubbing on 2026-07-30. Every capture taken before that is
+/// still sitting in the events table at full size (1.53 MB rows measured), and
+/// no migration rewrites them, so this is what keeps them off the wire.
+pub(super) fn strip_app_capture_in_tool_result<E: HasEventPayload>(row: &mut E) {
+    rewrite_tool_result(row, crate::engine::strip_app_capture_marker);
+}
+
+/// Both inline-image rescues in one call. Read paths should use this rather
+/// than picking a stripper: the app-capture half was missed for months
+/// precisely because it was a separate decision at each call site.
+pub(super) fn strip_inline_image_payloads<E: HasEventPayload>(row: &mut E) {
+    strip_image_content_in_tool_result(row);
+    strip_app_capture_in_tool_result(row);
 }
 
 /// Lazy-fetch payload returned by `GET /events/:event_id/context` — the
@@ -146,10 +172,12 @@ pub(in crate::api) async fn get_context_capture(
     // `mergeContextCaptureSections` treats both arrays as authoritative, so
     // serving an empty 200 for a corrupted row would silently mask the
     // failure. Demand at least one of the two keys be present.
-    let payload_obj = row
-        .payload
-        .as_object()
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Payload not an object".to_string()))?;
+    let payload_obj = row.payload.as_object().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Payload not an object".to_string(),
+        )
+    })?;
     if !payload_obj.contains_key("sections") && !payload_obj.contains_key("tools") {
         return Err((
             StatusCode::NOT_FOUND,
@@ -188,7 +216,10 @@ pub(super) fn strip_context_capture_sections(row: &mut ThreadEventRow) {
     };
     obj.remove("sections");
     obj.remove("tools");
-    obj.insert("sections_stripped".to_string(), serde_json::Value::Bool(true));
+    obj.insert(
+        "sections_stripped".to_string(),
+        serde_json::Value::Bool(true),
+    );
 }
 
 /// Drop `result` from `ToolResult` payloads on the snapshot path and stamp a
@@ -235,7 +266,7 @@ pub(in crate::api) async fn get_tool_result(
     let event_uuid = Uuid::parse_str(&event_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid event_id: {}", e)))?;
 
-    let row = state
+    let mut row = state
         .event_store
         .get_event_by_id(event_uuid)
         .await
@@ -252,10 +283,18 @@ pub(in crate::api) async fn get_tool_result(
         ));
     }
 
-    let payload_obj = row
-        .payload
-        .as_object()
-        .ok_or_else(|| (StatusCode::INTERNAL_SERVER_ERROR, "Payload not an object".to_string()))?;
+    // The modal renders this in a `<pre>`, so an inlined image is unreadable
+    // noise at best. Legacy rows predate the write-time stubs and can be
+    // multi-megabyte; this endpoint applied no stripping at all until now, so
+    // it was the one read path still shipping them in full.
+    strip_inline_image_payloads(&mut row);
+
+    let payload_obj = row.payload.as_object().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Payload not an object".to_string(),
+        )
+    })?;
 
     // `result` may legitimately be absent (image-only tool results); return
     // null so the modal can render its image-only state without 404-ing.

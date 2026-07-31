@@ -10,9 +10,7 @@
 use super::*;
 
 use crate::engine::event_bus::{BusEvent, SystemEvent};
-use crate::engine::trigger_group_writes::{
-    CreateTriggerGroupError, RenameTriggerGroupError,
-};
+use crate::engine::trigger_group_writes::{CreateTriggerGroupError, RenameTriggerGroupError};
 use crate::triggers::TriggerGroup;
 
 #[derive(Serialize)]
@@ -155,7 +153,10 @@ pub(super) async fn create_trigger_group(
             })),
         ),
         Err(CreateTriggerGroupError::EmitFailed(msg)) => {
-            log!("[TriggerGroups] Failed to emit TriggerGroupCreated: {}", msg);
+            log!(
+                "[TriggerGroups] Failed to emit TriggerGroupCreated: {}",
+                msg
+            );
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("Failed to emit event: {}", msg) })),
@@ -206,7 +207,10 @@ pub(super) async fn update_trigger_group(
                 );
             }
             Err(RenameTriggerGroupError::EmitFailed(msg)) => {
-                log!("[TriggerGroups] Failed to emit TriggerGroupRenamed: {}", msg);
+                log!(
+                    "[TriggerGroups] Failed to emit TriggerGroupRenamed: {}",
+                    msg
+                );
                 return (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     Json(serde_json::json!({ "error": format!("Failed to emit rename: {}", msg) })),
@@ -241,7 +245,10 @@ pub(super) async fn update_trigger_group(
             }))
             .await
         {
-            log!("[TriggerGroups] Failed to emit TriggerGroupReordered: {}", e);
+            log!(
+                "[TriggerGroups] Failed to emit TriggerGroupReordered: {}",
+                e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("Failed to emit reorder: {}", e) })),
@@ -294,7 +301,11 @@ pub(super) async fn delete_trigger_group(
             member_count: members.len(),
             member_trigger_ids: members,
         };
-        return (StatusCode::CONFLICT, Json(serde_json::to_value(body).unwrap())).into_response();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::to_value(body).unwrap()),
+        )
+            .into_response();
     }
 
     let payload = serde_json::json!({ "group_id": group_id });
@@ -367,7 +378,11 @@ pub(super) async fn reorder_trigger_groups(
             }))
             .await
         {
-            log!("[TriggerGroups] Failed to emit TriggerGroupReordered for {}: {}", group_id, e);
+            log!(
+                "[TriggerGroups] Failed to emit TriggerGroupReordered for {}: {}",
+                group_id,
+                e
+            );
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "error": format!("Failed to emit reorder: {}", e) })),
@@ -398,8 +413,5 @@ pub(super) fn router() -> Router<AppState> {
                 .put(update_trigger_group)
                 .delete(delete_trigger_group),
         )
-        .route(
-            "/trigger-groups/reorder",
-            post(reorder_trigger_groups),
-        )
+        .route("/trigger-groups/reorder", post(reorder_trigger_groups))
 }

@@ -48,7 +48,9 @@ async fn plan_marker_missing_when_no_db_row() {
         PlanMarkerState::Missing,
         "No DB row should report Missing"
     );
-    assert!(!plan_marker_state(&pool, &repo_path, "any-branch").await.satisfies_gate());
+    assert!(!plan_marker_state(&pool, &repo_path, "any-branch")
+        .await
+        .satisfies_gate());
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -60,7 +62,9 @@ async fn plan_marker_present_after_record_planned() {
     let (_tmp, repo_path) = make_test_repo().await;
 
     let _ = git_cmd(&["checkout", "-b", "feature"], &repo_path).await;
-    tokio::fs::write(repo_path.join("a.txt"), "a").await.unwrap();
+    tokio::fs::write(repo_path.join("a.txt"), "a")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo_path).await;
     let _ = git_cmd(&["commit", "-m", "feature work"], &repo_path).await;
     let head_sha = current_head_sha(&repo_path).await.unwrap();
@@ -81,7 +85,9 @@ async fn plan_marker_present_after_record_planned() {
         plan_marker_state(&pool, &repo_path, "feature").await,
         PlanMarkerState::Present(PlanMarkerKind::Planned),
     );
-    assert!(plan_marker_state(&pool, &repo_path, "feature").await.satisfies_gate());
+    assert!(plan_marker_state(&pool, &repo_path, "feature")
+        .await
+        .satisfies_gate());
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -123,7 +129,9 @@ async fn plan_marker_stays_present_after_new_commit() {
     let (_tmp, repo_path) = make_test_repo().await;
 
     let _ = git_cmd(&["checkout", "-b", "feature"], &repo_path).await;
-    tokio::fs::write(repo_path.join("a.txt"), "a").await.unwrap();
+    tokio::fs::write(repo_path.join("a.txt"), "a")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo_path).await;
     let _ = git_cmd(&["commit", "-m", "plan-time commit"], &repo_path).await;
     let head_sha = current_head_sha(&repo_path).await.unwrap();
@@ -139,12 +147,16 @@ async fn plan_marker_stays_present_after_new_commit() {
     .await
     .unwrap();
 
-    tokio::fs::write(repo_path.join("b.txt"), "b").await.unwrap();
+    tokio::fs::write(repo_path.join("b.txt"), "b")
+        .await
+        .unwrap();
     let _ = git_cmd(&["add", "."], &repo_path).await;
     let _ = git_cmd(&["commit", "-m", "later work"], &repo_path).await;
 
     assert!(
-        plan_marker_state(&pool, &repo_path, "feature").await.satisfies_gate(),
+        plan_marker_state(&pool, &repo_path, "feature")
+            .await
+            .satisfies_gate(),
         "a follow-up commit must not invalidate a settled plan decision",
     );
     pool.close().await;
@@ -169,7 +181,9 @@ async fn plan_marker_consumed_returns_to_missing() {
     )
     .await
     .unwrap();
-    assert!(plan_marker_state(&pool, &repo_path, "feature").await.satisfies_gate());
+    assert!(plan_marker_state(&pool, &repo_path, "feature")
+        .await
+        .satisfies_gate());
 
     consume_plan_marker(&pool, &repo_path, "feature").await;
     assert_eq!(
@@ -248,7 +262,9 @@ async fn proposed_plan_does_not_satisfy_gate_until_approved() {
         PlanMarkerState::Present(PlanMarkerKind::Proposed),
     );
     assert!(
-        !plan_marker_state(&pool, &repo_path, "feature").await.satisfies_gate(),
+        !plan_marker_state(&pool, &repo_path, "feature")
+            .await
+            .satisfies_gate(),
         "a proposed (unapproved) plan must NOT satisfy the gate",
     );
 
@@ -259,7 +275,9 @@ async fn proposed_plan_does_not_satisfy_gate_until_approved() {
         plan_marker_state(&pool, &repo_path, "feature").await,
         PlanMarkerState::Present(PlanMarkerKind::Planned),
     );
-    assert!(plan_marker_state(&pool, &repo_path, "feature").await.satisfies_gate());
+    assert!(plan_marker_state(&pool, &repo_path, "feature")
+        .await
+        .satisfies_gate());
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -316,13 +334,12 @@ async fn approve_plan_is_targeted_and_preserves_plan_path() {
     .await
     .unwrap();
     assert!(approve_plan(&pool, &repo_path, "feature").await.unwrap());
-    let stored_path: Option<String> = sqlx::query_scalar(
-        "SELECT plan_path FROM planned_branches WHERE branch_name = $1",
-    )
-    .bind("feature")
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let stored_path: Option<String> =
+        sqlx::query_scalar("SELECT plan_path FROM planned_branches WHERE branch_name = $1")
+            .bind("feature")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(
         stored_path.as_deref(),
         Some("docs/plans/keep-me.md"),

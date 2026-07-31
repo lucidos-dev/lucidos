@@ -108,7 +108,11 @@ mod channel_tests {
     /// This pins the two together instead.
     #[test]
     fn from_wire_matches_the_serde_representation_for_every_variant() {
-        let mut markers: Vec<u8> = ALL_CHANNELS.iter().copied().map(exhaustive_marker).collect();
+        let mut markers: Vec<u8> = ALL_CHANNELS
+            .iter()
+            .copied()
+            .map(exhaustive_marker)
+            .collect();
         markers.sort_unstable();
         markers.dedup();
         assert_eq!(

@@ -1,6 +1,4 @@
-use crate::support::{
-    base_url, db_url, http_client, poll_thread_summary_by_marker, unique_marker,
-};
+use crate::support::{base_url, db_url, http_client, poll_thread_summary_by_marker, unique_marker};
 use uuid::Uuid;
 
 #[tokio::test]
@@ -440,5 +438,87 @@ async fn chat_stream_accepts_large_image_payload() {
     assert_eq!(
         status, 200,
         "chat_stream must accept >2 MiB body (mobile screenshots). Got {status}: {text}",
+    );
+}
+
+/// A `200` from `POST /chat/stream` must mean the follow-up is ALREADY in the
+/// thread, with its sequence assigned, and two sends issued one after the other
+/// must land in that order.
+///
+/// This is the engine half of the fix for messages arriving reversed
+/// (`docs/plans/2026-07-30-serialize-chat-sends-per-thread.md`). The handler
+/// used to spawn the turn and ack immediately, with `MessageReceived` emitted
+/// inside the spawned task behind a Thread Queue slot wait, so a client that
+/// waited for the ack still had no ordering guarantee: the second request's
+/// task could take the lower sequence. `created` is stamped at emit time and
+/// the request carries no client-side ordering data, so such a reversal is
+/// unrecoverable after the fact.
+#[tokio::test]
+async fn follow_up_is_persisted_before_the_ack_and_keeps_send_order() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("Failed to connect to E2E workspace database");
+    let url = format!("{}/api/v1/chat/stream", base_url());
+    let marker = unique_marker("api-send-order");
+
+    // First message creates the thread. It is deliberately NOT pre-emitted (a
+    // brand-new thread has nothing to be out of order with), so resolve the
+    // thread the same way the other tests do.
+    let resp: serde_json::Value = client
+        .post(&url)
+        .json(&serde_json::json!({
+            "message": format!("Reply with one word. {marker}"),
+            "mode": "human",
+        }))
+        .send()
+        .await
+        .expect("First chat request failed")
+        .json()
+        .await
+        .expect("Invalid JSON");
+    assert!(resp["event_id"].is_string());
+    let thread_id = poll_thread_summary_by_marker(&pool, &marker, 15)
+        .await
+        .thread_id;
+
+    // Two follow-ups, issued strictly one after the other, exactly as the
+    // client's per-thread send chain does it.
+    let mut sequences = Vec::new();
+    for (nth, text) in ["first follow-up", "second follow-up"].iter().enumerate() {
+        let body = serde_json::json!({
+            "message": format!("{text} {marker}"),
+            "mode": "human",
+            "thread_id": thread_id.to_string(),
+        });
+        let status = client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .expect("Follow-up chat request failed")
+            .status();
+        assert_eq!(status, 200, "follow-up {nth} should be accepted");
+
+        // No polling: the ack is the claim under test, so read the event once,
+        // immediately. A miss here means the handler acked before persisting.
+        let seq: Option<i64> = sqlx::query_scalar(
+            "SELECT sequence FROM events \
+             WHERE thread_id = $1 AND event_type = 'MessageReceived' \
+             AND payload->>'text' = $2",
+        )
+        .bind(thread_id)
+        .bind(format!("{text} {marker}"))
+        .fetch_optional(&pool)
+        .await
+        .expect("events query failed");
+        sequences.push(seq.unwrap_or_else(|| {
+            panic!("follow-up {nth} ({text}) was not persisted by the time the POST returned 200")
+        }));
+    }
+
+    assert!(
+        sequences[0] < sequences[1],
+        "follow-ups must keep send order, got sequences {sequences:?}",
     );
 }

@@ -54,9 +54,8 @@ pub(crate) fn cmd_path(ws: &Workspace, relative: &str, mkdir: bool) -> Result<()
     let abs = resolve_data_path(ws, relative)?;
     if mkdir {
         if let Some(parent) = abs.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| {
-                format!("Failed to create parent dir {}: {}", parent.display(), e)
-            })?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create parent dir {}: {}", parent.display(), e))?;
         }
     }
     println!("{}", abs.display());
@@ -68,7 +67,11 @@ pub(crate) enum WriteSource {
     File(PathBuf),
 }
 
-pub(crate) fn cmd_write(ws: &Workspace, relative: &str, source: WriteSource) -> Result<(), BoxError> {
+pub(crate) fn cmd_write(
+    ws: &Workspace,
+    relative: &str,
+    source: WriteSource,
+) -> Result<(), BoxError> {
     let normalized = normalize_data_path(relative)?;
     let abs = ws.data_dir().join(&normalized);
     if let Some(parent) = abs.parent() {
@@ -110,7 +113,12 @@ mod tests {
     use tempfile::tempdir;
 
     fn ws_at(root: PathBuf) -> Workspace {
-        Workspace { root, api_port: 0, proto: "https".to_string(), api_base_override: None }
+        Workspace {
+            root,
+            api_port: 0,
+            proto: "https".to_string(),
+            api_base_override: None,
+        }
     }
 
     #[test]
@@ -168,7 +176,10 @@ mod tests {
 
     #[test]
     fn normalize_data_path_prepends_artifacts_when_missing_prefix() {
-        assert_eq!(normalize_data_path("report.html").unwrap(), "artifacts/report.html");
+        assert_eq!(
+            normalize_data_path("report.html").unwrap(),
+            "artifacts/report.html"
+        );
     }
 
     #[test]
@@ -188,7 +199,10 @@ mod tests {
 
     #[test]
     fn chat_link_handles_top_level_file() {
-        assert_eq!(chat_link("artifacts/report.html"), "[report.html](artifacts/report.html)");
+        assert_eq!(
+            chat_link("artifacts/report.html"),
+            "[report.html](artifacts/report.html)"
+        );
     }
 
     #[test]

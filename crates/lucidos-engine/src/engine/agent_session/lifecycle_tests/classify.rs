@@ -81,35 +81,34 @@ fn shutdown_wins_over_cc_error() {
     assert!(
         !emit_idle,
         "shutdown must skip CodingAgentIdled regardless of cc_error"
-        );
-    }
+    );
+}
 
-    /// user_hit_stop beats cc_error — this is the interrupt-cancel case. The
-    /// `Stop` button (Cancel = Esc) routes through CC's native interrupt, and an
-    /// interrupted turn comes back as a `Result` with `is_error: true` (CC
-    /// reports the aborted turn, e.g. `stop_reason=tool_use` / an
-    /// `[ede_diagnostic]` line). That error is *caused by* the user's cancel, so
-    /// it must classify as `Canceled`, not `Failed` — otherwise the user sees a
-    /// red "Failed" dot for a turn they deliberately stopped and the
-    /// branch-preservation gate (keyed on `Canceled`) never fires. A real
-    /// failure on a turn the user did NOT stop still classifies as `Failed`
-    /// (user_hit_stop is false there — see `cc_error_wins_over_empty_text`).
-    #[test]
-    fn user_hit_stop_wins_over_cc_error() {
-        use crate::engine::thread_events::CancelCause;
-        let err = "[ede_diagnostic] result_type=user stop_reason=tool_use".to_string();
-        let (terminal, emit_idle) =
-            classify_result(false, true, false, false, Some(err), false);
-        assert_eq!(
-            terminal,
-            Some(TerminalKind::Canceled(CancelCause::UserStop)),
-            "an interrupted turn (cc_error set by the cancel) must be Canceled, not Failed"
-        );
-        assert!(
-            emit_idle,
-            "cancel is a turn boundary — CodingAgentIdled must follow so the session stays resumable"
-        );
-    }
+/// user_hit_stop beats cc_error: this is the interrupt-cancel case. The
+/// `Stop` button (Cancel = Esc) routes through CC's native interrupt, and an
+/// interrupted turn comes back as a `Result` with `is_error: true` (CC
+/// reports the aborted turn, e.g. `stop_reason=tool_use` / an
+/// `[ede_diagnostic]` line). That error is *caused by* the user's cancel, so
+/// it must classify as `Canceled`, not `Failed`, otherwise the user sees a
+/// red "Failed" dot for a turn they deliberately stopped and the
+/// branch-preservation gate (keyed on `Canceled`) never fires. A real
+/// failure on a turn the user did NOT stop still classifies as `Failed`
+/// (user_hit_stop is false there, see `cc_error_wins_over_empty_text`).
+#[test]
+fn user_hit_stop_wins_over_cc_error() {
+    use crate::engine::thread_events::CancelCause;
+    let err = "[ede_diagnostic] result_type=user stop_reason=tool_use".to_string();
+    let (terminal, emit_idle) = classify_result(false, true, false, false, Some(err), false);
+    assert_eq!(
+        terminal,
+        Some(TerminalKind::Canceled(CancelCause::UserStop)),
+        "an interrupted turn (cc_error set by the cancel) must be Canceled, not Failed"
+    );
+    assert!(
+        emit_idle,
+        "cancel is a turn boundary: CodingAgentIdled must follow so the session stays resumable"
+    );
+}
 
 /// Empty assistant text on an otherwise-clean turn classifies as `Failed`,
 /// not `Generated`. Without this branch, a Claude Code subprocess that bailed after
@@ -121,8 +120,7 @@ fn shutdown_wins_over_cc_error() {
 /// worktree state for Apply.
 #[test]
 fn empty_text_classifies_as_failed_with_empty_response_error() {
-    let (terminal, emit_idle) =
-        classify_result(false, false, false, false, None, true);
+    let (terminal, emit_idle) = classify_result(false, false, false, false, None, true);
     assert_eq!(
         terminal,
         Some(TerminalKind::Failed {
@@ -144,87 +142,85 @@ fn empty_text_classifies_as_failed_with_empty_response_error() {
 #[test]
 fn cc_error_wins_over_empty_text() {
     let err = "rate_limit_error".to_string();
-        let (terminal, _) =
-            classify_result(false, false, false, false, Some(err.clone()), true);
-        assert_eq!(terminal, Some(TerminalKind::Failed { error: err }));
-    }
+    let (terminal, _) = classify_result(false, false, false, false, Some(err.clone()), true);
+    assert_eq!(terminal, Some(TerminalKind::Failed { error: err }));
+}
 
-    /// User-driven cancel that happens to land on an empty Result is still a
-    /// cancel — the user clicked Stop, the turn ended deliberately. Routing
-    /// to Failed here would mislabel a deliberate stop as an unexpected
-    /// failure and break the cancel UX.
-    #[test]
-    fn user_hit_stop_wins_over_empty_text() {
-        use crate::engine::thread_events::CancelCause;
-        let (terminal, _) = classify_result(false, true, false, false, None, true);
-        assert_eq!(
-            terminal,
-            Some(TerminalKind::Canceled(CancelCause::UserStop))
-        );
-    }
+/// User-driven cancel that happens to land on an empty Result is still a
+/// cancel: the user clicked Stop, the turn ended deliberately. Routing
+/// to Failed here would mislabel a deliberate stop as an unexpected
+/// failure and break the cancel UX.
+#[test]
+fn user_hit_stop_wins_over_empty_text() {
+    use crate::engine::thread_events::CancelCause;
+    let (terminal, _) = classify_result(false, true, false, false, None, true);
+    assert_eq!(
+        terminal,
+        Some(TerminalKind::Canceled(CancelCause::UserStop))
+    );
+}
 
-    /// A Codex mid-turn follow-up redirect (interrupt_is_redirect=true) classifies
-    /// the interrupted turn as `Canceled(SupersededByFollowup)` — NOT `UserStop` —
-    /// so the frontend renders it neutrally (like the chat/CC follow-up) instead of
-    /// "Canceled ✕". Still a cancel mechanically (no Generated, no proposal); only
-    /// the cause differs. The redirect flag is meaningful only when user_hit_stop
-    /// is set (an interrupt fired); it never overrides shutdown/error precedence.
-    #[test]
-    fn redirect_followup_classifies_as_superseded_by_followup() {
-        use crate::engine::thread_events::CancelCause;
-        let (terminal, emit_idle) = classify_result(false, true, true, false, None, false);
-        assert_eq!(
-            terminal,
-            Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)),
-            "a follow-up redirect interrupt must carry the SupersededByFollowup cause"
-        );
-        assert!(
-            emit_idle,
-            "redirect cancel is still a turn boundary — CodingAgentIdled must follow"
-        );
-        // Same inputs but with an interrupt-caused cc_error still classify as the
-        // redirect cancel (user_hit_stop ranks above cc_error).
-        let (with_err, _) = classify_result(
-            false,
-            true,
-            true,
-            false,
-            Some("[ede_diagnostic] result_type=user stop_reason=tool_use".to_string()),
-            true,
-        );
-        assert_eq!(
-            with_err,
-            Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)),
-        );
-        // redirect flag without user_hit_stop is inert — a clean Result is Generated.
-        let (clean, _) = classify_result(false, false, true, false, None, false);
-        assert_eq!(clean, Some(TerminalKind::Generated));
-        // Shutdown still wins over a redirect interrupt.
-        let (shutdown, _) = classify_result(false, true, true, true, None, false);
-        assert_eq!(
-            shutdown,
-            Some(TerminalKind::Aborted(
-                crate::engine::thread_events::AbortCause::EngineShutdown
-            )),
-        );
-    }
+/// A Codex mid-turn follow-up redirect (interrupt_is_redirect=true) classifies
+/// the interrupted turn as `Canceled(SupersededByFollowup)`, NOT `UserStop`,
+/// so the frontend renders it neutrally (like the chat/CC follow-up) instead of
+/// "Canceled ✕". Still a cancel mechanically (no Generated, no proposal); only
+/// the cause differs. The redirect flag is meaningful only when user_hit_stop
+/// is set (an interrupt fired); it never overrides shutdown/error precedence.
+#[test]
+fn redirect_followup_classifies_as_superseded_by_followup() {
+    use crate::engine::thread_events::CancelCause;
+    let (terminal, emit_idle) = classify_result(false, true, true, false, None, false);
+    assert_eq!(
+        terminal,
+        Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)),
+        "a follow-up redirect interrupt must carry the SupersededByFollowup cause"
+    );
+    assert!(
+        emit_idle,
+        "redirect cancel is still a turn boundary: CodingAgentIdled must follow"
+    );
+    // Same inputs but with an interrupt-caused cc_error still classify as the
+    // redirect cancel (user_hit_stop ranks above cc_error).
+    let (with_err, _) = classify_result(
+        false,
+        true,
+        true,
+        false,
+        Some("[ede_diagnostic] result_type=user stop_reason=tool_use".to_string()),
+        true,
+    );
+    assert_eq!(
+        with_err,
+        Some(TerminalKind::Canceled(CancelCause::SupersededByFollowup)),
+    );
+    // redirect flag without user_hit_stop is inert: a clean Result is Generated.
+    let (clean, _) = classify_result(false, false, true, false, None, false);
+    assert_eq!(clean, Some(TerminalKind::Generated));
+    // Shutdown still wins over a redirect interrupt.
+    let (shutdown, _) = classify_result(false, true, true, true, None, false);
+    assert_eq!(
+        shutdown,
+        Some(TerminalKind::Aborted(
+            crate::engine::thread_events::AbortCause::EngineShutdown
+        )),
+    );
+}
 
-    /// Shutdown wins over empty text — engine going down classifies as
-    /// `Aborted` (not `Failed`) regardless of what CC sent. Without this,
-    /// a shutdown that lands on an empty Result would emit ResponseFailed
-    /// and the recovery path would skip re-resuming the session.
-    #[test]
-    fn shutdown_wins_over_empty_text() {
-        use crate::engine::thread_events::AbortCause;
-        let (terminal, emit_idle) =
-            classify_result(false, false, false, true, None, true);
-        assert_eq!(
-            terminal,
-            Some(TerminalKind::Aborted(AbortCause::EngineShutdown))
-        );
-        assert!(
-            !emit_idle,
-            "shutdown must skip CodingAgentIdled even when text is empty"
+/// Shutdown wins over empty text: engine going down classifies as
+/// `Aborted` (not `Failed`) regardless of what CC sent. Without this,
+/// a shutdown that lands on an empty Result would emit ResponseFailed
+/// and the recovery path would skip re-resuming the session.
+#[test]
+fn shutdown_wins_over_empty_text() {
+    use crate::engine::thread_events::AbortCause;
+    let (terminal, emit_idle) = classify_result(false, false, false, true, None, true);
+    assert_eq!(
+        terminal,
+        Some(TerminalKind::Aborted(AbortCause::EngineShutdown))
+    );
+    assert!(
+        !emit_idle,
+        "shutdown must skip CodingAgentIdled even when text is empty"
     );
 }
 
@@ -234,8 +230,7 @@ fn cc_error_wins_over_empty_text() {
 /// "no visible response" failure on a thread the user never engaged.
 #[test]
 fn silent_resume_drops_empty_text_too() {
-    let (terminal, emit_idle) =
-        classify_result(true, false, false, false, None, true);
+    let (terminal, emit_idle) = classify_result(true, false, false, false, None, true);
     assert!(terminal.is_none());
     assert!(!emit_idle);
 }
@@ -366,7 +361,9 @@ fn explicit_no_conversation_found_is_definitive() {
 /// qualifies.
 #[test]
 fn generic_cc_error_is_not_session_not_found() {
-    assert!(!is_definitive_session_not_found(Some("API Error: 529 overloaded")));
+    assert!(!is_definitive_session_not_found(Some(
+        "API Error: 529 overloaded"
+    )));
     assert!(!is_definitive_session_not_found(Some("error_max_turns")));
     assert!(!is_definitive_session_not_found(Some("")));
 }
@@ -418,12 +415,18 @@ fn classify_result_table() {
         ),
         (
             (false, false, true),
-            (Some(TerminalKind::Aborted(AbortCause::EngineShutdown)), false),
+            (
+                Some(TerminalKind::Aborted(AbortCause::EngineShutdown)),
+                false,
+            ),
         ),
         // Shutdown overrides user_hit_stop — Aborted, idle skipped.
         (
             (false, true, true),
-            (Some(TerminalKind::Aborted(AbortCause::EngineShutdown)), false),
+            (
+                Some(TerminalKind::Aborted(AbortCause::EngineShutdown)),
+                false,
+            ),
         ),
         // Silent resume / warmup (no user content) emits nothing.
         ((true, false, false), (None, false)),
@@ -481,25 +484,25 @@ fn user_action_suppresses_terminal_regardless_of_idle() {
         None,
         "Apply/Discard/Archive on actively-working CC must NOT emit Canceled — \
          the lifecycle event is the terminator"
-        );
-        assert_eq!(
-            stop_terminal_kind(false, true, true),
-            None,
-            "Apply/Discard/Archive on idle CC must NOT emit Canceled either — \
+    );
+    assert_eq!(
+        stop_terminal_kind(false, true, true),
+        None,
+        "Apply/Discard/Archive on idle CC must NOT emit Canceled either, \
          nothing in flight to cancel and the lifecycle event is the terminator"
-        );
-    }
+    );
+}
 
-    /// Shutdown of an idle CC must emit nothing — the prior exchange already
-    /// completed cleanly via `CodingAgentIdled`, and emitting `Aborted` here
-    /// would relabel a finished exchange as crashed when the engine goes
-    /// down.
-    #[test]
-    fn shutdown_of_idle_session_emits_no_terminal_event() {
-        assert_eq!(
-            stop_terminal_kind(true, true, false),
-            None,
-            "shutdown when CC is already idle must NOT emit a terminal event"
+/// Shutdown of an idle CC must emit nothing: the prior exchange already
+/// completed cleanly via `CodingAgentIdled`, and emitting `Aborted` here
+/// would relabel a finished exchange as crashed when the engine goes
+/// down.
+#[test]
+fn shutdown_of_idle_session_emits_no_terminal_event() {
+    assert_eq!(
+        stop_terminal_kind(true, true, false),
+        None,
+        "shutdown when CC is already idle must NOT emit a terminal event"
     );
     assert_eq!(
         stop_terminal_kind(true, true, true),
@@ -537,14 +540,26 @@ fn should_auto_commit_on_cleanup_table() {
     use crate::engine::thread_events::{AbortCause, CancelCause};
     let cases: &[(bool, &Option<TerminalKind>, bool, &str)] = &[
         // Discard always wins — never commit, even on a clean Generated.
-        (true, &Some(TerminalKind::Generated), false, "discard wins over Generated"),
+        (
+            true,
+            &Some(TerminalKind::Generated),
+            false,
+            "discard wins over Generated",
+        ),
         (true, &None, false, "discard wins over safety-net abort"),
         // Generated + not discarded → the only commit path.
-        (false, &Some(TerminalKind::Generated), true, "clean Generated commits"),
+        (
+            false,
+            &Some(TerminalKind::Generated),
+            true,
+            "clean Generated commits",
+        ),
         // Every non-Generated terminal refuses, regardless of discard.
         (
             false,
-            &Some(TerminalKind::Failed { error: "stream interrupted".into() }),
+            &Some(TerminalKind::Failed {
+                error: "stream interrupted".into(),
+            }),
             false,
             "Failed must NOT auto-commit — half-assed work",
         ),
@@ -563,7 +578,12 @@ fn should_auto_commit_on_cleanup_table() {
         // Safety-net abort sets terminal to None inside cleanup. THIS is
         // the regression test for the original bug: cleanup auto-commit
         // on safety-net fired the per-commit hook → spurious ChangeProposed.
-        (false, &None, false, "safety-net abort (None terminal) must NOT auto-commit"),
+        (
+            false,
+            &None,
+            false,
+            "safety-net abort (None terminal) must NOT auto-commit",
+        ),
     ];
     for (should_discard, terminal, expected, label) in cases {
         assert_eq!(
@@ -776,7 +796,8 @@ fn classify_session_end_action_table() {
         ((true, false, true, false, true), KeepExternalBranch),
         ((true, false, false, true, true), CrashedKeepBranch), // defensive: can't really co-occur
     ];
-    for ((has_commits, files_empty, is_external, safety_net_fired, user_canceled), expected) in cases
+    for ((has_commits, files_empty, is_external, safety_net_fired, user_canceled), expected) in
+        cases
     {
         assert_eq!(
             classify_session_end_action(

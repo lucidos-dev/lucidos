@@ -9,6 +9,7 @@
       "Bash(./scripts/e2e-embedder.sh*)",
       "Bash(./scripts/e2e.sh*)",
       "Bash(./scripts/new-migration.sh*)",
+      "Bash(./scripts/check-em-dashes.sh*)",
       "Bash(cargo check*)",
       "Bash(cargo build*)",
       "Bash(cargo test*)",
@@ -33,6 +34,28 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/pre-kill.sh"
+          },
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/no-em-dashes.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/no-em-dashes.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/no-em-dashes.sh"
           }
         ]
       }

@@ -173,12 +173,8 @@ async fn migrate_legacy_event_images(
             break;
         }
         for (id, mut payload) in batch {
-            let migration = migrate_image_payload(
-                &mut payload,
-                workspace,
-                legacy_field,
-                "user_image_hashes",
-            )?;
+            let migration =
+                migrate_image_payload(&mut payload, workspace, legacy_field, "user_image_hashes")?;
             if let Some(m) = migration {
                 if m.failed_decode > 0 {
                     crate::log!(
@@ -255,13 +251,11 @@ async fn migrate_legacy_compose_images(
                     .get("compose_image_hashes")
                     .cloned()
                     .unwrap_or_else(|| json!([]));
-                sqlx::query(
-                    "UPDATE thread_summaries SET compose_images = $1 WHERE thread_id = $2",
-                )
-                .bind(&new_array)
-                .bind(thread_id)
-                .execute(pool)
-                .await?;
+                sqlx::query("UPDATE thread_summaries SET compose_images = $1 WHERE thread_id = $2")
+                    .bind(&new_array)
+                    .bind(thread_id)
+                    .execute(pool)
+                    .await?;
                 count += 1;
             }
         }
@@ -296,14 +290,10 @@ mod tests {
             "text": "hi",
             "user_images": [{ "base64": b64(&png_bytes()), "mime_type": "image/png" }]
         });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "user_images",
-            "user_image_hashes",
-        )
-        .unwrap()
-        .expect("migration must report Some when legacy field present");
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "user_images", "user_image_hashes")
+                .unwrap()
+                .expect("migration must report Some when legacy field present");
         assert_eq!(result.hashes.len(), 1);
         assert_eq!(result.failed_decode, 0);
         assert!(payload.get("user_images").is_none(), "legacy field removed");
@@ -323,13 +313,9 @@ mod tests {
     fn migrate_image_payload_returns_none_when_legacy_field_absent() {
         let dir = tempfile::tempdir().unwrap();
         let mut payload = json!({ "text": "no images here" });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "user_images",
-            "user_image_hashes",
-        )
-        .unwrap();
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "user_images", "user_image_hashes")
+                .unwrap();
         assert_eq!(result, None);
         assert_eq!(payload, json!({ "text": "no images here" }));
     }
@@ -340,15 +326,10 @@ mod tests {
     #[test]
     fn migrate_image_payload_idempotent_on_already_migrated() {
         let dir = tempfile::tempdir().unwrap();
-        let mut payload =
-            json!({ "text": "hi", "user_image_hashes": ["abc123"] });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "user_images",
-            "user_image_hashes",
-        )
-        .unwrap();
+        let mut payload = json!({ "text": "hi", "user_image_hashes": ["abc123"] });
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "user_images", "user_image_hashes")
+                .unwrap();
         assert_eq!(result, None);
         assert_eq!(payload["user_image_hashes"], json!(["abc123"]));
     }
@@ -365,14 +346,13 @@ mod tests {
         let mut payload = json!({
             "compose_images": ["abcd1234", "ef567890"]
         });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "compose_images",
-            "compose_images",
-        )
-        .unwrap();
-        assert_eq!(result, None, "must report None, not a destructive migration");
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "compose_images", "compose_images")
+                .unwrap();
+        assert_eq!(
+            result, None,
+            "must report None, not a destructive migration"
+        );
         assert_eq!(
             payload["compose_images"],
             json!(["abcd1234", "ef567890"]),
@@ -394,14 +374,10 @@ mod tests {
                 { "base64": "not!valid!base64", "mime_type": "image/png" }
             ]
         });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "user_images",
-            "user_image_hashes",
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "user_images", "user_image_hashes")
+                .unwrap()
+                .unwrap();
         assert_eq!(result.hashes.len(), 1);
         assert_eq!(result.failed_decode, 1);
         assert_eq!(payload["user_image_hashes"].as_array().unwrap().len(), 1);
@@ -418,14 +394,10 @@ mod tests {
                 { "base64": b64(b"not an image"), "mime_type": "image/png" }
             ]
         });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "user_images",
-            "user_image_hashes",
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "user_images", "user_image_hashes")
+                .unwrap()
+                .unwrap();
         assert_eq!(result.hashes.len(), 0);
         assert_eq!(result.failed_decode, 1);
         // Field shape still flipped so the migration gate stops matching.
@@ -439,14 +411,10 @@ mod tests {
     fn migrate_image_payload_handles_empty_array() {
         let dir = tempfile::tempdir().unwrap();
         let mut payload = json!({ "text": "empty", "user_images": [] });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "user_images",
-            "user_image_hashes",
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "user_images", "user_image_hashes")
+                .unwrap()
+                .unwrap();
         assert_eq!(result.hashes.len(), 0);
         assert_eq!(result.failed_decode, 0);
         assert!(payload.get("user_images").is_none());
@@ -465,14 +433,10 @@ mod tests {
                 { "base64": b64(&png_bytes()), "mime_type": "image/png" }
             ]
         });
-        let result = migrate_image_payload(
-            &mut payload,
-            dir.path(),
-            "user_images",
-            "user_image_hashes",
-        )
-        .unwrap()
-        .unwrap();
+        let result =
+            migrate_image_payload(&mut payload, dir.path(), "user_images", "user_image_hashes")
+                .unwrap()
+                .unwrap();
         assert_eq!(result.hashes.len(), 2);
         assert_eq!(result.hashes[0], result.hashes[1], "same bytes = same hash");
     }

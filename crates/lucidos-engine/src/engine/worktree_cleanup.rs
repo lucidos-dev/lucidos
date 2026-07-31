@@ -319,11 +319,15 @@ impl WorktreeCleanup {
             }
         };
 
-        let free_bytes = available_disk_bytes(&dir)
-            .or_else(|| available_disk_bytes(&self.workspace_root));
+        let free_bytes =
+            available_disk_bytes(&dir).or_else(|| available_disk_bytes(&self.workspace_root));
         let under_hard = free_bytes.is_some_and(|b| b < self.free_hard_bytes);
         let under_soft = free_bytes.is_some_and(|b| b < self.free_soft_bytes);
-        let tier1_idle = if under_hard { self.force_tier1_idle } else { TIER_1_IDLE };
+        let tier1_idle = if under_hard {
+            self.force_tier1_idle
+        } else {
+            TIER_1_IDLE
+        };
 
         let mut total_freed_under_hard: u64 = 0;
         // Sum of every recognised worktree's on-disk size — the "Lucidos
@@ -335,7 +339,11 @@ impl WorktreeCleanup {
         // Tier 0 / orphan-path grace: 1h normally, 0 under disk pressure.
         // Same threshold for both since the safety story is identical
         // (provably zero information on disk).
-        let zero_info_grace = if under_hard { Duration::ZERO } else { TIER_0_GRACE };
+        let zero_info_grace = if under_hard {
+            Duration::ZERO
+        } else {
+            TIER_0_GRACE
+        };
 
         for entry in entries.flatten() {
             let path = entry.path();
@@ -375,8 +383,7 @@ impl WorktreeCleanup {
                     // skip below — `inventory_worktrees` counts active worktrees
                     // too, and the disk-low alert's "Lucidos uses X GB" framing
                     // breaks if a live session's bytes silently disappear.
-                    lucidos_footprint_bytes =
-                        lucidos_footprint_bytes.saturating_add(pre_size);
+                    lucidos_footprint_bytes = lucidos_footprint_bytes.saturating_add(pre_size);
 
                     // A live Claude Code subprocess parked on `AskUserQuestion` emits
                     // no events while the user thinks, so `last_activity_age`
@@ -432,10 +439,7 @@ impl WorktreeCleanup {
                                 }
                             }
                             if age >= TIER_2_IDLE
-                                && self
-                                    .try_tier_2(thread_id, &path, pre_size)
-                                    .await
-                                    .is_some()
+                                && self.try_tier_2(thread_id, &path, pre_size).await.is_some()
                             {
                                 continue;
                             }
@@ -453,12 +457,12 @@ impl WorktreeCleanup {
                 None => {
                     // Orphan worktrees are excluded from the footprint to
                     // match `inventory_worktrees` (Settings → Disk Usage).
-                    if let Some(freed) =
-                        self.try_orphan_path(&dir, &path, pre_size, zero_info_grace).await
+                    if let Some(freed) = self
+                        .try_orphan_path(&dir, &path, pre_size, zero_info_grace)
+                        .await
                     {
                         if under_hard {
-                            total_freed_under_hard =
-                                total_freed_under_hard.saturating_add(freed);
+                            total_freed_under_hard = total_freed_under_hard.saturating_add(freed);
                         }
                     }
                 }
@@ -479,13 +483,15 @@ impl WorktreeCleanup {
                 crossed
             };
             if just_crossed_soft {
-                self.emit_disk_low_alert(free, lucidos_footprint_bytes).await;
+                self.emit_disk_low_alert(free, lucidos_footprint_bytes)
+                    .await;
             }
             // Action notification: only when forced cleanup actually ran AND
             // reclaimed something. Routine 24h Tier 1 / 30d Tier 2 sweeps stay
             // silent.
             if under_hard && total_freed_under_hard > 0 {
-                self.emit_auto_cleanup_alert(free, total_freed_under_hard).await;
+                self.emit_auto_cleanup_alert(free, total_freed_under_hard)
+                    .await;
             }
         }
     }
@@ -494,12 +500,7 @@ impl WorktreeCleanup {
     /// main HEAD + no pending change), typically after Apply merged the work.
     /// No saved-thread exemption: events stay in Postgres regardless, and the
     /// worktree itself carries nothing not in main.
-    async fn try_tier_0(
-        &self,
-        thread_id: Uuid,
-        worktree: &Path,
-        pre_size: u64,
-    ) -> Option<u64> {
+    async fn try_tier_0(&self, thread_id: Uuid, worktree: &Path, pre_size: u64) -> Option<u64> {
         // Don't reclaim a parent that still owes a child fan-in resume — it would
         // have nothing to resume into (ADR 0011, B2).
         if self.has_pending_fan_in(thread_id).await {
@@ -779,12 +780,11 @@ impl WorktreeCleanup {
     }
 
     async fn is_saved(&self, thread_id: Uuid) -> Result<bool, sqlx::Error> {
-        let row: Option<(bool,)> = sqlx::query_as(
-            "SELECT is_saved FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await?;
+        let row: Option<(bool,)> =
+            sqlx::query_as("SELECT is_saved FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.map(|(p,)| p).unwrap_or(false))
     }
 
@@ -794,12 +794,11 @@ impl WorktreeCleanup {
     /// On a DB error (or unknown thread) returns `false` — keep the worktree, as
     /// reclaiming on uncertain state is the unsafe direction.
     async fn is_archived(&self, thread_id: Uuid) -> bool {
-        let row: Result<Option<(String,)>, sqlx::Error> = sqlx::query_as(
-            "SELECT archive_state FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(thread_id)
-        .fetch_optional(&self.pool)
-        .await;
+        let row: Result<Option<(String,)>, sqlx::Error> =
+            sqlx::query_as("SELECT archive_state FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_optional(&self.pool)
+                .await;
         match row {
             Ok(Some((state,))) => state == "archived",
             Ok(None) => false,

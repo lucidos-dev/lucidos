@@ -1,9 +1,7 @@
-use super::*;
 use super::aq_test_helpers::*;
+use super::*;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
-
-
 
 #[test]
 fn validate_answer_accepts_selected_and_freetext_and_canceled() {
@@ -117,10 +115,6 @@ fn validate_answer_rejects_multi_selected_for_single_select_question() {
         "error must explain mismatch; got {err:?}"
     );
 }
-
-
-
-
 
 /// No `agent_sessions` entry means `notify()` cannot reach a hook; the
 /// answer would silently strand without a `ContinuationRequested`.
@@ -259,7 +253,12 @@ async fn arm_question_resume_sets_flag_on_live_session() {
     .await;
     assert!(armed, "must report a live subprocess was armed");
     assert!(
-        sessions.lock().await.get(&thread_id).unwrap().question_resume_pending,
+        sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .unwrap()
+            .question_resume_pending,
         "live session must have question_resume_pending set so the run loop self-heals"
     );
 }
@@ -282,7 +281,12 @@ async fn arm_question_resume_skips_exited_session() {
     .await;
     assert!(!armed, "an exited subprocess must not be armed");
     assert!(
-        !sessions.lock().await.get(&thread_id).unwrap().question_resume_pending,
+        !sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .unwrap()
+            .question_resume_pending,
         "exited session must leave question_resume_pending false"
     );
 }
@@ -315,11 +319,15 @@ async fn arm_question_resume_skips_canceled_even_when_live() {
     let armed = arm_question_resume_if_live(&sessions, thread_id, &AnswerKind::Canceled).await;
     assert!(!armed, "Canceled must never arm a resume");
     assert!(
-        !sessions.lock().await.get(&thread_id).unwrap().question_resume_pending,
+        !sessions
+            .lock()
+            .await
+            .get(&thread_id)
+            .unwrap()
+            .question_resume_pending,
         "Canceled must leave question_resume_pending false even on a live session"
     );
 }
-
 
 /// Cancel-stamp path (HTTP `claude_code_stop`, `archive_thread`) always
 /// follows the Canceled answer with `stop_agent`, so the marker would
@@ -336,15 +344,14 @@ async fn emit_resume_marker_skips_emit_for_canceled_answer() {
     let thread_id = Uuid::new_v4();
     seed_cc_thread(&bus, thread_id).await;
 
-    let emitted =
-        emit_resume_marker_for_cc_answer(
-            &bus,
-            thread_id,
-            &AnswerKind::Canceled,
-            None,
-            crate::runtime::CodingAgent::ClaudeCode,
-        )
-        .await;
+    let emitted = emit_resume_marker_for_cc_answer(
+        &bus,
+        thread_id,
+        &AnswerKind::Canceled,
+        None,
+        crate::runtime::CodingAgent::ClaudeCode,
+    )
+    .await;
     assert!(
         !emitted,
         "Canceled answer must not emit a resume marker — no CC turn follows"
@@ -409,7 +416,6 @@ async fn emit_resume_marker_emits_for_free_text_answer() {
     teardown_test_db(&db_name).await;
 }
 
-
 /// Baseline: an unanswered question with nothing after it is returned by
 /// both lookup variants — the turn is still in flight.
 #[tokio::test]
@@ -439,7 +445,6 @@ async fn both_lookups_return_question_when_unanswered_and_no_terminator() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
-
 
 /// The chat-side `ask_user_question` tool emits `UserQuestionAsked` with
 /// `meta.channel = Chat`. `answer_pending_question` must be able to read
@@ -614,8 +619,6 @@ async fn response_aborted_orphans_only_active_lookup() {
     )
     .await;
 }
-
-
 
 #[test]
 fn selected_answer_resolves_to_label() {

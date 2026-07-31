@@ -78,8 +78,7 @@ async fn engine_restart_continue_cycle_leaves_parent_blocking_count_at_zero() {
         bus.emit(BusEvent::Thread {
             thread_id: child_id,
             event: ThreadEvent::ContinuationRequested {
-                reason: crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON
-                    .to_string(),
+                reason: crate::engine::agent_recovery::USER_CLICKED_CONTINUE_REASON.to_string(),
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -334,14 +333,13 @@ async fn subscriber_observes_event_with_committed_projection() {
     // connection via the pool. If the broadcast had fired pre-commit, the
     // subscriber could observe the event before any other connection saw the
     // row — this query would return None and fail the test.
-    let committed_first_message: Option<String> = sqlx::query_scalar(
-        "SELECT first_message FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_optional(&pool)
-    .await
-    .unwrap()
-    .flatten();
+    let committed_first_message: Option<String> =
+        sqlx::query_scalar("SELECT first_message FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_optional(&pool)
+            .await
+            .unwrap()
+            .flatten();
 
     assert_eq!(
         committed_first_message.as_deref(),

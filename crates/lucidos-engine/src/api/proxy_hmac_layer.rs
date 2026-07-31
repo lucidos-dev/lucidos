@@ -69,19 +69,12 @@ impl AuthLayer for HmacSignedLayer {
         &self.namespace
     }
 
-    async fn apply(
-        &self,
-        input: &LayerInput<'_>,
-    ) -> Result<AuthMutation, (StatusCode, String)> {
+    async fn apply(&self, input: &LayerInput<'_>) -> Result<AuthMutation, (StatusCode, String)> {
         let key = lookup_credential_value(&self.pool, &self.key_credential).await?;
         let secret = lookup_credential_value(&self.pool, &self.secret_credential).await?;
 
         // Existing query string from the request URL (without the leading `?`).
-        let existing_query = input
-            .url
-            .split_once('?')
-            .map(|(_, q)| q)
-            .unwrap_or("");
+        let existing_query = input.url.split_once('?').map(|(_, q)| q).unwrap_or("");
         let now_ms = u64::try_from(chrono::Utc::now().timestamp_millis()).unwrap_or(0);
         let (ts_opt, sig) = self.sign_with(existing_query, secret.as_bytes(), now_ms);
 
@@ -131,7 +124,8 @@ mod tests {
             lazy_pool(),
         );
         let secret = b"my-test-secret";
-        let (ts, sig) = layer.sign_with("symbol=BTCUSDT&recvWindow=5000", secret, 1_700_000_000_000);
+        let (ts, sig) =
+            layer.sign_with("symbol=BTCUSDT&recvWindow=5000", secret, 1_700_000_000_000);
         assert_eq!(ts, Some(1_700_000_000_000));
         // The signed payload includes the timestamp.
         let expected = compute_hmac_hex(

@@ -22,8 +22,8 @@
  *     `handleNavigationRequest`. Same router, different entry point.
  *
  * What's NOT covered here:
- *   - Drawer click on mobile — the hamburger button only renders on the
- *     mobile *content* header (MobileAppHeader.tsx:167), so the regression
+ *   - Drawer click on mobile. The hamburger button only renders on the
+ *     mobile *content* header (MobileAppHeader.tsx:168), so the regression
  *     scenarios the unit tests pin (`item === prev`, `mobileView !== 'thread'`)
  *     aren't reachable from the drawer on mobile. They ARE pinned in
  *     menu.test.ts via the `setActiveMenu (pure plumbing)` describe.

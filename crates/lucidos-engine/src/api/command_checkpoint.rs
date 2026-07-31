@@ -40,8 +40,5 @@ pub(super) async fn undo_command_checkpoint(
 /// Route for the command-checkpoint undo (ADR 0002, Phase 4) — restore the
 /// workspace from a ReversibleDanger snapshot.
 pub(super) fn router() -> Router<AppState> {
-    Router::new().route(
-        "/command-checkpoint/undo",
-        post(undo_command_checkpoint),
-    )
+    Router::new().route("/command-checkpoint/undo", post(undo_command_checkpoint))
 }

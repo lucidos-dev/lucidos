@@ -55,7 +55,10 @@ async fn teardown_skips_abort_for_question_parked_thread() {
     )
     .await;
 
-    assert!(!emitted, "question-parked thread must be preserved, not aborted");
+    assert!(
+        !emitted,
+        "question-parked thread must be preserved, not aborted"
+    );
     assert_eq!(
         count_response_aborted(&pool, thread_id).await,
         0,
@@ -135,7 +138,10 @@ async fn teardown_skips_abort_for_question_parked_chat_thread() {
     )
     .await;
 
-    assert!(!emitted, "question-parked chat thread must be preserved, not aborted");
+    assert!(
+        !emitted,
+        "question-parked chat thread must be preserved, not aborted"
+    );
     assert_eq!(
         count_response_aborted(&pool, thread_id).await,
         0,
@@ -168,7 +174,10 @@ async fn teardown_emits_device_abort_for_working_thread() {
     )
     .await;
 
-    assert!(emitted, "a working (non-parked) thread gets the boundary abort");
+    assert!(
+        emitted,
+        "a working (non-parked) thread gets the boundary abort"
+    );
     assert_eq!(count_response_aborted(&pool, thread_id).await, 1);
     assert!(
         switch_was_user_initiated(&pool, thread_id).await,

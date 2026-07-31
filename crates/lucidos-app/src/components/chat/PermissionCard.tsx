@@ -80,10 +80,14 @@ const CC_PROTECTED_PATH_MARKERS: readonly string[] = ['.claude/', '.git/'];
  *  ("Always allow") and Narrow ("Always allow Bash(rm:*)") in that case —
  *  those buttons would persist patterns CC ignores for the same path.
  *  Session ("Allow for this thread") still works because the engine
- *  intercepts before CC's gate. Restricted to Bash because that's the only
- *  tool we've empirically observed surfacing the card on these paths under
- *  the user's bare-allowlist setup (Read / Edit / cat all auto-approved
- *  silently). Mirror of `input_touches_protected_path` in `claude_code.rs`. */
+ *  intercepts before CC's gate — and it now survives an engine restart, since
+ *  the engine rehydrates the grant from the persisted resolution events.
+ *  Restricted to Bash because that's the only tool we've empirically observed
+ *  surfacing the card on these paths under the user's bare-allowlist setup
+ *  (Read / Edit / cat all auto-approved silently), and because a command is
+ *  deliberately excluded from the engine's in-worktree write fast path: it can
+ *  do anything, so a `Bash` touching `.claude/` still asks even in-worktree.
+ *  Mirror of `input_touches_protected_path` in `claude_code.rs`. */
 export function inputTouchesProtectedPath(
   toolName: string,
   input: Record<string, unknown>,
@@ -146,7 +150,11 @@ const SESSION_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set(['file_change']);
  *    - Edit/Write/NotebookEdit: `--permission-mode acceptEdits` routes them
  *      through `--permission-prompt-tool` for CC's protected paths (`.claude/`,
  *      `.git/`) and auto-approves them everywhere else, so a bare `Edit` line
- *      in `cc-allowed-tools` never helps.
+ *      in `cc-allowed-tools` never helps. (The engine now answers the
+ *      in-worktree half of that itself — `cc_permission::worktree_write_auto_allowed`
+ *      resolves an in-worktree file write with no card at all — so these tools
+ *      reach a card only for a target OUTSIDE the worktree, or under its
+ *      `.git/`. The allowlist entry is still ineffective for those.)
  *    - ExitPlanMode: CC always routes plan-mode exit through the permission
  *      prompt regardless of `--allowedTools`, because the plan must be
  *      reviewed by the user before the assistant continues.

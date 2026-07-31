@@ -58,16 +58,30 @@ async fn get_recent_messages_selects_most_recent_threads_not_uuid_order() {
     let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     // Recency ascending: oldest < middle < newest.
     insert_message_at(&pool, oldest, base, "oldest thread").await;
-    insert_message_at(&pool, middle, base + chrono::Duration::hours(1), "middle thread").await;
-    insert_message_at(&pool, newest, base + chrono::Duration::hours(2), "newest thread").await;
+    insert_message_at(
+        &pool,
+        middle,
+        base + chrono::Duration::hours(1),
+        "middle thread",
+    )
+    .await;
+    insert_message_at(
+        &pool,
+        newest,
+        base + chrono::Duration::hours(2),
+        "newest thread",
+    )
+    .await;
 
     let messages = store
         .get_recent_messages(2, None)
         .await
         .expect("get_recent_messages");
 
-    let returned: std::collections::HashSet<String> =
-        messages.iter().filter_map(|m| m.thread_id.clone()).collect();
+    let returned: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|m| m.thread_id.clone())
+        .collect();
 
     assert!(
         returned.contains(&newest.to_string()),
@@ -104,8 +118,20 @@ async fn get_recent_messages_before_cursor_orders_by_recency() {
 
     let base = Utc.timestamp_opt(1_700_000_000, 0).unwrap();
     insert_message_at(&pool, oldest, base, "oldest thread").await;
-    insert_message_at(&pool, middle, base + chrono::Duration::hours(1), "middle thread").await;
-    insert_message_at(&pool, newest, base + chrono::Duration::hours(2), "newest thread").await;
+    insert_message_at(
+        &pool,
+        middle,
+        base + chrono::Duration::hours(1),
+        "middle thread",
+    )
+    .await;
+    insert_message_at(
+        &pool,
+        newest,
+        base + chrono::Duration::hours(2),
+        "newest thread",
+    )
+    .await;
 
     let cutoff = base + chrono::Duration::hours(3);
     let messages = store
@@ -113,8 +139,10 @@ async fn get_recent_messages_before_cursor_orders_by_recency() {
         .await
         .expect("get_recent_messages before cutoff");
 
-    let returned: std::collections::HashSet<String> =
-        messages.iter().filter_map(|m| m.thread_id.clone()).collect();
+    let returned: std::collections::HashSet<String> = messages
+        .iter()
+        .filter_map(|m| m.thread_id.clone())
+        .collect();
 
     assert_eq!(
         returned,

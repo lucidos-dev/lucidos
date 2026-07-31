@@ -83,9 +83,7 @@ pub(super) struct ExternalWatchdogInput {
 /// `Resume`, `FirePastCeiling` → `ResumeIfRunning`, everything else → `Skip`.
 /// Sharing the gate with the in-loop guarantees the two watchdogs agree on what
 /// "stuck" means; only the timeout differs.
-pub(super) fn external_watchdog_decision(
-    input: ExternalWatchdogInput,
-) -> ExternalWatchdogDecision {
+pub(super) fn external_watchdog_decision(input: ExternalWatchdogInput) -> ExternalWatchdogDecision {
     if input.loop_ended {
         let stale = input.last_event_at_ms > 0
             && input.now_ms.saturating_sub(input.last_event_at_ms) > input.limit_ms;
@@ -142,9 +140,8 @@ impl ExternalWatchdog {
 
     pub(crate) fn spawn(self) -> tokio::task::JoinHandle<()> {
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(
-                EXTERNAL_WATCHDOG_TICK_SECS,
-            ));
+            let mut interval =
+                tokio::time::interval(Duration::from_secs(EXTERNAL_WATCHDOG_TICK_SECS));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             // `interval` always fires at t=0; discard so the first tick
             // lands at `EXTERNAL_WATCHDOG_TICK_SECS` instead of racing
@@ -176,12 +173,8 @@ impl ExternalWatchdog {
             sessions
                 .iter()
                 .filter_map(|(tid, s)| {
-                    let last_ms = s
-                        .last_event_at
-                        .load(std::sync::atomic::Ordering::Relaxed);
-                    let tif = s
-                        .tools_in_flight
-                        .load(std::sync::atomic::Ordering::Relaxed);
+                    let last_ms = s.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
+                    let tif = s.tools_in_flight.load(std::sync::atomic::Ordering::Relaxed);
                     let decision = external_watchdog_decision(ExternalWatchdogInput {
                         is_waiting: s.is_waiting,
                         last_event_at_ms: last_ms,
@@ -274,9 +267,7 @@ impl ExternalWatchdog {
                 // means a fresh event arrived, i.e. the session recovered on its
                 // own (un-wedged, or the slow `.await` returned). Never
                 // cancel/kill a live, progressing session — skip it.
-                let current_last_ms = c
-                    .last_event_at
-                    .load(std::sync::atomic::Ordering::Relaxed);
+                let current_last_ms = c.last_event_at.load(std::sync::atomic::Ordering::Relaxed);
                 if current_last_ms > c.snapshot_last_ms {
                     log!(
                         "[ExternalWatchdog] thread={} produced a fresh event since the snapshot (recovered) — leaving it alone",

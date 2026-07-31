@@ -172,7 +172,13 @@ async fn note_self_clears_on_next_plain_turn() {
 
     emit_message_received(&bus, thread_id, "turn 1").await;
     emit_idled(&bus, thread_id).await;
-    emit_change_applied(&bus, thread_id, vec!["feat: landed work"], Some("aaaaaaaa11")).await;
+    emit_change_applied(
+        &bus,
+        thread_id,
+        vec!["feat: landed work"],
+        Some("aaaaaaaa11"),
+    )
+    .await;
 
     // Turn 2: the apply is newer than turn 1's boundary → note fires.
     let turn2 = emit_message_received(&bus, thread_id, "turn 2").await;
@@ -210,7 +216,13 @@ async fn trailing_idle_after_apply_still_produces_note() {
 
     emit_message_received(&bus, thread_id, "do the thing").await;
     emit_idled(&bus, thread_id).await;
-    emit_change_applied(&bus, thread_id, vec!["feat: landed work"], Some("bbbbbbbb22")).await;
+    emit_change_applied(
+        &bus,
+        thread_id,
+        vec!["feat: landed work"],
+        Some("bbbbbbbb22"),
+    )
+    .await;
     // Tier-1 live-apply emits a trailing idle AFTER ChangeApplied. Keying off
     // the last idle would make the note miss the apply — keying off the turn
     // boundary does not.
@@ -279,9 +291,15 @@ async fn multiple_applies_listed_oldest_first_and_capped() {
         .await
         .unwrap();
     // 60 commits, MAX_LINES = 50 → 10 truncated.
-    assert!(note.contains("and 10 more"), "expected truncation note: {note}");
+    assert!(
+        note.contains("and 10 more"),
+        "expected truncation note: {note}"
+    );
     assert!(note.contains("commit 0"), "first commit present: {note}");
-    assert!(!note.contains("commit 59"), "tail commit must be truncated: {note}");
+    assert!(
+        !note.contains("commit 59"),
+        "tail commit must be truncated: {note}"
+    );
 
     pool.close().await;
     crate::test_support::teardown_test_db(&db_name).await;

@@ -1,5 +1,6 @@
 use super::events_snapshot::{
-    strip_context_capture_sections, strip_image_content_in_tool_result, strip_tool_result_content,
+    strip_app_capture_in_tool_result, strip_context_capture_sections,
+    strip_image_content_in_tool_result, strip_inline_image_payloads, strip_tool_result_content,
 };
 use super::search::{combined_score, dampen_text_score, TEXT_MATCH_DAMPEN_THRESHOLD};
 use crate::core::ThreadEventRow;
@@ -65,6 +66,86 @@ fn read_time_strip_handles_missing_result_field() {
     let before = row.payload.clone();
     strip_image_content_in_tool_result(&mut row);
     assert_eq!(row.payload, before, "missing result field is a no-op");
+}
+
+/// The app-capture half of the same rescue. The write path only started
+/// stubbing these on 2026-07-30, so every capture taken before that is still in
+/// the events table at full size (1.53 MB rows measured) and no migration
+/// rewrites them.
+#[test]
+fn read_time_strip_replaces_app_capture_in_tool_result() {
+    let huge_b64 = "A".repeat(2 * 1024 * 1024);
+    let mut row = row(
+        "ToolResult",
+        json!({
+            "name": "capture_app",
+            "result": format!("[APP_CAPTURE:{}]\nDOM snapshot:\n<html>hi</html>", huge_b64),
+            "images": [],
+        }),
+    );
+    assert!(row.payload["result"].as_str().unwrap().len() > 1_000_000);
+
+    strip_app_capture_in_tool_result(&mut row);
+
+    let stripped = row.payload["result"].as_str().unwrap();
+    assert!(stripped.len() < 200, "stripped to {} bytes", stripped.len());
+    assert!(
+        stripped.contains("<html>hi</html>"),
+        "the DOM is the part worth keeping, got: {}",
+        stripped
+    );
+    assert!(!stripped.contains(&huge_b64));
+}
+
+#[test]
+fn read_time_app_capture_strip_leaves_other_results_alone() {
+    let mut row = row(
+        "ToolResult",
+        json!({ "name": "list_files", "result": "file1.txt", "images": [] }),
+    );
+    strip_app_capture_in_tool_result(&mut row);
+    assert_eq!(row.payload["result"], "file1.txt");
+}
+
+/// Read paths call the combined entry point so neither sentinel can be missed
+/// at a new call site, which is exactly how the app-capture half went
+/// unstripped on every read path for months.
+#[test]
+fn combined_strip_covers_both_sentinels() {
+    let b64 = "A".repeat(2000);
+
+    let mut image_row = row(
+        "ToolResult",
+        json!({ "name": "read_file", "result": format!("[IMAGE_CONTENT:image/png]\n{}", b64) }),
+    );
+    strip_inline_image_payloads(&mut image_row);
+    assert!(!image_row.payload["result"].as_str().unwrap().contains(&b64));
+
+    let mut capture_row = row(
+        "ToolResult",
+        json!({ "name": "capture_app", "result": format!("[APP_CAPTURE:{}]\nDOM", b64) }),
+    );
+    strip_inline_image_payloads(&mut capture_row);
+    assert!(!capture_row.payload["result"]
+        .as_str()
+        .unwrap()
+        .contains(&b64));
+}
+
+/// The lazy-fetch endpoint holds an `EventRow`, not a `ThreadEventRow`. Both
+/// implement `HasEventPayload`, and the strippers are generic over it so the
+/// two read paths cannot drift apart.
+#[test]
+fn combined_strip_works_on_the_lazy_fetch_row_type() {
+    let b64 = "A".repeat(2000);
+    let mut event_row = crate::core::events::EventRow::new(
+        "ToolResult",
+        json!({ "name": "capture_app", "result": format!("[APP_CAPTURE:{}]\nDOM", b64) }),
+    );
+
+    strip_inline_image_payloads(&mut event_row);
+
+    assert!(!event_row.payload["result"].as_str().unwrap().contains(&b64));
 }
 
 #[test]

@@ -128,6 +128,35 @@ describe('getContentTitle — email confirm', () => {
   });
 });
 
+describe('getContentTitle — file preview', () => {
+  beforeEach(() => {
+    panelOverlay.value = null;
+    activeMenuItem.value = 'files';
+  });
+
+  it('shows the base name of a data-tree path', () => {
+    panelOverlay.value = { type: 'file-preview', path: 'artifacts/research/notes.md' };
+    expect(getContentTitle()).toBe('notes.md');
+  });
+
+  it('unwraps a repo-encoded path so the repo id never leaks into the title', () => {
+    panelOverlay.value = { type: 'file-preview', path: 'repo:repo-1:file:src/transforms/x.jslt' };
+    expect(getContentTitle()).toBe('x.jslt');
+  });
+
+  it('unwraps a repo file at the clone root (no slash to split on)', () => {
+    const overlay = { type: 'file-preview' as const, path: 'repo:repo-1:file:pom.xml' };
+    panelOverlay.value = overlay;
+    expect(getContentTitle()).toBe('pom.xml');
+    expect(navEntryTitle({
+      menuItem: 'files',
+      settingsSubview: 'main',
+      overlay,
+      wipPreviewThreadId: null,
+    })).toBe('pom.xml');
+  });
+});
+
 describe('getContentTitle — menu labels', () => {
   beforeEach(() => {
     panelOverlay.value = null;

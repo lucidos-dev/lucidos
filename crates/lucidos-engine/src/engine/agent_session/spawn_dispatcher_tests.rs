@@ -12,9 +12,7 @@ use crate::engine::thread_events::{
 };
 use crate::test_support::{setup_test_db, start_cc_session, teardown_test_db};
 
-use super::{
-    thread_has_unactuated_continuation, SpawnDispatcher, SpawnRequest, SpawnTrigger,
-};
+use super::{thread_has_unactuated_continuation, SpawnDispatcher, SpawnRequest, SpawnTrigger};
 
 fn cc_meta() -> EventMeta {
     EventMeta {
@@ -305,8 +303,12 @@ async fn continuation_requested_produces_spawn_request() {
     // chat thread).
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, "claude-code/cont", None).await;
-    let event_id =
-        emit_cc_thread(&bus, thread_id, continuation(ENGINE_RESTART_INTERRUPT_REASON)).await;
+    let event_id = emit_cc_thread(
+        &bus,
+        thread_id,
+        continuation(ENGINE_RESTART_INTERRUPT_REASON),
+    )
+    .await;
 
     let received = tokio::time::timeout(Duration::from_secs(2), spawn_rx.recv())
         .await
@@ -428,8 +430,7 @@ async fn dispatcher_dispatches_pending_triggers_on_startup() {
     emit_cc_thread(&bus, handled_thread, agent_idled("handled-sid", None)).await;
 
     let pending_thread = Uuid::new_v4();
-    let pending_msg_id =
-        emit_cc_thread(&bus, pending_thread, user_message("pending msg")).await;
+    let pending_msg_id = emit_cc_thread(&bus, pending_thread, user_message("pending msg")).await;
 
     let (dispatcher, _spawn_rx) = make_dispatcher(pool.clone());
     dispatcher
@@ -569,12 +570,18 @@ async fn continuation_emitted_immediately_after_spawn_is_not_lost() {
     // spawn() returns, whatever the backfill is still doing.
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, "claude-code/race", None).await;
-    let event_id =
-        emit_cc_thread(&bus, thread_id, continuation(AUTO_RESUME_AFTER_SWITCH_REASON)).await;
+    let event_id = emit_cc_thread(
+        &bus,
+        thread_id,
+        continuation(AUTO_RESUME_AFTER_SWITCH_REASON),
+    )
+    .await;
 
     let received = tokio::time::timeout(Duration::from_secs(2), spawn_rx.recv())
         .await
-        .expect("SpawnRequest must arrive — a timeout means the subscribe-after-backfill race is back")
+        .expect(
+            "SpawnRequest must arrive: a timeout means the subscribe-after-backfill race is back",
+        )
         .expect("channel must yield a SpawnRequest");
     assert_eq!(
         received,
@@ -612,8 +619,12 @@ async fn orphaned_continuation_is_redispatched_exactly_once_on_startup() {
     // was lost, so no lifecycle event ever followed.
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, "claude-code/orphan", None).await;
-    let orphan_id =
-        emit_cc_thread(&bus, thread_id, continuation(AUTO_RESUME_AFTER_SWITCH_REASON)).await;
+    let orphan_id = emit_cc_thread(
+        &bus,
+        thread_id,
+        continuation(AUTO_RESUME_AFTER_SWITCH_REASON),
+    )
+    .await;
 
     let (handle, mut spawn_rx) = SpawnDispatcher::spawn(pool.clone(), bus.clone());
 
@@ -651,10 +662,18 @@ async fn only_newest_unactuated_continuation_is_redispatched() {
 
     let thread_id = Uuid::new_v4();
     start_cc_session(&bus, thread_id, "claude-code/sup", None).await;
-    let _older =
-        emit_cc_thread(&bus, thread_id, continuation(AUTO_RESUME_AFTER_SWITCH_REASON)).await;
-    let newest =
-        emit_cc_thread(&bus, thread_id, continuation(AUTO_RESUME_AFTER_SWITCH_REASON)).await;
+    let _older = emit_cc_thread(
+        &bus,
+        thread_id,
+        continuation(AUTO_RESUME_AFTER_SWITCH_REASON),
+    )
+    .await;
+    let newest = emit_cc_thread(
+        &bus,
+        thread_id,
+        continuation(AUTO_RESUME_AFTER_SWITCH_REASON),
+    )
+    .await;
 
     let (handle, mut spawn_rx) = SpawnDispatcher::spawn(pool.clone(), bus.clone());
 
@@ -695,7 +714,12 @@ async fn actuated_and_settled_continuations_are_not_redispatched() {
     // Actuated: the request was followed by an idle — the resume ran.
     let actuated = Uuid::new_v4();
     start_cc_session(&bus, actuated, "claude-code/act", None).await;
-    emit_cc_thread(&bus, actuated, continuation(AUTO_RESUME_AFTER_SWITCH_REASON)).await;
+    emit_cc_thread(
+        &bus,
+        actuated,
+        continuation(AUTO_RESUME_AFTER_SWITCH_REASON),
+    )
+    .await;
     emit_cc_thread(&bus, actuated, agent_idled("sid-act", None)).await;
 
     // Actuation marker only: the spawn consumer emits ContinuationStarted
@@ -787,7 +811,12 @@ async fn thread_has_unactuated_continuation_tracks_request_lifecycle() {
         "no request at all → false"
     );
 
-    emit_cc_thread(&bus, thread_id, continuation(AUTO_RESUME_AFTER_SWITCH_REASON)).await;
+    emit_cc_thread(
+        &bus,
+        thread_id,
+        continuation(AUTO_RESUME_AFTER_SWITCH_REASON),
+    )
+    .await;
     assert!(
         thread_has_unactuated_continuation(&pool, thread_id).await,
         "an emitted-but-unactuated request → true"

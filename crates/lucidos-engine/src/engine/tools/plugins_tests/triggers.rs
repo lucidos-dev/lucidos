@@ -21,7 +21,10 @@ fn plugin_trigger_slug_matches_only_trigger_toml() {
         Some("daily-reflect")
     );
     // Not a trigger.toml / wrong depth / other content dirs → None.
-    assert_eq!(plugin_trigger_slug("triggers/daily-reflect/knowhow/a.md"), None);
+    assert_eq!(
+        plugin_trigger_slug("triggers/daily-reflect/knowhow/a.md"),
+        None
+    );
     assert_eq!(plugin_trigger_slug("triggers/trigger.toml"), None);
     assert_eq!(plugin_trigger_slug("apps/foo/trigger.toml"), None);
     assert_eq!(plugin_trigger_slug("knowhow/x.md"), None);

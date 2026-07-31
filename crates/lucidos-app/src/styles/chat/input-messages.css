@@ -834,9 +834,15 @@
     font-weight: bold;
 }
 
+/* The ↳ glyph's ink sits high in its em box — the elbow rides near cap height
+   while the label's lowercase text centers around the x-height — so centering
+   the two line boxes leaves the arrow visibly floating above "Done". Nudge it
+   down so the ink, not the box, lines up. */
 .exchange-status-continued {
     color: var(--text-secondary);
     font-size: var(--font-size-md);
+    position: relative;
+    top: 0.125rem;
 }
 
 
