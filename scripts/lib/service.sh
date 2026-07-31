@@ -37,8 +37,11 @@
 #     candidates, uninstall paths) — no side effects, unit-tested offline by
 #     scripts/lib/service_test.sh.
 #   • EFFECTFUL wrappers (the actual launchctl/systemctl/curl/kill/pg_ctl calls,
-#     port probing, instance listing) — thin, clearly sectioned, NEVER executed by
-#     the tests.
+#     port probing, instance listing): thin, clearly sectioned, and never run
+#     against a real service manager by the tests. The launchd pair is the one
+#     exception the tests DO drive, through a stateful fake launchctl on PATH,
+#     because its contract is a TIMING one that no pure helper can express (see
+#     the async-bootout rule further down).
 #
 # Pure shell. No dependence on the caller's `set -e`; helpers return explicit
 # status. Sourced by install.sh + uninstall.sh (locally from a checkout, else
@@ -288,6 +291,16 @@ service_launchd_domain() { printf 'gui/%s' "$1"; }
 # service_launchd_target <uid> <label> — gui/<uid>/<label> (the job target).
 service_launchd_target() { printf 'gui/%s/%s' "$1" "$2"; }
 
+# service_launchd_timeout: seconds to wait for a booted-out job to actually leave
+# the domain (see service_launchd_wait_gone). LUCIDOS_LAUNCHD_TIMEOUT overrides it.
+#
+# 30s is headroom, not the expected wait. launchd escalates SIGTERM to SIGKILL
+# only after the job's ExitTimeOut, whose documented default is 20s, and the
+# gateway always takes that path because it ignores SIGTERM. Measured teardown on
+# macOS 26 is ~5s, so the normal case returns long before this; the ceiling is
+# sized so a slow or loaded machine cannot be misreported as a stuck job.
+service_launchd_timeout() { printf '%s' "${LUCIDOS_LAUNCHD_TIMEOUT:-30}"; }
+
 # ── plist / unit templating (pure) ───────────────────────────────────────────
 
 # service_xml_escape <string> — minimal XML escaping for plist values.
@@ -481,31 +494,89 @@ service_launchd_is_loaded() {
     launchctl print "$(service_launchd_target "$1" "$2")" >/dev/null 2>&1
 }
 
+# ── the async-bootout rule, which the two wrappers below both depend on ──────
+#
+# `launchctl bootout` IS ASYNCHRONOUS, AND ITS EXIT CODE IS NOT AN ANSWER. It
+# returns 0 the moment launchd ACCEPTS the request, not when the job is gone.
+# launchd then SIGTERMs the job and, because the gateway deliberately IGNORES
+# SIGTERM (it stops on SIGUSR1: crates/lucidos-gateway/src/server.rs
+# install_shutdown, and the KillSignal note in this file's header), has to wait
+# out ExitTimeOut and SIGKILL it. For that entire window `launchctl print
+# gui/<uid>/<label>` keeps succeeding. Measured on macOS 26: bootout returns 0
+# and the job stays visible for ~5s.
+#
+# So NEITHER wrapper may act on launchctl's exit code. Both decide by OBSERVING
+# the domain, via service_launchd_wait_gone. Do not "simplify" that away: each
+# call site had a real, shipped bug caused by trusting the exit code, described
+# where it happened.
+#
+# The `launchctl load` family is a second trap in the same area: it prints
+# "Load failed: 5: Input/output error" and exits 0, so its status is no evidence
+# either. Only the observed state is.
+#
+# All of this is Darwin-only by construction (nothing else has launchctl), which
+# is why the fractional `sleep` below is safe. systemd needs no equivalent:
+# `systemctl --user disable --now` blocks until the unit has actually stopped.
+
+# service_launchd_wait_gone <uid> <label> [timeout-secs]: block until the job has
+# genuinely left the domain. 0 = gone, non-zero = still there at the deadline.
+service_launchd_wait_gone() {
+    local uid="$1" label="$2" timeout="${3:-$(service_launchd_timeout)}" deadline
+    deadline=$(( $(date +%s) + timeout ))
+    while service_launchd_is_loaded "$uid" "$label"; do
+        [ "$(date +%s)" -ge "$deadline" ] && return 1
+        sleep 0.2
+    done
+    return 0
+}
+
 # service_launchd_load <uid> <plist> <label> — (re)load + (re)start the agent,
-# idempotently: bootout an existing job first so a rewritten plist takes effect,
-# then bootstrap (legacy `load -w` fallback) and kickstart. Returns non-zero only
-# if the job is still not loaded afterwards.
+# idempotently: fully unload an existing job first so a rewritten plist takes
+# effect, then bootstrap (legacy `load -w` fallback) and kickstart. Returns
+# non-zero if the job is not loaded afterwards, or if an old job would not go.
+#
+# The unload has to COMPLETE before the bootstrap. Bootstrapping into a domain
+# that still holds the dying job is refused with "Bootstrap failed: 5: Input/
+# output error"; `load -w` then also fails while exiting 0, `kickstart` returns
+# 37, and is_loaded still sees the OLD job. This function therefore used to
+# report success on a re-run over a running instance and, seconds later, leave no
+# job in the domain at all: an upgrade or a --port change silently unregistered
+# the service until the next login. Reproduced deterministically on macOS 26.
 service_launchd_load() {
     local uid="$1" plist="$2" label="$3" domain target
     domain="$(service_launchd_domain "$uid")"
     target="$(service_launchd_target "$uid" "$label")"
-    if service_launchd_is_loaded "$uid" "$label"; then
-        launchctl bootout "$target" >/dev/null 2>&1 || true
-    fi
+    service_launchd_unload "$uid" "$label" || return 1
     launchctl bootstrap "$domain" "$plist" >/dev/null 2>&1 \
         || launchctl load -w "$plist" >/dev/null 2>&1 || true
     launchctl kickstart -k "$target" >/dev/null 2>&1 || true
     service_launchd_is_loaded "$uid" "$label"
 }
 
-# service_launchd_unload <uid> <label> — bootout the agent (legacy `remove`
-# fallback). A not-loaded job is success.
+# service_launchd_unload <uid> <label> [timeout-secs]: bootout the agent (legacy
+# `remove` fallback) and WAIT until it has actually left the domain. A not-loaded
+# job is success. Returns non-zero, with a diagnosis in SERVICE_LAUNCHD_ERR, if
+# the job is STILL bootstrapped at the deadline.
+#
+# Returning 0 straight after the bootout is what made `uninstall.sh` report
+# "Stopped launchd agent" over a job that was still loaded, which install-smoke's
+# front-door rung 7 catches. It also hid the case that actually hurts: when a
+# bootout is REFUSED, the agent carries KeepAlive, so the user who just
+# uninstalled keeps a gateway respawning until they log out. Both readings looked
+# identical from the exit code; only the wait can tell them apart.
 service_launchd_unload() {
-    local uid="$1" label="$2"
+    local uid="$1" label="$2" timeout="${3:-$(service_launchd_timeout)}" target out=""
+    target="$(service_launchd_target "$uid" "$label")"
+    SERVICE_LAUNCHD_ERR=""
     service_launchd_is_loaded "$uid" "$label" || return 0
-    launchctl bootout "$(service_launchd_target "$uid" "$label")" >/dev/null 2>&1 \
-        || launchctl remove "$label" >/dev/null 2>&1 || return 1
-    return 0
+    # Keep launchctl's stderr. It is the only thing that distinguishes "refused"
+    # from "accepted but slow", and discarding it is what made this invisible.
+    out="$(launchctl bootout "$target" 2>&1)" \
+        || out="$out${out:+; }launchctl remove: $(launchctl remove "$label" 2>&1)"
+    service_launchd_wait_gone "$uid" "$label" "$timeout" && return 0
+    # shellcheck disable=SC2034 # out-param: read by uninstall.sh remove_instance + install.sh register_launchd
+    SERVICE_LAUNCHD_ERR="still bootstrapped at $target after ${timeout}s${out:+ (launchctl said: $out)}"
+    return 1
 }
 
 # service_systemd_is_active <unit> — true if the unit is running.

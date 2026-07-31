@@ -64,6 +64,13 @@ fi
 #   CHANGELOG.md / docs/plans / docs/adr — historical records; they SHOULD name
 #     the version they describe, and rewriting history is the actual bug.
 #   *.lock, package-lock.json, node_modules — dependency versions, not ours.
+#   .github/dependabot.yml: same class, it exists to reason about THIRD-PARTY
+#     versions (the glib/gtk/tao/tauri resolution chain), so every literal in it
+#     is someone else's. Collisions with our own version are inevitable and
+#     recurring rather than a one-off: that file already names 0.18.2, 0.18.5,
+#     0.20.0, 0.35.3 and 2.11.4, and it blocked the 0.18.2 release when the
+#     release number happened to equal the resolved gtk version in a comment.
+#     Rewording the comment would only defer the same false positive to 0.20.0.
 #   RELEASE, install.sh — the source and its sanctioned, machine-written copy.
 # 0.0.0 and 0.1.0 are excluded: they're the unpublished crate/package version
 # and build.rs's fallback, neither of which tracks the release.
@@ -98,6 +105,7 @@ if git grep -nIwE '[0-9]+\.[0-9]+\.[0-9]+' -- \
     ':(exclude)docs/adr' \
     ':(exclude)*.lock' \
     ':(exclude)*package-lock.json' \
+    ':(exclude).github/dependabot.yml' \
     ':(exclude)**/node_modules/**' \
     ':(exclude)scripts/lib/version_sources_test.sh' \
     > "$HITS_FILE".all 2>/dev/null; then

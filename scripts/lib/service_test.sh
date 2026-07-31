@@ -12,6 +12,10 @@
 #     and uninstall (--list / --name / --all / --purge) with fake managers. All
 #     network-free, and all data pinned into temp dirs (the suite runs inside a live
 #     workspace whose ambient LUCIDOS_GATEWAY_DATA points at the REAL gateway dir).
+#   • EFFECTFUL launchd wrappers, the one place this suite calls an effectful
+#     helper directly, still only ever reaching the stateful fake launchctl below.
+#     Their contract is a TIMING one (bootout is async), so nothing pure can pin
+#     it. See make_fakebin and the section near the uninstall tests.
 # Run: ./scripts/lib/service_test.sh
 set -u
 
@@ -76,12 +80,30 @@ new_release_dir() {
     printf '%s' "$out"
 }
 
-# make_fakebin [uname-os] [launchctl-print-rc] — a PATH dir with fake launchctl
-# (print → given rc; everything else succeeds), fake systemctl (always fails, so
-# the systemd --user branch is skipped on any host), and (optional) a uname shim.
+# make_fakebin [uname-os] [initially-loaded] [linger]: a PATH dir with a STATEFUL
+# fake launchctl, a fake systemctl (always fails, so the systemd --user branch is
+# skipped on any host), and (optional) a uname shim.
+#
+# The launchctl fake MODELS launchd instead of returning a fixed exit code,
+# because the bug class this suite has to catch is a TIMING one: the real
+# `launchctl bootout` returns 0 as soon as launchd ACCEPTS the request, and the
+# job stays visible to `launchctl print` until the teardown finishes (~5s for the
+# gateway, which ignores SIGTERM, so launchd has to wait out ExitTimeOut and
+# SIGKILL it). A fake whose `print` always answered the same way cannot tell a
+# correct unload from one that reports success over a still-bootstrapped job,
+# which is exactly how that shipped. So here: `bootstrap`/`load` load the job,
+# `bootout`/`remove` schedule an ASYNC unload that only takes effect after
+# <linger> further `print` calls, and `print` observes. State and an ordered call
+# log are kept per LABEL under the fake's own dir.
+#
+#   $2  0 = every label starts out already bootstrapped, 1 = not bootstrapped.
+#       Same meaning the old launchctl-print-rc parameter carried.
+#   $3  how many further `print` calls a booted-out job stays visible for
+#       (default 2, so every caller exercises the wait path), or `stuck` for a
+#       job that never leaves the domain (launchd refused, or wedged).
 make_fakebin() {
-    local dir os rc
-    dir="$(mktemp -d)"; os="${1:-}"; rc="${2:-1}"
+    local dir os init linger
+    dir="$(mktemp -d)"; os="${1:-}"; init="${2:-1}"; linger="${3:-2}"
     if [ -n "$os" ]; then
         # shellcheck disable=SC2016 # $1 belongs to the GENERATED stub, so it must not expand here
         { printf '#!/bin/sh\n'
@@ -89,12 +111,62 @@ make_fakebin() {
           printf 'echo %s\n' "$os"; } > "$dir/uname"
         chmod +x "$dir/uname"
     fi
-    # shellcheck disable=SC2016 # $1 belongs to the GENERATED stub, so it must not expand here
-    printf '#!/bin/sh\ncase "$1" in print) exit %s;; *) exit 0;; esac\n' "$rc" > "$dir/launchctl"
+    mkdir -p "$dir/state"
+    if [ "$init" = "0" ]; then printf 'loaded\n' > "$dir/state/default"; else printf 'gone\n' > "$dir/state/default"; fi
+    printf '%s\n' "$linger" > "$dir/state/linger"
+    cat > "$dir/launchctl" <<'FAKE_LAUNCHCTL'
+#!/bin/sh
+# Stateful fake launchd. See make_fakebin in service_test.sh for the why.
+S="$(dirname "$0")/state"
+sub="$1"
+# The label is the last argument in every form we care about:
+#   print|bootout gui/<uid>/<label>   kickstart -k gui/<uid>/<label>
+#   remove <label>                    bootstrap gui/<uid> <plist> | load -w <plist>
+last=""
+for a in "$@"; do last="$a"; done
+case "$last" in
+    *.plist) label="$(basename "$last" .plist)" ;;
+    *)       label="${last##*/}" ;;
+esac
+st="$S/st.$label"; lg="$S/linger.$label"
+[ -f "$st" ] || cp "$S/default" "$st"
+log() { printf '%s\n' "$1" >> "$S/calls.$label.log"; }
+case "$sub" in
+    print)
+        [ "$(cat "$st")" = "loaded" ] || { log "print:gone"; exit 1; }
+        if [ -f "$lg" ]; then
+            n="$(cat "$lg")"
+            if [ "$n" -le 0 ]; then
+                printf 'gone\n' > "$st"; rm -f "$lg"
+                log "print:gone"; exit 1
+            fi
+            printf '%s\n' "$((n - 1))" > "$lg"
+        fi
+        log "print:loaded"; exit 0 ;;
+    bootout|remove)
+        log "$sub"
+        [ "$(cat "$st")" = "loaded" ] || exit 3   # the real one: "Boot-out failed: 3: No such process"
+        # Accepted, NOT completed: 0 now, still visible for <linger> more prints.
+        if [ "$(cat "$S/linger")" != "stuck" ]; then cp "$S/linger" "$lg"; fi
+        exit 0 ;;
+    bootstrap|load)
+        log "$sub"; printf 'loaded\n' > "$st"; rm -f "$lg"; exit 0 ;;
+    *)
+        log "$sub"; exit 0 ;;
+esac
+FAKE_LAUNCHCTL
     printf '#!/bin/sh\nexit 1\n' > "$dir/systemctl"
     chmod +x "$dir/launchctl" "$dir/systemctl"
     printf '%s' "$dir"
 }
+
+# fake_calls <fakebin-dir> <label>: the fake launchctl's ordered call log.
+fake_calls() { cat "$1/state/calls.$2.log" 2>/dev/null || true; }
+
+# fake_line <fakebin-dir> <label> <entry>: 1-based index of the FIRST <entry> in
+# that log, or empty if it never appears. Lets a test assert ORDERING, which is
+# the whole point when the defect is "acted before the job was actually gone".
+fake_line() { fake_calls "$1" "$2" | grep -n -x -F "$3" | head -1 | cut -d: -f1; }
 
 # ── PURE: identity (slug-suffixed) ────────────────────────────────────────────
 echo "test: service identity is slug-suffixed (coexists; never collides with the .app's com.lucidos.engine)"
@@ -215,6 +287,9 @@ echo "test: launchctl domain/target builders + xml escape + port candidates"
 if [ "$(service_launchd_domain 501)" = "gui/501" ]; then pass "domain = gui/<uid>"; else fail "domain"; fi
 if [ "$(service_launchd_target 501 com.lucidos.gateway.test)" = "gui/501/com.lucidos.gateway.test" ]; then pass "target = gui/<uid>/<label>"; else fail "target"; fi
 if [ "$(service_xml_escape '/a&b/<x>')" = "/a&amp;b/&lt;x&gt;" ]; then pass "xml escape"; else fail "xml escape"; fi
+if [ "$(service_launchd_timeout)" = "30" ]; then pass "unload timeout defaults to 30s"; else fail "timeout default: $(service_launchd_timeout)"; fi
+if [ "$(LUCIDOS_LAUNCHD_TIMEOUT=7 service_launchd_timeout)" = "7" ]; then pass "LUCIDOS_LAUNCHD_TIMEOUT overrides it"; else fail "timeout override ignored"; fi
+if [ "$(LUCIDOS_LAUNCHD_TIMEOUT='' service_launchd_timeout)" = "30" ]; then pass "an empty override falls back to the default"; else fail "empty override not defaulted"; fi
 cand="$(service_port_candidates 5252 3)"
 if [ "$cand" = "$(printf '5252\n5253\n5254')" ]; then pass "port candidates ascend from base"; else fail "candidates: $cand"; fi
 
@@ -284,7 +359,8 @@ rm -rf "$LP"
 echo ""
 echo "test: effectful wrappers are defined"
 for fn in service_detect_manager service_port_in_use service_list_instance_names service_write_file \
-          service_launchd_load service_launchd_unload service_systemd_load service_systemd_unload \
+          service_launchd_load service_launchd_unload service_launchd_wait_gone \
+          service_systemd_load service_systemd_unload \
           service_health_wait service_stop_embedded_runtime; do
     if type "$fn" >/dev/null 2>&1; then pass "$fn defined"; else fail "$fn missing"; fi
 done
@@ -533,6 +609,140 @@ else
     fail "bind env leaked into the service unit: $(cat "$PLB" 2>/dev/null)"
 fi
 rm -rf "$FB" "$REL" "$PREFIX" "$FAKEHOME" "$CERT" "$KEY"
+
+# ── EFFECTFUL: the launchd wrappers, against the stateful fake launchctl ─────
+# The only tests in this file that call the effectful launchd wrappers, and they
+# reach the fake above, never real launchd. They pin the ASYNC-BOOTOUT contract:
+# `launchctl bootout` returns 0 while the job is still bootstrapped, so success
+# has to be decided by OBSERVING the domain and never by trusting that exit code.
+# Trusting it is what made `uninstall.sh` print "Stopped launchd agent" over a
+# live KeepAlive job, which install-smoke's front-door rung 7 caught.
+echo ""
+echo "test: service_launchd_unload reports success ONLY once the job has left the domain"
+FB="$(make_fakebin "" 0 3)"   # bootstrapped; a bootout lingers for 3 more prints
+LBL="com.lucidos.gateway.wait0test"
+OLDPATH="$PATH"; PATH="$FB:$PATH"
+service_launchd_unload 501 "$LBL" 10; rc=$?
+still_loaded=1; service_launchd_is_loaded 501 "$LBL" || still_loaded=0
+PATH="$OLDPATH"
+if [ $rc -eq 0 ]; then pass "unload succeeded for a job that does go away"; else fail "unload returned $rc"; fi
+# THE regression pin. This is what failed before the wait existed: bootout's own
+# 0 was taken as proof while print kept seeing the job for seconds afterwards.
+if [ "$still_loaded" = "0" ]; then
+    pass "the job was genuinely GONE when unload returned success"
+else
+    fail "unload reported success while $LBL was still bootstrapped"
+fi
+if has "$(fake_calls "$FB" "$LBL")" "bootout"; then pass "it did issue a bootout"; else fail "no bootout issued: $(fake_calls "$FB" "$LBL")"; fi
+rm -rf "$FB"
+
+echo ""
+echo "test: a job that never leaves the domain is a reported FAILURE, not a swallowed one"
+FB="$(make_fakebin "" 0 stuck)"
+LBL="com.lucidos.gateway.wait1test"
+OLDPATH="$PATH"; PATH="$FB:$PATH"
+SERVICE_LAUNCHD_ERR=""
+service_launchd_unload 501 "$LBL" 1; rc=$?
+err="$SERVICE_LAUNCHD_ERR"
+PATH="$OLDPATH"
+if [ $rc -ne 0 ]; then pass "unload failed for a wedged job"; else fail "unload claimed success over a job that never left the domain"; fi
+if has "$err" "$LBL"; then pass "SERVICE_LAUNCHD_ERR names the target ($err)"; else fail "no usable diagnosis: '$err'"; fi
+rm -rf "$FB"
+
+echo ""
+echo "test: an already-unloaded job is success WITHOUT issuing a bootout"
+FB="$(make_fakebin "" 1)"
+LBL="com.lucidos.gateway.wait2test"
+OLDPATH="$PATH"; PATH="$FB:$PATH"
+service_launchd_unload 501 "$LBL" 10; rc=$?
+PATH="$OLDPATH"
+if [ $rc -eq 0 ]; then pass "a not-loaded job is a no-op success"; else fail "unload returned $rc for a job that was never loaded"; fi
+if has "$(fake_calls "$FB" "$LBL")" "bootout"; then fail "it booted out a job that was not loaded"; else pass "no bootout issued"; fi
+rm -rf "$FB"
+
+echo ""
+echo "test: service_launchd_load bootstraps only AFTER the old job has left the domain"
+# The same async gap on the RELOAD path, where it fails harder: bootstrapping
+# into a domain that still holds the dying job is refused ("Bootstrap failed: 5:
+# Input/output error"), the `load -w` fallback prints its own failure while
+# exiting 0, kickstart returns 37, and is_loaded still sees the OLD job. So a
+# re-run over a running instance reported success and, once the old job finally
+# died, left no service at all.
+FB="$(make_fakebin "" 0 3)"
+LBL="com.lucidos.gateway.reload0test"
+PLDIR="$(mktemp -d)"; PL="$PLDIR/$LBL.plist"; printf 'x\n' > "$PL"
+OLDPATH="$PATH"; PATH="$FB:$PATH"
+service_launchd_load 501 "$PL" "$LBL"; rc=$?
+PATH="$OLDPATH"
+gone_at="$(fake_line "$FB" "$LBL" "print:gone")"
+bs_at="$(fake_line "$FB" "$LBL" "bootstrap")"
+if [ $rc -eq 0 ]; then pass "reload succeeded"; else fail "reload returned $rc"; fi
+if [ -n "$gone_at" ] && [ -n "$bs_at" ] && [ "$gone_at" -lt "$bs_at" ]; then
+    pass "the old job was observed GONE before the new plist was bootstrapped"
+else
+    fail "bootstrapped without waiting out the old job (gone@${gone_at:-never} bootstrap@${bs_at:-never}): $(fake_calls "$FB" "$LBL")"
+fi
+rm -rf "$FB" "$PLDIR"
+
+echo ""
+echo "test: uninstall.sh WARNS (never claims 'Stopped') when the agent will not leave the domain"
+FB="$(make_fakebin "" 0 stuck)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+mkdir -p "$PREFIX/test" "$FAKEHOME/Library/LaunchAgents"; printf '5300\n' > "$PREFIX/test/port"
+PLIST="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.test.plist"; printf 'x\n' > "$PLIST"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' LUCIDOS_LAUNCHD_TIMEOUT=1 \
+        bash "$UNINSTALL" --prefix "$PREFIX" --name test 2>&1)"; rc=$?
+if has "$out" "Stopped launchd agent"; then
+    fail "claimed it stopped an agent that is still bootstrapped: $out"
+else
+    pass "did not claim it stopped a still-bootstrapped agent"
+fi
+if has "$out" "still bootstrapped"; then pass "warned about the agent it could not remove"; else fail "no warning about the stuck agent: $out"; fi
+# The plist still goes (no resurrection at next login) and the run still succeeds.
+if [ ! -e "$PLIST" ]; then pass "removed the plist anyway"; else fail "left the plist behind"; fi
+if [ $rc -eq 0 ]; then pass "uninstall still exits 0"; else fail "uninstall exited $rc"; fi
+# It must NOT claim it stopped a runtime that a live gateway would respawn.
+if has "$out" "Stopped instance"; then fail "claimed it stopped the embedded runtime of a live gateway: $out"; else pass "left the possibly-running gateway + engines alone"; fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
+echo "test: --purge is REFUSED while an agent we could not stop is still registered"
+# Deleting the data dir under a live gateway races its Postgres, and the still
+# registered KeepAlive agent re-creates a half-state at the same path, so
+# "purged" would be a lie. The destructive half is the one to skip.
+FB="$(make_fakebin "" 0 stuck)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+mkdir -p "$PREFIX/test" "$FAKEHOME/Library/LaunchAgents"; printf '5300\n' > "$PREFIX/test/port"
+PLIST="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.test.plist"; printf 'x\n' > "$PLIST"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' LUCIDOS_LAUNCHD_TIMEOUT=1 \
+        bash "$UNINSTALL" --prefix "$PREFIX" --name test --purge 2>&1)"; rc=$?
+if [ -d "$PREFIX/test" ]; then pass "kept the data of a still-running instance"; else fail "purged the data out from under a live gateway: $out"; fi
+if has "$out" "NOT deleting the data"; then pass "said so, and how to finish the job"; else fail "purge refusal was silent: $out"; fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
+echo "test: --all --purge keeps the SHARED runtime and drops the purged banner when a gateway is live"
+# The runtime holds the binaries the live gateway is executing, and launchd would
+# try to respawn it from a path we just deleted. And a banner reading
+# "uninstalled + purged" over data still on disk is the one thing it must not say.
+FB="$(make_fakebin "" 0 stuck)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+mkdir -p "$PREFIX/test" "$PREFIX/runtime/$STEM" "$FAKEHOME/Library/LaunchAgents"; printf '5300\n' > "$PREFIX/test/port"
+printf 'x\n' > "$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.test.plist"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' LUCIDOS_LAUNCHD_TIMEOUT=1 \
+        bash "$UNINSTALL" --prefix "$PREFIX" --all --purge 2>&1)"; rc=$?
+if [ -e "$PREFIX/runtime" ]; then pass "kept the shared runtime the live gateway is running from"; else fail "deleted the runtime under a live gateway: $out"; fi
+if has "$out" "uninstalled + purged"; then fail "claimed a purge that did not happen: $out"; else pass "banner does not claim it purged"; fi
+if has "$out" "Did NOT delete this data"; then pass "named the data it kept"; else fail "kept data was not reported: $out"; fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
+
+echo ""
+echo "test: --purge still deletes when the agent DOES go away"
+# The guard above must not become a blanket refusal: the normal path still purges.
+FB="$(make_fakebin "" 0 2)"; PREFIX="$(mktemp -d)"; FAKEHOME="$(mktemp -d)"
+mkdir -p "$PREFIX/test" "$FAKEHOME/Library/LaunchAgents"; printf '5300\n' > "$PREFIX/test/port"
+PLIST="$FAKEHOME/Library/LaunchAgents/com.lucidos.gateway.test.plist"; printf 'x\n' > "$PLIST"
+out="$(PATH="$FB:$PATH" HOME="$FAKEHOME" LUCIDOS_GATEWAY_DATA='' \
+        bash "$UNINSTALL" --prefix "$PREFIX" --name test --purge 2>&1)"; rc=$?
+if [ $rc -eq 0 ] && [ ! -e "$PREFIX/test" ]; then pass "purged normally once the agent left the domain"; else fail "expected a normal purge (rc=$rc): $out"; fi
+rm -rf "$FB" "$PREFIX" "$FAKEHOME"
 
 # ── INTEGRATION: uninstall --list ────────────────────────────────────────────
 echo ""

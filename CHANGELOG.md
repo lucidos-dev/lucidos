@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.18.2 — 2026-07-31
+
+### Fixed
+
+- **Uninstalling on macOS actually removes the LaunchAgent.** `launchctl bootout` is asynchronous: it returns 0 the moment launchd accepts the request, not when the job is gone. The gateway ignores `SIGTERM` by design, so launchd has to wait out its exit timeout and `SIGKILL` it, and for that whole window (measured at about five seconds) the job is still bootstrapped. The uninstaller took the exit code as the answer and reported "Stopped launchd agent" over a job that was still registered and, because the agent carries `KeepAlive`, still respawning a gateway until the next logout. Both wrappers now decide by observing the domain rather than by reading an exit code, bounded by a timeout that `LUCIDOS_LAUNCHD_TIMEOUT` overrides.
+- **Re-installing over a running instance no longer silently unregisters the service.** The load path booted the old job out and bootstrapped immediately, into a domain that still held it. launchd refused with `Bootstrap failed: 5: Input/output error`, the legacy `load -w` fallback also failed while exiting 0, and the loaded check still saw the old job, so the install reported success. Seconds later there was no job in the domain at all, which meant an upgrade or a `--port` change left the LaunchAgent gone until the next login. The unload now completes before the bootstrap, and a failure to unload is reported instead of being bootstrapped on top of.
+- **A failed stop no longer leads to destructive follow-up steps.** With the failure finally detectable, three downstream assumptions were wrong: the uninstaller killed engines that a live `KeepAlive` gateway just respawns, `--purge` deleted an instance's data while its Postgres was still writing to it, and `--all --purge` deleted the shared runtime out from under the running binaries. Each of those is now skipped when a service could not be stopped, with the manual `launchctl bootout` command printed so the user can finish the job.
+- **The uninstall summary no longer claims a purge it did not perform.** A refused purge printed the same "uninstalled + purged" banner as a completed one. It now names the data that is still on disk and why.
 ## v0.18.1 — 2026-07-31
 
 ### Changed

@@ -40,7 +40,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.18.1"
+LUCIDOS_DEFAULT_VERSION="0.18.2"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -811,8 +811,13 @@ register_launchd() {
         || die "Could not write the LaunchAgent plist at $plist"
     info "plist: $plist"
     uid="$(id -u)"
+    # A re-run over a running instance must fully unload the old job first, so
+    # this can now fail because the OLD agent would not leave the domain. That is
+    # reported rather than papered over: bootstrapping on top of it would leave
+    # the previous plist running while claiming the new one had loaded.
     service_launchd_load "$uid" "$plist" "$label" \
-        || die "launchctl could not load the service ($label). Try: launchctl bootstrap gui/$uid \"$plist\""
+        || die "launchctl could not load the service ($label)${SERVICE_LAUNCHD_ERR:+: $SERVICE_LAUNCHD_ERR}.
+       Try: launchctl bootout gui/$uid/$label ; launchctl bootstrap gui/$uid \"$plist\""
     ok "LaunchAgent $label loaded (RunAtLoad + KeepAlive)"
 }
 

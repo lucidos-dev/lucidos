@@ -182,7 +182,12 @@ EOF
 
 # ── remove one instance ──────────────────────────────────────────────────────
 remove_instance() {
-    local slug="$1" data runtime_root removed=0
+    # service_stopped=0 means "a service we could NOT stop is still registered".
+    # Both managers can reach that state (a launchd job that will not leave the
+    # domain, an unreachable systemd user bus), and it gates the same two things
+    # below: we do not kill engines a live gateway would just respawn, and we do
+    # not purge data it is still writing to.
+    local slug="$1" data runtime_root removed=0 service_stopped=1
     data="$(instance_data_dir "$slug")"
     runtime_root="$(service_runtime_root "$LUCIDOS_PREFIX")"
     step "Removing instance '$slug'"
@@ -194,10 +199,18 @@ remove_instance() {
         plist="$(service_launchd_plist_path "$HOME" "$slug")"
         uid="$(id -u)"
         if service_launchd_is_loaded "$uid" "$label"; then
+            # service_launchd_unload only succeeds once the job has actually left
+            # the domain, so this "Stopped" is a fact rather than a hope. On
+            # failure it leaves the launchctl diagnosis in SERVICE_LAUNCHD_ERR;
+            # say so, because the agent carries KeepAlive and a gateway that is
+            # still bootstrapped will keep respawning until the user logs out.
             if service_launchd_unload "$uid" "$label"; then
                 ok "Stopped launchd agent $label"
             else
-                warn "Could not bootout $label (try: launchctl bootout gui/$uid/$label)"
+                warn "launchd agent $label is ${SERVICE_LAUNCHD_ERR:-still loaded}"
+                info "It carries KeepAlive, so it will keep restarting until you log out."
+                info "Stop it by hand with:  launchctl bootout gui/$uid/$label"
+                service_stopped=0
             fi
             removed=1
         fi
@@ -212,7 +225,7 @@ remove_instance() {
     # over bare ssh: no XDG_RUNTIME_DIR/bus) — otherwise an "uninstalled"
     # service resurrects at the next boot. Only the stop/disable calls need the
     # bus; they stay best-effort behind the probe.
-    local bus_ok=0 service_stopped=1
+    local bus_ok=0
     if have systemctl && systemctl --user show-environment >/dev/null 2>&1; then
         bus_ok=1
     fi
@@ -244,16 +257,28 @@ remove_instance() {
         service_stop_embedded_runtime "$data" "$runtime_root"
         ok "Stopped instance '$slug' embedded runtime"
     elif [ "$removed" = "1" ]; then
-        # The gateway may still be running (unreachable user bus) and would
-        # respawn anything we kill — leave its processes alone; the removed unit
+        # A service we could not stop is still registered, and it would respawn
+        # anything we kill, so leave its processes alone. The removed plist/unit
         # file stops it from coming back after the next logout/reboot.
-        info "Left the possibly-running gateway + engines alone (no user bus); they stop at next logout/reboot."
+        info "Left the possibly-running gateway + engines alone; they stop at next logout/reboot."
     else
         info "Instance '$slug' had no registered service (nothing to stop)."
     fi
 
-    # Data: keep unless --purge.
-    if [ -n "$LUCIDOS_PURGE" ]; then
+    # Data: keep unless --purge, and REFUSE the purge while a service we could
+    # not stop is still registered. Its gateway is alive, so deleting the data
+    # dir would race a live Postgres and the still-registered agent would just
+    # re-create a half-state at the same path, which makes "purged" a lie. The
+    # destructive half is the one to skip, so this fails safe and says how to
+    # finish the job.
+    [ "$service_stopped" = "1" ] || LIVE_SERVICE_LEFT=1
+    local purge="$LUCIDOS_PURGE"
+    if [ -n "$purge" ] && [ "$service_stopped" != "1" ]; then
+        warn "NOT deleting the data for '$slug': its service is still running and would re-create it."
+        info "Stop it as described above, then re-run:  uninstall.sh --name $slug --purge"
+        purge=""
+    fi
+    if [ -n "$purge" ]; then
         local t
         while IFS= read -r t; do
             [ -n "$t" ] || continue
@@ -306,6 +331,11 @@ EOF
 
 # ── the uninstall flow ───────────────────────────────────────────────────────
 KEPT_DATA=""
+# Set by remove_instance when it could not stop a still-registered service. That
+# instance's gateway is alive, which makes two later steps unsafe or untrue: the
+# SHARED runtime must not be deleted out from under a running process, and the
+# closing banner must not claim a purge that was refused.
+LIVE_SERVICE_LEFT=""
 run_uninstall() {
     source_service_lib
 
@@ -325,10 +355,14 @@ run_uninstall() {
         remove_instance "$slug"
     done
 
-    # --all --purge also removes the SHARED runtime (no instance needs it anymore).
+    # --all --purge also removes the SHARED runtime, but only once nothing is
+    # still running out of it: a gateway we could not stop is executing those
+    # binaries, and launchd would try to respawn it from a path we just deleted.
     if [ -n "$LUCIDOS_ALL" ] && [ -n "$LUCIDOS_PURGE" ]; then
         local runtime="$LUCIDOS_PREFIX/runtime"
-        if [ -e "$runtime" ]; then
+        if [ -n "$LIVE_SERVICE_LEFT" ]; then
+            warn "NOT deleting the shared runtime $runtime: a gateway is still running out of it."
+        elif [ -e "$runtime" ]; then
             if rm -rf "$runtime"; then ok "Deleted the shared runtime $runtime"; else warn "Could not delete $runtime"; fi
         fi
     fi
@@ -337,17 +371,26 @@ run_uninstall() {
 }
 
 print_summary() {
-    if [ -z "$LUCIDOS_PURGE" ] && [ -n "$KEPT_DATA" ]; then
+    # KEPT_DATA is non-empty under --purge only when the purge was REFUSED for a
+    # still-running instance, so report it either way. Claiming "purged" over
+    # data that is still on disk is the one thing this summary must never do.
+    if [ -n "$KEPT_DATA" ]; then
         printf '\n'
-        info "Left your data in place (re-run with --purge to delete it):"
+        if [ -n "$LUCIDOS_PURGE" ]; then
+            info "Did NOT delete this data (its service is still running):"
+        else
+            info "Left your data in place (re-run with --purge to delete it):"
+        fi
         printf '%s' "$KEPT_DATA" | while IFS= read -r d; do
             [ -n "$d" ] && info "  $d"
         done
         [ -n "$LUCIDOS_ALL" ] && info "  $LUCIDOS_PREFIX/runtime  (shared runtime)"
     fi
     printf '\n%s========================================%s\n' "$C_GREEN" "$C_RESET"
-    if [ -n "$LUCIDOS_PURGE" ]; then
+    if [ -n "$LUCIDOS_PURGE" ] && [ -z "$KEPT_DATA" ]; then
         printf '%s  Lucidos uninstalled + purged ✓%s\n' "$C_BOLD" "$C_RESET"
+    elif [ -n "$LUCIDOS_PURGE" ]; then
+        printf '%s  Lucidos service removed; some data kept%s\n' "$C_BOLD" "$C_RESET"
     else
         printf '%s  Lucidos service removed ✓%s\n' "$C_BOLD" "$C_RESET"
     fi
