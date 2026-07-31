@@ -247,6 +247,56 @@ pub fn read_pidfile(resolved_dir: &Path) -> Option<u32> {
         .ok()
 }
 
+/// Whether `pid` names a process that is still RUNNING, reaping it first when
+/// it is one of our own children that has already exited.
+///
+/// A bare `kill(pid, 0)` does NOT answer this: it succeeds for a **zombie**, a
+/// process that has exited and lingers in the process table only until its
+/// parent reaps it. That matters here because the gateway IS the parent of
+/// every engine it spawns, and after a self re-exec it no longer holds a
+/// `Child` handle for them, so nothing reaps them. A zombie engine then reads
+/// as alive forever, and `respawn_decision` never culls an alive engine, so the
+/// workspace would meta-refresh the boot splash instead of being restarted.
+/// (Observed 2026-07-31: a workspace engine defunct for a day, its port dead.)
+///
+/// `waitpid(pid, WNOHANG)` answers and repairs in one call. It is scoped to the
+/// single pid, so it can never consume another child's exit status:
+///   * `> 0`  the pid was our child, it had exited, it is now REAPED, not alive.
+///   * `== 0`  our child and still running, alive.
+///   * `< 0`  (`ECHILD`) not our child, so fall back to the existence probe.
+///
+/// A foreign zombie is indistinguishable in that last branch, but the only
+/// zombies the gateway can create are its own children, which the first branch
+/// clears.
+#[cfg(unix)]
+pub fn pid_is_live(pid: u32) -> bool {
+    // Pid 0 is never an engine, and passing it on would be actively harmful:
+    // `waitpid(0, ...)` means "any child in MY process group", so a corrupt
+    // pidfile could reap a DIFFERENT engine and steal the exit status its
+    // `Child` handle is waiting for, which then reads as dead and gets culled.
+    if pid == 0 {
+        return false;
+    }
+    let mut status: libc::c_int = 0;
+    // SAFETY: `waitpid` with an explicit pid and `WNOHANG` never blocks, only
+    // ever touches that one pid, and writes into a stack local we own.
+    let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+    if waited > 0 {
+        return false;
+    }
+    if waited == 0 {
+        return true;
+    }
+    // SAFETY: signal 0 performs existence/permission checks without delivering
+    // a signal; returns 0 iff the process exists.
+    unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+}
+
+#[cfg(not(unix))]
+pub fn pid_is_live(_pid: u32) -> bool {
+    true
+}
+
 /// Send SIGUSR1 (the engine's graceful-stop signal — it ignores SIGTERM) to a
 /// stale engine recorded in the pidfile, so a respawn doesn't collide on the
 /// loopback port. Best-effort.
@@ -353,6 +403,110 @@ pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u1
 mod tests {
     use super::*;
     use crate::registry::Workspace;
+
+    /// A child that is still running is live, and probing it must NOT reap or
+    /// otherwise disturb it: the very next `try_wait` has to still work.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_child_is_live() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        assert!(pid_is_live(child.id()), "a running child must read as live");
+        assert!(
+            matches!(child.try_wait(), Ok(None)),
+            "probing must not consume the child's exit status"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// The bug this whole helper exists for: an exited child that nobody has
+    /// waited on is a ZOMBIE, and `kill(pid, 0)` still succeeds for it. It must
+    /// read as dead, and the probe must reap it so it stops existing at all.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreaped_exited_child_is_a_zombie_and_not_live() {
+        // Dropping a `Child` deliberately does NOT wait, so letting the handle
+        // fall out of scope leaves exactly the state a re-exec'd gateway is in:
+        // our own child, exited, and nobody reaping it.
+        let pid = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true")
+            .id();
+
+        // Wait until it is observably defunct, so this tests a zombie and not a
+        // still-running child. `ps` state is the portable read (macOS reserves
+        // `WNOWAIT` for `waitid`, and there is no /proc here).
+        let mut zombie = false;
+        for _ in 0..200 {
+            let state = std::process::Command::new("ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if state.starts_with('Z') {
+                zombie = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(zombie, "fixture never became an observable zombie");
+        // SAFETY: signal 0 is an existence check only. This is the premise of
+        // the whole helper: the old probe accepted this pid as alive.
+        assert!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
+            "premise gone: kill(pid, 0) no longer accepts a zombie"
+        );
+
+        assert!(
+            !pid_is_live(pid),
+            "a zombie must not read as live (kill -0 says it does)"
+        );
+        // And it is gone now, not merely reported dead.
+        let mut status: libc::c_int = 0;
+        // SAFETY: WNOHANG never blocks; the pid is expected to be reaped already.
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert!(waited < 0, "the probe must have reaped the zombie");
+    }
+
+    /// Pid 0 must be rejected before it reaches `waitpid`, where it would mean
+    /// "any child in my process group" and could reap an unrelated engine.
+    #[cfg(unix)]
+    #[test]
+    fn pid_zero_is_never_live_and_never_reaps() {
+        let mut bystander = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = bystander.id();
+        // Let it exit, so it is exactly the kind of child `waitpid(0, …)` would
+        // grab if the guard were missing.
+        std::thread::sleep(std::time::Duration::from_millis(50));
+
+        assert!(!pid_is_live(0), "pid 0 must never read as live");
+
+        // The bystander's exit status is still ours to collect.
+        match bystander.try_wait() {
+            Ok(Some(_)) => {}
+            other => panic!("pid 0 probe consumed another child's status: {other:?}"),
+        }
+        let _ = bystander.wait();
+        let _ = pid;
+    }
+
+    /// A pid that is not ours and not running (already reaped by its own parent,
+    /// or never existed) is not live either.
+    #[cfg(unix)]
+    #[test]
+    fn a_gone_pid_is_not_live() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        let _ = child.wait(); // reaped here, so the pid is fully gone
+        assert!(!pid_is_live(pid), "a reaped pid must not read as live");
+    }
 
     /// Regression cover for the 2026-07-26 incident: the live stack was running
     /// out of an ORPHANED coding-agent worktree, so it served a frozen `dist/`

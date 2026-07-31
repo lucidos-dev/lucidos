@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { preferences } from '../../store/store';
+import { enginePackaged, preferences } from '../../store/store';
 import { getSettingsSearchResults, findSettingsEntry } from './searchIndex';
 
 const originalInnerWidth = window.innerWidth;
@@ -11,10 +11,13 @@ function setViewportWidth(px: number): void {
 beforeEach(() => {
   // Default bindings (no overrides) — searchEverywhere = mod+Shift+S.
   preferences.value = { status: 'not-loaded' };
+  // Default to a dev install; the packaged-only cases opt in explicitly.
+  enginePackaged.value = false;
 });
 
 afterEach(() => {
   setViewportWidth(originalInnerWidth);
+  enginePackaged.value = false;
 });
 
 describe('settings search — keyboard shortcuts', () => {
@@ -109,5 +112,26 @@ describe('settings search — System section', () => {
     const entry = findSettingsEntry('system:maintenance');
     expect(entry?.subview).toBe('system');
     expect(entry?.anchor).toBe('system:maintenance');
+  });
+});
+
+describe('settings search: packaged-only rows', () => {
+  it('hides the Debugging "Restart engine" row from search on a dev install', () => {
+    // Dev keeps its restart in System > Overview as "Rebuild & Restart", so the
+    // Debugging row does not render there and must not be offered as a result.
+    enginePackaged.value = false;
+    expect(getSettingsSearchResults('restart engine', 20).some((r) => r.id === 'debugging:restart-engine')).toBe(false);
+  });
+
+  it('surfaces the Debugging "Restart engine" row on a packaged install', () => {
+    enginePackaged.value = true;
+    expect(getSettingsSearchResults('restart engine', 20).some((r) => r.id === 'debugging:restart-engine')).toBe(true);
+  });
+
+  it('keeps the entry resolvable by id regardless of mode (navigation by recents)', () => {
+    enginePackaged.value = false;
+    const entry = findSettingsEntry('debugging:restart-engine');
+    expect(entry?.subview).toBe('debugging');
+    expect(entry?.anchor).toBe('debugging:restart-engine');
   });
 });

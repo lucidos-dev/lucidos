@@ -128,14 +128,23 @@ show_workspace_status() {
         api_healthy="1"
     fi
 
-    # Engine status — pidfile liveness reconciled against reachability.
+    # Engine status: reachability first, then the pidfile. Serving is what
+    # "running" means to a caller; the pid only adds detail. A pid that is alive
+    # but NOT serving gets its own line rather than a bare RUNNING, because that
+    # is a boot in progress or a wedged engine, and either way the workspace
+    # can't be opened yet. `pid_is_live` (lib/workspace.sh) is zombie-aware; a
+    # plain `kill -0` reports a defunct engine as alive.
     if [ -f "$engine_pid_file" ]; then
         local pid
         pid="$(cat "$engine_pid_file")"
-        if kill -0 "$pid" 2>/dev/null; then
-            echo "  Engine:    RUNNING (PID $pid)"
-        elif [ -n "$api_healthy" ]; then
-            echo "  Engine:    RUNNING (serving on $api_port; pidfile PID $pid is stale)"
+        if [ -n "$api_healthy" ]; then
+            if pid_is_live "$pid"; then
+                echo "  Engine:    RUNNING (PID $pid)"
+            else
+                echo "  Engine:    RUNNING (serving on $api_port; pidfile PID $pid is stale)"
+            fi
+        elif pid_is_live "$pid"; then
+            echo "  Engine:    NOT SERVING (PID $pid alive, no /health on ${api_port:-?})"
         else
             echo "  Engine:    STOPPED (stale pidfile, PID $pid)"
         fi
@@ -149,7 +158,7 @@ show_workspace_status() {
     if [ -f "$frontend_pid_file" ]; then
         local pid
         pid="$(cat "$frontend_pid_file")"
-        if kill -0 "$pid" 2>/dev/null; then
+        if pid_is_live "$pid"; then
             echo "  Frontend:  RUNNING (PID $pid, http://localhost:${vite_port:-?})"
             # Show LAN IP
             local lan_ip
@@ -239,7 +248,6 @@ show_workspace_status() {
 json_workspace_status() {
     local ws="$1"
     local ports_file="$ws/.lucidos/ports"
-    local engine_pid_file="$ws/.lucidos/engine.pid"
 
     # Load ports
     local api_port="" vite_port="" pg_port=""
@@ -250,26 +258,23 @@ json_workspace_status() {
         vite_port="${VITE_PORT:-}"
     fi
 
-    # Engine running? Pidfile liveness OR a responding /health. Consumers of
-    # this field (cross-workspace open, the control-panel status dot) hit the
-    # port directly, so reachability is the truth they need — a stale pidfile
-    # on a serving engine must not read as "not running".
-    local engine_running="false"
-    if [ -f "$engine_pid_file" ]; then
-        local pid
-        pid="$(cat "$engine_pid_file")"
-        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-            engine_running="true"
-        fi
-    fi
-
     # Workspace name
     local name
     name=$(basename "$ws")
 
-    # One health probe: confirms reachability (overrides a stale pidfile) and
-    # yields the engine version in the same call.
-    local engine_version="" health_body=""
+    # `engine_running` is REACHABILITY, and nothing else: one health probe,
+    # which also yields the engine version in the same call. Both consumers
+    # (cross-workspace open, the control-panel switcher dot) navigate straight
+    # to the port, so "can I open this right now" is the only useful answer.
+    #
+    # The pidfile deliberately does NOT feed this field. It cannot answer that
+    # question and it lies in both directions: a live pid may not be serving
+    # yet, `kill -0` succeeds for a ZOMBIE, and a recycled pid belongs to an
+    # unrelated process. On 2026-07-31 a defunct engine pid held this field at
+    # `true` for a day (with `engine_version` empty in the same row, because
+    # /health never answered), which the switcher rendered as a healthy dot
+    # pointing at a dead port.
+    local engine_running="false" engine_version="" health_body=""
     if [ -n "$api_port" ] && health_body=$(_engine_health_json "$api_port"); then
         engine_running="true"
         engine_version=$(printf '%s' "$health_body" | python3 -c "import sys,json; print(json.load(sys.stdin).get('engine_version',''))" 2>/dev/null || echo "")

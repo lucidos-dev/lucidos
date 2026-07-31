@@ -54,6 +54,26 @@ export function setBootStatus(text: string): void {
   el.classList.toggle('boot-splash-status-shown', text.length > 0);
 }
 
+/** Reveal the inline splash's gateway escape link, when this document has one to
+ *  offer. Returns true if a link is now showing.
+ *
+ *  The link, its href rule and the conditions for offering it all live in the
+ *  inline document (see the boot watchdog in index.html), which exposes the
+ *  reveal as `window.__lucidosGatewayEscape`. This is a thin call through rather
+ *  than a second implementation: the same escape must be offered whether or not
+ *  the application bundle loaded, and two copies of "where does the gateway live"
+ *  would be free to drift apart.
+ *
+ *  Returns false when the hook is absent (the splash is already gone, or this
+ *  document is behind the gateway / has no gateway to escape to) so callers can
+ *  stay indifferent to which case they are in. */
+export function revealBootEscape(): boolean {
+  const reveal = (window as Window & { __lucidosGatewayEscape?: () => unknown })
+    .__lucidosGatewayEscape;
+  if (typeof reveal !== 'function') return false;
+  return reveal() != null;
+}
+
 /** Fade out and remove the splash. Idempotent — safe to call from the readiness
  *  gate, the safety cap, and the picker's "show the list" path. */
 export function dismissBootSplash(): void {

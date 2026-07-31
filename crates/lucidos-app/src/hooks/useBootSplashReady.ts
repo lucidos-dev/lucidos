@@ -5,6 +5,7 @@ import {
   bootSplashPresent,
   bootSplashRevealSkipped,
   dismissBootSplash,
+  revealBootEscape,
   setBootStatus,
 } from '../utils/bootSplash';
 import { WORKSPACE_ID } from '../utils/basePath';
@@ -77,8 +78,20 @@ export function isWorkspaceReady(connection: ConnectionStatus, threads: boolean)
  *  the splash accused a perfectly healthy workspace of being down. */
 export function delayedBootStatus(connection: ConnectionStatus, isDirect: boolean): string {
   if (connection === 'connected') return 'Loading…';
-  if (connection === 'disconnected' && isDirect) return 'Workspace not started';
+  if (workspaceIsUnreachable(connection, isDirect)) return 'Workspace not started';
   return 'Connecting…';
+}
+
+/** The one state the boot splash can name a cause for AND offer a way out of: a
+ *  direct engine port whose health probe actually FAILED. Nothing on that origin
+ *  lazy-starts the workspace, so the gateway escape (see `revealBootEscape`) is
+ *  the only action that can help.
+ *
+ *  Shared by the status line and the escape so the message and the affordance
+ *  cannot disagree about when the workspace is unreachable. Pure, so the pairing
+ *  is testable without the DOM. */
+export function workspaceIsUnreachable(connection: ConnectionStatus, isDirect: boolean): boolean {
+  return connection === 'disconnected' && isDirect;
 }
 
 /** Wire the splash's delayed status line and return its (idempotent) teardown.
@@ -97,6 +110,12 @@ export function startDelayedBootStatus(isDirect: boolean): () => void {
   const timer = window.setTimeout(() => {
     stop = effect(() => {
       setBootStatus(delayedBootStatus(connectionStatus.value, isDirect));
+      // Naming the cause is not enough on a direct port: the user cannot start
+      // the workspace from this origin. Offer the gateway, which starts a
+      // stopped workspace on the way in. Re-runs with the status, so a probe
+      // that lands later retracts the message and leaves the link behind
+      // whatever the splash does next (a ready workspace dismisses it).
+      if (workspaceIsUnreachable(connectionStatus.value, isDirect)) revealBootEscape();
     });
   }, STATUS_DELAY_MS);
   return () => {

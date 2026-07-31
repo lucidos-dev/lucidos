@@ -1,4 +1,4 @@
-import type { SettingsSubview } from '../../store/store';
+import { enginePackaged, type SettingsSubview } from '../../store/store';
 import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
@@ -24,6 +24,11 @@ interface SettingsSearchEntry {
    *  settings row is itself hidden on desktop (e.g. the Mobile section), so a
    *  desktop result would navigate to a row that doesn't render. */
   mobileOnly?: boolean;
+  /** Only surfaced on a PACKAGED install (the `packaged` flag from /health), for
+   *  the same reason as `mobileOnly`: the matching row renders only there (e.g.
+   *  Debugging's Restart engine, whose dev counterpart is Overview's
+   *  Rebuild & Restart), so a dev result would land on nothing. */
+  packagedOnly?: boolean;
 }
 
 /**
@@ -54,6 +59,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'debugging:capture-context', label: 'Capture context per step', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:capture-context', keywords: 'capture context step debug llm prompt' },
   { id: 'debugging:perf', label: 'Perf instrumentation', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:perf', keywords: 'perf performance instrumentation telemetry lag latency profiling thread open render linkify' },
   { id: 'debugging:animation-speed', label: 'Animation speed', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:animation-speed', keywords: 'animation speed transition duration slow motion multiplier' },
+  { id: 'debugging:restart-engine', label: 'Restart engine', subview: 'debugging', path: 'Settings → System → Debugging', anchor: 'debugging:restart-engine', keywords: 'restart engine service launchd relaunch reboot recovery unresponsive stuck', packagedOnly: true },
 
   // System overview
   { id: 'system:connection', label: 'Connection', subview: 'system', path: 'Settings → System', anchor: 'system:connection', keywords: 'status workspace path api url' },
@@ -126,7 +132,9 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
   const q = query.trim().toLowerCase();
   // Mobile-only rows are hidden in Settings on desktop, so don't surface them as
   // search results there — selecting one would land on a row that doesn't render.
-  const visible = (e: SettingsSearchEntry) => !e.mobileOnly || isMobile();
+  // Packaged-only rows are gated the same way, against the /health `packaged` flag.
+  const visible = (e: SettingsSearchEntry) =>
+    (!e.mobileOnly || isMobile()) && (!e.packagedOnly || enginePackaged.value);
   const matches = q
     ? allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
     : SETTINGS_SEARCH_INDEX.filter(visible);

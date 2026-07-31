@@ -1,4 +1,4 @@
-import { showToast, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
+import { showToast, showConfirm, dismissToast, removeToast, changes, appliedChanges, lazyChanges, findChangeById, changesHasMore, changesLoadingMore, restartRequired, restartGroups, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, threadMap, effectiveThreadStatus, isMidTurn, TOAST_AUTO_DISMISS_MS, engineRestarting, engineStartedAt, engineVersion, latestEngineVersion, engineNewVersionReady, enginePackaged, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY } from '../store';
 import { changeToastMessage } from './changeToast';
 import { toFailed } from '../types';
 import type { Loadable } from '../types';
@@ -220,6 +220,36 @@ export async function initiateEngineRestart(): Promise<void> {
     }
     // Network rejection after a 2xx: the engine is being killed.
     // Leave engineRestarting set; checkConnection() clears it on reconnect.
+  }
+}
+
+/** Confirm, then restart. The single confirm-then-restart entry point behind
+ *  every Settings restart control, so the dev "Rebuild & Restart" (System >
+ *  Overview) and the packaged "Restart Engine" (System > Debugging) cannot drift
+ *  on what the dialog says or offers. The dialog lists the applied changes this
+ *  restart activates, and on the desktop app offers restarting the GUI client as
+ *  a second, lighter action: `restart_app` re-execs the window shell only and
+ *  leaves the always-on service (and therefore every running thread) alone. */
+export async function confirmAndRestartEngine(): Promise<void> {
+  const extraAction = isTauri()
+    ? {
+        label: 'Restart App',
+        onClick: () => {
+          invoke('restart_app').catch((e: unknown) => {
+            showToast(`Failed to restart app: ${e}`, 'error');
+          });
+        },
+      }
+    : undefined;
+  const groups = restartGroups.value;
+  const details = groups.length > 0
+    ? {
+        intro: 'These changes will be applied:',
+        groups: groups.map(g => ({ header: g.threadTitle, items: g.commits })),
+      }
+    : undefined;
+  if (await showConfirm('Restart engine?', 'Restart', { extraAction, variant: 'default', details })) {
+    await initiateEngineRestart();
   }
 }
 

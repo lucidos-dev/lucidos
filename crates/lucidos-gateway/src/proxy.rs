@@ -249,9 +249,11 @@ fn boot_splash_response(html: String, retry_after: &'static str) -> Response {
 /// are one splash rather than two copies: the user crosses from this page to the
 /// app document mid-boot, on the same url, and nothing about the mark or the
 /// status can move because nothing about them is defined twice. What this page
-/// adds is its own canvas plus four documented deviations (a wrapping status
-/// line, no breathe under the meta-refresh, a tappable escape link, its own
-/// label). It is also self-contained by necessity: it renders when no engine is
+/// adds is its own canvas plus three documented deviations (a wrapping status
+/// line, no breathe under the meta-refresh, its own label), and one difference
+/// in timing rather than style: it renders the shared escape link outright,
+/// where the app document keeps the same link hidden until its boot gives up.
+/// It is also self-contained by necessity: it renders when no engine is
 /// reachable, so it can link nothing.
 ///
 /// The `<link rel="icon">` is an inline `data:` URI mirror of
@@ -289,13 +291,16 @@ fn splash_page_html(label: &str, refresh_secs: Option<u32>, escape: bool) -> Str
     // and the four places this page deliberately differs from the app splash.
     const GATEWAY_CSS_AND_BODY: &str = r##"
 html,body{margin:0;height:100%}
-/* Paint the gradient on the root with a solid fallback + fixed attachment so it
+/* Paint the gradient on the root with a base colour + fixed attachment so it
 covers the whole viewport, the iOS standalone-PWA bottom safe-area / overscroll
 region included. The fixed `inset:0` .boot-splash element leaves that strip
-uncovered, and it then falls back to a different color (the lighter band at the
-bottom). The solid #0a4ea8 fallback matches the gradient's dark end and the
-theme-color. index.html's FOUC script paints <html> for exactly this reason. */
-html{background:#0a4ea8 radial-gradient(125% 125% at 30% 22%,#2d83e0 0%,#0a4ea8 100%) no-repeat fixed}
+uncovered, and iOS fills it with the flat BASE COLOUR rather than the gradient
+image, so the base is what is actually seen there, butted against the gradient
+above it. #145eb9 is the gradient's own colour at the seam (progress 0.70, the
+mean across the bottom edge, which runs 0.62 to 0.84 and is aspect-independent);
+the 100%-stop #0a4ea8 that used to sit here read as a darker band. Keep this in
+step with index.html's FOUC script, which paints <html> for the same reason. */
+html{background:#145eb9 radial-gradient(125% 125% at 30% 22%,#2d83e0 0%,#0a4ea8 100%) no-repeat fixed}
 /* The deviations from the shared splash stylesheet above, and nothing else.
 Every size, color, font and animation comes from there. */
 /* 1. The app's status is always one short line (nowrap + ellipsis). These labels
@@ -314,18 +319,15 @@ would otherwise put a name back on the animation it silences for reduced motion.
 .boot-splash-mark{animation-name:boot-mark-reveal}
 .boot-splash-formed .boot-splash-mark{animation-name:none}
 }
-/* 3. The escape link (stalled/failed pages only). Type is inherited from
-.boot-splash like every other line here, so this sets only what is its own: it
-reads brighter than the status, is underlined so it reads as a tap target, and
-takes its pointer events back. The splash is `pointer-events:none` for the app,
-where it covers a live shell; here it covers nothing and this link is the one
-action left. */
-.boot-splash-escape{pointer-events:auto;color:#fff;opacity:.92;text-decoration:underline;text-underline-offset:.2em}
+/* The escape link needs nothing here: `.boot-splash-escape` is in the shared
+sheet above, because the app document offers the same link when its own boot
+gives up. This page differs only in WHEN it renders one (outright, on the
+stalled/failed pages, where there is nothing else left to offer). */
 </style></head>
 <body>
 <div class="boot-splash">
 "##;
-    // 4. The last deviation, in markup rather than CSS: the app bakes its own
+    // 3. The last deviation, in markup rather than CSS: the app bakes its own
     // status text ("Opening your workspace…"), ours is per-page.
     const MARK_TO_LABEL: &str = r##"
 <div class="boot-splash-status boot-splash-status-shown">"##;
@@ -506,6 +508,47 @@ mod tests {
         // the old `body{font-family:…}` without inheriting is what once left the
         // escape link rendering in the UA serif.
         assert!(!tail.contains("font-"), "{tail}");
+    }
+
+    /// The escape link is one link with one appearance across both surfaces: the
+    /// app document offers the same link when its own boot gives up, so the rule
+    /// lives in the shared sheet and this page must NOT carry a second copy.
+    #[test]
+    fn escape_link_is_styled_by_the_shared_sheet_not_a_local_copy() {
+        assert!(
+            app_splash_css().contains(".boot-splash-escape"),
+            "the shared sheet must own the escape link's appearance"
+        );
+        let html = splash_page_html("This is taking longer than expected.", Some(10), true);
+        let tail = html.split("</style>").next().unwrap_or_default();
+        let tail = tail.split("html,body{margin:0").nth(1).unwrap_or_default();
+        assert!(
+            !strip_css_comments(tail).contains(".boot-splash-escape"),
+            "{tail}"
+        );
+    }
+
+    /// The canvas base colour is what iOS paints into the bottom safe-area strip
+    /// on BOTH splash surfaces, so the two must agree or the seam moves when this
+    /// page hands over to the app document mid-boot. index.html is embedded here
+    /// already, so read the value out of it rather than keeping a second copy of
+    /// the constant.
+    #[test]
+    fn splash_canvas_base_colour_matches_the_app_document() {
+        let app_base = APP_INDEX_HTML
+            .split("<body style=\"background:")
+            .nth(1)
+            .and_then(|rest| rest.split(' ').next())
+            .expect("index.html body must paint the boot canvas");
+        assert!(
+            app_base.starts_with('#') && app_base.len() == 7,
+            "unexpected base colour in index.html: {app_base}"
+        );
+        let html = splash_page_html("Starting engine", Some(2), false);
+        assert!(
+            html.contains(&format!("html{{background:{app_base} radial-gradient(")),
+            "gateway canvas base drifted from index.html ({app_base}): {html}"
+        );
     }
 
     /// CSS comments removed, so a comment that MENTIONS a unit is not read as a

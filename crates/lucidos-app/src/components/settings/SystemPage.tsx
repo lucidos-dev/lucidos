@@ -3,16 +3,15 @@ import {
   appUpdateCheckError,
   appUpdateProgress,
   connectionStatus,
+  enginePackaged,
   engineStartedAt,
   engineVersion,
   latestEngineVersion,
   latestTauriAppVersion,
   lucidosRelease,
   lucidosReleaseDirty,
-  restartGroups,
   restartRequired,
   serviceWorkerBuildId,
-  showConfirm,
   showToast,
   SETTINGS_SYSTEM_SUBPANEL_ITEMS,
   type SettingsNavKey,
@@ -20,7 +19,7 @@ import {
   workspaceName,
   workspacePath,
 } from '../../store/store';
-import { initiateEngineRestart } from '../../store/actions/chat-changes';
+import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
 import { appUpdateNarration, checkForAppUpdate, installAppUpdate, packagedUpdateVersion } from '../../store/actions/app-update';
 import { cancelAppUpdate } from '../../utils/tauri';
 import { openSettingsSubview } from '../../store/actions/menu';
@@ -28,8 +27,6 @@ import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-updat
 import { isUnstampedBuildId } from '../../utils/buildId';
 import { isNewerVersion } from '../../utils/version';
 import { formatShortTime } from '../../utils/formatTime';
-import { isTauri } from '../../utils/platform';
-import { invoke } from '../../utils/tauri';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
 import { BackupSection } from './BackupSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
@@ -39,6 +36,7 @@ import { MemoryInspector } from './MemoryInspector';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
 import { NetworkAccessPage } from './NetworkAccessPage';
 import { DebuggingSection } from './DebuggingSection';
+import { restartControlHome } from './restartControl';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 
 /** The SPA origin, read lazily so importing this module never touches the DOM. */
@@ -96,6 +94,21 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const latestTauriVer = latestTauriAppVersion.value;
   const restart = restartRequired.value;
   const update = updateAvailable.value;
+  // Overview owns the restart control only in dev, where it genuinely rebuilds.
+  // On a packaged install it lives in System > Debugging instead, labelled
+  // "Restart Engine" (see restartControl.ts). Exactly one of the two renders.
+  //
+  // Dropping the button here does NOT strand the `restart` notice below, which
+  // says "restart to activate": `restart` cannot be true while packaged. Both
+  // routes that set it are dead there. The outdated-release check compares
+  // against `latest_engine_version`, which the engine derives from the repo root
+  // and so reports as the string `'unknown'` on a packaged install, and
+  // `isNewerVersion` coerces that to NaN and returns false. And an applied
+  // restart-requiring change needs a Lucidos-source coding-agent thread, which
+  // `packaged` (engine-side `!has_lucidos_source()`, resolved from the running
+  // binary's own path) is precisely the absence of. If packaged ever starts
+  // reporting a real engine version, this notice needs to point at Debugging.
+  const ownsRestart = restartControlHome(enginePackaged.value) === 'overview';
   const swBuildId = serviceWorkerBuildId.value;
   const swBuildLabel = swBuildId ? formatBuildId(swBuildId) : null;
 
@@ -105,29 +118,6 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
 
   const handleRefresh = useCallback(() => {
     refreshClient();
-  }, []);
-
-  const handleRestart = useCallback(async () => {
-    const extraAction = isTauri()
-      ? {
-          label: 'Restart App',
-          onClick: () => {
-            invoke('restart_app').catch((e: unknown) => {
-              showToast(`Failed to restart app: ${e}`, 'error');
-            });
-          },
-        }
-      : undefined;
-    const groups = restartGroups.value;
-    const details = groups.length > 0
-      ? {
-          intro: 'These changes will be applied:',
-          groups: groups.map(g => ({ header: g.threadTitle, items: g.commits })),
-        }
-      : undefined;
-    if (await showConfirm('Restart engine?', 'Restart', { extraAction, variant: 'default', details })) {
-      await initiateEngineRestart();
-    }
   }, []);
 
   /** Update now if one is known, otherwise re-check on demand. The on-demand
@@ -338,9 +328,11 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
                   {tauriHasUpdate ? 'Update & Restart' : 'Check for Updates'}
                 </button>
               ))}
-            <button class="action-btn" onClick={handleRestart}>
-              Rebuild &amp; Restart
-            </button>
+            {ownsRestart && (
+              <button class="action-btn" onClick={() => { void confirmAndRestartEngine(); }}>
+                Rebuild &amp; Restart
+              </button>
+            )}
           </div>
         </div>
       </>

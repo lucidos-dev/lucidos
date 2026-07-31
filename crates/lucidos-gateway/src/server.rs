@@ -1563,18 +1563,20 @@ fn respawn_decision(
 
 /// Whether a stack's engine process is currently alive. For an engine this
 /// gateway spawned we `try_wait` the `Child`; for a re-adopted one (no `Child`
-/// handle) we signal-probe the pidfile pid.
+/// handle, e.g. after a self re-exec) we ask `stack::pid_is_live` about the
+/// pidfile pid.
+///
+/// Both arms are zombie-aware, and that is the point: `try_wait` reaps, and
+/// `pid_is_live` reaps too rather than trusting `kill(pid, 0)`, which succeeds
+/// for a process that has already exited. An engine wrongly read as alive is
+/// never culled by `respawn_decision`, so it would keep its workspace on the
+/// boot splash forever instead of being respawned.
 fn engine_process_alive(s: &mut StackRuntime) -> bool {
     if let Some(child) = s.engine.as_mut() {
         return matches!(child.try_wait(), Ok(None));
     }
     match stack::read_pidfile(&s.resolved_dir) {
-        #[cfg(unix)]
-        // SAFETY: signal 0 performs existence/permission checks without
-        // delivering a signal; returns 0 iff the process exists.
-        Some(pid) => unsafe { libc::kill(pid as libc::pid_t, 0) == 0 },
-        #[cfg(not(unix))]
-        Some(_) => true,
+        Some(pid) => stack::pid_is_live(pid),
         None => false,
     }
 }

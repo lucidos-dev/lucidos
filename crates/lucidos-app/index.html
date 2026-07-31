@@ -125,7 +125,7 @@
         var bg = resolved === 'light' ? '#ffffff' : '#07172e';
         d.style.setProperty('--bg-primary', bg);
         // Paint the boot-splash brand gradient on the document canvas during boot
-        // (solid #0a4ea8 fallback + fixed attachment). This covers TWO gaps:
+        // (base colour + fixed attachment). This covers TWO gaps:
         //   1. the WKWebView white flash on iOS PWA cold-restart (what the
         //      previous solid-`bg` inline covered), and
         //   2. the iOS standalone bottom safe-area strip that the fixed
@@ -134,10 +134,21 @@
         //      that uncovered strip and shows white despite this root paint.
         //      Same fixed-attachment-gradient technique the gateway
         //      splash uses (crates/lucidos-gateway/src/proxy.rs `.mark`/html bg).
+        //
+        // THE BASE COLOUR IS THE SEAM COLOUR, not the gradient's end colour.
+        // iOS fills that bottom strip with the flat base colour and never with
+        // the gradient image, so the base is what the user actually sees there,
+        // butted directly against the gradient above it. #0a4ea8 (the 100% stop)
+        // made the strip a visibly darker band: along the bottom edge the
+        // gradient is only 0.62 (at x=30%) to 0.84 (at x=100%) of the way to it.
+        // #145eb9 is the gradient's own colour at progress 0.70, the mean across
+        // that edge, which leaves under 4% per channel anywhere along it. The
+        // progress figures are aspect-independent (both radii are percentages of
+        // their own axis), so this holds on every device.
         // dismissBootSplash() (src/utils/bootSplash.ts) reverts this to
         // var(--bg-primary) once the splash is gone, so no blue lingers behind
         // the app's own bottom safe-area inset.
-        d.style.background = '#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
+        d.style.background = '#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed';
         var FONTS = {
           monospace: "ui-monospace, SFMono-Regular, 'SF Mono', Menlo, 'Fira Code', 'JetBrains Mono', Monaco, Consolas, monospace",
           system: "system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif",
@@ -367,6 +378,22 @@
         transition: opacity 0.3s ease;
       }
       .boot-splash-status.boot-splash-status-shown { opacity: 1; }
+      /* The one action a splash can offer when boot cannot proceed: a link out.
+         Both surfaces render one, so the appearance is declared here once and
+         each surface owns only WHEN it is shown. The gateway page renders its
+         link outright (its stalled/failed pages have nothing else left to
+         offer); this document ships its own with the `hidden` attribute and
+         drops that only in the recovery state, so a healthy boot never shows
+         it. Reads brighter than the status and is underlined, so it reads as a
+         tap target, and it takes its pointer events back from the
+         pointer-events:none splash that covers a live shell. */
+      .boot-splash-escape {
+        color: #fff;
+        opacity: 0.92;
+        text-decoration: underline;
+        text-underline-offset: 0.2em;
+        pointer-events: auto;
+      }
       .boot-splash.boot-splash-stalled { pointer-events: auto; cursor: pointer; }
       .boot-splash-leaving { animation: boot-splash-out 0.45s ease forwards; }
       @keyframes boot-mark-reveal {
@@ -388,7 +415,7 @@
       /* lucidos-boot-splash-css-end */
     </style>
 </head>
-<body style="background:#0a4ea8 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed">
+<body style="background:#145eb9 radial-gradient(125% 125% at 30% 22%, #2d83e0 0%, #0a4ea8 100%) no-repeat fixed">
     <div class="boot-splash" aria-hidden="true">
       <!-- lucidos-boot-splash-mark-start -->
       <svg class="boot-splash-mark" viewBox="0 0 100 100" aria-hidden="true">
@@ -401,6 +428,13 @@
       </svg>
       <!-- lucidos-boot-splash-mark-end -->
       <div class="boot-splash-status boot-splash-status-shown" role="status" aria-live="polite">Opening your workspace…</div>
+      <!-- The way out of a workspace this document cannot reach, revealed only
+           when boot has given up (see the watchdog below and
+           src/utils/bootSplash.ts). `hidden` until then, and it carries no href
+           until one is built, so a healthy boot has nothing here to see or tap.
+           Kept OUTSIDE the mark markers: the gateway splash lifts only the mark
+           and renders its own escape link. -->
+      <a class="boot-splash-escape" hidden></a>
     </div>
     <script>
       // Gateway-splash handover, before first paint. The gateway serves its own
@@ -466,29 +500,104 @@
          with a tappable action instead of reload-looping forever. */
       (function () {
         var RETRY_KEY = 'lucidos-boot-retry';
+        var RETRY_PARAM = '_boot_retry';
         var base = document.querySelector('base');
         var baseHref = base && base.getAttribute('href');
         var workspaceSlug = baseHref && baseHref !== '/' && baseHref !== '/~/'
           ? baseHref.replace(/^\/+|\/+$/g, '')
           : null;
         function wsKey(name) { return workspaceSlug ? 'ws:' + workspaceSlug + ':' + name : name; }
-        var timer = window.setTimeout(function () {
+        var recovered = false;
+
+        function metaContent(name) {
+          var el = document.querySelector('meta[name="' + name + '"]');
+          var value = el && el.getAttribute('content');
+          return value ? value.trim() : '';
+        }
+
+        /* The way out of a workspace this document cannot reach, and the reason
+           the engine stamps a gateway port and a workspace id into every shell
+           (api/base_path.rs): built from those two metas plus `location`, so it
+           needs no engine, no network and no application bundle. Exactly the
+           resources a document served from the service worker's cache against a
+           dead origin still has.
+
+           Only a DIRECT-PORT document gets one. Direct access is the case with
+           no way out: nothing on that origin lazy-starts a stopped workspace,
+           and the gateway is a different origin (its own port), so no relative
+           route reaches it. A document already behind the gateway (base
+           `/<slug>/`), the picker (`/~/`), and an engine with no gateway at all
+           (no port meta) each have nothing to offer here, and keep the plain
+           retry. `inject_base_href` is a no-op for `/`, so "direct" is exactly
+           "no base element".
+
+           Prefers `/<slug>/`, whose navigation is what makes the gateway
+           lazy-start the workspace. A shell cached before the id stamp existed
+           falls back to the picker, which is a tap further but still a way in.
+
+           Returns the revealed anchor, or null when there is nothing to offer. */
+        function revealGatewayEscape() {
+          var splash = document.querySelector('.boot-splash');
+          if (!splash || baseHref) return null;
+          var port = metaContent('lucidos-gateway-port');
+          if (!port) return null;
+          var link = splash.querySelector('.boot-splash-escape');
+          if (!link) return null;
+          var slug = metaContent('lucidos-workspace-id');
+          var origin = location.protocol + '//' + location.hostname + ':' + port;
+          link.href = slug
+            ? origin + '/' + encodeURIComponent(slug) + '/'
+            : origin + '/~/?pick';
+          link.textContent = slug ? 'Start this workspace' : 'Back to workspaces';
+          link.hidden = false;
+          // The splash ships aria-hidden (it is decorative over a live shell).
+          // The moment it carries the only action on screen that has to stop:
+          // otherwise the status naming the problem is never announced, and the
+          // link is a focusable element inside an aria-hidden subtree.
+          splash.setAttribute('aria-hidden', 'false');
+          return link;
+        }
+
+        // One automatic retry, then a tappable action. Reached two ways, and the
+        // distinction is the whole point of the pair: the timer below covers a
+        // module that never takes ownership (a hang, where waiting IS the test),
+        // and `onEntryModuleError` covers a module that reported it CANNOT load
+        // (a stale bundle, or an engine that isn't answering at all), where the
+        // answer is already in and there is nothing left to wait for. Before the
+        // error arm, a dead direct engine port left the user staring at
+        // "Opening your workspace…" for 15s, then again after the silent retry.
+        function recover() {
+          if (recovered) return;
+          recovered = true;
+          window.clearTimeout(timer);
           var tried = false;
           try { tried = sessionStorage.getItem(wsKey(RETRY_KEY)) === '1'; } catch (e) {}
+          // The retry marks the URL as well as sessionStorage, and either mark
+          // spends the one attempt. A browser that refuses storage would
+          // otherwise never observe its own retry and would reload forever.
+          try {
+            tried = tried || new URL(location.href).searchParams.has(RETRY_PARAM);
+          } catch (e) {}
           if (!tried) {
             try { sessionStorage.setItem(wsKey(RETRY_KEY), '1'); } catch (e) {}
             var retryUrl = new URL(location.href);
-            retryUrl.searchParams.set('_boot_retry', '1');
+            retryUrl.searchParams.set(RETRY_PARAM, '1');
             location.replace(retryUrl.toString());
             return;
           }
           var splash = document.querySelector('.boot-splash');
           var status = splash && splash.querySelector('.boot-splash-status');
+          // On a direct engine port the gateway is the only thing that can help:
+          // reloading cannot start a stopped workspace, and the gateway starts
+          // one on a navigation to it. So where an escape exists it REPLACES
+          // tap-to-retry rather than sitting beside it, leaving exactly one tap
+          // target in the recovery state.
+          var escape = revealGatewayEscape();
           if (status) {
-            status.textContent = 'Tap to retry';
+            status.textContent = escape ? "Can't reach this workspace" : 'Tap to retry';
             status.classList.add('boot-splash-status-shown');
           }
-          if (splash) {
+          if (splash && !escape) {
             splash.classList.add('boot-splash-stalled');
             splash.setAttribute('aria-hidden', 'false');
             splash.addEventListener('click', function () {
@@ -496,15 +605,47 @@
               location.reload();
             }, { once: true });
           }
-        }, 15000);
+        }
+
+        var timer = window.setTimeout(recover, 15000);
+
+        // A script that fails to fetch (or is refused for its MIME type, which
+        // is how the SPA fallback's HTML answer for a deleted bundle arrives)
+        // fires `error` on its own element. That event does not bubble, but it
+        // does reach window in the CAPTURE phase, so this needs no attribute on
+        // the tag below and survives the build rewriting that tag's src.
+        //
+        // Keyed on the event, never on elapsed time: a slow but working load
+        // fires nothing, so it is untouched and still owned by the timer.
+        function onEntryModuleError(e) {
+          var el = e && e.target;
+          // A runtime exception targets window, not an element; only a module
+          // script's own load failure is evidence the entry never arrived.
+          if (!el || el === window || el.tagName !== 'SCRIPT' || el.type !== 'module') return;
+          recover();
+        }
+        window.addEventListener('error', onEntryModuleError, true);
+
+        // The application faces the same dead end when its bundle DID load but
+        // the engine is unreachable (utils/bootSplash.ts, reached from the
+        // direct-port branch of hooks/useBootSplashReady.ts). It reuses this
+        // one implementation rather than rebuilding the href rule in TS, so the
+        // two can never disagree about where the escape points. Deliberately
+        // NOT deleted by the handover below, unlike __lucidosBootLoaded: the
+        // application needs it precisely after boot has taken over.
+        window.__lucidosGatewayEscape = revealGatewayEscape;
 
         window.__lucidosBootLoaded = function () {
+          recovered = true;
           window.clearTimeout(timer);
+          // Boot is the module's now. A later module-script failure is the
+          // application's to handle, and must never reload the page under it.
+          window.removeEventListener('error', onEntryModuleError, true);
           try { sessionStorage.removeItem(wsKey(RETRY_KEY)); } catch (e) {}
           try {
             var current = new URL(location.href);
-            if (current.searchParams.has('_boot_retry')) {
-              current.searchParams.delete('_boot_retry');
+            if (current.searchParams.has(RETRY_PARAM)) {
+              current.searchParams.delete(RETRY_PARAM);
               history.replaceState(history.state, '', current.toString());
             }
           } catch (e) {}

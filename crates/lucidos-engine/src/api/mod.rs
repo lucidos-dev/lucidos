@@ -913,6 +913,8 @@ fn serve_shell(static_dir: &std::path::Path, prefix: &str) -> Response {
             let stamped = base_path::inject_base_href(&html, prefix);
             let stamped =
                 base_path::inject_gateway_port(&stamped, base_path::gateway_port().as_deref());
+            let stamped =
+                base_path::inject_workspace_id(&stamped, base_path::workspace_id().as_deref());
             (
                 [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
                 stamped,

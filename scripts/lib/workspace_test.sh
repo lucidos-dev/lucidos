@@ -1324,6 +1324,87 @@ test_locate_prefers_published_and_falls_back() {
     esac
 }
 
+# ── pid_is_live ────────────────────────────────────────────────────────
+# The zombie case is the whole point: `kill -0` succeeds for a defunct
+# process, which is what let a dead engine report as running.
+test_pid_is_live_rejects_a_zombie() {
+    echo "pid_is_live"
+
+    # A live process we own: `sleep` in the background, killed at the end.
+    sleep 30 &
+    local live_pid=$!
+    if pid_is_live "$live_pid"; then
+        pass "a running process is live"
+    else
+        fail "a running process was reported dead (pid $live_pid)"
+    fi
+
+    # A real zombie: fork a child that exits immediately from a parent that
+    # never reaps it, and hold that parent open while we probe. python3 is
+    # already required by this repo's scripts.
+    local zombie_dir="$SANDBOX/zombie"
+    mkdir -p "$zombie_dir"
+    python3 -c "
+import os, sys, time
+pid = os.fork()
+if pid == 0:
+    os._exit(0)
+sys.stdout.write(str(pid))
+sys.stdout.flush()
+time.sleep(10)
+" > "$zombie_dir/pid" &
+    local holder_pid=$!
+    local zombie_pid="" waited=0
+    while [ -z "$zombie_pid" ] && [ "$waited" -lt 50 ]; do
+        sleep 0.1
+        zombie_pid="$(cat "$zombie_dir/pid" 2>/dev/null || true)"
+        waited=$((waited + 1))
+    done
+
+    if [ -z "$zombie_pid" ]; then
+        fail "could not fork a zombie to test against"
+    else
+        # Guard the premise: this test is only meaningful while the pid really
+        # is a zombie that `kill -0` still accepts.
+        local state
+        state="$(ps -o state= -p "$zombie_pid" 2>/dev/null | tr -d '[:space:]')"
+        if [ "${state:0:1}" != "Z" ]; then
+            fail "fixture pid $zombie_pid is not a zombie (state '$state')"
+        elif ! kill -0 "$zombie_pid" 2>/dev/null; then
+            fail "fixture zombie $zombie_pid is not kill -0 visible, premise gone"
+        elif pid_is_live "$zombie_pid"; then
+            fail "a zombie was reported live (pid $zombie_pid)"
+        else
+            pass "a zombie is not live (kill -0 says otherwise)"
+        fi
+    fi
+
+    kill -KILL "$holder_pid" 2>/dev/null || true
+    kill -KILL "$live_pid" 2>/dev/null || true
+    wait "$holder_pid" 2>/dev/null || true
+    wait "$live_pid" 2>/dev/null || true
+
+    # A pid that has gone entirely (reaped, or never existed).
+    if pid_is_live "$live_pid"; then
+        fail "a reaped pid was reported live (pid $live_pid)"
+    else
+        pass "a gone pid is not live"
+    fi
+
+    # Garbage pidfile contents must not be live, and must not error.
+    if pid_is_live ""; then
+        fail "an empty pid was reported live"
+    else
+        pass "an empty pid is not live"
+    fi
+    if pid_is_live "not-a-pid"; then
+        fail "a non-numeric pid was reported live"
+    else
+        pass "a non-numeric pid is not live"
+    fi
+}
+
+test_pid_is_live_rejects_a_zombie
 test_keeps_shared_build_watch_when_a_workspace_still_serves
 test_kills_shared_build_watch_when_no_workspace_serves
 test_launch_bin_dir_is_per_profile_and_variant

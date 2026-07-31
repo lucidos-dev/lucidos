@@ -4,11 +4,12 @@ import {
   delayedBootStatus,
   remainingRevealMs,
   startDelayedBootStatus,
+  workspaceIsUnreachable,
   BOOT_SPLASH_MIN_REVEAL_MS,
   STATUS_DELAY_MS,
 } from './useBootSplashReady';
 import { connectionStatus } from '../store/store';
-import { setBootStatus } from '../utils/bootSplash';
+import { revealBootEscape, setBootStatus } from '../utils/bootSplash';
 
 // The status line is the unit under test; the splash DOM controller is not.
 vi.mock('../utils/bootSplash', () => ({
@@ -16,6 +17,7 @@ vi.mock('../utils/bootSplash', () => ({
   bootSplashPresent: vi.fn(() => true),
   bootSplashRevealSkipped: vi.fn(() => false),
   dismissBootSplash: vi.fn(),
+  revealBootEscape: vi.fn(() => true),
 }));
 
 describe('isWorkspaceReady', () => {
@@ -57,6 +59,33 @@ describe('delayedBootStatus', () => {
 
   it('keeps "Connecting…" behind the gateway (which lazy-starts the engine)', () => {
     expect(delayedBootStatus('disconnected', false)).toBe('Connecting…');
+  });
+});
+
+// The message and the affordance must agree about when the workspace is
+// unreachable, so both read the same predicate.
+describe('workspaceIsUnreachable', () => {
+  it('is true only for a direct port whose probe actually failed', () => {
+    expect(workspaceIsUnreachable('disconnected', true)).toBe(true);
+  });
+
+  it('is false behind the gateway, which lazy-starts the engine itself', () => {
+    expect(workspaceIsUnreachable('disconnected', false)).toBe(false);
+  });
+
+  it('is false while the first probe is still in flight, and once connected', () => {
+    expect(workspaceIsUnreachable('connecting', true)).toBe(false);
+    expect(workspaceIsUnreachable('connected', true)).toBe(false);
+  });
+
+  it('matches the state the status line names a cause for', () => {
+    for (const connection of ['connected', 'connecting', 'disconnected'] as const) {
+      for (const isDirect of [true, false]) {
+        expect(delayedBootStatus(connection, isDirect) === 'Workspace not started').toBe(
+          workspaceIsUnreachable(connection, isDirect),
+        );
+      }
+    }
   });
 });
 
@@ -116,6 +145,28 @@ describe('startDelayedBootStatus', () => {
     expect(written).toHaveBeenLastCalledWith('Workspace not started');
     connectionStatus.value = 'connected';
     expect(written).toHaveBeenLastCalledWith('Loading…');
+  });
+
+  // Naming the cause is not enough on a direct port: the user cannot start the
+  // workspace from that origin, so the splash must also offer the gateway.
+  it('offers the gateway escape exactly when the workspace is unreachable', () => {
+    const revealed = vi.mocked(revealBootEscape);
+    revealed.mockClear();
+    teardown = startDelayedBootStatus(true);
+    vi.advanceTimersByTime(STATUS_DELAY_MS);
+    // Still probing: no failure to act on yet.
+    expect(revealed).not.toHaveBeenCalled();
+    connectionStatus.value = 'disconnected';
+    expect(revealed).toHaveBeenCalled();
+  });
+
+  it('never offers the escape behind the gateway, which starts the engine itself', () => {
+    const revealed = vi.mocked(revealBootEscape);
+    revealed.mockClear();
+    teardown = startDelayedBootStatus(false);
+    vi.advanceTimersByTime(STATUS_DELAY_MS);
+    connectionStatus.value = 'disconnected';
+    expect(revealed).not.toHaveBeenCalled();
   });
 
   it('teardown stops the subscription — before the delay it never fires at all', () => {

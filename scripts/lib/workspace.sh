@@ -1193,6 +1193,37 @@ _start_postgres_container() {
     docker exec "lucidos-pg-$PG_NAME" psql -U lucidos -d lucidos -c "CREATE EXTENSION IF NOT EXISTS vector;" > /dev/null 2>&1 || true
 }
 
+# ── pid_is_live ─────────────────────────────────────────────────────────
+# True if pid $1 is a process that is actually still running. A ZOMBIE (state
+# `Z`, `<defunct>`) is NOT: it has already exited and only lingers in the
+# process table until its parent reaps it.
+#
+# This exists because `kill -0 <pid>` SUCCEEDS for a zombie, so a bare signal
+# probe reports a dead engine as running. On 2026-07-31 a workspace engine had
+# been a defunct child of the gateway for a day, `status.sh --json` still said
+# `engine_running: true`, and the workspace switcher rendered a healthy dot that
+# sent an iOS PWA to a port nothing was listening on.
+#
+# `ps -o state=` is the portable answer (macOS and Linux both print a single
+# state letter, `Z` for a zombie) and it also covers the pid-does-not-exist
+# case, where `ps` exits non-zero and prints nothing. A non-numeric or empty
+# pid (a truncated / garbage pidfile) is never live.
+pid_is_live() {
+    local pid="$1" state
+    [ -n "$pid" ] || return 1
+    case "$pid" in
+        *[!0-9]*) return 1 ;;
+    esac
+    state="$(ps -o state= -p "$pid" 2>/dev/null)" || return 1
+    # Strip the padding `ps` adds around the state column before matching.
+    state="${state//[[:space:]]/}"
+    [ -n "$state" ] || return 1
+    case "$state" in
+        Z*) return 1 ;;
+    esac
+    return 0
+}
+
 # ── _pid_in_list ────────────────────────────────────────────────────────
 # True if pid $1 appears in the space-separated list $2.
 _pid_in_list() {

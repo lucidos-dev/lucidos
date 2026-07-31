@@ -83,8 +83,55 @@ pub fn inject_gateway_port(html: &str, port: Option<&str>) -> String {
     }
 }
 
+/// This workspace's gateway slug, from `LUCIDOS_WORKSPACE_ID`, which the gateway
+/// sets when it spawns this engine (`lucidos-gateway` `stack.rs`). `None` for an
+/// engine no gateway launched, which has no slug to be addressed by.
+pub fn workspace_id() -> Option<String> {
+    std::env::var("LUCIDOS_WORKSPACE_ID")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Insert `<meta name="lucidos-workspace-id" content="…">` as the first child of
+/// `<head>`. Paired with [`inject_gateway_port`], this is what lets a page served
+/// on the engine's OWN port address ITSELF on the gateway
+/// (`https://<host>:<port>/<slug>/`) instead of only reaching the picker.
+///
+/// The reason that matters: a direct-port document has no `<base>` element at all
+/// (see [`inject_base_href`], a no-op for `/`), so the slug is otherwise nowhere
+/// in the document, and a navigation to `/<slug>/` is exactly what makes the
+/// gateway lazy-start a STOPPED workspace (ADR 0014 §11). So a page whose engine
+/// has died can still offer a working way in, from cached HTML, with no engine
+/// and no application bundle to help it.
+///
+/// The value is HTML-escaped. The gateway sets it from a registry slug and
+/// nothing else writes it, but it reaches us through an env var and lands in an
+/// attribute, so it is escaped here rather than trusted at the boundary.
+pub fn inject_workspace_id(html: &str, id: Option<&str>) -> String {
+    match id {
+        None => html.to_string(),
+        Some(id) => insert_into_head(
+            html,
+            &format!(
+                "<meta name=\"lucidos-workspace-id\" content=\"{}\">",
+                escape_attr(id)
+            ),
+        ),
+    }
+}
+
+/// Minimal HTML attribute escaping for a double-quoted value.
+fn escape_attr(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('"', "&quot;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 /// Insert `tag` as the first child of `<head>`; prepend it when there is no
-/// `<head>`. Shared by the base-href and gateway-port stampers.
+/// `<head>`. Shared by the base-href, gateway-port and workspace-id stampers.
 fn insert_into_head(html: &str, tag: &str) -> String {
     match find_head_open_end(html) {
         Some(pos) => {
@@ -174,6 +221,52 @@ mod tests {
             inject_gateway_port(html, Some("5252")),
             "<meta name=\"lucidos-gateway-port\" content=\"5252\"><p>x</p>"
         );
+    }
+
+    #[test]
+    fn inject_workspace_id_after_head() {
+        let html = "<html><head><meta charset=\"utf-8\"></head><body>x</body></html>";
+        let out = inject_workspace_id(html, Some("myws"));
+        assert!(out.contains(
+            "<head><meta name=\"lucidos-workspace-id\" content=\"myws\"><meta charset=\"utf-8\">"
+        ));
+    }
+
+    #[test]
+    fn inject_workspace_id_none_is_noop() {
+        let html = "<html><head></head></html>";
+        assert_eq!(inject_workspace_id(html, None), html);
+    }
+
+    /// The value lands in a double-quoted attribute. A slug never contains these
+    /// characters, but the value arrives through an env var, so a hostile or
+    /// merely malformed one must not break out of the attribute.
+    #[test]
+    fn inject_workspace_id_escapes_the_value() {
+        let out = inject_workspace_id(
+            "<html><head></head></html>",
+            Some("a\"><script>alert(1)</script>&x"),
+        );
+        assert!(
+            out.contains("content=\"a&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;&amp;x\">"),
+            "{out}"
+        );
+        assert!(!out.contains("<script>"), "{out}");
+    }
+
+    /// A direct-port document is the whole point of the pair: it gets NO base
+    /// element, so these two metas are the only way it can address itself on the
+    /// gateway and lazy-start a stopped workspace.
+    #[test]
+    fn direct_access_still_carries_both_metas_without_a_base() {
+        let html = "<html><head><title>x</title></head></html>";
+        let out = inject_workspace_id(
+            &inject_gateway_port(&inject_base_href(html, "/"), Some("5251")),
+            Some("myws"),
+        );
+        assert!(!out.contains("<base"), "{out}");
+        assert!(out.contains("content=\"5251\""), "{out}");
+        assert!(out.contains("content=\"myws\""), "{out}");
     }
 
     #[test]

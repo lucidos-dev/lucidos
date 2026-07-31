@@ -1,7 +1,9 @@
 import { useState } from 'preact/hooks';
 import { currentCaptureContext, setCaptureContext } from '../../store/actions/preferences';
 import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
-import { animationSpeed, speedMultiplier } from '../../store/store';
+import { animationSpeed, enginePackaged, speedMultiplier } from '../../store/store';
+import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
+import { restartControlHome } from './restartControl';
 
 /** Settings → System → Debugging: developer/diagnostic toggles, off by default.
  *
@@ -19,7 +21,23 @@ import { animationSpeed, speedMultiplier } from '../../store/store';
  *    device-global slider persisted in localStorage, see store.ts/effects.ts).
  *    It lives here as a diagnostic — slowing animations down makes transition
  *    glitches inspectable; reading `animationSpeed.value` in render subscribes
- *    to the signal so the multiplier label updates live as you drag. */
+ *    to the signal so the multiplier label updates live as you drag.
+ *  - "Restart engine" is shown on a PACKAGED install only, and is the packaged
+ *    counterpart of System > Overview's dev-only "Rebuild & Restart". Both sites
+ *    branch on `restartControlHome`, so exactly one of the two ever renders. A
+ *    packaged install ships its binary and has no source to rebuild, so the dev
+ *    label was a lie there and the action is purely a recovery one: it belongs
+ *    with the diagnostics, not on the page a user reads to see their version.
+ *    Both routes go through `confirmAndRestartEngine`, the single
+ *    confirm-then-restart entry point.
+ *
+ *    The note deliberately does NOT name a mechanism, because the packaged
+ *    restart has two shapes: the desktop app drives `restart_service`
+ *    (`launchctl kickstart -k` on the LaunchAgent, taking the gateway and every
+ *    workspace engine it spawned down with it), while a browser/PWA client POSTs
+ *    /restart, which the engine forwards to the gateway control API to respawn
+ *    just this workspace's stack. The blast radius is what the user needs, so
+ *    that is what the note states. */
 export function DebuggingSection() {
   // Lazy initializer: read localStorage once on mount, not on every render. The
   // panel remounts each time it's opened, so this reflects the current flag.
@@ -89,6 +107,24 @@ export function DebuggingSection() {
         animations down makes transition glitches easier to inspect. Per-device,
         persisted locally, takes effect immediately.
       </div>
+      {restartControlHome(enginePackaged.value) === 'debugging' && (
+        <>
+          <div class="settings-row" data-search-anchor="debugging:restart-engine">
+            <span class="settings-row-label">Restart engine</span>
+            <button class="action-btn" onClick={() => { void confirmAndRestartEngine(); }}>
+              Restart Engine
+            </button>
+          </div>
+          <div class="settings-row-note">
+            Stops this workspace's engine and starts it again. In the desktop app
+            it restarts the whole background service, so every workspace it runs
+            goes down and comes back with it. Nothing is rebuilt: this install
+            ships its binary, so a restart is a recovery action for an
+            unresponsive engine, not how you pick up a new version. Use Check for
+            Updates under Overview for that.
+          </div>
+        </>
+      )}
     </div>
   );
 }
