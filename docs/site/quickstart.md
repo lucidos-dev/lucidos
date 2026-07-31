@@ -15,6 +15,14 @@ covered in full below.
    end="<!--quickstart-end-->"
 %}
 
+## Working on Lucidos itself
+
+Everything above is about *running* Lucidos. Running it from a source checkout is
+a different activity, and the reason to do it is not that you get a runtime out
+of it: it is that Lucidos can then work on its own code, proposing each change as
+a diff you review and Apply. See **[Develop Lucidos](develop.md)** for that loop,
+the dev setup it needs, and how to contribute.
+
 ## Next steps
 
 - **[Concepts](concepts.md)** — the building blocks you'll work with.

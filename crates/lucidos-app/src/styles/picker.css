@@ -175,15 +175,49 @@
 
 /* Value-bearing controls (segmented bind picker, address field, inherit toggle).
    They render at full structure immediately so the popover's height is fixed at
-   open; while the gateway config is in flight they dim + go inert (no value is
-   marked active yet, so no wrong default shows). On load they fade to full
-   strength — opacity only, so the popover never resizes (the load jank fix). */
+   open; until the gateway config lands they dim + go inert, with NO value marked
+   active, so the popover can never show a bind other than the saved one. When it
+   settles they fade to full strength and the saved segment's thumb fades in.
+   `data-state` is the single marker for that: loading (or not-loaded yet) and
+   failed both read as unsettled. */
 .ws-picker-net-controls {
   transition: opacity var(--duration-normal) ease;
 }
-.ws-picker-net-controls.is-loading {
+.ws-picker-net-controls[data-state='loading'],
+.ws-picker-net-controls[data-state='failed'] {
   opacity: 0.45;
   pointer-events: none;
+}
+
+/* A row whose presence depends on the loaded value (the address field, the
+   failure notice). It stays MOUNTED and animates its own height, so settling on
+   a saved IP grows the popover smoothly instead of snapping, and switching
+   modes glides. `grid-template-rows: 0fr -> 1fr` is what lets a transition run
+   to an auto height; the inner element owns the overflow clip. */
+.ws-picker-net-collapse {
+  display: grid;
+  grid-template-rows: 0fr;
+  opacity: 0;
+  transition: grid-template-rows var(--duration-normal) ease,
+    opacity var(--duration-normal) ease;
+}
+.ws-picker-net-collapse > * {
+  overflow: hidden;
+  min-height: 0;
+}
+.ws-picker-net-collapse.is-open {
+  grid-template-rows: 1fr;
+  opacity: 1;
+}
+/* Each collapsible owns its leading gap as PADDING inside the clipped box, so a
+   closed row contributes exactly zero height. A margin would survive the clip
+   and leave a phantom gap when the row is shut. */
+.ws-picker-net-address,
+.ws-picker-net-failure {
+  padding-top: 0.5rem;
+}
+.ws-picker-net-failure .ws-picker-net-error {
+  margin-top: 0;
 }
 
 /* Three-mode bind picker as a single connected segmented control: an inset
@@ -193,7 +227,9 @@
   display: flex;
   gap: 0.1875rem;
   padding: 0.1875rem;
-  margin-bottom: 0.5rem;
+  /* No bottom margin: the gap below belongs to whatever follows (the address
+     collapse's own padding, or the toggle's margin), so a closed collapse
+     leaves the spacing exactly as if it were not there. */
   background: rgba(0, 0, 0, 0.18);
   border: 1px solid rgba(255, 255, 255, 0.14);
   border-radius: 0.5rem;
@@ -235,10 +271,12 @@
   color: rgba(255, 255, 255, 0.6);
   line-height: 1.4;
 }
-/* The detected Tailscale IP is a click-to-fill affordance: accent-tinted and
-   underlines on hover, so one tap drops it into the address field. Full-strength
-   color (its parent hint uses color, not opacity) so it reads as interactive. */
-.ws-picker-net-detected {
+/* Inline text-button affordances inside the popover: the detected Tailscale IP
+   (one tap drops it into the address field) and the failure row's Retry. Both
+   are accent-tinted and underline on hover. Full-strength color (their parent
+   line uses color, not opacity) so they read as interactive. */
+.ws-picker-net-detected,
+.ws-picker-net-retry {
   border: none;
   background: none;
   padding: 0;
@@ -249,7 +287,9 @@
   border-radius: 0.25rem;
 }
 .ws-picker-net-detected:hover,
-.ws-picker-net-detected:focus-visible {
+.ws-picker-net-detected:focus-visible,
+.ws-picker-net-retry:hover,
+.ws-picker-net-retry:focus-visible {
   color: #e7f1ff;
   text-decoration: underline;
   outline: none;
@@ -266,9 +306,31 @@
   color: rgba(255, 255, 255, 0.7);
   font-style: italic;
 }
-/* A touch of breathing room above Save / Cancel after the compacted body. */
+/* A touch of breathing room above Save / Cancel after the compacted body. The
+   confirm button holds a width: the row is right-aligned, so letting it grow
+   from "Save" to "Saving…" would shove Cancel sideways mid-save. Sized to the
+   LONGER label, or it would not hold anything: "Saving…" is ~3.5rem of 14px/500
+   text plus the button's 1.75rem of side padding, so the floor has to clear
+   ~5.25rem. In rem, so it tracks the user's UI scale with the text. */
 .ws-picker-net .ws-picker-confirm-actions {
   margin-top: 0.75rem;
+}
+.ws-picker-net .ws-picker-btn-confirm {
+  min-width: 5.75rem;
+}
+/* Why Save is unavailable, on the same row as the buttons so it costs no
+   height. Takes the leftover width (the row is right-aligned) and is clipped
+   rather than wrapped, so a long reason can never grow the row and reflow the
+   popover mid-interaction. */
+.ws-picker-net-blocked {
+  margin-right: auto;
+  min-width: 0;
+  align-self: center;
+  overflow: hidden;
+  white-space: nowrap;
+  text-overflow: ellipsis;
+  font-size: var(--font-size-sm);
+  color: rgba(255, 255, 255, 0.6);
 }
 
 /* Brand lockup: the animated mark with the wordmark vertically centered to it,
@@ -845,5 +907,13 @@
   .ws-picker-restore-spinner,
   .ws-picker-reload.is-reloading svg {
     animation: none;
+  }
+  /* The Network access popover settles instantly instead of fading/expanding.
+     It still never shows a value before it is settled, so the guarantee holds
+     without the motion. */
+  .ws-picker-net-controls,
+  .ws-picker-net-collapse,
+  .ws-picker-net-mode {
+    transition: none;
   }
 }

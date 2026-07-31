@@ -11,8 +11,7 @@ import type { MenuItem } from '../types';
 import { MENU_ITEMS } from '../types';
 import { normalizeUrl } from './artifacts';
 import { NAV_KEY } from './entityReferences';
-import { isTauri } from '../../utils/platform';
-import { currentInAppBrowser } from './preferences';
+import { inAppBrowserAvailable } from './preferences';
 import { revealContentPane } from './pane';
 
 /** A snapshot of panel navigation state. */
@@ -198,7 +197,7 @@ function restoreState(entry: NavEntry): void {
     // experimental in-app webview is off by default (URLs open in the system
     // browser, so there's no panel to resurrect on reload).
     const suppressUrlPreview = migrated.overlay?.type === 'url-preview'
-      && (!isTauri() || !currentInAppBrowser());
+      && !inAppBrowserAvailable();
     // Drop any transient, request-backed form overlay (plugin install/uninstall,
     // email-confirm, engine-prompted credential) — its staged request is dead
     // after a reload, so resurrecting the panel would show a stale form (see

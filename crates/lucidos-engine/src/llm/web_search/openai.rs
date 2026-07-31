@@ -32,6 +32,10 @@ fn build_request(model: &str, query: &str) -> serde_json::Value {
         "input": query,
         "tools": [{ "type": "web_search" }],
         "max_output_tokens": MAX_OUTPUT_TOKENS,
+        // One-shot call with nothing to chain from, so the `store: true`
+        // default would only hand OpenAI a 30-day copy of the query and answer
+        // that we never read back. Opt out.
+        "store": false,
     })
 }
 
@@ -204,6 +208,15 @@ mod tests {
         assert_eq!(req["input"], "rust release date");
         assert_eq!(req["tools"][0]["type"], "web_search");
         assert_eq!(req["max_output_tokens"], MAX_OUTPUT_TOKENS);
+    }
+
+    /// The Responses API retains response objects for at least 30 days under
+    /// its `store: true` default. This backend chains nothing, so the query and
+    /// its answer must not be left on OpenAI's servers.
+    #[test]
+    fn request_opts_out_of_server_side_storage() {
+        let req = build_request("gpt-5.5", "rust release date");
+        assert_eq!(req["store"], false);
     }
 
     #[test]

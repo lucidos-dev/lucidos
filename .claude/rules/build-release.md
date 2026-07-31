@@ -8,8 +8,10 @@ paths:
   - "scripts/lib/install*.sh"
   - "scripts/lib/service*.sh"
   - "scripts/lib/release_*.sh"
+  - "scripts/lib/front_door_parity*.sh"
   - "scripts/lib/tauri_signing_key.sh"
   - "scripts/lib/cargo_lock_holders_test.sh"
+  - "scripts/lib/front_door_gate_test.sh"
   - "install.sh"
   - "uninstall.sh"
   - "docker-entrypoint.sh"
@@ -51,9 +53,27 @@ artifact**, and that is the complete list of what belongs there:
 
 | workflow | fires on | verifies |
 |---|---|---|
-| `docs.yml` | `release: published`, manual | the mkdocs site deploy (`mkdocs build --strict`) |
-| `install-smoke.yml` | push to `rc/**`, `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, and the RC front door's payloads |
+| `install-smoke.yml` | push to `rc/**`, `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, and **route parity between the two front doors** |
 | `release-tarballs.yml` | `v*` tag push, `release: published`, manual | the per-triple headless tarball build |
+
+**Nothing in there DEPLOYS, and that is a second rule, not a coincidence of the
+first.** Publishing to a `lucidos.dev` origin runs on the maintainer's machine off
+a workspace trigger, both halves of it: the landing page via `LucidosReleased` →
+DMG-link bump → `SitePublishRequested` → publisher → `SitePublished`, and
+`docs.lucidos.dev` via the "Publish lucidos.dev docs" trigger on
+`LucidosReleased` (or an explicit `DocsPublishRequested`), which gates on
+`mkdocs build --strict`, deploys `site/` to the `lucidos-docs` Pages project
+through the engine's API proxy so the account credential never reaches argv or a
+log line, verifies routes against that deployment's own preview URL, and emits
+`DocsPublished` / `DocsPublishFailed`. The reason is the credential: a Cloudflare
+token that can deploy Pages for this account also carries, in the form available,
+`dns_records:edit` and `zone:edit` on the zone, which does not belong in a public
+repo's CI for a deploy that need not happen there. `docs.yml` was that job. It
+read a `CLOUDFLARE_API_TOKEN` secret the mirror never had, failed on **every**
+release from 2026-07-11 through 07-31 while `docs.lucidos.dev` sat twenty days
+stale, and was deleted rather than credentialed on 2026-07-31 (ADR 0031). No
+workflow reads a Cloudflare credential now, and the `CLOUDFLARE_ACCOUNT_ID`
+secret is referenced by none of them.
 
 **Never add a workflow that compiles, lints, type-checks or tests the tree per
 push/PR.** The repo is built and tested locally; the per-change gate is
@@ -63,7 +83,7 @@ substitute even if you wanted one: Lucidos is **not PR-based** — Apply merges
 the branch into `main` directly — so a `pull_request` trigger never fires and a
 `push` trigger only reports *after* the change is already on main. A new
 per-change check goes into `/harden` Phase 4.5's test-selection table
-(`.claude/commands/harden.md`). This is the CLAUDE.md rule "We build locally —
+(`.claude/commands/harden.md`). This is the CLAUDE.md rule "We build locally:
 GitHub Actions is RELEASE-ONLY"; the section here is its rationale and the
 inventory it is measured against.
 
@@ -84,7 +104,8 @@ local run and no per-change gate could substitute:
   `curl -fsSL` succeeded and the installer sourced HTML as shell. Its first rung
   asserts every helper lib **and `uninstall.sh`** resolves to a payload with a
   `#!` shebang rather than `<`, with the lib names and both URLs parsed out of
-  the served `install.sh`.
+  the served `install.sh`. The daily cron also runs **`front-door-parity`**, the
+  only job that fetches BOTH origins (see below).
 
 A schedule trigger fires the whole workflow, so **every job guards on
 `github.event.schedule`** to claim exactly one cron. Adding a cron without that
@@ -108,11 +129,11 @@ event, and the rung logic is written once per host family:
   *previous* origin, passing for the wrong reason. The publisher fires the
   dispatch itself once `SitePublished` lands.
 - **`payload`** — rung 1 only, then stop green. Auto-runs on every push to
-  `rc/**` against the **RC front door** (`https://lucidos.dev/rc`, libs at
-  `/rc/scripts/lib/`), so the soft-404 class is caught before anything reaches
-  the real path. Also selectable on a dispatch. Rung 1 sniffs the served
-  **uninstaller** too, so an RC is gated on both halves of the advertised
-  experience being real shell, not just its installer.
+  `rc/**` against the **RC front door** (`https://rc.lucidos.dev`, its own Pages
+  project, libs at `/scripts/lib/` on that host), so the soft-404 class is
+  caught before anything reaches the real path. Also selectable on a dispatch.
+  Rung 1 sniffs the served **uninstaller** too, so an RC is gated on both halves
+  of the advertised experience being real shell, not just its installer.
 
 **`front-door-macos` is the same ladder on a Mac, and it is not the `smoke`
 job's macOS exclusion sneaking back in.** The landing page shows the
@@ -214,6 +235,80 @@ The **full** mode is still deliberately **not** on the `rc/**` push: it tests
 production, not the RC tree, so a live-site outage must never be able to block
 cutting a release. Payload mode is the inverse — it gates the RC's *own* copy.
 
+**A dispatch naming the RC origin is REFUSED, not downgraded (2026-07-31).** The
+validate step classifies the origin (host begins `rc.`, or the legacy `.../rc`
+path form) and exits non-zero when it is an RC origin on any event other than
+the `push`, **before any fetch**. The refusal names the `push: rc/**` arm as the
+RC leg's owner and points at the caller, the workspace trigger
+`verify-front-door-after-publish`. This was decided **against** the obvious
+alternative of demoting the run to payload mode and carrying on, and the reason
+is worth keeping: the only known cause of a dispatch at the RC origin was that
+trigger's `/rc` suffix filter, written for the old path-based route and silently
+dead once the RC front door moved to its own host on 2026-07-30. That filter has
+been fixed, so an RC origin arriving on a dispatch now means something regressed
+again, and a downgrade would absorb the evidence of exactly the regression this
+job exists to surface. There is no `FD_MODE` rewriting anywhere in either job,
+and the drift test asserts that. A fail-closed companion refuses an RC origin
+whose `FD_MODE` is not `payload`, so an edit to the job-level expression reds in
+the validate step rather than driving a full install at an origin with no
+`v<version>` tag.
+
+**The full rungs wait for the release assets, and a download failure is named as
+one.** On the v0.18.0 release all three legs failed identically: the post-publish
+dispatch fired at 05:58, install.sh printed its own `Download failed:` for the
+headless tarball, and each leg then burned the entire 900 s
+`GW_HEALTH_TIMEOUT_SECS` before reporting *"the gateway never reported healthy"*.
+Nothing was broken. `release-tarballs.yml` had not finished attaching the assets
+until 06:21. Three faults in one shape, and all three are now covered:
+
+- **An asset preflight** runs between rung 1 and the launch step, full mode only.
+  It polls the tarball **and** its `.sha256` (install.sh's checksum step is
+  mandatory and fails closed, so a missing sidecar is just as fatal) with a
+  one-byte range request, `FD_ASSET_POLL_SECS: '30'`, bounded by
+  `FD_ASSET_WAIT_SECS: '1800'`. The URL is what install.sh will really fetch: the
+  version comes from rung 1's parse of the **served** installer's baked
+  `LUCIDOS_DEFAULT_VERSION` (what a piped run resolves, since no checkout means
+  no adjacent `RELEASE`), the base URL is **derived** from the served
+  `install_common.sh`, the stem is drift-guarded against the served
+  `headless_tarball.sh`, and the triple uses install.sh's own `uname` map (the
+  matrix `TRIPLE` on macOS). Every parse fails closed. Rung 1 therefore writes
+  its payloads to a stable `$RUNNER_TEMP/front-door-payloads` instead of a
+  `mktemp -d`, so the preflight consumes what it already fetched rather than
+  asking the origin a second time.
+- **Expiry fails fast**, naming both URLs and the `release-tarballs` window, and
+  never reaches the gateway poll.
+- **`assert_no_download_failure`** joins `assert_no_html_payload` inside both
+  health polls, matching install.sh's own asset-fetch aborts (`Download failed:`
+  and the checksum-sidecar one, not the checksum *mismatch*, which is a
+  different verdict). It matters most on macOS, which deliberately has no
+  installer-exited fast-fail.
+- **`timeout-minutes` is 75**, not 30: the ceiling has to exceed the budgets it
+  contains, and 1800 + 900 + 900 s of slack is 3600.
+
+**Both jobs are pinned by `scripts/lib/front_door_gate_test.sh`**, an offline
+drift test whose subject is the workflow file itself. It cannot be a unit test:
+these jobs only ever execute in the public mirror, so nothing local can run them
+before a release does. It asserts every invariant above that is checkable from
+the file, **once per job**, since the two are duplicated deliberately and silent
+divergence is the standing hazard: the preflight's position relative to the
+launch step, the budget band, the fail-closed branches, the in-poll download
+check, the timeout arithmetic, the RC refusal preceding the first `curl`, the
+absence of any downgrade, the Access-vs-soft-404 distinction, and the untouched
+guards. It strips comment lines first, so a job's prose about a rule (the macOS
+job documents the ABSENCE of a `kill -0` fast-fail in words) can neither satisfy
+nor violate one, and it re-checks the preflight's URL construction against the
+tree's real `install_common.sh` + `headless_tarball.sh` and its download-failure
+pattern against the real `install.sh`.
+
+**A Cloudflare Access login page is not a soft 404.** The RC origin sits behind
+Access; an unauthorized fetch 302s to a login page that `curl -L` follows and
+that arrives at **200 as HTML**, which the first-byte-is-`<` test reads as the
+Pages SPA fallback. That is how a dispatch at `rc.lucidos.dev` was reported as an
+origin regression when the real cause was the service token. The installer fetch
+records `%{url_effective}`, and `assert_shell_file` consults it before falling
+through to the soft-404 wording. The unset-token case is separately refused up
+front, so reaching the auth message means a token was sent and rejected.
+
 The `origin` dispatch input is treated as hostile: the job pipes what the origin
 serves into a shell, so a validation step accepts only `https://host[:port][/path]`
 over a strict character allowlist, normalises trailing slashes, and exports the
@@ -221,6 +316,49 @@ result under a *different* name (`FRONT_DOOR_INPUT` → `FRONT_DOOR`) so a skipp
 validation leaves consumers with an unset variable under `set -u` rather than a
 usable one. The origin reaches the `sh -c` launch as a positional argument, never
 string-interpolated. The job keeps `permissions: {}`.
+
+#### `front-door-parity` is the only job that sees BOTH origins
+
+Every job above, the two front-door ones included, resolves **one** `FRONT_DOOR`
+per run. So none of them can notice that production and the release candidate
+serve **different route sets**, which is a failure with its own cause: the site
+publisher decides the route set twice, in a production route-discovery path and
+a separate release-candidate one, and the two can drift. On 2026-07-30
+`/uninstall.sh` became a publish route and only the production path learned
+about it; nothing noticed until the `rc/0.18.0` push the next morning red all
+three payload legs at once.
+
+`front-door-parity` closes that. It runs `scripts/lib/front_door_parity.sh`,
+which derives each origin's route set from **that origin's own** served
+`install.sh` and `uninstall.sh` (never from a list, never from the checkout),
+probes the union at both, and reports per route which origin serves shell.
+
+- **Daily cron and dispatch, never the `rc/**` push.** The divergence exists
+  from the moment the publisher's two paths differ, so the daily cron names it
+  within a day and independently of any release. The rc push is the *latest*
+  point (it is where the 2026-07-30 omission surfaced), the RC leg already reds
+  there, and a candidate that legitimately ADDS a route would red it falsely.
+- **Severity is asymmetric on purpose.** Production-serves / candidate-missing
+  is **fatal** (always wrong, actionable now). Candidate-serves /
+  production-missing is a **warning**: an in-flight candidate leads production
+  until publish, and making it fatal would red the cron through every release
+  window. It stays covered, because at publish production's own installer starts
+  declaring the route and `front-door` rung 1 reds fatally. Missing at **both**
+  is a warning, since that is `front-door`'s verdict to give in the same run.
+- **It checks out the repo and `front-door` must not, which is not a
+  contradiction.** That rule keeps the *subject* honest; here the tree is the
+  instrument. The checkout buys ShellCheck coverage through `make lint`, a
+  hermetic offline test, and one definition of the derivation instead of a third
+  copy of bash in a YAML string.
+- Offline-tested by `scripts/lib/front_door_parity_test.sh` (two `file://`
+  origins). It pins the three severities, every fail-closed parse, the lib-base
+  **equality**, that the scrape still matches the **real** `install.sh` +
+  `uninstall.sh` (a partial-miss guard the `fewer than 2 libs` floor cannot
+  give), and that `FDP_RC_URL_DEFAULT` equals `rc_front_door_url`.
+
+**The repo side can only DETECT this.** The two discovery paths live in the site
+publisher, on the maintainer's machine, so the structural fix (one discovery
+function parameterised by destination) has to happen there.
 
 ### Toolchain pin — `rust-toolchain.toml` is authoritative
 

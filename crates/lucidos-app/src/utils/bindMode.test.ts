@@ -4,6 +4,8 @@ import {
   toBindValue,
   isValidIp,
   isValidBindSelection,
+  draftFromBind,
+  bindDraftMatchesSaved,
 } from './bindMode';
 
 describe('parseBindValue', () => {
@@ -51,6 +53,66 @@ describe('isValidIp', () => {
     expect(isValidIp('fd7a:115c:a1e0::1')).toBe(true);
     expect(isValidIp('not:valid:ipv6:xyz!')).toBe(false);
     expect(isValidIp('1::2::3')).toBe(false);
+  });
+});
+
+describe('draftFromBind', () => {
+  it('seeds the draft from the saved value, so it opens on what is stored', () => {
+    expect(draftFromBind('all', true)).toEqual({ mode: 'all', address: '', inherit: true });
+    expect(draftFromBind('loopback', false)).toEqual({
+      mode: 'loopback',
+      address: '',
+      inherit: false,
+    });
+    expect(draftFromBind('100.101.71.58', true)).toEqual({
+      mode: 'address',
+      address: '100.101.71.58',
+      inherit: true,
+    });
+  });
+
+  it('round-trips through toBindValue, so an untouched draft saves what it loaded', () => {
+    for (const bind of ['loopback', 'all', '100.101.71.58']) {
+      const d = draftFromBind(bind, true);
+      expect(toBindValue(d.mode, d.address)).toBe(bind);
+    }
+  });
+});
+
+describe('bindDraftMatchesSaved', () => {
+  it('a freshly seeded draft matches, so Save has nothing to offer on open', () => {
+    for (const bind of ['loopback', 'all', '100.101.71.58']) {
+      expect(bindDraftMatchesSaved(draftFromBind(bind, true), bind, true)).toBe(true);
+    }
+  });
+
+  it('detects a changed mode, address, or inherit flag', () => {
+    expect(bindDraftMatchesSaved(draftFromBind('loopback', true), 'all', true)).toBe(false);
+    expect(bindDraftMatchesSaved(draftFromBind('100.64.0.1', true), '100.101.71.58', true)).toBe(
+      false,
+    );
+    expect(bindDraftMatchesSaved(draftFromBind('all', false), 'all', true)).toBe(false);
+  });
+
+  it('normalizes both sides, so case and whitespace alone are not a change', () => {
+    expect(bindDraftMatchesSaved({ mode: 'all', address: '', inherit: true }, 'ALL', true)).toBe(
+      true,
+    );
+    expect(
+      bindDraftMatchesSaved(
+        { mode: 'address', address: ' 100.101.71.58 ', inherit: true },
+        '100.101.71.58',
+        true,
+      ),
+    ).toBe(true);
+  });
+
+  it('ignores address text in the modes that do not use it', () => {
+    // Type an IP, then pick "all": the write would still be "all", so there is
+    // nothing to save and the button must stay disabled.
+    expect(
+      bindDraftMatchesSaved({ mode: 'all', address: '100.64.0.1', inherit: true }, 'all', true),
+    ).toBe(true);
   });
 });
 

@@ -152,6 +152,18 @@ impl OpenAiProvider {
             "stream": true,
             "max_output_tokens": DEFAULT_MAX_COMPLETION_TOKENS,
             "input": input,
+            // Opt out of OpenAI's server-side response storage: the Responses
+            // API defaults to `store: true` and keeps the response object
+            // (prompt and output alike) for at least 30 days. We are stateless
+            // by construction, since `convert_messages_responses` rebuilds the
+            // full history as `input` items every turn and we never send
+            // `previous_response_id`, so the stored copy is retention with no
+            // upside. What it forecloses is chaining on `previous_response_id`
+            // to save input tokens: that id resolves to
+            // `previous_response_not_found` under `store: false`, so the
+            // optimization would have to carry reasoning items client-side
+            // instead of flipping this back.
+            "store": false,
         });
 
         if let Some(instructions) = system_prompt {
@@ -474,6 +486,23 @@ impl OpenAiProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The Responses API retains response objects for at least 30 days under
+    /// its `store: true` default. We rebuild the full history as `input` on
+    /// every turn and never read a stored response back, so every request must
+    /// carry the opt-out.
+    #[test]
+    fn responses_body_opts_out_of_server_side_storage() {
+        let provider = OpenAiProvider::new("k".to_string(), "gpt-5.5".to_string()).unwrap();
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: MessageContent::Text("hi".to_string()),
+        }];
+
+        let body = provider.build_responses_body("gpt-5.5", &messages, &[], None, None);
+
+        assert_eq!(body["store"], false);
+    }
 
     /// The Responses API `response.completed` terminal event carries the
     /// full Response object (usage + status). We must absorb both into the

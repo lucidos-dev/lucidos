@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable } from './preferences';
 import * as apiClient from '../../api/client';
 
 const platformMocks = vi.hoisted(() => ({ isIOS: false, isTauri: false }));
@@ -425,5 +425,44 @@ describe('currentInAppBrowser — experimental in-app browser, off by default', 
 
     expect(spy).toHaveBeenCalledWith('experimental_in_app_browser', 'true', undefined);
     expect((preferences.value as { data: Record<string, string> }).data.experimental_in_app_browser).toBe('true');
+  });
+});
+
+/**
+ * The surfaces that must agree about the in-app browser being the live URL
+ * target: the menu drawer's Browser row (its only entry point) and
+ * `restoreState`'s refusal to resurrect a url-preview overlay on reload.
+ *
+ * The preference half is the one that shipped missing from the row. With the
+ * toggle off `openUrl` deliberately routes to the OS opener, so the row rendered
+ * for every desktop user and a menu entry labelled "Browser" just launched the
+ * system browser on google.com.
+ */
+describe('inAppBrowserAvailable: desktop app AND the experimental opt-in', () => {
+  beforeEach(() => {
+    platformMocks.isTauri = false;
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('is off in the desktop app while the experimental toggle is off', () => {
+    platformMocks.isTauri = true;
+    expect(inAppBrowserAvailable()).toBe(false);
+  });
+
+  it('is on in the desktop app once the experimental toggle is on', () => {
+    platformMocks.isTauri = true;
+    preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+    expect(inAppBrowserAvailable()).toBe(true);
+  });
+
+  it('is off on web/PWA even with the toggle on, where there is no native webview', () => {
+    preferences.value = { status: 'loaded', data: { experimental_in_app_browser: 'true' } };
+    expect(inAppBrowserAvailable()).toBe(false);
+  });
+
+  it('is off while preferences are still loading, so the row cannot flash in', () => {
+    platformMocks.isTauri = true;
+    preferences.value = { status: 'loading' };
+    expect(inAppBrowserAvailable()).toBe(false);
   });
 });

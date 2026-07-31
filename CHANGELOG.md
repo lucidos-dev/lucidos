@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.18.1 — 2026-07-31
+
+### Changed
+
+- **OpenAI Responses API requests are sent with `store: false`.** Every request now opts out of server-side response retention rather than relying on the API's `store: true` default, so prompt and response bodies are not kept by the provider. Full conversation history is rebuilt locally as `input` on each call, which is what makes the opt-out possible.
+- **Running Lucidos from source is documented as a development guide** rather than as an installation route, so the quickstart stays about installing and a separate develop page covers the source workflow.
+- **The two front doors are gated on serving the same routes.** A piped `curl | sh` fetches its helper libraries back from whatever origin served it, so an origin that quietly stops serving one of them turns the next install into "execute a web page". A route-parity harness now checks production and the release candidate against the same expected route set, and the front-door CI jobs fail when the two diverge instead of only when production breaks on its own.
+- **The Access service token is sent only to the origin that is gated.** The front-door jobs attached the release-candidate credential to every origin, including the public one that does not want it, and reported having sent a token in cases where none applied. The precheck now scopes to any gated origin and says what it actually did.
+- **A front-door check waits for the release assets instead of racing them.** The job downloads the per-platform tarball from the release being tested, and a check dispatched before the upload finished failed on a missing asset after burning its full health timeout. It now waits for the assets within a bounded window, and a genuine download failure is reported as such rather than as a timeout.
+- **A release-candidate origin arriving on a dispatched run is refused.** The candidate front door is owned by the `rc/**` push arm and is payload-checks-only, since the tarballs for an unreleased version do not exist yet. A dispatch naming that origin is a caller error, and absorbing it into a passing run would hide exactly what the job exists to surface, so it is rejected before any fetch.
+- **Dependabot no longer retries a security update that cannot resolve.** The advisory range for `glib` is bounded below the versions this tree can move to, so the update was reopened and failed on every run. The ignore is scoped to that unresolvable range rather than to the package, so a future advisory fixed inside the reachable range still alerts.
+- **`lettre` updated from 0.11.19 to 0.11.22.**
+
+### Fixed
+
+- **The Tailscale IP is detected in the packaged app.** The probe resolved the binary by name, which works in a terminal but not inside a bundled `.app` where the user's shell PATH is absent, so Network access came up without the tailnet address. It now resolves by path across the known install locations, skips the macOS GUI binary that is not a CLI, and logs a detection failure when a real CLI was found but did not answer.
+- **The workspace picker's Network access popover opens on the saved bind.** It previously opened on a default and settled onto the stored value a moment later. The Save control is also sized to the longer of its two labels so the button no longer resizes as its state changes.
+- **The Browser row in the menu drawer follows the experimental in-app browser setting.** The row was always present regardless of the toggle. A single availability gate now governs the drawer row, the settings entry and the navigation path, so the three cannot disagree.
+- **The README no longer uses em dashes.** Thirty-three of them were rewritten as commas, colons, parentheses or separate sentences, with no content added or removed.
+
+### Removed
+
+- **The dead documentation deploy workflow.** Documentation publishes from the maintainer's machine off a workspace trigger, not from CI, so the workflow could only ever fail. ADR 0031 records why deploys do not run in CI: the available credential form carries broader zone permissions than a CI job should hold.
 ## v0.18.0 — 2026-07-31
 
 ### Added

@@ -23,7 +23,7 @@
 
 use serde::Deserialize;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The resolved bind scope for a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +264,77 @@ fn is_tailnet_ipv4(ip: &str) -> bool {
     )
 }
 
+/// Absolute-path candidates for the Tailscale CLI, most likely first.
+///
+/// **Real CLI binaries only.** `/Applications/Tailscale.app/Contents/MacOS/
+/// Tailscale` is deliberately NOT here: it is the GUI executable, and outside a
+/// GUI session it exits with "The Tailscale GUI failed to start ...
+/// (Tailscale.CLIError error 3)" instead of answering. Since resolution picks
+/// ONE candidate by existence and a failed run yields `None` with no
+/// fall-through, listing it would poison detection on every Mac that has the
+/// app (that is, every Mac that has Tailscale at all). macOS users get a CLI
+/// via Homebrew or via the app's own `/usr/local/bin/tailscale` symlink; with
+/// neither, detection stays `None` and the address is typed by hand, which is
+/// the pre-existing behavior.
+const TAILSCALE_CANDIDATES: &[&str] = &[
+    "/usr/local/bin/tailscale", // the macOS app's own CLI symlink, or Intel Homebrew
+    "/opt/homebrew/bin/tailscale", // Homebrew, Apple Silicon
+    "/usr/bin/tailscale",       // Linux distro package
+];
+
+/// Pure resolution of the Tailscale CLI: an explicit override, else the first
+/// candidate that exists, else the bare name.
+///
+/// Resolving by ABSOLUTE PATH is the whole point. A bare `Command::new(
+/// "tailscale")` works in dev (rich shell `PATH`) and silently fails in the
+/// packaged app, which Finder/launchd start with **no `PATH` at all**: the spawn
+/// errors, detection returns `None`, the picker offers no address to click, and
+/// the Tailnet / IP mode becomes unselectable because an empty address is not a
+/// valid bind. Same shape as `runtime::claude_code::resolve_claude_binary`. The
+/// bare-name fallback keeps a custom install working wherever a `PATH` does
+/// exist.
+fn resolve_tailscale_binary(
+    env_override: Option<&str>,
+    candidates: &[&str],
+    exists: impl Fn(&str) -> bool,
+) -> String {
+    if let Some(p) = env_override {
+        let trimmed = p.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
+        }
+    }
+    candidates
+        .iter()
+        .find(|c| exists(c))
+        .map(|c| (*c).to_string())
+        .unwrap_or_else(|| "tailscale".to_string())
+}
+
+/// [`resolve_tailscale_binary`] against the process env + the real filesystem.
+fn tailscale_binary() -> String {
+    resolve_tailscale_binary(
+        std::env::var("LUCIDOS_TAILSCALE_BIN").ok().as_deref(),
+        TAILSCALE_CANDIDATES,
+        |p| Path::new(p).exists(),
+    )
+}
+
+/// Note a detection failure and yield `None`.
+///
+/// Logs ONLY when an absolute CLI was resolved, which means Tailscale IS
+/// installed and something else broke. A failing bare-name fallback just means
+/// it is not installed, the common case, and a line on every popover open would
+/// be noise. Silence is exactly what made the packaged-app `PATH` bug
+/// invisible: the address hint simply never appeared, with nothing anywhere
+/// saying why, and finding it took reading the live process environment.
+fn note_detect_failure(bin: &str, reason: &str) -> Option<String> {
+    if bin != "tailscale" {
+        crate::log!("[NetConfig] '{bin} ip -4' failed ({reason}); no tailnet address to suggest");
+    }
+    None
+}
+
 /// Best-effort detection of this machine's Tailscale `100.x` IPv4, for the
 /// picker's Network access hint. Shells out to `tailscale ip -4` with a short
 /// timeout; any failure yields `None`.
@@ -271,15 +342,21 @@ pub async fn detect_tailscale_ipv4() -> Option<String> {
     use tokio::process::Command;
     use tokio::time::{timeout, Duration};
 
-    let output = timeout(
+    let bin = tailscale_binary();
+    let output = match timeout(
         Duration::from_millis(1500),
-        Command::new("tailscale").arg("ip").arg("-4").output(),
+        Command::new(&bin).arg("ip").arg("-4").output(),
     )
     .await
-    .ok()?
-    .ok()?;
+    {
+        Ok(Ok(output)) => output,
+        Ok(Err(e)) => return note_detect_failure(&bin, &e.to_string()),
+        Err(_) => return note_detect_failure(&bin, "timed out"),
+    };
     if !output.status.success() {
-        return None;
+        // Ran but refused. This is what a non-CLI binary looks like (the macOS
+        // GUI app's "Tailscale.CLIError error 3"), so carry its own words.
+        return note_detect_failure(&bin, String::from_utf8_lossy(&output.stderr).trim());
     }
     String::from_utf8_lossy(&output.stdout)
         .lines()
@@ -378,6 +455,62 @@ mod tests {
         assert!(is_tailnet_ipv4(TAILNET));
         assert!(!is_tailnet_ipv4("100.63.0.1"));
         assert!(!is_tailnet_ipv4("10.0.0.1"));
+    }
+
+    #[test]
+    fn tailscale_binary_prefers_the_first_existing_candidate() {
+        // The packaged app has no PATH, so detection MUST resolve an absolute
+        // path when one exists rather than relying on the bare name.
+        let only_homebrew = |p: &str| p == "/opt/homebrew/bin/tailscale";
+        assert_eq!(
+            resolve_tailscale_binary(None, TAILSCALE_CANDIDATES, only_homebrew),
+            "/opt/homebrew/bin/tailscale"
+        );
+        // With several present, the first listed CLI wins.
+        let all = |_: &str| true;
+        assert_eq!(
+            resolve_tailscale_binary(None, TAILSCALE_CANDIDATES, all),
+            "/usr/local/bin/tailscale"
+        );
+    }
+
+    #[test]
+    fn tailscale_binary_env_override_wins_over_every_candidate() {
+        assert_eq!(
+            resolve_tailscale_binary(Some("/custom/ts"), TAILSCALE_CANDIDATES, |_| true),
+            "/custom/ts"
+        );
+        // Set-but-empty is not an override; fall through to the candidates.
+        assert_eq!(
+            resolve_tailscale_binary(Some("  "), TAILSCALE_CANDIDATES, |_| true),
+            "/usr/local/bin/tailscale"
+        );
+    }
+
+    #[test]
+    fn tailscale_candidates_exclude_the_macos_gui_executable() {
+        // /Applications/Tailscale.app/Contents/MacOS/Tailscale is the GUI app,
+        // not a CLI: run headless it exits with "The Tailscale GUI failed to
+        // start ... (Tailscale.CLIError error 3)". Resolution picks ONE
+        // candidate by existence and a failed run yields None with no
+        // fall-through, so listing it would poison detection on every Mac that
+        // has Tailscale installed. Verified against a real packaged-gateway
+        // environment (PATH=/usr/bin:/bin:/usr/sbin:/sbin) where the GUI path
+        // errored and /opt/homebrew/bin/tailscale answered.
+        assert!(
+            !TAILSCALE_CANDIDATES.iter().any(|c| c.contains(".app/")),
+            "a macOS .app bundle is not a CLI; keep GUI executables out of the probe list"
+        );
+    }
+
+    #[test]
+    fn tailscale_binary_falls_back_to_the_bare_name() {
+        // No known location present: keep the old behavior so a custom install
+        // still resolves wherever a PATH exists (dev shells, most Linux).
+        assert_eq!(
+            resolve_tailscale_binary(None, TAILSCALE_CANDIDATES, |_| false),
+            "tailscale"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ Lucidos is an AI companion that shares your whole workspace. You talk, build, ru
 
 A local, event-driven, AI-native operating system. You own and store all the data yourself. The prompt is the primary interface, but Lucidos is a unified, integrated environment where configurable LLMs know all about your apps, triggers (scheduled or event-driven), and files. Describe an app and it's running in seconds - no build step, no deploy. Built to augment the *user*, it remembers everything you do. While it is not an "autonomous" role playing entity, you can automate anything. Nothing happens without a user intent, though - which is a central concept for Lucidos.
 
-The integrated environment makes for a smooth user experience, where researching a topic, storing the findings, spinning up an app around them, and pulling in data from external sources — whether through scheduled syncs or direct API calls — can all be done in one simple flow. Local data lives in a Postgres event store or as git-versioned artifacts.
+The integrated environment makes for a smooth user experience, where researching a topic, storing the findings, spinning up an app around them, and pulling in data from external sources (whether through scheduled syncs or direct API calls) can all be done in one simple flow. Local data lives in a Postgres event store or as git-versioned artifacts.
 <!--intro-end-->
 
 ---
@@ -35,41 +35,53 @@ This is the headless path: the same engine and UI served in your browser, plus
 an always-on background service. It is also the only path on Linux.
 
 By **default** the installer DOWNLOADS the prebuilt headless runtime for your
-platform — the engine, the gateway, the frontend, and a relocatable PostgreSQL 18
-+ pgvector, all bundled — verifies its `sha256` checksum, extracts it under
+platform (the engine, the gateway, the frontend, and a relocatable PostgreSQL 18
++ pgvector, all bundled), verifies its `sha256` checksum, extracts it under
 `~/.lucidos/runtime/`, and **registers the bundled gateway as an always-on user
 service** (a launchd LaunchAgent on macOS, a systemd `--user` unit on Linux) so it
-survives terminal-close + reboot and restarts on failure — the gateway provisions
+survives terminal-close + reboot and restarts on failure. The gateway provisions
 the embedded Postgres and supervises the engine, the same model as the macOS
 `.app`. No Docker, no Rust/Node, no clone, no compile. First run is seconds, not
 minutes. It opens at <http://localhost:5252>. Pass `--no-service` to run it in the
 foreground instead (Ctrl-C to stop).
 
-Two more ways to get the headless runtime:
+One more way to get the headless runtime:
 
-- **Build from source** (the original behavior):
-  ```bash
-  curl -fsSL https://lucidos.dev/install.sh | sh -s -- --dev
-  ```
-  `--dev` (alias `--source`, or `LUCIDOS_FROM_SOURCE=1`) bootstraps the
-  toolchain (Rust, Node, Docker, build deps), clones the repo to `~/lucidos`,
-  compiles the engine from source (a **release** build, typically **10–20+
-  minutes** on a clean machine; `LUCIDOS_DEBUG_BUILD=1` for a faster debug
-  build), and starts the stack via `scripts/run.sh`.
 - **Install a tarball you built yourself** with
   [`scripts/build-headless.sh`](https://github.com/lucidos-dev/lucidos/blob/main/scripts/build-headless.sh):
   ```bash
   ./install.sh --from-tarball /path/to/lucidos-<version>-<triple>.tar.gz
   ```
   It verifies the adjacent `.sha256` (fail-closed on mismatch), extracts, and
-  launches — fully offline.
+  launches, fully offline.
+
+**Running from source is not a third way to install Lucidos: it is how you work
+*on* Lucidos.** Neither shipped runtime carries the platform's own source, so
+neither can change it; a source checkout can, and that is the point of this
+path. Lucidos then works on its own code, proposing each change as a diff in an
+isolated git worktree for you to review and Apply. The whole loop, prerequisites
+included, is documented under
+[**Develop Lucidos**](https://docs.lucidos.dev/develop/). The one-command
+bootstrap for it is:
+
+<!--devbootstrap-start-->
+```bash
+curl -fsSL https://lucidos.dev/install.sh | sh -s -- --dev
+```
+
+`--dev` (alias `--source`, or `LUCIDOS_FROM_SOURCE=1`) bootstraps the toolchain
+(Rust, Node, Docker, build deps), clones the repo to `~/lucidos`, compiles the
+engine from source (a **release** build, typically **10–20+ minutes** on a clean
+machine; `LUCIDOS_DEBUG_BUILD=1` for a faster debug build), and starts the stack
+via `scripts/run.sh`.
+<!--devbootstrap-end-->
 
 > **On a brand-new release**, the per-platform tarballs are attached by CI about
 > 30 minutes *after* the GitHub Release is published, so a download started in
 > that window can still 404. Retry shortly, pass `--version <previous-version>`,
 > or use one of the two paths above.
 
-The installer is idempotent — safe to re-run. The download/tarball paths skip an
+The installer is idempotent, safe to re-run. The download/tarball paths skip an
 already-extracted runtime for the same version unless you pass `--force`; `--dev`
 reuses an existing checkout, build, and workspace.
 
@@ -85,22 +97,22 @@ embedding-model download, web push). `python3` is optional (script tooling).
 
 **Remote access & push notifications.** The gateway listens on **localhost
 only** by default (the secure posture) and serves plain HTTP. Browsers grant
-service workers — and with them **push notifications + PWA install** — only on
+service workers (and with them **push notifications + PWA install**) only on
 a *secure origin* (https or localhost), so to use Lucidos from other devices:
 
-- `ssh -L 5252:localhost:5252 <host>`, then open <http://localhost:5252> — the
+- `ssh -L 5252:localhost:5252 <host>`, then open <http://localhost:5252>: the
   full app including push, zero config (localhost is a secure context).
-- `tailscale serve --bg 5252` — trusted HTTPS on your tailnet.
+- `tailscale serve --bg 5252`: trusted HTTPS on your tailnet.
 - Or expose it directly:
   `./install.sh --bind all --tls-cert <cert.pem> --tls-key <key.pem>`.
   `--bind` writes the machine-global `~/.lucidos/network.toml` (the same knob
   as the picker's Settings → Network access); the TLS pair makes the gateway
   serve https (push needs a certificate your browsers trust). A bare
-  `--bind all` without TLS serves the app over `http://<host>` — usable, but
+  `--bind all` without TLS serves the app over `http://<host>`, usable, but
   browsers will not grant push/PWA there.
 
 **Always-on service & multiple gateways.** The default install registers a
-**user-level service** named after the instance — on macOS a launchd LaunchAgent
+**user-level service** named after the instance. On macOS a launchd LaunchAgent
 `com.lucidos.gateway.<name>` at `~/Library/LaunchAgents/`, on Linux a systemd
 `--user` unit `lucidos-gateway-<name>.service` at `~/.config/systemd/user/`
 (`RunAtLoad`/`KeepAlive` ≈ `Restart=always`; logs at `<prefix>/<name>/logs/` on
@@ -171,11 +183,11 @@ time, pass it through the pipe:
 # OpenAI (GPT models)
 curl -fsSL https://lucidos.dev/install.sh | OPENAI_API_KEY=sk-… sh
 
-# Vertex AI (Claude / Gemini) — also run `gcloud auth application-default login`
+# Vertex AI (Claude / Gemini), also run `gcloud auth application-default login`
 curl -fsSL https://lucidos.dev/install.sh | VERTEX_PROJECT_ID=my-gcp-project sh
 ```
 
-Knobs (all optional; flags or environment variables — see `install.sh --help`):
+Knobs (all optional; flags or environment variables, see `install.sh --help`):
 
 | | |
 |---|---|
@@ -194,7 +206,7 @@ Knobs (all optional; flags or environment variables — see `install.sh --help`)
 Prefer to drive the setup yourself? The manual path is below.
 <!--quickstart-end-->
 
-### Desktop app (.dmg) — building it yourself
+### Desktop app (.dmg): building it yourself
 
 The shipped `.dmg` is on the [releases page](https://github.com/lucidos-dev/lucidos/releases/latest)
 (see **Install** above); this section is for building your own. It is a
@@ -207,6 +219,7 @@ for the architecture.
 
 ---
 
+<!--devsetup-start-->
 ## Prerequisites
 
 - **Rust** (stable toolchain)
@@ -235,12 +248,12 @@ This starts one shared PostgreSQL Docker container, builds/runs the Rust engine 
 
 ### Ports
 
-The first workspace lands on `5173` for direct engine access. Each additional workspace gets the next engine-port offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same engine port every run. The shared dev gateway listens on `5251` by default (`LUCIDOS_DEV_GATEWAY_PORT` overrides it) and serves workspaces at `http(s)://localhost:5251/<slug>/` — `5251` (not the packaged app's `5252`) so a dev gateway and an installed `Lucidos.app` coexist out of the box. PostgreSQL uses one shared Docker container (`lucidos-pg-shared`) with one database per workspace; the chosen PG port is written to `<workspace>/.lucidos/ports`.
+The first workspace lands on `5173` for direct engine access. Each additional workspace gets the next engine-port offset (`5174`, `5175`, …), stored in `~/.lucidos/port-registry` so the same workspace gets the same engine port every run. The shared dev gateway listens on `5251` by default (`LUCIDOS_DEV_GATEWAY_PORT` overrides it) and serves workspaces at `http(s)://localhost:5251/<slug>/`, using `5251` (not the packaged app's `5252`) so a dev gateway and an installed `Lucidos.app` coexist out of the box. PostgreSQL uses one shared Docker container (`lucidos-pg-shared`) with one database per workspace; the chosen PG port is written to `<workspace>/.lucidos/ports`.
 
-If the target port is already taken by something else (e.g. another Vite app on `5173`), Lucidos walks forward to the next free offset and persists the new assignment — it does **not** kill the squatter. To pin a specific port:
+If the target port is already taken by something else (e.g. another Vite app on `5173`), Lucidos walks forward to the next free offset and persists the new assignment. It does **not** kill the squatter. To pin a specific port:
 
-- `LUCIDOS_VITE_PORT=5273 ./scripts/web-dev.sh -w dev` — env var, one-shot.
-- `<workspace>/lucidos.toml` — per-workspace, persistent:
+- `LUCIDOS_VITE_PORT=5273 ./scripts/web-dev.sh -w dev`: env var, one-shot.
+- `<workspace>/lucidos.toml`: per-workspace, persistent:
   ```toml
   [ports]
   vite = 5273
@@ -252,15 +265,16 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `LUCIDOS_WORKSPACE` | — | Workspace directory |
-| `LUCIDOS_VITE_PORT` | `5173` | Base direct engine port — overrides per-workspace offset + `lucidos.toml`. |
+| `LUCIDOS_WORKSPACE` | (none) | Workspace directory |
+| `LUCIDOS_VITE_PORT` | `5173` | Base direct engine port, overrides per-workspace offset + `lucidos.toml`. |
 | `LUCIDOS_DEV_GATEWAY_PORT` | `5251` | Shared dev gateway port for `/<slug>/` and `/~/` (`5251` keeps dev clear of the packaged app's `5252`). |
 | `LUCIDOS_MODEL` | `claude-opus-5@default` | LLM model name |
-| `VERTEX_PROJECT_ID` | — | GCP project (for `claude-*`/`gemini-*`) |
+| `VERTEX_PROJECT_ID` | (none) | GCP project (for `claude-*`/`gemini-*`) |
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
-| `OPENAI_API_KEY` | — | OpenAI key (for `gpt-*` models). Fallback below a stored `openai` credential; if unset too, the engine auto-detects a key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` (`apikey` login only). |
+| `OPENAI_API_KEY` | (none) | OpenAI key (for `gpt-*` models). Fallback below a stored `openai` credential; if unset too, the engine auto-detects a key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` (`apikey` login only). |
 
-**Per-workspace environment variables:** beyond the global `.env` the engine loads at startup, each workspace can define its own non-secret environment variables in **Settings → System → Environment variables** (DB-backed). The engine injects them as real env vars into every subprocess it spawns — `run_bash`, `run_python`, scheduled scripts, triggers, and coding-agent sessions — alongside `CRED_*`/`OAUTH_*`. Use them for per-workspace identity (e.g. `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` so `gh` / `git push` authenticate as the right account). Changes take effect on the next subprocess — no restart. They are non-secret (real secrets belong in credentials). The legacy `<workspace>/data/.env` file is migrated into this store on startup and removed.
+**Per-workspace environment variables:** beyond the global `.env` the engine loads at startup, each workspace can define its own non-secret environment variables in **Settings → System → Environment variables** (DB-backed). The engine injects them as real env vars into every subprocess it spawns (`run_bash`, `run_python`, scheduled scripts, triggers, and coding-agent sessions) alongside `CRED_*`/`OAUTH_*`. Use them for per-workspace identity (e.g. `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` so `gh` / `git push` authenticate as the right account). Changes take effect on the next subprocess, no restart. They are non-secret (real secrets belong in credentials). The legacy `<workspace>/data/.env` file is migrated into this store on startup and removed.
+<!--devsetup-end-->
 
 ---
 
@@ -290,7 +304,7 @@ The mkcert root CA must be trusted on iOS for HTTPS to work:
    ```bash
    mkcert -CAROOT   # prints the directory, e.g. ~/Library/Application Support/mkcert
    ```
-2. **Transfer `rootCA.pem` to your device** — AirDrop is easiest.
+2. **Transfer `rootCA.pem` to your device**. AirDrop is easiest.
 3. **Install the profile:** Open the file on iOS. Go to **Settings > General > VPN & Device Management** and install the downloaded profile.
 4. **Enable full trust:** Go to **Settings > General > About > Certificate Trust Settings** and toggle on the mkcert root CA.
 
@@ -298,9 +312,9 @@ After this, Safari and Chrome on iOS will trust your dev server's HTTPS certific
 
 ### Notes
 
-- **`.certs/` is gitignored** — certs are machine-specific, never committed.
+- **`.certs/` is gitignored**: certs are machine-specific, never committed.
 - **HTTP still works.** If `.certs/cert.pem` doesn't exist, Vite falls back to plain HTTP automatically. HTTPS is opt-in.
-- **Restart Chrome** after running `mkcert -install` for the first time — Chrome caches the CA store and won't pick up the new root CA until restarted.
+- **Restart Chrome** after running `mkcert -install` for the first time. Chrome caches the CA store and won't pick up the new root CA until restarted.
 - **Service workers require HTTPS** (or localhost). If testing push notifications or PWA features from a mobile device over Tailscale, HTTPS is required.
 
 ---
@@ -352,11 +366,11 @@ The full placement and ownership rules are in [`docs/taxonomy.md`](docs/taxonomy
 
 ### Core Concepts
 
-- **Events** — Immutable, append-only records of confirmed outcomes. The single source of truth.
-- **Artifacts** — Versioned outputs (code, documents, apps) stored in Git. Addressable, with provenance.
+- **Events**: Immutable, append-only records of confirmed outcomes. The single source of truth.
+- **Artifacts**: Versioned outputs (code, documents, apps) stored in Git. Addressable, with provenance.
 - **Apps**: persistent UIs you open repeatedly, described in chat rather than scaffolded by hand.
 - **Knowhow**: how-to docs the agent discovers semantically and loads when relevant.
-- **Prompt-first UI** — Everything doable in apps must be doable via the prompt.
+- **Prompt-first UI**: Everything doable in apps must be doable via the prompt.
 
 <!--invariants-start-->
 ### Key Invariants
@@ -373,7 +387,7 @@ The full placement and ownership rules are in [`docs/taxonomy.md`](docs/taxonomy
 
 Two independent version axes:
 
-- **`RELEASE`** (repo root) — the umbrella user-facing version of the Lucidos
+- **`RELEASE`** (repo root): the umbrella user-facing version of the Lucidos
   release that bundles all crates. The `RELEASE` file is the source of truth
   for the current number (mirrored by the latest `v<version>` tag on
   [GitHub Releases](https://github.com/lucidos-dev/lucidos/releases)). Think
@@ -381,7 +395,7 @@ Two independent version axes:
   individual components inside have moved. Exposed at runtime as
   `lucidos_engine::LUCIDOS_RELEASE`, in the `release` field of `/api/health`,
   in the engine's `--version` output, and in the desktop app's control panel.
-- **Per-crate `Cargo.toml` versions** — semver per component (lucidos-engine,
+- **Per-crate `Cargo.toml` versions**: semver per component (lucidos-engine,
   lucidos-app, etc.), bumped on their own cadence by `build.rs`. Visible as
   `engine_version` / `latest_tauri_app_version` in `/api/health`.
 
@@ -394,7 +408,7 @@ Releases are produced as squashed-orphan commits on `lucidos/main` (one per
 
 ## Contributing
 
-Contributions are welcome — Lucidos is pre-1.0, so there's plenty to do (and
+Contributions are welcome, Lucidos is pre-1.0, so there's plenty to do (and
 expect breakage before 1.0). Start with [CONTRIBUTING.md](CONTRIBUTING.md) for
 dev setup, the branch/PR flow, commit conventions, and the DCO sign-off
 (`git commit -s`) required on every commit. Please also read the
@@ -403,7 +417,7 @@ dev setup, the branch/PR flow, commit conventions, and the DCO sign-off
 project is run. Questions and ideas are welcome in
 [GitHub Discussions](https://github.com/lucidos-dev/lucidos/discussions).
 
-Thanks to everyone who has contributed — see the full list on the
+Thanks to everyone who has contributed, see the full list on the
 [contributors graph](https://github.com/lucidos-dev/lucidos/graphs/contributors).
 
 ## License

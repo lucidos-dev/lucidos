@@ -55,6 +55,12 @@
 #     mode is the opposite — it gates the RC's OWN copy of the installer at
 #     rc.lucidos.dev, before anything reaches the real path.
 #
+#   * ROUTE PARITY (job: front-door-parity) the only job that looks at BOTH
+#     origins in one run. Every job above, this file's front-door ones included,
+#     sees exactly ONE origin, so none of them can notice that production and
+#     the release candidate serve DIFFERENT route sets. Daily cron + dispatch,
+#     never the rc/** push. See the job for the severity rules.
+#
 # NOTE: only effective once lucidos-dev is public. Before the public flip this
 # repo is still private, so runs bill against the private free tier (~2000
 # min/month, macOS 10x) — the first launch relies on the manual DMG verify plus,
@@ -751,7 +757,15 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: ubuntu:22.04
-    timeout-minutes: 30
+    # The ceiling must always exceed the budgets it contains, and
+    # front_door_gate_test.sh does that arithmetic from the literals in this
+    # file: FD_ASSET_WAIT_SECS (1800) + GW_HEALTH_TIMEOUT_SECS (900) leaves 900 s
+    # of 75 minutes for the install itself, the four uninstall rungs and the
+    # runner setup. It was 30 minutes before the asset preflight existed, which
+    # the preflight budget alone would have exhausted. A job timeout is a hard
+    # kill with no diagnosis, which is exactly the burying this file's guards
+    # exist to prevent.
+    timeout-minutes: 75
     # This job pipes remote code into a shell by design, so give it a token with
     # no scopes at all — it reads nothing from the repo and writes nothing back.
     permissions: {}
@@ -776,6 +790,20 @@ jobs:
       RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
       GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
       GW_HEALTH_TIMEOUT_SECS: '900'    # download + extract + embedded-PG first boot
+      # ── the release-asset preflight budget (full mode) ───────────────────────
+      # A full install downloads lucidos-<version>-<triple>.tar.gz from the
+      # v<version> Release, and release-tarballs.yml attaches those assets ~23
+      # minutes AFTER the Release is cut. The post-publish dispatch therefore
+      # arrives BEFORE the thing it installs exists (v0.18.0: dispatched 05:58,
+      # assets landed 06:21), so the preflight waits rather than failing, then
+      # fails FAST and by name if the wait expires.
+      #
+      # BOUNDED, never a spin: 30 minutes covers the observed attach window with
+      # room, and an asset still missing after it is a broken release rather than
+      # a slow one. The poll is deliberately coarse, because these are one-byte
+      # range requests against GitHub and not something to hammer.
+      FD_ASSET_WAIT_SECS: '1800'       # 30 min; release-tarballs takes ~23
+      FD_ASSET_POLL_SECS: '30'
       # A stranger's shell has no LUCIDOS_* set, but this workflow's top-level env
       # block exports two for the --dev smoke job — and install.sh treats every
       # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
@@ -812,6 +840,47 @@ jobs:
 
           if ! [[ "$origin" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$ ]]; then
             echo "::error::refusing origin '$FRONT_DOOR_INPUT' — it must be an https:// URL of the form https://host[:port][/path] using only [A-Za-z0-9._~-] in its path. This job pipes what the origin serves into a shell, so anything that is not plainly a URL is rejected."
+            exit 1
+          fi
+
+          # ── an RC origin is REFUSED unless this is the rc/** push ─────────────
+          # A HARD REFUSE, decided deliberately on 2026-07-31 (see
+          # docs/plans/2026-07-31-front-door-asset-preflight-and-rc-dispatch.md).
+          # Do NOT soften it back into "downgrade to payload and carry on".
+          #
+          # The RC leg of this workflow is owned by the `push: rc/**` arm, which
+          # points itself at https://rc.lucidos.dev in payload mode on every
+          # release candidate. A DISPATCH naming the RC origin is therefore not a
+          # mode question, it is a caller sending an origin it was never supposed
+          # to send. That used to happen for a known reason: the workspace
+          # trigger verify-front-door-after-publish filtered the RC origin by a
+          # `/rc` path suffix, which stopped matching when the RC front door
+          # moved to its own host on 2026-07-30. THAT FILTER HAS BEEN FIXED, so
+          # an RC origin arriving here now means something regressed again.
+          # Downgrading the run would silently absorb the evidence of exactly the
+          # regression this job exists to surface. A refusal is a real signal.
+          #
+          # Refused HERE, in the first step, before anything is fetched: running
+          # the payload rungs green and only then failing is slower and reads as
+          # an origin problem rather than the caller problem it is.
+          case "$origin" in
+            https://rc.*|*/rc) fd_is_rc=1 ;;   # the host form, and the legacy path form
+            *)                 fd_is_rc=0 ;;
+          esac
+
+          if [ "$fd_is_rc" -eq 1 ] && [ "${GITHUB_EVENT_NAME:-}" != "push" ]; then
+            echo "::error::refusing origin '$origin' on a '${GITHUB_EVENT_NAME:-unknown}' event. The RC front door is verified by THIS workflow's 'push: rc/**' arm, payload-only, on every release candidate; a dispatcher is not supposed to send this origin at all. Check the CALLER: the workspace trigger verify-front-door-after-publish dispatches this job after a publish and must send the production origin only."
+            exit 1
+          fi
+
+          # Fail-closed companion, covering the one path that legitimately
+          # reaches the RC origin. The rc/** push pins FD_MODE to 'payload' in
+          # the job env, so this cannot fire today; it is here so that an edit to
+          # that expression reds in the validate step instead of driving a real
+          # install against an origin with no v<version> tag and therefore no
+          # headless tarball (see the long note at the top of this job).
+          if [ "$fd_is_rc" -eq 1 ] && [ "$FD_MODE" != "payload" ]; then
+            echo "::error::the RC origin '$origin' is payload-only, but FD_MODE is '$FD_MODE'. An RC has no v<version> release tag and therefore no headless tarball, so a full install here would 404 at the download step on every single run."
             exit 1
           fi
 
@@ -854,7 +923,15 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          tmp="$(mktemp -d)"
+          # A STABLE directory, not `mktemp -d`: the asset preflight below reuses
+          # the payloads this rung already fetched (the served install.sh, and
+          # the served install_common.sh + headless_tarball.sh it derives the
+          # download URL from) rather than fetching the origin a second time and
+          # risking a second, differing answer. Each step is its own shell, so a
+          # random path would not survive to the next one.
+          tmp="$RUNNER_TEMP/front-door-payloads"
+          rm -rf "$tmp"
+          mkdir -p "$tmp"
 
           # ── Cloudflare Access headers for the gated RC origin ────────────────
           # rc.lucidos.dev is behind an Access app; the service token is the only
@@ -864,17 +941,28 @@ jobs:
           # An unset FD_HDR would abort the step under `set -u`, so it is always
           # declared. Bash 4.4+ (ubuntu:22.04 has 5.1) expands "${FD_HDR[@]}" of
           # an empty array to nothing rather than an empty string.
+          #
+          # THE ORIGIN IS TESTED FIRST, and the order is load-bearing. The two
+          # secrets are set at JOB level, so they are present on a production run
+          # too; keying only on "are the secrets set?" attached the RC service
+          # token to every https://lucidos.dev fetch, disclosing a credential to
+          # a host that has no use for it. `curl -L` also forwards custom headers
+          # across a cross-host redirect, so the exposure was not bounded by the
+          # origin we typed. Gated origin decides; the secrets only decide
+          # whether that origin can be reached at all.
           FD_HDR=()
-          if [ -n "${RC_ACCESS_CLIENT_ID:-}" ] && [ -n "${RC_ACCESS_CLIENT_SECRET:-}" ]; then
-            FD_HDR=(-H "CF-Access-Client-Id: $RC_ACCESS_CLIENT_ID"
-                    -H "CF-Access-Client-Secret: $RC_ACCESS_CLIENT_SECRET")
-            echo "==> Cloudflare Access service token present (gated origin)"
-          elif [ "$FRONT_DOOR" != "${FRONT_DOOR#https://rc.}" ]; then
-            # Named explicitly rather than left to fail as "returned HTML": a
-            # missing secret and a broken deploy look identical in the payload
-            # sniff, and only one of them is an origin regression.
-            echo "::error::$FRONT_DOOR is behind Cloudflare Access but RC_ACCESS_CLIENT_ID/SECRET are not set. Every fetch will get the 302 login page and be reported as 'not shell'. Add both repo secrets (Cloudflare -> Access -> Service Tokens -> lucidos-ci-front-door)."
-            exit 1
+          if [ "$FRONT_DOOR" != "${FRONT_DOOR#https://rc.}" ]; then
+            if [ -n "${RC_ACCESS_CLIENT_ID:-}" ] && [ -n "${RC_ACCESS_CLIENT_SECRET:-}" ]; then
+              FD_HDR=(-H "CF-Access-Client-Id: $RC_ACCESS_CLIENT_ID"
+                      -H "CF-Access-Client-Secret: $RC_ACCESS_CLIENT_SECRET")
+              echo "==> Cloudflare Access service token present (gated origin)"
+            else
+              # Named explicitly rather than left to fail as "returned HTML": a
+              # missing secret and a broken deploy look identical in the payload
+              # sniff, and only one of them is an origin regression.
+              echo "::error::$FRONT_DOOR is behind Cloudflare Access but RC_ACCESS_CLIENT_ID/SECRET are not set. Every fetch will get the 302 login page and be reported as 'not shell'. Add both repo secrets (Cloudflare -> Access -> Service Tokens -> lucidos-ci-front-door)."
+              exit 1
+            fi
           fi
 
           # assert_shell_file <file> <url> — the payload must be a shell script.
@@ -888,6 +976,24 @@ jobs:
               return 1
             fi
             if [ "$(head -c 1 "$f")" = "<" ]; then
+              # A Cloudflare Access login page is an AUTH failure, NOT a soft
+              # 404, and conflating the two is what sent the 2026-07-31 dispatch
+              # chasing a Pages misconfiguration that did not exist. Access
+              # answers an unauthorized fetch with a 302, `curl -L` follows it,
+              # and the login page arrives at 200 as HTML, which this
+              # first-byte test cannot tell apart from the SPA fallback. Where
+              # the fetch LANDED can, and it was recorded at the installer fetch
+              # below. On the gated origin the unset-token case is refused
+              # earlier in this step, so reaching here with THAT origin means a
+              # token was sent and Access rejected it; the message covers the
+              # other origin too rather than asserting a token nobody sent.
+              case "${FD_EFFECTIVE_URL:-}" in
+                *cloudflareaccess.com*)
+                  echo "::error::$url served no payload: the fetch was redirected to the Cloudflare Access login page at ${FD_EFFECTIVE_URL}. That is an AUTH failure, not the Pages soft 404, and it says nothing about what $FRONT_DOOR actually serves. If this is the gated RC origin, a service token was sent (an unset one is refused earlier in this step) and Access REJECTED it: check that RC_ACCESS_CLIENT_ID / RC_ACCESS_CLIENT_SECRET are current and still authorized for this Access application. If it is not, then an Access application has started covering a host that is supposed to be public, which is an origin change rather than a CI one."
+                  echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
+                  return 1
+                  ;;
+              esac
               echo "::error::$url returned HTML, not shell — the origin answered a script path with the landing page at status 200 (soft 404). A piped install sources this AS SHELL."
               echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
               # In payload mode the whole origin is a subpath the site publisher
@@ -913,10 +1019,35 @@ jobs:
             return 0
           }
 
+          # The EFFECTIVE URL is recorded, not only the body. Cloudflare Access
+          # answers an unauthorized fetch with a 302 to a login page that arrives
+          # at 200 as HTML, so the payload sniff alone reports it as a soft 404;
+          # where the fetch landed is what tells the two apart, and
+          # assert_shell_file consults this.
           echo "==> Fetching the advertised installer"
-          curl -fsSL "${FD_HDR[@]}" "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" \
+          FD_EFFECTIVE_URL="$(curl -fsSL "${FD_HDR[@]}" "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" -w '%{url_effective}')" \
             || { echo "::error::could not fetch $FRONT_DOOR/install.sh"; exit 1; }
           assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh" || exit 1
+
+          # ── the version the SERVED installer will resolve ─────────────────────
+          # Parsed on every event, not only the rc/** push, because the asset
+          # preflight needs the same number: a piped run has no checkout and
+          # therefore no adjacent RELEASE file, so this baked constant is exactly
+          # what install.sh downloads. Exported for the preflight step, and
+          # parsed ONCE here so the rc check below and the preflight can never
+          # disagree about which version this origin serves.
+          #
+          # Fails closed. A parser that finds nothing must never be read as "the
+          # version is fine": the rc check would vacuously pass and the preflight
+          # would probe a URL no installer would ever request.
+          served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+          if [ -z "$served_version" ]; then
+            echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the served $FRONT_DOOR/install.sh. This check must never silently pass, so it fails closed."
+            grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+            exit 1
+          fi
+          echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
+          echo "    served version: $served_version"
 
           # ── the RC origin must be serving THIS release candidate ──────────────
           # Only on an rc/** push, where the branch name pins the version we are
@@ -925,21 +1056,15 @@ jobs:
           # satisfies every payload check and the gate goes green having verified
           # last release's installer. That is the "passes for the wrong reason"
           # failure this whole job exists to avoid, so it is fatal, not a warning.
+          #
+          # The baked constant parsed above is what a piped install actually
+          # resolves, and release.sh rewrites it in the same step that bumps
+          # RELEASE, so it pins the candidate exactly.
           if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
             case "${GITHUB_REF_NAME:-}" in
               rc/?*) rc_version="${GITHUB_REF_NAME#rc/}" ;;
               *) echo "::error::this job only runs on a push for an rc/<version> branch, got '${GITHUB_REF_NAME:-}'"; exit 1 ;;
             esac
-            # The baked constant is what a piped install actually resolves (no
-            # checkout ⇒ no adjacent RELEASE file), so it is the right thing to
-            # compare — and it is rewritten by release.sh in the same step that
-            # bumps RELEASE, so it pins the candidate exactly.
-            served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
-            if [ -z "$served_version" ]; then
-              echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the served $FRONT_DOOR/install.sh — this check must never silently pass, so it fails closed"
-              grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
-              exit 1
-            fi
             if [ "$served_version" != "$rc_version" ]; then
               echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version) — the RC front door is serving a DIFFERENT release candidate. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree."
               exit 1
@@ -1132,6 +1257,147 @@ jobs:
             echo "                origin post-publish (dispatch) and daily (cron)."
           fi
 
+      # ── the release assets must EXIST before the install starts ───────────────
+      # FULL MODE ONLY, and ordered BEFORE the launch step deliberately.
+      #
+      # WHY: on 2026-07-31 all three v0.18.0 front-door legs died the same way.
+      # The post-publish dispatch fired at 05:58, install.sh printed its own
+      # "Download failed:" for the headless tarball, and each leg then burned the
+      # entire 900 s gateway poll waiting for a gateway that could never come up
+      # before reporting "the gateway never reported healthy within 900s". The
+      # release was fine: release-tarballs.yml did not finish attaching the
+      # per-triple assets until 06:21, 23 minutes later. Three separate faults in
+      # one shape, and this step fixes the first two: the job did not wait for an
+      # artifact it knows it needs, and it spent 15 minutes per leg finding out.
+      # (The third, the misattribution to health, is the poll's own guard below.)
+      #
+      # It is a WAIT, not a retry of the install: a download that fails after
+      # this step went green is a real failure and stays one.
+      - name: Wait for the release assets this install will download
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -uo pipefail
+          payloads="$RUNNER_TEMP/front-door-payloads"
+
+          # ── the triple, resolved with install.sh's own uname map ──────────────
+          # stage_runtime_theseus_os / stage_runtime_arch, reproduced rather than
+          # sourced (this job has no checkout by design). Unknown values fail
+          # closed: install.sh would refuse the platform too, and a preflight
+          # that guessed a triple would wait out its budget on a URL no installer
+          # ever requests.
+          case "$(uname -s)" in
+            Linux)  fd_os='unknown-linux-gnu' ;;
+            Darwin) fd_os='apple-darwin' ;;
+            *) echo "::error::unsupported OS '$(uname -s)': install.sh maps only Darwin and Linux to a target triple, so there is no asset URL to probe."; exit 1 ;;
+          esac
+          case "$(uname -m)" in
+            arm64|aarch64) fd_arch='aarch64' ;;
+            x86_64|amd64)  fd_arch='x86_64' ;;
+            *) echo "::error::unsupported arch '$(uname -m)': install.sh maps only arm64/aarch64 and x86_64/amd64, so there is no asset URL to probe."; exit 1 ;;
+          esac
+          triple="$fd_arch-$fd_os"
+
+          # ── the version, from the SERVED installer ────────────────────────────
+          # Exported by rung 1 out of the baked LUCIDOS_DEFAULT_VERSION, which is
+          # what a piped run resolves (no checkout means no adjacent RELEASE).
+          version="${FD_SERVED_VERSION:-}"
+          if [ -z "$version" ]; then
+            echo "::error::FD_SERVED_VERSION is empty. Rung 1 parses the served installer's baked version and exports it; without it this step would have to guess which release to probe, so it fails closed instead."
+            exit 1
+          fi
+
+          # ── the base URL, DERIVED from the served install_common.sh ───────────
+          # Not hardcoded here. install.sh resolves its download base through
+          # install_default_base_url in that lib, and rung 1 already fetched the
+          # copy THIS origin serves, so deriving from it keeps the preflight and
+          # the install pointed at the same place even if the base moves. The
+          # shape is validated: anything that is not a single '%s' at the end of
+          # an https:// string fails closed rather than being substituted blind.
+          lib="$payloads/install_common.sh"
+          if [ ! -s "$lib" ]; then
+            echo "::error::rung 1 left no served install_common.sh at $lib, so the download URL cannot be derived from what this origin serves. Fail closed rather than assume the GitHub default."
+            exit 1
+          fi
+          base_fmt="$(sed -n '/^install_default_base_url()/,/^}/p' "$lib" \
+                      | sed -n "s/.*printf '\([^']*\)'.*/\1/p" | head -n 1)"
+          case "$base_fmt" in
+            https://*%s) ;;
+            *)
+              echo "::error::could not derive the release base URL from the served install_common.sh: install_default_base_url prints '$base_fmt', which is not the expected 'https://...%s' shape. Update this step to match the lib rather than probing a URL install.sh would never request."
+              exit 1
+              ;;
+          esac
+          base_prefix="${base_fmt%'%s'}"
+          case "$base_prefix" in
+            *%*)
+              echo "::error::the served install_default_base_url format '$base_fmt' carries more than one printf directive, and this preflight only knows how to substitute the version. Fail closed."
+              exit 1
+              ;;
+          esac
+          base_url="$base_prefix$version"
+
+          # ── the artifact stem, drift-guarded against the served lib ───────────
+          # headless_tarball_stem takes its two arguments positionally, so its
+          # format string cannot be substituted safely from the outside; the
+          # shape is pinned instead, and a change to it reds HERE with the fix
+          # named rather than silently probing the wrong asset.
+          stem_lib="$payloads/headless_tarball.sh"
+          if [ ! -s "$stem_lib" ]; then
+            echo "::error::rung 1 left no served headless_tarball.sh at $stem_lib, so the artifact name cannot be checked against what this origin serves. Fail closed."
+            exit 1
+          fi
+          stem_fmt="$(sed -n '/^headless_tarball_stem()/,/^}/p' "$stem_lib" \
+                      | sed -n "s/.*printf '\([^']*\)'.*/\1/p" | head -n 1)"
+          if [ "$stem_fmt" != 'lucidos-%s-%s' ]; then
+            echo "::error::the served headless_tarball_stem builds '$stem_fmt', not the 'lucidos-%s-%s' this preflight constructs. The artifact name changed shape, so update this step to match it."
+            exit 1
+          fi
+          stem="lucidos-$version-$triple"
+
+          tarball_url="$base_url/$stem.tar.gz"
+          checksum_url="$tarball_url.sha256"
+          echo "==> The install will download, and both must exist first:"
+          echo "    $tarball_url"
+          echo "    $checksum_url"
+          echo "    (the .sha256 too: install.sh's checksum step is mandatory and fails closed)"
+
+          # A RANGE request for one byte, not a download: enough to prove the
+          # asset resolves, and GitHub answers 206 to it. Deliberately NOT
+          # `curl -f`, because the status code is the thing being read.
+          fd_code=''
+          probe() {
+            fd_code="$(curl -sS -L -r 0-0 -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null || echo 000)"
+            case "$fd_code" in 200|206) return 0 ;; *) return 1 ;; esac
+          }
+
+          deadline=$(( $(date +%s) + FD_ASSET_WAIT_SECS ))
+          attempt=0
+          tar_code='000'
+          sha_code='000'
+          while : ; do
+            attempt=$(( attempt + 1 ))
+            if probe "$tarball_url"; then
+              tar_code="$fd_code"
+              if probe "$checksum_url"; then
+                sha_code="$fd_code"
+                echo "preflight OK on attempt $attempt: the tarball answered $tar_code and its .sha256 answered $sha_code."
+                break
+              fi
+              sha_code="$fd_code"
+            else
+              tar_code="$fd_code"
+              sha_code='not probed'
+            fi
+            now="$(date +%s)"
+            if [ "$now" -ge "$deadline" ]; then
+              echo "::error::the release assets this install needs are still not published after ${FD_ASSET_WAIT_SECS}s of waiting: $tarball_url answered $tar_code and $checksum_url answered $sha_code. This is an ASSET AVAILABILITY failure. It is not a broken front door and not a gateway health failure, and the install is deliberately NOT being started: it would 404 at the download step and then burn the ${GW_HEALTH_TIMEOUT_SECS}s gateway poll before reporting the wrong cause. release-tarballs.yml attaches the per-triple headless tarballs roughly 23 minutes AFTER the Release is cut, so a dispatch fired at publish time legitimately arrives early. Check that the release-tarballs run for v$version finished and attached $stem.tar.gz + .sha256."
+              exit 1
+            fi
+            echo "    attempt $attempt: tarball $tar_code, sidecar $sha_code; $(( deadline - now ))s of the ${FD_ASSET_WAIT_SECS}s budget left, retrying in ${FD_ASSET_POLL_SECS}s"
+            sleep "$FD_ASSET_POLL_SECS"
+          done
+
       # ── rungs 2-4: FULL MODE ONLY ─────────────────────────────────────────────
       # Everything below drives a REAL install, which downloads the headless
       # tarball from the v<version> release. That tag does not exist during an RC,
@@ -1191,6 +1457,30 @@ jobs:
             exit 1
           }
 
+          # ── the residual download failure, named as itself ────────────────────
+          # The preflight step proved these assets existed before the install
+          # started, so reaching this is a DIFFERENT failure: the asset went
+          # away, github.com was blocked, or the mandatory sidecar could not be
+          # fetched. None of those are the gateway's fault, and until 2026-07-31
+          # every one of them was reported as one. The v0.18.0 legs printed
+          # install.sh's own "Download failed:" and then burned the whole health
+          # budget before concluding "the gateway never reported healthy within
+          # 900s", which names the wrong subsystem and hides the real cause.
+          # Terminal on sight instead, with the right name.
+          #
+          # BOTH of install.sh's asset-fetch aborts are matched: the tarball
+          # (download_failed) and the mandatory .sha256 sidecar, which dies with
+          # its own wording. NOT the checksum MISMATCH, which means a corrupt or
+          # tampered download and is a different verdict.
+          DOWNLOAD_FAIL_RE='Download failed:|could NOT fetch its checksum sidecar'
+          assert_no_download_failure() {
+            grep -qE "$DOWNLOAD_FAIL_RE" "$log" 2>/dev/null || return 0
+            echo "::error::the installer could not fetch the release asset, AFTER the preflight found it published. This is a DOWNLOAD failure, not a gateway health failure: the gateway was never going to start."
+            grep -nE "$DOWNLOAD_FAIL_RE" "$log" | head -n 5 | sed 's/^/      /'
+            dump
+            exit 1
+          }
+
           # ── rung 3: the gateway answers /health (polled) ──────────────────────
           # The gateway lives in the sigil namespace: a bare /api/v1/health would
           # resolve as a workspace slug and 404. The port comes from the launch
@@ -1202,6 +1492,7 @@ jobs:
           body=""
           while [ "$(date +%s)" -lt "$deadline" ]; do
             assert_no_html_payload
+            assert_no_download_failure
             banner_port="$(sed -n 's|.*http://localhost:\([0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
             [ -n "$banner_port" ] && port="$banner_port"
             body="$(curl -fsS --max-time 5 "http://localhost:$port/~/api/v1/health" 2>/dev/null || true)"
@@ -1213,12 +1504,14 @@ jobs:
             if ! kill -0 "$INSTALL_PID" 2>/dev/null; then
               echo "::error::the installer exited before the gateway became healthy"
               assert_no_html_payload      # names the cause when it is the HTML one
+              assert_no_download_failure  # or the download one
               dump
               exit 1
             fi
             sleep 5
           done
           assert_no_html_payload
+          assert_no_download_failure
           echo "$body" | grep -q '"status":"ok"' \
             || { echo "::error::the gateway never reported healthy within ${GW_HEALTH_TIMEOUT_SECS}s"; dump; exit 1; }
           echo "$body" | grep -q '"role":"gateway"' \
@@ -1576,7 +1869,9 @@ jobs:
           # testing the same triple while claiming to test two.
           - { runner: macos-15-intel, triple: x86_64-apple-darwin }
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    # Same arithmetic as `front-door`, asserted by front_door_gate_test.sh:
+    # FD_ASSET_WAIT_SECS + GW_HEALTH_TIMEOUT_SECS + 900 s of slack must fit.
+    timeout-minutes: 75
     # Same reasoning as `front-door`: this job pipes remote code into a shell by
     # design, so it gets a token with no scopes at all.
     permissions: {}
@@ -1588,6 +1883,12 @@ jobs:
       RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
       GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
       GW_HEALTH_TIMEOUT_SECS: '900'    # download + extract + embedded-PG first boot
+      # The asset-preflight budget, identical to `front-door` (see that job for
+      # why 30 minutes and why it is bounded). It matters MORE here: this job has
+      # no installer-exited fast-fail, so a missing asset costs the full health
+      # budget instead of seconds.
+      FD_ASSET_WAIT_SECS: '1800'       # 30 min; release-tarballs takes ~23
+      FD_ASSET_POLL_SECS: '30'
       # A stranger's Mac has no LUCIDOS_* set, but this workflow's top-level env
       # block exports two for the --dev smoke job — and install.sh treats every
       # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
@@ -1628,6 +1929,27 @@ jobs:
 
           if ! [[ "$origin" =~ ^https://[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]{1,5})?(/[A-Za-z0-9._~-]+)*$ ]]; then
             echo "::error::refusing origin '$FRONT_DOOR_INPUT' — it must be an https:// URL of the form https://host[:port][/path] using only [A-Za-z0-9._~-] in its path. This job pipes what the origin serves into a shell, so anything that is not plainly a URL is rejected."
+            exit 1
+          fi
+
+          # ── an RC origin is REFUSED unless this is the rc/** push ─────────────
+          # Verbatim from `front-door`, including the reasoning: this is a HARD
+          # REFUSE decided on 2026-07-31, not a downgrade, and the workspace
+          # trigger that used to send the RC origin by mistake has been fixed, so
+          # an RC origin on a dispatch now means something regressed again. The
+          # canonical comment is on the Linux job.
+          case "$origin" in
+            https://rc.*|*/rc) fd_is_rc=1 ;;   # the host form, and the legacy path form
+            *)                 fd_is_rc=0 ;;
+          esac
+
+          if [ "$fd_is_rc" -eq 1 ] && [ "${GITHUB_EVENT_NAME:-}" != "push" ]; then
+            echo "::error::refusing origin '$origin' on a '${GITHUB_EVENT_NAME:-unknown}' event. The RC front door is verified by THIS workflow's 'push: rc/**' arm, payload-only, on every release candidate; a dispatcher is not supposed to send this origin at all. Check the CALLER: the workspace trigger verify-front-door-after-publish dispatches this job after a publish and must send the production origin only."
+            exit 1
+          fi
+
+          if [ "$fd_is_rc" -eq 1 ] && [ "$FD_MODE" != "payload" ]; then
+            echo "::error::the RC origin '$origin' is payload-only, but FD_MODE is '$FD_MODE'. An RC has no v<version> release tag and therefore no headless tarball, so a full install here would 404 at the download step on every single run."
             exit 1
           fi
 
@@ -1690,7 +2012,12 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          tmp="$(mktemp -d)"
+          # A STABLE directory rather than `mktemp -d`, for the same reason as
+          # the Linux job: the asset preflight below consumes the payloads this
+          # rung already fetched, and each step is its own shell.
+          tmp="$RUNNER_TEMP/front-door-payloads"
+          rm -rf "$tmp"
+          mkdir -p "$tmp"
 
           # ── Cloudflare Access headers for the gated RC origin ────────────────
           # rc.lucidos.dev is behind an Access app; the service token is the only
@@ -1705,17 +2032,24 @@ jobs:
           # origin, which is the one that has no headers. (scripts/lint-shell.sh
           # documents the same bash-3.2 array trap.) The guarded form is correct
           # on both 3.2 and 5.x, so it costs nothing to always use it here.
+          #
+          # THE ORIGIN IS TESTED FIRST, exactly as in the Linux job and for the
+          # same reason: the two secrets are set at JOB level, so keying only on
+          # "are the secrets set?" attached the RC service token to every
+          # production fetch as well.
           FD_HDR=()
-          if [ -n "${RC_ACCESS_CLIENT_ID:-}" ] && [ -n "${RC_ACCESS_CLIENT_SECRET:-}" ]; then
-            FD_HDR=(-H "CF-Access-Client-Id: $RC_ACCESS_CLIENT_ID"
-                    -H "CF-Access-Client-Secret: $RC_ACCESS_CLIENT_SECRET")
-            echo "==> Cloudflare Access service token present (gated origin)"
-          elif [ "$FRONT_DOOR" != "${FRONT_DOOR#https://rc.}" ]; then
-            # Named explicitly rather than left to fail as "returned HTML": a
-            # missing secret and a broken deploy look identical in the payload
-            # sniff, and only one of them is an origin regression.
-            echo "::error::$FRONT_DOOR is behind Cloudflare Access but RC_ACCESS_CLIENT_ID/SECRET are not set. Every fetch will get the 302 login page and be reported as 'not shell'. Add both repo secrets (Cloudflare -> Access -> Service Tokens -> lucidos-ci-front-door)."
-            exit 1
+          if [ "$FRONT_DOOR" != "${FRONT_DOOR#https://rc.}" ]; then
+            if [ -n "${RC_ACCESS_CLIENT_ID:-}" ] && [ -n "${RC_ACCESS_CLIENT_SECRET:-}" ]; then
+              FD_HDR=(-H "CF-Access-Client-Id: $RC_ACCESS_CLIENT_ID"
+                      -H "CF-Access-Client-Secret: $RC_ACCESS_CLIENT_SECRET")
+              echo "==> Cloudflare Access service token present (gated origin)"
+            else
+              # Named explicitly rather than left to fail as "returned HTML": a
+              # missing secret and a broken deploy look identical in the payload
+              # sniff, and only one of them is an origin regression.
+              echo "::error::$FRONT_DOOR is behind Cloudflare Access but RC_ACCESS_CLIENT_ID/SECRET are not set. Every fetch will get the 302 login page and be reported as 'not shell'. Add both repo secrets (Cloudflare -> Access -> Service Tokens -> lucidos-ci-front-door)."
+              exit 1
+            fi
           fi
 
           # assert_shell_file <file> <url> — the payload must be a shell script.
@@ -1729,6 +2063,19 @@ jobs:
               return 1
             fi
             if [ "$(head -c 1 "$f")" = "<" ]; then
+              # A Cloudflare Access login page is an AUTH failure, NOT a soft
+              # 404. Same reasoning and same wording as the Linux job, whose
+              # comment is the canonical one: the 302 to the login page is
+              # followed by `curl -L` and arrives at 200 as HTML, so only the
+              # EFFECTIVE URL recorded at the installer fetch can tell it apart
+              # from the Pages SPA fallback.
+              case "${FD_EFFECTIVE_URL:-}" in
+                *cloudflareaccess.com*)
+                  echo "::error::$url served no payload: the fetch was redirected to the Cloudflare Access login page at ${FD_EFFECTIVE_URL}. That is an AUTH failure, not the Pages soft 404, and it says nothing about what $FRONT_DOOR actually serves. If this is the gated RC origin, a service token was sent (an unset one is refused earlier in this step) and Access REJECTED it: check that RC_ACCESS_CLIENT_ID / RC_ACCESS_CLIENT_SECRET are current and still authorized for this Access application. If it is not, then an Access application has started covering a host that is supposed to be public, which is an origin change rather than a CI one."
+                  echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
+                  return 1
+                  ;;
+              esac
               echo "::error::$url returned HTML, not shell — the origin answered a script path with the landing page at status 200 (soft 404). A piped install sources this AS SHELL."
               echo "    first 3 lines:"; head -n 3 "$f" | sed 's/^/      /'
               # In payload mode the whole origin is a subpath the site publisher
@@ -1752,10 +2099,24 @@ jobs:
             return 0
           }
 
+          # The EFFECTIVE URL is recorded for the Access-vs-soft-404 distinction,
+          # exactly as in the Linux job.
           echo "==> Fetching the advertised installer"
-          curl -fsSL ${FD_HDR[@]+"${FD_HDR[@]}"} "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" \
+          FD_EFFECTIVE_URL="$(curl -fsSL ${FD_HDR[@]+"${FD_HDR[@]}"} "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" -w '%{url_effective}')" \
             || { echo "::error::could not fetch $FRONT_DOOR/install.sh"; exit 1; }
           assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh" || exit 1
+
+          # ── the version the SERVED installer will resolve ─────────────────────
+          # Parsed on every event and exported for the asset preflight, fail
+          # closed, for the reasons spelled out in the Linux job.
+          served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+          if [ -z "$served_version" ]; then
+            echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the served $FRONT_DOOR/install.sh. This check must never silently pass, so it fails closed."
+            grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+            exit 1
+          fi
+          echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
+          echo "    served version: $served_version"
 
           # ── the RC origin must be serving THIS release candidate ──────────────
           # Only on an rc/** push, where the branch name pins the version we are
@@ -1767,12 +2128,6 @@ jobs:
               rc/?*) rc_version="${GITHUB_REF_NAME#rc/}" ;;
               *) echo "::error::this job only runs on a push for an rc/<version> branch, got '${GITHUB_REF_NAME:-}'"; exit 1 ;;
             esac
-            served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
-            if [ -z "$served_version" ]; then
-              echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the served $FRONT_DOOR/install.sh — this check must never silently pass, so it fails closed"
-              grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
-              exit 1
-            fi
             if [ "$served_version" != "$rc_version" ]; then
               echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version) — the RC front door is serving a DIFFERENT release candidate. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree."
               exit 1
@@ -1917,6 +2272,113 @@ jobs:
             echo "                origin post-publish (dispatch) and daily (cron)."
           fi
 
+      # ── the release assets must EXIST before the install starts ───────────────
+      # The `front-door` job carries the canonical note on why this step exists
+      # (the 2026-07-31 v0.18.0 legs, which downloaded nothing and then reported
+      # a 900 s health timeout while release-tarballs was still attaching the
+      # assets). Two macOS differences only:
+      #
+      #   * the triple comes from the MATRIX, not from a uname map. This leg
+      #     already asserted `uname -m` against $TRIPLE in its own step above,
+      #     and that assertion is the whole justification for the second matrix
+      #     entry, so re-deriving here would be a second, weaker copy of it.
+      #   * this leg is exactly where the wait pays for itself: macOS has no
+      #     installer-exited fast-fail (see the verify step), so a missing asset
+      #     costs the FULL health budget rather than a few seconds.
+      - name: Wait for the release assets this install will download
+        if: env.FD_MODE == 'full'
+        shell: bash
+        run: |
+          set -uo pipefail
+          payloads="$RUNNER_TEMP/front-door-payloads"
+          triple="$TRIPLE"
+
+          version="${FD_SERVED_VERSION:-}"
+          if [ -z "$version" ]; then
+            echo "::error::FD_SERVED_VERSION is empty. Rung 1 parses the served installer's baked version and exports it; without it this step would have to guess which release to probe, so it fails closed instead."
+            exit 1
+          fi
+
+          # The base URL is DERIVED from the served install_common.sh and the
+          # artifact stem is drift-guarded against the served headless_tarball.sh,
+          # both fail closed. See the Linux job for why each shape is validated
+          # rather than assumed.
+          lib="$payloads/install_common.sh"
+          if [ ! -s "$lib" ]; then
+            echo "::error::rung 1 left no served install_common.sh at $lib, so the download URL cannot be derived from what this origin serves. Fail closed rather than assume the GitHub default."
+            exit 1
+          fi
+          base_fmt="$(sed -n '/^install_default_base_url()/,/^}/p' "$lib" \
+                      | sed -n "s/.*printf '\([^']*\)'.*/\1/p" | head -n 1)"
+          case "$base_fmt" in
+            https://*%s) ;;
+            *)
+              echo "::error::could not derive the release base URL from the served install_common.sh: install_default_base_url prints '$base_fmt', which is not the expected 'https://...%s' shape. Update this step to match the lib rather than probing a URL install.sh would never request."
+              exit 1
+              ;;
+          esac
+          base_prefix="${base_fmt%'%s'}"
+          case "$base_prefix" in
+            *%*)
+              echo "::error::the served install_default_base_url format '$base_fmt' carries more than one printf directive, and this preflight only knows how to substitute the version. Fail closed."
+              exit 1
+              ;;
+          esac
+          base_url="$base_prefix$version"
+
+          stem_lib="$payloads/headless_tarball.sh"
+          if [ ! -s "$stem_lib" ]; then
+            echo "::error::rung 1 left no served headless_tarball.sh at $stem_lib, so the artifact name cannot be checked against what this origin serves. Fail closed."
+            exit 1
+          fi
+          stem_fmt="$(sed -n '/^headless_tarball_stem()/,/^}/p' "$stem_lib" \
+                      | sed -n "s/.*printf '\([^']*\)'.*/\1/p" | head -n 1)"
+          if [ "$stem_fmt" != 'lucidos-%s-%s' ]; then
+            echo "::error::the served headless_tarball_stem builds '$stem_fmt', not the 'lucidos-%s-%s' this preflight constructs. The artifact name changed shape, so update this step to match it."
+            exit 1
+          fi
+          stem="lucidos-$version-$triple"
+
+          tarball_url="$base_url/$stem.tar.gz"
+          checksum_url="$tarball_url.sha256"
+          echo "==> The install will download, and both must exist first:"
+          echo "    $tarball_url"
+          echo "    $checksum_url"
+          echo "    (the .sha256 too: install.sh's checksum step is mandatory and fails closed)"
+
+          fd_code=''
+          probe() {
+            fd_code="$(curl -sS -L -r 0-0 -o /dev/null -w '%{http_code}' --max-time 30 "$1" 2>/dev/null || echo 000)"
+            case "$fd_code" in 200|206) return 0 ;; *) return 1 ;; esac
+          }
+
+          deadline=$(( $(date +%s) + FD_ASSET_WAIT_SECS ))
+          attempt=0
+          tar_code='000'
+          sha_code='000'
+          while : ; do
+            attempt=$(( attempt + 1 ))
+            if probe "$tarball_url"; then
+              tar_code="$fd_code"
+              if probe "$checksum_url"; then
+                sha_code="$fd_code"
+                echo "preflight OK on attempt $attempt: the tarball answered $tar_code and its .sha256 answered $sha_code."
+                break
+              fi
+              sha_code="$fd_code"
+            else
+              tar_code="$fd_code"
+              sha_code='not probed'
+            fi
+            now="$(date +%s)"
+            if [ "$now" -ge "$deadline" ]; then
+              echo "::error::the release assets this install needs are still not published after ${FD_ASSET_WAIT_SECS}s of waiting: $tarball_url answered $tar_code and $checksum_url answered $sha_code. This is an ASSET AVAILABILITY failure. It is not a broken front door and not a gateway health failure, and the install is deliberately NOT being started: it would 404 at the download step and then burn the ${GW_HEALTH_TIMEOUT_SECS}s gateway poll before reporting the wrong cause. release-tarballs.yml attaches the per-triple headless tarballs roughly 23 minutes AFTER the Release is cut, so a dispatch fired at publish time legitimately arrives early. Check that the release-tarballs run for v$version finished and attached $stem.tar.gz + .sha256."
+              exit 1
+            fi
+            echo "    attempt $attempt: tarball $tar_code, sidecar $sha_code; $(( deadline - now ))s of the ${FD_ASSET_WAIT_SECS}s budget left, retrying in ${FD_ASSET_POLL_SECS}s"
+            sleep "$FD_ASSET_POLL_SECS"
+          done
+
       # ── rungs 2-4: FULL MODE ONLY ─────────────────────────────────────────────
       # The RC payload-only rule applies here IDENTICALLY, and for the same
       # reason — an RC install.sh bakes LUCIDOS_DEFAULT_VERSION=<rc version> and
@@ -2043,6 +2505,22 @@ jobs:
             exit 1
           }
 
+          # ── the residual download failure, named as itself ────────────────────
+          # The `front-door` job carries the canonical note. It matters MORE on
+          # this runner: there is no installer-exited fast-fail below (see the
+          # next paragraph), so without this a failed download would poll out the
+          # entire health budget and then report the gateway rather than the
+          # download. Both of install.sh's asset-fetch aborts are matched, but
+          # not the checksum MISMATCH, which is a different verdict.
+          DOWNLOAD_FAIL_RE='Download failed:|could NOT fetch its checksum sidecar'
+          assert_no_download_failure() {
+            grep -qE "$DOWNLOAD_FAIL_RE" "$log" 2>/dev/null || return 0
+            echo "::error::the installer could not fetch the release asset, AFTER the preflight found it published. This is a DOWNLOAD failure, not a gateway health failure: the gateway was never going to start."
+            grep -nE "$DOWNLOAD_FAIL_RE" "$log" | head -n 5 | sed 's/^/      /'
+            dump
+            exit 1
+          }
+
           # ── rung 3: the gateway answers /health (polled) ──────────────────────
           # The gateway lives in the sigil namespace: a bare /api/v1/health would
           # resolve as a workspace slug and 404. The port comes from the launch
@@ -2076,6 +2554,7 @@ jobs:
           body=""
           while [ "$(date +%s)" -lt "$deadline" ]; do
             assert_no_html_payload
+            assert_no_download_failure
             banner_port="$(sed -n 's|.*http://localhost:\([0-9][0-9]*\)/.*|\1|p' "$log" 2>/dev/null | head -n 1)"
             [ -n "$banner_port" ] && port="$banner_port"
             body="$(curl -fsS --max-time 5 "http://localhost:$port/~/api/v1/health" 2>/dev/null || true)"
@@ -2083,6 +2562,7 @@ jobs:
             sleep 5
           done
           assert_no_html_payload
+          assert_no_download_failure
           echo "$body" | grep -q '"status":"ok"' \
             || { echo "::error::the gateway never reported healthy within ${GW_HEALTH_TIMEOUT_SECS}s ($(installer_state))"; dump; exit 1; }
           echo "$body" | grep -q '"role":"gateway"' \
@@ -2387,3 +2867,98 @@ jobs:
             echo "no launchd job left behind ($GW_LAUNCHD_LABEL)"
           fi
 
+  # ── FRONT-DOOR ROUTE PARITY (production vs the release candidate) ────────────
+  # THE ONLY JOB IN THIS FILE THAT LOOKS AT BOTH ORIGINS. Read that before
+  # folding it into `front-door`, which is where it superficially belongs.
+  #
+  # A *publish route* is any path a piped run curls back from its own origin and
+  # executes: `/install.sh`, `/uninstall.sh`, and every `/scripts/lib/*.sh` the
+  # two of them source. The site publisher decides that set TWICE, in a
+  # route-discovery path for production and a separate one for the release
+  # candidate, and the two can drift.
+  #
+  # On 2026-07-30 they did. `/uninstall.sh` became a published route and only
+  # the production path learned about it. Nothing noticed until the rc/0.18.0
+  # push the next morning, when all three `front-door (rc, payload only)` legs
+  # failed on `could not fetch https://rc.lucidos.dev/uninstall.sh`. One
+  # omission, reported three times, on release morning.
+  #
+  # WHY NO EXISTING JOB CATCHES IT EARLIER, and why a better rung 1 would not
+  # help: rung 1 is already correct. It derives the checked route list from the
+  # served installer rather than hardcoding it, and it DID fail on the missing
+  # route. Its limit is structural, not a bug: `FRONT_DOOR` holds one origin per
+  # run, so no amount of care inside a single-origin job can see that the OTHER
+  # origin serves a different set. Only a job that fetches both can, which is
+  # this one.
+  #
+  # TRIGGERS: the daily cron and a dispatch. DELIBERATELY NOT the rc/** push.
+  # The divergence exists from the moment the publisher's two paths differ, so
+  # the daily cron names it within a day, independent of any release; the rc
+  # push is the LATEST possible moment (it is exactly where the 2026-07-30
+  # omission surfaced), the RC leg already reds there, and a fourth red on
+  # release morning is noise. It would also red falsely: a candidate that ADDS a
+  # route legitimately leads production until publish.
+  #
+  # SEVERITY IS ASYMMETRIC AND THAT IS THE DESIGN, not an inconsistency:
+  #
+  #   production serves it, the candidate does not  -> FATAL. The 2026-07-30
+  #       shape. Always wrong, always actionable now.
+  #   the candidate serves it, production does not  -> WARNING. Expected while a
+  #       candidate that adds a route is in flight. Failing would red this cron
+  #       through every such release window, and it does not go unguarded: at
+  #       publish, production's own served installer starts declaring the route
+  #       and `front-door` rung 1 reds fatally on it.
+  #   neither serves it                             -> WARNING. Both front doors
+  #       are broken, which is `front-door`'s verdict to give, and that job runs
+  #       against production in this same daily run. A second red adds nothing.
+  #
+  # THIS JOB CHECKS OUT THE REPO AND `front-door` MUST NOT, which is not an
+  # inconsistency either. That rule keeps the SUBJECT of the test honest:
+  # front-door's entire input has to be what the origin serves. Here the tree is
+  # the measuring instrument, never the subject. `front_door_parity.sh` derives
+  # each origin's route set from THAT ORIGIN'S own served scripts and reads
+  # nothing about routes from the checkout. What the checkout buys is real:
+  # ShellCheck coverage through `make lint`, a hermetic offline test
+  # (`front_door_parity_test.sh`, which also pins the scrape against the tree's
+  # actual install.sh), one definition of the derivation instead of a third copy
+  # of bash inside a YAML string, and a command the maintainer can run by hand
+  # to confirm a publisher fix without waiting for a cron.
+  #
+  # The origins are the harness's own constants rather than the `origin`
+  # dispatch input: this job's subject IS that specific pair, and taking no URL
+  # from the event means there is no hostile input to validate. It also never
+  # pipes anything into a shell, it only sniffs, which is why it does not need
+  # front-door's validate-and-rename dance.
+  front-door-parity:
+    name: front-door route parity (production vs rc)
+    # Public mirror only (see the smoke job's repo guard). Dispatch and the
+    # DAILY cron. The `github.event.schedule` guard is not optional: a schedule
+    # trigger fires the whole workflow, so a job without it would silently drag
+    # itself into the weekly run too.
+    if: >-
+      github.repository == 'lucidos-dev/lucidos'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event_name == 'schedule'
+              && github.event.schedule == '0 6 * * *'))
+      && inputs.dmg_tag == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    # `contents: read` rather than front-door's `{}`, and only because this job
+    # checks the harness out. It still executes nothing it fetches.
+    permissions:
+      contents: read
+    env:
+      # The RC origin sits behind Cloudflare Access. Without the service token
+      # every fetch of it answers 302 to a login page, every route sniffs as
+      # "not shell", and the run would report a total divergence whose real
+      # cause is a missing secret. The harness refuses up front rather than
+      # producing that diagnosis.
+      RC_ACCESS_CLIENT_ID: ${{ secrets.RC_ACCESS_CLIENT_ID }}
+      RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
+    steps:
+      - name: Checkout (the harness only; the route sets come from the origins)
+        uses: actions/checkout@v4
+
+      - name: Both front doors serve the same publish routes
+        shell: bash
+        run: ./scripts/lib/front_door_parity.sh

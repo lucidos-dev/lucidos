@@ -3,10 +3,10 @@ import { useRef } from 'preact/hooks';
 import { activeMenuItem, panelOverlay, pinnedApps, appsList, changes, appliedChanges } from '../../store/store';
 import { switchMenuItem } from '../../store/actions/menu';
 import { openUrl } from '../../store/actions/artifacts';
+import { inAppBrowserAvailable } from '../../store/actions/preferences';
 import { openAppById } from '../../store/actions/apps';
 import { showToast } from '../../store/store';
 import { errorDetail } from '../../utils/errorDetail';
-import { isTauri } from '../../utils/platform';
 import { isMobile } from '../../utils/viewport';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from '../shared/Overlay';
@@ -179,7 +179,12 @@ export function Drawer() {
           </div>
         ))}
 
-        {isTauri() && (
+        {/* The only entry point to the experimental in-app browser, so it is
+            gated on the same availability the feature has. Gating on isTauri()
+            alone shipped the row with the toggle off, where openUrl routes to
+            the OS opener: a row labelled "Browser" just launched the system
+            browser on google.com. */}
+        {inAppBrowserAvailable() && (
           <div
             class={`drawer-item ${panelOverlay.value?.type === 'url-preview' ? 'active' : ''}`}
             onClick={() => {

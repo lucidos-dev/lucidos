@@ -728,7 +728,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 - **`front-door`'s payload gate on `push: rc/**` racing the RC publication is
   the chosen design, not an oversight.** Reviewers flag that the job fetches
-  `https://lucidos.dev/rc/install.sh` the moment the rc branch is pushed, while
+  `https://rc.lucidos.dev/install.sh` the moment the rc branch is pushed, while
   the RC copy is published by a separate, asynchronous step — so an ordering
   skew reds a perfectly good release candidate. The mechanism is real; the
   conclusion isn't. Three reasons it stays: (1) the race is inherent to the
@@ -752,6 +752,26 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`.github/workflows/install-smoke.yml` § front-door, `scripts/release.sh`
   § `print_rc_gate_handoff`.)
 
+- **`front-door-parity`'s asymmetric severity is deliberate, and so is its
+  checkout.** Two things about that job read as inconsistencies and are not.
+  (1) *Production serves a route the candidate does not* is FATAL while the
+  reverse is only a WARNING. Reviewers propose symmetry. It would be wrong: an
+  in-flight candidate that ADDS a publish route legitimately leads production
+  until publish, so a symmetric gate reds the daily cron through every such
+  release window. The direction is not left uncovered either, it is covered
+  later and harder: once the GA publishes, production's own served installer
+  declares the route and `front-door` rung 1 reds fatally on it. Likewise
+  "missing at both" is a warning because that is `front-door`'s verdict to give,
+  in the same daily run. (2) It runs `actions/checkout` while `front-door`
+  pointedly does not. The no-checkout rule protects the *subject* of the test:
+  front-door's whole input must be what the origin serves. Parity's subject is
+  still the two origins, and `front_door_parity.sh` derives every route set from
+  the served scripts; the tree is only the measuring instrument, which is what
+  buys ShellCheck coverage and a hermetic test. Re-flag only if the harness
+  starts reading routes from the checkout.
+  (`.github/workflows/install-smoke.yml` § front-door-parity,
+  `scripts/lib/front_door_parity.sh`.)
+
 - **`release-tarballs.yml`'s delete-then-upload attach loop cannot clobber a
   signed macOS tarball.** Reviewers read the automatic `release: published`
   attach — which runs for all four matrix entries, macOS included, and deletes
@@ -774,6 +794,40 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   curl-fetched files.
   (`.github/workflows/release-tarballs.yml` § attach step, `scripts/build-dmg.sh`
   `gh release upload`, `.claude/rules/build-release.md` § Linux tarballs via CI.)
+
+- **`front-door` and `front-door-macos` duplicate their step bodies ON PURPOSE,
+  and the asset preflight is duplicated with them.** A reviewer meets two nearly
+  identical validate steps, two payload sniffs, two ~80-line preflights and two
+  health polls, and proposes a composite action, a `needs:` chain, or a shared
+  `scripts/lib` helper. All three break something load-bearing. The jobs must
+  report **independently**: a Linux-only outage must not hide the Mac verdict or
+  the reverse, which a shared job or a `needs:` edge would do. `front-door` must
+  keep **no checkout**, since its entire input has to be what the origin serves,
+  so a `scripts/lib` helper is unavailable to it by construction (that rule is
+  what `front-door-parity` is explicitly carved out of, and it pays for the carve
+  by not being a front-door job). And a composite action is a third dialect on
+  top of two host families that genuinely differ, in the launch shape (`launchd`
+  exits 0; the container holds the foreground) and in bash version (Apple ships
+  3.2, hence `${FD_HDR[@]+"${FD_HDR[@]}"}` on the macOS side only). The real
+  hazard of duplication, silent divergence, is answered with a test rather than
+  a refactor: `scripts/lib/front_door_gate_test.sh` runs every invariant **once
+  per job**, so a fix landing in one job reds. Re-flag only with evidence the two
+  have diverged in a way that test does not cover, and then extend the test.
+  (`.github/workflows/install-smoke.yml` § front-door + front-door-macos,
+  `scripts/lib/front_door_gate_test.sh`.)
+
+- **`front_door_gate_test.sh`'s file-wide `# shellcheck disable=SC2016` is the
+  correct scope, not a blanket silencer.** Every needle in that file is LITERAL
+  shell text to find inside the workflow (`"$INSTALL_PID"`, `$tarball_url`,
+  `$RUNNER_TEMP/front-door-payloads`), so the `$` must reach `grep` unexpanded.
+  Expanding any of them, all unset in the test's own shell, would turn the needle
+  into the empty string and the assertion into a vacuous pass, which is the one
+  failure a drift test cannot afford. Per-line disables were considered and are
+  worse here: nine of them across the file, each restating the same reason. Note
+  that even the `FASTFAIL=...` assignment trips SC2016, so hoisting needles into
+  variables does not avoid it. Re-flag only if the file grows a use of single
+  quotes where expansion WAS intended.
+  (`scripts/lib/front_door_gate_test.sh` header.)
 
 ## Plugins & triggers (ADR 0019)
 

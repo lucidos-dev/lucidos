@@ -1,0 +1,47 @@
+# Dependabot configuration.
+#
+# This file exists only to scope Dependabot's *security* updates, which run on the
+# public mirror whether or not this file is present. Version updates stay off:
+# `open-pull-requests-limit: 0` disables them for the ecosystem, and security
+# updates are explicitly exempt from that limit, so they keep behaving exactly as
+# they do today. Lucidos is not PR-based (Apply merges a branch straight into
+# main), so a standing stream of version-bump pull requests would have nobody to
+# merge it.
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      # Required by the schema. Inert while open-pull-requests-limit is 0.
+      interval: "weekly"
+    open-pull-requests-limit: 0
+    ignore:
+      # glib, 2026-07-31.
+      #
+      # The advisory affects ">= 0.15.0, < 0.20.0", so the lowest non-vulnerable
+      # version is 0.20.0, and this tree cannot reach it: tauri 2.11.4 -> tao
+      # 0.35.3 -> gtk 0.18.2 -> glib 0.18.5, and gtk3-rs has never moved past glib
+      # 0.18. Every attempt therefore ends in
+      #
+      #   security_update_not_possible
+      #   { "latest-resolvable-version": "0.18.5",
+      #     "lowest-non-vulnerable-version": "0.20.0",
+      #     "conflicting-dependencies": [] }
+      #
+      # and a red "Dependabot Updates" run, roughly every other day (2026-07-28,
+      # 07-29, 07-31), for an upgrade that cannot be performed. The other cargo
+      # security updates in this repo succeed and are untouched by this entry.
+      #
+      # The bound is the set of versions that are actually unresolvable right now,
+      # not the package: everything at or above 0.20.0 is out of reach, everything
+      # below it is left alone. So a future advisory whose fix lands inside the
+      # resolvable 0.18.x range still alerts and still gets a pull request.
+      #
+      # Revisit when the gtk/tauri chain moves. Once tao/gtk depend on glib >= 0.20,
+      # delete this entry and let the update run. Nothing reopens it on its own:
+      # "the tree can now resolve 0.20" is not a condition this schema can express,
+      # and an upper bound here would only re-raise the same impossible upgrade the
+      # next time glib cuts a release.
+      - dependency-name: "glib"
+        versions:
+          - ">= 0.20.0"

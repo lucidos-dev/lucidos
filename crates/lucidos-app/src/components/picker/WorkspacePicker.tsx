@@ -19,6 +19,7 @@
 import { useSignal } from '@preact/signals';
 import { useEffect, useRef } from 'preact/hooks';
 import type { Loadable } from '../../store/types';
+import { toFailed } from '../../store/types';
 import { Overlay } from '../shared/Overlay';
 import { LoadingFade } from '../shared/LoadingFade';
 import { SkeletonProvider, SkText, SkBlock } from '../shared/Skeleton';
@@ -54,15 +55,14 @@ import {
   type WorkspaceStatus,
   type GwRestoreStatus,
   type GatewayStatus,
-  type GatewayNetworkConfig,
 } from '../../api/client/control';
 import {
-  parseBindValue,
   toBindValue,
-  isValidIp,
   isValidBindSelection,
-  type BindMode,
+  draftFromBind,
+  type BindDraft,
 } from '../../utils/bindMode';
+import { networkAccessBody, type NetworkEditor } from './NetworkAccessPopover';
 
 /** Derived display state — collapses health + last_error into one status the row
  *  renders as a dot. A stopped workspace reports `unhealthy` + "not started"; we
@@ -274,14 +274,22 @@ export function WorkspacePicker() {
   const reloadAnchor = useSignal<HTMLElement | null>(null);
   // Machine-global Network access control (writes ~/.lucidos/network.toml): the
   // gateway bind + the "engines inherit gateway bind" toggle. Anchored to the
-  // header gear. Lazy-loaded on open.
+  // header gear. Re-read from the gateway on every open.
+  //
+  // ONE signal holds both the saved config and the edit against it, so a draft
+  // cannot outlive the config it came from. Splitting them (a config signal
+  // plus three loose draft fields, none of them reset) is what made the popover
+  // reopen on the last CLICKED mode instead of the saved one: the config signal
+  // stayed truthy from the previous open, so the stale draft rendered as
+  // settled until the refetch corrected it.
   const networkOpen = useSignal(false);
   const networkAnchor = useSignal<HTMLElement | null>(null);
-  const networkConfig = useSignal<GatewayNetworkConfig | null>(null);
-  const gwMode = useSignal<BindMode>('loopback');
-  const gwAddress = useSignal('');
-  const gwInherit = useSignal(true);
+  const network = useSignal<Loadable<NetworkEditor>>({ status: 'not-loaded' });
   const networkSaving = useSignal(false);
+  // Identifies the newest load, so a slow response from a previous open cannot
+  // land on top of a newer one (the GET shells out to `tailscale ip -4`, so it
+  // is not always fast).
+  const networkLoadToken = useRef(0);
   // Per-row overflow menu (autostart / rename / delete). Only one open at a time;
   // anchor is the ⋯ button that opened it.
   const menuOpenId = useSignal<string | null>(null);
@@ -380,43 +388,70 @@ export function WorkspacePicker() {
     });
   }
 
-  function openNetwork(btn: HTMLElement) {
-    networkAnchor.value = btn;
-    networkOpen.value = true;
+  // Re-read the machine-global config and seed a fresh draft from it. Called on
+  // every open (and by the failure row's Retry), so what the popover shows is
+  // always what is stored, never a leftover edit.
+  function loadNetwork() {
+    const token = ++networkLoadToken.current;
+    network.value = { status: 'loading' };
     void getGatewayNetworkConfig()
       .then((cfg) => {
-        networkConfig.value = cfg;
-        const parsed = parseBindValue(cfg.gateway_bind);
-        gwMode.value = parsed.mode;
-        gwAddress.value = parsed.address;
-        gwInherit.value = cfg.inherit;
+        if (token !== networkLoadToken.current) return; // superseded by a newer open
+        network.value = {
+          status: 'loaded',
+          data: { config: cfg, draft: draftFromBind(cfg.gateway_bind, cfg.inherit) },
+        };
       })
       .catch((e) => {
-        error.value = String(e);
+        if (token !== networkLoadToken.current) return;
+        // Stated inside the popover (with a Retry) rather than on the picker's
+        // error screen: the failure belongs to the thing the user just opened.
+        network.value = toFailed(e);
       });
   }
 
+  function openNetwork(btn: HTMLElement) {
+    networkAnchor.value = btn;
+    networkOpen.value = true;
+    loadNetwork();
+  }
+
+  /** Edit the draft. A no-op unless a config is loaded, because a draft only
+   *  exists as part of one. */
+  function patchNetworkDraft(patch: Partial<BindDraft>) {
+    const s = network.value;
+    if (s.status !== 'loaded') return;
+    network.value = {
+      status: 'loaded',
+      data: { ...s.data, draft: { ...s.data.draft, ...patch } },
+    };
+  }
+
   // Click-to-fill the detected Tailscale address: drop it into the IP field and
-  // switch to the Tailnet / IP mode (idempotent — already in that mode when the
-  // detected line is visible, but set both so the affordance is self-contained).
+  // switch to the Tailnet / IP mode (idempotent, since that mode is the only one
+  // where the detected line shows, but set both so it is self-contained).
   function fillDetectedTailscaleIp() {
-    const ip = networkConfig.value?.detected_tailscale_ip;
+    const s = network.value;
+    if (s.status !== 'loaded') return;
+    const ip = s.data.config.detected_tailscale_ip;
     if (!ip) return;
-    gwMode.value = 'address';
-    gwAddress.value = ip;
+    patchNetworkDraft({ mode: 'address', address: ip });
   }
 
   function onSaveNetwork() {
-    if (!isValidBindSelection(gwMode.value, gwAddress.value)) {
-      error.value = 'Enter a valid IP address';
-      return;
-    }
+    const s = network.value;
+    // Both guards are also what disables the Save button, so neither is
+    // reachable by clicking; they keep the write honest if it is ever called
+    // from somewhere else.
+    if (s.status !== 'loaded') return;
+    const { draft } = s.data;
+    if (!isValidBindSelection(draft.mode, draft.address)) return;
     void withBusy(async () => {
       networkSaving.value = true;
       try {
         await setGatewayNetworkConfig({
-          gateway_bind: toBindValue(gwMode.value, gwAddress.value),
-          inherit: gwInherit.value,
+          gateway_bind: toBindValue(draft.mode, draft.address),
+          inherit: draft.inherit,
         });
         networkOpen.value = false;
       } finally {
@@ -660,106 +695,18 @@ export function WorkspacePicker() {
             backdrop={false}
             panelClass="ws-picker-confirm ws-picker-net"
           >
-            <h2 class="ws-picker-net-title">Network access</h2>
-            <p class="ws-picker-net-desc">
-              How this machine's Lucidos is reachable. The gateway fronts every
-              workspace; engines can follow it or bind per-workspace.
-            </p>
-            {/* The form STRUCTURE renders immediately at a constant height; only
-                the config-dependent VALUES (active bind, toggle state, the
-                address field) wait for the load. So the popover never resizes on
-                load for the loopback/all cases — the jank the user hit when a
-                skeleton of a different height swapped to the form. While loading,
-                the value-bearing controls dim + go inert (no wrong default shown,
-                since nothing is marked active until the config lands); the static
-                explanatory text below renders right away and pins the height. */}
-            <div class={`ws-picker-net-controls${networkConfig.value ? '' : ' is-loading'}`} aria-busy={!networkConfig.value}>
-              <div class="ws-picker-net-modes" role="radiogroup" aria-label="Gateway bind">
-                {(
-                  [
-                    ['loopback', 'Loopback only'],
-                    ['address', 'Tailnet / IP'],
-                    ['all', 'All interfaces'],
-                  ] as [BindMode, string][]
-                ).map(([m, label]) => (
-                  <button
-                    key={m}
-                    type="button"
-                    role="radio"
-                    aria-checked={!!networkConfig.value && gwMode.value === m}
-                    class={`ws-picker-net-mode${networkConfig.value && gwMode.value === m ? ' active' : ''}`}
-                    disabled={busy.value || !networkConfig.value}
-                    onClick={() => (gwMode.value = m)}
-                  >
-                    {label}
-                  </button>
-                ))}
-              </div>
-              {networkConfig.value && gwMode.value === 'address' && (
-                <>
-                  <input
-                    class="ws-picker-input"
-                    type="text"
-                    placeholder={networkConfig.value?.detected_tailscale_ip ?? '100.x.y.z'}
-                    value={gwAddress.value}
-                    aria-invalid={gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value)}
-                    aria-label="Gateway bind IP address"
-                    onInput={(e) => (gwAddress.value = (e.target as HTMLInputElement).value)}
-                  />
-                  {gwAddress.value.trim() !== '' && !isValidIp(gwAddress.value) ? (
-                    <span class="ws-picker-net-error">Not a valid IP address.</span>
-                  ) : networkConfig.value?.detected_tailscale_ip ? (
-                    <span class="ws-picker-net-hint">
-                      Detected Tailscale:{' '}
-                      <button
-                        type="button"
-                        class="ws-picker-net-detected"
-                        data-tooltip="Use this address"
-                        onClick={fillDetectedTailscaleIp}
-                      >
-                        {networkConfig.value.detected_tailscale_ip}
-                      </button>
-                    </span>
-                  ) : (
-                    <span class="ws-picker-net-hint">Your Tailscale 100.x address, or a LAN IP.</span>
-                  )}
-                </>
-              )}
-              <label class="ws-picker-net-toggle">
-                <input
-                  type="checkbox"
-                  checked={!!networkConfig.value && gwInherit.value}
-                  disabled={!networkConfig.value}
-                  onChange={(e) => (gwInherit.value = (e.target as HTMLInputElement).checked)}
-                />
-                <span>Engines inherit gateway bind</span>
-              </label>
-            </div>
-            <p class="ws-picker-net-hint">
-              When off, each workspace sets its own engine bind in its Settings →
-              Network access.
-            </p>
-            <p class="ws-picker-net-restart">
-              Takes effect after the gateway / engine restarts.
-            </p>
-            <div class="ws-picker-confirm-actions">
-              <button class="ws-picker-btn" onClick={() => (networkOpen.value = false)}>
-                Cancel
-              </button>
-              <button
-                class="ws-picker-btn ws-picker-btn-confirm"
-                disabled={
-                  busy.value ||
-                  networkSaving.value ||
-                  !networkConfig.value ||
-                  (gwMode.value === 'address' &&
-                    (gwAddress.value.trim() === '' || !isValidIp(gwAddress.value)))
-                }
-                onClick={onSaveNetwork}
-              >
-                {networkSaving.value ? 'Saving…' : 'Save'}
-              </button>
-            </div>
+            {networkAccessBody({
+              state: network.value,
+              saving: networkSaving.value,
+              busy: busy.value,
+              onMode: (mode) => patchNetworkDraft({ mode }),
+              onAddress: (address) => patchNetworkDraft({ address }),
+              onInherit: (inherit) => patchNetworkDraft({ inherit }),
+              onFillDetected: fillDetectedTailscaleIp,
+              onRetry: loadNetwork,
+              onCancel: () => (networkOpen.value = false),
+              onSave: onSaveNetwork,
+            })}
           </Overlay>
           {gatewayStatus.value && !gatewayStatus.value.packaged && (
             <>

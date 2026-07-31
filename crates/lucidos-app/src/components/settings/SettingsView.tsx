@@ -933,8 +933,9 @@ export function SettingsView() {
         <div class="settings-section-title" data-search-anchor="experimental:in-app-browser">In-app browser</div>
         <p class="settings-section-desc">
           Open links inside the app in a built-in browser pane instead of your
-          system browser. Experimental — the in-app browser has rough edges, so
-          it's off by default.
+          system browser, and add a Browser entry to the menu drawer.
+          Experimental: the in-app browser has rough edges, so it's off by
+          default.
         </p>
         <div class="settings-row" data-search-anchor="experimental:in-app-browser-toggle">
           <span class="settings-row-label">Open links in the in-app browser</span>

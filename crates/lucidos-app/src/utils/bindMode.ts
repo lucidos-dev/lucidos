@@ -9,6 +9,48 @@
 
 export type BindMode = 'loopback' | 'address' | 'all';
 
+/** An in-progress edit of a bind: the three-mode selection, the address text
+ *  that only `address` mode uses, and the engine-inherit flag that rides along
+ *  in the same form.
+ *
+ *  A draft is only ever meaningful next to the saved value it was seeded from,
+ *  so holders must keep the two together (see `NetworkEditor` in
+ *  `components/picker/NetworkAccessPopover.tsx`) rather than in independent
+ *  fields: a draft that can outlive its config resurfaces as the "saved" value
+ *  the next time the form opens. */
+export interface BindDraft {
+  mode: BindMode;
+  address: string;
+  inherit: boolean;
+}
+
+/** Seed a draft from a saved bind value. The only way to make one, so a draft
+ *  always starts out equal to what is actually stored. */
+export function draftFromBind(bind: string, inherit: boolean): BindDraft {
+  const { mode, address } = parseBindValue(bind);
+  return { mode, address, inherit };
+}
+
+/** Would saving this draft change anything?
+ *
+ *  Compares the PAYLOAD the write would send against the payload that
+ *  reproduces the stored state, so both sides are canonical: keyword case and
+ *  surrounding whitespace collapse, and the address is ignored in the modes
+ *  that do not use it (typing an IP and then picking "all" is not a change).
+ *  Save is offered only when this is false, so an enabled Save button always
+ *  means "there is something to save". */
+export function bindDraftMatchesSaved(
+  draft: BindDraft,
+  savedBind: string,
+  savedInherit: boolean,
+): boolean {
+  const saved = draftFromBind(savedBind, savedInherit);
+  return (
+    draft.inherit === saved.inherit &&
+    toBindValue(draft.mode, draft.address) === toBindValue(saved.mode, saved.address)
+  );
+}
+
 /** Parse a stored bind value into a UI mode + (for `address`) the IP text. */
 export function parseBindValue(value: string): { mode: BindMode; address: string } {
   const v = value.trim().toLowerCase();
