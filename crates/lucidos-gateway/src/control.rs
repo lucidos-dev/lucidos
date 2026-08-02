@@ -420,7 +420,7 @@ async fn network_config() -> Json<Value> {
     Json(json!({
         "gateway_bind": net.gateway_bind.unwrap_or_else(|| "loopback".to_string()),
         "inherit": net.engine_inherit,
-        "detected_tailscale_ip": net_config::detect_tailscale_ipv4().await,
+        "detected_tailscale_ip": net_config::detect_tailscale_ipv4(),
     }))
 }
 

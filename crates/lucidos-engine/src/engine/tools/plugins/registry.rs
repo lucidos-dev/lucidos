@@ -131,7 +131,7 @@ pub(crate) struct InstalledRecord {
 impl InstalledRecord {
     // Raw manifest sits at `payload.data.manifest.manifest.*` — serde's
     // `tag/content` adds one wrapper, the payload-map-inside-SystemEvent.manifest
-    // assignment adds the other. See `system-knowhow/building-a-plugin.md`.
+    // assignment adds the other. See `system-knowhow/plugins.md`.
     pub(crate) fn version(&self) -> Option<&str> {
         self.payload
             .pointer("/data/manifest/manifest/version")

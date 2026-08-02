@@ -509,7 +509,7 @@ mod tests {
         let project_id = "test-project";
         let api_key = Some("sk-test");
 
-        PreferenceStore::set(&pool, crate::core::PREF_IMAGE_MODEL, "imagen-4")
+        crate::test_support::seed_preference(&pool, crate::core::PREF_IMAGE_MODEL, "imagen-4")
             .await
             .unwrap();
         let p1 = build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;
@@ -518,7 +518,7 @@ mod tests {
             "Vertex AI Imagen 4"
         );
 
-        PreferenceStore::set(&pool, crate::core::PREF_IMAGE_MODEL, "gpt-image-2")
+        crate::test_support::seed_preference(&pool, crate::core::PREF_IMAGE_MODEL, "gpt-image-2")
             .await
             .unwrap();
         let p2 = build_image_provider(&pool, api_key, project_id, &location, &token_cache).await;

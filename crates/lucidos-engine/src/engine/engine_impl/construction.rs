@@ -936,11 +936,18 @@ impl LucidosEngine {
         // source-thread backfill below.
         if crate::paths::has_lucidos_source() {
             let default_repo_root_commit = git_ops::root_commit_sha(&repo_root).await;
-            if let Err(e) = crate::core::repositories::RepositoryStore::ensure_exists(
+            // Engine-internal registration, so no actor. `register` announces
+            // it only if the row was actually created or moved, which keeps a
+            // plain restart from emitting `RepositoryAdded` (and re-firing
+            // every trigger listening on it) every single boot.
+            if let Err(e) = crate::core::repositories::RepositoryStore::register(
                 &pool,
+                &event_bus,
                 Self::DEFAULT_REPO_NAME,
                 &repo_root.to_string_lossy(),
+                None,
                 default_repo_root_commit.as_deref(),
+                None,
             )
             .await
             {
@@ -1067,7 +1074,7 @@ impl LucidosEngine {
             }
         }
 
-        let mcp_manager = crate::mcp::McpManager::new(pool.clone());
+        let mcp_manager = crate::mcp::McpManager::new(pool.clone(), event_bus.clone());
 
         let user_dir = std::env::var("HOME")
             .ok()

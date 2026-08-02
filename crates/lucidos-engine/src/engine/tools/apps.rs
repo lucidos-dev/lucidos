@@ -50,29 +50,15 @@ impl LucidosEngine {
 
                 match self
                     .app_manager
-                    .create_app(id, name, description, html_content)
+                    .create_app(&self.event_bus, id, name, description, html_content)
+                    .await
                 {
-                    Ok((path, commit)) => {
-                        if let Err(e) = self
-                            .event_bus
-                            .emit(crate::engine::event_bus::BusEvent::System(
-                                crate::engine::event_bus::SystemEvent::AppCreated {
-                                    app_id: id.to_string(),
-                                    name: Some(name.to_string()),
-                                    actor: None,
-                                },
-                            ))
-                            .await
-                        {
-                            log!("[Apps] Failed to emit AppCreated event: {}", e);
-                        }
-                        Ok(format!(
-                            "Created app '{}' at {} (commit: {})",
-                            name,
-                            crate::core::home_path::abbreviate(&path),
-                            &commit[..commit.floor_char_boundary(8)]
-                        ))
-                    }
+                    Ok((path, commit)) => Ok(format!(
+                        "Created app '{}' at {} (commit: {})",
+                        name,
+                        crate::core::home_path::abbreviate(&path),
+                        &commit[..commit.floor_char_boundary(8)]
+                    )),
                     Err(e) => Err(format!("creating app: {}", e).into()),
                 }
             }

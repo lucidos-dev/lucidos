@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 // ---------------------------------------------------------------------------
@@ -149,16 +152,29 @@ pub fn provider_for_url(url: &str) -> Option<&'static str> {
 // OAuthStore — database operations
 // ---------------------------------------------------------------------------
 
-/// Store for managing OAuth accounts in the database
+/// Store for managing OAuth accounts in the database.
+///
+/// **No caller can skip the event.** [`Self::connect`] and [`Self::delete`] are
+/// the only reachable mutators of an account's existence; the raw row writes
+/// are private to this module. `OAuthAccount{Connected,Deleted}` is what
+/// reloads the Settings Accounts list on every device.
+///
+/// [`Self::update_tokens`] is the one deliberate exception: a token rotation is
+/// not a user-visible change (see its doc).
+///
+/// Same shape as `RepositoryStore`; see `core::announced_surfaces`.
 pub struct OAuthStore;
 
 impl OAuthStore {
-    /// Insert or update an OAuth account (upsert on provider+email).
+    /// Insert or update an OAuth account row (upsert on provider+email).
     /// Uses a separate conflict clause when email is NULL because PostgreSQL
     /// treats NULL != NULL, so `UNIQUE(provider, email)` never fires for NULLs.
     /// A partial unique index `oauth_accounts_provider_no_email` covers that case.
+    ///
+    /// **Private on purpose**: [`Self::connect`] is the reachable mutator, and
+    /// it emits. See the type-level doc.
     #[allow(clippy::too_many_arguments)]
-    pub async fn insert(
+    async fn upsert_row(
         pool: &PgPool,
         provider: &str,
         email: Option<&str>,
@@ -271,6 +287,12 @@ impl OAuthStore {
     }
 
     /// Update tokens after a refresh
+    /// Refresh an account's tokens in place.
+    ///
+    /// Deliberately silent, and registered as the one `oauth_accounts`
+    /// exemption in `core::announced_surfaces`: a token rotation changes
+    /// nothing the user can see, and announcing every refresh would put an
+    /// events row on the timeline each time a token neared expiry.
     pub async fn update_tokens(
         pool: &PgPool,
         id: Uuid,
@@ -327,14 +349,89 @@ impl OAuthStore {
         .await
     }
 
-    /// Delete an OAuth account by UUID
-    pub async fn delete(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
+    /// Delete an OAuth account row. **Private on purpose**: [`Self::delete`] is
+    /// the reachable mutator, and it emits.
+    async fn delete_row(pool: &PgPool, id: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM oauth_accounts WHERE id = $1")
             .bind(id)
             .execute(pool)
             .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Store a freshly authorized OAuth account and announce it. The only way
+    /// to connect one.
+    ///
+    /// This emit is the half that was missing: `OAuthAccountDeleted` already
+    /// existed and the frontend reloads its Accounts list on it, so
+    /// disconnecting refreshed every client while connecting refreshed none,
+    /// and nothing recorded that an account had been connected at all.
+    ///
+    /// Announces on a re-authorization too (the upsert path), because
+    /// re-connecting is how scopes are granted: the account's capabilities
+    /// changed even though the row already existed.
+    #[allow(clippy::too_many_arguments)] // one arg per token column, plus the bus and actor
+    pub async fn connect(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        provider: &str,
+        email: Option<&str>,
+        display_name: Option<&str>,
+        access_token: &str,
+        refresh_token: Option<&str>,
+        token_expiry: Option<DateTime<Utc>>,
+        scopes: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Uuid, sqlx::Error> {
+        let id = Self::upsert_row(
+            pool,
+            provider,
+            email,
+            display_name,
+            access_token,
+            refresh_token,
+            token_expiry,
+            scopes,
+        )
+        .await?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::OAuthAccountConnected {
+                    account_id: id.to_string(),
+                    provider: provider.to_string(),
+                    email: email.map(str::to_string),
+                    actor,
+                }),
+                "[OAuth] OAuthAccountConnected",
+            )
+            .await;
+        Ok(id)
+    }
+
+    /// Delete an OAuth account and announce it. The only way to disconnect one.
+    ///
+    /// `OAuthAccountDeleted` fires only when a row was actually deleted, so a
+    /// repeated or racing disconnect announces once.
+    pub async fn delete(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let removed = Self::delete_row(pool, id).await?;
+        if removed {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::OAuthAccountDeleted {
+                        account_id: id.to_string(),
+                        actor,
+                    }),
+                    "[OAuth] OAuthAccountDeleted",
+                )
+                .await;
+        }
+        Ok(removed)
     }
 }
 
@@ -1176,6 +1273,7 @@ pub struct PreparedOAuthFlow {
 /// Await `result_rx` to get the flow outcome.
 pub async fn prepare_oauth_flow(
     pool: &PgPool,
+    event_bus: &EventBus,
     provider: &str,
     scopes: &str,
 ) -> Result<PreparedOAuthFlow, BoxError> {
@@ -1248,6 +1346,7 @@ pub async fn prepare_oauth_flow(
     // Spawn background task to wait for callback and complete the exchange
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     let pool = pool.clone();
+    let event_bus = event_bus.clone();
     let provider = provider.to_string();
 
     tokio::spawn(async move {
@@ -1282,9 +1381,12 @@ pub async fn prepare_oauth_flow(
             // Use actually granted scopes from the token response, fall back to what we requested
             let granted_scopes = token_resp.scope.as_deref().unwrap_or(&merged_scopes);
 
-            // Store account with granted scopes
-            OAuthStore::insert(
+            // Store account with granted scopes. `connect` announces
+            // OAuthAccountConnected from inside the write path, so every device
+            // reloads its Accounts list without waiting for a page refresh.
+            OAuthStore::connect(
                 &pool,
+                &event_bus,
                 &provider,
                 email.as_deref(),
                 display_name.as_deref(),
@@ -1292,6 +1394,7 @@ pub async fn prepare_oauth_flow(
                 token_resp.refresh_token.as_deref(),
                 token_expiry,
                 granted_scopes,
+                None,
             )
             .await
             .map_err(|e| format!("Failed to store OAuth account: {}", e))?;
@@ -1320,10 +1423,11 @@ pub async fn prepare_oauth_flow(
 /// opens the browser directly). Calls `prepare_oauth_flow` then opens the URL.
 pub async fn run_oauth_flow(
     pool: &PgPool,
+    event_bus: &EventBus,
     provider: &str,
     scopes: &str,
 ) -> Result<(Option<String>, Option<String>, String), BoxError> {
-    let prepared = prepare_oauth_flow(pool, provider, scopes).await?;
+    let prepared = prepare_oauth_flow(pool, event_bus, provider, scopes).await?;
 
     // Open browser (macOS — only used from LLM tool calls, not from frontend)
     crate::log!("[OAuth] Opening browser for {} authorization", provider);

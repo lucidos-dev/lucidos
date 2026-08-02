@@ -15,7 +15,6 @@
 use super::{LucidosEngine, ToolOutcome};
 use crate::core::environment_variables::validate_name;
 use crate::core::EnvironmentVariableStore;
-use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::llm::tool_names as tn;
 
 impl LucidosEngine {
@@ -83,20 +82,12 @@ impl LucidosEngine {
         if name.is_empty() {
             return Ok("Error: name is required".to_string());
         }
-        match EnvironmentVariableStore::delete(&self.pool, name).await {
-            Ok(true) => {
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::EnvironmentVariableDeleted {
-                        name: name.to_string(),
-                        actor: None,
-                    }))
-                    .await?;
-                Ok(format!(
-                    "[ACTION COMPLETED] Environment variable '{}' deleted. The change takes \
+        match EnvironmentVariableStore::delete(&self.pool, &self.event_bus, name, None).await {
+            Ok(true) => Ok(format!(
+                "[ACTION COMPLETED] Environment variable '{}' deleted. The change takes \
                      effect on newly spawned subprocesses — no restart needed.",
-                    name
-                ))
-            }
+                name
+            )),
             Ok(false) => Ok(format!("Environment variable '{}' not found.", name)),
             Err(e) => Ok(format!(
                 "Error: Failed to delete environment variable: {}",
@@ -124,17 +115,11 @@ impl LucidosEngine {
             return Ok(format!("Error: {}", rejection.message(name)));
         }
 
-        if let Err(e) = EnvironmentVariableStore::upsert(&self.pool, name, value).await {
+        if let Err(e) =
+            EnvironmentVariableStore::upsert(&self.pool, &self.event_bus, name, value, None).await
+        {
             return Ok(format!("Error: Failed to save environment variable: {}", e));
         }
-
-        self.event_bus
-            .emit(BusEvent::System(SystemEvent::EnvironmentVariableSet {
-                name: name.to_string(),
-                value: value.to_string(),
-                actor: None,
-            }))
-            .await?;
 
         Ok(format!(
             "[ACTION COMPLETED] Environment variable '{}' set. It is injected into newly \

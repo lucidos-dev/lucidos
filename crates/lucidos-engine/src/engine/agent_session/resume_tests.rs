@@ -1075,6 +1075,7 @@ async fn external_edits_produce_injected_note() {
     let note = super::super::external_edits::compute_external_edit_note(
         &repo_root,
         recorded_sha.as_deref(),
+        false,
     )
     .await
     .expect("non-empty diff against recorded SHA must produce a note");

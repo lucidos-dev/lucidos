@@ -190,6 +190,57 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      how many calls you've made — a handful of drains is minutes, not \
      hours.";
 
+/// Stops the chat agent from naming things to the user by their raw
+/// identifier. The reported failure (2026-08-02): a trigger thread asked
+/// "Change 99da1708 is docs-only and its plan is separate from it. What do you
+/// want first?", with an option labelled "Apply 99da1708 now". That hex string
+/// is a change id the user cannot resolve: no Lucidos surface is labelled with
+/// it, so the question was unanswerable without scrolling back through the
+/// agent's own tool calls.
+///
+/// The agent has everything it needs to do better: `changes` action 'list'
+/// returns `thread_title` (the originating thread's title, batch-enriched by
+/// `core::changes::enrich_thread_titles`) and `description` alongside the id.
+///
+/// Two carve-outs keep the rule presentation-only, and both are load-bearing.
+/// Ids must stay legal in tool arguments, or the model stops passing
+/// `change_id` to `changes(action='apply')`. And a **markdown link target** is
+/// not prose: `run_thread` / `run_coding_agent` results tell the agent verbatim
+/// to reply with `[Open thread](thread:<ws>/<uuid>)` (see
+/// `agentic_loop_special_tool`), and `lucidos spawn-thread` prints that same
+/// shape for a script to paste. A rule that banned the uuid there would strip
+/// the only affordance the user has for opening the thread that was just
+/// spawned.
+///
+/// Mirrored for coding agents by `agent_session::prompts::NAMES_NOT_IDS_RULE`
+/// (same rule, tuned to commits and worktrees). Change both together.
+const NAMES_NOT_IDS_RULE: &str = "NAMING THINGS TO THE USER, NEVER A RAW ID OR SHA:\n\
+     Identifiers are for tool calls, not for prose. A change id, thread id, event id, request \
+     id, commit sha, branch name, or any other uuid/hex string is meaningless to the user: no \
+     screen in Lucidos is labelled with it, so they cannot look it up and cannot act on it. \
+     NEVER put one in a message, in an `ask_user_question` `question` or option label, or in a \
+     notification. \"Change 4f2c1a90 is docs-only\" is the bug; \"the docs-only change from the \
+     Habit Tracker thread\" is the fix.\n\
+     Name each thing the way the user already sees it:\n\
+     - A change: the originating thread's title (`thread_title` from `changes` action 'list'), \
+     plus its `description` or what it touches.\n\
+     - A thread: its title. An app: its name (linked, see FILE REFERENCES). A trigger: its \
+     name. A file: its full path. A commit: its subject line, never the sha.\n\
+     - When two of them would read alike, tell them apart by what they change, or by when they \
+     arrived (\"this morning's\"). Never by pasting an id.\n\
+     Ids stay where they belong: `changes(action='apply', change_id=…)` still takes the uuid, \
+     tool results still carry ids, and reading them is how you do your job. That is plumbing \
+     the user never sees.\n\
+     A MARKDOWN LINK TARGET IS NOT PROSE, so keep writing the links: \
+     `[Open thread](thread:<ws>/<uuid>)` for a thread you spawned (paste it exactly as the \
+     tool result or the `lucidos spawn-thread` output gives it to you) and \
+     `[Habit Tracker](app:habit-tracker)` for an app. The user reads the label and taps it; \
+     the id rides in the target where the UI needs it. Dropping such a link because it \
+     contains a uuid leaves the user with no way to open what you just started. What is \
+     banned is the id as the thing you NAME.\n\
+     ONE EXCEPTION: the user asked for the raw value (\"what's the sha?\", \"give me the change \
+     id\") or needs it to paste somewhere. Then give it, wrapped in <copy>…</copy> tags.";
+
 /// Stops the chat agent from CLAIMING it performed an action it never actually
 /// invoked the tool for — the single most common way the agent lies to the
 /// user. The observed failure (testing-notifications thread, 2026-06-30): the
@@ -221,6 +272,44 @@ pub(crate) const REPEATED_ACTION_RULE: &str = "DOING IT AGAIN — A REPEAT \
      success result IN THIS turn. If you did not call the tool this turn, you \
      did not do it — call it now. This holds for every state-changing tool, \
      not just file writes.";
+
+/// Routes the chat agent to the authoritative system-knowhow file before it
+/// touches a workspace asset.
+///
+/// Deliberately covers **operating on an existing trigger**, not just creating
+/// one. The block used to read "Before creating a trigger, app, knowhow file,
+/// or plugin" with a `triggers (action create/update)` row, so a request to
+/// RUN an existing trigger off-schedule matched no route: the agent never
+/// loaded the trigger knowhow, guessed, and started by resuming a paused
+/// trigger (which restores the schedule and runs nothing). Any future
+/// narrowing of the trigger row reintroduces that gap, which is what
+/// `workspace_assets_rule_routes_existing_trigger_operations` pins.
+///
+/// Extracted as a const rather than left inline in the prompt literal so it is
+/// assertable, matching [`ASK_USER_QUESTION_RULE`] and [`REPEATED_ACTION_RULE`].
+pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
+    "WORKING WITH WORKSPACE ASSETS, LOAD KNOWHOW FIRST:\n\
+     Before creating a trigger, app, knowhow file, or plugin, AND before \
+     acting on an EXISTING trigger (editing it, pausing/resuming it, or \
+     running one now, off-schedule), you MUST first call load_knowhow on the \
+     matching system-knowhow file:\n\
+     - triggers, ANY action (create, update, pause/resume, or run: \"run it now\" / \
+     \"fire it manually\" / an ad hoc off-schedule run) → load \
+     `system-knowhow/triggers`\n\
+     - create_app → load `system-knowhow/building-an-app`\n\
+     - writing a new file under knowhow/ → load `system-knowhow/building-knowhow`\n\
+     - packaging a plugin → load `system-knowhow/plugins`\n\
+     To run an existing trigger off-schedule, use triggers(action=\"run\"). Do \
+     not improvise a substitute: resuming a paused trigger does not run it, \
+     and a run_thread carrying a copy of the trigger's intent is not a run. \
+     The knowhow covers the cases where run is refused.\n\
+     Each loaded knowhow has a \"Questions to settle with the user before \
+     creating\" section, which is the source of truth for what to ask before \
+     creating. The ACTION FIRST rule below does NOT apply to working with \
+     workspace assets: load the knowhow, follow its guidance (ask whatever it \
+     says to ask), then act.\n\
+     Skip the load_knowhow call if you already loaded the same knowhow earlier \
+     in this thread; its content is still in your context.";
 
 impl LucidosEngine {
     /// Build the full chat system prompt for this turn plus the mandatory
@@ -468,19 +557,7 @@ UNCERTAINTY:
 - ALWAYS use web_search when: answering trivia, identifying something, or verifying facts you're uncertain about
 - NEVER write guesses to user_profile.md or other memory files - only write confirmed facts
 
-CREATING WORKSPACE ASSETS — LOAD KNOWHOW FIRST:
-Before creating a trigger, app, knowhow file, or plugin, you MUST first call
-load_knowhow on the matching system-knowhow file:
-- triggers (action create/update) → load `system-knowhow/building-a-trigger`
-- create_app → load `system-knowhow/building-an-app`
-- writing a new file under knowhow/ → load `system-knowhow/building-knowhow`
-- packaging a plugin → load `system-knowhow/building-a-plugin`
-Each loaded knowhow has a "Questions to settle with the user before creating"
-section — that is the source of truth for what to ask before creating. The
-ACTION FIRST rule below does NOT apply to creating workspace assets: load
-the knowhow, follow its guidance (ask whatever it says to ask), then create.
-Skip the load_knowhow call if you already loaded the same knowhow earlier
-in this thread — its content is still in your context.
+__WORKSPACE_ASSETS_KNOWHOW_RULE__
 
 SETTING UP A NEWLY-INSTALLED PLUGIN — LOAD KNOWHOW FIRST:
 When the request is to set up a newly-installed plugin (e.g. "Set up the
@@ -501,7 +578,7 @@ ACTION FIRST - NO CLARIFICATION LOOPS:
 - Examples of GOOD behavior:
   - User: "Show me this week's tasks" → Good: [immediately search and show tasks]
   - User: "What did I do today?" → Good: [immediately search and show today's activity]
-- Exception: see CREATING WORKSPACE ASSETS above — that overrides this rule.
+- Exception: see WORKING WITH WORKSPACE ASSETS above, which overrides this rule.
 
 __ASK_USER_QUESTION_RULE__
 
@@ -617,6 +694,8 @@ FILE REFERENCES:
 - For UI panels (notifications inbox, apps list, triggers list, changes, files, settings), use a markdown link to the bare panel name: `[Notifications](notifications)`, `[Triggers](triggers)`, `[Settings](settings)`. Accepts the `data/` prefix too — `[Notifications](data/notifications)` works the same way.
 - Apps and other plugins are downloaded from the **Plugins** panel (uncheck its "Installed only" filter to browse and install from marketplaces). When the user asks where to get/download/install apps, point them there with a `[Plugins](app-store)` link (the `app-store` target opens the Plugins panel). Do NOT call it the "App Store" or a "Store" — those names are retired.
 
+__NAMES_NOT_IDS_RULE__
+
 PLUGINS (the `plugins` tool):
 A plugin is a coherent bundle of workspace content (apps, knowhow, triggers, scripts) shipped by another author. Once installed, its files live under data/ and are indistinguishable from anything the user authored themselves. All actions are on the grouped `plugins` tool.
 - action='install' (source): install from a GitHub tree URL (e.g. 'https://github.com/lucidos-dev/plugins/tree/main/browser-learning'), a plain git URL, or a local '.lucidos-plugin' archive. The user confirms in a panel — after calling, do NOT claim it succeeded; the next message reports the outcome.
@@ -684,6 +763,11 @@ __REPEATED_ACTION_RULE__"#;
             .replace("__ENGINE_RESTART_RULE__", ENGINE_RESTART_RULE)
             .replace("__APPLY_VERIFY_RULE__", &apply_verify_rule)
             .replace("__ASK_USER_QUESTION_RULE__", ASK_USER_QUESTION_RULE)
+            .replace(
+                "__WORKSPACE_ASSETS_KNOWHOW_RULE__",
+                WORKSPACE_ASSETS_KNOWHOW_RULE,
+            )
+            .replace("__NAMES_NOT_IDS_RULE__", NAMES_NOT_IDS_RULE)
             .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
             .replace(
                 "__MAX_TOOL_CALLS__",
@@ -897,8 +981,125 @@ Do NOT refuse to discuss the user's own personal information from their own file
 #[cfg(test)]
 mod tests {
     use super::super::super::process_helpers::{APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE};
-    use super::{coding_surface_section, workspace_identity_section};
+    use super::{
+        coding_surface_section, workspace_identity_section, NAMES_NOT_IDS_RULE,
+        WORKSPACE_ASSETS_KNOWHOW_RULE,
+    };
     use std::path::{Path, PathBuf};
+
+    /// Every placeholder token in the prompt template must have a matching
+    /// `.replace(...)` in the substitution chain, or the raw token ships to the
+    /// model verbatim.
+    ///
+    /// Nothing else catches this. The tokens are plain text inside a raw string
+    /// literal, so a dropped `.replace` compiles clean, passes clippy, and only
+    /// shows up as gibberish in the LLM's context. The substitution chain is
+    /// also a standing merge-conflict site: two branches that each add a rule
+    /// collide on the same line, and resolving by picking one side silently
+    /// drops the other's substitution while leaving its token in the template.
+    /// That is exactly what the 2026-08-02 merge of the knowhow-rename branch
+    /// had to resolve by hand.
+    ///
+    /// Reads its own source rather than a hand-maintained token list, so a new
+    /// rule is covered the moment it is added and there is no second list to
+    /// keep in sync.
+    #[test]
+    fn every_prompt_placeholder_is_substituted() {
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let path = repo.join("crates/lucidos-engine/src/engine/chat/process/system_prompt.rs");
+        let src = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+
+        let token = regex::Regex::new(r"__[A-Z][A-Z_]*__").expect("static pattern compiles");
+        let tokens: std::collections::BTreeSet<&str> =
+            token.find_iter(&src).map(|m| m.as_str()).collect();
+        assert!(
+            !tokens.is_empty(),
+            "found no placeholders at all, the scan is broken rather than the template being clean"
+        );
+
+        let missing: Vec<&str> = tokens
+            .iter()
+            .copied()
+            .filter(|t| !src.contains(&format!("\"{t}\"")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "placeholder(s) in the prompt template with no matching .replace(\"…\", …) \
+             in the substitution chain, so the raw token would reach the model: {missing:?}"
+        );
+    }
+
+    /// The reported failure, pinned. The block was scoped to "Before creating"
+    /// with a `triggers (action create/update)` row, so "run my digest trigger
+    /// now" matched no route, the agent never loaded the trigger knowhow, and
+    /// it guessed: it resumed a paused trigger, which only restores the
+    /// schedule and runs nothing. Narrowing the trigger row back to
+    /// create/update reopens exactly that gap.
+    #[test]
+    fn workspace_assets_rule_routes_existing_trigger_operations() {
+        let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
+
+        assert!(
+            rule.contains("EXISTING trigger"),
+            "the rule must fire for an existing trigger, not only a create:\n{rule}"
+        );
+        assert!(
+            rule.contains("off-schedule"),
+            "running a trigger off-schedule is the case that had no route:\n{rule}"
+        );
+        assert!(
+            rule.contains("ANY action"),
+            "the trigger row must not narrow back to create/update:\n{rule}"
+        );
+        // The action that does the job. Before it existed the rule said "there
+        // is NO run now action"; once that sentence is a lie the agent is back
+        // to improvising, so the route must name the real action.
+        assert!(
+            rule.contains("triggers(action=\"run\")"),
+            "the rule must name the action that runs a trigger off-schedule:\n{rule}"
+        );
+        // The specific wrong guess the incident produced.
+        assert!(
+            rule.contains("resuming a paused trigger does not run it"),
+            "must pre-empt the resume-means-run guess:\n{rule}"
+        );
+        assert!(
+            !rule.contains("action create/update"),
+            "the create/update-only phrasing is what caused the miss:\n{rule}"
+        );
+    }
+
+    /// Every id in the routing block must be a real `system-knowhow/<id>`, or
+    /// `load_knowhow` answers with the not-found sentinel and the agent
+    /// proceeds unguided. The ids are filename-derived, so a knowhow rename
+    /// silently invalidates them; both `triggers` and `plugins` were renamed
+    /// from `building-a-*` on 2026-08-02.
+    #[test]
+    fn workspace_assets_rule_names_only_live_knowhow_ids() {
+        let rule = WORKSPACE_ASSETS_KNOWHOW_RULE;
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+
+        for id in ["triggers", "building-an-app", "building-knowhow", "plugins"] {
+            assert!(
+                rule.contains(&format!("`system-knowhow/{id}`")),
+                "routing block must still name system-knowhow/{id}:\n{rule}"
+            );
+            assert!(
+                repo.join("system-knowhow")
+                    .join(format!("{id}.md"))
+                    .exists(),
+                "routed id system-knowhow/{id} has no backing file, so \
+                 load_knowhow would return the not-found sentinel"
+            );
+        }
+        for stale in ["building-a-trigger", "building-a-plugin"] {
+            assert!(
+                !rule.contains(stale),
+                "renamed knowhow id {stale} still routed:\n{rule}"
+            );
+        }
+    }
 
     /// The reported failure, pinned. On an install with no source checkout the
     /// prompt must say so outright — the agent had claimed to read
@@ -1053,6 +1254,48 @@ mod tests {
         assert!(section.contains("CURRENT TIME: now"));
         assert!(section.contains("USER LANGUAGE: English"));
         assert!(section.contains("PERSONAL DATA ACCESS:"));
+    }
+
+    /// Regression guard for the reported card: "Change 99da1708 is docs-only
+    /// and its plan is separate from it. What do you want first?", with an
+    /// option labelled "Apply 99da1708 now". Nothing the user can see is
+    /// labelled with that id, so the question was unanswerable. The rule must
+    /// (1) ban raw ids in prose, questions and option labels, (2) say what to
+    /// use instead, and (3) keep ids legal in tool arguments.
+    #[test]
+    fn names_not_ids_rule_bans_raw_ids_in_user_facing_text() {
+        let rule = NAMES_NOT_IDS_RULE;
+        for needle in [
+            "NAMING THINGS TO THE USER, NEVER A RAW ID OR SHA",
+            "`ask_user_question` `question` or option label",
+            "commit sha",
+            "branch name",
+        ] {
+            assert!(
+                rule.contains(needle),
+                "rule must ban raw identifiers in user-facing text (`{needle}`):\n{rule}"
+            );
+        }
+        // A ban with no alternative just makes the agent vague.
+        assert!(
+            rule.contains("thread_title") && rule.contains("its subject line, never the sha"),
+            "rule must name the human-readable substitute for each thing:\n{rule}"
+        );
+        // Presentation-only: the model must keep passing `change_id` to the
+        // apply action. Over-correcting here breaks applying, not just wording.
+        assert!(
+            rule.contains("changes(action='apply', change_id="),
+            "rule must keep ids legal in tool arguments:\n{rule}"
+        );
+        // `run_thread` / `run_coding_agent` results tell the agent verbatim to
+        // reply with `[Open thread](thread:<ws>/<uuid>)`. Without this
+        // carve-out the rule reads as a ban on that link, and the user loses
+        // the only way to open the thread the agent just spawned.
+        assert!(
+            rule.contains("A MARKDOWN LINK TARGET IS NOT PROSE")
+                && rule.contains("[Open thread](thread:<ws>/<uuid>)"),
+            "rule must exempt markdown link targets so spawned-thread links survive:\n{rule}"
+        );
     }
 
     /// Abbreviation is a `$HOME`-prefix collapse, not a blanket redaction — a

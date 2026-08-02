@@ -297,7 +297,44 @@ impl LucidosEngine {
         // Phase 1: Interrupt all active sessions (like pressing Esc).
         // This makes CC stop current work and emit a Result event, which triggers
         // CodingAgentIdled (with cc_session_id) to be persisted to DB.
-        for (tid, interrupt, _) in &sessions {
+        //
+        // EXCEPT a session parked on an unanswered `AskUserQuestion`. Esc is a
+        // USER gesture, and CC applies it to the tool it is blocked on: the
+        // pending `AskUserQuestion`. CC then records a rejection the user never
+        // made ("The user doesn't want to proceed with this tool use") as a
+        // `CodingAgentToolResult` and races on past the question. That single
+        // event lands after the `UserQuestionAsked`, so it strikes the card
+        // through client-side AND ends the park server-side, while the terminal
+        // that would normally follow is suppressed by
+        // `external_terminal_emitted`. What is left is a thread with a dead
+        // question, no terminator, and a permanent "Working" (the 2026-08-01
+        // report; see
+        // `docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`).
+        //
+        // This was the one restart path with no preserve guard. Parked sessions
+        // go straight to the hard stop instead, whose arm skips its own terminal
+        // and text flush for exactly this reason
+        // (`preserve_question_park_at_shutdown`) while still cancelling the
+        // runtime, so the subprocess dies with the engine and the poll below is
+        // not spent waiting on a session that was never asked to stop.
+        // Probe concurrently, then notify synchronously. Same rationale as the
+        // per-thread lookups in `abort_in_flight_for_restart` above: serial
+        // awaits here would hold every session's Esc behind N round-trips on a
+        // busy restart.
+        let parked: Vec<bool> = futures::future::join_all(sessions.iter().map(|(tid, _, _)| {
+            crate::engine::agent_recovery::preserve_question_park_at_shutdown(
+                &self.pool,
+                "session sweep",
+                *tid,
+                true,
+            )
+        }))
+        .await;
+        for ((tid, interrupt, stop), is_parked) in sessions.iter().zip(parked) {
+            if is_parked {
+                stop.notify_one();
+                continue;
+            }
             log!("[Shutdown] Interrupting Claude Code session {}", tid);
             interrupt.notify_one();
         }

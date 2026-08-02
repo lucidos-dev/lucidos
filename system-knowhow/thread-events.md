@@ -9,7 +9,7 @@ The complete enumerated list of `ThreadEvent` — the per-thread event family th
 
 For the coding-agent slice (`CodingAgent*` + the `UserQuestion*` / permission machinery) the deep-dive lives in `system-knowhow/coding-agent-events.md`. This file is the master enumeration; the coding-agent entries below summarize and link.
 
-For event-store column shape, the chat-mode terminator set, and the `events` table schema, see `.claude/rules/db.md`. For trigger config syntax (cron, the `on` subscription list, per-entry `condition` operators), see `system-knowhow/building-a-trigger.md`.
+For event-store column shape, the chat-mode terminator set, and the `events` table schema, see `.claude/rules/db.md`. For trigger config syntax (cron, the `on` subscription list, per-entry `condition` operators), see `system-knowhow/triggers.md`.
 
 ## Today the scheduler uses a blocklist
 
@@ -24,9 +24,9 @@ The blocklist contains exactly the per-token streaming variants — many fires p
 
 Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemorySearched`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable** — fire once per discrete action, scope with per-entry `condition:` filters (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`, `estimated_total_tokens: { $gt: 150000 }`).
 
-That means right now (each example below is one entry inside a trigger's `on` list — see `system-knowhow/building-a-trigger.md` for the full subscription shape):
+That means right now (each example below is one entry inside a trigger's `on` list, see `system-knowhow/triggers.md` for the full subscription shape):
 
-- `event_type: UserQuestionAsked` — works. The typical use is "push me when an interactive question is raised so I can answer from my phone." Pair `send_notification` with `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<source_event_id>' } }` so the tap deep-links straight to the question — see `building-a-trigger.md` for the worked example.
+- `event_type: UserQuestionAsked`: works. The typical use is "push me when an interactive question is raised so I can answer from my phone." Pair `send_notification` with `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<source_event_id>' } }` so the tap deep-links straight to the question, see `triggers.md` for the worked example.
 - `event_type: CodingAgentPermissionRequest` / `CommandPermissionRequested` / `McpPermissionRequested` / `CredentialRequested` — **work**. These are the other blocking-request events that should wake the user. `CommandPermissionRequested` is the chat command-guard card (ADR 0002); `McpPermissionRequested` is the chat MCP-tool card.
 - `event_type: ResponseGenerated` / `ResponseFailed` / `CodingAgentIdled` / `ChangeApplied` / `ChangeHardened` / `TriggerCompleted` / `BackgroundBashCompleted` / every `Change*` / every `Thread*` lifecycle event — **work**.
 - `event_type: ToolCalled` / `CodingAgentToolCalled` / `ContextCaptured` / `ImageDescribed` etc. — **work**. Use a per-entry `condition:` filter to scope; without one a chatty per-action variant will fire the trigger many times per turn.
@@ -125,7 +125,7 @@ The umbrella `CodingAgent*` family covers Claude Code and Codex (the variants ca
 
 ## Question / permission machinery
 
-Not prefixed `CodingAgent*` because the same machinery serves any agent that needs to ask the user a structured question. All the blocking-request events below are triggerable — wire a trigger to any of them to push the user when the agent needs an answer. See `building-a-trigger.md` for the deep-link pattern (`tap: { kind: 'navigate', to: { target: 'thread', id, event_id } }`).
+Not prefixed `CodingAgent*` because the same machinery serves any agent that needs to ask the user a structured question. All the blocking-request events below are triggerable: wire a trigger to any of them to push the user when the agent needs an answer. See `triggers.md` for the deep-link pattern (`tap: { kind: 'navigate', to: { target: 'thread', id, event_id } }`).
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
@@ -592,7 +592,12 @@ unanswered `UserQuestionAsked` is *preserved* across a restart (no
 either: the resumed work carries the original turn's `request_event_id` and
 continues that exchange, exactly as it would have without the restart. A
 subscription on `ContinuationStarted` therefore fires for a revived
-interruption, never for an answered question.
+interruption, never for an answered question. "Parked" is strict: it holds only
+while the question is still the newest thing on the thread. If anything in
+`ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` landed after it the agent has moved
+on, the card is dead, and the thread recovers as an ordinary interrupted turn
+with its boundary and its Continue button. See `coding-agent-events.md`
+§ "An engine restart alone does NOT orphan a pending question".
 
 ## How a workspace would actually trigger on these
 
@@ -617,7 +622,7 @@ Trigger-run failures still auto-create an error notification — no separate wir
 
 ## Recipe-shaped guidance
 
-For trigger config syntax (cron format, the `on` subscription list, the per-entry `condition` operator vocabulary `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in`), see `system-knowhow/building-a-trigger.md`. Conditions are pure payload filters — they read top-level fields of the event payload (the `data: { … }` object above), nothing else.
+For trigger config syntax (cron format, the `on` subscription list, the per-entry `condition` operator vocabulary `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in`), see `system-knowhow/triggers.md`. Conditions are pure payload filters: they read top-level fields of the event payload (the `data: { … }` object above), nothing else.
 
 For the coding-agent slice — the `UserQuestion` vs permission distinction, the exact `CodingAgentIdled` field semantics, and the no-`CodingAgentErrored` gap — see `system-knowhow/coding-agent-events.md`.
 

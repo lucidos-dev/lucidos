@@ -182,6 +182,16 @@ pub struct SubmitOutcome {
     pub admitted: bool,
     /// 1-based queue position when `admitted == false`; 0 when admitted.
     pub position: usize,
+    /// `true` when admission COALESCED the entry away: a fire of this cron
+    /// trigger was already active or queued, so nothing new was started and
+    /// `completion` is already resolved.
+    ///
+    /// The scheduler's two submit sites ignore this (a dropped redundant fire
+    /// is exactly what they want). It exists for the off-schedule-run path,
+    /// where `admitted: false, position: 0` is otherwise indistinguishable from
+    /// a queued entry and a caller would report "started" for a run that never
+    /// happened. See `engine_impl::trigger_runs`.
+    pub coalesced: bool,
     /// Resolves when the entry's work finishes OR the entry is dropped.
     pub completion: oneshot::Receiver<()>,
 }
@@ -501,6 +511,7 @@ impl ThreadQueue {
                     entry_id,
                     admitted: true,
                     position: 0,
+                    coalesced: false,
                     completion: completion_rx,
                 }
             }
@@ -520,6 +531,7 @@ impl ThreadQueue {
                     entry_id,
                     admitted: false,
                     position,
+                    coalesced: false,
                     completion: completion_rx,
                 }
             }
@@ -529,6 +541,7 @@ impl ThreadQueue {
                     entry_id,
                     admitted: false,
                     position: 0,
+                    coalesced: false,
                     completion: completion_rx,
                 }
             }
@@ -553,6 +566,7 @@ impl ThreadQueue {
                     entry_id,
                     admitted: false,
                     position: 0,
+                    coalesced: true,
                     completion: completion_rx,
                 }
             }

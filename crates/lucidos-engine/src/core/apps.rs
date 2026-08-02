@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppManifest {
     pub name: String,
@@ -178,8 +181,14 @@ impl AppManager {
     }
 
     /// Create a new app directory with manifest.json + index.html and commit to git.
-    pub fn create_app(
+    /// Create an app on disk, commit it, and announce it.
+    ///
+    /// `AppCreated` is what puts the app in every client's list; the emit lives
+    /// here rather than at the call site so a second creation path cannot ship
+    /// an app nothing can see.
+    pub async fn create_app(
         &self,
+        event_bus: &EventBus,
         app_id: &str,
         name: &str,
         description: &str,
@@ -207,13 +216,25 @@ impl AppManager {
             ],
             &format!("Create app: {}", name),
         )?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::AppCreated {
+                    app_id: app_id.to_string(),
+                    name: Some(name.to_string()),
+                    actor: None,
+                }),
+                "[Apps] AppCreated",
+            )
+            .await;
         Ok((app_dir, commit))
     }
 
-    /// Delete an app directory and commit to git.
-    pub fn delete_app(
+    /// Delete an app directory, commit to git, and announce it.
+    pub async fn delete_app(
         &self,
+        event_bus: &EventBus,
         app_id: &str,
+        actor: Option<MessageOrigin>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
         let app_dir = self.apps_path.join(app_id);
@@ -223,22 +244,39 @@ impl AppManager {
 
         std::fs::remove_dir_all(&app_dir)?;
 
-        let repo = self.repo.lock().unwrap();
-        let mut index = repo.index()?;
-        super::reset_index_to_head(&repo, &mut index)?;
-        index.remove_dir(Path::new(&format!("data/apps/{}", app_id)), 0)?;
-        index.write()?;
-
-        let message = format!("Delete app: {}", app_id);
-        Ok(super::commit_index(&repo, &message)?)
+        // Scoped so the repo guard and the git2 index (neither of which is
+        // Send) are gone before the await below; otherwise this future stops
+        // being Send and axum refuses the handler.
+        let commit = {
+            let repo = self.repo.lock().unwrap();
+            let mut index = repo.index()?;
+            super::reset_index_to_head(&repo, &mut index)?;
+            index.remove_dir(Path::new(&format!("data/apps/{}", app_id)), 0)?;
+            index.write()?;
+            let message = format!("Delete app: {}", app_id);
+            super::commit_index(&repo, &message)?
+        };
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::AppDeleted {
+                    app_id: app_id.to_string(),
+                    actor,
+                }),
+                "[Apps] AppDeleted",
+            )
+            .await;
+        Ok(commit)
     }
 
-    /// Update an app's name and description in manifest.json, preserving icon.
-    pub fn update_app_metadata(
+    /// Update an app's name and description in manifest.json (preserving icon),
+    /// commit, and announce it.
+    pub async fn update_app_metadata(
         &self,
+        event_bus: &EventBus,
         app_id: &str,
         name: &str,
         description: &str,
+        actor: Option<MessageOrigin>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
         let manifest_path = self.apps_path.join(app_id).join("manifest.json");
@@ -259,6 +297,16 @@ impl AppManager {
             &format!("{}/manifest.json", app_id),
             &format!("Update app metadata: {}", name),
         )?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::AppUpdated {
+                    app_id: app_id.to_string(),
+                    name: Some(name.to_string()),
+                    actor,
+                }),
+                "[Apps] AppUpdated",
+            )
+            .await;
         Ok(commit)
     }
 
@@ -306,12 +354,19 @@ impl AppManager {
         Ok(result)
     }
 
-    /// Write app source files and commit to git.
+    /// Write app source files, commit to git, and announce the app changed.
     /// Validates each filename to reject path traversal and absolute paths.
-    pub fn write_app_source(
+    ///
+    /// One `AppUpdated` per save, not per file: this is the editor's save
+    /// button, and the agent's per-file writes go through the file tools, which
+    /// coalesce into a single end-of-turn `AppUpdated` instead (see
+    /// `engine/tools/files.rs::app_lifecycle_event`).
+    pub async fn write_app_source(
         &self,
+        event_bus: &EventBus,
         app_id: &str,
         files: &[(String, String)],
+        actor: Option<MessageOrigin>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         reject_path_traversal(app_id)?;
         let app_dir = self.apps_path.join(app_id);
@@ -333,6 +388,16 @@ impl AppManager {
         }
 
         let commit = self.commit_batch(&git_paths, &format!("Edit app: {}", app_id))?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::AppUpdated {
+                    app_id: app_id.to_string(),
+                    name: self.app_name(app_id),
+                    actor,
+                }),
+                "[Apps] AppUpdated",
+            )
+            .await;
         Ok(commit)
     }
 
@@ -369,6 +434,11 @@ impl AppManager {
 
     /// Delete a single file from an app and commit.
     /// `app_path` is relative to data/apps/ (e.g., "my-app/old-file.js").
+    ///
+    /// Deliberately silent, and registered as an exemption in
+    /// `core::announced_surfaces`: removing one file is not an app lifecycle
+    /// change. The caller (`engine/tools/files.rs`) decides whether the deletion
+    /// killed the app, by checking whether it took `manifest.json` with it.
     pub fn delete_file_and_commit(
         &self,
         app_path: &str,
@@ -444,8 +514,8 @@ mod tests {
         assert_eq!(deserialized.icon, manifest.icon);
     }
 
-    #[test]
-    fn path_validation_rejects_traversal() {
+    #[tokio::test]
+    async fn path_validation_rejects_traversal() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let manager = AppManager::new(ws).unwrap();
@@ -454,13 +524,18 @@ mod tests {
         let app_dir = ws.join("data/apps/test-app");
         std::fs::create_dir_all(&app_dir).unwrap();
 
+        let bus = crate::test_support::offline_event_bus();
         let files = vec![("../etc/passwd".to_string(), "bad".to_string())];
-        let result = manager.write_app_source("test-app", &files);
+        let result = manager
+            .write_app_source(&bus, "test-app", &files, None)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
 
         let files = vec![("foo/../../etc/passwd".to_string(), "bad".to_string())];
-        let result = manager.write_app_source("test-app", &files);
+        let result = manager
+            .write_app_source(&bus, "test-app", &files, None)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
     }
@@ -469,22 +544,25 @@ mod tests {
     /// reached from the LLM tool handler with a model-provided id, and an
     /// unchecked `../…` id would create (or, via delete_app, remove) files
     /// outside `data/apps/`.
-    #[test]
-    fn path_validation_rejects_traversal_in_app_id() {
+    #[tokio::test]
+    async fn path_validation_rejects_traversal_in_app_id() {
         let tmp = tempfile::tempdir().unwrap();
         let manager = AppManager::new(tmp.path()).unwrap();
 
-        let result = manager.create_app("../escaped", "Evil", "", "<html></html>");
+        let bus = crate::test_support::offline_event_bus();
+        let result = manager
+            .create_app(&bus, "../escaped", "Evil", "", "<html></html>")
+            .await;
         assert!(result.is_err());
         assert!(!tmp.path().join("data/escaped").exists());
 
-        assert!(manager.delete_app("../..").is_err());
+        assert!(manager.delete_app(&bus, "../..", None).await.is_err());
         assert!(manager.get_app("../..").is_err());
         assert!(!manager.app_exists("../.."));
     }
 
-    #[test]
-    fn path_validation_rejects_absolute() {
+    #[tokio::test]
+    async fn path_validation_rejects_absolute() {
         let tmp = tempfile::tempdir().unwrap();
         let ws = tmp.path();
         let manager = AppManager::new(ws).unwrap();
@@ -492,8 +570,11 @@ mod tests {
         let app_dir = ws.join("data/apps/test-app");
         std::fs::create_dir_all(&app_dir).unwrap();
 
+        let bus = crate::test_support::offline_event_bus();
         let files = vec![("/etc/passwd".to_string(), "bad".to_string())];
-        let result = manager.write_app_source("test-app", &files);
+        let result = manager
+            .write_app_source(&bus, "test-app", &files, None)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
 
@@ -501,7 +582,9 @@ mod tests {
             "\\Windows\\System32\\evil.dll".to_string(),
             "bad".to_string(),
         )];
-        let result = manager.write_app_source("test-app", &files);
+        let result = manager
+            .write_app_source(&bus, "test-app", &files, None)
+            .await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("Invalid filename"));
     }

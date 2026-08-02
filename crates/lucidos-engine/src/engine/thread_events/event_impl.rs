@@ -25,18 +25,32 @@ impl ThreadEvent {
     /// message; the hook blocked the question but the siblings dispatched).
     /// Once any of these lands after a question, the next typed user text
     /// must start a fresh follow-up rather than be routed as a `FreeText`
-    /// answer to the dead question. Sole consumer:
-    /// `agent_question::lookup_active_question_tool_use_id` (the CC chat
-    /// FreeText fast-path in `chat::process.rs`). `lookup_pending_question_…`
-    /// is intentionally broader and ignores this list, so archive's
-    /// cancel-stamp still works on overtaken questions.
+    /// answer to the dead question. Two consumers:
+    ///
+    /// * `agent_question::lookup_active_question_tool_use_id` (the CC chat
+    ///   FreeText fast-path in `chat::process.rs`). `lookup_pending_question_…`
+    ///   is intentionally broader and ignores this list, so archive's
+    ///   cancel-stamp still works on overtaken questions.
+    /// * `agent_recovery::unanswered_question_exists_sql`, the restart preserve
+    ///   guard, which unions this list with three extras of its own. So a name
+    ///   added or removed here also moves the boundary between "this thread is
+    ///   a preserved checkpoint across a restart" and "this is an ordinary
+    ///   interrupted turn"; check that side too.
+    ///
+    /// The frontend mirrors the list a third time as
+    /// `QUESTION_OVERTAKEN_STEP_TYPES` (`store/thread-events/exchange-grouping.ts`),
+    /// which decides both whether the card renders struck through and whether
+    /// the exchange can still read "Needs your answer".
     ///
     /// `ResponseGenerated` is omitted because `UserQuestionAsked` is currently
     /// CC-only on the production path; CC turns end with `CodingAgentIdled`,
-    /// not `ResponseGenerated`. The chat-agent variants below are included
-    /// for symmetry — the agentic loop blocks sequentially on
-    /// `ask_user_question` today, but the uniform list defends against
-    /// future regressions.
+    /// not `ResponseGenerated`. That reasoning is scoped to the consumers
+    /// above; the preserve guard cannot afford the assumption, which is why it
+    /// adds `ResponseGenerated` / `SessionEnded` / `UserQuestionAnswered` in its
+    /// own `PARK_ENDING_EXTRA_EVENT_TYPES` rather than widening this list. The
+    /// chat-agent variants below are included for symmetry: the agentic loop
+    /// blocks sequentially on `ask_user_question` today, but the uniform list
+    /// defends against future regressions.
     ///
     /// `UserQuestionAsked` is NOT in the set: the SQL's
     /// `ORDER BY sequence DESC LIMIT 1` already picks the latest unanswered

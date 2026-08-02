@@ -212,24 +212,25 @@ mod tests {
     #[tokio::test]
     async fn context_loads_registered_device_and_effective_user_preferences() {
         let (pool, db_name) = setup_test_db().await;
-        DeviceStore::register(
+        crate::test_support::seed_device(
             &pool,
             "device-ios",
             Some("Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) Version/18.0 Mobile/15E148 Safari/604.1"),
+            Some("Ios pwa"),
         )
-        .await
-        .unwrap();
-        DeviceStore::rename(&pool, "device-ios", Some("Ios pwa"))
+        .await;
+        crate::test_support::seed_preference(&pool, "theme", "dark")
             .await
             .unwrap();
-        PreferenceStore::set(&pool, "theme", "dark").await.unwrap();
-        PreferenceStore::set_for_device(&pool, "theme", "light", "device-ios")
+        crate::test_support::seed_preference_for_device(&pool, "theme", "light", "device-ios")
             .await
             .unwrap();
-        PreferenceStore::set_for_device(&pool, "ui-scale", "125", "device-ios")
+        crate::test_support::seed_preference_for_device(&pool, "ui-scale", "125", "device-ios")
             .await
             .unwrap();
-        PreferenceStore::set(&pool, "vapid_keys", r#"{"private":"secret"}"#)
+        // Written through the guarded silent door, matching production: a
+        // transport secret is not a setting, so it must not announce.
+        PreferenceStore::set_silent(&pool, "vapid_keys", r#"{"private":"secret"}"#)
             .await
             .unwrap();
 

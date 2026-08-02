@@ -11,10 +11,10 @@ Lucidos is more than an engine — it's the apps, triggers, and knowhow that mak
 workspace useful. This template is for proposing one of those.
 
 Before filing, please skim:
-  - docs/taxonomy.md                    — where things live and the survivability test
-  - system-knowhow/building-knowhow.md  — how to write knowhow
-  - system-knowhow/building-an-app.md   — how to build an app
-  - system-knowhow/building-a-trigger.md — how to build a trigger
+  - docs/taxonomy.md:                    where things live and the survivability test
+  - system-knowhow/building-knowhow.md:  how to write knowhow
+  - system-knowhow/building-an-app.md:   how to build an app
+  - system-knowhow/triggers.md:          working with triggers, building and running them
   - the glossaries (system-knowhow/glossary.md, docs/glossary.md) for the terms below
 -->
 

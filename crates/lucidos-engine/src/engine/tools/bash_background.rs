@@ -613,7 +613,11 @@ mod tests {
             .await
             .expect("spawn");
 
-        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
+        // Ceiling generously above the 1 s spawn timeout, and still well below
+        // the 30 s the task would run un-killed: a broken timeout leaves it
+        // alive at 20 s and the assert fires. A tight 3 s ceiling measured host
+        // spawn latency instead, and failed under a loaded full-suite run.
+        let finished = reg.wait_for_finish(&task_id, Duration::from_secs(20)).await;
         assert!(finished, "timeout did not fire");
 
         let snap = reg
@@ -934,17 +938,30 @@ mod tests {
             running.elapsed_secs
         );
 
-        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        let done = reg
+        // Same widening as the two siblings above: a 1.8 s margin over a 1.2 s
+        // sleep is a host-speed measurement, not an assertion about this code.
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(20)).await);
+        let at_finish = reg
             .read_output_in_memory_wait(&task_id, Duration::ZERO)
             .await
             .expect("snapshot");
-        assert!(done.finished);
-        assert!(
-            done.elapsed_secs <= 2,
-            "a finished task reports its RUNTIME, not time since spawn, got {}",
-            done.elapsed_secs
+        assert!(at_finish.finished);
+
+        // The invariant is that the number FREEZES at completion, so assert it
+        // stops moving rather than bounding it against wall-clock. An absolute
+        // ceiling (this once read `<= 2` for a 1.2 s sleep) measures the host's
+        // spawn latency as much as the code: on a machine running another test
+        // suite the shell spawn alone ate the margin and the task genuinely ran
+        // ~6 s, failing a test that had found no bug.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        let later = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("snapshot");
+        assert_eq!(
+            later.elapsed_secs, at_finish.elapsed_secs,
+            "a finished task reports its RUNTIME, frozen at completion, not a \
+             time-since-spawn that keeps counting"
         );
     }
 
@@ -963,16 +980,21 @@ mod tests {
             .await
             .expect("spawn");
 
+        // "Woke early" is proven by the GAP between the wake and the ceiling,
+        // not by an absolute duration: a wide ceiling with a much lower bound
+        // still fails a wait that ran to timeout, while a tight pair (3 s
+        // ceiling, 2 s bound) just measures how loaded the host is. That pair
+        // failed under a full-suite run for a 0.3 s task.
         let start = std::time::Instant::now();
         let snap = reg
-            .read_output_in_memory_wait(&task_id, Duration::from_secs(3))
+            .read_output_in_memory_wait(&task_id, Duration::from_secs(30))
             .await
             .expect("snapshot");
         let elapsed = start.elapsed();
         assert!(snap.finished, "wait must wake when the task finishes");
         assert_eq!(snap.outcome, Some(TaskOutcome::Exited(0)));
         assert!(
-            elapsed < Duration::from_secs(2),
+            elapsed < Duration::from_secs(15),
             "wait should wake on finish, not run the full timeout (took {:?})",
             elapsed
         );

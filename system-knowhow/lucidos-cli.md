@@ -269,7 +269,7 @@ lucidos notify \
   --event-id "$TRIGGER_EVENT_ID"
 ```
 
-The `TRIGGER_EVENT_THREAD_ID` and `TRIGGER_EVENT_ID` env vars in the snippet are set by the engine on every script trigger fired by a thread-scoped event (see `building-a-trigger.md` § "Script trigger env vars"). For schedule-fired triggers neither is set, so `--tap modal` (the default) is the only meaningful choice.
+The `TRIGGER_EVENT_THREAD_ID` and `TRIGGER_EVENT_ID` env vars in the snippet are set by the engine on every script trigger fired by a thread-scoped event (see `triggers.md` § "Script trigger env vars"). For schedule-fired triggers neither is set, so `--tap modal` (the default) is the only meaningful choice.
 
 The CLI rejects `--tap navigate` without `--thread-id` and `--app-id` (the navigate kind needs a destination) with a clear error before the HTTP round-trip — the server returns the same 400 if the CLI's check is bypassed. For panel-shaped targets (`changes`, `triggers`, `files`, …) the CLI doesn't currently expose a flag — use the `send_notification` LLM tool or POST directly to `/api/v1/notifications` with the full structured `tap` object.
 
@@ -335,7 +335,7 @@ global view). `set` requires `--key` + `--value`; pass `--device-id` only for a
 per-device key. The chat agent's in-process equivalent is the grouped
 `preferences` tool (`action: get | set`).
 
-### `lucidos triggers list | create | update | delete`
+### `lucidos triggers list | create | update | delete | run`
 
 Manage *triggers* — scheduled (cron) and/or event-driven automations. Generated
 from the manifest. The rich fields (`run`, `on`, `cron_expressions`,
@@ -354,13 +354,26 @@ $ lucidos triggers create --name "Bad sleep alert" \
 # Update keeps run history (prefer over delete+create); pause/resume via --paused
 $ lucidos triggers update --id <uuid> --paused true
 $ lucidos triggers delete --id <uuid>
+# Fire an existing trigger once, right now, outside its schedule
+$ lucidos triggers run --id <uuid>
 ```
 
 `create`/`update` accept `--name`, `--run`, `--cron-expressions`, `--on`,
 `--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`, `--slug`;
-`update`/`delete` take `--id <uuid>`. The chat agent's in-process equivalent is
-the grouped `triggers` tool (`action: create | list | update | delete | pause |
-resume`) — pause/resume are tool-only (the CLI pauses via `update --paused`).
+`update`/`delete`/`run` take `--id <uuid>`. The chat agent's in-process
+equivalent is the grouped `triggers` tool (`action: create | list | update |
+delete | pause | resume | run`). Pause/resume are tool-only there; the CLI
+pauses via `update --paused`.
+
+`run` performs an **off-schedule run**: a real fire that records
+`TriggerExecuted` / `last_run` and carries the trigger's own identity,
+side-effect grant and `go_to_review`, indistinguishable downstream from a
+scheduled one. It returns as soon as the run is admitted, so a `success: true`
+response does not mean the work finished. Read `status` in the response body:
+`started`, `queued` (over capacity), or `already-running` (a fire was already
+active or queued, so **nothing new started**). It is refused for a paused
+trigger and for an event-only one (emit its subscribed event with
+`lucidos events emit` instead); the `message` field says which.
 
 ### `lucidos trigger-groups list | create | rename | reorder | delete`
 

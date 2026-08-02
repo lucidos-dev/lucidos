@@ -4196,6 +4196,7 @@ version = "0.1.0"
 dependencies = [
  "block2",
  "libc",
+ "lucidos-tailscale",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -4272,6 +4273,7 @@ dependencies = [
  "kamadak-exif",
  "lettre",
  "libc",
+ "lucidos-tailscale",
  "mail-parser",
  "native-tls",
  "openssl",
@@ -4317,6 +4319,7 @@ dependencies = [
  "dotenvy",
  "futures",
  "libc",
+ "lucidos-tailscale",
  "reqwest 0.12.28",
  "rustls",
  "serde",
@@ -4326,6 +4329,13 @@ dependencies = [
  "toml 0.8.23",
  "tower",
  "tower-http",
+]
+
+[[package]]
+name = "lucidos-tailscale"
+version = "0.1.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]

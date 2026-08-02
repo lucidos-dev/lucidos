@@ -436,8 +436,8 @@ mod tests {
 
     #[tokio::test]
     async fn run_script_accepts_all_credential_types_and_injects_correct_env_vars() {
-        use crate::core::credentials::{AuthType, CredentialStore};
-        use crate::test_support::{setup_test_db, teardown_test_db};
+        use crate::core::credentials::AuthType;
+        use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
 
         const ECHO_SCRIPT: &str = r#"
 import os, json
@@ -479,17 +479,14 @@ print(json.dumps({
         ];
 
         for (auth_type, auth_value, expected_headers) in cases.iter() {
-            CredentialStore::upsert(
+            seed_credential(
                 &pool,
                 "testsvc",
                 "https://example.test",
                 *auth_type,
                 auth_value,
-                None,
-                None,
             )
-            .await
-            .expect("upsert credential");
+            .await;
 
             // Fresh ProxyTokenCache + layer per iteration so the previous
             // case's headers can't satisfy this one's request.

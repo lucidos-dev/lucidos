@@ -218,11 +218,20 @@ pub(super) async fn write_data(
         // `write_and_commit` takes `impl AsRef<[u8]>` — pass the raw bytes so
         // binary uploads (PNG, PDF, …) aren't silently mangled by a lossy
         // UTF-8 round-trip that replaces every non-UTF-8 byte with U+FFFD.
+        // The store announces the Artifact* entity event; the DataFileWritten
+        // below is the API-origin audit event on top of it. Before this the
+        // entity event was missing entirely for a data-API write, so a
+        // CLI-written artifact never reached the memory index and the frontend
+        // carried a workaround arm for the gap.
         match am
             .write_and_commit(
+                &state.engine.event_bus,
                 artifact_path,
                 body.as_ref(),
                 &format!("Update {}", artifact_path),
+                crate::core::WriteAnnouncement::Entity {
+                    source: Some("data_api".to_string()),
+                },
             )
             .await
         {
@@ -319,7 +328,11 @@ pub(super) async fn delete_data(
 
     let (commit_opt, response) = if let Some(artifact_path) = path.strip_prefix("artifacts/") {
         match am
-            .delete_and_commit(artifact_path, &format!("Delete {}", artifact_path))
+            .delete_and_commit(
+                &state.engine.event_bus,
+                artifact_path,
+                &format!("Delete {}", artifact_path),
+            )
             .await
         {
             Ok(commit) => (
@@ -337,7 +350,11 @@ pub(super) async fn delete_data(
         }
     } else {
         match am
-            .delete_data_path_and_commit(&path, &format!("Delete {}", path))
+            .delete_data_path_and_commit(
+                &state.engine.event_bus,
+                &path,
+                &format!("Delete {}", path),
+            )
             .await
         {
             Ok(commit) => (

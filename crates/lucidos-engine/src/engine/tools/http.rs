@@ -1,8 +1,8 @@
 use super::super::LucidosEngine;
 use super::bulk_limits::{bulk_threshold_error, BulkContext, MAX_BULK_BYTES};
 use crate::core::oauth::{self, provider_for_url};
+use crate::core::WriteAnnouncement;
 use crate::core::{AuthType, CredentialStore, OAuthStore};
-use crate::engine::event_bus::{BusEvent, SystemEvent};
 use std::time::Duration;
 
 /// Per-request timeout for the `http_request` LLM tool. A server that accepts
@@ -315,23 +315,20 @@ impl LucidosEngine {
                         body_bytes,
                     ));
                 }
-                let file_exists = self.artifact_manager.artifact_exists(artifact_path);
-                let commit_sha = self
-                    .artifact_manager
+                // The store captures the pre-write existence and announces.
+                // This call site used to do both by hand, which is why the
+                // helper it called (`SystemEvent::artifact_change`) existed at
+                // all, and why the image tool could forget the pair entirely.
+                self.artifact_manager
                     .write_and_commit(
+                        &self.event_bus,
                         artifact_path,
                         &body_text,
                         &format!("HTTP response: {}", artifact_path),
+                        WriteAnnouncement::Entity {
+                            source: Some("http_request".to_string()),
+                        },
                     )
-                    .await?;
-
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::artifact_change(
-                        file_exists,
-                        artifact_path.to_string(),
-                        commit_sha.clone(),
-                        Some("http_request".to_string()),
-                    )))
                     .await?;
             }
         }

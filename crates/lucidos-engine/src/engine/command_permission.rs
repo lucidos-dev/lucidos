@@ -275,18 +275,90 @@ fn canceled_refusal() -> String {
     "The command was not run — the request was canceled before you got permission.".to_string()
 }
 
+/// Byte cap on the command excerpt embedded in the trigger-block message. Long
+/// enough to recognise which step of a multi-command script tripped the guard,
+/// short enough that the failure notification stays readable.
+const BLOCKED_COMMAND_EXCERPT_BYTES: usize = 400;
+
 /// The tool result fed back to the LLM when a trigger's command is blocked
 /// because the firing trigger isn't granted the command's side-effect category
 /// (ADR 0002, Phase 5). The agentic loop also emits a terminal `ResponseFailed`
-/// and returns `Err`, so the scheduler's failure-notification path surfaces it.
-fn trigger_block_refusal(category: SideEffectCategory) -> String {
-    format!(
-        "Blocked by the command guard — this trigger is not authorized to perform {reason}, so the \
-         command was NOT run and the trigger failed. To allow it, grant the \"{label}\" side-effect \
-         on the trigger (in the trigger's settings) and re-run.",
+/// and returns `Err`, so the scheduler's failure-notification path surfaces this
+/// string to the user verbatim as the notification body.
+///
+/// It has to name **what was tried**, because the user reads it out of context:
+/// the judge's tailored summary of the side-effect (when it produced one) and an
+/// excerpt of the command itself. The category reason alone is not enough for
+/// [`SideEffectCategory::Other`], whose reason is the catch-all "an irreversible
+/// real-world side-effect" and says nothing about which step of the trigger
+/// failed.
+fn trigger_block_refusal(
+    category: SideEffectCategory,
+    tool_name: &str,
+    input: &Value,
+    summary: Option<&str>,
+) -> String {
+    let mut msg = format!(
+        "Blocked by the command guard: this trigger is not authorized to perform {reason}, so the \
+         command was NOT run and the trigger failed.",
         reason = category.reason(),
+    );
+    if let Some(why) = summary.map(str::trim).filter(|s| !s.is_empty()) {
+        msg.push_str(&format!("\n\nWhy it was gated: {why}"));
+    }
+    msg.push_str(&format!(
+        "\n\nTo allow it, grant the \"{label}\" side-effect on the trigger (in the trigger's \
+         settings) and re-run.",
         label = category.label(),
-    )
+    ));
+    // The verbatim command goes LAST, after the one-line summary and the remedy.
+    // A push notification body is this same string, and the OS preview shows only
+    // its first couple of lines: the summary and the remedy are what a glance
+    // should carry, and the raw command (which can contain a token the postgres
+    // scrub below does not know about) stays off the lock screen.
+    if let Some(excerpt) = blocked_command_excerpt(tool_name, input) {
+        let fence = code_fence_for(&excerpt);
+        msg.push_str(&format!(
+            "\n\nWhat it tried ({tool_name}):\n{fence}\n{excerpt}\n{fence}"
+        ));
+    }
+    msg
+}
+
+/// A fence long enough that `excerpt` cannot break out of its code block: one
+/// backtick more than the longest backtick run inside it (the CommonMark rule),
+/// minimum three. The notification body is rendered as markdown, so a command
+/// containing a ``` run would otherwise close the fence early and the rest of it
+/// would render as markdown rather than as the code it is.
+fn code_fence_for(excerpt: &str) -> String {
+    let longest_run = excerpt.split(|c| c != '`').map(str::len).max().unwrap_or(0);
+    "`".repeat(longest_run.saturating_add(1).max(3))
+}
+
+/// The blocked call's command text, redacted and length-capped for embedding in
+/// [`trigger_block_refusal`]. `None` when the tool carries no inspectable
+/// command or the command is blank.
+///
+/// Redaction is [`crate::core::redact_postgres_secrets`] and nothing more, which
+/// is deliberate: that is the codebase's single boundary scrub for command text,
+/// already applied by `ToolCalled.args`, `CommandPermissionRequested.command` and
+/// `CommandCheckpointed.command`. This very command is therefore ALREADY
+/// persisted and SSE-broadcast at exactly this redaction level by the
+/// `ToolCalled` event of the same tool call, so the excerpt adds no new class of
+/// exposure. Widening the scrub is a codebase-wide change to that one helper, not
+/// a special case here (a scrubber that only guards this one surface would read
+/// as a guarantee the other three don't keep).
+fn blocked_command_excerpt(tool_name: &str, input: &Value) -> Option<String> {
+    let raw = command_guard::command_text(tool_name, input)?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let redacted = crate::core::redact_postgres_secrets(raw);
+    if redacted.len() <= BLOCKED_COMMAND_EXCERPT_BYTES {
+        return Some(redacted);
+    }
+    let cut = redacted.floor_char_boundary(BLOCKED_COMMAND_EXCERPT_BYTES);
+    Some(format!("{}...", &redacted[..cut]))
 }
 
 // ---------------------------------------------------------------------------
@@ -621,7 +693,12 @@ impl LucidosEngine {
                     cat.reason(),
                     tool_name
                 );
-                GuardDecision::FailTrigger(trigger_block_refusal(cat))
+                GuardDecision::FailTrigger(trigger_block_refusal(
+                    cat,
+                    tool_name,
+                    input,
+                    summary.as_deref(),
+                ))
             }
         }
     }
@@ -1201,6 +1278,136 @@ mod tests {
             ),
             GuardAction::Proceed
         );
+    }
+
+    // --- trigger_block_refusal: the message the user reads out of context ---
+
+    fn bash_input(cmd: &str) -> Value {
+        serde_json::json!({ "command": cmd })
+    }
+
+    #[test]
+    fn trigger_block_refusal_names_what_was_tried() {
+        // The whole point of the message: a user reading only the failure
+        // notification must learn which command was blocked and why, not just
+        // that "an irreversible real-world side-effect" was refused.
+        let msg = trigger_block_refusal(
+            SideEffectCategory::Other,
+            tn::RUN_BASH,
+            &bash_input("pkill -x \"Google Chrome\""),
+            Some("Kills processes outside the workspace."),
+        );
+        assert!(msg.contains("pkill -x \"Google Chrome\""), "{msg}");
+        assert!(msg.contains(tn::RUN_BASH), "{msg}");
+        assert!(
+            msg.contains("Kills processes outside the workspace."),
+            "{msg}"
+        );
+        // Still carries the block verdict and the remedy.
+        assert!(msg.contains("was NOT run"), "{msg}");
+        assert!(
+            msg.contains(SideEffectCategory::Other.label()),
+            "the remedy must name the grant to tick: {msg}"
+        );
+    }
+
+    #[test]
+    fn trigger_block_refusal_without_a_judge_summary_still_names_the_command() {
+        // The judge-off / judge-failed path produces no tailored summary; the
+        // command excerpt is then the only concrete detail, so it must survive.
+        let msg = trigger_block_refusal(
+            SideEffectCategory::CloudCli,
+            tn::RUN_BASH,
+            &bash_input("gh release delete v1.2.3"),
+            None,
+        );
+        assert!(msg.contains("gh release delete v1.2.3"), "{msg}");
+        assert!(!msg.contains("Why it was gated"), "{msg}");
+    }
+
+    #[test]
+    fn trigger_block_refusal_truncates_a_long_command() {
+        let long = format!("echo {}", "x".repeat(2_000));
+        let msg = trigger_block_refusal(
+            SideEffectCategory::Other,
+            tn::RUN_BASH,
+            &bash_input(&long),
+            None,
+        );
+        assert!(
+            msg.len() < 1_000,
+            "a long script must not flood the notification: {} bytes",
+            msg.len()
+        );
+        assert!(msg.contains("..."), "truncation must be visible: {msg}");
+        assert!(msg.contains(SideEffectCategory::Other.label()), "{msg}");
+    }
+
+    #[test]
+    fn trigger_block_refusal_puts_the_raw_command_last() {
+        // The push notification body IS this string and the OS preview shows
+        // only its first lines, so the summary and the remedy must precede the
+        // raw command text.
+        let msg = trigger_block_refusal(
+            SideEffectCategory::ExternalApi,
+            tn::RUN_BASH,
+            &bash_input("curl -X POST https://api.example.com/pay"),
+            Some("Charges a payment endpoint."),
+        );
+        let why = msg.find("Why it was gated").expect("summary line");
+        let remedy = msg.find("To allow it").expect("remedy line");
+        let tried = msg.find("What it tried").expect("command block");
+        assert!(why < remedy && remedy < tried, "{msg}");
+    }
+
+    #[test]
+    fn trigger_block_refusal_fences_a_command_containing_backticks() {
+        // A command carrying its own ``` run must not close the fence early and
+        // let the rest of it render as markdown in the notification body.
+        let msg = trigger_block_refusal(
+            SideEffectCategory::Other,
+            tn::RUN_BASH,
+            &bash_input("echo '```' && rm -rf /etc/x"),
+            None,
+        );
+        assert!(
+            msg.contains("\n````\necho '```' && rm -rf /etc/x\n````"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn code_fence_grows_past_the_longest_backtick_run() {
+        assert_eq!(code_fence_for("plain command"), "```");
+        assert_eq!(code_fence_for("echo `date`"), "```");
+        assert_eq!(code_fence_for("echo '```'"), "````");
+        assert_eq!(code_fence_for("`````"), "``````");
+    }
+
+    #[test]
+    fn trigger_block_refusal_redacts_a_postgres_password() {
+        let msg = trigger_block_refusal(
+            SideEffectCategory::ExternalApi,
+            tn::RUN_BASH,
+            &bash_input("psql postgres://u:hunter2@localhost/db -c 'delete from t'"),
+            None,
+        );
+        assert!(!msg.contains("hunter2"), "{msg}");
+        assert!(msg.contains("postgres://u:***@localhost/db"), "{msg}");
+    }
+
+    #[test]
+    fn trigger_block_refusal_omits_an_empty_command_block() {
+        // Defensive: a blank command yields no excerpt rather than an empty
+        // fenced block.
+        let msg = trigger_block_refusal(
+            SideEffectCategory::Other,
+            tn::RUN_BASH,
+            &bash_input("   "),
+            None,
+        );
+        assert!(!msg.contains("What it tried"), "{msg}");
+        assert!(msg.contains("was NOT run"), "{msg}");
     }
 
     #[test]

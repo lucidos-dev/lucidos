@@ -1,12 +1,13 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable } from './preferences';
 import * as apiClient from '../../api/client';
 
-const platformMocks = vi.hoisted(() => ({ isIOS: false, isTauri: false }));
+const platformMocks = vi.hoisted(() => ({ isIOS: false, isTauri: false, isIOSPwa: false }));
 vi.mock('../../utils/platform', () => ({
   isIOS: () => platformMocks.isIOS,
   isTauri: () => platformMocks.isTauri,
+  isIOSPwa: () => platformMocks.isIOSPwa,
 }));
 
 // applyTheme tints the native title bar via this when isTauri(); mock it so the
@@ -464,5 +465,94 @@ describe('inAppBrowserAvailable: desktop app AND the experimental opt-in', () =>
     platformMocks.isTauri = true;
     preferences.value = { status: 'loading' };
     expect(inAppBrowserAvailable()).toBe(false);
+  });
+});
+
+/**
+ * The external-link target is read on the tap itself, inside a code path with
+ * no `await` before it (the Web Share branch needs the user activation intact),
+ * so every fallback has to be a pure synchronous default rather than a retry.
+ * That is what these cases pin: unset, still-loading, and a value the enum
+ * doesn't know all resolve to `safari`, the behaviour shipped in dbc7386d.
+ */
+describe('currentExternalLinkTarget: safari unless the user chose otherwise', () => {
+  beforeEach(() => {
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('defaults to safari on a loaded workspace with the preference unset', () => {
+    preferences.value = { status: 'loaded', data: {} };
+    expect(currentExternalLinkTarget()).toBe('safari');
+  });
+
+  it('defaults to safari while preferences are still loading', () => {
+    // A link tapped during startup must not land in a different mode than the
+    // same link tapped a second later.
+    preferences.value = { status: 'loading' };
+    expect(currentExternalLinkTarget()).toBe('safari');
+  });
+
+  it('returns each of the three modes the user can choose', () => {
+    for (const target of ['safari', 'ask', 'in-app'] as const) {
+      preferences.value = { status: 'loaded', data: { external_link_target: target } };
+      expect(currentExternalLinkTarget()).toBe(target);
+    }
+  });
+
+  it('degrades an unrecognized stored value to safari, never to no hand-off', () => {
+    // e.g. a value written by a newer build, or a hand-edited row. Falling back
+    // to the working default beats leaving the user trapped in the web view.
+    preferences.value = { status: 'loaded', data: { external_link_target: 'chrome' } };
+    expect(currentExternalLinkTarget()).toBe('safari');
+  });
+
+  it('setExternalLinkTarget persists the chosen mode', async () => {
+    preferences.value = { status: 'loaded', data: {} };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+
+    await setExternalLinkTarget('ask');
+
+    expect(spy).toHaveBeenCalledWith('external_link_target', 'ask', undefined);
+    expect((preferences.value as { data: Record<string, string> }).data.external_link_target).toBe('ask');
+  });
+});
+
+/**
+ * The Settings row must not render where the choice decides nothing. Every
+ * client except an installed iOS PWA opens a new tab (or the desktop OS opener)
+ * regardless of the stored value, so a row there would be a control that does
+ * nothing, which `.claude/rules/frontend.md` treats as a lie rather than a
+ * harmless extra.
+ */
+describe('externalLinkTargetConfigurable: the row shows only where it bites', () => {
+  beforeEach(() => {
+    platformMocks.isIOSPwa = false;
+    platformMocks.isTauri = false;
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('is on for an installed iOS PWA', () => {
+    platformMocks.isIOSPwa = true;
+    expect(externalLinkTargetConfigurable()).toBe(true);
+  });
+
+  it('is off in a desktop browser and a normal mobile Safari tab', () => {
+    expect(externalLinkTargetConfigurable()).toBe(false);
+  });
+
+  it('is off in the desktop app, which has its own in-app browser toggle', () => {
+    platformMocks.isTauri = true;
+    expect(externalLinkTargetConfigurable()).toBe(false);
+  });
+
+  it('does not depend on preferences having loaded', () => {
+    // Platform-only, so the row cannot pop in partway through startup.
+    platformMocks.isIOSPwa = true;
+    preferences.value = { status: 'loading' };
+    expect(externalLinkTargetConfigurable()).toBe(true);
   });
 });

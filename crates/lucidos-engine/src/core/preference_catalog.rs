@@ -95,6 +95,10 @@ const IMAGE_MODELS: &[&str] = &[
     "gpt-image-1.5",
     "gpt-image-2",
 ];
+/// Mirrors `ExternalLinkTarget` in
+/// `crates/lucidos-app/src/store/actions/preferences.ts`, which is also where
+/// the routing lives (`utils/openExternalUrl.ts`).
+const EXTERNAL_LINK_TARGETS: &[&str] = &["safari", "ask", "in-app"];
 /// Mirrors `Theme` / `FontFamily` in the same frontend file.
 const THEMES: &[&str] = &["light", "dark", "system"];
 const FONT_FAMILIES: &[&str] = &[
@@ -223,6 +227,15 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
+        key: "external_link_target",
+        label: "External links open in",
+        scope: PrefScope::Global,
+        value: PrefValue::Enum(EXTERNAL_LINK_TARGETS),
+        default: "safari",
+        description: "Where an external http(s) link goes when tapped in an INSTALLED iOS PWA (no effect on desktop, Android, or a normal Safari tab, which all open a new tab). 'safari' hands it to the Safari app; 'ask' opens the OS share sheet so iOS offers every installed browser, including the user's real default; 'in-app' keeps it in the PWA's in-app web view, which has no address bar and no shared Safari session.",
+        side_effect: PrefSideEffect::None,
+    },
+    PrefSpec {
         key: "welcome_suggestions_dismissed",
         label: "Welcome message dismissed",
         scope: PrefScope::Global,
@@ -343,6 +356,59 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("engine_switch_dismissed_build", "internal UI state — the on-disk engine build id the user deferred the 'Switch to new version' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
     ("client_refresh_dismissed_build", "internal UI state — the served client build id the user deferred the 'refresh to sync' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
 ];
+
+/// Preference keys the engine writes as its own internal state, and which
+/// therefore do NOT announce `PreferencesChanged`.
+///
+/// The `preferences` table is a general key/value store used for two different
+/// things: settings the user changes (which every device must learn about) and
+/// engine bookkeeping that happens to need a durable home. Announcing is the
+/// DEFAULT, and this list is the closed set of exceptions, each with the reason
+/// it is not a setting.
+///
+/// [`PreferenceStore::set_silent`] REJECTS any key absent from this list, so a
+/// caller cannot use the silent door to write a user-visible preference by
+/// mistake. That inversion is the point: forgetting to announce is the failure
+/// this guards against, so silence has to be asked for explicitly and by name.
+///
+/// Distinct from [`INTERNAL_KEYS`], which is about who may WRITE a key (those
+/// are real settings the human edits in Settings; the agent just must not touch
+/// them, and they announce normally).
+pub const SILENT_PREF_KEYS: &[(&str, &str)] = &[
+    (
+        "vapid_keys",
+        "the workspace's Web Push signing keypair, generated once on demand; a \
+         transport secret, not a setting",
+    ),
+    (
+        "backup_last_run",
+        "the outcome of the most recent backup, written by the backup job itself \
+         so the Settings page survives a restart; the run already announces \
+         BackupCompleted / BackupFailed",
+    ),
+    (
+        "backfill_trigger_id_from_events_done",
+        "a one-shot migration marker, so a completed backfill is not re-run",
+    ),
+    (
+        "backfill_trigger_id_v5_to_config_id_done",
+        "a one-shot migration marker, so a completed backfill is not re-run",
+    ),
+    (
+        "backfill_repo_names_from_changes_done",
+        "a one-shot migration marker, so a completed backfill is not re-run",
+    ),
+    (
+        "backfill_cc_repo_id_to_deterministic_done",
+        "a one-shot migration marker, so a completed backfill is not re-run",
+    ),
+];
+
+/// Whether a preference key is engine-internal state rather than a setting, and
+/// so writes silently. See [`SILENT_PREF_KEYS`].
+pub fn is_silent_key(key: &str) -> bool {
+    SILENT_PREF_KEYS.iter().any(|(k, _)| *k == key)
+}
 
 /// Find the catalog spec for an agent-settable key.
 pub fn lookup(key: &str) -> Option<&'static PrefSpec> {

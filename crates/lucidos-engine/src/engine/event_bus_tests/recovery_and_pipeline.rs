@@ -157,10 +157,10 @@ async fn emit_user_system_resolves_actor_and_emits_system_event() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
-    DeviceStore::register(&pool, "test-device-emit", Some("Mozilla/5.0"))
+    DeviceStore::register(&pool, &bus, "test-device-emit", Some("Mozilla/5.0"), None)
         .await
         .unwrap();
-    DeviceStore::rename(&pool, "test-device-emit", Some("Test MacBook"))
+    DeviceStore::rename(&pool, &bus, "test-device-emit", Some("Test MacBook"), None)
         .await
         .unwrap();
 

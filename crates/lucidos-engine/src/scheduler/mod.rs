@@ -844,10 +844,17 @@ impl SchedulerManager {
     /// `cron`: A 6-field cron expression (e.g., "0 0 3 * * *" for daily at 3am),
     ///         or `None` to disable.
     /// `provider`: The backup provider ID (e.g., "google_drive").
+    /// `actor` is stamped on the `PreferencesChanged` events the store emits
+    /// for the keys this writes. Those emits are load-bearing rather than
+    /// cosmetic: the scheduler's own `PreferencesChanged` subscriber
+    /// re-registers the backup cron from them, and the Settings page reloads on
+    /// them. They used to be hand-rolled by the one HTTP caller, which left the
+    /// next caller of this method silently un-announced.
     pub async fn set_backup_schedule(
         &mut self,
         cron: Option<&str>,
         provider: &str,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         use crate::core::backup::{PREF_BACKUP_PROVIDER, PREF_BACKUP_SCHEDULE};
 
@@ -857,8 +864,11 @@ impl SchedulerManager {
                 crate::engine::tools::scheduler::parse_standard_cron(expr)
                     .map_err(|e| format!("Invalid cron expression '{}': {}", expr, e))?;
 
-                PreferenceStore::set(&self.pool, PREF_BACKUP_SCHEDULE, expr).await?;
-                PreferenceStore::set(&self.pool, PREF_BACKUP_PROVIDER, provider).await?;
+                let bus = &self.engine.event_bus;
+                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_SCHEDULE, expr, actor.clone())
+                    .await?;
+                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_PROVIDER, provider, actor)
+                    .await?;
 
                 register_backup_job(
                     &self.scheduler,
@@ -871,7 +881,14 @@ impl SchedulerManager {
             }
             None => {
                 // Disable schedule
-                PreferenceStore::set(&self.pool, PREF_BACKUP_SCHEDULE, "off").await?;
+                PreferenceStore::set(
+                    &self.pool,
+                    &self.engine.event_bus,
+                    PREF_BACKUP_SCHEDULE,
+                    "off",
+                    actor,
+                )
+                .await?;
                 remove_backup_job(&self.scheduler, &self.backup_job_id).await?;
                 log!("[Scheduler] Backup schedule disabled");
             }
@@ -1131,8 +1148,6 @@ pub(crate) async fn disable_push_on_stale_devices(
     pool: PgPool,
     cutoff_days: i64,
 ) {
-    use crate::engine::event_bus::{BusEvent, SystemEvent};
-
     let stale = match crate::core::DeviceStore::list_stale_push_enabled(&pool, cutoff_days).await {
         Ok(ids) => ids,
         Err(e) => {
@@ -1153,20 +1168,18 @@ pub(crate) async fn disable_push_on_stale_devices(
     );
 
     for device_id in stale {
-        match crate::core::DeviceStore::set_push_enabled(&pool, &device_id, false).await {
-            Ok(true) => {
-                engine
-                    .event_bus
-                    .emit_or_log(
-                        BusEvent::System(SystemEvent::DevicePushChanged {
-                            device_id: device_id.clone(),
-                            push_enabled: false,
-                            actor: None,
-                        }),
-                        "[Scheduler] DevicePushChanged (stale)",
-                    )
-                    .await;
-            }
+        // `set_push_enabled` announces `DevicePushChanged` itself, and only when
+        // a row actually flipped, so this sweep cannot report a device it missed.
+        match crate::core::DeviceStore::set_push_enabled(
+            &pool,
+            &engine.event_bus,
+            &device_id,
+            false,
+            None,
+        )
+        .await
+        {
+            Ok(true) => {}
             Ok(false) => {
                 // Disappeared between SELECT and UPDATE — benign race.
             }

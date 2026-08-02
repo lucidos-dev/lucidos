@@ -182,7 +182,10 @@ pub(super) async fn mark_notification_read(
     headers: HeaderMap,
 ) -> Result<Json<MarkReadResponse>, (StatusCode, String)> {
     let id = query.id;
-    let success = NotificationStore::mark_read(&state.pool, id)
+    // `mark_read` emits `NotificationRead` itself, and only when the row really
+    // moved from unread to read; resolve the device actor for it.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let success = NotificationStore::mark_read(&state.pool, &state.engine.event_bus, id, actor)
         .await
         .map_err(|e| {
             (
@@ -192,19 +195,6 @@ pub(super) async fn mark_notification_read(
         })?;
 
     if success {
-        state
-            .engine
-            .event_bus
-            .emit_user_system(
-                &headers,
-                &state.pool,
-                "[Notifications] NotificationRead",
-                |actor| crate::engine::event_bus::SystemEvent::NotificationRead {
-                    id: id.to_string(),
-                    actor,
-                },
-            )
-            .await;
         // Cross-device dismiss (macOS desktop only): tell any connected Tauri
         // app to REMOVE the already-delivered native banner for this id. The
         // open web can't silently remove a Web Push banner (Safari revokes a
@@ -226,7 +216,8 @@ pub(super) async fn mark_all_notifications_read(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<MarkReadResponse>, (StatusCode, String)> {
-    let count = NotificationStore::mark_all_read(&state.pool)
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let count = NotificationStore::mark_all_read(&state.pool, &state.engine.event_bus, actor)
         .await
         .map_err(|e| {
             (
@@ -236,16 +227,6 @@ pub(super) async fn mark_all_notifications_read(
         })?;
 
     if count > 0 {
-        state
-            .engine
-            .event_bus
-            .emit_user_system(
-                &headers,
-                &state.pool,
-                "[Notifications] NotificationsAllRead",
-                |actor| crate::engine::event_bus::SystemEvent::NotificationsAllRead { actor },
-            )
-            .await;
         // Cross-device dismiss (macOS desktop only): `None` = remove ALL
         // delivered native banners on connected Tauri apps. Web / PWA banners
         // persist (no silent Web Push removal). See notifications.md §4.

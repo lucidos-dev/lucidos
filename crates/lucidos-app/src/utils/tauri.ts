@@ -251,13 +251,30 @@ export function cancelAppUpdate(): Promise<void> {
 
 // --- Mobile access (packaged desktop app; macOS) ---
 
-/** Tailscale install/login state for the host Mac (mirror of the Rust
- *  `TailscaleInfo`). */
+/** This Mac's Tailscale setup, as two INDEPENDENT facts (mirror of the Rust
+ *  `TailscaleInfo`).
+ *
+ *  Tailnet state (`on_tailnet` / `tailnet_ip` / `magic_dns_name` / `serve_url`)
+ *  is read from the machine itself with no CLI. `cli_available` gates the action
+ *  buttons and nothing else: a Mac whose Tailscale works but has no CLI still
+ *  gets described accurately, which before the split rendered as a Sign in
+ *  button that could not work. */
 export interface TailscaleInfo {
+  /** Tailscale is present at all (app bundle or CLI). Drives "Get Tailscale",
+   *  so it deliberately does NOT mean "usable". */
   installed: boolean;
-  running: boolean;
-  hostname: string | null;
-  url: string | null;
+  /** This Mac holds a tailnet address: signed in and connected. */
+  on_tailnet: boolean;
+  /** The tailnet IPv4. Reachable over plain HTTP from the same tailnet. */
+  tailnet_ip: string | null;
+  /** MagicDNS name, no scheme. Null on a tailnet with MagicDNS disabled, which
+   *  is NOT the same as being offline. */
+  magic_dns_name: string | null;
+  /** `https://<magic_dns_name>`, set only once something is PROVEN to be
+   *  serving it. Before `tailscale serve` runs, nothing listens on 443. */
+  serve_url: string | null;
+  /** A working `tailscale` CLI was found. Actions only, never reporting. */
+  cli_available: boolean;
 }
 
 /** localhost / LAN / Tailscale connect URLs for the engine (mirror of the Rust

@@ -179,7 +179,7 @@ impl LucidosEngine {
                 }
 
                 let (email, _display_name, _merged_scopes) =
-                    oauth::run_oauth_flow(&self.pool, &provider, scopes).await?;
+                    oauth::run_oauth_flow(&self.pool, &self.event_bus, &provider, scopes).await?;
 
                 let email_display = email.as_deref().unwrap_or("unknown");
                 Ok(format!(

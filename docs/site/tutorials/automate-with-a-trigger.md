@@ -112,7 +112,7 @@ knowhow file *first*, then creates the trigger.
 
 ## Going deeper
 
-- **Building a Trigger** (`system-knowhow/building-a-trigger.md`) — cron vs. event in
+- **Triggers** (`system-knowhow/triggers.md`): cron vs. event in
   depth, multi-event subscriptions, conditions, script triggers, one-shots, and
   notification routing.
 - **Concepts → Intent, knowhow, and scripts** ([here](../concepts.md#intent-knowhow-and-scripts)) — the

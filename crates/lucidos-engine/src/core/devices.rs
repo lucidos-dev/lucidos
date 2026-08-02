@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
 use super::PinnedAppStore;
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::FromRow)]
 pub struct Device {
@@ -14,6 +16,15 @@ pub struct Device {
     pub created_at: DateTime<Utc>,
 }
 
+/// The registry of devices that have connected to this workspace.
+///
+/// **No caller can skip the event.** [`Self::register`], [`Self::rename`],
+/// [`Self::set_push_enabled`] and [`Self::delete`] are the only reachable
+/// mutators; the raw row writes are private to this module.
+/// `Device{Registered,Renamed,PushChanged,Deleted}` is what reloads the
+/// Settings devices list on every other device.
+///
+/// Same shape as `RepositoryStore`; see `core::announced_surfaces`.
 pub struct DeviceStore;
 
 impl DeviceStore {
@@ -40,15 +51,17 @@ impl DeviceStore {
 
     /// Register or update a device (upsert by id). Returns `(device, inserted)`
     /// where `inserted` is true iff a new row was created (false on
-    /// last-seen-at refresh). Callers stamp `DeviceRegistered` audit events
-    /// only when `inserted` is true so a page-load refresh doesn't append a
-    /// row to the events table on every navigation.
+    /// last-seen-at refresh).
+    ///
+    /// **Private on purpose**: [`Self::register`] is the reachable mutator, and
+    /// it emits `DeviceRegistered` only when `inserted` is true, so a page-load
+    /// refresh does not append a row to the events table on every navigation.
     ///
     /// `xmax = 0` on PostgreSQL is the standard idiom for "INSERT path of an
     /// ON CONFLICT DO UPDATE" — the system column holds the deleting
     /// transaction id, which is 0 for a freshly inserted row and the
     /// current xid for an UPDATE.
-    pub async fn register(
+    async fn upsert_row(
         pool: &PgPool,
         id: &str,
         user_agent: Option<&str>,
@@ -128,8 +141,8 @@ impl DeviceStore {
         Ok(devices)
     }
 
-    /// Rename a device
-    pub async fn rename(
+    /// Rename a device row. **Private on purpose**: [`Self::rename`] emits.
+    async fn rename_row(
         pool: &PgPool,
         id: &str,
         name: Option<&str>,
@@ -142,8 +155,14 @@ impl DeviceStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete a device and its per-device preferences
-    pub async fn delete(
+    /// Delete a device and everything scoped to it. **Private on purpose**:
+    /// [`Self::delete`] emits.
+    ///
+    /// The cascade (per-device preferences, push subscriptions, pinned apps) is
+    /// deliberately silent. `DeviceDeleted` is the announcement for all of it:
+    /// the device is gone, so a `PreferencesChanged` or `PinnedAppUnpinned` per
+    /// row would describe changes to a device no client still tracks.
+    async fn delete_row(
         pool: &PgPool,
         id: &str,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
@@ -166,18 +185,134 @@ impl DeviceStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Set push_enabled for a device
-    pub async fn set_push_enabled(
+    /// Set push_enabled on a device row. **Private on purpose**:
+    /// [`Self::set_push_enabled`] emits.
+    ///
+    /// Returns `None` when no such device exists, `Some(changed)` otherwise.
+    /// `rows_affected` cannot answer "changed": Postgres writes a new tuple
+    /// version even when the value is identical. The self-join reads the
+    /// pre-update value in the same statement.
+    async fn set_push_enabled_row(
         pool: &PgPool,
         id: &str,
         enabled: bool,
+    ) -> Result<Option<bool>, Box<dyn std::error::Error + Send + Sync>> {
+        let changed: Option<bool> = sqlx::query_scalar(
+            "UPDATE devices AS d SET push_enabled = $2 \
+             FROM (SELECT id, push_enabled FROM devices WHERE id = $1) AS prior \
+             WHERE d.id = prior.id \
+             RETURNING (prior.push_enabled IS DISTINCT FROM $2)",
+        )
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(pool)
+        .await?;
+        Ok(changed)
+    }
+
+    /// Register a device and announce it. The only way to add one.
+    ///
+    /// `DeviceRegistered` fires only on a genuinely new device, never on the
+    /// last-seen-at refresh every page load performs.
+    pub async fn register(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        user_agent: Option<&str>,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(Device, bool), Box<dyn std::error::Error + Send + Sync>> {
+        let (device, inserted) = Self::upsert_row(pool, id, user_agent).await?;
+        if inserted {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::DeviceRegistered {
+                        device_id: device.id.clone(),
+                        user_agent: device.user_agent.clone(),
+                        actor,
+                    }),
+                    "[Devices] DeviceRegistered",
+                )
+                .await;
+        }
+        Ok((device, inserted))
+    }
+
+    /// Rename a device and announce it. Announces only when a row existed.
+    pub async fn rename(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        name: Option<&str>,
+        actor: Option<MessageOrigin>,
     ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-        let result = sqlx::query("UPDATE devices SET push_enabled = $2 WHERE id = $1")
-            .bind(id)
-            .bind(enabled)
-            .execute(pool)
-            .await?;
-        Ok(result.rows_affected() > 0)
+        let renamed = Self::rename_row(pool, id, name).await?;
+        if renamed {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::DeviceRenamed {
+                        device_id: id.to_string(),
+                        name: name.map(str::to_string),
+                        actor,
+                    }),
+                    "[Devices] DeviceRenamed",
+                )
+                .await;
+        }
+        Ok(renamed)
+    }
+
+    /// Flip a device's push flag and announce it.
+    ///
+    /// Returns whether the device exists (the HTTP handler reports "Device not
+    /// found" on `false`), but announces only when the flag actually MOVED.
+    /// The stale-device prune already avoided no-op announcements by filtering
+    /// `push_enabled = true` at its SELECT; enforcing it in the write path
+    /// covers the HTTP handler too, which has no such filter.
+    pub async fn set_push_enabled(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        enabled: bool,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let outcome = Self::set_push_enabled_row(pool, id, enabled).await?;
+        if outcome == Some(true) {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::DevicePushChanged {
+                        device_id: id.to_string(),
+                        push_enabled: enabled,
+                        actor,
+                    }),
+                    "[Devices] DevicePushChanged",
+                )
+                .await;
+        }
+        Ok(outcome.is_some())
+    }
+
+    /// Delete a device and announce it. The only way to remove one; the
+    /// per-device cascade rides along under this single event (see
+    /// [`Self::delete_row`]).
+    pub async fn delete(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let removed = Self::delete_row(pool, id).await?;
+        if removed {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::DeviceDeleted {
+                        device_id: id.to_string(),
+                        actor,
+                    }),
+                    "[Devices] DeviceDeleted",
+                )
+                .await;
+        }
+        Ok(removed)
     }
 
     /// List IDs of currently push-enabled devices whose `last_seen_at` is
@@ -315,38 +450,144 @@ mod tests {
             .unwrap();
     }
 
+    /// The load-bearing guarantee: a device write and its announcement are one
+    /// operation, so the Settings devices list on every OTHER device reloads.
+    /// The one write that must stay silent is the last-seen-at refresh the
+    /// frontend performs on every page load: announcing it would append an
+    /// events row per navigation.
+    #[tokio::test]
+    async fn register_announces_a_new_device_but_not_a_last_seen_refresh() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        async fn emitted(pool: &PgPool, event_type: &str) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+                .bind(event_type)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        let (_, inserted) = DeviceStore::register(&pool, &bus, "d1", Some("UA"), None)
+            .await
+            .unwrap();
+        assert!(inserted);
+        assert_eq!(emitted(&pool, "DeviceRegistered").await, 1);
+
+        let (_, inserted) = DeviceStore::register(&pool, &bus, "d1", Some("UA"), None)
+            .await
+            .unwrap();
+        assert!(!inserted);
+        assert_eq!(
+            emitted(&pool, "DeviceRegistered").await,
+            1,
+            "a page-load last-seen refresh must not announce"
+        );
+
+        DeviceStore::rename(&pool, &bus, "d1", Some("My MacBook"), None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "DeviceRenamed").await, 1);
+
+        DeviceStore::set_push_enabled(&pool, &bus, "d1", true, None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "DevicePushChanged").await, 1);
+
+        // Re-asserting the current value still reports the device exists (the
+        // HTTP handler renders `false` as "Device not found"), but announces
+        // nothing.
+        assert!(DeviceStore::set_push_enabled(&pool, &bus, "d1", true, None)
+            .await
+            .unwrap());
+        assert_eq!(
+            emitted(&pool, "DevicePushChanged").await,
+            1,
+            "a no-op toggle must not announce"
+        );
+
+        assert!(DeviceStore::delete(&pool, &bus, "d1", None).await.unwrap());
+        assert_eq!(emitted(&pool, "DeviceDeleted").await, 1);
+        assert!(!DeviceStore::delete(&pool, &bus, "d1", None).await.unwrap());
+        assert_eq!(
+            emitted(&pool, "DeviceDeleted").await,
+            1,
+            "second delete removes nothing and therefore announces nothing"
+        );
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// Deleting a device takes its pins with it under the single DeviceDeleted
+    /// event. A PinnedAppUnpinned per app would describe a device no client
+    /// still tracks, so the cascade is deliberately silent.
+    #[tokio::test]
+    async fn delete_cascades_pins_silently_under_device_deleted() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        DeviceStore::register(&pool, &bus, "d1", Some("UA"), None)
+            .await
+            .unwrap();
+        PinnedAppStore::pin(&pool, &bus, "habit-tracker", "main", "d1", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            PinnedAppStore::list_for_device(&pool, "d1")
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        DeviceStore::delete(&pool, &bus, "d1", None).await.unwrap();
+        assert!(PinnedAppStore::list_for_device(&pool, "d1")
+            .await
+            .unwrap()
+            .is_empty());
+        let unpinned: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'PinnedAppUnpinned'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(unpinned, 0, "the cascade rides under DeviceDeleted");
+
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
     #[tokio::test]
     async fn list_stale_push_enabled_filters_by_age_and_push_state() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
 
         // Push-enabled + old → returned
-        DeviceStore::register(&pool, "old-on", Some("UA"))
+        DeviceStore::register(&pool, &bus, "old-on", Some("UA"), None)
             .await
             .unwrap();
-        DeviceStore::set_push_enabled(&pool, "old-on", true)
+        DeviceStore::set_push_enabled(&pool, &bus, "old-on", true, None)
             .await
             .unwrap();
         backdate_last_seen(&pool, "old-on", 45).await;
 
         // Push-enabled + recent → excluded (last_seen is today)
-        DeviceStore::register(&pool, "fresh-on", Some("UA"))
+        DeviceStore::register(&pool, &bus, "fresh-on", Some("UA"), None)
             .await
             .unwrap();
-        DeviceStore::set_push_enabled(&pool, "fresh-on", true)
+        DeviceStore::set_push_enabled(&pool, &bus, "fresh-on", true, None)
             .await
             .unwrap();
 
         // Push-disabled + old → excluded (filtered at SELECT to avoid no-op events)
-        DeviceStore::register(&pool, "old-off", Some("UA"))
+        DeviceStore::register(&pool, &bus, "old-off", Some("UA"), None)
             .await
             .unwrap();
         backdate_last_seen(&pool, "old-off", 45).await;
 
         // Right on the cutoff (29 days) → excluded
-        DeviceStore::register(&pool, "almost-on", Some("UA"))
+        DeviceStore::register(&pool, &bus, "almost-on", Some("UA"), None)
             .await
             .unwrap();
-        DeviceStore::set_push_enabled(&pool, "almost-on", true)
+        DeviceStore::set_push_enabled(&pool, &bus, "almost-on", true, None)
             .await
             .unwrap();
         backdate_last_seen(&pool, "almost-on", 29).await;
@@ -362,10 +603,11 @@ mod tests {
     #[tokio::test]
     async fn list_stale_push_enabled_returns_empty_when_nothing_stale() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
-        DeviceStore::register(&pool, "fresh", Some("UA"))
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        DeviceStore::register(&pool, &bus, "fresh", Some("UA"), None)
             .await
             .unwrap();
-        DeviceStore::set_push_enabled(&pool, "fresh", true)
+        DeviceStore::set_push_enabled(&pool, &bus, "fresh", true, None)
             .await
             .unwrap();
 

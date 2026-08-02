@@ -16,6 +16,7 @@ import {
   createTrigger,
   updateTrigger,
   deleteTriggerApi,
+  runTriggerApi,
 } from '../../api/client';
 import { pushNavState } from './navigation';
 import { setActiveMenu } from './menu';
@@ -218,6 +219,28 @@ export async function toggleTrigger(
     }
   } catch (error) {
     showToast('Failed to update trigger: ' + errorDetail(error), 'error');
+  }
+}
+
+/** Fire an existing trigger once, off-schedule.
+ *
+ *  The toast reports what actually happened rather than assuming a start:
+ *  `already-running` means admission coalesced the fire away and nothing new
+ *  began, so it toasts as info, not success.
+ *
+ *  Deliberately does NOT reload the list. Nothing on the row changes at submit
+ *  time, and when the run records, the `TriggerExecuted` SSE arm in
+ *  `entityReferences.ts` already calls `loadTriggers`. */
+export async function runTriggerNow(triggerId: string): Promise<void> {
+  try {
+    const data = await runTriggerApi(triggerId);
+    if (!data.success) {
+      showToast(data.message || 'Failed to run trigger', 'error');
+      return;
+    }
+    showToast(data.message, data.status === 'already-running' ? 'info' : 'success');
+  } catch (error) {
+    showToast('Failed to run trigger: ' + errorDetail(error), 'error');
   }
 }
 

@@ -570,6 +570,7 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // + migrations are up; self-idempotent (the file is gone afterwards).
     lucidos_engine::core::environment_variables::migrate_env_file_to_db(
         engine.pool(),
+        &engine.event_bus,
         &workspace_path,
     )
     .await;

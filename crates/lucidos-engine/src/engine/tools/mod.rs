@@ -19,6 +19,7 @@ pub(crate) mod plugins;
 mod preferences;
 mod proxy;
 mod python;
+mod repositories;
 pub(crate) mod scheduler;
 pub(crate) mod search;
 pub(crate) mod todo;
@@ -59,6 +60,28 @@ fn to_outcome(r: Result<String, Box<dyn std::error::Error + Send + Sync>>) -> To
     match r {
         Ok(s) => lift_legacy_string(s),
         Err(e) => Err(format!("Error: {}", e)),
+    }
+}
+
+/// The actor to stamp on a `SystemEvent` a tool call mutated state through:
+/// the agent running in THIS thread did it, not the user directly.
+/// `ThreadLink { mode: Agent }` is the in-process analog of the CLI's
+/// `Api { mode: Agent, source_thread_id }`, deep-linking back to the thread
+/// whose agent acted so the route popover never mislabels it as "You".
+/// `direction: Parent` because the dominant flow is a chat thread acting on
+/// behalf of work it spawned.
+///
+/// One definition shared by every agent-tool emit site (repositories, plugins,
+/// change apply, Thread Queue policy) so the attribution can't drift per tool.
+pub(crate) fn agent_tool_actor(
+    thread_id: uuid::Uuid,
+) -> crate::engine::thread_events::MessageOrigin {
+    crate::engine::thread_events::MessageOrigin::ThreadLink {
+        thread_id,
+        title: None,
+        spawning_event_id: None,
+        mode: crate::engine::thread_events::ActorMode::Agent,
+        direction: crate::engine::thread_events::ThreadDirection::Parent,
     }
 }
 
@@ -136,6 +159,7 @@ impl LucidosEngine {
             | tn::DELETE_TRIGGER
             | tn::PAUSE_TRIGGER
             | tn::RESUME_TRIGGER
+            | tn::RUN_TRIGGER
             | tn::LIST_TRIGGER_GROUPS
             | tn::CREATE_TRIGGER_GROUP
             | tn::RENAME_TRIGGER_GROUP
@@ -199,7 +223,7 @@ impl LucidosEngine {
             }
             tn::DISMISS_FROM_CONTEXT => self.execute_dismiss_from_context(args, thread_id).await,
             tn::TODO_WRITE => self.execute_todo_write(args, thread_id).await,
-            tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args).await,
+            tn::MANAGE_REPOSITORIES => self.execute_manage_repositories(args, thread_id).await,
             tn::INSTALL_PLUGIN
             | tn::REGISTER_PLUGIN_MARKETPLACE
             | tn::CHECK_PLUGIN_UPDATES
@@ -532,125 +556,16 @@ impl LucidosEngine {
         dismiss_from_context_impl(&self.pool, &self.event_bus, args, thread_id).await
     }
 
-    async fn execute_manage_repositories(&self, args: &serde_json::Value) -> ToolOutcome {
-        let action = match args.get("action").and_then(|v| v.as_str()) {
-            Some(a) => a,
-            None => return Err("Error: 'action' is required (add, list, remove)".to_string()),
-        };
-
-        match action {
-            "list" => match crate::core::repositories::RepositoryStore::list(&self.pool).await {
-                Ok(repos) if repos.is_empty() => Ok("No repositories registered.".to_string()),
-                Ok(repos) => {
-                    let mut out = format!("{} registered repositories:\n", repos.len());
-                    for r in &repos {
-                        // `~/…`, not the raw absolute path: a home dir named
-                        // `<username>@<employer-domain>` would otherwise reach
-                        // the model provider. `folder` inputs are re-expanded
-                        // on the way back in (`resolve_folder_input`), so the
-                        // abbreviated form stays usable.
-                        out.push_str(&format!(
-                            "- **{}** — `{}`",
-                            r.name,
-                            crate::core::home_path::abbreviate_str(&r.path)
-                        ));
-                        if let Some(ref desc) = r.description {
-                            out.push_str(&format!(" ({})", desc));
-                        }
-                        out.push('\n');
-                    }
-                    Ok(out)
-                }
-                Err(e) => Err(format!("Error: failed to list repositories: {}", e)),
-            },
-            "add" => {
-                let name = match args.get("name").and_then(|v| v.as_str()) {
-                    Some(n) if !n.is_empty() => n,
-                    _ => return Err("Error: 'name' is required for 'add' action".to_string()),
-                };
-                let path = match args.get("path").and_then(|v| v.as_str()) {
-                    Some(p) if !p.is_empty() => p,
-                    _ => return Err("Error: 'path' is required for 'add' action".to_string()),
-                };
-
-                let expanded = crate::core::home_path::expand(path);
-
-                // Validate path exists and is a git repo
-                if !std::path::Path::new(&expanded).exists() {
-                    return Err(format!(
-                        "Error: path does not exist: {}",
-                        crate::core::home_path::abbreviate_str(&expanded)
-                    ));
-                }
-
-                let git_check = tokio::process::Command::new("git")
-                    .args(["rev-parse", "--git-dir"])
-                    .current_dir(&expanded)
-                    .output()
-                    .await;
-                match git_check {
-                    Ok(o) if !o.status.success() => {
-                        return Err(format!(
-                            "Error: not a git repository: {}",
-                            crate::core::home_path::abbreviate_str(&expanded)
-                        ));
-                    }
-                    Err(e) => return Err(format!("Error: failed to check git repo: {}", e)),
-                    _ => {}
-                }
-
-                let desc = args.get("description").and_then(|v| v.as_str());
-                // Deterministic identity from the repo's root-commit SHA (read
-                // from disk); None (no commits) → path-derived id inside `add`.
-                let root_commit_sha =
-                    crate::engine::git_ops::root_commit_sha(std::path::Path::new(&expanded)).await;
-                match crate::core::repositories::RepositoryStore::add(
-                    &self.pool,
-                    name,
-                    &expanded,
-                    desc,
-                    root_commit_sha.as_deref(),
-                )
-                .await
-                {
-                    Ok(repo) => Ok(format!(
-                        "Repository '{}' registered at `{}`",
-                        repo.name, repo.path
-                    )),
-                    Err(e) => Err(format!("Error: failed to add repository: {}", e)),
-                }
-            }
-            "remove" => {
-                let name = match args.get("name").and_then(|v| v.as_str()) {
-                    Some(n) if !n.is_empty() => n,
-                    _ => return Err("Error: 'name' is required for 'remove' action".to_string()),
-                };
-
-                match crate::core::repositories::RepositoryStore::get_by_name(&self.pool, name).await {
-                    Ok(Some(repo)) => {
-                        match crate::core::repositories::RepositoryStore::remove(
-                            &self.pool, repo.id,
-                        ).await {
-                            Ok(true) => Ok(format!("Repository '{}' removed", name)),
-                            Ok(false) => Err(format!(
-                                "Error: repository '{}' not found at remove time",
-                                name
-                            )),
-                            Err(e) => Err(format!("Error: failed to remove repository: {}", e)),
-                        }
-                    }
-                    Ok(None) => Err(format!(
-                        "Error: no repository found with name '{}'. Use action 'list' to see registered repos.",
-                        name
-                    )),
-                    Err(e) => Err(format!("Error: failed to look up repository: {}", e)),
-                }
-            }
-            other => Err(format!(
-                "Error: unknown action '{}'. Use 'add', 'list', or 'remove'.",
-                other
-            )),
-        }
+    /// Thin wrapper over [`repositories::manage_repositories_impl`], which owns
+    /// the add/list/remove branches plus their `Repository{Added,Removed}`
+    /// emits. Same split as `execute_dismiss_from_context`: the free function
+    /// takes the pool + bus so tests can drive it without booting the engine.
+    async fn execute_manage_repositories(
+        &self,
+        args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        repositories::manage_repositories_impl(&self.pool, &self.event_bus, args, thread_id).await
     }
 
     async fn execute_query_events(&self, args: &serde_json::Value) -> ToolOutcome {
@@ -824,22 +739,12 @@ impl LucidosEngine {
         thread_id: uuid::Uuid,
     ) -> ToolOutcome {
         let change_id = parse_apply_change_id(args)?;
-        // The agent in THIS thread drove the apply. `ThreadLink { mode: Agent }`
-        // is the in-process analog of the CLI's `Api { mode: Agent,
-        // source_thread_id }`: it stamps an Agent attribution on the
-        // `ChangeApplied` event (emitted on the *proposing* thread's timeline)
-        // that deep-links back to the thread whose agent applied it — so the
-        // route popover never mislabels an agent apply as "You". `direction:
-        // Parent` because the dominant flow is a chat thread applying the change
-        // of a coding-agent thread it spawned (the proposing thread is the
-        // child; this thread is its parent).
-        let actor = crate::engine::thread_events::MessageOrigin::ThreadLink {
-            thread_id,
-            title: None,
-            spawning_event_id: None,
-            mode: crate::engine::thread_events::ActorMode::Agent,
-            direction: crate::engine::thread_events::ThreadDirection::Parent,
-        };
+        // The agent in THIS thread drove the apply, so the `ChangeApplied`
+        // event (emitted on the *proposing* thread's timeline) deep-links back
+        // here. `direction: Parent` fits the dominant flow: a chat thread
+        // applying the change of a coding-agent thread it spawned (the
+        // proposing thread is the child; this thread is its parent).
+        let actor = agent_tool_actor(thread_id);
         // `apply_change` takes `&Arc<Self>`; the tool handler only has `&self`.
         let engine = self.clone_arc();
         match engine.apply_change(change_id, Some(actor)).await {
@@ -878,13 +783,7 @@ impl LucidosEngine {
     ) -> ToolOutcome {
         let previous = self.thread_queue.policy().await;
         let policy = merge_thread_queue_policy_patch(previous.clone(), args)?;
-        let actor = crate::engine::thread_events::MessageOrigin::ThreadLink {
-            thread_id,
-            title: None,
-            spawning_event_id: None,
-            mode: crate::engine::thread_events::ActorMode::Agent,
-            direction: crate::engine::thread_events::ThreadDirection::Parent,
-        };
+        let actor = agent_tool_actor(thread_id);
         let engine = self.clone_arc();
         engine
             .thread_queue

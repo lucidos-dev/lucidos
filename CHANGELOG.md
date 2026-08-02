@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.19.0 — 2026-08-02
+
+### Added
+
+- **Run once.** Fire an existing trigger immediately, off-schedule, from the trigger row or the triggers tool. Not available for paused or event-only triggers.
+- **External link target on iOS.** Choose where external links open: Safari, ask each time, or the in-app web view. Set it under Settings > Links.
+
+### Changed
+
+- Mobile Access reads Tailscale state from the machine itself and needs no Tailscale CLI. A CLI is required only for the Sign in and Share actions.
+- The Mobile Access page is reachable from a phone, and Get Tailscale opens the App Store or Play Store for the device reading it.
+- A coding agent is told what happened to its work between turns: applies, discards, reverts, failed applies and worktree reclamation.
+- Every write to credentials, repositories, env vars, models, devices, pinned apps, MCP servers, OAuth accounts, preferences and notifications emits its event.
+- A trigger-failure notification links to the trigger.
+- The trigger-block message names the blocked command, and a blocked command containing a code fence renders as code.
+- Four off-scale font sizes are back on the type scale, and the composer's type scale applies only to the composer.
+
+### Fixed
+
+- Mobile Access publishes a tailnet URL only once something answers on it, and the tailnet HTTP row follows the gateway's network bind rather than tailnet membership, so the page never shows a dead address or the same address twice.
+- The Get Tailscale button works outside the desktop app.
+- A coding agent parked on an unanswered question survives an engine restart, instead of leaving the thread reading "Working" with a struck-through question card.
+- The SDK warms its link-target cache without a theming flash.
+- The RC front-door version check retries past Cloudflare POP lag.
 ## v0.18.5 — 2026-07-31
 
 ### Changed

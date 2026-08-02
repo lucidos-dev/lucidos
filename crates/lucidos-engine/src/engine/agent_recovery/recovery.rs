@@ -1079,8 +1079,9 @@ impl LucidosEngine {
     }
 }
 
-/// True when the thread's most recent `UserQuestionAsked` has no later answer or
-/// terminal — i.e. it's parked waiting for the user. Such a thread is a stable,
+/// True when the thread's most recent `UserQuestionAsked` has no later answer,
+/// terminal, or agent progression: it is parked waiting for the user, and the
+/// card on screen is still live. Such a thread is a stable,
 /// resumable checkpoint: recovery must preserve it (no abort, no idle) across a
 /// restart so the card stays answerable; answering resumes via the existing
 /// no-live-subprocess `ContinuationRequested` → `--resume` path
@@ -1109,6 +1110,61 @@ pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_i
         .unwrap_or(false)
 }
 
+/// True when an engine teardown must leave this thread exactly as it is because
+/// its session is parked on an unanswered `AskUserQuestion`. Thin wrapper over
+/// [`thread_has_unanswered_question`] so the two teardown sites cannot diverge
+/// on either half of the decision (the cause gate and the predicate), and so the
+/// skip is always logged.
+///
+/// A parked session is a stable checkpoint, not an interrupted turn: the card
+/// must stay answerable across the restart, and answering resumes it via
+/// `ContinuationRequested` then `--resume`. That requires the
+/// `UserQuestionAsked` to still be the thread's newest event when the next
+/// engine boots. Two teardown sites can break that, and both consult this:
+///
+/// * `shutdown_agent_sessions` would send the graceful `interrupt` (Claude
+///   Code's Esc), which cancels the pending `AskUserQuestion` and makes CC
+///   record a rejection the user never made as a `CodingAgentToolResult`.
+/// * the stop / chat-cancel arms of `run_session` would emit a terminal AND
+///   flush any buffered agent text (`kill_cc_and_flush` runs BEFORE the
+///   `external_terminal_emitted` dedup check, and that flag only covers sessions
+///   `abort_in_flight_for_restart` actually walked, not one inserted after that
+///   pass by a slow `--resume` racing the restart).
+///
+/// Every one of those events is park-ending, so any of them kills the card and
+/// strands the turn with no terminator: the 2026-08-01 "Working forever" report
+/// (`docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`).
+/// Callers still cancel the agent runtime, so the subprocess cannot outlive the
+/// engine.
+///
+/// Gated on `is_shutdown`, so outside a teardown this never fires: a user Stop /
+/// Apply / Discard / Archive with a question on screen is untouched, because
+/// those are deliberate user actions that DO end the turn and they cancel-stamp
+/// the card themselves. The gate is a *window*, not an actor test, and the
+/// `emit_stop_terminal` call site widens it to `is_shutdown ||
+/// engine.is_shutting_down()` to cover a session inserted after
+/// `shutdown_agent_sessions` took its flag pass. So a raw Stop that lands inside
+/// the teardown window IS swallowed too. That is deliberate: the engine is on
+/// its way out either way, and preserving the card costs the user nothing that
+/// the restart was not about to take anyway.
+pub(crate) async fn preserve_question_park_at_shutdown(
+    pool: &sqlx::PgPool,
+    site: &'static str,
+    thread_id: Uuid,
+    is_shutdown: bool,
+) -> bool {
+    if !is_shutdown || !thread_has_unanswered_question(pool, thread_id).await {
+        return false;
+    }
+    log!(
+        "[Shutdown] {}: preserving session {}, parked on an unanswered question \
+         (no interrupt, no terminal, no text flush)",
+        site,
+        thread_id
+    );
+    true
+}
+
 /// Canonical "thread is parked on an unanswered `AskUserQuestion`" predicate, as
 /// a correlated SQL `EXISTS(...)` body. `id_expr` is a SQL expression yielding
 /// the thread's `aggregate_id` (text): `"$1"` for the single-thread bool check
@@ -1125,6 +1181,17 @@ pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_i
 /// after the `UserQuestionAsked` flips it to false, so a path that wrongly
 /// emitted one would defeat every OTHER path's guard on the next boot — which is
 /// exactly why all of them must consult this one fragment.
+///
+/// "Parked" means the question is still the last thing that happened on the
+/// thread: no answer, no terminal, AND no agent progression. The progression
+/// half comes from [`ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`], the same
+/// constant the frontend mirrors to strike the card through, so "the card is
+/// dead" and "the thread is no longer preserved" cannot disagree. Before
+/// 2026-08-01 this list was terminals-only, and a `CodingAgentToolResult` from
+/// an Esc'd `AskUserQuestion` left a thread reported as preserved while its card
+/// was already unanswerable and its turn had no terminator, so recovery skipped
+/// it and it read "Working" forever (see
+/// `docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`).
 pub(crate) fn unanswered_question_exists_sql(id_expr: &str) -> String {
     format!(
         "EXISTS ( \
@@ -1133,14 +1200,37 @@ pub(crate) fn unanswered_question_exists_sql(id_expr: &str) -> String {
               AND NOT EXISTS ( \
                   SELECT 1 FROM events later \
                   WHERE later.aggregate_id = {id} AND later.sequence > uqa.sequence \
-                    AND later.event_type IN ( \
-                        'UserQuestionAnswered', 'ResponseAborted', 'CodingAgentIdled', \
-                        'ResponseGenerated', 'SessionEnded') \
+                    AND later.event_type IN ({park_ending}) \
               ) \
          )",
-        id = id_expr
+        id = id_expr,
+        park_ending = &*PARK_ENDING_EVENT_TYPES_SQL,
     )
 }
+
+/// Park-ending events that are NOT in
+/// [`ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES`], and why each is absent
+/// there. `UserQuestionAnswered` is the overtaken check's own pairing key (it
+/// looks the answer up by `tool_use_id` rather than by type). `ResponseGenerated`
+/// and `SessionEnded` are omitted from the shared constant because
+/// `UserQuestionAsked` is CC-only on the production path and CC turns end with
+/// `CodingAgentIdled`; the preserve guard still has to treat them as park-ending,
+/// because either one means the turn that owned the question is over.
+const PARK_ENDING_EXTRA_EVENT_TYPES: &[&str] =
+    &["UserQuestionAnswered", "ResponseGenerated", "SessionEnded"];
+
+/// The park-ending event types as a SQL `IN (...)` body. Every name is a
+/// compile-time literal from the two lists above, so there is nothing to
+/// parameterize and nothing to escape. Built once: the predicate runs per
+/// candidate thread in both recovery sweeps, and the list never varies.
+static PARK_ENDING_EVENT_TYPES_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    crate::engine::thread_events::ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES
+        .iter()
+        .chain(PARK_ENDING_EXTRA_EVENT_TYPES.iter())
+        .map(|t| format!("'{t}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+});
 
 /// True when the newest `ResponseAborted` (after the thread's last start-or-resume)
 /// is an **engine-shutdown teardown carrying a device actor** — the fingerprint of a

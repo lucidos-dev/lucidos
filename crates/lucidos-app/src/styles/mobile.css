@@ -211,14 +211,24 @@
         padding-left: max(0.75rem, env(safe-area-inset-left, 0px));
     }
 
-    .prompt-box .prompt-textarea {
+    .prompt-row .prompt-textarea {
         /* Intentionally a LITERAL, not a --font-size-* token: this must compute
            to >=16px so focusing it doesn't trigger iOS Safari's input zoom, and
            the mobile root is 18px (var(--user-ui-scale, 112.5%) above). 0.9rem ×
            18px = 16.2px clears the threshold; the nearest token (--font-size-lg,
-           0.875rem = 15.75px here) would fall below it. Leave as 0.9rem. */
+           0.875rem = 15.75px here) would fall below it. Leave as 0.9rem.
+           Scoped to `.prompt-row`, the CHAT composer, rather than the shared
+           `.prompt-box` shell: the trigger form's Intent field is a .prompt-box
+           too, and there the bump only made one form field a step larger than
+           the ones beside it. */
         font-size: 0.9rem;
-        min-height: 2.25rem; /* Accommodate clear-button height in prompt row */
+    }
+
+    .prompt-box .prompt-textarea {
+        /* Sized for the composer's clear button; the Intent field shares the
+           floor so both .prompt-box surfaces keep one mobile box height. Only
+           the type scale above is composer-specific. */
+        min-height: 2.25rem;
         -webkit-user-select: text;
         user-select: text;
     }

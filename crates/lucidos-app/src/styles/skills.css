@@ -161,6 +161,11 @@
     background: var(--bg-tertiary);
     border-radius: 0.25rem;
     user-select: none;
+    /* Sets the size the name and the inline rename input inherit. Without it
+       they fell through to the root (18px on mobile, 16px on desktop), making a
+       group heading the largest text on the panel, above the trigger titles it
+       heads. The count and chevron keep their own smaller tokens. */
+    font-size: var(--font-size-md);
 }
 
 .trigger-group-section:first-child .trigger-group-header {
@@ -208,13 +213,20 @@
 }
 
 .trigger-group-name-input {
-    font-weight: 600;
     color: var(--text-primary);
     background: var(--bg-primary);
     border: 1px solid var(--accent);
     border-radius: 0.1875rem;
     padding: 0.125rem 0.25rem;
-    font: inherit;
+    /* Same text size and weight as the .trigger-group-name span it replaces (the
+       input's own border and padding still make the header a few px taller while
+       renaming). Spelled out rather than `font: inherit`, which the rule used to
+       carry: the shorthand was declared after font-weight and reset it back to
+       inherited, and it also picked up the raw root size in the create row,
+       which sets no size of its own. */
+    font-family: inherit;
+    font-size: var(--font-size-md);
+    font-weight: 600;
     min-width: 0;
     flex: 1;
 }

@@ -10,7 +10,6 @@ use uuid::Uuid;
 
 use super::AppState;
 use crate::core::repositories::{Repository, RepositoryStore};
-use crate::engine::event_bus::SystemEvent;
 
 pub async fn list_repositories(
     State(state): State<AppState>,
@@ -75,12 +74,18 @@ pub async fn add_repository(
     // back to a path-derived id inside `add`.
     let root_commit_sha = crate::engine::git_ops::root_commit_sha(path).await;
 
-    let repo = RepositoryStore::add(
+    // `register` emits `RepositoryAdded` itself, so this handler resolves the
+    // device actor up front instead of going through `emit_user_system`. The
+    // emit is not the caller's to make (see `RepositoryStore`'s type doc).
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let repo = RepositoryStore::register(
         &state.pool,
+        &state.engine.event_bus,
         &req.name,
         &expanded_path,
         req.description.as_deref(),
         root_commit_sha.as_deref(),
+        actor,
     )
     .await
     .map_err(|e| {
@@ -90,21 +95,6 @@ pub async fn add_repository(
         )
     })?;
 
-    state
-        .engine
-        .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
-            "[Repositories] RepositoryAdded",
-            |actor| SystemEvent::RepositoryAdded {
-                repo_id: repo.id.to_string(),
-                name: repo.name.clone(),
-                root_path: repo.path.clone(),
-                actor,
-            },
-        )
-        .await;
     Ok((StatusCode::CREATED, Json(repo)))
 }
 
@@ -113,23 +103,9 @@ pub async fn remove_repository(
     axum::extract::Path(id): axum::extract::Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, (StatusCode, String)> {
-    match RepositoryStore::remove(&state.pool, id).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Repositories] RepositoryRemoved",
-                    |actor| SystemEvent::RepositoryRemoved {
-                        repo_id: id.to_string(),
-                        actor,
-                    },
-                )
-                .await;
-            Ok(StatusCode::NO_CONTENT)
-        }
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match RepositoryStore::unregister(&state.pool, &state.engine.event_bus, id, actor).await {
+        Ok(true) => Ok(StatusCode::NO_CONTENT),
         Ok(false) => Err((StatusCode::NOT_FOUND, "Repository not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,

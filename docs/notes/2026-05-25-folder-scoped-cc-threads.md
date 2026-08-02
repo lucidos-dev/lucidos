@@ -1,6 +1,9 @@
 # Folder-scoped Claude Code threads
 
-**Status:** Design — not implemented. The user reads this and decides what to build.
+**Status:** Note. An architecture discussion written down, not a plan. Nothing
+here was scheduled or decided as written. **Partly superseded:** the narrowed
+version of this became `docs/plans/2026-05-27-app-coding-agent-threads-design.md`
+(worktrees for `data/apps/` only, not all of `data/`), which shipped.
 **Date:** 2026-05-25
 **Glossary terms used:** coding-agent thread, agent session, Claude Code session, worktree, repository, app, workspace, change, hardening, Apply.
 

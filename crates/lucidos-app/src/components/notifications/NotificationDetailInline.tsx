@@ -6,6 +6,7 @@ import {
   showToast,
 } from '../../store/store';
 import { openApp, openAppById } from '../../store/actions/apps';
+import { navigateToTrigger } from '../../store/actions/triggers';
 import { navigateAdjacentNotification } from '../../store/actions/notifications';
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
@@ -16,6 +17,7 @@ import { loadedOr } from '../../store/types';
 import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 import { resolveLinkedApp } from './resolveLinkedApp';
 import { navigateTapLabel } from './notificationTapLabel';
+import { notificationActions, notificationTriggerId } from './notificationActions';
 
 /** The notification detail rendered directly in the content pane (replacing the
  *  former modal). The content-pane header owns the title and the back/forward
@@ -45,16 +47,11 @@ export function NotificationDetailInline() {
   const content = linkifyPaths(renderMarkdown(detail.message), [], apps);
   const dateStr = formatNotificationDate(new Date(detail.created_at));
 
-  // A `navigate` tap (e.g. the "N changes ready to apply" trigger push → the
-  // Changes panel) is actionable from the OS-push tap and the in-app toast, but
-  // the inbox detail would otherwise ignore the tap entirely. Surface it as a
-  // button here too. Skip it when a dedicated button already covers the same
-  // destination (thread / app), so we never show two buttons that do the same.
-  const navTap = detail.tap?.kind === 'navigate' ? detail.tap.to : null;
-  const navDuplicatesDedicatedButton =
-    (navTap?.target === 'thread' && !!detail.thread_id) ||
-    (navTap?.target === 'app' && linked.kind === 'linked');
-  const showNavButton = !!navTap && !navDuplicatesDedicatedButton;
+  // Which buttons the actions row offers, including the dedup between a
+  // `navigate` tap and a dedicated button for the same destination. Pure and
+  // unit-tested in notificationActions.test.ts.
+  const actions = notificationActions(detail, linked.kind === 'linked');
+  const triggerId = notificationTriggerId(detail);
 
   function handleOpenApp() {
     if (linked.kind !== 'linked') return;
@@ -69,8 +66,16 @@ export function NotificationDetailInline() {
   }
 
   function handleNavigateTap() {
-    if (!navTap) return;
-    handleNavigationRequest(navTap);
+    if (!actions.navTap) return;
+    handleNavigationRequest(actions.navTap);
+  }
+
+  function handleOpenTrigger() {
+    if (!triggerId) return;
+    // navigateToTrigger re-fetches the trigger list on a cache miss before
+    // concluding the trigger is gone, and names this notification as the origin
+    // in that toast. Mirrors handleBodyClick's openAppById call.
+    void navigateToTrigger(triggerId, 'a notification');
   }
 
   function handleBodyClick(e: MouseEvent) {
@@ -126,21 +131,26 @@ export function NotificationDetailInline() {
         onClick={handleBodyClick}
         dangerouslySetInnerHTML={{ __html: content }}
       />
-      {(linked.kind === 'linked' || detail.thread_id || showNavButton) && (
+      {actions.any && (
         <div class="notification-detail-actions">
           {linked.kind === 'linked' && (
             <button class="action-btn" onClick={handleOpenApp}>
               Open {linked.app.name}
             </button>
           )}
-          {detail.thread_id && (
+          {actions.openThread && (
             <button class="action-btn" onClick={handleOpenThread}>
               Open thread
             </button>
           )}
-          {showNavButton && navTap && (
+          {actions.openTrigger && (
+            <button class="action-btn" onClick={handleOpenTrigger}>
+              Open trigger
+            </button>
+          )}
+          {actions.navTap && (
             <button class="action-btn" onClick={handleNavigateTap}>
-              {navigateTapLabel(navTap)}
+              {navigateTapLabel(actions.navTap)}
             </button>
           )}
         </div>

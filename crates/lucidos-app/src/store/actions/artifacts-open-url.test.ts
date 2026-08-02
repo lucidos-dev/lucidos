@@ -9,10 +9,12 @@ vi.mock('./navigation', () => ({ pushNavState }));
 const revealContentPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane }));
 
-const platformMocks = vi.hoisted(() => ({ isTauri: false }));
+const platformMocks = vi.hoisted(() => ({ isTauri: false, isIOSPwa: false }));
 vi.mock('../../utils/platform', () => ({
   isTauri: () => platformMocks.isTauri,
   isIOS: () => false,
+  // Read by openExternalUrl (the non-Tauri branch of openUrl).
+  isIOSPwa: () => platformMocks.isIOSPwa,
 }));
 
 // openExternal is the OS opener (system browser). setTitlebarColor is unused
@@ -32,6 +34,8 @@ const { openUrl } = await import('./artifacts');
 const windowOpen = vi.hoisted(() => vi.fn());
 
 const TARGET_URL = 'https://example.com/';
+const APP_URL = 'https://app.example.com/ws/dev/';
+let fakeLocation: { href: string };
 
 describe('openUrl — system browser vs in-app webview routing', () => {
   beforeEach(() => {
@@ -39,11 +43,14 @@ describe('openUrl — system browser vs in-app webview routing', () => {
     webviewInitialUrl.value = null;
     preferences.value = { status: 'loaded', data: {} };
     platformMocks.isTauri = false;
+    platformMocks.isIOSPwa = false;
     pushNavState.mockClear();
     revealContentPane.mockClear();
     openExternal.mockClear();
     windowOpen.mockClear();
+    fakeLocation = { href: APP_URL };
     vi.stubGlobal('open', windowOpen);
+    vi.stubGlobal('location', fakeLocation);
   });
 
   afterEach(() => {
@@ -55,6 +62,19 @@ describe('openUrl — system browser vs in-app webview routing', () => {
     openUrl(TARGET_URL);
 
     expect(window.open).toHaveBeenCalledWith(TARGET_URL, '_blank', 'noopener');
+    expect(openExternal).not.toHaveBeenCalled();
+    expect(panelOverlay.value).toBeNull();
+    expect(window.location.href).toBe(APP_URL);
+  });
+
+  it('installed iOS PWA: hands the URL to Safari, never the inescapable in-app web view', () => {
+    platformMocks.isTauri = false;
+    platformMocks.isIOSPwa = true;
+
+    openUrl(TARGET_URL);
+
+    expect(window.location.href).toBe(`x-safari-${TARGET_URL}`);
+    expect(window.open).not.toHaveBeenCalled();
     expect(openExternal).not.toHaveBeenCalled();
     expect(panelOverlay.value).toBeNull();
   });
@@ -69,6 +89,7 @@ describe('openUrl — system browser vs in-app webview routing', () => {
     expect(panelOverlay.value).toBeNull();
     expect(window.open).not.toHaveBeenCalled();
     expect(pushNavState).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(APP_URL);
   });
 
   it('Tauri + toggle on: opens the in-app webview panel, never the system browser', () => {
@@ -82,5 +103,6 @@ describe('openUrl — system browser vs in-app webview routing', () => {
     expect(revealContentPane).toHaveBeenCalledTimes(1);
     expect(pushNavState).toHaveBeenCalledTimes(1);
     expect(openExternal).not.toHaveBeenCalled();
+    expect(window.location.href).toBe(APP_URL);
   });
 });

@@ -459,9 +459,10 @@ describe('processSSEForReferences', () => {
     });
   });
 
-  describe('OAuthAccountDeleted', () => {
+  describe('OAuthAccount* events', () => {
     it('does not reload when oauthAccounts cache is not-loaded', () => {
       oauthAccounts.value = { status: 'not-loaded' };
+      processSSEForReferences('OAuthAccountConnected', { account_id: 'acc-1', provider: 'google' });
       processSSEForReferences('OAuthAccountDeleted', { account_id: 'acc-1' });
       expect(loadOAuthAccounts).not.toHaveBeenCalled();
     });
@@ -469,6 +470,15 @@ describe('processSSEForReferences', () => {
     it('reloads when oauthAccounts cache is loaded', () => {
       oauthAccounts.value = { status: 'loaded', data: [] };
       processSSEForReferences('OAuthAccountDeleted', { account_id: 'acc-1' });
+      expect(loadOAuthAccounts).toHaveBeenCalled();
+    });
+
+    // The connect half is the one that was missing: the engine wrote the
+    // account row straight from the OAuth callback and emitted nothing, so
+    // every device except the one running the flow sat on a stale list.
+    it('reloads on connect, not only on disconnect', () => {
+      oauthAccounts.value = { status: 'loaded', data: [] };
+      processSSEForReferences('OAuthAccountConnected', { account_id: 'acc-1', provider: 'google' });
       expect(loadOAuthAccounts).toHaveBeenCalled();
     });
   });

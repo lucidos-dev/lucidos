@@ -48,8 +48,12 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set(&self.pool, BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER, "1")
-            .await?;
+        crate::core::PreferenceStore::set_silent(
+            &self.pool,
+            BACKFILL_TRIGGER_ID_FROM_EVENTS_MARKER,
+            "1",
+        )
+        .await?;
         Ok(updated)
     }
 
@@ -108,7 +112,8 @@ impl EventStore {
             .rows_affected() as usize
         };
 
-        crate::core::PreferenceStore::set(&self.pool, BACKFILL_TRIGGER_ID_V5_MARKER, "1").await?;
+        crate::core::PreferenceStore::set_silent(&self.pool, BACKFILL_TRIGGER_ID_V5_MARKER, "1")
+            .await?;
         Ok(updated)
     }
 
@@ -164,8 +169,12 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set(&self.pool, BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER, "1")
-            .await?;
+        crate::core::PreferenceStore::set_silent(
+            &self.pool,
+            BACKFILL_REPO_NAMES_FROM_CHANGES_MARKER,
+            "1",
+        )
+        .await?;
         Ok(inserted)
     }
 
@@ -225,7 +234,7 @@ impl EventStore {
         .await?
         .rows_affected() as usize;
 
-        crate::core::PreferenceStore::set(
+        crate::core::PreferenceStore::set_silent(
             &self.pool,
             BACKFILL_CC_REPO_ID_DETERMINISTIC_MARKER,
             "1",

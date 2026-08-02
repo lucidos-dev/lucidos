@@ -375,9 +375,17 @@ export function sortEventsChronologically(
  *  exchange (without a matching `UserQuestionAnswered`) means the agent has
  *  raced past the question and the QuestionCard's buttons should disable.
  *  Mirrors the Rust `ThreadEvent::QUESTION_OVERTAKEN_EVENT_TYPES` constant
- *  (see `crates/lucidos-engine/src/engine/thread_events.rs`). Keep both lists
- *  in sync — the engine constant gates the typed-text routing (Layer 1)
- *  and this set gates the click-button affordance (Layer 2). */
+ *  (see `crates/lucidos-engine/src/engine/thread_events/event_impl.rs`).
+ *
+ *  Keep both lists in sync. One question, four gates now hang off them:
+ *  server-side, the engine constant gates typed-text routing (a follow-up
+ *  becomes a fresh message instead of a `FreeText` answer) and, unioned with
+ *  three extras, the restart preserve guard (`unanswered_question_exists_sql`);
+ *  client-side, this set gates the click-button affordance AND whether
+ *  `exchangeStatus` may still read "Needs your answer" (via the
+ *  `questionOvertaken` flag it sets below). They must agree: a card whose
+ *  buttons are dead must not be labelled answerable, and a thread whose card is
+ *  dead must not be preserved as a resumable checkpoint. */
 const QUESTION_OVERTAKEN_STEP_TYPES: ReadonlySet<string> = new Set([
   // Terminal (both agents)
   'ResponseAborted',

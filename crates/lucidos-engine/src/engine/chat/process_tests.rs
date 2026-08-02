@@ -929,7 +929,7 @@ fn chat_prompt_forbids_faking_repeated_actions() {
 use super::run::message_can_answer_pending_question;
 use super::run::resolve_route_overrides;
 use super::PreEmittedOrigin;
-use crate::core::{PreferenceStore, PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT};
+use crate::core::{PREF_CHAT_MODEL, PREF_CHAT_REASONING_EFFORT};
 use crate::engine::thread_events::ActorMode;
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
@@ -941,10 +941,10 @@ use uuid::Uuid;
 #[tokio::test]
 async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
     let (pool, db_name) = setup_test_db().await;
-    PreferenceStore::set(&pool, PREF_CHAT_MODEL, "gemini-3.5-flash")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "gemini-3.5-flash")
         .await
         .unwrap();
-    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "max")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "max")
         .await
         .unwrap();
 
@@ -967,7 +967,7 @@ async fn coding_agent_route_does_not_inherit_chat_model_or_effort_defaults() {
 #[tokio::test]
 async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
     let (pool, db_name) = setup_test_db().await;
-    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
         .await
         .unwrap();
 
@@ -983,10 +983,10 @@ async fn coding_agent_route_preserves_explicit_agent_effort_pick() {
 #[tokio::test]
 async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
     let (pool, db_name) = setup_test_db().await;
-    PreferenceStore::set(&pool, PREF_CHAT_MODEL, "claude-opus-4-8[1m]")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-4-8[1m]")
         .await
         .unwrap();
-    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
         .await
         .unwrap();
 
@@ -1004,10 +1004,10 @@ async fn chat_route_still_inherits_chat_model_and_effort_defaults() {
 #[tokio::test]
 async fn chat_route_reuses_thread_last_model_over_preference() {
     let (pool, db_name) = setup_test_db().await;
-    PreferenceStore::set(&pool, PREF_CHAT_MODEL, "account-model")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
         .await
         .unwrap();
-    PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
         .await
         .unwrap();
     let tid = uuid::Uuid::new_v4();

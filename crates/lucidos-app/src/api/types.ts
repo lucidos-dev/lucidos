@@ -188,6 +188,19 @@ export interface TriggersListResponse {
   triggers: import('../store/types').TriggerInfo[];
 }
 
+/** Response from an *off-schedule run* (`POST /api/v1/triggers/run`).
+ *
+ *  `success: true` with `status: 'already-running'` means the request was valid
+ *  and NOTHING new started: a fire of this trigger was already active or
+ *  queued, and cron fires coalesce to at most one pending run per trigger. It
+ *  must never be presented as a started run. `success: false` means refused
+ *  (paused trigger, or event-only), with the reason in `message`. */
+export interface TriggerRunResult {
+  success: boolean;
+  status?: 'started' | 'queued' | 'already-running';
+  message: string;
+}
+
 export interface DeviceInfo {
   id: string;
   name: string | null;

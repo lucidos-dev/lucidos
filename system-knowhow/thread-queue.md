@@ -99,6 +99,14 @@ above govern them); they are never coalesced. This is what stops a restart storm
 (each boot re-queuing the in-flight fire + re-firing the missed occurrence) from
 stacking dozens of identical cron fires.
 
+An **off-schedule run** (`triggers(action="run")`, the trigger row's *Run once*
+button) is a third submitter of the same cron kind, so it coalesces by the same
+rule. That is fine for the scheduler, which wants the redundant fire dropped,
+but wrong to report to a person who just asked for a run, so `SubmitOutcome`
+carries a `coalesced` flag and the run action answers "already running, nothing
+started" instead of claiming it began one. The two scheduler submit sites ignore
+the flag.
+
 Concurrency caps of **0 mean "hold"** — admission pauses and the queue
 accumulates (e.g. `max_concurrent_total: 0` freezes all work — including new
 user responses). `max_queued_per_trigger` must be ≥ 1.

@@ -139,6 +139,12 @@ pub struct Operation {
     /// handler — no logic rewrite; (2) the legacy name keeps resolving to this
     /// domain via [`domain_for_tool`] so cached prompts/threads still work.
     /// `None` for brand-new operations with no predecessor.
+    ///
+    /// It doubles as the **handler key** in a domain that dispatches by flat
+    /// name (`triggers`, `trigger_groups`, `preferences` route every action
+    /// through [`Domain::legacy_tool_for_action`]). A new operation in one of
+    /// those domains therefore needs a name here even with no predecessor to
+    /// supersede, or `grouped_legacy_name` rejects it as an unknown action.
     pub llm_alias: Option<&'static str>,
     /// Raw JSON *properties object* this operation contributes to the grouped
     /// LLM tool schema, used verbatim when the LLM-facing shape diverges from
@@ -654,15 +660,35 @@ const TRIGGERS_OPS: &[Operation] = &[
         cli: Some(false),
         sdk: Some(false),
     },
+    Operation {
+        action: "run",
+        summary: "Fire an existing trigger ONCE, right now, off-schedule ('run it now', 'fire it manually', an ad hoc run). The real thing: it records TriggerExecuted / last_run and runs under the trigger's own identity, side-effect grant and go_to_review, so never imitate it by copying run.intent into run_thread. Returns as soon as the run starts. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).",
+        method: Method::Post,
+        path: "/triggers/run",
+        args: &[TRIGGER_ID_QUERY_ARG],
+        cli_name: "run",
+        sdk_name: "run",
+        mutating: true,
+        // Not a retired flat tool: `run` is new, and the name is the handler key
+        // the `triggers` domain dispatches on (see `grouped_legacy_name`).
+        llm_alias: Some("run_trigger"),
+        llm_schema: Some(
+            r#"{"trigger_id":{"type":"string","description":"UUID of the trigger to run now, off-schedule."}}"#,
+        ),
+        llm: None,
+        cli: None,
+        sdk: None,
+    },
 ];
 
 const TRIGGERS_DOMAIN: Domain = Domain {
     name: "triggers",
     tool_name: "triggers",
-    tool_summary: "Create and manage triggers — scheduled (cron) and/or event-driven \
+    tool_summary: "Create and manage triggers: scheduled (cron) and/or event-driven \
         automations. 'create' a new trigger, 'list' existing ones, 'update' a trigger \
-        in place (prefer over delete+create — keeps run history), 'delete', and \
-        'pause'/'resume'. Cron times are in the user's local timezone (set it first). \
+        in place (prefer over delete+create, which keeps run history), 'delete', and \
+        'pause'/'resume'. Use 'run' to fire an existing trigger once, right now, \
+        off-schedule. Cron times are in the user's local timezone (set it first). \
         To organize triggers into panel folders, use the trigger_groups tool.",
     llm: true,
     cli: true,
@@ -2447,7 +2473,7 @@ mod tests {
         let triggers = domains().iter().find(|d| d.name == "triggers").unwrap();
         assert_eq!(
             triggers.actions(),
-            vec!["create", "list", "update", "delete", "pause", "resume"]
+            vec!["create", "list", "update", "delete", "pause", "resume", "run"]
         );
         // pause/resume are LLM-only (no dedicated HTTP route).
         let pause = triggers
@@ -2456,6 +2482,17 @@ mod tests {
             .find(|o| o.action == "pause")
             .unwrap();
         assert!(pause.on_llm(triggers) && !pause.on_cli(triggers) && !pause.on_sdk(triggers));
+        // `run` DOES have its own route (POST /triggers/run), so unlike
+        // pause/resume it is on every surface. A regression that drops it from
+        // the CLI or SDK re-splits the parity the manifest exists to hold.
+        let run = triggers
+            .operations
+            .iter()
+            .find(|o| o.action == "run")
+            .unwrap();
+        assert!(run.on_llm(triggers) && run.on_cli(triggers) && run.on_sdk(triggers));
+        assert_eq!(run.path, "/triggers/run");
+        assert!(run.mutating);
 
         let groups = domains()
             .iter()

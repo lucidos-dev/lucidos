@@ -21,7 +21,8 @@ use crate::core::plugins::{
 };
 use crate::core::DATA_DIR;
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
-use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
+use crate::engine::thread_events::MessageOrigin;
+use crate::engine::tools::agent_tool_actor;
 use crate::engine::LucidosEngine;
 
 mod registry;
@@ -277,16 +278,6 @@ impl LucidosEngine {
 }
 
 type PendingInstallsMap = std::sync::Mutex<std::collections::HashMap<String, PendingInstall>>;
-
-fn agent_tool_actor(thread_id: uuid::Uuid) -> MessageOrigin {
-    MessageOrigin::ThreadLink {
-        thread_id,
-        title: None,
-        spawning_event_id: None,
-        mode: ActorMode::Agent,
-        direction: ThreadDirection::Parent,
-    }
-}
 
 pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &str) -> String {
     let workspace = engine.workspace_path.clone();
@@ -1279,7 +1270,7 @@ pub(crate) async fn install_from_unpacked_with_bus(
     // Plugins may only ship event-driven (`on:`) triggers — reject a shipped
     // `trigger.toml` with a cron `schedule` BEFORE any file is written (clean
     // failure, nothing copied). Cron is workspace state, not plugin content
-    // (ADR 0019, building-a-plugin.md "What doesn't belong in a plugin").
+    // (ADR 0019, plugins.md "What doesn't belong in a plugin").
     validate_plugin_triggers_event_driven(&planned)?;
 
     let conflicts = detect_conflicts(&planned, &data_dir);

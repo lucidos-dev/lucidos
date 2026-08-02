@@ -1,12 +1,25 @@
 use serde::Serialize;
 use sqlx::PgPool;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
 pub struct PinnedAppUi {
     pub app_id: String,
     pub ui_id: String,
 }
 
+/// Per-device pinned app UIs.
+///
+/// **No caller can skip the event.** [`Self::pin`] and [`Self::unpin`] are the
+/// only reachable single-row mutators, and they emit
+/// `PinnedApp{Pinned,Unpinned}` themselves. Pins are device-scoped, so the
+/// event is what lets a second tab on the SAME device (and the agent's own
+/// pin/unpin tool) reflect the change instead of sitting stale.
+///
+/// [`Self::delete_for_device`] is the one deliberate exception: see its doc.
+/// Same shape as `RepositoryStore`; see `core::announced_surfaces`.
 pub struct PinnedAppStore;
 
 impl PinnedAppStore {
@@ -45,12 +58,9 @@ impl PinnedAppStore {
         Ok(rows)
     }
 
-    /// Pin an app UI for a device (idempotent — ignores if already pinned).
-    /// Returns `true` if a new row was inserted, `false` if the
-    /// `(app_id, ui_id, device_id)` triple already existed. Callers gate
-    /// `PinnedAppPinned` audit emits on the bool so duplicate clicks don't
-    /// flood the events table.
-    pub async fn pin(
+    /// Insert a pin row (idempotent). **Private on purpose**: [`Self::pin`] is
+    /// the reachable mutator, and it emits.
+    async fn insert_row(
         pool: &PgPool,
         app_id: &str,
         ui_id: &str,
@@ -69,8 +79,9 @@ impl PinnedAppStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Unpin an app UI for a device
-    pub async fn unpin(
+    /// Delete a pin row. **Private on purpose**: [`Self::unpin`] is the
+    /// reachable mutator, and it emits.
+    async fn delete_row(
         pool: &PgPool,
         app_id: &str,
         ui_id: &str,
@@ -87,7 +98,64 @@ impl PinnedAppStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Delete all pinned app UIs for a device (used when deleting a device)
+    /// Pin an app UI for a device and announce it. Idempotent: a duplicate
+    /// click inserts nothing and therefore announces nothing, so repeated taps
+    /// cannot flood the events table.
+    pub async fn pin(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        app_id: &str,
+        ui_id: &str,
+        device_id: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let pinned = Self::insert_row(pool, app_id, ui_id, device_id).await?;
+        if pinned {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::PinnedAppPinned {
+                        app_id: app_id.to_string(),
+                        device_id: device_id.to_string(),
+                        actor,
+                    }),
+                    "[PinnedApps] PinnedAppPinned",
+                )
+                .await;
+        }
+        Ok(pinned)
+    }
+
+    /// Unpin an app UI for a device and announce it. Announces only when a row
+    /// was actually removed.
+    pub async fn unpin(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        app_id: &str,
+        ui_id: &str,
+        device_id: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+        let unpinned = Self::delete_row(pool, app_id, ui_id, device_id).await?;
+        if unpinned {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::PinnedAppUnpinned {
+                        app_id: app_id.to_string(),
+                        device_id: device_id.to_string(),
+                        actor,
+                    }),
+                    "[PinnedApps] PinnedAppUnpinned",
+                )
+                .await;
+        }
+        Ok(unpinned)
+    }
+
+    /// Delete every pin for a device, silently. Called only from
+    /// `DeviceStore::delete`, whose `DeviceDeleted` is the announcement: the
+    /// device is gone, so an unpin event per app would describe changes to a
+    /// device no client still tracks. Registered as the one `pinned_apps`
+    /// exemption in `core::announced_surfaces`.
     pub async fn delete_for_device(
         pool: &PgPool,
         device_id: &str,

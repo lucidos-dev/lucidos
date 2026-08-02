@@ -189,8 +189,13 @@
     position: relative;
 }
 
+/* `.prompt-row` wraps the textarea in the CHAT composer only; the trigger form's
+   Intent field sits directly in `.prompt-box`. So this is where the composer's
+   own type scale belongs, rather than on the shared `.prompt-box` shell where it
+   used to sit and leak into the form. */
 .prompt-row .prompt-textarea {
     flex: 1;
+    font-size: var(--font-size-lg);
 }
 
 .prompt-clear {

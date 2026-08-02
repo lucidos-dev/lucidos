@@ -5,7 +5,7 @@ import { getPreferences, setPreference } from '../../api/client';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
 import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
-import { isIOS, isTauri } from '../../utils/platform';
+import { isIOS, isIOSPwa, isTauri } from '../../utils/platform';
 import { setTitlebarColor } from '../../utils/tauri';
 
 export type Theme = 'light' | 'dark' | 'system';
@@ -414,6 +414,47 @@ export function setInAppBrowser(enabled: boolean): Promise<void> {
  *  opener. */
 export function inAppBrowserAvailable(): boolean {
   return isTauri() && currentInAppBrowser();
+}
+
+// --- External link target (installed iOS PWA only) ---
+
+/** Where an external http(s) link goes when tapped in an INSTALLED iOS PWA.
+ *  Consulted only there: every other client (desktop web, Android, a normal
+ *  Safari tab, and all three Tauri branches) opens a new tab / the OS opener
+ *  regardless. See `utils/openExternalUrl.ts` for what each mode does and why
+ *  the platform forces the choice on us at all. */
+export type ExternalLinkTarget = 'safari' | 'ask' | 'in-app';
+
+const EXTERNAL_LINK_TARGETS: readonly ExternalLinkTarget[] = ['safari', 'ask', 'in-app'];
+
+export const DEFAULT_EXTERNAL_LINK_TARGET: ExternalLinkTarget = 'safari';
+
+/** Defaults to `'safari'` (the shipped behaviour) both when unset and while
+ *  preferences are still loading, so a link tapped during startup can't fall
+ *  into a different mode than the same link tapped a second later. An
+ *  unrecognized stored value degrades to the default rather than disabling the
+ *  hand-off. */
+export function currentExternalLinkTarget(): ExternalLinkTarget {
+  if (preferences.value.status !== 'loaded') return DEFAULT_EXTERNAL_LINK_TARGET;
+  const stored = preferences.value.data['external_link_target'];
+  return EXTERNAL_LINK_TARGETS.includes(stored as ExternalLinkTarget)
+    ? stored as ExternalLinkTarget
+    : DEFAULT_EXTERNAL_LINK_TARGET;
+}
+
+export function setExternalLinkTarget(target: ExternalLinkTarget): Promise<void> {
+  return savePreference('external_link_target', target);
+}
+
+/** Whether this client is one where the target actually decides anything, and
+ *  so the Settings row is worth showing. Only an installed iOS PWA is: every
+ *  other client opens a new tab (or the desktop OS opener) whatever the stored
+ *  value says. Rendering the row elsewhere would be a control that does nothing.
+ *
+ *  Deliberately NOT read by `openExternalUrl`, which re-checks `isIOSPwa()` on
+ *  its own, so the routing cannot come to depend on a Settings-facing helper. */
+export function externalLinkTargetConfigurable(): boolean {
+  return isIOSPwa();
 }
 
 // --- Mobile header sticky ---

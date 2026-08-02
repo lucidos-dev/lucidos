@@ -55,7 +55,7 @@ pub fn is_self_deleting_trigger(trigger_id: &str) -> bool {
 
 /// Emit a `NotificationCreated` for a trigger failure and send push to all devices.
 /// Failure notifications never deep-link to the trigger's owning app — see the
-/// "Deep-link discipline" guidance in `system-knowhow/building-a-trigger.md`.
+/// "Deep-link discipline" guidance in `system-knowhow/triggers.md`.
 async fn emit_failure_notification(
     engine: &SharedEngine,
     config: &TriggerConfig,

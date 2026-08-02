@@ -16,7 +16,7 @@
 use uuid::Uuid;
 
 use super::{LucidosEngine, ToolOutcome};
-use crate::engine::event_bus::{BusEvent, SystemEvent};
+
 use crate::llm::tool_names as tn;
 use crate::scheduler::NotificationStore;
 
@@ -119,7 +119,8 @@ impl LucidosEngine {
             }
         };
 
-        let marked = match NotificationStore::mark_read(&self.pool, id).await {
+        let marked = match NotificationStore::mark_read(&self.pool, &self.event_bus, id, None).await
+        {
             Ok(b) => b,
             Err(e) => return Err(format!("Error: failed to mark notification read: {}", e)),
         };
@@ -129,13 +130,6 @@ impl LucidosEngine {
                 id
             ));
         }
-        self.event_bus
-            .emit(BusEvent::System(SystemEvent::NotificationRead {
-                id: id.to_string(),
-                actor: None,
-            }))
-            .await
-            .map_err(|e| format!("Error: failed to emit NotificationRead: {}", e))?;
         Ok(format!(
             "[ACTION COMPLETED] Notification {} marked read.",
             id
@@ -143,7 +137,8 @@ impl LucidosEngine {
     }
 
     async fn notifications_mark_all_read(&self) -> ToolOutcome {
-        let count = match NotificationStore::mark_all_read(&self.pool).await {
+        let count = match NotificationStore::mark_all_read(&self.pool, &self.event_bus, None).await
+        {
             Ok(c) => c,
             Err(e) => {
                 return Err(format!(
@@ -155,12 +150,6 @@ impl LucidosEngine {
         if count == 0 {
             return Ok("No unread notifications to mark read.".to_string());
         }
-        self.event_bus
-            .emit(BusEvent::System(SystemEvent::NotificationsAllRead {
-                actor: None,
-            }))
-            .await
-            .map_err(|e| format!("Error: failed to emit NotificationsAllRead: {}", e))?;
         Ok(format!(
             "[ACTION COMPLETED] Marked {} notification(s) read; inbox is clear.",
             count

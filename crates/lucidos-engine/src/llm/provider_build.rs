@@ -564,7 +564,9 @@ fn build_local_provider(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{setup_test_db, teardown_test_db};
+    use crate::test_support::{
+        delete_credential, seed_credential, setup_test_db, teardown_test_db,
+    };
 
     /// Build a non-mock context with no Vertex and the boot-without-provider gate
     /// on — the packaged first-run shape. `model_is_mock: false` is the load-
@@ -641,17 +643,14 @@ mod tests {
         }
 
         // Add the first provider credential (anthropic — env-independent).
-        crate::core::CredentialStore::upsert(
+        seed_credential(
             &pool,
             "anthropic",
             "https://api.anthropic.com",
             crate::core::AuthType::ApiKey,
             "sk-ant-test",
-            None,
-            None,
         )
-        .await
-        .expect("upsert anthropic credential");
+        .await;
 
         // Rebuild → Real, configured, and NEVER mock (model_is_mock is false).
         let (provider, selection) =
@@ -680,9 +679,10 @@ mod tests {
         );
 
         // Remove it → back to Unconfigured (only meaningful with no ambient env).
-        crate::core::CredentialStore::delete(&pool, "anthropic")
-            .await
-            .expect("delete anthropic credential");
+        // Through the test helper, not the store directly: the store's delete
+        // needs an EventBus for its CredentialDeleted emit, and `llm/` must not
+        // name `crate::engine` (llm_does_not_depend_on_engine).
+        delete_credential(&pool, "anthropic").await;
         if !ambient {
             let (provider, selection) =
                 install(build_active_provider(Some(&pool), &ctx).await.unwrap());
@@ -758,17 +758,14 @@ mod tests {
             default_model: "z-ai/glm-5.2".to_string(),
             ..unconfigured_ctx(true)
         };
-        crate::core::CredentialStore::upsert(
+        seed_credential(
             &pool,
             "anthropic",
             "https://api.anthropic.com",
             crate::core::AuthType::ApiKey,
             "sk-ant-test",
-            None,
-            None,
         )
-        .await
-        .expect("upsert anthropic credential");
+        .await;
 
         let chain = installed_search(build_active_provider(Some(&pool), &ctx).await.unwrap());
         assert!(
@@ -871,17 +868,14 @@ mod tests {
             vertex_token_cache: Some(std::sync::Arc::new(std::sync::Mutex::new(None))),
             ..unconfigured_ctx(true)
         };
-        crate::core::CredentialStore::upsert(
+        seed_credential(
             &pool,
             "anthropic",
             "https://api.anthropic.com",
             crate::core::AuthType::ApiKey,
             "sk-ant-test",
-            None,
-            None,
         )
-        .await
-        .expect("upsert anthropic credential");
+        .await;
 
         let chain = installed_search(build_active_provider(Some(&pool), &ctx).await.unwrap());
         let ids = chain.backend_ids();
@@ -910,17 +904,14 @@ mod tests {
         }
         let (pool, db) = setup_test_db().await;
         let ctx = unconfigured_ctx(true);
-        crate::core::CredentialStore::upsert(
+        seed_credential(
             &pool,
             "local",
             DEFAULT_LOCAL_BASE_URL,
             crate::core::AuthType::ApiKey,
             "local-key",
-            None,
-            None,
         )
-        .await
-        .expect("upsert local credential");
+        .await;
 
         let chain = installed_search(build_active_provider(Some(&pool), &ctx).await.unwrap());
         assert!(

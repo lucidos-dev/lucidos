@@ -1,6 +1,7 @@
 use super::super::LucidosEngine;
 use crate::api::ChatImage;
 use crate::core::events::{walk_thread_images, HasEventPayload};
+use crate::core::WriteAnnouncement;
 use crate::llm::image::ImageSize;
 use base64::Engine as _;
 use std::path::Path;
@@ -212,11 +213,18 @@ impl LucidosEngine {
                 .into());
             }
             let raw_bytes = base64::engine::general_purpose::STANDARD.decode(&compressed.base64)?;
+            // The store announces the write. This tool used to call the raw
+            // writer and emit nothing at all, so a generated image appeared in no
+            // artifact list until a reload and was never indexed into memory.
             self.artifact_manager
                 .write_and_commit(
+                    &self.event_bus,
                     artifact_path,
                     &raw_bytes,
                     &format!("feat: generated image {}", artifact_path),
+                    WriteAnnouncement::Entity {
+                        source: Some("generate_image".to_string()),
+                    },
                 )
                 .await?;
             crate::log!("[Image] Saved to artifact: {}", artifact_path);
@@ -264,9 +272,13 @@ impl LucidosEngine {
 
         self.artifact_manager
             .write_and_commit(
+                &self.event_bus,
                 artifact_path,
                 &raw_bytes,
                 &format!("feat: save thread image to {}", artifact_path),
+                WriteAnnouncement::Entity {
+                    source: Some("save_thread_image".to_string()),
+                },
             )
             .await?;
 

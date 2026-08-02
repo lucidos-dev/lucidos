@@ -63,6 +63,16 @@ const _isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent) ||
   (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 export function isIOS(): boolean { return _isIOS; }
 
+/** Check if running on Android (cached, never changes in a session).
+ *
+ *  Sits beside {@link isIOS} and is used the same way: to send someone to the
+ *  store for the device they are actually holding. Deliberately does NOT try to
+ *  exclude Android tablets or ChromeOS, since the Play Store serves those too.
+ *  Matched on the UA rather than `navigator.platform`, which Android reports
+ *  inconsistently and which is deprecated. */
+const _isAndroid = /Android/.test(navigator.userAgent);
+export function isAndroid(): boolean { return _isAndroid; }
+
 /** Check if running as an installed PWA (standalone/fullscreen) — cached */
 // `navigator.standalone` is iOS Safari only and missing from the standard Navigator type.
 const _isStandalone = window.matchMedia('(display-mode: standalone)').matches ||

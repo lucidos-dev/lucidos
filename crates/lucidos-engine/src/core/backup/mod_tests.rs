@@ -1198,7 +1198,7 @@ fn workspace_archive_name_uses_final_component() {
 async fn get_retention_count_reads_preference() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
-    crate::core::PreferenceStore::set(&pool, PREF_BACKUP_RETENTION, "10")
+    crate::test_support::seed_preference(&pool, PREF_BACKUP_RETENTION, "10")
         .await
         .unwrap();
     assert_eq!(get_retention_count(&pool).await, 10);
@@ -1217,7 +1217,7 @@ async fn get_retention_count_falls_back_to_default() {
     assert_eq!(get_retention_count(&pool).await, DEFAULT_BACKUP_RETENTION);
 
     // Unparseable → default, not 0.
-    crate::core::PreferenceStore::set(&pool, PREF_BACKUP_RETENTION, "not-a-number")
+    crate::test_support::seed_preference(&pool, PREF_BACKUP_RETENTION, "not-a-number")
         .await
         .unwrap();
     assert_eq!(get_retention_count(&pool).await, DEFAULT_BACKUP_RETENTION);

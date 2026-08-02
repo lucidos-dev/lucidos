@@ -628,6 +628,42 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// An MCP server was registered, or an existing one re-registered with a
+    /// new command / args / env. The `mcp_servers` table drives which external
+    /// tools the agent can call, so a registration changes the agent's own tool
+    /// surface: it belongs on the timeline even though no UI lists it yet.
+    McpServerRegistered {
+        server_id: String,
+        name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// An MCP server's settings changed without re-registering it (today: the
+    /// auto-approve flag, which decides whether its tool calls prompt).
+    McpServerUpdated {
+        server_id: String,
+        auto_approve: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// An MCP server was unregistered and its tools left the agent's surface.
+    McpServerRemoved {
+        server_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// An OAuth account was connected (or re-authorized with new scopes). The
+    /// counterpart of `OAuthAccountDeleted`: without it the Accounts list only
+    /// refreshed live on a disconnect, and connecting from one device left
+    /// every other one showing a stale list until a reload.
+    OAuthAccountConnected {
+        account_id: String,
+        provider: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        email: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// An OAuth account row was removed (revoke / delete from settings).
     OAuthAccountDeleted {
         account_id: String,
@@ -911,6 +947,10 @@ impl SystemEvent {
                 | Self::ModelCreated { .. }
                 | Self::ModelUpdated { .. }
                 | Self::ModelDeleted { .. }
+                | Self::McpServerRegistered { .. }
+                | Self::McpServerUpdated { .. }
+                | Self::McpServerRemoved { .. }
+                | Self::OAuthAccountConnected { .. }
                 | Self::OAuthAccountDeleted { .. }
                 | Self::DataFileWritten { .. }
                 | Self::DataFileDeleted { .. }
@@ -1000,6 +1040,10 @@ impl SystemEvent {
             Self::ModelCreated { .. } => "ModelCreated",
             Self::ModelUpdated { .. } => "ModelUpdated",
             Self::ModelDeleted { .. } => "ModelDeleted",
+            Self::McpServerRegistered { .. } => "McpServerRegistered",
+            Self::McpServerUpdated { .. } => "McpServerUpdated",
+            Self::McpServerRemoved { .. } => "McpServerRemoved",
+            Self::OAuthAccountConnected { .. } => "OAuthAccountConnected",
             Self::OAuthAccountDeleted { .. } => "OAuthAccountDeleted",
             Self::DataFileWritten { .. } => "DataFileWritten",
             Self::DataFileDeleted { .. } => "DataFileDeleted",
@@ -1091,6 +1135,10 @@ impl SystemEvent {
         "ModelCreated",
         "ModelUpdated",
         "ModelDeleted",
+        "McpServerRegistered",
+        "McpServerUpdated",
+        "McpServerRemoved",
+        "OAuthAccountConnected",
         "OAuthAccountDeleted",
         "DataFileWritten",
         "DataFileDeleted",
@@ -1174,7 +1222,12 @@ impl SystemEvent {
             Self::ModelCreated { .. } | Self::ModelUpdated { .. } | Self::ModelDeleted { .. } => {
                 "model"
             }
-            Self::OAuthAccountDeleted { .. } => "oauth_account",
+            Self::McpServerRegistered { .. }
+            | Self::McpServerUpdated { .. }
+            | Self::McpServerRemoved { .. } => "mcp_server",
+            Self::OAuthAccountConnected { .. } | Self::OAuthAccountDeleted { .. } => {
+                "oauth_account"
+            }
             Self::DataFileWritten { .. }
             | Self::DataFileDeleted { .. }
             | Self::DataFileEdited { .. } => "data_file",
@@ -1277,7 +1330,11 @@ impl SystemEvent {
             Self::ModelCreated { id, .. }
             | Self::ModelUpdated { id, .. }
             | Self::ModelDeleted { id, .. } => id.clone(),
-            Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
+            Self::McpServerRegistered { server_id, .. }
+            | Self::McpServerUpdated { server_id, .. }
+            | Self::McpServerRemoved { server_id, .. } => server_id.clone(),
+            Self::OAuthAccountConnected { account_id, .. }
+            | Self::OAuthAccountDeleted { account_id, .. } => account_id.clone(),
             Self::DataFileWritten { path, .. }
             | Self::DataFileDeleted { path, .. }
             | Self::DataFileEdited { path, .. } => path.clone(),

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, enginePackaged } from '../../store/store';
+import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -113,6 +113,12 @@ const FONT_OPTIONS: Array<{ value: FontFamily; label: string }> = [
   { value: 'jetbrains-mono', label: 'JetBrains Mono' },
   { value: 'ibm-plex-mono', label: 'IBM Plex Mono' },
   { value: 'fira-code', label: 'Fira Code' },
+];
+
+const EXTERNAL_LINK_TARGET_OPTIONS: Array<{ value: ExternalLinkTarget; label: string }> = [
+  { value: 'safari', label: 'Safari' },
+  { value: 'ask', label: 'Ask (share sheet)' },
+  { value: 'in-app', label: 'In-app view' },
 ];
 
 const IMAGE_MODELS = [
@@ -949,6 +955,53 @@ export function SettingsView() {
     );
   }
 
+  /** Links: how Lucidos routes links. Its nav entry is gated on having
+   *  something to show (see the `navItems` filter), so it never opens onto an
+   *  empty panel. */
+  function linksSection() {
+    return <>{externalLinksSection()}</>;
+  }
+
+  /** Only rendered on an installed iOS PWA, the one client where the choice has
+   *  any effect. See `externalLinkTargetConfigurable`.
+   *
+   *  Lives under **Links**, NOT Experimental: the Experimental nav row is
+   *  itself filtered to `isTauri()` (its toggles are desktop-webview-only), so a
+   *  section placed there is unreachable on the one platform this setting is
+   *  for. Not Appearance either, which is display preferences; where a link
+   *  opens is behaviour. */
+  function externalLinksSection() {
+    if (!externalLinkTargetConfigurable()) return null;
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="links:external-links">External links</div>
+        <p class="settings-section-desc">
+          Where a link to another site goes when you tap it. Installed on the
+          home screen, iOS would otherwise trap every link in an in-app view with
+          no address bar and no shared Safari session. iOS gives web apps no way
+          to reach your default-browser setting directly, so "Ask" is the option
+          that lets iOS itself offer every browser you have installed.
+        </p>
+        {/* The per-link override is iOS's OWN long-press menu, not something we
+            render: suppressing it to draw our own would cost Copy Link, Share
+            and Add to Reading List alongside Open in Safari. Naming it here is
+            the documented way to make it discoverable. */}
+        <p class="settings-section-desc">
+          For a one-off, long-press any link instead: iOS offers Open in Safari,
+          Copy and Share without changing this setting.
+        </p>
+        <div class="settings-row" data-search-anchor="links:external-links-target">
+          <span class="settings-row-label">Open links in</span>
+          <Dropdown
+            options={EXTERNAL_LINK_TARGET_OPTIONS}
+            value={currentExternalLinkTarget()}
+            onChange={(v) => void setExternalLinkTarget(v as ExternalLinkTarget)}
+          />
+        </div>
+      </div>
+    );
+  }
+
   function renderSubview() {
     switch (settingsSubview.value) {
       case 'system': return <SystemPage />;
@@ -963,6 +1016,7 @@ export function SettingsView() {
       case 'marketplaces': return <MarketplacesSection />;
       case 'mobile-access': return <MobileAccessPage />;
       case 'permissions': return permissionsSection();
+      case 'links': return linksSection();
       case 'experimental': return experimentalSection();
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
@@ -981,13 +1035,21 @@ export function SettingsView() {
     );
   }
 
-  // Mobile Access is meaningful only for the packaged desktop app's always-on
-  // service (its Tauri commands surface the connect URLs + drive Tailscale).
+  // Mobile Access is listed everywhere, deliberately. Its machine-side controls
+  // (connect URLs, Sign in, Expose) are Tauri commands and the page hides them
+  // off the packaged desktop app, but its other half explains how to get
+  // Tailscale and Lucidos onto a phone, and the phone is where that is worth
+  // reading. Gating the row on `isTauri()` made the phone-facing half reachable
+  // only from the Mac.
   // Experimental hosts desktop-only toggles (the in-app browser webview exists
   // only under Tauri), so it's hidden in Chrome/PWA.
   const navItems = SETTINGS_NAV_ITEMS.filter(({ key }) => {
-    if (key === 'mobile-access') return isTauri() && enginePackaged.value;
     if (key === 'experimental') return isTauri();
+    // Links holds only platform-conditional rows today, so list it exactly when
+    // one of them would render. Listing it unconditionally would open an empty
+    // panel; the External links row it carries applies to an installed iOS PWA
+    // only.
+    if (key === 'links') return externalLinkTargetConfigurable();
     return true;
   });
 

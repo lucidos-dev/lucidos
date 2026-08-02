@@ -3,6 +3,10 @@ import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
 import { isMobile } from '../../utils/viewport';
+// The one definition of "this client can actually act on the external-link
+// target", shared with the Settings row and its nav entry so search can never
+// offer a result that lands on nothing.
+import { externalLinkTargetConfigurable } from '../../store/actions/preferences';
 
 type Subview = Exclude<SettingsSubview, 'main'>;
 
@@ -29,6 +33,11 @@ interface SettingsSearchEntry {
    *  Debugging's Restart engine, whose dev counterpart is Overview's
    *  Rebuild & Restart), so a dev result would land on nothing. */
   packagedOnly?: boolean;
+  /** Only surfaced on an INSTALLED iOS PWA, for the same reason as the two
+   *  above. Strictly narrower than `mobileOnly`: a narrow desktop window and
+   *  mobile Chrome both pass `isMobile()` but are not standalone iOS, and the
+   *  rows behind this flag (External links) render only there. */
+  iosPwaOnly?: boolean;
 }
 
 /**
@@ -41,6 +50,7 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   // Top-level subviews
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
   { id: 'appearance', label: 'Appearance', subview: 'appearance', path: 'Settings' },
+  { id: 'links', label: 'Links', subview: 'links', path: 'Settings', keywords: 'links external browser safari open', iosPwaOnly: true },
   { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings' },
   { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
   { id: 'repositories', label: 'Repositories', subview: 'repositories', path: 'Settings' },
@@ -81,6 +91,10 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:image-description' },
   { id: 'models:memory-context', label: 'Memory & context', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:memory-context' },
   { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:region' },
+
+  // Links subview
+  { id: 'links:external-links', label: 'External links', subview: 'links', path: 'Settings → Links', anchor: 'links:external-links', keywords: 'external links browser safari share sheet in-app web view open link default browser', iosPwaOnly: true },
+  { id: 'links:external-links-target', label: 'Open links in', subview: 'links', path: 'Settings → Links → External links', anchor: 'links:external-links-target', keywords: 'safari ask share sheet in-app browser open link', iosPwaOnly: true },
 
   // Appearance subview
   { id: 'appearance:theme', label: 'Theme', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:theme' },
@@ -134,7 +148,9 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
   // search results there — selecting one would land on a row that doesn't render.
   // Packaged-only rows are gated the same way, against the /health `packaged` flag.
   const visible = (e: SettingsSearchEntry) =>
-    (!e.mobileOnly || isMobile()) && (!e.packagedOnly || enginePackaged.value);
+    (!e.mobileOnly || isMobile())
+    && (!e.packagedOnly || enginePackaged.value)
+    && (!e.iosPwaOnly || externalLinkTargetConfigurable());
   const matches = q
     ? allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
     : SETTINGS_SEARCH_INDEX.filter(visible);

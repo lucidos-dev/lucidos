@@ -1,5 +1,6 @@
 use super::super::LucidosEngine;
 use super::bulk_limits::{bulk_threshold_error, BulkContext, MAX_BULK_BYTES, MAX_BULK_FILE_COUNT};
+use crate::core::WriteAnnouncement;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::memory::MemorySource;
 use chrono::Utc;
@@ -113,9 +114,11 @@ impl LucidosEngine {
                     let main_commit = self
                         .artifact_manager
                         .write_and_commit(
+                            &self.event_bus,
                             &dest_relative,
                             &bytes,
                             &format!("Import {}", dest_relative),
+                            WriteAnnouncement::SupersededBy("ArtifactImported"),
                         )
                         .await?;
 
@@ -143,9 +146,11 @@ impl LucidosEngine {
                             let commit_sha = self
                                 .artifact_manager
                                 .write_and_commit(
+                                    &self.event_bus,
                                     &dest_relative,
                                     &bytes,
                                     &format!("Import {}", dest_relative),
+                                    WriteAnnouncement::SupersededBy("ArtifactImported"),
                                 )
                                 .await?;
                             self.event_bus
@@ -165,9 +170,11 @@ impl LucidosEngine {
                     let main_commit = self
                         .artifact_manager
                         .write_and_commit(
+                            &self.event_bus,
                             &dest_relative,
                             &content,
                             &format!("Import {}", dest_relative),
+                            WriteAnnouncement::SupersededBy("ArtifactImported"),
                         )
                         .await?;
 
@@ -591,15 +598,23 @@ impl LucidosEngine {
         let commit_sha = if is_binary {
             let bytes = std::fs::read(source)?;
             self.artifact_manager
-                .write_and_commit(&dest_relative, &bytes, &format!("Import {}", dest_relative))
+                .write_and_commit(
+                    &self.event_bus,
+                    &dest_relative,
+                    &bytes,
+                    &format!("Import {}", dest_relative),
+                    WriteAnnouncement::SupersededBy("ArtifactImported"),
+                )
                 .await?
         } else {
             let content = std::fs::read_to_string(source)?;
             self.artifact_manager
                 .write_and_commit(
+                    &self.event_bus,
                     &dest_relative,
                     &content,
                     &format!("Import {}", dest_relative),
+                    WriteAnnouncement::SupersededBy("ArtifactImported"),
                 )
                 .await?
         };

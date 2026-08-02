@@ -1,4 +1,3 @@
-mod applied_changes;
 mod apply_now;
 mod cc_spawn_coalesce;
 pub(crate) mod coding_agent_kind;
@@ -15,6 +14,7 @@ mod run_session;
 mod runtime_helpers;
 mod spawn;
 pub(crate) mod spawn_dispatcher;
+mod turn_gap;
 
 pub(crate) use cc_spawn_coalesce::{
     combine_messages, queued_to_orphans, CcSpawnCoalescer, LeaderElection, QueuedMessage,

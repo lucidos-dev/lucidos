@@ -6,6 +6,7 @@ members = [
     "crates/lucidos-app",
     "crates/lucidos-cli",
     "crates/lucidos-e2e",
+    "crates/lucidos-tailscale",
 ]
 
 [workspace.package]

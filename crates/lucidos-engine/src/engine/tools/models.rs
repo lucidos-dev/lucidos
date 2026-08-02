@@ -9,7 +9,6 @@
 
 use super::super::LucidosEngine;
 use crate::core::models::ModelStore;
-use crate::engine::event_bus::{BusEvent, SystemEvent};
 
 /// Providers the registry accepts — kept in lockstep with
 /// `api::settings::valid_provider` / `llm::model_registry::ProviderKind`.
@@ -110,17 +109,19 @@ impl LucidosEngine {
             }
         };
 
-        match ModelStore::create(&self.pool, id, label, provider, sort_order, context_window).await
+        match ModelStore::create(
+            &self.pool,
+            &self.event_bus,
+            id,
+            label,
+            provider,
+            sort_order,
+            context_window,
+            None,
+        )
+        .await
         {
             Ok(model) => {
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::ModelCreated {
-                        id: model.id.clone(),
-                        label: model.label.clone(),
-                        provider: model.provider.clone(),
-                        actor: None,
-                    }))
-                    .await?;
                 Ok(format!(
                     "[ACTION COMPLETED] Model '{}' ({}) added to the registry and enabled.",
                     model.id, model.provider
@@ -144,20 +145,12 @@ impl LucidosEngine {
         if id.is_empty() {
             return Ok("Error: id is required.".to_string());
         }
-        match ModelStore::set_enabled(&self.pool, id, enabled).await {
-            Ok(true) => {
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::ModelUpdated {
-                        id: id.to_string(),
-                        actor: None,
-                    }))
-                    .await?;
-                Ok(format!(
-                    "[ACTION COMPLETED] Model '{}' {}.",
-                    id,
-                    if enabled { "enabled" } else { "disabled" }
-                ))
-            }
+        match ModelStore::set_enabled(&self.pool, &self.event_bus, id, enabled, None).await {
+            Ok(true) => Ok(format!(
+                "[ACTION COMPLETED] Model '{}' {}.",
+                id,
+                if enabled { "enabled" } else { "disabled" }
+            )),
             Ok(false) => Ok(format!(
                 "Error: no model '{}' in the registry. Use action 'list' to see model ids.",
                 id
@@ -191,19 +184,11 @@ impl LucidosEngine {
                 id
             ));
         }
-        match ModelStore::delete(&self.pool, id).await {
-            Ok(_) => {
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::ModelDeleted {
-                        id: id.to_string(),
-                        actor: None,
-                    }))
-                    .await?;
-                Ok(format!(
-                    "[ACTION COMPLETED] Model '{}' removed from the registry.",
-                    id
-                ))
-            }
+        match ModelStore::delete(&self.pool, &self.event_bus, id, None).await {
+            Ok(_) => Ok(format!(
+                "[ACTION COMPLETED] Model '{}' removed from the registry.",
+                id
+            )),
             Err(e) => Ok(format!("Error: failed to remove model '{}': {}", id, e)),
         }
     }

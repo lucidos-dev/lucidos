@@ -1,4 +1,4 @@
-//! The single chokepoint for writing a user preference.
+//! The single chokepoint for a preference write's SIDE EFFECTS.
 //!
 //! Both entry paths — the `set_preference` LLM tool and the HTTP
 //! `PUT /api/v1/preferences` handler (which the Settings UI uses) — funnel
@@ -6,11 +6,15 @@
 //! side-effects can never diverge by who made the write:
 //! - `language` / `timezone` refresh the engine's in-memory `user_language` /
 //!   `user_timezone` and emit `LanguageSet` / `TimezoneSet` (the frontend
-//!   live-applies on those), so the new Settings → System "Locale" controls take
+//!   live-applies on those), so the Settings → System "Locale" controls take
 //!   effect without an engine restart.
 //! - `push_notifications` syncs `devices.push_enabled`.
-//! - everything else emits the persisted `PreferencesChanged` the frontend
-//!   already refetches on.
+//!
+//! The persisted `PreferencesChanged` is NOT emitted here. It belongs to
+//! `PreferenceStore`'s write path, so a writer that bypasses this chokepoint
+//! (the scheduler's backup schedule and the HTTP retention handler both do,
+//! deliberately) still announces. That is the fix for the bug where each of
+//! them hand-rolled the emit at its own call site.
 //!
 //! This chokepoint is intentionally **permissive about the key**: the HTTP path
 //! legitimately writes internal keys (`command_guard`, `keybindings`,
@@ -46,6 +50,10 @@ impl LucidosEngine {
         device_id: Option<&str>,
         actor: Option<MessageOrigin>,
     ) -> Result<PreferenceWriteOutcome, String> {
+        // Cloned up front: the store write below consumes the actor for the
+        // `PreferencesChanged` it emits, and the push side-effect still needs
+        // it for the paired `DevicePushChanged`.
+        let side_effect_actor = actor.clone();
         // Side-effect declared in the catalog (plain/unknown key → None).
         let side_effect = preference_catalog::lookup(key)
             .map(|s| s.side_effect)
@@ -82,10 +90,15 @@ impl LucidosEngine {
         // Persist. Scope follows the caller's device_id, matching the historical
         // HTTP behavior (frontend sends device_id for device-scoped keys, omits it
         // for global ones).
+        // The store announces `PreferencesChanged` from inside the write, so
+        // this chokepoint no longer emits it: its remaining job is the
+        // catalog-declared SIDE EFFECTS below (in-memory caches, the legacy
+        // per-key events, the devices.push_enabled mirror).
         let write = if let Some(did) = device_id {
-            PreferenceStore::set_for_device(&self.pool, key, value, did).await
+            PreferenceStore::set_for_device(&self.pool, &self.event_bus, key, value, did, actor)
+                .await
         } else {
-            PreferenceStore::set(&self.pool, key, value).await
+            PreferenceStore::set(&self.pool, &self.event_bus, key, value, actor).await
         };
         write.map_err(|e| format!("Failed to save preference '{}': {}", key, e))?;
 
@@ -116,34 +129,22 @@ impl LucidosEngine {
                 // Best-effort: a failure here shouldn't fail the whole write —
                 // the preference (the user's intent) is already persisted.
                 if let Some(did) = device_id {
-                    if let Err(e) = DeviceStore::set_push_enabled(&self.pool, did, enabled).await {
+                    if let Err(e) = DeviceStore::set_push_enabled(
+                        &self.pool,
+                        &self.event_bus,
+                        did,
+                        enabled,
+                        side_effect_actor,
+                    )
+                    .await
+                    {
                         log!("[Preferences] Failed to set devices.push_enabled: {}", e);
                     }
                 }
-                self.emit_preferences_changed(key, value, actor).await?;
             }
-            PrefSideEffect::None => {
-                self.emit_preferences_changed(key, value, actor).await?;
-            }
+            PrefSideEffect::None => {}
         }
 
         Ok(PreferenceWriteOutcome { push_enabled })
-    }
-
-    async fn emit_preferences_changed(
-        &self,
-        key: &str,
-        value: &str,
-        actor: Option<MessageOrigin>,
-    ) -> Result<(), String> {
-        self.event_bus
-            .emit(BusEvent::System(SystemEvent::PreferencesChanged {
-                key: key.to_string(),
-                value: Some(value.to_string()),
-                actor,
-            }))
-            .await
-            .map(|_| ())
-            .map_err(|e| format!("Failed to emit PreferencesChanged: {}", e))
     }
 }

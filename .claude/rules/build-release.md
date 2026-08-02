@@ -226,7 +226,24 @@ Four properties keep a payload-mode green honest, and all four are load-bearing:
   script, and the rung would pass having touched nothing at this origin;
 - on an `rc/**` push the served installer's baked `LUCIDOS_DEFAULT_VERSION` must
   equal the version in `rc/<version>`, so the previous RC's copy sitting at the
-  same URL cannot pass the gate;
+  same URL cannot pass the gate. **A mismatch is re-read before it is believed
+  (2026-07-31).** `release.sh` arms the gate by blocking until the origin serves
+  the candidate (`scripts/lib/release_rc_front_door.sh`), but that wait polls
+  from the maintainer's Mac and so sees exactly ONE Cloudflare POP; a runner
+  resolves to another, whose edge cache can still hold the previous release's
+  copy. v0.18.3 and v0.18.5 both reddened a front-door leg for that reason alone
+  and both passed on a bare `gh run rerun --failed` (on v0.18.5 only
+  `macos-latest` reddened while `macos-15-intel` and `ubuntu` read the correct
+  version off the same origin, which is a per-POP cache and not an origin
+  regression). So rung 1 now polls the mismatch case, and **only** that case on
+  the push arm, to a bounded `FD_RC_VERSION_WAIT_SECS` (240 s) every
+  `FD_RC_VERSION_POLL_SECS` (30 s), each re-read defeating the edge cache with a
+  per-attempt `?cb=` nonce (Cloudflare's cache key includes the query string)
+  plus no-cache headers, re-running `assert_shell_file` on the fresh copy, and
+  exporting `FD_SERVED_VERSION` only after the loop so a retried value cannot be
+  shadowed by the stale first read. Converging late emits a `::warning::` naming
+  the elapsed seconds; expiry is still a hard failure, worded so the exhausted
+  budget rules propagation lag out;
 - the lib-name scrape, the `LUCIDOS_INSTALL_URL` parse, the version parse and
   both uninstaller-pin parses all **fail closed**. A parser that finds nothing
   must never report green.
@@ -293,8 +310,12 @@ the file, **once per job**, since the two are duplicated deliberately and silent
 divergence is the standing hazard: the preflight's position relative to the
 launch step, the budget band, the fail-closed branches, the in-poll download
 check, the timeout arithmetic, the RC refusal preceding the first `curl`, the
-absence of any downgrade, the Access-vs-soft-404 distinction, and the untouched
-guards. It strips comment lines first, so a job's prose about a rule (the macOS
+absence of any downgrade, the Access-vs-soft-404 distinction, the untouched
+guards, and the rc version re-read (its bounded budget and interval band, the
+`cb=` nonce and no-cache header on the retry fetch, the retry staying scoped to
+the push/mismatch path while the empty-parse branch still exits immediately, the
+expiry still exiting rather than warning, and `FD_SERVED_VERSION` being exported
+after the loop). It strips comment lines first, so a job's prose about a rule (the macOS
 job documents the ABSENCE of a `kill -0` fast-fail in words) can neither satisfy
 nor violate one, and it re-checks the preflight's URL construction against the
 tree's real `install_common.sh` + `headless_tarball.sh` and its download-failure

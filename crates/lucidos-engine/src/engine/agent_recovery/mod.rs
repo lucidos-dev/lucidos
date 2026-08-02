@@ -18,7 +18,10 @@ pub use helpers::*;
 // that documents them; re-export the ones the teardown emit + its tests share
 // (`engine_impl/shutdown.rs`), so both sides of the preserve/resume contract
 // key on one definition.
-pub(crate) use recovery::{thread_has_unanswered_question, unanswered_question_exists_sql};
+pub(crate) use recovery::{
+    preserve_question_park_at_shutdown, thread_has_unanswered_question,
+    unanswered_question_exists_sql,
+};
 // The switch-vs-crash fingerprint, shared with the chat resume gate
 // (`chat::recovery::switch_resume_candidates`) so the coding-agent and chat
 // halves of the auto-resume contract cannot drift apart.
@@ -37,6 +40,10 @@ mod startup_sweep_tests;
 #[cfg(test)]
 #[path = "../agent_recovery_tests/end_stale.rs"]
 mod end_stale_tests;
+
+#[cfg(test)]
+#[path = "../agent_recovery_tests/question_park.rs"]
+mod question_park_tests;
 
 #[cfg(test)]
 #[path = "../agent_recovery_integration_tests/continuation.rs"]

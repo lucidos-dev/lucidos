@@ -658,3 +658,129 @@ describe('CC waiting_for_user_answer: trailing Thinking cleanup in non-last exch
     expect(e3WhileRunning.filter(isPendingThinking)).toHaveLength(0);
   });
 });
+
+// Regression (2026-08-01): a coding-agent turn whose terminator never landed
+// read "Working" forever. `exchangeStatus`'s `if (isCC)` branch returned
+// 'coding-agent-working' BEFORE the threadIdle stale detector could fire, so a
+// CC exchange with steps and no terminal spun a live-looking spinner on a
+// subprocess that no longer existed.
+//
+// The engine-side cause was a teardown that Esc'd a session parked on an
+// unanswered AskUserQuestion (fixed separately): CC recorded a rejection the
+// user never made, raced past the question, and the terminal that would have
+// followed was suppressed. This suite pins the CLIENT half, which must hold
+// however the turn lost its terminator.
+// See docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md
+describe('coding-agent turn with no terminator must not read Working forever', () => {
+  const now = Date.now();
+  const t = (offset: number) => new Date(now + offset).toISOString();
+
+  /** The reproduced shape: question asked, agent raced past it, no
+   *  CodingAgentIdled / SessionEnded / ResponseAborted ever.
+   *
+   *  `trailingText` is the second half of what a teardown-Esc actually emitted
+   *  (the rejection tool result, then a `"\n\n"` continuation). Both shapes
+   *  must behave identically: `CodingAgentToolResult` alone is in
+   *  `QUESTION_OVERTAKEN_STEP_TYPES` (so the card is already struck through and
+   *  disabled) but is NOT one of the three types that clear `isWaitingForAnswer`
+   *  in the status walk, so before the fix the tool-result-only shape read
+   *  "Needs your answer" over dead buttons instead of "Working" forever. Same
+   *  dead end, different label. */
+  const seedOvertakenQuestion = (
+    name: string,
+    status: 'idle' | 'running' | 'waiting',
+    trailingText = true,
+  ) => {
+    const { map, id } = makeThread(name, status);
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'iterate on the vision', channel: 'claude_code', created: t(-300000) },
+      { type: 'SessionStarted', session_id: 's1', created: t(-299000) },
+      { type: 'CodingAgentTextStreamed', text: 'Here are the options.', created: t(-290000) },
+      { type: 'UserQuestionAsked', tool_use_id: 'toolu_park', cc_session_id: 's1', question: 'Which line?', options: [{ id: 'opt-0', label: 'A' }], created: t(-280000) },
+      // Teardown Esc'd the pending AskUserQuestion: CC reports a rejection the
+      // user never made. No terminal follows.
+      { type: 'CodingAgentToolResult', name: '', result: 'The user doesn\'t want to proceed with this tool use.', created: t(-200000) },
+      ...(trailingText
+        ? [{ type: 'CodingAgentTextStreamed' as const, text: '\n\n', created: t(-199000) }]
+        : []),
+    ]);
+    return getExchanges(map, id);
+  };
+
+  it('reads aborted once the thread has settled, not coding-agent-working', () => {
+    resetSeqCounter();
+    const exchanges = seedOvertakenQuestion('cc-no-terminator-1', 'idle');
+    const last = exchanges[exchanges.length - 1];
+
+    const status = exchangeStatus(last, '', true, false, /* threadIsCC */ true, /* threadIdle */ true);
+    expect(status).toBe('aborted');
+    expect(isActive(status)).toBe(false);
+  });
+
+  it('still reads coding-agent-working while the thread is genuinely running', () => {
+    resetSeqCounter();
+    const exchanges = seedOvertakenQuestion('cc-no-terminator-2', 'running');
+    const last = exchanges[exchanges.length - 1];
+
+    const status = exchangeStatus(last, '', true, false, /* threadIsCC */ true, /* threadIdle */ false);
+    expect(status).toBe('coding-agent-working');
+  });
+
+  it('does not fire during the answer-to-resume gap (threadAwaitingAnswer)', () => {
+    resetSeqCounter();
+    const exchanges = seedOvertakenQuestion('cc-no-terminator-3', 'waiting');
+    const last = exchanges[exchanges.length - 1];
+
+    const status = exchangeStatus(
+      last, '', true, false, /* threadIsCC */ true, /* threadIdle */ true, /* threadAwaitingAnswer */ true,
+    );
+    expect(status).not.toBe('aborted');
+    expect(status).toBe('coding-agent-working');
+  });
+
+  /** The exact Esc shape, with no trailing text to rescue it. The card is
+   *  already overtaken (struck through, buttons disabled), so claiming it
+   *  "Needs your answer" is a dead end the user cannot act on. */
+  it('a lone rejected tool result reads aborted, not "Needs your answer"', () => {
+    resetSeqCounter();
+    const exchanges = seedOvertakenQuestion('cc-no-terminator-4', 'idle', /* trailingText */ false);
+    const last = exchanges[exchanges.length - 1];
+    expect(last.questionOvertaken).toBe(true);
+
+    const status = exchangeStatus(last, '', true, false, /* threadIsCC */ true, /* threadIdle */ true);
+    expect(status).toBe('aborted');
+  });
+
+  /** The complement: a question nothing has raced past is still answerable,
+   *  and must keep reading "Needs your answer" even on a settled thread. */
+  it('a live question card is untouched by the overtaken carve-out', () => {
+    resetSeqCounter();
+    const { map, id } = makeThread('cc-live-question', 'waiting');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'iterate on the vision', channel: 'claude_code', created: t(-300000) },
+      { type: 'SessionStarted', session_id: 's1', created: t(-299000) },
+      { type: 'UserQuestionAsked', tool_use_id: 'toolu_live', cc_session_id: 's1', question: 'Which line?', options: [{ id: 'opt-0', label: 'A' }], created: t(-280000) },
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    const last = exchanges[exchanges.length - 1];
+    expect(last.questionOvertaken).toBe(false);
+    expect(exchangeStatus(last, '', true, false, true, true, true)).toBe('awaiting-answer');
+  });
+
+  it('a properly terminated CC turn on an idle thread is still done', () => {
+    resetSeqCounter();
+    const { map, id } = makeThread('cc-terminated-1', 'idle');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'fix the bug', channel: 'claude_code', created: t(-300000) },
+      { type: 'SessionStarted', session_id: 's1', created: t(-299000) },
+      { type: 'CodingAgentToolCalled', name: 'Edit', args: { file: 'foo.rs' }, created: t(-280000) },
+      { type: 'CodingAgentToolResult', name: 'Edit', result: 'ok', created: t(-279000) },
+      { type: 'CodingAgentIdled', has_changes: true, created: t(-270000) },
+    ]);
+
+    const exchanges = getExchanges(map, id);
+    const status = exchangeStatus(exchanges[0], '', true, false, true, true);
+    expect(status).toBe('done');
+  });
+});

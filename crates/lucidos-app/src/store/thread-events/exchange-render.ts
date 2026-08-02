@@ -1088,6 +1088,29 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   const onlyStep = exchange.steps.length === 1 ? exchange.steps[0].event : undefined;
   const isAbsorbedUpiPlaceholder = onlyStep?.type === 'UserPromptInjected' && !!onlyStep.injected_message_id;
 
+  // Stale exchange: the thread's projection says quiescent, but this exchange
+  // has steps and no terminal event. The agentic loop (or the coding-agent
+  // subprocess) died without emitting ResponseGenerated / ResponseAborted /
+  // CodingAgentIdled: an engine crash, a lid close, or a teardown that skipped
+  // its terminal. Nothing is running, so the panel must read "Aborted" rather
+  // than spin forever. `hasSteps` covers tool calls AND streamed text (both are
+  // in `exchange.steps`).
+  //
+  // EXCEPT when the thread is `waiting_for_user_answer` (threadAwaitingAnswer):
+  // a thread parked on / resuming from a question or permission card is never
+  // crashed. A just-answered question-divider (UserQuestionAnswered step, no
+  // terminal yet) whose resume `running` aggregate hasn't reached the client
+  // would otherwise flash "Aborted" during the answer→resume gap. The agent's
+  // continuation (and its terminal) is in flight; render it as working, not
+  // crashed. A genuine crash settles to `idle`/`failed`, never
+  // `waiting_for_user_answer`, so this can't mask a real abort.
+  //
+  // The absorbed-UPI placeholder is excluded because its lone UPI step means
+  // the real response lives in the PRIOR exchange: it is 'done', not crashed.
+  const isStale =
+    threadIdle && !threadAwaitingAnswer && isLast && !isComplete && hasSteps
+    && !isAbsorbedUpiPlaceholder;
+
   if (isFailed) return 'error';
   // Abort/shutdown AFTER the exchange was already completed (e.g., auto-harden
   // crash after CodingAgentIdled/ResponseGenerated) — the user's work was done.
@@ -1118,7 +1141,18 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // 'awaiting-answer' so the surrounding spinner stops AND the header reads
   // "Needs your answer" (not the misleading "Done ✓"). The QuestionCard /
   // PermissionCard inside the exchange shows the action surface.
-  if (isWaitingForAnswer) return 'awaiting-answer';
+  //
+  // `!exchange.questionOvertaken` is what keeps this honest. The switch above
+  // clears `isWaitingForAnswer` on only three progression types, while
+  // `QUESTION_OVERTAKEN_STEP_TYPES` (which decides whether the card renders
+  // struck through and disabled) covers twelve. A shape in the gap read
+  // "Needs your answer" over a card whose buttons were already dead: exactly
+  // the lone `CodingAgentToolResult` a teardown-Esc'd `AskUserQuestion`
+  // produces. Deferring to the overtaken flag means one list decides both, the
+  // client mirror of the engine's single park-ending set. An overtaken divider
+  // falls through to the stale detector below ('aborted' on a settled thread)
+  // or to 'coding-agent-working' while the agent really is still going.
+  if (isWaitingForAnswer && !exchange.questionOvertaken) return 'awaiting-answer';
   // Non-last with steps but no terminator: the user moved past this exchange
   // (chat fast-path injects the follow-up via UPI under the parent's
   // request_event_id and redirects later events to the new exchange; CC
@@ -1158,31 +1192,31 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // post-completion step, instead of a misleading "Done ✓" (real thread
   // 4d193da8). Once steps arrive the spinner is driven by them as usual.
   if (userEventType === 'ChildThreadCompleted' && !hasSteps && (threadIdle || !isLast)) return 'done';
+
   // CC exchanges are 'coding-agent-working' once they have steps, 'pending' before.
-  if (isCC) return hasSteps ? 'coding-agent-working' : 'pending';
+  //
+  // `!isStale` is what stops a DEAD coding-agent turn reading "Working"
+  // forever. A coding agent used to escape the stale detector below entirely:
+  // this branch returned first, unconditionally. So a CC turn whose terminator
+  // never landed spun a live-looking spinner on a subprocess that no longer
+  // exists. That is exactly what a teardown-Esc'd `AskUserQuestion` produced on
+  // 2026-08-01 (see
+  // `docs/plans/2026-08-01-preserve-question-parked-session-through-teardown.md`):
+  // progression events after the question, no terminal, thread settled to
+  // 'idle' by the boot reset, panel stuck on "Working". A live CC turn is
+  // `running`, so `isStale` is false and this branch still wins.
+  if (isCC && !isStale) return hasSteps ? 'coding-agent-working' : 'pending';
+  // A live streaming buffer beats staleness for either agent: tokens are
+  // arriving right now, whatever the projection last said.
   if (streamingBuffer) return 'streaming';
 
   // Absorbed-UPI placeholder: handled here for the isLast case (the
-  // !isLast branch above bypasses 'interrupted' for it). Must run before
-  // the threadIdle stale-detector to avoid a false 'aborted'.
+  // !isLast branch above bypasses 'interrupted' for it). It must not read as a
+  // crash, which is why `isStale` excludes it outright rather than relying on
+  // this line's position.
   if (isAbsorbedUpiPlaceholder) return 'done';
 
-  // Stale exchange: thread DB says idle but exchange has no terminal event and
-  // no live streaming buffer. This happens when the engine crashed or lid closed
-  // mid-response — the agentic loop died without emitting ResponseGenerated or
-  // ResponseAborted. Detect this BEFORE the streaming fallbacks so we show
-  // "Aborted" instead of an eternal "Working" spinner.
-  // hasSteps covers both tool calls AND TextStreamed events (both are in exchange.steps).
-  //
-  // EXCEPT when the thread is `waiting_for_user_answer` (threadAwaitingAnswer):
-  // a thread parked on / resuming from a question or permission card is never
-  // crashed. A just-answered question-divider (UserQuestionAnswered step, no
-  // terminal yet) whose resume `running` aggregate hasn't reached the client
-  // would otherwise flash "Aborted" during the answer→resume gap. The agent's
-  // continuation (and its terminal) is in flight; render it as working, not
-  // crashed. A genuine crash settles to `idle`/`failed`, never
-  // `waiting_for_user_answer`, so this can't mask a real abort.
-  if (threadIdle && !threadAwaitingAnswer && isLast && !isComplete && hasSteps) return 'aborted';
+  if (isStale) return 'aborted';
 
   // Persisted response text (TextStreamed events) without a completion event
   // means the response is still in progress — the streaming buffer was just

@@ -133,6 +133,138 @@ pub async fn start_cc_session(
     .unwrap();
 }
 
+/// Seed a credential for a test that only cares that one exists.
+///
+/// The store's mutators take the `EventBus` because a credential write and its
+/// `Credential{Created,Updated}` announcement are one operation (see
+/// `CredentialStore`'s type doc). A fixture has no bus of its own and no
+/// interest in the event, so this builds a throwaway one against the test
+/// database rather than pushing that ceremony into every seeding call site.
+/// Tests that assert ON the event build their own bus and call the store
+/// directly.
+pub async fn seed_credential(
+    pool: &PgPool,
+    service_name: &str,
+    base_url: &str,
+    auth_type: crate::core::AuthType,
+    auth_value: &str,
+) {
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    crate::core::CredentialStore::upsert(
+        pool,
+        &bus,
+        service_name,
+        base_url,
+        auth_type,
+        auth_value,
+        None,
+        None,
+        None,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("seed credential {service_name}: {e}"));
+}
+
+/// Delete a credential in a test.
+///
+/// Exists so callers outside the engine layer do not have to name
+/// `crate::engine::event_bus` to build a bus for the store's
+/// `CredentialDeleted` emit: `llm/*.rs` is forbidden from depending on
+/// `crate::engine` (see `llm::validate::tests::llm_does_not_depend_on_engine`).
+pub async fn delete_credential(pool: &PgPool, service_name: &str) {
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    crate::core::CredentialStore::delete(pool, &bus, service_name, None)
+        .await
+        .unwrap_or_else(|e| panic!("delete credential {service_name}: {e}"));
+}
+
+/// Register a device and give it a display name, for a test that needs one to
+/// exist (actor resolution, presence, device-scoped preferences).
+///
+/// Same rationale as [`seed_credential`]: the store's mutators own their
+/// `Device{Registered,Renamed}` emits, and a fixture has no bus of its own.
+pub async fn seed_device(pool: &PgPool, id: &str, user_agent: Option<&str>, name: Option<&str>) {
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    crate::core::DeviceStore::register(pool, &bus, id, user_agent, None)
+        .await
+        .unwrap_or_else(|e| panic!("seed device {id}: {e}"));
+    if name.is_some() {
+        crate::core::DeviceStore::rename(pool, &bus, id, name, None)
+            .await
+            .unwrap_or_else(|e| panic!("name device {id}: {e}"));
+    }
+}
+
+/// Seed a connected OAuth account for a test that needs one to exist (token
+/// resolution, provider routing, scope merging).
+///
+/// Argument order mirrors `OAuthStore::connect` minus the bus and actor, which
+/// a fixture has no opinion about. Same rationale as [`seed_credential`].
+#[allow(clippy::too_many_arguments)] // mirrors the store's column list
+pub async fn seed_oauth_account(
+    pool: &PgPool,
+    provider: &str,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    token_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    scopes: &str,
+) -> Result<uuid::Uuid, sqlx::Error> {
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    crate::core::OAuthStore::connect(
+        pool,
+        &bus,
+        provider,
+        email,
+        display_name,
+        access_token,
+        refresh_token,
+        token_expiry,
+        scopes,
+        None,
+    )
+    .await
+}
+
+/// Seed a global preference for a test that just needs one stored.
+///
+/// Same rationale as [`seed_credential`]: `PreferenceStore`'s writers announce
+/// `PreferencesChanged`, and a fixture has no bus of its own. Returns the
+/// store's `Result` so existing call sites keep their `.unwrap()`. Tests that
+/// assert ON the announcement build a bus and call the store directly.
+pub async fn seed_preference(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    crate::core::PreferenceStore::set(pool, &bus, key, value, None).await
+}
+
+/// [`seed_preference`], scoped to one device.
+pub async fn seed_preference_for_device(
+    pool: &PgPool,
+    key: &str,
+    value: &str,
+    device_id: &str,
+) -> Result<(), sqlx::Error> {
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    crate::core::PreferenceStore::set_for_device(pool, &bus, key, value, device_id, None).await
+}
+
+/// An `EventBus` backed by a pool that never dials, for tests whose subject is
+/// a rejection or a filesystem effect and that never reach an emit.
+///
+/// `connect_lazy` builds the pool without touching the network, so this stays a
+/// fast no-DB test. If a test using it DOES reach an emit, `emit_or_log` logs
+/// the connection failure rather than panicking, which is the wrong shape for
+/// an assertion: a test that cares about the event wants a real
+/// `setup_test_db`.
+pub fn offline_event_bus() -> EventBus {
+    let pool = PgPoolOptions::new()
+        .connect_lazy("postgres://lucidos:lucidos@127.0.0.1:1/offline")
+        .expect("lazy pool");
+    let (bus, _callback_rx) = EventBus::new(pool);
+    bus
+}
+
 pub async fn teardown_test_db(db_name: &str) {
     let base_url = admin_url();
     let admin_pool = PgPoolOptions::new()

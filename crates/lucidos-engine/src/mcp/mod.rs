@@ -22,6 +22,11 @@ pub struct McpManager {
     /// Currently running servers keyed by server id.
     running: Arc<Mutex<HashMap<String, RunningServer>>>,
     pool: sqlx::PgPool,
+    /// Registry mutations announce through here. Held rather than passed per
+    /// call because `McpServerStore`'s mutators require it: registering a
+    /// server changes the agent's tool surface, and that is not the caller's
+    /// choice to skip (see `core::announced_surfaces`).
+    event_bus: crate::engine::event_bus::EventBus,
 }
 
 /// Status of an MCP server for display.
@@ -36,10 +41,11 @@ pub struct McpServerStatus {
 }
 
 impl McpManager {
-    pub fn new(pool: sqlx::PgPool) -> Self {
+    pub fn new(pool: sqlx::PgPool, event_bus: crate::engine::event_bus::EventBus) -> Self {
         Self {
             running: Arc::new(Mutex::new(HashMap::new())),
             pool,
+            event_bus,
         }
     }
 
@@ -52,7 +58,17 @@ impl McpManager {
         args: &[String],
         env: &HashMap<String, String>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        let server = McpServerStore::insert(&self.pool, id, name, command, args, env).await?;
+        let server = McpServerStore::register(
+            &self.pool,
+            &self.event_bus,
+            id,
+            name,
+            command,
+            args,
+            env,
+            None,
+        )
+        .await?;
 
         // Try to connect immediately
         match self.start_server_internal(&server).await {
@@ -157,7 +173,7 @@ impl McpManager {
             }
         }
 
-        if McpServerStore::delete(&self.pool, id).await? {
+        if McpServerStore::unregister(&self.pool, &self.event_bus, id, None).await? {
             Ok(format!("MCP server '{}' removed.", id))
         } else {
             Ok(format!("MCP server '{}' not found.", id))
@@ -201,7 +217,8 @@ impl McpManager {
         id: &str,
         auto_approve: bool,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-        McpServerStore::set_auto_approve(&self.pool, id, auto_approve).await?;
+        McpServerStore::set_auto_approve(&self.pool, &self.event_bus, id, auto_approve, None)
+            .await?;
 
         // Update in-memory config too
         let mut running = self.running.lock().await;

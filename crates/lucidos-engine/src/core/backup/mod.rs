@@ -197,7 +197,7 @@ impl BackupLastRun {
 pub async fn persist_last_run(pool: &PgPool, run: &BackupLastRun) -> Result<(), BoxError> {
     use crate::core::PreferenceStore;
     let value = serde_json::to_string(run)?;
-    PreferenceStore::set(pool, PREF_BACKUP_LAST_RUN, &value).await?;
+    PreferenceStore::set_silent(pool, PREF_BACKUP_LAST_RUN, &value).await?;
     Ok(())
 }
 

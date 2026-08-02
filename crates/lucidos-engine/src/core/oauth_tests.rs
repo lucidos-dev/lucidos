@@ -319,6 +319,76 @@ fn debug_shows_refresh_token_none_when_absent() {
 // These need a real Postgres — run via `./scripts/test-engine.sh`.
 // ---------------------------------------------------------------------------
 
+/// The load-bearing guarantee, and the half that was missing: connecting an
+/// account announces, so every OTHER device reloads its Accounts list instead
+/// of waiting for a page refresh. A token rotation deliberately stays silent.
+#[tokio::test]
+async fn connect_announces_and_a_token_refresh_does_not() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    async fn emitted(pool: &sqlx::PgPool, event_type: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    let id = OAuthStore::connect(
+        &pool,
+        &bus,
+        "google",
+        Some("user@example.com"),
+        Some("User"),
+        "access",
+        Some("refresh"),
+        None,
+        "openid email",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(emitted(&pool, "OAuthAccountConnected").await, 1);
+
+    // A re-authorization grants scopes, so it announces even though the row
+    // already existed.
+    OAuthStore::connect(
+        &pool,
+        &bus,
+        "google",
+        Some("user@example.com"),
+        Some("User"),
+        "access2",
+        Some("refresh"),
+        None,
+        "openid email https://www.googleapis.com/auth/drive",
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(emitted(&pool, "OAuthAccountConnected").await, 2);
+
+    OAuthStore::update_tokens(&pool, id, "rotated", None, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        emitted(&pool, "OAuthAccountConnected").await,
+        2,
+        "a token rotation changes nothing the user can see"
+    );
+
+    assert!(OAuthStore::delete(&pool, &bus, id, None).await.unwrap());
+    assert_eq!(emitted(&pool, "OAuthAccountDeleted").await, 1);
+    assert!(!OAuthStore::delete(&pool, &bus, id, None).await.unwrap());
+    assert_eq!(
+        emitted(&pool, "OAuthAccountDeleted").await,
+        1,
+        "second delete removes nothing and therefore announces nothing"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
 #[tokio::test]
 async fn get_by_provider_returns_most_recently_connected() {
     // The reported bug: an old narrow-scope `drive.file` account (no email →
@@ -327,7 +397,7 @@ async fn get_by_provider_returns_most_recently_connected() {
     // (newest `created_at`) account so a fresh connect wins.
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
-    let old_id = OAuthStore::insert(
+    let old_id = crate::test_support::seed_oauth_account(
         &pool,
         "google",
         None,
@@ -340,7 +410,7 @@ async fn get_by_provider_returns_most_recently_connected() {
     .await
     .unwrap();
 
-    let new_id = OAuthStore::insert(
+    let new_id = crate::test_support::seed_oauth_account(
         &pool,
         "google",
         Some("user@example.com"),
@@ -386,7 +456,7 @@ async fn insert_upserts_same_provider_email_in_place() {
     // None-passing upsert via COALESCE.
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
-    let first = OAuthStore::insert(
+    let first = crate::test_support::seed_oauth_account(
         &pool,
         "google",
         Some("user@example.com"),
@@ -399,7 +469,7 @@ async fn insert_upserts_same_provider_email_in_place() {
     .await
     .unwrap();
 
-    let second = OAuthStore::insert(
+    let second = crate::test_support::seed_oauth_account(
         &pool,
         "google",
         Some("user@example.com"),
@@ -437,7 +507,7 @@ async fn insert_upserts_no_email_account_in_place() {
     // (provider, NULL) row via the partial unique index.
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
-    let first = OAuthStore::insert(
+    let first = crate::test_support::seed_oauth_account(
         &pool,
         "google",
         None,
@@ -450,7 +520,7 @@ async fn insert_upserts_no_email_account_in_place() {
     .await
     .unwrap();
 
-    let second = OAuthStore::insert(
+    let second = crate::test_support::seed_oauth_account(
         &pool,
         "google",
         None,
@@ -478,7 +548,7 @@ async fn insert_keeps_distinct_emails_as_separate_rows() {
     // Genuinely distinct accounts (different non-null emails) stay separate.
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
-    OAuthStore::insert(
+    crate::test_support::seed_oauth_account(
         &pool,
         "google",
         Some("a@example.com"),
@@ -490,7 +560,7 @@ async fn insert_keeps_distinct_emails_as_separate_rows() {
     )
     .await
     .unwrap();
-    OAuthStore::insert(
+    crate::test_support::seed_oauth_account(
         &pool,
         "google",
         Some("b@example.com"),

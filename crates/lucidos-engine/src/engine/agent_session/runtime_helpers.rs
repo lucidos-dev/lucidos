@@ -161,6 +161,11 @@ impl LucidosEngine {
     /// originated from Apply / Discard / Archive — those paths emit their
     /// own lifecycle event (`ChangeApplied` / `ChangeDiscarded` /
     /// `ThreadArchived`) and must NOT also emit `ResponseCanceled`.
+    ///
+    /// At engine teardown the whole body is skipped for a session parked on an
+    /// unanswered `AskUserQuestion` (see
+    /// [`crate::engine::agent_recovery::preserve_question_park_at_shutdown`]):
+    /// such a session must land NOTHING after its `UserQuestionAsked`.
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn emit_stop_terminal(
         &self,
@@ -179,6 +184,24 @@ impl LucidosEngine {
         cc_reasoning_effort: &Option<String>,
         coding_agent: crate::runtime::CodingAgent,
     ) {
+        // `is_shutdown` is the PER-SESSION flag, which `shutdown_agent_sessions`
+        // sets only on sessions present in `agent_sessions` when its pass ran. A
+        // session inserted after that pass (a slow `--resume` racing the restart)
+        // carries `false` while the engine is very much shutting down, and that
+        // is precisely the race the preserve guard's doc names. OR in the
+        // engine-global flag, exactly as `finalize_direct_agent` does for the
+        // same reason (`completion.rs`, the thread-9e37697e incident).
+        if crate::engine::agent_recovery::preserve_question_park_at_shutdown(
+            &self.pool,
+            arm,
+            thread_id,
+            is_shutdown || self.is_shutting_down(),
+        )
+        .await
+        {
+            agent_cancel.cancel();
+            return;
+        }
         Self::kill_cc_and_flush(
             agent_cancel,
             claude_text_buf,

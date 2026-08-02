@@ -47,7 +47,7 @@ pub struct PluginManifest {
 /// public-API value convention). Authors tag a plugin in `manifest.toml`
 /// (`categories = ["finance", ...]`); the Plugins → Store tab filters/browses by
 /// these. A value outside this set is dropped + flagged at scan time. Keep in
-/// sync with `system-knowhow/building-a-plugin.md` and the *plugin category*
+/// sync with `system-knowhow/plugins.md` and the *plugin category*
 /// glossary entry.
 pub const PLUGIN_CATEGORIES: &[&str] = &[
     "productivity",

@@ -1,5 +1,9 @@
 # Lucidos
 
+[![A half-marathon training app, described in chat and running live beside it, reading this morning's Oura readiness](docs/screenshots/readme-hero.png)](https://lucidos.dev)
+
+<sub>Described in chat, running seconds later in the same window, wired to the user's own data. [60-second demo](https://www.youtube.com/watch?v=hNN5bL1nq7k) &middot; [lucidos.dev](https://lucidos.dev) &middot; macOS DMG, or one line on macOS and Linux.</sub>
+
 <!--intro-start-->
 Lucidos is an AI companion that shares your whole workspace. You talk, build, run, automate, and remember together - in one place. Chat lives alongside your work in a persistent split view on desktop, and as a separate pane you can swipe to on mobile. You're never leaving your work to talk to the AI; you're always working with it - manifesting your intent in a rich, extensible interface.
 

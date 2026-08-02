@@ -48,7 +48,9 @@ async fn git_head_sha_returns_none_for_non_git_dir() {
 async fn compute_returns_none_when_last_sha_is_none() {
     // Truly-first turn: no prior idle to compare against → no note.
     let (_tmp, repo) = make_repo().await;
-    assert!(compute_external_edit_note(&repo, None).await.is_none());
+    assert!(compute_external_edit_note(&repo, None, false)
+        .await
+        .is_none());
 }
 
 #[tokio::test]
@@ -56,7 +58,7 @@ async fn compute_returns_none_when_worktree_unchanged() {
     let (_tmp, repo) = make_repo().await;
     let head = current_head(&repo).await;
     assert!(
-        compute_external_edit_note(&repo, Some(&head))
+        compute_external_edit_note(&repo, Some(&head), false)
             .await
             .is_none(),
         "no edits since last idle → no note"
@@ -66,7 +68,7 @@ async fn compute_returns_none_when_worktree_unchanged() {
 #[tokio::test]
 async fn compute_returns_none_when_worktree_path_missing() {
     let missing = std::path::PathBuf::from("/nonexistent/wt");
-    assert!(compute_external_edit_note(&missing, Some("abcd"))
+    assert!(compute_external_edit_note(&missing, Some("abcd"), false)
         .await
         .is_none());
 }
@@ -81,7 +83,7 @@ async fn compute_detects_uncommitted_changes() {
         .await
         .unwrap();
 
-    let note = compute_external_edit_note(&repo, Some(&head))
+    let note = compute_external_edit_note(&repo, Some(&head), false)
         .await
         .expect("dirty worktree should produce a note");
     assert!(note.contains("Uncommitted changes:"), "note: {}", note);
@@ -111,7 +113,7 @@ async fn compute_detects_new_commits_since_last_idle() {
     let _ = git_cmd(&["add", "."], &repo).await;
     let _ = git_cmd(&["commit", "-m", "user added a thing"], &repo).await;
 
-    let note = compute_external_edit_note(&repo, Some(&last_head))
+    let note = compute_external_edit_note(&repo, Some(&last_head), false)
         .await
         .expect("HEAD moved → note");
     assert!(
@@ -148,7 +150,7 @@ async fn compute_detects_both_commits_and_uncommitted() {
         .await
         .unwrap();
 
-    let note = compute_external_edit_note(&repo, Some(&last_head))
+    let note = compute_external_edit_note(&repo, Some(&last_head), false)
         .await
         .expect("two changes → note");
     assert!(note.contains("Committed changes since your last action:"));
@@ -167,10 +169,116 @@ async fn compute_truncates_huge_dirty_lists() {
             .await
             .unwrap();
     }
-    let note = compute_external_edit_note(&repo, Some(&last_head))
+    let note = compute_external_edit_note(&repo, Some(&last_head), false)
         .await
         .expect("many dirty → note");
     assert!(note.contains("… and 10 more file(s)"), "note: {}", note);
+}
+
+/// The note must not assert a cause it cannot know: it sees a SHA and a
+/// `git status`, never who moved them. Blaming the user for an engine reset is
+/// the misattribution this wording fix exists to stop.
+#[tokio::test]
+async fn note_does_not_blame_the_user() {
+    let (_tmp, repo) = make_repo().await;
+    let head = current_head(&repo).await;
+    tokio::fs::write(repo.join("a.txt"), "edited")
+        .await
+        .unwrap();
+
+    let note = compute_external_edit_note(&repo, Some(&head), false)
+        .await
+        .expect("dirty worktree → note");
+    assert!(
+        !note.contains("the user edited"),
+        "note must not assert who changed the worktree: {}",
+        note
+    );
+}
+
+/// Build the Discard signature: commit on top of `main`, then reset the branch
+/// back. HEAD has moved relative to the recorded SHA, but `<last>..HEAD` is
+/// empty because HEAD went BACKWARDS. Returns the pre-reset SHA (what the last
+/// `CodingAgentIdled` would have recorded).
+async fn reset_backwards(repo: &std::path::Path) -> String {
+    tokio::fs::write(repo.join("agent_work.txt"), "work")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], repo).await;
+    let _ = git_cmd(&["commit", "-m", "the agent's commit"], repo).await;
+    let pre_reset = current_head(repo).await;
+    let _ = git_cmd(&["reset", "--hard", "HEAD~1"], repo).await;
+    let _ = git_cmd(&["clean", "-fd"], repo).await;
+    pre_reset
+}
+
+/// The regression: after a Discard, the whole note was "the user edited files
+/// … HEAD moved (no log available)". With the cause explained by the turn-gap
+/// note and a clean tree, there is nothing left to report.
+#[tokio::test]
+async fn head_move_with_empty_log_suppressed_when_explained() {
+    let (_tmp, repo) = make_repo().await;
+    let last_sha = reset_backwards(&repo).await;
+
+    assert!(
+        compute_external_edit_note(&repo, Some(&last_sha), true)
+            .await
+            .is_none(),
+        "an explained backwards reset with a clean tree has nothing to report"
+    );
+
+    // Unexplained, the same state still reports the move: the suppression is
+    // scoped to the caller knowing the cause, not to the shape of the reset.
+    let note = compute_external_edit_note(&repo, Some(&last_sha), false)
+        .await
+        .expect("an unexplained HEAD move must still be reported");
+    assert!(note.contains("HEAD moved (no log available)"), "{}", note);
+}
+
+/// Suppressing the HEAD-move line must not swallow a real edit the user made
+/// after the reset.
+#[tokio::test]
+async fn dirty_files_still_reported_when_explained() {
+    let (_tmp, repo) = make_repo().await;
+    let last_sha = reset_backwards(&repo).await;
+    tokio::fs::write(repo.join("user_edit.txt"), "by hand")
+        .await
+        .unwrap();
+
+    let note = compute_external_edit_note(&repo, Some(&last_sha), true)
+        .await
+        .expect("a real edit after the reset must still be reported");
+    assert!(note.contains("Uncommitted changes:"), "{}", note);
+    assert!(note.contains("user_edit.txt"), "{}", note);
+    assert!(
+        !note.contains("HEAD moved (no log available)"),
+        "the explained reset line must still be suppressed: {}",
+        note
+    );
+}
+
+/// A non-empty log is factual and names no cause, so an explained HEAD move
+/// (e.g. an Apply, which moves the worktree FORWARD onto merged commits) keeps
+/// reporting it.
+#[tokio::test]
+async fn real_commits_still_reported_when_explained() {
+    let (_tmp, repo) = make_repo().await;
+    let last_head = current_head(&repo).await;
+    tokio::fs::write(repo.join("landed.txt"), "merged")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "feat: the merged work"], &repo).await;
+
+    let note = compute_external_edit_note(&repo, Some(&last_head), true)
+        .await
+        .expect("commits ahead of the recorded SHA are still worth reporting");
+    assert!(
+        note.contains("Committed changes since your last action:"),
+        "{}",
+        note
+    );
+    assert!(note.contains("feat: the merged work"), "{}", note);
 }
 
 // -------------------- verify_branch --------------------

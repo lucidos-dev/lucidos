@@ -9,6 +9,9 @@
 use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 /// `source = 'builtin'` rows are seeded by migration: disable-only, never
 /// deletable (deleting one could orphan a user's saved `chat_model` pref).
 pub const SOURCE_BUILTIN: &str = "builtin";
@@ -73,6 +76,18 @@ fn row_to_model(row: ModelRow) -> Model {
     }
 }
 
+/// The chat model registry.
+///
+/// **No caller can skip the event.** [`Self::create`], [`Self::update`],
+/// [`Self::set_enabled`] and [`Self::delete`] are the only reachable mutators;
+/// the raw row writes are private to this module. `Model{Created,Updated,
+/// Deleted}` is what makes the in-memory `ModelRegistry` reload
+/// (`spawn_models_registry_subscriber`) and the picker update without a
+/// restart, so a silent write would leave the registry serving a stale model
+/// list until the next boot.
+///
+/// Same shape and the same reachability-not-atomicity guarantee as
+/// `RepositoryStore`; see `core::announced_surfaces`.
 pub struct ModelStore;
 
 impl ModelStore {
@@ -97,9 +112,9 @@ impl ModelStore {
         Ok(row.map(row_to_model))
     }
 
-    /// Insert a user-added model. Errors (unique violation) if `id` already
-    /// exists — the caller maps that to a 4xx so the user can pick another id.
-    pub async fn create(
+    /// Insert a user-added model row. **Private on purpose**: [`Self::create`]
+    /// is the reachable mutator, and it emits.
+    async fn insert_row(
         pool: &PgPool,
         id: &str,
         label: &str,
@@ -127,7 +142,7 @@ impl ModelStore {
     /// hands the model back to the prefix-map fallback, so the caller must
     /// resolve "field absent from the request" to the existing value before
     /// calling. Returns whether a row existed.
-    pub async fn update(
+    async fn update_row(
         pool: &PgPool,
         id: &str,
         label: &str,
@@ -153,23 +168,156 @@ impl ModelStore {
 
     /// Toggle a model's enabled flag without touching its other fields. Works on
     /// builtin rows too (the disable-only path). Returns whether a row existed.
-    pub async fn set_enabled(pool: &PgPool, id: &str, enabled: bool) -> Result<bool, sqlx::Error> {
-        let result =
-            sqlx::query("UPDATE models SET enabled = $2, updated_at = NOW() WHERE id = $1")
-                .bind(id)
-                .bind(enabled)
-                .execute(pool)
-                .await?;
-        Ok(result.rows_affected() > 0)
+    /// Returns `None` when no such model exists, `Some(changed)` otherwise.
+    /// `rows_affected` cannot answer "changed": Postgres writes a new tuple
+    /// version even when the value is identical. The self-join reads the
+    /// pre-update value in the same statement.
+    async fn set_enabled_row(
+        pool: &PgPool,
+        id: &str,
+        enabled: bool,
+    ) -> Result<Option<bool>, sqlx::Error> {
+        sqlx::query_scalar(
+            "UPDATE models AS m SET enabled = $2, updated_at = NOW() \
+             FROM (SELECT id, enabled FROM models WHERE id = $1) AS prior \
+             WHERE m.id = prior.id \
+             RETURNING (prior.enabled IS DISTINCT FROM $2)",
+        )
+        .bind(id)
+        .bind(enabled)
+        .fetch_optional(pool)
+        .await
     }
 
-    /// Delete a model by id. The caller guards against deleting builtins.
-    pub async fn delete(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+    /// Delete a model row. **Private on purpose**: [`Self::delete`] is the
+    /// reachable mutator, and it emits.
+    async fn delete_row(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM models WHERE id = $1")
             .bind(id)
             .execute(pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Add a user model and announce it. The only way to create one.
+    ///
+    /// Errors (unique violation) if `id` already exists; the caller maps that to
+    /// a 4xx so the user can pick another id. Nothing is announced on that
+    /// error, because nothing was written.
+    #[allow(clippy::too_many_arguments)] // one arg per model column, plus the bus and actor
+    pub async fn create(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        label: &str,
+        provider: &str,
+        sort_order: i32,
+        context_window: Option<i32>,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Model, sqlx::Error> {
+        let model = Self::insert_row(pool, id, label, provider, sort_order, context_window).await?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::ModelCreated {
+                    id: model.id.clone(),
+                    label: model.label.clone(),
+                    provider: model.provider.clone(),
+                    actor,
+                }),
+                "[Models] ModelCreated",
+            )
+            .await;
+        Ok(model)
+    }
+
+    /// Edit a user model and announce it. Announces only when a row existed, so
+    /// an edit aimed at a missing id stays silent.
+    #[allow(clippy::too_many_arguments)] // one arg per editable column, plus the bus and actor
+    pub async fn update(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        label: &str,
+        provider: &str,
+        sort_order: i32,
+        enabled: bool,
+        context_window: Option<i32>,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let updated = Self::update_row(
+            pool,
+            id,
+            label,
+            provider,
+            sort_order,
+            enabled,
+            context_window,
+        )
+        .await?;
+        if updated {
+            Self::announce_update(event_bus, id, actor).await;
+        }
+        Ok(updated)
+    }
+
+    /// Toggle a model's enabled flag and announce it, without touching its other
+    /// fields. Works on builtin rows too (the disable-only path).
+    ///
+    /// Returns whether the model exists (callers report "no model '<id>' in the
+    /// registry" on `false`), but announces only when the flag actually MOVED:
+    /// `ModelUpdated` makes the in-memory ModelRegistry rebuild, and a retrying
+    /// agent re-asserting the current value would rebuild it once per call for
+    /// no state change.
+    pub async fn set_enabled(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        enabled: bool,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let outcome = Self::set_enabled_row(pool, id, enabled).await?;
+        if outcome == Some(true) {
+            Self::announce_update(event_bus, id, actor).await;
+        }
+        Ok(outcome.is_some())
+    }
+
+    /// Remove a model and announce it. The caller guards against deleting
+    /// builtins. `ModelDeleted` fires only when a row was actually removed.
+    pub async fn delete(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        id: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let removed = Self::delete_row(pool, id).await?;
+        if removed {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::ModelDeleted {
+                        id: id.to_string(),
+                        actor,
+                    }),
+                    "[Models] ModelDeleted",
+                )
+                .await;
+        }
+        Ok(removed)
+    }
+
+    /// Shared by the two edit paths, which differ only in which columns they
+    /// touch: the registry reloads wholesale on `ModelUpdated`, so both say the
+    /// same thing.
+    async fn announce_update(event_bus: &EventBus, id: &str, actor: Option<MessageOrigin>) {
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::ModelUpdated {
+                    id: id.to_string(),
+                    actor,
+                }),
+                "[Models] ModelUpdated",
+            )
+            .await;
     }
 }
 
@@ -242,18 +390,28 @@ mod tests {
     async fn create_update_delete_user_model_round_trips() {
         let (pool, db_name) = setup_test_db().await;
 
-        let created = ModelStore::create(&pool, "my-model", "My Model", "anthropic", 99, None)
-            .await
-            .unwrap();
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let created = ModelStore::create(
+            &pool,
+            &bus,
+            "my-model",
+            "My Model",
+            "anthropic",
+            99,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(created.source, SOURCE_USER);
         assert!(created.enabled);
         assert!(!created.is_builtin());
 
-        assert!(
-            ModelStore::update(&pool, "my-model", "Renamed", "vertex", 5, false, None)
-                .await
-                .unwrap()
-        );
+        assert!(ModelStore::update(
+            &pool, &bus, "my-model", "Renamed", "vertex", 5, false, None, None
+        )
+        .await
+        .unwrap());
         let fetched = ModelStore::get(&pool, "my-model").await.unwrap().unwrap();
         assert_eq!(fetched.label, "Renamed");
         assert_eq!(fetched.provider, "vertex");
@@ -261,8 +419,80 @@ mod tests {
         // source is immutable through update
         assert_eq!(fetched.source, SOURCE_USER);
 
-        assert!(ModelStore::delete(&pool, "my-model").await.unwrap());
+        assert!(ModelStore::delete(&pool, &bus, "my-model", None)
+            .await
+            .unwrap());
         assert!(ModelStore::get(&pool, "my-model").await.unwrap().is_none());
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The load-bearing guarantee: a registry write and its announcement are one
+    /// operation, so the in-memory ModelRegistry reloads no matter which entry
+    /// path made the write. An edit or delete aimed at a missing id changes
+    /// nothing and therefore announces nothing.
+    #[tokio::test]
+    async fn every_mutation_announces_and_a_miss_does_not() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        async fn emitted(pool: &PgPool, event_type: &str) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+                .bind(event_type)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        ModelStore::create(&pool, &bus, "m", "M", "anthropic", 10, None, None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "ModelCreated").await, 1);
+
+        ModelStore::update(&pool, &bus, "m", "M2", "anthropic", 10, true, None, None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "ModelUpdated").await, 1);
+
+        ModelStore::set_enabled(&pool, &bus, "m", false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            emitted(&pool, "ModelUpdated").await,
+            2,
+            "a toggle is an update the registry must reload on"
+        );
+
+        // Re-asserting the current value still reports the model exists, but
+        // must not make the registry rebuild for no state change.
+        assert!(ModelStore::set_enabled(&pool, &bus, "m", false, None)
+            .await
+            .unwrap());
+        assert_eq!(
+            emitted(&pool, "ModelUpdated").await,
+            2,
+            "a no-op toggle must not announce"
+        );
+
+        assert!(
+            !ModelStore::set_enabled(&pool, &bus, "missing", false, None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            emitted(&pool, "ModelUpdated").await,
+            2,
+            "a toggle that matched no row must not announce"
+        );
+
+        assert!(ModelStore::delete(&pool, &bus, "m", None).await.unwrap());
+        assert_eq!(emitted(&pool, "ModelDeleted").await, 1);
+        assert!(!ModelStore::delete(&pool, &bus, "m", None).await.unwrap());
+        assert_eq!(
+            emitted(&pool, "ModelDeleted").await,
+            1,
+            "second delete removes nothing and therefore announces nothing"
+        );
 
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -277,19 +507,31 @@ mod tests {
         let (pool, db_name) = setup_test_db().await;
 
         // Absent on create → NULL (fall back to the prefix map).
-        let created = ModelStore::create(&pool, "ctx-model", "Ctx", "openrouter", 99, None)
-            .await
-            .unwrap();
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let created = ModelStore::create(
+            &pool,
+            &bus,
+            "ctx-model",
+            "Ctx",
+            "openrouter",
+            99,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(created.context_window, None);
 
         // Declared on create.
         let declared = ModelStore::create(
             &pool,
+            &bus,
             "moonshotai/kimi-k3",
             "Kimi K3",
             "openrouter",
             100,
             Some(1_048_576),
+            None,
         )
         .await
         .unwrap();
@@ -304,12 +546,14 @@ mod tests {
         // Update sets it.
         assert!(ModelStore::update(
             &pool,
+            &bus,
             "ctx-model",
             "Ctx",
             "openrouter",
             99,
             true,
-            Some(262_144)
+            Some(262_144),
+            None
         )
         .await
         .unwrap());
@@ -317,11 +561,19 @@ mod tests {
         assert_eq!(fetched.context_window, Some(262_144));
 
         // …and `None` clears it back to the fallback.
-        assert!(
-            ModelStore::update(&pool, "ctx-model", "Ctx", "openrouter", 99, true, None)
-                .await
-                .unwrap()
-        );
+        assert!(ModelStore::update(
+            &pool,
+            &bus,
+            "ctx-model",
+            "Ctx",
+            "openrouter",
+            99,
+            true,
+            None,
+            None
+        )
+        .await
+        .unwrap());
         let cleared = ModelStore::get(&pool, "ctx-model").await.unwrap().unwrap();
         assert_eq!(cleared.context_window, None);
 
@@ -413,9 +665,12 @@ mod tests {
     #[tokio::test]
     async fn set_enabled_toggles_builtin_without_other_changes() {
         let (pool, db_name) = setup_test_db().await;
-        assert!(ModelStore::set_enabled(&pool, "claude-fable-5", false)
-            .await
-            .unwrap());
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        assert!(
+            ModelStore::set_enabled(&pool, &bus, "claude-fable-5", false, None)
+                .await
+                .unwrap()
+        );
         let m = ModelStore::get(&pool, "claude-fable-5")
             .await
             .unwrap()
@@ -433,8 +688,18 @@ mod tests {
         // Colliding with a seeded builtin id must fail (unique PK violation) so
         // the API can return a clear "already exists" rather than silently
         // overwriting a builtin.
-        let result =
-            ModelStore::create(&pool, "claude-fable-5", "Dupe", "anthropic", 1, None).await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        let result = ModelStore::create(
+            &pool,
+            &bus,
+            "claude-fable-5",
+            "Dupe",
+            "anthropic",
+            1,
+            None,
+            None,
+        )
+        .await;
         assert!(result.is_err(), "duplicate id must error");
         pool.close().await;
         teardown_test_db(&db_name).await;

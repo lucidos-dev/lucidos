@@ -84,6 +84,13 @@ mod tests {
             grouped_legacy_name("triggers", &json!({"action": "pause"})).unwrap(),
             "pause_trigger"
         );
+        // `run` has no retired flat predecessor, but the `triggers` domain
+        // dispatches every action through this map, so the manifest still has
+        // to name a handler key or the action is rejected as unknown.
+        assert_eq!(
+            grouped_legacy_name("triggers", &json!({"action": "run"})).unwrap(),
+            "run_trigger"
+        );
         assert_eq!(
             grouped_legacy_name("trigger_groups", &json!({"action": "reorder"})).unwrap(),
             "reorder_trigger_groups"

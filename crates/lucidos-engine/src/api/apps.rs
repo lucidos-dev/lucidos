@@ -1,7 +1,6 @@
 use super::app_ui::{rescope_app_html, rewrite_for_thread_id};
 use super::*;
 
-use crate::engine::event_bus::SystemEvent;
 use std::path::PathBuf;
 
 /// Query params for single app
@@ -153,20 +152,15 @@ pub(super) async fn delete_app(
         }
     }
 
-    match state.app_manager.delete_app(&query.id) {
-        Ok(commit) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Apps] AppDeleted", |actor| {
-                    SystemEvent::AppDeleted {
-                        app_id: query.id.clone(),
-                        actor,
-                    }
-                })
-                .await;
-            Json(serde_json::json!({ "commit": commit })).into_response()
-        }
+    // The manager emits `AppDeleted` from inside the write path, so resolve the
+    // device actor and hand it over (see `AppManager`'s type doc).
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match state
+        .app_manager
+        .delete_app(&state.engine.event_bus, &query.id, actor)
+        .await
+    {
+        Ok(commit) => Json(serde_json::json!({ "commit": commit })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -194,24 +188,13 @@ pub(super) async fn update_app(
         .get("description")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match state
         .app_manager
-        .update_app_metadata(&query.id, name, description)
+        .update_app_metadata(&state.engine.event_bus, &query.id, name, description, actor)
+        .await
     {
-        Ok(commit) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Apps] AppUpdated", |actor| {
-                    SystemEvent::AppUpdated {
-                        app_id: query.id.clone(),
-                        name: Some(name.to_string()),
-                        actor,
-                    }
-                })
-                .await;
-            Json(serde_json::json!({ "commit": commit })).into_response()
-        }
+        Ok(commit) => Json(serde_json::json!({ "commit": commit })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),
@@ -273,21 +256,13 @@ pub(super) async fn write_app_source(
         };
         files.push((name, content));
     }
-    match state.app_manager.write_app_source(&app_id, &files) {
-        Ok(commit) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Apps] AppUpdated", |actor| {
-                    SystemEvent::AppUpdated {
-                        app_id: app_id.clone(),
-                        name: None,
-                        actor,
-                    }
-                })
-                .await;
-            Json(serde_json::json!({ "commit": commit })).into_response()
-        }
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match state
+        .app_manager
+        .write_app_source(&state.engine.event_bus, &app_id, &files, actor)
+        .await
+    {
+        Ok(commit) => Json(serde_json::json!({ "commit": commit })).into_response(),
         Err(e) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({ "error": e.to_string() })),

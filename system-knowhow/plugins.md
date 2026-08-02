@@ -1,11 +1,11 @@
 ---
-name: Building a Plugin
+name: Plugins
 description: Use when the user wants to author, package, publish, share, install, update, or uninstall a Lucidos plugin -- phrases like "build a plugin", "publish a plugin", "share this app as a plugin", "package this for other workspaces", "ship a knowhow bundle", "install the X plugin", "update plugins", "make a .lucidos-plugin". Covers the manifest schema, plugin layout, the five LLM tools, distribution shapes, and the v1 guide-only uninstall semantics.
 ---
 
-# Building a Plugin
+# Plugins
 
-How to package a coherent bundle of workspace content (apps + knowhow + triggers + scripts) so another workspace can install it as a unit. The full v1 design lives in `docs/plans/2026-04-29-plugins-v1-design.md` -- this file is the operational reference for authoring, distributing, and maintaining one.
+The working reference for *plugins*: packaging a coherent bundle of workspace content (apps + knowhow + triggers + scripts) so another workspace can install it as a unit, then distributing, updating, and uninstalling it. The full v1 design lives in `docs/plans/2026-04-29-plugins-v1-design.md`; this file is the operational reference. For setting up a plugin right after it is installed, see `plugin-setup.md`.
 
 ## When a plugin is the right artifact
 
@@ -256,7 +256,7 @@ before assuming the CLI or the token is at fault.
 A plugin ships a trigger by declaring it in a **`trigger.toml`** at
 `triggers/<slug>/trigger.toml` — mirroring how an app is its own folder
 (`apps/<id>/manifest.json`). The file is a *trigger definition* (see
-`building-a-trigger.md` § "On-disk trigger definition"): `name`, `run`
+`triggers.md` § "On-disk trigger definition"): `name`, `run`
 (`intent` or `script`), `on` (event subscriptions), and the usual optional
 fields (`app_id`, `go_to_review`, `group_id`, `side_effect_grant`). Put any
 procedure the trigger needs in `triggers/<slug>/knowhow/`, beside it.
@@ -359,7 +359,7 @@ Pick this for: ad-hoc sharing (Slack, email), pre-publication testing, plugins t
 
 ## Authoring loop
 
-1. **Lay out the tree.** Create `my-plugin/manifest.toml` and the content directories. Author content as if it were already installed -- knowhow files use the same frontmatter rules as any other knowhow (`system-knowhow/building-knowhow.md`), apps follow the app conventions (`system-knowhow/building-an-app.md`), triggers obey the intent-vs-procedure rule (`system-knowhow/building-a-trigger.md`).
+1. **Lay out the tree.** Create `my-plugin/manifest.toml` and the content directories. Author content as if it were already installed -- knowhow files use the same frontmatter rules as any other knowhow (`system-knowhow/building-knowhow.md`), apps follow the app conventions (`system-knowhow/building-an-app.md`), triggers obey the intent-vs-procedure rule (`system-knowhow/triggers.md`).
 2. **Find every external reference, then ask the user how to handle each one.** Walk the apps' HTML/JS/CSS for `src=`, `href=`, `import`, and `fetch(...)` calls. For each path that does not resolve to a file you're already shipping under the plugin tree -- absolute paths, paths into `data/artifacts/`, paths into another app's tree, paths into the workspace's `data/scripts/` or `data/knowhow/` you don't intend to ship -- **list it back to the user and ask what to do** before bundling. Do not silently rewrite or drop references. Per reference, the user picks one of: (a) bundle the asset by copying it into `apps/<id>/` (or the appropriate plugin subtree) and rewriting the reference, (b) leave the reference as-is because the installer is expected to provide the file separately (rare -- document this in the plugin's README or `description`), (c) delete the reference and the dependent feature, or (d) abort packaging. The reason for asking: an image in `data/artifacts/foo.png` might be the user's source-of-truth they want to share, or it might be incidental scratch they want to drop -- the engine cannot guess.
 3. **Bump `version` in `manifest.toml` before publishing.** Without a version bump, `check_plugin_updates` will report `"Already at latest"` to existing installers and they will not pick up the new content.
 4. **For archive distribution, package as zip and verify.** From inside the plugin tree, run `zip -r ../my-plugin.lucidos-plugin .`. Then verify with `unzip -l ../my-plugin.lucidos-plugin` that every expected file is present and `file ../my-plugin.lucidos-plugin` reports `Zip archive data` (not `gzip compressed data`). Never substitute `tar`, `tar -czf`, or `gzip` -- the install path only understands PKZip.

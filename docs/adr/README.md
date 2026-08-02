@@ -6,11 +6,13 @@ backed out of an approach after thinking it through. The point is so future-us
 (and the next person who has the same idea) can read *why* instead of
 re-litigating it from scratch.
 
-This complements `docs/plans/` and `docs/design/`:
+This complements `docs/plans/` and `docs/notes/`:
 
-- `docs/plans/`, `docs/design/` — how a feature is/was built (the design + the
-  implementation steps). Reach for these when you're building something.
-- `docs/adr/` — *why* a decision went the way it did, including roads not taken.
+- `docs/notes/`: thinking, before anything is decided. An architecture
+  discussion written down so it is not lost. No commitment, may be abandoned.
+- `docs/plans/`: how a feature is/was built (the design + the implementation
+  steps). Reach for these when you're building something.
+- `docs/adr/`: *why* a decision went the way it did, including roads not taken.
   Reach for this when you're about to revisit a settled question.
 
 ## Format
@@ -61,3 +63,4 @@ Keep entries scannable. A decision log nobody reads is just more drift.
 - [0029 — A release tag names the main-line commit; the mirror's tag of the same name names the orphan (and the bump is *landed* on main, never skipped)](0029-a-release-tag-names-the-main-line-commit.md)
 - [0030: `make lint` gates rustfmt, and the tree was swept once to make that possible (no `rustfmt.toml`; generated Rust emits itself formatted)](0030-rustfmt-gate-after-a-one-time-sweep.md)
 - [0031: A deploy to a lucidos.dev origin runs on the maintainer's machine, never from public CI (the docs deploy workflow is deleted, not credentialed)](0031-deploys-run-on-the-maintainers-machine.md)
+- [0032: A state write owns its announcement (the emit lives in the write path, and every announced surface is classified in one enforced registry)](0032-a-state-write-owns-its-announcement.md)

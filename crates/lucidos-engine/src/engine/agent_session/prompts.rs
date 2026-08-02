@@ -427,6 +427,43 @@ const REASONING_NOT_VISIBLE_RULE: &str = "\n\n\
     analysis\") unless you actually put it in a visible message this turn. When in doubt, write \
     it in the message.";
 
+/// Backend-INDEPENDENT teaching appended to every coding-agent prompt by
+/// [`append_backend_rules`], the same chokepoint [`REASONING_NOT_VISIBLE_RULE`]
+/// rides.
+///
+/// A coding agent swims in identifiers: commit shas from `git log`, the change
+/// id and short sha in the turn-gap note (`turn_gap::change_label` falls back
+/// to `change abc12345` when a change has no description), its own branch name,
+/// background task ids. None of them name anything the user can see. The
+/// Lucidos UI labels a change by its thread title and its Diff, never by id, so
+/// an assistant message built around one is unreadable: the user cannot tell
+/// which change is meant, let alone decide about it.
+///
+/// Two carve-outs keep the rule presentation-only, and both are load-bearing.
+/// Ids stay legal in git commands and tool arguments, or the agent stops using
+/// them where they are required. And a **markdown link target** is not prose:
+/// `lucidos spawn-thread` prints `[title](thread:<ws>/<uuid>)` for the agent to
+/// paste (see `system-knowhow/lucidos-cli.md`), and that link is the user's
+/// only way to open the thread it just started.
+///
+/// Mirrored for the chat agent by
+/// `chat::process::system_prompt::NAMES_NOT_IDS_RULE` (same rule, tuned to
+/// changes and the `changes` tool). Change both together.
+const NAMES_NOT_IDS_RULE: &str = "\n\n\
+    NAME THINGS THE WAY THE USER SEES THEM, NEVER A RAW ID OR SHA: Identifiers belong in \
+    commands, not in prose. A commit sha, change id, thread id, task id, branch name, or any \
+    other uuid/hex string is meaningless to the user: no screen in Lucidos is labelled with it, \
+    so they cannot look it up and cannot act on it. NEVER put one in an assistant message, in a \
+    question, or in an option label. Refer to the work by what it is: a commit by its subject \
+    line, a change by what it does and which files it touches, a thread by its title, a file by \
+    its path. Your session summary lists commit subjects and file paths, never shas. Ids stay \
+    where they belong: git commands, tool arguments, and CLI calls still take them, and the \
+    Diff view shows the user the real thing. A markdown link TARGET is not prose either, so \
+    keep pasting `[title](thread:<ws>/<uuid>)` exactly as `lucidos spawn-thread` prints it: \
+    the user reads the label and taps it, and without the link they cannot open the thread you \
+    started. The only other exception is a raw value the user asked for, or one they have to \
+    paste somewhere.";
+
 /// Append backend-specific rules — plus the backend-independent
 /// [`REASONING_NOT_VISIBLE_RULE`], which rides every prompt here — to a finished
 /// system prompt — the single
@@ -444,10 +481,11 @@ pub(super) fn append_backend_rules(
     prompt: String,
     coding_agent: crate::runtime::CodingAgent,
 ) -> String {
-    // Backend-INDEPENDENT: both backends hide the model's reasoning from the UI,
-    // so every prompt flavor gets the reasoning-not-visible rule here (the shared
-    // chokepoint) before the backend-specific teaching below.
-    let prompt = format!("{prompt}{REASONING_NOT_VISIBLE_RULE}");
+    // Backend-INDEPENDENT: both backends hide the model's reasoning from the UI
+    // and both talk to the user about work they track by sha, so every prompt
+    // flavor gets these two rules here (the shared chokepoint) before the
+    // backend-specific teaching below.
+    let prompt = format!("{prompt}{REASONING_NOT_VISIBLE_RULE}{NAMES_NOT_IDS_RULE}");
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
         crate::runtime::CodingAgent::Codex => {
@@ -1212,18 +1250,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn coding_agent_prompts_tell_agent_its_reasoning_is_not_visible() {
-        // Regression guard for the "Caption copy: do the six lines above work?"
-        // card whose six lines never rendered: the model drafted them in its
-        // reasoning (display-omitted / signature-only for the current models, and
-        // unavailable through the CC CLI we drive) and then referenced them as if
-        // shown. Every coding-agent prompt — every flavor, both backends — must
-        // tell the agent its reasoning is not shown so it puts must-see content in
-        // a visible message. The rule is injected at the shared
-        // `append_backend_rules` chokepoint, so build each flavor and run it
-        // through that (the same way the real spawn does).
-        let flavors: &[(&str, String)] = &[
+    /// Every prompt flavor, built the way the real spawn builds it (before
+    /// `append_backend_rules`). Shared by the guards for rules injected at that
+    /// chokepoint, which must reach all of them for both backends.
+    fn all_prompt_flavors() -> Vec<(&'static str, String)> {
+        vec![
             ("worktree", worktree_system_prompt("feature/x", "dev")),
             (
                 "external_repo",
@@ -1246,12 +1277,26 @@ mod tests {
                 "conflict_resolution",
                 conflict_resolution_system_prompt().to_string(),
             ),
-        ];
+        ]
+    }
+
+    #[test]
+    fn coding_agent_prompts_tell_agent_its_reasoning_is_not_visible() {
+        // Regression guard for the "Caption copy: do the six lines above work?"
+        // card whose six lines never rendered: the model drafted them in its
+        // reasoning (display-omitted / signature-only for the current models, and
+        // unavailable through the CC CLI we drive) and then referenced them as if
+        // shown. Every coding-agent prompt (every flavor, both backends) must
+        // tell the agent its reasoning is not shown so it puts must-see content in
+        // a visible message. The rule is injected at the shared
+        // `append_backend_rules` chokepoint, so build each flavor and run it
+        // through that (the same way the real spawn does).
+        let flavors = all_prompt_flavors();
         for agent in [
             crate::runtime::CodingAgent::ClaudeCode,
             crate::runtime::CodingAgent::Codex,
         ] {
-            for (label, base) in flavors {
+            for (label, base) in &flavors {
                 let full = append_backend_rules(base.clone(), agent);
                 for needle in [
                     "YOUR REASONING IS NOT SHOWN TO THE USER",
@@ -1275,6 +1320,49 @@ mod tests {
             codex.contains("ask_user_question` tool (on the `lucidos` MCP"),
             "Codex prompt must still swap in the MCP ask_user_question rule",
         );
+    }
+
+    /// Regression guard for the question card that asked "Change 99da1708 is
+    /// docs-only and its plan is separate from it. What do you want first?"
+    /// with an option labelled "Apply 99da1708 now". A change id names nothing
+    /// the user can see, so the card was unanswerable. Rides the same
+    /// `append_backend_rules` chokepoint as the reasoning rule, so every flavor
+    /// and both backends must carry it.
+    #[test]
+    fn coding_agent_prompts_forbid_raw_ids_and_shas_in_user_facing_text() {
+        let flavors = all_prompt_flavors();
+        for agent in [
+            crate::runtime::CodingAgent::ClaudeCode,
+            crate::runtime::CodingAgent::Codex,
+        ] {
+            for (label, base) in &flavors {
+                let full = append_backend_rules(base.clone(), agent);
+                for needle in [
+                    "NAME THINGS THE WAY THE USER SEES THEM, NEVER A RAW ID OR SHA",
+                    "NEVER put one in an assistant message, in a question, or in an option label",
+                    "a commit by its subject line",
+                    "never shas",
+                ] {
+                    assert!(
+                        full.contains(needle),
+                        "{label} ({agent:?}) must forbid raw ids in user-facing text (`{needle}`)",
+                    );
+                }
+                // Presentation-only. Without the carve-outs the agent
+                // over-corrects: it stops passing shas to git and ids to tools,
+                // and it drops the `lucidos spawn-thread` link that is the
+                // user's only way to open a thread it started.
+                assert!(
+                    full.contains("git commands, tool arguments"),
+                    "{label} ({agent:?}) must keep ids legal where they are required",
+                );
+                assert!(
+                    full.contains("markdown link TARGET is not prose")
+                        && full.contains("[title](thread:<ws>/<uuid>)"),
+                    "{label} ({agent:?}) must exempt markdown link targets",
+                );
+            }
+        }
     }
 
     /// Codex has no slash-command runtime, yet prompts across every flavor

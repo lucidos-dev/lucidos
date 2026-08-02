@@ -79,6 +79,18 @@ export interface ApiResult {
   error?: string;
 }
 
+/** Result of an off-schedule run. `success: true` with
+ *  `status: 'already-running'` means the request was valid and nothing new
+ *  started: a fire of this trigger was already active or queued, and scheduled
+ *  fires coalesce to at most one pending run per trigger. Never present that
+ *  as a started run. */
+export interface TriggerRunResult {
+  success: boolean;
+  status?: 'started' | 'queued' | 'already-running';
+  /** Human-readable summary; on a refusal this is the reason. */
+  message: string;
+}
+
 export const triggers = {
   list(): Promise<Trigger[]> {
     return request<{ triggers: Trigger[] }>('/triggers').then(r => r.triggers);
@@ -109,6 +121,27 @@ export const triggers = {
   delete(id: string): Promise<ApiResult> {
     return request(`/triggers?id=${encodeURIComponent(id)}`, {
       method: 'DELETE',
+    });
+  },
+
+  /** Fire an existing trigger once, right now, outside its schedule.
+   *
+   *  This is a real fire, not an imitation: it records `TriggerExecuted` and
+   *  `last_run`, and runs under the trigger's own identity, side-effect grant
+   *  and `go_to_review` routing. Resolves as soon as the run is admitted, not
+   *  when it finishes.
+   *
+   *  Refused (`success: false`) when the trigger is paused and when it has no
+   *  cron schedule (emit its subscribed event instead).
+   *
+   *  The engine also refuses a run requested from inside a trigger fire, but
+   *  that guard reads a task-local set only on the in-process LLM-tool path, so
+   *  it does NOT fire for this HTTP call. Asking a trigger to run itself from
+   *  its own script is bounded anyway: the trigger is active, so the fire
+   *  coalesces and comes back as `already-running`. */
+  run(id: string): Promise<TriggerRunResult> {
+    return request(`/triggers/run?id=${encodeURIComponent(id)}`, {
+      method: 'POST',
     });
   },
 };

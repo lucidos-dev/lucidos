@@ -588,12 +588,16 @@
     border-color: var(--accent);
 }
 
-/* Selector qualified with .prompt-box so it outranks `.form-group textarea`
-   in skills.css (the trigger Intent textarea sits inside both wrappers). */
+/* The shared shell of the two .prompt-box surfaces: the chat composer and the
+   trigger form's Intent field. Selector qualified with .prompt-box so it
+   outranks `.form-group textarea` in skills.css (the Intent textarea sits inside
+   both wrappers). The type SCALE is deliberately not here: it differs per
+   surface, so the composer sets its own on `.prompt-row .prompt-textarea`
+   (chat/input-messages.css) and the Intent field keeps the form's size from
+   `.form-group textarea`. */
 .prompt-box .prompt-textarea {
     width: 100%;
     padding: 0.5rem 1rem;
-    font-size: var(--font-size-lg);
     font-family: var(--font-ui);
     -webkit-appearance: none;
     appearance: none;

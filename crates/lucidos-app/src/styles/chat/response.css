@@ -1158,7 +1158,10 @@
 
 .allowlist-empty {
     color: var(--text-muted);
-    font-size: var(--font-size-lg);
+    /* Help-text size, matching the .settings-section-desc paragraph directly
+       above it in the same section. It was --font-size-lg, the emphasis/title
+       step, which read a notch larger than every other line on the page. */
+    font-size: var(--font-size-sm);
     padding: 0.25rem 0;
 }
 
@@ -1166,13 +1169,23 @@
     display: flex;
     gap: 0.5rem;
     align-items: center;
+    /* Pins the row to the footprint AllowlistRow's skeleton blocks declare
+       (h="2.25rem"), so the crossfade out of the skeleton doesn't shift the
+       list. Without it the row height is whatever the input's font metrics
+       happen to add up to, which drifts away from the placeholder every time
+       the type scale moves. */
+    min-height: 2.25rem;
 }
 
 .allowlist-row-input {
     flex: 1;
     min-width: 0;
     font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
-    font-size: var(--font-size-lg);
+    /* The app's text-input size, shared with .settings-text-input and
+       .form-group input. It was --font-size-lg (the emphasis/title step), which
+       made the Permissions page the only settings page whose fields ran a whole
+       scale step larger than every other field in the app. */
+    font-size: var(--font-size-md);
     line-height: 1.5;
     padding: 0.375rem 0.625rem;
     border: 1px solid var(--border-color);

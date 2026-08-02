@@ -35,6 +35,13 @@
 #      FRONT_DOOR rename, and the macOS rule that an exited installer is never
 #      by itself a verdict.
 #
+# And one more, from the v0.18.5 propagation failure rather than that plan:
+#  10. an rc/** version mismatch is RE-READ before it is believed, with a
+#      bounded budget, a cache-busting fetch that can actually see past the
+#      runner's Cloudflare POP, and no widening of the retry to any other
+#      verdict in the step. FD_SERVED_VERSION must be exported after that loop,
+#      or a retried version would be shadowed by the stale first read.
+#
 # Hermetic and offline: it reads one tracked file and two tracked libs, makes no
 # network call, and runs no part of the workflow. Comment lines are stripped
 # before every assertion, so a job's own prose about a rule (the macOS job
@@ -283,6 +290,108 @@ for job in "${JOBS[@]}"; do
     fail "an existing guard is missing: $frag"
   done
   [ "$guards_ok" -eq 1 ] && pass "the existing guards are intact (mirror-only, no permissions, hostile-origin allowlist, validated rename)"
+
+  # ── 10. an rc/** version mismatch is re-read before it is believed ──────────
+  # release.sh arms this gate by blocking until the RC origin serves the
+  # candidate, but that wait polls from the maintainer's Mac and therefore sees
+  # exactly ONE Cloudflare POP; a runner resolves to another, whose edge cache
+  # can still hold the previous release's copy. v0.18.3 and v0.18.5 both reddened
+  # a front-door leg for that reason alone and both went green on a bare rerun.
+  # So a single fetch is a SAMPLE, not a verdict, and what is pinned here is that
+  # the mismatch case re-reads, that the re-read can see past the edge cache, and
+  # that no OTHER verdict in the step learned to retry along with it.
+  sniff="$(step_code "$job" "Every helper lib the installer needs resolves to shell")"
+  rc_loop_needle='while [ "$served_version" != "$rc_version" ]'
+  rc_loop_line="$(printf '%s\n' "$sniff" | line_with "$rc_loop_needle")"
+  rc_deadline_line="$(printf '%s\n' "$sniff" | line_with 'rc_deadline=$(( rc_started + FD_RC_VERSION_WAIT_SECS ))')"
+
+  if [ -n "$rc_loop_line" ] && [ -n "$rc_deadline_line" ]; then
+    pass "an rc version mismatch is re-read rather than believed on the first fetch (loop line $rc_loop_line, deadline line $rc_deadline_line)"
+  else
+    fail "the payload-sniff step has no bounded re-read around the rc version mismatch (loop ${rc_loop_line:-missing}, deadline ${rc_deadline_line:-missing}); one sample from one Cloudflare POP would again be treated as a verdict"
+  fi
+
+  # Parsed out of the file, never restated here: a budget this test hardcodes is
+  # a budget that can silently diverge from the one the job actually spends.
+  rc_wait="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*FD_RC_VERSION_WAIT_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
+  rc_poll="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*FD_RC_VERSION_POLL_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
+  if [ -n "$rc_wait" ] && [ -n "$rc_poll" ]; then
+    if [ "$rc_poll" -ge 15 ] && [ "$rc_poll" -le 60 ] && [ "$rc_wait" -gt "$rc_poll" ] && [ "$rc_wait" -le 600 ]; then
+      pass "the rc re-read budget is bounded and its interval is in band: wait ${rc_wait}s, poll ${rc_poll}s"
+    else
+      fail "the rc re-read budget is out of band: wait ${rc_wait}s, poll ${rc_poll}s (want 15 <= poll <= 60 < wait <= 600). Too tight and it cannot outlast POP lag; too loose and it just makes a real mismatch slower."
+    fi
+  else
+    fail "FD_RC_VERSION_WAIT_SECS / FD_RC_VERSION_POLL_SECS are not both literal integers in this job's env: an unbounded or interpolated re-read is exactly what this asserts against"
+  fi
+
+  # A re-read that hits the same cached copy for four minutes is not a retry, it
+  # is a slower red. Cloudflare's cache key includes the query string, so the
+  # per-attempt nonce is what forces a MISS; the no-cache headers are the second
+  # half. The Access headers must survive both, or the gated RC origin answers
+  # every re-read with a login page.
+  cb_ok=1
+  printf '%s\n' "$sniff" | grep -qF 'install.sh?cb=$(date +%s)-$rc_attempt' \
+    || { cb_ok=0; fail "the re-read fetch carries no per-attempt cb= query nonce, so Cloudflare would serve it from the same POP cache the first fetch already read"; }
+  rc_fetch="$(printf '%s\n' "$sniff" | grep -F 'Cache-Control: no-cache' | head -n 1)"
+  if [ -z "$rc_fetch" ]; then
+    cb_ok=0
+    fail "the re-read fetch sends no 'Cache-Control: no-cache' header"
+  else
+    case "$rc_fetch" in
+      *FD_HDR*'"$rc_url"'*) ;;
+      *) cb_ok=0; fail "the no-cache fetch is not the cache-busted URL with the Access headers attached: $rc_fetch" ;;
+    esac
+  fi
+  [ "$cb_ok" -eq 1 ] && pass "every re-read defeats the edge cache (cb= nonce plus no-cache headers) and keeps the Access headers"
+
+  # Scope. The retry covers the MISMATCH on the push arm and nothing else.
+  push_line="$(printf '%s\n' "$sniff" | line_with '[ "${GITHUB_EVENT_NAME:-}" = "push" ]')"
+  if [ -n "$push_line" ] && [ -n "$rc_loop_line" ] && [ "$rc_loop_line" -gt "$push_line" ]; then
+    pass "the re-read is inside the push arm (guard line $push_line, loop line $rc_loop_line)"
+  else
+    fail "the re-read loop is not inside the '\${GITHUB_EVENT_NAME:-} = push' arm (guard ${push_line:-missing}, loop ${rc_loop_line:-missing}), so it would run on events that assert no version at all"
+  fi
+
+  empty_line="$(printf '%s\n' "$sniff" | line_with 'could not parse LUCIDOS_DEFAULT_VERSION out of the served')"
+  if [ -z "$empty_line" ]; then
+    fail "the first-read fail-closed branch for an unparseable LUCIDOS_DEFAULT_VERSION is gone: a parser that finds nothing must never be read as 'the version is fine'"
+  else
+    empty_tail="$(sed -n "$((empty_line + 1)),$((empty_line + 3))p" "$WORKFLOW")"
+    if printf '%s\n' "$empty_tail" | grep -qF 'exit 1' \
+       && ! printf '%s\n' "$empty_tail" | grep -qE 'sleep|while '; then
+      pass "an unparseable version still fails closed immediately (line $empty_line), with no re-read"
+    else
+      fail "the unparseable-version branch at line $empty_line no longer exits straight away: the re-read is for the MISMATCH case only, and a fail-closed parse must never wait"
+    fi
+  fi
+
+  # Expiry stays fatal, and says which of the two causes it has ruled out.
+  exp_rc="$(printf '%s\n' "$sniff" | grep -F 'never converged' | head -n 1)"
+  if [ -z "$exp_rc" ]; then
+    fail "the re-read has no expiry error separating exhausted propagation lag from a genuinely different published candidate"
+  else
+    exp_rc_line="${exp_rc%%:*}"
+    exp_ok=1
+    case "$exp_rc" in
+      *'Last read: $served_version'*'Expected: $rc_version'*) ;;
+      *) exp_ok=0; fail "the expiry error does not report both the last-read and the expected version" ;;
+    esac
+    case "$(sed -n "$((exp_rc_line + 1))p" "$WORKFLOW")" in
+      *'exit 1'*) ;;
+      *) exp_ok=0; fail "the expiry error at line $exp_rc_line is not immediately followed by 'exit 1': the gate must never degrade a genuine mismatch to a warning" ;;
+    esac
+    [ "$exp_ok" -eq 1 ] && pass "expiry still fails hard (line $exp_rc_line), naming the last-read and expected versions"
+  fi
+
+  # The export must reflect whichever copy the loop finally accepted.
+  env_line="$(printf '%s\n' "$sniff" | line_with 'echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"')"
+  env_count="$(printf '%s\n' "$sniff" | grep -cF 'FD_SERVED_VERSION=$served_version')"
+  if [ -n "$env_line" ] && [ -n "$rc_loop_line" ] && [ "$env_line" -gt "$rc_loop_line" ] && [ "$env_count" -eq 1 ]; then
+    pass "FD_SERVED_VERSION is exported once, after the re-read loop (line $env_line, loop line $rc_loop_line)"
+  else
+    fail "FD_SERVED_VERSION is exported at line ${env_line:-none} ($env_count time(s)), not exactly once after the re-read loop (${rc_loop_line:-missing}): a retried version would be shadowed by the stale first read"
+  fi
 done
 
 # ── the one asymmetry between the jobs, asserted in both directions ───────────

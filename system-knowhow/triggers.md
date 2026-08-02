@@ -1,14 +1,14 @@
 ---
-name: Building a Trigger
-description: Use when the user wants something to happen automatically — "every morning", "notify me when X happens", "watch for Y", recurring or event-driven background work. Covers cron vs event subscriptions, the intent-vs-procedure rule, and notification discipline.
+name: Triggers
+description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y", recurring or event-driven background work), or wants an EXISTING trigger to run right now: "run this trigger now", "fire it manually", an ad hoc or off-schedule run, testing a trigger that already exists. Covers cron vs event subscriptions, the intent-vs-procedure rule, notification discipline, and the run action that fires an existing trigger off-schedule (plus when it is refused, and why an event-only trigger needs its event emitted instead).
 ---
 
-# Building a Trigger
+# Triggers
 
-How to guide a user from "I want this to happen automatically" to a working trigger. Cron format, frontmatter, and field reference live in the engine system prompt and the grouped `triggers` tool description — don't restate them. The CLAUDE.md "trigger intent vs. procedure" rule is summarized below; see `docs/taxonomy.md` § Triggers for the worked example.
+The working reference for *triggers*: choosing one, building it, editing it, and running an existing one off-schedule. Cron format, frontmatter, and field reference live in the engine system prompt and the grouped `triggers` tool description, so don't restate them. The CLAUDE.md "trigger intent vs. procedure" rule is summarized below; see `docs/taxonomy.md` § Triggers for the worked example.
 
 > **Tool surface.** Triggers are managed through the grouped **`triggers`** tool
-> (`action: create | list | update | delete | pause | resume`) and the grouped
+> (`action: create | list | update | delete | pause | resume | run`) and the grouped
 > **`trigger_groups`** tool (`action: list | create | rename | reorder |
 > delete`). Throughout this guide, a bare verb like `update_trigger` /
 > `list_trigger_groups` is shorthand for that tool with the matching `action`
@@ -127,7 +127,7 @@ Source event id: 7a9c2c5f-…
 
 For schedule (cron) triggers there is no source event, so no `event_id`. For on-event triggers that notify about *a different* event (e.g. fire on `CodingAgentIdled` but notify about the last `UserQuestionAsked`), look the right event up yourself with `query_events` and use that id.
 
-#### Worked example — push when agent needs me
+#### Worked example: push when agent needs me
 
 ```yaml
 on:
@@ -177,7 +177,7 @@ When the engine fires a script trigger that subscribes to a domain event, it set
 
 The trigger's own thread is `LUCIDOS_THREAD_ID` (same env var every spawned subprocess gets). `TRIGGER_EVENT_THREAD_ID` is the *source* event's thread — these are different threads. A script that mixes them up will deep-link the push into the trigger's own (uninteresting) thread instead of where the user actually needs to act.
 
-### Worked example — push when any subscribed event fires
+### Worked example: push when any subscribed event fires
 
 The script is *event-agnostic*: the trigger's `on:` list owns which events fire it; the script just consumes whatever arrives. Add or remove events from `on:` and the same script keeps working.
 
@@ -265,7 +265,7 @@ This matters **only when the workspace has the command guard on** (Settings → 
 A chat turn would *ask* the user to approve such a command. A trigger fires unattended: there's nobody to ask. So instead the trigger carries a **side-effect grant** — the set of irreversible side-effect categories it's pre-authorized to perform. At fire time:
 
 - the command's side-effect category **is in the grant** → it runs;
-- it **isn't** → the command is blocked and **the whole trigger run fails** (a failure notification surfaces it, naming the missing grant).
+- it **isn't** → the command is blocked and **the whole trigger run fails** (a failure notification surfaces it, naming the blocked command and the missing grant, with an *Open trigger* button that lands on these settings).
 
 The categories are: **email**, **external API** (mutating HTTP), **cloud CLI** (gh/aws/gcloud), **out-of-workspace destruction**, and **other** (anything irreversible that fits none of the above). The default grant is empty — a new trigger may perform *no* irreversible side-effect.
 
@@ -295,6 +295,33 @@ This applies to every shape of change:
 | "Run it once more, like at 7pm tonight" | `update_trigger(trigger_id, cron=[existing..., one_shot_expr])`, then a follow-up `update_trigger` after it fires to remove the one-shot row. Don't create a duplicate trigger — even temporarily |
 
 If you genuinely need a different trigger (different *workflow*, not a tweak of the same one), give it a clearly different name. Two live triggers named identically are a UX trap — the user can't tell them apart in any picker.
+
+## Running an existing trigger once, off-schedule
+
+**`triggers(action="run", trigger_id)`.** That is the whole answer for a cron trigger. The CLI is `lucidos triggers run --id <uuid>`, the SDK is `lucidos.triggers.run(id)`, and the trigger's row in the panel has a **Run once** button. (Not to be confused with the Thread Queue panel's **Run now**, which force-admits an entry that is *already queued* and cannot create a fire.)
+
+It is a real fire, so it records `TriggerExecuted` / `TriggerCompleted` and the panel's `last_run` and OK/failed status, and it runs under the trigger's own identity, its side-effect grant, and (for an `intent` run) its *trigger thread* and `go_to_review` routing. Downstream nothing distinguishes it from a scheduled fire, deliberately. It returns as soon as the run is admitted, not when the run finishes.
+
+Three answers other than "started", each of which you must relay as-is rather than reporting a run:
+
+- **Already running.** A fire of this trigger was already active or queued, so nothing new started: scheduled fires coalesce to at most one pending run per trigger. Tell the user that; do not claim you started one.
+- **Paused.** Refused. Resuming does not run anything *on purpose*, so if the user wants both, do both. (It can still fire something incidentally: re-registering the schedule also re-runs the missed-slot catch-up, so a cron slot from the past hour that never ran fires on resume. That is a side effect of restoring the schedule, not a way to ask for a run, and you cannot predict it.)
+- **No cron schedule.** Refused, because a payload-less fire is a shape an event-only trigger has never had (an intent run would find no `## Triggering Event` block, a script run would get none of the `TRIGGER_EVENT_*` vars). Emit its event instead.
+
+### Event-only trigger: emit the event
+
+`events(action="emit", …)`, or `lucidos events emit <Type> --summary "…" --payload '{…}'` from a script. The emit goes through the same matcher, the same admission, and the same run as a real event, so this is the faithful reproduction.
+
+- **Per-entry `condition` filters still apply.** A payload that fails the condition matches nothing and you get silence, not an error. Read the `on` array from `list_triggers` and build a payload that passes.
+- Shape the payload like the real emitter's, not just enough to match: the run reads it (`## Triggering Event` for an intent, `TRIGGER_EVENT_PAYLOAD` for a script).
+- The event is real and persisted, so every *other* subscriber fires too.
+- **Event fires do NOT coalesce.** Unlike the run action (cron fires collapse to at most one pending run per trigger), event fires keep strict FIFO because each carries its own payload. Emit twice and the trigger runs twice, the second surfacing as an unexplained extra run minutes later. Check `list_threads` (rows carry `trigger_id` and `status`) before re-emitting.
+
+### Don't imitate the fire
+
+Copying `run.intent` into `run_thread`, or running the trigger's script yourself with `run_python` / `run_bash`, produces something that looks like a run and isn't one: no `TriggerExecuted`, no `last_run`, nothing in the trigger's history, none of the trigger-fire framing or its system rules, and no side-effect grant. Doing the work inline in the conversation thread is worse still: no per-run thread for the user to open, and a long or destructive procedure runs inside a chat turn.
+
+Both stay fine for **debugging** ("does the script still crash?"), as long as you call it that. A hand-run script gets none of `TRIGGER_EVENT_TYPE` / `TRIGGER_EVENT_PAYLOAD` / `TRIGGER_EVENT_ID` / `TRIGGER_EVENT_THREAD_ID`, so an event-driven one raises `KeyError` on the first lookup, and `LUCIDOS_THREAD_ID` points at your conversation, so any `lucidos notify` lands in the wrong thread.
 
 ## Questions to settle with the user before creating
 
@@ -356,7 +383,7 @@ them.
 
 The file exists so a trigger is inspectable (the Plugins panel's installed-plugin
 file links point at it for plugin-shipped triggers) and so a *plugin* can SHIP a
-trigger by declaring one — see `building-a-plugin.md`.
+trigger by declaring one, see `plugins.md`.
 
 ### Renamed trigger → stale `run.path`
 
@@ -392,6 +419,7 @@ in `list_triggers`.
 
 - **Recreating instead of editing.** See "Edit, don't recreate" above. The single biggest source of orphaned thread history.
 - **Hand-editing `trigger.toml`.** It's a derived read-model the scheduler never reads: the edit silently no-ops (the trigger keeps its old config) and is clobbered by the next trigger event or restart. Change the config with `update_trigger`, then verify against `list_triggers` — never by reading the file back. See "On-disk trigger definition" above.
+- **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume restores the schedule and runs nothing by itself. Use `triggers(action="run")` (or emit the subscribed event, for an event-only trigger) rather than copying the intent into `run_thread` or executing the script yourself. See "Running an existing trigger once, off-schedule" above.
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
 - **Cron when an event subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
 - **Parallel triggers for one workflow that reacts to several events.** Use one trigger with multiple `on` entries; never duplicate the intent across siblings — editing one and forgetting the other silently drifts behaviour.

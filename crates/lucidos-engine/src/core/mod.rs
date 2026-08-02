@@ -1,3 +1,4 @@
+pub mod announced_surfaces;
 pub mod apps;
 pub mod artifacts;
 pub mod backup;
@@ -190,7 +191,9 @@ pub const KNOWHOW_DIR: &str = "data/knowhow";
 pub const TRIGGERS_DIR: &str = "data/triggers";
 
 pub use apps::{App, AppManager, AppManifest};
-pub use artifacts::{list_searchable_data_files, ArtifactChange, ArtifactManager};
+pub use artifacts::{
+    list_searchable_data_files, ArtifactChange, ArtifactManager, WriteAnnouncement,
+};
 pub use credentials::{AuthType, Credential, CredentialInfo, CredentialStore};
 pub use devices::DeviceStore;
 pub use email::{EmailAccount, EmailAccountInfo, EmailStore};

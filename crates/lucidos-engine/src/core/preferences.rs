@@ -2,6 +2,9 @@ use sqlx::PgPool;
 use std::collections::HashMap;
 use uuid::Uuid;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 // Background model preference keys
 pub const PREF_MODEL_TITLE: &str = "model_title";
 pub const PREF_MODEL_IMAGE_DESCRIPTION: &str = "model_image_description";
@@ -66,7 +69,25 @@ pub(crate) const PREF_COMMAND_GUARD: &str = "command_guard";
 // master `command_guard` toggle is on.
 pub(crate) const PREF_COMMAND_GUARD_JUDGE: &str = "command_guard_judge";
 
-/// Store for managing user preferences in the database
+/// Store for managing user preferences in the database.
+///
+/// **Announcing is the default, and the silent door is guarded.**
+/// [`Self::set`], [`Self::set_for_device`] and [`Self::delete`] emit
+/// `PreferencesChanged` from inside the write path; the raw row writes are
+/// private to this module. [`Self::set_silent`] exists for the handful of keys
+/// that are engine bookkeeping rather than settings, and it REJECTS any key
+/// absent from `preference_catalog::SILENT_PREF_KEYS`, so it cannot be used to
+/// write a user-visible preference quietly.
+///
+/// That inversion matters here more than for the other stores, because
+/// `PreferencesChanged` is a MECHANISM and not just a notification: the
+/// scheduler re-registers the backup cron off a `backup_schedule` write, and
+/// the frontend live-applies theme / font / scale. Two writers used to bypass
+/// `apply_preference_write` and hand-roll the emit at their call site (the
+/// scheduler's backup schedule and the HTTP retention handler), which is the
+/// shape that produced the bug this whole change is about.
+///
+/// See `core::announced_surfaces`.
 pub struct PreferenceStore;
 
 impl PreferenceStore {
@@ -89,8 +110,11 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Set a global preference (insert or update, device_id IS NULL)
-    pub async fn set(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
+    /// Set a global preference (insert or update, device_id IS NULL).
+    ///
+    /// **Private on purpose**: [`Self::set`] and [`Self::set_silent`] are the
+    /// reachable mutators, and the first of them emits.
+    async fn set_row(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
             INSERT INTO preferences (key, value, device_id, updated_at)
@@ -108,8 +132,11 @@ impl PreferenceStore {
         Ok(())
     }
 
-    /// Set a per-device preference (insert or update)
-    pub async fn set_for_device(
+    /// Set a per-device preference (insert or update).
+    ///
+    /// **Private on purpose**: [`Self::set_for_device`] is the reachable
+    /// mutator, and it emits.
+    async fn set_for_device_row(
         pool: &PgPool,
         key: &str,
         value: &str,
@@ -202,14 +229,105 @@ impl PreferenceStore {
         Ok(map)
     }
 
-    /// Delete a global preference by key
-    pub async fn delete(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
+    /// Delete a global preference row. **Private on purpose**:
+    /// [`Self::delete`] is the reachable mutator, and it emits.
+    async fn delete_row(pool: &PgPool, key: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM preferences WHERE key = $1 AND device_id IS NULL")
             .bind(key)
             .execute(pool)
             .await?;
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Write a global preference and announce it.
+    ///
+    /// Announces unconditionally, including when the value is unchanged: a
+    /// preference write is a deliberate user action, and `PreferencesChanged`
+    /// is what re-applies the setting (the scheduler re-registers the backup
+    /// cron on it), so suppressing a same-value write could skip the
+    /// re-application the user was asking for.
+    pub async fn set(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        key: &str,
+        value: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), sqlx::Error> {
+        Self::set_row(pool, key, value).await?;
+        Self::announce(event_bus, key, Some(value.to_string()), actor).await;
+        Ok(())
+    }
+
+    /// Write a per-device preference override and announce it.
+    pub async fn set_for_device(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        key: &str,
+        value: &str,
+        device_id: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<(), sqlx::Error> {
+        Self::set_for_device_row(pool, key, value, device_id).await?;
+        Self::announce(event_bus, key, Some(value.to_string()), actor).await;
+        Ok(())
+    }
+
+    /// Delete a global preference and announce it. Announces only when a row
+    /// existed; `value: None` on the event means "back to the default".
+    pub async fn delete(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        key: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let removed = Self::delete_row(pool, key).await?;
+        if removed {
+            Self::announce(event_bus, key, None, actor).await;
+        }
+        Ok(removed)
+    }
+
+    /// Write a preference key that is engine bookkeeping rather than a setting,
+    /// without announcing.
+    ///
+    /// **Rejects any key not listed in
+    /// [`preference_catalog::SILENT_PREF_KEYS`]**, which is what stops this
+    /// from becoming the easy way to skip an announcement. Reach for
+    /// [`Self::set`] for anything a user can see; if a genuinely internal key
+    /// is missing from the list, add it there with its reason.
+    pub async fn set_silent(pool: &PgPool, key: &str, value: &str) -> Result<(), sqlx::Error> {
+        if !crate::core::preference_catalog::is_silent_key(key) {
+            // A protocol violation by the caller, not a database failure. sqlx's
+            // error type has no variant for that, so `Protocol` carries the
+            // message: the alternative is a second error type for one call site.
+            return Err(sqlx::Error::Protocol(format!(
+                "'{key}' is not an engine-internal preference key, so it must be written through \
+                 PreferenceStore::set (which announces PreferencesChanged). Add it to \
+                 SILENT_PREF_KEYS with a reason if it really is internal state."
+            )));
+        }
+        Self::set_row(pool, key, value).await
+    }
+
+    /// One place the three announcing paths share, so a write and a delete
+    /// cannot drift in what they say.
+    async fn announce(
+        event_bus: &EventBus,
+        key: &str,
+        value: Option<String>,
+        actor: Option<MessageOrigin>,
+    ) {
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::PreferencesChanged {
+                    key: key.to_string(),
+                    value,
+                    actor,
+                }),
+                "[Preferences] PreferencesChanged",
+            )
+            .await;
     }
 
     /// Check if a global preference exists
@@ -391,6 +509,93 @@ mod tests {
     use super::*;
     use crate::test_support::{setup_test_db, teardown_test_db};
 
+    async fn emitted(pool: &PgPool, event_type: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The load-bearing guarantee. `PreferencesChanged` is a MECHANISM here,
+    /// not just a notification: the scheduler re-registers the backup cron off
+    /// it and the frontend live-applies theme / font / scale, so a preference
+    /// written without it silently fails to take effect.
+    ///
+    /// A same-value write still announces. The event re-applies the setting, so
+    /// suppressing it would skip the re-application the user asked for.
+    #[tokio::test]
+    async fn every_preference_write_announces_including_a_same_value_rewrite() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        PreferenceStore::set(&pool, &bus, "theme", "dark", None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "PreferencesChanged").await, 1);
+
+        PreferenceStore::set(&pool, &bus, "theme", "dark", None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "PreferencesChanged").await, 2);
+
+        PreferenceStore::set_for_device(&pool, &bus, "theme", "light", "d1", None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "PreferencesChanged").await, 3);
+
+        assert!(PreferenceStore::delete(&pool, &bus, "theme", None)
+            .await
+            .unwrap());
+        assert_eq!(emitted(&pool, "PreferencesChanged").await, 4);
+        assert!(!PreferenceStore::delete(&pool, &bus, "theme", None)
+            .await
+            .unwrap());
+        assert_eq!(
+            emitted(&pool, "PreferencesChanged").await,
+            4,
+            "deleting a key that was already gone changes nothing, so it says nothing"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The silent door is guarded, which is what stops it from becoming the
+    /// easy way to skip an announcement. A listed engine-internal key writes
+    /// quietly; anything else is refused rather than written.
+    #[tokio::test]
+    async fn set_silent_writes_internal_keys_and_refuses_real_preferences() {
+        let (pool, db_name) = setup_test_db().await;
+
+        PreferenceStore::set_silent(&pool, "vapid_keys", "{}")
+            .await
+            .expect("a listed internal key writes");
+        assert_eq!(
+            PreferenceStore::get(&pool, "vapid_keys").await.unwrap(),
+            Some("{}".to_string())
+        );
+        assert_eq!(
+            emitted(&pool, "PreferencesChanged").await,
+            0,
+            "an internal key is not a setting and must not announce"
+        );
+
+        let refused = PreferenceStore::set_silent(&pool, "theme", "dark").await;
+        assert!(
+            refused.is_err(),
+            "a user-visible preference must not be writable through the silent door"
+        );
+        assert_eq!(
+            PreferenceStore::get(&pool, "theme").await.unwrap(),
+            None,
+            "the refusal must happen before the write, not after"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     #[tokio::test]
     async fn user_chat_settings_returns_none_when_unset() {
         let (pool, db_name) = setup_test_db().await;
@@ -412,7 +617,7 @@ mod tests {
     #[tokio::test]
     async fn capture_context_returns_false_when_disabled() {
         let (pool, db_name) = setup_test_db().await;
-        PreferenceStore::set(&pool, PREF_CAPTURE_CONTEXT, "false")
+        crate::test_support::seed_preference(&pool, PREF_CAPTURE_CONTEXT, "false")
             .await
             .unwrap();
         assert!(!PreferenceStore::capture_context(&pool).await.unwrap());
@@ -423,7 +628,7 @@ mod tests {
     #[tokio::test]
     async fn capture_context_returns_true_when_explicitly_true() {
         let (pool, db_name) = setup_test_db().await;
-        PreferenceStore::set(&pool, PREF_CAPTURE_CONTEXT, "true")
+        crate::test_support::seed_preference(&pool, PREF_CAPTURE_CONTEXT, "true")
             .await
             .unwrap();
         assert!(PreferenceStore::capture_context(&pool).await.unwrap());
@@ -462,10 +667,10 @@ mod tests {
     #[tokio::test]
     async fn user_chat_settings_returns_stored_values() {
         let (pool, db_name) = setup_test_db().await;
-        PreferenceStore::set(&pool, PREF_CHAT_MODEL, "claude-opus-4-7[1m]")
+        crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "claude-opus-4-7[1m]")
             .await
             .unwrap();
-        PreferenceStore::set(&pool, PREF_CHAT_REASONING_EFFORT, "max")
+        crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "max")
             .await
             .unwrap();
         let (model, effort) = PreferenceStore::user_chat_settings(&pool).await;
@@ -476,10 +681,10 @@ mod tests {
     }
 
     async fn seed_chat_prefs(pool: &PgPool, model: &str, effort: &str) {
-        PreferenceStore::set(pool, PREF_CHAT_MODEL, model)
+        crate::test_support::seed_preference(pool, PREF_CHAT_MODEL, model)
             .await
             .unwrap();
-        PreferenceStore::set(pool, PREF_CHAT_REASONING_EFFORT, effort)
+        crate::test_support::seed_preference(pool, PREF_CHAT_REASONING_EFFORT, effort)
             .await
             .unwrap();
     }

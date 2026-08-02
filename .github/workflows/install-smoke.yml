@@ -804,6 +804,20 @@ jobs:
       # range requests against GitHub and not something to hammer.
       FD_ASSET_WAIT_SECS: '1800'       # 30 min; release-tarballs takes ~23
       FD_ASSET_POLL_SECS: '30'
+      # ── the RC version-convergence budget (payload mode, rung 1) ─────────────
+      # How long rung 1 will keep re-reading the served installer's baked version
+      # with cache-busting before it calls an rc/** mismatch real. The full
+      # reasoning is at the check itself; the short version is that the arming
+      # wait in release.sh polls from ONE Cloudflare POP and a GitHub runner
+      # resolves to another, so a single fetch is a sample rather than a verdict.
+      #
+      # BOUNDED, and additive ONLY on the failing path: a correctly-propagated
+      # POP matches on the very first fetch and spends none of this. It is also
+      # mutually exclusive with FD_ASSET_WAIT_SECS (that budget is full mode, this
+      # one only ever runs in payload mode), so it cannot stack with the
+      # preflight, and 240 s sits far inside the 75-minute ceiling either way.
+      FD_RC_VERSION_WAIT_SECS: '240'   # 4 min of propagation slack, then it is real
+      FD_RC_VERSION_POLL_SECS: '30'    # so roughly 8 re-reads after the first fetch
       # A stranger's shell has no LUCIDOS_* set, but this workflow's top-level env
       # block exports two for the --dev smoke job — and install.sh treats every
       # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
@@ -1046,13 +1060,12 @@ jobs:
             grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
             exit 1
           fi
-          echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
           echo "    served version: $served_version"
 
           # ── the RC origin must be serving THIS release candidate ──────────────
           # Only on an rc/** push, where the branch name pins the version we are
           # gating (release.sh force-pushes the stripped tree to rc/<version>).
-          # Without this, the previous RC's copy — still sitting at the same URL —
+          # Without this, the previous RC's copy, still sitting at the same URL,
           # satisfies every payload check and the gate goes green having verified
           # last release's installer. That is the "passes for the wrong reason"
           # failure this whole job exists to avoid, so it is fatal, not a warning.
@@ -1060,17 +1073,79 @@ jobs:
           # The baked constant parsed above is what a piped install actually
           # resolves, and release.sh rewrites it in the same step that bumps
           # RELEASE, so it pins the candidate exactly.
+          #
+          # A MISMATCH IS RE-READ BEFORE IT IS BELIEVED, and this is the one part
+          # of the check that is not a plain assertion. release.sh arms this gate
+          # by publishing /rc and then blocking until the origin serves the
+          # candidate (scripts/lib/release_rc_front_door.sh), but that wait polls
+          # from the maintainer's Mac and therefore observes exactly ONE
+          # Cloudflare POP. A GitHub runner resolves to a different one, whose
+          # edge cache can still be holding the PREVIOUS release's copy. Twice
+          # now the arming wait reported the new version while a runner read the
+          # old one: v0.18.3, and v0.18.5 on 2026-07-31 where ONLY the
+          # macos-latest leg reddened while macos-15-intel and ubuntu read the
+          # correct version off the same origin. That is the signature of a
+          # per-POP cache, not an origin regression, and both went green on a
+          # bare `gh run rerun --failed`. A single fetch is a SAMPLE from one POP
+          # at one instant, and treating it as a verdict is what reddened them.
+          #
+          # So the mismatch case, and ONLY the mismatch case on the rc/** push
+          # arm, polls to a bounded deadline (FD_RC_VERSION_WAIT_SECS, every
+          # FD_RC_VERSION_POLL_SECS). Every other verdict in this step is
+          # unchanged and still immediate: an unparseable version above still
+          # fails closed on the first read, HTML and a Cloudflare Access login
+          # page still fail with their own messages (the retry re-runs
+          # assert_shell_file, so a retry that lands on HTML is reported as HTML
+          # rather than swallowed as another mismatch), and a non-push event
+          # asserts no version at all.
+          #
+          # Each retry MUST defeat the edge cache or it just re-reads the same
+          # stale POP copy for four minutes and only makes the red slower. Two
+          # mechanisms together: a per-attempt nonce in the query string, which
+          # Cloudflare includes in its cache key so a fresh one forces a MISS and
+          # a pull from the Pages origin, and the no-cache request headers.
           if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
             case "${GITHUB_REF_NAME:-}" in
               rc/?*) rc_version="${GITHUB_REF_NAME#rc/}" ;;
               *) echo "::error::this job only runs on a push for an rc/<version> branch, got '${GITHUB_REF_NAME:-}'"; exit 1 ;;
             esac
-            if [ "$served_version" != "$rc_version" ]; then
-              echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version) — the RC front door is serving a DIFFERENT release candidate. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree."
-              exit 1
+            rc_started="$(date +%s)"
+            rc_deadline=$(( rc_started + FD_RC_VERSION_WAIT_SECS ))
+            rc_attempt=0
+            while [ "$served_version" != "$rc_version" ]; do
+              if [ "$(date +%s)" -ge "$rc_deadline" ]; then
+                echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version): the RC front door is serving a DIFFERENT release candidate. This is not a first-read verdict. The baked version was re-read with a cache-busting query nonce and no-cache headers $rc_attempt time(s) across the full ${FD_RC_VERSION_WAIT_SECS}s budget and never converged, so Cloudflare POP propagation lag no longer explains it. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree. Last read: $served_version. Expected: $rc_version."
+                exit 1
+              fi
+              sleep "$FD_RC_VERSION_POLL_SECS"
+              rc_attempt=$(( rc_attempt + 1 ))
+              # The nonce is per attempt AND carries the clock, so no two fetches
+              # in a run (or across reruns) can share a cache key.
+              rc_url="$FRONT_DOOR/install.sh?cb=$(date +%s)-$rc_attempt"
+              FD_EFFECTIVE_URL="$(curl -fsSL "${FD_HDR[@]}" -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$rc_url" -o "$tmp/install.sh" -w '%{url_effective}')" \
+                || { echo "::error::could not re-fetch $rc_url while waiting for this runner's Cloudflare POP to serve $rc_version"; exit 1; }
+              # The whole payload is re-validated, not just the version: the
+              # retried copy is the one every later step reads out of $tmp.
+              assert_shell_file "$tmp/install.sh" "$rc_url" || exit 1
+              served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+              if [ -z "$served_version" ]; then
+                echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the re-fetched $rc_url. This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+                exit 1
+              fi
+              echo "    re-read $rc_attempt at $(( $(date +%s) - rc_started ))s: this POP now serves $served_version (want $rc_version)"
+            done
+            if [ "$rc_attempt" -gt 0 ]; then
+              echo "::warning::the RC front door needed $rc_attempt cache-busting re-read(s) over $(( $(date +%s) - rc_started ))s before this runner's Cloudflare POP served $rc_version. The origin is fine: this is Cloudflare POP propagation lag on the RC origin, which release.sh's arming wait cannot see because it polls from a single vantage point. Recorded here so the run does not read as a clean first-try pass."
             fi
             echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
           fi
+
+          # Exported only NOW, after the convergence loop, and exactly once. A
+          # write before the loop would pin the FIRST read, so every later
+          # consumer (the asset preflight, the LUCIDOS_INSTALL_URL parse) would
+          # see the stale version a retry had already replaced.
+          echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
 
           # Which libs, from where — both READ OUT of the installer we just
           # fetched, so this stays correct when the set changes.
@@ -1889,6 +1964,14 @@ jobs:
       # budget instead of seconds.
       FD_ASSET_WAIT_SECS: '1800'       # 30 min; release-tarballs takes ~23
       FD_ASSET_POLL_SECS: '30'
+      # The RC version-convergence budget, identical to `front-door` (see that
+      # job, and the check itself, for why a single fetch is a sample rather than
+      # a verdict). It matters MOST here: on v0.18.5 the macos-latest leg was the
+      # only one whose Cloudflare POP still held the previous release's copy.
+      # Additive only on the failing path, and payload-mode only, so it never
+      # stacks with FD_ASSET_WAIT_SECS.
+      FD_RC_VERSION_WAIT_SECS: '240'   # 4 min of propagation slack, then it is real
+      FD_RC_VERSION_POLL_SECS: '30'    # so roughly 8 re-reads after the first fetch
       # A stranger's Mac has no LUCIDOS_* set, but this workflow's top-level env
       # block exports two for the --dev smoke job — and install.sh treats every
       # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
@@ -2115,25 +2198,73 @@ jobs:
             grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
             exit 1
           fi
-          echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
           echo "    served version: $served_version"
 
           # ── the RC origin must be serving THIS release candidate ──────────────
           # Only on an rc/** push, where the branch name pins the version we are
-          # gating. Without this, the previous RC's copy — still sitting at the
-          # same URL — satisfies every payload check and the gate goes green
+          # gating. Without this, the previous RC's copy, still sitting at the
+          # same URL, satisfies every payload check and the gate goes green
           # having verified last release's installer.
+          #
+          # A MISMATCH IS RE-READ BEFORE IT IS BELIEVED, same as the Linux job,
+          # whose comment is the canonical one. release.sh's arming wait
+          # (scripts/lib/release_rc_front_door.sh) blocks until the origin serves
+          # the candidate, but it polls from the maintainer's Mac and so observes
+          # exactly ONE Cloudflare POP; a runner resolves to another, whose edge
+          # cache can still hold the PREVIOUS release's copy. This job is where
+          # that bit: on v0.18.5 (2026-07-31) the macos-latest leg reddened alone
+          # while macos-15-intel and ubuntu read the correct version off the same
+          # origin, which is a per-POP cache and not an origin regression, and
+          # v0.18.3 was the same failure. Both passed on a bare
+          # `gh run rerun --failed`.
+          #
+          # ONLY the mismatch case retries, to a bounded deadline
+          # (FD_RC_VERSION_WAIT_SECS, every FD_RC_VERSION_POLL_SECS). The
+          # unparseable-version branch above still fails closed on the first
+          # read, HTML and the Access login page still fail with their own
+          # messages (each retry re-runs assert_shell_file, so a retry landing on
+          # HTML is reported as HTML), and a non-push event asserts nothing.
+          # Every retry fetch defeats the edge cache with a per-attempt query
+          # nonce (Cloudflare's cache key includes the query string) plus the
+          # no-cache request headers, and keeps the Access headers in the
+          # bash-3.2-safe expansion form this job uses everywhere.
           if [ "${GITHUB_EVENT_NAME:-}" = "push" ]; then
             case "${GITHUB_REF_NAME:-}" in
               rc/?*) rc_version="${GITHUB_REF_NAME#rc/}" ;;
               *) echo "::error::this job only runs on a push for an rc/<version> branch, got '${GITHUB_REF_NAME:-}'"; exit 1 ;;
             esac
-            if [ "$served_version" != "$rc_version" ]; then
-              echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version) — the RC front door is serving a DIFFERENT release candidate. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree."
-              exit 1
+            rc_started="$(date +%s)"
+            rc_deadline=$(( rc_started + FD_RC_VERSION_WAIT_SECS ))
+            rc_attempt=0
+            while [ "$served_version" != "$rc_version" ]; do
+              if [ "$(date +%s)" -ge "$rc_deadline" ]; then
+                echo "::error::$FRONT_DOOR/install.sh bakes version $served_version, but this push is $GITHUB_REF_NAME (expected $rc_version): the RC front door is serving a DIFFERENT release candidate. This is not a first-read verdict. The baked version was re-read with a cache-busting query nonce and no-cache headers $rc_attempt time(s) across the full ${FD_RC_VERSION_WAIT_SECS}s budget and never converged, so Cloudflare POP propagation lag no longer explains it. Either the site publisher has not published this RC's installer yet, or it published another one; gating against it would verify the wrong tree. Last read: $served_version. Expected: $rc_version."
+                exit 1
+              fi
+              sleep "$FD_RC_VERSION_POLL_SECS"
+              rc_attempt=$(( rc_attempt + 1 ))
+              rc_url="$FRONT_DOOR/install.sh?cb=$(date +%s)-$rc_attempt"
+              FD_EFFECTIVE_URL="$(curl -fsSL ${FD_HDR[@]+"${FD_HDR[@]}"} -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' "$rc_url" -o "$tmp/install.sh" -w '%{url_effective}')" \
+                || { echo "::error::could not re-fetch $rc_url while waiting for this runner's Cloudflare POP to serve $rc_version"; exit 1; }
+              assert_shell_file "$tmp/install.sh" "$rc_url" || exit 1
+              served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+              if [ -z "$served_version" ]; then
+                echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the re-fetched $rc_url. This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+                exit 1
+              fi
+              echo "    re-read $rc_attempt at $(( $(date +%s) - rc_started ))s: this POP now serves $served_version (want $rc_version)"
+            done
+            if [ "$rc_attempt" -gt 0 ]; then
+              echo "::warning::the RC front door needed $rc_attempt cache-busting re-read(s) over $(( $(date +%s) - rc_started ))s before this runner's Cloudflare POP served $rc_version. The origin is fine: this is Cloudflare POP propagation lag on the RC origin, which release.sh's arming wait cannot see because it polls from a single vantage point. Recorded here so the run does not read as a clean first-try pass."
             fi
             echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
           fi
+
+          # Exported only NOW, after the convergence loop, and exactly once: a
+          # write before it would pin the FIRST read and hand every later
+          # consumer the stale version a retry had already replaced.
+          echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
 
           # Which libs, from where — both READ OUT of the installer we just
           # fetched, so this stays correct when the set changes.

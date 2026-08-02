@@ -162,9 +162,12 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       if (artifacts.value.status === 'loaded') void loadArtifacts();
       break;
     // Data-file mutations via the HTTP `/data/*` API (SDK `lucidos.data.*`,
-    // `lucidos` CLI). The engine emits these but NOT a paired Artifact* event,
-    // so a write/edit/delete under `data/artifacts/` would otherwise leave the
-    // artifacts list stale until reload. `path` is relative to `data/`
+    // `lucidos` CLI). These are the API-origin AUDIT events; the paired
+    // `Artifact*` entity event now fires alongside them, emitted from inside
+    // `ArtifactManager`'s write path. This arm used to be the workaround for
+    // its absence, and is kept because a data-API write to a non-artifact
+    // subtree still only produces a `DataFile*`, and because reloading the
+    // same list twice is idempotent. `path` is relative to `data/`
     // (e.g. `artifacts/notes.md`); refresh the artifacts cache when it targets
     // the artifacts subtree. Gated on `loaded` like the Artifact* trio.
     case 'DataFileWritten':
@@ -210,14 +213,27 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     case 'ModelDeleted':
       if (chatModels.value.status === 'loaded') void loadChatModels();
       break;
+    // Settings → Accounts. Both halves of the pair matter: connecting used to
+    // emit nothing at all (the engine wrote the row straight from the OAuth
+    // callback), so a disconnect refreshed every client while a connect
+    // refreshed none. The engine now emits both from inside
+    // `OAuthStore::{connect,delete}`, so the browser tab that ran the flow and
+    // every other device converge without a reload. A token refresh
+    // deliberately emits nothing: nothing user-visible changed.
+    case 'OAuthAccountConnected':
     case 'OAuthAccountDeleted':
       if (oauthAccounts.value.status === 'loaded') void loadOAuthAccounts();
       break;
     // Registered-repositories list (Settings → Repositories). Only Add/Remove
-    // change it — they carry repo_id and are HTTP-driven (there is no agent
-    // tool that registers a repo). RepositoryImported is handled above with the
-    // artifact events, NOT here: it's a clone into artifacts, not a registered
-    // repo.
+    // change it, and both carry repo_id. The engine emits them from INSIDE its
+    // single registry write path (`RepositoryStore::{register,unregister}`), not
+    // per call site, so every way a repo can appear reaches this arm: the HTTP
+    // CRUD, the `manage_repositories` agent tool (the user asking for a repo in
+    // chat), and the engine's own startup registration. The tool used to write
+    // the row directly and emit nothing, which left an agent-registered repo
+    // invisible here until a page reload. RepositoryImported is handled above
+    // with the artifact events, NOT here: it's a clone into artifacts, not a
+    // registered repo.
     case 'RepositoryAdded':
     case 'RepositoryRemoved':
       if (repositories.value.status === 'loaded') void loadRepositories();

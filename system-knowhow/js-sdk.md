@@ -44,7 +44,7 @@ What each piece does — include only what you need:
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
 | `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`) — use these class names and the app's buttons/lists/etc. render identically to the host shell. The body inherits the root font-size (the user's UI scale), matching Lucidos. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
-| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs two iframe-only side effects: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.navigate()`) and a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus — iframe keydowns otherwise never reach the host). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
+| `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs two iframe-only side effects: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`) and a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
 | `lucidos.ui.watchPreferences()` | Re-applies preferences live: when the user changes one (SSE `PreferencesChanged`), and — under a `system` preference — when the OS light/dark appearance flips (a `prefers-color-scheme` listener, off iOS, matching the host shell) | Static apps that have opted out of Lucidos theming |
 
@@ -474,7 +474,28 @@ lucidos.triggers.list(): Promise<Trigger[]>
 lucidos.triggers.create(trigger: CreateTrigger): Promise<ApiResult>
 lucidos.triggers.update(id: string, trigger: UpdateTrigger): Promise<ApiResult>
 lucidos.triggers.delete(id: string): Promise<ApiResult>
+lucidos.triggers.run(id: string): Promise<TriggerRunResult>
 ```
+
+`run` fires an existing trigger **once, right now**, outside its schedule (an
+*off-schedule run*). It is a real fire: it records `TriggerExecuted` /
+`last_run` and runs under the trigger's own identity, side-effect grant and
+`go_to_review` routing, indistinguishable downstream from a scheduled fire. Use
+it for a "Sync now" button in an app rather than re-implementing the trigger's
+work in the app.
+
+It resolves when the run is **admitted**, not when it finishes, so a truthy
+`success` is not "the work is done". Branch on `status`:
+
+| `status` | Meaning |
+|---|---|
+| `started` | Running now. |
+| `queued` | Over capacity; runs when capacity frees. |
+| `already-running` | A fire was already active or queued, so **nothing new started**. Never render this as a started run. |
+
+`success: false` means refused, with the reason in `message`: the trigger is
+paused, or it has no cron schedule (it is event-only, so emit its subscribed
+event with `lucidos.events.emit` instead).
 
 ### Types
 
@@ -555,6 +576,17 @@ interface UpdateTrigger {
 interface ApiResult {
   success: boolean;
   error?: string;
+}
+
+// Result of an off-schedule run. `success: true` with
+// status: 'already-running' means the request was valid and NOTHING new
+// started, because scheduled fires coalesce to at most one pending run per
+// trigger. `success: false` means refused (paused, or event-only), and
+// `message` says which.
+interface TriggerRunResult {
+  success: boolean;
+  status?: 'started' | 'queued' | 'already-running';
+  message: string;
 }
 ```
 
@@ -875,6 +907,7 @@ interface ThreadSummary {
 | Show "N active threads" badge | `lucidos.threads.count({ active: true })` |
 | React to thread state changes in real time | Subscribe to `lucidos.sse` instead |
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })` |
+| Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
 
 ## lucidos.ui — UI Control
 
@@ -882,6 +915,7 @@ interface ThreadSummary {
 lucidos.ui.applyPreferences(): Promise<void>
 lucidos.ui.watchPreferences(): void
 lucidos.ui.navigate(target: NavigateTarget, params?: NavigateParams): Promise<void>
+lucidos.ui.openExternal(url: string): Promise<void>
 lucidos.ui.startThread(opts?: { prompt?: string }): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
 lucidos.ui.toast(message: string, type?: ToastType, opts?: ToastOptions): void
@@ -927,6 +961,38 @@ await lucidos.ui.navigate('file', {
 ```
 
 The preview pane binds itself to that repository, so the Files panel behind it and the preview's changed-files sidebar stay on the same repo. A malformed `repo:…` string is not a repo path — it falls back to the artifact rule above.
+
+### Opening a link outside Lucidos
+
+`lucidos.ui.openExternal(url)` sends a URL out of the app. **Use it instead of
+`window.open` for any link that leaves Lucidos.**
+
+Plain anchors are already handled for you: the SDK's link interceptor catches
+`<a href="https://…">` clicks and routes them here automatically. Reach for
+`openExternal` when you open a URL from JavaScript instead (a button handler, a
+row action, a redirect after a fetch).
+
+```js
+document.querySelector('#docs-btn').addEventListener('click', () => {
+  lucidos.ui.openExternal('https://example.com/docs');
+});
+```
+
+Two rules:
+
+- **Call it synchronously from the click handler.** When the user has chosen the
+  "Ask" external-link target, this opens the OS share sheet, which the browser
+  refuses without a live user gesture. An `await` before the call spends that
+  gesture. Do async work first, then open from a later interaction.
+- **Don't fall back to `window.open`.** Inside an installed iOS PWA `window.open`
+  cannot leave the app: WebKit renders it in an in-app web view with no address
+  bar, no tabs and no shared Safari session. That overlay is exactly what the
+  user's `external_link_target` preference (`safari` / `ask` / `in-app`, default
+  `safari`) exists to control, so falling back to it overrides their choice.
+
+Non-http(s) URLs (`mailto:`, `tel:`) are handed to the platform unchanged. The
+promise resolves once the open has been dispatched; a user dismissing the share
+sheet resolves normally rather than rejecting.
 
 ### Starting a fresh chat with a prefilled prompt
 

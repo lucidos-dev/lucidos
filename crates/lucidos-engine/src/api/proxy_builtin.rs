@@ -415,8 +415,8 @@ mod tests {
 
     // ---- DB-backed resolver tests (need Postgres via test-engine.sh) --------
 
-    use crate::core::{AuthType, CredentialStore, PreferenceStore};
-    use crate::test_support::{setup_test_db, teardown_test_db};
+    use crate::core::AuthType;
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
 
     /// Run a resolved target's layers over a dummy request and collect the
     /// injected header pairs (name lowercased by `HeaderName`, value).
@@ -440,17 +440,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_openai_injects_bearer_from_credential() {
         let (pool, db) = setup_test_db().await;
-        CredentialStore::upsert(
+        seed_credential(
             &pool,
             "openai",
             OPENAI_DEFAULT_BASE_URL,
             AuthType::ApiKey,
             "sk-test-openai",
-            None,
-            None,
         )
-        .await
-        .expect("seed openai credential");
+        .await;
 
         let target = resolve_openai(&pool).await.expect("openai resolves");
         assert_eq!(target.0, OPENAI_DEFAULT_BASE_URL);
@@ -469,17 +466,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_openrouter_injects_bearer_from_credential() {
         let (pool, db) = setup_test_db().await;
-        CredentialStore::upsert(
+        seed_credential(
             &pool,
             "openrouter",
             OPENROUTER_BASE_URL,
             AuthType::Bearer,
             "sk-or-test",
-            None,
-            None,
         )
-        .await
-        .expect("seed openrouter credential");
+        .await;
 
         let target = resolve_openrouter(&pool)
             .await
@@ -497,17 +491,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_anthropic_api_key_injects_x_api_key() {
         let (pool, db) = setup_test_db().await;
-        CredentialStore::upsert(
+        seed_credential(
             &pool,
             "anthropic",
             ANTHROPIC_API_BASE_URL,
             AuthType::ApiKey,
             "sk-ant-test",
-            None,
-            None,
         )
-        .await
-        .expect("seed anthropic credential");
+        .await;
 
         let target = resolve_anthropic(&pool).await.expect("anthropic resolves");
         assert_eq!(target.0, ANTHROPIC_API_BASE_URL);
@@ -524,17 +515,14 @@ mod tests {
     #[tokio::test]
     async fn resolve_anthropic_oauth_injects_bearer_and_beta_header() {
         let (pool, db) = setup_test_db().await;
-        CredentialStore::upsert(
+        seed_credential(
             &pool,
             "anthropic",
             ANTHROPIC_API_BASE_URL,
             AuthType::Bearer,
             "oauth-token-xyz",
-            None,
-            None,
         )
-        .await
-        .expect("seed anthropic oauth credential");
+        .await;
 
         let target = resolve_anthropic(&pool).await.expect("anthropic resolves");
         let headers = injected_headers(&target).await;
@@ -576,9 +564,13 @@ mod tests {
     #[tokio::test]
     async fn resolve_local_uses_pref_base_and_is_keyless() {
         let (pool, db) = setup_test_db().await;
-        PreferenceStore::set(&pool, PREF_LOCAL_BASE_URL, "http://localhost:1234/v1")
-            .await
-            .expect("seed local_base_url pref");
+        crate::test_support::seed_preference(
+            &pool,
+            PREF_LOCAL_BASE_URL,
+            "http://localhost:1234/v1",
+        )
+        .await
+        .expect("seed local_base_url pref");
 
         let target = resolve_local(&pool).await.expect("local resolves");
         assert_eq!(target.0, "http://localhost:1234/v1");
@@ -593,20 +585,21 @@ mod tests {
     #[tokio::test]
     async fn resolve_local_with_key_injects_bearer() {
         let (pool, db) = setup_test_db().await;
-        PreferenceStore::set(&pool, PREF_LOCAL_BASE_URL, "http://localhost:1234/v1")
-            .await
-            .expect("seed local_base_url pref");
-        CredentialStore::upsert(
+        crate::test_support::seed_preference(
+            &pool,
+            PREF_LOCAL_BASE_URL,
+            "http://localhost:1234/v1",
+        )
+        .await
+        .expect("seed local_base_url pref");
+        seed_credential(
             &pool,
             "local",
             "http://localhost:1234/v1",
             AuthType::Bearer,
             "local-key",
-            None,
-            None,
         )
-        .await
-        .expect("seed local credential");
+        .await;
 
         let target = resolve_local(&pool).await.expect("local resolves");
         assert_eq!(

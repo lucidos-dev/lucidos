@@ -4,6 +4,9 @@ use sqlx::PgPool;
 use std::fmt;
 use uuid::Uuid;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 /// Authentication type for a stored credential.
 ///
 /// `Unknown` catches DB rows written by a newer engine version with an
@@ -177,7 +180,20 @@ fn parse_credential_info(row: CredentialInfoRow) -> CredentialInfo {
     }
 }
 
-/// Store for managing API credentials in the database
+/// Store for managing API credentials in the database.
+///
+/// **No caller can skip the event.** [`Self::upsert`], [`Self::update`] and
+/// [`Self::delete`] are the only reachable mutators: the raw row writes
+/// ([`Self::upsert_row`], [`Self::update_row`], [`Self::delete_row`]) are
+/// private to this module, so nothing anywhere in the crate can change a
+/// credential without the paired `Credential{Created,Updated,Deleted}` emit
+/// being attempted. Those events are what reload the Settings credentials list
+/// over SSE and, for a provider credential, what makes the engine hot-swap its
+/// active LLM provider without a restart.
+///
+/// Same shape and the same reachability-not-atomicity guarantee as
+/// `RepositoryStore`; see its type doc, and `core::announced_surfaces` for why
+/// every announced surface is built this way.
 pub struct CredentialStore;
 
 impl CredentialStore {
@@ -205,8 +221,19 @@ impl CredentialStore {
         Ok(())
     }
 
-    /// Insert or update a credential (upsert by service_name)
-    pub async fn upsert(
+    /// Insert or update a credential (upsert by service_name), reporting
+    /// whether the row was created.
+    ///
+    /// **Private on purpose.** This is the raw row write with no event; going
+    /// through [`Self::upsert`] is what guarantees the paired
+    /// `Credential{Created,Updated}`. See the type-level doc.
+    ///
+    /// `xmax = 0` is Postgres' standard way to tell an `ON CONFLICT` insert
+    /// from an update in a single round trip: a freshly inserted tuple has no
+    /// deleting transaction, an updated one carries the id of the transaction
+    /// that superseded the old version.
+    #[allow(clippy::too_many_arguments)] // one arg per credential column
+    async fn upsert_row(
         pool: &PgPool,
         service_name: &str,
         base_url: &str,
@@ -214,10 +241,10 @@ impl CredentialStore {
         auth_value: &str,
         auth_header: Option<&str>,
         env_var_name: Option<&str>,
-    ) -> Result<Uuid, sqlx::Error> {
+    ) -> Result<(Uuid, bool), sqlx::Error> {
         let auth_header = auth_header.unwrap_or("Authorization");
 
-        let result = sqlx::query_scalar::<_, Uuid>(
+        let result = sqlx::query_as::<_, (Uuid, bool)>(
             r#"
             INSERT INTO credentials (service_name, base_url, auth_type, auth_value, auth_header, env_var_name)
             VALUES ($1, $2, $3, $4, $5, $6)
@@ -228,7 +255,7 @@ impl CredentialStore {
                 auth_header = EXCLUDED.auth_header,
                 env_var_name = EXCLUDED.env_var_name,
                 updated_at = NOW()
-            RETURNING id
+            RETURNING id, (xmax = 0) AS created
             "#,
         )
         .bind(service_name)
@@ -241,6 +268,52 @@ impl CredentialStore {
         .await?;
 
         Ok(result)
+    }
+
+    /// Save a credential and announce it. The only way to create one.
+    ///
+    /// Emits `CredentialCreated` when the service was new and
+    /// `CredentialUpdated` when an existing one was overwritten, so the
+    /// timeline distinguishes "connected a provider" from "rotated its key".
+    /// The emit is not the caller's choice: see the type-level doc.
+    #[allow(clippy::too_many_arguments)] // one arg per credential column, plus the bus and actor
+    pub async fn upsert(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        service_name: &str,
+        base_url: &str,
+        auth_type: AuthType,
+        auth_value: &str,
+        auth_header: Option<&str>,
+        env_var_name: Option<&str>,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Uuid, sqlx::Error> {
+        let (id, created) = Self::upsert_row(
+            pool,
+            service_name,
+            base_url,
+            auth_type,
+            auth_value,
+            auth_header,
+            env_var_name,
+        )
+        .await?;
+        let event = if created {
+            SystemEvent::CredentialCreated {
+                service_name: service_name.to_string(),
+                auth_type,
+                actor,
+            }
+        } else {
+            SystemEvent::CredentialUpdated {
+                service_name: service_name.to_string(),
+                actor,
+            }
+        };
+        event_bus
+            .emit_or_log(BusEvent::System(event), "[Credentials] upsert")
+            .await;
+        Ok(id)
     }
 
     /// Get a credential by service name (includes the secret)
@@ -281,8 +354,10 @@ impl CredentialStore {
         Ok(results.into_iter().map(parse_credential).collect())
     }
 
-    /// Delete a credential by service name
-    pub async fn delete(pool: &PgPool, service_name: &str) -> Result<bool, sqlx::Error> {
+    /// Delete a credential row. **Private on purpose**, same as
+    /// [`Self::upsert_row`]: [`Self::delete`] is the reachable mutator, and it
+    /// emits.
+    async fn delete_row(pool: &PgPool, service_name: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM credentials WHERE service_name = $1")
             .bind(service_name)
             .execute(pool)
@@ -291,11 +366,39 @@ impl CredentialStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Delete a credential and announce it. The only way to remove one.
+    ///
+    /// `CredentialDeleted` fires only when a row was actually deleted, so a
+    /// repeated or racing delete announces once.
+    pub async fn delete(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        service_name: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let removed = Self::delete_row(pool, service_name).await?;
+        if removed {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::CredentialDeleted {
+                        service_name: service_name.to_string(),
+                        actor,
+                    }),
+                    "[Credentials] CredentialDeleted",
+                )
+                .await;
+        }
+        Ok(removed)
+    }
+
     /// Update an existing credential's editable fields (everything except the
     /// immutable `service_name`). `auth_value: None` keeps the stored secret
     /// untouched — used when the user edits non-secret fields without
     /// re-entering the secret. Returns whether a row existed.
-    pub async fn update(
+    ///
+    /// **Private on purpose**, same as [`Self::upsert_row`]: [`Self::update`]
+    /// is the reachable mutator, and it emits.
+    async fn update_row(
         pool: &PgPool,
         service_name: &str,
         base_url: &str,
@@ -346,6 +449,47 @@ impl CredentialStore {
         };
 
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Update an existing credential and announce it. The only way to edit one.
+    ///
+    /// `CredentialUpdated` fires only when a row was actually updated, so an
+    /// edit aimed at a missing service announces nothing. See [`Self::update_row`]
+    /// for the `auth_value: None` "keep the stored secret" contract.
+    #[allow(clippy::too_many_arguments)] // one arg per editable column, plus the bus and actor
+    pub async fn update(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        service_name: &str,
+        base_url: &str,
+        auth_type: AuthType,
+        auth_header: Option<&str>,
+        auth_value: Option<&str>,
+        env_var_name: Option<&str>,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let updated = Self::update_row(
+            pool,
+            service_name,
+            base_url,
+            auth_type,
+            auth_header,
+            auth_value,
+            env_var_name,
+        )
+        .await?;
+        if updated {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::CredentialUpdated {
+                        service_name: service_name.to_string(),
+                        actor,
+                    }),
+                    "[Credentials] CredentialUpdated",
+                )
+                .await;
+        }
+        Ok(updated)
     }
 
     /// Find a credential whose base_url scopes the given URL.
@@ -462,6 +606,157 @@ pub fn credential_env_vars(credentials: Vec<Credential>) -> Vec<(String, String)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    async fn emitted(pool: &PgPool, event_type: &str) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+            .bind(event_type)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+    }
+
+    /// The load-bearing guarantee: a credential write and its announcement are
+    /// one operation. A first save reads as a creation and a second as an
+    /// update, so the timeline distinguishes connecting a provider from
+    /// rotating its key.
+    #[tokio::test]
+    async fn upsert_announces_creation_then_update() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        CredentialStore::upsert(
+            &pool,
+            &bus,
+            "openai",
+            "https://api.openai.com",
+            AuthType::ApiKey,
+            "sk-one",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(emitted(&pool, "CredentialCreated").await, 1);
+        assert_eq!(emitted(&pool, "CredentialUpdated").await, 0);
+
+        CredentialStore::upsert(
+            &pool,
+            &bus,
+            "openai",
+            "https://api.openai.com",
+            AuthType::ApiKey,
+            "sk-two",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            emitted(&pool, "CredentialCreated").await,
+            1,
+            "overwriting an existing service is not a creation"
+        );
+        assert_eq!(emitted(&pool, "CredentialUpdated").await, 1);
+
+        teardown_test_db(&db).await;
+    }
+
+    /// An edit aimed at a service that does not exist changes nothing, so it
+    /// announces nothing.
+    #[tokio::test]
+    async fn update_announces_only_when_a_row_was_touched() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        assert!(!CredentialStore::update(
+            &pool,
+            &bus,
+            "missing",
+            "https://example.test",
+            AuthType::ApiKey,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap());
+        assert_eq!(emitted(&pool, "CredentialUpdated").await, 0);
+
+        CredentialStore::upsert(
+            &pool,
+            &bus,
+            "svc",
+            "https://example.test",
+            AuthType::ApiKey,
+            "secret",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(CredentialStore::update(
+            &pool,
+            &bus,
+            "svc",
+            "https://example.test/v2",
+            AuthType::ApiKey,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap());
+        assert_eq!(emitted(&pool, "CredentialUpdated").await, 1);
+
+        teardown_test_db(&db).await;
+    }
+
+    /// Removal announces exactly once: a repeated delete finds no row and stays
+    /// silent, so a racing double-remove cannot emit twice.
+    #[tokio::test]
+    async fn delete_announces_once_and_is_silent_when_nothing_was_removed() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+        CredentialStore::upsert(
+            &pool,
+            &bus,
+            "svc",
+            "https://example.test",
+            AuthType::ApiKey,
+            "secret",
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert!(CredentialStore::delete(&pool, &bus, "svc", None)
+            .await
+            .unwrap());
+        assert_eq!(emitted(&pool, "CredentialDeleted").await, 1);
+
+        assert!(
+            !CredentialStore::delete(&pool, &bus, "svc", None)
+                .await
+                .unwrap(),
+            "second delete removes nothing"
+        );
+        assert_eq!(
+            emitted(&pool, "CredentialDeleted").await,
+            1,
+            "and therefore announces nothing"
+        );
+
+        teardown_test_db(&db).await;
+    }
 
     fn make_cred(service_name: &str, auth_type: AuthType, auth_value: &str) -> Credential {
         Credential {

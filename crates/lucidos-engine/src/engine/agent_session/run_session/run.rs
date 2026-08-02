@@ -773,9 +773,12 @@ impl LucidosEngine {
                 thread_id,
                 origin_id,
                 user_message,
-                worktree_path.as_deref(),
-                last_idle_sha.as_deref(),
-                adoption_note.as_deref(),
+                ResumeSpawnContext {
+                    worktree_path: worktree_path.as_deref(),
+                    last_idle_sha: last_idle_sha.as_deref(),
+                    adoption_note: adoption_note.as_deref(),
+                    session_branch: Some(branch_name.as_str()),
+                },
             )
             .await;
 
@@ -2512,21 +2515,47 @@ impl LucidosEngine {
     }
 }
 
+/// What the spawn knows about the worktree it is resuming into. Grouped rather
+/// than passed as four more parameters: they all come from the same
+/// `SpawnWorktreeContext` resolution and are only ever read together.
+pub(super) struct ResumeSpawnContext<'a> {
+    /// The session's worktree on disk, when it has one.
+    pub worktree_path: Option<&'a Path>,
+    /// `worktree_head_sha` from the last `CodingAgentIdled`, the baseline the
+    /// external-edit detector diffs against. `None` on a first turn.
+    pub last_idle_sha: Option<&'a str>,
+    /// Pre-built note from `try_adopt_renegade_branch`, when the worktree was
+    /// switched to a branch holding this agent's work.
+    pub adoption_note: Option<&'a str>,
+    /// The branch this session resumes on, so a discard elsewhere can be told
+    /// apart from a discard of the agent's own work.
+    pub session_branch: Option<&'a str>,
+}
+
 /// Build the text handed to the resumed agent's input channel: the user's
 /// message, optionally prefixed with up to three resume-time notes that
-/// reconcile what changed while the agent was idle —
+/// reconcile what changed while the agent was idle:
 ///
-/// 1. **branch adoption** — the worktree was switched to a new branch holding
+/// 1. **branch adoption**: the worktree was switched to a new branch holding
 ///    the agent's work (`try_adopt_renegade_branch`),
-/// 2. **external edits** — the user edited/committed in the worktree
-///    (`external_edits::compute_external_edit_note`),
-/// 3. **applied changes** — the user clicked Apply, merging the agent's
-///    proposed change into `main` and resetting the worktree
-///    (`applied_changes::compute_applied_change_note`).
+/// 2. **turn gap**: the user or the engine resolved one of the agent's changes
+///    (Apply / Discard / Revert / a failed Apply) or the cleanup worker
+///    reclaimed the worktree (`turn_gap::compute_turn_gap_note`),
+/// 3. **external edits**: the worktree changed under the agent
+///    (`external_edits::compute_external_edit_note`).
+///
+/// The turn-gap note is computed FIRST because it decides whether the
+/// external-edit note is allowed to report a HEAD move as unexplained. An
+/// Apply, a Discard or a tier-2 worktree clean moves HEAD without anyone
+/// editing a file, and the edit detector cannot tell the difference: left to
+/// itself it reports "the user edited files in your worktree … HEAD moved (no
+/// log available)", blaming a hand edit for something the engine did. The
+/// turn-gap note states the real cause, so it passes `explains_worktree_reset`
+/// down and the edit note drops that one line (and only that line).
 ///
 /// The notes are folded into one block (joined by `\n`) and prepended to the
 /// message. An empty `user_message` (warm-up/continue-signal resume) is passed
-/// through untouched — notes only ride on a real turn so they can't trigger an
+/// through untouched: notes only ride on a real turn so they can't trigger an
 /// otherwise-empty LLM call.
 ///
 /// This single assembly point serves both Claude Code and Codex.
@@ -2535,38 +2564,53 @@ pub(super) async fn build_resume_prompt_text(
     thread_id: Uuid,
     current_origin_id: Uuid,
     user_message: &str,
-    worktree_path: Option<&Path>,
-    last_idle_sha: Option<&str>,
-    adoption_note: Option<&str>,
+    spawn: ResumeSpawnContext<'_>,
 ) -> String {
     if user_message.is_empty() {
         return user_message.to_string();
     }
 
-    let edit_note = match (worktree_path, last_idle_sha) {
-        (Some(wt), Some(sha)) => {
-            crate::engine::agent_session::external_edits::compute_external_edit_note(wt, Some(sha))
-                .await
-        }
-        _ => None,
-    };
-    // Phase 8.4: detect proposed changes the user APPLIED (merged to main +
-    // worktree reset) in the gap before this turn. The agent's --resume replay
-    // still thinks they're pending, so tell it they've landed. `current_origin_id`
-    // bounds the lookup to the previous turn boundary — stateless &
-    // self-clearing, see `compute_applied_change_note`.
-    let applied_note = crate::engine::agent_session::applied_changes::compute_applied_change_note(
+    let ResumeSpawnContext {
+        worktree_path,
+        last_idle_sha,
+        adoption_note,
+        session_branch,
+    } = spawn;
+
+    // What the user and the engine did to this agent's work in the gap before
+    // this turn. `current_origin_id` bounds the lookup to the previous turn
+    // boundary: stateless and self-clearing, see `compute_turn_gap_note`.
+    let gap_note = crate::engine::agent_session::turn_gap::compute_turn_gap_note(
         pool,
         thread_id,
         current_origin_id,
+        session_branch,
     )
     .await;
 
-    // Fold the three resume-time notes into one prepended block.
-    let combined: Vec<&str> = [adoption_note, edit_note.as_deref(), applied_note.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect();
+    let edit_note = match (worktree_path, last_idle_sha) {
+        (Some(wt), Some(sha)) => {
+            crate::engine::agent_session::external_edits::compute_external_edit_note(
+                wt,
+                Some(sha),
+                gap_note.as_ref().is_some_and(|n| n.explains_worktree_reset),
+            )
+            .await
+        }
+        _ => None,
+    };
+
+    // Fold the resume-time notes into one prepended block, cause before
+    // observation: the gap note explains a reset the edit note can only see the
+    // effects of.
+    let combined: Vec<&str> = [
+        adoption_note,
+        gap_note.as_ref().map(|n| n.note.as_str()),
+        edit_note.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
 
     if combined.is_empty() {
         return user_message.to_string();
@@ -2574,7 +2618,7 @@ pub(super) async fn build_resume_prompt_text(
 
     let block = combined.join("\n");
     log!(
-        "[AgentSession] Injecting resume note (adoption/external-edit/applied) for thread {} ({} chars)",
+        "[AgentSession] Injecting resume note (adoption/turn-gap/external-edit) for thread {} ({} chars)",
         thread_id,
         block.len()
     );

@@ -18,6 +18,16 @@ use std::str::FromStr;
 ///
 /// Pure: callers pass in `active_trigger_id` (read from `ACTIVE_TRIGGER_ID`
 /// at the dispatch site). `None` means "not in a trigger fire" → always allow.
+///
+/// **`run_trigger` is deliberately NOT gated here.** Its guard is stricter (it
+/// refuses even self-id, because self-run recurses where self-pause terminates)
+/// AND it has to hold on `POST /api/v1/triggers/run` too, which never reaches
+/// this function. Both would drift if stated twice, so the single owner is
+/// `engine_impl::trigger_runs::check_off_schedule_run`, which every surface
+/// funnels through. Note the runaway is bounded regardless: a second cron fire
+/// while one is active COALESCES away (`policy.rs`), so a script trigger that
+/// calls `lucidos triggers run` on itself over HTTP is reported as already
+/// running rather than stacking.
 pub(crate) fn check_scheduling_tool_in_trigger(
     tool_name: &str,
     target_trigger_id: Option<&str>,
@@ -504,6 +514,18 @@ impl LucidosEngine {
                     "[ACTION COMPLETED] {} trigger '{}' (ID: {}).",
                     action, existing.name, trigger_id
                 ))
+            }
+            tn::RUN_TRIGGER => {
+                let trigger_id = match args["trigger_id"].as_str() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => return Ok("Error: trigger_id is required".to_string()),
+                };
+                // Every refusal and the submit itself live in one place so the
+                // LLM, CLI and HTTP surfaces cannot drift apart.
+                match self.run_trigger_off_schedule(&trigger_id).await {
+                    Ok(outcome) => Ok(format!("[ACTION COMPLETED] {}", outcome.message())),
+                    Err(refusal) => Ok(format!("Error: {}", refusal.message())),
+                }
             }
             "list_trigger_groups" => {
                 let mut groups: Vec<crate::triggers::TriggerGroup> = {

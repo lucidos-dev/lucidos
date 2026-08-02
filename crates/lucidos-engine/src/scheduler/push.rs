@@ -274,7 +274,7 @@ pub async fn get_or_create_vapid_keys(
 
     // Store in preferences
     let keys_json = serde_json::to_string(&keys)?;
-    PreferenceStore::set(pool, "vapid_keys", &keys_json).await?;
+    PreferenceStore::set_silent(pool, "vapid_keys", &keys_json).await?;
 
     log!("[Push] Generated new VAPID key pair");
     Ok(keys)

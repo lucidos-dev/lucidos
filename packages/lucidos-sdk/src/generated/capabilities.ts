@@ -39,6 +39,7 @@ export const CAPABILITIES: CapabilityDomain[] = [
       { action: 'list', sdkName: 'list', method: 'GET', path: '/triggers' },
       { action: 'update', sdkName: 'update', method: 'PUT', path: '/triggers' },
       { action: 'delete', sdkName: 'delete', method: 'DELETE', path: '/triggers' },
+      { action: 'run', sdkName: 'run', method: 'POST', path: '/triggers/run' },
     ],
   },
   {

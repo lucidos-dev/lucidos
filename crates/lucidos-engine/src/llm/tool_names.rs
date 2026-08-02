@@ -59,6 +59,7 @@ pub const UPDATE_TRIGGER: &str = "update_trigger";
 pub const DELETE_TRIGGER: &str = "delete_trigger";
 pub const PAUSE_TRIGGER: &str = "pause_trigger";
 pub const RESUME_TRIGGER: &str = "resume_trigger";
+pub const RUN_TRIGGER: &str = "run_trigger";
 
 // Trigger groups (user-visible folders that organize triggers in the panel) —
 // grouped `trigger_groups` tool (list/create/rename/reorder/delete) from the

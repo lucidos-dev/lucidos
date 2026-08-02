@@ -1094,20 +1094,9 @@ and emits the PluginUninstalled event so the registry stays in sync.",
                         .delete_file_and_commit(app_path, &commit_msg)?
                 } else {
                     self.artifact_manager
-                        .delete_data_path_and_commit(path, &commit_msg)
+                        .delete_data_path_and_commit(&self.event_bus, path, &commit_msg)
                         .await?
                 };
-
-                // Only emit event for artifacts/ paths
-                if path.starts_with("artifacts/") {
-                    let artifact_path = path.strip_prefix("artifacts/").unwrap();
-                    self.event_bus
-                        .emit(BusEvent::System(SystemEvent::ArtifactDeleted {
-                            artifact_path: artifact_path.to_string(),
-                            commit: commit_sha.clone(),
-                        }))
-                        .await?;
-                }
 
                 self.emit_app_event_for_data_path(path, app_existed_before, true)
                     .await?;

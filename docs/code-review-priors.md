@@ -230,6 +230,23 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   committing a run that then fails costs nothing. Pinned by
   `a_cancel_that_lands_before_the_commit_wins`.
 
+- **Command text surfaced to the user is scrubbed by `redact_postgres_secrets`
+  and nothing more, on purpose.** Reviewers see a command embedded in a
+  persisted / pushed string and ask for broader credential sanitisation (a
+  `curl -H 'Authorization: Bearer …'` would ride through). That one helper is
+  the codebase's single boundary scrub for command text, and every surface
+  applies exactly it: `ToolCalled.args`, `CommandPermissionRequested.command`,
+  `CommandCheckpointed.command`, and the command-guard trigger-block message
+  (`command_permission.rs` `blocked_command_excerpt`). So a new surface showing
+  the same command adds no new class of exposure, and a scrubber narrowed to
+  one call site would read as a guarantee the other three don't keep. The
+  block message additionally orders the excerpt LAST so an OS push preview
+  shows the summary and the remedy rather than raw command text. Re-flag only
+  as a change to `core::redact_postgres_secrets` itself, applied at every
+  surface at once.
+  (`crates/lucidos-engine/src/core/mod.rs`,
+  `crates/lucidos-engine/src/engine/command_permission.rs`.)
+
 ## Frontend
 
 - **`serverDraft` letting an inbound compose report overwrite a newer PUT ack is
@@ -761,6 +778,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only with new evidence that the publisher cannot publish before the
   rc push — in which case the fix is a bounded poll for the matching baked
   version, NOT dropping the assertion.
+  **That bounded poll now EXISTS, for a second and distinct race (2026-07-31).**
+  The publisher does publish before the rc push (`release.sh` blocks on
+  `scripts/lib/release_rc_front_door.sh` until the origin serves the candidate),
+  but that wait polls from one machine and therefore observes exactly ONE
+  Cloudflare POP, while a runner resolves to another whose edge cache can still
+  hold the previous release's copy. v0.18.3 and v0.18.5 both reddened a
+  front-door leg on that alone, and on v0.18.5 only `macos-latest` reddened
+  while `macos-15-intel` and `ubuntu` read the correct version off the same
+  origin, which is a per-POP cache rather than an origin regression. Rung 1
+  therefore re-reads a mismatch, and only a mismatch on the push arm, to a
+  bounded budget with a cache-busting query nonce plus no-cache headers, warns
+  loudly when it converges late, and still exits on expiry. So a reviewer
+  proposing "retry the version check" is describing what is already there: the
+  live question is only whether the budget or the cache-busting still fits the
+  observed lag, and the arming wait's single vantage point stays deliberately
+  unchanged so the next failure of this shape is unambiguous.
   (`.github/workflows/install-smoke.yml` § front-door, `scripts/release.sh`
   § `print_rc_gate_handoff`.)
 
@@ -1035,6 +1068,72 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   provider that actually needs `[::1]`, or if the bind result becomes available
   before the resolve.
   (`crates/lucidos-engine/src/core/oauth.rs`.)
+
+- **`emit_or_log` after a committed write is the engine's contract, not a
+  dropped error.** Reviewers see a store method commit its row in one
+  transaction and then emit through `emit_or_log`, and flag that a transient
+  failure inside `emit` is swallowed while the method still reports success,
+  so the write can land without its projection/SSE event. Accepted: every
+  `SystemEvent` emitter in the engine works this way (`emit_or_log` logs under
+  `[EventBus] <ctx> emit failed`), `EventBus::emit` owns its own transaction so
+  there is no caller-owned tx to join, and propagating would report failure for
+  a write that actually succeeded, sending the user into a retry against a row
+  that already exists. `RepositoryStore::register` is the worked example: the
+  cost is one missed live refresh, and nothing durable is lost because a live
+  repo's name resolves from the `repositories` row itself and the next client
+  load refetches the list. Re-flag only where the emit is the ONLY record of
+  the state change (nothing re-derivable from the committed row), or once
+  `EventBus` accepts a caller-supplied transaction.
+  (`crates/lucidos-engine/src/core/repositories.rs`,
+  `crates/lucidos-engine/src/engine/event_bus/mod.rs`.)
+
+- **A store mutator taking `&EventBus` is the design, not a layering
+  violation.** Reviewers see `core/` stores depending on the engine's EventBus
+  and flag the inversion, or propose returning the event for the caller to
+  emit. Accepted, and load-bearing: an event the caller emits is an event the
+  next caller forgets, which is precisely how an agent-registered repository
+  stayed invisible in every client's list. ADR 0032 makes the write path own
+  the announcement, `core::announced_surfaces` classifies every surface, and
+  source-scan tests fail a reachable writer that does not emit. Re-flag only
+  with a concrete alternative that keeps the emit unskippable.
+  (`crates/lucidos-engine/src/core/announced_surfaces.rs`, `docs/adr/0032-a-state-write-owns-its-announcement.md`.)
+
+- **A new table needs a registry entry, and "it has no consumer yet" is a
+  classification, not a reason to skip one.** Reviewers propose deferring the
+  decision until something listens. The registry's `Silent { reason }` arm is
+  that decision, recorded, and the completeness test refuses a table without
+  one. The point is that the next person re-decides instead of re-discovering.
+  (`crates/lucidos-engine/src/core/announced_surfaces.rs`.)
+
+- **`POST /api/v1/triggers/run` stamps no actor, and that is the feature.**
+  Reviewers read `.claude/rules/rust.md` ("mutating endpoints stamp the
+  actor") and flag the handler. Two reasons it does not apply. The handler
+  emits no `SystemEvent` of its own: the run's `TriggerExecuted` /
+  `TriggerCompleted` come from the queue executor, exactly as for a scheduled
+  fire. And an actor on those events is precisely the tell that would make an
+  *off-schedule run* distinguishable downstream, which the design says it must
+  not be (nothing has to learn a third kind of run, and `catch_up_decision`
+  keeps reading `last_run` as "did this work happen"). Re-flag only alongside
+  a decision to make manual runs distinguishable, which is a payload addition
+  to `TriggerExecuted`, not a change to this handler.
+  (`crates/lucidos-engine/src/api/triggers.rs`,
+  `crates/lucidos-engine/src/engine/engine_impl/trigger_runs.rs`,
+  `docs/plans/2026-08-02-trigger-run-action.md`.)
+
+- **The run action's in-fire recursion guard is in `trigger_runs`, not in
+  `check_scheduling_tool_in_trigger`, and it does not cover the HTTP path.**
+  Reviewers notice `run_trigger` missing from the scheduling-tool guard's match
+  arm, or that a script trigger can reach the run endpoint over HTTP where the
+  `ACTIVE_TRIGGER_ID` task-local is unset. Both are known. The guard is
+  stricter than that function's contract (it refuses self-id too, because
+  self-run recurses where self-pause terminates) and has to hold for the HTTP
+  and CLI surfaces, which never reach that function, so stating it twice would
+  drift. The HTTP gap is bounded by design: a trigger asking to run itself is
+  already active, so the cron fire coalesces and comes back as
+  `already-running`. Re-flag only with a way to propagate trigger context
+  across the HTTP boundary.
+  (`crates/lucidos-engine/src/engine/tools/scheduler.rs`,
+  `crates/lucidos-engine/src/engine/engine_impl/trigger_runs.rs`.)
 
 ## Settled architecture questions
 

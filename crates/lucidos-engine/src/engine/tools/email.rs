@@ -4,6 +4,7 @@ use crate::api::is_path_traversal;
 use crate::core::format_byte_size;
 use crate::core::oauth;
 use crate::core::OAuthStore;
+use crate::core::WriteAnnouncement;
 use crate::llm::tool_names as tn;
 use uuid::Uuid;
 
@@ -473,9 +474,11 @@ impl LucidosEngine {
                 let commit_sha = match self
                     .artifact_manager
                     .write_and_commit(
+                        &self.event_bus,
                         &dest_relative,
                         &data,
                         &format!("Import email attachment: {}", safe_filename),
+                        WriteAnnouncement::SupersededBy("ArtifactImported"),
                     )
                     .await
                 {

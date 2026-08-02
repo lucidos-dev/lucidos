@@ -7,7 +7,7 @@ import type {
   TriggerGroup,
   TriggerRun,
 } from '../../store/types';
-import type { ApiResult, TriggersListResponse } from '../types';
+import type { ApiResult, TriggerRunResult, TriggersListResponse } from '../types';
 
 // --- Triggers (SDK delegation) ---
 export function listTriggers(): Promise<TriggersListResponse> {
@@ -53,6 +53,12 @@ export function deleteTriggerApi(
   id: string
 ): Promise<ApiResult> {
   return lucidos.triggers.delete(id) as Promise<ApiResult>;
+}
+
+/** Fire an existing trigger once, off-schedule. Resolves when the run is
+ *  admitted, not when it finishes, so `status` carries what actually happened. */
+export function runTriggerApi(id: string): Promise<TriggerRunResult> {
+  return lucidos.triggers.run(id) as Promise<TriggerRunResult>;
 }
 
 // Bypasses the @lucidos/sdk delegation above — this is engine-internal

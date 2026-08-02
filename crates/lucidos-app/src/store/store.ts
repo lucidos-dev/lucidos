@@ -129,7 +129,7 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables' | 'network-access' | 'thread-queue' | 'debugging' | 'experimental';
+export type SettingsSubview = 'main' | 'links' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables' | 'network-access' | 'thread-queue' | 'debugging' | 'experimental';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
@@ -152,6 +152,12 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
 export const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
   { key: 'models', label: 'Models' },
   { key: 'appearance', label: 'Appearance' },
+  // How Lucidos handles links: where an external one opens, and (in future)
+  // anything else about link routing. A NAMED category rather than a generic
+  // General/Advanced bucket, which the settings-IA guidance warns becomes a
+  // junk drawer. Its rows are platform-conditional today, so the entry itself
+  // is gated on having one to show. See the filter in SettingsView.
+  { key: 'links', label: 'Links' },
   { key: 'devices', label: 'Devices' },
   { key: 'accounts', label: 'Accounts' },
   { key: 'repositories', label: 'Repositories' },

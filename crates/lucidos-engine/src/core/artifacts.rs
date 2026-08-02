@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use super::ARTIFACTS_DIR;
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 
 /// Subdirectories under `data/` that browseable workspace tools (list_files,
 /// glob_files, grep_files) walk. Anything outside these — postgres event
@@ -75,6 +76,47 @@ fn reject_path_traversal(p: &str) -> Result<(), git2::Error> {
     Ok(())
 }
 
+/// What a `data/` write announces.
+///
+/// Every writer has to pick one. There is no "no event" option that is not
+/// spelled out, which is the whole point: the failure this guards against is a
+/// write whose announcement was simply forgotten, and an omission is not
+/// expressible here.
+pub enum WriteAnnouncement {
+    /// The default. `ArtifactCreated` or `ArtifactUpdated`, decided from whether
+    /// the file existed before this write. `source` labels who wrote it
+    /// (`"http_request"`, `"run_python"`, …) or `None` for a plain write.
+    Entity { source: Option<String> },
+    /// The caller emits a RICHER event that stands in for the entity event on
+    /// this write, and the entity event must be suppressed rather than added.
+    ///
+    /// The case this exists for is `ArtifactImported`: it carries the source and
+    /// a summary, the frontend reloads the artifact list on it, and
+    /// `memory_consumer` indexes on it. Emitting a paired `ArtifactCreated`
+    /// would put two rows on the timeline for one import and index the same
+    /// file into memory twice.
+    ///
+    /// Names the event so a reader can check the claim.
+    SupersededBy(&'static str),
+}
+
+/// The `data/` git store: writes a file under the workspace `data/` tree and
+/// commits it.
+///
+/// **The write path owns the announcement.** [`Self::write_and_commit`] and
+/// [`Self::delete_data_path_and_commit`] emit the matching entity event
+/// themselves, so a caller cannot land a file in `data/artifacts/` that no list
+/// refreshes on and the memory index never sees. That was not hypothetical: the
+/// image tool wrote generated and saved images through the raw writer and
+/// emitted nothing, so they appeared in no artifact list until a reload and
+/// were never indexed.
+///
+/// It also moves the Created-vs-Updated decision to the one place that can get
+/// it right. Every caller used to capture `artifact_exists` BEFORE its own
+/// write and pass the flag to `SystemEvent::artifact_change`; that helper exists
+/// only because the decision was duplicated five times.
+///
+/// See `core::announced_surfaces` for the registry entry and the exemptions.
 pub struct ArtifactManager {
     workspace_path: PathBuf,
     repo: Arc<Mutex<Repository>>,
@@ -147,15 +189,35 @@ impl ArtifactManager {
         Ok(full_path)
     }
 
-    /// Write artifact and commit in one operation
+    /// Write an artifact, commit it, and announce it.
+    ///
+    /// Created-vs-Updated is decided from whether the file existed BEFORE this
+    /// write, checked here so no caller has to sequence that itself. See
+    /// [`WriteAnnouncement`] for the one case that suppresses the entity event.
     pub async fn write_and_commit(
         &self,
+        event_bus: &EventBus,
         relative_path: &str,
         content: impl AsRef<[u8]>,
         message: &str,
+        announcement: WriteAnnouncement,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+        let existed = self.artifact_exists(relative_path);
         self.write_artifact(relative_path, content)?;
         let commit_sha = self.commit(relative_path, message).await?;
+        if let WriteAnnouncement::Entity { source } = announcement {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::artifact_change(
+                        existed,
+                        relative_path.to_string(),
+                        commit_sha.clone(),
+                        source,
+                    )),
+                    "[Artifacts] artifact write",
+                )
+                .await;
+        }
         Ok(commit_sha)
     }
 
@@ -256,9 +318,14 @@ impl ArtifactManager {
         .unwrap()
     }
 
-    /// Delete a data-relative file and commit the deletion.
+    /// Delete a data-relative file, commit the deletion, and announce it.
+    ///
+    /// Emits `ArtifactDeleted` for a path under `artifacts/`, which is the only
+    /// `data/` subtree with a list that reloads on an entity event. Other
+    /// subtrees commit silently, matching their registry classification.
     pub async fn delete_data_path_and_commit(
         &self,
+        event_bus: &EventBus,
         data_relative_path: &str,
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -281,6 +348,17 @@ impl ArtifactManager {
         })
         .await
         .unwrap()?;
+        if let Some(artifact_path) = data_relative_path.strip_prefix("artifacts/") {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::ArtifactDeleted {
+                        artifact_path: artifact_path.to_string(),
+                        commit: commit_id.clone(),
+                    }),
+                    "[Artifacts] ArtifactDeleted",
+                )
+                .await;
+        }
         Ok(commit_id)
     }
 
@@ -407,14 +485,16 @@ impl ArtifactManager {
         .into())
     }
 
-    /// Delete artifact and commit the deletion
+    /// Delete an artifact and commit the deletion. Announces through
+    /// [`Self::delete_data_path_and_commit`].
     pub async fn delete_and_commit(
         &self,
+        event_bus: &EventBus,
         relative_path: &str,
         message: &str,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         let data_relative = format!("artifacts/{}", relative_path);
-        self.delete_data_path_and_commit(&data_relative, message)
+        self.delete_data_path_and_commit(event_bus, &data_relative, message)
             .await
     }
 
@@ -712,6 +792,88 @@ mod tests {
     /// Mirrors what `import_file_from_path` does: resolve a collision-free dest,
     /// then write+commit to it. Three same-name imports must land at the base
     /// name, "(1)", and "(2)" with every earlier file preserved untouched.
+    /// The load-bearing guarantee for the `data/` half: a write announces, and
+    /// Created-vs-Updated is decided from the state BEFORE the write.
+    ///
+    /// The second half is why the decision moved in here. Every caller used to
+    /// capture `artifact_exists` itself and pass the flag along, which is easy
+    /// to sequence wrong and easy to skip entirely: the image tool skipped it,
+    /// so a generated image reached no artifact list and no memory index.
+    #[tokio::test]
+    async fn write_and_commit_announces_created_then_updated() {
+        let (pool, db_name) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+        let dir = tempdir().unwrap();
+        let manager = ArtifactManager::new(dir.path().to_path_buf()).unwrap();
+
+        manager
+            .write_and_commit(
+                &bus,
+                "notes.md",
+                "one",
+                "Write notes",
+                WriteAnnouncement::Entity { source: None },
+            )
+            .await
+            .unwrap();
+        manager
+            .write_and_commit(
+                &bus,
+                "notes.md",
+                "two",
+                "Rewrite notes",
+                WriteAnnouncement::Entity {
+                    source: Some("run_python".to_string()),
+                },
+            )
+            .await
+            .unwrap();
+
+        let kinds: Vec<String> = sqlx::query_scalar(
+            "SELECT event_type FROM events \
+             WHERE event_type IN ('ArtifactCreated', 'ArtifactUpdated') ORDER BY sequence",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(kinds, vec!["ArtifactCreated", "ArtifactUpdated"]);
+
+        // A caller with a richer event of its own suppresses the entity event
+        // rather than adding to it, so an import is not double-announced.
+        manager
+            .write_and_commit(
+                &bus,
+                "imported/doc.txt",
+                "x",
+                "Import doc",
+                WriteAnnouncement::SupersededBy("ArtifactImported"),
+            )
+            .await
+            .unwrap();
+        let after: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events \
+             WHERE event_type IN ('ArtifactCreated', 'ArtifactUpdated')",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, 2, "a superseded write must not add an entity event");
+
+        manager
+            .delete_and_commit(&bus, "notes.md", "Delete notes")
+            .await
+            .unwrap();
+        let deleted: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = 'ArtifactDeleted'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(deleted, 1);
+
+        pool.close().await;
+        crate::test_support::teardown_test_db(&db_name).await;
+    }
+
     #[tokio::test]
     async fn test_import_flow_auto_suffixes_and_preserves_existing() {
         let dir = tempdir().unwrap();
@@ -722,30 +884,23 @@ mod tests {
             .resolve_collision_free_path("imported/Brev.pdf")
             .unwrap();
         assert_eq!(dest1, "imported/Brev.pdf");
-        manager
-            .write_and_commit(&dest1, "first", "Import Brev.pdf")
-            .await
-            .unwrap();
+        // The subject is collision-free naming, so the raw writer is enough:
+        // the next `resolve_collision_free_path` only needs the file on disk.
+        manager.write_artifact(&dest1, "first").unwrap();
 
         // Second import, same source name: auto-suffixed to "(1)".
         let dest2 = manager
             .resolve_collision_free_path("imported/Brev.pdf")
             .unwrap();
         assert_eq!(dest2, "imported/Brev (1).pdf");
-        manager
-            .write_and_commit(&dest2, "second", "Import Brev.pdf")
-            .await
-            .unwrap();
+        manager.write_artifact(&dest2, "second").unwrap();
 
         // Third import: "(2)".
         let dest3 = manager
             .resolve_collision_free_path("imported/Brev.pdf")
             .unwrap();
         assert_eq!(dest3, "imported/Brev (2).pdf");
-        manager
-            .write_and_commit(&dest3, "third", "Import Brev.pdf")
-            .await
-            .unwrap();
+        manager.write_artifact(&dest3, "third").unwrap();
 
         // All three exist; earlier files were never overwritten.
         assert_eq!(manager.read_artifact("imported/Brev.pdf").unwrap(), "first");

@@ -355,27 +355,18 @@ pub async fn set_schedule(
         None
     };
 
+    // `set_backup_schedule` writes through `PreferenceStore::set`, which
+    // announces each key it touches. The handler used to hand-roll those emits
+    // afterwards; moving them into the write path is what makes a second caller
+    // of `set_backup_schedule` impossible to get wrong.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     {
         let mut scheduler = state.scheduler.lock().await;
         scheduler
-            .set_backup_schedule(cron, &req.provider)
+            .set_backup_schedule(cron, &req.provider, actor)
             .await
             .map_err(|e| ApiError::bad_request(format!("Failed to set schedule: {e}")))?;
     }
-
-    // Mirror set_retention: emit PreferencesChanged for every preference the
-    // scheduler wrote so timeline and UI projections can react. Without this
-    // the scheduler mutates state silently — no "you set a backup schedule"
-    // entry appears in the audit timeline.
-    emit_schedule_preferences_changed(
-        &state.engine.event_bus,
-        &headers,
-        &state.pool,
-        active,
-        &req.schedule,
-        &req.provider,
-    )
-    .await;
 
     if active {
         Ok(Json(ScheduleResponse {
@@ -387,58 +378,6 @@ pub async fn set_schedule(
             schedule: None,
             provider: None,
         }))
-    }
-}
-
-/// Emit `PreferencesChanged` for the keys `scheduler.set_backup_schedule`
-/// wrote: when `active`, both `PREF_BACKUP_SCHEDULE` (cron expression) and
-/// `PREF_BACKUP_PROVIDER`; when inactive, only `PREF_BACKUP_SCHEDULE`
-/// (= `"off"`). Pulled out of the axum handler so it can be unit-tested
-/// without spinning up the scheduler.
-pub(crate) async fn emit_schedule_preferences_changed(
-    bus: &crate::engine::event_bus::EventBus,
-    headers: &HeaderMap,
-    pool: &PgPool,
-    active: bool,
-    schedule: &str,
-    provider: &str,
-) {
-    let actor = crate::api::actor::user_actor_resolved(headers, pool, None).await;
-    if active {
-        bus.emit_or_log(
-            crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::PreferencesChanged {
-                    key: backup::PREF_BACKUP_SCHEDULE.to_string(),
-                    value: Some(schedule.to_string()),
-                    actor: actor.clone(),
-                },
-            ),
-            "[Backup] PreferencesChanged",
-        )
-        .await;
-        bus.emit_or_log(
-            crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::PreferencesChanged {
-                    key: backup::PREF_BACKUP_PROVIDER.to_string(),
-                    value: Some(provider.to_string()),
-                    actor,
-                },
-            ),
-            "[Backup] PreferencesChanged",
-        )
-        .await;
-    } else {
-        bus.emit_or_log(
-            crate::engine::event_bus::BusEvent::System(
-                crate::engine::event_bus::SystemEvent::PreferencesChanged {
-                    key: backup::PREF_BACKUP_SCHEDULE.to_string(),
-                    value: Some("off".to_string()),
-                    actor,
-                },
-            ),
-            "[Backup] PreferencesChanged",
-        )
-        .await;
     }
 }
 
@@ -468,23 +407,16 @@ pub async fn set_retention(
         return Err(ApiError::bad_request("Must keep at least 1 backup"));
     }
     let value = req.keep.to_string();
-    PreferenceStore::set(&state.pool, backup::PREF_BACKUP_RETENTION, &value)
-        .await
-        .map_err(|e| ApiError::internal(format!("Failed to save retention: {e}")))?;
-    state
-        .engine
-        .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
-            "[Backup] PreferencesChanged",
-            |actor| crate::engine::event_bus::SystemEvent::PreferencesChanged {
-                key: backup::PREF_BACKUP_RETENTION.to_string(),
-                value: Some(value.clone()),
-                actor,
-            },
-        )
-        .await;
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    PreferenceStore::set(
+        &state.pool,
+        &state.engine.event_bus,
+        backup::PREF_BACKUP_RETENTION,
+        &value,
+        actor,
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("Failed to save retention: {e}")))?;
     Ok(Json(RetentionResponse { keep: req.keep }))
 }
 
@@ -641,25 +573,40 @@ mod tests {
         ));
     }
 
-    /// Active schedule: scheduler writes both keys (cron + provider).
-    /// The handler must emit two `PreferencesChanged` rows so timeline /
-    /// projections can react. Mirrors the convention `set_retention` already
-    /// uses for `PREF_BACKUP_RETENTION`.
+    /// Enabling a schedule writes two preference keys (cron + provider) and
+    /// each must announce, because the scheduler's own `PreferencesChanged`
+    /// subscriber is what re-registers the backup cron and the Settings page is
+    /// what reloads on it.
+    ///
+    /// Drives `PreferenceStore::set` directly, which is exactly what
+    /// `TaskScheduler::set_backup_schedule` calls: the announcement used to be
+    /// hand-rolled in the axum handler after the fact, and moving it into the
+    /// write path is what makes a second caller of `set_backup_schedule`
+    /// impossible to get wrong. Keeping the assertion here means it does not
+    /// need a booted scheduler.
     #[tokio::test]
-    async fn emit_schedule_preferences_changed_active_emits_both_keys() {
+    async fn enabling_a_schedule_announces_both_keys() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _parent_rx) = EventBus::new(pool.clone());
-        let headers = HeaderMap::new();
 
-        emit_schedule_preferences_changed(
-            &bus,
-            &headers,
+        PreferenceStore::set(
             &pool,
-            true,
+            &bus,
+            backup::PREF_BACKUP_SCHEDULE,
             "0 0 3 * * *",
-            "google_drive",
+            None,
         )
-        .await;
+        .await
+        .unwrap();
+        PreferenceStore::set(
+            &pool,
+            &bus,
+            backup::PREF_BACKUP_PROVIDER,
+            "google_drive",
+            None,
+        )
+        .await
+        .unwrap();
 
         let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
             "SELECT event_type, payload FROM events \
@@ -670,38 +617,39 @@ mod tests {
         .unwrap();
 
         assert_eq!(rows.len(), 2, "expected one row per written preference");
-        let keys: Vec<&str> = rows
+        let by_key: std::collections::HashMap<&str, &str> = rows
             .iter()
-            .map(|(_, p)| p["data"]["key"].as_str().unwrap())
+            .map(|(_, p)| {
+                (
+                    p["data"]["key"].as_str().unwrap(),
+                    p["data"]["value"].as_str().unwrap(),
+                )
+            })
             .collect();
-        assert!(keys.contains(&backup::PREF_BACKUP_SCHEDULE));
-        assert!(keys.contains(&backup::PREF_BACKUP_PROVIDER));
-
-        for (_, payload) in &rows {
-            let key = payload["data"]["key"].as_str().unwrap();
-            let value = payload["data"]["value"].as_str().unwrap();
-            if key == backup::PREF_BACKUP_SCHEDULE {
-                assert_eq!(value, "0 0 3 * * *");
-            } else if key == backup::PREF_BACKUP_PROVIDER {
-                assert_eq!(value, "google_drive");
-            }
-        }
+        assert_eq!(
+            by_key.get(backup::PREF_BACKUP_SCHEDULE),
+            Some(&"0 0 3 * * *")
+        );
+        assert_eq!(
+            by_key.get(backup::PREF_BACKUP_PROVIDER),
+            Some(&"google_drive")
+        );
 
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Inactive schedule: scheduler writes only `PREF_BACKUP_SCHEDULE = "off"`
-    /// and leaves the provider preference untouched. The emit must match —
-    /// one row for the schedule key, no row for the provider key (an
-    /// uncorrected emit would falsely suggest a provider change).
+    /// Disabling writes only `PREF_BACKUP_SCHEDULE = "off"` and leaves the
+    /// provider preference untouched, so exactly one row appears: a provider
+    /// row here would falsely suggest the user changed their backup
+    /// destination.
     #[tokio::test]
-    async fn emit_schedule_preferences_changed_inactive_emits_only_schedule() {
+    async fn disabling_a_schedule_announces_only_the_schedule_key() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _parent_rx) = EventBus::new(pool.clone());
-        let headers = HeaderMap::new();
 
-        emit_schedule_preferences_changed(&bus, &headers, &pool, false, "off", "google_drive")
-            .await;
+        PreferenceStore::set(&pool, &bus, backup::PREF_BACKUP_SCHEDULE, "off", None)
+            .await
+            .unwrap();
 
         let rows: Vec<(String, serde_json::Value)> = sqlx::query_as(
             "SELECT event_type, payload FROM events \

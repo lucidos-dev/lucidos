@@ -330,12 +330,13 @@ async fn user_actor_resolved_enriches_device_label_from_db() {
     // and never looked up the label, so events stamped Device { label: <fallback> }
     // — visible as the bare `device-<short>` placeholder in the actor popover.
     let (pool, db_name) = crate::test_support::setup_test_db().await;
-    crate::core::DeviceStore::register(&pool, "test-device-1", Some("Mozilla/5.0"))
-        .await
-        .unwrap();
-    crate::core::DeviceStore::rename(&pool, "test-device-1", Some("My MacBook"))
-        .await
-        .unwrap();
+    crate::test_support::seed_device(
+        &pool,
+        "test-device-1",
+        Some("Mozilla/5.0"),
+        Some("My MacBook"),
+    )
+    .await;
 
     let h = headers_with(&[("x-lucidos-device-id", "test-device-1")]);
     let actor = user_actor_resolved(&h, &pool, None).await;
@@ -357,12 +358,7 @@ async fn user_actor_resolved_enriches_device_label_from_db() {
 async fn user_actor_resolved_uses_explicit_device_id_override() {
     // The settings endpoint takes device_id from the request body, not the header.
     let (pool, db_name) = crate::test_support::setup_test_db().await;
-    crate::core::DeviceStore::register(&pool, "from-body", None)
-        .await
-        .unwrap();
-    crate::core::DeviceStore::rename(&pool, "from-body", Some("Body Device"))
-        .await
-        .unwrap();
+    crate::test_support::seed_device(&pool, "from-body", None, Some("Body Device")).await;
 
     let h = headers_with(&[("x-lucidos-device-id", "from-header")]);
     let actor = user_actor_resolved(&h, &pool, Some("from-body")).await;
@@ -801,12 +797,8 @@ async fn user_actor_resolved_subprocess_token_overrides_device_lookup() {
     // actor. The whole point is "agent actions are never 'You', no
     // matter what other identity the request carries".
     let (pool, db_name) = crate::test_support::setup_test_db().await;
-    crate::core::DeviceStore::register(&pool, "real-device", Some("Mozilla"))
-        .await
-        .unwrap();
-    crate::core::DeviceStore::rename(&pool, "real-device", Some("My MacBook"))
-        .await
-        .unwrap();
+    crate::test_support::seed_device(&pool, "real-device", Some("Mozilla"), Some("My MacBook"))
+        .await;
     let token = install_test_token();
     let source = Uuid::new_v4();
     let h = headers_with(&[

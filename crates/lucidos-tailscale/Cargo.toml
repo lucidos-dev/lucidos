@@ -1,0 +1,21 @@
+[package]
+name = "lucidos-tailscale"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Everything the tree knows about Tailscale, in one place: reading this
+# machine's tailnet address, resolving its MagicDNS name, and locating the CLI.
+#
+# It exists because THREE crates needed the same knowledge and each grew its own
+# copy, which is how a fix landed in two of them and missed the third (see
+# docs/plans/2026-08-02-mobile-access-cli-free-tailscale-detection.md).
+#
+# Deliberately tiny, and it must stay that way: `libc` is the only dependency.
+# ADR 0014 §1 requires `lucidos-gateway` to have NO dependency on
+# `lucidos-engine`, and offers "extracted to a tiny shared util or duplicated"
+# for the surface they share. This crate is the first option, so it may never
+# pull in tokio, sqlx, serde, or anything from the engine.
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

@@ -1,5 +1,5 @@
 import { requestVoid } from './_fetch';
-import { assertPlainObject } from './_validate';
+import { assertPlainObject, assertString } from './_validate';
 import { wsLocalGet } from './_storage';
 import { preferences as prefsModule } from './preferences';
 import { sse } from './sse';
@@ -168,6 +168,73 @@ function installPromptListener() {
   });
 }
 
+/** Where an external http(s) link goes when tapped in an installed iOS PWA.
+ *  Mirrors `ExternalLinkTarget` in
+ *  `crates/lucidos-app/src/store/actions/preferences.ts`. */
+export type ExternalLinkTarget = 'safari' | 'ask' | 'in-app';
+
+const EXTERNAL_LINK_TARGETS: readonly ExternalLinkTarget[] = ['safari', 'ask', 'in-app'];
+
+/** The last-seen `external_link_target`, refreshed by `applyPreferences` (and
+ *  therefore by `watchPreferences`, which re-runs it on `PreferencesChanged`).
+ *
+ *  It is a cache rather than a fetch because `openExternal` must decide
+ *  SYNCHRONOUSLY: the `ask` mode calls `navigator.share`, which requires
+ *  transient user activation, and any `await` between the click and the call
+ *  spends it. `null` means "not fetched yet", which routes to the host instead
+ *  of guessing. */
+let externalLinkTargetCache: ExternalLinkTarget | null = null;
+
+function cacheExternalLinkTarget(raw: string | undefined): void {
+  externalLinkTargetCache = EXTERNAL_LINK_TARGETS.includes(raw as ExternalLinkTarget)
+    ? raw as ExternalLinkTarget
+    : 'safari';
+}
+
+/** In-flight prime, so a themed app calling `applyPreferences` and the
+ *  load-time prime below don't each fetch. */
+let primingExternalLinkTarget: Promise<void> | null = null;
+
+/** Warm {@link externalLinkTargetCache} without going through
+ *  `applyPreferences`.
+ *
+ *  Needed because `applyPreferences` is OPTIONAL: an app shipping its own
+ *  complete visual identity legitimately never calls it, yet still gets the
+ *  SDK's delegated link handler (installed unconditionally by `browser.ts`).
+ *  Left to theming alone, those apps would hold a `null` cache forever, take the
+ *  host path on every link, and silently ignore the user's "Ask" choice, since
+ *  by then the activation `navigator.share` needs is long gone.
+ *
+ *  Called at load from `browser.ts`, and only inside an installed iOS PWA, the
+ *  one place the cache is ever read. Best-effort: a failure leaves the cache
+ *  null, which falls back to the host path (the same behaviour as before this
+ *  preference existed).
+ *
+ *  Not live: an app that never calls `watchPreferences` keeps the mode it saw at
+ *  load until the next reload. Subscribing SSE from every app iframe to catch a
+ *  rare mid-session change is not worth the connection. */
+export function primeExternalLinkTarget(): Promise<void> {
+  if (externalLinkTargetCache !== null) return Promise.resolve();
+  if (!inIOSStandalone()) return Promise.resolve();
+  primingExternalLinkTarget ??= prefsModule.get()
+    .then((prefs) => { cacheExternalLinkTarget(prefs['external_link_target']); })
+    .finally(() => { primingExternalLinkTarget = null; });
+  return primingExternalLinkTarget;
+}
+
+/** Whether this frame is inside an installed iOS PWA. The app iframe inherits
+ *  the host's display mode, so the same check the host makes works here. */
+function inIOSStandalone(): boolean {
+  if (typeof navigator === 'undefined' || typeof window === 'undefined') return false;
+  const iOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
+    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  if (!iOS) return false;
+  return window.matchMedia?.('(display-mode: standalone)').matches === true
+    || (navigator as Navigator & { standalone?: boolean }).standalone === true;
+}
+
+const HTTP_SCHEME_RE = /^https?:\/\//i;
+
 export const ui = {
   /** Fetch user preferences and apply theme, font, scale as CSS variables. */
   async applyPreferences(): Promise<void> {
@@ -225,6 +292,10 @@ export const ui = {
         document.documentElement.style.setProperty('--user-ui-scale', `${snapped}%`);
       }
     }
+
+    // Cache the external-link target for openExternal, which must resolve it
+    // WITHOUT awaiting (see EXTERNAL_LINK_TARGET_CACHE).
+    cacheExternalLinkTarget(prefs['external_link_target']);
   },
 
   watchPreferences(): void {
@@ -266,6 +337,52 @@ export const ui = {
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ target, params }),
     });
+  },
+
+  /**
+   * Open a URL outside Lucidos, honouring the user's external-link preference.
+   *
+   * Use this instead of `window.open` for any link out of your app. From inside
+   * an app iframe `window.open` cannot escape an installed iOS PWA: WebKit
+   * renders it in the PWA's in-app web view, which has no address bar, no tabs
+   * and no shared Safari session. Anchors are already handled for you (the SDK
+   * delegates `<a href="https://…">` clicks automatically); this is the
+   * programmatic equivalent for links opened from JS.
+   *
+   * MUST be called synchronously from the user's click/tap handler. In the
+   * user's "Ask" mode this opens the OS share sheet via `navigator.share`, which
+   * the browser refuses without transient user activation, and any `await`
+   * before this call spends that activation. Do the async work first, then call
+   * this from a later gesture.
+   *
+   * Non-http(s) URLs (`mailto:`, `tel:`) are handed to the platform unchanged.
+   * Resolves once the open has been dispatched; a user dismissing the share
+   * sheet is a normal resolve, not a rejection.
+   */
+  openExternal(url: string): Promise<void> {
+    assertString('url', url);
+    // Share only where the preference can apply and only for a web page. Off
+    // iOS, and for `mailto:` / `tel:`, the host path is always right.
+    if (
+      inIOSStandalone()
+      && HTTP_SCHEME_RE.test(url)
+      && externalLinkTargetCache === 'ask'
+      && typeof navigator.share === 'function'
+    ) {
+      // Deliberately NOT routed through the host: user activation does not
+      // survive the hop (the host's navigate goes over HTTP and lands via SSE),
+      // so a host-side share would be refused on every app link. The iframe is
+      // same-origin, so the `web-share` permissions-policy default of `self`
+      // covers this frame.
+      return navigator.share({ url }).catch((err: unknown) => {
+        // The user closing the sheet chose "none of these"; honour it rather
+        // than opening something anyway. Anything else means the sheet never
+        // worked, so fall through to the host.
+        if (err instanceof Error && err.name === 'AbortError') return;
+        return ui.navigate('url', { url });
+      });
+    }
+    return ui.navigate('url', { url });
   },
 
   /**

@@ -59,6 +59,49 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### Batch `data/` writes announce once for the caller, not per file
+
+- **Added:** 2026-08-01
+- **Lives in:** `ArtifactManager::write_batch_and_commit`
+  (`crates/lucidos-engine/src/core/artifacts.rs`), registered as an
+  `ExemptWriter` on the `core/artifacts.rs` entry in
+  `crates/lucidos-engine/src/core/announced_surfaces.rs`.
+- **Impermanent because:** Every other `data/` write takes a
+  `WriteAnnouncement` and cannot skip its entity event. The batch writer is the
+  one hole: it writes N files and announces nothing, relying on its single
+  caller (`git_clone`) to emit one `RepositoryImported` for the whole import.
+  That is the right behaviour for a bulk import (an entity event per file would
+  flood the timeline and index each file separately), but it is expressed as an
+  exemption rather than as a choice the caller states, so a second caller of
+  `write_batch_and_commit` would write files that announce nothing at all. That
+  is exactly the failure mode the surrounding change exists to remove.
+- **Removal / resolution condition:** Give `write_batch_and_commit` a
+  `WriteAnnouncement` parameter like `write_and_commit` has, with a batch-shaped
+  `Entity` arm (one summary event, or per-file when the batch is small) so the
+  caller has to state the choice. Then drop the `ExemptWriter` and confirm
+  `core::announced_surfaces::tests::every_reachable_data_writer_announces` still
+  passes with it gone.
+- **Status:** open
+
+### `commit_data_path` announces at the call site, not in the write path
+
+- **Added:** 2026-08-01
+- **Lives in:** `ArtifactManager::commit_data_path(s)`
+  (`crates/lucidos-engine/src/core/artifacts.rs`) and its callers in
+  `crates/lucidos-engine/src/engine/tools/files.rs`.
+- **Impermanent because:** These are commit-only helpers: the caller does its
+  own `fs::write` and then asks the manager to stage and commit. The manager
+  therefore cannot know whether the file pre-existed, so it cannot decide
+  Created-vs-Updated, and the entity emit stays with the caller. That leaves the
+  file tools on the old shape (write here, announce there) that every other
+  `data/` writer has now left behind.
+- **Removal / resolution condition:** Route the file tools' writes through
+  `ArtifactManager::write_and_commit` instead of writing themselves and
+  committing separately, then make `commit_data_path(s)` private. Verify by
+  checking that `engine/tools/files.rs` contains no `SystemEvent::artifact_change`
+  or `Artifact*` construction, and that the tripwire still passes.
+- **Status:** open
+
 ### iOS-PWA liveness diagnostic
 
 - **Added:** 2026-05-18
@@ -263,6 +306,50 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   restatements), the refresh trigger, and `bootSplashPlaysNoReveal()` in both its
   arms. Deleting the cover with the trigger would silently restore the cold-launch
   animation on every refresh, which no upstream fix has anything to do with.
+- **Status:** active
+- **Investigation:** n/a (the cause is known and upstream; nothing is being
+  chased here, only waited on)
+
+### `x-safari-` scheme prefix to escape an iOS standalone PWA
+
+- **Added:** 2026-08-02
+- **Lives in:** `crates/lucidos-app/src/utils/openExternalUrl.ts`
+  (`SAFARI_SCHEME_PREFIX` and `handOffToSafari`, reached by the `safari` mode and
+  as the fallback from `ask`). Every external-link surface arrives through
+  `openUrl` (`store/actions/artifacts.ts`), including app iframes via
+  `lucidos.ui.openExternal`, so this one site is the whole measure.
+- **Scope note (2026-08-02):** the `external_link_target` preference added the
+  same day is **permanent** and is NOT part of this measure. `ask` (the OS share
+  sheet) and `in-app` are ordinary platform behaviours that need no undocumented
+  scheme; only the `safari` mode's `x-safari-` prefix is the workaround. If the
+  prefix goes, the preference keeps its three modes and `safari` simply becomes
+  a plain `window.open`.
+- **Impermanent because:** Inside an installed iOS PWA (`display-mode:
+  standalone`) WebKit refuses to hand a URL to the Safari app: both
+  `window.open(url, '_blank')` and `<a target="_blank">` render in the PWA's own
+  in-app web view, which has no address bar, no tabs, no shared Safari session,
+  and no way back to a real browser. `x-safari-https://…` is an **undocumented
+  Apple URL scheme**, not a web standard, and it is the only channel that
+  works. So this is a workaround for an upstream gap, on the same footing as the
+  cross-document notification-tap reload above: the day WebKit honours the
+  standard affordance, the prefix is pure liability, and being undocumented it
+  can be withdrawn without a deprecation.
+- **Removal / resolution condition:** When an installed iOS PWA opens
+  `window.open(url, '_blank', 'noopener')` in the **Safari app** rather than the
+  in-app web view. Verify on a real device (not the desktop responsive simulator
+  or Playwright's `mobile-webkit` project, where `isIOSPwa()` is false and the
+  branch never runs): install the PWA to the home screen, tap an external link in
+  a chat response, and confirm the address bar and tab bar are present and the
+  page shares the Safari session. Then delete `SAFARI_SCHEME_PREFIX` and
+  `handOffToSafari`, point the `safari` mode and the `ask` fallback at
+  `window.open`, and drop the `x-safari-` cases from `openExternalUrl.test.ts`
+  and `artifacts-open-url.test.ts`. **Keep everything else**, per the scope note
+  above: the `external_link_target` preference and all three of its modes, the
+  Settings row, `lucidos.ui.openExternal` plus its cache, and `openExternalUrl`
+  itself even once it collapses to a lone `window.open`. It is the single choke
+  point every external-link surface routes through, and the delegation guard in
+  `useStartup.test.ts` is pinned to that funnel for reasons that outlive this
+  measure.
 - **Status:** active
 - **Investigation:** n/a (the cause is known and upstream; nothing is being
   chased here, only waited on)

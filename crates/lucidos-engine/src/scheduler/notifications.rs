@@ -5,6 +5,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 /// Where a tap on this notification (OS push, in-app toast) should land.
 ///
 /// Discriminated union — `kind` selects the variant. `Modal` (default) opens
@@ -403,12 +406,12 @@ impl NotificationStore {
         .await
     }
 
-    /// Mark a notification as read. Returns `true` only when the row was
-    /// actually flipped from unread to read; an already-read row returns
-    /// `false`. Callers gate the `NotificationRead` event emit on the bool
-    /// so a redundant write (e.g. SW POSTs read on tap AND the in-app
-    /// dispatch also marks read) doesn't fan out a duplicate SSE frame.
-    pub async fn mark_read(pool: &PgPool, notification_id: Uuid) -> Result<bool, sqlx::Error> {
+    /// Flip one notification to read. Returns `true` only when the row moved
+    /// from unread to read.
+    ///
+    /// **Private on purpose**: [`Self::mark_read`] is the reachable mutator,
+    /// and it emits.
+    async fn mark_read_row(pool: &PgPool, notification_id: Uuid) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE notifications
@@ -423,8 +426,11 @@ impl NotificationStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// Mark all notifications as read
-    pub async fn mark_all_read(pool: &PgPool) -> Result<u64, sqlx::Error> {
+    /// Flip every unread notification to read, returning how many moved.
+    ///
+    /// **Private on purpose**: [`Self::mark_all_read`] is the reachable
+    /// mutator, and it emits.
+    async fn mark_all_read_rows(pool: &PgPool) -> Result<u64, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE notifications
@@ -436,6 +442,51 @@ impl NotificationStore {
         .await?;
 
         Ok(result.rows_affected())
+    }
+
+    /// Mark a notification read and announce it. The only way to flip one.
+    ///
+    /// `NotificationRead` fires only when the row really moved from unread to
+    /// read, so a redundant write (the service worker POSTs read on tap AND the
+    /// in-app dispatch also marks read) cannot fan out a duplicate SSE frame.
+    pub async fn mark_read(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        notification_id: Uuid,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let marked = Self::mark_read_row(pool, notification_id).await?;
+        if marked {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::NotificationRead {
+                        id: notification_id.to_string(),
+                        actor,
+                    }),
+                    "[Notifications] NotificationRead",
+                )
+                .await;
+        }
+        Ok(marked)
+    }
+
+    /// Mark every unread notification read and announce it once. Returns how
+    /// many moved; announces nothing when the inbox was already clear.
+    pub async fn mark_all_read(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        actor: Option<MessageOrigin>,
+    ) -> Result<u64, sqlx::Error> {
+        let count = Self::mark_all_read_rows(pool).await?;
+        if count > 0 {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::NotificationsAllRead { actor }),
+                    "[Notifications] NotificationsAllRead",
+                )
+                .await;
+        }
+        Ok(count)
     }
 
     /// Get notification by ID

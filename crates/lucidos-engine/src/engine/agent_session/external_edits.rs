@@ -103,13 +103,28 @@ async fn git_log_oneline(worktree_path: &Path, last_sha: &str) -> String {
     }
 }
 
-/// Compute an "external edits since last idle" note for prepending to the
-/// next CC user prompt. Returns `None` when the worktree is unchanged from
+/// Compute a "your worktree changed since last idle" note for prepending to
+/// the next CC user prompt. Returns `None` when the worktree is unchanged from
 /// the recorded SHA (no new commits, no uncommitted changes).
 ///
 /// The note is intentionally short — CC just needs to know that something
 /// moved and what kind of move it was. Long diffs are out of scope; CC can
 /// run `git status` / `git log` itself if it needs more.
+///
+/// The wording deliberately does **not** name a cause. This detector sees a
+/// SHA and a `git status`; it cannot tell a hand edit from an engine reset, and
+/// asserting "the user edited files" for a reset the *engine* performed on the
+/// user's Discard click is a misattribution that sends CC looking for the wrong
+/// thing.
+///
+/// `head_move_explained` is the caller saying another note already states the
+/// cause of the HEAD move (`turn_gap::TurnGapNote::explains_worktree_reset`:
+/// an Apply, a Discard, or a tier-2 worktree clean). It suppresses exactly one
+/// line, the "HEAD moved (no log available)" fallback, which is the signature
+/// of a *backwards* reset and carries no information once the cause is known. A
+/// non-empty log (someone really did commit) and any uncommitted change are
+/// still reported, so nothing real is lost. If that leaves nothing to say, the
+/// whole note is `None`.
 ///
 /// If `last_sha` is `None`, returns `None` — the caller should skip
 /// injection on the very first turn (no prior idle to compare against).
@@ -117,6 +132,7 @@ async fn git_log_oneline(worktree_path: &Path, last_sha: &str) -> String {
 pub(crate) async fn compute_external_edit_note(
     worktree_path: &Path,
     last_sha: Option<&str>,
+    head_move_explained: bool,
 ) -> Option<String> {
     let last_sha = last_sha?;
     if !worktree_path.exists() {
@@ -138,41 +154,51 @@ pub(crate) async fn compute_external_edit_note(
         return None;
     }
 
-    let mut note = String::from(
-        "[Note from engine: the user edited files in your worktree since you were last active.",
-    );
+    // Build the sections first: with the HEAD-move line suppressed and a clean
+    // tree there is nothing left to say, and the note must not render as a bare
+    // header.
+    let mut sections = String::new();
 
     if head_moved {
         let log = git_log_oneline(worktree_path, last_sha).await;
         if log.is_empty() {
-            note.push_str(
-                "\nCommitted changes since your last action: HEAD moved (no log available).",
-            );
+            if !head_move_explained {
+                sections.push_str(
+                    "\nCommitted changes since your last action: HEAD moved (no log available).",
+                );
+            }
         } else {
-            note.push_str("\nCommitted changes since your last action:\n");
-            note.push_str(&log);
+            sections.push_str("\nCommitted changes since your last action:\n");
+            sections.push_str(&log);
         }
     }
 
     if !dirty.is_empty() {
-        note.push_str("\nUncommitted changes:\n");
+        sections.push_str("\nUncommitted changes:\n");
         // `git status --porcelain` lines are already short and one-per-file.
         // Cap at 50 to keep the prompt bounded for huge edits.
         const MAX_LINES: usize = 50;
         let total = dirty.len();
         for line in dirty.iter().take(MAX_LINES) {
-            note.push_str(line);
-            note.push('\n');
+            sections.push_str(line);
+            sections.push('\n');
         }
         if total > MAX_LINES {
-            note.push_str(&format!("… and {} more file(s)\n", total - MAX_LINES));
+            sections.push_str(&format!("… and {} more file(s)\n", total - MAX_LINES));
         }
         // Trim trailing newline before the closing bracket for tidiness.
-        if note.ends_with('\n') {
-            note.pop();
+        if sections.ends_with('\n') {
+            sections.pop();
         }
     }
 
+    if sections.is_empty() {
+        return None;
+    }
+
+    let mut note =
+        String::from("[Note from engine: your worktree changed since you were last active.");
+    note.push_str(&sections);
     note.push(']');
     Some(note)
 }

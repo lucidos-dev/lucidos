@@ -127,7 +127,7 @@ pub fn dispatch_preferences(ws: &Workspace, cmd: PreferencesCmd) -> Result<(), B
     }
 }
 
-/// Create and manage triggers — scheduled (cron) and/or event-driven automations. 'create' a new trigger, 'list' existing ones, 'update' a trigger in place (prefer over delete+create — keeps run history), 'delete', and 'pause'/'resume'. Cron times are in the user's local timezone (set it first). To organize triggers into panel folders, use the trigger_groups tool.
+/// Create and manage triggers: scheduled (cron) and/or event-driven automations. 'create' a new trigger, 'list' existing ones, 'update' a trigger in place (prefer over delete+create, which keeps run history), 'delete', and 'pause'/'resume'. Use 'run' to fire an existing trigger once, right now, off-schedule. Cron times are in the user's local timezone (set it first). To organize triggers into panel folders, use the trigger_groups tool.
 #[derive(clap::Subcommand)]
 pub enum TriggersCmd {
     /// Create a NEW trigger (schedule-based via cron, event-based via on, or both). list/update existing workflows instead of recreating. Set timezone first.
@@ -200,6 +200,12 @@ pub enum TriggersCmd {
     },
     /// Delete a trigger by id (orphans its run history — prefer update for tweaks).
     Delete {
+        /// UUID of the trigger.
+        #[arg(long)]
+        id: String,
+    },
+    /// Fire an existing trigger ONCE, right now, off-schedule ('run it now', 'fire it manually', an ad hoc run). The real thing: it records TriggerExecuted / last_run and runs under the trigger's own identity, side-effect grant and go_to_review, so never imitate it by copying run.intent into run_thread. Returns as soon as the run starts. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).
+    Run {
         /// UUID of the trigger.
         #[arg(long)]
         id: String,
@@ -347,6 +353,16 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
                 .query(&query)
                 .json(&serde_json::json!({}));
             send_and_print("DELETE", &url, req)
+        }
+        TriggersCmd::Run { id } => {
+            let url = format!("{}/api/v1/triggers/run", ws.base_url());
+            let mut query: Vec<(&str, String)> = Vec::new();
+            query.push(("id", id.to_string()));
+            let req = client()?
+                .post(&url)
+                .query(&query)
+                .json(&serde_json::json!({}));
+            send_and_print("POST", &url, req)
         }
     }
 }

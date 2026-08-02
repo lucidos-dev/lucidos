@@ -4,6 +4,7 @@ import {
   openEditTrigger,
   toggleTrigger,
   deleteTrigger,
+  runTriggerNow,
 } from '../../store/actions/triggers';
 import { formatShortDate, formatShortTime } from '../../utils/formatTime';
 import { describeCron } from '../../utils/describeCron';
@@ -24,6 +25,12 @@ export function TriggerItem({ trigger }: Partial<Props>) {
   const lastRunStr = lastRunDate ? `${formatShortDate(lastRunDate)} ${formatShortTime(lastRunDate)}` : null;
   const triggerType = trigger ? deriveTriggerType(trigger) : 'schedule';
   const noMoreRuns = trigger ? hasNoMoreRuns(trigger) : false;
+  // Mirrors the two server-side refusals, so the row never offers a button
+  // that is guaranteed to error: an off-schedule run needs a cron schedule (an
+  // event-only trigger has to have its event emitted instead) and an unpaused
+  // trigger. Labelled "Run once", not "Run now": the Thread Queue panel's Run
+  // now force-admits an already-queued entry, a different operation.
+  const canRunOnce = !!trigger && !trigger.paused && triggerType !== 'event';
 
   return (
     <div
@@ -108,6 +115,17 @@ export function TriggerItem({ trigger }: Partial<Props>) {
             {trigger?.paused ? 'Resume' : 'Pause'}
           </button>
         </SkBlock>
+        {(sk || canRunOnce) && (
+          <SkBlock w="4.5rem" h="2rem" round>
+            <button
+              class="action-btn"
+              data-tooltip="Fire this trigger once, right now, outside its schedule"
+              onClick={(e) => { e.stopPropagation(); if (trigger) void runTriggerNow(trigger.id); }}
+            >
+              Run once
+            </button>
+          </SkBlock>
+        )}
       </div>
     </div>
   );

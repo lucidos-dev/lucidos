@@ -16,6 +16,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
+use crate::engine::thread_events::MessageOrigin;
+
 /// A single user-managed environment variable (name + plaintext value).
 ///
 /// The name root `EnvironmentVariable` is used identically across DB
@@ -118,6 +121,16 @@ pub fn validate_name(name: &str) -> Result<(), NameRejection> {
 }
 
 /// Store for user-managed environment variables.
+///
+/// **No caller can skip the event.** [`Self::upsert`], [`Self::update`] and
+/// [`Self::delete`] are the only reachable mutators: the raw row writes
+/// ([`Self::upsert_row`], [`Self::update_row`], [`Self::delete_row`]) are
+/// private to this module. `EnvironmentVariable{Set,Deleted}` is what reloads
+/// the Settings list on every device, and these values are deliberately
+/// non-secret, so the event carries the value.
+///
+/// Same shape and the same reachability-not-atomicity guarantee as
+/// `RepositoryStore`; see `core::announced_surfaces`.
 pub struct EnvironmentVariableStore;
 
 type Row = (Uuid, String, String, DateTime<Utc>, DateTime<Utc>);
@@ -135,7 +148,10 @@ fn parse_row(row: Row) -> EnvironmentVariable {
 
 impl EnvironmentVariableStore {
     /// Insert or update a variable (upsert by name). Returns the row id.
-    pub async fn upsert(pool: &PgPool, name: &str, value: &str) -> Result<Uuid, sqlx::Error> {
+    ///
+    /// **Private on purpose**: [`Self::upsert`] is the reachable mutator, and it
+    /// emits. See the type-level doc.
+    async fn upsert_row(pool: &PgPool, name: &str, value: &str) -> Result<Uuid, sqlx::Error> {
         sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO environment_variables (name, value)
@@ -150,6 +166,33 @@ impl EnvironmentVariableStore {
         .bind(value)
         .fetch_one(pool)
         .await
+    }
+
+    /// Save a variable and announce it. The only way to create one.
+    ///
+    /// Announces unconditionally, unlike `RepositoryStore::register`: setting a
+    /// variable to the value it already holds is a deliberate user action on a
+    /// surface nothing re-runs on a loop, so there is no restart-spam hazard to
+    /// suppress and the timeline should show that the user did it.
+    pub async fn upsert(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        name: &str,
+        value: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<Uuid, sqlx::Error> {
+        let id = Self::upsert_row(pool, name, value).await?;
+        event_bus
+            .emit_or_log(
+                BusEvent::System(SystemEvent::EnvironmentVariableSet {
+                    name: name.to_string(),
+                    value: value.to_string(),
+                    actor,
+                }),
+                "[EnvVars] EnvironmentVariableSet",
+            )
+            .await;
+        Ok(id)
     }
 
     /// Get a single variable by name.
@@ -185,7 +228,9 @@ impl EnvironmentVariableStore {
     }
 
     /// Update the value of an existing variable. Returns `true` if a row existed.
-    pub async fn update(pool: &PgPool, name: &str, value: &str) -> Result<bool, sqlx::Error> {
+    ///
+    /// **Private on purpose**: [`Self::update`] is the reachable mutator.
+    async fn update_row(pool: &PgPool, name: &str, value: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query(
             r#"
             UPDATE environment_variables
@@ -200,13 +245,65 @@ impl EnvironmentVariableStore {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Update an existing variable and announce it. Announces only when a row
+    /// was actually updated, so an edit aimed at a missing name stays silent.
+    pub async fn update(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        name: &str,
+        value: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let updated = Self::update_row(pool, name, value).await?;
+        if updated {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::EnvironmentVariableSet {
+                        name: name.to_string(),
+                        value: value.to_string(),
+                        actor,
+                    }),
+                    "[EnvVars] EnvironmentVariableSet",
+                )
+                .await;
+        }
+        Ok(updated)
+    }
+
     /// Delete a variable by name. Returns `true` if a row existed.
-    pub async fn delete(pool: &PgPool, name: &str) -> Result<bool, sqlx::Error> {
+    ///
+    /// **Private on purpose**: [`Self::delete`] is the reachable mutator.
+    async fn delete_row(pool: &PgPool, name: &str) -> Result<bool, sqlx::Error> {
         let result = sqlx::query("DELETE FROM environment_variables WHERE name = $1")
             .bind(name)
             .execute(pool)
             .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete a variable and announce it. The only way to remove one.
+    ///
+    /// `EnvironmentVariableDeleted` fires only when a row was actually deleted,
+    /// so a repeated or racing delete announces once.
+    pub async fn delete(
+        pool: &PgPool,
+        event_bus: &EventBus,
+        name: &str,
+        actor: Option<MessageOrigin>,
+    ) -> Result<bool, sqlx::Error> {
+        let removed = Self::delete_row(pool, name).await?;
+        if removed {
+            event_bus
+                .emit_or_log(
+                    BusEvent::System(SystemEvent::EnvironmentVariableDeleted {
+                        name: name.to_string(),
+                        actor,
+                    }),
+                    "[EnvVars] EnvironmentVariableDeleted",
+                )
+                .await;
+        }
+        Ok(removed)
     }
 
     /// Build the `(NAME, value)` pairs to inject into a spawned subprocess.
@@ -249,15 +346,21 @@ fn unquote(s: &str) -> String {
 ///
 /// Self-idempotent: the file is removed after a successful import, so a later
 /// boot finds nothing to do. Invalid- or reserved-named lines are skipped with a
-/// log line (the engine owns those names). No `EnvironmentVariableSet` event is
-/// emitted — this is a silent backfill, and the settings UI picks the rows up on
-/// its next load. The store is non-secret, which is correct here: `.env` held
-/// only non-secret config (paths, CLI config dirs, identifiers); real secrets
-/// live in the credential / OAuth stores.
+/// log line (the engine owns those names). Each imported row announces
+/// `EnvironmentVariableSet` like any other write, because the write path owns
+/// the emit and a backfill is not special: these variables genuinely start
+/// existing here. It cannot spam a restart, since the file is deleted after the
+/// import. The store is non-secret, which is correct here: `.env` held only
+/// non-secret config (paths, CLI config dirs, identifiers); real secrets live in
+/// the credential / OAuth stores.
 ///
 /// Best-effort: read/parse/delete errors are logged, never fatal — a broken
 /// `.env` must not stop the engine from booting.
-pub async fn migrate_env_file_to_db(pool: &PgPool, workspace: &std::path::Path) {
+pub async fn migrate_env_file_to_db(
+    pool: &PgPool,
+    event_bus: &EventBus,
+    workspace: &std::path::Path,
+) {
     let env_path = workspace.join(crate::core::DATA_DIR).join(".env");
     if !env_path.exists() {
         return;
@@ -287,10 +390,12 @@ pub async fn migrate_env_file_to_db(pool: &PgPool, workspace: &std::path::Path) 
         let key = raw_key.trim();
         let value = unquote(raw_val.trim());
         match validate_name(key) {
-            Ok(()) => match EnvironmentVariableStore::upsert(pool, key, &value).await {
-                Ok(_) => imported += 1,
-                Err(e) => crate::log!("[EnvMigration] Failed to import '{}': {}", key, e),
-            },
+            Ok(()) => {
+                match EnvironmentVariableStore::upsert(pool, event_bus, key, &value, None).await {
+                    Ok(_) => imported += 1,
+                    Err(e) => crate::log!("[EnvMigration] Failed to import '{}': {}", key, e),
+                }
+            }
             Err(rejection) => crate::log!(
                 "[EnvMigration] Skipping '{}' from data/.env: {}",
                 key,
@@ -420,19 +525,77 @@ mod tests {
         assert_eq!(validate_name("path"), Err(NameRejection::Invalid));
     }
 
+    /// The load-bearing guarantee: a variable write and its announcement are one
+    /// operation, so the Settings list on every device reloads no matter which
+    /// entry path made the write. Deletion announces only when a row was really
+    /// removed, so a racing double-delete speaks once.
+    #[tokio::test]
+    async fn every_mutation_announces_and_a_no_op_delete_does_not() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        async fn emitted(pool: &PgPool, event_type: &str) -> i64 {
+            sqlx::query_scalar("SELECT count(*) FROM events WHERE event_type = $1")
+                .bind(event_type)
+                .fetch_one(pool)
+                .await
+                .unwrap()
+        }
+
+        EnvironmentVariableStore::upsert(&pool, &bus, "MY_FLAG", "1", None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "EnvironmentVariableSet").await, 1);
+
+        EnvironmentVariableStore::update(&pool, &bus, "MY_FLAG", "2", None)
+            .await
+            .unwrap();
+        assert_eq!(emitted(&pool, "EnvironmentVariableSet").await, 2);
+
+        assert!(
+            !EnvironmentVariableStore::update(&pool, &bus, "MISSING", "x", None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            emitted(&pool, "EnvironmentVariableSet").await,
+            2,
+            "an update that matched no row must not announce"
+        );
+
+        assert!(
+            EnvironmentVariableStore::delete(&pool, &bus, "MY_FLAG", None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(emitted(&pool, "EnvironmentVariableDeleted").await, 1);
+        assert!(
+            !EnvironmentVariableStore::delete(&pool, &bus, "MY_FLAG", None)
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            emitted(&pool, "EnvironmentVariableDeleted").await,
+            1,
+            "second delete removes nothing and therefore announces nothing"
+        );
+
+        crate::test_support::teardown_test_db(&db).await;
+    }
+
     #[tokio::test]
     async fn env_pairs_round_trips_and_filters_reserved() {
         let (pool, _db) = crate::test_support::setup_test_db().await;
 
-        EnvironmentVariableStore::upsert(&pool, "MY_FLAG", "1")
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        EnvironmentVariableStore::upsert(&pool, &bus, "MY_FLAG", "1", None)
             .await
             .expect("upsert MY_FLAG");
-        EnvironmentVariableStore::upsert(&pool, "LUCIDOS_REPO", "my-repo")
+        EnvironmentVariableStore::upsert(&pool, &bus, "LUCIDOS_REPO", "my-repo", None)
             .await
             .expect("upsert LUCIDOS_REPO");
         // A reserved-named row written out-of-band (the API/tool would refuse it)
         // must be filtered out of the injected pairs as a defense-in-depth net.
-        EnvironmentVariableStore::upsert(&pool, "PGUSER", "evil")
+        EnvironmentVariableStore::upsert(&pool, &bus, "PGUSER", "evil", None)
             .await
             .expect("upsert reserved row");
 
@@ -458,10 +621,11 @@ mod tests {
     async fn upsert_replaces_value_and_update_requires_existing() {
         let (pool, _db) = crate::test_support::setup_test_db().await;
 
-        EnvironmentVariableStore::upsert(&pool, "FOO", "one")
+        let (bus, _callback_rx) = EventBus::new(pool.clone());
+        EnvironmentVariableStore::upsert(&pool, &bus, "FOO", "one", None)
             .await
             .expect("insert");
-        EnvironmentVariableStore::upsert(&pool, "FOO", "two")
+        EnvironmentVariableStore::upsert(&pool, &bus, "FOO", "two", None)
             .await
             .expect("upsert replace");
         let got = EnvironmentVariableStore::get(&pool, "FOO")
@@ -471,18 +635,18 @@ mod tests {
         assert_eq!(got.value, "two");
 
         assert!(
-            EnvironmentVariableStore::update(&pool, "FOO", "three")
+            EnvironmentVariableStore::update(&pool, &bus, "FOO", "three", None)
                 .await
                 .expect("update existing"),
             "update of existing row returns true"
         );
         assert!(
-            !EnvironmentVariableStore::update(&pool, "MISSING", "x")
+            !EnvironmentVariableStore::update(&pool, &bus, "MISSING", "x", None)
                 .await
                 .expect("update missing"),
             "update of missing row returns false"
         );
-        assert!(EnvironmentVariableStore::delete(&pool, "FOO")
+        assert!(EnvironmentVariableStore::delete(&pool, &bus, "FOO", None)
             .await
             .expect("delete"),);
         assert!(EnvironmentVariableStore::get(&pool, "FOO")

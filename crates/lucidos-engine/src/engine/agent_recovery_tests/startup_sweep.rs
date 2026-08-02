@@ -386,20 +386,23 @@ mod startup_sweep_coding_agent_has_diff {
 
         let (pool, db_name) = setup_test_db().await;
 
+        let (bus, _rx) = EventBus::new(pool.clone());
+
         // Insert the `repositories` row pointing at the external repo. This
         // is what `RepositoryStore::list` returns inside the sweep — the
         // population the cc_repo_id lookup keys on.
-        let repo = RepositoryStore::add(
+        let repo = RepositoryStore::register(
             &pool,
+            &bus,
             "external-test",
             external_repo.to_str().unwrap(),
+            None,
             None,
             None,
         )
         .await
         .unwrap();
 
-        let (bus, _rx) = EventBus::new(pool.clone());
         let thread_id = Uuid::new_v4();
         start_cc_session(&bus, thread_id, branch, Some(repo.id.to_string())).await;
 

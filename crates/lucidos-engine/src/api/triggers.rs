@@ -587,6 +587,51 @@ pub(super) async fn delete_trigger(
     ApiResult::ok()
 }
 
+/// Result of `POST /api/v1/triggers/run`.
+///
+/// `success: true` with `status: "already-running"` is the honest answer when
+/// admission coalesced the fire away: the request was valid and nothing new
+/// started. A bare `{"success": true}` would read as "it started", which is the
+/// class of lie this whole operation replaces.
+#[derive(Serialize)]
+pub struct TriggerRunResponse {
+    pub success: bool,
+    /// `started` | `queued` | `already-running`. Absent on a refusal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<&'static str>,
+    /// Human-readable summary; on a refusal this is the reason.
+    pub message: String,
+}
+
+/// Fire an existing trigger once, right now, outside its schedule.
+///
+/// No actor is stamped, deliberately: an **off-schedule run** is
+/// indistinguishable downstream from a scheduled fire, and an actor on the
+/// resulting events would be exactly the tell that breaks that. The handler
+/// emits no `SystemEvent` of its own either; the run's `TriggerExecuted` /
+/// `TriggerCompleted` come from the queue executor like any other fire. See
+/// `engine_impl::trigger_runs`, which owns every refusal so the LLM, CLI and
+/// HTTP surfaces cannot drift.
+pub(super) async fn run_trigger(
+    State(state): State<AppState>,
+    Query(query): Query<TriggerIdQuery>,
+) -> Json<TriggerRunResponse> {
+    Json(
+        match state.engine.run_trigger_off_schedule(&query.id).await {
+            Ok(outcome) => TriggerRunResponse {
+                success: true,
+                status: Some(outcome.status()),
+                message: outcome.message(),
+            },
+            Err(refusal) => TriggerRunResponse {
+                success: false,
+                status: None,
+                message: refusal.message(),
+            },
+        },
+    )
+}
+
 /// Routes for the `/triggers*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
@@ -598,6 +643,7 @@ pub(super) fn router() -> Router<AppState> {
                 .delete(delete_trigger),
         )
         .route("/triggers/historical", get(list_historical_triggers))
+        .route("/triggers/run", post(run_trigger))
 }
 
 #[cfg(test)]

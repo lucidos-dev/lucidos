@@ -14,6 +14,7 @@ import { listArtifacts, uploadFile } from '../../api/client';
 import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
+import { openExternalUrl } from '../../utils/openExternalUrl';
 import { openExternal } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
 import { currentInAppBrowser } from './preferences';
@@ -165,7 +166,9 @@ export function normalizeUrl(url: string): string {
 export function openUrl(url: string): void {
   const normalized = normalizeUrl(url);
   if (!isTauri()) {
-    window.open(normalized, '_blank', 'noopener');
+    // Browser + PWA: a new tab, except on an installed iOS PWA where that would
+    // be the inescapable in-app web view. See utils/openExternalUrl.ts.
+    openExternalUrl(normalized);
     return;
   }
   // Experimental in-app browser (the Tauri native webview) is opt-in. Off by

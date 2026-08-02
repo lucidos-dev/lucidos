@@ -9,7 +9,6 @@ use crate::engine::claude_code::{read_allowed_tools_file, write_allowed_tools_fi
 use crate::engine::command_permission::{
     read_agent_allowed_commands_file, write_agent_allowed_commands_file,
 };
-use crate::engine::event_bus::{BusEvent, SystemEvent};
 
 /// Response/request body for both allowlist editors (`cc-allowed-tools` and
 /// `agent-allowed-commands`) — the raw file text, one pattern per line. The
@@ -137,14 +136,21 @@ pub(super) async fn create_credential(
             return ApiResult::err(rejection.message(name));
         }
     }
+    // `upsert` emits `Credential{Created,Updated}` itself, so this handler
+    // resolves the device actor up front instead of going through
+    // `emit_user_system`. The emit is not the caller's to make (see
+    // `CredentialStore`'s type doc).
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match CredentialStore::upsert(
         &state.pool,
+        &state.engine.event_bus,
         &request.service_name,
         &request.base_url,
         auth_type,
         &request.auth_value,
         request.auth_header.as_deref(),
         env_var_name,
+        actor,
     )
     .await
     {
@@ -165,20 +171,6 @@ pub(super) async fn create_credential(
                     }
                 }
             }
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] CredentialCreated",
-                    |actor| SystemEvent::CredentialCreated {
-                        service_name: request.service_name.clone(),
-                        auth_type,
-                        actor,
-                    },
-                )
-                .await;
             ApiResult::ok()
         }
         Err(e) => ApiResult::err(format!("Failed to save credential: {}", e)),
@@ -225,14 +217,19 @@ pub(super) async fn update_credential(
         }
     }
 
+    // Same as the create path: the store owns the `CredentialUpdated` emit, so
+    // resolve the device actor here and hand it over.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match CredentialStore::update(
         &state.pool,
+        &state.engine.event_bus,
         &service,
         &base_url,
         auth_type,
         request.auth_header.as_deref(),
         new_secret,
         env_var_name,
+        actor,
     )
     .await
     {
@@ -272,19 +269,6 @@ pub(super) async fn update_credential(
                     }
                 }
             }
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] CredentialUpdated",
-                    |actor| SystemEvent::CredentialUpdated {
-                        service_name: service.clone(),
-                        actor,
-                    },
-                )
-                .await;
             ApiResult::ok()
         }
         Ok(false) => ApiResult::err(format!("Credential '{}' not found", service)),
@@ -340,23 +324,10 @@ pub(super) async fn delete_credential(
     headers: HeaderMap,
 ) -> Json<ApiResult> {
     let service = query.service;
-    match CredentialStore::delete(&state.pool, &service).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] CredentialDeleted",
-                    |actor| SystemEvent::CredentialDeleted {
-                        service_name: service.clone(),
-                        actor,
-                    },
-                )
-                .await;
-            ApiResult::ok()
-        }
+    // `delete` emits `CredentialDeleted` itself; resolve the device actor for it.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match CredentialStore::delete(&state.pool, &state.engine.event_bus, &service, actor).await {
+        Ok(true) => ApiResult::ok(),
         Ok(false) => ApiResult::err(format!("Credential '{}' not found", service)),
         Err(e) => ApiResult::err(format!("Failed to delete credential: {}", e)),
     }
@@ -409,28 +380,24 @@ pub(super) async fn create_env_var(
     if let Err(rejection) = validate_name(&request.name) {
         return Err((StatusCode::BAD_REQUEST, rejection.message(&request.name)));
     }
-    if let Err(e) =
-        EnvironmentVariableStore::upsert(&state.pool, &request.name, &request.value).await
+    // The store emits `EnvironmentVariableSet` from inside its write path, so
+    // this handler resolves the device actor and hands it over rather than
+    // emitting afterwards (see `EnvironmentVariableStore`'s type doc).
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    if let Err(e) = EnvironmentVariableStore::upsert(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.name,
+        &request.value,
+        actor,
+    )
+    .await
     {
         return Ok(ApiResult::err(format!(
             "Failed to save environment variable: {}",
             e
         )));
     }
-    state
-        .engine
-        .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
-            "[Settings] EnvironmentVariableSet",
-            |actor| SystemEvent::EnvironmentVariableSet {
-                name: request.name.clone(),
-                value: request.value.clone(),
-                actor,
-            },
-        )
-        .await;
     Ok(ApiResult::ok())
 }
 
@@ -446,24 +413,17 @@ pub(super) async fn update_env_var(
     if let Err(rejection) = validate_name(&query.name) {
         return Err((StatusCode::BAD_REQUEST, rejection.message(&query.name)));
     }
-    match EnvironmentVariableStore::update(&state.pool, &query.name, &request.value).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] EnvironmentVariableSet",
-                    |actor| SystemEvent::EnvironmentVariableSet {
-                        name: query.name.clone(),
-                        value: request.value.clone(),
-                        actor,
-                    },
-                )
-                .await;
-            Ok(ApiResult::ok())
-        }
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match EnvironmentVariableStore::update(
+        &state.pool,
+        &state.engine.event_bus,
+        &query.name,
+        &request.value,
+        actor,
+    )
+    .await
+    {
+        Ok(true) => Ok(ApiResult::ok()),
         Ok(false) => Ok(ApiResult::err(format!(
             "Environment variable '{}' not found",
             query.name
@@ -481,23 +441,11 @@ pub(super) async fn delete_env_var(
     Query(query): Query<NameQuery>,
     headers: HeaderMap,
 ) -> Json<ApiResult> {
-    match EnvironmentVariableStore::delete(&state.pool, &query.name).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] EnvironmentVariableDeleted",
-                    |actor| SystemEvent::EnvironmentVariableDeleted {
-                        name: query.name.clone(),
-                        actor,
-                    },
-                )
-                .await;
-            ApiResult::ok()
-        }
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match EnvironmentVariableStore::delete(&state.pool, &state.engine.event_bus, &query.name, actor)
+        .await
+    {
+        Ok(true) => ApiResult::ok(),
         Ok(false) => ApiResult::err(format!("Environment variable '{}' not found", query.name)),
         Err(e) => ApiResult::err(format!("Failed to delete environment variable: {}", e)),
     }
@@ -565,31 +513,22 @@ pub(super) async fn create_model(
     }
     // User models sort after the builtins by default.
     let sort_order = request.sort_order.unwrap_or(1000);
+    // The store emits `ModelCreated` from inside its write path (the in-memory
+    // ModelRegistry reloads on it), so resolve the device actor and hand it over.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match ModelStore::create(
         &state.pool,
+        &state.engine.event_bus,
         id,
         label,
         &request.provider,
         sort_order,
         request.context_window,
+        actor,
     )
     .await
     {
-        Ok(model) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] ModelCreated", |actor| {
-                    SystemEvent::ModelCreated {
-                        id: model.id.clone(),
-                        label: model.label.clone(),
-                        provider: model.provider.clone(),
-                        actor,
-                    }
-                })
-                .await;
-            ApiResult::ok()
-        }
+        Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!(
             "Failed to create model (id may already exist): {}",
             e
@@ -611,6 +550,8 @@ pub(super) async fn update_model(
         Ok(None) => return ApiResult::err(format!("Model '{}' not found", query.id)),
         Err(e) => return ApiResult::err(format!("Failed to load model: {}", e)),
     };
+    // The store owns the `ModelUpdated` emit for both arms below.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
 
     let result = if existing.is_builtin() {
         // Builtins keep their IDENTITY — label / provider / sort_order are
@@ -626,12 +567,14 @@ pub(super) async fn update_model(
         }
         ModelStore::update(
             &state.pool,
+            &state.engine.event_bus,
             &existing.id,
             &existing.label,
             &existing.provider,
             existing.sort_order,
             enabled,
             context_window,
+            actor,
         )
         .await
     } else {
@@ -652,30 +595,20 @@ pub(super) async fn update_model(
         }
         ModelStore::update(
             &state.pool,
+            &state.engine.event_bus,
             &existing.id,
             &label,
             &provider,
             sort_order,
             enabled,
             context_window,
+            actor,
         )
         .await
     };
 
     match result {
-        Ok(_) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] ModelUpdated", |actor| {
-                    SystemEvent::ModelUpdated {
-                        id: existing.id.clone(),
-                        actor,
-                    }
-                })
-                .await;
-            ApiResult::ok()
-        }
+        Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to update model: {}", e)),
     }
 }
@@ -695,20 +628,9 @@ pub(super) async fn delete_model(
     if existing.is_builtin() {
         return ApiResult::err("Builtin models cannot be deleted — disable it instead");
     }
-    match ModelStore::delete(&state.pool, &existing.id).await {
-        Ok(_) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] ModelDeleted", |actor| {
-                    SystemEvent::ModelDeleted {
-                        id: existing.id.clone(),
-                        actor,
-                    }
-                })
-                .await;
-            ApiResult::ok()
-        }
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match ModelStore::delete(&state.pool, &state.engine.event_bus, &existing.id, actor).await {
+        Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to delete model: {}", e)),
     }
 }
@@ -739,23 +661,10 @@ pub(super) async fn delete_oauth_account(
         Err(_) => return ApiResult::err("Invalid account ID"),
     };
 
-    match OAuthStore::delete(&state.pool, id).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] OAuthAccountDeleted",
-                    |actor| SystemEvent::OAuthAccountDeleted {
-                        account_id: id.to_string(),
-                        actor,
-                    },
-                )
-                .await;
-            ApiResult::ok()
-        }
+    // `delete` emits `OAuthAccountDeleted` itself; resolve the device actor.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match OAuthStore::delete(&state.pool, &state.engine.event_bus, id, actor).await {
+        Ok(true) => ApiResult::ok(),
         Ok(false) => ApiResult::err("OAuth account not found"),
         Err(e) => ApiResult::err(format!("Failed to delete OAuth account: {}", e)),
     }
@@ -784,7 +693,14 @@ pub(super) async fn reauthorize_oauth(
         Ok(Some(_)) => {}
     }
 
-    match crate::core::oauth::prepare_oauth_flow(&state.pool, &provider, &scopes).await {
+    match crate::core::oauth::prepare_oauth_flow(
+        &state.pool,
+        &state.engine.event_bus,
+        &provider,
+        &scopes,
+    )
+    .await
+    {
         Ok(prepared) => {
             let auth_url = prepared.auth_url.clone();
             // Store the receiver so /oauth/complete can await it
@@ -883,24 +799,11 @@ pub(super) async fn delete_preference(
     headers: HeaderMap,
 ) -> Json<ApiResult> {
     let key = query.key;
-    match PreferenceStore::delete(&state.pool, &key).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] PreferencesChanged",
-                    |actor| crate::engine::event_bus::SystemEvent::PreferencesChanged {
-                        key: key.clone(),
-                        value: None,
-                        actor,
-                    },
-                )
-                .await;
-            ApiResult::ok()
-        }
+    // `delete` emits the `PreferencesChanged` with `value: None` ("back to the
+    // default") itself; resolve the device actor for it.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    match PreferenceStore::delete(&state.pool, &state.engine.event_bus, &key, actor).await {
+        Ok(true) => ApiResult::ok(),
         Ok(false) => ApiResult::err(format!("Preference '{}' not found", key)),
         Err(e) => ApiResult::err(format!("Failed to delete preference: {}", e)),
     }
@@ -945,7 +848,7 @@ pub(super) async fn get_network_config(
         engine_bind,
         inherit: net.engine_inherit,
         gateway_bind: net.gateway_bind.unwrap_or_else(|| "loopback".to_string()),
-        detected_tailscale_ip: crate::net_config::detect_tailscale_ipv4().await,
+        detected_tailscale_ip: crate::net_config::detect_tailscale_ipv4(),
     }))
 }
 
@@ -1027,26 +930,19 @@ pub(super) async fn pin_app(
     headers: HeaderMap,
     Json(request): Json<PinAppRequest>,
 ) -> Json<ApiResult> {
-    match PinnedAppStore::pin(&state.pool, &request.app_id, "main", &request.device_id).await {
-        Ok(true) => {
-            let actor =
-                super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id))
-                    .await;
-            state
-                .engine
-                .event_bus
-                .emit_or_log(
-                    BusEvent::System(SystemEvent::PinnedAppPinned {
-                        app_id: request.app_id.clone(),
-                        device_id: request.device_id.clone(),
-                        actor,
-                    }),
-                    "[Settings] PinnedAppPinned",
-                )
-                .await;
-            ApiResult::ok()
-        }
-        Ok(false) => ApiResult::ok(),
+    let actor =
+        super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id)).await;
+    match PinnedAppStore::pin(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.app_id,
+        "main",
+        &request.device_id,
+        actor,
+    )
+    .await
+    {
+        Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to pin app: {}", e)),
     }
 }
@@ -1058,26 +954,19 @@ pub(super) async fn unpin_app(
     headers: HeaderMap,
     Json(request): Json<PinAppRequest>,
 ) -> Json<ApiResult> {
-    match PinnedAppStore::unpin(&state.pool, &request.app_id, "main", &request.device_id).await {
-        Ok(true) => {
-            let actor =
-                super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id))
-                    .await;
-            state
-                .engine
-                .event_bus
-                .emit_or_log(
-                    BusEvent::System(SystemEvent::PinnedAppUnpinned {
-                        app_id: request.app_id.clone(),
-                        device_id: request.device_id.clone(),
-                        actor,
-                    }),
-                    "[Settings] PinnedAppUnpinned",
-                )
-                .await;
-            ApiResult::ok()
-        }
-        Ok(false) => ApiResult::ok(),
+    let actor =
+        super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id)).await;
+    match PinnedAppStore::unpin(
+        &state.pool,
+        &state.engine.event_bus,
+        &request.app_id,
+        "main",
+        &request.device_id,
+        actor,
+    )
+    .await
+    {
+        Ok(_) => ApiResult::ok(),
         Err(e) => ApiResult::err(format!("Failed to unpin app: {}", e)),
     }
 }
@@ -1089,40 +978,22 @@ pub(super) async fn register_device(
     headers: HeaderMap,
     Json(request): Json<DeviceRegisterRequest>,
 ) -> Json<serde_json::Value> {
+    // The frontend calls this on every page load to refresh `last_seen_at`, so
+    // the upsert path is the steady state. `register` announces only a genuine
+    // first-touch insert, so the events table does not grow by a row per
+    // refresh (see `DeviceStore`'s type doc).
+    let actor =
+        super::actor::user_actor_resolved(&headers, &state.pool, Some(&request.device_id)).await;
     match crate::core::DeviceStore::register(
         &state.pool,
+        &state.engine.event_bus,
         &request.device_id,
         request.user_agent.as_deref(),
+        actor,
     )
     .await
     {
-        Ok((device, inserted)) => {
-            // Frontend calls this endpoint on every page load to refresh
-            // `last_seen_at`, so the upsert path is the steady state — only
-            // emit `DeviceRegistered` for genuine first-touch inserts.
-            // Otherwise the events table would grow by one row per refresh.
-            if inserted {
-                let actor = super::actor::user_actor_resolved(
-                    &headers,
-                    &state.pool,
-                    Some(&request.device_id),
-                )
-                .await;
-                state
-                    .engine
-                    .event_bus
-                    .emit_or_log(
-                        BusEvent::System(SystemEvent::DeviceRegistered {
-                            device_id: request.device_id.clone(),
-                            user_agent: request.user_agent.clone(),
-                            actor,
-                        }),
-                        "[Settings] DeviceRegistered",
-                    )
-                    .await;
-            }
-            Json(serde_json::json!({ "success": true, "device": device }))
-        }
+        Ok((device, _inserted)) => Json(serde_json::json!({ "success": true, "device": device })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
 }
@@ -1148,21 +1019,17 @@ pub(super) async fn rename_device(
     headers: HeaderMap,
     Json(request): Json<DeviceRenameRequest>,
 ) -> Json<serde_json::Value> {
-    match crate::core::DeviceStore::rename(&state.pool, &device_id, request.name.as_deref()).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] DeviceRenamed", |actor| {
-                    SystemEvent::DeviceRenamed {
-                        device_id: device_id.clone(),
-                        name: request.name.clone(),
-                        actor,
-                    }
-                })
-                .await;
-            Json(serde_json::json!({ "success": true }))
-        }
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, Some(&device_id)).await;
+    match crate::core::DeviceStore::rename(
+        &state.pool,
+        &state.engine.event_bus,
+        &device_id,
+        request.name.as_deref(),
+        actor,
+    )
+    .await
+    {
+        Ok(true) => Json(serde_json::json!({ "success": true })),
         Ok(false) => Json(serde_json::json!({ "success": false, "error": "Device not found" })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
@@ -1174,26 +1041,17 @@ pub(super) async fn set_device_push(
     headers: HeaderMap,
     Json(request): Json<DevicePushRequest>,
 ) -> Json<serde_json::Value> {
-    match crate::core::DeviceStore::set_push_enabled(&state.pool, &device_id, request.push_enabled)
-        .await
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, Some(&device_id)).await;
+    match crate::core::DeviceStore::set_push_enabled(
+        &state.pool,
+        &state.engine.event_bus,
+        &device_id,
+        request.push_enabled,
+        actor,
+    )
+    .await
     {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(
-                    &headers,
-                    &state.pool,
-                    "[Settings] DevicePushChanged",
-                    |actor| SystemEvent::DevicePushChanged {
-                        device_id: device_id.clone(),
-                        push_enabled: request.push_enabled,
-                        actor,
-                    },
-                )
-                .await;
-            Json(serde_json::json!({ "success": true }))
-        }
+        Ok(true) => Json(serde_json::json!({ "success": true })),
         Ok(false) => Json(serde_json::json!({ "success": false, "error": "Device not found" })),
         Err(e) => Json(serde_json::json!({ "success": false, "error": e.to_string() })),
     }
@@ -1204,20 +1062,11 @@ pub(super) async fn delete_device(
     Path(device_id): Path<String>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match crate::core::DeviceStore::delete(&state.pool, &device_id).await {
-        Ok(true) => {
-            state
-                .engine
-                .event_bus
-                .emit_user_system(&headers, &state.pool, "[Settings] DeviceDeleted", |actor| {
-                    SystemEvent::DeviceDeleted {
-                        device_id: device_id.clone(),
-                        actor,
-                    }
-                })
-                .await;
-            Ok(Json(serde_json::json!({ "success": true })))
-        }
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, Some(&device_id)).await;
+    match crate::core::DeviceStore::delete(&state.pool, &state.engine.event_bus, &device_id, actor)
+        .await
+    {
+        Ok(true) => Ok(Json(serde_json::json!({ "success": true }))),
         Ok(false) => Err((StatusCode::NOT_FOUND, "Device not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1524,7 +1373,6 @@ pub(super) fn router() -> Router<AppState> {
 #[cfg(test)]
 mod oauth_access_token_tests {
     use super::*;
-    use crate::core::OAuthStore;
     use chrono::{Duration, Utc};
 
     #[tokio::test]
@@ -1552,7 +1400,7 @@ mod oauth_access_token_tests {
     async fn returns_access_token_and_expires_at_when_connected() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let expiry = Utc::now() + Duration::seconds(3600);
-        OAuthStore::insert(
+        crate::test_support::seed_oauth_account(
             &pool,
             "spotify",
             Some("user@example.com"),
@@ -1605,7 +1453,7 @@ mod oauth_access_token_tests {
         // refresh code path runs (rather than returning the stale token).
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let past = Utc::now() - Duration::seconds(120);
-        OAuthStore::insert(
+        crate::test_support::seed_oauth_account(
             &pool,
             "spotify",
             Some("user@example.com"),

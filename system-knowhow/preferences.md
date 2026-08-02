@@ -79,6 +79,7 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `local_base_url` | global | URL | `http://localhost:11434/v1` | Base URL for the `local` OpenAI-compatible provider. |
 | `notifications_filter` | global | `all` \| `unread` | `all` | Which notifications the bell shows. |
 | `mobile_header_sticky` | global | `true` \| `false` | `true` | Keep the mobile header always visible. |
+| `external_link_target` | global | `safari` \| `ask` \| `in-app` | `safari` | Where an external http(s) link goes when tapped in an **installed iOS PWA**. No effect on desktop, Android, or a normal Safari tab, which all open a new tab. `safari` hands it to the Safari app; `ask` opens the OS share sheet so iOS offers every installed browser, including the user's real default; `in-app` keeps it in the PWA's in-app web view (no address bar, no shared Safari session). |
 | `welcome_suggestions_dismissed` | global | `true` \| `false` | `false` | Hide the new-workspace welcome message. Set `false` to SHOW it again. |
 | `coding_agent_default` | global | `claude-code` \| `codex` | `claude-code` | Default coding agent the compose picker pre-selects. |
 | `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
