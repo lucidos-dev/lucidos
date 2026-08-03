@@ -3,10 +3,11 @@
  *
  * `useStartup`'s `onResume` is what a long-resident client relies on to notice
  * anything that changed while the user was away: it fires on window `focus`,
- * `visibilitychange` and `pageshow`. Four separate update surfaces reconcile
- * there, and each one is a single unremarkable call that a refactor can drop
- * without breaking a type or a test. Losing one is invisible until a user asks
- * why they were never told about a release.
+ * `visibilitychange` and `pageshow`. Several separate update surfaces reconcile
+ * there (the list below is the set, so it cannot go stale against a count in
+ * this sentence), and each one is a single unremarkable call that a refactor can
+ * drop without breaking a type or a test. Losing one is invisible until a user
+ * asks why they were never told about a release.
  *
  * That is not hypothetical. The packaged app updater was missing from this set
  * until 2026-07-31, so a 0.18.0 client that neither remounted nor waited out its
@@ -66,6 +67,7 @@ const RESUME_RECONCILED: Array<[call: string, whatBreaks: string]> = [
   ['checkEngineVersion(', 'an engine build that finished while away shows as still spinning'],
   ['recheckAppUpdateOnResume(', 'a packaged release goes unannounced until the next poll'],
   ['flushPendingPreferenceWrites(', 'a settings change WebKit aborted at suspend never reaches the engine, so the device and the server disagree until the next reload'],
+  ['flushUndeliveredComposeDrafts(', 'a draft whose PUT failed while offline is never re-sent, and since a draft lives only in memory it dies with the next iOS eviction'],
 ];
 
 describe('useStartup resume reconciliation', () => {
@@ -115,5 +117,57 @@ describe('useStartup external-link delegation', () => {
 
   it('never opens an external URL itself, so the platform routing has one home', () => {
     expect(body).not.toContain('window.open(');
+  });
+});
+
+/**
+ * One wake, one pass.
+ *
+ * iOS fires `visibilitychange`, `focus` AND `pageshow` together on a resume, so
+ * binding `onResume` to all three ran the whole reconciliation set above three
+ * times per wake. The gateway log showed it directly: 3x `engine/version-status`,
+ * 3x `memory/embedding-model-status` and 3-4x `notifications` inside one second.
+ *
+ * That is worse than wasted requests. The burst goes down a tunnel that is
+ * itself still re-establishing after the wake, and it grows with the workspace
+ * (85 thread-event GETs in one minute, against 16 earlier the same day). It also
+ * silently collapsed the tolerance of every consecutive-failure counter reached
+ * from here: `loadUnreadNotifications` is meant to stay quiet until three
+ * failures in a row, and one bad wake was spending all three on its own, which
+ * is why the stale-unread-count card appeared constantly.
+ *
+ * A source scan for the same reason as the guard above: standing `useStartup` up
+ * in jsdom to count listener invocations would pin the mechanism rather than the
+ * requirement. The gate's own behaviour is unit-tested in
+ * `utils/leadingEdgeGate.test.ts`.
+ */
+describe('useStartup coalesces the iOS wake burst', () => {
+  const src = stripComments(readFileSync(SOURCE, 'utf8'));
+
+  it('routes all three wake events through the gate, never at onResume directly', () => {
+    for (const binding of [
+      `window.addEventListener('focus', onResumeCoalesced)`,
+      `window.addEventListener('pageshow', onResumeCoalesced)`,
+    ]) {
+      expect(src, 'a listener bound straight to onResume re-triples the wake burst').toContain(binding);
+    }
+    // The visibility branch reaches it through its own handler.
+    expect(handlerBody(src, 'function handleVisibilityChange()')).toContain('onResumeCoalesced()');
+  });
+
+  it('tears down the same references it added, so the listeners cannot leak', () => {
+    // `removeEventListener` matches on function identity: leaving these pointing
+    // at `onResume` would silently keep the old listeners alive across remounts,
+    // and each remount would add a fresh set on top.
+    expect(src).toContain(`window.removeEventListener('focus', onResumeCoalesced)`);
+    expect(src).toContain(`window.removeEventListener('pageshow', onResumeCoalesced)`);
+    expect(src).not.toContain(`window.removeEventListener('focus', onResume)`);
+    expect(src).not.toContain(`window.removeEventListener('pageshow', onResume)`);
+  });
+
+  it('gates on the shared leading-edge helper rather than a bespoke timer', () => {
+    const gate = handlerBody(src, 'function onResumeCoalesced()');
+    expect(gate).toContain('resumeGate.allow()');
+    expect(src).toContain('createLeadingEdgeGate(RESUME_COALESCE_MS)');
   });
 });

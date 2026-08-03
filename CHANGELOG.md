@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.20.1 — 2026-08-03
+
+### Fixed
+
+- Waking the installed iOS PWA no longer fills the screen with error toasts. A wake runs one reconciliation pass, and a dropped connection is reported by the connection dot rather than by a stale-unread-count card.
+- A compose draft that fails to reach the engine is queued and re-sent on the next resume or reconnect, so text typed on a phone survives an iOS eviction of the app. Repeat failures collapse into a single card instead of stacking.
 ## v0.20.0 — 2026-08-03
 
 ### Added

@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   notifications,
   unreadNotifications,
@@ -10,6 +10,7 @@ import {
   notificationDetailPending,
   activeMenuItem,
   toasts,
+  connectionStatus,
 } from '../store';
 import type { Notification, Loadable } from '../types';
 
@@ -662,6 +663,10 @@ describe('loadUnreadNotifications failure handling', () => {
   beforeEach(async () => {
     toasts.value = [];
     seedUnread([]);
+    // The escalation only counts failures while the engine is REACHABLE (an
+    // outage is the connection dot's to report, once). The signal defaults to
+    // 'connecting', so every countable case has to say so explicitly.
+    connectionStatus.value = 'connected';
     // Reset the module-level failure counter — every test starts with a
     // successful load so failures are independent across tests.
     (getNotifications as Mock).mockReset();
@@ -670,6 +675,10 @@ describe('loadUnreadNotifications failure handling', () => {
     });
     await loadUnreadNotifications();
     toasts.value = [];
+  });
+
+  afterEach(() => {
+    connectionStatus.value = 'connecting';
   });
 
   it('does not toast on a single transient failure (best-effort poll)', async () => {
@@ -730,6 +739,54 @@ describe('loadUnreadNotifications failure handling', () => {
     await loadUnreadNotifications();
     await loadUnreadNotifications();
     await loadUnreadNotifications();
+    await loadUnreadNotifications();
+
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
+  });
+
+  it('does not count ANY failure while the engine is unreachable', async () => {
+    // The reported symptom. Over a dropped tunnel the GET hangs rather than
+    // refusing, so it dies on the 10s client deadline as a TimeoutError, which
+    // the abort/transport suppressions above deliberately let through as the
+    // stronger "genuinely stuck" signal. But the connection dot is already
+    // reporting the outage, so counting it here tells the user the same thing
+    // twice. This is what made the card a constant companion on an iOS PWA.
+    connectionStatus.value = 'disconnected';
+    (getNotifications as Mock).mockRejectedValue(
+      new DOMException('Request timed out after 10000ms', 'TimeoutError'),
+    );
+
+    for (let i = 0; i < 5; i++) await loadUnreadNotifications();
+
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
+  });
+
+  it('still toasts when the engine is REACHABLE but this endpoint keeps failing', async () => {
+    // The other half of the gate: /health answering while /notifications does
+    // not is a real, actionable fault and must not be swallowed with the outage.
+    connectionStatus.value = 'connected';
+    (getNotifications as Mock).mockRejectedValue(
+      new DOMException('Request timed out after 10000ms', 'TimeoutError'),
+    );
+
+    await loadUnreadNotifications();
+    await loadUnreadNotifications();
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);
+
+    await loadUnreadNotifications();
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
+  });
+
+  it('retracts the stale-count card once a load lands', async () => {
+    // The card asserts the count is stale. A landed set makes that false, so
+    // leaving it up parks a permanent lie above a live, correct badge.
+    (getNotifications as Mock).mockRejectedValue(new Error('boom'));
+    for (let i = 0; i < 3; i++) await loadUnreadNotifications();
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
+
+    (getNotifications as Mock).mockResolvedValue({
+      notifications: [], unread_count: 0, has_more: false,
+    });
     await loadUnreadNotifications();
 
     expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(0);

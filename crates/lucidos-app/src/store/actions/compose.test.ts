@@ -23,7 +23,7 @@ vi.mock('../../api/threads', () => ({
   fetchThreadEvents: vi.fn().mockResolvedValue([]),
 }));
 
-import { applySuggestion, composeEditedAt, discardCompose, ensureFocusedComposeThread, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, updateCompose, applyRemoteCompose } from './compose';
+import { applySuggestion, clearSupersededDraft, composeEditedAt, discardCompose, ensureFocusedComposeThread, flushUndeliveredComposeDrafts, pendingComposePuts, prefillCompose, sendCompose, sendFollowup, updateCompose, applyRemoteCompose, _resetUndeliveredComposeDraftsForTesting, _undeliveredComposeDraftsForTesting } from './compose';
 import { focusThread, unfocusThread } from './threads';
 import { connectionStatus, confirmState, focusedThreadId, inputMode, threadMap, selectedScope, FOCUSED_THREAD_KEY, toasts } from '../store';
 import { promptOverrideSyncSeq } from '../../components/chat/promptValueSync';
@@ -1172,5 +1172,376 @@ describe('pendingComposePuts covers the LAST pending write, not the first', () =
     await vi.advanceTimersByTimeAsync(0);         // the FIRST PUT settles
 
     expect(pendingComposePuts.has('t-1')).toBe(true);
+  });
+});
+
+/**
+ * Compose drafts: type locally, deliver durably.
+ *
+ * A draft lives ONLY in the `composeDrafts` signal, so the server is its
+ * storage and the debounced PUT is the only thing that gets it there. On an
+ * installed iOS PWA that PUT fails constantly for reasons that say nothing
+ * about the request (WebKit aborts in-flight fetches when it suspends the page;
+ * the tunnel to the engine drops on any radio change) and the page is then
+ * evicted, taking the only copy of the text with it. The reported symptom was
+ * three stacked "Compose sync failed: Load failed" cards during one four-minute
+ * outage, with nothing re-sending the draft afterwards.
+ *
+ * Mirrors the pending-preference-write suite in `preferences.test.ts`.
+ */
+describe('undelivered compose drafts are parked and re-sent', () => {
+  /** Rejects the way a suspended page / dropped tunnel does: no answer, so
+   *  `isTransientFetchError` is true and a re-send is owed. A `TimeoutError`
+   *  (not a transport `TypeError`) so `mutatingFetchIdempotent`'s own single
+   *  retry stays out of the way and each push is exactly one attempt. */
+  function noAnswer(): DOMException {
+    return new DOMException('Request timed out after 10000ms', 'TimeoutError');
+  }
+
+  const composePuts = (m: ReturnType<typeof vi.fn>) =>
+    m.mock.calls.filter(([url, init]) =>
+      String(url).endsWith('/compose') && (init as RequestInit | undefined)?.method === 'PUT');
+
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = 't-1';
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeActiveThread());
+    threadMap.value = map;
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    toasts.value = [];
+    mockFetch = vi.fn().mockResolvedValue(new Response(null, { status: 204 }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    toasts.value = [];
+    vi.restoreAllMocks();
+  });
+
+  it('stays silent on the first failure and parks the thread', async () => {
+    mockFetch.mockRejectedValue(noAnswer());
+
+    updateCompose('t-1', { text: 'typed while the tunnel was down' });
+    await vi.runAllTimersAsync();
+
+    expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+  });
+
+  it('escalates ONCE after three failures, however many more follow', async () => {
+    mockFetch.mockRejectedValue(noAnswer());
+
+    for (const text of ['a', 'ab', 'abc', 'abcd', 'abcde']) {
+      updateCompose('t-1', { text });
+      await vi.runAllTimersAsync();
+    }
+
+    const errors = toasts.value.filter((t) => t.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toMatch(/not reaching the engine/i);
+    // The reported symptom was a stack of identical cards: the key is what
+    // collapses them, and an error toast has no auto-dismiss to hide the bug.
+    expect(errors[0].key).toBeTruthy();
+  });
+
+  it('surfaces a REFUSAL immediately, without parking it', async () => {
+    // The engine answered. No retry can change that and the user is owed the
+    // reason, so this keeps today's behaviour (a 410 on a discarded thread, a
+    // 409 on an archived one) rather than being swallowed into the queue.
+    mockFetch.mockResolvedValue(new Response(JSON.stringify({ error: 'thread discarded' }), { status: 410 }));
+
+    updateCompose('t-1', { text: 'against a dead thread' });
+    await vi.runAllTimersAsync();
+
+    const errors = toasts.value.filter((t) => t.type === 'error');
+    expect(errors).toHaveLength(1);
+    expect(errors[0].message).toMatch(/Compose sync failed: 410 thread discarded/);
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+  });
+
+  it('collapses repeated refusals into one card', async () => {
+    mockFetch.mockResolvedValue(new Response(JSON.stringify({ error: 'thread discarded' }), { status: 410 }));
+
+    updateCompose('t-1', { text: 'one' });
+    await vi.runAllTimersAsync();
+    updateCompose('t-1', { text: 'two' });
+    await vi.runAllTimersAsync();
+
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
+  });
+
+  it('re-sends the CURRENT draft on flush, then drains and retracts the card', async () => {
+    mockFetch.mockRejectedValue(noAnswer());
+    for (const text of ['a', 'ab', 'abc']) {
+      updateCompose('t-1', { text });
+      await vi.runAllTimersAsync();
+    }
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
+    const before = composePuts(mockFetch).length;
+
+    // The link is back.
+    mockFetch.mockResolvedValue(new Response(null, { status: 204 }));
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+
+    const sent = composePuts(mockFetch);
+    expect(sent.length).toBe(before + 1);
+    // The park holds a thread id, not a snapshot, so the re-send carries the
+    // draft as it stands now rather than whichever keystroke happened to fail.
+    expect(JSON.parse(String((sent[sent.length - 1][1] as RequestInit).body)).text).toBe('abc');
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+    expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
+  });
+
+  it('re-parks a flush that fails again, and issues nothing when nothing is owed', async () => {
+    mockFetch.mockRejectedValue(noAnswer());
+    updateCompose('t-1', { text: 'still offline' });
+    await vi.runAllTimersAsync();
+
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+
+    // Drained: a later flush must be a no-op, not a stray PUT on every resume.
+    _resetUndeliveredComposeDraftsForTesting();
+    const before = composePuts(mockFetch).length;
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+    expect(composePuts(mockFetch).length).toBe(before);
+  });
+
+  it('does not stamp the edit watermark on a re-push', async () => {
+    // A re-push is a delivery attempt, not an edit. Re-stamping would move the
+    // reference point `draftIsSuperseded` compares against, which is what makes
+    // a draft another device already submitted droppable.
+    mockFetch.mockRejectedValue(noAnswer());
+    updateCompose('t-1', { text: 'owed' });
+    await vi.runAllTimersAsync();
+    const editedAt = composeEditedAt.get('t-1');
+
+    vi.advanceTimersByTime(60_000);
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+
+    expect(composeEditedAt.get('t-1')).toBe(editedAt);
+  });
+
+  it('discarding a thread stops it being owed, so no flush resurrects it', async () => {
+    mockFetch.mockRejectedValue(noAnswer());
+    updateCompose('t-1', { text: 'never mind' });
+    await vi.runAllTimersAsync();
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+
+    mockFetch.mockResolvedValue(new Response(null, { status: 204 }));
+    await discardCompose('t-1');
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+
+    const before = composePuts(mockFetch).length;
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+    expect(composePuts(mockFetch).length).toBe(before);
+  });
+
+  it('sending a thread stops it being owed, so no flush re-posts the draft', async () => {
+    mockFetch.mockRejectedValue(noAnswer());
+    updateCompose('t-1', { text: 'about to send' });
+    await vi.runAllTimersAsync();
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+
+    mockFetch.mockResolvedValue(new Response(JSON.stringify({ event_id: 'e-1' }), { status: 200 }));
+    await sendCompose('t-1', {});
+
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+    const before = composePuts(mockFetch).length;
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+    expect(composePuts(mockFetch).length).toBe(before);
+  });
+
+  it('a draft the thread history proves was submitted stops being owed', async () => {
+    // The peer-submission case. This device typed text, got it acked, edited it,
+    // then went offline while another device sent the very same text. Without
+    // the drop, the reconnect flush would push the sent message back up as a
+    // live draft and it would reappear on every device.
+    updateCompose('t-1', { text: 'shared text' });
+    await vi.runAllTimersAsync();                  // acked: serverDraft = 'shared text'
+
+    mockFetch.mockRejectedValue(noAnswer());
+    updateCompose('t-1', { text: 'shared text v2' });
+    await vi.runAllTimersAsync();                  // fails: parked
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+
+    // The peer's submission lands: compose cleared server-side, and the thread's
+    // own history now carries exactly this draft's content.
+    applyRemoteCompose('t-1', { text: '', image_hashes: [], mode: null });
+    const thread = threadMap.value.get('t-1')!;
+    thread.events.set(9 as never, {
+      type: 'MessageReceived',
+      text: 'shared text v2',
+      user_image_hashes: [],
+      created: '2099-01-01T00:00:00Z',
+    } as never);
+
+    clearSupersededDraft('t-1');
+
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+    const before = composePuts(mockFetch).length;
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+    expect(composePuts(mockFetch).length).toBe(before);
+  });
+});
+
+/** The park must not outlive the thread it belongs to. `pushNow` early-returns
+ *  for a thread that is gone (its POST /threads failed and the optimistic entry
+ *  rolled back) or already discarded, so it never settles and the entry would
+ *  sit in the queue forever, holding the unreachable card up behind it. */
+describe('flushUndeliveredComposeDrafts drops what is no longer owed', () => {
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = 't-1';
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeActiveThread());
+    threadMap.value = map;
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    toasts.value = [];
+    mockFetch = vi.fn().mockRejectedValue(new DOMException('Request timed out after 10000ms', 'TimeoutError'));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    toasts.value = [];
+    vi.restoreAllMocks();
+  });
+
+  it('drops a parked thread that has vanished from threadMap, and retracts the card', async () => {
+    for (const text of ['a', 'ab', 'abc']) {
+      updateCompose('t-1', { text });
+      await vi.runAllTimersAsync();
+    }
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+    expect(toasts.value.filter((t) => t.type === 'error')).toHaveLength(1);
+
+    threadMap.value = new Map();
+    flushUndeliveredComposeDrafts();
+    await vi.runAllTimersAsync();
+
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+    expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
+  });
+});
+
+/**
+ * Out-of-order completion of overlapping PUTs.
+ *
+ * Two PUTs for one thread can be in flight at once: a PUT slower than the 250ms
+ * debounce overlaps the next one, which is what `inFlightPushes` exists to
+ * track. They can therefore also COMPLETE out of order, and an answer only
+ * speaks for the attempt that produced it. Without that, an older push landing
+ * last clears the re-send obligation a newer FAILED push just recorded, even
+ * though the server only ever received the older text, and the newest draft
+ * dies with the next eviction. That is the exact data loss the queue exists to
+ * prevent, so it gets its own guard and its own test.
+ */
+describe('an out-of-order push answers only for itself', () => {
+  let resolvers: Array<{ resolve: (r: Response) => void; reject: (e: unknown) => void; body: string }>;
+  let mockFetch: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    connectionStatus.value = 'connected';
+    focusedThreadId.value = 't-1';
+    const map = new Map<string, ThreadState>();
+    map.set('t-1', makeActiveThread());
+    threadMap.value = map;
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    toasts.value = [];
+    resolvers = [];
+    // Every compose PUT hangs until the test resolves it by hand, so the two
+    // attempts can be settled in the opposite order to the one they started in.
+    mockFetch = vi.fn((_url: string, init?: RequestInit) => new Promise<Response>((resolve, reject) => {
+      resolvers.push({ resolve, reject, body: String(init?.body ?? '') });
+    }));
+    globalThis.fetch = mockFetch as unknown as typeof fetch;
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    globalThis.fetch = originalFetch;
+    connectionStatus.value = 'disconnected';
+    focusedThreadId.value = null;
+    threadMap.value = new Map();
+    _resetComposeDraftsForTesting();
+    _resetUndeliveredComposeDraftsForTesting();
+    toasts.value = [];
+    vi.restoreAllMocks();
+  });
+
+  it('a stale success does not clear the re-send a newer failure recorded', async () => {
+    updateCompose('t-1', { text: 'abc' });
+    await vi.advanceTimersByTimeAsync(300);        // PUT A goes out with 'abc'
+    updateCompose('t-1', { text: 'abcd' });
+    await vi.advanceTimersByTimeAsync(300);        // PUT B goes out with 'abcd'
+
+    expect(resolvers).toHaveLength(2);
+    expect(JSON.parse(resolvers[0].body).text).toBe('abc');
+    expect(JSON.parse(resolvers[1].body).text).toBe('abcd');
+
+    // The newer attempt fails: its text never reached the engine.
+    resolvers[1].reject(new DOMException('Request timed out after 10000ms', 'TimeoutError'));
+    await vi.runAllTimersAsync();
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+
+    // Then the OLDER attempt lands, carrying only 'abc'.
+    resolvers[0].resolve(new Response(null, { status: 204 }));
+    await vi.runAllTimersAsync();
+
+    // 'abcd' is still unsynced, so it is still owed a re-send. Clearing it here
+    // is what would strand the newest text in a page iOS is about to evict.
+    expect(_undeliveredComposeDraftsForTesting()).toEqual(['t-1']);
+    expect(getDraft('t-1').text).toBe('abcd');
+  });
+
+  it('the latest attempt succeeding still settles, whatever an older one did', async () => {
+    updateCompose('t-1', { text: 'abc' });
+    await vi.advanceTimersByTimeAsync(300);
+    updateCompose('t-1', { text: 'abcd' });
+    await vi.advanceTimersByTimeAsync(300);
+
+    // The older attempt fails and must not park on the newer one's behalf...
+    resolvers[0].reject(new DOMException('Request timed out after 10000ms', 'TimeoutError'));
+    await vi.runAllTimersAsync();
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+
+    // ...and the newer one lands with the text the user can actually see.
+    resolvers[1].resolve(new Response(null, { status: 204 }));
+    await vi.runAllTimersAsync();
+
+    expect(_undeliveredComposeDraftsForTesting()).toEqual([]);
+    expect(toasts.value.filter((t) => t.type === 'error')).toEqual([]);
   });
 });

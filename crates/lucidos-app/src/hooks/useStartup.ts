@@ -42,6 +42,8 @@ import {
 import { dispatchDeepLink } from '../store/actions/in-app-notification-toast';
 import { setupHashDeeplinkRouting } from '../store/actions/hash-deeplink-router';
 import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
+import { createLeadingEdgeGate } from '../utils/leadingEdgeGate';
+import { flushUndeliveredComposeDrafts } from '../store/actions/compose';
 import { isKnownAppFrame } from '../utils/appFrame';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
 
@@ -56,6 +58,11 @@ const COLD_START_BOUNCE_MS = 10_000;
 // notificationclick silently dropped) without churning the recovery path,
 // which is itself cooldown-debounced.
 const SW_PROBE_INTERVAL_MS = 5 * 60 * 1000;
+// One iOS wake delivers `visibilitychange`, `focus` and `pageshow` together, so
+// the resume fan-out is gated to one pass per window. Only has to outlast the
+// burst (same tick, occasionally a few hundred ms apart); a genuine later wake
+// still gets its own pass. See `onResumeCoalesced`.
+const RESUME_COALESCE_MS = 1000;
 
 export function useStartup(): void {
   useEffect(() => {
@@ -518,9 +525,38 @@ export function useStartup(): void {
       // suspended PWA missed every transient status frame, so re-read the
       // snapshot rather than trusting the last one seen before backgrounding.
       void loadEmbeddingModelStatus();
+      // Re-send any compose draft the engine never received, for the same
+      // reason as the preference writes above. A draft lives only in memory
+      // (`store/composeDrafts.ts`), so the server is its storage and an
+      // undelivered one dies with the next iOS eviction. No-op when nothing is
+      // parked. See store/actions/compose.ts.
+      flushUndeliveredComposeDrafts();
       // Probe the SW for liveness too — a wedged SW won't accept update()
       // either, so resume is the natural moment to detect and recover.
       checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });
+    }
+
+    /** One wake, one pass. iOS fires `visibilitychange`, `focus` AND `pageshow`
+     *  together on a resume, so every listener below used to run the whole
+     *  `onResume` fan-out, three times over: the gateway log showed 3x
+     *  `engine/version-status`, 3x `memory/embedding-model-status` and 3-4x
+     *  `notifications` inside one second. Two things went wrong with that. The
+     *  burst is fired down a tunnel that is itself still re-establishing after
+     *  the wake, and it grows with the workspace (85 thread-event GETs in one
+     *  minute against 16 earlier the same day). And it silently collapsed the
+     *  tolerance of every consecutive-failure counter reached from here:
+     *  `loadUnreadNotifications` is meant to stay quiet until three failures in
+     *  a row, which ONE bad wake was spending on its own.
+     *
+     *  Leading edge, so the work is deduplicated and never delayed. The window
+     *  only has to outlast the burst; a genuine later wake still gets a full
+     *  pass. `handleResume`'s own `resumeInFlight` guard is complementary, not
+     *  redundant: it covers a slow in-flight health check that outlives this
+     *  window. See `docs/plans/2026-08-03-ios-pwa-resume-storm-and-durable-compose-drafts.md`. */
+    const resumeGate = createLeadingEdgeGate(RESUME_COALESCE_MS);
+    function onResumeCoalesced() {
+      if (!resumeGate.allow()) return;
+      onResume();
     }
 
     // Closes the gap where focus/visibilitychange triggers don't fire (tab
@@ -541,15 +577,15 @@ export function useStartup(): void {
 
     function handleVisibilityChange() {
       if (document.visibilityState === 'visible') {
-        onResume();
+        onResumeCoalesced();
         startSwProbe();
       } else {
         stopSwProbe();
       }
     }
     document.addEventListener('visibilitychange', handleVisibilityChange);
-    window.addEventListener('focus', onResume);
-    window.addEventListener('pageshow', onResume);
+    window.addEventListener('focus', onResumeCoalesced);
+    window.addEventListener('pageshow', onResumeCoalesced);
     if (document.visibilityState === 'visible') startSwProbe();
 
     // Periodic health polling as connection watchdog.
@@ -613,8 +649,8 @@ export function useStartup(): void {
       stopScrollVisibility();
       document.removeEventListener('click', onGlobalClick);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
-      window.removeEventListener('focus', onResume);
-      window.removeEventListener('pageshow', onResume);
+      window.removeEventListener('focus', onResumeCoalesced);
+      window.removeEventListener('pageshow', onResumeCoalesced);
     };
   }, []);
 

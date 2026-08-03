@@ -2,6 +2,8 @@ import {
   notifications,
   unreadNotifications,
   showToast,
+  removeToast,
+  connectionStatus,
   notificationsFilter,
   notificationsHasMore,
   notificationsLoadingMore,
@@ -229,16 +231,23 @@ export function setNotificationsFilter(filter: 'all' | 'unread'): void {
   void savePreference('notifications_filter', filter);
 }
 
+/** Keyed so repeats collapse into one card, and so a landed load can retract
+ *  it: the message asserts the count is stale, which a fresh set makes false. */
+const UNREAD_STALE_TOAST_KEY = 'refresh-unread-count';
+
 /** Threshold for the unread-load escalation toast. Three consecutive failures
- *  before we bother the user — a single transient failure shouldn't surface,
- *  but a sustained outage should so the user knows the badge is stale. Reset on
- *  the next success. */
+ *  before we bother the user: a single transient failure shouldn't surface, but
+ *  a reachable engine that keeps refusing this endpoint should, so the user
+ *  knows the badge is stale. Reset on the next success. */
 const UNREAD_LOAD_TOAST_THRESHOLD = 3;
 const unreadLoadFailures = createFailureCounter(UNREAD_LOAD_TOAST_THRESHOLD, () => {
   showToast(
-    `Unread count is stale — couldn't reach the engine after ${UNREAD_LOAD_TOAST_THRESHOLD} tries`,
+    // Not "the engine answered nothing": a counted failure is either no answer
+    // (the client deadline fired) or a bad one (an HTTP error), and an HTTP
+    // error IS an answer. Say what is true of both.
+    `Unread count is stale: ${UNREAD_LOAD_TOAST_THRESHOLD} refresh attempts in a row failed`,
     'error',
-    { key: 'refresh-unread-count' },
+    { key: UNREAD_STALE_TOAST_KEY },
   );
 });
 
@@ -246,7 +255,9 @@ const unreadLoadFailures = createFailureCounter(UNREAD_LOAD_TOAST_THRESHOLD, () 
  *  on startup / resume / notification SSE; runs without user intent, so it's
  *  best-effort: individual failures are swallowed (see `.claude/rules/frontend.md`
  *  § "Carve-out: best-effort telemetry") and escalated via a single toast only
- *  after `UNREAD_LOAD_TOAST_THRESHOLD` consecutive failures. */
+ *  after `UNREAD_LOAD_TOAST_THRESHOLD` consecutive failures WHILE THE ENGINE IS
+ *  REACHABLE (see the catch below for why an outage is the dot's to report, not
+ *  this one's). A landed load retracts the toast. */
 export async function loadUnreadNotifications(): Promise<void> {
   const seq = claimUnreadSeq();
   try {
@@ -260,6 +271,10 @@ export async function loadUnreadNotifications(): Promise<void> {
       syncWorkspaceAppBadge();
     }
     unreadLoadFailures.recordSuccess();
+    // The card claims the count is stale. A set just landed, so it isn't.
+    // Structural removal (not the user-dismiss path), because this is the
+    // toast tracking the signal that drives it, not the user reading it.
+    removeToast(UNREAD_STALE_TOAST_KEY);
   } catch (e) {
     // Transient page-lifecycle / reachability noise on an iOS PWA wake over a
     // flaky link (freeze, radio handoff, Tailscale reconnect) surfaces here as
@@ -274,6 +289,16 @@ export async function loadUnreadNotifications(): Promise<void> {
     // the stronger "genuinely stuck" signal that still counts. Mirrors the
     // AbortError+transport swallow in `refreshChangesState` / `refreshThreadEvents`.
     if (isAbortError(e) || isTransportError(e)) return;
+    // ...but only while the engine is REACHABLE. An unreachable engine is
+    // already being reported, once, by the connection dot, and this endpoint
+    // failing is then the same fact told twice. It is also the dominant case in
+    // practice: over a dropped tunnel the GET hangs rather than refusing, so it
+    // dies on the 10s client deadline as a TimeoutError, which is exactly what
+    // the line above lets through. The counter therefore means "consecutive
+    // failures while the engine was reachable". A disconnected engine neither
+    // adds to it nor clears it, so a genuinely broken endpoint is still caught
+    // the moment the dot is green.
+    if (connectionStatus.value !== 'connected') return;
     unreadLoadFailures.recordFailure();
   }
 }

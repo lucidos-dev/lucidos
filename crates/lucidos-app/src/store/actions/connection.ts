@@ -5,6 +5,7 @@ import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
+import { flushUndeliveredComposeDrafts } from './compose';
 import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
 import { gatewayPickerHref } from '../../utils/basePath';
@@ -109,6 +110,12 @@ function runResumeSync(): void {
   clearForcedRetries();
 
   void loadUnreadNotifications();
+  // Re-send any compose draft the engine never received. Paired with the same
+  // flush in `useStartup`'s onResume, and needed separately from it: this path
+  // runs on a reconnect the 5s health poll notices with no wake at all (a
+  // desktop client, or a phone that stayed awake through the outage), where no
+  // resume event ever fires. Idempotent, and a no-op when nothing is parked.
+  flushUndeliveredComposeDrafts();
   disconnectThreadEvents();
   connectThreadEvents();
   refreshChangesState();
@@ -162,7 +169,14 @@ function runResumeSync(): void {
 
 /** Guards against concurrent handleResume calls — iOS Safari PWA fires
  *  visibilitychange, focus, and pageshow simultaneously on wake, causing
- *  three concurrent SSE disconnect/reconnect cycles. */
+ *  three concurrent SSE disconnect/reconnect cycles.
+ *
+ *  Still load-bearing after `useStartup`'s `onResumeCoalesced` gate, which
+ *  collapses that same three-event burst before it reaches here. The two cover
+ *  different windows: the gate is a fixed ~1s leading edge, while this flag
+ *  lasts exactly as long as the `checkConnection` round-trip, which on a slow
+ *  link routinely outlives the gate. Whichever one is wider is the one holding
+ *  at that moment, so both stay. */
 let resumeInFlight = false;
 
 /** Called on visibility change / focus / pageshow after laptop wake.

@@ -24,7 +24,15 @@ export function errorDetail(err: unknown): string {
  *  debounced connection dot owning genuine sustained outages. A real client-side
  *  timeout fires `TimeoutError` (distinct — it survives the retry and still
  *  surfaces/escalates as the stronger "waited the full window and got nothing"
- *  signal). */
+ *  signal).
+ *
+ *  Two WRITE paths reach the same conclusion by a different route, because a
+ *  write that got no answer is still owed a re-send rather than a toast:
+ *  `savePreference` and the compose draft push both park the write and escalate
+ *  once via `createFailureCounter`. They gate on `isTransientFetchError`
+ *  (`api/client/_core.ts`), which is the wider predicate: it folds a
+ *  `TimeoutError` in with the aborts and transport errors, since for a write no
+ *  answer of any kind means the same thing. */
 export function isAbortError(err: unknown): boolean {
   return err instanceof DOMException && err.name === 'AbortError';
 }

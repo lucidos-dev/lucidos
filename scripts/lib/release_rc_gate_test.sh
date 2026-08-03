@@ -284,6 +284,11 @@ if logged "dmg_tag=$RC_TAG"; then
 else
   fail_t "the dispatch does not carry dmg_tag=$RC_TAG: $(cat "$GH_LOG")"
 fi
+if logged "--ref $RC_BRANCH"; then
+  pass "the dispatch pins --ref $RC_BRANCH (the candidate's own workflow, not the mirror default branch's)"
+else
+  fail_t "the dispatch does not pin --ref $RC_BRANCH: $(cat "$GH_LOG")"
+fi
 create_at="$(log_line_of 'release create')"
 dispatch_at="$(log_line_of 'workflow run')"
 if [ -n "$create_at" ] && [ -n "$dispatch_at" ] && [ "$create_at" -lt "$dispatch_at" ]; then
@@ -390,13 +395,23 @@ assert_not_logged "release delete" \
 echo
 echo "test: dispatch_dmg_verify returns status, leaving severity to the caller"
 new_case 0 0
-run_fn dispatch_dmg_verify "v$VERSION"
+run_fn dispatch_dmg_verify "v$VERSION" "v$VERSION"
 assert_ok "a queued dispatch returns 0" "a queued dispatch reported failure"
 new_case 0 0
 GH_DISPATCH_OK=0
-run_fn dispatch_dmg_verify "v$VERSION"
+run_fn dispatch_dmg_verify "v$VERSION" "v$VERSION"
 assert_fail "a dispatch that cannot be queued returns non-zero" \
             "an unqueued dispatch returned 0"
+
+# The ref is what makes the candidate verify itself with the workflow it ships.
+# Unpinned, `gh workflow run` takes the mirror's default branch, which is the
+# PREVIOUS release's tree: that is how v0.20.0's gate ran v0.19.0's workflow,
+# whose dmg-verify job had no `contents: write` and so could not read the rc
+# draft at all. Refusing an empty ref is cheaper than diagnosing that twice.
+new_case 0 0
+run_fn dispatch_dmg_verify "v$VERSION"
+assert_fail "a dispatch with no ref is refused" \
+            "an unpinned dispatch was allowed (it would run the default branch's workflow)"
 
 # The two callers must differ, and only the source can show that: Phase A pipes
 # it into `fail` (the gate is all that stands before an irreversible publish),
