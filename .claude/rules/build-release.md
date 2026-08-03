@@ -2,6 +2,7 @@
 paths:
   - "scripts/build*.sh"
   - "scripts/release*.sh"
+  - "scripts/rebuild-mirror-history.sh"
   - "scripts/lib/build_*.sh"
   - "scripts/lib/stage_runtime*.sh"
   - "scripts/lib/headless_tarball*.sh"
@@ -10,6 +11,8 @@ paths:
   - "scripts/lib/release_*.sh"
   - "scripts/lib/front_door_parity*.sh"
   - "scripts/lib/tauri_signing_key.sh"
+  - "scripts/lib/updater_payload*.sh"
+  - "scripts/lib/codesign.sh"
   - "scripts/lib/cargo_lock_holders_test.sh"
   - "scripts/lib/front_door_gate_test.sh"
   - "install.sh"
@@ -33,6 +36,12 @@ frontend-serving half of the former `scripts.md` is
 what makes a dev-script edit skip this file. A new script under `scripts/`
 therefore gets NO rule until its path is added here or to `dev-runtime.md`.
 
+`scripts/lib/codesign.sh` is listed here **as well as** in `dev-runtime.md`, on
+purpose. It is the dev signing identity's home, and since `build-dmg.sh` gained
+its local-signing fallback it is also on the packaged build's critical path. A
+path may appear in both lists, and both rules then load when it is touched,
+which is the right outcome for a file that genuinely serves both.
+
 ## Build
 
 ```bash
@@ -53,7 +62,7 @@ artifact**, and that is the complete list of what belongs there:
 
 | workflow | fires on | verifies |
 |---|---|---|
-| `install-smoke.yml` | push to `rc/**`, `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, and **route parity between the two front doors** |
+| `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, and **route parity between the two front doors** |
 | `release-tarballs.yml` | `v*` tag push, `release: published`, manual | the per-triple headless tarball build |
 
 **Nothing in there DEPLOYS, and that is a second rule, not a coincidence of the
@@ -200,7 +209,7 @@ publisher and says the deploy runs on the maintainer's machine off the
 **Payload mode must never run the install, and this is not a gap to close.** An
 RC `install.sh` bakes `LUCIDOS_DEFAULT_VERSION=<rc version>` and resolves its
 tarball to `…/releases/download/v<ver>/…`, but during an RC **that tag does not
-exist** — Phase A publishes only an `rc-<ver>` prerelease carrying the DMG +
+exist**: Phase A publishes only an `rc-<ver>` draft release carrying the DMG +
 updater `.sig`, and headless tarballs live solely on real `v*` releases. Wiring
 the install in would 404 at the download step on every single run and the gate
 would be permanently red. Nothing is lost: the bug class the RC gate exists to
@@ -454,7 +463,15 @@ Pure helpers are offline-tested by `scripts/lib/stage_runtime_test.sh`. The `luc
 
 **Linux tarballs via CI (`.github/workflows/release-tarballs.yml`).** A `workflow_dispatch` + `v*`-tag-`push` matrix over the four target triples (`x86_64-unknown-linux-gnu` is the must-work entry; macOS x86_64 + Linux aarch64 are best-effort; `fail-fast: false`). Each entry runs `build-headless.sh` on a **native** runner — the Linux entries INSIDE an `ubuntu:22.04` container (the **glibc 2.35 floor**: a binary built on the raw 24.04 runner image refuses to start on Ubuntu 22.04 / Debian 12 / RHEL 9 with `GLIBC_2.3x not found`, and the same-machine tarball-smoke can't see it), guarded by an "Assert portability floor" step that fails the build if any staged binary references a `GLIBC`/`GLIBCXX`/`CXXABI` symbol version above that floor. Every entry uploads the tarball + `.sha256` as a **workflow artifact**. It never creates or tags a Release — but the "attach to an existing Release" step **does fire automatically** for a PUBLISHED, non-prerelease Release (`rc-<version>` prereleases are excluded by the `prerelease == false` guard, so the RC gate never sees these), which is what makes `install.sh`'s default download path work at all: `release.sh --publish-verified` cuts the Release with the DMG, and this run ADDS the Linux + macOS headless tarballs to it **~30 min later**. That lag is user-visible — a `curl … | sh` started inside the window 404s — so the installer's failure message names it first. A manual `workflow_dispatch` with `attach_to_release=true` (+ `attach_tag`, or a tag ref) is the backfill arm. Upload goes through the raw GitHub REST API with `curl`, NOT `gh release upload`: the Linux matrix entries run inside the `ubuntu:22.04` container, which has no `gh`.
 
-**The macOS headless tarballs on a Release are the UNSIGNED CI ones** — including the one a Mac's `curl … | sh` downloads. `build-dmg.sh`'s upload attaches exactly the DMG + `Lucidos.app.tar.gz` + `.sig` + `latest.json`, and `release.sh` never passes `--emit-tarball`, so the local SIGNED headless tarball exists as a capability but is never attached to anything — there is no signed macOS tarball for CI to clobber, and none for a user to download. That is acceptable rather than accidental: a `curl`-fetched file carries no `com.apple.quarantine` xattr, so Gatekeeper never assesses the runtime (the same reasoning ADR 0027 relies on to defer notarization), and `install.sh`'s `verify_runtime_executes` runs the gateway once at install time so any refusal is loud and immediate. Wiring `--emit-tarball` into the release flow would be the fix if that ever stops holding; asset timings on v0.17.0 (DMG trio 04:08, all eight headless assets 04:19–04:51) are how to confirm which path produced which asset.
+**The macOS headless tarballs on a Release are the UNSIGNED CI ones**, including the one a Mac's `curl … | sh` downloads. `build-dmg.sh`'s upload attaches exactly the DMG + `Lucidos.app.tar.gz` + `.sig` + `latest.json`, and `release.sh` never passes `--emit-tarball`, so the local SIGNED headless tarball exists as a capability but is never attached to anything.
+
+**The reason is a principle, not the current wiring (ADR 0034).** The Developer ID identity lives only on the release machine and cannot be handed to CI, the same boundary ADR 0031 drew for the Cloudflare deploy credential, so **any artifact CI builds is ad-hoc by construction**. Its consequence is the second half of the rule and must be stated with it: the headless install path has a code identity that changes on every build (an ad-hoc Mach-O's designated requirement is a bare `cdhash`, which moves with every compile). This replaces the old justification, *"there is no signed macOS tarball for CI to clobber"*, which described that day's wiring rather than a rule and read as though wiring `--emit-tarball` in would be a straightforward improvement. It would not be: the signed tarball is built on the release machine for the HOST triple only, while the four published ones come from a CI matrix over four triples on native runners, so signing them means either building all four somewhere with no Linux runner and no Intel Mac, or moving the identity into CI.
+
+The cost of that consequence is measured in ADR 0034 rather than asserted, and it is near zero **by default**: everything the headless install touches (`~/.lucidos/runtime`, the per-instance dir, gateway-provisioned workspaces, which resolve RELATIVE to app-data, loopback and outbound network) is outside every TCC-gated location, and the engine / gateway / CLI declare no Apple-framework dependencies at all, so there is no camera, microphone, screen-recording, accessibility, contacts, calendar, photos, location or Apple Events path to gate. It is NOT zero where a user points a workspace or a coding-agent repository at Documents / Desktop / Downloads: there the per-build identity discards the grant at every update. Read ADR 0034 before changing this, including its list of what would reopen the decision.
+
+Two other things keep the unsigned front door safe, and both predate the principle: a `curl`-fetched file carries no `com.apple.quarantine` xattr, so Gatekeeper never assesses the runtime (the same reasoning ADR 0027 relies on to defer notarization), and `install.sh`'s `verify_runtime_executes` runs the gateway once at install time so any refusal is loud and immediate. Asset timings on v0.17.0 (DMG trio 04:08, all eight headless assets 04:19–04:51) are how to confirm which path produced which asset.
+
+**After F1 the front door is the ONLY unstable code identity of the three.** The same engine gets a different identity per install path: the DMG's is Developer ID with a certificate-anchored DR (always was stable), the updater payload's is now the same because the payload is repacked from the signed app (stable since F1; ad-hoc with a per-build cdhash on every release through v0.19.0), and the headless tarball's is ad-hoc `lucidos_engine-<crate metadata hash>` (still unstable). That asymmetry used to be background and is now the exception, which is why it is recorded rather than left as a consequence.
 
 Packaging lives in `scripts/lib/headless_tarball.sh` (offline-tested by `headless_tarball_test.sh`); it copies with `ditto` on macOS (preserves embedded Mach-O signatures) and `cp -a` elsewhere (Linux runners have no `ditto`).
 
@@ -487,8 +504,18 @@ exactly how the 2026-07-28 leak came back.
 2. records `RC_COMMIT` in `verify-build-<version>.env` (alongside
    `SOURCE_COMMIT`, `PR_NUMBER`, `PR_TITLE`), pinned locally at
    `refs/release-candidates/<version>` so the object can't be GC'd between phases;
-3. after staging, deletes + recreates the `rc-<version>` **prerelease** at that
-   branch with the staged DMG + updater `.sig`, which fires the `dmg-verify` leg.
+3. after staging, deletes + recreates the `rc-<version>` **draft release** at that
+   branch with the staged DMG + updater `.sig`, then DISPATCHES the `dmg-verify`
+   leg at it (`-f dmg_tag=rc-<version>`). A **draft** so the gate artifact is
+   never listed on the public releases page (as a prerelease it sat above the
+   current GA for the whole Phase A to Phase B window, days on a deferred
+   notarization), and an **explicit dispatch** because GitHub fires no workflow
+   event whatsoever for a draft release. Do not try to bring back an
+   event-driven trigger by adding `created` to the workflow's `release: types:`;
+   it does not fire for drafts and would double-run the job for a non-draft rc.
+   See ADR 0036, which also covers why `dmg-verify` must keep
+   `permissions: contents: write` (a draft is invisible to a `contents: read`
+   token).
 
 A **notarize resume** reaches both steps too. **`release.sh --push-rc <version>`**
 re-arms the gate from the recorded release commit with no rebuild (a failed
@@ -506,7 +533,7 @@ sha256 drifted. Then `release-to-lucidos.sh --promote-rc <sha>` re-asserts the
 unmoved rc, re-scans that commit's tree (the deterministic floor at the
 irreversible push), and force-pushes **that same object** to the mirror's `main`
 + tags it `v<version>` **by SHA**, attaches the staged artifacts, and the rc
-branch + prerelease are deleted.
+branch + draft release are deleted.
 
 The legacy one-shot (`release.sh <version>`, no phase flag) still builds its own
 tree from HEAD through the same lib and has no rc gate. Offline-tested by
@@ -565,11 +592,13 @@ exiting ERR trap, and the wiring in both release scripts.
 
 ### Notarization is resumable — never a foreground `--wait`
 
-Apple's notary service routinely outlives the process waiting on it, and the orchestration layer caps background tasks at **3600 s**, so a slow notarization can never be held in a foreground wait. `build-dmg.sh` therefore submits with **`--no-wait`**, **persists a resume handle before any waiting** (`<repo-root>/.lucidos/release-state/notarize-<version>.json` — submission id, absolute DMG path, its sha256 at submit time, source commit, timestamp; written atomically by `scripts/lib/release_notarize.sh`), then polls `notarytool info`. Losing the waiter costs a poll, not a rebuild — before this, a killed wait threw away a full cargo release build, ~134 inside-out codesigns, and a signed DMG, because the staple, the staging dir, the `manifest.json`, and the only copy of the submission id all died with the process.
+Apple's notary service routinely outlives the process waiting on it, and the orchestration layer caps background tasks at **3600 s**, so a slow notarization can never be held in a foreground wait. `build-dmg.sh` therefore submits with **`--no-wait`**, **persists a resume handle before any waiting** (`<repo-root>/.lucidos/release-state/notarize-<version>.json`, written atomically by `scripts/lib/release_notarize.sh`), then polls `notarytool info`.
 
-- **Resume:** `release.sh --resume-notarize <version>`, or `build-dmg.sh --resume-notarize` directly. Re-running `release.sh --verify-build <version>` auto-promotes to a resume when a handle exists (and then no longer requires `-c` — that changelog is already committed). The resume reuses the EXISTING Phase A worktree and writes the `verify-build-<version>.env` state the killed run never reached, so `--publish-verified` works afterwards.
-- **Adopt:** `build-dmg.sh --adopt-submission <uuid>` records an in-flight submission whose id was never persisted against the on-disk DMG, then resumes.
-- **The resume gate is strict** (`release_notarize_resumable`): the DMG must still hash to what was submitted, AND the tree must still be on the recorded `source_commit`. The second half is load-bearing — the resuming run stamps `manifest.source_commit` from its own HEAD, so resuming on a moved tree would make the staging manifest claim a commit the DMG was never built from, and `--publish-verified`'s identity guard would pass on a lie. A build-grade run that finds a NON-resumable handle says why and rebuilds; an explicit `--resume-notarize` fails loud.
+**One handle carries BOTH notary submissions.** A release notarizes the `.app` first and the DMG second (ADR 0033), so the handle records a `stage` field (`app` | `dmg`) naming which is outstanding, plus `artifact_path` / `artifact_sha256` for whichever file was handed to notarytool (the app zip, or the DMG), `app_path` / `app_cdhash` at the app stage, `version`, `source_commit`, `submitted_at`, and the three **pairing** fields `updater_tarball_path` / `updater_tarball_sha256` / `updater_sig_sha256`. Every key is always written, empty when it does not apply, so a MISSING key means exactly one thing: a handle from before this shape, which `release_notarize_resumable` refuses by name rather than reading as "no pairing recorded, so nothing can mismatch". `dmg_path` / `dmg_sha256` were renamed to `artifact_*` when the app stage made the old names a lie at one of the two stages. Losing the waiter costs a poll, not a rebuild. Before this, a killed wait threw away a full cargo release build, ~134 inside-out codesigns, and a signed DMG, because the staple, the staging dir, the `manifest.json`, and the only copy of the submission id all died with the process.
+
+- **Resume:** `release.sh --resume-notarize <version>`, or `build-dmg.sh --resume-notarize` directly. It branches on the handle's `stage`: an `app` stage polls, staples the bundle, and then runs on into the DMG half through the same `run_dmg_notarize_stage` a fresh build uses, so a resumed release and a fresh one build the image through identical code. Re-running `release.sh --verify-build <version>` auto-promotes to a resume when a handle exists (and then no longer requires `-c`, since that changelog is already committed). The resume reuses the EXISTING Phase A worktree and writes the `verify-build-<version>.env` state the killed run never reached, so `--publish-verified` works afterwards.
+- **Adopt:** `build-dmg.sh --adopt-submission <uuid>` records an in-flight DMG submission whose id was never persisted against the on-disk DMG, then resumes. `--adopt-app-submission <uuid>` is its sibling for the `.app` half (it needs the `<app>.notarize.zip` still on disk, since that is the only record of what Apple scanned). Only one may be given: one submission is outstanding at a time, and adopting both would write one handle over the other and silently discard a live submission.
+- **The resume gate is strict** (`release_notarize_resumable`): the handle must carry every field of the current shape, name a known stage, its submitted artifact must still hash to what was submitted, the **paired updater payload and `.sig` must still hash to what was recorded**, AND the tree must still be on the recorded `source_commit`. The source-commit half is load-bearing: the resuming run stamps `manifest.source_commit` from its own HEAD, so resuming on a moved tree would make the staging manifest claim a commit the DMG was never built from, and `--publish-verified`'s identity guard would pass on a lie. A build-grade run that finds a NON-resumable handle says why and rebuilds; an explicit `--resume-notarize` fails loud.
 - **Terminal cases:** `Accepted` → staple (idempotent, via `stapler validate` fallback) + stage; `Invalid`/`Rejected` → print the notary log and refuse to stage; an id Apple doesn't recognise → say so and require a fresh submit (never silently re-submit). The handle is dropped once staging succeeds, so a later run can't resume a finished release.
 - **Credentials are unchanged and load-bearing.** One `notarytool_run` wrapper resolves them for `submit`/`info`/`log` alike: App Store Connect API key first (`-i` only when `APPLE_API_ISSUER_ID` is set — required for Team keys, must be omitted for Individual ones), else `APPLE_PASSWORD` piped on **stdin**. Never `--password` in argv (world-readable via `ps`), never `store-credentials` (headless ⇒ "User interaction is not allowed"). `build_dmg_test.sh` asserts all of this against the notarytool call sites.
 
@@ -577,15 +606,85 @@ Offline-tested by `scripts/lib/release_notarize_test.sh` (the pure handle: round
 
 ### The release does not wait on Apple — deferred DMG (ADR 0027)
 
-Resumability stopped a slow verdict costing a *rebuild*; it did not stop it blocking the *release*. **`--defer-notarization` does.** Notarization gates exactly one artifact — the `.dmg` a browser downloads. The headless tarball and the updater trio (`.app.tar.gz` + `.sig` + `latest.json`) are never quarantined, so Gatekeeper never assesses them: existing users and `curl … | sh` installs are wholly unaffected.
+Resumability stopped a slow verdict costing a *rebuild*; it did not stop it blocking the *release*. **`--defer-notarization` does, for the DMG's verdict.** Since ADR 0033 a release makes TWO notary submissions in Apple's order, the `.app` and then the DMG, and only the second is deferrable: the DMG is built FROM the stapled app, so there is nothing to stage until the app's verdict lands. A deferred release therefore waits once (1 to 20 hours, 8h06m on v0.16.0) rather than not at all. That is the cost of F5 and it is recorded in ADR 0033, not hidden here. Notarization still gates exactly one *shipped* artifact, the `.dmg` a browser downloads. The headless tarball and the updater trio (`.app.tar.gz` + `.sig` + `latest.json`) are never quarantined, so Gatekeeper never assesses them: existing users and `curl … | sh` installs are wholly unaffected.
 
-- **Phase A** — `release.sh --verify-build --defer-notarization <version>` submits, persists the handle, and stages the **unstapled** DMG with `notarized: false` in the manifest. With an already in-flight submission it stages **without polling**, which is the rescue path for a Phase A stuck on a slow verdict. It does **not** create the `rc-<ver>` prerelease (`arm_dmg_gate_if_notarized`): `dmg-verify` asserts a stapled ticket, so arming a gate that must fail says nothing.
+- **Phase A**: `release.sh --verify-build --defer-notarization <version>` submits, persists the handle, and stages the **unstapled** DMG with `notarized: false` in the manifest. With an already in-flight submission it stages **without polling**, which is the rescue path for a Phase A stuck on a slow verdict. It does **not** create the `rc-<ver>` draft release (`arm_dmg_gate_if_notarized`): `dmg-verify` asserts a stapled ticket, so arming a gate that must fail says nothing.
 - **Phase B** — `--publish-verified` publishes with the *notarization-pending banner* on the Release body and **keeps** the worktree, staging, state file, notarize handle and submitted-bytes pin. Those are the attach step's only inputs; deleting them would strand a published DMG unstaplable.
 - **Finish** — `release.sh --attach-notarized <version>` polls, staples, re-stages, `--clobber`s the asset in place, rewrites the body **after** the upload lands, dispatches `dmg-verify` against the published tag (`-f dmg_tag=v<version>`), emits `ReleaseDmgNotarized` (which bumps the site link), then runs the deferred cleanup.
 
 **The pending state is a manifest field, never a flag.** `release_staging_is_notarized` is the single question every public-facing consumer asks, so the banner, the site link and the cleanup cannot disagree with the bytes. An **absent** `notarized` key means notarized (the pre-2026-07-29 writer staged only after `Accepted`), and `restage_manifest_for_commit` carries the value forward — a restamp that dropped it would launder a deferred staging into a clean-looking one. `--defer-notarization` is refused on `--release` / `--release-attach`, which upload in the same process where no banner can be composed.
 
 **Two accepted costs, both documented at their sites.** The updater tarball is built pre-staple, so early auto-updaters keep an unstapled (still Developer ID signed) bundle forever — invisible in practice, and unreachable by a later re-issue. And an `Invalid`/`Rejected` verdict now lands on an already-public asset: pull it with `gh release delete-asset`, leave the banner up, patch-release the fix. Deliberately not automated.
+
+("Still Developer ID signed" was the *intent* of that first cost, and not the behaviour until 2026-08-02: see the next section. Pre-staple remains deliberate, because `--defer-notarization` never staples at all, so repacking after the staple would make the payload's contents depend on whether the release was deferred.)
+
+### The updater payload is repacked from the SIGNED app (the v0.19.0 bug)
+
+`cargo tauri build` packs `Lucidos.app.tar.gz` from the `.app` as the bundler leaves it, and `build-dmg.sh` runs that build with `APPLE_SIGNING_IDENTITY` stripped from the **subprocess** env on purpose (Tauri's codesign pass skips the ~200 loose Mach-O files in the Postgres tree, so the script signs the bundle itself, inside-out, afterwards). `refresh_dmg_payload` re-injects the signed app into the DMG, which is why the DMG was always correct. **Nothing did the same for the updater payload**, so every release from the introduction of the signed path through v0.19.0 shipped an ad-hoc updater bundle: `Signature=adhoc`, `TeamIdentifier=not set`, designated requirement `cdhash H"…"`, no `Contents/_CodeSignature`. Since a cdhash-anchored requirement changes with every build and macOS TCC keys grants on code identity, every auto-update silently destroyed every permission grant the user had made.
+
+`scripts/lib/updater_payload.sh` (public-mirror-safe, offline-tested by `updater_payload_test.sh`) owns the fix, and `build-dmg.sh` wires it in at three points:
+
+- **Repack + re-sign**, after `sign_app_bundle` and before `refresh_dmg_payload`. The `.sig` MUST be regenerated: a signature over the pre-repack bytes makes every updater reject the update. The signer is `tauri_signer_sign_file` in `tauri_signing_key.sh`, now the **single** `cargo tauri signer sign` call site (the release preflight's throwaway test-sign was refactored onto it, so the preflight validates the invocation the build actually makes).
+- **A round-trip hard gate inside the repack**: extract what was just written and run `codesign --verify --deep --strict`, plus the three layout rules `tauri-plugin-updater`'s `entry.path().iter().skip(1)` + `Entry::unpack` impose. One top-level `.app` component; **no hard-link entries** (unpack resolves a hard link against the process CWD, and `bsdtar` emits them where Tauri's `tar` crate writer never did, so the hazard is one the repack introduces); no AppleDouble `._` entries. Packing uses `COPYFILE_DISABLE=1 tar --no-xattrs`: the second flag is what actually keeps xattrs (and with them a `PaxHeaders/…` entry per file, since macOS stamps `com.apple.provenance` on everything) out of the archive, keeping it the shape the updater has always been fed.
+- **A publish gate at both chokepoints**, `stage_release_artifacts` and `upload_staged_assets`: extract the payload and assert a Developer ID designated requirement (`anchor apple generic` **and** `certificate leaf[subject.OU]`, not a bare `cdhash`) with a Team Identifier set. Both are fatal, and staging only ever runs release-grade, so this is the check that would have caught v0.19.0.
+
+**The verdict is re-derived from the bytes, never recorded in the manifest.** A `updater_payload_signed` field would have to be carried forward by `release.sh::restage_manifest_for_commit` exactly like `notarized`, and a restamp that dropped it would launder an unsigned payload into a clean-looking one. Re-deriving costs one extraction and has no laundering path. The consequence to know: `--release-attach` now needs the system `codesign`, so it is macOS-bound (and, since the staple gate landed beside it, `xcrun stapler` too, which ships in the same Command Line Tools). That costs nothing (a release is macOS-only end to end and `require_release_signing_credentials` refuses a non-Darwin host), and it is why the attach path's "needs no Darwin tooling" comment now says "no build tooling".
+
+**There is no verification of the regenerated `.sig`.** `cargo tauri signer` exposes only `sign` and `generate`, so nothing available can check a minisign signature against `plugins.updater.pubkey`. Standing in for it: the release preflight proves the key can sign at all, the signer fails loud on a non-zero exit, and `updater_payload_resign` refuses unless the new `.sig` is non-empty **and differs** from the pre-repack one, which is what catches a silent no-op. If a verifier ever becomes available, the honest place for it is beside the Developer ID check in `stage_release_artifacts`.
+
+**Local builds get the same treatment one rung down.** With no `APPLE_SIGNING_IDENTITY`, `build-dmg.sh` signs the bundle with the stable dev identity from `scripts/lib/codesign.sh` when `lucidos_signing_identity_ready`, so a local `.app` rebuild stops discarding the developer's TCC grants. Strictly a fallback: an explicit identity wins, `--release*` still hard-requires Developer ID, the staging gate rejects a self-signed payload (no Team Identifier), and no notarization is attempted. It uses **neither** `--options runtime` nor `--timestamp`, deliberately: both exist for notarization, library validation under the hardened runtime matches by Team Identifier (which a self-signed cert lacks, risking the bundled Postgres dylibs failing to load), a secure timestamp would mean ~200 network round trips, and the certificate-anchored requirement depends on neither.
+
+### The submitted set is paired, and the manifest is published last (F3, F4, F5, F8, F10)
+
+Five findings from `docs/audits/2026-08-02-macos-update-path-audit.md`, all in `build-dmg.sh` and its libs.
+
+**The notarize handle pins a SET, not a file (F3).** It recorded `dmg_sha256` and nothing about the `.app.tar.gz` + `.sig`, which staging then picked up by glob from whatever was on disk. Nothing tied them to the build that produced the pinned DMG, and the recovery branch made that active rather than passive: it RESTORES the DMG from its pin after a concurrent rebuild, which is exactly the state in which the tarball beside it belongs to the newer build. The manifest recorded both, `release_staging_verify` found them self-consistent (it only ever compares staged bytes to the manifest the same run wrote), and the release shipped a DMG and an updater payload from two different builds. The 2026-07-28 three-concurrent-pollers incident is the precondition, so the tree has been in that state.
+
+- The pairing is **captured at the first submission and carried forward** to the second (`notarize_capture_updater_pairing` / `notarize_carry_updater_pairing_forward`). Re-capturing at the second submit would let a tarball replaced during the first wait be adopted as the pairing: self-consistent again, and wrong again.
+- **Every member is pinned**, each under its own content address (`.lucidos/notarize-submissions/<version>/<sha12>/`), so two concurrent builds of one version cannot collide. `cp -c` (APFS clonefile), never a hardlink: a hardlink is a second name for the same inode, so an in-place `codesign` rewrite corrupts the pin, and the suite proves it.
+- `assert_submitted_artifacts_are_intact` **decides first and acts second**. Three `cp`s cannot be atomic, and they need not be; what must never happen is restoring SOME members and proceeding. It records what it would restore, copies nothing until every member is known intact or recoverable, and on any unrecoverable member dies having touched nothing, saying so. Each refusal `return`s as well as calling `die`, so the refusal is a property of that function rather than of `die`'s exit semantics.
+- The gate runs before every irreversible step: before stapling, on both deferred branches, and at the top of `stage_release_artifacts`, which additionally refuses when the tarball it is about to stage is not the one the submission was paired with.
+- **Our own staple is an intended mutation, and the gate has to know it (v0.19.1 Phase A).** `xcrun stapler staple` writes the ticket INTO the DMG, so the protected bytes change at the one moment the guard does not expect them to, and the gate could not tell that from a concurrent rebuild. The v0.19.1 run stapled the DMG, `stage_release_artifacts`' second assertion found the mismatch, located the pre-staple pin and copied it back over the ticket. The staple was silently undone, the manifest recorded the unstapled sha, and `release_staging_verify` found the pair self-consistent because it only ever compares staged bytes to the manifest the same run wrote. `spctl` still reported `accepted / source=Notarized Developer ID`, since that is an ONLINE lookup, so only the rc `dmg-verify` leg caught it (`stapler validate`, exit 65, *"does not have a ticket stapled to it"*). `notarize_record_stapled_dmg` now moves the expected bytes forward the instant the staple lands, and it **re-pins as well as re-records**: re-recording keeps a later rebuild detected, re-pinning keeps it recoverable by the STAPLED bytes rather than by a copy with no ticket. It sits in `staple_notarized_artifacts`, the one function both stapling paths funnel through (the fresh build and the `--attach-notarized` resume), so the two cannot drift. `--defer-notarization` never reaches it, which is correct: that path stages before anything is stapled, with `notarized: false` and its submission still in flight, so it keeps comparing against the submitted sha and keeps its pin and handle. Only the DMG needs it, because no later assertion reads the standalone `.app`'s bytes (the app stage checks its submitted zip, which stapling the bundle does not touch, and its cdhash, which the ticket does not change). Two things defend the moment the expected bytes move, because whatever gets recorded there is what the release stages: the DMG's ticket is **validated before its bytes are adopted** (and re-hashed afterwards to prove nothing moved during the check), which is the same proof the `.app` stage has always made after its own staple and the DMG half never did; and the ticket is **re-derived from the bytes at BOTH publish chokepoints**, `stage_release_artifacts` and `upload_staged_assets`, exactly like the Developer ID check beside it and for the same reason: `--release-attach` can be pointed at a staging dir an older `build-dmg.sh` wrote, and `run_release_attach`'s own pending check reads the manifest's `notarized` **flag**, which is precisely what said `true` over the unstapled v0.19.1 DMG. Both gates skip a deferred release, which stages and uploads unstapled by design and carries the pending banner. These gates are what turn the whole class loud: nothing else on the path says it out loud, because `spctl` resolves the ticket online. The **third** place the expectation lives is the *notarize resume handle*, and it moves at the same chokepoint (`notarize_carry_staple_into_handle`): the resume gate re-hashes `artifact_path` against `artifact_sha256` and refuses on any mismatch, so a handle left on the pre-staple bytes would make a just-stapled release unresumable, and on a deferred release that strands an already-published DMG no attach could ever staple. Pinned by section 9 of `release_staple_guard_test.sh`, which runs the real chokepoint against a fake `stapler` that mutates the file and then asserts the staged bytes and the manifest sha rather than any log line, plus the gate-before-copy ordering assertions in `build_dmg_test.sh`.
+
+**Every DMG discovery excludes the refresh intermediates (F4).** `refresh_dmg_payload` writes `.rw.dmg` and `.zlib.dmg` beside the real artifact and a run killed mid-refresh leaves one behind; both match `*.dmg`, and the version-stamp guard cannot tell them apart because they carry the same version string. The adopt path had the exclusion and an arity check; the main discovery had `find … -name '*.dmg' | head -1`, which is directory order. `scripts/lib/release_dmg.sh` (offline-tested by `release_dmg_test.sh`) now owns the suffixes, so the code that WRITES them and the code that EXCLUDES them read one definition, and `release_dmg_find` refuses an ambiguous directory rather than picking arbitrarily. `refresh_dmg_payload` also clears both intermediates up front and unwinds its mount and its temp images on every failure branch, explicitly rather than through a `trap … RETURN` (under `set -e` a failing command does not return from a function, it exits through the ERR trap, and a RETURN trap never fires on that path).
+
+**`latest.json` is attached last (F8).** All four assets went up in one `gh release upload`, which uploads concurrently, so the smallest file won. The updater reads `…/releases/latest/download/latest.json`, the release is already marked latest when the upload starts, and the manifest names a payload on the same tag: 10 s of 404 on v0.19.0, 65 s on v0.15.0, and **8h06m on v0.16.0**, during which the latest release carried no `latest.json` at all. `scripts/lib/release_upload.sh` (offline-tested with a fake `gh`) uploads the artifacts, re-reads the release and asserts each is present, `state == uploaded` and the right SIZE (a name appears the moment an upload starts, so size is the load-bearing half), then uploads the manifest in a second call. Bounded retry, fail-closed, and the manifest is a separate PARAMETER rather than the last artifact, so no argument list can put it back in the first batch. Both upload paths funnel through `upload_staged_assets`, so a corrective `--attach-notarized` re-upload cannot reopen the window.
+
+**`latest.json`'s platform key describes the ARTIFACT (F10).** It came from a
+`case "$(uname -m)"` in `upload_staged_assets`, which answers "what is this
+machine" rather than "what is this payload". All ten sampled releases happened to
+be right because the DMG is Apple-Silicon-only and the uploads ran on the build
+Mac, but a `--release-attach` from a different host mislabels the payload, and
+the mislabelling is **silent**: an updater whose target key is absent from
+`platforms` reports *no update* rather than an error, so no client, log or gate
+ever says anything. The key is now derived at BUILD time from the staged app
+binary with `lipo -archs` (`release_staging_platform_key_for_binary`) and
+recorded as `platform_key` in the staging manifest, which is also the only shape
+that serves `--release-attach`, the path with no `.app` on disk. Three properties
+hold it together:
+
+- **`release_staging_verify` refuses a manifest without it**, and refuses an
+  ABSENT key differently from an EMPTY one. Absent means a staging written before
+  the recording existed, which a re-stage fixes; empty means a writer that
+  recorded nothing, which a re-stage reproduces. That distinction is the same one
+  `release_notarize_resumable` draws for a handle predating the pairing, and
+  collapsing it would send an operator through a 40-minute rebuild to land on the
+  identical manifest.
+- **A universal binary is a hard error**, not two keys and not the first arch.
+  The rest of the bundle is single-arch by construction (`stage_runtime_fetch_postgres`
+  resolves one relocatable Postgres per target triple), so `darwin-x86_64` beside
+  `darwin-aarch64` would advertise an Intel update whose bundled Postgres is
+  arm64-only. The message names the two real answers: ship one release per
+  architecture, or make the whole bundle universal first.
+- **The generator cannot derive a key.** `release_upload_write_latest_json`
+  (in `release_upload.sh`, moved there out of `build-dmg.sh` so it is unit-testable)
+  takes the key as a PARAMETER and refuses an empty one; `release_upload_test.sh`
+  asserts that nothing on that path consults `uname` at all. `release.sh`'s
+  `restage_manifest_for_commit` carries the key forward like `notarized`, which
+  cannot launder anything here because the key describes bytes the restamp leaves
+  untouched.
+
+**The `.app` inside the DMG is stapled (F5).** See ADR 0033: two notary submissions in Apple's order, the app's identity re-asserted by **cdhash** (what a ticket is issued for, and the only workable choice since `ditto -c -k` is not byte-reproducible), and the staple proved afterwards with both `stapler validate` and `codesign --verify --deep --strict`. The ticket lands in `Contents/CodeResources`, outside the sealed set at `Contents/_CodeSignature/CodeResources`, which is why stapling does not break the signature.
 
 Banner + changelog-section text live in `scripts/lib/release_notes.sh` — **one** extractor shared by the publish and the attach step, so the body the attach step rewrites is byte-identical to the one the publish wrote. Offline-tested by `release_notes_test.sh` (banner content, the compose that never touches `$NOTES_FILE`, and that latest.json's notes stay plain) and the deferred sections of `build_dmg_test.sh` + `release_staging_test.sh`.
 

@@ -1,9 +1,10 @@
-import { preferences, showToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent } from '../store';
+import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent } from '../store';
 import type { CodingAgent } from '../../api/types';
 import { toFailed } from '../types';
-import { getPreferences, setPreference } from '../../api/client';
+import { getPreferences, setPreference, isTransientFetchError } from '../../api/client';
 import { getDeviceId } from './devices';
 import { errorDetail } from '../../utils/errorDetail';
+import { createFailureCounter } from '../../utils/failureCounter';
 import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
 import { isIOS, isIOSPwa, isTauri } from '../../utils/platform';
 import { setTitlebarColor } from '../../utils/tauri';
@@ -76,6 +77,167 @@ function currentPreference<T extends string>(
   return defaultValue;
 }
 
+// --- Preference writes: apply locally, deliver durably ---
+//
+// `savePreference` applies the value BEFORE the network call (the side effect
+// plus the optimistic signal patch), so the UI is never gated on the round trip.
+// That makes delivery the only thing that can still go wrong, and on an
+// installed iOS PWA it goes wrong constantly for a reason that says nothing
+// about the request: WebKit suspends the page (tens of times a day on a busy
+// workspace) and aborts every in-flight fetch. The old code toasted that as
+// "Failed to save <key> preference: request cancelled", never retried, and left
+// the device showing a value the server never received.
+
+/** A preference write the engine has not accepted yet. Parked once an immediate
+ *  re-send has also failed transiently, and flushed on the next page resume.
+ *
+ *  `seq` is the write's position in the global request order, used to spot one
+ *  that a newer value for the same key has superseded. `PUT /preferences?key=<k>`
+ *  is a per-key overwrite, so this map is last-write-wins rather than a queue: a
+ *  value for a key the user has since changed again is garbage, not backlog.
+ *  See `docs/glossary.md` § pending preference write. */
+interface PendingPreferenceWrite {
+  value: string;
+  deviceScoped: boolean;
+  seq: number;
+}
+
+const pendingPreferenceWrites = new Map<string, PendingPreferenceWrite>();
+let writeSeq = 0;
+
+/** The newest `seq` requested per key, in-flight ones included. */
+const latestWriteSeq = new Map<string, number>();
+
+/** The tail of each key's delivery chain. Two writes to the same key must never
+ *  be in flight at once: the engine applies them in ARRIVAL order, so an older
+ *  request landing second silently overwrites the user's latest choice, and the
+ *  local `seq` bookkeeping cannot see that happen. Serializing also gives the
+ *  supersede check below its meaning, because a queued write re-decides whether
+ *  it is still wanted at the moment it would actually go out.
+ *
+ *  Bounded by the number of distinct preference keys, and each entry is dropped
+ *  as soon as its chain goes idle. */
+const deliveryChains = new Map<string, Promise<void>>();
+
+function enqueueDelivery(key: string, run: () => Promise<void>): Promise<void> {
+  const prior = deliveryChains.get(key) ?? Promise.resolve();
+  // `then(run, run)` so one rejected link cannot wedge the key's chain forever.
+  const next = prior.then(run, run);
+  deliveryChains.set(key, next);
+  void next.finally(() => {
+    if (deliveryChains.get(key) === next) deliveryChains.delete(key);
+  });
+  return next;
+}
+
+/** The engine REJECTED the write (4xx/5xx, a bad body). A verdict the user is
+ *  owed, and one no retry can change. Keyed so repeats collapse into one card. */
+const PREFERENCE_REJECTED_TOAST = 'preference-save-rejected';
+/** The write never GOT to the engine, repeatedly. Keyed separately from the
+ *  verdict above so draining the queue can retract this one without also
+ *  clearing a rejection the user still needs to read. */
+const PREFERENCE_UNREACHABLE_TOAST = 'preference-save-unreachable';
+
+/** Consecutive writes that got no ANSWER. Silent below the threshold, because
+ *  the value is applied locally and a re-send is owed, so one suspended fetch is
+ *  noise rather than news. At the threshold it speaks once: a genuinely
+ *  unreachable engine must not be swallowed. Reset by any answer, a rejection
+ *  included, since a 4xx proves the engine is reachable. */
+const writeFailures = createFailureCounter(3, () => {
+  const stuck = [...pendingPreferenceWrites.keys()].sort().join(', ');
+  showToast(
+    `Preference changes are not reaching the engine (${stuck}). They are applied on this device and will be re-sent automatically.`,
+    'error',
+    { key: PREFERENCE_UNREACHABLE_TOAST },
+  );
+});
+
+/** The engine answered about this key, so it is no longer owed a re-send. Both
+ *  answers land here, accepted and refused alike, because both prove the engine
+ *  is reachable: the unreachable banner has to be retracted whichever way the
+ *  queue drained, or it keeps insisting nothing is getting through while the
+ *  rejection card next to it says otherwise. */
+function settleDelivered(key: string): void {
+  pendingPreferenceWrites.delete(key);
+  writeFailures.recordSuccess();
+  if (pendingPreferenceWrites.size === 0) removeToast(PREFERENCE_UNREACHABLE_TOAST);
+}
+
+/** Queue one preference write behind any other delivery for the same key. Every
+ *  path that talks to the engine about a preference goes through here, so writes
+ *  to one key are strictly ordered while different keys still go in parallel. */
+function deliverOrPark(key: string, write: PendingPreferenceWrite): Promise<void> {
+  return enqueueDelivery(key, () => deliverNow(key, write));
+}
+
+/** Send one preference write: retry once on a transient rejection, park it for
+ *  the next resume if that fails too, surface a real verdict immediately.
+ *
+ *  Two attempts rather than one because the two transient causes need different
+ *  medicine. A radio handoff or a stale connection heals within milliseconds, so
+ *  the immediate re-send usually lands (this is `retryTransientRead`'s bargain,
+ *  applied to the most idempotent write in the app). A suspended page does not,
+ *  so the second failure hands off to the resume flush instead of burning more
+ *  attempts against a webview that is not running.
+ *
+ *  Runs inside the key's delivery chain, so no other write for this key is in
+ *  flight and the map bookkeeping below needs no ordering guards of its own. */
+async function deliverNow(key: string, write: PendingPreferenceWrite): Promise<void> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    // Re-checked per attempt, not once up front: the user can change the same
+    // setting again while we wait our turn OR between our two attempts. The
+    // newer value owns the key from that moment, and sending ours would put the
+    // stale one on the server after it.
+    if ((latestWriteSeq.get(key) ?? write.seq) > write.seq) return;
+    try {
+      await setPreference(key, write.value, write.deviceScoped ? getDeviceId() : undefined);
+    } catch (e) {
+      if (isTransientFetchError(e)) continue;
+      // The engine ANSWERED and refused. No retry can change that, and the user
+      // is owed the reason. It also proves the engine is reachable, so this key
+      // stops being owed a re-send and the unreachable count resets.
+      settleDelivered(key);
+      showToast(`Failed to save ${key} preference: ${errorDetail(e)}`, 'error', {
+        key: PREFERENCE_REJECTED_TOAST,
+      });
+      return;
+    }
+    // Kept OUT of the try: a throw from the bookkeeping below is not a failed
+    // save, and catching it here would report one.
+    settleDelivered(key);
+    return;
+  }
+  // Both attempts were cancelled, timed out, or dropped in transit. Park the
+  // value and stay quiet: the user sees their change applied, and the resume
+  // flush delivers it.
+  pendingPreferenceWrites.set(key, write);
+  writeFailures.recordFailure();
+}
+
+/** Re-send every parked preference write. Called from `useStartup`'s resume
+ *  handler, which is the moment a suspended iOS PWA can reach the engine again.
+ *  A write that fails transiently here stays parked for the next resume. */
+export async function flushPendingPreferenceWrites(): Promise<void> {
+  if (pendingPreferenceWrites.size === 0) return;
+  // Snapshot first: `deliverNow` mutates the map as each write settles.
+  const entries = [...pendingPreferenceWrites.entries()];
+  await Promise.all(entries.map(([key, write]) => deliverOrPark(key, write)));
+}
+
+/** Test-only: the keys whose latest value the engine has not accepted. */
+export function _pendingPreferenceKeysForTesting(): string[] {
+  return [...pendingPreferenceWrites.keys()].sort();
+}
+
+/** Test-only: drop all parked writes, delivery ordering and the escalation
+ *  counter, so one case's undelivered write can't leak into the next. */
+export function _resetPendingPreferenceWritesForTesting(): void {
+  pendingPreferenceWrites.clear();
+  latestWriteSeq.clear();
+  deliveryChains.clear();
+  writeFailures.recordSuccess();
+}
+
 export async function savePreference(
   key: string,
   value: string,
@@ -89,11 +251,11 @@ export async function savePreference(
       data: { ...preferences.value.data, [key]: value },
     };
   }
-  try {
-    await setPreference(key, value, deviceScoped ? getDeviceId() : undefined);
-  } catch (e) {
-    showToast(`Failed to save ${key} preference: ${errorDetail(e)}`, 'error');
-  }
+  const seq = ++writeSeq;
+  // Claim the key BEFORE queueing, so any write already in flight or waiting its
+  // turn can see it has been superseded and stand down.
+  latestWriteSeq.set(key, seq);
+  await deliverOrPark(key, { value, deviceScoped, seq });
 }
 
 // --- UI scale ---
@@ -289,6 +451,70 @@ export function setReasoningEffort(effort: string): Promise<void> {
   return savePreference('chat_reasoning_effort', effort, () => {
     reasoningEffort.value = effort;
   });
+}
+
+// --- Max tool calls (the per-turn tool-call cap) ---
+
+/** Mirrors `DEFAULT_MAX_TOOL_CALLS` in `core/preferences.rs`. */
+export const MAX_TOOL_CALLS_DEFAULT = 500;
+
+/** Mirrors `MIN_MAX_TOOL_CALLS` in `core/preferences.rs`. There is deliberately
+ *  no maximum: a high cap costs the user time and tokens, which is their call to
+ *  make. The floor rules out only the value that is broken rather than small,
+ *  since the loop checks `iterations > cap` after incrementing and a cap of 0
+ *  would end the turn before the first LLM call. */
+export const MAX_TOOL_CALLS_MIN = 1;
+
+/** The largest cap the UI will write. This is NOT the policy ceiling the design
+ *  deliberately omits, it is the point where JavaScript stops being able to
+ *  carry the number: past `Number.MAX_SAFE_INTEGER`, `Number('…')` rounds (and
+ *  eventually reaches `Infinity`), so `String(Number(input))` would save a
+ *  *different* value than the user typed and the engine would then enforce, or
+ *  reject, something else again. Nine quadrillion tool calls is not a cap anyone
+ *  reaches; the bound exists so the UI cannot display a value the engine will
+ *  not honor. */
+export const MAX_TOOL_CALLS_REPRESENTABLE = Number.MAX_SAFE_INTEGER;
+
+/** Roughly how long a turn can run at a given cap, in seconds per tool call.
+ *  The LLM round-trip dominates a step: ~15s for a large-context reasoning
+ *  model, faster on a small model with light tools, slower under heavy `bash`
+ *  work. Reads as an upper estimate, because a step that batches several tool
+ *  calls pays one round-trip for all of them. Used only to show the user what a
+ *  number means before they pick it, so an order of magnitude is the point. */
+const SECONDS_PER_TOOL_CALL = 15;
+
+/** A human "about N hours" (or minutes/days) for a cap, for the Settings note.
+ *  Deliberately coarse: the point is the order of magnitude, not a promise. */
+export function estimateTurnDuration(maxToolCalls: number): string {
+  const minutes = (maxToolCalls * SECONDS_PER_TOOL_CALL) / 60;
+  if (minutes < 60) return `${Math.max(1, Math.round(minutes))} min`;
+  const hours = minutes / 60;
+  if (hours < 48) return `${hours < 10 ? hours.toFixed(1).replace(/\.0$/, '') : Math.round(hours)} hours`;
+  return `${Math.round(hours / 24)} days`;
+}
+
+/** The per-turn tool-call cap. Mirrors `PreferenceStore::max_tool_calls` so the
+ *  UI never displays a value the engine would not honor: an absent or
+ *  unparseable value shows the default, and a parsed value is raised to the
+ *  floor. A large value is shown as stored, since there is no ceiling. */
+export function currentMaxToolCalls(): number {
+  if (preferences.value.status !== 'loaded') return MAX_TOOL_CALLS_DEFAULT;
+  const raw = preferences.value.data['max_tool_calls'];
+  if (raw == null) return MAX_TOOL_CALLS_DEFAULT;
+  // Integers only, matching the engine's `parse::<usize>()`: it rejects "12.5"
+  // and "-5" outright, where `parseInt` would happily read 12 and -5.
+  const trimmed = raw.trim();
+  if (!/^\d+$/.test(trimmed)) return MAX_TOOL_CALLS_DEFAULT;
+  // A value JS cannot carry exactly could only have been written outside this
+  // UI (the CLI, the HTTP API, psql), since `setMaxToolCalls` refuses to write
+  // one. Show the bound rather than a silently rounded number.
+  const parsed = Number(trimmed);
+  if (parsed > MAX_TOOL_CALLS_REPRESENTABLE) return MAX_TOOL_CALLS_REPRESENTABLE;
+  return Math.max(MAX_TOOL_CALLS_MIN, parsed);
+}
+
+export function setMaxToolCalls(maxToolCalls: number): Promise<void> {
+  return savePreference('max_tool_calls', String(maxToolCalls));
 }
 
 // --- Locale (language + timezone) ---

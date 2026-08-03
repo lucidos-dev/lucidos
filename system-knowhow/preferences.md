@@ -105,6 +105,15 @@ surface):
   setting. The backup *schedule*, *provider*, and *retention* ARE settable (see
   the table above); use `get_backup_status` to read the current schedule, next /
   last run, and recent history.
+- `max_tool_calls`: how many tool calls you may make in a single turn before
+  the engine stops the turn with an `[ENGINE-LIMIT]` message. Counts individual
+  calls, not replies, so three calls in one reply spend three of them.
+  Defaults to `500`;
+  the user may set any number (there is no ceiling, and a value below `1` is
+  raised to `1`). Changed in Settings → Models → Chat & Triggers, never via
+  `set_preference`: this is the backstop over your own loop, so you must not
+  raise your own limit. You still cannot observe your own tool-call count while
+  a turn runs; the `[ENGINE-LIMIT]` prefix is the only signal the cap was hit.
 - `keybindings` — Settings → Keyboard Shortcuts.
 - `capture_context` — a debug-only toggle.
 - `network_bind` — this workspace's engine network bind (`loopback` / `all` /

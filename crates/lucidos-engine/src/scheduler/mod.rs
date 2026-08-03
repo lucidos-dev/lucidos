@@ -284,7 +284,7 @@ impl SchedulerManager {
             }
         }
 
-        use crate::engine::event_bus::{BusEvent, SystemEvent};
+        use crate::engine::trigger_writes::TriggerWrite;
 
         // Check if trigger_crons table exists
         let table_exists: bool = sqlx::query_scalar(
@@ -336,41 +336,27 @@ impl SchedulerManager {
                 "run": serde_json::to_value(TriggerRun::Intent { intent: format!("Run trigger {}", legacy_target) }).unwrap(),
             });
 
-            if let Err(e) = self
-                .engine
-                .event_bus
-                .emit(BusEvent::System(SystemEvent::TriggerCreated {
-                    trigger_id: trigger_id_str.clone(),
+            self.engine
+                .emit_trigger_write_or_log(
+                    TriggerWrite::Created,
+                    &trigger_id_str,
                     payload,
-                    actor: None,
-                }))
-                .await
-            {
-                log!(
-                    "[Scheduler] Failed to emit TriggerCreated during migration for {}: {}",
-                    trigger_id_str,
-                    e
-                );
-            }
+                    None,
+                    "[Scheduler] (legacy migration)",
+                )
+                .await;
 
-            // If the row was disabled, also emit TriggerDisabled
+            // If the row was disabled, also record the pause.
             if !enabled {
-                if let Err(e) = self
-                    .engine
-                    .event_bus
-                    .emit(BusEvent::System(SystemEvent::TriggerDisabled {
-                        trigger_id: trigger_id_str.clone(),
-                        payload: serde_json::json!({ "trigger_id": trigger_id_str }),
-                        actor: None,
-                    }))
-                    .await
-                {
-                    log!(
-                        "[Scheduler] Failed to emit TriggerDisabled during migration for {}: {}",
-                        trigger_id_str,
-                        e
-                    );
-                }
+                self.engine
+                    .emit_trigger_write_or_log(
+                        TriggerWrite::Disabled,
+                        &trigger_id_str,
+                        serde_json::json!({ "trigger_id": trigger_id_str }),
+                        None,
+                        "[Scheduler] (legacy migration)",
+                    )
+                    .await;
             }
         }
 
@@ -490,7 +476,7 @@ impl SchedulerManager {
     /// `migrate_db_triggers_to_events` once telemetry confirms zero workspaces
     /// still hold the placeholder prompts.
     async fn migrate_stale_trigger_prompts(&self) {
-        use crate::engine::event_bus::{BusEvent, SystemEvent};
+        use crate::engine::trigger_writes::TriggerWrite;
 
         let stale_configs: Vec<TriggerConfig> = {
             let configs = self.trigger_configs.read().unwrap();
@@ -526,15 +512,12 @@ impl SchedulerManager {
                     "run": serde_json::to_value(&new_run).unwrap(),
                 });
 
-                // Persist TriggerUpdated event
+                // The chokepoint persists the event AND applies it to the
+                // registry, which this migration needs doubly: it runs before
+                // the subscriber starts, so nothing else would.
                 if let Err(e) = self
                     .engine
-                    .event_bus
-                    .emit(BusEvent::System(SystemEvent::TriggerUpdated {
-                        trigger_id: config.id.clone(),
-                        payload: payload.clone(),
-                        actor: None,
-                    }))
+                    .emit_trigger_write(TriggerWrite::Updated, &config.id, payload.clone(), None)
                     .await
                 {
                     log!(
@@ -543,14 +526,6 @@ impl SchedulerManager {
                         e
                     );
                     continue;
-                }
-
-                // Update in-memory state directly (subscriber not started yet)
-                {
-                    let mut configs = self.trigger_configs.write().unwrap();
-                    if let Some(c) = configs.get_mut(&config.id) {
-                        c.apply_update(&payload);
-                    }
                 }
 
                 updated += 1;

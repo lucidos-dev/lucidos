@@ -1,4 +1,4 @@
-import { API, json, mutatingFetch, throwIfNotOk } from './client';
+import { API, ApiError, json, mutatingFetch, throwIfNotOk } from './client';
 import type { ThreadSection, ThreadInitiator, ThreadAggregate } from '../store/thread-events';
 import type { ComposeSelectionOverride } from '../store/composeSelections';
 
@@ -17,6 +17,13 @@ export interface ThreadSummary {
    *  tooltip's "Agent ·" line, distinct from `last_user_action`. */
   last_agent_action?: string;
   message_count: number;
+  /** Whether the user parked this thread in the Saved section. `GET
+   *  /api/v1/threads` also says this structurally (saved threads come back in
+   *  its own `saved` array, which is what `loadAllThreads` reads); this field is
+   *  what makes the by-id fetch self-sufficient, since one bare summary carries
+   *  no such array. Both come from `thread_summaries.is_saved`, so they agree.
+   *  Optional only so test mocks needn't supply it. */
+  saved?: boolean;
   section: ThreadSection;
   active_children_count: number;
   total_children_count: number;
@@ -118,6 +125,28 @@ export interface ThreadsResponse {
 export async function fetchThreads(focusedThreadId?: string): Promise<ThreadsResponse> {
     const params = focusedThreadId ? `?focused=${encodeURIComponent(focusedThreadId)}` : '';
     return json(`${API}/threads${params}`);
+}
+
+/** One thread's summary by id, or null when the engine has no such thread.
+ *
+ *  The cheap complement to `fetchThreads`: that endpoint assembles saved +
+ *  recent archive + active + composing + the family base, which on a large
+ *  workspace is hundreds of milliseconds of server time (measured p50 262ms /
+ *  p90 359ms at ~5k threads) before any network cost. Bootstrapping ONE thread
+ *  through it, which is what a notification tap landing outside the loaded
+ *  window does, pays that whole bill to learn about a single row.
+ *
+ *  A 404 is a verdict ("no such thread") and returns null; every other failure
+ *  throws, because callers holding durable navigation state must distinguish
+ *  "gone" from "could not ask" and retry only the latter. See
+ *  `focusThreadOrBootstrapResult` and `landThreadHash`. */
+export async function fetchThreadById(threadId: string): Promise<ThreadSummary | null> {
+    try {
+        return await json<ThreadSummary>(`${API}/threads/${encodeURIComponent(threadId)}`);
+    } catch (err) {
+        if (err instanceof ApiError && err.httpCode === 404) return null;
+        throw err;
+    }
 }
 
 async function postThreadAction(path: string, body: Record<string, unknown>, signal?: AbortSignal): Promise<Response> {

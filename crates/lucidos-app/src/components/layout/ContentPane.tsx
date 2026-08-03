@@ -1,6 +1,8 @@
 import { useEffect, useRef } from 'preact/hooks';
-import { activeMenuItem, panelOverlay, parseRepoPath, type PanelOverlay } from '../../store/store';
+import { activeMenuItem, panelOverlay, notificationDetailPending, parseRepoPath, type PanelOverlay } from '../../store/store';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
+import { SkeletonProvider } from '../shared/Skeleton';
 import { lazyComponent } from '../../utils/lazyComponent';
 import { forceIOSRepaint } from '../../utils/iosRepaint';
 import { onPageResume } from '../../utils/pageResume';
@@ -57,6 +59,20 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
 
   const isAppUi = overlay?.type === 'app-ui';
 
+  // A notification detail is being fetched and hasn't landed yet. Delay-gated
+  // (`.claude/rules/frontend.md`: never render a loading indicator immediately)
+  // and dropped as soon as the real overlay exists, so the skeleton and the
+  // content can't both be on screen.
+  //
+  // `!overlay` rather than "replace whatever is showing": the fetch only happens
+  // when neither notification list holds the row, which in practice is the cold
+  // push-tap deep link (a warm page has loaded the unread set for its bell
+  // badge, so the tapped row resolves from memory). A cold boot has no overlay
+  // yet, so this is the case that matters, and it keeps the skeleton from
+  // tearing down a live app-ui iframe for the length of a fetch.
+  const showPendingNotification =
+    useDelayedFlag(notificationDetailPending.value !== null) && !overlay;
+
   const bodyRef = useRef<HTMLDivElement>(null);
   const viewKey = contentViewKey(active, overlay);
   // resetOnEmpty: this body hosts every view; without it, a stale scrollTop
@@ -88,8 +104,17 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   // lazy chunk and its data. The notification detail keys `viewKey` per
   // notification, so every prev/next chevron tap paid it, on a path already
   // optimized to drop a network round-trip for latency. Reported as lag opening
-  // notifications. Do not reintroduce a navigation-triggered repaint here without
-  // first making scroll consumers ignore the repaint nudge.
+  // notifications.
+  //
+  // That mechanism is gone as of 2026-08-03: `useHideOnScroll` now skips scroll
+  // events inside the nudge window (`isRepaintNudging`), the offset is written on
+  // its two consumer elements instead of `:root`, and it feeds `transform` rather
+  // than `top`, so there is no header move and no forced layout left to pay. The
+  // old precondition on reintroducing a navigation repaint is therefore satisfied.
+  // It stays resume-only anyway, for the reason that outlived the regression: a
+  // wake fires visibilitychange + pageshow + focus, so the resume path already
+  // gets three superseding attempts, and a navigation repaint buys nothing a
+  // switch-triggered render does not already cover.
   useEffect(() => onPageResume(() => {
     if (hostsAppUiIframe()) return;
     forceIOSRepaint(bodyRef.current);
@@ -119,6 +144,20 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
         })()}
         {overlay?.type === 'url-preview' && <UrlPreviewInline url={overlay.url} layout={layout} />}
         {overlay?.type === 'notification-detail' && <NotificationDetailInline />}
+        {/* A notification the page doesn't already hold is being fetched (the
+            cold push-tap deep link; every other open resolves from memory and
+            never gets here). The pane was revealed on the tap, so this fills it
+            with the detail's own skeleton rather than an empty panel.
+
+            Mounting the lazy component here also WARMS ITS CHUNK in parallel
+            with the fetch, where it used to start only once the overlay was set,
+            i.e. strictly after the round-trip. `lazyComponent` renders null
+            until the chunk lands, so on a genuinely cold chunk the skeleton may
+            not paint before the notification does; that is the pre-existing
+            empty-panel behaviour, minus a serial chunk load. */}
+        {showPendingNotification && (
+          <SkeletonProvider><NotificationDetailInline /></SkeletonProvider>
+        )}
         {!overlay && (
           <>
             {active === 'files' && <FilesView />}

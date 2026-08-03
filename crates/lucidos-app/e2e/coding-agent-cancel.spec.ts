@@ -4,7 +4,7 @@ import {
   assertHealthy, pickComposeDestination, newThread,
   waitForCCToStart, waitForCCToFinish, waitForExchangeCount,
   cancelStreamingResponse, countVisibleResponses, dismissCCSession,
-  waitForStreamingToStart,
+  waitForStreamingToStart, waitForActionPanel, USER_MSG_SELECTOR,
 } from './helpers';
 import { psql } from './db-helpers';
 
@@ -131,18 +131,60 @@ test.describe('Claude Code cancel and stop', () => {
     const msg = uniqueMessage('cc-dismiss');
     await sendMessage(page, `Say exactly: "done ${msg}" and nothing else. Do not create any files.`);
 
+    // Gate on the session actually reaching idle-with-actions. `waitForCCToFinish`
+    // alone is not a gate here: it reports "finished" when NO status label is
+    // rendered yet, which on a fast desktop load is the state right after the send.
+    // The whole test then flew through in ~600ms with the transcript still empty,
+    // and every assertion after it was vacuous (nothing to dismiss, no marker to
+    // disappear). That is how it passed on chromium while failing on the two
+    // mobile projects.
+    await waitForActionPanel(page, 'Archive', 120_000);
     await waitForCCToFinish(page, 120_000);
+
+    // Read the thread we are about to dismiss straight from the app. Archive
+    // moves focus to the next review thread, so this has to happen first, and
+    // naming the thread by hand beats inferring it from the newest
+    // `SessionStarted`: a previous test's session can still be settling and
+    // emit one of its own after ours.
+    const threadId = await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'));
+    expect(threadId).toMatch(/^[0-9a-f-]{36}$/);
 
     // Dismiss the session
     await dismissCCSession(page);
 
-    // After dismissing, the action banner should disappear
-    await page.waitForFunction(() => {
-      const banners = document.querySelectorAll('.thread-action-buttons');
-      return !Array.from(banners).some(el => {
+    // Archive does NOT clear every action banner from the page: handleArchiveThread
+    // focuses the NEXT review thread, and that thread carries its own banner (the
+    // cancel/resume tests above each leave an idle CC session behind). So the
+    // invariant is per-thread, not per-page: THIS thread leaves the pane and lands
+    // archived. The old assertion ("no visible .thread-action-buttons anywhere")
+    // asserted the opposite of the documented behaviour and only ever passed
+    // because a `.catch(() => {})` swallowed its timeout.
+    // `coding-agent-stuck-waiting.spec.ts` makes the same point at its own Archive.
+    await page.waitForFunction(({ marker, sel }) => {
+      return !Array.from(document.querySelectorAll(sel)).some(el => {
         const rect = el.getBoundingClientRect();
-        return rect.width > 0 && rect.height > 0;
+        return rect.width > 0 && rect.height > 0 && (el.textContent ?? '').includes(marker);
       });
-    }, undefined, { timeout: 10_000 }).catch(() => {});
+    }, { marker: msg, sel: USER_MSG_SELECTOR }, { timeout: 10_000 });
+
+    // And the click actually dismissed the session rather than silently missing
+    // the button. `dismissCCSession` swallows a failed click by design (the
+    // session may legitimately have ended) and `handleArchiveThread` flips the
+    // pane optimistically before its POST, so the marker check above cannot tell
+    // a landed archive from a rejected one. The persisted event can.
+    //
+    // Assert the EVENT, not `thread_summaries.archive_state`: archiving an idle
+    // CC thread stops the agent, and the `CodingAgentIdled` that stop emits
+    // resolves to `to_inbox` for a coding-agent thread (thread_lifecycle.rs), so
+    // the column races back to 'inbox' whenever that event lands after
+    // `ThreadArchived`. The frontend already guards the same race via
+    // `archivingThreadIds`.
+    await expect.poll(
+      () => psql(
+        `SELECT COUNT(*) FROM events WHERE aggregate_id = '${threadId}' ` +
+        `AND event_type = 'ThreadArchived'`,
+      ).trim(),
+      { intervals: [400], timeout: 15_000 },
+    ).toBe('1');
   });
 });

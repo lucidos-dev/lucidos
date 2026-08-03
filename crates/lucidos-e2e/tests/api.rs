@@ -118,3 +118,6 @@ mod backup_key_test;
 
 #[path = "api_support/network_config_test.rs"]
 mod network_config_test;
+
+#[path = "api_support/embedding_model_status_test.rs"]
+mod embedding_model_status_test;

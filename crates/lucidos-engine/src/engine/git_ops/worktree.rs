@@ -417,22 +417,38 @@ async fn link_git_crypt_dir(wt_path: &Path) -> Result<(), String> {
 /// "directory + `.git` entry exists" test, which a stranded tree passes (its
 /// `.git` file can survive while the admin dir it points at is gone, or git
 /// simply walks up to the enclosing repo).
+///
+/// An unanswered probe reads as **live**. See [`worktree_liveness`] for why:
+/// every caller of this function reacts to "not live" by clearing and
+/// recreating the directory, so an unanswered probe that resolved to `false`
+/// would authorize deleting a tree that is fine.
 pub(crate) async fn is_live_worktree_at(wt_path: &Path) -> bool {
+    worktree_liveness(wt_path).await.or_unknown(true)
+}
+
+/// Tri-state form of [`is_live_worktree_at`]: `Yes` when git confirms the path
+/// is its own work tree, `No` when git confirms it is not (no repo at all, or
+/// it resolves upward to an enclosing one), `Unknown` when git could not be
+/// asked.
+///
+/// The `Unknown` arm is load-bearing. On 2026-08-03, with the host saturated by
+/// the e2e suite, `git rev-parse --show-toplevel` exceeded the 30s ceiling
+/// against a perfectly healthy worktree. The old code mapped that straight to
+/// "not a live worktree", the spawn path concluded the tree was stranded, and
+/// the session-end cleanup then ran `git worktree remove --force` over the
+/// user's work. Treating `Unknown` as live is the recoverable direction: if the
+/// tree really is broken, the next git call inside it fails loudly and the
+/// session surfaces an error, which costs a retry rather than a working copy.
+pub(crate) async fn worktree_liveness(wt_path: &Path) -> GitAnswer {
     if !wt_path.exists() {
-        return false;
-    }
-    let out = match git_cmd(&["rev-parse", "--show-toplevel"], wt_path).await {
-        Ok(o) if o.status.success() => o,
-        // git failed to run, or the path is in no work tree at all. Treat as
-        // not-live; the caller recreates (clearing the dead dir first).
-        _ => return false,
-    };
-    let toplevel = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if toplevel.is_empty() {
-        return false;
+        return GitAnswer::No;
     }
     let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    canon(Path::new(&toplevel)) == canon(wt_path)
+    git_answer_with(&["rev-parse", "--show-toplevel"], wt_path, |o| {
+        let toplevel = String::from_utf8_lossy(&o.stdout).trim().to_string();
+        !toplevel.is_empty() && canon(Path::new(&toplevel)) == canon(wt_path)
+    })
+    .await
 }
 
 /// Attempts for a shared-`.git/config` write that loses the `.git/config.lock`
@@ -675,29 +691,26 @@ pub(crate) async fn clear_stranded_worktree_dir(repo_root: &Path, wt_path: &Path
     // `git worktree remove --force` too, not just the `remove_dir_all` — that
     // command silently discards a live, dirty worktree, so a transient
     // liveness-probe failure upstream must not be able to reach it here.
-    match git_cmd(&["rev-parse", "--show-toplevel"], wt_path).await {
-        Ok(o) if o.status.success() => {
-            let top = String::from_utf8_lossy(&o.stdout).trim().to_string();
-            let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-            if !top.is_empty() && canon(Path::new(&top)) == canon(wt_path) {
-                // Reads as a live worktree after all — never touch it.
-                log!(
-                    "[Git] refusing to clear {} — it reads as a live worktree",
-                    wt_path.display()
-                );
-                return;
-            }
-            // Resolves to an enclosing repo → stranded → safe to remove.
-        }
-        Ok(_) => { /* not a work tree at all → leftover residue → safe. */ }
-        Err(e) => {
+    // Only a positive `No` (git ran and said this is not its own work tree)
+    // authorizes the removal below.
+    match worktree_liveness(wt_path).await {
+        GitAnswer::Yes => {
             log!(
-                "[Git] cannot verify {} is stranded ({}); leaving dir in place",
-                wt_path.display(),
-                e
+                "[Git] refusing to clear {}: it reads as a live worktree",
+                wt_path.display()
             );
             return;
         }
+        GitAnswer::Unknown => {
+            log!(
+                "[Git] cannot verify {} is stranded (git gave no answer); leaving dir in place",
+                wt_path.display()
+            );
+            return;
+        }
+        // git ran and confirmed this is not its own work tree: it resolves to
+        // an enclosing repo, or is no repo at all. Leftover residue, safe.
+        GitAnswer::No => {}
     }
 
     // Confirmed stranded. Clear any stale git registration first (so a later
@@ -721,6 +734,23 @@ pub(crate) async fn clear_stranded_worktree_dir(repo_root: &Path, wt_path: &Path
             e
         ),
     }
+}
+
+/// Does this worktree have uncommitted changes?
+///
+/// `Unknown` when git could not say, which includes a non-zero `git status`
+/// (the path is no longer a work tree, or a filter such as git-crypt failed on
+/// a locked repo) as well as spawn errors and timeouts. Every caller of this is
+/// deciding whether a tree is safe to throw away, so the only answer that may
+/// authorize that is a positive `No`. This is the single definition of the
+/// question: the background cleanup worker and the session-end path both
+/// collapse it with `or_unknown(true)`, so an unanswerable tree counts as dirty
+/// in both.
+pub(crate) async fn worktree_dirtiness(worktree: &Path) -> GitAnswer {
+    git_answer_when_ok(&["status", "--porcelain"], worktree, |o| {
+        !o.stdout.is_empty()
+    })
+    .await
 }
 
 /// Get the current branch of a worktree (before it is removed).

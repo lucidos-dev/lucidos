@@ -248,6 +248,31 @@ export interface TopicCount {
   count: number;
 }
 
+/** How far the engine's background embedding-model load has got. Mirrors the
+ *  Rust `EmbeddingModelLoadState` (`memory/embedder_slot.rs`); `kind` is the
+ *  wire discriminator, pinned by `embedding_model_load_state_wire_tags_are_stable`.
+ *
+ *  Read two ways, deliberately: live from the `EmbeddingModelStatusChanged` SSE
+ *  frame, and as a snapshot from `/memory/embedding-model-status` for a client
+ *  that loads mid-download (the normal case on a fresh workspace, where the
+ *  download starts at engine boot). Both carry this exact shape. */
+export type EmbeddingModelLoadState =
+  /** Cache is cold: bytes are being fetched. `total_bytes` is what is known so
+   *  far, and the pair is monotonic, so it is safe to render as a bar. */
+  | { kind: 'downloading'; downloaded_bytes: number; total_bytes: number }
+  /** Files are local; the ONNX session is being built. Seconds, not minutes. */
+  | { kind: 'loading' }
+  | { kind: 'ready' }
+  /** A fetch failed (offline, hub blocked); the loader is backing off. */
+  | { kind: 'waiting'; attempt: number }
+  /** Terminal: the loader has stopped and only a fix plus a restart changes it. */
+  | { kind: 'failed'; message: string };
+
+export interface EmbeddingModelStatus {
+  model_id: string;
+  load_state: EmbeddingModelLoadState;
+}
+
 export interface MemoryStatsResponse {
   total: number;
   event_count: number;

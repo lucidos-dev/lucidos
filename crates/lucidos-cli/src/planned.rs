@@ -83,8 +83,16 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         return Err(format!("POST {} returned {}: {}", url, status, text).into());
     }
     match kind {
+        // Naming the question tool here matters: this line is what the agent
+        // reads at the exact moment it turns to present the plan. Told only to
+        // "present it", it writes prose and the thread sits idle until the user
+        // types "approve" by hand (2026-08-02). Both tool names are spelled out
+        // because the CLI serves both backends and cannot tell them apart:
+        // Claude Code has `AskUserQuestion`, Codex has `ask_user_question` on
+        // the Lucidos MCP server, and sending either after the other's tool
+        // would strand a proposed plan with no way to get it approved.
         MarkKind::Plan(p) => println!(
-            "Plan recorded (awaiting approval): {} ({}). Present it to the user; once approved, run `lucidos planned approve`.",
+            "Plan recorded (awaiting approval): {} ({}). Present it, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), not in prose. Once approved, run `lucidos planned approve`.",
             branch, p
         ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),

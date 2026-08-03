@@ -21,11 +21,12 @@
 #
 #   * DMG VERIFY (job: dmg-verify) — needs the built+signed+notarized DMG, which
 #     Phase A produces LOCALLY (signing identity never leaves the Mac) and then
-#     uploads to an `rc-<ver>` PRERELEASE in lucidos-dev. That upload fires
-#     `release: prereleased`, so this job downloads the rc DMG asset onto a FRESH
-#     macOS runner (one that has never trusted your cert) and runs spctl +
-#     stapler validate + a mount/launch — the real "does a stranger's Mac accept
-#     this DMG" check. Gates BEFORE the real tag.
+#     uploads to an `rc-<ver>` DRAFT release in lucidos-dev. A draft is never
+#     listed on the public releases page, and it also fires no webhook, so Phase
+#     A DISPATCHES this workflow with `dmg_tag=rc-<ver>` (ADR 0036). This job
+#     downloads the rc DMG asset onto a FRESH macOS runner (one that has never
+#     trusted your cert) and runs spctl + stapler validate + a mount/launch, the
+#     real "does a stranger's Mac accept this DMG" check. Gates BEFORE the real tag.
 #
 #   * SAFETY NET (job: smoke, on `release: published`) — the only trigger that
 #     exercises the REAL stranger path (curl|sh -> git clone lucidos-dev), because
@@ -103,27 +104,44 @@ on:
         type: choice
         default: 'full'
         options: [full, payload]
-      # dmg-verify only. A DEFERRED release publishes before Apple's notarization
-      # verdict, so it never creates the rc-<ver> prerelease that normally fires
-      # this gate (an unstapled DMG cannot pass a stapled-ticket assertion). When
-      # release.sh --attach-notarized later staples and swaps the asset, it
-      # dispatches this input so verification FOLLOWS the artifact to the GA tag.
+      # dmg-verify only, and now BOTH of that job's real triggers arrive here.
+      #
+      #   * the RC gate. Phase A puts the staged DMG on an rc-<ver> DRAFT release
+      #     so it is never listed publicly, and a draft fires no webhook at all
+      #     (GitHub: "Workflows are not triggered for the created, edited, or
+      #     deleted activity types for draft releases"), so release.sh dispatches
+      #     this input with dmg_tag=rc-<ver>. See ADR 0036.
+      #   * the DEFERRED release. It publishes before Apple's notarization
+      #     verdict, so Phase A armed no gate at all (an unstapled DMG cannot pass
+      #     a stapled-ticket assertion). When release.sh --attach-notarized later
+      #     staples and swaps the asset, it dispatches dmg_tag=v<ver> so
+      #     verification FOLLOWS the artifact to the GA tag.
+      #
       # Setting it runs dmg-verify and NOTHING else — every other job guards on
       # it being empty, or a 30-second asset check would drag a 40-minute source
       # install and a 90-minute tarball build along with it.
       dmg_tag:
-        description: 'dmg-verify: verify the DMG on this published tag (e.g. v0.16.0). Runs dmg-verify only.'
+        description: 'dmg-verify: verify the DMG on this tag, either an rc-<ver> draft or a published v<ver>. Runs dmg-verify only.'
         type: string
         default: ''
   push:
     branches: ['rc/**']        # release candidates -> auto clean-machine gate
   # release events drive two different jobs:
-  #   prereleased/released (prerelease==true) -> rc-<ver> uploaded in Phase A:
-  #     gate the signed DMG (dmg-verify). BOTH actions are accepted because
-  #     creating an rc via `gh release create --prerelease` can surface `released`
-  #     instead of `prereleased`; the prerelease==true guard keeps the GA out.
+  #   prereleased/released (prerelease==true) -> a NON-draft rc-<ver>, made by
+  #     hand or by a release.sh older than ADR 0036: gate the signed DMG
+  #     (dmg-verify). BOTH actions are accepted because creating an rc via
+  #     `gh release create --prerelease` can surface `released` instead of
+  #     `prereleased`; the prerelease==true guard keeps the GA out. Phase A no
+  #     longer takes this path (it dispatches dmg_tag at a DRAFT instead), but
+  #     the arm is kept so a hand-made rc still gates.
   #   published (prerelease==false) -> real tag exists: post-publish curl|sh +
   #     clone safety net (smoke).
+  #
+  # `created` is deliberately NOT in this list, and adding it does not make a
+  # draft rc fire. GitHub does not trigger workflows for the created / edited /
+  # deleted activity types on DRAFT releases, so the draft Phase A makes emits
+  # nothing here; `created` would only add a duplicate dmg-verify run for the
+  # non-draft rc above, which already matches prereleased. See ADR 0036.
   release:
     types: [prereleased, released, published]
   # Two crons, and each job picks EXACTLY ONE via `github.event.schedule` (the
@@ -334,17 +352,20 @@ jobs:
           if-no-files-found: ignore
 
   # ── DMG VERIFY ───────────────────────────────────────────────────────────────
-  # Gates the signed/notarized DMG. TWO ways in, because the artifact does not
+  # Gates the signed/notarized DMG. THREE ways in, because the artifact does not
   # always arrive at the same time as the release:
-  #   • the normal path — Phase A uploads the rc-<ver> PRERELEASE (release
-  #     `prereleased` OR `released`, guarded on prerelease==true; see the
-  #     release-types note above), and this gates it BEFORE the real release;
-  #   • the deferred path — a release published while Apple's notary verdict was
-  #     outstanding never created that prerelease (an unstapled DMG cannot pass
-  #     the stapled-ticket assertion below). `release.sh --attach-notarized`
-  #     staples the DMG, swaps the published asset, then dispatches this job with
-  #     `dmg_tag=v<ver>` so the gate runs against the GA tag. Verification follows
-  #     the artifact rather than requiring a prerelease that no longer exists.
+  #   • the normal path (dispatch, `dmg_tag=rc-<ver>`): Phase A uploads the DMG to
+  #     an rc-<ver> DRAFT release so it is never publicly listed, and since a
+  #     draft fires no event, release.sh dispatches this job at it. Gates BEFORE
+  #     the real release. See ADR 0036.
+  #   • the deferred path (dispatch, `dmg_tag=v<ver>`): a release published while
+  #     Apple's notary verdict was outstanding armed no gate at all (an unstapled
+  #     DMG cannot pass the stapled-ticket assertion below). `release.sh
+  #     --attach-notarized` staples the DMG, swaps the published asset, then
+  #     dispatches this job so verification follows the artifact to the GA tag.
+  #   • the legacy path (release event): a NON-draft rc-<ver> prerelease made by
+  #     hand or by an older release.sh (`prereleased` OR `released`, guarded on
+  #     prerelease==true; see the release-types note above).
   # Either way it downloads the DMG asset onto a CLEAN macOS runner — one that has never trusted your Developer ID
   # cert and has no prior state — and confirms Gatekeeper accepts it, the
   # notarization ticket is stapled, and the app actually mounts + launches. This
@@ -353,14 +374,26 @@ jobs:
   dmg-verify:
     name: dmg-verify (macOS, clean)
     # Public mirror only (see the smoke job's repo guard) — never bill the private
-    # source repo's 10x macOS minutes. Fires for an rc-<ver> PRERELEASE only: accept
-    # both `prereleased` and `released` (rc creation can surface either action) and
-    # guard on prerelease==true so the real GA publish never triggers it.
+    # source repo's 10x macOS minutes. The dispatch arm is the live one (both the
+    # rc draft and the deferred GA tag arrive that way). The release arm is kept
+    # for a NON-draft rc: accept both `prereleased` and `released` (rc creation
+    # can surface either action) and guard on prerelease==true so the real GA
+    # publish never triggers it.
     if: >-
       github.repository == 'lucidos-dev/lucidos'
       && ((github.event_name == 'release'
            && github.event.release.prerelease == true)
           || (github.event_name == 'workflow_dispatch' && inputs.dmg_tag != ''))
+    # `contents: write` is what makes a DRAFT release readable, and it is the only
+    # reason this job needs write at all: it downloads and verifies, it never
+    # pushes. GitHub only lists draft releases to callers with push access, and
+    # this repo's default_workflow_permissions is `read`, so an inherited token
+    # 404s on the rc draft. Do NOT tighten this to `contents: read`, and do NOT
+    # copy front-door's `permissions: {}` here: either one silently breaks the
+    # gate. The token stays scoped to the download step's env below, so the DMG
+    # this job mounts and launches never sees it. See ADR 0036.
+    permissions:
+      contents: write
     runs-on: macos-latest
     timeout-minutes: 30
     steps:
@@ -372,8 +405,23 @@ jobs:
           set -euo pipefail
           mkdir -p "$RUNNER_TEMP/dmg"
           echo "Fetching DMG asset(s) from $TAG"
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
-            --pattern '*.dmg' --dir "$RUNNER_TEMP/dmg"
+          # A failure here is most likely the rc DRAFT being invisible to this
+          # token rather than a missing asset, and a bare 404 does not say so.
+          # GitHub lists drafts only to callers with push access, which is what
+          # the job-level `contents: write` buys. Distinguish the two cases and
+          # name the escape hatch. See ADR 0036.
+          if ! gh release download "$TAG" --repo "$GITHUB_REPOSITORY" \
+                 --pattern '*.dmg' --dir "$RUNNER_TEMP/dmg"; then
+            echo "::error::could not download a .dmg from $TAG on $GITHUB_REPOSITORY"
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              echo "::error::the release resolves, so its .dmg asset is missing or misnamed"
+            else
+              echo "::error::the release does not resolve at all. If $TAG is a draft, this token cannot see it:"
+              echo "::error::confirm the dmg-verify job still declares permissions.contents: write."
+              echo "::error::escape hatch: gh release edit $TAG --repo $GITHUB_REPOSITORY --draft=false (publishes it, so it becomes publicly listed)"
+            fi
+            exit 1
+          fi
           DMG="$(ls "$RUNNER_TEMP/dmg"/*.dmg | head -1)"
           [ -f "$DMG" ] || { echo "::error::no .dmg asset on $TAG"; exit 1; }
           echo "DMG=$DMG" >> "$GITHUB_ENV"

@@ -15,6 +15,7 @@ import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths } from '../../utils/linkifyPaths';
 import { loadedOr } from '../../store/types';
 import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
+import { useSkeleton, SkText } from '../shared/Skeleton';
 import { resolveLinkedApp } from './resolveLinkedApp';
 import { navigateTapLabel } from './notificationTapLabel';
 import { notificationActions, notificationTriggerId } from './notificationActions';
@@ -29,7 +30,14 @@ import { notificationActions, notificationTriggerId } from './notificationAction
  *  every mutation routes through actions/notifications.ts (prev/next) or the
  *  navigation actions (open app / thread / nav-tap). */
 export function NotificationDetailInline() {
+  const sk = useSkeleton();
   const detail = viewingNotification.value;
+  // Skeleton mode renders the same frame with shimmer leaves, so the detail's
+  // loading placeholder is this component and cannot drift from it (the
+  // self-skeletonizing rule in `.claude/rules/frontend.md`). Only reachable via
+  // `ContentPane`'s pending branch, which mounts it inside a SkeletonProvider
+  // while a notification the page does not already hold is being fetched.
+  if (sk) return <NotificationDetailSkeleton />;
   if (!detail) return null;
 
   const items = loadedOr(notifications.value, []);
@@ -160,6 +168,35 @@ export function NotificationDetailInline() {
           <span class="error-text">Unknown app: {linked.appId}</span>
         </div>
       )}
+    </div>
+  );
+}
+
+/** The detail drawn as a loading placeholder: the same frame (nav row, title,
+ *  body) with shimmer leaves instead of content. Mirrors the real layout above
+ *  by sharing its class names, so the swap to real content doesn't reflow.
+ *
+ *  Rendered while a notification is being FETCHED, which after the memory-first
+ *  open in `viewNotification` means only the cold push-tap deep link: the page
+ *  holds neither list yet, so it genuinely has to ask the engine. The chevrons
+ *  and action buttons are omitted rather than shimmered, because which of them
+ *  exist is a property of the row we haven't got. */
+function NotificationDetailSkeleton() {
+  return (
+    <div class="notification-detail">
+      <div class="notification-detail-header">
+        <span class="notification-detail-date">
+          <SkText w="7rem" />
+        </span>
+      </div>
+      <h2 class="notification-detail-title">
+        <SkText w="12rem" />
+      </h2>
+      <div class="notification-detail-body markdown-content">
+        <SkText as="div" w="100%" />
+        <SkText as="div" w="92%" />
+        <SkText as="div" w="64%" />
+      </div>
     </div>
   );
 }

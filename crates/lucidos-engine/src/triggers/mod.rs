@@ -2,6 +2,7 @@ pub mod condition;
 pub mod config;
 pub mod definition;
 pub mod groups;
+pub mod registry;
 pub mod replay;
 pub mod run_history;
 pub mod summary;

@@ -15,6 +15,12 @@ export const USER_MSG_SELECTOR = '.initiator-panel-user .initiator-body';
 export const REAL_THREAD_ROW = '.thread-row:not(.compose-draft-row)';
 export const REAL_THREAD_NAV = '[data-thread-nav]:not([data-draft-id])';
 
+/** Start of the thread-drawer toggle's `aria-label` (from the `toggleThreadDrawer`
+ *  shortcut label). Always match it as a PREFIX: `ThreadToggleButton` appends
+ *  " (N needing attention)" whenever the thread list is hidden and something is
+ *  waiting on the user, so an exact-match selector silently stops resolving. */
+export const DRAWER_TOGGLE_LABEL = 'Show or hide thread drawer';
+
 /** Locator for the first physically visible user-message body (dual-layout safe). */
 export function userMessageBody(page: Page): Locator {
   return page.locator(`${USER_MSG_SELECTOR}:visible`).first();
@@ -315,7 +321,14 @@ export async function openThreadDrawer(page: Page): Promise<void> {
     // collapsed-thread-actions, thread pane), and the brand copy stays mounted
     // (faded) while the drawer is closed — target the collapsed-thread-actions
     // one explicitly: it is the interactable opener whenever the drawer is closed.
-    await page.locator('.collapsed-thread-actions button[aria-label="Show or hide thread drawer"]').click();
+    //
+    // Match the label as a PREFIX, never exact: ThreadToggleButton appends the
+    // needs-attention count to its own aria-label ("... (1 needing attention)")
+    // because the badge itself is decorative markup, and it does so exactly
+    // while the thread list is hidden, which is every case this branch runs in.
+    // An `=` match therefore found nothing the moment any thread awaited the
+    // user, the seeded state of most of coding-agent-question.spec.ts.
+    await page.locator(`.collapsed-thread-actions button[aria-label^="${DRAWER_TOGGLE_LABEL}"]`).click();
   }
   // Wait for the drawer's open width-transition (`width var(--duration-slow)`)
   // to SETTLE — not merely to be non-zero. Returning at width > 0 catches the

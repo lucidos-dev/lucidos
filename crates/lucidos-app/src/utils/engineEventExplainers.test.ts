@@ -1,6 +1,17 @@
 import { describe, it, expect } from 'vitest';
-import { describeAbortCause, describeCancelCause, describeEngineReason } from './engineEventExplainers';
-import type { AbortCause, CancelCause } from '../store/thread-events';
+import {
+  describeAbortCause,
+  describeCancelCause,
+  describeContinuationReason,
+  describeEngineReason,
+} from './engineEventExplainers';
+import {
+  CONTINUATION_AUTO_RECOVERY_REASON,
+  CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
+  CONTINUATION_USER_CLICKED_REASON,
+  type AbortCause,
+  type CancelCause,
+} from '../store/thread-events';
 
 describe('describeEngineReason', () => {
   it('returns explainer for session_recovered', () => {
@@ -81,6 +92,31 @@ describe('describeAbortCause', () => {
       const text = describeAbortCause(cause);
       expect(text.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe('describeContinuationReason', () => {
+  it('names the Switch to new version that stopped the response', () => {
+    expect(describeContinuationReason(CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON))
+      .toMatch(/switch to new version/i);
+  });
+
+  // The honesty rule `continuationStartedSummary` enforces for the turn header
+  // has to hold in the popover too: a hang recovery is a LOCAL interruption, so
+  // the explainer must not claim anything restarted.
+  it('does not claim an engine restart for auto_recovery_after_hang', () => {
+    const text = describeContinuationReason(CONTINUATION_AUTO_RECOVERY_REASON);
+    expect(text).toMatch(/stopped responding|stray signal/i);
+    expect(text).toMatch(/nothing restarted/i);
+  });
+
+  it('attributes a user-clicked Continue to the user', () => {
+    expect(describeContinuationReason(CONTINUATION_USER_CLICKED_REASON)).toMatch(/^You clicked Continue/);
+  });
+
+  it('returns null for an unrecorded or unrecognized reason rather than inventing one', () => {
+    expect(describeContinuationReason(undefined)).toBeNull();
+    expect(describeContinuationReason('answered_after_idle')).toBeNull();
   });
 });
 

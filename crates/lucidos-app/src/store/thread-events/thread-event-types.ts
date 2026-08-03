@@ -165,6 +165,22 @@ export const RESPONSE_CANCELED_SUMMARY = 'Response canceled';
  *  "continue" after a real restart, which DOES warrant the restart wording. */
 export const CONTINUATION_AUTO_RECOVERY_REASON = 'auto_recovery_after_hang';
 
+/** ContinuationStarted.reason emitted when the user clicked Continue on an
+ *  interrupted response. Mirrors Rust's `USER_CLICKED_CONTINUE_REASON`. This
+ *  path also stamps the clicking device on the actor, so the popover shows a
+ *  Device row alongside the explainer. */
+export const CONTINUATION_USER_CLICKED_REASON = 'user_clicked_continue';
+
+/** ContinuationStarted.reason emitted when the engine auto-resumes a
+ *  coding-agent thread that was in flight during a user-initiated *Switch to
+ *  new version*. Mirrors Rust's `AUTO_RESUME_AFTER_SWITCH_REASON`, which is
+ *  stamped on the coding-agent resume path alone (`engine_version.rs`): a chat
+ *  or trigger thread auto-resumed by the same Switch records no reason at all
+ *  (`emit_resume_anchor`) and falls back to the generic engine explanation. The
+ *  device that pressed Switch is recorded on the teardown `ResponseAborted`,
+ *  not here, so the resume itself carries no actor. */
+export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = 'auto_resume_after_switch';
+
 /** Header label / preview text for a `ContinuationStarted` turn. The reason
  *  takes precedence: an `auto_recovery_after_hang` resume is a LOCAL
  *  interruption (hang or stray signal-kill), never an engine restart, so it

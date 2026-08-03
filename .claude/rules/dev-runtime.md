@@ -277,6 +277,22 @@ Two rules follow, and both are load-bearing:
   isolates the port *registry* (`LUCIDOS_PORT_REGISTRY` is `$HOME`-relative).
   A test that needs a pid to be *unprotected* must use a dead or synthetic one
   — the `kill -0` liveness gate on the pidfile arms is what makes that work.
+- **A process-selection guard matches `argv[0]`, NEVER the whole command line.**
+  A process is a Playwright browser child if the BINARY IT RUNS lives under the
+  browsers cache; what its arguments happen to say is irrelevant. A substring
+  test against the full `ps -o command=` output cannot tell *is that process*
+  from *mentions that path*, and the difference is a SIGKILL. This is not
+  hypothetical: on 2026-08-03 it killed two Claude Code sessions. A coding agent
+  carries the engine's `THREAD HISTORY` block inside a roughly 22 KB
+  `--append-system-prompt` argument (`agent_session/run_session/run.rs`), so any
+  thread whose conversation quotes `ms-playwright/webkit` became a kill
+  candidate, and the thread hardening the reaper quoted it while explaining the
+  leak. It matched its own matcher and SIGKILLed itself, twice. Both
+  `webkit_reaper.sh` (`reap_once`) and `e2e_lock.sh` (`_e2e_list_orphans`) now
+  match `${command%% *}`, and both suites carry a Claude-Code-shaped fixture
+  asserting a mention is not a match. The reaper additionally warns at start
+  when the resolved token contains whitespace, since argv[0] is read up to the
+  first space and such a token silently disarms the guard.
 - **A `scripts/lib/*_test.sh` that sources `ports.sh` must stub `lsof` for the
   WHOLE file**, not per test. Stubbing `port_is_free` alone is not enough:
   `_port_is_ours_or_free` calls `lsof -ti :<port> -sTCP:LISTEN` separately, and
@@ -285,6 +301,16 @@ Two rules follow, and both are load-bearing:
   the suite if one was attempted — copy that pattern rather than inventing
   another. This is not hypothetical: it is why the machine's dev engine died
   twice on 2026-07-28.
+- **A process-listing seam must fail CLOSED.** The same rule, one layer up: when
+  a test overrides a `ps` seam, an empty synthetic feed means "no candidates",
+  never "fall back to the real `ps`". `webkit_reaper_test.sh` had that fallback,
+  and one new test that set the feed empty to assert "clean host returns 0" put
+  the entire host process table into a real `kill -KILL` on 2026-08-03. A
+  standalone lib test does not source `ports.sh`, so the `is_protected_host_pid`
+  backstop is undefined and its `command -v` guard skips it: the seam and the
+  `kill` shim are the only guards that actually run. Both
+  `webkit_reaper_test.sh` and `e2e_lock_test.sh` now do
+  `[ -n "$SYNTHETIC_PS" ] || return 0`.
 
 ## Engine tests need Postgres — use `test-engine.sh`
 

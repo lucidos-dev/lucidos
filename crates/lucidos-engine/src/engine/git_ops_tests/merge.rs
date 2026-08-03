@@ -331,6 +331,341 @@ async fn ff_main_to_leaves_clean_working_tree() {
     );
 }
 
+#[test]
+fn index_lock_collision_is_told_apart_from_a_real_git_failure() {
+    assert!(is_index_lock_collision(
+        "fatal: Unable to create '/ws/.git/index.lock': File exists.\n\n\
+         Another git process seems to be running in this repository"
+    ));
+    // Not a lock collision -- these must fail on the first attempt, never retry.
+    assert!(!is_index_lock_collision(
+        "error: Your local changes to the following files would be overwritten by checkout"
+    ));
+    assert!(!is_index_lock_collision("fatal: invalid reference: main"));
+    assert!(!is_index_lock_collision(""));
+}
+
+/// Regression (2026-08-03): `ff_main_to` advanced `main` and then lost the race
+/// for `.git/index.lock` on the `checkout -f main` that syncs the working tree.
+/// The failure was logged and swallowed, so the repo root stayed at the OLD
+/// commit while `main` pointed at the new one -- every file the merge added
+/// looked deleted to the next `git add -A` of `data/`, and the following
+/// `commit_all_dirty` committed that deletion on top of main. In the nightly
+/// this reverted a just-applied app change (`style-b.css` merged, then removed
+/// by a "Script task output" commit). The sync now waits the lock out.
+#[tokio::test]
+async fn ff_main_to_syncs_the_working_tree_when_the_index_lock_is_briefly_held() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "new feature")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
+
+    let main_sha =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    let feature_sha = String::from_utf8_lossy(
+        &git_cmd(&["rev-parse", "feature"], &repo)
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+
+    // Stand in for the other writer on this repo (libgit2 via ArtifactManager),
+    // holding the index lock across the moment main advances and releasing it
+    // shortly after. `update-ref` takes `refs/heads/main.lock`, not the index
+    // lock, so the ref still moves -- only the working-tree sync collides.
+    let lock = repo.join(".git/index.lock");
+    tokio::fs::write(&lock, b"").await.unwrap();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let _ = tokio::fs::remove_file(&lock).await;
+    });
+
+    let result = ff_main_to(&repo, &feature_sha, &main_sha).await;
+    assert!(
+        result.is_ok(),
+        "ff_main_to should succeed: {:?}",
+        result.err()
+    );
+
+    assert!(
+        repo.join("feature.txt").exists(),
+        "the merged file must be in the working tree after ff_main_to, even when \
+         the index lock was held while main advanced -- otherwise the next \
+         auto-commit of data/ records it as deleted"
+    );
+    let status = git_cmd(&["status", "--porcelain"], &repo).await.unwrap();
+    let status_output = String::from_utf8_lossy(&status.stdout).to_string();
+    assert!(
+        status_output.trim().is_empty(),
+        "working tree should be clean and level with main, got: {}",
+        status_output
+    );
+}
+
+/// A sync that never wins the lock must FAIL the merge, not report a clean
+/// apply over a working tree it knows is behind main. The callers' retry loops
+/// re-enter on the Err (the ff is a no-op by then), and a caller that gives up
+/// surfaces a recoverable failed apply rather than letting the next auto-commit
+/// of `data/` revert the merged files.
+#[tokio::test]
+async fn ff_main_to_fails_when_the_working_tree_cannot_be_synced() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "new feature")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
+
+    let main_sha =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    let feature_sha = String::from_utf8_lossy(
+        &git_cmd(&["rev-parse", "feature"], &repo)
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+
+    // Held for the whole retry budget and never released.
+    tokio::fs::write(repo.join(".git/index.lock"), b"")
+        .await
+        .unwrap();
+
+    let err = ff_main_to(&repo, &feature_sha, &main_sha)
+        .await
+        .expect_err("a working tree left behind main must fail the merge");
+    assert!(
+        err.to_string().contains("working tree could not be synced"),
+        "the error must name the unsynced working tree, got: {}",
+        err
+    );
+}
+
+/// Regression (2026-08-03, second occurrence): `update-ref` publishes the merge
+/// instantly while the `checkout -f main` that syncs the repo-root working tree
+/// is a separate process. A `commit_all_dirty` landing in that window resets its
+/// index to the NEW head, stages the OLD working tree over it, and commits every
+/// just-merged file as deleted, straight onto main. Retrying cannot close it:
+/// neither side fails. `ff_main_to` must therefore hold REPO_WORKTREE_MUTEX
+/// across publish AND sync, which this pins by taking the lock first and proving
+/// main cannot move until it is released.
+#[tokio::test]
+async fn ff_main_to_cannot_publish_main_while_a_worktree_snapshot_holds_the_lock() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "new feature")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
+
+    let main_sha =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    let feature_sha = String::from_utf8_lossy(
+        &git_cmd(&["rev-parse", "feature"], &repo)
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+
+    // Stand in for `commit_dirty_logged`, which holds this lock while it
+    // snapshots the working tree.
+    let snapshot_guard = REPO_WORKTREE_MUTEX.lock().await;
+
+    let merge_repo = repo.clone();
+    let merge_branch = feature_sha.clone();
+    let merge_main = main_sha.clone();
+    let merging =
+        tokio::spawn(async move { ff_main_to(&merge_repo, &merge_branch, &merge_main).await });
+
+    // While the snapshot holds the lock the merge must not have published main,
+    // so a snapshot of the working tree can never disagree with the ref.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let during =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    assert_eq!(
+        during, main_sha,
+        "main must not advance while a worktree snapshot holds REPO_WORKTREE_MUTEX"
+    );
+
+    drop(snapshot_guard);
+    merging
+        .await
+        .expect("merge task panicked")
+        .expect("ff_main_to should succeed once the snapshot releases the lock");
+
+    let after =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    assert_eq!(
+        after, feature_sha,
+        "main must advance once the lock is free"
+    );
+    assert!(
+        repo.join("feature.txt").exists(),
+        "the merged file must be in the working tree by the time the lock is released"
+    );
+}
+
+/// Regression (2026-08-03, same class as the two above): the exclusion above is
+/// only worth what its LIFETIME is worth, and it used to be held by the
+/// snapshot's caller around a `tokio::time::timeout`. `commit_all_dirty` does
+/// its libgit2 work inside `spawn_blocking`, and a blocking task cannot be
+/// cancelled: when the 30s ceiling fired, `commit_dirty_logged` logged the
+/// timeout, returned, and dropped its guard while the closure was still inside
+/// `reset_index_to_head` / `add_all` / `commit_index`. A concurrent `ff_main_to`
+/// then took the free lock and published main mid-snapshot, which is exactly the
+/// interleaving that records every just-merged file as deleted. The guard now
+/// travels INTO the blocking closure, so it is released when the snapshot really
+/// finishes rather than when its caller walks away.
+#[tokio::test]
+async fn a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish() {
+    let (_tmp, repo) = make_test_repo().await;
+    // Opens the repo `make_test_repo` just created, and commits a .gitignore on
+    // main, so build it BEFORE the shas below are captured.
+    let artifacts = crate::core::ArtifactManager::new(repo.clone()).unwrap();
+
+    let _ = git_cmd(&["checkout", "-b", "feature"], &repo).await;
+    tokio::fs::write(repo.join("feature.txt"), "new feature")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "add feature"], &repo).await;
+
+    let main_sha =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    let feature_sha = String::from_utf8_lossy(
+        &git_cmd(&["rev-parse", "feature"], &repo)
+            .await
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+
+    // Stall the snapshot at a real contention point: the ArtifactManager's repo
+    // handle, which every artifact commit takes. `commit_all_dirty`'s closure
+    // parks there AFTER it owns the worktree exclusion, which is the state this
+    // test is about. The oneshot makes the stall observably in place before the
+    // snapshot starts, so nothing here depends on a sleep.
+    let repo_handle = artifacts.repo_handle_for_test();
+    let (held_tx, held_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let stall = tokio::task::spawn_blocking(move || {
+        let _repo = repo_handle.lock().unwrap();
+        held_tx.send(()).unwrap();
+        let _ = release_rx.recv();
+    });
+    held_rx.await.expect("the stall task must take the handle");
+
+    // REPO_WORKTREE_MUTEX is process-global and every other `ff_main_to` test in
+    // this binary takes it too. Own it first and register the snapshot as the
+    // next waiter (tokio hands the lock out in request order), so the guard the
+    // assertions below are about is provably the snapshot's own.
+    let queue_head = REPO_WORKTREE_MUTEX.lock().await;
+    let mut snapshot = Box::pin(artifacts.commit_all_dirty("Script task output"));
+    tokio::select! {
+        biased;
+        _ = &mut snapshot => panic!("the snapshot cannot finish while the repo handle is stalled"),
+        _ = std::future::ready(()) => {}
+    }
+    drop(queue_head);
+
+    // The caller gives up and walks away: `commit_dirty_logged` on its ceiling.
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(500), &mut snapshot)
+            .await
+            .is_err(),
+        "the stalled snapshot must still be in flight when its caller's timeout fires"
+    );
+    drop(snapshot);
+
+    let merge_repo = repo.clone();
+    let merge_branch = feature_sha.clone();
+    let merge_main = main_sha.clone();
+    let merging =
+        tokio::spawn(async move { ff_main_to(&merge_repo, &merge_branch, &merge_main).await });
+
+    // The caller's future is gone but the snapshot is not, so the merge must
+    // still be excluded -- publishing main here is what commits the merged files
+    // as deleted.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let during =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    assert_eq!(
+        during, main_sha,
+        "main must not advance while an abandoned snapshot is still writing the index"
+    );
+
+    // Let the snapshot finish. Only its real completion may free the exclusion.
+    release_tx.send(()).unwrap();
+    stall.await.expect("stall task panicked");
+    merging
+        .await
+        .expect("merge task panicked")
+        .expect("ff_main_to should succeed once the snapshot has really finished");
+
+    let after =
+        String::from_utf8_lossy(&git_cmd(&["rev-parse", "main"], &repo).await.unwrap().stdout)
+            .trim()
+            .to_string();
+    assert_eq!(
+        after, feature_sha,
+        "main must advance once the lock is free"
+    );
+    assert!(
+        repo.join("feature.txt").exists(),
+        "the merged file must be in the working tree once the merge completes"
+    );
+}
+
+/// The retry is scoped to lock collisions: a command that fails for its own
+/// reasons must come back on the first attempt, not after the full budget.
+#[tokio::test]
+async fn git_cmd_await_index_lock_does_not_retry_a_real_failure() {
+    let (_tmp, repo) = make_test_repo().await;
+
+    let started = std::time::Instant::now();
+    let out = git_cmd_await_index_lock(&["checkout", "-f", "no-such-branch"], &repo)
+        .await
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(
+        started.elapsed() < std::time::Duration::from_millis(500),
+        "a non-lock failure must not burn the retry budget, took {:?}",
+        started.elapsed()
+    );
+}
+
 #[tokio::test]
 async fn ff_main_to_with_diverged_main_fails() {
     let (_tmp, repo) = make_test_repo().await;

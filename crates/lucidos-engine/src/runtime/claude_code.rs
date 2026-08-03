@@ -388,6 +388,38 @@ fn resolve_lucidos_binary(
     resolve_lucidos_binary_in(cli_dir, std::env::var_os("PATH").as_deref())
 }
 
+/// Byte-idle deadline we hand Claude Code for its own streaming watchdog,
+/// in milliseconds. 30 minutes, which is also the maximum CC accepts (it
+/// clamps `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` to `[10_000, 1_800_000]`).
+///
+/// CC wraps every SSE response body in a watchdog that aborts the turn when no
+/// BYTES arrive for a deadline, defaulting to 300_000 ms. It then reports
+/// `API Error: Stream idle timeout - no chunks received`, does NOT fall back to
+/// a non-streaming request, and retries at most once and only while nothing but
+/// thinking has been produced, so in practice the turn just dies. A large
+/// cache-cold prompt is silent on the wire from `message_start` until the first
+/// content delta, and at the 200k+ token contexts a coding-agent session
+/// routinely reaches, that silence can exceed 5 minutes (measured: two deaths at
+/// 303 s and one survivor at 290 s on the same thread, 2026-08-02).
+///
+/// Raising it past the engine's own silence detectors
+/// (`agent_session::lifecycle::WATCHDOG_INACTIVITY_LIMIT_MS`, 10 min in-loop,
+/// and `agent_session::external_watchdog::EXTERNAL_WATCHDOG_LIMIT_MS`, 12 min
+/// out-of-loop) is the point: they cover the same "subprocess went silent
+/// mid-turn" case and their response is `ContinuationRequested`, a
+/// non-destructive kill plus auto-resume via `--resume`. Whichever deadline is shorter decides
+/// the outcome, so making CC's the outer one converts a dead thread into a
+/// resumed turn while keeping a backstop for the cases the engine watchdog
+/// legitimately stands down on (a tool in flight below
+/// `WATCHDOG_HUNG_TOOL_CEILING_MS`). Disabling CC's watchdog outright
+/// (`CLAUDE_ENABLE_BYTE_WATCHDOG=0`) would remove that backstop and reintroduce
+/// the unbounded hang it was shipped to fix.
+///
+/// Temporary measure, see `docs/temporary-measures.md`
+/// ("CC byte-idle deadline raised past the engine watchdog") and
+/// `docs/investigations/2026-08-02-cc-stream-idle-timeout.md`.
+const CC_BYTE_STREAM_IDLE_TIMEOUT_MS: u64 = 30 * 60 * 1000;
+
 /// Build the `claude` Command with all flags and env vars. Extracted so unit
 /// tests can inspect args/env without spawning. `cli_dir` is the directory
 /// containing the `lucidos` binary, prepended to PATH; pass `None` to skip.
@@ -445,6 +477,19 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     if let Some(prompt) = args.system_prompt {
         cmd.arg("--append-system-prompt").arg(prompt);
     }
+    // Push CC's own byte-idle streaming deadline out past the engine's
+    // inactivity watchdog, so a provider stall auto-resumes instead of killing
+    // the turn. See `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` for the full reasoning.
+    //
+    // Set BEFORE `apply_lucidos_env`, which is load-bearing: that helper applies
+    // the user's workspace env vars FIRST and lets engine-owned vars win a
+    // collision, so anything written after it is unoverridable. This one is a
+    // tunable default, not a contract, so it goes before and a workspace env var
+    // of the same name still wins.
+    cmd.env(
+        "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS",
+        CC_BYTE_STREAM_IDLE_TIMEOUT_MS.to_string(),
+    );
     // Agent-independent Lucidos env contract (workspace, host protection,
     // PG*, subprocess origin, spawn metadata, RUSTC_WRAPPER, PATH) — shared
     // with every other AgentRuntime via `spawn_env::apply_lucidos_env`.

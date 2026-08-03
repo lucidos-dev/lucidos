@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.20.0 — 2026-08-03
+
+### Added
+
+- **Max tool calls.** Set how many tool calls the agent may make in one turn, under Settings > Models > Chat & Triggers. Presets or your own number, with an estimate of how long a turn that size can run.
+- **Background activity on the brand badge.** The marker beside the Lucidos title now covers any background work and is tappable, opening a status toast naming what is running.
+- **Embedding model download progress.** A fresh workspace fetches about 465 MB before vector memory works, and the status toast now shows it byte by byte.
+- **The build toast shows elapsed time and the commits the new version will bring.**
+
+### Changed
+
+- Mobile Access recognises a phone already on the tailnet as set up, with no install prompt or setup steps.
+- Expose is narrated on the brand badge, uses the current `tailscale serve` syntax with the older form as a fallback, and bounds each attempt with a deadline.
+- A Mobile Access failure toast shows the CLI's own error.
+- The macOS DMG ships a notarized and stapled app, so Gatekeeper clears it on first launch without contacting Apple.
+- Notifications open instantly, from the list already in memory, with a skeleton on a cold push tap.
+- The Origin popover on an engine-issued turn names the engine and why the turn resumed.
+
+### Fixed
+
+- A phone held sideways no longer gets a rotate-to-portrait lock. The layout follows the viewport, so most phones get the desktop split in landscape.
+- A preference change survives an iOS PWA suspend instead of raising "request cancelled", and writes to one key stay in order.
+- A left-edge swipe no longer exits an app that is fullscreen on the installed iOS PWA.
+- An auto-update keeps the app's macOS permission grants, and the build refuses an updater payload that is not Developer ID signed.
+- A failed update swap reports the failure instead of restarting into a destroyed bundle.
+- The update manifest's platform key comes from the built artifact, and it is uploaded only after its payload is present.
+- A coding-agent session survives a long silent turn instead of dying with "Stream idle timeout, no chunks received".
+- Pausing, creating or deleting a trigger takes effect for the very next request.
+- A tool call killed mid-execution renders as unfinished instead of spinning forever.
+- A coding-agent worktree is reclaimed only on positive evidence that it is dead, so a slow git probe can no longer destroy live work.
+- A workspace whose database provisioning fails transiently, such as the gateway starting before Docker, is retried instead of staying dead.
+- An apply refused for incomplete hardening no longer discards the coding agent's commits.
+- Streaming turn text no longer double-renders, the applied-changes list scrolls again, and a failed thread-list fetch no longer aborts the resync.
+- The command guard reads the real command out of `sh -c '<script>' <args>`.
+- An embedding model that does not fit the vector column is refused at load instead of failing every memory write later.
 ## v0.19.0 — 2026-08-02
 
 ### Added

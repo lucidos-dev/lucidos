@@ -941,6 +941,14 @@ impl LucidosEngine {
                 .await;
         }
 
+        // The turn's tool-call cap, read ONCE here and handed to both consumers
+        // below: the system prompt states it to the model, and the agentic loop
+        // enforces it. Two independent reads could disagree (and would hand the
+        // model a number nothing enforces), and reading it here also freezes the
+        // cap for the whole turn, so changing the setting mid-turn cannot move
+        // the backstop under a running loop.
+        let max_tool_calls = crate::core::PreferenceStore::max_tool_calls(&self.pool).await;
+
         let (system_prompt, missing_pref_keys, image_provider_available) = self
             .build_chat_system_prompt(
                 &user_timezone,
@@ -948,6 +956,7 @@ impl LucidosEngine {
                 device_id,
                 is_trigger,
                 &trigger,
+                max_tool_calls,
             )
             .await;
 
@@ -1238,6 +1247,7 @@ impl LucidosEngine {
                     capture_body,
                 },
                 &trigger_side_effect_grant,
+                max_tool_calls,
             )
             .await;
 

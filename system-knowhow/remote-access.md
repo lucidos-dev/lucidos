@@ -1,6 +1,6 @@
 ---
 name: Remote Access & HTTPS
-description: Use when the user wants to reach Lucidos from a phone, tablet, or another machine: "access from my phone", "remote access", "Mobile Access", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "reverse proxy". Covers the Settings > Mobile Access page and what each of its controls does, finding which gateway is listening on which port, the three routes to HTTPS (tailscale serve, mkcert, plain HTTP over the tunnel), and the per-device certificate trust steps.
+description: Use when the user wants to reach Lucidos from a phone, tablet, or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "Serve is not enabled on your tailnet", "reverse proxy". Covers the Settings > Mobile Access page and what each of its controls does, the Expose run and the tailnet approval it can wait on, finding which gateway is listening on which port, the three routes to HTTPS (tailscale serve, mkcert, plain HTTP over the tunnel), and the per-device certificate trust steps.
 ---
 
 # Remote Access & HTTPS
@@ -143,10 +143,35 @@ device: phones, tablets, and other laptops just work, on or off the LAN. The
 gateway can stay bound to loopback, because `serve` proxies from this machine to
 `127.0.0.1`.
 
-**Prerequisite the agent cannot satisfy.** Tailnet HTTPS is an **account-level**
-toggle: <https://login.tailscale.com/admin/dns> → **HTTPS Certificates** →
-**Enable HTTPS**. Only a tailnet admin can flip it, in a browser. If it is off,
-cert provisioning fails with exactly this:
+**Prerequisite the agent cannot satisfy: Serve, and tailnet HTTPS, are
+account-level and enabled in a browser.** Only a tailnet admin can turn them on.
+This shows up in two different ways depending on which layer you hit first, and
+the two look nothing alike, so recognise both.
+
+**1. `tailscale serve` prints a link and then blocks.** On a tailnet that has
+never had Serve enabled, the CLI does not fail. It says this and then waits,
+polling the control plane until someone visits the link (measured 2026-08-02 on
+CLI 1.96.4):
+
+```
+Serve is not enabled on your tailnet.
+To enable, visit:
+
+         https://login.tailscale.com/f/serve?node=<node id>
+```
+
+The node id is per-machine and cannot be reconstructed, so **that exact line is
+the whole answer**: open it, approve, and the still-running command finishes by
+itself. `tailscale status --json` shows the same precondition from the outside
+as an empty `CertDomains`.
+
+**`--yes` does not help.** It suppresses interactive *prompts*, and this is not
+a prompt. Tested: with `--yes` the command blocks identically. Nor does closing
+stdin. The only thing that unblocks it is the approval.
+
+**2. Cert provisioning fails outright**, if Serve is enabled but tailnet HTTPS
+certificates are not: <https://login.tailscale.com/admin/dns> → **HTTPS
+Certificates** → **Enable HTTPS**.
 
 ```
 500 Internal Server Error: your Tailscale account does not support getting TLS certs
@@ -168,16 +193,60 @@ tailscale cert mymac.tailnet-name.ts.net                 # provision/inspect the
 ```
 
 The packaged desktop app does this for the user: **Settings → Mobile Access**
-runs `tailscale serve --bg https / http://127.0.0.1:<port>` behind its **Expose**
-button and then shows the resulting `https://mymac.tailnet-name.ts.net` URL.
-Prefer pointing the user there over hand-running commands when they are on the
-packaged app. See § Settings → Mobile Access below for what the page can and
-cannot do.
+runs `tailscale serve --bg --https=443 http://127.0.0.1:<port>` behind its
+**Expose** button, waits out the tailnet approval above if one is needed, and
+then shows the resulting `https://mymac.tailnet-name.ts.net` URL. Prefer
+pointing the user there over hand-running commands when they are on the packaged
+app. See § Settings → Mobile Access below for what the page can and cannot do,
+and § The Expose run for the steps it goes through.
 
-`serve` flag syntax has changed across CLI versions (the positional
-`https / <target>` form and the `--https=<port> <target>` form both exist in the
-wild). `tailscale serve --help` is the authority for the installed version, and
-`tailscale serve status` is the proof of what actually got configured.
+**`serve` syntax changed in CLI 1.52, and the old form has since been removed.**
+Two forms exist in the wild and a given CLI takes one of them:
+
+| Form | CLI | On the wrong CLI |
+|---|---|---|
+| `serve --bg --https=443 <target>` | 1.52 and later | unrecognised flag |
+| `serve https / <target>` | before 1.52 | `Error: the CLI for serve and funnel has changed`, exits non-zero, configures nothing |
+
+`--bg` arrived with the same 1.52 rework, so it belongs only on the first form:
+before that, `serve` was persistent by default. The Expose button tries the
+current form and falls back to the old one (`serve_arg_forms` in
+`crates/lucidos-app/src/mobile.rs`). If both fail it reports **both** errors,
+current first with the retry labelled, because whichever form the CLI does not
+understand contributes only noise: on a current CLI that is the legacy attempt's
+"the CLI for serve and funnel has changed", and on a pre-1.52 one it is the
+current attempt's unknown flag. Keeping both is what stops the real reason from
+being the one that gets dropped.
+
+**The fallback runs only when the CLI rejected a FLAG**, never on any other
+failure. That gate is load-bearing rather than tidy. It used to retry on
+anything, so on a modern CLI a run that timed out waiting for the tailnet
+approval collected "Error: the CLI for serve and funnel has changed" from the
+doomed legacy attempt and led with it, sending the reader after a syntax problem
+they did not have while the approval link went unmentioned. A deadline is not
+the CLI declining our argv.
+
+**`--bg` belongs only on the current form, and an attempt has TWO deadlines.**
+The 1.52 rework did not just add flags, it inverted the default: before it,
+`serve` wrote persistent config and had no foreground concept (so no `--bg`);
+after it, `serve` holds a foreground session until Ctrl-C unless you pass
+`--bg`. A CLI in the window between that rework and the removal of the old
+syntax therefore accepts `serve https / <target>` **and** runs it in the
+foreground, so that invocation never returns on its own. Hand-running the old
+form on a recent CLI, expect it to sit there rather than come back.
+
+Hence 20 seconds while the command should be *configuring*, which is a stall
+guard, and ten minutes once it has printed the tailnet-approval link, which is a
+patience budget: at that point it is not stalled, it is waiting for a human, and
+it completes on its own. The child's output is streamed while it runs rather
+than read after it exits, so an attempt that is killed still reports everything
+it had said. Reading the pipes only at exit is what once discarded the approval
+link along with the child.
+
+Hand-running, `tailscale serve --help` is the authority for the installed
+version and `tailscale serve status` is the proof of what actually got
+configured. When a newer CLI rejects the old form it **prints the exact command
+it wants**, so read the error instead of guessing at syntax.
 
 **Port 443 fronts exactly one target.** With two gateways, one takes 443 and the
 other takes an alternate port:
@@ -281,13 +350,31 @@ here before hand-running commands.
 | Half | Contains | Shown |
 |---|---|---|
 | Machine-side | Connect URLs, Sign in to Tailscale, Expose | Packaged desktop app only |
-| Install | What Tailscale buys you, Get Tailscale, the phone steps | Everywhere, phone browsers and the PWA included |
+| Phone-facing | What Tailscale buys you, a Tailscale row for the reading device, the remaining steps | Everywhere, phone browsers and the PWA included |
 
 The machine-side controls are native commands with no HTTP equivalent, so they
-cannot work in a browser. The install half needs nothing, and the phone is
+cannot work in a browser. The phone-facing half needs nothing, and the phone is
 exactly where it is worth reading, so the page is reachable from a phone and
 rewords itself for whichever device opened it. **Get Tailscale** opens the App
 Store on iOS, the Play Store on Android, and `tailscale.com/download` otherwise.
+
+**The phone-facing half reads the device it is running on**, so it never asks a
+phone to redo a step it has already done. Its evidence is the host that device
+was served on, since there is no Tauri bridge and no way to inspect a phone's
+interfaces from a web page:
+
+| How this device got here | The page shows |
+|---|---|
+| Any other address | **Get Tailscale**, then all three steps (install, copy the Mac's Tailscale address, add to home screen) |
+| A `*.ts.net` name, in a browser | "Tailscale is connected on this device", and the one step left: add to home screen |
+| A `*.ts.net` name, in the installed PWA | "Tailscale is connected on this device", and "This phone is set up" |
+
+A MagicDNS name resolves only on a device signed in to the tailnet that owns it,
+so reading the page at one is proof that Tailscale is installed and working
+*here*. A bare `100.64/10` host is deliberately **not** treated as proof: that
+range is real CGNAT space an ISP can hand to a physical interface, and the
+interface check that settles it for the Mac cannot be run against the phone. An
+unproven host keeps the install offer, which is the harmless way to be wrong.
 
 **Connect URLs** lists the addresses the engine answers on:
 
@@ -332,6 +419,51 @@ reverse lookup, so it reports correctly no matter how Tailscale was installed
 | On a tailnet, not serving | yes | **Expose** |
 | On a tailnet, not serving | no | How to get the CLI; the plain-HTTP URL works meanwhile |
 | On a tailnet, serving | any | The `https://...ts.net` URL, plus **Re-apply** with a CLI |
+
+**A failed Sign in or Expose shows the underlying error verbatim.** The toast
+carries no Lucidos framing of its own, because every message the page can raise
+already names what failed: the missing CLI, the missing tailnet address or
+MagicDNS name, `tailscale <cmd> failed: <stderr>`, or a post-condition that
+reported success and changed nothing. So read the toast as the CLI's own words.
+That matters most for a syntax rejection, where the CLI prints the exact command
+it wants and that line **is** the fix.
+
+One thing is filtered out of those messages: `Warning: client version "..." !=
+tailscaled server version "..."`. Tailscale prints it on stderr for *every*
+command whenever the CLI and the running daemon differ in version, which is the
+normal state of a Homebrew CLI beside the Mac app's daemon, and with the child's
+output streamed it would otherwise be the first line of every error. It is still
+worth resolving before debugging `serve` in earnest (see the troubleshooting
+table), it just is not the error.
+
+### The Expose run
+
+Pressing **Expose** starts a supervised run, not a single blocking call. It
+reports on the **brand badge** in the header (the shared background-activity
+surface, alongside a dev engine rebuild and the embedding-model download): the
+badge spins for the whole run from any screen, and tapping it opens the status
+toast with the current step. Every step is indeterminate, so the toast spins
+rather than showing a bar.
+
+| Step | What is happening |
+|---|---|
+| Setting up Tailscale access | Locating a CLI, then reading the tailnet address and MagicDNS name |
+| Configuring tailscale serve | The `serve` command is running |
+| Waiting for you to enable Serve on your tailnet | The CLI printed an approval link (see Route B). The toast offers it as **Enable in Tailscale**; approve it in the browser and the run continues on its own |
+| Waiting for HTTPS to come up | The mapping is written; polling 443 for up to 30s, because a first-run certificate takes a moment |
+
+The run ends as the `https://...ts.net` address, an error shown verbatim, or
+nothing at all if it was cancelled. **Cancel** is offered throughout, and a
+cancelled run leaves no serve config behind (killing the child before it commits
+writes nothing). Only one run exists at a time: pressing Expose again while one
+is live is refused rather than racing it, and the button reads "Setting up…" and
+stays disabled even if you navigate away and come back, because the run lives in
+the app and not on the page.
+
+Two things this means when debugging a report of "Expose did nothing". First,
+the run may simply be waiting for the user on Tailscale's site, and the badge is
+where that is said. Second, nothing here can occupy the UI thread: every Mobile
+Access command runs on a worker thread, so a frozen window is a different bug.
 
 **Never run `/Applications/Tailscale.app/Contents/MacOS/Tailscale`.** It is the
 GUI executable, not a CLI. Outside a GUI session it prints "The Tailscale GUI
@@ -429,6 +561,8 @@ tailnet reaches it, the coffee-shop LAN does not.
 | Certificate error naming a different host | SAN list is missing the MagicDNS name. `openssl x509 ... -text`. |
 | "Not trusted" on one device only | iOS trust step 4 (Certificate Trust Settings) was skipped. |
 | `500 ... your Tailscale account does not support getting TLS certs` | The account-level HTTPS toggle is off. Nothing local will fix it. |
+| `tailscale serve` prints a `login.tailscale.com/f/serve` link and never returns | Serve is not enabled for the tailnet. Open that exact link and approve; the command finishes by itself. Not a hang. |
+| Expose reports a CLI syntax change on a current CLI | Read past it. That line comes from the pre-1.52 fallback attempt, which now runs only on a rejected flag; if you see it on 1.52+, the build predates that gate. |
 | Works on 5252, fails on 5251 (or vice versa) | Two gateways, two TLS setups. Probe the failing port on its own. |
 | No push notifications | Not a secure origin (check that first), or the OS-level permission was never granted. |
 | Apps load blank behind a reverse proxy | A path prefix was added. Serve Lucidos at the origin root, on its own port. |

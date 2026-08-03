@@ -69,6 +69,31 @@ pub(crate) const PREF_COMMAND_GUARD: &str = "command_guard";
 // master `command_guard` toggle is on.
 pub(crate) const PREF_COMMAND_GUARD_JUDGE: &str = "command_guard_judge";
 
+/// How many tool calls the Lucidos Agent may make in a single turn (chat and
+/// trigger alike) before the agentic loop stops with its `[ENGINE-LIMIT]`
+/// terminator. Human-only: it is in `preference_catalog::INTERNAL_KEYS`, since
+/// the cap is the backstop over the agent's own loop and the agent must not be
+/// able to raise it. Changed in Settings, Models, Chat & Triggers.
+pub const PREF_MAX_TOOL_CALLS: &str = "max_tool_calls";
+
+/// The per-turn tool-call cap when `max_tool_calls` is unset. Was the hardcoded
+/// `MAX_ITERATIONS` before the cap became configurable, and keeps that value so
+/// an untouched workspace behaves exactly as before.
+pub const DEFAULT_MAX_TOOL_CALLS: usize = 500;
+
+/// The floor [`PreferenceStore::max_tool_calls`] applies. There is deliberately
+/// no ceiling: a high cap costs the user time and tokens, which is their call to
+/// make. The floor is not a restriction either, it rules out the one value that
+/// is broken rather than merely small. The loop checks `iterations > cap` after
+/// incrementing, so a cap of `0` fires the backstop before the first LLM call
+/// and the turn produces nothing but the limit message.
+///
+/// A cap below 5 does pre-empt the generic circuit breaker (which warns at 3
+/// consecutive identical failures and breaks at 5) and `MAX_QUESTION_REASK`, so
+/// a stuck turn ends with `[ENGINE-LIMIT]` instead of a breaker message. That is
+/// the honest consequence of asking for a tiny cap, not a reason to refuse one.
+pub const MIN_MAX_TOOL_CALLS: usize = 1;
+
 /// Store for managing user preferences in the database.
 ///
 /// **Announcing is the default, and the silent door is guarded.**
@@ -393,6 +418,48 @@ impl PreferenceStore {
         }
     }
 
+    /// Resolve the per-turn tool-call cap for one turn.
+    ///
+    /// Total by construction: this is the loop's runaway backstop, and refusing
+    /// to run a turn because a preference row is malformed is strictly worse
+    /// than running it at the default. So an absent row, an unparseable value,
+    /// and a DB error all resolve to [`DEFAULT_MAX_TOOL_CALLS`] (the error is
+    /// logged, matching [`Self::command_judge_model`]), and a parsed value is
+    /// raised to [`MIN_MAX_TOOL_CALLS`] if it is below it.
+    ///
+    /// A large value is honored as written. There is no ceiling on purpose:
+    /// see [`MIN_MAX_TOOL_CALLS`] for why the floor is the only clamp.
+    pub async fn max_tool_calls(pool: &PgPool) -> usize {
+        let raw = match Self::get(pool, PREF_MAX_TOOL_CALLS).await {
+            Ok(Some(v)) => v,
+            Ok(None) => return DEFAULT_MAX_TOOL_CALLS,
+            Err(e) => {
+                log!(
+                    "[Preferences] Failed to read {}: {}. Using the default cap of {}",
+                    PREF_MAX_TOOL_CALLS,
+                    e,
+                    DEFAULT_MAX_TOOL_CALLS
+                );
+                return DEFAULT_MAX_TOOL_CALLS;
+            }
+        };
+        // Parsing as usize rejects a negative outright, which is what we want:
+        // "-5" is not a smaller cap, it is not a cap at all, so it falls back to
+        // the default rather than silently becoming the floor.
+        match raw.trim().parse::<usize>() {
+            Ok(n) => n.max(MIN_MAX_TOOL_CALLS),
+            Err(_) => {
+                log!(
+                    "[Preferences] {} is not a number ({:?}). Using the default cap of {}",
+                    PREF_MAX_TOOL_CALLS,
+                    raw,
+                    DEFAULT_MAX_TOOL_CALLS
+                );
+                DEFAULT_MAX_TOOL_CALLS
+            }
+        }
+    }
+
     /// Read the user's chat model + reasoning effort preferences for code
     /// paths that originate a chat without an explicit user request
     /// (spawn_thread, process_trigger). DB errors are logged and treated as
@@ -662,6 +729,78 @@ mod tests {
             "DB error must propagate as Err so callers can render a failed state, got {:?}",
             err_result,
         );
+    }
+
+    // --- Per-turn tool-call cap
+    // (docs/plans/2026-08-03-configurable-max-tool-calls.md) ---
+
+    /// One case per resolution branch, in one test: the reader is total, so the
+    /// property worth pinning is that EVERY input lands on a usable cap. Split
+    /// across separate tests, a regression that collapsed the branches into a
+    /// single `unwrap_or(default)` (losing the floor, or losing large values)
+    /// would still pass most of them.
+    #[tokio::test]
+    async fn max_tool_calls_resolves_every_input_to_a_usable_cap() {
+        let (pool, db_name) = setup_test_db().await;
+
+        assert_eq!(
+            PreferenceStore::max_tool_calls(&pool).await,
+            DEFAULT_MAX_TOOL_CALLS,
+            "an untouched workspace must keep the pre-setting behavior"
+        );
+
+        for (stored, expected, why) in [
+            ("2000", 2000, "a plain value is honored"),
+            (" 750 ", 750, "surrounding whitespace is tolerated"),
+            (
+                "1000000",
+                1_000_000,
+                "there is no ceiling: a huge cap is the user's call to make",
+            ),
+            (
+                "0",
+                MIN_MAX_TOOL_CALLS,
+                "0 would fire the backstop before the first LLM call, so it is raised to the floor",
+            ),
+            (
+                "-5",
+                DEFAULT_MAX_TOOL_CALLS,
+                "a negative is not a cap at all, so it falls back rather than becoming the floor",
+            ),
+            ("abc", DEFAULT_MAX_TOOL_CALLS, "garbage falls back"),
+            ("", DEFAULT_MAX_TOOL_CALLS, "an empty value falls back"),
+        ] {
+            crate::test_support::seed_preference(&pool, PREF_MAX_TOOL_CALLS, stored)
+                .await
+                .unwrap();
+            assert_eq!(
+                PreferenceStore::max_tool_calls(&pool).await,
+                expected,
+                "stored {:?}: {}",
+                stored,
+                why
+            );
+        }
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A DB error must not fail the turn. Unlike `capture_context`, which
+    /// propagates `Err` so a caller can render a failed state, this read has no
+    /// caller that could do anything useful with the error: the loop needs a
+    /// number to run at all.
+    #[tokio::test]
+    async fn max_tool_calls_falls_back_to_the_default_on_a_db_error() {
+        let (pool, db_name) = setup_test_db().await;
+        pool.close().await;
+
+        assert_eq!(
+            PreferenceStore::max_tool_calls(&pool).await,
+            DEFAULT_MAX_TOOL_CALLS
+        );
+
+        teardown_test_db(&db_name).await;
     }
 
     #[tokio::test]

@@ -1150,6 +1150,9 @@ impl LucidosEngine {
         let trigger_configs: Arc<
             std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>,
         > = Arc::new(std::sync::RwLock::new(HashMap::new()));
+        // Shared with the Thread Queue too: its overflow guard performs a real
+        // trigger write, and a lock only the engine held would not serialize it.
+        let trigger_write_lock = Arc::new(tokio::sync::Mutex::new(()));
 
         // Thread Queue admission control. Policy is event-sourced — the
         // latest CapacityPolicyChanged event is the configuration.
@@ -1158,6 +1161,8 @@ impl LucidosEngine {
             pool.clone(),
             event_bus.clone(),
             trigger_configs.clone(),
+            workspace_path.clone(),
+            trigger_write_lock.clone(),
             capacity_policy,
         ));
 
@@ -1188,6 +1193,7 @@ impl LucidosEngine {
             update_check: std::sync::Mutex::new(Default::default()),
             source_behind_cache: std::sync::Mutex::new(Default::default()),
             disk_direction_cache: std::sync::Mutex::new(Default::default()),
+            pending_commits_cache: std::sync::Mutex::new(Default::default()),
             self_heal_state: std::sync::Mutex::new(Default::default()),
             build_task: std::sync::Mutex::new(None),
             build_generation: std::sync::atomic::AtomicU64::new(0),
@@ -1292,6 +1298,7 @@ impl LucidosEngine {
             trigger_configs,
             trigger_groups: Arc::new(std::sync::RwLock::new(HashMap::new())),
             trigger_group_write_lock: Arc::new(tokio::sync::Mutex::new(())),
+            trigger_write_lock,
             bash_background: crate::engine::tools::bash_background::BackgroundBashRegistry::new(),
             thread_queue: thread_queue_manager,
         })

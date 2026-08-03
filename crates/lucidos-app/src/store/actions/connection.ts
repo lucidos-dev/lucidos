@@ -1,5 +1,6 @@
-import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS } from '../store';
-import { checkHealth, API_BASE } from '../../api/client';
+import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
+import { checkHealth, API_BASE, isTransportError } from '../../api/client';
+import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY } from './chat-changes';
@@ -143,10 +144,20 @@ function runResumeSync(): void {
   // eventsLoadFailed and does a full load (lastDbSeq is still 0).
   for (const id of failedIds) void loadThreadEvents(id);
 
-  // Also load thread list to pick up any brand-new threads. loadAllThreads
-  // stamps Loadable failed states internally; the catch is the rejection-
-  // tracker silencer.
-  loadAllThreads().catch(() => {});
+  // Also load thread list to pick up any brand-new threads. `loadAllThreads`
+  // REJECTS on a failed GET and has no Loadable or toast of its own, so surface
+  // it here rather than swallowing. Transient iOS-PWA wake / stale-connection
+  // rejections stay silent (the next resume re-syncs), matching
+  // `refreshThreadEvents`; a genuine failure toasts.
+  loadAllThreads().catch((err) => {
+    if (isAbortError(err) || isTransportError(err)) {
+      console.warn('[Connection] resume thread-list refresh failed transiently; next resume re-syncs', err);
+      return;
+    }
+    showToast(`Failed to refresh the thread list: ${errorDetail(err)}`, 'error', {
+      key: THREAD_LIST_REFRESH_TOAST_KEY,
+    });
+  });
 }
 
 /** Guards against concurrent handleResume calls — iOS Safari PWA fires

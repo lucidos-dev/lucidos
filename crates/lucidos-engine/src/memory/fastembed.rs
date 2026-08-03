@@ -69,7 +69,11 @@ pub fn is_model_fetch_failure(err: &(dyn std::error::Error + Send + Sync)) -> bo
     false
 }
 
-fn resolve_model(
+/// Map a configured model id onto the fastembed variant and its vector width.
+/// `pub(crate)` because `model_download` resolves the same id to find the repo
+/// and file set it has to pre-fetch, and the two must never disagree about
+/// which model an id names.
+pub(crate) fn resolve_model(
     id: &str,
 ) -> Result<(EmbeddingModel, usize), Box<dyn std::error::Error + Send + Sync>> {
     match id {
@@ -83,8 +87,14 @@ fn resolve_model(
     }
 }
 
-/// Actionable wrapper for a `TextEmbedding::try_new` failure. `cause` is the
-/// flattened (`{e:#}`) original error chain.
+/// Actionable wrapper for a model-init failure: the `TextEmbedding::try_new`
+/// load, and the [`model_download`](super::model_download) fetch that now runs
+/// ahead of it. `cause` is the flattened (`{e:#}`) original error chain.
+///
+/// Shared by both so a cold-cache failure keeps naming the cache directory and
+/// the CA bundle whichever half of the load hit it. Splitting the download out
+/// of `with_model` would otherwise have quietly dropped that guidance from
+/// exactly the case it was written for.
 ///
 /// The guidance text deliberately contains NONE of the
 /// [`is_model_fetch_failure`] markers (say "the Hugging Face model hub", never
@@ -93,7 +103,10 @@ fn resolve_model(
 /// baked into `cause`, or every init failure — a corrupt cached model included
 /// — would classify as a fetch failure and boot degraded-with-retries instead
 /// of failing loudly. Pinned by `init_error_message_*` tests below.
-fn init_error_message(id: &str, cause: String) -> Box<dyn std::error::Error + Send + Sync> {
+pub(crate) fn init_error_message(
+    id: &str,
+    cause: String,
+) -> Box<dyn std::error::Error + Send + Sync> {
     let cache = std::env::var("FASTEMBED_CACHE_DIR")
         .unwrap_or_else(|_| ".fastembed_cache (relative to the workspace)".to_string());
     format!(

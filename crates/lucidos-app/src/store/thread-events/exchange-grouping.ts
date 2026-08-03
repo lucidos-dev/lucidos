@@ -1214,8 +1214,16 @@ export function handleEvent(
       }
     }
   } else {
-    if ('text' in event) {
-      thread.streamingBuffer += event.text;
+    if ('text' in event && typeof event.text === 'string') {
+      // `CumulativeTextUpdated` carries the FULL accumulated text for the turn,
+      // not a delta: the engine re-sends its whole `raw_buffer` on every flush
+      // (agentic_loop/run.rs). So this REPLACES. Appending double-renders
+      // whenever two flushes land before the paired persisted TextStreamed
+      // resets the buffer, which `should_flush` makes routine (a completed
+      // heading line and a following blank line are two flushes in a row).
+      // The `typeof` guard also keeps a payload with no text from appending the
+      // literal "undefined", which the previous `+=` did.
+      thread.streamingBuffer = event.text;
     }
     // Transient events (streaming text, tool calls) represent the thread's
     // own active work — update updatedAt so the drawer timestamp stays

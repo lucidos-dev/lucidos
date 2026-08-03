@@ -81,6 +81,45 @@ interface InFlightToggle {
 }
 const inFlight = new WeakMap<object, InFlightToggle>();
 
+/** `performance.now()` of the most recent `scrollTop` write made by the nudge. */
+let lastNudgeAt = -Infinity;
+
+/** How long after a nudge write its `scroll` event is still expected to arrive.
+ *  A `scrollTop` write does not dispatch `scroll` synchronously: the event is
+ *  queued and fired in the next frame's "run the scroll steps", BEFORE that
+ *  frame's rAF callbacks. So the window has to outlive the write by a frame,
+ *  which rules out clearing a flag in the restoring rAF. 64ms is ~4 frames at
+ *  60Hz, generous enough for a loaded main thread and far below the cadence of
+ *  a real finger scroll. */
+export const NUDGE_EVENT_WINDOW_MS = 64;
+
+/** Whether a `scroll` event arriving right now is likely the compositor-recovery
+ *  nudge below rather than the user.
+ *
+ *  The nudge writes ±1px and puts it back a frame later, so both writes fire a
+ *  real `scroll` event on the container. A consumer that turns scroll deltas into
+ *  visible motion has to skip them, or the element it drives jitters once per
+ *  nudge. On a streaming thread the nudge runs on a ~200ms throttle
+ *  (`ThreadView`'s `streamRepaintGate`), so that reads as a permanent shake while
+ *  the user is doing nothing at all. `useHideOnScroll` is the consumer this
+ *  exists for; `ContentPane` documents the same collision as the reason it fires
+ *  the repaint on resume only.
+ *
+ *  Deliberately a time window and not a counter: a counter would have to be
+ *  decremented a frame after the restore (see NUDGE_EVENT_WINDOW_MS) through
+ *  every supersede and teardown path, and a single leaked increment would pin the
+ *  header forever. A stale window costs at most one skipped scroll event. */
+export function isRepaintNudging(now: number = performance.now()): boolean {
+  return now - lastNudgeAt < NUDGE_EVENT_WINDOW_MS;
+}
+
+/** Every `scrollTop` write the nudge makes goes through here, so `lastNudgeAt`
+ *  cannot fall out of sync with the writes it is meant to describe. */
+function writeNudgedScrollTop(el: HTMLElement, top: number) {
+  lastNudgeAt = performance.now();
+  el.scrollTop = top;
+}
+
 /** Undo a toggle's OWN scroll nudge — restore to the value it nudged FROM, iff
  *  `scrollTop` is still the value it nudged TO. If anything else moved it
  *  meanwhile (useScrollMemory's saved-position restore on open, useAutoScroll's
@@ -90,7 +129,7 @@ function restoreNudge(el: HTMLElement, entry: InFlightToggle) {
   // `nudgedTop` is set only when raf1 actually nudged (nudgeScroll was true), so
   // this is implicitly a no-op for the non-scrollable / deep-link-claim cases.
   if (entry.nudgedTop !== undefined && el.scrollTop === entry.nudgedTop) {
-    el.scrollTop = entry.restoreTop!;
+    writeNudgedScrollTop(el, entry.restoreTop!);
   }
 }
 
@@ -176,7 +215,7 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
       const nudged = live > 0 ? live - 1 : live + 1;
       entry.restoreTop = live;
       entry.nudgedTop = nudged;
-      el.scrollTop = nudged;
+      writeNudgedScrollTop(el, nudged);
     }
     // Force a synchronous layout flush so the nudged state actually paints this
     // frame (the documented reliable repaint trigger) rather than being coalesced

@@ -15,11 +15,14 @@
 
 use std::sync::Arc;
 
+use crate::engine::event_bus::SystemEvent;
 use crate::engine::LucidosEngine;
 use crate::memory::fastembed::{is_model_fetch_failure, FastEmbedProvider};
+use crate::memory::model_download::{ensure_model_cached, DownloadFrame, ModelDownloadObserver};
 // Brings the `model_id()` trait method into scope so the loader can read the
 // slot's captured id (the slot also has a private `model_id` field).
 use crate::memory::provider::EmbeddingProvider;
+use crate::memory::EmbeddingModelLoadState;
 
 /// Backoff schedule between attempts AFTER the first (immediate) one; the last
 /// entry repeats forever. Starts quick (a router blip on first open should heal
@@ -47,6 +50,91 @@ fn delay_before_attempt(completed_attempts: u32) -> Option<std::time::Duration> 
         .copied()
         .unwrap_or(*RETRY_DELAYS_SECS.last().expect("non-empty schedule"));
     Some(std::time::Duration::from_secs(secs))
+}
+
+/// Broadcast the slot's CURRENT status to connected clients, without changing
+/// it. Used after [`EmbedderSlot::install`](crate::memory::EmbedderSlot::install),
+/// which sets `Ready` itself.
+fn broadcast_status(engine: &Arc<LucidosEngine>) {
+    let status = engine.embedder().status();
+    engine
+        .event_bus
+        .broadcast_transient_system(SystemEvent::EmbeddingModelStatusChanged {
+            model_id: status.model_id,
+            load_state: status.load_state,
+        });
+}
+
+/// Publish where the loader has got to: onto the slot (which the REST snapshot
+/// reads, for a client that arrives mid-download) and onto the bus as a
+/// transient frame (for clients already watching).
+///
+/// Both, in that order, so the snapshot is never staler than the last frame a
+/// client received.
+fn publish(engine: &Arc<LucidosEngine>, state: EmbeddingModelLoadState) {
+    engine.embedder().set_load_state(state);
+    broadcast_status(engine);
+}
+
+/// Whether a freshly-built provider's vector width disagrees with the live
+/// `memory_entries.embedding` column, returning the message to report if so.
+///
+/// Both accepted model ids are 384-dim today, so this cannot fire yet. It
+/// exists because nothing else checks: `VECTOR_DIM` only ever reaches a
+/// `CREATE TABLE IF NOT EXISTS`, so an existing workspace's column keeps its
+/// original width and a future model swap would install cleanly and then break
+/// every write. The message names both numbers, because which side is wrong is
+/// the whole question.
+///
+/// `None` when there is no memory index, or the table has not been created yet:
+/// no column means nothing to disagree with.
+async fn dimension_mismatch(
+    engine: &Arc<LucidosEngine>,
+    provider: &FastEmbedProvider,
+) -> Option<String> {
+    let index = engine.memory_index().clone()?;
+    let column = match index.embedding_column_dimensions().await {
+        Ok(dims) => dims?,
+        Err(e) => {
+            // Could not ask. Do NOT invent a mismatch: refusing to install over
+            // a transient DB hiccup would disable memory for the whole session.
+            log!(@Memory, "Could not read the embedding column width, skipping the dimension check: {}", e);
+            return None;
+        }
+    };
+    let model = provider.dimensions();
+    if model == column {
+        return None;
+    }
+    Some(format!(
+        "The embedding model '{}' produces {}-dimensional vectors, but this workspace's \
+         memory_entries.embedding column is vector({}). Memory is disabled rather than \
+         writing rows that cannot be stored. Either set LUCIDOS_EMBEDDING_MODEL back to a \
+         {}-dimensional model and restart, or migrate the column and rebuild memory.",
+        provider.model_id(),
+        model,
+        column,
+        column
+    ))
+}
+
+/// Turns `ensure_model_cached`'s byte frames into published `Downloading`
+/// states. The frames are already throttled and monotonic (see
+/// `memory::model_download`), so this adds no gating of its own.
+struct DownloadReporter {
+    engine: Arc<LucidosEngine>,
+}
+
+impl ModelDownloadObserver for DownloadReporter {
+    fn progressed(&self, frame: DownloadFrame) {
+        publish(
+            &self.engine,
+            EmbeddingModelLoadState::Downloading {
+                downloaded_bytes: frame.downloaded_bytes,
+                total_bytes: frame.total_bytes,
+            },
+        );
+    }
 }
 
 impl LucidosEngine {
@@ -79,11 +167,52 @@ impl LucidosEngine {
                     return;
                 }
                 attempt += 1;
+                // Each attempt starts by declaring itself, which is what takes
+                // the UI out of a previous attempt's `Waiting`.
+                publish(&engine, EmbeddingModelLoadState::Loading);
                 let id = model_id.clone();
-                match tokio::task::spawn_blocking(move || FastEmbedProvider::with_model(&id)).await
+                let reporter = DownloadReporter {
+                    engine: Arc::clone(&engine),
+                };
+                let load_engine = Arc::clone(&engine);
+                // Download and ONNX load share one blocking thread. Splitting
+                // the fetch out of `with_model` is what buys byte progress:
+                // fastembed offers no hook, so the files are pulled first (with
+                // one) and `with_model` then finds them local.
+                match tokio::task::spawn_blocking(move || {
+                    let downloaded = ensure_model_cached(&id, &reporter)?;
+                    if downloaded {
+                        // Bytes are in; the ONNX session build is what is left.
+                        publish(&load_engine, EmbeddingModelLoadState::Loading);
+                    }
+                    FastEmbedProvider::with_model(&id)
+                })
+                .await
                 {
                     Ok(Ok(provider)) => {
+                        // The model loads fine but may not FIT: an existing
+                        // workspace's vector column keeps the width it was
+                        // created with. Refuse before installing, or every
+                        // insert and every re-embed UPDATE fails on a
+                        // dimension mismatch with nothing said out loud.
+                        if let Some(message) = dimension_mismatch(&engine, &provider).await {
+                            log!(
+                                "[Memory] {}. Giving up; memory stays disabled until the model \
+                                 or the column changes",
+                                message
+                            );
+                            publish(
+                                &engine,
+                                EmbeddingModelLoadState::Failed {
+                                    message: message.clone(),
+                                },
+                            );
+                            notify(&engine, "Memory features are disabled", &message).await;
+                            return;
+                        }
+                        // `install` sets the slot to Ready; broadcast that.
                         engine.embedder().install(provider);
+                        broadcast_status(&engine);
                         log!(
                             "[Memory] Embedding model loaded (attempt #{}) — memory features active",
                             attempt
@@ -122,6 +251,7 @@ impl LucidosEngine {
                             attempt,
                             e
                         );
+                        publish(&engine, EmbeddingModelLoadState::Waiting { attempt });
                         if attempt == NOTIFY_AFTER_ATTEMPTS {
                             notify(
                                 &engine,
@@ -144,6 +274,12 @@ impl LucidosEngine {
                              giving up (fix the model cache / config and restart)",
                             e
                         );
+                        publish(
+                            &engine,
+                            EmbeddingModelLoadState::Failed {
+                                message: e.to_string(),
+                            },
+                        );
                         notify(
                             &engine,
                             "Memory features are disabled",
@@ -162,6 +298,9 @@ impl LucidosEngine {
                             "[Memory] Embedding model load task panicked: {} — retrying",
                             join_err
                         );
+                        // Say so, or the UI sits on the last download frame
+                        // this attempt happened to emit for the whole backoff.
+                        publish(&engine, EmbeddingModelLoadState::Waiting { attempt });
                     }
                 }
             }

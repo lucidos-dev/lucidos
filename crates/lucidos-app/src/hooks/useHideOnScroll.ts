@@ -3,6 +3,8 @@ import { mobileView, panelOverlay, preferences, type MobileView, type PanelOverl
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
 import { getResizeMode, pinToBottomNow, scrolledUp, isHeaderPinnedForScroll } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
+import { isRepaintNudging } from '../utils/iosRepaint';
+import { isUserScrolling } from '../utils/scrollActivity';
 import { currentMobileHeaderSticky } from '../store/actions/preferences';
 
 /** Pure rule for when hide-on-scroll should be inert and the header pinned visible.
@@ -60,6 +62,8 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
     let cachedSafeAreaTop = 0;
     let titleBarHeight = 0; // px, thread title bar height (0 when not on thread view)
     let titleBarEl: HTMLElement | null = null;
+    // The scroll-to-top chevron, the other `--mobile-header-offset` consumer.
+    let chevronEl: HTMLElement | null = null;
     let titleBarResizeObserver: ResizeObserver | null = null;
     let currentContainer: Element | null = null;
     let currentContainerPane: Element | null = null;
@@ -129,6 +133,48 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       }
     }
 
+    /** Bind the two elements that CONSUME `--mobile-header-offset`, so the
+     *  per-frame write can target them instead of `documentElement`.
+     *
+     *  Custom properties inherit, so setting one on the root invalidates style
+     *  for every node in the document. This var is rewritten on essentially
+     *  every scroll frame and the transcript is the largest tree in the app, so
+     *  that was a whole-document style recalc per frame: the jank that survived
+     *  moving the var off `top` onto `transform` (which had only removed the
+     *  LAYOUT half). Writing it on the consumers narrows invalidation to two
+     *  tiny subtrees. The CSS needs no change either way, since `var()` resolves
+     *  a custom property from the element's own computed value.
+     *
+     *  Deliberately NOT back to `documentElement` even though that would keep a
+     *  future third consumer working for free: a third consumer is exactly the
+     *  thing that should have to opt in here, rather than silently reinstating
+     *  the document-wide recalc.
+     *
+     *  Merging the two headers into one container would delete this var
+     *  outright, and is off the table: the title bar lives inside the scroll
+     *  container ON PURPOSE, so it swipes with the pane rather than sitting
+     *  frozen while the pane slides out from under it (`766f53acd`, and
+     *  `MobileThreadTitleBar`'s own doc comment). */
+    function bindOffsetConsumers(container: Element | null) {
+      const nextTitleBar = (container?.querySelector('.mobile-thread-title-row') ?? null) as HTMLElement | null;
+      // ScrollControls renders as a SIBLING of the scroll container, not inside
+      // it, so this reaches up one level. `:scope >` keeps it to THIS pane's
+      // chevron rather than the first one in document order.
+      const nextChevron = (container?.parentElement?.querySelector(':scope > .scroll-to-top') ?? null) as HTMLElement | null;
+      if (nextTitleBar === titleBarEl && nextChevron === chevronEl) return false;
+      // The outgoing elements keep their last value rather than being cleared.
+      // They are on their way out, and clearing would snap a still-visible title
+      // bar back to its resting position mid pane-swipe. `paneState` restores
+      // the real offset when the pane comes back.
+      bindTitleBar(nextTitleBar);
+      chevronEl = nextChevron;
+      // Force the next applyTransform to write. The freshly-bound elements carry
+      // no value (or a stale one), and the change-detection guard below would
+      // otherwise skip them because the OFFSET itself has not moved.
+      lastOffsetRem = NaN;
+      return true;
+    }
+
     function applyTransform() {
       if (headerRef.current) {
         // Disabled (app UI active) = always fully visible, regardless of scroll/keyboard
@@ -145,7 +191,9 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         const offsetRem = offset / cachedRemSize;
         if (offsetRem !== lastOffsetRem) {
           lastOffsetRem = offsetRem;
-          document.documentElement.style.setProperty('--mobile-header-offset', `${offsetRem}rem`);
+          const value = `${offsetRem}rem`;
+          titleBarEl?.style.setProperty('--mobile-header-offset', value);
+          chevronEl?.style.setProperty('--mobile-header-offset', value);
         }
       }
     }
@@ -193,6 +241,40 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       if (!header || cachedHeight === 0 || !currentContainer || disabled) return;
 
       recoverKeyboardState();
+
+      // The iOS compositor-recovery nudge (utils/iosRepaint.ts) writes ±1px to
+      // this exact container and puts it back a frame later. Both writes fire a
+      // real scroll event, and turning them into header deltas made the header
+      // twitch by a pixel once per nudge. On a streaming thread that nudge runs
+      // on a ~200ms throttle, so the header shook continuously while the user was
+      // doing nothing at all (reported on an iOS PWA, 2026-08-03).
+      //
+      // Neither leg is harmless. The nudge leg alone already moves the header for
+      // a frame, and at the clamp the pair does not even cancel: with the header
+      // fully visible the reveal leg clamps at 0 while the restore leg is free to
+      // hide, so the header settles a pixel low and then oscillates 0 to -1px on
+      // every nudge after that.
+      //
+      // Skip the event WITHOUT advancing prevScrollTop: the nudge returns to the
+      // value it came from, so the pre-nudge baseline stays correct and any real
+      // scroll racing the nudge is simply folded into the next event's delta.
+      // ContentPane's repaint call site has carried "do not reintroduce a
+      // navigation-triggered repaint here without first making scroll consumers
+      // ignore the repaint nudge" since that collision was first traced; this is
+      // the scroll consumer doing the ignoring.
+      //
+      // A live drag overrides the window, because the two gates are duals and
+      // must stay that way: forceIOSRepaint refuses to WRITE a nudge while
+      // isUserScrolling() (it would cancel iOS momentum), so a nudge can only
+      // exist when the user is still. Suppressing during a drag could therefore
+      // only ever eat the user's own events, and `lastNudgeAt` is module-global,
+      // so a repaint of a different pane must not be able to freeze this one's
+      // header. isUserScrolling() keys off `touchmove`, never `scroll`, so the
+      // nudge's own synthetic event cannot trip this bypass. The residual case is
+      // a drag beginning in the frame between a nudge and its restore, which
+      // costs the 1px twitch back for one frame, invisible against the finger's
+      // own motion and far cheaper than dropping real scroll deltas.
+      if (isRepaintNudging() && !isUserScrolling()) return;
 
       const rawScrollTop = currentContainer.scrollTop;
       const maxScroll = Math.max(0, currentContainer.scrollHeight - currentContainer.clientHeight);
@@ -248,7 +330,21 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // every MutationObserver callback, even when container is unchanged.
       recoverKeyboardState();
 
-      if (container === currentContainer) return;
+      // Also before the early return: the title bar and chevron can be REPLACED
+      // while the scroll container itself is reused (switching threads reuses
+      // .thread-content). Now that the offset is written on those two elements
+      // rather than inherited from the root, a missed rebind leaves the new
+      // element with no value at all, so the title bar would sit at its resting
+      // position while the header is scrolled away.
+      const rebound = bindOffsetConsumers(container);
+
+      if (container === currentContainer) {
+        // Nothing else changed, but freshly-bound elements need the current
+        // offset written to them now. The container-change path below reaches
+        // its own applyTransform after restoring this pane's saved offset.
+        if (rebound) applyTransform();
+        return;
+      }
 
       if (currentViewKey) {
         paneState[currentViewKey] = { headerOffset, prevScrollTop };
@@ -261,9 +357,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       currentContainer = container;
       currentContainerPane = container?.closest('.mobile-swipe-pane') ?? null;
       currentViewKey = view;
-      // Measure title bar height — only present on thread view. ResizeObserver
-      // keeps the CSS var fresh as the title wraps/unwraps.
-      bindTitleBar(container?.querySelector('.mobile-thread-title-row') as HTMLElement | null);
       refreshHeight();
       if (container) {
         // Restore this pane's saved scroll state, or derive from scroll position
@@ -491,8 +584,10 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         headerRef.current.style.transform = '';
       }
       document.documentElement.style.removeProperty('--mobile-header-height');
-      document.documentElement.style.removeProperty('--mobile-header-offset');
       document.documentElement.style.removeProperty('--mobile-thread-title-height');
+      // The offset lives on its two consumers, not the root (bindOffsetConsumers).
+      titleBarEl?.style.removeProperty('--mobile-header-offset');
+      chevronEl?.style.removeProperty('--mobile-header-offset');
     };
   }, []);
 }

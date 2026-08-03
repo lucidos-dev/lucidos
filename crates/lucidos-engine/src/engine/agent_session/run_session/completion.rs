@@ -2,8 +2,9 @@ use super::idle_snapshot::CodingAgentIdleSnapshot;
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
     classify_session_end_action, conflict_abort_deletes_temp_state,
-    conflict_resolution_cleanup_action, should_auto_commit_on_cleanup,
+    conflict_resolution_cleanup_action, discarded_worktree_removal, should_auto_commit_on_cleanup,
     ConflictResolutionCleanupAction, SafetyNetAction, SessionEndAction, TerminalKind,
+    WorktreeRemoval,
 };
 use crate::engine::agent_session::resume::change_description_fallback;
 use crate::engine::change_ops::branch_is_hardened;
@@ -15,9 +16,50 @@ use crate::engine::git_ops::{
 };
 use crate::engine::thread_events::EventChannel;
 use crate::engine::{LucidosEngine, ProcessResult, StopReason};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use uuid::Uuid;
+
+/// Remove the worktree of a session the user chose to **Discard**, and only
+/// then. Discard is the one session end that asks for the work to go away: the
+/// branch is deleted in the same breath, so the tree carries nothing the user
+/// still wants.
+///
+/// Every other session end leaves the worktree alone. Reclamation has exactly
+/// one owner, the background `WorktreeCleanup` worker, which decides on
+/// evidence it gathers when nothing is racing it (ADR 0035, and
+/// `docs/plans/2026-08-03-single-owner-worktree-reclamation.md`). A teardown is
+/// the worst possible place to make that call: it frequently runs *because*
+/// something just went wrong, so it is exactly when the engine's picture of the
+/// world is least reliable, and it can be unwinding concurrently with the
+/// safety net relaunching a session into the very tree it is deleting.
+///
+/// [`discarded_worktree_removal`] still holds the one guard worth keeping here:
+/// a worktree checked out on some other branch is not this session's to delete.
+async fn remove_discarded_worktree(
+    worktree: &Path,
+    repo_root: &Path,
+    session_branch: &str,
+    worktree_branch: Option<&str>,
+) {
+    match discarded_worktree_removal(worktree_branch, session_branch) {
+        WorktreeRemoval::Keep(reason) => {
+            log!(
+                "[AgentSession] Keeping worktree {}: {}",
+                worktree.display(),
+                reason
+            );
+        }
+        WorktreeRemoval::Remove => {
+            let wt_path_str = worktree.to_string_lossy();
+            if let Err(e) =
+                git_cmd(&["worktree", "remove", "--force", &wt_path_str], repo_root).await
+            {
+                log!("[AgentSession] {}", e);
+            }
+        }
+    }
+}
 
 impl LucidosEngine {
     /// Completion / teardown lifecycle stage of `run_direct_agent`, extracted
@@ -454,12 +496,9 @@ impl LucidosEngine {
                         )
                         .await;
                 }
-                let wt_path_str = wt.to_string_lossy();
-                if let Err(e) =
-                    git_cmd(&["worktree", "remove", "--force", &wt_path_str], &repo_root).await
-                {
-                    log!("[AgentSession] {}", e);
-                }
+                let discard_branch = worktree_current_branch(wt).await;
+                remove_discarded_worktree(wt, &repo_root, &branch_name, discard_branch.as_deref())
+                    .await;
                 log!("[AgentSession] Discarding changes (branch {})", branch_name);
                 if let Err(e) = git_cmd(&["branch", "-D", &branch_name], &repo_root).await {
                     log!(
@@ -500,13 +539,17 @@ impl LucidosEngine {
                     Vec::new()
                 };
 
-                // Remove the worktree directory (the branch stays)
-                let wt_path_str = wt.to_string_lossy();
-                if let Err(e) =
-                    git_cmd(&["worktree", "remove", "--force", &wt_path_str], &repo_root).await
-                {
-                    log!("[AgentSession] {}", e);
-                }
+                // The worktree deliberately STAYS. A session end that is not an
+                // explicit Discard reclaims nothing: `WorktreeCleanup` is the
+                // single owner of that decision (ADR 0035). This call site used
+                // to run `git worktree remove --force` here, unconditionally,
+                // and it destroyed two live worktrees on 2026-08-03: once by
+                // acting on a timed-out git probe, once by racing the safety
+                // net's auto-resume into the very tree it deleted. Note also
+                // that this path runs ONLY when a session ended abnormally, a
+                // clean idle exit having returned earlier in `run.rs`. So the
+                // disk it ever reclaimed was near zero, while its whole risk
+                // surface was the failure paths.
 
                 // A user cancel is a resumable turn boundary, not a terminator:
                 // keep the branch even with no commits so the next message can

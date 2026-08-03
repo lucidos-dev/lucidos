@@ -46,6 +46,14 @@ axum = { version = "0.7", features = ["macros", "multipart"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "fs", "set-header", "compression-gzip", "compression-br"] }
 fastembed = "4"
+# Direct dep ONLY so `memory/model_download.rs` can drive the embedding-model
+# download itself with a byte-progress callback (fastembed exposes no hook, just
+# an indicatif bar on stderr). It MUST resolve to the same version fastembed
+# does: the two share the on-disk cache layout, and a split would make fastembed
+# re-download everything we just fetched. Features mirror what fastembed's
+# default `online` feature turns on (`hf-hub/ureq` + `hf-hub/native-tls`), so the
+# feature union is unchanged.
+hf-hub = { version = "0.4", default-features = false, features = ["ureq", "native-tls"] }
 fs2 = "0.4"
 # usearch removed - using pgvector for vector search
 tokio-cron-scheduler = { version = "0.15", features = ["signal"] }

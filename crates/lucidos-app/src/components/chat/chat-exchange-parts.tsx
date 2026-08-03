@@ -398,7 +398,7 @@ function lastLinePreview(text: string, max = 120): string {
 }
 
 export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
-  const { className } = stepStatus(event.success);
+  const { label, icon, className } = stepStatus(event.outcome);
   const snap = event.contextCapture;
   const used = snap?.usage?.input_tokens ?? snap?.estimated_total_tokens ?? event.context_tokens;
   const window = snap?.context_window;
@@ -410,19 +410,24 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
   const thinkingTail = event.thinkingText ? lastLinePreview(event.thinkingText) : '';
   const detailText = event.detail || thinkingTail;
 
+  const isPending = event.outcome === 'pending';
+
   return (
     <button
       type="button"
       class={`inline-step ${className}`}
       data-role="inline-step"
+      /* A row the user can't read at a glance needs naming: a killed-mid-call
+         step is struck and muted, and the tooltip says what that means without
+         a trip through the detail modal. */
+      data-tooltip={event.outcome === 'unfinished' ? label : undefined}
       onClick={() => { stepDetailModal.value = event; }}
     >
-      {/* In-progress step: no leading icon — the shimmering description is the
-          "live" affordance (the step-icon is hidden via CSS for `.pending`). */}
-      <span class="step-icon">
-        {event.success === null ? null : event.success ? '✓' : '⚠'}
-      </span>
-      <span class={`step-description${event.success === null ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
+      {/* In-progress step: no leading icon (`stepStatus` returns an empty one),
+          because the shimmering description is the "live" affordance. The empty
+          slot itself is hidden via CSS for `.pending`. */}
+      <span class="step-icon">{icon || null}</span>
+      <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
       {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
       {hasContext && (
         <span class={`step-context${trimmed ? ' trimmed' : ''}`}>

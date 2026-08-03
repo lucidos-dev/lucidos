@@ -29,16 +29,17 @@ vi.hoisted(() => {
 
 import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
-import { fetchThreads } from '../../api/threads';
+import { fetchThreads, fetchThreadById } from '../../api/threads';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { archivingThreadIds, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts } from '../store';
+import { archivingThreadIds, bootstrappingThreadId, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts } from '../store';
 import { ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
-import { focusThread } from './threads';
+import { focusThread, focusThreadOrBootstrapResult } from './threads';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
   fetchThreads: vi.fn(),
+  fetchThreadById: vi.fn(),
   fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
   fetchThreadMessages: vi.fn(),
   saveThread: vi.fn().mockResolvedValue(undefined),
@@ -173,43 +174,73 @@ describe('ensureThreadInMap', () => {
 // ---------------------------------------------------------------------------
 
 describe('ensureThreadByIdInMap', () => {
+  function summary(overrides: Record<string, unknown> = {}) {
+    return {
+      thread_id: 'old-archived-1',
+      title: 'Old Archived Thread',
+      channel: 'chat',
+      initiator: 'user',
+      last_activity: '2026-01-01T00:00:00Z',
+      created_at: '2026-01-01T00:00:00Z',
+      message_count: 4,
+      section: 'archived',
+      active_children_count: 0,
+      total_children_count: 0,
+      status: 'idle',
+      coding_agent_proposed: false,
+      coding_agent_requires_restart: false,
+      coding_agent_is_external_repo: false,
+      coding_agent_applying: false,
+      last_revived_at: null,
+      ...overrides,
+    };
+  }
+
+  beforeEach(() => {
+    (fetchThreads as any).mockClear();
+    (fetchThreadById as any).mockReset();
+  });
+
   it('fetches metadata for a thread not in the map and adds it', async () => {
     threadsLoaded.value = true;
     threadMap.value = new Map();
 
-    (fetchThreads as any).mockResolvedValue({
-      saved: [],
-      archive: [],
-      active: [],
-      active_threads: [],
-      composing: [],
-      focused_thread: {
-        thread_id: 'old-archived-1',
-        title: 'Old Archived Thread',
-        channel: 'chat',
-        initiator: 'user',
-        last_activity: '2026-01-01T00:00:00Z',
-        created_at: '2026-01-01T00:00:00Z',
-        message_count: 4,
-        section: 'archived',
-        active_children_count: 0,
-        total_children_count: 0,
-        status: 'idle',
-        coding_agent_proposed: false,
-        coding_agent_requires_restart: false,
-        coding_agent_is_external_repo: false,
-        coding_agent_applying: false,
-        last_revived_at: null,
-      },
-    });
+    (fetchThreadById as any).mockResolvedValue(summary());
 
     const ok = await ensureThreadByIdInMap('old-archived-1');
     expect(ok).toBe(true);
-    expect(fetchThreads).toHaveBeenCalledWith('old-archived-1');
+    expect(fetchThreadById).toHaveBeenCalledWith('old-archived-1');
     const added = threadMap.value.get('old-archived-1');
     expect(added).toBeDefined();
     expect(added!.meta.title).toBe('Old Archived Thread');
     expect(added!.meta.channel).toBe('chat');
+  });
+
+  it('reads the by-id endpoint, NEVER the grouped thread list', async () => {
+    // The grouped GET /api/v1/threads assembles saved + recent archive + active
+    // + composing + the family base: p50 262ms of server time at ~5k threads,
+    // paid to learn about one row. It sat on the notification-tap critical path
+    // (a tap navigating to a thread outside the loaded window blocks here with
+    // nothing on screen) and duplicated the grouped fetch the same cold boot had
+    // already issued.
+    threadMap.value = new Map();
+    (fetchThreadById as any).mockResolvedValue(summary());
+
+    await ensureThreadByIdInMap('old-archived-1');
+
+    expect(fetchThreads).not.toHaveBeenCalled();
+  });
+
+  it('carries `saved` off the summary, so a saved thread does not land unsaved', async () => {
+    // The grouped endpoint conveys saved structurally (membership in its `saved`
+    // array); one bare summary cannot, so the flag rides on the row itself.
+    // Guessing false here would show a saved thread as unsaved in the drawer.
+    threadMap.value = new Map();
+    (fetchThreadById as any).mockResolvedValue(summary({ saved: true }));
+
+    await ensureThreadByIdInMap('old-archived-1');
+
+    expect(threadMap.value.get('old-archived-1')!.meta.saved).toBe(true);
   });
 
   it('returns true without fetching when the thread is already in the map', async () => {
@@ -218,19 +249,16 @@ describe('ensureThreadByIdInMap', () => {
       meta: { id: 'already-here', title: 'Already Here', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
     }));
     threadMap.value = map;
-    (fetchThreads as any).mockClear();
 
     const ok = await ensureThreadByIdInMap('already-here');
     expect(ok).toBe(true);
-    expect(fetchThreads).not.toHaveBeenCalled();
+    expect(fetchThreadById).not.toHaveBeenCalled();
   });
 
-  it('returns false when the API has no record of the thread', async () => {
+  it('returns false when the API has no record of the thread (404)', async () => {
     threadMap.value = new Map();
-    (fetchThreads as any).mockResolvedValue({
-      saved: [], archive: [], active: [], active_threads: [], composing: [],
-      // no focused_thread → API doesn't know this thread
-    });
+    // fetchThreadById maps the engine's 404 to null: a real "gone" verdict.
+    (fetchThreadById as any).mockResolvedValue(null);
 
     const ok = await ensureThreadByIdInMap('does-not-exist');
     expect(ok).toBe(false);
@@ -238,11 +266,146 @@ describe('ensureThreadByIdInMap', () => {
   });
 
   it('propagates fetch errors to the caller (no swallow)', async () => {
+    // "Could not ask" must stay distinct from "gone": landThreadHash retries a
+    // thrown failure (a peer engine lazy-starting behind the gateway routinely
+    // fails the first request) and must never retry a 404.
     threadMap.value = new Map();
-    const apiError = new Error('network down');
-    (fetchThreads as any).mockRejectedValue(apiError);
+    (fetchThreadById as any).mockRejectedValue(new Error('network down'));
 
     await expect(ensureThreadByIdInMap('any-id')).rejects.toThrow('network down');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// focusThreadOrBootstrapResult: the tap must be acknowledged before the
+// metadata lands. 80% of this workspace's notifications navigate to a thread,
+// and when the thread is outside the loaded window the old code awaited the
+// fetch with nothing on screen: no pane movement, no skeleton, no cursor. On a
+// cold push tap the map is always empty, so it happened on every single one.
+// ---------------------------------------------------------------------------
+
+describe('focusThreadOrBootstrapResult, optimistic focus while bootstrapping', () => {
+  function summary(id: string) {
+    return {
+      thread_id: id,
+      title: 'Bootstrapped',
+      channel: 'chat',
+      initiator: 'user',
+      last_activity: '2026-01-01T00:00:00Z',
+      created_at: '2026-01-01T00:00:00Z',
+      message_count: 1,
+      section: 'archived',
+      active_children_count: 0,
+      total_children_count: 0,
+      status: 'idle',
+      coding_agent_proposed: false,
+      coding_agent_requires_restart: false,
+      coding_agent_is_external_repo: false,
+      coding_agent_applying: false,
+      last_revived_at: null,
+    };
+  }
+
+  function deferred<T>(): { promise: Promise<T>; resolve: (v: T) => void; reject: (e: unknown) => void } {
+    let resolve!: (v: T) => void;
+    let reject!: (e: unknown) => void;
+    const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+    return { promise, resolve, reject };
+  }
+
+  beforeEach(() => {
+    threadsLoaded.value = true;
+    threadMap.value = new Map();
+    bootstrappingThreadId.value = null;
+    (fetchThreadById as any).mockReset();
+  });
+
+  it('focuses the target and flags the bootstrap BEFORE the metadata arrives', async () => {
+    const d = deferred<any>();
+    (fetchThreadById as any).mockReturnValue(d.promise);
+
+    const pending = focusThreadOrBootstrapResult('target');
+
+    // Both true on this tick, with the fetch still in flight. The focus is what
+    // moves the pane; the flag is what stops ThreadView's stale-pointer cleanup
+    // from immediately undoing it (the thread is legitimately not in the map).
+    expect(focusedThreadId.value).toBe('target');
+    expect(bootstrappingThreadId.value).toBe('target');
+
+    d.resolve(summary('target'));
+    await pending;
+  });
+
+  it('clears the bootstrap flag once the thread is really in the map', async () => {
+    (fetchThreadById as any).mockResolvedValue(summary('target'));
+
+    const outcome = await focusThreadOrBootstrapResult('target');
+
+    expect(outcome.kind).toBe('focused');
+    expect(focusedThreadId.value).toBe('target');
+    // Left set, it would exempt a genuinely stale pointer from cleanup later.
+    expect(bootstrappingThreadId.value).toBeNull();
+  });
+
+  it('restores the previous focus when the thread does not exist', async () => {
+    threadMap.value = new Map([['was-here', makeThreadState('was-here')]]);
+    focusedThreadId.value = 'was-here';
+    (fetchThreadById as any).mockResolvedValue(null);
+
+    const outcome = await focusThreadOrBootstrapResult('ghost');
+
+    expect(outcome.kind).toBe('not-found');
+    // Not left staring at a skeleton for a thread that will never arrive.
+    expect(focusedThreadId.value).toBe('was-here');
+    expect(bootstrappingThreadId.value).toBeNull();
+  });
+
+  it('restores the previous focus when the fetch fails', async () => {
+    threadMap.value = new Map([['was-here', makeThreadState('was-here')]]);
+    focusedThreadId.value = 'was-here';
+    (fetchThreadById as any).mockRejectedValue(new Error('network down'));
+
+    const outcome = await focusThreadOrBootstrapResult('unreachable');
+
+    expect(outcome.kind).toBe('failed');
+    expect(focusedThreadId.value).toBe('was-here');
+    expect(bootstrappingThreadId.value).toBeNull();
+  });
+
+  it('a superseded bootstrap does not yank focus off the newer one', async () => {
+    // The user taps a second notification while the first is still in flight.
+    const first = deferred<any>();
+    const second = deferred<any>();
+    (fetchThreadById as any)
+      .mockReturnValueOnce(first.promise)
+      .mockReturnValueOnce(second.promise);
+
+    const p1 = focusThreadOrBootstrapResult('first');
+    const p2 = focusThreadOrBootstrapResult('second');
+    expect(bootstrappingThreadId.value).toBe('second');
+
+    // The FIRST one now fails. It must not restore its own `previousFocus`,
+    // which would drag the user off the thread they actually asked for last.
+    first.reject(new Error('too late'));
+    await p1;
+
+    expect(focusedThreadId.value).toBe('second');
+    expect(bootstrappingThreadId.value).toBe('second');
+
+    second.resolve(summary('second'));
+    await p2;
+    expect(focusedThreadId.value).toBe('second');
+    expect(bootstrappingThreadId.value).toBeNull();
+  });
+
+  it('a thread already in the map focuses synchronously and never flags a bootstrap', () => {
+    threadMap.value = new Map([['warm', makeThreadState('warm')]]);
+
+    void focusThreadOrBootstrapResult('warm');
+
+    expect(focusedThreadId.value).toBe('warm');
+    expect(bootstrappingThreadId.value).toBeNull();
+    expect(fetchThreadById).not.toHaveBeenCalled();
   });
 });
 

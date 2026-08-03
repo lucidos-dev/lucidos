@@ -52,7 +52,11 @@ pub fn inject_base_href(html: &str, prefix: &str) -> String {
     if prefix == "/" {
         return html.to_string();
     }
-    insert_into_head(html, &format!("<base href=\"{prefix}\">"))
+    // `prefix` comes from the request's `X-Forwarded-Prefix`, so it must be
+    // attribute-escaped exactly like `inject_workspace_id` escapes its value.
+    // Unescaped, a direct hit on the engine port with a crafted header breaks
+    // out of the attribute and injects markup into <head>.
+    insert_into_head(html, &format!("<base href=\"{}\">", escape_attr(prefix)))
 }
 
 /// The workspace gateway's external port, from `LUCIDOS_GATEWAY_PORT` — set by
@@ -252,6 +256,20 @@ mod tests {
             "{out}"
         );
         assert!(!out.contains("<script>"), "{out}");
+    }
+
+    /// The prefix lands in a double-quoted attribute and comes straight from the
+    /// request's `X-Forwarded-Prefix`. The gateway strips a client-supplied one,
+    /// but the engine port can be reached directly on a tailnet bind, so the
+    /// value must not break out of the attribute.
+    #[test]
+    fn inject_base_href_escapes_the_prefix() {
+        let out = inject_base_href(
+            "<html><head></head></html>",
+            "/a\"><script>alert(1)</script><b c=\"",
+        );
+        assert!(!out.contains("<script>"), "{out}");
+        assert!(out.contains("&quot;&gt;&lt;script&gt;"), "{out}");
     }
 
     /// A direct-port document is the whole point of the pair: it gets NO base

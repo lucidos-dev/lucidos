@@ -49,7 +49,7 @@ mod image_pin_tests {
     }
 
     /// Pinned images are exempt from trim pass 0 by construction, and the model
-    /// can issue up to `MAX_ITERATIONS` (500) image reads in one turn — a
+    /// can issue as many image reads in one turn as its tool-call cap allows. A
     /// "describe every photo in this folder" turn would otherwise accumulate
     /// hundreds of un-strippable images and blow the context window. The cap
     /// releases the oldest pin, keeping the most recent window.

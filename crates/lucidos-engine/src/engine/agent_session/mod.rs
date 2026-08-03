@@ -4,7 +4,7 @@ pub(crate) mod coding_agent_kind;
 mod external_edits;
 pub(crate) mod external_watchdog;
 mod io_helpers;
-mod lifecycle;
+pub(crate) mod lifecycle;
 mod node_modules_setup;
 mod parsing;
 mod prompts;

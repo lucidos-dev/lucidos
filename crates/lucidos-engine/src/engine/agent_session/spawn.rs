@@ -1,4 +1,4 @@
-use crate::engine::git_ops::git_cmd;
+use crate::engine::git_ops::{git_answer, GitAnswer};
 use crate::engine::LucidosEngine;
 use crate::runtime::{CodingAgent, RunningAgent, SpawnArgs};
 use std::path::Path;
@@ -68,24 +68,50 @@ pub(super) async fn resolve_branch_for_resume(
             resume_session_id: None,
         };
     };
-    let exists = git_cmd(&["rev-parse", "--verify", rb], repo_root)
-        .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if exists {
+    let answer = git_answer(&["rev-parse", "--verify", rb], repo_root).await;
+    decide_branch_resolution(answer, rb, resume_session_id)
+}
+
+/// Pure half of [`resolve_branch_for_resume`]: given git's answer about the
+/// recorded branch, decide whether to reuse it or start over.
+///
+/// `Unknown` (git timed out or could not run) reuses the branch and keeps the
+/// session id, because the two directions fail very differently. Reusing a
+/// branch that turns out to be gone fails LOUDLY and recoverably: the following
+/// `git worktree add` errors, the spawn surfaces "resend the message to retry",
+/// and nothing is destroyed. Starting fresh when the branch was there all along
+/// silently severs the thread from its work: the session id is dropped (so
+/// conversation continuity is lost), and the spawn then treats the thread's live
+/// worktree as a stale artifact of somebody else's branch, which is exactly the
+/// route that emptied a worktree on 2026-08-03 while the host was saturated and
+/// every `rev-parse` was timing out.
+pub(super) fn decide_branch_resolution(
+    branch_exists: GitAnswer,
+    resume_branch: &str,
+    resume_session_id: Option<String>,
+) -> BranchResolution {
+    if branch_exists.is_unknown() {
         log!(
-            "[AgentSession] Reusing existing branch {} for resumed session",
-            rb
+            "[AgentSession] Could not verify resume branch {} (git gave no answer). Reusing it rather than starting fresh, since dropping a branch that exists loses the session",
+            resume_branch
         );
+    }
+    if branch_exists.or_unknown(true) {
+        if !branch_exists.is_unknown() {
+            log!(
+                "[AgentSession] Reusing existing branch {} for resumed session",
+                resume_branch
+            );
+        }
         BranchResolution {
-            branch_name: rb.to_string(),
+            branch_name: resume_branch.to_string(),
             reusing_branch: true,
             resume_session_id,
         }
     } else {
         log!(
-            "[AgentSession] Resume branch {} no longer exists — creating fresh branch (dropping stale session id)",
-            rb
+            "[AgentSession] Resume branch {} no longer exists, creating fresh branch (dropping stale session id)",
+            resume_branch
         );
         BranchResolution {
             branch_name: generate_cc_branch_name(),
@@ -98,6 +124,7 @@ pub(super) async fn resolve_branch_for_resume(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::git_ops::git_cmd;
 
     async fn make_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -153,6 +180,45 @@ mod tests {
         assert!(resolution.reusing_branch);
         assert_eq!(resolution.branch_name, "claude-code/active-session");
         assert_eq!(resolution.resume_session_id, Some("good-sid".into()));
+    }
+
+    /// The 2026-08-03 regression. Under e2e load every `rev-parse` was blowing
+    /// the 30s ceiling, the old `.unwrap_or(false)` read that as "branch gone",
+    /// and the fresh-branch path that follows is what let the spawn treat a live
+    /// worktree as somebody else's leftover and remove it. An unanswered probe
+    /// must leave both the branch and the session id alone.
+    #[test]
+    fn unverifiable_resume_branch_is_reused_not_replaced() {
+        let resolution = decide_branch_resolution(
+            GitAnswer::Unknown,
+            "claude-code/live-session",
+            Some("good-sid".into()),
+        );
+        assert!(
+            resolution.reusing_branch,
+            "an unanswered rev-parse must not be read as a deleted branch"
+        );
+        assert_eq!(resolution.branch_name, "claude-code/live-session");
+        assert_eq!(
+            resolution.resume_session_id,
+            Some("good-sid".into()),
+            "keeping the branch is pointless if the session id is dropped with it"
+        );
+    }
+
+    /// A real answer still decides, in both directions.
+    #[test]
+    fn answered_probes_still_decide_branch_reuse() {
+        let reused =
+            decide_branch_resolution(GitAnswer::Yes, "claude-code/there", Some("sid".into()));
+        assert!(reused.reusing_branch);
+        assert_eq!(reused.resume_session_id, Some("sid".into()));
+
+        let fresh =
+            decide_branch_resolution(GitAnswer::No, "claude-code/pruned", Some("sid".into()));
+        assert!(!fresh.reusing_branch);
+        assert_ne!(fresh.branch_name, "claude-code/pruned");
+        assert_eq!(fresh.resume_session_id, None);
     }
 
     #[tokio::test]

@@ -21,7 +21,7 @@ vi.mock('../components/chat/scrollState', () => ({ hasPendingEventScroll: () => 
 let userScrolling = false;
 vi.mock('./scrollActivity', () => ({ isUserScrolling: () => userScrolling }));
 
-import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS } from './iosRepaint';
+import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle, OPEN_REPAINT_BURST_DELAYS_MS, isRepaintNudging, NUDGE_EVENT_WINDOW_MS } from './iosRepaint';
 
 describe('OPEN_REPAINT_BURST_DELAYS_MS', () => {
   it('starts with an immediate (0ms) attempt', () => {
@@ -497,6 +497,73 @@ describe('forceIOSRepaint', () => {
     userScrolling = false; // momentum ends before the restore frame
     flushFrame(); // frame 2: restore is a no-op (decision was OFF) — untouched
     expect(el.scrollTop).toBe(500);
+  });
+});
+
+describe('isRepaintNudging', () => {
+  // `lastNudgeAt` is module state that outlives a test, and the window is a
+  // recency check against the real clock, so a bare `isRepaintNudging()` could
+  // read a nudge left behind by an earlier test. Ask the order-independent
+  // question instead: evaluating the window at `since + NUDGE_EVENT_WINDOW_MS`
+  // is true exactly when a nudge write landed at or after `since`.
+  function nudgedSince(since: number): boolean {
+    return isRepaintNudging(since + NUDGE_EVENT_WINDOW_MS);
+  }
+
+  it('reports nudging from the nudge write until after the restore', () => {
+    // The header hook skips scroll events inside this window. It has to stay open
+    // across BOTH legs: the -1px write in frame 1 and the +1px restore in frame 2
+    // each dispatch their own scroll event a frame later, and letting either
+    // through moves the header (the iOS PWA "header shakes at rest" report).
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const t0 = performance.now();
+    forceIOSRepaint(el);
+
+    // Scheduling alone writes nothing, so nothing to hide from the hook yet.
+    expect(nudgedSince(t0)).toBe(false);
+
+    flushFrame(); // frame 1: the -1px nudge
+    expect(el.scrollTop).toBe(499);
+    const afterNudge = performance.now();
+    expect(nudgedSince(t0)).toBe(true);
+
+    flushFrame(); // frame 2: the restore, itself a scrollTop write
+    expect(el.scrollTop).toBe(500);
+    expect(nudgedSince(afterNudge)).toBe(true);
+  });
+
+  it('closes the window once it has elapsed, so a real scroll is never swallowed', () => {
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    forceIOSRepaint(el);
+    flushFrame();
+    const atNudge = performance.now();
+    // A finger scroll one window later must reach the header untouched.
+    expect(isRepaintNudging(atNudge + NUDGE_EVENT_WINDOW_MS)).toBe(false);
+  });
+
+  it('stays closed for the transform-only repaint (no scrollTop write)', () => {
+    // A non-scrollable element takes the transform + forced-layout path and never
+    // touches scrollTop, so there is no synthetic scroll event to hide. Reporting
+    // a nudge here would blind the header to real scrolls for no reason.
+    const el = fakeEl();
+    const t0 = performance.now();
+    forceIOSRepaint(el);
+    flushFrame();
+    flushFrame();
+    expect(nudgedSince(t0)).toBe(false);
+  });
+
+  it('stays closed when the nudge is skipped for an in-flight user scroll', () => {
+    // Same reason, the other skip gate: nothing was written, so nothing to hide.
+    // This is the case where swallowing events would be worst, because the user
+    // is actively scrolling and every event is theirs.
+    userScrolling = true;
+    const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
+    const t0 = performance.now();
+    forceIOSRepaint(el);
+    flushFrame();
+    flushFrame();
+    expect(nudgedSince(t0)).toBe(false);
   });
 });
 

@@ -167,7 +167,14 @@ export async function throwIfNotOk(res: Response): Promise<void> {
  *  GET reads are held by `awaitEngineReady` while the engine is mid-restart so
  *  they don't paint spurious "Failed to load…" errors on the page behind the
  *  restart overlay; mutations (which never reach here — they go through
- *  `mutatingFetch`) and the health probe are exempt. */
+ *  `mutatingFetch`) and the health probe are exempt.
+ *
+ *  The signal composition + `TimeoutError` re-stamp below are mirrored by
+ *  `restampDeadline` in `packages/lucidos-sdk/src/_fetch.ts`, which covers every
+ *  call routed through the SDK (preference writes among them). Two copies on
+ *  purpose: the SDK bundles standalone for app iframes and cannot import from
+ *  the host, and only this half gates on `awaitEngineReady`. Change one, change
+ *  the other. */
 async function fetchWithDefaults(url: string, init: RequestInit | undefined, timeoutMs: number): Promise<Response> {
   const method = (init?.method ?? 'GET').toUpperCase();
   if (method === 'GET' && !isHealthProbe(url)) await awaitEngineReady();

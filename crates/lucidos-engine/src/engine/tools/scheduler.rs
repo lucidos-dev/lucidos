@@ -1,5 +1,6 @@
 use super::super::LucidosEngine;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
+use crate::engine::trigger_writes::TriggerWrite;
 use crate::llm::tool_names as tn;
 use crate::triggers::{EventSubscription, TriggerRun};
 use std::str::FromStr;
@@ -199,13 +200,13 @@ impl LucidosEngine {
                     event_payload["group_id"] = serde_json::json!(gid);
                 }
 
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::TriggerCreated {
-                        trigger_id: trigger_id_str.clone(),
-                        payload: event_payload,
-                        actor: None,
-                    }))
-                    .await?;
+                self.emit_trigger_write(
+                    TriggerWrite::Created,
+                    &trigger_id_str,
+                    event_payload,
+                    None,
+                )
+                .await?;
 
                 let trigger_desc = trigger_description(&cron_display, &subscriptions);
                 let run_desc = match &run {
@@ -423,12 +424,7 @@ impl LucidosEngine {
                     );
                 }
 
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::TriggerUpdated {
-                        trigger_id: trigger_id.clone(),
-                        payload: update_payload,
-                        actor: None,
-                    }))
+                self.emit_trigger_write(TriggerWrite::Updated, &trigger_id, update_payload, None)
                     .await?;
 
                 let display_name = new_name.unwrap_or(&existing.name);
@@ -461,18 +457,17 @@ impl LucidosEngine {
                 let self_deleting =
                     crate::scheduler::user_tasks::is_self_deleting_trigger(&trigger_id);
 
-                // Emit via EventBus
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::TriggerDeleted {
-                        trigger_id: trigger_id.clone(),
-                        payload: serde_json::json!({
-                            "trigger_id": trigger_id,
-                            "name": existing.name,
-                            "self_deleting": self_deleting,
-                        }),
-                        actor: None,
-                    }))
-                    .await?;
+                self.emit_trigger_write(
+                    TriggerWrite::Deleted,
+                    &trigger_id,
+                    serde_json::json!({
+                        "trigger_id": trigger_id,
+                        "name": existing.name,
+                        "self_deleting": self_deleting,
+                    }),
+                    None,
+                )
+                .await?;
 
                 Ok(format!(
                     "[ACTION COMPLETED] Deleted trigger '{}' (ID: {}).",
@@ -502,12 +497,11 @@ impl LucidosEngine {
                     return Ok(format!("Trigger '{}' is {}.", existing.name, state));
                 }
                 let payload = serde_json::json!({ "trigger_id": &trigger_id, "paused": paused });
-                self.event_bus
-                    .emit(BusEvent::System(SystemEvent::TriggerUpdated {
-                        trigger_id: trigger_id.clone(),
-                        payload,
-                        actor: None,
-                    }))
+                // Through the chokepoint so the registry is already paused when
+                // the next tool call in this same turn reads it. `pause_trigger`
+                // followed by `run_trigger` is the agent-side twin of the HTTP
+                // race, and it would otherwise fire the trigger it just paused.
+                self.emit_trigger_write(TriggerWrite::Updated, &trigger_id, payload, None)
                     .await?;
                 let action = if paused { "Paused" } else { "Resumed" };
                 Ok(format!(

@@ -1175,8 +1175,30 @@
     flex-shrink: 0;
 }
 
-/* Building-a-new-version badge: a spinning refresh glyph in place of the "!".
-   Inherits the badge's white-on-accent color via currentColor. */
+/* Background-activity badge: a spinning refresh glyph in place of the "!",
+   rendered as a real <button> because tapping it opens the status toast naming
+   what is running. Strip the UA button chrome so it stays visually identical to
+   the non-interactive "!" span, and widen the touch target past the ~0.875rem
+   glyph without moving it (the badge is a flex sibling of the title, so padding
+   would shift the layout). */
+.brand-badge-action {
+    -webkit-appearance: none;
+    appearance: none;
+    border: 0;
+    font: inherit;
+    color: inherit;
+    cursor: pointer;
+}
+
+.brand-badge-action::after {
+    content: '';
+    position: absolute;
+    /* ~2.75rem square around a 0.875rem badge, centred, so a finger lands on it
+       without the glyph growing. */
+    inset: -0.9375rem;
+}
+
+/* Inherits the badge's white-on-accent color via currentColor. */
 .brand-badge-spinner {
     display: inline-flex;
     animation: spin 1s linear infinite;

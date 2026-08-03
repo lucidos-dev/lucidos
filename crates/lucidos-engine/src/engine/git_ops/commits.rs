@@ -323,11 +323,13 @@ pub(crate) async fn proposal_files_for_branch(
 }
 
 /// Auto-commit uncommitted changes in a worktree with a generic message.
+///
+/// `or_unknown(true)`: when git cannot say whether there is anything to commit,
+/// try anyway. A commit attempt against a clean tree is a no-op that git
+/// refuses harmlessly, whereas skipping it leaves the user's edits uncommitted
+/// on the strength of a question that was never answered.
 pub(crate) async fn auto_commit_worktree(worktree_path: &Path, message: &str) {
-    let has_changes = git_cmd(&["status", "--porcelain"], worktree_path)
-        .await
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+    let has_changes = worktree_dirtiness(worktree_path).await.or_unknown(true);
     if has_changes {
         let _ = git_cmd(&["add", "-A"], worktree_path).await;
         let _ = git_cmd(&["commit", "-m", message], worktree_path).await;
@@ -403,7 +405,10 @@ pub(crate) async fn git_commit_no_edit(worktree_path: &Path) -> Result<(), Strin
 /// BEFORE committing and re-stamps it afterward with the new HEAD SHA.
 ///
 /// Short-circuits: if the worktree has no uncommitted files, no marker check
-/// is needed (HEAD won't move).
+/// is needed (HEAD won't move). `or_unknown(true)`, so an unanswerable
+/// `git status` takes the commit path rather than the short-circuit: against a
+/// clean tree the commit is a harmless no-op and the marker is re-stamped with
+/// the unchanged HEAD, while skipping would leave real edits uncommitted.
 pub(crate) async fn auto_commit_preserving_marker(
     pool: &sqlx::PgPool,
     worktree_path: &Path,
@@ -411,10 +416,7 @@ pub(crate) async fn auto_commit_preserving_marker(
     branch_name: &str,
     message: &str,
 ) {
-    let has_changes = git_cmd(&["status", "--porcelain"], worktree_path)
-        .await
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+    let has_changes = worktree_dirtiness(worktree_path).await.or_unknown(true);
     if !has_changes {
         return;
     }
@@ -461,6 +463,11 @@ pub(crate) enum NoCommitsRecovery {
 /// Read-only — unlike [`recover_no_commits_branch`] it never auto-commits the
 /// worktree, so `apply_now`'s already-merged check can call it without risking a
 /// commit that a subsequent failure-path `reset --hard` would destroy.
+///
+/// `or_unknown(false)`: a `true` here concludes the work is already on main and
+/// resolves the change as a no-op, which is the direction that silently drops
+/// it. An unanswered probe therefore reads as "not applied", and the caller
+/// surfaces a loud recovery error the user can retry.
 pub(crate) async fn main_history_touches_files(repo_root: &Path, change_files: &[String]) -> bool {
     if change_files.is_empty() {
         return false;
@@ -475,10 +482,9 @@ pub(crate) async fn main_history_touches_files(repo_root: &Path, change_files: &
     ];
     args.extend(change_files.iter().cloned());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    git_cmd(&arg_refs, repo_root)
+    git_answer_with(&arg_refs, repo_root, |o| !o.stdout.is_empty())
         .await
-        .map(|o| o.status.success() && !o.stdout.is_empty())
-        .unwrap_or(false)
+        .or_unknown(false)
 }
 
 /// When `has_branch_commits` returned false, decide what to do about it.

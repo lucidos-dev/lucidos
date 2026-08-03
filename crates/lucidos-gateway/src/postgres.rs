@@ -108,6 +108,71 @@ fn validate_embedded_pg_dirs(bin: &Path, lib: &Path) -> Result<(), BoxError> {
     Ok(())
 }
 
+/// Whether a provisioning failure can plausibly clear on its own.
+///
+/// The gateway supervisor reads this to decide between retrying the workspace
+/// and latching it as dead. Getting it wrong in the `Terminal` direction is the
+/// expensive mistake: it makes a workspace permanently unopenable for the
+/// lifetime of the gateway process, which is why [`ProvisionError`]'s
+/// `From<BoxError>` conversion defaults every unclassified failure to
+/// `Transient`. Retrying is bounded and backed off, so a wrong `Transient`
+/// costs a couple of minutes and then says the same thing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ProvisionErrorKind {
+    /// An environment condition that can clear with nobody doing anything: the
+    /// Docker daemon still starting (the 2026-08-03 login race), a cluster that
+    /// has not finished coming up, an image pull failing on a flaky network.
+    Transient,
+    /// A condition no retry can change: an invalid workspace id, a `docker`
+    /// command that is not installed, a mis-staged bundled Postgres tree.
+    Terminal,
+}
+
+/// A provisioning failure plus the verdict on whether retrying it is worth
+/// anything. `message` is user-facing: it reaches the boot splash and the
+/// picker's health-dot tooltip, not just the log.
+#[derive(Debug)]
+pub struct ProvisionError {
+    pub kind: ProvisionErrorKind,
+    pub message: String,
+}
+
+impl ProvisionError {
+    /// A failure worth retrying (see [`ProvisionErrorKind::Transient`]).
+    pub fn transient(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProvisionErrorKind::Transient,
+            message: message.into(),
+        }
+    }
+
+    /// A failure retrying cannot fix (see [`ProvisionErrorKind::Terminal`]).
+    pub fn terminal(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProvisionErrorKind::Terminal,
+            message: message.into(),
+        }
+    }
+}
+
+impl std::fmt::Display for ProvisionError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProvisionError {}
+
+/// Every unclassified provisioning failure is [`ProvisionErrorKind::Transient`].
+/// This is what makes the classification safe to add incrementally: a `?` on any
+/// helper that has not been classified yet gets the retryable verdict, and only
+/// the provably-hopeless sites opt into `Terminal`.
+impl From<BoxError> for ProvisionError {
+    fn from(e: BoxError) -> Self {
+        Self::transient(e.to_string())
+    }
+}
+
 /// A handle to a provisioned workspace database, used on workspace delete.
 #[derive(Clone, Debug)]
 pub enum PgHandle {
@@ -165,13 +230,18 @@ pub struct Provisioned {
 /// the gateway dumps it into the shared database and then starts the engine on
 /// the shared URL. If the shared database already exists, the legacy URL is not
 /// consulted, so an explicit later decommission is safe.
+///
+/// Failures carry a [`ProvisionErrorKind`] so the caller can tell an environment
+/// condition that will clear (Docker still starting) from one that never will
+/// (an invalid workspace id). See ADR 0014, 2026-08-03 addendum.
 pub async fn ensure(
     backend: &PgBackend,
     ws_id: &str,
     app_data: &Path,
     legacy_url: Option<&str>,
-) -> Result<Provisioned, BoxError> {
-    let database = database_name(ws_id)?;
+) -> Result<Provisioned, ProvisionError> {
+    // A malformed workspace id cannot become valid by waiting.
+    let database = database_name(ws_id).map_err(|e| ProvisionError::terminal(e.to_string()))?;
     match backend {
         PgBackend::Docker => ensure_docker(&database, legacy_url).await,
         PgBackend::Embedded { bin, lib } => {
@@ -213,7 +283,10 @@ pub fn database_name(ws_id: &str) -> Result<String, BoxError> {
 
 // ── Docker backend (dev) ────────────────────────────────────────────────────
 
-async fn ensure_docker(database: &str, legacy_url: Option<&str>) -> Result<Provisioned, BoxError> {
+async fn ensure_docker(
+    database: &str,
+    legacy_url: Option<&str>,
+) -> Result<Provisioned, ProvisionError> {
     let container = docker_container_name();
     let host_port = ensure_docker_cluster(&container).await?;
     let url = docker_database_url(host_port, database);
@@ -266,7 +339,75 @@ fn docker_container_name() -> String {
         .unwrap_or_else(|| SHARED_DOCKER_CONTAINER.to_string())
 }
 
-async fn ensure_docker_cluster(container: &str) -> Result<u16, BoxError> {
+/// Whether the Docker daemon is answering right now.
+#[derive(Debug, PartialEq, Eq)]
+enum DaemonState {
+    /// The daemon answered the probe.
+    Ready,
+    /// The CLI ran but could not reach the daemon: Docker Desktop still
+    /// starting, the socket absent, the daemon stopped. Carries the CLI's own
+    /// stderr for the log (never for classification).
+    Unreachable(String),
+    /// The `docker` executable is not on this process's PATH.
+    CliMissing,
+}
+
+/// The Docker daemon's user-facing state when it is not up yet. A boot-splash
+/// sentence, not a CLI error: the stderr goes to the gateway log.
+const DOCKER_NOT_RUNNING: &str = "The Docker daemon is not running yet.";
+/// No `docker` on PATH. Waiting cannot fix this one, so it latches.
+const DOCKER_CLI_MISSING: &str =
+    "Docker is not installed, or the docker command is not on the PATH this gateway was \
+     launched with.";
+
+/// Ask the Docker CLI whether the daemon answers.
+///
+/// The probe exists because `docker inspect` exits **1 for both** "no such
+/// container" and "the daemon is unreachable", so [`docker_container_state`]
+/// read a daemon that had not started as `ContainerState::Absent` and went on to
+/// `docker run`. That is how the 2026-08-03 login race surfaced as `docker run
+/// failed: failed to connect to the docker API at unix:///…`. Running this first
+/// makes `Absent` mean what it says.
+///
+/// `docker version --format {{.Server.Version}}` is the probe because its
+/// **exit status** answers the question: the server half of `docker version` can
+/// only be filled in by a daemon that responded. Classification therefore never
+/// reads an error message, which would break the moment Docker rewords one.
+fn docker_daemon_state() -> DaemonState {
+    classify_daemon_probe(
+        Command::new("docker")
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .output(),
+    )
+}
+
+/// The pure half of [`docker_daemon_state`]: exit status and spawn-error kind in,
+/// verdict out. Split so the classification is unit-tested without a daemon.
+fn classify_daemon_probe(probe: std::io::Result<std::process::Output>) -> DaemonState {
+    match probe {
+        Ok(out) if out.status.success() => DaemonState::Ready,
+        Ok(out) => {
+            DaemonState::Unreachable(String::from_utf8_lossy(&out.stderr).trim().to_string())
+        }
+        // The binary itself is missing, which is a different problem from a
+        // daemon that has not started, and is not one that fixes itself.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DaemonState::CliMissing,
+        Err(e) => DaemonState::Unreachable(e.to_string()),
+    }
+}
+
+async fn ensure_docker_cluster(container: &str) -> Result<u16, ProvisionError> {
+    // Establish that the daemon is up BEFORE interpreting any container state:
+    // every `docker` call below reads a down daemon as some other failure.
+    match docker_daemon_state() {
+        DaemonState::Ready => {}
+        DaemonState::Unreachable(detail) => {
+            crate::log!("[Gateway] Docker daemon not reachable yet: {}", detail);
+            return Err(ProvisionError::transient(DOCKER_NOT_RUNNING));
+        }
+        DaemonState::CliMissing => return Err(ProvisionError::terminal(DOCKER_CLI_MISSING)),
+    }
+
     let host_port = match docker_container_state(container)? {
         ContainerState::Running => docker_published_port(container)?,
         ContainerState::Stopped => {
@@ -436,7 +577,7 @@ async fn ensure_embedded(
     app_data: &Path,
     database: &str,
     legacy_url: Option<&str>,
-) -> Result<Provisioned, BoxError> {
+) -> Result<Provisioned, ProvisionError> {
     let data = app_data.join("pgdata");
     let port = ensure_embedded_cluster(bin, lib, &data).await?;
     let url = embedded_database_url(port, database);
@@ -482,7 +623,11 @@ async fn teardown_embedded_workspace(
     if !data.join("PG_VERSION").exists() {
         return Ok(());
     }
-    let port = ensure_embedded_cluster(bin, lib, &data).await?;
+    // Delete is best-effort and has no supervisor to retry it, so the
+    // provisioning verdict is not useful here: flatten back to a plain error.
+    let port = ensure_embedded_cluster(bin, lib, &data)
+        .await
+        .map_err(|e| -> BoxError { Box::new(e) })?;
     drop_database_embedded(bin, lib, port, database)
 }
 
@@ -505,7 +650,11 @@ async fn teardown_embedded_workspace(
 /// Teardown only ever targets THIS data dir (`pg_ctl -D <data>`) or the single
 /// PID recorded in its `postmaster.pid` — never a broad kill, so concurrent
 /// workspace engines and other-version bundles on the machine are untouched.
-async fn ensure_embedded_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<u16, BoxError> {
+async fn ensure_embedded_cluster(
+    bin: &Path,
+    lib: &Path,
+    data: &Path,
+) -> Result<u16, ProvisionError> {
     let bundled = bundled_major(bin, lib)?;
 
     // Foreign-major data dir: cannot be opened by the bundled binaries. Stop any
@@ -526,7 +675,9 @@ async fn ensure_embedded_cluster(bin: &Path, lib: &Path, data: &Path) -> Result<
                 moved.display()
             ),
             Err(e) => {
-                return Err(format!("could not move foreign-version data dir aside: {e}").into())
+                return Err(ProvisionError::transient(format!(
+                    "could not move foreign-version data dir aside: {e}"
+                )))
             }
         }
     }
@@ -1131,6 +1282,107 @@ mod tests {
         std::fs::remove_dir_all(root.path().join("share")).unwrap();
         let err = validate_embedded_pg_dirs(&bin, &lib).expect_err("missing share must error");
         assert!(err.to_string().contains("share"), "{err}");
+    }
+
+    // ── Provisioning-failure classification ──────────────────────────────────
+    // A workspace whose provisioning failed once is retried unless the failure
+    // is provably hopeless (ADR 0014, 2026-08-03). These pin which is which, and
+    // pin that the Docker verdict comes from an EXIT STATUS rather than the text
+    // of an error message.
+
+    /// Build a fake `docker version` result with the given exit code.
+    fn probe_exit(code: i32, stderr: &str) -> std::io::Result<std::process::Output> {
+        use std::os::unix::process::ExitStatusExt;
+        Ok(std::process::Output {
+            // `from_raw` takes a wait(2) status: the exit code sits in the high
+            // byte, so code 1 is 0x0100.
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: Vec::new(),
+            stderr: stderr.as_bytes().to_vec(),
+        })
+    }
+
+    #[test]
+    fn daemon_probe_reads_the_exit_status_not_the_message() {
+        // Exit 0: the daemon filled in the server half of `docker version`.
+        assert_eq!(classify_daemon_probe(probe_exit(0, "")), DaemonState::Ready);
+        // Non-zero: unreachable, whatever the wording. The stderr is carried for
+        // the log only, so a Docker release that rewords it changes nothing.
+        assert_eq!(
+            classify_daemon_probe(probe_exit(1, "failed to connect to the docker API")),
+            DaemonState::Unreachable("failed to connect to the docker API".to_string())
+        );
+        assert_eq!(
+            classify_daemon_probe(probe_exit(1, "some future wording nobody predicted")),
+            DaemonState::Unreachable("some future wording nobody predicted".to_string())
+        );
+    }
+
+    #[test]
+    fn missing_docker_binary_is_distinct_from_a_down_daemon() {
+        // Spawn-level NotFound means no `docker` on PATH, which waiting cannot
+        // fix; anything else the spawn can fail with is treated as unreachable.
+        assert_eq!(
+            classify_daemon_probe(Err(std::io::Error::from(std::io::ErrorKind::NotFound))),
+            DaemonState::CliMissing
+        );
+        assert_eq!(
+            classify_daemon_probe(Err(std::io::Error::from(
+                std::io::ErrorKind::PermissionDenied
+            ))),
+            DaemonState::Unreachable(
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied).to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn unclassified_provisioning_failures_default_to_transient() {
+        // The safety property behind incremental classification: a `?` on any
+        // helper that has not been classified is retryable, so no unclassified
+        // failure can latch a workspace dead.
+        let e: ProvisionError = (Box::from("psql failed: connection reset") as BoxError).into();
+        assert_eq!(e.kind, ProvisionErrorKind::Transient);
+        assert_eq!(e.to_string(), "psql failed: connection reset");
+        assert_eq!(
+            ProvisionError::terminal("no docker").kind,
+            ProvisionErrorKind::Terminal
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_workspace_id_is_terminal() {
+        // A malformed id cannot become valid by waiting, so it must NOT spend
+        // the retry budget. Reached before any backend call, so no daemon or
+        // bundled cluster is needed.
+        // Matched rather than `expect_err`, which would need `Provisioned: Debug`
+        // and so put a password-bearing database URL one derive away from a log.
+        let Err(err) = ensure(&PgBackend::Docker, "../bad", Path::new("/tmp"), None).await else {
+            panic!("an invalid workspace id must fail");
+        };
+        assert_eq!(err.kind, ProvisionErrorKind::Terminal);
+        assert!(err.to_string().contains("../bad"), "{err}");
+    }
+
+    /// The real `docker` CLI, pointed at a socket that does not exist, must
+    /// classify as `Unreachable` (the 2026-08-03 login race). Skips when the CLI
+    /// is absent, like the gated embedded-cluster tests below. `DOCKER_HOST` is
+    /// set on THIS command only, never on the process env, so a parallel test
+    /// cannot see it.
+    #[test]
+    fn gated_real_docker_cli_with_no_daemon_is_unreachable() {
+        let probe = Command::new("docker")
+            .env("DOCKER_HOST", "unix:///tmp/lucidos-no-such-docker.sock")
+            .args(["version", "--format", "{{.Server.Version}}"])
+            .output();
+        if matches!(&probe, Err(e) if e.kind() == std::io::ErrorKind::NotFound) {
+            eprintln!("SKIP gated_real_docker_cli_with_no_daemon_is_unreachable: no docker CLI");
+            return;
+        }
+        assert!(
+            matches!(classify_daemon_probe(probe), DaemonState::Unreachable(_)),
+            "an absent daemon socket must classify as unreachable"
+        );
     }
 
     #[test]

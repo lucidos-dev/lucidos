@@ -23,6 +23,17 @@ use std::time::{Duration, Instant};
 /// Short enough that a freshly-merged engine change surfaces within a few seconds.
 const SOURCE_BEHIND_TTL: Duration = Duration::from_secs(3);
 
+/// How long a [`PendingCommits`] read is reused before `git log` is re-run. Same
+/// rationale as [`SOURCE_BEHIND_TTL`] (bound the git forks to one per interval
+/// no matter how many clients poll), and the same short window so a freshly
+/// merged commit shows up in the toast within a few seconds.
+const PENDING_COMMITS_TTL: Duration = Duration::from_secs(3);
+
+/// How many commit subjects the version-status response carries. The toast is a
+/// glance, not a changelog: past a handful the list stops being readable, so the
+/// rest are counted rather than named ([`PendingCommits::total`]).
+const PENDING_COMMIT_SUBJECT_CAP: usize = 5;
+
 /// Max background rebuilds the self-heal driver auto-triggers for a single HEAD
 /// before giving up (until HEAD moves). Bounds a genuinely broken `main` so it
 /// can't spin builds forever; an Apply or a manual rebuild is always still
@@ -37,7 +48,15 @@ pub enum BuildState {
     #[default]
     Idle,
     /// A background `cargo build` is in progress; the old engine keeps serving.
-    Building,
+    ///
+    /// Carries the moment it started so the status toast can count up while it
+    /// runs. In the variant rather than beside it: "building, but nobody knows
+    /// since when" is not a state this engine should be able to represent, and a
+    /// separate `Option<Instant>` field would drift the moment a future caller
+    /// set the state without stamping it. In-memory only, like the rest of the
+    /// build orchestration: a build dies with the engine, and a restart starts
+    /// from `Idle`.
+    Building { started_at: Instant },
     /// The rebuild finished; a newer on-disk binary is ready to switch onto.
     Ready,
     /// The rebuild failed (compile error). The old engine keeps running; the
@@ -50,9 +69,25 @@ impl BuildState {
     pub fn as_wire(&self) -> &'static str {
         match self {
             BuildState::Idle => "idle",
-            BuildState::Building => "building",
+            BuildState::Building { .. } => "building",
             BuildState::Ready => "ready",
             BuildState::Failed => "failed",
+        }
+    }
+
+    /// A fresh `Building` stamped with now. The one constructor, so every build
+    /// start records its own clock rather than inheriting a caller's.
+    pub fn building_now() -> Self {
+        BuildState::Building {
+            started_at: Instant::now(),
+        }
+    }
+
+    /// How long this build has been running, or `None` when it isn't one.
+    pub fn elapsed(&self) -> Option<Duration> {
+        match self {
+            BuildState::Building { started_at } => Some(started_at.elapsed()),
+            _ => None,
         }
     }
 }
@@ -74,6 +109,35 @@ pub struct UpdateCheck {
 pub struct SourceBehindCache {
     checked_at: Option<Instant>,
     behind: bool,
+}
+
+/// The commits a *Switch to new version* would bring: everything between the
+/// running engine's commit and HEAD. Surfaced on `version_status` so the status
+/// toast behind the spinning brand badge can say what is being built instead of
+/// repeating its own tooltip.
+///
+/// "commits", not "changes": a *change* is the coding-agent change the user
+/// Applies (see `system-knowhow/glossary.md`), and not every commit in this
+/// range is one (a merge, a hand commit), so naming them changes would be wrong
+/// in both directions.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PendingCommits {
+    /// How many commits are in the range. Can exceed `subjects.len()`, which is
+    /// capped, so the UI can say "+N more" honestly.
+    pub total: usize,
+    /// Newest-first subject lines, at most [`PENDING_COMMIT_SUBJECT_CAP`].
+    pub subjects: Vec<String>,
+}
+
+/// Throttled cache of [`LucidosEngine::pending_commits`], mirroring
+/// [`SourceBehindCache`]: version-status is polled ~every 4s per connected
+/// client, and this forks `git log`. `checked_at == None` means "never
+/// computed"; `commits == None` is a cached UNKNOWN (git could not answer),
+/// which is deliberately cached too so a wedged git isn't re-forked per poll.
+#[derive(Default)]
+pub struct PendingCommitsCache {
+    checked_at: Option<Instant>,
+    commits: Option<PendingCommits>,
 }
 
 /// Memoized ancestry verdict for the on-disk binary — see
@@ -135,6 +199,25 @@ pub struct VersionStatus {
     /// from a peer's; the frontend disambiguates via `build_state`. Always false
     /// packaged (never rebuilds from source).
     pub shared_build_in_progress: bool,
+    /// How long THIS engine's own background rebuild has been running, in ms, or
+    /// absent when no build of ours is in flight (including a co-located peer's
+    /// build, whose clock we don't have, and packaged).
+    ///
+    /// ELAPSED rather than a start timestamp on purpose: the client renders a
+    /// counter from it, and differencing an engine wall-clock against the
+    /// browser's would show a wrong (or negative) duration whenever the two
+    /// clocks disagree. The client anchors this to its own `Date.now()` at
+    /// receipt and counts up locally, so skew cannot reach the number.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub build_elapsed_ms: Option<u64>,
+    /// The commits between the running engine's commit and HEAD, or absent when
+    /// git could not say (see [`PendingCommits`]). Only read when a build is in
+    /// flight or the source is behind HEAD, so an idle workspace forks no git.
+    ///
+    /// Absent is UNKNOWN, never "none pending": a `Some` with `total: 0` is the
+    /// only way to say there is nothing to bring.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pending_commits: Option<PendingCommits>,
 }
 
 impl LucidosEngine {
@@ -413,15 +496,80 @@ impl LucidosEngine {
         // as "a build is running" — that would hide the Rebuild escape hatch).
         let shared_build_in_progress =
             !crate::runtime::is_packaged() && shared_engine_build_lock_held();
+        let build_state = self.build_state();
+        // Only look up what a switch would bring when there is something to
+        // bring: a build in flight (ours or a co-located peer's) or a source
+        // behind HEAD. At rest this is the difference between one `git log` per
+        // poll per client and none at all.
+        let pending_commits =
+            if build_state.elapsed().is_some() || shared_build_in_progress || source_behind_head {
+                self.pending_commits().await
+            } else {
+                None
+            };
         VersionStatus {
             build_id: crate::ENGINE_BUILD_ID.to_string(),
             update_available,
             disk_build_id,
             packaged: crate::runtime::is_packaged(),
-            build_state: self.build_state().as_wire(),
+            build_state: build_state.as_wire(),
             source_behind_head,
             shared_build_in_progress,
+            build_elapsed_ms: build_state
+                .elapsed()
+                .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX)),
+            pending_commits,
         }
+    }
+
+    /// The commits between the running engine's commit and HEAD, newest first
+    /// and capped, or `None` when git could not answer. TTL-cached
+    /// ([`PENDING_COMMITS_TTL`]) so the `git log` runs at most once per interval
+    /// across every polling client.
+    async fn pending_commits(&self) -> Option<PendingCommits> {
+        {
+            let mut cache = self.pending_commits_cache.lock().unwrap();
+            if cache
+                .checked_at
+                .is_some_and(|at| at.elapsed() < PENDING_COMMITS_TTL)
+            {
+                return cache.commits.clone();
+            }
+            // Claim the refresh BEFORE dropping the lock and forking git, so a
+            // client polling during the read reuses the previous answer instead
+            // of starting a second `git log`. Stamping only on completion would
+            // leave the TTL bounding nothing under concurrency: every client
+            // that arrives while a read is in flight reads the same expired
+            // timestamp and forks its own. The cost is that those callers see
+            // one generation behind for the length of a single `git log`, which
+            // for a 3s display value is nothing. (A read that never completes,
+            // e.g. its request was cancelled mid-await, just means the previous
+            // answer is served for one more TTL.)
+            cache.checked_at = Some(Instant::now());
+        }
+        let commits = self.read_pending_commits().await;
+        self.pending_commits_cache
+            .lock()
+            .unwrap()
+            .commits
+            .clone_from(&commits);
+        commits
+    }
+
+    /// Uncached read behind [`Self::pending_commits`]. `None` at every step that
+    /// cannot produce a trustworthy answer: packaged (nothing rebuilds from
+    /// source), a `src-…` build id with no commit to range from, no resolvable
+    /// checkout, or a `git log` that failed or timed out.
+    async fn read_pending_commits(&self) -> Option<PendingCommits> {
+        if crate::runtime::is_packaged() {
+            return None;
+        }
+        let running = build_id_commit(crate::ENGINE_BUILD_ID)?;
+        let root = crate::paths::repo_root().ok()?;
+        let range = format!("{running}..HEAD");
+        classify_pending_commits(
+            crate::engine::git_ops::git_cmd(&["log", "--format=%s", &range], &root).await,
+        )
     }
 
     /// One periodic self-heal tick (dev only): if the engine SOURCE is behind
@@ -457,7 +605,9 @@ impl LucidosEngine {
             return;
         }
         // A rebuild (self-heal's or the Apply path's) is already in flight → wait.
-        if self.build_state() == BuildState::Building {
+        // `matches!` rather than `==`: `Building` carries its start instant, so
+        // two in-flight builds are never equal to each other.
+        if matches!(self.build_state(), BuildState::Building { .. }) {
             return;
         }
         // An upgrade is already on disk → the Switch is surfaced via
@@ -534,7 +684,10 @@ impl LucidosEngine {
         if let Some(old) = self.build_task.lock().unwrap().take() {
             old.abort();
         }
-        self.set_build_state(BuildState::Building);
+        // Stamped once here, so the state the SSE poke reports and the state the
+        // elapsed counter reads are the same start moment.
+        let building = BuildState::building_now();
+        self.set_build_state(building.clone());
         let engine = self.clone();
         let workspace = self.workspace_path().to_path_buf();
         let handle = tokio::spawn(async move {
@@ -542,7 +695,7 @@ impl LucidosEngine {
             // immediately — the 4s version-status poll alone misses this transient
             // window (iOS suspends the timer on a backgrounded PWA), so the spinner
             // badge never showed. See engine_version::emit_build_state_changed.
-            engine.emit_build_state_changed(&BuildState::Building).await;
+            engine.emit_build_state_changed(&building).await;
             let outcome = run_engine_build(&workspace).await;
             // Only the latest generation updates state — a superseded build's
             // completion is ignored (a newer build is already `Building`).
@@ -726,6 +879,47 @@ fn build_id_commit(id: &str) -> Option<&str> {
     (!commit.is_empty()).then_some(commit)
 }
 
+/// Classify a `git log --format=%s <range>` run into the commit list the status
+/// toast shows, keeping "git could not answer" apart from "git answered none".
+///
+/// `Err` is a spawn failure or the [`GIT_TIMEOUT`](crate::engine::git_ops) ceiling,
+/// and a non-zero exit means git refused the range (an unknown commit, no
+/// repository); neither says anything about what is pending, so both are `None`.
+/// Only a successful run yields a verdict, and an empty one is a real
+/// `total: 0`. Reading an unanswerable probe as "nothing is coming" is the
+/// failure this split exists to prevent (`.claude/rules/rust.md`).
+fn classify_pending_commits(
+    result: Result<std::process::Output, String>,
+) -> Option<PendingCommits> {
+    match result {
+        Ok(out) if out.status.success() => {
+            Some(parse_pending_commits(&String::from_utf8_lossy(&out.stdout)))
+        }
+        Ok(_) | Err(_) => None,
+    }
+}
+
+/// Parse `git log --format=%s` stdout (newest first, one subject per line) into
+/// a total plus the first [`PENDING_COMMIT_SUBJECT_CAP`] subjects. Pure so the
+/// cap, the total and the ordering are testable without a repository. Blank
+/// lines are dropped: an empty subject would render as an empty bullet, and it
+/// would inflate the count of what the user is waiting for.
+fn parse_pending_commits(stdout: &str) -> PendingCommits {
+    let subjects: Vec<&str> = stdout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    PendingCommits {
+        total: subjects.len(),
+        subjects: subjects
+            .into_iter()
+            .take(PENDING_COMMIT_SUBJECT_CAP)
+            .map(str::to_string)
+            .collect(),
+    }
+}
+
 /// Is the on-disk binary a genuine upgrade, given its id, the running id, and the
 /// ancestry answer (`Some(true)` = disk commit is a strict ancestor of the running
 /// commit, i.e. provably older; `None` = git couldn't tell)?
@@ -882,8 +1076,9 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_id_commit, commit_is_strict_ancestor, disk_upgrade_verdict, lock_held_at,
-        self_heal_is_wedged, try_lock_file, BuildState,
+        build_id_commit, classify_pending_commits, commit_is_strict_ancestor, disk_upgrade_verdict,
+        lock_held_at, parse_pending_commits, self_heal_is_wedged, try_lock_file, BuildState,
+        PENDING_COMMIT_SUBJECT_CAP,
     };
 
     /// Poll `cond` until it holds, up to ~2 s.
@@ -1120,6 +1315,124 @@ mod tests {
                 .await,
             None,
             "an unknown object is indeterminate, never 'provably older'"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The list is capped so the toast stays glanceable, but the COUNT is not:
+    /// "+N more" is only honest if the total saw every commit. Blank lines are
+    /// dropped rather than counted, since an empty subject would both render as
+    /// an empty bullet and inflate what the user is waiting for.
+    #[test]
+    fn parse_pending_commits_caps_the_list_but_not_the_count() {
+        let many: String = (1..=8).map(|i| format!("commit {i}\n")).collect();
+        let parsed = parse_pending_commits(&many);
+        assert_eq!(parsed.total, 8, "every commit counts toward the total");
+        assert_eq!(parsed.subjects.len(), PENDING_COMMIT_SUBJECT_CAP);
+        assert_eq!(
+            parsed.subjects[0], "commit 1",
+            "git log order is preserved (newest first)"
+        );
+
+        // Blank and whitespace-only lines are not commits.
+        let ragged = parse_pending_commits("fix: one\n\n   \nfix: two\n");
+        assert_eq!(ragged.total, 2);
+        assert_eq!(ragged.subjects, vec!["fix: one", "fix: two"]);
+
+        // A genuinely empty range is a real answer: zero, with nothing to list.
+        let none = parse_pending_commits("");
+        assert_eq!(none.total, 0);
+        assert!(none.subjects.is_empty());
+    }
+
+    /// The distinction the whole field rests on: git saying "no commits" is
+    /// `Some(total: 0)`, git failing to say anything is `None`. Collapsing the
+    /// second into the first would tell the user nothing is coming while a build
+    /// is running (`.claude/rules/rust.md`: unknown is never a no).
+    #[test]
+    fn classify_pending_commits_keeps_unknown_apart_from_none() {
+        // A spawn failure or the git timeout is unknowable, so it is no verdict.
+        assert_eq!(
+            classify_pending_commits(Err("git log timed out after 30s".to_string())),
+            None
+        );
+    }
+
+    /// Elapsed exists exactly while a build does, so the toast cannot show a
+    /// timer for work that is not running.
+    #[test]
+    fn build_state_reports_elapsed_only_while_building() {
+        assert!(BuildState::building_now().elapsed().is_some());
+        assert!(BuildState::Idle.elapsed().is_none());
+        assert!(BuildState::Ready.elapsed().is_none());
+        assert!(BuildState::Failed.elapsed().is_none());
+        assert_eq!(BuildState::building_now().as_wire(), "building");
+    }
+
+    /// The real range against a throwaway repo: `<running>..HEAD` lists what a
+    /// switch would bring, newest first, with the running commit itself
+    /// excluded. And a range git cannot resolve classifies as UNKNOWN rather
+    /// than as empty.
+    #[tokio::test]
+    async fn pending_commits_reads_the_range_between_the_running_commit_and_head() {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-pending-commits-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .output()
+                .expect("git runs in the test environment")
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "test@example.com"]);
+        git(&["config", "user.name", "Test"]);
+        std::fs::write(dir.join("a.txt"), "one").unwrap();
+        git(&["add", "."]);
+        git(&["commit", "-qm", "running: the version in use"]);
+        let running = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout)
+            .unwrap()
+            .trim()
+            .to_string();
+        for subject in ["fix: the older one", "feat: the newer one"] {
+            std::fs::write(dir.join("a.txt"), subject).unwrap();
+            git(&["add", "."]);
+            git(&["commit", "-qm", subject]);
+        }
+
+        let range = format!("{running}..HEAD");
+        let commits = classify_pending_commits(
+            crate::engine::git_ops::git_cmd(&["log", "--format=%s", &range], &dir).await,
+        )
+        .expect("a resolvable range is a real answer");
+        assert_eq!(
+            commits.subjects,
+            vec!["feat: the newer one", "fix: the older one"],
+            "newest first, and the running commit is not part of what is coming"
+        );
+        assert_eq!(commits.total, 2);
+
+        // A range git refuses (unknown object) exits non-zero: unknown, not empty.
+        assert_eq!(
+            classify_pending_commits(
+                crate::engine::git_ops::git_cmd(
+                    &[
+                        "log",
+                        "--format=%s",
+                        "0000000000000000000000000000000000000000..HEAD",
+                    ],
+                    &dir,
+                )
+                .await
+            ),
+            None,
+            "a range git cannot resolve says nothing about what is pending"
         );
 
         std::fs::remove_dir_all(&dir).ok();

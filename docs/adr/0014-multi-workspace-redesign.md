@@ -326,3 +326,79 @@ cannot, and the gateway has already stopped respawning, so a refresh loop would
 only re-render the same page forever. The escape link to the picker is the single
 remaining action. Splash labels are now HTML-escaped as well — a phase label is a
 static string, but a failure message crosses the control-plane wire.
+
+## Addendum (2026-08-03): a provisioning failure is retried unless it is provably terminal
+
+The addendum above gave the gateway a way to say "this boot cannot succeed". The
+inverse case had no model at all: **every** Postgres provisioning failure was
+treated as that verdict. `bring_up` built its failure `StackRuntime` with
+`restart_attempts: RESTART_CAP` **and** `health: Unhealthy`, and either half
+latches on its own (the supervisor's snapshot phase skips an `Unhealthy` stack
+before it ever probes). One error was permanent for the lifetime of the gateway
+process.
+
+The incident: at login the gateway autostarted before Docker Desktop had created
+its daemon socket, so both autostart workspaces failed with `docker run failed:
+failed to connect to the docker API at unix:///…`. Docker finished starting
+seconds later. Neither workspace retried; one recovered only because the user
+opened it from the picker, and the other still read `unhealthy` with the stale
+error many minutes later. The user saw a boot splash stuck on "Provisioning
+database…", because the same failure arm cleared the boot phase and set no boot
+failure, leaving the reason visible only in the picker's `last_error`.
+
+**Decision.**
+
+1. **Provisioning failures are classified, and the default is RETRY.**
+   `postgres::ensure` returns a `ProvisionError` carrying
+   `ProvisionErrorKind::{Transient, Terminal}`. `Terminal` is reserved for what
+   is provably unfixable (an invalid workspace id, no `docker` on the PATH), and
+   every unclassified failure arrives as `Transient` through the
+   `From<BoxError>` conversion. The asymmetry is deliberate: a wrong `Transient`
+   costs a bounded couple of minutes and then says the same thing, while a wrong
+   `Terminal` is the bug above.
+
+2. **The Docker verdict comes from an exit status, not an error message.**
+   `ensure_docker_cluster` first probes `docker version --format
+   {{.Server.Version}}`, whose **exit status** answers "did a daemon respond?".
+   This is not merely more robust than matching on the CLI's wording; it fixes a
+   real misreading. `docker inspect` exits 1 *identically* for "no such
+   container" and "the daemon is unreachable", so `docker_container_state` read a
+   daemon that had not started as `ContainerState::Absent` and proceeded to
+   `docker run`. That is why the incident's error names container creation rather
+   than the daemon. A spawn-level `NotFound` (no `docker` binary at all) is a
+   distinct, structural signal and is the terminal case.
+
+3. **A retried provisioning attempt spends the ordinary restart budget.** There
+   is no second counter: `restart_attempts` counts every bring-up attempt since
+   the stack was last healthy, a failed provision included, and a healthy probe
+   resets it. A workspace that cannot get a database is no more startable than
+   one whose engine keeps exiting.
+
+4. **The respawn backoff grows** (`respawn_backoff`): `RESPAWN_BACKOFF` doubling
+   per attempt to a 60s cap. The first gap is unchanged, so a one-off engine
+   crash still recovers as promptly as it did under the flat 5s gate. The growth
+   is what keeps a *repeating* failure from re-running the whole `docker`
+   sequence every five seconds, and it stretches the budget's wall-clock reach
+   past a cold Docker Desktop start, which five 5s gaps would not have covered.
+
+5. **A boot failure now carries a disposition**, `Retrying` or `Terminal`
+   (`crates/lucidos-gateway/src/boot_failure.rs`). Only `Terminal` short-circuits
+   `respawn_decision` and renders the no-refresh failure page. A `Retrying`
+   failure is rendered as the label of the ordinary auto-refreshing splash,
+   carrying the reason and the attempt count, so the wait reads as bounded
+   progress rather than either an opaque spinner or a dead end. It outranks the
+   boot phase, which by then only names the step that failed. An engine-reported
+   failure is always `Terminal`, unchanged: the engine stays silent unless it has
+   classified the failure itself.
+
+6. **Giving up promotes.** When the supervisor finally marks the workspace
+   unhealthy, a recorded `Retrying` failure is rewritten as `Terminal` ("did not
+   start after N attempts"). Without that, the splash would keep auto-refreshing
+   under a message promising an attempt that is no longer coming.
+
+**Not changed:** the never-cull-an-alive-engine rule (2026-06-27) is untouched,
+since `respawn_backoff` only moves the gate a process that has already exited
+passes through; the engine-side `boot_failure.rs` and its control endpoint; and
+`RESTART_CAP` itself.
+
+Plan: `docs/plans/2026-08-03-transient-provisioning-failure-retries.md`.

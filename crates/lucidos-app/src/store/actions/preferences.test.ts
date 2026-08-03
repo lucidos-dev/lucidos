@@ -1,7 +1,9 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { preferences } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable } from './preferences';
+import { preferences, toasts } from '../store';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN } from './preferences';
 import * as apiClient from '../../api/client';
+import { ApiError } from '../../api/client';
+import type { ApiResult } from '../../api/types';
 
 const platformMocks = vi.hoisted(() => ({ isIOS: false, isTauri: false, isIOSPwa: false }));
 vi.mock('../../utils/platform', () => ({
@@ -554,5 +556,422 @@ describe('externalLinkTargetConfigurable: the row shows only where it bites', ()
     platformMocks.isIOSPwa = true;
     preferences.value = { status: 'loading' };
     expect(externalLinkTargetConfigurable()).toBe(true);
+  });
+});
+
+/**
+ * An installed iOS PWA suspends tens of times a day, and WebKit aborts every
+ * in-flight fetch when it does. `savePreference` applies the value locally
+ * first, so the only thing left to go wrong is delivery, and it used to go
+ * wrong loudly and permanently: one toast per cancelled write, never retried,
+ * leaving the device showing a value the server never received.
+ *
+ * The contract now: a transient rejection is retried, then parked and flushed
+ * on resume, silently; a real engine verdict still speaks up at once; and
+ * neither can stack more than one card.
+ */
+describe('preference writes survive an iOS PWA suspend', () => {
+  /** What WebKit rejects with when it kills an in-flight fetch. */
+  const cancelled = () => new DOMException('Fetch is aborted', 'AbortError');
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  afterEach(() => {
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+  });
+
+  it('retries once immediately and stays quiet when the second attempt lands', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference')
+      .mockRejectedValueOnce(cancelled())
+      .mockResolvedValueOnce(undefined as never);
+
+    await savePreference('theme', 'light');
+
+    expect(spy).toHaveBeenCalledTimes(2);
+    expect(toasts.value).toHaveLength(0);
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+  });
+
+  it('parks the write with no toast when both attempts are cancelled', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
+
+    await savePreference('ui-scale', '125', undefined, true);
+
+    expect(toasts.value).toHaveLength(0);
+    expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
+  });
+
+  it('re-sends parked writes on resume, then clears them', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
+    await savePreference('ui-scale', '125', undefined, true);
+    expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
+
+    spy.mockResolvedValue(undefined as never);
+    await flushPendingPreferenceWrites();
+
+    expect(spy).toHaveBeenLastCalledWith('ui-scale', '125', expect.any(String));
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+  });
+
+  it('last write wins per key: the superseded value is dropped, not queued behind it', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
+    await savePreference('ui-scale', '112.5', undefined, true);
+    await savePreference('ui-scale', '150', undefined, true);
+    expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
+
+    spy.mockReset();
+    spy.mockResolvedValue(undefined as never);
+    await flushPendingPreferenceWrites();
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(spy).toHaveBeenCalledWith('ui-scale', '150', expect.any(String));
+  });
+
+  it('surfaces a real engine rejection at once, with no retry and nothing parked', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference')
+      .mockRejectedValue(new ApiError(400, 'unknown preference key'));
+
+    await savePreference('bogus', 'x');
+
+    expect(spy).toHaveBeenCalledTimes(1);
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain('unknown preference key');
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+  });
+
+  it('collapses repeated rejections into one card instead of stacking', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockRejectedValue(new ApiError(500, 'db down'));
+
+    await savePreference('theme', 'light');
+    await savePreference('font-family', 'inter');
+    await savePreference('ui-scale', '125', undefined, true);
+
+    expect(toasts.value).toHaveLength(1);
+  });
+
+  it('speaks once when writes keep failing to arrive, naming what is stuck', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
+
+    await savePreference('theme', 'light');
+    expect(toasts.value).toHaveLength(0);
+    await savePreference('font-family', 'inter');
+    expect(toasts.value).toHaveLength(0);
+
+    await savePreference('ui-scale', '125', undefined, true);
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain('font-family, theme, ui-scale');
+  });
+
+  it('retracts the unreachable banner once the queue drains', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
+    await savePreference('theme', 'light');
+    await savePreference('font-family', 'inter');
+    await savePreference('ui-scale', '125', undefined, true);
+    expect(toasts.value).toHaveLength(1);
+
+    spy.mockResolvedValue(undefined as never);
+    await flushPendingPreferenceWrites();
+
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('applies the value locally before the network call, so a failed write still shows', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
+    const applied = vi.fn();
+
+    await savePreference('theme', 'light', applied);
+
+    expect(applied).toHaveBeenCalledTimes(1);
+    expect(preferences.value).toMatchObject({ data: { theme: 'light' } });
+  });
+});
+
+/**
+ * `PUT /preferences?key=<k>` is applied in ARRIVAL order, so two overlapping
+ * writes to one key are a lost-update race the local bookkeeping cannot see:
+ * an older request landing second puts the stale value on the server while the
+ * device shows the newer one. Deliveries are therefore serialized per key, and
+ * a write that a newer one has superseded stands down instead of sending.
+ */
+describe('concurrent writes to one preference key', () => {
+  const cancelled = () => new DOMException('Fetch is aborted', 'AbortError');
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  afterEach(() => {
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+  });
+
+  it('never has two writes for one key in flight at once', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.spyOn(apiClient, 'setPreference').mockImplementation(async () => {
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      await Promise.resolve();
+      inFlight--;
+      return { success: true };
+    });
+
+    await Promise.all([
+      savePreference('ui-scale', '112.5', undefined, true),
+      savePreference('ui-scale', '125', undefined, true),
+      savePreference('ui-scale', '150', undefined, true),
+    ]);
+
+    expect(maxInFlight).toBe(1);
+  });
+
+  it('drops a write superseded before it was ever dispatched', async () => {
+    const sent: string[] = [];
+    vi.spyOn(apiClient, 'setPreference').mockImplementation(async (_k, v) => {
+      sent.push(v);
+      return { success: true };
+    });
+
+    // Both requested in the same tick, so the first has not gone out yet when
+    // the second claims the key. Sending it at all would be pure waste.
+    await Promise.all([
+      savePreference('ui-scale', '112.5', undefined, true),
+      savePreference('ui-scale', '150', undefined, true),
+    ]);
+
+    expect(sent).toEqual(['150']);
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+  });
+
+  it('does not re-send a superseded write between its own two attempts', async () => {
+    const sent: string[] = [];
+    let failFirstAttempt: (() => void) | null = null;
+    let markDispatched: () => void = () => {};
+    const firstDispatched = new Promise<void>(r => { markDispatched = r; });
+
+    vi.spyOn(apiClient, 'setPreference').mockImplementation((_k, v) => {
+      sent.push(v);
+      // Hold the very first request open so the test can interleave a newer
+      // write while it is genuinely on the wire.
+      if (v === '112.5' && !failFirstAttempt) {
+        return new Promise<ApiResult>((_resolve, reject) => {
+          failFirstAttempt = () => reject(cancelled());
+          markDispatched();
+        });
+      }
+      return Promise.reject(cancelled());
+    });
+
+    const first = savePreference('ui-scale', '112.5', undefined, true);
+    await firstDispatched;
+    const second = savePreference('ui-scale', '150', undefined, true);
+    failFirstAttempt!();
+    await Promise.all([first, second]);
+
+    // The older value went out once and was NOT retried: by then the user had
+    // moved on, and its retry would have landed after the newer write.
+    expect(sent.filter(v => v === '112.5')).toHaveLength(1);
+    expect(sent.filter(v => v === '150')).toHaveLength(2);
+    expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
+  });
+
+  it('keeps a newer parked write when an older one is rejected outright', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference');
+    // Older write: two cancels, so it parks.
+    spy.mockRejectedValue(cancelled());
+    await savePreference('ui-scale', '125', undefined, true);
+    expect(_pendingPreferenceKeysForTesting()).toEqual(['ui-scale']);
+
+    // A LATER rejection for the same key must not evict the parked value: it is
+    // still the user's choice and still owed a re-send.
+    spy.mockRejectedValue(new ApiError(500, 'db down'));
+    await flushPendingPreferenceWrites();
+    expect(toasts.value.some(t => t.message.includes('db down'))).toBe(true);
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+  });
+
+  it('writes to different keys still go out in parallel', async () => {
+    let inFlight = 0;
+    let maxInFlight = 0;
+    vi.spyOn(apiClient, 'setPreference').mockImplementation(async () => {
+      maxInFlight = Math.max(maxInFlight, ++inFlight);
+      await Promise.resolve();
+      inFlight--;
+      return { success: true };
+    });
+
+    await Promise.all([
+      savePreference('theme', 'light'),
+      savePreference('font-family', 'inter'),
+      savePreference('ui-scale', '125', undefined, true),
+    ]);
+
+    expect(maxInFlight).toBeGreaterThan(1);
+  });
+});
+
+/**
+ * The two failure banners answer different questions, so draining the queue must
+ * retract the "not reaching the engine" one whichever way it drained. A queue
+ * emptied by rejections used to leave it on screen insisting nothing was getting
+ * through, directly contradicting the rejection card beside it.
+ */
+describe('unreachable banner tracks the queue, not just the happy path', () => {
+  const cancelled = () => new DOMException('Fetch is aborted', 'AbortError');
+  const UNREACHABLE = 'preference-save-unreachable';
+
+  beforeEach(() => {
+    vi.restoreAllMocks();
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  afterEach(() => {
+    _resetPendingPreferenceWritesForTesting();
+    toasts.value = [];
+  });
+
+  /** Park three writes so the escalation threshold trips. */
+  async function stallThreeWrites() {
+    const spy = vi.spyOn(apiClient, 'setPreference').mockRejectedValue(cancelled());
+    await savePreference('theme', 'light');
+    await savePreference('font-family', 'inter');
+    await savePreference('ui-scale', '125', undefined, true);
+    expect(toasts.value.some(t => t.key === UNREACHABLE)).toBe(true);
+    return spy;
+  }
+
+  it('retracts it when the queue drains through rejections, not just successes', async () => {
+    const spy = await stallThreeWrites();
+
+    spy.mockRejectedValue(new ApiError(400, 'unknown preference key'));
+    await flushPendingPreferenceWrites();
+
+    expect(_pendingPreferenceKeysForTesting()).toEqual([]);
+    expect(toasts.value.some(t => t.key === UNREACHABLE)).toBe(false);
+    // The rejection itself still has to be readable.
+    expect(toasts.value.some(t => t.message.includes('unknown preference key'))).toBe(true);
+  });
+
+  it('treats a rejection as proof the engine is reachable, resetting the count', async () => {
+    const spy = vi.spyOn(apiClient, 'setPreference');
+    spy.mockRejectedValue(cancelled());
+    await savePreference('theme', 'light');
+    await savePreference('font-family', 'inter');
+
+    // An answer, even a refusal, breaks the "nothing is getting through" streak.
+    spy.mockRejectedValue(new ApiError(400, 'nope'));
+    await savePreference('image_model', 'auto');
+    toasts.value = toasts.value.filter(t => t.key !== 'preference-save-rejected');
+
+    // So the next single cancel is back to being noise, not the third strike.
+    spy.mockRejectedValue(cancelled());
+    await savePreference('timezone', 'UTC');
+    expect(toasts.value.some(t => t.key === UNREACHABLE)).toBe(false);
+  });
+
+  it('a successful save does not churn the toast signal when nothing is showing', async () => {
+    vi.spyOn(apiClient, 'setPreference').mockResolvedValue({ success: true });
+    const before = toasts.value;
+
+    await savePreference('theme', 'light');
+
+    // Same array identity: retracting an absent banner must not notify
+    // subscribers, or every preference save re-renders the toast container.
+    expect(toasts.value).toBe(before);
+  });
+});
+
+
+/**
+ * `currentMaxToolCalls` mirrors `PreferenceStore::max_tool_calls` in
+ * `core/preferences.rs`. The two must agree, or Settings shows a cap the engine
+ * would not honor: the user reads 12 and the loop runs 500.
+ *
+ * The engine parses with `parse::<usize>()`, which is stricter than JS's
+ * `parseInt` in exactly the ways that matter here, so these cases are the
+ * contract between them rather than incidental input validation.
+ */
+describe('currentMaxToolCalls: mirrors the engine resolution', () => {
+  beforeEach(() => {
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('defaults when unset, so an untouched workspace reads as it behaves', () => {
+    expect(currentMaxToolCalls()).toBe(MAX_TOOL_CALLS_DEFAULT);
+  });
+
+  it('defaults while preferences are still loading', () => {
+    preferences.value = { status: 'loading' };
+    expect(currentMaxToolCalls()).toBe(MAX_TOOL_CALLS_DEFAULT);
+  });
+
+  it('honors a stored value, including one far above any preset', () => {
+    preferences.value = { status: 'loaded', data: { max_tool_calls: '2000' } };
+    expect(currentMaxToolCalls()).toBe(2000);
+    // There is no ceiling: a huge cap is the user's call to make, and the UI
+    // must show what is actually stored rather than a clamped fiction.
+    preferences.value = { status: 'loaded', data: { max_tool_calls: '1000000' } };
+    expect(currentMaxToolCalls()).toBe(1_000_000);
+  });
+
+  it('tolerates surrounding whitespace, as the engine does', () => {
+    preferences.value = { status: 'loaded', data: { max_tool_calls: ' 750 ' } };
+    expect(currentMaxToolCalls()).toBe(750);
+  });
+
+  it('raises 0 to the floor, the one value that would break the turn', () => {
+    // The loop checks `iterations > cap` after incrementing, so 0 ends the turn
+    // before the first LLM call.
+    preferences.value = { status: 'loaded', data: { max_tool_calls: '0' } };
+    expect(currentMaxToolCalls()).toBe(MAX_TOOL_CALLS_MIN);
+  });
+
+  it('shows the representable bound rather than a silently rounded number', () => {
+    // Only reachable by a write from outside this UI (CLI / HTTP / psql), since
+    // setMaxToolCalls refuses these. `Number('1'.repeat(400))` is Infinity and
+    // a 20-digit value rounds, either of which would render a figure the engine
+    // is not enforcing.
+    preferences.value = { status: 'loaded', data: { max_tool_calls: '1'.repeat(400) } };
+    expect(currentMaxToolCalls()).toBe(Number.MAX_SAFE_INTEGER);
+    preferences.value = { status: 'loaded', data: { max_tool_calls: '99999999999999999999' } };
+    expect(currentMaxToolCalls()).toBe(Number.MAX_SAFE_INTEGER);
+  });
+
+  it('falls back to the default for anything that is not a whole number', () => {
+    // "-5" and "12.5" are the cases where a bare parseInt would diverge from the
+    // engine's usize parse, reading -5 and 12 where the engine reads neither.
+    for (const raw of ['', '   ', 'abc', '-5', '12.5', '1e3', '1_000']) {
+      preferences.value = { status: 'loaded', data: { max_tool_calls: raw } };
+      expect(currentMaxToolCalls(), `stored ${JSON.stringify(raw)}`).toBe(MAX_TOOL_CALLS_DEFAULT);
+    }
+  });
+});
+
+/**
+ * The Settings note tells the user what a cap means in wall-clock terms before
+ * they pick one, which is the whole reason there is no maximum: the number is
+ * theirs to choose, so it has to be legible. Coarse on purpose.
+ */
+describe('estimateTurnDuration', () => {
+  it('scales from minutes through hours to days', () => {
+    expect(estimateTurnDuration(50)).toBe('13 min');
+    expect(estimateTurnDuration(500)).toBe('2.1 hours');
+    expect(estimateTurnDuration(2000)).toBe('8.3 hours');
+    expect(estimateTurnDuration(100000)).toBe('17 days');
+  });
+
+  it('never reads as zero for the smallest allowed cap', () => {
+    expect(estimateTurnDuration(MAX_TOOL_CALLS_MIN)).toBe('1 min');
   });
 });

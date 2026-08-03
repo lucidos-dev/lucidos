@@ -17,13 +17,23 @@
 // from the DOM (parent unmounts) and on tab close. Reliable in iframes.
 
 import { wsSessionGet, wsSessionSet, wsSessionRemove } from './_storage';
+import { getBaseUrl } from './_fetch';
 
 const SCROLL_KEY_PREFIX = 'lucidos-scroll-app-';
 const APP_PATH_RE = /^\/app\/([^/]+)/;
 const RESTORE_DEADLINE_MS = 3000;
 
-export function parseAppId(pathname: string): string | null {
-  const match = pathname.match(APP_PATH_RE);
+/** Extract the app id from an app iframe's pathname.
+ *
+ *  `baseUrl` is the SDK base path: `''` when the engine is hit directly, and
+ *  `/<slug>` behind the workspace gateway (every packaged install). It must be
+ *  stripped first, because behind the gateway an app loads at
+ *  `/<slug>/app/<id>/`, where a bare `^/app/` match returns null. That silently
+ *  disabled scroll memory and app-local asset URLs on every gateway topology.
+ *  Defaults to `''` so a direct-hit caller is unchanged. */
+export function parseAppId(pathname: string, baseUrl: string = ''): string | null {
+  const rel = baseUrl && pathname.startsWith(baseUrl) ? pathname.slice(baseUrl.length) : pathname;
+  const match = rel.match(APP_PATH_RE);
   if (!match) return null;
   const raw = match[1];
   if (!raw) return null;
@@ -60,7 +70,7 @@ export function isFullyRestorable(saved: number, scrollHeight: number, clientHei
  * silently does nothing).
  */
 export function installScrollMemory(): () => void {
-  const appId = parseAppId(window.location.pathname);
+  const appId = parseAppId(window.location.pathname, getBaseUrl());
   if (!appId) return () => {};
   const key = scrollKey(appId);
 

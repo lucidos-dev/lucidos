@@ -61,11 +61,14 @@ _e2e_orphan_ps() {
     ps -Aww -o pid=,command= 2>/dev/null
 }
 
-# Command substrings that mark a process as a Playwright browser child. Matching
-# by the browsers-cache path (NOT a bare "WebContent") is what keeps us off the
-# user's own Safari/Chrome and unrelated WebKit consumers — the same discriminator
-# webkit_reaper.sh uses, broadened from webkit to every browser engine because a
-# dead run can orphan any of them. Honors PLAYWRIGHT_BROWSERS_PATH like the reaper.
+# Executable-path substrings that mark a process as a Playwright browser child.
+# Matching by the browsers-cache path (NOT a bare "WebContent") is what keeps us
+# off the user's own Safari/Chrome and unrelated WebKit consumers: the same
+# discriminator webkit_reaper.sh uses, broadened from webkit to every browser
+# engine because a dead run can orphan any of them. Honors
+# PLAYWRIGHT_BROWSERS_PATH like the reaper.
+#
+# Tested against argv[0] ONLY, never the whole command line. See _e2e_list_orphans.
 _e2e_orphan_browser_tokens() {
     local base
     if [ -n "${PLAYWRIGHT_BROWSERS_PATH:-}" ]; then
@@ -86,15 +89,49 @@ _e2e_list_orphans() {
     local tokens
     tokens="$(_e2e_orphan_browser_tokens)"
     local pid command tok
+
+    # Tokens are matched against argv[0], which is read up to the first space, so
+    # a browsers path containing whitespace can never match and orphan detection
+    # is effectively off. Say so out loud: a silently blind scan lets a new run
+    # stack on live orphans, which is the pile-up this lock exists to prevent.
+    # Only an operator override of PLAYWRIGHT_BROWSERS_PATH can reach this; the
+    # default cache paths carry no spaces.
+    while IFS= read -r tok; do
+        case "$tok" in
+            *[[:space:]]*)
+                echo "[e2e-lock] WARNING: browser token '$tok' contains whitespace, so it can never match argv[0]. Orphan browser detection is effectively OFF. Use a PLAYWRIGHT_BROWSERS_PATH without spaces." >&2
+                ;;
+        esac
+    done <<EOF
+$tokens
+EOF
     _e2e_orphan_ps | while read -r pid command; do
         case "$pid" in ''|*[!0-9]*) continue ;; esac
         [ "$pid" -le 1 ] && continue
         [ "$pid" = "$self" ] && continue
         # Iterate tokens via read (not `for tok in $(...)`) so a browsers-cache
         # path containing whitespace can't word-split the match.
+        #
+        # Each token is matched against argv[0] ONLY, never the whole command
+        # line: a process is a browser child if the BINARY IT RUNS lives under
+        # the browsers cache, not if its arguments mention that path. This
+        # branch SIGKILLs unconditionally with no RSS threshold, so a full
+        # command-line match is especially dangerous here. A Claude Code process
+        # carries the engine's THREAD HISTORY inside a ~22 KB
+        # --append-system-prompt argument, and on 2026-08-03 the sibling matcher
+        # in webkit_reaper.sh killed two sessions that merely discussed these
+        # paths.
+        #
+        # The one Playwright-owned process this deliberately stops matching is
+        # the `pw_run.sh` wrapper shell, whose argv[0] is bash and whose path is
+        # only argv[1]. That is fine and must not be "fixed" by widening back to
+        # the whole command line: the wrapper holds a few MB, not the browser's
+        # RSS, and since it runs the browser WITHOUT exec it simply exits once we
+        # kill its child. Widening to argv[1] would put every `bash -c` whose
+        # argument mentions these paths back in scope.
         while IFS= read -r tok; do
             [ -z "$tok" ] && continue
-            case "$command" in
+            case "${command%% *}" in
                 *"$tok"*) echo "browser $pid"; break ;;
             esac
         done <<EOF

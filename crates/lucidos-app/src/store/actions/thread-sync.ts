@@ -1,7 +1,7 @@
-import { API } from '../../api/client';
+import { API, isTransportError } from '../../api/client';
 import type { Change } from '../../api/client';
-import { threadMap, focusedThreadId, changes, appliedChanges, changesHasMore, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { memoryRebuildProgress, backupProgress, backupStatusVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
+import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
+import { memoryRebuildProgress, backupProgress, backupStatusVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
@@ -50,8 +50,10 @@ import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
-import { errorDetail } from '../../utils/errorDetail';
+import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { handleNavigationRequest, describeNavTarget } from './navigation-request';
+import { applyEmbeddingModelStatus } from './backgroundActivity';
+import type { EmbeddingModelStatus } from '../../api/types';
 
 /** The nil UUID the engine stamps on a thread-less `NavigationRequested` —
  *  emitted by the SDK `lucidos.ui.navigate` app-iframe bridge (api/sdk.rs),
@@ -230,8 +232,10 @@ export function connectThreadEvents(): void {
       // so the user can retry; an in-flight backup will repopulate on the next
       // BackupProgress event, and a duplicate POST returns 409 with a clear toast.
       backupProgress.value = null;
-      // `resyncLoadedThreads` coalesces and surfaces per-thread failures via
-      // the Loadable/showToast paths inside loadAllThreads + refreshThreadEvents.
+      // `resyncLoadedThreads` coalesces, and surfaces its own failures (the
+      // thread-list refresh and each per-thread refresh both toast a genuine
+      // error and stay silent on transient wake noise), so `void` here just
+      // acknowledges we don't need the promise back.
       void resyncLoadedThreads();
     }
   };
@@ -269,8 +273,24 @@ export function resyncLoadedThreads(): Promise<void> {
   resyncInFlight = (async () => {
     try {
       // Refresh thread-level metadata (status, section, message_count) first
-      // so any per-thread refresh sees the authoritative state.
-      await loadAllThreads();
+      // so any per-thread refresh sees the authoritative state. `loadAllThreads`
+      // REJECTS on a failed GET and has no Loadable or toast of its own, so
+      // contain it here: letting it propagate skipped the per-thread refreshes
+      // below, which are what clear a stuck "Thinking" spinner after an SSE gap
+      // (the very failure this function exists to repair). Transient iOS-PWA
+      // wake / stale-connection rejections stay silent, matching
+      // `refreshThreadEvents`; a genuine failure toasts.
+      try {
+        await loadAllThreads();
+      } catch (err) {
+        if (isAbortError(err) || isTransportError(err)) {
+          console.warn('[SSE] resync thread-list refresh failed transiently (iOS PWA wake / engine restart); per-thread refresh still runs', err);
+        } else {
+          showToast(`Failed to refresh the thread list: ${errorDetail(err)}`, 'error', {
+            key: THREAD_LIST_REFRESH_TOAST_KEY,
+          });
+        }
+      }
       const ids = [...threadMap.value.values()]
         .filter((t) => t.eventsLoaded)
         .map((t) => t.meta.id);
@@ -880,6 +900,22 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       break;
     }
 
+    case 'EmbeddingModelStatusChanged': {
+      // Transient frame from the engine's background embedding-model loader:
+      // download progress and every transition between downloading / loading /
+      // ready / waiting / failed. Same shape as the
+      // `/memory/embedding-model-status` snapshot useStartup reads, so this is
+      // a straight assignment with no translation.
+      // Routed through the action rather than assigning the signal here, so the
+      // freshness counter an in-flight snapshot read compares against cannot be
+      // bypassed (see `applyEmbeddingModelStatus`).
+      applyEmbeddingModelStatus({
+        model_id: String(data.model_id ?? ''),
+        load_state: data.load_state as EmbeddingModelStatus['load_state'],
+      });
+      break;
+    }
+
     case 'ApplyAllBatchStarted': {
       // An Apply All batch started (possibly on another device). Reflect
       // "in progress" on the bulk buttons and mark every member as applying so
@@ -918,10 +954,14 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     case 'ChangesUpdated': {
       const pending = (data.pending ?? []) as Change[];
       const applied = (data.applied ?? []) as Change[];
-      const totalPending = (data.total_pending as number) ?? 0;
       changes.value = { status: 'loaded', data: pending };
       appliedChanges.value = { status: 'loaded', data: applied };
-      changesHasMore.value = totalPending > pending.length;
+      // `changesHasMore` tracks whether more APPLIED changes are pageable, and
+      // the ChangesUpdated payload carries no `has_more_applied` (its
+      // `total_pending` is literally `pending.len()`, so a pending-count
+      // comparison is always false). Deriving it here silently killed the
+      // applied-list infinite scroll; leave the flag to refreshChangesState and
+      // loadMoreChanges, which read the real field.
       // restartRequired is intentionally not touched here — stale SSE values
       // would otherwise dismiss an active restart toast.
       // Debounce repo-scoped refresh — ChangesUpdated fires on every change globally
@@ -986,9 +1026,9 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // streaming exchange) reconciles with the now-completed backend state.
       const count = (data.count as number) ?? 0;
       console.warn(`[SSE] Stream lagged by ${count} events — resyncing loaded threads`);
-      // Loadable/showToast surfaces inside loadAllThreads + refreshThreadEvents
-      // carry the failure if one happens; here `void` just acknowledges that
-      // we don't need the promise back.
+      // `resyncLoadedThreads` toasts a genuine failure itself (and stays silent
+      // on transient wake noise), so `void` just acknowledges that we don't
+      // need the promise back.
       void resyncLoadedThreads();
       break;
     }

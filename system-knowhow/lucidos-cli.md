@@ -595,7 +595,9 @@ Record, approve, or query the *plan marker* — the durable enforcement that the
 # This records the AWAITING-APPROVAL `proposed` state — it does NOT unblock editing:
 lucidos planned mark --plan docs/plans/2026-06-19-my-change.md
 
-# Present the plan to the user. Once the user APPROVES in chat, flip it to gate-satisfying:
+# Present the plan, then ask for approval with your question tool (AskUserQuestion on
+# Claude Code, ask_user_question on Codex; options `Approve` / `Request changes`), not in
+# prose. Once the user APPROVES, flip it to gate-satisfying:
 lucidos planned approve
 
 # Genuinely local fix that doesn't warrant a plan — acknowledge instead (no approval needed):
@@ -605,7 +607,7 @@ lucidos planned mark --simple "rename a misspelled variable"
 lucidos planned state
 ```
 
-`mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. **`mark --plan` records `proposed` (awaiting approval) — it does NOT satisfy the gate.** The agent must present the plan to the user and, only after the user approves in chat, run `lucidos planned approve` to flip `proposed`→`planned` (gate-satisfying). If the user requests changes, revise the plan file, re-commit, and re-present (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly — local fixes need no approval. `planned` and `acknowledged_simple` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand — the `implementation-plan` skill drives them — but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
+`mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. **`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must present the plan and ask for approval **with its question tool** (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), never in prose: approval is a DECISION question the agent is blocked on, and asked in prose it leaves the thread idle until the user types "approve" by hand. Only after the user approves does the agent run `lucidos planned approve` to flip `proposed`→`planned` (gate-satisfying). If the user requests changes, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval. `planned` and `acknowledged_simple` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand (the `implementation-plan` skill drives them), but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
 
 ### `lucidos knowhow list`
 

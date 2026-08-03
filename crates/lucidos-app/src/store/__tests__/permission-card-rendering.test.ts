@@ -201,7 +201,7 @@ function mcpRequestStep(seq: number, overrides: Partial<{
     server_id: 'slack',
     server_name: 'Slack (read-only)',
     tool_name: 'channels_list',
-    arguments_summary: '{ "query": "ua-tech" }',
+    arguments_summary: '{ "query": "general" }',
     ...overrides,
   });
 }
@@ -246,8 +246,8 @@ describe('exchangeStatus around McpPermissionRequested (chat MCP gate)', () => {
     const ev = (type: string, fields: Record<string, unknown> = {}): StoredEvent =>
       ({ type, ...fields }) as StoredEvent;
     const events = new Map<number, StoredEvent>([
-      [1, ev('MessageReceived', { text: 'list the ua-tech channels', _eventId: 'req-1' })],
-      [2, ev('ToolCalled', { name: 'mcp__slack__channels_list', args: { query: 'ua-tech' }, request_event_id: 'req-1', _eventId: 'tc-1' })],
+      [1, ev('MessageReceived', { text: 'list the general channels', _eventId: 'req-1' })],
+      [2, ev('ToolCalled', { name: 'mcp__slack__channels_list', args: { query: 'general' }, request_event_id: 'req-1', _eventId: 'tc-1' })],
       [3, ev('McpPermissionRequested', { request_id: 'mreq-1', tool_use_id: 'tu-1', server_id: 'slack', server_name: 'Slack (read-only)', tool_name: 'channels_list', arguments_summary: '{}', _eventId: 'mpr-1' })],
       [4, ev('McpPermissionResolved', { request_id: 'mreq-1', allowed: true, persist_scope: 'broad' })],
       [5, ev('ToolResult', { name: 'mcp__slack__channels_list', result: 'ok', success: true, tool_called_event_id: 'tc-1', request_event_id: 'req-1' })],

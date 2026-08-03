@@ -28,6 +28,7 @@ GATED_TESTS=(
     test_similar_texts_have_similar_embeddings
     test_norwegian_synonyms_have_high_similarity
     test_bil_verksted_query_matches_norwegian_vehicle_service_thread
+    test_downloaded_model_loads_without_a_second_fetch
 )
 
 # Drift check: any test annotated with both `#[cfg(feature =

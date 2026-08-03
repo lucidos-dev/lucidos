@@ -7,7 +7,7 @@ import { markThreadOpenStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { applyDraftBatch, setDraft, clearDraft, type ComposeDraft } from '../composeDrafts';
 import { setComposeSelectionFromServer } from '../composeSelections';
-import { fetchThreads, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
+import { fetchThreads, fetchThreadById, fetchThreadEvents, fetchOlderThreads, fetchFilterFacets, fetchArchivedCount } from '../../api/threads';
 import type { ThreadSummary, ThreadEventRow } from '../../api/threads';
 import { isTransportError } from '../../api/client';
 import { toFailed } from '../types';
@@ -436,23 +436,32 @@ export async function ensureThreadInMap(info: ThreadSummary): Promise<void> {
  *  in the loaded thread list — e.g. an archived thread beyond the per-source
  *  Archive window. Returns true if the thread is now in the map, false if
  *  the API has no record of this ID. Network/HTTP failures propagate so the
- *  caller can surface the real error instead of a generic "not found". */
+ *  caller can surface the real error instead of a generic "not found".
+ *
+ *  Reads the BY-ID endpoint, not the grouped `GET /api/v1/threads`. The grouped
+ *  one assembles saved + recent archive + active + composing + the family base,
+ *  which is hundreds of milliseconds of server time on a large workspace, and
+ *  this function needs exactly one row out of it. That cost sat directly on the
+ *  notification-tap critical path: a tap that navigates to a thread outside the
+ *  loaded window blocks here with nothing on screen, and on a cold push tap the
+ *  map is always empty (the deep link dispatches while `loadAllThreads` is still
+ *  in flight), so it fired on every single tap AND duplicated the grouped fetch
+ *  the same boot had already issued. */
 export async function ensureThreadByIdInMap(threadId: string): Promise<boolean> {
   if (threadMap.value.has(threadId)) return true;
   const requestStartedAt = Date.now();
-  const response = await fetchThreads(threadId);
-  // The backend returns the focused thread separately when it isn't already
-  // in saved/active/archive. When it IS already there, we still need to
-  // pluck it out of those lists.
-  const info =
-    response.focused_thread
-    ?? response.saved.find(t => t.thread_id === threadId)
-    ?? response.active_threads.find(t => t.thread_id === threadId)
-    ?? response.archive.find(t => t.thread_id === threadId);
+  const info = await fetchThreadById(threadId);
+  // null is the engine's 404, i.e. a real "no such thread" verdict. Anything
+  // else threw, so the caller can tell "gone" from "could not ask" and retry
+  // only the latter (see focusThreadOrBootstrapResult / landThreadHash).
   if (!info) return false;
-  const isSaved = response.saved.some(t => t.thread_id === threadId);
   const map = threadMap.value;
-  upsertThread(map, info, isSaved, requestStartedAt);
+  // `saved` rides on the summary itself here; the grouped endpoint conveys it
+  // structurally instead (membership in its `saved` array), which a single row
+  // cannot. Both read `thread_summaries.is_saved`. Absent only from a test mock
+  // or an engine predating the field, where unsaved is the honest reading: the
+  // Saved section is opt-in, and the next grouped load reconciles either way.
+  upsertThread(map, info, info.saved === true, requestStartedAt);
   threadMap.value = new Map(map);
   return true;
 }

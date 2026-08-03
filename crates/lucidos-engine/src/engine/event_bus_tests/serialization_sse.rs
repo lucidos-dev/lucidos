@@ -388,6 +388,85 @@ fn system_memory_rebuild_progress_matches_server_event_shape() {
     assert_eq!(json["data"]["percent"], 50);
 }
 
+/// The `EmbeddingModelStatusChanged` payload and the
+/// `GET /api/v1/memory/embedding-model-status` snapshot are ONE shape by
+/// contract: a client that arrives mid-download (the normal case on a fresh
+/// workspace) reads the snapshot, and must not have to translate it into what
+/// the stream would have told it. Pin the two serializations against each other.
+#[test]
+fn embedding_model_status_event_matches_the_rest_snapshot() {
+    let status = crate::memory::EmbeddingModelStatus {
+        model_id: "multilingual-e5-small".into(),
+        load_state: crate::memory::EmbeddingModelLoadState::Downloading {
+            downloaded_bytes: 244_000_000,
+            total_bytes: 488_000_000,
+        },
+    };
+    let emitted = EmittedEvent {
+        event_id: Uuid::new_v4(),
+        seq: None,
+        created: Utc::now(),
+        typed: BusEvent::System(SystemEvent::EmbeddingModelStatusChanged {
+            model_id: status.model_id.clone(),
+            load_state: status.load_state.clone(),
+        }),
+        aggregate: None,
+    };
+
+    let json: serde_json::Value = serde_json::from_str(&emitted.to_sse_json()).unwrap();
+    assert_eq!(json["type"], "EmbeddingModelStatusChanged");
+    assert_eq!(
+        json["data"],
+        serde_json::to_value(&status).unwrap(),
+        "the SSE payload and the REST snapshot must serialize identically"
+    );
+}
+
+/// The `kind` discriminator and its kebab-case values are what the frontend
+/// switches on, so they are wire contract, not an implementation detail.
+#[test]
+fn embedding_model_load_state_wire_tags_are_stable() {
+    use crate::memory::EmbeddingModelLoadState as S;
+    let cases = [
+        (
+            S::Downloading {
+                downloaded_bytes: 7,
+                total_bytes: 9,
+            },
+            "downloading",
+        ),
+        (S::Loading, "loading"),
+        (S::Ready, "ready"),
+        (S::Waiting { attempt: 3 }, "waiting"),
+        (
+            S::Failed {
+                message: "boom".into(),
+            },
+            "failed",
+        ),
+    ];
+    for (state, expected) in cases {
+        let json = serde_json::to_value(&state).unwrap();
+        assert_eq!(json["kind"], expected, "wire tag drifted for {state:?}");
+    }
+
+    // The payload fields each variant carries, spot-checked where the UI reads
+    // them: the progress bar needs both byte counts on the same object as the
+    // tag (no nesting), and a terminal failure has to carry its reason.
+    let downloading = serde_json::to_value(S::Downloading {
+        downloaded_bytes: 7,
+        total_bytes: 9,
+    })
+    .unwrap();
+    assert_eq!(downloading["downloaded_bytes"], 7);
+    assert_eq!(downloading["total_bytes"], 9);
+    let failed = serde_json::to_value(S::Failed {
+        message: "boom".into(),
+    })
+    .unwrap();
+    assert_eq!(failed["message"], "boom");
+}
+
 #[test]
 fn system_backup_progress_matches_server_event_shape() {
     let emitted = EmittedEvent {
@@ -552,6 +631,10 @@ fn reserved_type_names_match_event_type() {
             processed: 0,
             total: 0,
             percent: 0,
+        },
+        EmbeddingModelStatusChanged {
+            model_id: "m".into(),
+            load_state: crate::memory::EmbeddingModelLoadState::Loading,
         },
         ChangesUpdated {
             pending: vec![],

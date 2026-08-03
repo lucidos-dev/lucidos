@@ -963,6 +963,19 @@ async fn run_turn(
 
     // Reap the child: clean exit path lets it finish; interrupt/shutdown kill it.
     let wait_result = if interrupted || shutdown {
+        // The child is its own process-group leader (`isolate_in_process_group`
+        // at spawn), so `start_kill` signals ONLY the leader: everything the
+        // Codex turn spawned (cargo/rustc, a Playwright runner and its browsers)
+        // survives as an orphan burning CPU. Tear the whole group down first,
+        // exactly as the CC driver does after the 2026-06-24 WebKit pile-up.
+        #[cfg(unix)]
+        if let Some(pid) = child_pid {
+            super::spawn_env::graceful_kill_child_process_group(
+                pid,
+                std::time::Duration::from_secs(3),
+            )
+            .await;
+        }
         let _ = child.start_kill();
         child.wait().await
     } else {

@@ -59,7 +59,12 @@
     position: absolute;
     top: calc(env(safe-area-inset-top, 0px) + 0.5rem);
     right: calc(env(safe-area-inset-right, 0px) + 0.5rem);
-    z-index: 1;
+    /* Above the `.edge-swipe-zone` guards this overlay also carries, which
+       rank 1: the right strip is 1.25rem wide and the button sits 0.5rem in,
+       so they overlap. At equal z-index the winner would be whichever renders
+       last, and losing this one means no way out of fullscreen but Escape,
+       which a phone has not got. */
+    z-index: 2;
     background: var(--bg-secondary);
     border: 1px solid var(--border-color);
     border-radius: 0.375rem;
@@ -320,22 +325,23 @@
 }
 
 /* Insight callout */
+/* Emphasis is carried by the tinted surface alone. A colored left border here
+   would be the banned left-accent stripe (.claude/rules/frontend.md F18). */
 .slides-pv-insight {
     font-size: var(--font-size-sm);
     line-height: 1.5;
     color: var(--text-secondary);
-    border-left: 0.125rem solid var(--accent);
     padding: 0.375rem 0.625rem;
     margin-top: 0.5rem;
-    background: color-mix(in srgb, var(--accent) 5%, transparent);
-    border-radius: 0 0.25rem 0.25rem 0;
+    background: color-mix(in srgb, var(--accent) 8%, transparent);
+    border-radius: 0.25rem;
     font-style: italic;
 }
 
-.slides-pv-insight[data-color="green"] { border-color: var(--accent-green); background: color-mix(in srgb, var(--accent-green) 5%, transparent); }
-.slides-pv-insight[data-color="orange"] { border-color: #f59e0b; background: color-mix(in srgb, #f59e0b 5%, transparent); }
-.slides-pv-insight[data-color="purple"] { border-color: #a78bfa; background: color-mix(in srgb, #a78bfa 5%, transparent); }
-.slides-pv-insight[data-color="cyan"] { border-color: #06b6d4; background: color-mix(in srgb, #06b6d4 5%, transparent); }
+.slides-pv-insight[data-color="green"] { background: color-mix(in srgb, var(--accent-green) 8%, transparent); }
+.slides-pv-insight[data-color="orange"] { background: color-mix(in srgb, #f59e0b 8%, transparent); }
+.slides-pv-insight[data-color="purple"] { background: color-mix(in srgb, #a78bfa 8%, transparent); }
+.slides-pv-insight[data-color="cyan"] { background: color-mix(in srgb, #06b6d4 8%, transparent); }
 
 /* Card */
 .slides-pv-card {

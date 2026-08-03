@@ -477,7 +477,7 @@ describe('Flow: Edge cases', () => {
     expect(steps[0].description).toBe('Read file');
     expect(steps[1].description).toBe('Web search');
     expect(steps[2].description).toBe('Write file');
-    expect(steps.every(s => s.success === true)).toBe(true);
+    expect(steps.every(s => s.outcome === 'success')).toBe(true);
   });
 
   it('ToolCalled without ToolResult shows pending step', () => {
@@ -490,7 +490,7 @@ describe('Flow: Edge cases', () => {
 
     const exchanges = getExchanges(map, id);
     expect(exchangeSteps(exchanges[0])).toHaveLength(1);
-    expect(exchangeSteps(exchanges[0])[0].success).toBeNull(); // still pending
+    expect(exchangeSteps(exchanges[0])[0].outcome).toBe('pending'); // still pending
     expect(getLabel(exchanges[0])).toBe('Working');
   });
 
@@ -508,7 +508,7 @@ describe('Flow: Edge cases', () => {
     const steps = exchangeSteps(exchanges[0]);
     expect(steps).toHaveLength(1);
     expect(steps[0].description).toBe('Thinking');
-    expect(steps[0].success).toBe(true);
+    expect(steps[0].outcome).toBe('success');
     expect(steps[0].context_tokens).toBe(5000);
     expect(steps[0].context_messages).toBe(3);
 
@@ -533,7 +533,7 @@ describe('Flow: Edge cases', () => {
     const steps = exchangeSteps(exchanges[0]);
     expect(steps).toHaveLength(2);
     expect(steps[0].description).toBe('Memory searched');
-    expect(steps[0].success).toBe(true);
+    expect(steps[0].outcome).toBe('success');
     expect(steps[1].description).toBe('Thinking');
 
     const events = exchangeResponseEvents(exchanges[0]);

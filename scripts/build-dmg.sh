@@ -82,6 +82,14 @@
 #   --adopt-submission <uuid>  write a handle for an in-flight submission whose id
 #                              was never persisted (the DMG on disk is the one
 #                              Apple is scanning), then resume
+#   --adopt-app-submission <uuid>
+#                              the same for the .app half (see below)
+#
+# A release makes TWO submissions, in Apple's documented order: the .app first,
+# so it can be STAPLED before the DMG is built around it, then the DMG. One
+# handle carries both and names which is outstanding in its `stage` field, so a
+# resume picks up whichever half died and runs on through the other. See "The
+# .app notarization stage" further down, and ADR 0033 for what that costs.
 # The handle is dropped once staging succeeds, so a later run can't resume a
 # finished release. This exists because the orchestration layer caps background
 # tasks at 3600s: a notarization slower than that can never be held in a
@@ -92,8 +100,13 @@
 # waited on it — for 1 to 20 hours, every time. It never had to: notarization
 # gates exactly one artifact, the DMG a browser downloads. The headless tarball
 # (`curl | sh`) and the Tauri updater (.app.tar.gz + .sig + latest.json) are never
-# quarantined, so Gatekeeper never assesses them; the updater's integrity comes
-# from our own minisign key and the bundle launches on its Developer ID signature.
+# quarantined: the updater writes the bundle itself and sets no
+# com.apple.quarantine, so Gatekeeper performs no assessment on launch. Integrity
+# comes from our own minisign key, which IS checked. The payload is Developer ID
+# signed as of the repack below, but that signature is NOT the launch mechanism
+# and must not be cited as one (F7 in the 2026-08-02 macOS update-path audit: the
+# same sentence sat in ADR 0027 and docs/desktop-app.md, and it is the reason
+# nobody looked for 19 releases).
 #
 # --defer-notarization therefore submits, persists the handle, and STAGES THE
 # UNSTAPLED DMG (manifest `notarized: false`) so the release publishes now. The
@@ -171,6 +184,12 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 APP_DIR="$REPO_ROOT/crates/lucidos-app"
 STAGE="$APP_DIR/bundle-resources"
+# Where `cargo tauri build` leaves the .app and the .dmg. A constant, hoisted here
+# rather than assigned after the build, because the resume paths reach for it
+# BEFORE any build runs (an adopted submission has to find the updater payload the
+# submitted DMG is paired with, and `set -u` turns a not-yet-assigned global into
+# a crash rather than an empty string).
+BUNDLE_DIR="$REPO_ROOT/target/release/bundle"
 # `lucidos` (the CLI) is a bundled Mach-O executable too — it MUST be codesigned
 # (BUNDLED_EXECUTABLES) or notarization rejects it, and it MUST be staged
 # (RESOURCE_NAMES) or the engine can't launch the CC permission MCP server.
@@ -237,6 +256,42 @@ source "$SCRIPT_DIR/lib/release_build_fingerprint.sh"
 # shellcheck source=scripts/lib/stage_runtime.sh
 source "$SCRIPT_DIR/lib/stage_runtime.sh"
 
+# Asset-attach ordering: upload the artifacts, prove they are on the Release,
+# and only then upload the latest.json that points at them. One `gh release
+# upload` for all four uploaded concurrently, so the smallest file (the manifest)
+# finished first and the updater endpoint advertised a payload that was not there
+# yet: 10 s on v0.19.0, 8h06m on v0.16.0 (F8). Public-mirror-safe; source
+# unconditionally.
+# shellcheck source=scripts/lib/release_upload.sh
+source "$SCRIPT_DIR/lib/release_upload.sh"
+
+# Which file under target/release/bundle/dmg is THE release DMG. refresh_dmg_payload
+# writes two intermediates (.rw.dmg / .zlib.dmg) next to the real artifact, and a
+# run killed mid-refresh leaves one behind; both match `*.dmg`, and the
+# version-stamp guard cannot tell them apart because they carry the same version
+# string. This lib owns the suffixes, so the code that WRITES them and the code
+# that EXCLUDES them cannot drift (F4). Public-mirror-safe; source unconditionally.
+# shellcheck source=scripts/lib/release_dmg.sh
+source "$SCRIPT_DIR/lib/release_dmg.sh"
+
+# Updater-payload repack + re-sign + the Developer ID publish gate. `cargo tauri
+# build` packs Lucidos.app.tar.gz from the app BEFORE this script signs it (see
+# the codesign section below for why the build runs with the identity stripped
+# from its env), so without a repack the updater ships an ad-hoc bundle while the
+# DMG ships a Developer ID one. That is the v0.19.0 incident. Depends on
+# tauri_signing_key.sh (which it sources itself) for the one signer call site.
+# Public-mirror-safe; source it unconditionally.
+# shellcheck source=scripts/lib/updater_payload.sh
+source "$SCRIPT_DIR/lib/updater_payload.sh"
+
+# Stable dev signing identity (the self-signed cert scripts/dev-codesign-setup.sh
+# creates). Used ONLY as the local-build fallback when no APPLE_SIGNING_IDENTITY
+# is set: it gives the bundle a certificate-anchored designated requirement, so a
+# local rebuild stops destroying the macOS TCC grants the developer has clicked
+# through. It can never satisfy a release (see the signing branch below).
+# shellcheck source=scripts/lib/codesign.sh
+source "$SCRIPT_DIR/lib/codesign.sh"
+
 # Release-mode state (set by arg parsing below). In default (local-build) mode
 # all stay 0: no events, no asserted creds, no staging, no asset upload.
 #   RELEASE_MODE  1 for any --release* mode (drives event emission + assertions)
@@ -261,12 +316,28 @@ HEADLESS_TARBALL_PATH="" # set by emit_headless_tarball for the final report
 # by --resume-notarize / --adopt-submission, and also by the automatic detection
 # of a resumable handle in a build-grade run.
 DO_RESUME_NOTARIZE=0
-ADOPT_SUBMISSION=""          # --adopt-submission <uuid>
+ADOPT_SUBMISSION=""          # --adopt-submission <uuid> (the DMG stage)
+ADOPT_APP_SUBMISSION=""      # --adopt-app-submission <uuid> (the .app stage)
 NOTARIZE_STATE_FILE=""       # resolved once EFFECTIVE_VERSION is known
 NOTARIZE_SUBMISSION_ID=""    # set by notarize_submit
 NOTARIZE_STATUS=""           # set by notarize_poll (the terminal Apple verdict)
-NOTARIZE_SUBMITTED_SHA=""    # sha256 of the DMG as submitted; asserted before stapling
-NOTARIZE_PINNED_DMG=""       # immutable hardlink to the submitted bytes (see notarize_pin_submitted_dmg)
+# The bytes the current notary stage is accountable for, which is what every
+# integrity assertion compares against: the app zip at the `app` stage, the DMG
+# at the `dmg` stage, and the POST-staple DMG once the ticket is in (the staple
+# writes it INTO the image). Same definition as the resume handle's
+# artifact_sha256, deliberately. It was NOTARIZE_SUBMITTED_SHA until the staple
+# had to be accounted for; "submitted" then stopped being true at exactly the
+# moments the value is load-bearing.
+NOTARIZE_EXPECTED_SHA=""
+# The updater trio this release's submissions are PAIRED with (F3). Captured once
+# at the first submit, carried forward to the second, written into the resume
+# handle, and re-asserted before anything is stapled or staged. Without them the
+# handle pinned the DMG and staging picked up whatever .app.tar.gz was on disk,
+# so a concurrent rebuild could put a DMG and an updater payload from two
+# different builds into one release.
+NOTARIZE_UPDATER_TARBALL=""
+NOTARIZE_UPDATER_TARBALL_SHA=""
+NOTARIZE_UPDATER_SIG_SHA=""
 
 # Deferred-DMG release (--defer-notarization). Apple's verdict routinely takes
 # 1–20 hours, and everything the release actually needs — the tarball, the
@@ -425,12 +496,17 @@ Resumable notarization:
   .lucidos/release-state/notarize-<version>.json BEFORE it starts polling, so
   losing the waiting process costs a poll, not a rebuild. Any build-grade run that
   finds a resumable handle for its version resumes automatically.
-  --defer-notarization submit to Apple, persist the resume handle, and STAGE THE
-                       UNSTAPLED DMG instead of waiting for the verdict, so the
-                       release can publish now (manifest records
+  --defer-notarization submit the DMG to Apple, persist the resume handle, and
+                       STAGE THE UNSTAPLED DMG instead of waiting for its
+                       verdict, so the release can publish now (manifest records
                        notarized:false). Build-grade runs only, never with
                        --release/--release-attach. With --resume-notarize it
-                       stages an ALREADY in-flight submission without polling.
+                       stages an ALREADY in-flight DMG submission without
+                       polling.
+                       It defers the DMG's verdict ONLY. A release makes two
+                       notary submissions and the .app's comes first, because the
+                       DMG is built from the stapled .app, so that one is always
+                       waited for.
                        Finish with: release.sh --attach-notarized <version>
   --allow-pending-notarization
                        --release-attach only: permit uploading a staging whose
@@ -445,6 +521,12 @@ Resumable notarization:
                        already-built, already-signed DMG on disk, then resume.
                        Use when a submission is in flight but its id was never
                        persisted. Implies --resume-notarize.
+  --adopt-app-submission U
+                       the same, for the .app half of the notarization: records
+                       UUID U against the .app and the <app>.notarize.zip on
+                       disk. Implies --resume-notarize. Only one of the two adopt
+                       flags may be given, since only one submission is ever
+                       outstanding.
   Env: NOTARIZE_POLL_INTERVAL (default 30s), NOTARIZE_POLL_TIMEOUT (default
   7200s — bounds this process only; the handle outlives it),
   NOTARIZE_POLL_MAX_FAILURES (default 5 consecutive transient errors).
@@ -499,12 +581,90 @@ check_resource_contract() {
 stage_release_artifacts() {
     local dir="$1"
     local app_tarball app_sig source_commit
-    app_tarball="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz' 2>/dev/null | head -1 || true)"
-    app_sig="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
+    app_tarball="$(find_updater_tarball)"
+    app_sig="$(/usr/bin/find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
     [ -n "$app_tarball" ] || die "no .app.tar.gz produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
     [ -n "$app_sig" ]     || die "no .app.tar.gz.sig produced — is the updater key set (TAURI_SIGNING_PRIVATE_KEY_PATH or TAURI_SIGNING_PRIVATE_KEY)?"
     source_commit="$(git -C "$REPO_ROOT" rev-parse HEAD)" \
         || die "cannot read git HEAD of $REPO_ROOT for the staging manifest"
+
+    # THE PAIRING GATE (F3), at the chokepoint where the mismatch would become
+    # permanent. Everything above this point discovered the updater artifacts by
+    # GLOB, which is exactly what let a rebuild slip a newer build's tarball in
+    # beside a checksum-pinned DMG: the manifest recorded both, and
+    # release_staging_verify found them self-consistent because it only ever
+    # compares the staged bytes to the manifest the same run wrote.
+    #
+    # Two questions, and both have to be asked here rather than earlier: is the
+    # tarball on disk the one this submission was paired with (identity), and are
+    # all three members still the submitted bytes (integrity)? The window between
+    # the staple and this copy is small but it is not zero, and this is the last
+    # moment at which refusing is free.
+    if [ -n "$NOTARIZE_UPDATER_TARBALL" ] && [ "$app_tarball" != "$NOTARIZE_UPDATER_TARBALL" ]; then
+        die "the updater payload about to be staged is not the one this notarization was paired with.
+       paired with: $NOTARIZE_UPDATER_TARBALL
+       found:       $app_tarball
+       Staging this would put a DMG and an updater payload from two different
+       builds into one release. Rebuild rather than resuming."
+    fi
+    # Comparing against the SUBMITTED sha here is what silently unstapled the
+    # v0.19.1 DMG: this assertion read our own staple as a rebuild and recovered
+    # the pre-staple pin over it. Hence the expected sha rather than a submitted
+    # one, which on a stapled release is the post-staple value.
+    assert_submitted_set_is_intact "$NOTARIZE_EXPECTED_SHA"
+
+    # THE GATE THAT WOULD HAVE CAUGHT v0.19.1, asserted on the bytes about to be
+    # copied rather than inferred from the checksums above. A run that made a
+    # notary submission and is not deferred MUST ship a ticket, and nothing else
+    # on the path says so out loud: `spctl` resolves the ticket ONLINE, so it
+    # answers `accepted / source=Notarized Developer ID` for an unstapled DMG and
+    # hid this for a whole release. Same shape as the Developer ID gate below:
+    # re-derive the verdict from the bytes at the last moment refusing is free.
+    #
+    # The condition names the two states where a ticket is genuinely expected. A
+    # deferred release stages before anything is stapled (DMG_NOTARIZED_STATE is
+    # false, and the manifest says so); a run with no submission id never
+    # notarized at all, which release mode already refuses upstream.
+    if [ -n "$NOTARIZE_SUBMISSION_ID" ] && [ "$DMG_NOTARIZED_STATE" = "true" ]; then
+        step "Verifying the DMG carries its stapled notarization ticket"
+        dmg_ticket_is_stapled "$DMG_PATH" \
+            || die "refusing to stage $(basename "$DMG_PATH"): it carries NO stapled notarization ticket.
+       Notarization completed for submission $NOTARIZE_SUBMISSION_ID, so the
+       ticket was stapled and has since been lost, which means something wrote
+       over the image after the staple. Gatekeeper would still accept this DMG
+       on a machine that can reach Apple, and reject it on one that cannot,
+       which is the entire reason the ticket is stapled in the first place.
+       Rebuild rather than publishing it."
+        echo "    $(basename "$DMG_PATH") validates against its stapled ticket."
+    fi
+
+    # THE GATE THAT WOULD HAVE CAUGHT v0.19.0. Staging only ever runs in a
+    # release-grade build, where APPLE_SIGNING_IDENTITY is asserted at startup,
+    # so a payload that is not Developer ID signed means the repack did not
+    # happen (or did not take) and this release would ship an updater that
+    # replaces every user's notarized app with an ad-hoc one. Refuse before a
+    # single byte reaches the staging dir a later --publish-verified will ship.
+    #
+    # The refusal has to name the resume handle, because the ONE path that can
+    # legitimately reach this with a stale payload is the auto-resume: a run that
+    # picks up a handle written by a build predating the repack skips the build
+    # AND the repack, so the tarball on disk is that older build's ad-hoc one.
+    # "Rebuild" alone would be a dead end there, since the next run auto-resumes
+    # into the same wall.
+    #
+    # Like every other refusal in this function, this die lands with CURRENT_STEP
+    # unset (finalize_release_artifacts calls staging after end_step notarize),
+    # so it emits no cockpit event. That is consistent with the neighbouring
+    # "no .app.tar.gz produced" guards rather than an oversight: the cockpit's
+    # step vocabulary has no id for staging, and inventing one it does not render
+    # would be worse than the exit code the operator already sees.
+    step "Verifying the updater payload is Developer ID signed"
+    updater_payload_assert_developer_id "$app_tarball" "$(basename "$app_tarball")" \
+        || die "refusing to stage an updater payload that is not Developer ID signed (see above).
+       If this run RESUMED a notarization (it says so above) the tarball on disk
+       is the one that build produced, and no repack has touched it. Delete the
+       resume handle so the next run rebuilds instead of resuming:
+           rm ${NOTARIZE_STATE_FILE:-.lucidos/release-state/notarize-<version>.json}"
 
     # Record WHAT THIS DMG WAS BUILT FROM in content terms, not just commit
     # terms. A later re-fold compares these to decide whether rebuilding could
@@ -516,17 +676,31 @@ stage_release_artifacts() {
     build_fp="$(release_build_fingerprint_compute "$REPO_ROOT" "$source_commit" 2>/dev/null || true)"
     recipe_fp="$(release_build_recipe_fingerprint_compute "$REPO_ROOT" "$source_commit" 2>/dev/null || true)"
 
+    # Record WHICH PLATFORM this payload is for, read off the app binary that was
+    # just signed (F10). This is the only moment the artifact and a machine that
+    # can interrogate it are both present: --release-attach deliberately has no
+    # .app on disk, and deriving the key there from `uname -m` described the
+    # upload host instead. Fatal on failure rather than degrading, because the
+    # degraded answer is exactly the silent mislabelling this replaces: an updater
+    # whose target key is absent from `platforms` reports "no update", so a wrong
+    # key produces no error anywhere, ever.
+    local platform_key
+    platform_key="$(release_staging_platform_key_for_binary "$APP_PATH/Contents/MacOS/lucidos-app")" \
+        || die "could not determine the latest.json platform key for the staged app (see above)."
+
     rm -rf "$dir"
     mkdir -p "$dir"
     cp "$DMG_PATH" "$dir/"
     cp "$app_tarball" "$dir/"
     cp "$app_sig" "$dir/"
+    RELEASE_STAGING_PLATFORM_KEY="$platform_key" \
     RELEASE_STAGING_BUILD_FINGERPRINT="$build_fp" \
     RELEASE_STAGING_RECIPE_FINGERPRINT="$recipe_fp" \
     RELEASE_STAGING_NOTARIZED="$DMG_NOTARIZED_STATE" \
     release_staging_write_manifest "$dir" "$EFFECTIVE_VERSION" "$source_commit" \
         "$(basename "$DMG_PATH")" "$(basename "$app_tarball")" "$(basename "$app_sig")" \
         || die "failed to write the staging manifest in $dir"
+    echo "    platform key: $platform_key"
     [ -n "$build_fp" ] && echo "    build fingerprint: $build_fp"
     if [ "$DMG_NOTARIZED_STATE" = "false" ]; then
         echo "    notarized: false — the DMG is signed but NOT yet stapled (deferred release)"
@@ -578,58 +752,109 @@ upload_staged_assets() {
     command -v gh >/dev/null 2>&1 || die "gh CLI required to upload release artifacts (https://cli.github.com/)."
 
     local dmg app_tarball app_sig
-    dmg="$(/usr/bin/find "$dir" -maxdepth 1 -name '*.dmg' 2>/dev/null | head -1 || true)"
+    # The same shared discovery the build uses. A staging dir should hold exactly
+    # one DMG and no intermediates, so this is belt-and-braces rather than a known
+    # hazard, but "publish whichever .dmg find happened to list first" is not a
+    # property worth keeping anywhere on the path to a public Release.
+    dmg="$(release_dmg_find "$dir" 2>/dev/null || true)"
     app_tarball="$(/usr/bin/find "$dir" -maxdepth 1 -name '*.app.tar.gz' 2>/dev/null | head -1 || true)"
     app_sig="$(/usr/bin/find "$dir" -maxdepth 1 -name '*.app.tar.gz.sig' 2>/dev/null | head -1 || true)"
     [ -n "$dmg" ]         || die "no staged .dmg in $dir"
     [ -n "$app_tarball" ] || die "no staged .app.tar.gz in $dir"
     [ -n "$app_sig" ]     || die "no staged .app.tar.gz.sig in $dir"
 
+    # The same Developer ID gate stage_release_artifacts applies, re-run on the
+    # STAGED bytes at the last moment before they become public. Not redundant:
+    # --release-attach can be pointed at a staging dir produced by an older
+    # build-dmg.sh, or by a run that predates the repack, and nothing else on
+    # that path looks inside the tarball. This function is the single chokepoint
+    # both upload paths (--release-attach and the one-shot --release) go through,
+    # which is what makes "no upload can publish an unsigned payload" a property
+    # of the code.
+    #
+    # Deliberately re-derived from the bytes rather than read back from a
+    # manifest field: a recorded verdict would have to be carried forward by
+    # every restamp (release.sh's restage_manifest_for_commit), and a restamp
+    # that dropped it would launder an unsigned payload into a signed-looking
+    # one. That is the trap the `notarized` flag has to keep dodging.
+    #
+    # Unlike run_release_attach's manifest verify, this one runs INSIDE the
+    # `upload` step, so a refusal emits ReleaseStepFailed(upload) and the cockpit
+    # goes red rather than staying silent. That is the right signal here and not
+    # an oversight: the manifest verify is a precondition checked before the step
+    # begins, whereas this is the upload step's own work failing. Being the one
+    # chokepoint both upload paths share is worth more than matching the other
+    # guard's silence.
+    step "Verifying the staged updater payload is Developer ID signed"
+    updater_payload_assert_developer_id "$app_tarball" "$(basename "$app_tarball") in $dir" \
+        || die "refusing to upload an updater payload that is not Developer ID signed (see above)."
+
+    # THE SAME TICKET GATE stage_release_artifacts applies, re-run on the STAGED
+    # bytes at the last moment before they become public, and for the same reason
+    # the Developer ID check above is duplicated here: --release-attach can be
+    # pointed at a staging dir produced by an older build-dmg.sh, or by the run
+    # that shipped the v0.19.1 defect, and nothing else on that path looks at the
+    # DMG's ticket. run_release_attach's own pending check reads the manifest's
+    # `notarized` FLAG, which is precisely the thing that said `true` over an
+    # unstapled DMG, so only re-deriving the verdict from the bytes closes it.
+    #
+    # The condition is the manifest flag rather than a build-time global, because
+    # this function is the chokepoint for BOTH upload paths and the attach one has
+    # no build state at all. A deferred publish stages `notarized: false` on
+    # purpose and carries the pending banner, so it is skipped here exactly as it
+    # is at staging.
+    if release_staging_is_notarized "$dir"; then
+        step "Verifying the staged DMG carries its notarization ticket"
+        dmg_ticket_is_stapled "$dmg" \
+            || die "refusing to upload $(basename "$dmg"): the staged DMG carries NO stapled notarization ticket, though its manifest says it is notarized.
+       Gatekeeper resolves a missing ticket ONLINE, so this would be accepted on
+       a machine that can reach Apple and refused on one that cannot, which is
+       the entire reason the ticket is stapled.
+       This staging is the one v0.19.1 produced: the manifest's notarized flag
+       and the bytes disagree, so re-STAGE it. --attach-notarized cannot fix it
+       (it short-circuits on a manifest that already claims to be stapled):
+           scripts/release.sh --verify-build $EFFECTIVE_VERSION"
+        echo "    $(basename "$dmg") validates against its stapled ticket."
+    fi
+
     # latest.json (the in-app auto-update manifest). The uploaded asset's name is
     # the file's basename, and the updater endpoint resolves
     # …/releases/latest/download/latest.json — so the file must literally be named
     # latest.json. Stage it under that exact name.
+    #
+    # THE PLATFORM KEY COMES FROM THE MANIFEST (F10), not from `uname -m`. The old
+    # `case "$(uname -m)"` here described whichever machine ran the upload, which
+    # is not the same question as which architecture the payload is for, and the
+    # two diverge on exactly the path that cannot check: --release-attach has no
+    # .app on disk to fall back to. release_staging_verify has already refused a
+    # manifest that predates the recording, so reaching here means a key exists;
+    # the read below is what makes that a hard dependency rather than a hope.
     local platform_key tarball_name download_url pub_date latest_dir latest_json
-    case "$(uname -m)" in
-        arm64|aarch64) platform_key="darwin-aarch64" ;;
-        x86_64)        platform_key="darwin-x86_64" ;;
-        *) die "unsupported arch for latest.json: $(uname -m)" ;;
-    esac
+    platform_key="$(release_staging_platform_key "$dir")" \
+        || die "cannot build latest.json for $UPLOAD_TAG (see above)."
     tarball_name="$(basename "$app_tarball")"
     download_url="https://github.com/$REPO_SLUG/releases/download/$UPLOAD_TAG/$tarball_name"
     pub_date="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     latest_dir="$(mktemp -d -t lucidos-latest)"
     latest_json="$latest_dir/latest.json"
 
-    # python3 is present on any Mac with the Xcode CLT this script already needs.
-    # It JSON-encodes the multi-line changelog notes + the signature safely. The
-    # notes file is optional (empty notes if --notes-file was not supplied).
-    RELEASE_VERSION="$EFFECTIVE_VERSION" PLATFORM_KEY="$platform_key" DOWNLOAD_URL="$download_url" \
-    PUB_DATE="$pub_date" NOTES_FILE="${NOTES_FILE:-}" SIG_FILE="$app_sig" \
-    python3 - > "$latest_json" <<'PY'
-import json, os
-notes_file = os.environ.get("NOTES_FILE", "")
-notes = open(notes_file, encoding="utf-8").read().strip() if notes_file else ""
-sig = open(os.environ["SIG_FILE"], encoding="utf-8").read().strip()
-manifest = {
-    "version": os.environ["RELEASE_VERSION"],
-    "notes": notes,
-    "pub_date": os.environ["PUB_DATE"],
-    "platforms": {
-        os.environ["PLATFORM_KEY"]: {
-            "signature": sig,
-            "url": os.environ["DOWNLOAD_URL"],
-        }
-    },
-}
-print(json.dumps(manifest, indent=2))
-PY
-    [ -s "$latest_json" ] || die "latest.json generation produced no output"
+    if ! release_upload_write_latest_json "$latest_json" "$EFFECTIVE_VERSION" "$platform_key" \
+            "$download_url" "$pub_date" "$app_sig" "${NOTES_FILE:-}"; then
+        rm -rf "$latest_dir"
+        die "could not generate latest.json for $UPLOAD_TAG (see above)."
+    fi
 
-    # --clobber so a re-run replaces assets instead of erroring on existing names.
-    gh release upload "$UPLOAD_TAG" --repo "$REPO_SLUG" --clobber \
-        "$dmg" "$app_tarball" "$app_sig" "$latest_json" \
-        || die "gh release upload failed for $UPLOAD_TAG"
+    # THE ORDERING (F8). latest.json goes up LAST, in its own call, after the
+    # three artifacts it references are verified present on the Release. Attaching
+    # all four in one `gh release upload` uploaded them concurrently, so the
+    # smallest file won and the updater endpoint advertised a Lucidos.app.tar.gz
+    # GitHub still answered with a 404. The manifest is a separate parameter, not
+    # the last artifact, so no argument list can put it back in the first batch.
+    if ! release_upload_artifacts_then_manifest "$UPLOAD_TAG" "$REPO_SLUG" "$latest_json" \
+            "$dmg" "$app_tarball" "$app_sig"; then
+        rm -rf "$latest_dir"
+        die "could not attach the release assets to $UPLOAD_TAG (see above)."
+    fi
     rm -rf "$latest_dir"
 }
 
@@ -868,115 +1093,465 @@ staple_idempotent() {
     die "stapler staple failed for $path and the artifact carries no valid ticket."
 }
 
-# assert_dmg_is_the_submitted_bytes — refuse to staple a DMG that is no longer
-# the file Apple scanned.
+# ── The submitted set: pin it, then prove it is still intact ─────────────────
 #
 # THE 2026-07-28 ORPHANED-POLLER BUG. build-dmg.sh writes the DMG to a FIXED path
 # (target/release/bundle/dmg/Lucidos_<version>_aarch64.dmg), so a rebuild
 # overwrites the exact file an in-flight submission was for. That day three
-# pollers were alive at once and two of them were waiting on submissions whose
-# DMG bytes no longer existed — had those verdicts returned, each would have
-# stapled a ticket issued for one set of bytes onto a different set.
+# pollers were alive at once and two were waiting on submissions whose bytes no
+# longer existed. Had those verdicts returned, each would have stapled a ticket
+# issued for one set of bytes onto a different set.
 #
-# release_notarize_resumable() checks this on the RESUME path. This is the same
-# assertion on the FRESH-BUILD path, which had none: submit → (long wait) →
-# staple has exactly the same window, because a concurrent build can overwrite
-# the DMG while this process sits in notarize_poll. Cheap (one sha256 of a file
-# already in the page cache) against a silent mis-staple.
-assert_dmg_is_the_submitted_bytes() {
-    local expected="$1" actual pinned
-    [ -n "$expected" ] || return 0
+# THE F3 EXTENSION. The guard that fixed that covered the DMG and nothing else,
+# and the release does not ship a DMG alone: it ships the DMG, `Lucidos.app.tar.gz`
+# and its `.sig`, which must all come from ONE build. Worse than a passive gap,
+# the recovery below actively creates the mismatch if it is applied per-artifact:
+# it restores the DMG from its pin after a concurrent rebuild, which is exactly
+# the state in which the tarball on disk belongs to the newer build. So the set is
+# pinned together and asserted together.
 
-    # If the fixed path was overwritten by a concurrent build, the pinned copy
-    # still holds the exact bytes Apple scanned — recover from it instead of
-    # throwing away a completed notarization.
-    if [ ! -f "$DMG_PATH" ] || [ "$(release_staging_sha256 "$DMG_PATH" 2>/dev/null || true)" != "$expected" ]; then
-        pinned="${NOTARIZE_PINNED_DMG:-}"
-        if [ -z "$pinned" ]; then
-            pinned="$(/usr/bin/find "$REPO_ROOT/.lucidos/notarize-submissions/${EFFECTIVE_VERSION:-unversioned}/${expected:0:12}" \
-                -maxdepth 1 -name '*.dmg' 2>/dev/null | head -1 || true)"
+# notarize_pin_dir <sha256>: the content-addressed directory a pinned artifact
+# lives in. Addressed by CONTENT rather than by submission, so two concurrent
+# builds of the same version cannot collide, which is the 2026-07-28 shape.
+notarize_pin_dir() {
+    printf '%s/.lucidos/notarize-submissions/%s/%s' \
+        "$REPO_ROOT" "${EFFECTIVE_VERSION:-unversioned}" "${1:0:12}"
+}
+
+# notarize_pin_artifact <path> <sha256>: keep an immutable copy of <path> under
+# its content address, so a later run can RECOVER those bytes instead of losing a
+# completed notarization. Usually the bytes Apple scanned, and after the staple
+# the bytes that carry the ticket (see notarize_record_stapled_dmg), which is why
+# this is worded by content address rather than by "submitted".
+#
+# WHY A CLONE AND NOT A HARDLINK. A hardlink is the obvious zero-cost pin and it
+# is WRONG here: it is a second name for the SAME inode, so anything that writes
+# the file IN PLACE (`codesign` rewriting a signature, a truncating `>`) is seen
+# through both names and silently corrupts the pin. The test suite proves this: an
+# in-place write mutates a hardlinked pin while leaving a cloned one intact.
+# `cp -c` requests an APFS clonefile, which is copy-on-write, so it costs no disk
+# until one side diverges and an in-place write to the original allocates new
+# blocks instead of touching the pinned copy. On a non-APFS volume the -c fails
+# and the plain copy takes over: correct, just not free.
+#
+# Best-effort by design. If the pin cannot be created the build proceeds unpinned:
+# the checksum assertion is the correctness guarantee (it refuses rather than
+# mis-staples), and the pin is only what additionally lets a poller recover.
+notarize_pin_artifact() {
+    local path="$1" sha="$2" pin_dir pin
+    [ -n "$sha" ] || return 0
+    [ -f "$path" ] || return 0
+    pin_dir="$(notarize_pin_dir "$sha")"
+    if ! mkdir -p "$pin_dir" 2>/dev/null; then
+        echo "    NOTE: could not create $pin_dir, so $(basename "$path") is unpinned."
+        return 0
+    fi
+    pin="$pin_dir/$(basename "$path")"
+    if [ -f "$pin" ]; then
+        echo "    pinned (already): $pin"
+        return 0
+    fi
+    if cp -c "$path" "$pin" 2>/dev/null || cp "$path" "$pin" 2>/dev/null; then
+        echo "    pinned: $pin"
+    else
+        echo "    NOTE: could not pin $path, so it is unpinned."
+        rm -f "$pin"
+    fi
+}
+
+# notarize_find_pin <sha256>: print a pinned file whose bytes hash to <sha256>, or
+# nothing. Located by content address alone, so a FRESH process (the orphaned
+# poller, which knows nothing about what the dead one pinned) finds it just as
+# well as the process that created it.
+notarize_find_pin() {
+    local sha="$1" candidate
+    [ -n "$sha" ] || return 0
+    for candidate in "$(notarize_pin_dir "$sha")"/*; do
+        [ -f "$candidate" ] || continue
+        if [ "$(release_staging_sha256 "$candidate" 2>/dev/null || true)" = "$sha" ]; then
+            printf '%s' "$candidate"
+            return 0
         fi
-        if [ -n "$pinned" ] && [ -f "$pinned" ] \
-           && [ "$(release_staging_sha256 "$pinned" 2>/dev/null || true)" = "$expected" ]; then
-            echo "    NOTE: $DMG_PATH no longer holds the submitted bytes (a rebuild replaced it)."
-            echo "          Recovering the notarized bytes from the pin: $pinned"
-            cp -f "$pinned" "$DMG_PATH" \
-                || die "could not restore the submitted DMG from its pin at $pinned"
+    done
+    return 0
+}
+
+# notarize_pin_submitted_set <artifact> <artifact-sha256>: pin the artifact about
+# to be handed to Apple TOGETHER WITH the updater payload it is paired with, so a
+# recovery can restore a whole build rather than half of one.
+notarize_pin_submitted_set() {
+    notarize_pin_artifact "$1" "$2"
+    if [ -n "$NOTARIZE_UPDATER_TARBALL" ]; then
+        notarize_pin_artifact "$NOTARIZE_UPDATER_TARBALL" "$NOTARIZE_UPDATER_TARBALL_SHA"
+        notarize_pin_artifact "$NOTARIZE_UPDATER_TARBALL.sig" "$NOTARIZE_UPDATER_SIG_SHA"
+    fi
+}
+
+# assert_submitted_artifacts_are_intact <label> <path> <sha256> [<label> <path> <sha256>…]
+#
+# Refuse to staple or stage unless EVERY member of the submitted set is still the
+# bytes that were submitted, restoring from the pins where it can.
+#
+# DECIDE FIRST, THEN ACT, and that ordering is the whole point. Three separate
+# `cp`s cannot be atomic on a filesystem, but nothing needs to be: what must never
+# happen is restoring SOME members and proceeding. The loop below therefore only
+# records what it would restore; it copies nothing until every member is known to
+# be either intact or recoverable, and on any unrecoverable member it dies having
+# touched nothing. The previous version copied the DMG the instant it noticed
+# drift, which is precisely how a release ends up holding half a build.
+#
+# A member with an empty expected sha is skipped: a local build with no updater
+# key has no payload to compare, and the release-grade refusal for a missing one
+# belongs to stage_release_artifacts.
+# SC2317: ShellCheck can see that `die` ends in `exit`, so it calls the `return 1`
+# after each die unreachable. They are deliberate, and the comment inside the
+# function says why: the refusal must be this function's own behaviour, not a
+# consequence of a helper's exit semantics.
+# shellcheck disable=SC2317
+assert_submitted_artifacts_are_intact() {
+    local label path sha actual pin detail i
+    local -a restore_from=() restore_to=() restore_label=() problems=()
+
+    while [ "$#" -ge 3 ]; do
+        label="$1"; path="$2"; sha="$3"; shift 3
+        # No recorded checksum means there is nothing to assert: a local build
+        # with no updater key has no payload to compare against.
+        [ -n "$sha" ] || continue
+        # A recorded checksum with NO path is an inconsistent caller, and it must
+        # refuse rather than skip. Skipping would silently drop a member from the
+        # set, which is the exact class of hole this function exists to close.
+        if [ -z "$path" ]; then
+            problems+=("$label: submitted $sha, but no path was given to check it against")
+            continue
         fi
+        if [ -f "$path" ]; then
+            actual="$(release_staging_sha256 "$path" 2>/dev/null || true)"
+            [ "$actual" = "$sha" ] && continue
+            [ -n "$actual" ] || actual="(unreadable)"
+        else
+            actual="(missing)"
+        fi
+        pin="$(notarize_find_pin "$sha")"
+        if [ -n "$pin" ]; then
+            restore_from+=("$pin")
+            restore_to+=("$path")
+            restore_label+=("$label")
+        else
+            problems+=("$label: submitted $sha, on disk $actual, and no pinned copy survives")
+        fi
+    done
+    # Every refusal below `return`s as well as calling `die`. `die` exits in
+    # build-dmg.sh, so the return is unreachable there, and that is the point:
+    # whether this function refuses must be a property of THIS function rather
+    # than of a helper's exit semantics. Without it, a `die` that ever became
+    # non-exiting would fall through to the restore loop and produce exactly the
+    # half-restored tree the refusal exists to prevent.
+    if [ "$#" -ne 0 ]; then
+        die "assert_submitted_artifacts_are_intact takes <label> <path> <sha256> triples; got $# trailing argument(s)"
+        return 1
     fi
 
-    [ -f "$DMG_PATH" ] || die "the DMG vanished while Apple was notarizing it: $DMG_PATH"
-    actual="$(release_staging_sha256 "$DMG_PATH")" \
-        || die "could not re-hash $DMG_PATH before stapling"
-    if [ "$actual" != "$expected" ]; then
-        die "REFUSING TO STAPLE: $DMG_PATH is not the file that was submitted.
-       submitted: $expected
-       on disk:   $actual
-       Another build overwrote the DMG while this submission was in flight.
-       Stapling now would attach a notarization ticket issued for different
-       bytes. Rebuild, or resume the submission from the tree that built it."
+    if [ "${#problems[@]}" -gt 0 ]; then
+        detail="$(printf '       %s\n' "${problems[@]}")"
+        die "REFUSING TO STAPLE OR STAGE: the set Apple scanned is no longer on disk.
+$detail
+       Another build replaced these while the submission was in flight. Restoring
+       only the members that CAN be recovered is what produces the failure this
+       exists to prevent: a DMG from one build staged beside an updater payload
+       from another, self-consistent in the manifest and wrong on disk.
+       NOTHING has been restored. Rebuild, or resume from the tree that built it."
+        return 1
+    fi
+
+    i=0
+    while [ "$i" -lt "${#restore_to[@]}" ]; do
+        echo "    NOTE: ${restore_label[$i]} no longer holds the submitted bytes (a rebuild replaced it)."
+        echo "          Recovering them from the pin: ${restore_from[$i]}"
+        if ! cp -f "${restore_from[$i]}" "${restore_to[$i]}"; then
+            die "could not restore ${restore_label[$i]} from its pin at ${restore_from[$i]}"
+            return 1
+        fi
+        i=$((i + 1))
+    done
+}
+
+# assert_submitted_set_is_intact <expected-artifact-sha256>: the same assertion,
+# over the set this run actually submitted: the artifact Apple scanned plus the
+# updater payload and signature it was paired with.
+assert_submitted_set_is_intact() {
+    local expected="${1:-}" sig=""
+    if [ -n "$NOTARIZE_UPDATER_TARBALL" ]; then
+        sig="$NOTARIZE_UPDATER_TARBALL.sig"
+    fi
+    assert_submitted_artifacts_are_intact \
+        "$(basename "$DMG_PATH")" "$DMG_PATH"                 "$expected" \
+        "the updater payload"     "$NOTARIZE_UPDATER_TARBALL" "$NOTARIZE_UPDATER_TARBALL_SHA" \
+        "the updater signature"   "$sig"                      "$NOTARIZE_UPDATER_SIG_SHA"
+}
+
+# dmg_ticket_is_stapled <path>: zero when <path> carries a valid stapled ticket,
+# non-zero when stapler says it does not. The three gates that ask this question
+# share it so they cannot drift, and so none of them has to repeat the reason it
+# is not a bare `xcrun stapler validate`.
+#
+# A MISSING TICKET AND A MISSING TOOLCHAIN ARE OPPOSITE ANSWERS. `stapler`
+# reports "does not have a ticket stapled to it" with exit **65**, and that is
+# the only non-zero exit that is a verdict about the DMG. Exit 127 (no `xcrun`)
+# or an unselected developer dir (`tool 'stapler' requires Xcode`) means the
+# question was never asked, and reporting that as "no ticket" sends the operator
+# into a 40-minute rebuild and re-notarization for what is an
+# `xcode-select --install`. So anything other than 0 or 65 dies here, quoting
+# what stapler actually said.
+#
+# SC2317: the `return 1` after `die` is deliberate, for the reason spelled out in
+# assert_submitted_artifacts_are_intact: refusing must be this function's own
+# behaviour rather than a consequence of a helper's exit semantics. It matters
+# more here than anywhere, because this function's callers branch on its status.
+# shellcheck disable=SC2317
+dmg_ticket_is_stapled() {
+    local path="$1" out rc=0
+    out="$(xcrun stapler validate "$path" 2>&1)" || rc=$?
+    case "$rc" in
+        0)  return 0 ;;
+        65) return 1 ;;
+    esac
+    die "could not tell whether $(basename "$path") carries a notarization ticket: \`xcrun stapler validate\` exited $rc, which is neither 0 (stapled) nor 65 (not stapled).
+$out
+       That is a toolchain failure, not a verdict about the DMG. Check that the
+       Command Line Tools are installed and selected: xcode-select -p"
+    return 1
+}
+
+# notarize_carry_staple_into_handle <post-staple-sha256>: move the resume
+# handle's record of the DMG forward with the other two.
+#
+# The expectation lives in THREE places, and leaving one behind is the same
+# asymmetry that produced the bug this whole section is about. The global drives
+# this process, the pin is what a recovery reads, and the handle is what a LATER
+# process reads. `release_notarize_resumable` re-hashes `artifact_path` against
+# `artifact_sha256` and refuses on any mismatch, so a handle left describing the
+# pre-staple bytes makes the run unresumable the moment the DMG is stapled. That
+# window is small but it is exactly the deferred release's: `--attach-notarized`
+# staples an ALREADY-PUBLISHED DMG and then stages, and a staging failure after
+# the staple would strand it, unstaplable without a full rebuild, which is the
+# one outcome ADR 0027 says the handle exists to prevent.
+#
+# The field keeps its meaning: `artifact_sha256` is the bytes this submission is
+# accountable for, which are the submitted bytes right up until we add our own
+# ticket to them. Only the DMG stage can reach here, so the `app` stage's record
+# of the submitted zip is never touched.
+#
+# Best-effort, like the pin, and for the same reason: the staple has already
+# succeeded and the assertion (not the handle) is the correctness guarantee, so
+# failing a release over bookkeeping would be the wrong trade. Say so, though, so
+# the operator knows a crash before staging will need the rebuild.
+notarize_carry_staple_into_handle() {
+    local sha="$1" commit submitted_at
+    [ -n "$NOTARIZE_STATE_FILE" ] && [ -f "$NOTARIZE_STATE_FILE" ] || return 0
+    [ -n "$NOTARIZE_SUBMISSION_ID" ] || return 0
+    # A FAILED READ MUST NOT BECOME A WRITTEN EMPTY FIELD. These two are carried
+    # over verbatim rather than regenerated, so if either read fails (corrupt
+    # JSON, a transient python3 failure) the rewrite would replace a good handle
+    # with one whose source_commit is "", and the resume gate would then refuse
+    # with "the tree moved since the artifact was built" against a tree that
+    # never moved: the exact stranding this function exists to prevent, wearing
+    # the wrong diagnosis. Leave the handle alone and say so instead.
+    if ! commit="$(release_notarize_field "$NOTARIZE_STATE_FILE" source_commit 2>/dev/null)" \
+       || ! submitted_at="$(release_notarize_field "$NOTARIZE_STATE_FILE" submitted_at 2>/dev/null)"; then
+        echo "    NOTE: could not read $NOTARIZE_STATE_FILE back, so it still describes the pre-staple bytes; a failure before staging will need a rebuild rather than a resume."
+        return 0
+    fi
+    RELEASE_NOTARIZE_UPDATER_TARBALL="$NOTARIZE_UPDATER_TARBALL" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL_SHA256="$NOTARIZE_UPDATER_TARBALL_SHA" \
+    RELEASE_NOTARIZE_UPDATER_SIG_SHA256="$NOTARIZE_UPDATER_SIG_SHA" \
+    release_notarize_write_state "$NOTARIZE_STATE_FILE" "$RELEASE_NOTARIZE_STAGE_DMG" \
+        "$NOTARIZE_SUBMISSION_ID" "$DMG_PATH" "$sha" "$EFFECTIVE_VERSION" \
+        "$commit" "$submitted_at" \
+        || echo "    NOTE: could not update $NOTARIZE_STATE_FILE to the stapled bytes; a failure before staging will need a rebuild rather than a resume."
+}
+
+# notarize_record_stapled_dmg: the staple REWROTE the DMG, so make the stapled
+# bytes what every later assertion expects, pin them, and carry them into the
+# handle.
+#
+# THE v0.19.1 PHASE A DEFECT. `xcrun stapler staple` writes the ticket INTO the
+# disk image, so the file the guard protects necessarily changes at the one
+# moment the guard does not expect it to, and nothing above could tell that
+# INTENDED mutation from the concurrent rebuild the guard exists to catch. The
+# staple succeeded; stage_release_artifacts then ran its own
+# assert_submitted_set_is_intact, found the mismatch, located the PRE-STAPLE pin
+# and copied it back over the stapled DMG. The staple was silently undone, the
+# manifest recorded the unstapled sha, release_staging_verify found the pair
+# self-consistent, and --publish-verified would have shipped a DMG carrying no
+# ticket. `spctl` said `accepted / source=Notarized Developer ID` throughout,
+# because that is an ONLINE lookup, the exact dependency stapling exists to
+# remove; that is why Gatekeeper acceptance hid it and the rc DMG-verify leg
+# (`stapler validate`, exit 65) is what caught it.
+#
+# EVERY HALF MOVES FORWARD, and each is load-bearing. Re-recording keeps a
+# rebuild after this point DETECTED: the expected sha is the one now on disk, so
+# a replacement still mismatches with the same force as before. Re-pinning keeps
+# it RECOVERABLE, and by the right bytes: the pre-staple pin can only ever
+# restore a DMG with no ticket, which is the failure above wearing a different
+# hat. Pins are content-addressed, so the stapled copy sits BESIDE the submitted
+# one rather than replacing it, and finalize_release_artifacts drops the whole
+# version's pin dir once staging holds a copy. The handle is the third
+# (notarize_carry_staple_into_handle, above).
+#
+# Only the DMG needs this. staple_notarized_artifacts also staples the standalone
+# .app, and no later assertion reads that bundle's bytes: the app stage asserts
+# its submitted ZIP (which stapling the bundle does not touch) and its CDHash
+# (which the ticket does not change, since it lands in Contents/CodeResources,
+# outside the sealed set, which is why that stage's codesign --verify passes).
+#
+# SC2317: `die` ends in `exit`, so ShellCheck reads the `return 1` as
+# unreachable. It is deliberate, for the reason spelled out in
+# assert_submitted_artifacts_are_intact: refusing must be this function's own
+# behaviour rather than a consequence of a helper's exit semantics.
+# shellcheck disable=SC2317
+notarize_record_stapled_dmg() {
+    local sha again
+    sha="$(release_staging_sha256 "$DMG_PATH" 2>/dev/null || true)"
+    if [ -z "$sha" ]; then
+        die "could not re-hash $DMG_PATH after stapling it. Every later integrity check compares against that value, and the staple has just changed the bytes it describes, so proceeding would either restore the unstapled copy over the ticket or refuse to stage at all."
+        return 1
+    fi
+    # PROVE THE TICKET BEFORE ADOPTING THE BYTES, then prove the bytes did not
+    # move while we proved it. Whatever this function records becomes what the
+    # release stages, so the one thing it must never do is bless a file it has
+    # not checked. The window between the staple returning and the hash above is
+    # small, but the DMG lives at a FIXED path and a concurrent build overwrites
+    # exactly that path, which is the 2026-07-28 shape; without these two checks
+    # a rebuild landing in that window would be adopted as "the stapled bytes"
+    # and pinned as the recovery copy, and the release would ship a DMG that was
+    # never submitted to Apple. This is also the check the .app stage has always
+    # made after its own staple; the DMG half never did, which is why the missing
+    # ticket had to travel all the way to a CI runner to be noticed.
+    #
+    # It proves A ticket, not OUR ticket, and the gap is accepted: another build
+    # would have to finish building, submitting, waiting out Apple and stapling
+    # inside a window this function closes in milliseconds. The pairing gate in
+    # stage_release_artifacts is the backstop if it ever happened, since that
+    # build's tarball would not be the one this submission is paired with.
+    dmg_ticket_is_stapled "$DMG_PATH" || {
+        die "stapler reported success for $DMG_PATH but the bytes now at that path carry no valid ticket. Another build almost certainly replaced the image between the staple and this check. Refusing to record them: they would be staged and published as the notarized DMG."
+        return 1
+    }
+    again="$(release_staging_sha256 "$DMG_PATH" 2>/dev/null || true)"
+    if [ "$again" != "$sha" ]; then
+        die "$DMG_PATH changed while its staple was being verified (was $sha, now ${again:-(unreadable)}). Another build is writing to this path. Refusing to record either version."
+        return 1
+    fi
+    if [ "$sha" = "$NOTARIZE_EXPECTED_SHA" ]; then
+        # staple_idempotent's already-carries-a-ticket branch, which is normal on
+        # a resume. Nothing moved, so say so rather than claiming a rewrite.
+        echo "    $(basename "$DMG_PATH") already held its ticket; the expected bytes are unchanged."
+    else
+        echo "    the staple rewrote $(basename "$DMG_PATH"); later checks now expect $sha"
+    fi
+    NOTARIZE_EXPECTED_SHA="$sha"
+    notarize_pin_artifact "$DMG_PATH" "$sha"
+    notarize_carry_staple_into_handle "$sha"
+    # A pin that does not hold the bytes it is addressed by is worse than no pin:
+    # notarize_find_pin verifies content, so such a pin is simply never found and
+    # the recoverability this re-pin exists for is silently gone. Pinning stays
+    # best-effort (the assertion, not the pin, is the correctness guarantee), so
+    # say so rather than fail the release over it.
+    if [ -z "$(notarize_find_pin "$sha")" ]; then
+        echo "    NOTE: the stapled bytes are unpinned, so a rebuild after this point will refuse rather than recover."
     fi
 }
 
 # staple_notarized_artifacts [<expected-dmg-sha256>] — staple the DMG and (when
 # present) the .app. When the caller knows the sha256 that was submitted it MUST
 # pass it: stapling different bytes than Apple scanned is the failure mode this
-# guards (see assert_dmg_is_the_submitted_bytes).
+# guards (see assert_submitted_artifacts_are_intact).
+#
+# THE CHOKEPOINT FOR THE STAPLE ITSELF. Both paths that staple a DMG come through
+# here, the fresh build and the resume behind --attach-notarized, so the expected
+# bytes move forward in exactly one place and the two cannot drift.
+# --defer-notarization never reaches this function at all: it stages the
+# unstapled DMG with notarized:false and keeps comparing against the submitted
+# sha, which is correct, because its submission is still in flight.
 staple_notarized_artifacts() {
-    assert_dmg_is_the_submitted_bytes "${1:-}"
+    assert_submitted_set_is_intact "${1:-}"
     step "Stapling the notarization ticket"
     staple_idempotent "$DMG_PATH"
+    # Immediately, before anything else can observe the stale expectation.
+    notarize_record_stapled_dmg
+    # The standalone .app normally already carries a ticket by now: the app stage
+    # stapled it before the DMG was built around it, so this reports "already
+    # carries a valid ticket" and changes nothing. It is kept rather than dropped
+    # because the app stage is skipped when there are no Apple credentials, and
+    # an adopted DMG submission can be resumed on a tree whose app never went
+    # through it. Stapling the shipped copy is the app stage's job (F5); this only
+    # keeps the standalone bundle consistent with it.
     if [ -n "$APP_PATH" ] && [ -e "$APP_PATH" ]; then
         staple_idempotent "$APP_PATH"
     else
-        echo "    (no .app on disk to staple — the DMG carries the ticket that matters)"
+        echo "    (no .app on disk to staple; the DMG carries its own ticket)"
     fi
 }
 
-# notarize_pin_submitted_dmg <sha256> — hardlink the DMG about to be submitted
-# into .lucidos/notarize-submissions/<version>/<sha12>/ and set
-# NOTARIZE_PINNED_DMG to that path.
+# find_updater_tarball: the `.app.tar.gz` this build produced, or empty. One
+# definition, so the repack, the pairing capture, staging and the closing report
+# all mean the same file.
+find_updater_tarball() {
+    /usr/bin/find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app.tar.gz' 2>/dev/null | head -1 || true
+}
+
+# notarize_capture_updater_pairing: record WHICH updater payload this build's
+# submission is paired with, into the three NOTARIZE_UPDATER_* globals the handle
+# writer reads.
 #
-# WHY: the release DMG is written to a fixed, version-scoped path, so EVERY
-# rebuild of the same version overwrites it. An in-flight notarization refers to
-# the BYTES, not the path — so a rebuild silently orphans the submission, and the
-# poller waiting on it is now watching a file that no longer contains what Apple
-# scanned.
+# THE F3 PAIRING. The handle used to pin the DMG's bytes and say nothing about
+# the `.app.tar.gz` + `.sig`, which staging then picked up by glob from whatever
+# was on disk at that moment. Nothing tied them to the build that produced the
+# pinned DMG, and the recovery branch of the staple-time assertion made it worse
+# rather than passive: it RESTORES the DMG from its pin after a concurrent
+# rebuild overwrote it, which is precisely the state in which the tarball beside
+# it belongs to the newer build. The staging manifest then recorded both,
+# release_staging_verify found them self-consistent because it only ever checks
+# internal consistency, and the release shipped a DMG and an updater payload from
+# two different builds.
 #
-# WHY A CLONE AND NOT A HARDLINK. A hardlink is the obvious zero-cost pin and it
-# is WRONG here: it is a second name for the SAME inode, so anything that writes
-# the DMG IN PLACE — `codesign` rewriting the signature, a truncating `>` — is
-# seen through both names and silently corrupts the pin. (The test suite proves
-# this: an in-place write mutates a hardlinked pin while leaving a cloned one
-# intact.) `cp -c` requests an APFS clonefile: copy-on-write, so it costs no disk
-# until one side diverges, and an in-place write to the original allocates new
-# blocks instead of touching the pinned copy. On a non-APFS volume the -c fails
-# and we fall back to a plain copy — correct, just not free.
+# Captured ONCE, at the first submission of the release, and carried forward to
+# the second (see notarize_carry_updater_pairing_forward). Re-capturing at the
+# second submit would let a tarball replaced during the first wait be adopted as
+# the pairing: self-consistent again, and wrong again.
 #
-# Best-effort by design: if the pin cannot be created the build proceeds
-# unpinned. The sha assertion before stapling is the correctness guarantee (it
-# refuses rather than mis-staples); the pin is what additionally lets a poller
-# RECOVER the right bytes instead of losing a completed notarization.
-notarize_pin_submitted_dmg() {
-    local sha="$1" pin_dir
-    [ -n "$sha" ] || return 0
-    pin_dir="$REPO_ROOT/.lucidos/notarize-submissions/${EFFECTIVE_VERSION:-unversioned}/${sha:0:12}"
-    if ! mkdir -p "$pin_dir" 2>/dev/null; then
-        echo "    NOTE: could not create $pin_dir — submitting unpinned."
+# An empty capture is legitimate and distinct from an absent one: a build with no
+# updater key produces no tarball at all, the handle records the keys empty, and
+# the pairing checks become vacuous. The release-grade refusal for a missing
+# payload belongs to stage_release_artifacts, which explains it in actionable
+# terms.
+notarize_capture_updater_pairing() {
+    NOTARIZE_UPDATER_TARBALL="$(find_updater_tarball)"
+    NOTARIZE_UPDATER_TARBALL_SHA=""
+    NOTARIZE_UPDATER_SIG_SHA=""
+    [ -n "$NOTARIZE_UPDATER_TARBALL" ] || return 0
+
+    NOTARIZE_UPDATER_TARBALL_SHA="$(release_staging_sha256 "$NOTARIZE_UPDATER_TARBALL")" \
+        || die "could not hash $NOTARIZE_UPDATER_TARBALL to pair it with this submission"
+    if [ -f "$NOTARIZE_UPDATER_TARBALL.sig" ]; then
+        NOTARIZE_UPDATER_SIG_SHA="$(release_staging_sha256 "$NOTARIZE_UPDATER_TARBALL.sig")" \
+            || die "could not hash $NOTARIZE_UPDATER_TARBALL.sig to pair it with this submission"
+    fi
+}
+
+# notarize_carry_updater_pairing_forward: reload the pairing the FIRST submission
+# of this release recorded, so the second submission records the identical values
+# instead of re-reading disk. See the note above on why re-capturing would defeat
+# the purpose. Falls back to a fresh capture when there was no first submission.
+notarize_carry_updater_pairing_forward() {
+    if [ -n "$NOTARIZE_STATE_FILE" ] && [ -f "$NOTARIZE_STATE_FILE" ] \
+       && release_notarize_has_fields "$NOTARIZE_STATE_FILE" updater_tarball_path; then
+        NOTARIZE_UPDATER_TARBALL="$(release_notarize_field "$NOTARIZE_STATE_FILE" updater_tarball_path)"
+        NOTARIZE_UPDATER_TARBALL_SHA="$(release_notarize_field "$NOTARIZE_STATE_FILE" updater_tarball_sha256)"
+        NOTARIZE_UPDATER_SIG_SHA="$(release_notarize_field "$NOTARIZE_STATE_FILE" updater_sig_sha256)"
         return 0
     fi
-    NOTARIZE_PINNED_DMG="$pin_dir/$(basename "$DMG_PATH")"
-    if [ -f "$NOTARIZE_PINNED_DMG" ]; then
-        echo "    pinned (already): $NOTARIZE_PINNED_DMG"
-        return 0
-    fi
-    if cp -c "$DMG_PATH" "$NOTARIZE_PINNED_DMG" 2>/dev/null \
-       || cp "$DMG_PATH" "$NOTARIZE_PINNED_DMG" 2>/dev/null; then
-        echo "    pinned submitted bytes: $NOTARIZE_PINNED_DMG"
-    else
-        echo "    NOTE: could not pin $DMG_PATH — submitting unpinned."
-        NOTARIZE_PINNED_DMG=""
-    fi
+    notarize_capture_updater_pairing
 }
 
 # notarize_submit_and_persist — submit and durably record the handle, stopping
@@ -987,18 +1562,21 @@ notarize_submit_and_persist() {
     local sha commit submitted_at
     sha="$(release_staging_sha256 "$DMG_PATH")" \
         || die "could not hash $DMG_PATH for the notarize resume handle"
-    NOTARIZE_SUBMITTED_SHA="$sha"
+    NOTARIZE_EXPECTED_SHA="$sha"
     commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
     submitted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    # The DMG is the SECOND submission of a release, so the pairing comes from the
+    # app stage's handle rather than from a fresh read of disk.
+    notarize_carry_updater_pairing_forward
 
-    # PIN THE SUBMITTED BYTES before handing them to Apple. The DMG lives at a
+    # PIN THE SUBMITTED SET before handing the DMG to Apple. The DMG lives at a
     # FIXED path that the next build overwrites, so the file the notary is
     # scanning can silently become different bytes mid-flight (2026-07-28: three
-    # concurrent pollers, two of them orphaned this way). The pin is a hardlink
-    # into an immutable per-submission directory — same inode, so it costs no
-    # disk and no copy time, and a later `mv -f` onto the fixed path replaces the
-    # DIRECTORY ENTRY without touching the pinned inode.
-    notarize_pin_submitted_dmg "$sha"
+    # concurrent pollers, two of them orphaned this way). The updater payload and
+    # its signature live at fixed paths too and are overwritten by the same
+    # rebuild, so pinning only the DMG is what let a recovery restore half a
+    # build (F3).
+    notarize_pin_submitted_set "$DMG_PATH" "$sha"
 
     step "Submitting $(basename "$DMG_PATH") to the Apple notary service"
     notarize_submit "$DMG_PATH"
@@ -1006,8 +1584,12 @@ notarize_submit_and_persist() {
     # Persist BEFORE the first poll. Everything above this line is expensive and
     # already on disk; from here on, losing this process costs a poll rather than a
     # full rebuild (the 2026-07-28 incident, where the id died with the waiter).
-    release_notarize_write_state "$NOTARIZE_STATE_FILE" "$NOTARIZE_SUBMISSION_ID" \
-        "$DMG_PATH" "$EFFECTIVE_VERSION" "$sha" "$commit" "$submitted_at" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL="$NOTARIZE_UPDATER_TARBALL" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL_SHA256="$NOTARIZE_UPDATER_TARBALL_SHA" \
+    RELEASE_NOTARIZE_UPDATER_SIG_SHA256="$NOTARIZE_UPDATER_SIG_SHA" \
+    release_notarize_write_state "$NOTARIZE_STATE_FILE" "$RELEASE_NOTARIZE_STAGE_DMG" \
+        "$NOTARIZE_SUBMISSION_ID" "$DMG_PATH" "$sha" "$EFFECTIVE_VERSION" \
+        "$commit" "$submitted_at" \
         || die "could not persist the notarize resume handle to $NOTARIZE_STATE_FILE"
     echo "    submission $NOTARIZE_SUBMISSION_ID — resume handle: $NOTARIZE_STATE_FILE"
 }
@@ -1025,29 +1607,398 @@ notarize_submit_and_wait() {
 # one that was submitted; the poll below verifies the id with Apple, and the
 # checksum recorded here is what every later resume is gated on.
 notarize_adopt_submission() {
-    local head_commit="$1" dmg_dir dmg sha count
+    local head_commit="$1" dmg_dir dmg sha
     dmg_dir="$REPO_ROOT/target/release/bundle/dmg"
-    # Exclude refresh_dmg_payload's intermediates: a run killed mid-refresh can
-    # leave a .rw.dmg / .zlib.dmg behind, and adopting one of those would record a
-    # checksum for bytes Apple never saw. Require exactly one real candidate.
-    dmg="$(/usr/bin/find "$dmg_dir" -maxdepth 1 -name '*.dmg' \
-        ! -name '*.rw.dmg' ! -name '*.zlib.dmg' 2>/dev/null | sort || true)"
-    [ -n "$dmg" ] \
-        || die "--adopt-submission found no built .dmg under $dmg_dir — adoption needs the signed DMG that was submitted still on disk."
-    count="$(printf '%s\n' "$dmg" | wc -l | tr -d '[:space:]')"
-    [ "$count" = "1" ] \
-        || die "--adopt-submission found $count candidate DMGs under $dmg_dir; cannot tell which one was submitted:
-$dmg"
+    # release_dmg_find excludes refresh_dmg_payload's intermediates and refuses an
+    # ambiguous directory: a run killed mid-refresh can leave a .rw.dmg /
+    # .zlib.dmg behind, and adopting one of those would record a checksum for
+    # bytes Apple never saw. Its reason lands on stderr just above this die.
+    dmg="$(release_dmg_find "$dmg_dir")" \
+        || die "--adopt-submission could not identify the built .dmg that was submitted (the reason is above). Adoption needs exactly one signed DMG still on disk under $dmg_dir."
     case "$(basename "$dmg")" in
         *"_${EFFECTIVE_VERSION}_"*) ;;
         *) die "--adopt-submission: the on-disk DMG '$(basename "$dmg")' does not carry version '$EFFECTIVE_VERSION' — refusing to adopt a submission for a different build." ;;
     esac
     sha="$(release_staging_sha256 "$dmg")" || die "could not hash $dmg"
     step "Adopting in-flight submission $ADOPT_SUBMISSION for $(basename "$dmg")"
-    release_notarize_write_state "$NOTARIZE_STATE_FILE" "$ADOPT_SUBMISSION" "$dmg" \
-        "$EFFECTIVE_VERSION" "$sha" "$head_commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    # Adoption is the one path with no earlier submission to inherit the pairing
+    # from, so it captures the trio from disk. That is the best available claim:
+    # the DMG on disk is being taken as the submitted one, and the tarball beside
+    # it is the same build's on exactly the same evidence.
+    notarize_capture_updater_pairing
+    RELEASE_NOTARIZE_UPDATER_TARBALL="$NOTARIZE_UPDATER_TARBALL" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL_SHA256="$NOTARIZE_UPDATER_TARBALL_SHA" \
+    RELEASE_NOTARIZE_UPDATER_SIG_SHA256="$NOTARIZE_UPDATER_SIG_SHA" \
+    release_notarize_write_state "$NOTARIZE_STATE_FILE" "$RELEASE_NOTARIZE_STAGE_DMG" \
+        "$ADOPT_SUBMISSION" "$dmg" "$sha" "$EFFECTIVE_VERSION" \
+        "$head_commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
         || die "could not write the notarize resume handle to $NOTARIZE_STATE_FILE"
     echo "    wrote $NOTARIZE_STATE_FILE (submitted_at records the adoption time)"
+}
+
+# sign_dmg <dmg>: Developer ID sign the finished disk image. Up here with the
+# other notarize helpers rather than in the build section, because the resume
+# path reaches it before any build runs.
+sign_dmg() {
+    local dmg="$1"
+    codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
+    codesign --verify --strict --verbose=2 "$dmg"
+}
+
+# refresh_dmg_payload_cleanup <rw> <out> <mnt>: unwind whatever this refresh has
+# created so far. Called on every failure branch below and on the success path.
+#
+# It exists because the two intermediates are the raw material of F4: a run that
+# dies between the convert and the trailing `rm -f` leaves a `.rw.dmg` sitting in
+# the bundler's output dir permanently, where the next build's discovery has to
+# know to skip it. The exclusion in release_dmg.sh is the guard; not creating the
+# litter in the first place is the fix. A left-behind MOUNT is worse still: the
+# volume stays attached after the build exits, and the next `hdiutil attach` of
+# the same image fails.
+#
+# Explicit calls rather than a `trap … RETURN`: under `set -e` a failing command
+# does not return from the function, it exits the shell through the ERR trap, and
+# a RETURN trap never fires on that path.
+refresh_dmg_payload_cleanup() {
+    local rw="$1" out="$2" mnt="$3"
+    if [ -n "$mnt" ] && [ -d "$mnt" ]; then
+        hdiutil detach "$mnt" -force >/dev/null 2>&1 || true
+        rmdir "$mnt" 2>/dev/null || true
+    fi
+    rm -f "$rw" "$out"
+}
+
+refresh_dmg_payload() {
+    local dmg="$1"
+    local app="$2"
+    local rw out mnt
+    rw="$(release_dmg_rw_path "$dmg")"
+    out="$(release_dmg_zlib_path "$dmg")"
+    mnt="$(mktemp -d)"
+    # Clear BOTH intermediates up front, not just the read-write one: a previous
+    # run killed during the recompress leaves the .zlib.dmg behind, and hdiutil
+    # refuses to convert onto an existing path.
+    rm -f "$rw" "$out"
+    hdiutil convert "$dmg" -format UDRW -o "$rw" >/dev/null \
+        || { refresh_dmg_payload_cleanup "$rw" "$out" "$mnt"; die "hdiutil could not convert $(basename "$dmg") to a read-write image"; }
+    hdiutil attach "$rw" -nobrowse -noautoopen -mountpoint "$mnt" >/dev/null \
+        || { refresh_dmg_payload_cleanup "$rw" "$out" "$mnt"; die "hdiutil could not mount $(basename "$rw")"; }
+    # ${mnt:?} so a hypothetically-empty mountpoint can never turn this into an
+    # `rm -rf /<app-name>` against the live filesystem.
+    rm -rf "${mnt:?}/$(basename "$app")"
+    ditto "$app" "$mnt/$(basename "$app")" \
+        || { refresh_dmg_payload_cleanup "$rw" "$out" "$mnt"; die "could not copy $(basename "$app") into the mounted DMG"; }
+    [ -f "$mnt/.VolumeIcon.icns" ] && chflags hidden "$mnt/.VolumeIcon.icns"
+    hdiutil detach "$mnt" -force >/dev/null
+    rmdir "$mnt" 2>/dev/null || true
+    mnt=""
+    # Recompress to a temp path, then atomically swap onto the original: never
+    # delete the only good artifact before its replacement is fully written, so
+    # a failed recompress can't lose the (expensive) build output.
+    hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$out" >/dev/null \
+        || { refresh_dmg_payload_cleanup "$rw" "$out" ""; die "hdiutil could not recompress $(basename "$rw")"; }
+    mv -f "$out" "$dmg" \
+        || { refresh_dmg_payload_cleanup "$rw" "$out" ""; die "could not move the recompressed image onto $(basename "$dmg")"; }
+    refresh_dmg_payload_cleanup "$rw" "$out" ""
+}
+
+# ── The .app notarization stage (F5) ─────────────────────────────────────────
+# Apple's documented ordering is: notarize and staple the .app, THEN build the
+# disk image around the stapled app, then sign, notarize and staple the image.
+# This script did only the second half. The only copy it ever stapled was the
+# standalone build output, which is never shipped, so the `.app` inside every
+# published DMG carried no ticket. Verified on all ten releases the 2026-08-02
+# audit tested: `xcrun stapler validate` on the mounted app reports "does not
+# have a ticket stapled to it", and `spctl` accepts it only through an ONLINE
+# lookup against Apple's service. Apple's whole stated reason for stapling is to
+# make that lookup unnecessary.
+#
+# THE CHEAP FIX DOES NOT EXIST. `stapler staple` writes the ticket INTO the
+# bundle, so putting it in the copy inside the DMG means rewriting the image,
+# which changes the image's own cdhash and voids both its signature and its
+# ticket. Two submissions are required, and they cannot overlap, because the DMG
+# has to be built from the already-stapled app.
+#
+# THE COST, stated because it is real: a release now waits for two Apple verdicts
+# in sequence instead of one, and `--defer-notarization` can defer only the
+# second. The app's verdict sits in the critical path of every release. On the
+# v0.16.0 evidence that is a second window of up to eight hours. See ADR 0033,
+# which records the amendment to ADR 0027 this makes.
+
+# app_bundle_cdhash <app>: the code-directory hash codesign reports for <app>.
+#
+# This, and not a file hash, is what a notarization ticket is issued for, so it
+# is what has to still be true before stapling. It is also the only workable
+# choice: the submitted archive comes from `ditto -c -k`, which is not
+# byte-reproducible, so re-archiving and comparing checksums would report false
+# mismatches on an untouched bundle.
+app_bundle_cdhash() {
+    local app="$1" line
+    line="$(codesign -dvvv "$app" 2>&1 | grep -m1 '^CDHash=' || true)"
+    [ -n "$line" ] || return 1
+    printf '%s' "${line#CDHash=}"
+}
+
+# notarize_app_zip_path: where the archive handed to notarytool lives.
+#
+# Deliberately `<app>.notarize.zip`, beside the bundle: it matches neither the
+# `*.app` discovery nor the `*.app.tar.gz` one, so no later step can mistake it
+# for the bundle or for the updater payload.
+notarize_app_zip_path() {
+    printf '%s.notarize.zip' "$APP_PATH"
+}
+
+# notarize_app_submit_and_persist: archive the signed .app, submit it, and record
+# the resume handle before any waiting, exactly as the DMG stage does.
+#
+# This is the FIRST submission of a release, so it is where the updater pairing
+# is captured and where the whole set is pinned. See
+# notarize_capture_updater_pairing for why the second submission must inherit
+# that pairing rather than re-read it from disk.
+notarize_app_submit_and_persist() {
+    local zip sha cdhash commit submitted_at
+    zip="$(notarize_app_zip_path)"
+
+    cdhash="$(app_bundle_cdhash "$APP_PATH")" \
+        || die "could not read the code-directory hash of $APP_PATH. Without it there is no way to prove the bundle that gets stapled is the bundle Apple scanned."
+
+    step "Archiving $(basename "$APP_PATH") for notarization"
+    rm -f "$zip"
+    # ditto rather than `zip`: it is what Apple documents for this, and it keeps
+    # the symlinks and resource forks a bundle can carry.
+    ditto -c -k --sequesterRsrc --keepParent "$APP_PATH" "$zip" \
+        || die "could not archive $APP_PATH for notarization"
+    sha="$(release_staging_sha256 "$zip")" \
+        || die "could not hash $zip for the notarize resume handle"
+    NOTARIZE_EXPECTED_SHA="$sha"
+    commit="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || true)"
+    submitted_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+    notarize_capture_updater_pairing
+    notarize_pin_submitted_set "$zip" "$sha"
+
+    step "Submitting $(basename "$zip") to the Apple notary service"
+    notarize_submit "$zip"
+
+    RELEASE_NOTARIZE_APP_PATH="$APP_PATH" \
+    RELEASE_NOTARIZE_APP_CDHASH="$cdhash" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL="$NOTARIZE_UPDATER_TARBALL" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL_SHA256="$NOTARIZE_UPDATER_TARBALL_SHA" \
+    RELEASE_NOTARIZE_UPDATER_SIG_SHA256="$NOTARIZE_UPDATER_SIG_SHA" \
+    release_notarize_write_state "$NOTARIZE_STATE_FILE" "$RELEASE_NOTARIZE_STAGE_APP" \
+        "$NOTARIZE_SUBMISSION_ID" "$zip" "$sha" "$EFFECTIVE_VERSION" \
+        "$commit" "$submitted_at" \
+        || die "could not persist the notarize resume handle to $NOTARIZE_STATE_FILE"
+    echo "    submission $NOTARIZE_SUBMISSION_ID (the .app): resume handle $NOTARIZE_STATE_FILE"
+}
+
+# notarize_restore_app_from_pin <zip-sha256>: put back the exact .app that was
+# submitted, from its pinned archive. Non-zero when no usable pin survives.
+notarize_restore_app_from_pin() {
+    local pin parent base
+    pin="$(notarize_find_pin "$1")"
+    [ -n "$pin" ] || return 1
+    parent="$(dirname "$APP_PATH")"
+    base="$(basename "$APP_PATH")"
+    echo "    NOTE: $base is no longer the bundle Apple scanned (a rebuild replaced it)."
+    echo "          Recovering it from the pinned archive: $pin"
+    rm -rf "${parent:?}/${base:?}"
+    ditto -x -k "$pin" "$parent" || return 1
+    [ -d "$APP_PATH" ] || return 1
+}
+
+# notarize_app_await_and_staple: poll the .app submission to a verdict, prove the
+# bundle on disk is still the one Apple scanned, staple it, and prove the staple
+# took without breaking the seal.
+notarize_app_await_and_staple() {
+    local expected_cdhash zip zip_sha sig="" actual
+
+    expected_cdhash="$(release_notarize_field "$NOTARIZE_STATE_FILE" app_cdhash)" \
+        || die "could not read the submitted app identity from $NOTARIZE_STATE_FILE"
+    zip="$(release_notarize_field "$NOTARIZE_STATE_FILE" artifact_path)" \
+        || die "could not read the submitted archive path from $NOTARIZE_STATE_FILE"
+    zip_sha="$(release_notarize_field "$NOTARIZE_STATE_FILE" artifact_sha256)" \
+        || die "could not read the submitted archive checksum from $NOTARIZE_STATE_FILE"
+
+    notarize_await_verdict "$NOTARIZE_SUBMISSION_ID"
+
+    # The whole submitted set has to survive the wait, not just the archive. The
+    # updater payload is already packed by this point, and a concurrent rebuild
+    # replaces it at the same fixed path it replaces everything else at (F3).
+    if [ -n "$NOTARIZE_UPDATER_TARBALL" ]; then
+        sig="$NOTARIZE_UPDATER_TARBALL.sig"
+    fi
+    assert_submitted_artifacts_are_intact \
+        "the submitted .app archive" "$zip"                      "$zip_sha" \
+        "the updater payload"        "$NOTARIZE_UPDATER_TARBALL" "$NOTARIZE_UPDATER_TARBALL_SHA" \
+        "the updater signature"      "$sig"                      "$NOTARIZE_UPDATER_SIG_SHA"
+
+    # The bundle itself is checked by CODE IDENTITY. A ticket is issued for a
+    # cdhash, so this is the exact correctness condition, and it is both cheaper
+    # and stricter than any file comparison could be.
+    if [ -n "$expected_cdhash" ]; then
+        actual="$(app_bundle_cdhash "$APP_PATH" 2>/dev/null || true)"
+        if [ "$actual" != "$expected_cdhash" ]; then
+            notarize_restore_app_from_pin "$zip_sha" \
+                || die "REFUSING TO STAPLE: $APP_PATH is not the bundle Apple scanned.
+       submitted: $expected_cdhash
+       on disk:   ${actual:-(unreadable)}
+       Another build replaced it while the submission was in flight, and no
+       pinned archive survives to restore it from. A ticket issued for one code
+       identity must never be attached to another. Rebuild."
+            actual="$(app_bundle_cdhash "$APP_PATH" 2>/dev/null || true)"
+            [ "$actual" = "$expected_cdhash" ] \
+                || die "restored $APP_PATH from its pinned archive, but its code identity is ${actual:-(unreadable)} rather than the submitted $expected_cdhash."
+        fi
+    fi
+
+    step "Stapling the notarization ticket to $(basename "$APP_PATH")"
+    staple_idempotent "$APP_PATH"
+    # Prove BOTH halves. The ticket being present in the copy that ships is the
+    # entire point of this stage, and a staple that broke the seal would be worse
+    # than no staple at all.
+    xcrun stapler validate "$APP_PATH" >/dev/null 2>&1 \
+        || die "stapler reported success for $APP_PATH but the ticket does not validate."
+    codesign --verify --deep --strict "$APP_PATH" \
+        || die "$APP_PATH no longer passes codesign --verify after stapling. The ticket goes to Contents/CodeResources, outside the sealed resource set, so this should not be possible. Refusing to build a DMG around a bundle macOS will not launch."
+    echo "    $(basename "$APP_PATH") carries a stapled ticket, and its signature still verifies."
+}
+
+# notarize_adopt_app_submission <head-commit>: write a stage `app` resume handle
+# for a submission that is ALREADY in flight but whose id was never persisted.
+#
+# The sibling of --adopt-submission, for the stage that now runs first. The
+# window it covers is the same one: between notarytool returning an id and the
+# handle reaching disk. Without it the only recovery from that window is a full
+# rebuild, which is the cost the whole resume mechanism exists to avoid.
+notarize_adopt_app_submission() {
+    local head_commit="$1" app zip sha cdhash
+    app="$(/usr/bin/find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' 2>/dev/null | head -1 || true)"
+    [ -n "$app" ] \
+        || die "--adopt-app-submission found no built .app under $BUNDLE_DIR/macos. Adoption needs the signed bundle that was submitted still on disk."
+    APP_PATH="$app"
+    zip="$(notarize_app_zip_path)"
+    [ -f "$zip" ] \
+        || die "--adopt-app-submission needs the archive that was submitted, and there is none at $zip. Without it nothing records what Apple actually scanned, and a rebuild during the wait could not be recovered from. Rebuild instead."
+    sha="$(release_staging_sha256 "$zip")" || die "could not hash $zip"
+    cdhash="$(app_bundle_cdhash "$app")" \
+        || die "could not read the code-directory hash of $app"
+
+    step "Adopting in-flight .app submission $ADOPT_APP_SUBMISSION for $(basename "$app")"
+    notarize_capture_updater_pairing
+    notarize_pin_submitted_set "$zip" "$sha"
+    RELEASE_NOTARIZE_APP_PATH="$app" \
+    RELEASE_NOTARIZE_APP_CDHASH="$cdhash" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL="$NOTARIZE_UPDATER_TARBALL" \
+    RELEASE_NOTARIZE_UPDATER_TARBALL_SHA256="$NOTARIZE_UPDATER_TARBALL_SHA" \
+    RELEASE_NOTARIZE_UPDATER_SIG_SHA256="$NOTARIZE_UPDATER_SIG_SHA" \
+    release_notarize_write_state "$NOTARIZE_STATE_FILE" "$RELEASE_NOTARIZE_STAGE_APP" \
+        "$ADOPT_APP_SUBMISSION" "$zip" "$sha" "$EFFECTIVE_VERSION" \
+        "$head_commit" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        || die "could not write the notarize resume handle to $NOTARIZE_STATE_FILE"
+    echo "    wrote $NOTARIZE_STATE_FILE (submitted_at records the adoption time)"
+}
+
+# run_app_notarize_resume <submission-id> <submitted-at>: pick a lost .app
+# notarization back up. The DMG half runs afterwards, from the shared
+# run_dmg_notarize_stage, so a resumed release and a fresh one build the image
+# through the identical code.
+run_app_notarize_resume() {
+    local submission_id="$1" submitted_at="$2"
+    APP_PATH="$(release_notarize_field "$NOTARIZE_STATE_FILE" app_path)" \
+        || die "could not read the .app path from $NOTARIZE_STATE_FILE"
+    [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ] \
+        || die "the .app this submission was made from is gone: '$APP_PATH'. Rebuild."
+    # The DMG this build produced is still the pre-refresh one from `cargo tauri
+    # build`; run_dmg_notarize_stage injects the stapled app into it below.
+    DMG_PATH="$(release_dmg_find "$BUNDLE_DIR/dmg")" \
+        || die "resuming the .app notarization needs the DMG this build produced (the reason is above)."
+
+    notarize_credentials_present \
+        || die "resuming the .app notarization needs APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID to ask Apple about submission $submission_id."
+    [ -n "${APPLE_SIGNING_IDENTITY:-}" ] \
+        || die "resuming the .app notarization needs APPLE_SIGNING_IDENTITY: the DMG built around the stapled app still has to be signed before it can be submitted."
+
+    begin_step notarize "Resuming the .app notarization (submission $submission_id, submitted $submitted_at), then building the DMG around the stapled app, signing it, submitting it and stapling the ticket."
+    step "Resuming .app notarization $submission_id, submitted $submitted_at"
+    echo "    app:    $APP_PATH"
+    echo "    handle: $NOTARIZE_STATE_FILE"
+    notarize_announce_credentials
+    notarize_app_await_and_staple
+}
+
+# ── Build the DMG around the stapled app, then notarize the DMG ──────────────
+# One function so a fresh build and a resumed .app stage run the identical
+# sequence. The caller opens the `notarize` cockpit step (the .app half runs
+# inside it too, because the cockpit's step vocabulary has no id for a second
+# notarization and inventing one it does not render would be worse); this
+# function closes it.
+run_dmg_notarize_stage() {
+    step "Refreshing DMG payload and hiding .VolumeIcon.icns"
+    refresh_dmg_payload "$DMG_PATH" "$APP_PATH"
+
+    # ── 6. sign DMG + notarize (env-gated) ──────────────────────────────────────
+    # In --release mode signing + notarization are MANDATORY: a missing credential
+    # fails loud here rather than silently producing an un-notarized DMG (the v0.10.1
+    # "notarization silently skipped" fragility). In local mode they stay optional.
+    # The submit → persist → poll → staple sequence lives in the notarize functions
+    # defined near the top of this script (they are shared with the resume path); the
+    # credential rules that used to be documented inline are on notarytool_run.
+    if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+        step "Codesigning DMG + notarizing"
+        sign_dmg "$DMG_PATH"
+        if notarize_credentials_present; then
+            notarize_announce_credentials
+            if [ "$DEFER_NOTARIZATION" = "1" ]; then
+                # Deferred: hand the DMG to Apple, persist the handle, and stop.
+                # The bytes still have to be the submitted ones before they are
+                # staged: a concurrent rebuild between submit and stage would
+                # otherwise publish a DMG that the eventual ticket does not match.
+                notarize_submit_and_persist
+                assert_submitted_set_is_intact "$NOTARIZE_EXPECTED_SHA"
+                DMG_NOTARIZED_STATE="false"
+                step "Deferring the notary wait (--defer-notarization)"
+                echo "    submission $NOTARIZE_SUBMISSION_ID is in flight; the DMG is signed but NOT stapled."
+                echo "    Staging it so the release can publish now. Finish it later with:"
+                echo "        scripts/release.sh --attach-notarized $EFFECTIVE_VERSION"
+            else
+                notarize_submit_and_wait
+                # NOTARIZE_EXPECTED_SHA was recorded by notarize_submit_and_wait before
+                # the wait; assert the DMG is still those bytes before stapling.
+                staple_notarized_artifacts "$NOTARIZE_EXPECTED_SHA"
+            fi
+        elif [ "$RELEASE_MODE" = "1" ]; then
+            die "release mode requires notarization but APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID are not all set. Refusing to ship an un-notarized DMG."
+        else
+            echo "    APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID not all set, so notarization is skipped."
+        fi
+    elif [ "$RELEASE_MODE" = "1" ]; then
+        # The dev-identity fallback above can NEVER reach this branch as a pass: a
+        # release asserts APPLE_SIGNING_IDENTITY at startup, and this is the second
+        # place it refuses. A self-signed certificate is not a Developer ID.
+        die "release mode requires signing but APPLE_SIGNING_IDENTITY is not set."
+    else
+        echo ""
+        echo "NOTE: APPLE_SIGNING_IDENTITY not set, so the .dmg is UNSIGNED and not notarized."
+        if [ -n "$BUNDLE_SIGNED_WITH" ]; then
+            echo "      (The .app inside it is signed with the local dev identity, which is what"
+            echo "      keeps your macOS permission grants across rebuilds. It is not a"
+            echo "      Developer ID, so Gatekeeper still blocks this build elsewhere.)"
+        fi
+        echo "      Gatekeeper will block it on other Macs (right-click → Open to bypass locally)."
+        echo "      Set the APPLE_* env vars to sign + notarize. See docs/desktop-app.md."
+    fi
+    # A DEFERRED run stapled nothing: the submission is still with Apple. Saying
+    # "Notarized + stapled" here would make the Release Cockpit, the one surface an
+    # operator checks to see whether a release is deferred, assert the opposite of
+    # the truth. The step is genuinely finished (this run's notarize work is done),
+    # so it still succeeds; only the summary tells which outcome it reached.
+    # --attach-notarized emits the real completion later, through the resume path.
+    if [ "$DMG_NOTARIZED_STATE" = "false" ]; then
+        end_step notarize "Submitted to the Apple notary service and DEFERRED: the DMG is signed but NOT stapled; finish with release.sh --attach-notarized $EFFECTIVE_VERSION."
+    else
+        end_step notarize "Notarized + stapled the DMG and the .app."
+    fi
 }
 
 # run_notarize_resume — pick a lost notarization back up. NO build, NO codesign,
@@ -1055,7 +2006,7 @@ $dmg"
 # polls for the verdict, staples, and runs the same finalize tail a fresh build
 # does. This is what makes a Phase A survive losing the process waiting on Apple.
 run_notarize_resume() {
-    local head_commit submission_id submitted_at
+    local head_commit stage submission_id submitted_at
 
     [ -n "$EFFECTIVE_VERSION" ] \
         || die "resuming notarization needs a version — no RELEASE file at $REPO_ROOT/RELEASE."
@@ -1065,10 +2016,15 @@ run_notarize_resume() {
     if [ -n "$ADOPT_SUBMISSION" ]; then
         notarize_adopt_submission "$head_commit"
     fi
+    if [ -n "$ADOPT_APP_SUBMISSION" ]; then
+        notarize_adopt_app_submission "$head_commit"
+    fi
 
     release_notarize_resumable "$NOTARIZE_STATE_FILE" "$head_commit" \
         || die "cannot resume notarization for $EFFECTIVE_VERSION (see the reason above)."
 
+    stage="$(release_notarize_field "$NOTARIZE_STATE_FILE" stage)" \
+        || die "could not read the notarization stage from $NOTARIZE_STATE_FILE"
     submission_id="$(release_notarize_field "$NOTARIZE_STATE_FILE" submission_id)" \
         || die "could not read the submission id from $NOTARIZE_STATE_FILE"
     # Mirror it into the global the closing report reads, so a deferred resume
@@ -1076,18 +2032,49 @@ run_notarize_resume() {
     NOTARIZE_SUBMISSION_ID="$submission_id"
     submitted_at="$(release_notarize_field "$NOTARIZE_STATE_FILE" submitted_at)" \
         || die "could not read the submit time from $NOTARIZE_STATE_FILE"
-    DMG_PATH="$(release_notarize_field "$NOTARIZE_STATE_FILE" dmg_path)" \
+    # Load the updater payload this release's FIRST submission was paired with,
+    # before either branch below can assert against it (F3).
+    notarize_carry_updater_pairing_forward
+
+    # A release makes two submissions in sequence, so a resume has to know which
+    # half it is picking up. The .app half runs on into the DMG half through the
+    # same run_dmg_notarize_stage a fresh build uses, so the two cannot drift.
+    #
+    # --defer-notarization cannot reach this branch as a shortcut, and that is
+    # not an oversight: the DMG is BUILT FROM the stapled app, so there is nothing
+    # to stage until the app's verdict lands. Deferral defers the DMG's verdict,
+    # never the app's.
+    if [ "$stage" = "$RELEASE_NOTARIZE_STAGE_APP" ]; then
+        if [ "$DEFER_NOTARIZATION" = "1" ]; then
+            step "The .app notarization cannot be deferred; waiting for its verdict, then deferring the DMG's"
+            echo "    The DMG is built from the stapled .app, so there is nothing to stage"
+            echo "    until Apple answers on submission $submission_id. Only the DMG's own"
+            echo "    verdict is deferred."
+        fi
+        run_app_notarize_resume "$submission_id" "$submitted_at"
+        run_dmg_notarize_stage
+        finalize_release_artifacts
+        return 0
+    fi
+
+    DMG_PATH="$(release_notarize_field "$NOTARIZE_STATE_FILE" artifact_path)" \
         || die "could not read the DMG path from $NOTARIZE_STATE_FILE"
-    BUNDLE_DIR="$REPO_ROOT/target/release/bundle"
+    NOTARIZE_EXPECTED_SHA="$(release_notarize_field "$NOTARIZE_STATE_FILE" artifact_sha256)" \
+        || die "could not read the submitted checksum from $NOTARIZE_STATE_FILE"
+    # The path test below is a necessary condition and never was a sufficient one:
+    # it says the recorded DMG lives in this tree, and says nothing about whether
+    # the .app.tar.gz beside it belongs to the same build. The pairing loaded
+    # above is what answers that, and every gate from here on re-derives its
+    # verdict by re-hashing those exact bytes (F3).
     # Staging pairs the recorded DMG with the .app.tar.gz + .sig found under
-    # BUNDLE_DIR. Those must be the same build's artifacts, so refuse a handle
-    # whose DMG lives somewhere else — otherwise a manifest could describe a DMG
-    # from one build and updater artifacts from another.
+    # BUNDLE_DIR, so refuse a handle whose DMG lives somewhere else: the pairing
+    # checks would then be comparing this tree's artifacts against another tree's
+    # submission.
     case "$DMG_PATH" in
         "$BUNDLE_DIR/dmg/"*) ;;
         *) die "the resume handle records a DMG outside this tree's bundle dir ($DMG_PATH is not under $BUNDLE_DIR/dmg/) — resume from the tree that built it." ;;
     esac
-    APP_PATH="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app' 2>/dev/null | head -1 || true)"
+    APP_PATH="$(/usr/bin/find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' 2>/dev/null | head -1 || true)"
 
     # A DEFERRED resume does not poll at all: the submission stays in flight and
     # the already-built, already-signed DMG is staged unstapled so the release can
@@ -1103,8 +2090,7 @@ run_notarize_resume() {
         step "Staging the in-flight submission $submission_id without waiting (--defer-notarization)"
         echo "    dmg:    $DMG_PATH"
         echo "    handle: $NOTARIZE_STATE_FILE"
-        assert_dmg_is_the_submitted_bytes \
-            "$(release_notarize_field "$NOTARIZE_STATE_FILE" dmg_sha256 2>/dev/null || true)"
+        assert_submitted_set_is_intact "$NOTARIZE_EXPECTED_SHA"
         DMG_NOTARIZED_STATE="false"
         finalize_release_artifacts
         return 0
@@ -1122,7 +2108,7 @@ run_notarize_resume() {
     # The resume gate already hashed the DMG, but the poll above can run for
     # hours — re-assert against the recorded sha so a build that landed DURING
     # the wait cannot slip different bytes under the staple.
-    staple_notarized_artifacts "$(release_notarize_field "$NOTARIZE_STATE_FILE" dmg_sha256 2>/dev/null || true)"
+    staple_notarized_artifacts "$NOTARIZE_EXPECTED_SHA"
     end_step notarize "Notarized + stapled the DMG and the .app (resumed submission $submission_id)."
 
     finalize_release_artifacts
@@ -1157,6 +2143,14 @@ finalize_release_artifacts() {
     # feature exists to avoid. The same goes for the pin: it protects the
     # submitted bytes for as long as the submission is in flight, which is now
     # past the end of this process.
+    # The .app archive is spent either way. Both notary stages are behind us by
+    # here (the DMG cannot have been built without the app's ticket), the handle
+    # names the DMG stage, and the pinned copy is what a recovery would reach for,
+    # so the working copy is just ~70MB of litter in target/ per build.
+    if [ -n "${APP_PATH:-}" ]; then
+        rm -f "$(notarize_app_zip_path)"
+    fi
+
     if [ "$DMG_NOTARIZED_STATE" = "false" ]; then
         echo "    keeping the resume handle + submitted-bytes pin (submission still in flight)"
     else
@@ -1168,7 +2162,6 @@ finalize_release_artifacts() {
         # 67MB-per-build graveyard under .lucidos/.
         if [ "$DO_BUILD" = "1" ] && [ -n "${EFFECTIVE_VERSION:-}" ]; then
             rm -rf "$REPO_ROOT/.lucidos/notarize-submissions/$EFFECTIVE_VERSION"
-            NOTARIZE_PINNED_DMG=""
         fi
     fi
 
@@ -1263,6 +2256,9 @@ while [ $# -gt 0 ]; do
         --adopt-submission)
             [ $# -ge 2 ] || die "--adopt-submission requires a notary submission UUID"
             ADOPT_SUBMISSION="$2"; DO_RESUME_NOTARIZE=1; shift 2 ;;
+        --adopt-app-submission)
+            [ $# -ge 2 ] || die "--adopt-app-submission requires a notary submission UUID"
+            ADOPT_APP_SUBMISSION="$2"; DO_RESUME_NOTARIZE=1; shift 2 ;;
         *)                 die "unknown argument: $1" ;;
     esac
 done
@@ -1277,6 +2273,16 @@ fi
 if [ -n "$ADOPT_SUBMISSION" ]; then
     release_notarize_valid_submission_id "$ADOPT_SUBMISSION" \
         || die "--adopt-submission expects a notary submission UUID (8-4-4-4-12 hex), got '$ADOPT_SUBMISSION'"
+fi
+if [ -n "$ADOPT_APP_SUBMISSION" ]; then
+    release_notarize_valid_submission_id "$ADOPT_APP_SUBMISSION" \
+        || die "--adopt-app-submission expects a notary submission UUID (8-4-4-4-12 hex), got '$ADOPT_APP_SUBMISSION'"
+fi
+# One handle, one outstanding submission. Adopting both would write the .app
+# handle over the DMG one (or the reverse, depending on order) and silently throw
+# a live submission away.
+if [ -n "$ADOPT_SUBMISSION" ] && [ -n "$ADOPT_APP_SUBMISSION" ]; then
+    die "--adopt-submission and --adopt-app-submission name the two halves of one release's notarization, and only one can be outstanding at a time. Adopt the one that is actually in flight."
 fi
 
 # --release-attach uploads artifacts a prior build already notarized and staged;
@@ -1302,9 +2308,13 @@ fi
 # ── --release-attach (no build): verify the staged artifacts and upload them ──
 # This path does NO build, NO codesign, NO notarize — it only attaches artifacts
 # a prior --release-build already produced + verified. It therefore needs neither
-# the Apple/Tauri signing creds nor the Darwin/cargo/tauri/npm build tooling; it
-# only needs `gh` + a valid staging dir. Handled before the build preamble so the
-# manifest guard fails fast offline.
+# the Apple/Tauri signing creds nor the cargo/tauri/npm build TOOLING; it needs
+# `gh`, a valid staging dir, and (since the updater-payload gate landed) the
+# system `codesign` to re-verify the staged payload before publishing it. That
+# last one keeps this path macOS-bound in practice, which costs nothing: a
+# release is macOS-only end to end, and require_release_signing_credentials
+# refuses a non-Darwin host outright. Handled before the build preamble so the
+# manifest guard still fails fast offline.
 if [ "$DO_ATTACH" = "1" ] && [ "$DO_BUILD" = "0" ]; then
     run_release_attach
     exit 0
@@ -1469,10 +2479,15 @@ else
     (cd "$APP_DIR" && cargo "${TAURI_BUILD_ARGS[@]}")
 fi
 
-BUNDLE_DIR="$REPO_ROOT/target/release/bundle"
-DMG_PATH="$(/usr/bin/find "$BUNDLE_DIR/dmg" -name '*.dmg' 2>/dev/null | head -1 || true)"
-APP_PATH="$(/usr/bin/find "$BUNDLE_DIR/macos" -name '*.app' 2>/dev/null | head -1 || true)"
-[ -n "$DMG_PATH" ] || die "no .dmg produced under $BUNDLE_DIR/dmg"
+# release_dmg_find, not a bare `find … | head -1`: that returned DIRECTORY order
+# over everything matching `*.dmg`, so a .rw.dmg / .zlib.dmg left by a run killed
+# mid-refresh could be adopted as the release DMG and then signed, notarized,
+# stapled and published. The version-stamp guard below cannot catch that, because
+# the leftovers carry the same version string (F4). The adopt path has had this
+# exclusion since it was written; this is the site that did not.
+DMG_PATH="$(release_dmg_find "$BUNDLE_DIR/dmg")" \
+    || die "could not identify the .dmg this build produced (the reason is above)."
+APP_PATH="$(/usr/bin/find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' 2>/dev/null | head -1 || true)"
 [ -n "$APP_PATH" ] || die "no .app produced under $BUNDLE_DIR/macos"
 
 # Version-stamp guard (post-build half). Tauri names the artifact
@@ -1490,8 +2505,19 @@ fi
 end_step build "Built $(basename "$DMG_PATH") (.app + .dmg + updater artifacts)."
 
 # ── 5b. sign (env-gated) ────────────────────────────────────────────────────
+# sign_app_bundle <app> <identity> [<codesign-arg>…]: sign every Mach-O file in
+# the bundle inside-out, then the bundle itself, with <identity>. The extra args
+# are passed to every codesign call, which is how the two callers differ: the
+# Developer ID path needs `--options runtime --timestamp` for notarization, the
+# local dev-identity fallback deliberately needs neither (see the call site).
 sign_app_bundle() {
-    local app="$1"
+    local app="$1" identity="$2"
+    shift 2
+    # macOS ships bash 3.2, where expanding an EMPTY named array under `set -u`
+    # is an unbound-variable error, so every use below is written
+    # ${sign_args[@]+"${sign_args[@]}"}. Both callers pass flags today; a future
+    # one that passes none must not blow up halfway through ~200 codesigns.
+    local -a sign_args=("$@")
     local resources="$app/Contents/Resources"
     local bin path
 
@@ -1522,17 +2548,15 @@ sign_app_bundle() {
 
     [ "${#macho_files[@]}" -gt 0 ] || die "no Mach-O binaries found inside $app"
 
-    step "Signing ${#macho_files[@]} Mach-O binaries inside-out"
+    step "Signing ${#macho_files[@]} Mach-O binaries inside-out with $identity"
     for path in "${macho_files[@]}"; do
-        codesign --force --options runtime --timestamp \
-            --sign "$APPLE_SIGNING_IDENTITY" "$path" \
+        codesign --force ${sign_args[@]+"${sign_args[@]}"} --sign "$identity" "$path" \
             || die "codesign failed for $path"
     done
 
     # Sign the outer .app LAST. Keep --deep as belt-and-suspenders (re-seals any
     # nested bundle), but the loose payload above is what makes notarization pass.
-    codesign --force --deep --options runtime --timestamp \
-        --sign "$APPLE_SIGNING_IDENTITY" "$app" \
+    codesign --force --deep ${sign_args[@]+"${sign_args[@]}"} --sign "$identity" "$app" \
         || die "codesign failed for $app"
 
     # Verify the whole bundle, then spot-verify a couple of the Postgres binaries
@@ -1551,111 +2575,151 @@ sign_app_bundle() {
     done
 }
 
-sign_dmg() {
-    local dmg="$1"
-    codesign --force --timestamp --sign "$APPLE_SIGNING_IDENTITY" "$dmg"
-    codesign --verify --strict --verbose=2 "$dmg"
-}
-
-if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-    begin_step codesign "Signing gateway + engine + app + bundled Postgres tree with Developer ID."
-    step "Codesigning bundled gateway + engine + app"
-    sign_app_bundle "$APP_PATH"
-    end_step codesign "Codesigned the bundle (gateway + engine + app + ~200 loose Postgres Mach-O files) with Developer ID."
-fi
-
-# ── 5c. refresh DMG payload + hide the stray .VolumeIcon.icns ───────────────
-# create-dmg (what `cargo tauri build` shells out to) drops `.VolumeIcon.icns`
-# at the volume root but, unlike `.DS_Store`, never sets its UF_HIDDEN flag — so
-# on macOS setups where a leading dot alone isn't enough, it shows as a visible
-# file in the install window next to the app. Mount the DMG read-write, set
-# UF_HIDDEN on it, and recompress in place. The volume's custom icon still works
-# (hiding the file doesn't disable it). Also replaces the app inside the DMG with
-# the post-build app path, so manual resource signing above is actually reflected
-# in the installer payload.
-step "Refreshing DMG payload and hiding .VolumeIcon.icns"
-refresh_dmg_payload() {
-    local dmg="$1"
-    local app="$2"
-    local rw="${dmg%.dmg}.rw.dmg"
-    local mnt
-    mnt="$(mktemp -d)"
-    rm -f "$rw"
-    hdiutil convert "$dmg" -format UDRW -o "$rw" >/dev/null
-    hdiutil attach "$rw" -nobrowse -noautoopen -mountpoint "$mnt" >/dev/null
-    # ${mnt:?} so a hypothetically-empty mountpoint can never turn this into an
-    # `rm -rf /<app-name>` against the live filesystem.
-    rm -rf "${mnt:?}/$(basename "$app")"
-    ditto "$app" "$mnt/$(basename "$app")"
-    [ -f "$mnt/.VolumeIcon.icns" ] && chflags hidden "$mnt/.VolumeIcon.icns"
-    hdiutil detach "$mnt" -force >/dev/null
-    rmdir "$mnt" 2>/dev/null || true
-    # Recompress to a temp path, then atomically swap onto the original — never
-    # delete the only good artifact before its replacement is fully written, so
-    # a failed recompress can't lose the (expensive) build output.
-    local out="${dmg%.dmg}.zlib.dmg"
-    rm -f "$out"
-    hdiutil convert "$rw" -format UDZO -imagekey zlib-level=9 -o "$out" >/dev/null
-    mv -f "$out" "$dmg"
-    rm -f "$rw"
-}
-begin_step notarize "Refreshing DMG payload, signing the DMG, submitting to the Apple notary service, polling for the verdict, stapling the ticket."
-refresh_dmg_payload "$DMG_PATH" "$APP_PATH"
-
-# ── 6. sign DMG + notarize (env-gated) ──────────────────────────────────────
-# In --release mode signing + notarization are MANDATORY: a missing credential
-# fails loud here rather than silently producing an un-notarized DMG (the v0.10.1
-# "notarization silently skipped" fragility). In local mode they stay optional.
-# The submit → persist → poll → staple sequence lives in the notarize functions
-# defined near the top of this script (they are shared with the resume path); the
-# credential rules that used to be documented inline are on notarytool_run.
-if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
-    step "Codesigning DMG + notarizing"
-    sign_dmg "$DMG_PATH"
-    if notarize_credentials_present; then
-        notarize_announce_credentials
-        if [ "$DEFER_NOTARIZATION" = "1" ]; then
-            # Deferred: hand the DMG to Apple, persist the handle, and stop.
-            # The bytes still have to be the submitted ones before they are
-            # staged — a concurrent rebuild between submit and stage would
-            # otherwise publish a DMG that the eventual ticket does not match.
-            notarize_submit_and_persist
-            assert_dmg_is_the_submitted_bytes "$NOTARIZE_SUBMITTED_SHA"
-            DMG_NOTARIZED_STATE="false"
-            step "Deferring the notary wait (--defer-notarization)"
-            echo "    submission $NOTARIZE_SUBMISSION_ID is in flight; the DMG is signed but NOT stapled."
-            echo "    Staging it so the release can publish now. Finish it later with:"
-            echo "        scripts/release.sh --attach-notarized $EFFECTIVE_VERSION"
-        else
-            notarize_submit_and_wait
-            # NOTARIZE_SUBMITTED_SHA was recorded by notarize_submit_and_wait before
-            # the wait; assert the DMG is still those bytes before stapling.
-            staple_notarized_artifacts "$NOTARIZE_SUBMITTED_SHA"
-        fi
-    elif [ "$RELEASE_MODE" = "1" ]; then
-        die "release mode requires notarization but APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID are not all set — refusing to ship an un-notarized DMG."
-    else
-        echo "    APPLE_ID / APPLE_PASSWORD / APPLE_TEAM_ID not all set — skipping notarization."
+# repack_updater_payload: rebuild Lucidos.app.tar.gz from the app we just signed,
+# and re-sign it.
+#
+# THE v0.19.0 BUG. `cargo tauri build` packed this tarball several steps ago,
+# from the app as the bundler left it, and the build above deliberately ran with
+# APPLE_SIGNING_IDENTITY stripped from its env so Tauri would skip its own
+# (insufficient) codesign pass. So the tarball on disk holds an UNSIGNED bundle.
+# refresh_dmg_payload re-injects the signed app into the DMG a few lines below,
+# which is why the DMG has always been correct; nothing did the same for the
+# updater payload, so every auto-update since replaced a notarized Developer ID
+# app with an ad-hoc one whose designated requirement is a bare cdhash. macOS TCC
+# keys grants on code identity, so each update silently destroyed every
+# permission the user had ever granted.
+#
+# Ordering: this MUST run after sign_app_bundle and before refresh_dmg_payload,
+# so it packs the signed bundle and leaves the DMG path untouched.
+#
+# Pre-staple by design, matching the accepted cost already documented for the
+# deferred-DMG mode: notarization has not happened yet, so the payload is
+# Developer ID signed but carries no stapled ticket. Repacking after the staple
+# instead would make the tarball's contents depend on whether the release was
+# deferred (--defer-notarization never staples at all), and Gatekeeper never
+# assesses the tarball anyway, since a payload the updater downloads carries no
+# quarantine xattr.
+repack_updater_payload() {
+    local tarball
+    tarball="$(/usr/bin/find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app.tar.gz' 2>/dev/null | head -1 || true)"
+    if [ -z "$tarball" ]; then
+        echo "    (no .app.tar.gz produced by this build, so there is no updater payload to repack.)"
+        return 0
     fi
-elif [ "$RELEASE_MODE" = "1" ]; then
-    die "release mode requires signing but APPLE_SIGNING_IDENTITY is not set."
+
+    step "Repacking the updater payload from the SIGNED app: $(basename "$tarball")"
+    updater_payload_repack "$APP_PATH" "$tarball" \
+        || die "could not repack the updater payload from $APP_PATH"
+
+    # The .sig covers the OLD bytes now. Regenerating it is not optional: a
+    # signature that does not match makes every updater reject the update. Tauri
+    # only emits a .sig when the updater key is set, and a build with no key
+    # never had one to invalidate.
+    if [ -f "$tarball.sig" ]; then
+        updater_payload_resign "$tarball" \
+            || die "repacked $(basename "$tarball") but could not re-sign it; the stale .sig would make every updater reject the update"
+        echo "    re-signed $(basename "$tarball").sig over the repacked bytes"
+    else
+        echo "    (no .app.tar.gz.sig on disk, so no updater key was set; nothing to re-sign.)"
+    fi
+}
+
+# Which identity signed the bundle, if any. Empty means Tauri's ad-hoc output was
+# left alone, which is the only case where the updater payload is left stale too.
+BUNDLE_SIGNED_WITH=""
+# The summary the `codesign` step closes with. Deferred into a variable because
+# the step does NOT end at the bottom of this if/elif: it stays open across the
+# updater repack below, so a repack failure reds the cockpit instead of stalling
+# it (see the end_step call after the repack).
+CODESIGN_STEP_SUMMARY=""
+
+if [ -n "${APPLE_SIGNING_IDENTITY:-}" ]; then
+    begin_step codesign "Signing gateway + engine + app + bundled Postgres tree with Developer ID, then repacking the updater payload from the signed bundle."
+    step "Codesigning bundled gateway + engine + app"
+    # --options runtime (hardened runtime) and --timestamp (a secure timestamp
+    # from Apple's TSA) are both REQUIRED for notarization.
+    sign_app_bundle "$APP_PATH" "$APPLE_SIGNING_IDENTITY" --options runtime --timestamp
+    BUNDLE_SIGNED_WITH="$APPLE_SIGNING_IDENTITY"
+    CODESIGN_STEP_SUMMARY="Codesigned the bundle (gateway + engine + app + ~200 loose Postgres Mach-O files) with Developer ID, and repacked the updater payload from it."
+elif lucidos_signing_identity_ready; then
+    # LOCAL BUILDS ONLY. Release mode never reaches here: it asserts
+    # APPLE_SIGNING_IDENTITY at startup and dies below if signing was skipped, so
+    # the self-signed dev identity can never satisfy a release. The staging gate
+    # is the second lock: a dev-identity payload has no Team Identifier, so
+    # updater_payload_assert_developer_id refuses it.
+    #
+    # What this buys: Tauri's ad-hoc output has a cdhash-anchored designated
+    # requirement, so every local rebuild of the .app is a NEW code identity and
+    # macOS re-prompts for (and discards) every TCC grant. The dev identity is a
+    # stable certificate, so the requirement becomes `identifier "com.lucidos.app"
+    # and certificate leaf = H"…"` and one Allow click sticks across rebuilds.
+    # This is the same fix scripts/lib/codesign.sh already applies to the dev
+    # engine binary, applied here to the packaged bundle.
+    #
+    # NEITHER --options runtime NOR --timestamp here, deliberately:
+    #   • hardened runtime exists to satisfy notarization, which this path never
+    #     does. Worse, library validation under the hardened runtime matches
+    #     loaded code by Team Identifier, and a self-signed certificate has none,
+    #     so enabling it risks the bundled Postgres dylibs failing to load at
+    #     exactly the moment the developer is trying to test the packaged app.
+    #   • a secure timestamp means a network round trip to Apple PER FILE, and
+    #     there are ~200 of them, for a certificate no one else trusts.
+    # The certificate-anchored designated requirement, which is the entire point,
+    # depends on neither.
+    begin_step codesign "Signing the app with the stable dev identity (local build; no Developer ID configured)."
+    step "Codesigning with the stable dev identity ($LUCIDOS_SIGNING_IDENTITY)"
+    lucidos_ensure_keychain_in_search_list
+    security unlock-keychain -p "$LUCIDOS_SIGNING_KC_PASS" "$LUCIDOS_SIGNING_KEYCHAIN" 2>/dev/null || true
+    sign_app_bundle "$APP_PATH" "$LUCIDOS_SIGNING_IDENTITY" \
+        --timestamp=none --keychain "$LUCIDOS_SIGNING_KEYCHAIN"
+    BUNDLE_SIGNED_WITH="$LUCIDOS_SIGNING_IDENTITY"
+    CODESIGN_STEP_SUMMARY="Codesigned the bundle with the stable dev identity (local build, not notarizable) and repacked the updater payload from it."
+    echo "    NOTE: signed with the LOCAL dev identity, not Developer ID. Gatekeeper"
+    echo "          still blocks this build on other Macs, but your macOS permission"
+    echo "          grants now survive a rebuild."
 else
     echo ""
-    echo "NOTE: APPLE_SIGNING_IDENTITY not set — produced an UNSIGNED .dmg."
-    echo "      Gatekeeper will block it on other Macs (right-click → Open to bypass locally)."
-    echo "      Set the APPLE_* env vars to sign + notarize. See docs/desktop-app.md."
+    echo "NOTE: no APPLE_SIGNING_IDENTITY and no dev signing identity, so the .app is"
+    echo "      left ad-hoc signed. Its code identity changes on every rebuild, so"
+    echo "      macOS will re-prompt for every permission. Fix once with:"
+    echo "      ./scripts/dev-codesign-setup.sh"
 fi
-# A DEFERRED run stapled nothing — the submission is still with Apple. Saying
-# "Notarized + stapled" here would make the Release Cockpit, the one surface an
-# operator checks to see whether a release is deferred, assert the opposite of
-# the truth. The step is genuinely finished (this run's notarize work is done),
-# so it still succeeds; only the summary tells which outcome it reached.
-# --attach-notarized emits the real completion later, through the resume path.
-if [ "$DMG_NOTARIZED_STATE" = "false" ]; then
-    end_step notarize "Submitted to the Apple notary service and DEFERRED — the DMG is signed but NOT stapled; finish with release.sh --attach-notarized $EFFECTIVE_VERSION."
-else
-    end_step notarize "Notarized + stapled the DMG and the .app."
+
+# ── 5b2. repack the updater payload from the signed app ─────────────────────
+# Gated on the bundle actually having been signed, not literally on
+# APPLE_SIGNING_IDENTITY: the dev-identity branch above signs it too, and a
+# tarball that disagrees with the .app sitting next to it is the whole bug. An
+# unsigned local build keeps today's behaviour, where the tarball and the app
+# match because neither is signed.
+#
+# This runs INSIDE the still-open `codesign` step, and that is load-bearing:
+# die/on_err emit ReleaseStepFailed only while CURRENT_STEP is set, so a repack
+# failure in the gap between two steps would exit non-zero with NO event and the
+# Release Cockpit would stall on a green `codesign` forever. That silent stall is
+# the exact failure the `set -E` + on_err rationale at the top of this file
+# exists to prevent. Signing the bundle and making the updater payload match it
+# are one unit of work, so one step covers both.
+if [ -n "$BUNDLE_SIGNED_WITH" ]; then
+    repack_updater_payload
+    end_step codesign "$CODESIGN_STEP_SUMMARY"
 fi
+
+# ── 5c. notarize + staple the .app, then build the DMG around it ────────────
+# Apple's ordering (see "The .app notarization stage" near the top of this
+# file). The cockpit step is opened here and closed by run_dmg_notarize_stage,
+# so BOTH notary submissions report under one `notarize` step.
+#
+# Gated on the same credentials the DMG's own notarization is gated on. A local
+# build with the full Apple credential set is deliberately reproducing the
+# release and gets both submissions; one without them gets neither. A third
+# behaviour keyed on release mode would be a special case with no user.
+begin_step notarize "Notarizing and stapling the .app, then refreshing the DMG payload around it, signing the DMG, submitting it, polling for the verdict and stapling the ticket."
+if [ -n "${APPLE_SIGNING_IDENTITY:-}" ] && notarize_credentials_present; then
+    notarize_announce_credentials
+    notarize_app_submit_and_persist
+    notarize_app_await_and_staple
+fi
+run_dmg_notarize_stage
 
 # ── 6b–7. stage → drop the resume handle → tarball → upload → report ─────────
 # Shared with the resume path so the two can't drift (see

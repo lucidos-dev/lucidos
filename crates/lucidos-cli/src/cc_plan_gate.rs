@@ -75,14 +75,23 @@ pub(crate) fn build_deny_json(file_path: &str) -> String {
 
 /// Deny reason for a `Proposed` marker — a plan exists but the user hasn't
 /// approved it. The path forward is approval, NOT re-running the skill.
+///
+/// It names the `AskUserQuestion` tool and its option pair because prose alone
+/// is what failed: told only to "present the plan and wait", the agent wrote a
+/// summary and ended the turn, and the thread sat idle until the user typed
+/// "approve" by hand (2026-08-02). Approval is a DECISION question, and this
+/// hook firing is the proof: source edits are blocked until it is answered.
 pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: the implementation plan on this branch is awaiting the user's approval. \
          Do NOT re-run the `implementation-plan` skill — the plan is already recorded. Present the \
-         plan to the user and wait for their approval. Once the user approves, run \
-         `lucidos planned approve` to unblock implementation, then retry your edit to `{path}`. \
-         If the user requests changes, revise the plan file under docs/plans/, re-commit, and \
-         present it again (the marker stays `proposed` until approved).",
+         plan, then ASK FOR APPROVAL WITH THE `AskUserQuestion` TOOL, offering `Approve` and \
+         `Request changes`. Approval is a DECISION question, not a post-work confirmation: this \
+         very hook is blocking your edits until it is answered, so asking in plain prose leaves \
+         the thread idle. Once the user approves, run `lucidos planned approve` to unblock \
+         implementation, then retry your edit to `{path}`. If the user requests changes, revise \
+         the plan file under docs/plans/, re-commit, and ask again the same way (the marker stays \
+         `proposed` until approved).",
         path = file_path,
     );
     deny_envelope(&reason)
@@ -243,6 +252,22 @@ mod tests {
             reason.contains("Do NOT re-run"),
             "awaiting-approval reason must tell the agent not to re-plan: {reason}"
         );
+        // "Present the plan and wait" is what failed: the agent wrote prose and
+        // the thread sat idle until the user typed "approve" by hand
+        // (2026-08-02). This hook firing IS the proof that approval is a
+        // decision the agent is blocked on, so it must say how to ask. Keep the
+        // option pair identical to the prompt rules and the skill.
+        for needle in [
+            "`AskUserQuestion`",
+            "`Approve` and `Request changes`",
+            "DECISION question",
+        ] {
+            assert!(
+                reason.contains(needle),
+                "awaiting-approval reason must route approval through the question tool \
+                 (missing {needle:?}): {reason}"
+            );
+        }
     }
 
     #[test]

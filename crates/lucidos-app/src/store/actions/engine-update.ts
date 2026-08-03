@@ -1,7 +1,9 @@
-import { showToast, dismissToast, removeToast, engineVersionReady, engineBuilding, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { showToast, dismissToast, removeToast, engineVersionReady, engineBuilding, engineBuildDetail, engineRestarting, preferences, NEW_VERSION_TOAST_KEY, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
+import type { EngineVersionStatus } from '../../api/client';
 import { initiateEngineRestart } from './chat-changes';
 import { noteSwitchBuildId, wasSwitchDismissed } from '../../hooks/sw-update';
+import { syncBackgroundActivityToast } from './backgroundActivity';
 
 /** Kick off the dev engine rebuild — the "Rebuild" escape hatch behind the
  *  pending / build-failed toasts. The version-status poll (and the
@@ -27,6 +29,32 @@ const BUILD_FAILED_TOAST_KEY = 'engine-build-failed';
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
 
+/** The ONE writer of the building pair: the boolean that spins the badge, and
+ *  the detail the status toast narrates from.
+ *
+ *  A single entry point because `pollEngineVersion` decides "not building" on
+ *  three different paths (packaged, build failed, and the ordinary end), and two
+ *  independent assignments are exactly how a stale narration survives its build.
+ *  That failure already happened once here, which is what the `finally` comment
+ *  in `checkEngineVersion` records. With one writer, `engineBuilding === false`
+ *  implies no leftover detail by construction.
+ *
+ *  `anchoredAt` is stamped HERE, from the client clock, right as the response
+ *  lands: the counter then advances as `elapsedMs + (now - anchoredAt)` and never
+ *  subtracts an engine timestamp from a browser one. */
+function setEngineBuilding(building: boolean, status?: EngineVersionStatus): void {
+  engineBuilding.value = building;
+  if (!building) {
+    engineBuildDetail.value = null;
+    return;
+  }
+  engineBuildDetail.value = {
+    elapsedMs: status?.build_elapsed_ms ?? null,
+    anchoredAt: Date.now(),
+    pendingCommits: status?.pending_commits ?? null,
+  };
+}
+
 /** Poll the engine's version status and surface the unified "New version
  *  available → Switch to new version" flow (dev half). Packaged builds report
  *  `packaged: true` and never `update_available` — their new-version source is the
@@ -36,6 +64,23 @@ let pollTimer: ReturnType<typeof setInterval> | null = null;
  *  intent, so a failed poll is logged, not toasted — the next poll retries, and
  *  the user-facing failure surface is the switch action's own toast. */
 export async function checkEngineVersion(): Promise<void> {
+  try {
+    await pollEngineVersion();
+  } finally {
+    // `engineBuilding` is one of the two things the background-activity toast
+    // narrates, and `pollEngineVersion` clears it on several EARLY-return paths
+    // (packaged, build failed). Syncing only at its happy-path end left an open
+    // toast reading "Building new version" after a build had already failed,
+    // with nothing to correct it on a workspace whose model is long since
+    // cached. A `finally` covers every exit, including the throw path.
+    //
+    // Safe to call unconditionally: it only ever updates a toast that is
+    // already on screen, and never opens one.
+    syncBackgroundActivityToast();
+  }
+}
+
+async function pollEngineVersion(): Promise<void> {
   // Don't poll (or re-toast) while a switch is already in flight — the restart
   // toast owns the UI and the engine is on its way down.
   if (engineRestarting.value) return;
@@ -56,13 +101,13 @@ export async function checkEngineVersion(): Promise<void> {
   // Packaged builds never run a background rebuild — the spinning-build badge is
   // a dev-only affordance.
   if (status.packaged) {
-    engineBuilding.value = false;
+    setEngineBuilding(false);
     return;
   }
 
   if (status.build_state === 'failed') {
     engineVersionReady.value = false;
-    engineBuilding.value = false;
+    setEngineBuilding(false);
     // A new version exists in source but the last rebuild failed. Offer a manual
     // retry so the user isn't stuck (the engine self-heal driver also retries, up
     // to a per-HEAD cap). No auto-switch — the build must succeed first.
@@ -181,12 +226,14 @@ export async function checkEngineVersion(): Promise<void> {
   // SkippedLocked). The `!update_available` term drops the spinner the instant a
   // switchable binary lands, even within a probe window, handing off to the
   // ready→Switch surface above.
-  engineBuilding.value =
+  setEngineBuilding(
     status.build_state === 'building' ||
-    (sharedBuilding &&
-      status.source_behind_head === true &&
-      !status.update_available &&
-      status.build_state === 'idle');
+      (sharedBuilding &&
+        status.source_behind_head === true &&
+        !status.update_available &&
+        status.build_state === 'idle'),
+    status,
+  );
 }
 
 /** SSE handler for the engine's `EngineBuildStateChanged` poke. The engine emits

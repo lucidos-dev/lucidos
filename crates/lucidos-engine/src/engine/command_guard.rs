@@ -170,6 +170,85 @@ pub struct JudgedClassification {
     pub category: Option<SideEffectCategory>,
 }
 
+/// Unwrap a single shell `-c`-style wrapper so the inner script is what gets
+/// classified.
+///
+/// Both classifiers inspect each segment's HEAD token and do NOT descend into a
+/// shell `-c`/`-lc` payload, so a wrapped command would read as head `zsh`/`bash`
+/// and bypass every check. Codex sends commands pre-wrapped as
+/// `/bin/zsh -lc '<script>'`; a chat `run_bash` can be handed the same shape.
+/// Returns the original command when it isn't a recognized shell wrapper (Claude
+/// Code's `Bash` passes the raw command, which falls through unchanged).
+pub(crate) fn unwrap_shell_command(command: &str) -> &str {
+    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
+    let trimmed = command.trim_start();
+    let Some(first) = trimmed.split_whitespace().next() else {
+        return command;
+    };
+    let base = first.rsplit('/').next().unwrap_or(first);
+    if !SHELLS.contains(&base) {
+        return command;
+    }
+    // Walk whitespace-delimited tokens (with byte offsets) to find the `-c`-style
+    // flag; everything after it is the script. One quote layer is stripped so the
+    // common `zsh -lc 'curl ...'` form classifies as a clean `curl ...`.
+    let bytes = trimmed.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        let start = i;
+        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if start == i {
+            break;
+        }
+        if is_shell_c_flag(&trimmed[start..i]) {
+            return shell_script_operand(trimmed[i..].trim());
+        }
+    }
+    command
+}
+
+/// A single-dash cluster of shell option letters that includes `c`: `-c`, `-lc`,
+/// `-ic`, `-lic`, etc. Rejects long options and non-shell flags (`-config`,
+/// `-l`).
+fn is_shell_c_flag(tok: &str) -> bool {
+    match tok.strip_prefix('-') {
+        Some(letters) if tok.len() >= 2 && !tok.starts_with("--") => {
+            letters.contains('c') && letters.chars().all(|ch| "clixeasfm".contains(ch))
+        }
+        _ => false,
+    }
+}
+
+/// Take the script operand that follows a shell `-c` flag.
+///
+/// In `sh -c <script> [$0 [arg ...]]` the script is ONE word, and anything after
+/// it sets `$0` and the positional parameters. So the close quote is not
+/// necessarily the last character: `bash -c 'rm -rf /' ignored` really does run
+/// `rm -rf /`. Cutting at the matching close quote (rather than only unwrapping
+/// when the quotes surround the whole remainder) is what keeps that form from
+/// presenting a head token of `'rm` and slipping past every head-token scan.
+///
+/// An unquoted or unterminated operand is returned as-is: there is no full shell
+/// parser here, and the classifiers downstream are the ones that must stay
+/// conservative.
+fn shell_script_operand(s: &str) -> &str {
+    let b = s.as_bytes();
+    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') {
+        let quote = b[0] as char;
+        // `find` returns a byte offset relative to `s[1..]`, and both it and the
+        // opening quote are ASCII, so these are real char boundaries.
+        if let Some(end) = s[1..].find(quote) {
+            return &s[1..1 + end];
+        }
+    }
+    s
+}
+
 /// The static, deterministic, zero-cost classification pass.
 ///
 /// Only the four bash/python command-running tools are inspected; every other
@@ -183,9 +262,16 @@ pub struct JudgedClassification {
 /// Catastrophic wins over everything (checked first), so a command that is both
 /// catastrophic and side-effect-shaped is hard-blocked rather than judged.
 pub fn static_classify(tool_name: &str, input: &Value) -> StaticVerdict {
-    let Some(cmd) = command_text(tool_name, input) else {
+    let Some(raw) = command_text(tool_name, input) else {
         return StaticVerdict::Settled(RiskLane::Safe);
     };
+    // Classify the INNER script of a `sh -c '<script>'` wrapper. Every check
+    // below reads each segment's head token and does not descend into the
+    // payload, so without this a wrapped `bash -c 'rm -rf /'` reads as head
+    // `bash`, skips the catastrophic hard-block entirely, and (with the judge
+    // off) falls all the way through to Safe. The coding-agent lane has always
+    // unwrapped; this is the same call for the chat lane.
+    let cmd = unwrap_shell_command(raw);
     if catastrophic_reason(cmd).is_some() {
         return StaticVerdict::Settled(RiskLane::Catastrophic);
     }
@@ -1259,6 +1345,30 @@ mod tests {
             "rm -rf ${HOME}",
             "cd /tmp && rm -rf /", // chained segment
             "/bin/rm -rf /",       // absolute path to rm
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    #[test]
+    fn catastrophic_survives_a_shell_c_wrapper() {
+        // Every scan reads a segment's HEAD token, so a `sh -c '<script>'`
+        // wrapper used to hide the payload behind head `bash`/`zsh`: the
+        // catastrophic hard-block was skipped and, with the judge off, the
+        // static fallback settled it Safe and ran `rm -rf /` with no card.
+        for cmd in [
+            "bash -c 'rm -rf /'",
+            "bash -c \"rm -rf /\"",
+            "/bin/zsh -lc 'rm -rf ~'",
+            "sh -c 'chmod -R 777 /'",
+            "bash -c 'cd /tmp && rm -rf /'",
+            // `sh -c <script> [$0 [arg ...]]`: the script is ONE word and the
+            // operands after it only set $0 and the positional params, so these
+            // run `rm -rf /` too. Cutting at the matching close quote is what
+            // stops the head token from reading as `'rm`.
+            "bash -c 'rm -rf /' ignored",
+            "bash -c \"rm -rf /\" sh extra",
+            "/bin/zsh -lc 'rm -rf ~' zsh",
         ] {
             assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
         }

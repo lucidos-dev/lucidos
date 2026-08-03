@@ -1,4 +1,4 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, bootstrappingThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
 import { revealThreadPane } from './pane';
 import type { ThreadSection, ThreadState } from '../thread-events';
 import { threadPassesChannelFilter } from '../threadFilter';
@@ -105,15 +105,57 @@ export async function focusThreadOrBootstrapResult(
     focusThread(threadId, options);
     return { kind: 'focused' };
   }
+  // Miss path: a round-trip stands between the tap and anything on screen, and
+  // this is where a notification navigating to a thread outside the loaded
+  // window lands (always, on a cold push tap: the deep link dispatches while
+  // `loadAllThreads` is still in flight, so the map is empty). Acknowledge the
+  // tap NOW rather than after the fetch. Focusing optimistically moves the pane
+  // and hands `ThreadView` a focused-but-absent thread, which it already renders
+  // as its delay-gated skeleton with the 8s "tap to reload" escape hatch. The
+  // `bootstrappingThreadId` signal is what stops ThreadView's stale-pointer
+  // cleanup from immediately unfocusing it again.
+  const previousFocus = focusedThreadId.value;
+  bootstrappingThreadId.value = threadId;
+  setFocusedThread(threadId);
+  revealThreadPane();
   let found: boolean;
   try {
     found = await ensureThreadByIdInMap(threadId);
   } catch (error) {
+    releaseBootstrap(threadId, previousFocus);
     return { kind: 'failed', error };
   }
-  if (!found) return { kind: 'not-found' };
+  if (!found) {
+    releaseBootstrap(threadId, previousFocus);
+    return { kind: 'not-found' };
+  }
+  // Clear BEFORE focusing: the thread is in the map now, so ThreadView needs no
+  // exemption, and leaving it set would exempt a genuinely stale pointer later.
+  if (bootstrappingThreadId.value === threadId) bootstrappingThreadId.value = null;
   focusThread(threadId, options);
   return { kind: 'focused' };
+}
+
+/** Undo an optimistic bootstrap focus that didn't land, so the user isn't left
+ *  staring at a skeleton for a thread that will never arrive.
+ *
+ *  A no-op when a NEWER bootstrap has claimed the slot (the user tapped a second
+ *  notification mid-flight): that one owns the focus now, and restoring this
+ *  call's `previousFocus` would yank them off it.
+ *
+ *  Each call releases, including the ones inside `landThreadHash`'s retry ladder
+ *  (`hash-deeplink-router.ts`), so a cross-workspace landing that loses the race
+ *  against a lazy-starting peer engine shows the target's skeleton, drops back to
+ *  the prior thread for the backoff, then re-focuses on the next attempt. That
+ *  blip is deliberate: holding the focus across attempts instead would mean this
+ *  function could no longer release unconditionally, and a caller that forgot to
+ *  would leave a thread permanently exempt from ThreadView's stale-pointer
+ *  cleanup. Re-capturing `previousFocus` per attempt keeps the restore correct
+ *  either way. */
+function releaseBootstrap(threadId: string, previousFocus: string | null): void {
+  if (bootstrappingThreadId.value !== threadId) return;
+  bootstrappingThreadId.value = null;
+  if (focusedThreadId.value === threadId) setFocusedThread(previousFocus);
 }
 
 /** Fire-and-forget {@link focusThreadOrBootstrapResult} that surfaces the

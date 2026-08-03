@@ -323,6 +323,13 @@ impl LucidosEngine {
         device_id: Option<&str>,
         is_trigger: bool,
         trigger: &Option<TriggerContext>,
+        // This turn's resolved tool-call cap, for the `__MAX_TOOL_CALLS__`
+        // placeholder. Passed in rather than read here so it is the SAME number
+        // `run_agentic_loop` enforces: the prompt tells the model this is the
+        // only real per-turn cap, and a prompt that names a number the loop
+        // doesn't use is the fabricated engine internal that section warns
+        // against.
+        max_tool_calls: usize,
     ) -> (String, Vec<&'static str>, bool) {
         // System prompt with current date for time-aware responses
         let now = Utc::now();
@@ -728,7 +735,7 @@ __ENGINE_RESTART_RULE__
 __APPLY_VERIFY_RULE__
 
 ENGINE INTERNALS YOU CANNOT OBSERVE:
-You cannot count your own tool calls, detect a per-turn cap, or measure any internal engine budget. The only real per-turn cap is at __MAX_TOOL_CALLS__ tool calls; when it fires the engine prepends "[ENGINE-LIMIT]" to its message — that prefix is the only signal the cap was hit. Never claim you "hit a tool-call cap", "tool-call limit", "tool-call budget", "per-turn limit", or any similar made-up engine internal. If you stop mid-task, give the real reason or just keep going. Do NOT cite specific numbers (e.g. "~25 calls", "agentic_loop.rs", "MAX_ITERATIONS") about the agent loop — those numbers are not visible to you and inventing them poisons long-term memory for future turns.
+You cannot count your own tool calls, detect a per-turn cap, or measure any internal engine budget. The only real per-turn cap is at __MAX_TOOL_CALLS__ tool calls; when it fires the engine prepends "[ENGINE-LIMIT]" to its message, and that prefix is the only signal the cap was hit. Never claim you "hit a tool-call cap", "tool-call limit", "tool-call budget", "per-turn limit", or any similar made-up engine internal. If you stop mid-task, give the real reason or just keep going. Do NOT cite specific numbers (e.g. "~25 calls", "agentic_loop.rs", "DEFAULT_MAX_TOOL_CALLS") about the agent loop: those numbers are not visible to you and inventing them poisons long-term memory for future turns. The cap above is the exception, since the engine just told you what it is; the user can change it in Settings under Models, Chat & Triggers, Max tool calls.
 
 IMPORTANT — spawn threads sparingly:
 - DEFAULT: Do the work yourself. Use your own tools (web_search, read_file, run_python, etc.) directly.
@@ -769,10 +776,7 @@ __REPEATED_ACTION_RULE__"#;
             )
             .replace("__NAMES_NOT_IDS_RULE__", NAMES_NOT_IDS_RULE)
             .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
-            .replace(
-                "__MAX_TOOL_CALLS__",
-                &crate::engine::agentic_loop::MAX_ITERATIONS.to_string(),
-            )
+            .replace("__MAX_TOOL_CALLS__", &max_tool_calls.to_string())
             .replace(
                 "__MAX_CHILDREN_PER_THREAD__",
                 &super::super::recursion_guard::MAX_CHILDREN_PER_THREAD.to_string(),

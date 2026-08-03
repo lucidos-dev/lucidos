@@ -2,6 +2,7 @@ import { useRef, useCallback, useEffect, useLayoutEffect } from 'preact/hooks';
 import { mobileView, MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, appPseudoFullscreen } from '../../store/store';
 import { navigateToPane, resolveSwipePane } from '../../store/actions/pane';
 import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
+import { EdgeSwipeZones } from './EdgeSwipeZones';
 import { isTextInput, isInteractiveTarget, opensSoftwareKeyboard } from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
 import { scrolledUp, pinToBottomNow } from '../chat/scrollState';
@@ -47,6 +48,30 @@ export function shouldSuppressEdgeNavigation(args: {
   const { clientX, viewportWidth, targetIsInteractive, textInputFocused } = args;
   if (targetIsInteractive || textInputFocused) return false;
   return clientX <= EDGE_NAV_GUARD_LEFT_PX || clientX >= viewportWidth - EDGE_NAV_GUARD_RIGHT_PX;
+}
+
+/** Pure decision: may a Lucidos pane swipe START for this touch?
+ *
+ *  The first two are properties of the touch: a focused text input means the
+ *  user is typing and a horizontal drag must not navigate away, and a
+ *  horizontally-scrollable target (a code block, a range slider knob) owns its
+ *  own horizontal drag.
+ *
+ *  `appFullscreen` is the odd one out, being a property of the app rather than
+ *  the touch: a pseudo-fullscreen app IS the screen, so the three-pane swipe is
+ *  off entirely. Nothing visible moves during it anyway (the overlay is
+ *  position:fixed over the viewport and the track's transform is pinned to
+ *  `none`), so a pane change there is invisible state drift, and the user
+ *  leaves fullscreen on a pane they never chose. Deliberately does NOT cover
+ *  the separate suppression of WebKit's native edge gesture, which must keep
+ *  running while fullscreen: see `shouldSuppressEdgeNavigation`. */
+export function shouldStartPaneSwipe(args: {
+  textInputFocused: boolean;
+  targetScrollable: boolean;
+  appFullscreen: boolean;
+}): boolean {
+  const { textInputFocused, targetScrollable, appFullscreen } = args;
+  return !textInputFocused && !targetScrollable && !appFullscreen;
 }
 
 /** Pure decision: what value should `--app-height` be written to, given the
@@ -228,10 +253,14 @@ export function MobileSwipeContainer() {
       e.preventDefault();
     }
 
-    // Don't start pane swipes while a text input is focused — the user is
-    // typing and horizontal drags should not navigate away.
-    if (textInputFocused) return;
-    if (touchTargetScrollable.current) return;
+    // Must come AFTER the suppression above: a pseudo-fullscreen app cancels
+    // OUR swipe, but WebKit's native one still has to be preventDefault'd or
+    // suppressing ours just hands the gesture over. See shouldStartPaneSwipe.
+    if (!shouldStartPaneSwipe({
+      textInputFocused,
+      targetScrollable: touchTargetScrollable.current,
+      appFullscreen: appPseudoFullscreen.value,
+    })) return;
 
     touch.current.start(t.clientX, t.clientY);
     const track = trackRef.current;
@@ -473,12 +502,10 @@ export function MobileSwipeContainer() {
             return (
               <div key={v} class="mobile-swipe-pane">
                 <Pane />
-                {/* Edge swipe zones — see .edge-swipe-zone in mobile.css.
-                    Rendered inside each pane (not the swipe container) so they
+                {/* Rendered inside each pane (not the swipe container) so they
                     share a stacking context with the prompt-area, allowing
                     .prompt-area's z-index:2 to keep its buttons clickable. */}
-                <div class="edge-swipe-zone edge-swipe-left" />
-                <div class="edge-swipe-zone edge-swipe-right" />
+                <EdgeSwipeZones />
               </div>
             );
           })}

@@ -146,12 +146,14 @@ describe('Deduplication', () => {
 // Streaming buffer
 // ---------------------------------------------------------------------------
 describe('Streaming buffer', () => {
-  it('transient events (seq=null) go to streaming buffer', () => {
+  it('transient events (seq=null) go to streaming buffer, last cumulative frame wins', () => {
     const thread = makeThread();
     const map = new Map([['t1', thread]]);
 
+    // Each frame carries the FULL accumulated text, not a delta, so the second
+    // frame replaces the first rather than appending to it.
     handleEventWithAgg(map, 't1', null, { type: 'CumulativeTextUpdated', text: 'hello ' });
-    handleEventWithAgg(map, 't1', null, { type: 'CumulativeTextUpdated', text: 'world' });
+    handleEventWithAgg(map, 't1', null, { type: 'CumulativeTextUpdated', text: 'hello world' });
 
     expect(thread.streamingBuffer).toBe('hello world');
     expect(thread.events.size).toBe(0);

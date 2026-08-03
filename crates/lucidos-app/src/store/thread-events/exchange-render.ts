@@ -3,36 +3,62 @@ import { isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
 import type { ExchangeStatus } from '../exchange-status';
-import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step } from '../types';
+import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
 import type { ActorMode, SequencedEvent, ThreadEvent } from './thread-event-types';
 
-/** Mark the last pending step (success === null) as completed.
+/** The two projections' step shapes, as far as the resolvers care. */
+type StepLike = { outcome: StepOutcome; description?: string };
+
+/** How an exchange ended, as far as its pending steps are concerned.
+ *  `null` = no terminator yet (or the agent resumed past one).
+ *  `'clean'` = ResponseGenerated / CodingAgentIdled: the turn finished, so a
+ *  step still pending did run to completion and merely lacks a recorded
+ *  result.
+ *  `'unclean'` = ResponseFailed / ResponseAborted / ResponseCanceled: the turn
+ *  died, so a step still pending never finished and must not be resolved to a
+ *  success. One variable rather than a completion flag plus a kind, so
+ *  "complete, with a stale kind left over from an earlier terminator" cannot
+ *  be represented: every write states both at once, and the last terminator in
+ *  the exchange wins (which is also what makes the superseded-abort case, an
+ *  abort followed by a same-request ResponseGenerated, come out right). */
+type TerminalKind = null | 'clean' | 'unclean';
+
+/** The outcome a terminated exchange's still-pending steps take. */
+function pendingOutcomeFor(terminal: TerminalKind): StepOutcome {
+  return terminal === 'unclean' ? 'unfinished' : 'success';
+}
+
+/** Mark the last pending step as completed.
  *  Walks backwards so parallel tool calls resolve in LIFO order as results arrive.
  *  Optional `pred` narrows which pending step to resolve (e.g. only "Thinking" steps). */
 function resolveLastPendingStep(
-  steps: { success: boolean | null; description?: string }[],
+  steps: StepLike[],
   pred?: (s: { description?: string }) => boolean,
 ): void {
   for (let i = steps.length - 1; i >= 0; i--) {
-    if (steps[i].success === null && (!pred || pred(steps[i]))) {
-      steps[i].success = true;
+    if (steps[i].outcome === 'pending' && (!pred || pred(steps[i]))) {
+      steps[i].outcome = 'success';
       return;
     }
   }
 }
 
-/** Force ALL pending steps to completed.
- *  Called after a completion event so spinners don't persist on finished exchanges.
+/** Force ALL pending steps to `outcome`, so spinners don't persist on finished
+ *  exchanges. Called after a completion event with the outcome that fits how
+ *  the turn ended (`pendingOutcomeFor`): a clean end resolves them to a
+ *  success, a turn that died marks them `'unfinished'` (a green check on a
+ *  tool killed mid-execution is a worse lie than the spinner).
  *  Optional `pred` narrows which pending steps to resolve (mirrors
  *  `resolveLastPendingStep`) — used to finalize ONLY the dead 'Thinking' markers
  *  of a handed-off exchange while its tool steps keep spinning. */
 function resolvePendingSteps(
-  steps: { success: boolean | null; description?: string }[],
+  steps: StepLike[],
+  outcome: StepOutcome,
   pred?: (s: { description?: string }) => boolean,
 ): void {
   for (const step of steps) {
-    if (step.success === null && (!pred || pred(step))) step.success = true;
+    if (step.outcome === 'pending' && (!pred || pred(step))) step.outcome = outcome;
   }
 }
 
@@ -128,7 +154,7 @@ function bindSnapshotToStep<T>(
   }
 }
 
-/** Build Step[] from exchange events (tool calls with success tracking).
+/** Build Step[] from exchange events (tool calls with outcome tracking).
  *  @param _isLast — kept for caller compatibility; spinners are no longer resolved
  *  on `!isLast` alone. A non-last exchange can still be the one the agentic loop
  *  is actively processing (chat mid-flight injection — the parent's
@@ -139,7 +165,7 @@ function bindSnapshotToStep<T>(
  *  flag to finalize pending steps. */
 export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = false): Step[] {
   const steps: Step[] = [];
-  let isComplete = false;
+  let terminal: TerminalKind = null;
   let legacyAcc: LegacyContextEvents = {};
   let lastThinkingIdx = -1;
   const refreshLegacySnapshot = () => {
@@ -150,7 +176,7 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
     switch (event.type) {
       case 'MemorySearched': {
         const results = (event as { results?: number }).results ?? 0;
-        steps.push({ description: results > 0 ? 'Memory searched' : 'Memory: no results', success: true });
+        steps.push({ description: results > 0 ? 'Memory searched' : 'Memory: no results', outcome: 'success' });
         break;
       }
       case 'ThoughtStreamed': {
@@ -164,7 +190,7 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         legacyAcc = { thinking: ctx };
         steps.push({
           description: 'Thinking',
-          success: null,
+          outcome: 'pending',
           context_tokens: ctx.context_tokens,
           context_messages: ctx.context_messages,
           trimmed: ctx.trimmed,
@@ -214,20 +240,20 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         // LLM produced a tool call — the prior Thinking step is done.
         resolveLastPendingStep(steps, isThinking);
         const e = event as { name: string; args: unknown; description?: string };
-        steps.push({ description: e.description || describeEngineTool(e.name, e.args), success: null });
+        steps.push({ description: e.description || describeEngineTool(e.name, e.args), outcome: 'pending' });
         break;
       }
       case 'ToolResult':
         resolveLastPendingStep(steps, isNotThinking);
         break;
       case 'CodingAgentPromptSent':
-        steps.push({ description: 'Thinking', success: null });
+        steps.push({ description: 'Thinking', outcome: 'pending' });
         break;
       case 'CodingAgentToolCalled': {
         resolveLastPendingStep(steps, isThinking);
         const e = event as { name: string; args: unknown; description?: string };
-        steps.push({ description: e.description || describeCCTool(e.name, e.args), success: null, tool_use_id: toolUseIdOf(event) });
-        isComplete = false; // CC resumed — not finished yet
+        steps.push({ description: e.description || describeCCTool(e.name, e.args), outcome: 'pending', tool_use_id: toolUseIdOf(event) });
+        terminal = null; // CC resumed, not finished yet
         break;
       }
       case 'CodingAgentToolResult': {
@@ -241,8 +267,8 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         let resolved = false;
         if (id) {
           for (const step of steps) {
-            if (step.success === null && step.tool_use_id === id) {
-              step.success = true;
+            if (step.outcome === 'pending' && step.tool_use_id === id) {
+              step.outcome = 'success';
               resolved = true;
               break;
             }
@@ -251,9 +277,13 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         if (!resolved) resolveLastPendingStep(steps, isNotThinking);
         break;
       }
-      case 'ResponseGenerated': case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
-      case 'CodingAgentIdled':
-        isComplete = true;
+      // Mirror of exchangeResponseEvents: the terminator's KIND decides what a
+      // still-pending step becomes. See `TerminalKind`.
+      case 'ResponseGenerated': case 'CodingAgentIdled':
+        terminal = 'clean';
+        break;
+      case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
+        terminal = 'unclean';
         break;
       case 'CodingAgentThoughtStreamed': {
         // Mirror of exchangeResponseEvents: accumulate reasoning into the live
@@ -261,29 +291,29 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         const text = (event as { text?: string }).text ?? '';
         let target: Step | undefined;
         for (let i = steps.length - 1; i >= 0; i--) {
-          if (steps[i].success === null && steps[i].description === 'Thinking') {
+          if (steps[i].outcome === 'pending' && steps[i].description === 'Thinking') {
             target = steps[i];
             break;
           }
         }
         if (!target) {
-          target = { description: 'Thinking', success: null };
+          target = { description: 'Thinking', outcome: 'pending' };
           steps.push(target);
         }
         target.thinkingText = (target.thinkingText ?? '') + text;
-        isComplete = false; // CC actively reasoning — not finished
+        terminal = null; // CC actively reasoning, not finished
         break;
       }
       case 'CodingAgentTextStreamed':
         resolveLastPendingStep(steps, isThinking);
-        isComplete = false; // CC resumed — not finished yet
+        terminal = null; // CC resumed, not finished yet
         break;
     }
   }
-  // See `exchangeResponseEvents` for why a handed-off exchange finalizes only
-  // its Thinking markers.
-  if (isComplete || threadIdle) resolvePendingSteps(steps);
-  else if (exchange.continuationMoved) resolvePendingSteps(steps, isThinking);
+  // See `exchangeResponseEvents` for the outcome split and for why a handed-off
+  // exchange finalizes only its Thinking markers.
+  if (terminal !== null || threadIdle) resolvePendingSteps(steps, pendingOutcomeFor(terminal));
+  else if (exchange.continuationMoved) resolvePendingSteps(steps, 'success', isThinking);
   return steps;
 }
 
@@ -308,8 +338,8 @@ function resolveLastPendingResponseStep(
 ): Extract<ResponseEvent, { type: 'step' }> | null {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
-    if (e.type === 'step' && e.success === null && (!pred || pred(e))) {
-      e.success = true;
+    if (e.type === 'step' && e.outcome === 'pending' && (!pred || pred(e))) {
+      e.outcome = 'success';
       return e;
     }
   }
@@ -330,7 +360,7 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   const hasCCContent = exchangeHasCCContent(exchange);
   // Count images across the thread for thread:N numbering — starts after user images in this exchange
   let imageCounter = imageOffset + exchangeUserImageHashes(exchange).length;
-  let isComplete = false;
+  let terminal: TerminalKind = null;
   // Set when the exchange completed via a text-less ResponseGenerated — a
   // benign empty completion (the model ended its turn cleanly with no text).
   // Drives the neutral "empty response" note pushed after the loop.
@@ -359,7 +389,7 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         const ms = event as { results?: number; queries?: string[] };
         const results = ms.results ?? 0;
         const detail = ms.queries?.length ? ms.queries.join(', ') : undefined;
-        pushStep({ type: 'step', description: results > 0 ? 'Memory searched' : 'Memory: no results', success: true, detail, created });
+        pushStep({ type: 'step', description: results > 0 ? 'Memory searched' : 'Memory: no results', outcome: 'success', detail, created });
         break;
       }
       case 'ThoughtStreamed': {
@@ -371,7 +401,7 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         pushStep({
           type: 'step',
           description: 'Thinking',
-          success: null,
+          outcome: 'pending',
           context_tokens: ctx.context_tokens,
           context_messages: ctx.context_messages,
           trimmed: ctx.trimmed,
@@ -426,7 +456,7 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         const e = event as { name: string; args: unknown; description?: string };
         const description = e.description || describeEngineTool(e.name, e.args);
         const full = fullCommandForEngineTool(e.name, e.args);
-        pushStep({ type: 'step', description, tool_name: e.name, success: null, full, created });
+        pushStep({ type: 'step', description, tool_name: e.name, outcome: 'pending', full, created });
         break;
       }
       case 'ToolResult': {
@@ -465,15 +495,15 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         if (hasCCContent) events.push({ type: 'section_break', channel: 'claude_code' });
         break;
       case 'CodingAgentPromptSent':
-        pushStep({ type: 'step', description: 'Thinking', success: null, created });
+        pushStep({ type: 'step', description: 'Thinking', outcome: 'pending', created });
         break;
       case 'CodingAgentToolCalled': {
         resolveLastPendingResponseStep(events, isThinking);
         const e = event as { name: string; args: unknown; description?: string };
         const description = e.description || describeCCTool(e.name, e.args);
         const full = fullCommandForCCTool(e.name, e.args);
-        pushStep({ type: 'step', description, tool_name: e.name, success: null, tool_use_id: toolUseIdOf(event), full, created });
-        isComplete = false; // CC resumed — not finished yet
+        pushStep({ type: 'step', description, tool_name: e.name, outcome: 'pending', tool_use_id: toolUseIdOf(event), full, created });
+        terminal = null; // CC resumed, not finished yet
         break;
       }
       case 'CodingAgentToolResult': {
@@ -483,8 +513,8 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         let resolved = false;
         if (id) {
           for (const e of events) {
-            if (e.type === 'step' && e.success === null && e.tool_use_id === id) {
-              e.success = true;
+            if (e.type === 'step' && e.outcome === 'pending' && e.tool_use_id === id) {
+              e.outcome = 'success';
               if (ccResult !== undefined) e.result = ccResult;
               resolved = true;
               break;
@@ -506,23 +536,23 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         let target: Extract<ResponseEvent, { type: 'step' }> | undefined;
         for (let i = events.length - 1; i >= 0; i--) {
           const e = events[i];
-          if (e.type === 'step' && e.success === null && e.description === 'Thinking') {
+          if (e.type === 'step' && e.outcome === 'pending' && e.description === 'Thinking') {
             target = e;
             break;
           }
         }
         if (!target) {
-          target = { type: 'step', description: 'Thinking', success: null, created };
+          target = { type: 'step', description: 'Thinking', outcome: 'pending', created };
           pushStep(target);
         }
         target.thinkingText = (target.thinkingText ?? '') + text;
-        isComplete = false; // CC actively reasoning — not finished
+        terminal = null; // CC actively reasoning, not finished
         break;
       }
       case 'CodingAgentTextStreamed':
         resolveLastPendingResponseStep(events, isThinking);
         events.push({ type: 'text', md: (event as { text: string }).text });
-        isComplete = false; // CC resumed — not finished yet
+        terminal = null; // CC resumed, not finished yet
         break;
       case 'CodingAgentUserMessageSent':
         // Legacy event — now an exchange boundary in groupIntoExchanges, never a step
@@ -552,17 +582,23 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
         }
         break;
       }
+      // The terminator's KIND decides what a still-pending step becomes: a
+      // turn that finished leaves a step that ran to completion without a
+      // recorded result, a turn that DIED leaves one that never finished. See
+      // `TerminalKind`.
       case 'ResponseGenerated':
-        isComplete = true;
+        terminal = 'clean';
         // A text-less ResponseGenerated is a benign empty completion. The
         // [ENGINE-LIMIT] cap path also emits a ResponseGenerated with no
         // preceding TextStreamed, but with non-empty text — so checking the
         // event's own text distinguishes the two.
         emptyCompletion = !(event as { text?: string }).text?.trim();
         break;
-      case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
       case 'CodingAgentIdled':
-        isComplete = true;
+        terminal = 'clean';
+        break;
+      case 'ResponseCanceled': case 'ResponseAborted': case 'ResponseFailed':
+        terminal = 'unclean';
         break;
       // ChangeApplied/Discarded/Reverted/ApplyFailed and UserQuestionAsked/
       // CodingAgentPermissionRequest/CredentialRequested/McpConsentRequested
@@ -582,6 +618,14 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   // processing, so we DON'T resolve purely on `!isLast` — wait for the
   // exchange's terminator OR for the thread to go idle.
   //
+  // WHAT they resolve TO is the terminator's kind (`pendingOutcomeFor`): a
+  // clean end means the step finished and only its result event is missing, a
+  // turn that died means it never finished and is marked `'unfinished'`.
+  // `threadIdle` on its own keeps resolving to a success deliberately: the
+  // quiescent set includes `waiting_for_user_answer`, so a thread merely
+  // parked on a question card would otherwise paint "did not finish" over
+  // work that is about to resume.
+  //
   // The turn ending is not the only way a spinner strands: when the fold hands
   // a RUNNING turn to a later exchange (`Exchange.continuationMoved` — a child
   // completion card / divider took the redirect), the LLM's next output lands
@@ -589,10 +633,11 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   // those — a pending TOOL step is still owed a result that re-routes back by
   // tool id (the `ask_user_question` spinner that must keep running while the
   // card is on screen).
-  const finalizeAll = isComplete || threadIdle;
+  const finalizeAll = terminal !== null || threadIdle;
   if (finalizeAll || exchange.continuationMoved) {
-    const stepEvents = events.filter(e => e.type === 'step') as { success: boolean | null; description?: string }[];
-    resolvePendingSteps(stepEvents, finalizeAll ? undefined : isThinking);
+    const stepEvents = events.filter(e => e.type === 'step') as StepLike[];
+    if (finalizeAll) resolvePendingSteps(stepEvents, pendingOutcomeFor(terminal));
+    else resolvePendingSteps(stepEvents, 'success', isThinking);
     // Strip trailing Thinking steps — noise from CC processing notifications
     // (e.g., post-ChangeApplied) without producing output. Keep at least one
     // event so canceled/aborted exchanges still show .response-content.
@@ -618,13 +663,22 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
   return mergeAdjacentTextEvents(events);
 }
 
-/** Tri-state mapping for a step's `success` field: null = pending, true =
- *  succeeded, false = failed. Both the inline-step row and the detail modal
- *  consume this — the class drives the icon color, the label is user-facing. */
-export function stepStatus(success: boolean | null): { label: string; className: 'pending' | 'success' | 'error' } {
-  if (success === null) return { label: 'In progress', className: 'pending' };
-  if (success) return { label: 'Completed', className: 'success' };
-  return { label: 'Failed', className: 'error' };
+/** User-facing presentation of a `StepOutcome`. Both the inline-step row and
+ *  the detail modal consume this: the outcome IS the CSS class (which drives
+ *  the icon and the row's treatment), and this adds the label.
+ *
+ *  'Did not finish' is deliberately not 'Failed': a step killed mid-execution
+ *  never reported anything, while 'Failed' asserts it ran and returned an
+ *  error. */
+export function stepStatus(outcome: StepOutcome): { label: string; icon: string; className: StepOutcome } {
+  switch (outcome) {
+    // In-progress rows show no leading icon: the shimmering description is the
+    // "live" affordance (see `.inline-step.pending .step-icon` in steps.css).
+    case 'pending': return { label: 'In progress', icon: '', className: 'pending' };
+    case 'success': return { label: 'Completed', icon: '✓', className: 'success' };
+    case 'error': return { label: 'Failed', icon: '⚠', className: 'error' };
+    case 'unfinished': return { label: 'Did not finish', icon: '⊘', className: 'unfinished' };
+  }
 }
 
 /** Whether a non-last exchange's response panel should be hidden as visual

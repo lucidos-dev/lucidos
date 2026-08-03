@@ -267,7 +267,7 @@ impl OpenAiProvider {
             }
         }
 
-        Ok(Self::build_llm_response(content, tool_call_map, meta))
+        Self::build_llm_response(content, tool_call_map, meta)
     }
 
     /// Process a single Chat Completions SSE chunk. The final usage chunk
@@ -472,7 +472,7 @@ mod tests {
         assert_eq!(meta.output_tokens, Some(7));
         assert_eq!(meta.cache_read_tokens, Some(12));
 
-        let resp = OpenAiProvider::build_llm_response(content, tools, meta);
+        let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
         assert_eq!(resp.content.as_deref(), Some("hi"));
         assert_eq!(resp.stop_reason.as_deref(), Some("stop"));
         assert_eq!(resp.input_tokens, Some(42));
@@ -506,7 +506,7 @@ mod tests {
         )
         .unwrap();
 
-        let resp = OpenAiProvider::build_llm_response(content, tools, meta);
+        let resp = OpenAiProvider::build_llm_response(content, tools, meta).unwrap();
         assert_eq!(resp.content, None);
         assert!(resp.tool_calls.is_empty());
         assert_eq!(resp.stop_reason.as_deref(), Some("length"));

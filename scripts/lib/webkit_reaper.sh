@@ -57,13 +57,16 @@ _reaper_interval_s() {
     printf '%s' "$v"
 }
 
-# The command-substring that marks a process as a Playwright WebKit child.
-# Matching by the browsers-cache path (NOT a bare "WebContent" substring) is what
-# keeps us off the user's own Safari, Chrome, the lucidos-engine, node/vite, and
-# unrelated WebKit consumers. On macOS the WebContent/GPU/Networking XPC services
-# launched by Playwright's WebKit all live under
-# <browsers>/ms-playwright/webkit-NNNN/, so their argv path contains this token;
+# The executable-path substring that marks a process as a Playwright WebKit
+# child. Matching by the browsers-cache path (NOT a bare "WebContent" substring)
+# is what keeps us off the user's own Safari, Chrome, the lucidos-engine,
+# node/vite, and unrelated WebKit consumers. On macOS the WebContent/GPU/
+# Networking XPC services launched by Playwright's WebKit all live under
+# <browsers>/ms-playwright/webkit-NNNN/, so their argv[0] contains this token;
 # Playwright's chromium lives under ms-playwright/chromium-NNNN/ and is excluded.
+#
+# This token is tested against argv[0] ONLY, never the whole command line. See
+# the candidate loop in reap_once for why that distinction is load-bearing.
 _reaper_match() {
     if [ -n "${E2E_WEBKIT_REAP_MATCH:-}" ]; then
         printf '%s' "$E2E_WEBKIT_REAP_MATCH"
@@ -120,8 +123,15 @@ reap_once() {
         [ "$pid" -le 1 ] && continue
         [ "$pid" = "$self" ] && continue
         [ -n "$reaper_pid" ] && [ "$pid" = "$reaper_pid" ] && continue
-        # Substring match on the full command path (see _reaper_match).
-        case "$command" in
+        # Match argv[0] ONLY, never the whole command line. A process is a
+        # Playwright WebKit child if the BINARY IT RUNS lives under the browsers
+        # cache; what its arguments happen to say is irrelevant. Matching the
+        # full command line cannot tell "is that process" from "mentions that
+        # path", and on 2026-08-03 that killed two Claude Code sessions: a CC
+        # process carries the engine's THREAD HISTORY inside a ~22 KB
+        # --append-system-prompt argument, so a coding-agent thread discussing
+        # this very file matched its own matcher and SIGKILLed itself.
+        case "${command%% *}" in
             *"$match"*) ;;
             *) continue ;;
         esac
@@ -188,6 +198,16 @@ start_webkit_reaper() {
     cap_mb=$(_reaper_cap_mb)
     interval=$(_reaper_interval_s)
     match=$(_reaper_match)
+
+    # Candidates are matched on argv[0], which is read up to the first space, so
+    # a token containing whitespace can never match and the guard is effectively
+    # off. Say so out loud: a silently disarmed host-memory guard is how a leaked
+    # browser reaches 18.9 GB unnoticed.
+    case "$match" in
+        *[[:space:]]*)
+            echo "[webkit-reaper] WARNING: match token '$match' contains whitespace, so it can never match argv[0]. The host-memory guard is effectively OFF. Use a browsers path without spaces."
+            ;;
+    esac
 
     _reaper_loop "$interval" &
     WEBKIT_REAPER_PID=$!

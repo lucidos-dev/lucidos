@@ -40,6 +40,24 @@ pub(crate) async fn ff_main_to(
     branch_sha: &str,
     main_sha: &str,
 ) -> Result<(String, String), Box<dyn std::error::Error + Send + Sync>> {
+    // An unresolved ref reaches here as an empty string (the callers' own
+    // `rev-parse` calls fall back to `unwrap_or_default`). Reject that up front:
+    // otherwise a `merge-base` that also failed leaves both sides empty, the
+    // ff-ability guard below compares equal, and an `update-ref` fires on refs
+    // nobody could resolve. Deliberately ahead of the lock below: it reads no
+    // repo state, so an unresolvable ref should fail fast rather than queue
+    // behind an unrelated worktree snapshot.
+    if branch_sha.is_empty() || main_sha.is_empty() {
+        return Err("Cannot fast-forward: could not resolve the branch and main revisions".into());
+    }
+
+    // Held across the ref move AND the working-tree sync below, so no
+    // `commit_all_dirty` can snapshot the repo root while main is published but
+    // the tree has not caught up. See REPO_WORKTREE_MUTEX for the failure it
+    // prevents; MERGE_MUTEX (already held by every caller) is always the outer
+    // lock, so the pair cannot deadlock.
+    let _worktree_guard = REPO_WORKTREE_MUTEX.lock().await;
+
     // Verify ff-ability: main must be an ancestor of the branch
     let merge_base = git_cmd(&["merge-base", "main", branch_sha], repo_root)
         .await
@@ -66,14 +84,47 @@ pub(crate) async fn ff_main_to(
             // tree or index. `checkout -f main` both attaches HEAD to main (in case
             // it was detached, e.g. by a failed `pull --rebase`) and resets the
             // working tree + index to match the new main.
-            // If this fails, ensure_head_on_main (called before the next apply) is the safety net.
-            match git_cmd(&["checkout", "-f", "main"], repo_root).await {
-                Ok(o) if o.status.success() => {}
-                Ok(o) => log!(
-                    "[Changes] checkout -f main after update-ref failed: {}",
-                    String::from_utf8_lossy(&o.stderr).trim()
-                ),
-                Err(e) => log!("[Changes] checkout -f main after update-ref failed: {}", e),
+            //
+            // This sync MUST land, so it waits out a concurrent `.git/index.lock`
+            // holder instead of giving up on the first collision. `main` is already
+            // advanced at this point, so a repo-root working tree left at the old
+            // commit reads as "every file the merge added has been deleted" -- and
+            // the next `commit_all_dirty` (script output, artifact write, any
+            // auto-commit that stages all of data/) commits exactly that deletion on
+            // top of main, silently reverting the change that was just applied. That
+            // is how a concurrent app-thread apply lost a merged file on 2026-08-03.
+            // The collision itself is routine: libgit2 (via ArtifactManager) and
+            // these shell calls write the same index lock without waiting for each
+            // other. `ensure_head_on_main` is NOT a safety net for it -- that only
+            // aborts a stale rebase and re-attaches a detached HEAD, and HEAD is
+            // already on main here.
+            let sync_err =
+                match git_cmd_await_index_lock(&["checkout", "-f", "main"], repo_root).await {
+                    Ok(o) if o.status.success() => None,
+                    Ok(o) => Some(String::from_utf8_lossy(&o.stderr).trim().to_string()),
+                    Err(e) => Some(e),
+                };
+            // A sync that still fails after the retries FAILS the merge rather than
+            // reporting a clean apply over a tree it knows is stale. Both retry
+            // loops above re-enter here on the Err, and by then the ff itself is a
+            // no-op (main and the branch are already equal), so an ordinary
+            // collision just costs another attempt. If every attempt loses, the
+            // caller surfaces a failed apply, which is recoverable (main carries the
+            // commits, so a re-apply takes the already-merged idempotent path)
+            // whereas silently reverting the merged files is not. Logged as well as
+            // returned, because the Tier-3 fast path discards the Err.
+            if let Some(err) = sync_err {
+                let short = &branch_sha[..branch_sha.floor_char_boundary(8)];
+                log!(
+                    "[Changes] ERROR: checkout -f main after update-ref failed: {}. main advanced to {} but the repo-root working tree did not, so this merge is reported as failed rather than left to be silently reverted by the next auto-commit of data/.",
+                    err,
+                    short
+                );
+                return Err(format!(
+                    "main advanced to {} but the repo-root working tree could not be synced: {}",
+                    short, err
+                )
+                .into());
             }
             Ok((main_sha.to_string(), branch_sha.to_string()))
         }
@@ -191,9 +242,23 @@ pub(crate) async fn ff_merge_to_main(
         }
     }
 
-    // All retries exhausted -- clean up
-    let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
-    let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
+    // All retries exhausted. Clean up ONLY throwaway temp state: on a Tier-2 (or
+    // pruned-temp re-attach) resolution `temp_branch == feature_branch`, i.e. the
+    // session ran in the THREAD's own worktree on the REAL change branch, so
+    // removing the worktree and force-deleting the branch here would destroy the
+    // user's committed work while the change row stays pending and points at a
+    // branch that no longer exists. Failure-path cleanup must only undo what this
+    // attempt created (.claude/rules/rust.md), which is why the Abort arm has the
+    // same guard in `conflict_abort_deletes_temp_state`.
+    if temp_branch != feature_branch {
+        let _ = git_cmd(&["worktree", "remove", "--force", wt_path], repo_root).await;
+        let _ = git_cmd(&["branch", "-D", temp_branch], repo_root).await;
+    } else {
+        log!(
+            "[Changes] ff-merge exhausted for {}: keeping the thread worktree and branch (the merge ran on the real change branch)",
+            temp_branch
+        );
+    }
     Err(format!(
         "Fast-forward merge to main failed after 3 retries: {}",
         last_err
@@ -205,11 +270,13 @@ pub(crate) async fn ff_merge_to_main(
 }
 
 /// Check if an `origin` remote exists in the repository.
+///
+/// `or_unknown(false)`: the only consequence is skipping a background push,
+/// which the next apply retries. Nothing is deleted on either answer.
 async fn has_origin_remote(repo_root: &Path) -> bool {
-    git_cmd(&["remote", "get-url", "origin"], repo_root)
+    git_answer(&["remote", "get-url", "origin"], repo_root)
         .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .or_unknown(false)
 }
 
 /// Push main to origin in the background if the remote exists.
@@ -299,13 +366,21 @@ pub(crate) async fn ensure_head_on_main(repo_root: &Path) {
         }
     }
 
-    let head_ok = git_cmd(&["symbolic-ref", "HEAD"], repo_root)
+    // `or_unknown(true)`: only a positive "HEAD is detached" may reach the
+    // `checkout -f` below, which discards whatever is uncommitted in the repo
+    // root's working tree. A timed-out `symbolic-ref` used to resolve to
+    // `false` here, so a saturated host could force-checkout main over the
+    // user's checkout on the strength of a probe that never answered.
+    // Skipping a genuinely needed re-attach costs a loud merge failure instead.
+    let head_ok = git_answer(&["symbolic-ref", "HEAD"], repo_root)
         .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .or_unknown(true);
     if !head_ok {
         log!("[Changes] HEAD is detached -- re-attaching to main");
-        match git_cmd(&["checkout", "-f", "main"], repo_root).await {
+        // Same index-lock contention as the sync in ff_main_to: a detached HEAD
+        // that stays detached because a concurrent artifact commit held the lock
+        // makes every later `git status` report false dirty files.
+        match git_cmd_await_index_lock(&["checkout", "-f", "main"], repo_root).await {
             Ok(o) if o.status.success() => {}
             Ok(o) => log!(
                 "[Changes] Failed to re-attach HEAD: {}",
@@ -352,36 +427,53 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
 
-    if current_branch.as_deref() == Some(local_branch) {
-        // We're on the default branch -- merge ff-only to update it in place
-        match git_cmd(&["merge", "--ff-only", &remote_ref], repo_root).await {
-            Ok(o) if o.status.success() => log!(
-                "[Changes] Fast-forwarded local {} to {}",
-                local_branch,
-                remote_ref
-            ),
-            Ok(_) => log!(
-                "[Changes] Could not fast-forward {} (diverged) -- worktree will branch from {}",
-                local_branch,
-                remote_ref
-            ),
-            Err(e) => log!("[Changes] Failed to fast-forward {}: {}", local_branch, e),
+    match current_branch.as_deref() {
+        Some(b) if b == local_branch => {
+            // We're on the default branch -- merge ff-only to update it in place
+            match git_cmd(&["merge", "--ff-only", &remote_ref], repo_root).await {
+                Ok(o) if o.status.success() => log!(
+                    "[Changes] Fast-forwarded local {} to {}",
+                    local_branch,
+                    remote_ref
+                ),
+                Ok(_) => log!(
+                    "[Changes] Could not fast-forward {} (diverged) -- worktree will branch from {}",
+                    local_branch,
+                    remote_ref
+                ),
+                Err(e) => log!("[Changes] Failed to fast-forward {}: {}", local_branch, e),
+            }
         }
-    } else {
-        // Not on the default branch -- update the local ref directly (local-only, no network)
-        let local_ref = format!("refs/heads/{}", local_branch);
-        match git_cmd(&["update-ref", &local_ref, &remote_ref], repo_root).await {
-            Ok(o) if o.status.success() => log!(
-                "[Changes] Updated local {} to match {}",
+        Some(_) => {
+            // Not on the default branch -- update the local ref directly (local-only, no network)
+            let local_ref = format!("refs/heads/{}", local_branch);
+            match git_cmd(&["update-ref", &local_ref, &remote_ref], repo_root).await {
+                Ok(o) if o.status.success() => log!(
+                    "[Changes] Updated local {} to match {}",
+                    local_branch,
+                    remote_ref
+                ),
+                Ok(_) => log!(
+                    "[Changes] Could not update local {} -- worktree will branch from {}",
+                    local_branch,
+                    remote_ref
+                ),
+                Err(e) => log!("[Changes] Failed to update local {}: {}", local_branch, e),
+            }
+        }
+        None => {
+            // git could not say which branch the repo root is on. The two arms
+            // above are not interchangeable: the update-ref one moves
+            // refs/heads/<default> with no old-value guard, so running it while
+            // we are in fact standing on that branch rewrites the ref under a
+            // live checkout and the whole tree reads as uncommitted. Leave the
+            // local ref alone; worktrees branch from a slightly older base,
+            // which both arms already treat as an acceptable outcome.
+            log!(
+                "[Changes] Could not read the current branch; leaving local {} alone (worktree will branch from {})",
                 local_branch,
                 remote_ref
-            ),
-            Ok(_) => log!(
-                "[Changes] Could not update local {} -- worktree will branch from {}",
-                local_branch,
-                remote_ref
-            ),
-            Err(e) => log!("[Changes] Failed to update local {}: {}", local_branch, e),
+            );
         }
     }
 
@@ -584,25 +676,34 @@ async fn primary_worktree_head(repo_root: &Path) -> Option<String> {
 }
 
 /// `true` if `git_ref` resolves to a commit in `repo_root`.
+///
+/// `or_unknown(false)`: both directions fail safely at every current call site.
+/// `worktree_add` either tries `-b` on an existing branch or checks out a
+/// missing one, and git refuses loudly either way; `default_diff_base` merely
+/// picks a different base to diff against. Do NOT reuse this to gate a
+/// destructive step: an unknown would read as "the ref is gone". A gate like
+/// that wants the tri-state [`git_answer`] directly, so it can refuse.
 pub(crate) async fn git_ref_exists(repo_root: &Path, git_ref: &str) -> bool {
-    git_cmd(&["rev-parse", "--verify", "--quiet", git_ref], repo_root)
+    git_answer(&["rev-parse", "--verify", "--quiet", git_ref], repo_root)
         .await
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+        .or_unknown(false)
 }
 
 /// `true` if `ancestor` is an ancestor of `descendant` (i.e. `descendant`'s
 /// history contains `ancestor`). Mirrors `git merge-base --is-ancestor`, whose
 /// exit status is 0 for yes and 1 for no. A commit is its own ancestor, so
 /// equal refs return `true`.
+///
+/// `or_unknown(false)`: its only caller is `default_diff_base`, where a
+/// `false` means "assume the local default diverged" and diff against
+/// `origin/<default>` instead. That is a read-only choice of base.
 async fn is_ancestor(repo_root: &Path, ancestor: &str, descendant: &str) -> bool {
-    git_cmd(
+    git_answer(
         &["merge-base", "--is-ancestor", ancestor, descendant],
         repo_root,
     )
     .await
-    .map(|o| o.status.success())
-    .unwrap_or(false)
+    .or_unknown(false)
 }
 
 const DEFAULT_BRANCH_CACHE_TTL: Duration = Duration::from_secs(60);

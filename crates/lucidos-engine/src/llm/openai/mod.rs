@@ -251,11 +251,19 @@ impl OpenAiProvider {
 
     /// Build an LlmResponse from accumulated text content, tool calls, and
     /// the per-stream meta captured from `finish_reason` / `usage` deltas.
+    ///
+    /// Errors when a tool call's streamed argument JSON does not parse. That is
+    /// a real upstream failure (most often a `finish_reason: length` truncation
+    /// mid-object), and substituting `{}` would silently execute the tool with
+    /// no arguments: `list_files({})` lists the workspace root instead of the
+    /// requested directory, `query_events({})` returns the unfiltered default,
+    /// and the model then reasons over the wrong result. The Anthropic parser
+    /// already errors on the same condition.
     fn build_llm_response(
         content: String,
         tool_call_map: Vec<AccumulatedToolCall>,
         meta: StreamMeta,
-    ) -> LlmResponse {
+    ) -> Result<LlmResponse, Box<dyn std::error::Error + Send + Sync>> {
         let final_content = if content.is_empty() {
             None
         } else {
@@ -265,29 +273,29 @@ impl OpenAiProvider {
         let tool_calls: Vec<ToolCall> = tool_call_map
             .into_iter()
             .map(|tc| {
-                let arguments = if tc.arguments_json.is_empty() {
+                // Whitespace-only counts as "no arguments streamed", same as
+                // empty: a no-arg tool call must not read as a parse failure.
+                let arguments = if tc.arguments_json.trim().is_empty() {
                     serde_json::json!({})
                 } else {
-                    serde_json::from_str(&tc.arguments_json).unwrap_or_else(|e| {
-                        log!(
-                            "[OpenAI] Failed to parse OpenAI tool arguments: {} (json: {})",
-                            e,
-                            tc.arguments_json
-                        );
-                        serde_json::json!({})
-                    })
+                    serde_json::from_str(&tc.arguments_json).map_err(|e| {
+                        format!(
+                            "Failed to parse OpenAI tool arguments for '{}': {} (json: {})",
+                            tc.name, e, tc.arguments_json
+                        )
+                    })?
                 };
-                ToolCall {
+                Ok(ToolCall {
                     id: tc.id,
                     name: tc.name,
                     arguments,
                     // OpenAI doesn't surface Gemini-style thought signatures.
                     thought_signature: None,
-                }
+                })
             })
-            .collect();
+            .collect::<Result<Vec<ToolCall>, String>>()?;
 
-        LlmResponse {
+        Ok(LlmResponse {
             content: final_content,
             tool_calls,
             stop_reason: meta.stop_reason,
@@ -301,7 +309,7 @@ impl OpenAiProvider {
             cache_read_tokens: meta.cache_read_tokens,
             thinking_chars: None,
             unknown_sse_dropped: 0,
-        }
+        })
     }
 }
 

@@ -65,6 +65,7 @@ const RESUME_RECONCILED: Array<[call: string, whatBreaks: string]> = [
   ['syncClientUpdateFromBuild(', 'the client-update badge misses a build that landed while away'],
   ['checkEngineVersion(', 'an engine build that finished while away shows as still spinning'],
   ['recheckAppUpdateOnResume(', 'a packaged release goes unannounced until the next poll'],
+  ['flushPendingPreferenceWrites(', 'a settings change WebKit aborted at suspend never reaches the engine, so the device and the server disagree until the next reload'],
 ];
 
 describe('useStartup resume reconciliation', () => {

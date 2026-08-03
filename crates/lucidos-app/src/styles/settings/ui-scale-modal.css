@@ -90,8 +90,11 @@
     color: var(--text-muted);
 }
 
+/* The row already carries a "This device" badge, so a raised neutral surface is
+   enough. A colored left border would be the banned left-accent stripe
+   (.claude/rules/frontend.md F18). */
 .device-current {
-    border-left: 0.125rem solid var(--accent);
+    background: var(--bg-tertiary);
 }
 
 .device-badge {

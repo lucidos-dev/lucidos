@@ -33,7 +33,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use uuid::Uuid;
 
-use crate::engine::command_guard::{self, RiskLane, SideEffectCategory, StaticVerdict};
+use crate::engine::command_guard::{
+    self, unwrap_shell_command, RiskLane, SideEffectCategory, StaticVerdict,
+};
 use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::engine::thread_events::{
     ActorMode, EngineReason, EventMeta, MessageOrigin, ThreadDirection, ThreadEvent,
@@ -356,6 +358,12 @@ pub async fn lookup_thread_actor(pool: &sqlx::PgPool, thread_id: Uuid) -> Option
 /// `request_id` alone would let an agent grant itself a standing allow for any
 /// tool.
 ///
+/// That boundary has to hold on BOTH aliases, which is why `q` carries its own
+/// `thread_id = $1`. The resolved row `r` being thread-scoped is not enough: the
+/// REQUEST row is what supplies `tool_name` and `input` to
+/// `derive_allow_pattern`, so a forged request matched on `request_id` alone
+/// could pair a legitimate grant with an attacker-chosen tool.
+///
 /// Fails toward asking: a query error logs and leaves the thread unhydrated, so
 /// the card renders and the next prompt retries.
 async fn hydrate_session_allows(
@@ -377,6 +385,7 @@ async fn hydrate_session_allows(
          FROM events r \
          JOIN events q \
            ON q.event_type = 'CodingAgentPermissionRequest' \
+          AND q.thread_id = $1 \
           AND q.payload->>'request_id' = r.payload->>'request_id' \
          WHERE r.event_type = 'CodingAgentPermissionResolved' \
            AND r.thread_id = $1 \
@@ -584,68 +593,6 @@ fn coding_agent_command<'a>(tool_name: &str, input: &'a serde_json::Value) -> Op
         return None;
     }
     input.get("command").and_then(|v| v.as_str())
-}
-
-/// Codex sends commands pre-wrapped as `/bin/zsh -lc '<script>'`, but the command
-/// guard's static classifier only inspects each segment's HEAD and does NOT
-/// descend into a shell `-c`/`-lc` payload — so a wrapped `curl -X POST` would
-/// read as head `zsh` → benign, silently bypassing the grant check. Unwrap a
-/// single shell `-c`-style wrapper so the inner script is what gets classified.
-/// Returns the original command when it isn't a recognized shell wrapper (Claude
-/// Code's `Bash` passes the raw command, which falls through unchanged).
-fn unwrap_shell_command(command: &str) -> &str {
-    const SHELLS: &[&str] = &["sh", "bash", "zsh", "dash", "ksh", "ash"];
-    let trimmed = command.trim_start();
-    let Some(first) = trimmed.split_whitespace().next() else {
-        return command;
-    };
-    let base = first.rsplit('/').next().unwrap_or(first);
-    if !SHELLS.contains(&base) {
-        return command;
-    }
-    // Walk whitespace-delimited tokens (with byte offsets) to find the `-c`-style
-    // flag; everything after it is the script. One quote layer is stripped so the
-    // common `zsh -lc 'curl …'` form classifies as a clean `curl …`.
-    let bytes = trimmed.as_bytes();
-    let mut i = 0;
-    while i < bytes.len() {
-        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        let start = i;
-        while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
-            i += 1;
-        }
-        if start == i {
-            break;
-        }
-        if is_shell_c_flag(&trimmed[start..i]) {
-            return strip_one_quote_layer(trimmed[i..].trim());
-        }
-    }
-    command
-}
-
-/// A single-dash cluster of shell option letters that includes `c` — `-c`, `-lc`,
-/// `-ic`, `-lic`, etc. Rejects long options and non-shell flags (`-config`,
-/// `-l`).
-fn is_shell_c_flag(tok: &str) -> bool {
-    match tok.strip_prefix('-') {
-        Some(letters) if tok.len() >= 2 && !tok.starts_with("--") => {
-            letters.contains('c') && letters.chars().all(|ch| "clixeasfm".contains(ch))
-        }
-        _ => false,
-    }
-}
-
-/// Strip one matching layer of surrounding single/double quotes, if present.
-fn strip_one_quote_layer(s: &str) -> &str {
-    let b = s.as_bytes();
-    if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') && b[b.len() - 1] == b[0] {
-        &s[1..s.len() - 1]
-    } else {
-        s
-    }
 }
 
 /// Extract the target path from a coding-agent *file-write* request. Codex
@@ -1591,6 +1538,21 @@ mod tests {
             "curl -X POST https://x -d @y"
         );
         assert_eq!(unwrap_shell_command("bash -c \"rm -rf /\""), "rm -rf /");
+        // `sh -c <script> [$0 [arg ...]]`: operands after the script only set $0
+        // and the positional params, so the script is still what runs. Cutting
+        // at the matching close quote (not just unwrapping when the quotes wrap
+        // the whole remainder) is what keeps this from classifying as `'rm`.
+        assert_eq!(
+            unwrap_shell_command("bash -c 'rm -rf /' ignored"),
+            "rm -rf /"
+        );
+        assert_eq!(
+            unwrap_shell_command("/bin/zsh -lc 'curl -X POST https://x' zsh arg1"),
+            "curl -X POST https://x"
+        );
+        // Unterminated quote: no matching close, so it is returned as-is rather
+        // than guessed at.
+        assert_eq!(unwrap_shell_command("bash -c 'rm -rf"), "'rm -rf");
         // Not a shell wrapper → unchanged (Claude Code's raw Bash command).
         assert_eq!(
             unwrap_shell_command("curl -X POST https://x"),

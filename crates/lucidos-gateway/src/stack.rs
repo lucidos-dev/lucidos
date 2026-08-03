@@ -422,6 +422,31 @@ mod tests {
         let _ = child.wait();
     }
 
+    /// Block until `pid` is an observably exited-but-unreaped child (`ps` state
+    /// `Z`), returning false if it never gets there. `ps` state is the portable
+    /// read: macOS reserves `WNOWAIT` for `waitid`, there is no /proc here, and
+    /// `try_wait` would REAP the child, which is the very state under test.
+    ///
+    /// A poll rather than a fixed sleep because these tests share a machine with
+    /// every other test in the suite (and with whatever else the developer is
+    /// running): a sleep long enough to be reliable under load is a sleep the
+    /// whole suite pays on every run.
+    #[cfg(unix)]
+    fn wait_until_defunct(pid: u32) -> bool {
+        for _ in 0..200 {
+            let state = std::process::Command::new("ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            if state.starts_with('Z') {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        false
+    }
+
     /// The bug this whole helper exists for: an exited child that nobody has
     /// waited on is a ZOMBIE, and `kill(pid, 0)` still succeeds for it. It must
     /// read as dead, and the probe must reap it so it stops existing at all.
@@ -436,23 +461,10 @@ mod tests {
             .expect("spawn true")
             .id();
 
-        // Wait until it is observably defunct, so this tests a zombie and not a
-        // still-running child. `ps` state is the portable read (macOS reserves
-        // `WNOWAIT` for `waitid`, and there is no /proc here).
-        let mut zombie = false;
-        for _ in 0..200 {
-            let state = std::process::Command::new("ps")
-                .args(["-o", "state=", "-p", &pid.to_string()])
-                .output()
-                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-                .unwrap_or_default();
-            if state.starts_with('Z') {
-                zombie = true;
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(zombie, "fixture never became an observable zombie");
+        assert!(
+            wait_until_defunct(pid),
+            "fixture never became an observable zombie"
+        );
         // SAFETY: signal 0 is an existence check only. This is the premise of
         // the whole helper: the old probe accepted this pid as alive.
         assert!(
@@ -480,9 +492,15 @@ mod tests {
             .spawn()
             .expect("spawn true");
         let pid = bystander.id();
-        // Let it exit, so it is exactly the kind of child `waitpid(0, …)` would
-        // grab if the guard were missing.
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        // Wait for it to actually exit, so it is exactly the kind of child
+        // `waitpid(0, …)` would grab if the guard were missing. Polled, not
+        // slept: a busy machine can leave a just-spawned `true` unscheduled past
+        // any fixed delay, and the test would then pass for the wrong reason (or
+        // fail spuriously on its own bystander assertion).
+        assert!(
+            wait_until_defunct(pid),
+            "bystander never exited, so the guard would not be under test"
+        );
 
         assert!(!pid_is_live(0), "pid 0 must never read as live");
 

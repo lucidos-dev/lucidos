@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { exchangeResponseEvents, exchangeStatus, exchangeSteps, type AnswerKind, type Exchange, type ThreadEvent, type ThreadMeta, type ThreadState } from '../thread-events';
 import type { StoredEvent } from '../thread-events';
 import { findPendingMultiSelectQuestion, computeSubmitMultiCount } from '../../components/chat/PromptInput';
+import type { StepOutcome } from '../types';
 
 function step(seq: number, event: Partial<StoredEvent> & { type: string }): { seq: number; event: StoredEvent } {
   return { seq, event: event as StoredEvent };
@@ -109,16 +110,16 @@ describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
 
     // The resume-marker Thinking step must still be a spinner (success: null).
     const events = exchangeResponseEvents(ex, 0, true);
-    const stepEvents = events.filter(e => e.type === 'step') as Array<{ description: string; success: boolean | null }>;
+    const stepEvents = events.filter(e => e.type === 'step') as Array<{ description: string; outcome: StepOutcome }>;
     const trailingThinking = stepEvents[stepEvents.length - 1];
     expect(trailingThinking.description).toBe('Thinking');
-    expect(trailingThinking.success).toBeNull();
+    expect(trailingThinking.outcome).toBe('pending');
 
     // exchangeSteps (the parallel projection used by other UI surfaces) must agree.
     const steps = exchangeSteps(ex, true, false);
     const lastStep = steps[steps.length - 1];
     expect(lastStep.description).toBe('Thinking');
-    expect(lastStep.success).toBeNull();
+    expect(lastStep.outcome).toBe('pending');
   });
 });
 

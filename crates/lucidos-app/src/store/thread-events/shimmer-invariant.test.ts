@@ -32,7 +32,7 @@ function shimmerState(exchange: Exchange, showSteps: boolean, collapsed = false,
     labelShimmers: className === 'working' && !liveStepOnScreen,
     // A step shimmer is on screen iff steps are expanded, the panel isn't
     // collapsed (collapse hides the steps body), AND a pending step renders.
-    stepShimmers: showSteps && !collapsed && events.some(e => e.type === 'step' && e.success === null),
+    stepShimmers: showSteps && !collapsed && events.some(e => e.type === 'step' && e.outcome === 'pending'),
   };
 }
 

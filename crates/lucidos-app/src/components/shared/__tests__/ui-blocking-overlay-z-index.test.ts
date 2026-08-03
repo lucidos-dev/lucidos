@@ -73,11 +73,11 @@ describe('ui-blocking overlay z-index (only toasts above the blocker)', () => {
   });
 
   it('tooltip-layer elements are pulled below the overlay while blocked', () => {
-    // The three --z-tooltip (10000) consumers — the JS tooltip, the
-    // pseudo-fullscreen app iframe, and the landscape lock — all outrank the
-    // overlay in normal use; :root[data-ui-blocked] makes them step aside.
+    // Both --z-tooltip (10000) consumers, the JS tooltip and a pseudo-fullscreen
+    // app iframe, outrank the overlay in normal use; :root[data-ui-blocked]
+    // makes them step aside. (A third one, the landscape rotate lock, was
+    // deleted when rotation stopped being an error state.)
     expect(modalCss).toMatch(/:root\[data-ui-blocked\]\s+#tooltip\s*\{[^}]*display:\s*none/);
     expect(modalCss).toMatch(/:root\[data-ui-blocked\][^{]*\.app-ui-fullscreen/);
-    expect(modalCss).toMatch(/:root\[data-ui-blocked\][^{]*\.landscape-lock/);
   });
 });

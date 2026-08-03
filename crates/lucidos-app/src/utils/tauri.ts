@@ -234,12 +234,23 @@ export type AppUpdateProgress =
   | (AppUpdateFrame & { phase: 'restarting-services' })
   | (AppUpdateFrame & { phase: 'relaunching' })
   | (AppUpdateFrame & { phase: 'cancelled' })
-  | (AppUpdateFrame & { phase: 'failed'; message: string });
+  | (AppUpdateFrame & { phase: 'failed'; message: string })
+  /** The install left no runnable app behind: the swap destroyed the old bundle
+   *  without landing the new one. Its own phase rather than a longer `failed`
+   *  message, because the two need different handling and not just different
+   *  wording: `failed` is retryable and this is not, the recovery is a reinstall
+   *  from the .dmg, and the page must not re-offer the update. Rust's
+   *  `AppUpdatePhase::BundleSwapFailed`, raised from both install outcomes. */
+  | (AppUpdateFrame & { phase: 'bundle-swap-failed'; message: string });
 
-/** A frame describing a run still IN FLIGHT. `cancelled` and `failed` END a run
- *  rather than describe one, so surfaces replace themselves on those instead of
- *  updating — which is why the narration helper takes only these. */
-export type AppUpdateRunning = Exclude<AppUpdateProgress, { phase: 'cancelled' | 'failed' }>;
+/** A frame describing a run still IN FLIGHT. `cancelled`, `failed` and
+ *  `bundle-swap-failed` END a run rather than describe one, so surfaces replace
+ *  themselves on those instead of updating, which is why the narration helper
+ *  takes only these. */
+export type AppUpdateRunning = Exclude<
+  AppUpdateProgress,
+  { phase: 'cancelled' | 'failed' | 'bundle-swap-failed' }
+>;
 
 /** Abandon an in-flight packaged-update download. Only the check + download can
  *  be cancelled — once the bundle swap has started the run has committed and this
@@ -307,10 +318,64 @@ export function tailscaleUp(authKey?: string): Promise<void> {
 }
 
 /** Expose the engine over the tailnet (`tailscale serve`), returning the
- *  `…ts.net` URL. Rejects with a string error. Only call when isTauri() is true. */
+ *  `…ts.net` URL. Rejects with a string error. Only call when isTauri() is true.
+ *
+ *  Resolves only when the whole run is OVER, and a run legitimately waits minutes
+ *  for a tailnet approval. Everything the user sees in between arrives on
+ *  {@link TAILSCALE_SERVE_PROGRESS_EVENT}. Awaiting it silently is exactly what
+ *  made the button look dead. */
 export function tailscaleServe(): Promise<string> {
   return invoke<string>('tailscale_serve');
 }
+
+/** Abandon the in-flight Expose run. The outcome arrives as a `cancelled` frame,
+ *  not as this promise's resolution. A no-op when nothing is running. Only call
+ *  when isTauri() is true. */
+export function cancelTailscaleServe(): Promise<void> {
+  return invoke('cancel_tailscale_serve');
+}
+
+/** Tauri event carrying {@link TailscaleServeProgress} frames while an Expose run
+ *  is in flight. Emitted by `src/mobile.rs`; the name must match
+ *  `SERVE_PROGRESS_EVENT` there. */
+export const TAILSCALE_SERVE_PROGRESS_EVENT = 'tailscale-serve-progress';
+
+/** Where an Expose run currently is: the TypeScript mirror of Rust's `ServePhase`
+ *  (`src/mobile.rs`), serialized internally-tagged on `phase`.
+ *
+ *  A discriminated union rather than a bare string, for the same two reasons the
+ *  updater's is one: the phase's data travels with it (only the approval phase
+ *  has a URL, only `done` has one, only `failed` has a message), and `tsc` forces
+ *  every consumer to handle every phase, so a variant added in Rust cannot render
+ *  as a blank line here.
+ *
+ *  No phase carries a fraction, deliberately: not one step of this flow can
+ *  honestly report one, so the surface spins rather than inventing a bar. */
+export type TailscaleServeProgress =
+  /** Claimed the slot, about to look for a CLI. */
+  | { phase: 'starting' }
+  /** Reading the tailnet address and the MagicDNS name. */
+  | { phase: 'checking-tailnet' }
+  /** `tailscale serve` is running. */
+  | { phase: 'configuring' }
+  /** Serve is not enabled on this tailnet, and the CLI is waiting for someone to
+   *  approve it in a browser. `url` is the link IT printed (the node id in it is
+   *  not reconstructable, and Rust has already checked it is an HTTPS Tailscale
+   *  URL before offering it). The run keeps waiting and finishes by itself. */
+  | { phase: 'awaiting-tailnet-approval'; url: string }
+  /** Configured; waiting for something to answer on 443 (a first-run certificate
+   *  takes a moment). */
+  | { phase: 'waiting-for-https' }
+  | { phase: 'done'; url: string }
+  | { phase: 'failed'; message: string }
+  | { phase: 'cancelled' };
+
+/** A frame describing a run still IN FLIGHT. The three terminal phases END a run
+ *  rather than describe one, so the badge drops them and the toast settles. */
+export type TailscaleServeRunning = Exclude<
+  TailscaleServeProgress,
+  { phase: 'done' | 'failed' | 'cancelled' }
+>;
 
 /** Listen for a Tauri event. Returns an unlisten function. Only call when isTauri() is true. */
 export function listen<T>(event: string, handler: (e: { payload: T }) => void): Promise<() => void> {

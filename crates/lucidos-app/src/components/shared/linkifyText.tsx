@@ -6,7 +6,7 @@ import type { ComponentChildren } from 'preact';
 const URL_RE = /https?:\/\/[^\s<>"')\]]+/g;
 
 // Sentence punctuation that follows a URL should stay OUTSIDE the link — a URL
-// ending a sentence ("… /fable-mythos-access.") must not swallow the period.
+// ending a sentence ("… /docs/getting-started.") must not swallow the period.
 const TRAILING_PUNCT = /[.,;:!?]+$/;
 
 /** Turn bare URLs in plain text into clickable links for rendering as JSX.

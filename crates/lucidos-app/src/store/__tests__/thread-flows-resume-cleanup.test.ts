@@ -3,6 +3,7 @@ import { getExchanges, insertEvents, makeThread, resetSeqCounter } from './threa
 import { exchangeResponseEvents, exchangeStatus, exchangeSteps, type ThreadEvent } from '../thread-events';
 import { isActive } from '../exchange-status';
 import { displaySection } from '../../generated/thread-lifecycle';
+import type { StepOutcome } from '../types';
 import { isThreadQuiescent } from '../store';
 
 beforeEach(resetSeqCounter);
@@ -144,7 +145,7 @@ describe('stale exchange recovery (incomplete last exchange)', () => {
 
     // Pending steps should be resolved (no spinning "Running Python")
     const steps = exchangeSteps(lastExchange, true, threadIdle);
-    const pendingSteps = steps.filter(s => s.success === null);
+    const pendingSteps = steps.filter(s => s.outcome === 'pending');
     expect(pendingSteps).toHaveLength(0);
   });
 
@@ -353,8 +354,8 @@ describe('chat follow-up while parent loop still running', () => {
     const events = exchangeResponseEvents(exchanges[0], 0, /* isLast */ false);
     const pythonSteps = events.filter(e => e.type === 'step' && /python/i.test((e as { description?: string }).description ?? ''));
     expect(pythonSteps).toHaveLength(2);
-    const lastPython = pythonSteps[pythonSteps.length - 1] as { success: boolean | null };
-    expect(lastPython.success).toBeNull(); // spinner, not ✓
+    const lastPython = pythonSteps[pythonSteps.length - 1] as { outcome: StepOutcome };
+    expect(lastPython.outcome).toBe('pending'); // spinner, not ✓
   });
 
   // Verbatim event shape from a production thread: parent emits two
@@ -639,8 +640,8 @@ describe('CC waiting_for_user_answer: trailing Thinking cleanup in non-last exch
     // E2 (AskUserQuestion exchange) and E3 (mid-flight MR) both have a
     // stranded resume-marker / queued-prompt Thinking from CodingAgentPromptSent.
     // Both are non-last and must be cleaned up.
-    const isPendingThinking = (e: { type: string; description?: string; success?: boolean | null }) =>
-      e.type === 'step' && e.description === 'Thinking' && e.success === null;
+    const isPendingThinking = (e: { type: string; description?: string; outcome?: StepOutcome }) =>
+      e.type === 'step' && e.description === 'Thinking' && e.outcome === 'pending';
 
     const e2Events = exchangeResponseEvents(exchanges[1], 0, /* isLast */ false, threadIdle);
     expect(e2Events.filter(isPendingThinking)).toHaveLength(0);

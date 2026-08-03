@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { buildCCThread, makeThreadState } from './thread-events-helpers';
 import { exchangeResponseEvents, exchangeSteps, fullCommandForCCTool, fullCommandForEngineTool, groupIntoExchanges, handleEvent, type StoredEvent, type ThreadEvent } from '../thread-events';
+import type { StepOutcome } from '../types';
 
 describe('UserPromptInjected in groupIntoExchanges', () => {
   it('UserPromptInjected starts a new exchange', () => {
@@ -136,9 +137,11 @@ describe('step completion — no eternal spinners', () => {
     const events = exchangeResponseEvents(exchanges[0]);
     const steps = events.filter(e => e.type === 'step');
 
-    // Both steps must be completed (no spinner) — the exchange is done
+    // Both steps must be completed (no spinner): the exchange is done, and
+    // CodingAgentIdled is a CLEAN terminator, so the lost result resolves to a
+    // checkmark rather than "did not finish".
     for (const step of steps) {
-      expect((step as { success: boolean | null }).success).not.toBeNull();
+      expect((step as { outcome: StepOutcome }).outcome).toBe('success');
     }
   });
 
@@ -159,7 +162,7 @@ describe('step completion — no eternal spinners', () => {
 
     expect(steps).toHaveLength(1);
     // Step must NOT show spinner on a completed exchange
-    expect((steps[0] as { success: boolean | null }).success).not.toBeNull();
+    expect((steps[0] as { outcome: StepOutcome }).outcome).toBe('success');
   });
 
   it('does NOT force-resolve spinners when CC resumed after idle', () => {
@@ -181,8 +184,8 @@ describe('step completion — no eternal spinners', () => {
     const steps = events.filter(e => e.type === 'step');
 
     // The last step should still show spinner — CC is actively working
-    const lastStep = steps[steps.length - 1] as { success: boolean | null };
-    expect(lastStep.success).toBeNull();
+    const lastStep = steps[steps.length - 1] as { outcome: StepOutcome };
+    expect(lastStep.outcome).toBe('pending');
   });
 
   it('three parallel subagents resolve individually as results arrive (live streaming)', () => {
@@ -202,9 +205,9 @@ describe('step completion — no eternal spinners', () => {
 
     let exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     let events = exchangeResponseEvents(exchanges[0]);
-    let steps = events.filter(e => e.type === 'step') as { success: boolean | null }[];
-    let resolved = steps.filter(s => s.success === true).length;
-    let pending = steps.filter(s => s.success === null).length;
+    let steps = events.filter(e => e.type === 'step') as { outcome: StepOutcome }[];
+    let resolved = steps.filter(s => s.outcome === 'success').length;
+    let pending = steps.filter(s => s.outcome === 'pending').length;
     expect(resolved).toBe(1);
     expect(pending).toBe(2);
 
@@ -212,9 +215,9 @@ describe('step completion — no eternal spinners', () => {
     handleEvent(map, 'thread-1', 7, { type: 'CodingAgentToolResult', name: '', result: 'done 2' } as ThreadEvent, '2026-04-04T10:00:06Z');
     exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     events = exchangeResponseEvents(exchanges[0]);
-    steps = events.filter(e => e.type === 'step') as { success: boolean | null }[];
-    resolved = steps.filter(s => s.success === true).length;
-    pending = steps.filter(s => s.success === null).length;
+    steps = events.filter(e => e.type === 'step') as { outcome: StepOutcome }[];
+    resolved = steps.filter(s => s.outcome === 'success').length;
+    pending = steps.filter(s => s.outcome === 'pending').length;
     expect(resolved).toBe(2);
     expect(pending).toBe(1);
 
@@ -222,8 +225,8 @@ describe('step completion — no eternal spinners', () => {
     handleEvent(map, 'thread-1', 8, { type: 'CodingAgentToolResult', name: '', result: 'done 3' } as ThreadEvent, '2026-04-04T10:00:07Z');
     exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     events = exchangeResponseEvents(exchanges[0]);
-    steps = events.filter(e => e.type === 'step') as { success: boolean | null }[];
-    resolved = steps.filter(s => s.success === true).length;
+    steps = events.filter(e => e.type === 'step') as { outcome: StepOutcome }[];
+    resolved = steps.filter(s => s.outcome === 'success').length;
     expect(resolved).toBe(3);
   });
 
@@ -247,13 +250,13 @@ describe('step completion — no eternal spinners', () => {
     const respSteps = respEvents.filter(e => e.type === 'step');
     expect(respSteps).toHaveLength(3);
     for (const step of respSteps) {
-      expect((step as { success: boolean | null }).success).toBe(true);
+      expect((step as { outcome: StepOutcome }).outcome).toBe('success');
     }
 
     const steps = exchangeSteps(exchanges[0]);
     expect(steps).toHaveLength(3);
     for (const step of steps) {
-      expect(step.success).toBe(true);
+      expect(step.outcome).toBe('success');
     }
   });
 
@@ -274,17 +277,17 @@ describe('step completion — no eternal spinners', () => {
     const exchanges = groupIntoExchanges(events);
     expect(exchanges).toHaveLength(1);
 
-    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as { tool_use_id?: string; success: boolean | null }[];
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as { tool_use_id?: string; outcome: StepOutcome }[];
     expect(respSteps).toHaveLength(2);
     const stepA = respSteps.find(s => s.tool_use_id === 'tu-A');
     const stepB = respSteps.find(s => s.tool_use_id === 'tu-B');
-    expect(stepA?.success).toBe(true);  // Row that got its result is done
-    expect(stepB?.success).toBeNull();  // Other row keeps spinning until its result arrives
+    expect(stepA?.outcome).toBe('success');  // Row that got its result is done
+    expect(stepB?.outcome).toBe('pending');  // Other row keeps spinning until its result arrives
 
-    const steps = exchangeSteps(exchanges[0]) as { tool_use_id?: string; success: boolean | null }[];
+    const steps = exchangeSteps(exchanges[0]) as { tool_use_id?: string; outcome: StepOutcome }[];
     expect(steps).toHaveLength(2);
-    expect(steps.find(s => s.tool_use_id === 'tu-A')?.success).toBe(true);
-    expect(steps.find(s => s.tool_use_id === 'tu-B')?.success).toBeNull();
+    expect(steps.find(s => s.tool_use_id === 'tu-A')?.outcome).toBe('success');
+    expect(steps.find(s => s.tool_use_id === 'tu-B')?.outcome).toBe('pending');
   });
 
   it('legacy CC events without tool_use_id fall back to backward-walk resolution', () => {
@@ -301,9 +304,9 @@ describe('step completion — no eternal spinners', () => {
     ]);
 
     const exchanges = groupIntoExchanges(events);
-    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as { success: boolean | null }[];
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as { outcome: StepOutcome }[];
     expect(respSteps).toHaveLength(2);
-    for (const step of respSteps) expect(step.success).toBe(true);
+    for (const step of respSteps) expect(step.outcome).toBe('success');
   });
 
   it('parallel engine tool results resolve individual pending steps', () => {
@@ -321,13 +324,13 @@ describe('step completion — no eternal spinners', () => {
     const respSteps = respEvents.filter(e => e.type === 'step');
     expect(respSteps).toHaveLength(2);
     for (const step of respSteps) {
-      expect((step as { success: boolean | null }).success).toBe(true);
+      expect((step as { outcome: StepOutcome }).outcome).toBe('success');
     }
 
     const steps = exchangeSteps(exchanges[0]);
     expect(steps).toHaveLength(2);
     for (const step of steps) {
-      expect(step.success).toBe(true);
+      expect(step.outcome).toBe('success');
     }
   });
 
@@ -345,7 +348,109 @@ describe('step completion — no eternal spinners', () => {
     const steps = exchangeSteps(exchanges[0]);
 
     expect(steps).toHaveLength(1);
-    expect(steps[0].success).not.toBeNull();
+    expect(steps[0].outcome).toBe('success');
+  });
+});
+
+// ===========================================================================
+// A tool call that never returned: the turn died mid-execution
+// ===========================================================================
+// Real thread, 2026-08-03: a Bash tool call at 07:44:41, the Claude Code
+// process SIGKILLed at 07:44:43 before the tool produced anything, and the turn
+// terminated at 07:44:44 with a red "Event stream error" card. The step row sat
+// directly above that card with no check and no failure marker, reading as
+// though it were still executing.
+//
+// The turn's terminator decides the verdict, and the two branches must stay
+// split. A CLEAN end (ResponseGenerated / CodingAgentIdled) means the step did
+// finish and merely lacks a recorded result, so a ✓ is honest. An UNCLEAN end
+// (ResponseFailed / ResponseAborted / ResponseCanceled) means the step did NOT
+// finish, so a ✓ would be a worse lie than the spinner it replaces.
+// ===========================================================================
+
+/** The reproduction's event shape: one tool call that got its result, one that
+ *  was still running when `terminal` landed. */
+function killedMidCall(terminal: Record<string, unknown>): Map<number, ThreadEvent> {
+  return new Map<number, ThreadEvent>([
+    [1, { type: 'MessageReceived', text: 'run the linter', created: '2026-08-03T07:44:30Z' } as ThreadEvent],
+    [2, { type: 'SessionStarted', session_id: 's1', created: '2026-08-03T07:44:31Z' } as ThreadEvent],
+    [3, { type: 'CodingAgentToolCalled', name: 'Read', args: { file_path: 'scripts/lib/webkit_shard.sh' }, tool_use_id: 'tu-done', created: '2026-08-03T07:44:35Z' } as ThreadEvent],
+    [4, { type: 'CodingAgentToolResult', name: 'Read', result: 'ok', tool_use_id: 'tu-done', created: '2026-08-03T07:44:36Z' } as ThreadEvent],
+    [5, { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'shellcheck scripts/lib/webkit_shard.sh' }, tool_use_id: 'tu-killed', created: '2026-08-03T07:44:41Z' } as ThreadEvent],
+    // SIGKILL at 07:44:43: no CodingAgentToolResult for tu-killed, ever.
+    [6, { ...terminal, created: '2026-08-03T07:44:44Z' } as unknown as ThreadEvent],
+  ]);
+}
+
+/** Both projections of the first exchange, as `{ tool_use_id, outcome }` rows. */
+function stepOutcomes(events: Map<number, ThreadEvent>) {
+  const exchanges = groupIntoExchanges(events);
+  const inline = exchangeResponseEvents(exchanges[0])
+    .filter(e => e.type === 'step') as { tool_use_id?: string; outcome: string }[];
+  const list = exchangeSteps(exchanges[0]) as unknown as { tool_use_id?: string; outcome: string }[];
+  return { inline, list };
+}
+
+describe('step outcome when a tool call never returned', () => {
+  const UNCLEAN_TERMINALS = [
+    { name: 'ResponseFailed', event: { type: 'ResponseFailed', error: 'Event stream error' } },
+    { name: 'ResponseAborted', event: { type: 'ResponseAborted' } },
+    { name: 'ResponseCanceled', event: { type: 'ResponseCanceled' } },
+  ];
+
+  for (const { name, event } of UNCLEAN_TERMINALS) {
+    it(`${name}: the in-flight step reads unfinished, never pending and never a checkmark`, () => {
+      const { inline, list } = stepOutcomes(killedMidCall(event));
+
+      for (const steps of [inline, list]) {
+        expect(steps).toHaveLength(2);
+        const killed = steps.find(s => s.tool_use_id === 'tu-killed');
+        // The bug: 'pending' forever (an eternal spinner above a red error
+        // card). The wrong fix: 'success' (a green check on a killed call).
+        expect(killed?.outcome).toBe('unfinished');
+        // The call that DID return keeps its checkmark, so the kill lands on
+        // exactly one row and the user can see which.
+        expect(steps.find(s => s.tool_use_id === 'tu-done')?.outcome).toBe('success');
+      }
+    });
+  }
+
+  const CLEAN_TERMINALS = [
+    { name: 'ResponseGenerated', event: { type: 'ResponseGenerated', text: 'linted' } },
+    { name: 'CodingAgentIdled', event: { type: 'CodingAgentIdled', has_changes: false } },
+  ];
+
+  for (const { name, event } of CLEAN_TERMINALS) {
+    it(`${name}: the same shape resolves to a checkmark, the turn finished`, () => {
+      const { inline, list } = stepOutcomes(killedMidCall(event));
+
+      for (const steps of [inline, list]) {
+        expect(steps).toHaveLength(2);
+        // A clean terminator means the tool DID finish and only its result
+        // event is missing. Collapsing this branch into the unclean one would
+        // put "did not finish" rows all over successful turns.
+        expect(steps.find(s => s.tool_use_id === 'tu-killed')?.outcome).toBe('success');
+        expect(steps.find(s => s.tool_use_id === 'tu-done')?.outcome).toBe('success');
+      }
+    });
+  }
+
+  it('a later same-request terminal wins: the recovered engine-restart turn keeps its checkmarks', () => {
+    // Engine restart mid-turn: recovery emits ResponseAborted, the rerun re-uses
+    // the original request_event_id and succeeds. `supersededAbortIndices`
+    // already deflates the panel verdict to the success; the steps must agree.
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'run the linter', _eventId: 'req-1', created: '2026-08-03T07:44:30Z' } as ThreadEvent],
+      [2, { type: 'SessionStarted', session_id: 's1', created: '2026-08-03T07:44:31Z' } as ThreadEvent],
+      [3, { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'shellcheck x.sh' }, tool_use_id: 'tu-1', request_event_id: 'req-1', created: '2026-08-03T07:44:41Z' } as ThreadEvent],
+      [4, { type: 'ResponseAborted', request_event_id: 'req-1', created: '2026-08-03T07:44:44Z' } as ThreadEvent],
+      [5, { type: 'ResponseGenerated', text: 'done', request_event_id: 'req-1', created: '2026-08-03T07:45:10Z' } as ThreadEvent],
+    ]);
+    const { inline, list } = stepOutcomes(events);
+
+    for (const steps of [inline, list]) {
+      expect(steps.find(s => s.tool_use_id === 'tu-1')?.outcome).toBe('success');
+    }
   });
 });
 
@@ -423,12 +528,12 @@ describe('tool description from event', () => {
     const steps = exchangeSteps(exchanges[0], /* isLast */ true);
     expect(steps).toHaveLength(1);
     expect(steps[0].description).toBe('Thinking');
-    expect(steps[0].success).toBeNull();
+    expect(steps[0].outcome).toBe('pending');
 
     const respEvents = exchangeResponseEvents(exchanges[0]);
     const respSteps = respEvents.filter((e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step');
     expect(respSteps).toHaveLength(1);
-    expect(respSteps[0].success).toBeNull();
+    expect(respSteps[0].outcome).toBe('pending');
   });
 
   it('Thinking resolves to ✓ when ToolCalled arrives', () => {
@@ -441,15 +546,15 @@ describe('tool description from event', () => {
     const exchanges = groupIntoExchanges(map.get('t')!.events);
     const steps = exchangeSteps(exchanges[0], /* isLast */ true);
     expect(steps[0].description).toBe('Thinking');
-    expect(steps[0].success).toBe(true);
-    expect(steps[1].success).toBeNull(); // tool still pending
+    expect(steps[0].outcome).toBe('success');
+    expect(steps[1].outcome).toBe('pending'); // tool still pending
 
     const respSteps = exchangeResponseEvents(exchanges[0]).filter(
       (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
     );
     expect(respSteps[0].description).toBe('Thinking');
-    expect(respSteps[0].success).toBe(true);
-    expect(respSteps[1].success).toBeNull();
+    expect(respSteps[0].outcome).toBe('success');
+    expect(respSteps[1].outcome).toBe('pending');
   });
 
   it('Thinking resolves to ✓ when TextStreamed arrives', () => {
@@ -463,13 +568,13 @@ describe('tool description from event', () => {
     const steps = exchangeSteps(exchanges[0], /* isLast */ true);
     expect(steps).toHaveLength(1);
     expect(steps[0].description).toBe('Thinking');
-    expect(steps[0].success).toBe(true);
+    expect(steps[0].outcome).toBe('success');
 
     const respSteps = exchangeResponseEvents(exchanges[0]).filter(
       (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
     );
     expect(respSteps[0].description).toBe('Thinking');
-    expect(respSteps[0].success).toBe(true);
+    expect(respSteps[0].outcome).toBe('success');
   });
 
   it('Back-to-back ThoughtStreamed: prior Thinking resolves, latest stays pending', () => {
@@ -482,15 +587,15 @@ describe('tool description from event', () => {
     const exchanges = groupIntoExchanges(map.get('t')!.events);
     const steps = exchangeSteps(exchanges[0], /* isLast */ true);
     expect(steps).toHaveLength(2);
-    expect(steps[0].success).toBe(true);
-    expect(steps[1].success).toBeNull();
+    expect(steps[0].outcome).toBe('success');
+    expect(steps[1].outcome).toBe('pending');
 
     const respSteps = exchangeResponseEvents(exchanges[0]).filter(
       (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
     );
     expect(respSteps).toHaveLength(2);
-    expect(respSteps[0].success).toBe(true);
-    expect(respSteps[1].success).toBeNull();
+    expect(respSteps[0].outcome).toBe('success');
+    expect(respSteps[1].outcome).toBe('pending');
   });
 
   it('exchangeResponseEvents uses event description for CodingAgentToolCalled when present', () => {
@@ -656,15 +761,15 @@ describe('tool description from event', () => {
 
     // Verify the step IS pending when treated as the last exchange (the bug scenario)
     const stepsAsLast = exchangeSteps(exchanges[0], true);
-    expect(stepsAsLast.filter(s => s.success === null)).toHaveLength(1);
+    expect(stepsAsLast.filter(s => s.outcome === 'pending')).toHaveLength(1);
 
     // Exchange 1's ToolResult ended up in exchange 2. Cancel took the thread
     // idle, which is what resolves the orphaned spinner.
     const ex1Steps = exchangeSteps(exchanges[0], /* isLast */ false, /* threadIdle */ true);
-    expect(ex1Steps.filter(s => s.success === null)).toHaveLength(0);
+    expect(ex1Steps.filter(s => s.outcome === 'pending')).toHaveLength(0);
 
     const ex1Events = exchangeResponseEvents(exchanges[0], 0, /* isLast */ false, /* threadIdle */ true);
-    const pendingEvents = ex1Events.filter(e => e.type === 'step' && (e as { success: boolean | null }).success === null);
+    const pendingEvents = ex1Events.filter(e => e.type === 'step' && (e as { outcome: StepOutcome }).outcome === 'pending');
     expect(pendingEvents).toHaveLength(0);
   });
 });
@@ -875,13 +980,13 @@ describe('CodingAgentThoughtStreamed reasoning rendering', () => {
     const exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     const events = exchangeResponseEvents(exchanges[0]);
     const thinking = events.find(e => e.type === 'step' && e.description === 'Thinking') as
-      | { thinkingText?: string; success: boolean | null }
+      | { thinkingText?: string; outcome: StepOutcome }
       | undefined;
     expect(thinking).toBeDefined();
     // Both deltas coalesced onto the one Thinking step, in order.
     expect(thinking!.thinkingText).toBe('Let me check the tokens.');
     // Visible text resolved the Thinking step (no dangling spinner).
-    expect(thinking!.success).not.toBeNull();
+    expect(thinking!.outcome).toBe('success');
   });
 
   it('opens a Thinking step from reasoning when no CodingAgentPromptSent fired (resumed initial prompt)', () => {
@@ -898,12 +1003,12 @@ describe('CodingAgentThoughtStreamed reasoning rendering', () => {
     const exchanges = groupIntoExchanges(map.get('thread-1')!.events);
     const events = exchangeResponseEvents(exchanges[0]);
     const thinking = events.find(e => e.type === 'step' && e.description === 'Thinking') as
-      | { thinkingText?: string; success: boolean | null }
+      | { thinkingText?: string; outcome: StepOutcome }
       | undefined;
     expect(thinking).toBeDefined();
     expect(thinking!.thinkingText).toBe('Reasoning hard…');
     // Still streaming — the step is live (spinner), not resolved.
-    expect(thinking!.success).toBeNull();
+    expect(thinking!.outcome).toBe('pending');
   });
 });
 

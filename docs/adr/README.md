@@ -64,3 +64,7 @@ Keep entries scannable. A decision log nobody reads is just more drift.
 - [0030: `make lint` gates rustfmt, and the tree was swept once to make that possible (no `rustfmt.toml`; generated Rust emits itself formatted)](0030-rustfmt-gate-after-a-one-time-sweep.md)
 - [0031: A deploy to a lucidos.dev origin runs on the maintainer's machine, never from public CI (the docs deploy workflow is deleted, not credentialed)](0031-deploys-run-on-the-maintainers-machine.md)
 - [0032: A state write owns its announcement (the emit lives in the write path, and every announced surface is classified in one enforced registry)](0032-a-state-write-owns-its-announcement.md)
+- [0033: The .app is notarized before the DMG, so a release waits on Apple once even when deferring (amends 0027)](0033-the-app-is-notarized-before-the-dmg.md)
+- [0034: A CI-built artifact is ad-hoc by construction, so the headless front door stays unsigned (the Developer ID identity cannot leave the release machine)](0034-ci-built-artifacts-are-ad-hoc-by-construction.md)
+- [0035: Worktree reclamation has exactly one owner, the cleanup worker, never a session teardown (the only session-path removal left is an explicit Discard)](0035-worktree-reclamation-has-exactly-one-owner.md)
+- [0036: The release-candidate gate artifact is never public: a DRAFT release, fired by dispatch (drafts emit no `release` event)](0036-the-rc-gate-artifact-is-never-public.md)

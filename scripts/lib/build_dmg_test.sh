@@ -84,6 +84,11 @@ fi
 # whole suite stays offline + signing-free.
 # shellcheck source=scripts/lib/release_staging.sh
 source "$PROJECT_DIR/scripts/lib/release_staging.sh"
+# Every fixture manifest needs a platform key, because release_staging_verify
+# refuses one without it (F10) and would otherwise short-circuit each case below
+# before it reached the thing it is actually testing. The case that IS about the
+# missing key clears this locally.
+export RELEASE_STAGING_PLATFORM_KEY="darwin-aarch64"
 make_staging() {
     local dir; dir="$(mktemp -d)"
     printf 'dmg\n' > "$dir/Lucidos_0.0.0_aarch64.dmg"
@@ -105,6 +110,28 @@ else
     fail "expected missing-manifest refusal; got rc=$rc out: $out"
 fi
 rm -rf "$EMPTY"
+
+# F10, end to end: --release-attach is the ONE path that can be pointed at a
+# staging dir some earlier build-dmg.sh wrote, and it is also the path with no
+# .app on disk to fall back to. A staging predating platform-key recording must
+# stop here, before any gh call, rather than uploading a latest.json keyed off
+# whichever machine happens to be running the attach.
+echo ""
+echo "test: --release-attach refuses a staging that predates platform-key recording"
+S="$(RELEASE_STAGING_PLATFORM_KEY="" make_staging)"
+out="$("$PROJECT_DIR/scripts/build-dmg.sh" --release-attach --staging-dir "$S" --upload-tag v9.9.9 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "records no platform_key"; then
+    pass "a keyless staging is refused before anything is published"
+else
+    fail "expected a platform-key refusal; got rc=$rc out: $out"
+fi
+if echo "$out" | grep -q -- "--release-build"; then
+    pass "the refusal names the re-stage command"
+else
+    fail "the refusal does not say how to recover: $out"
+fi
+rm -rf "$S"
 
 echo ""
 echo "test: --release-attach refuses a missing staged artifact"
@@ -227,9 +254,9 @@ seed_notarize_state() {  # <source-commit>
     mkdir -p "$BUNDLE_DMG_DIR"
     FAKE_DMG="$BUNDLE_DMG_DIR/Lucidos_${RELEASE_VERSION_UNDER_TEST}_test.dmg"
     printf 'pretend signed dmg\n' > "$FAKE_DMG"
-    release_notarize_write_state "$NOTARIZE_STATE" "$FAKE_SUBMISSION" "$FAKE_DMG" \
-        "$RELEASE_VERSION_UNDER_TEST" "$(release_staging_sha256 "$FAKE_DMG")" \
-        "$1" "2026-07-28T08:22:00Z"
+    release_notarize_write_state "$NOTARIZE_STATE" "$RELEASE_NOTARIZE_STAGE_DMG" \
+        "$FAKE_SUBMISSION" "$FAKE_DMG" "$(release_staging_sha256 "$FAKE_DMG")" \
+        "$RELEASE_VERSION_UNDER_TEST" "$1" "2026-07-28T08:22:00Z"
 }
 clear_notarize_state() {
     rm -f "$NOTARIZE_STATE" "${FAKE_DMG:-}"
@@ -315,9 +342,9 @@ echo "test: --resume-notarize refuses a handle pointing outside this tree's bund
 # different builds.
 OUTSIDE_DMG="$(mktemp -t lucidos-outside)"
 printf 'pretend signed dmg\n' > "$OUTSIDE_DMG"
-release_notarize_write_state "$NOTARIZE_STATE" "$FAKE_SUBMISSION" "$OUTSIDE_DMG" \
-    "$RELEASE_VERSION_UNDER_TEST" "$(release_staging_sha256 "$OUTSIDE_DMG")" \
-    "$HEAD_COMMIT" "2026-07-28T08:22:00Z"
+release_notarize_write_state "$NOTARIZE_STATE" "$RELEASE_NOTARIZE_STAGE_DMG" \
+    "$FAKE_SUBMISSION" "$OUTSIDE_DMG" "$(release_staging_sha256 "$OUTSIDE_DMG")" \
+    "$RELEASE_VERSION_UNDER_TEST" "$HEAD_COMMIT" "2026-07-28T08:22:00Z"
 out="$(no_apple_creds "$PROJECT_DIR/scripts/build-dmg.sh" --resume-notarize 2>&1)"
 rc=$?
 if [ $rc -ne 0 ] && echo "$out" | grep -qi "outside this tree's bundle dir"; then
@@ -353,7 +380,7 @@ else
     out="$(no_apple_creds "$PROJECT_DIR/scripts/build-dmg.sh" \
             --adopt-submission "$FAKE_SUBMISSION" 2>&1)"
     rc=$?
-    if [ $rc -ne 0 ] && echo "$out" | grep -qi "no built .dmg"; then
+    if [ $rc -ne 0 ] && echo "$out" | grep -qi "no .dmg found directly under"; then
         pass "adoption without an on-disk DMG is refused"
     else
         fail "expected a no-DMG refusal; got rc=$rc out: $out"
@@ -379,7 +406,7 @@ else
     else
         fail "expected adoption of $(basename "$REAL"); got: $out"
     fi
-    if [ "$(release_notarize_field "$NOTARIZE_STATE" dmg_path 2>/dev/null)" = "$REAL" ]; then
+    if [ "$(release_notarize_field "$NOTARIZE_STATE" artifact_path 2>/dev/null)" = "$REAL" ]; then
         pass "the handle records the real DMG"
     else
         fail "the handle does not record $REAL"
@@ -574,8 +601,8 @@ else
         printf 'pretend signed dmg\n' > "$WT_DMG"
         release_notarize_write_state \
             "$FAKE_WT/.lucidos/release-state/notarize-9.9.9.json" \
-            "$FAKE_SUBMISSION" "$WT_DMG" 9.9.9 \
-            "$(release_staging_sha256 "$WT_DMG")" \
+            "$RELEASE_NOTARIZE_STAGE_DMG" "$FAKE_SUBMISSION" "$WT_DMG" \
+            "$(release_staging_sha256 "$WT_DMG")" 9.9.9 \
             "$(git -C "$FAKE_WT" rev-parse HEAD)" "2026-07-28T08:22:00Z"
         out="$(sandboxed "$RELEASE_SH" --verify-build 9.9.9 2>&1)"
         if echo "$out" | grep -qi "found a resumable notarization"; then
@@ -597,7 +624,7 @@ else
         # A handle that exists but is NOT resumable (DMG rebuilt, tree moved) must
         # NOT promote — otherwise --verify-build dead-ends on "cannot resume"
         # instead of doing the rebuild that was asked for.
-        printf '{"submission_id":"%s","dmg_path":"/nonexistent/gone.dmg","version":"9.9.9","dmg_sha256":"deadbeef","source_commit":"abc","submitted_at":"t"}\n' \
+        printf '{"stage":"dmg","submission_id":"%s","artifact_path":"/nonexistent/gone.dmg","version":"9.9.9","artifact_sha256":"deadbeef","source_commit":"abc","submitted_at":"t","app_path":"","app_cdhash":"","updater_tarball_path":"","updater_tarball_sha256":"","updater_sig_sha256":""}\n' \
             "$FAKE_SUBMISSION" > "$FAKE_WT/.lucidos/release-state/notarize-9.9.9.json"
         out="$(sandboxed "$RELEASE_SH" --verify-build 9.9.9 2>&1)"
         if echo "$out" | grep -qi "is NOT resumable"; then
@@ -772,14 +799,14 @@ else
     # The DMG-verify leg asserts a stapled ticket, so arming it for a deferred DMG
     # would guarantee a red run.
     case "$(awk '/^arm_dmg_gate_if_notarized\(\) \{/,/^\}/' "$RELEASE_SH")" in
-        *release_staging_is_notarized*) pass "the rc prerelease is armed only for a notarized staging" ;;
+        *release_staging_is_notarized*) pass "the rc draft release is armed only for a notarized staging" ;;
         *) fail "arm_dmg_gate_if_notarized does not consult the manifest" ;;
     esac
-    if grep -q 'refresh_release_candidate_prerelease$' "$RELEASE_SH" \
-       && [ "$(grep -c '^  refresh_release_candidate_prerelease$' "$RELEASE_SH")" -eq 0 ]; then
+    if grep -q 'refresh_release_candidate_draft$' "$RELEASE_SH" \
+       && [ "$(grep -c '^  refresh_release_candidate_draft$' "$RELEASE_SH")" -eq 0 ]; then
         pass "every Phase-A caller goes through the notarization-aware wrapper"
     else
-        fail "a Phase-A path still calls refresh_release_candidate_prerelease directly"
+        fail "a Phase-A path still calls refresh_release_candidate_draft directly"
     fi
 
     echo ""
@@ -920,6 +947,340 @@ else
     else
         pass "the duplicate extraction awk is gone from release-to-lucidos.sh"
     fi
+fi
+
+# ── Updater payload: repacked from the SIGNED app, and gated on it ───────────
+# The v0.19.0 incident: `cargo tauri build` packs Lucidos.app.tar.gz from the app
+# BEFORE this script signs it, and the build deliberately runs with
+# APPLE_SIGNING_IDENTITY stripped from its env, so the payload shipped ad-hoc
+# while the DMG shipped Developer ID. The mechanics live in
+# scripts/lib/updater_payload.sh (unit-tested by updater_payload_test.sh); what
+# is asserted here is the WIRING, which is where the bug actually was.
+echo ""
+echo "test: the updater payload is repacked from the signed app, in the right order"
+for f in scripts/lib/updater_payload.sh scripts/lib/updater_payload_test.sh; do
+    if [ -f "$PROJECT_DIR/$f" ]; then
+        pass "$f exists"
+    else
+        fail "$f is missing"
+    fi
+done
+
+# Ordering is the whole fix: pack AFTER the bundle is signed (or the tarball is
+# the unsigned one again) and BEFORE the DMG payload is refreshed (which is what
+# makes the DMG correct and must stay untouched).
+#
+# Compared at the CALL sites, not the definitions. refresh_dmg_payload now lives
+# inside run_dmg_notarize_stage, whose definition sits near the top of the file
+# with the other helpers the resume path needs, so definition order says nothing
+# about execution order any more.
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+L_SIGN="$(grep -n 'sign_app_bundle "\$APP_PATH" "\$APPLE_SIGNING_IDENTITY"' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+L_REPACK="$(grep -n '^    repack_updater_payload$' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+L_APP_NOTARIZE="$(grep -n '^    notarize_app_submit_and_persist$' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+L_DMG_STAGE="$(grep -n '^run_dmg_notarize_stage$' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+if [ -n "$L_SIGN" ] && [ -n "$L_REPACK" ] && [ -n "$L_APP_NOTARIZE" ] && [ -n "$L_DMG_STAGE" ] \
+   && [ "$L_SIGN" -lt "$L_REPACK" ] && [ "$L_REPACK" -lt "$L_APP_NOTARIZE" ] \
+   && [ "$L_APP_NOTARIZE" -lt "$L_DMG_STAGE" ]; then
+    pass "the repack runs after sign_app_bundle and before both notary stages"
+else
+    fail "repack ordering is wrong (sign=$L_SIGN repack=$L_REPACK app=$L_APP_NOTARIZE dmg=$L_DMG_STAGE)"
+fi
+
+# ── F5: the .app is stapled BEFORE the DMG is built around it ────────────────
+# The finding: the only copy this script ever stapled was the standalone build
+# output, which is never shipped, so the .app inside every published DMG had no
+# ticket. All ten releases the audit tested report "does not have a ticket
+# stapled to it". The fix is Apple's ordering, and the ordering IS the fix.
+echo ""
+echo "test: the .app is notarized and stapled before the DMG is built around it"
+L_APP_STAPLE="$(grep -n '^    notarize_app_await_and_staple$' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+if [ -n "$L_APP_STAPLE" ] && [ -n "$L_DMG_STAGE" ] && [ "$L_APP_STAPLE" -lt "$L_DMG_STAGE" ]; then
+    pass "the .app staple precedes run_dmg_notarize_stage"
+else
+    fail "the .app is not stapled before the DMG stage (staple=$L_APP_STAPLE dmg=$L_DMG_STAGE)"
+fi
+# Inside that stage, the refresh (which injects the stapled app) must precede the
+# DMG's own signature and submission, or the image is signed around stale bytes.
+DMG_STAGE_FN="$(awk '/^run_dmg_notarize_stage\(\) \{/,/^\}/' "$BUILD_DMG")"
+D_REFRESH="$(printf '%s\n' "$DMG_STAGE_FN" | grep -n 'refresh_dmg_payload "' | cut -d: -f1 | head -1)"
+D_SIGN="$(printf '%s\n' "$DMG_STAGE_FN" | grep -n 'sign_dmg "' | cut -d: -f1 | head -1)"
+D_SUBMIT="$(printf '%s\n' "$DMG_STAGE_FN" | grep -n 'notarize_submit_and_wait\|notarize_submit_and_persist' | cut -d: -f1 | head -1)"
+if [ -n "$D_REFRESH" ] && [ -n "$D_SIGN" ] && [ -n "$D_SUBMIT" ] \
+   && [ "$D_REFRESH" -lt "$D_SIGN" ] && [ "$D_SIGN" -lt "$D_SUBMIT" ]; then
+    pass "the DMG stage refreshes, then signs, then submits"
+else
+    fail "the DMG stage is out of order (refresh=$D_REFRESH sign=$D_SIGN submit=$D_SUBMIT)"
+fi
+# The staple must be proved, not assumed: a stapler that reported success without
+# attaching a ticket would reproduce the finding silently.
+APP_STAPLE_FN="$(awk '/^notarize_app_await_and_staple\(\) \{/,/^\}/' "$BUILD_DMG")"
+A_VERDICT="$(printf '%s\n' "$APP_STAPLE_FN" | grep -n 'notarize_await_verdict' | cut -d: -f1 | head -1)"
+A_STAPLE="$(printf '%s\n' "$APP_STAPLE_FN" | grep -n 'staple_idempotent' | cut -d: -f1 | head -1)"
+A_VALIDATE="$(printf '%s\n' "$APP_STAPLE_FN" | grep -n 'stapler validate' | cut -d: -f1 | head -1)"
+A_CODESIGN="$(printf '%s\n' "$APP_STAPLE_FN" | grep -n 'codesign --verify' | cut -d: -f1 | head -1)"
+if [ -n "$A_VERDICT" ] && [ -n "$A_STAPLE" ] && [ "$A_VERDICT" -lt "$A_STAPLE" ]; then
+    pass "the .app is stapled only after Apple returns a verdict"
+else
+    fail "the .app staple does not follow the verdict (verdict=$A_VERDICT staple=$A_STAPLE)"
+fi
+if [ -n "$A_VALIDATE" ] && [ -n "$A_CODESIGN" ] \
+   && [ "$A_STAPLE" -lt "$A_VALIDATE" ] && [ "$A_STAPLE" -lt "$A_CODESIGN" ]; then
+    pass "the ticket AND the signature are re-verified after stapling"
+else
+    fail "stapling the .app is not verified (staple=$A_STAPLE validate=$A_VALIDATE codesign=$A_CODESIGN)"
+fi
+# The identity assertion is by cdhash, which is what a ticket is issued for. A
+# file hash of the ditto archive could not serve: ditto is not reproducible.
+case "$APP_STAPLE_FN" in
+    *app_bundle_cdhash*) pass "the bundle identity is re-asserted by cdhash before stapling" ;;
+    *) fail "nothing proves the .app being stapled is the one Apple scanned" ;;
+esac
+
+echo ""
+echo "test: --defer-notarization cannot defer the .app half"
+# It structurally cannot: the DMG is built FROM the stapled app, so there is
+# nothing to stage until that verdict lands. The app stage sits outside every
+# DEFER_NOTARIZATION branch, and the resume says so rather than silently waiting.
+RESUME_FN="$(awk '/^run_notarize_resume\(\) \{/,/^\}/' "$BUILD_DMG")"
+case "$RESUME_FN" in
+    *"cannot be deferred"*) pass "an app-stage resume says the .app verdict is not deferrable" ;;
+    *) fail "a deferred app-stage resume gives no account of why it still waits" ;;
+esac
+if printf '%s\n' "$DMG_STAGE_FN" | grep -q 'notarize_app_submit_and_persist'; then
+    fail "the .app submission sits inside the DMG stage, where deferral could skip it"
+else
+    pass "the .app submission is outside the DMG stage's deferral branch"
+fi
+
+echo ""
+echo "test: --adopt-app-submission parses, shape-checks, and excludes its sibling"
+out="$("$BUILD_DMG" --adopt-app-submission 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "requires a notary submission UUID"; then
+    pass "--adopt-app-submission without an argument is refused"
+else
+    fail "expected a missing-argument refusal; got rc=$rc out: $out"
+fi
+out="$("$BUILD_DMG" --adopt-app-submission not-a-uuid 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -q "expects a notary submission UUID"; then
+    pass "--adopt-app-submission shape-checks the UUID before touching Apple"
+else
+    fail "expected a UUID shape refusal; got rc=$rc out: $out"
+fi
+out="$("$BUILD_DMG" --adopt-submission "$FAKE_SUBMISSION" --adopt-app-submission "$FAKE_SUBMISSION" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "only one can be outstanding"; then
+    pass "adopting both halves at once is refused"
+else
+    fail "expected a both-adopt refusal; got rc=$rc out: $out"
+fi
+if "$BUILD_DMG" --help 2>&1 | grep -q -- '--adopt-app-submission'; then
+    pass "--help documents --adopt-app-submission"
+else
+    fail "--help does not mention --adopt-app-submission"
+fi
+
+# A repack with a stale .sig next to it makes EVERY updater reject the update, so
+# the re-sign must live inside the repack step and follow the pack.
+REPACK_FN="$(awk '/^repack_updater_payload\(\) \{/,/^\}/' "$BUILD_DMG")"
+R_PACK="$(printf '%s\n' "$REPACK_FN" | grep -n 'updater_payload_repack' | cut -d: -f1 | head -1)"
+R_SIGN="$(printf '%s\n' "$REPACK_FN" | grep -n 'updater_payload_resign' | cut -d: -f1 | head -1)"
+if [ -n "$R_PACK" ] && [ -n "$R_SIGN" ] && [ "$R_PACK" -lt "$R_SIGN" ]; then
+    pass "the .sig is regenerated after the repack, in the same step"
+else
+    fail "the repack does not re-sign the new bytes (pack=$R_PACK sign=$R_SIGN)"
+fi
+
+# The repack must run INSIDE the still-open `codesign` cockpit step. die/on_err
+# emit ReleaseStepFailed only while CURRENT_STEP is set, so a repack sitting in
+# the gap between two steps would exit non-zero with NO event and leave the
+# Release Cockpit stalled on a green codesign, which is the silent stall the
+# script's `set -E` + on_err rationale exists to prevent.
+L_BEGIN="$(grep -n 'begin_step codesign' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+L_END="$(grep -n 'end_step codesign' "$BUILD_DMG" | cut -d: -f1 | tail -1)"
+if [ -n "$L_BEGIN" ] && [ -n "$L_END" ] && [ -n "$L_REPACK" ] \
+   && [ "$L_BEGIN" -lt "$L_REPACK" ] && [ "$L_REPACK" -lt "$L_END" ]; then
+    pass "the repack runs inside the open codesign step, so a failure reds the cockpit"
+else
+    fail "the repack is outside the codesign step bracket (begin=$L_BEGIN repack=$L_REPACK end=$L_END)"
+fi
+# Both signing branches must reach that single end_step, or one of them closes
+# the step with an empty summary.
+if [ "$(grep -c 'CODESIGN_STEP_SUMMARY=' "$BUILD_DMG")" -eq 3 ]; then
+    pass "both signing branches set the deferred codesign summary"
+else
+    fail "a signing branch does not set CODESIGN_STEP_SUMMARY"
+fi
+
+echo ""
+echo "test: no path can stage or upload a payload that is not Developer ID signed"
+# Both gates must precede the irreversible act they guard: the copy into staging,
+# and the upload. A gate after the fact is not a gate.
+STAGE_FN="$(awk '/^stage_release_artifacts\(\) \{/,/^\}/' "$BUILD_DMG")"
+S_GATE="$(printf '%s\n' "$STAGE_FN" | grep -n 'updater_payload_assert_developer_id' | cut -d: -f1 | head -1)"
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+S_COPY="$(printf '%s\n' "$STAGE_FN" | grep -n 'cp "\$app_tarball"' | cut -d: -f1 | head -1)"
+if [ -n "$S_GATE" ] && [ -n "$S_COPY" ] && [ "$S_GATE" -lt "$S_COPY" ]; then
+    pass "staging verifies the payload before copying it in"
+else
+    fail "stage_release_artifacts does not gate the payload before staging it (gate=$S_GATE copy=$S_COPY)"
+fi
+
+echo ""
+echo "test: staging refuses a DMG with no stapled ticket, before it copies it in"
+# The v0.19.1 failure: the staple was undone between stapling and staging, and
+# nothing on the path said so, because spctl resolves the ticket ONLINE and
+# happily reports `accepted / source=Notarized Developer ID` without one. The
+# gate has to precede the copy, and it has to be skipped on a deferred release,
+# which stages unstapled by design.
+S_TICKET="$(printf '%s\n' "$STAGE_FN" | grep -n 'dmg_ticket_is_stapled' | cut -d: -f1 | head -1)"
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+S_DMG_COPY="$(printf '%s\n' "$STAGE_FN" | grep -n 'cp "\$DMG_PATH"' | cut -d: -f1 | head -1)"
+if [ -n "$S_TICKET" ] && [ -n "$S_DMG_COPY" ] && [ "$S_TICKET" -lt "$S_DMG_COPY" ]; then
+    pass "staging validates the ticket before copying the DMG in"
+else
+    fail "stage_release_artifacts can stage an unstapled DMG (validate=$S_TICKET copy=$S_DMG_COPY)"
+fi
+if printf '%s\n' "$STAGE_FN" | grep -q 'DMG_NOTARIZED_STATE" = "true"'; then
+    pass "the ticket gate is skipped on a deferred release, which stages unstapled"
+else
+    fail "the ticket gate would fire on --defer-notarization, which stages unstapled by design"
+fi
+
+# Whole-file line numbers here, not an awk-extracted body: upload_staged_assets
+# embeds a python heredoc whose closing brace sits at column 0, so the usual
+# /^fn\(\) \{/,/^\}/ range truncates the function well before the upload.
+U_FN="$(grep -n '^upload_staged_assets() {' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+U_GATE="$(grep -n 'updater_payload_assert_developer_id' "$BUILD_DMG" | cut -d: -f1 | sed -n '2p')"
+U_PUSH="$(grep -n 'gh release upload' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+if [ -n "$U_FN" ] && [ -n "$U_GATE" ] && [ -n "$U_PUSH" ] \
+   && [ "$U_FN" -lt "$U_GATE" ] && [ "$U_GATE" -lt "$U_PUSH" ]; then
+    pass "the upload chokepoint re-verifies the STAGED payload before publishing"
+else
+    fail "upload_staged_assets can publish an unverified payload (fn=$U_FN gate=$U_GATE upload=$U_PUSH)"
+fi
+
+# The ticket gate has to be duplicated at the upload chokepoint for exactly the
+# reason the Developer ID one is: --release-attach can be pointed at a staging
+# dir written by an older build-dmg.sh, or by the run that shipped v0.19.1, and
+# run_release_attach's own pending check reads the manifest FLAG, which is the
+# thing that said notarized:true over a DMG with no ticket.
+U_TICKET="$(grep -n 'dmg_ticket_is_stapled' "$BUILD_DMG" | cut -d: -f1 \
+    | awk -v lo="$U_FN" -v hi="$U_PUSH" '$1 > lo && $1 < hi { print; exit }')"
+if [ -n "$U_TICKET" ]; then
+    pass "the upload chokepoint re-derives the STAPLED ticket from the staged DMG"
+else
+    fail "upload_staged_assets can publish an unstapled DMG (fn=$U_FN upload=$U_PUSH)"
+fi
+if awk -v lo="$U_FN" -v hi="$U_PUSH" 'NR > lo && NR < hi' "$BUILD_DMG" \
+   | grep -q 'release_staging_is_notarized'; then
+    pass "the upload ticket gate is skipped for a deferred (pending) staging"
+else
+    fail "the upload ticket gate would refuse a deferred release, which uploads unstapled by design"
+fi
+# Both upload paths must funnel through that one function, or the gate is
+# decorative: --release-attach and the one-shot --release.
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if [ "$(grep -c 'upload_staged_assets "\$STAGING_DIR"' "$BUILD_DMG")" -eq 2 ]; then
+    pass "both upload paths go through the gated upload_staged_assets"
+else
+    fail "an upload path bypasses upload_staged_assets"
+fi
+
+echo ""
+echo "test: --release-attach refuses a staging whose payload is not Developer ID signed"
+# The end-to-end version of the guard above, and the closest offline reproduction
+# of v0.19.0: a perfectly valid staging dir (manifest verifies, checksums match,
+# notarized) whose .app.tar.gz holds an unsigned bundle. It must die at the gate
+# and never reach `gh`.
+#
+# Sandboxed with a minimal PATH for the reason the resume tests document: no
+# `lucidos` on PATH means release_events.sh no-ops, so this cannot emit phantom
+# ReleaseStep* events into the developer's workspace. A FAKE gh is planted on that
+# PATH because upload_staged_assets checks `command -v gh` before it reaches the
+# gate; the fake records that it ran, and the test asserts it never did.
+S="$(mktemp -d)"
+FAKEBIN="$(mktemp -d)"
+printf '#!/bin/sh\ntouch "%s/gh-was-called"\nexit 1\n' "$FAKEBIN" > "$FAKEBIN/gh"
+chmod +x "$FAKEBIN/gh"
+PAYLOAD_SRC="$(mktemp -d)"
+mkdir -p "$PAYLOAD_SRC/Lucidos.app/Contents/MacOS"
+printf 'not a real bundle\n' > "$PAYLOAD_SRC/Lucidos.app/Contents/Info.plist"
+( cd "$PAYLOAD_SRC" && COPYFILE_DISABLE=1 tar -czf "$S/Lucidos.app.tar.gz" Lucidos.app )
+printf 'dmg\n' > "$S/Lucidos_0.0.0_aarch64.dmg"
+printf 'sig\n' > "$S/Lucidos.app.tar.gz.sig"
+release_staging_write_manifest "$S" 0.0.0 abc123 \
+    Lucidos_0.0.0_aarch64.dmg Lucidos.app.tar.gz Lucidos.app.tar.gz.sig >/dev/null
+out="$(PATH="$FAKEBIN:/usr/bin:/bin:/usr/sbin:/sbin" \
+        "$BUILD_DMG" --release-attach --staging-dir "$S" --upload-tag v9.9.9 2>&1)"
+rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "not Developer ID signed"; then
+    pass "an unsigned staged payload is refused at the upload gate"
+else
+    fail "expected a Developer-ID refusal; got rc=$rc out: $out"
+fi
+if [ -e "$FAKEBIN/gh-was-called" ]; then
+    fail "the refusal came AFTER gh ran; the upload was already attempted"
+else
+    pass "gh was never invoked, so nothing was published"
+fi
+rm -rf "$S" "$FAKEBIN" "$PAYLOAD_SRC"
+
+# ── The local dev-identity fallback ──────────────────────────────────────────
+# Same root symptom as the shipping bug, one layer down: an ad-hoc .app has a
+# cdhash-anchored designated requirement, so every local rebuild is a new code
+# identity and macOS discards the developer's TCC grants.
+echo ""
+echo "test: the dev identity is a fallback only, and never satisfies a release"
+SIGN_BLOCK="$(awk '/^if \[ -n "\$\{APPLE_SIGNING_IDENTITY:-\}" \]; then$/,/^fi$/' "$BUILD_DMG" \
+    | awk '/begin_step codesign/,0')"
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+B_DEVID="$(printf '%s\n' "$SIGN_BLOCK" | grep -n 'sign_app_bundle "\$APP_PATH" "\$APPLE_SIGNING_IDENTITY"' | cut -d: -f1 | head -1)"
+B_DEV="$(printf '%s\n' "$SIGN_BLOCK" | grep -n 'lucidos_signing_identity_ready' | cut -d: -f1 | head -1)"
+if [ -n "$B_DEVID" ] && [ -n "$B_DEV" ] && [ "$B_DEVID" -lt "$B_DEV" ]; then
+    pass "an explicit APPLE_SIGNING_IDENTITY is tried before the dev identity"
+else
+    fail "the dev identity is not strictly a fallback (devid=$B_DEVID dev=$B_DEV)"
+fi
+# Release mode asserts APPLE_SIGNING_IDENTITY up front and refuses again at the
+# DMG step, so a self-signed certificate can never carry a release.
+if grep -q 'release mode requires signing but APPLE_SIGNING_IDENTITY is not set' "$BUILD_DMG"; then
+    pass "release mode still refuses when no Developer ID is configured"
+else
+    fail "the release-mode signing refusal is gone"
+fi
+# Notarization must stay keyed on APPLE_SIGNING_IDENTITY, not on "the bundle was
+# signed": Apple would reject a self-signed submission, and the local build has
+# no business talking to the notary service at all.
+NOTARIZE_GATE="$(grep -n 'step "Codesigning DMG + notarizing"' "$BUILD_DMG" | cut -d: -f1 | head -1)"
+if [ -n "$NOTARIZE_GATE" ] \
+   && sed -n "$((NOTARIZE_GATE - 1))p" "$BUILD_DMG" | grep -q 'APPLE_SIGNING_IDENTITY'; then
+    pass "notarization is still gated on APPLE_SIGNING_IDENTITY alone"
+else
+    fail "the notarize block is no longer gated on APPLE_SIGNING_IDENTITY"
+fi
+# The hardened runtime + secure timestamp are required for notarization and
+# deliberately NOT used for the self-signed identity (no team for library
+# validation to match; ~200 network round trips for a cert nobody trusts).
+if printf '%s\n' "$SIGN_BLOCK" | grep -q 'APPLE_SIGNING_IDENTITY" --options runtime --timestamp'; then
+    pass "the Developer ID path keeps --options runtime --timestamp"
+else
+    fail "the Developer ID path lost the flags notarization requires"
+fi
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+DEV_SIGN_CALL="$(printf '%s\n' "$SIGN_BLOCK" | grep -A1 'sign_app_bundle "\$APP_PATH" "\$LUCIDOS_SIGNING_IDENTITY"')"
+if printf '%s\n' "$DEV_SIGN_CALL" | grep -q -- '--timestamp=none' \
+   && ! printf '%s\n' "$DEV_SIGN_CALL" | grep -q -- '--options runtime'; then
+    pass "the dev-identity path uses neither the hardened runtime nor a timestamp"
+else
+    fail "the dev-identity sign call does not match the documented decision: $DEV_SIGN_CALL"
+fi
+# The repack follows whichever identity signed, so a dev-signed .app never sits
+# next to a tarball holding the unsigned one.
+# shellcheck disable=SC2016 # matching the literal source text, not expanding it
+if grep -q 'if \[ -n "\$BUNDLE_SIGNED_WITH" \]; then' "$BUILD_DMG"; then
+    pass "the repack is gated on the bundle having been signed, either way"
+else
+    fail "the repack gate does not follow the signing branch"
 fi
 
 echo ""

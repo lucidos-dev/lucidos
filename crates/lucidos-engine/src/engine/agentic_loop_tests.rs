@@ -12,8 +12,9 @@ use super::super::{InjectedPrompt, InjectedPromptKind};
 use super::{
     append_injected_prompts_to_messages, emit_iteration_cap_response_generated,
     emit_user_prompt_injected_event, ensure_terminator_emitted, filter_removed_queued_prompts,
-    MAX_ITERATIONS,
+    round_backstop_message, tool_call_cap_message,
 };
+use crate::core::DEFAULT_MAX_TOOL_CALLS;
 use crate::llm::{Message, MessageContent};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use uuid::Uuid;
@@ -77,8 +78,21 @@ async fn iteration_cap_emits_response_generated_terminator() {
     let origin_id = Uuid::new_v4();
     let meta = anchor_request(&bus, thread_id, origin_id, "long task").await;
 
-    let msg =
-        emit_iteration_cap_response_generated(&bus, thread_id, &meta, vec![], None, None).await;
+    // A non-default cap on purpose: the message must name the cap that actually
+    // fired, not the compiled-in default. Passing 500 here would let a
+    // regression that reverted to the constant pass unnoticed.
+    let configured_cap = 42;
+    assert_ne!(configured_cap, DEFAULT_MAX_TOOL_CALLS);
+    let msg = emit_iteration_cap_response_generated(
+        &bus,
+        thread_id,
+        &meta,
+        vec![],
+        None,
+        None,
+        tool_call_cap_message(configured_cap),
+    )
+    .await;
 
     assert!(
         msg.contains("[ENGINE-LIMIT]"),
@@ -86,8 +100,28 @@ async fn iteration_cap_emits_response_generated_terminator() {
         msg
     );
     assert!(
-        msg.contains(&MAX_ITERATIONS.to_string()),
-        "the user-facing message must name the cap"
+        msg.contains(&configured_cap.to_string()),
+        "the user-facing message must name the cap that fired, got: {}",
+        msg
+    );
+    assert!(
+        !msg.contains(&DEFAULT_MAX_TOOL_CALLS.to_string()),
+        "the message must not name the default when a different cap fired: {}",
+        msg
+    );
+    // Hitting the cap is the one moment the user has a reason to raise it, and a
+    // packaged user has no constant to edit. The pointer is the whole mechanism
+    // by which they learn the setting exists, so pin both halves: the clickable
+    // panel link and the row's name.
+    assert!(
+        msg.contains("[Settings](settings)"),
+        "the message must carry a clickable Settings link, got: {}",
+        msg
+    );
+    assert!(
+        msg.contains("Max tool calls"),
+        "the message must name the setting row, got: {}",
+        msg
     );
 
     let (count, request_link): (i64, Option<String>) = sqlx::query_as(
@@ -111,6 +145,42 @@ async fn iteration_cap_emits_response_generated_terminator() {
     );
 
     teardown_test_db(&db_name).await;
+}
+
+/// The two backstops must not borrow each other's wording. The round backstop
+/// fires when the loop span without a tool call, so claiming the user hit their
+/// tool-call limit would be false, and it would carry the one prefix the system
+/// prompt tells the model to trust. Raising the setting would not help there
+/// either, so only the real cap message points at Settings.
+#[test]
+fn the_two_engine_limit_messages_say_different_things() {
+    let cap = tool_call_cap_message(42);
+    let backstop = round_backstop_message(600);
+
+    for msg in [&cap, &backstop] {
+        assert!(
+            msg.starts_with("[ENGINE-LIMIT]"),
+            "both terminators carry the sentinel the prompt tells the model to trust: {msg}"
+        );
+        assert!(
+            msg.contains("Send any message to continue"),
+            "both must tell the user the turn is resumable: {msg}"
+        );
+    }
+
+    assert!(cap.contains("42") && cap.contains("[Settings](settings)"));
+    assert!(
+        !backstop.contains("[Settings](settings)"),
+        "raising the cap does not help a turn that never reached it: {backstop}"
+    );
+    assert!(
+        !backstop.contains("limit of"),
+        "the backstop must not read as the user's cap being reached: {backstop}"
+    );
+    assert!(
+        backstop.contains("600"),
+        "the backstop should say how far the turn got: {backstop}"
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -137,7 +137,7 @@ pub async fn proxy(
             // phases: once `bring_up` sets the route (while the engine is still
             // Booting), a lazy-start navigation lands here, not on `fallback`'s
             // no-route branch — so `boot_label` carries the current phase
-            // (caller passes `boot_phase_label`; a transient mid-session restart
+            // (caller passes `boot_splash_label`; a transient mid-session restart
             // has no phase and gets the neutral default).
             return starting_page(boot_label);
         }
@@ -167,9 +167,17 @@ pub async fn proxy(
 /// Used by the proxy on a connect failure (engine cold boot) and by the gateway
 /// `fallback` when a document navigation lazy-starts a stopped workspace.
 ///
-/// `label` is the current boot-phase label (see [`crate::boot_phase`]) — the
-/// gateway passes the phase for the slug, the proxy passes the neutral default.
-/// It advances across the 2s meta-refresh reloads as the boot progresses.
+/// `label` is what the gateway currently knows about this boot
+/// ([`crate::server::GatewayState::boot_splash_label`]): the boot phase (see
+/// [`crate::boot_phase`]), or a RETRYING boot failure's message when an attempt
+/// failed on something that can still clear, such as a Docker daemon that has
+/// not finished starting. The proxy's own connect-failure path passes the
+/// neutral default. It advances across the 2s meta-refresh reloads as the boot
+/// progresses.
+///
+/// A retrying failure belongs on THIS page rather than [`failed_page`] precisely
+/// because of the refresh: the condition is expected to clear, and when it does
+/// the next reload lands the user in the workspace with nothing to click.
 ///
 /// Carries `X-Lucidos-Boot-Splash: 1` so the PWA service worker
 /// (`crates/lucidos-app/public/sw.js::networkFirstShell`) can tell this
@@ -602,13 +610,9 @@ mod tests {
 
     #[test]
     fn starting_splash_renders_the_phase_label_and_has_no_escape_link() {
-        let html = splash_page_html(
-            "Downloading memory model: first run, this can take a minute…",
-            Some(2),
-            false,
-        );
+        let html = splash_page_html("Running migrations…", Some(2), false);
         // The current boot-phase label is shown beneath the mark.
-        assert!(html.contains("Downloading memory model: first run, this can take a minute…"));
+        assert!(html.contains("Running migrations…"));
         // The 2s auto-refresh that advances the label / drives the happy-path
         // transition is preserved.
         assert!(html.contains(r#"http-equiv="refresh" content="2""#));
@@ -620,6 +624,39 @@ mod tests {
         assert!(!html.contains("boot-escape"));
         assert!(!html.contains("show-escape"));
         assert!(!html.contains("lucidos-boot-since"));
+    }
+
+    /// A gateway-observed failure the supervisor is still retrying rides the
+    /// SAME starting splash: the reason is visible, and the 2s refresh survives
+    /// so the page carries the user into the workspace the moment an attempt
+    /// succeeds. Reading as a dead end would be wrong, because it is not one.
+    #[test]
+    fn retrying_splash_states_the_reason_and_keeps_refreshing() {
+        let resp = starting_page(
+            &crate::boot_failure::BootFailure::retrying(
+                "The Docker daemon is not running yet.",
+                2,
+                5,
+            )
+            .message(),
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let html = splash_page_html(
+            "The Docker daemon is not running yet. Retrying… (attempt 2 of 5)",
+            Some(2),
+            false,
+        );
+        assert!(
+            html.contains("The Docker daemon is not running yet."),
+            "{html}"
+        );
+        assert!(html.contains("Retrying… (attempt 2 of 5)"), "{html}");
+        // The refresh is the whole point: this state clears by itself.
+        assert!(
+            html.contains(r#"http-equiv="refresh" content="2""#),
+            "{html}"
+        );
+        assert!(html.contains("<title>Starting…</title>"), "{html}");
     }
 
     #[test]
@@ -875,7 +912,7 @@ mod proxy_tests {
             &build_client(),
             &target,
             "dev",
-            "Downloading memory model: first run, this can take a minute…",
+            "Running migrations…",
             request("GET", "/dev/", Body::empty()),
         )
         .await;
@@ -889,7 +926,7 @@ mod proxy_tests {
             .unwrap();
         let html = String::from_utf8_lossy(&body);
         assert!(
-            html.contains("Downloading memory model: first run, this can take a minute…"),
+            html.contains("Running migrations…"),
             "the connect-failure splash must render the passed boot phase label"
         );
     }

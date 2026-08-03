@@ -218,6 +218,34 @@ export interface EngineVersionStatus {
    *  shared lock show the building spinner instead of the manual "Rebuild"
    *  escape hatch. Absent/false when packaged. */
   shared_build_in_progress?: boolean;
+  /** How long THIS engine's own background rebuild has been running, in ms.
+   *  Absent when no build of ours is in flight, which includes a co-located
+   *  peer's build (we don't have its clock) and packaged.
+   *
+   *  ELAPSED rather than a start timestamp, deliberately: the status toast
+   *  renders a live counter from it, and differencing an engine wall-clock
+   *  against the browser's would show a wrong (or negative) duration whenever
+   *  the two disagree. The client anchors this to its own `Date.now()` at
+   *  receipt and counts up locally, so skew never reaches the number. */
+  build_elapsed_ms?: number;
+  /** The commits between the running engine's commit and HEAD: what a Switch
+   *  would bring, which is what the status toast lists while a rebuild runs.
+   *  `subjects` is capped engine-side; `total` counts them all, so the UI can
+   *  say "+N more" honestly.
+   *
+   *  Absent means UNKNOWN (git couldn't answer, or nothing was asked because
+   *  no build is in flight), never "none pending". A present object with
+   *  `total: 0` is the only way to say there is nothing to bring. */
+  pending_commits?: PendingCommits;
+}
+
+/** The commits a Switch would bring. See `EngineVersionStatus.pending_commits`
+ *  for why an ABSENT value and a `total: 0` one mean different things. */
+export interface PendingCommits {
+  /** How many commits are in the range. Can exceed `subjects.length`. */
+  total: number;
+  /** Newest-first subject lines, capped engine-side. */
+  subjects: string[];
 }
 
 export async function engineVersionStatus(): Promise<EngineVersionStatus> {

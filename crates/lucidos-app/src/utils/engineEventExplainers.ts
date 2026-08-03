@@ -1,4 +1,11 @@
-import type { AbortCause, CancelCause, EngineReason } from '../store/thread-events';
+import {
+  CONTINUATION_AUTO_RECOVERY_REASON,
+  CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
+  CONTINUATION_USER_CLICKED_REASON,
+  type AbortCause,
+  type CancelCause,
+  type EngineReason,
+} from '../store/thread-events';
 
 /** Why a user-driven `ResponseCanceled` fired, for the Initiator info popover.
  *  Mirrors Rust's `CancelCause` doc comments. The heading ("Why the response
@@ -43,6 +50,29 @@ export function describeAbortCause(cause: AbortCause | undefined): string {
   }
 }
 
+/** Why a `ContinuationStarted` resume boundary exists, for the route popover.
+ *  The heading ("Why this resumed") is owned by the renderer.
+ *
+ *  Keyed on the event's own `reason` rather than on the coarser `EngineReason`,
+ *  because the distinction is load-bearing: an `auto_recovery_after_hang`
+ *  resume is a LOCAL interruption and must not claim an engine restart, the
+ *  same honesty rule `continuationStartedSummary` enforces for the turn header.
+ *
+ *  Returns null for a legacy row that recorded no reason, so the popover shows
+ *  the "Issued by" row alone rather than inventing a plausible cause. */
+export function describeContinuationReason(reason: string | undefined): string | null {
+  switch (reason) {
+    case CONTINUATION_USER_CLICKED_REASON:
+      return 'You clicked Continue on the interrupted response, and the engine picked the session back up where it stopped.';
+    case CONTINUATION_AUTO_RECOVERY_REASON:
+      return 'The agent session stopped responding, or a stray signal killed it. Nothing restarted: the engine relaunched that one session and carried on.';
+    case CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON:
+      return 'You chose Switch to new version, which stopped this response mid-flight. The engine resumed it automatically once the new version was up.';
+    default:
+      return null;
+  }
+}
+
 /** Why the engine acted, for the route popover. Returns null for `scheduler`
  *  because that variant has its own richer renderer (links to the trigger).
  *  The popover heading ("Why the engine acted") is owned by the renderer. */
@@ -50,7 +80,10 @@ export function describeEngineReason(reason: EngineReason): string | null {
   switch (reason.kind) {
     case 'continuation_started':
     case 'session_recovered':
-      return 'Claude Code sessions running when the engine stops are auto-resumed when it restarts. This event marks the resume.';
+      // Deliberately channel-agnostic: this is the fallback a resume boundary
+      // lands on when it recorded no finer `reason`, and `ContinuationStarted`
+      // is emitted on chat and trigger threads too, not just coding-agent ones.
+      return 'A response still running when the engine stopped is auto-resumed once the engine is back. This event marks the resume.';
     case 'orphan_recovery':
       return 'After a restart, the engine resumes orphaned threads where work was in flight.';
     case 'harden_retrigger':

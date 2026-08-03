@@ -28,69 +28,14 @@
 //! this".
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
 
 use super::{
     Announcement, DataWriterRule, TableRule, DATA_WRITERS, RUNTIME_CREATED_TABLES, TABLES,
 };
+use crate::test_support::source_scan::{
+    is_test_path, production_sources, read_production_source, src_root,
+};
 use crate::test_support::{setup_test_db, teardown_test_db};
-
-/// `crates/lucidos-engine/src`.
-fn src_root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
-}
-
-/// A path convention test module. Excluded from every scan: a fixture that
-/// inserts a row directly is test setup, not a production write path.
-fn is_test_path(rel: &str) -> bool {
-    rel.split('/').any(|part| {
-        let base = part.strip_suffix(".rs").unwrap_or(part);
-        base == "tests" || base == "bin" || base.ends_with("_test") || base.ends_with("_tests")
-    })
-}
-
-/// Read a source file with its inline test module cut off. Inline `mod tests`
-/// sits at the end of the file by convention, so truncating at the first
-/// top-level `#[cfg(test)]` drops it whole.
-fn read_production_source(path: &Path) -> String {
-    let text =
-        std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-    match text.find("\n#[cfg(test)]") {
-        Some(idx) => text[..idx].to_string(),
-        None => text,
-    }
-}
-
-/// Every non-test engine source, as `(path relative to src/, production text)`.
-fn production_sources() -> Vec<(String, String)> {
-    let root = src_root();
-    let mut out = Vec::new();
-    let mut stack = vec![root.clone()];
-    while let Some(dir) = stack.pop() {
-        for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-                continue;
-            }
-            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
-                continue;
-            }
-            let rel = path
-                .strip_prefix(&root)
-                .expect("under src")
-                .to_string_lossy()
-                .replace('\\', "/");
-            if is_test_path(&rel) {
-                continue;
-            }
-            let text = read_production_source(&path);
-            out.push((rel, text));
-        }
-    }
-    out.sort();
-    out
-}
 
 /// One function, sliced out by signature line.
 struct FnSegment {

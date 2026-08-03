@@ -100,11 +100,15 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     (`.claude/skills/implementation-plan/SKILL.md`) — it turns the prompt, any grill/design \
     thread, ADRs, and code reconnaissance into `docs/plans/<date>-<slug>.md` and records a \
     PROPOSED plan marker via `lucidos planned mark --plan <path>`. A proposed plan does NOT \
-    unblock editing: present the plan to the user and wait for their approval. Once the user \
-    approves, run `lucidos planned approve` to flip the marker to gate-satisfying — only then do \
-    source edits and Apply unblock. If the user requests changes, revise the plan file, re-commit, \
-    and present it again (the marker stays proposed until approved). If this is genuinely a local \
-    fix, acknowledge that instead with `lucidos planned mark --simple \"<one-line reason>\"` (no \
+    unblock editing: present the plan to the user, then ASK FOR APPROVAL WITH THE QUESTION TOOL \
+    named in the ASKING USERS section, offering `Approve` and `Request changes`. That is a \
+    DECISION question, not a post-work confirmation: the edit gate is closed until they answer, \
+    so approval asked in plain prose just leaves the thread sitting idle. Once the user approves, \
+    run `lucidos planned approve` to flip the marker to gate-satisfying. Only then do source \
+    edits and Apply unblock. If the user requests changes, revise the plan file, re-commit, and \
+    present it again, asking the same way (the marker stays proposed until approved). If this is \
+    genuinely a local fix, acknowledge that instead with \
+    `lucidos planned mark --simple \"<one-line reason>\"` (no \
     approval needed). A gate-satisfying marker MUST exist before the change can be applied: Claude \
     Code blocks your first source edit until one is set and approved, and Apply refuses a \
     marker-less or unapproved change. Writing the plan file itself under `docs/plans/` is never \
@@ -209,6 +213,34 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// wording actively told the agent to turn end-of-turn confirmations into button
 /// questions, which caused exactly that deadlock.
 ///
+/// The forbidding half then over-reached, so the rule carries an explicit
+/// carve-out for **plan approval**. A plan written and committed by the
+/// `implementation-plan` skill reads to the model as work it has ALREADY done,
+/// so "never CONFIRM finished work" swallowed the one approval the plan marker
+/// depends on: the agent presented the plan in prose and the thread sat idle
+/// until the user typed "approve" by hand (2026-08-02). It is the opposite
+/// case in every way that matters. The plan is a proposal about work NOT done,
+/// the `cc-plan-gate` hook blocks source edits until the answer arrives, and
+/// nothing is appliable yet. Keep the carve-out in sync with
+/// [`IMPLEMENTATION_PLAN_RULE`], `cc_plan_gate::build_awaiting_approval_json`
+/// and the `implementation-plan` skill, which all name the same
+/// `Approve` / `Request changes` option pair.
+///
+/// The general lesson from that same incident is the "WHY THE TOOL AND NOT
+/// PROSE" paragraph, and it is what makes the two halves cohere instead of
+/// reading as a contradiction. Both describe ONE mechanism: a tool call parks
+/// the thread in `WaitingForUserAnswer`, which is the only input to
+/// `thread_lifecycle::is_attention_needing`. That predicate lights the
+/// needs-attention badge, keeps the thread in `DisplaySection::Current` even
+/// once archived, bubbles up the ancestor chain via
+/// `attention_descendant_count`, and is a fire condition for the "When agent
+/// needs me" trigger, so it is also what can notify the
+/// user. Parking is therefore the COST when the work is finished (the reason
+/// for the forbidding half) and the POINT when the agent is blocked. A prose
+/// question is not the gentle middle option the model reads it as: the turn
+/// ends, nothing is marked, and the thread is indistinguishable from a
+/// completed one, so the user never learns anyone is waiting.
+///
 /// This shared rule is kept ENVIRONMENT-GENERIC (no "Apply" / "the change be
 /// proposed" / "Diff") because it is interpolated into external-repo prompts
 /// too, where there is no Apply — those sessions push and open PRs. The
@@ -229,8 +261,28 @@ const ASK_USER_QUESTION_RULE: &str =
      leave `question` empty. The engine rejects a call whose `question` is missing and \
      makes you re-ask. Use `AskUserQuestion` for any such decision with 2-4 discrete \
      answers, including the binary yes/no case. Mid-stream decision questions (\"border or \
-     bg?\", \"is this the right direction before I continue?\") are fine — nothing is \
-     blocked because there's no finished change yet.\n\n\
+     bg?\", \"is this the right direction before I continue?\") are fine, and nothing is \
+     blocked because there's no finished change yet. ASKING THE USER TO APPROVE A PLAN OR AN \
+     APPROACH BEFORE YOU IMPLEMENT IT IS ALWAYS SUCH A DECISION: the plan is a proposal about \
+     work you have NOT done, you cannot proceed without the answer, and there is nothing to hand \
+     off yet. Route it through this tool with `Approve` and `Request changes` as the options. \
+     The tool requires at least two options, so a lone `Approve` button is not expressible, and \
+     you never need one: the user can always type free text through the \"Other\" escape the \
+     tool adds for them.\n\n\
+     WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
+     waiting. It parks the thread in the waiting-for-answer state, which is what lights the \
+     needs-attention badge, keeps the thread in the live working set, and can push a \
+     notification to the user's phone. A question you type into your final message instead does \
+     none of that: the turn ends, the thread reads as FINISHED, and the user gets no signal \
+     that you are stuck. So a prose question is not a lighter-touch version of the tool. When \
+     you actually need an answer, it is silence. This is the same mechanism as the paragraph \
+     below, seen from the other side: parking the thread is the COST when your work is done and \
+     the user should be free to take it forward, and it is exactly the POINT when you cannot \
+     proceed without them. So the two paragraphs never disagree about a given question, because \
+     the resolutions differ. Blocked on the user: ask with the tool. Work finished: do not ask \
+     AT ALL, and do not promote a trailing \"does this look good?\" into a tool call either. \
+     Just hand it off. What is always wrong is the third thing: ending a turn with an \
+     unanswered question sitting in your prose.\n\n\
      DO NOT ask a confirmation question about work you've ALREADY done or are wrapping up — \
      \"does this look good?\", \"does this look complete?\", \"did I miss anything?\", \
      \"want me to tweak the color?\". A held-open question parks the thread in the \
@@ -239,7 +291,9 @@ const ASK_USER_QUESTION_RULE: &str =
      often cannot even judge the result until it's landed and running, so \"does this look \
      good?\" is unanswerable at that point. When the work is done, DON'T ask whether it's \
      good: finish and hand it off, and let the user review the result. If it needs tuning, \
-     they'll tell you in a new message. Ask to DECIDE, never to CONFIRM finished work.\n\n\
+     they'll tell you in a new message. Ask to DECIDE, never to CONFIRM finished work. Approving \
+     a plan you have not implemented yet is a DECISION and is never covered by this paragraph, \
+     however finished the plan document itself feels.\n\n\
      NEVER parallel-call `AskUserQuestion` alongside other tools — if you're asking a \
      question, stop the assistant message after the `AskUserQuestion` tool_use and do not \
      include any sibling tool_uses (no Bash, no Read, no TaskOutput, no second \
@@ -392,6 +446,16 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     complete?\" question about a change you've already made. A held-open question just parks \
     the thread and stalls hand-off, and the user can't judge a visual result until it's \
     landed and running — finish and hand it off instead so they can review it. \
+    Approving a plan BEFORE you implement it is the opposite case: a DECISION you cannot \
+    proceed without, about work you have NOT done. Always ask for plan approval through this \
+    tool, with `Approve` and `Request changes` as the options, never in plain prose. \
+    WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
+    waiting. It parks the thread in the waiting-for-answer state, which lights the \
+    needs-attention badge, keeps the thread in the live working set, and can notify the user. A \
+    question typed into your final message instead ends the turn, so the thread reads as \
+    FINISHED and the user gets no signal that you are stuck. Blocked on the user: ask with this \
+    tool. Work finished: don't ask at all, just hand it off. What is always wrong is ending a \
+    turn with an unanswered question sitting in your prose. \
     NEVER parallel-call `ask_user_question` alongside other tools — if you're asking a \
     question, stop the assistant message after the `ask_user_question` tool call and do not \
     include any sibling tool calls.";
@@ -1472,6 +1536,29 @@ mod tests {
                  block anything (no finished change yet); only post-work confirmations \
                  are forbidden. The distinction is the whole fix, so pin it",
             );
+            // Plan approval is the case the DON'T half over-reached and swallowed:
+            // a committed plan reads as work already done, so the agent asked in
+            // prose and the thread sat idle until the user typed "approve"
+            // (2026-08-02). The carve-out must survive, with the concrete option
+            // pair that makes it actionable (the tool needs 2-4 options, so a lone
+            // `Approve` is not expressible).
+            for needle in ["APPROVE A PLAN OR AN", "`Approve` and `Request changes`"] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must carve plan approval OUT of the no-confirmations rule \
+                     and name its option pair (missing: {needle:?})",
+                );
+            }
+            // A prose question ends the turn, so the thread looks finished and
+            // nothing tells the user someone is waiting. Only the tool call
+            // parks it in `WaitingForUserAnswer`, which drives the
+            // needs-attention badge, Review routing, and the notification
+            // trigger. Pin the general form, not just the plan-approval case.
+            assert!(
+                prompt.contains("WHY THE TOOL AND NOT PROSE"),
+                "{label} must say that only the tool marks the thread as needing attention, \
+                 so a prose question reads as a finished turn",
+            );
             assert!(
                 prompt.contains("NEVER parallel-call"),
                 "{label} must forbid parallel-calling `AskUserQuestion` alongside other \
@@ -1574,12 +1661,29 @@ mod tests {
                 "lucidos planned mark --simple",
                 "lucidos planned approve",
                 "docs/plans/",
+                // The approval must be ASKED with the question tool, not written
+                // as prose. Told only to "present the plan and wait", the agent
+                // ended the turn and the thread sat idle until the user typed
+                // "approve" by hand (2026-08-02). The tool is named indirectly
+                // ("the ASKING USERS section") because the two backends call it
+                // different things and `append_backend_rules` swaps only that
+                // section, never this rule.
+                "ASK FOR APPROVAL WITH THE QUESTION TOOL",
+                "`Approve` and `Request changes`",
             ] {
                 assert!(
                     base.contains(needle),
                     "{label} must carry the implementation-plan rule (`{needle}`)",
                 );
             }
+            // The indirection only works if the section it points at exists in
+            // the same prompt. Pin the pointer's target so a rename of the
+            // ASKING USERS heading can't leave the plan rule dangling.
+            assert!(
+                base.contains("ASKING USERS:"),
+                "{label} names \"the ASKING USERS section\" for the approval tool, so \
+                 that section must be in the same prompt",
+            );
             // Both backends inherit it: the rule is in the shared base, so the
             // appended backend section can't strip it.
             for agent in [
@@ -1613,6 +1717,67 @@ mod tests {
                 "{label} must NOT carry the implementation-plan rule (no docs/plans there)",
             );
         }
+    }
+
+    /// Plan approval must reach the user as a button question on BOTH backends.
+    /// The failure this pins: `IMPLEMENTATION_PLAN_RULE` said only "present the
+    /// plan and wait for their approval", while the ASKING USERS rule in the
+    /// same prompt forbade confirmations about "work you've ALREADY done". A
+    /// committed plan looks exactly like already-done work, so the agent
+    /// classified approval as forbidden and asked in prose. The thread then sat
+    /// idle for 20 minutes until the user typed "approve" by hand (2026-08-02).
+    ///
+    /// Each backend must name its OWN tool: `append_backend_rules` swaps the
+    /// whole `ASK_USER_QUESTION_RULE` for the Codex variant, so a CC tool name
+    /// leaking into a Codex prompt would send it after a tool it cannot call.
+    #[test]
+    fn plan_approval_is_carved_out_of_the_no_confirmations_rule_on_both_backends() {
+        let base = worktree_system_prompt("feature/x", "dev");
+        let cc = append_backend_rules(base.clone(), crate::runtime::CodingAgent::ClaudeCode);
+        let codex = append_backend_rules(base, crate::runtime::CodingAgent::Codex);
+
+        // Both backends carry the carve-out and the same option pair, so the
+        // two rules, the cc-plan-gate deny message and the skill stay
+        // describable in one sentence.
+        for (label, prompt) in [("claude-code", &cc), ("codex", &codex)] {
+            assert!(
+                prompt.contains("`Approve` and `Request changes`"),
+                "{label} must name the same approval option pair as the skill and the \
+                 cc-plan-gate deny message",
+            );
+            // The general lesson, not just the plan-approval instance: a prose
+            // question ends the turn, so the thread reads as finished and the
+            // user is never told anyone is waiting. Only a tool call parks it
+            // in `WaitingForUserAnswer`, which is what
+            // `thread_lifecycle::is_attention_needing` keys on.
+            assert!(
+                prompt.contains("WHY THE TOOL AND NOT PROSE"),
+                "{label} must explain that only a tool call marks the thread as needing \
+                 attention; prose leaves it looking finished",
+            );
+        }
+
+        assert!(
+            cc.contains("APPROVE A PLAN OR AN"),
+            "Claude Code prompt must exempt plan approval from the no-confirmations rule",
+        );
+        assert!(
+            cc.contains("`AskUserQuestion` tool"),
+            "Claude Code prompt must name its own question tool",
+        );
+        assert!(
+            codex.contains("Approving a plan BEFORE you implement it"),
+            "Codex prompt must exempt plan approval from the no-confirmations rule \
+             (the swap to CODEX_ASK_USER_QUESTION_RULE must carry the carve-out too)",
+        );
+        assert!(
+            codex.contains("`ask_user_question` tool"),
+            "Codex prompt must name the MCP tool it can actually call",
+        );
+        assert!(
+            !codex.contains("`AskUserQuestion` tool"),
+            "Codex has no `AskUserQuestion` tool; the swap must leave no CC tool name behind",
+        );
     }
 
     #[test]

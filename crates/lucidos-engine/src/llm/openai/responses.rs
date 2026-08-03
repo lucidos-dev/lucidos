@@ -263,7 +263,7 @@ impl OpenAiProvider {
             }
         }
 
-        Ok(Self::build_llm_response(content, tool_calls, meta))
+        Self::build_llm_response(content, tool_calls, meta)
     }
 
     /// Process a single Responses API SSE event. Returns `true` when the stream is done.

@@ -570,16 +570,8 @@ impl LucidosEngine {
 
     async fn execute_query_events(&self, args: &serde_json::Value) -> ToolOutcome {
         let event_type = args.get("event_type").and_then(|v| v.as_str());
-        let since = args
-            .get("since")
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        let until = args
-            .get("until")
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let since = parse_time_filter(args, "since")?;
+        let until = parse_time_filter(args, "until")?;
         let limit = QUERY_EVENTS_LIMIT.apply(args.get("limit").and_then(|v| v.as_i64()));
         let byte_limit =
             QUERY_EVENTS_BYTE_BUDGET.apply(args.get("byte_limit").and_then(|v| v.as_i64()));
@@ -601,16 +593,8 @@ impl LucidosEngine {
     /// (workspace-learning, workspace-audit) should call before drilling.
     async fn execute_count_events(&self, args: &serde_json::Value) -> ToolOutcome {
         let event_type = args.get("event_type").and_then(|v| v.as_str());
-        let since = args
-            .get("since")
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
-        let until = args
-            .get("until")
-            .and_then(|v| v.as_str())
-            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-            .map(|dt| dt.with_timezone(&chrono::Utc));
+        let since = parse_time_filter(args, "since")?;
+        let until = parse_time_filter(args, "until")?;
 
         if let Some(et) = event_type {
             match self.event_store.count_events(Some(et), since, until).await {
@@ -905,6 +889,36 @@ pub(crate) fn parse_apply_change_id(args: &serde_json::Value) -> Result<uuid::Uu
         _ => return Err("Error: change_id is required".to_string()),
     };
     uuid::Uuid::parse_str(raw).map_err(|_| format!("Error: change_id is not a valid UUID: {}", raw))
+}
+
+/// Parse an optional RFC3339 time filter (`since` / `until`) for the event
+/// query tools.
+///
+/// A present-but-unparseable value is a hard error, never a silent `None`:
+/// dropping the bound turns a windowed query into an all-time one, which the
+/// model then reports to the user as the window. `2026-07-01` (no time, no
+/// offset) is a very common model shape and does NOT parse as RFC3339, so this
+/// path is hit routinely rather than exotically.
+pub(crate) fn parse_time_filter(
+    args: &serde_json::Value,
+    key: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, String> {
+    let Some(raw) = args
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    else {
+        return Ok(None);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .map(|dt| Some(dt.with_timezone(&chrono::Utc)))
+        .map_err(|e| {
+            format!(
+                "Error: `{}` must be an RFC3339 timestamp (e.g. 2026-07-01T00:00:00Z), got '{}': {}",
+                key, raw, e
+            )
+        })
 }
 
 /// Default + inclusive `[min, max]` bounds for an optional numeric tool

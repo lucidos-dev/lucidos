@@ -154,6 +154,9 @@ struct Fixture {
     queue: Arc<ThreadQueue>,
     executor: Arc<GatedExecutor>,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>>,
+    /// Where the overflow guard's `TriggerDisabled` would project the on-disk
+    /// trigger definition. Held so it outlives every queue built from it.
+    workspace: tempfile::TempDir,
 }
 
 async fn fixture(max_total: usize) -> Fixture {
@@ -161,10 +164,13 @@ async fn fixture(max_total: usize) -> Fixture {
     let (bus, _rx) = EventBus::new(pool.clone());
     let trigger_configs: Arc<std::sync::RwLock<HashMap<String, crate::triggers::TriggerConfig>>> =
         Arc::new(std::sync::RwLock::new(HashMap::new()));
+    let workspace = tempfile::tempdir().expect("temp workspace");
     let queue = Arc::new(ThreadQueue::new(
         pool.clone(),
         bus.clone(),
         trigger_configs.clone(),
+        workspace.path().to_path_buf(),
+        Arc::new(tokio::sync::Mutex::new(())),
         test_policy(max_total),
     ));
     let executor = GatedExecutor::new();
@@ -176,6 +182,7 @@ async fn fixture(max_total: usize) -> Fixture {
         queue,
         executor,
         trigger_configs,
+        workspace,
     }
 }
 
@@ -569,6 +576,8 @@ async fn recover_collapses_duplicate_cron_rows_to_one() {
         f.pool.clone(),
         f.bus.clone(),
         f.trigger_configs.clone(),
+        f.workspace.path().to_path_buf(),
+        Arc::new(tokio::sync::Mutex::new(())),
         test_policy(5),
     ));
     let executor2 = GatedExecutor::new();
@@ -693,6 +702,8 @@ async fn recover_requeues_admitted_trigger_entries_after_restart() {
         f.pool.clone(),
         f.bus.clone(),
         f.trigger_configs.clone(),
+        f.workspace.path().to_path_buf(),
+        Arc::new(tokio::sync::Mutex::new(())),
         test_policy(5),
     ));
     let executor2 = GatedExecutor::new();
@@ -754,6 +765,8 @@ async fn recover_hands_off_spawn_entries_whose_thread_materialized() {
         f.pool.clone(),
         f.bus.clone(),
         f.trigger_configs.clone(),
+        f.workspace.path().to_path_buf(),
+        Arc::new(tokio::sync::Mutex::new(())),
         test_policy(5),
     ));
     queue2.set_executor(GatedExecutor::new());

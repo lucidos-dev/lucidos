@@ -422,3 +422,202 @@ mod tests {
         assert!(msg.contains("Queued an off-schedule run"), "{msg}");
     }
 }
+
+/// Does a trigger write reach the precondition check that reads it?
+///
+/// The tests above pin the pure checker against a config handed to it
+/// directly. These pin the step before that one: the config the checker will
+/// read has to already carry the write that just returned. It did not, and the
+/// gap was a real off-schedule fire of a trigger the user had just paused (the
+/// intermittent `run_refuses_a_paused_trigger_instead_of_silently_dropping_it`).
+///
+/// **No scheduler subscriber runs here**, deliberately. That is what makes
+/// these fail against the old code for the right reason instead of racing it:
+/// under the subscriber-only design the registry is never written at all, so
+/// the assertion is about the write path rather than about who wins.
+#[cfg(test)]
+mod read_your_writes_tests {
+    use super::*;
+    use crate::engine::event_bus::EventBus;
+    use crate::engine::trigger_writes::{TriggerRegistryWriter, TriggerWrite};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    use serde_json::json;
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    type Registry = RwLock<HashMap<String, TriggerConfig>>;
+
+    fn created_payload(id: &str) -> serde_json::Value {
+        json!({
+            "trigger_id": id,
+            "name": "Nightly e2e",
+            "slug": "nightly-e2e",
+            "schedule": ["0 0 2 * * *"],
+            "timezone": "UTC",
+            "run": { "type": "intent", "intent": "run the nightly e2e" },
+        })
+    }
+
+    /// What the run endpoint would answer for this id, right now.
+    fn refusal(configs: &Registry, trigger_id: &str) -> Option<RunRefusal> {
+        let config = configs.read().unwrap().get(trigger_id).cloned();
+        check_off_schedule_run(trigger_id, config.as_ref(), None, None)
+    }
+
+    #[tokio::test]
+    async fn a_pause_is_refused_by_the_very_next_run_request() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let ws = tempfile::tempdir().unwrap();
+        let configs: Registry = RwLock::new(HashMap::new());
+        let write_lock = tokio::sync::Mutex::new(());
+        let writer = TriggerRegistryWriter {
+            event_bus: &bus,
+            trigger_configs: &configs,
+            workspace_path: ws.path(),
+            write_lock: &write_lock,
+        };
+
+        writer
+            .write(TriggerWrite::Created, "t-1", created_payload("t-1"), None)
+            .await
+            .expect("create");
+        // A live trigger runs off-schedule; that is the baseline the refusal
+        // has to be measured against.
+        assert_eq!(refusal(&configs, "t-1"), None);
+
+        writer
+            .write(
+                TriggerWrite::Updated,
+                "t-1",
+                json!({ "trigger_id": "t-1", "paused": true }),
+                None,
+            )
+            .await
+            .expect("pause");
+
+        assert_eq!(
+            refusal(&configs, "t-1"),
+            Some(RunRefusal::Paused {
+                name: "Nightly e2e".to_string()
+            }),
+            "the pause returned, so the next run request must already see it"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    #[tokio::test]
+    async fn a_delete_is_not_found_by_the_very_next_run_request() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let ws = tempfile::tempdir().unwrap();
+        let configs: Registry = RwLock::new(HashMap::new());
+        let write_lock = tokio::sync::Mutex::new(());
+        let writer = TriggerRegistryWriter {
+            event_bus: &bus,
+            trigger_configs: &configs,
+            workspace_path: ws.path(),
+            write_lock: &write_lock,
+        };
+
+        writer
+            .write(TriggerWrite::Created, "t-1", created_payload("t-1"), None)
+            .await
+            .expect("create");
+        writer
+            .write(
+                TriggerWrite::Deleted,
+                "t-1",
+                json!({ "trigger_id": "t-1" }),
+                None,
+            )
+            .await
+            .expect("delete");
+
+        assert_eq!(
+            refusal(&configs, "t-1"),
+            Some(RunRefusal::NotFound {
+                trigger_id: "t-1".to_string()
+            }),
+            "a deleted trigger must not still be runnable"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The write is durable, not just fast. If the apply ever ran without the
+    /// event landing, the registry would be ahead of the log and a restart
+    /// would silently undo the user's change.
+    #[tokio::test]
+    async fn the_event_is_persisted_alongside_the_registry_apply() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let ws = tempfile::tempdir().unwrap();
+        let configs: Registry = RwLock::new(HashMap::new());
+        let write_lock = tokio::sync::Mutex::new(());
+
+        TriggerRegistryWriter {
+            event_bus: &bus,
+            trigger_configs: &configs,
+            workspace_path: ws.path(),
+            write_lock: &write_lock,
+        }
+        .write(TriggerWrite::Created, "t-1", created_payload("t-1"), None)
+        .await
+        .expect("create");
+
+        let persisted: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM events WHERE event_type = 'TriggerCreated' AND aggregate_id = $1",
+        )
+        .bind("t-1")
+        .fetch_one(&pool)
+        .await
+        .expect("count events");
+        assert_eq!(
+            persisted, 1,
+            "the write must be in the log, not only in memory"
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// Emit first, then apply. A failed emit must apply nothing: a resume live
+    /// in memory but absent from the log would come back paused after a
+    /// restart, with nothing to explain it.
+    #[tokio::test]
+    async fn a_failed_emit_leaves_the_registry_untouched() {
+        let (pool, db) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let ws = tempfile::tempdir().unwrap();
+        let configs: Registry = RwLock::new(HashMap::new());
+        let write_lock = tokio::sync::Mutex::new(());
+        let writer = TriggerRegistryWriter {
+            event_bus: &bus,
+            trigger_configs: &configs,
+            workspace_path: ws.path(),
+            write_lock: &write_lock,
+        };
+
+        writer
+            .write(TriggerWrite::Created, "t-1", created_payload("t-1"), None)
+            .await
+            .expect("create");
+
+        // Closing the pool is the cheapest real emit failure: the INSERT can no
+        // longer be issued, so the emit returns Err before anything is written.
+        pool.close().await;
+        let result = writer
+            .write(
+                TriggerWrite::Updated,
+                "t-1",
+                json!({ "trigger_id": "t-1", "paused": true }),
+                None,
+            )
+            .await;
+
+        assert!(result.is_err(), "a closed pool must fail the emit");
+        assert!(
+            !configs.read().unwrap()["t-1"].paused,
+            "a pause that was never persisted must not be live in memory"
+        );
+        teardown_test_db(&db).await;
+    }
+}

@@ -305,7 +305,7 @@ It is a real fire, so it records `TriggerExecuted` / `TriggerCompleted` and the 
 Three answers other than "started", each of which you must relay as-is rather than reporting a run:
 
 - **Already running.** A fire of this trigger was already active or queued, so nothing new started: scheduled fires coalesce to at most one pending run per trigger. Tell the user that; do not claim you started one.
-- **Paused.** Refused. Resuming does not run anything *on purpose*, so if the user wants both, do both. (It can still fire something incidentally: re-registering the schedule also re-runs the missed-slot catch-up, so a cron slot from the past hour that never ran fires on resume. That is a side effect of restoring the schedule, not a way to ask for a run, and you cannot predict it.)
+- **Paused.** Refused. Resuming does not run anything *on purpose*, so if the user wants both, do both. (It can still fire something incidentally: re-registering the schedule also re-runs the missed-slot catch-up, so a cron slot from the past hour that never ran fires on resume. That is a side effect of restoring the schedule, not a way to ask for a run, and you cannot predict it.) A pause *you* just made counts immediately: every trigger write is visible to the very next call, so `pause_trigger` followed by `run` in the same turn is refused rather than raced, and there is nothing to wait for in between.
 - **No cron schedule.** Refused, because a payload-less fire is a shape an event-only trigger has never had (an intent run would find no `## Triggering Event` block, a script run would get none of the `TRIGGER_EVENT_*` vars). Emit its event instead.
 
 ### Event-only trigger: emit the event

@@ -38,6 +38,7 @@ pub mod thread_state;
 pub mod todo_consumer;
 pub(crate) mod tools;
 pub(crate) mod trigger_group_writes;
+pub(crate) mod trigger_writes;
 pub mod types;
 pub mod worktree_cleanup;
 
@@ -307,6 +308,13 @@ pub struct LucidosEngine {
     /// ~4s version-status poll. Dev-only. See
     /// `engine_version::disk_binary_is_upgrade`.
     disk_direction_cache: std::sync::Mutex<engine_version::DiskDirectionCache>,
+    /// Throttled cache of the commits between the running engine's commit and
+    /// HEAD, which the status toast lists while a rebuild runs. Same reason as
+    /// `source_behind_cache`: version-status is polled every ~4s per client and
+    /// this forks `git log`. Only read when a build is in flight or the source is
+    /// behind HEAD, so an idle workspace never populates it. Dev-only. See
+    /// `engine_version::pending_commits`.
+    pending_commits_cache: std::sync::Mutex<engine_version::PendingCommitsCache>,
     /// Self-heal bookkeeping: how many background rebuilds this engine has
     /// auto-triggered for the current HEAD, so a genuinely broken `main` can't
     /// spin builds forever (bounded per HEAD; reset when HEAD moves). Dev-only.
@@ -557,6 +565,20 @@ pub struct LucidosEngine {
     /// invariant; delete-then-create false-positive 409 is a separate,
     /// known-quirk).
     pub(crate) trigger_group_write_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes emit + registry-apply on `trigger_configs`, so the order the
+    /// registry is written in is the order the event log records. Same shape as
+    /// the group lock above, for a different invariant.
+    ///
+    /// Without it the two steps of a write can interleave with another writer's:
+    /// `EventBus::emit` broadcasts before it returns, so writer A can be
+    /// preempted between its emit and its apply while writer B emits AND
+    /// applies, leaving A's older payload on top of B's newer one. Nothing
+    /// repairs that afterwards. The scheduler subscriber re-applies both events
+    /// in log order, but it is free to have run before A's late apply, so it is
+    /// not the backstop it looks like. Holding this across the pair means every
+    /// direct apply lands in sequence order, and the subscriber's ordered
+    /// replay can then only agree with it.
+    pub(crate) trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Live tasks for the `run_bash_background` chat tool. Holds only
     /// currently-running tasks; finished tasks are persisted to the
     /// events stream as `BackgroundBashCompleted` and evicted. See

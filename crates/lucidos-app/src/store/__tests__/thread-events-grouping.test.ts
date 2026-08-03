@@ -667,15 +667,17 @@ describe('handleEvent', () => {
     expect(thread.events.get(1)).toEqual(expect.objectContaining(event1)); // original kept
   });
 
-  it('appends transient text to streaming buffer', () => {
+  it('takes the latest cumulative transient text into the streaming buffer', () => {
     const thread = makeThreadState();
     const threadMap = new Map([['thread-1', thread]]);
+    // Each `CumulativeTextUpdated` carries the whole accumulated turn text, not
+    // a delta, so the later frame replaces the earlier one.
     const transient: TransientEvent = { type: 'CumulativeTextUpdated', text: 'hel' };
 
     handleEvent(threadMap, 'thread-1', null, transient);
     expect(thread.streamingBuffer).toBe('hel');
 
-    handleEvent(threadMap, 'thread-1', null, { type: 'CumulativeTextUpdated', text: 'lo' });
+    handleEvent(threadMap, 'thread-1', null, { type: 'CumulativeTextUpdated', text: 'hello' });
     expect(thread.streamingBuffer).toBe('hello');
   });
 

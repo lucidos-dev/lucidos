@@ -992,19 +992,14 @@ pub(crate) fn is_bad_image_description(desc: &str) -> bool {
         || lower.contains("no image provided")
 }
 
-/// Hard cap on per-turn LLM tool-call iterations. The engine returns a
-/// `[ENGINE-LIMIT]`-tagged response when the cap is hit — the chat agent
-/// cannot otherwise observe its own tool-call count, so any "tool-call
-/// cap" claim without this prefix is a hallucination. The chat system
-/// prompt tells the model the same.
-pub(crate) const MAX_ITERATIONS: usize = 500;
-
 /// How many times a single response may reject a prose answer and force the
 /// model to re-call `ask_user_question` after a failed ask. Bounds the re-ask
 /// guard so a persistently-broken question path (e.g. the DB is down and every
 /// `walk_question_batch` errors) or a model that refuses to comply can never
 /// trap the loop — after this many forces the turn finalizes normally with
-/// prose. Far below `MAX_ITERATIONS`, which remains the outer backstop.
+/// prose. Far below the default tool-call cap, which remains the outer
+/// backstop. (A user who configures a cap this low has deliberately chosen for
+/// the backstop to fire first; see [`crate::core::MIN_MAX_TOOL_CALLS`].)
 pub(crate) const MAX_QUESTION_REASK: usize = 2;
 
 /// The forcing instruction appended as a user message when the model abandons a
@@ -1066,8 +1061,8 @@ pub(crate) fn next_failure_streak(
 
 /// Map a consecutive-failure streak length onto the breaker action. Warn at
 /// 3-4 (give the model a STOP nudge with the results it already has), hard
-/// break at 5+ (it ignored the warnings). Both thresholds stay far below
-/// `MAX_ITERATIONS`, the outer backstop.
+/// break at 5+ (it ignored the warnings). Both thresholds stay far below the
+/// default tool-call cap, the outer backstop.
 pub(crate) fn generic_breaker_action(failure_streak: usize) -> BreakerAction {
     if failure_streak >= 5 {
         BreakerAction::Break
@@ -1109,8 +1104,60 @@ pub(crate) fn terminal_result(
     }
 }
 
+/// How many rounds past the tool-call cap the loop may spend before the
+/// unconditional backstop fires.
+///
+/// A handful of paths `continue` the loop WITHOUT executing a tool call, so
+/// they do not advance `tool_calls_made`: a forced `ask_user_question` re-ask,
+/// the three circuit-breaker warnings, and a mid-turn user injection. Each is
+/// individually bounded today, but "every path happens to be bounded" is a
+/// property that decays silently as paths are added, and the guarantee worth
+/// keeping is the unconditional one: a turn ALWAYS ends. (A turn that did not
+/// end is the zombie-thread bug in `agentic_loop_tests.rs`.)
+///
+/// Sized so it can never bind before the user's own cap: 100 non-tool rounds is
+/// an order of magnitude more than every bounded path can produce together,
+/// while still ending a turn that is genuinely spinning.
+pub(crate) const NON_TOOL_ROUND_SLACK: usize = 100;
+
+/// The `[ENGINE-LIMIT]` message for the user's tool-call cap.
+///
+/// The prefix is load-bearing: the chat agent cannot observe its own tool-call
+/// count, so any "tool-call cap" claim WITHOUT it is a hallucination. The chat
+/// system prompt tells the model the same, quoting the same cap.
+///
+/// Names the cap that actually fired (not the default) and says where to change
+/// it. Hitting the cap is the one moment the user has a reason to raise it, and
+/// on a packaged install the Settings row is the only way they can: there is no
+/// constant to edit and no rebuild. `[Settings](settings)` is a real clickable
+/// panel link in rendered message text (see `utils/linkifyPaths.ts`), so this is
+/// one tap plus the named path.
+pub(crate) fn tool_call_cap_message(max_tool_calls: usize) -> String {
+    format!(
+        "[ENGINE-LIMIT] Per-turn limit of {} tool calls reached. Send any message to continue \
+         from here, or raise the limit in [Settings](settings) under Models, Chat & Triggers, \
+         Max tool calls.",
+        max_tool_calls
+    )
+}
+
+/// The `[ENGINE-LIMIT]` message for the unconditional round backstop.
+///
+/// Deliberately NOT the tool-call message: the user has not reached their cap,
+/// and saying they did would be a false statement carrying the one prefix the
+/// system prompt tells the model to trust. Raising the setting would not help
+/// here, so this one does not suggest it.
+pub(crate) fn round_backstop_message(rounds: usize) -> String {
+    format!(
+        "[ENGINE-LIMIT] Turn ended after {} steps without reaching the tool-call limit, which \
+         means it was looping without getting anywhere. Send any message to continue from here.",
+        rounds
+    )
+}
+
 /// Without this emit the frontend would never see a terminator and the
-/// thread would show "running" forever after hitting the cap.
+/// thread would show "running" forever after hitting a cap. Takes the built
+/// message so both backstops share one emit path.
 pub(crate) async fn emit_iteration_cap_response_generated(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: Uuid,
@@ -1118,11 +1165,8 @@ pub(crate) async fn emit_iteration_cap_response_generated(
     images: Vec<String>,
     effective_model: Option<String>,
     effective_effort: Option<String>,
+    msg: String,
 ) -> String {
-    let msg = format!(
-        "[ENGINE-LIMIT] Per-turn limit of {} tool calls reached. Send any message to continue from here.",
-        MAX_ITERATIONS
-    );
     bus.emit_or_log(
         crate::engine::event_bus::BusEvent::Thread {
             thread_id,
@@ -1178,8 +1222,8 @@ pub(crate) async fn emit_user_prompt_injected_event(
 /// `view_image` again to bring it back.
 ///
 /// A cap is needed because pinned images are exempt from trim pass 0 by
-/// construction and the model may issue up to `MAX_ITERATIONS` image reads in a
-/// single turn — a "describe every photo in this folder" turn would otherwise
+/// construction and the model may issue as many image reads in a single turn as
+/// its tool-call cap allows. A "describe every photo in this folder" turn would otherwise
 /// accumulate hundreds of un-strippable images (~1600 tokens each, see
 /// `context::IMAGE_BUDGET_TOKEN_ESTIMATE`) and blow the context window.
 ///

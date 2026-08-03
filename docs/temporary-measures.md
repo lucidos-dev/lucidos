@@ -59,6 +59,28 @@ entry's removal condition should name them).
 
 Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
+### One-time mirror history rebuild script
+
+- **Added:** 2026-08-03
+- **Lives in:** `scripts/rebuild-mirror-history.sh`, listed in the `paths:`
+  frontmatter of `.claude/rules/build-release.md`.
+- **Impermanent because:** It exists to run once. It rebuilds the public
+  mirror's `main` as a linear chain of the 34 published releases, replacing the
+  parentless orphans `release-to-lucidos.sh` has published since v0.7. Its
+  preconditions are pinned to that exact state (`EXPECTED_TAGS=34`,
+  `FIRST_TAG=v0.7`, `main` == the newest tag's commit), so it refuses to run the
+  moment a 35th release lands. It is a repair, not a facility: chaining FUTURE
+  releases is a change to `release_tree.sh` and `release-to-lucidos.sh` that this
+  script deliberately does not make.
+- **Removal / resolution condition:** The rebuilt history is pushed and confirmed
+  on the mirror (`git log --oneline lucidos/main | wc -l` reports the release
+  count rather than 1). Then delete the script and its `paths:` entry. If a
+  release cuts before that happens, add `scripts/rebuild-mirror-history.sh` to
+  `RELEASE_TREE_EXCLUDE_PATHS` first: the script sources `release_tree.sh`, which
+  is itself withheld from the mirror, so a published copy would have no lib to
+  source.
+- **Status:** open
+
 ### Batch `data/` writes announce once for the caller, not per file
 
 - **Added:** 2026-08-01
@@ -353,6 +375,38 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Status:** active
 - **Investigation:** n/a (the cause is known and upstream; nothing is being
   chased here, only waited on)
+
+### CC byte-idle deadline raised past the engine watchdog
+
+- **Added:** 2026-08-02
+- **Lives in:** `CC_BYTE_STREAM_IDLE_TIMEOUT_MS` and the
+  `CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS` env write in `build_command`
+  (`crates/lucidos-engine/src/runtime/claude_code.rs`); the ordering invariant is
+  asserted against `agent_session::lifecycle::WATCHDOG_INACTIVITY_LIMIT_MS` in
+  `runtime/claude_code_tests/build_command.rs`.
+- **Impermanent because:** it works around an upstream client default. Claude Code
+  aborts a turn after 300 000 ms of zero bytes on the SSE body and reports
+  `API Error: Stream idle timeout - no chunks received`, terminally: no
+  non-streaming fallback, and at most one retry that is unavailable once
+  `message_start` has arrived. At the 200k+ token contexts a coding-agent session
+  reaches, a cache-cold prompt is silent on the wire for longer than that
+  (measured: two deaths at 303 s on one thread, 2026-08-02). We raise the deadline
+  to CC's clamp maximum purely so the engine's own 10-minute inactivity watchdog,
+  whose response is a non-destructive kill plus auto-resume, becomes the first
+  responder. If CC either retried this error class itself or defaulted above our
+  watchdog, we would set nothing.
+- **Removal / resolution condition:** drop the env write when EITHER (a) Claude
+  Code auto-resumes a stream-idle failure rather than ending the turn, verified by
+  seeing a session recover from the error with no `ResponseFailed`, or (b) its
+  default byte-idle deadline exceeds `WATCHDOG_INACTIVITY_LIMIT_MS`, verified by
+  re-reading the resolver in the installed bundle. On removal, delete
+  `CC_BYTE_STREAM_IDLE_TIMEOUT_MS`, both tests in
+  `runtime/claude_code_tests/build_command.rs`, and the `pub(crate)` justification
+  paragraph added to `WATCHDOG_INACTIVITY_LIMIT_MS`.
+- **Status:** active
+- **Investigation:** n/a (cause fully characterized in
+  `docs/investigations/2026-08-02-cc-stream-idle-timeout.md`; the upstream reports
+  are closed as duplicate / not planned, so there is nothing open to chase)
 
 ---
 
@@ -825,6 +879,50 @@ event that retires it.
   knowhow, or recipes still pass `repo` to this tool, then drop the schema param,
   the alias-resolution arm and both-passed error, and the
   `CrossWorkspaceSpawn.repo` field.
+- **Status:** active
+
+### `tailscale serve` pre-1.52 positional-syntax fallback
+
+- **Added:** 2026-08-02
+- **Lives in:** `crates/lucidos-app/src/mobile.rs` (`serve_arg_forms` returns
+  `(current, legacy)`, `serve_run` runs the legacy form only on a
+  `ServeAttemptError::FlagRejected` from the current one, and
+  `both_serve_forms_failed` merges the two errors), pinned by
+  `the_legacy_serve_form_is_the_pre_rework_syntax_without_bg`,
+  `a_double_failure_keeps_the_legacy_reason_too`,
+  `an_identical_double_failure_is_not_said_twice`,
+  `a_syntax_rejection_is_told_apart_from_every_other_failure` and
+  `a_rejected_flag_is_the_only_failure_that_asks_for_the_older_syntax`.
+  `SERVE_CONFIGURE_TIMEOUT` / `supervise_serve` exist partly for it (the legacy
+  form runs foreground on a CLI that still parses it), but the deadline is a
+  general stall guard and stays behind. Why the flag asymmetry is correct:
+  `docs/code-review-priors.md`.
+- **Narrowed 2026-08-02:** the retry originally fired on ANY failure of the
+  current form. On a modern CLI that made every unrelated failure collect the
+  legacy attempt's "the CLI for serve and funnel has changed" and lead with it,
+  which is how a run that was really waiting for a tailnet approval got reported
+  as a syntax problem. It is now gated on `is_flag_rejection`, so a deadline, a
+  cancel, or a daemon that is down never reaches it. That gate is part of the
+  measure and is deleted with it.
+- **Impermanent because:** The Expose button's real invocation is the flag form
+  `serve --bg --https=443 <target>`, which every Tailscale CLI from the 1.52
+  rework onward accepts. The positional `serve https / <target>` second attempt
+  is there only for a Mac still on a pre-1.52 CLI. Unlike a persisted wire shape
+  or an old event payload, an installed CLI gets upgraded, so the population
+  this serves shrinks to zero on its own. It landed because the reverse
+  hardcoding (positional only) is exactly what broke Expose once upstream
+  removed that syntax, so a single hardcoded form is what we are avoiding.
+- **Removal / resolution condition:** Once a pre-1.52 CLI is no longer worth
+  supporting (1.52 is already the floor the README and
+  `system-knowhow/remote-access.md` teach), drop the second tuple element so
+  `serve_arg_forms` returns one `Vec<String>`, collapse the fallback branch in
+  `serve_run` to a single `run_serve_attempt(...)?`, delete
+  `both_serve_forms_failed`, `is_flag_rejection` and the
+  `ServeAttemptError::FlagRejected` variant, and delete all five pinning tests.
+  Verify on the oldest CLI still in scope: `tailscale serve --help` lists
+  `--https` and `--bg`. Also drop the two-form table in `remote-access.md`
+  § Route B, the paragraph on reporting both errors, the paragraph on the
+  flag-parse gate, and the Expose troubleshooting row that points at it.
 - **Status:** active
 
 ---

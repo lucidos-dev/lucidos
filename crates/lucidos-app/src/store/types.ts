@@ -50,10 +50,23 @@ export type MenuItem = typeof MENU_ITEMS[number];
 // 5s poll only ever resolves to 'connected' or 'disconnected' thereafter.
 export type ConnectionStatus = 'connected' | 'disconnected' | 'connecting';
 
+/** What became of a step. The value set doubles as the CSS class name
+ *  (`.inline-step.<outcome>`, `.step-detail-status.<outcome>`); `stepStatus`
+ *  in `thread-events/exchange-render.ts` adds the user-facing label.
+ *
+ *  `'unfinished'` is the killed-mid-call state: the turn died (failed /
+ *  aborted / canceled) while this step was still in flight, so it never
+ *  reported anything. Distinct from `'error'`, which asserts the step ran and
+ *  reported a failure, and from `'pending'`, which asserts something is still
+ *  running. Deliberately NOT called `'interrupted'`: `ExchangeStatus` already
+ *  uses that word one layer up for "user sent a follow-up while streaming",
+ *  which renders as a neutral "Done ↳". */
+export type StepOutcome = 'pending' | 'success' | 'error' | 'unfinished';
+
 // A single step in chat processing (tool call, memory search, etc.)
 export interface Step {
   description: string;
-  success: boolean | null; // null = pending/in-progress
+  outcome: StepOutcome;
   /** Pairs the step with its CodingAgentToolResult by id; description is
    *  ambiguous for parallel calls like two `Read SKILL.md`. Absent for
    *  engine tools and legacy DB rows. */
@@ -149,7 +162,7 @@ export type ResponseEvent =
       type: 'step';
       description: string;
       tool_name?: string;
-      success: boolean | null;
+      outcome: StepOutcome;
       tool_use_id?: string;
       detail?: string;
       /** Legacy fields — see Step.context_tokens above. */

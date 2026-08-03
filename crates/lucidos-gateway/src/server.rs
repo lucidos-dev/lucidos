@@ -16,10 +16,11 @@
 //! A workspace slug can never start with the sigil (slugs are `[a-z0-9-]`), so
 //! the first path segment is unambiguous with no reserved-word list.
 
+use crate::boot_failure::BootFailure;
 use crate::boot_phase::{self, BootPhase};
 use crate::error::ApiError;
 use crate::net_config;
-use crate::postgres::{self, PgBackend, PgHandle};
+use crate::postgres::{self, PgBackend, PgHandle, ProvisionError, ProvisionErrorKind};
 use crate::proxy;
 use crate::registry::{self, Registry, Workspace, SIGIL};
 use crate::stack::{self, Health, ProbeOutcome, StackRuntime, WorkspaceStatus};
@@ -94,9 +95,16 @@ const SUPERVISE_INTERVAL: Duration = Duration::from_secs(2);
 /// migrations, and embedding-model warmup, which can take tens of seconds — so a
 /// still-booting engine must NOT be respawned out from under itself.
 const BOOT_GRACE: Duration = Duration::from_secs(120);
-/// Minimum gap between respawn attempts for one stack (crash backoff).
+/// Minimum gap between respawn attempts for one stack (crash backoff), and the
+/// gap before the FIRST retry (see [`respawn_backoff`]).
 const RESPAWN_BACKOFF: Duration = Duration::from_secs(5);
+/// Ceiling on the grown [`respawn_backoff`], so a workspace waiting out a long
+/// external outage still re-checks about once a minute.
+const RESPAWN_BACKOFF_MAX: Duration = Duration::from_secs(60);
 /// Auto-respawn attempts (since last healthy) before a stack is marked unhealthy.
+/// Counts EVERY bring-up attempt, a failed Postgres provision included: a
+/// workspace that cannot get a database is no more startable than one whose
+/// engine keeps exiting, and both are bounded by the same budget.
 const RESTART_CAP: u32 = 5;
 /// Consecutive missed probes before respawning an engine whose process has
 /// EXITED (crash recovery). Small: a real death should recover promptly. An
@@ -106,9 +114,11 @@ const DEAD_MISS_THRESHOLD: u32 = 2;
 /// How long a workspace may sit in the boot window (continuously non-healthy
 /// since its boot phase was first set) before the boot splash escapes to the
 /// manual "Back to workspaces" page (see [`proxy::stalled_page`]). Must exceed a
-/// legitimate slow first-run boot: `BOOT_GRACE` (120s) plus migrations, the
-/// memory-model download (the splash label warns "this can take a minute"), and
-/// recovery. The escape is needed because an alive-but-unreachable engine (e.g. a
+/// legitimate slow first-run boot: `BOOT_GRACE` (120s) plus migrations and
+/// recovery. (The embedding model is NOT part of that budget: it loads in the
+/// background and boot never waits on it, so a cold-cache first run reaches
+/// healthy just as fast as a warm one.) The escape is needed because an
+/// alive-but-unreachable engine (e.g. a
 /// misconfigured bind, network partition) is NEVER marked `Unhealthy`
 /// ([`respawn_decision`] never culls an alive process), so without a time budget
 /// the splash would meta-refresh forever with no way out.
@@ -203,15 +213,19 @@ struct GatewayInner {
     /// healthy / stopped so a later cold open never shows a stale phase. Mirrors
     /// the `routes` map (cheap `RwLock`, off the stack-mutex path).
     boot_phases: RwLock<HashMap<String, BootProgress>>,
-    /// id → the engine's TERMINAL boot-failure message, set via the `boot-failure`
-    /// control endpoint. Present means "this boot cannot succeed": the splash
-    /// renders the message instead of a phase label and the supervisor stops
-    /// respawning. Deliberately a SEPARATE map from `boot_phases` rather than a
-    /// field on [`BootProgress`], because `MarkUnhealthy` clears the phase on
-    /// purpose (a stale label would lie about a dead engine) and that is exactly
-    /// the moment the failure message must survive. Cleared only when the
-    /// workspace boots healthy or is stopped.
-    boot_failures: RwLock<HashMap<String, String>>,
+    /// id → why this workspace's boot attempt failed ([`crate::boot_failure`]).
+    /// Two producers write it: the engine's `boot-failure` control endpoint
+    /// (always terminal), and a failed Postgres provision here in the gateway
+    /// (terminal or retrying, per [`ProvisionErrorKind`]). A **terminal** entry
+    /// means "this boot cannot succeed": the splash renders the message with no
+    /// refresh and the supervisor stops respawning. A **retrying** one is the
+    /// splash label while the gateway works through its budget. Deliberately a
+    /// SEPARATE map from `boot_phases` rather than a field on [`BootProgress`],
+    /// because `MarkUnhealthy` clears the phase on purpose (a stale label would
+    /// lie about a dead engine) and that is exactly the moment the failure must
+    /// survive. Cleared only when the workspace boots healthy, is stopped, or a
+    /// fresh attempt begins.
+    boot_failures: RwLock<HashMap<String, BootFailure>>,
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
@@ -291,43 +305,58 @@ impl GatewayState {
         }
     }
 
-    /// Record a terminal boot failure for `id` (see [`GatewayInner::boot_failures`]).
+    /// Record a boot failure for `id` (see [`GatewayInner::boot_failures`]).
     /// Called by the `boot-failure` control endpoint when a dying engine reports
-    /// why its boot cannot succeed.
-    pub fn set_boot_failure(&self, id: &str, message: &str) {
-        if let Ok(mut f) = self.inner.boot_failures.write() {
-            f.insert(id.to_string(), message.to_string());
-        }
+    /// why its boot cannot succeed (always terminal), and by the provisioning
+    /// paths here when Postgres could not be brought up (terminal or retrying).
+    pub fn set_boot_failure(&self, id: &str, failure: BootFailure) {
         crate::log!(
-            "[Gateway] '{}' reported a terminal boot failure: {}",
+            "[Gateway] '{}' boot failure ({}): {}",
             id,
-            message
+            if failure.is_terminal() {
+                "terminal"
+            } else {
+                "retrying"
+            },
+            failure.message()
         );
+        if let Ok(mut f) = self.inner.boot_failures.write() {
+            f.insert(id.to_string(), failure);
+        }
     }
 
-    /// Drop any terminal boot failure for `id`. Called ONLY when the workspace
-    /// boots healthy or is stopped — never from `MarkUnhealthy`, which is the
-    /// state the message exists to explain.
+    /// Drop any boot failure for `id`. Called when the workspace boots healthy,
+    /// is stopped, or a fresh attempt begins. Never from `MarkUnhealthy`, which
+    /// is the state the message exists to explain.
     fn clear_boot_failure(&self, id: &str) {
         if let Ok(mut f) = self.inner.boot_failures.write() {
             f.remove(id);
         }
     }
 
-    /// The terminal boot-failure message for `id`, if one was reported this boot.
-    fn boot_failure(&self, id: &str) -> Option<String> {
+    /// The boot failure recorded for `id` this boot episode, if any.
+    fn boot_failure(&self, id: &str) -> Option<BootFailure> {
         self.inner.boot_failures.read().ok()?.get(id).cloned()
     }
 
-    /// The boot-splash label for `id` — the current phase's label, or the default
-    /// when no phase is known yet (initial paint / between boots).
-    fn boot_phase_label(&self, id: &str) -> &'static str {
-        self.inner
+    /// The boot-splash label for `id`: a RETRYING boot failure's message (the
+    /// reason plus how far through the budget we are), else the current phase's
+    /// label, else the default when no phase is known yet (initial paint /
+    /// between boots).
+    ///
+    /// A retrying failure outranks the phase because the phase is what we were
+    /// doing when it failed, and repeating "Provisioning database…" while the
+    /// gateway waits out a backoff is precisely the opaque splash this narration
+    /// exists to avoid. A TERMINAL failure never reaches here: the caller routes
+    /// it to [`proxy::failed_page`], which drops the auto-refresh.
+    fn boot_splash_label(&self, id: &str) -> String {
+        let phase = self
+            .inner
             .boot_phases
             .read()
             .ok()
-            .and_then(|p| p.get(id).map(|bp| bp.phase.label()))
-            .unwrap_or(boot_phase::DEFAULT_LABEL)
+            .and_then(|p| p.get(id).map(|bp| bp.phase));
+        splash_label(self.boot_failure(id).as_ref(), phase)
     }
 
     /// How long `id`'s current boot window has been open, or `None` when there is
@@ -602,8 +631,15 @@ impl GatewayState {
     }
 
     /// Provision Postgres + adopt-or-spawn the engine for one workspace, then
-    /// register its runtime stack + route. Never panics; a failure yields an
-    /// `Unhealthy` stack carrying the error (surfaced in the picker).
+    /// register its runtime stack + route. Never panics.
+    ///
+    /// A failure yields a stack whose shape depends on whether retrying it is
+    /// worth anything ([`provision_failure_action`]): a **retryable** one stays
+    /// `Booting` and supervised, so the health monitor works through the restart
+    /// budget with backoff; a **terminal** one latches `Unhealthy` immediately
+    /// (the picker's Retry / delete is the escape). Either way the reason is
+    /// recorded as a boot failure so the splash can explain itself instead of
+    /// sitting on the neutral default. See ADR 0014, 2026-08-03 addendum.
     async fn bring_up(&self, ws: Workspace) {
         let resolved_dir = ws.resolve_dir(self.app_data());
         if let Err(e) = std::fs::create_dir_all(resolved_dir.join("data")) {
@@ -625,19 +661,29 @@ impl GatewayState {
             },
             Err(e) => {
                 crate::log!("[Gateway] workspace '{}' failed to start: {}", ws.id, e);
-                // Start failed — drop any phase so the splash shows the neutral
-                // default rather than a stale "Provisioning database…".
-                self.clear_boot_phase(&ws.id);
+                // This was attempt 1 of the budget.
+                let attempts = 1;
+                let latch = self.record_provision_failure(&ws.id, &e, attempts)
+                    == ProvisionFailureAction::Latch;
                 StackRuntime {
                     ws: ws.clone(),
                     resolved_dir,
                     pg: PgHandle::External,
                     engine: None,
-                    health: Health::Unhealthy,
-                    restart_attempts: RESTART_CAP,
+                    // A retryable failure must stay OUT of `Unhealthy`: the
+                    // supervisor skips an unhealthy stack entirely, so that state
+                    // is the latch, not merely a label.
+                    health: if latch {
+                        Health::Unhealthy
+                    } else {
+                        Health::Booting
+                    },
+                    restart_attempts: if latch { RESTART_CAP } else { attempts },
                     health_misses: 0,
-                    last_spawn: None,
-                    last_error: Some(e.to_string()),
+                    // Dates the attempt either way, so the first retry waits out
+                    // a full backoff instead of firing on the next 2s tick.
+                    last_spawn: Some(Instant::now()),
+                    last_error: Some(e.message),
                     last_unread: None,
                 }
             }
@@ -652,13 +698,51 @@ impl GatewayState {
         crate::log!("[Gateway] workspace '{}' engine on :{}", ws.id, ws.port);
     }
 
+    /// Record a failed provisioning attempt for `id` and report whether the
+    /// workspace must now latch. Shared by the FIRST attempt ([`Self::bring_up`])
+    /// and every retry ([`Self::respawn_stack`]), so the two cannot drift into
+    /// classifying or narrating the same failure differently.
+    ///
+    /// `attempts` is how many bring-up attempts have been made since the stack
+    /// was last healthy, this one included.
+    fn record_provision_failure(
+        &self,
+        id: &str,
+        e: &ProvisionError,
+        attempts: u32,
+    ) -> ProvisionFailureAction {
+        let action = provision_failure_action(e.kind, attempts);
+        self.set_boot_failure(
+            id,
+            match action {
+                ProvisionFailureAction::Latch => BootFailure::terminal(&e.message),
+                ProvisionFailureAction::Retry => {
+                    BootFailure::retrying(&e.message, attempts, RESTART_CAP)
+                }
+            },
+        );
+        if action == ProvisionFailureAction::Latch {
+            // Nothing more will be attempted, so a phase label would only
+            // describe a step that is not running. The failure message is what
+            // the splash renders now.
+            self.clear_boot_phase(id);
+        }
+        action
+    }
+
     /// Ensure Postgres, then adopt a healthy already-running engine or spawn a
     /// fresh one.
+    ///
+    /// The error carries a [`ProvisionErrorKind`] so [`Self::bring_up`] can tell
+    /// a condition that will clear from one that never will. A failure to spawn
+    /// the engine binary arrives through the `From<BoxError>` default, i.e.
+    /// retryable, which matches what [`Self::respawn_stack`] already does with a
+    /// spawn error.
     async fn provision_and_start(
         &self,
         ws: &Workspace,
         resolved_dir: &Path,
-    ) -> Result<(PgHandle, Option<std::process::Child>, Health), BoxError> {
+    ) -> Result<(PgHandle, Option<std::process::Child>, Health), ProvisionError> {
         // First splash phase: provisioning Postgres can pull/start a container or
         // run `initdb` on a first-ever open.
         self.set_boot_phase(&ws.id, BootPhase::ProvisioningDatabase);
@@ -686,7 +770,11 @@ impl GatewayState {
             &prov.database_url,
             self.inner.gateway_port,
             self.inner.engine_loopback,
-        )?;
+        )
+        // Retryable, matching what `respawn_stack` already does with a spawn
+        // error: the common causes (a binary mid-rebuild, a transient resource
+        // limit) clear on their own, and the budget bounds the rest.
+        .map_err(|e| ProvisionError::transient(format!("could not spawn the engine: {e}")))?;
         // Engine process is up; it now reports finer phases (migrating, building
         // search index, recovering) via the boot-phase control endpoint until its
         // first healthy probe clears the phase.
@@ -1059,7 +1147,10 @@ impl GatewayState {
         }
     }
 
-    async fn ensure_postgres(&self, ws: &Workspace) -> Result<postgres::Provisioned, BoxError> {
+    async fn ensure_postgres(
+        &self,
+        ws: &Workspace,
+    ) -> Result<postgres::Provisioned, ProvisionError> {
         let _guard = self.inner.pg_lock.lock().await;
         postgres::ensure(
             &self.inner.pg_backend,
@@ -1249,12 +1340,26 @@ impl GatewayState {
         s.health_misses = 0;
 
         self.set_boot_phase(&s.ws.id, BootPhase::ProvisioningDatabase);
-        // Fresh attempt — see the matching clear in `bring_up`.
+        // Fresh attempt, so the previous attempt's reason no longer describes
+        // anything. See the matching clear in `provision_and_start`.
         self.clear_boot_failure(&s.ws.id);
         let prov = match self.ensure_postgres(&s.ws).await {
             Ok(p) => p,
             Err(e) => {
-                s.last_error = Some(format!("postgres: {e}"));
+                // Same classification and narration as the first attempt in
+                // `bring_up`: latch only what retrying cannot fix, or a spent
+                // budget. `restart_attempts` was incremented above, so it is this
+                // attempt's number.
+                s.health = match self.record_provision_failure(&s.ws.id, &e, s.restart_attempts) {
+                    ProvisionFailureAction::Latch => Health::Unhealthy,
+                    // Put the stack back under supervision, which matters when
+                    // this respawn came from the picker's Retry on an already
+                    // LATCHED workspace: leaving it `Unhealthy` would make the
+                    // supervisor skip it again, and the retrying message we just
+                    // recorded would promise attempts that never come.
+                    ProvisionFailureAction::Retry => Health::Booting,
+                };
+                s.last_error = Some(format!("postgres: {}", e.message));
                 return;
             }
         };
@@ -1393,7 +1498,10 @@ impl GatewayState {
                 since_spawn,
                 s.health_misses,
                 s.restart_attempts,
-                boot_failure.is_some(),
+                // Only a TERMINAL failure short-circuits. A retrying one is the
+                // gateway narrating its own backoff; treating it as terminal
+                // would latch exactly the workspace it exists to keep alive.
+                boot_failure.as_ref().is_some_and(BootFailure::is_terminal),
             ) {
                 // Healthy is handled above; treat defensively as a no-op.
                 SuperviseAction::Healthy => {}
@@ -1402,18 +1510,26 @@ impl GatewayState {
                 SuperviseAction::Wait => {}
                 SuperviseAction::MarkUnhealthy => {
                     s.health = Health::Unhealthy;
-                    // Gave up auto-respawning — drop the phase; the last label
-                    // would otherwise lie ("Downloading memory model…" on a dead
+                    // Gave up auto-respawning, so drop the phase: the last label
+                    // would otherwise lie ("Running migrations…" on a dead
                     // engine). The splash falls back to the neutral default, or to
                     // the reported failure when we have one (`boot_failures` is
                     // deliberately NOT cleared here — it outlives the phase).
                     self.clear_boot_phase(&t.id);
                     match &boot_failure {
-                        // A reported cause always beats the generic "gave up"
+                        // A recorded cause always beats the generic "gave up"
                         // string, including one an earlier probe already set —
                         // this is the specific, actionable text, and it doubles as
-                        // the picker's health-dot tooltip.
-                        Some(message) => s.last_error = Some(message.clone()),
+                        // the picker's health-dot tooltip. A retrying failure is
+                        // promoted first: the budget is spent, so the splash must
+                        // stop auto-refreshing under a promise of another attempt.
+                        Some(failure) => {
+                            let final_failure = failure.gave_up(s.restart_attempts);
+                            s.last_error = Some(final_failure.message());
+                            if !failure.is_terminal() {
+                                self.set_boot_failure(&t.id, final_failure);
+                            }
+                        }
                         None if s.last_error.is_none() => {
                             s.last_error = Some(
                                 "engine failed to become healthy after repeated restarts"
@@ -1423,13 +1539,18 @@ impl GatewayState {
                         None => {}
                     }
                     crate::log!(
-                        "[Gateway] '{}' marked unhealthy after {} restarts{}",
+                        "[Gateway] '{}' marked unhealthy after {} attempts{}",
                         t.id,
                         s.restart_attempts,
-                        if boot_failure.is_some() {
-                            " (terminal boot failure — not retrying)"
-                        } else {
-                            ""
+                        // Which of the two ways to stop this was. A reported
+                        // terminal failure short-circuits the budget, so saying
+                        // "not retried" of a workspace that simply ran out of
+                        // attempts would send the reader hunting for a report
+                        // that was never made.
+                        match &boot_failure {
+                            Some(f) if f.is_terminal() => " (terminal boot failure, not retried)",
+                            Some(_) => " (retry budget spent)",
+                            None => "",
                         }
                     );
                 }
@@ -1549,7 +1670,7 @@ fn respawn_decision(
         };
     }
     // The process has EXITED — crash recovery. Respawn with backoff + cap.
-    if since_spawn < RESPAWN_BACKOFF {
+    if since_spawn < respawn_backoff(restart_attempts) {
         return SuperviseAction::Wait;
     }
     if misses < DEAD_MISS_THRESHOLD {
@@ -1559,6 +1680,77 @@ fn respawn_decision(
         return SuperviseAction::MarkUnhealthy;
     }
     SuperviseAction::Respawn
+}
+
+/// Which of the two boot-window narrations the splash shows, given what is
+/// recorded for a workspace. Pure half of [`GatewayState::boot_splash_label`].
+///
+/// A RETRYING failure wins: it is strictly more informative than the phase (it
+/// carries the phase's failure AND how far through the budget we are), and a
+/// phase label alone during a backoff is the opaque splash this narration exists
+/// to replace. A TERMINAL failure is not rendered here at all; the caller sends
+/// it to [`proxy::failed_page`] instead, so a `None` phase alongside one still
+/// falls through to the neutral default rather than silently borrowing the
+/// terminal text into an auto-refreshing page.
+fn splash_label(failure: Option<&BootFailure>, phase: Option<BootPhase>) -> String {
+    match failure.filter(|f| !f.is_terminal()) {
+        Some(retrying) => retrying.message(),
+        None => phase
+            .map(BootPhase::label)
+            .unwrap_or(boot_phase::DEFAULT_LABEL)
+            .to_string(),
+    }
+}
+
+/// How long to wait before the next attempt at a stack that has already failed
+/// `restart_attempts` times since it was last healthy: [`RESPAWN_BACKOFF`]
+/// doubling per attempt, capped at [`RESPAWN_BACKOFF_MAX`].
+///
+/// The first gap is unchanged (5s), so a one-off engine crash still recovers as
+/// promptly as it always did. The growth matters for a *repeating* failure,
+/// which is now retried rather than latched on the first miss: without it, a
+/// workspace waiting for Docker Desktop would re-run the whole provisioning
+/// sequence (several `docker` invocations) every five seconds. Growth also buys
+/// the retry budget a longer wall-clock reach, which is the point: the budget
+/// has to outlast a cold Docker Desktop start, not just five ticks.
+fn respawn_backoff(restart_attempts: u32) -> Duration {
+    // Shift-clamped before the multiply: 2^6 * 5s is already past the cap, so
+    // anything beyond that would only risk an overflow for no behavior change.
+    let grown = RESPAWN_BACKOFF
+        .as_secs()
+        .saturating_mul(1u64 << restart_attempts.min(6));
+    Duration::from_secs(grown.min(RESPAWN_BACKOFF_MAX.as_secs()))
+}
+
+/// What the gateway does with a stack whose provisioning attempt just failed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ProvisionFailureAction {
+    /// Leave the stack supervised so the health monitor tries again after a
+    /// backoff.
+    Retry,
+    /// Mark it `Unhealthy` and stop: nothing further will be attempted until the
+    /// user retries from the picker.
+    Latch,
+}
+
+/// Whether a failed provisioning attempt is worth another try.
+///
+/// Two ways to stop. A **terminal** failure latches on the first attempt, for
+/// the same reason a reported terminal boot failure does (ADR 0014, 2026-07-29):
+/// retrying re-runs the identical failure, so burning the budget first only
+/// delays the message. Otherwise the budget itself is the bound: `attempts`
+/// counts every bring-up attempt since the stack was last healthy, and once it
+/// reaches [`RESTART_CAP`] the workspace latches with the last cause.
+///
+/// Pure, so the boundary is exhaustively testable: this is what stops the
+/// 2026-08-03 bug (one transient Docker error latching a workspace dead for the
+/// gateway's lifetime) from being reintroduced in either direction.
+fn provision_failure_action(kind: ProvisionErrorKind, attempts: u32) -> ProvisionFailureAction {
+    if kind == ProvisionErrorKind::Terminal || attempts >= RESTART_CAP {
+        ProvisionFailureAction::Latch
+    } else {
+        ProvisionFailureAction::Retry
+    }
 }
 
 /// Whether a stack's engine process is currently alive. For an engine this
@@ -1965,12 +2157,15 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // Non-document traffic (API/SSE/assets from an already-open tab) still
             // proxies; the frontend owns its own disconnected recovery.
             if is_document_navigation(&req) {
-                // A reported TERMINAL failure outranks the time budget: we already
-                // know why this workspace will never come up, so say so now rather
-                // than making the user wait out BOOT_ESCAPE_BUDGET for a page that
-                // only says "taking longer than expected".
-                if let Some(message) = state.boot_failure(&slug) {
-                    return proxy::failed_page(&message);
+                // A TERMINAL failure outranks the time budget: we already know why
+                // this workspace will never come up, so say so now rather than
+                // making the user wait out BOOT_ESCAPE_BUDGET for a page that only
+                // says "taking longer than expected". A RETRYING one deliberately
+                // does not land here: it is rendered as the ordinary splash's
+                // label below, which keeps the auto-refresh that carries the user
+                // into the workspace the moment an attempt succeeds.
+                if let Some(failure) = state.boot_failure(&slug).filter(|f| f.is_terminal()) {
+                    return proxy::failed_page(&failure.message());
                 }
                 if boot_window_stalled(state.boot_elapsed(&slug)) {
                     return proxy::stalled_page();
@@ -1981,10 +2176,10 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             // it's still Booting — so a cold-open navigation lands HERE, not on
             // the no-route branch below. Pass the current boot phase so the
             // proxy's connect-failure splash narrates the engine-reported phases
-            // (migrating → downloading memory model → recovering); a transient
-            // restart of a live workspace simply has no phase set (default).
-            let boot_label = state.boot_phase_label(&slug);
-            proxy::proxy(&state.inner.proxy_client, &target, &slug, boot_label, req).await
+            // (migrating → recovering); a transient restart of a live workspace
+            // simply has no phase set (default).
+            let boot_label = state.boot_splash_label(&slug);
+            proxy::proxy(&state.inner.proxy_client, &target, &slug, &boot_label, req).await
         }
         None => {
             // No live route. If the slug is a registered-but-stopped workspace
@@ -2012,7 +2207,7 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
                     // Label reflects the current boot phase (default until the
                     // background lazy-start records one); the 2s meta-refresh
                     // picks up later phases.
-                    return proxy::starting_page(state.boot_phase_label(&slug));
+                    return proxy::starting_page(&state.boot_splash_label(&slug));
                 }
                 return (
                     StatusCode::SERVICE_UNAVAILABLE,
@@ -2775,6 +2970,170 @@ mod tests {
                 RESTART_CAP
             ),
             SuperviseAction::MarkUnhealthy
+        );
+    }
+
+    // ── Provisioning-failure retry policy ──────────────────────────────────
+    // 2026-08-03: the gateway autostarted before Docker Desktop had created its
+    // daemon socket. `bring_up` built its failure stack with
+    // `restart_attempts: RESTART_CAP` and `health: Unhealthy`, so one transient
+    // error latched both workspaces dead for the gateway's lifetime, splash stuck
+    // on "Provisioning database…". These pin the fix in both directions: a
+    // transient failure is retried, a terminal one still is not, and the retry is
+    // bounded and backed off.
+
+    #[test]
+    fn a_transient_provisioning_failure_is_retried() {
+        assert_eq!(
+            provision_failure_action(ProvisionErrorKind::Transient, 1),
+            ProvisionFailureAction::Retry,
+            "one Docker hiccup must not be a permanent verdict"
+        );
+    }
+
+    #[test]
+    fn a_terminal_provisioning_failure_latches_on_the_first_attempt() {
+        // Same reasoning as a reported terminal boot failure (ADR 0014,
+        // 2026-07-29): the retry re-runs the identical failure, so spending the
+        // budget first only delays the message the user needs.
+        assert_eq!(
+            provision_failure_action(ProvisionErrorKind::Terminal, 1),
+            ProvisionFailureAction::Latch
+        );
+    }
+
+    #[test]
+    fn provisioning_retries_are_bounded_by_the_restart_cap() {
+        // Walk the loop the supervisor actually walks: attempt 1 is `bring_up`,
+        // each later one a `respawn_stack`. It must stop, and stop at the budget.
+        let mut attempts = 1;
+        while provision_failure_action(ProvisionErrorKind::Transient, attempts)
+            == ProvisionFailureAction::Retry
+        {
+            attempts += 1;
+            assert!(
+                attempts <= RESTART_CAP,
+                "retry loop ran past the budget at attempt {attempts}"
+            );
+        }
+        assert_eq!(
+            attempts, RESTART_CAP,
+            "the budget must be spent in full before latching"
+        );
+    }
+
+    #[test]
+    fn the_stack_a_transient_failure_leaves_behind_is_one_the_supervisor_respawns() {
+        // The other half of the latch was `health: Unhealthy`, which makes
+        // `supervise_once` skip the stack before it ever probes. `bring_up` now
+        // leaves `Booting` / `restart_attempts: 1` / no engine process; assert
+        // that shape reaches `Respawn` once the backoff and miss threshold pass.
+        let attempts = 1;
+        assert_eq!(
+            decide(
+                ProbeOutcome::Unreachable,
+                false, // no engine was spawned, so nothing is alive
+                respawn_backoff(attempts) + Duration::from_secs(1),
+                DEAD_MISS_THRESHOLD,
+                attempts,
+            ),
+            SuperviseAction::Respawn
+        );
+    }
+
+    #[test]
+    fn a_retry_waits_out_its_backoff_before_running_docker_again() {
+        // Provisioning shells out to `docker` several times per attempt, so the
+        // gate has to hold even with misses piled up.
+        let attempts = 3;
+        assert_eq!(
+            decide(
+                ProbeOutcome::Unreachable,
+                false,
+                respawn_backoff(attempts) - Duration::from_secs(1),
+                999,
+                attempts,
+            ),
+            SuperviseAction::Wait
+        );
+    }
+
+    #[test]
+    fn respawn_backoff_grows_from_the_old_flat_gap_up_to_the_cap() {
+        // The first gap is unchanged, so a one-off engine crash recovers exactly
+        // as promptly as it did before retries existed.
+        assert_eq!(respawn_backoff(0), RESPAWN_BACKOFF);
+        // Then it doubles, and never shrinks or overflows however many attempts
+        // are claimed.
+        let mut previous = respawn_backoff(0);
+        for attempts in 1..=64u32 {
+            let gap = respawn_backoff(attempts);
+            assert!(gap >= previous, "backoff shrank at attempt {attempts}");
+            assert!(gap <= RESPAWN_BACKOFF_MAX, "backoff blew the cap");
+            previous = gap;
+        }
+        assert_eq!(respawn_backoff(1), Duration::from_secs(10));
+        assert_eq!(respawn_backoff(u32::MAX), RESPAWN_BACKOFF_MAX);
+    }
+
+    #[test]
+    fn the_retry_budget_outlasts_a_cold_docker_desktop_start() {
+        // The reason the budget is spent over grown gaps rather than five 5s ones:
+        // it has to still be trying when Docker Desktop finishes starting. Sum the
+        // gaps the supervisor will actually wait, attempt 1 (bring_up) onward.
+        let window: Duration = (1..RESTART_CAP).map(respawn_backoff).sum();
+        assert!(
+            window >= Duration::from_secs(120),
+            "retry window {window:?} is too short to outlast a Docker Desktop cold start"
+        );
+    }
+
+    // ── Boot-failure disposition ───────────────────────────────────────────
+
+    #[test]
+    fn only_a_terminal_boot_failure_stops_the_supervisor() {
+        // The retrying failure is the gateway narrating its own backoff. Reading
+        // it as terminal would latch precisely the workspace it exists to keep
+        // alive, which is the 2026-08-03 bug wearing a different hat.
+        let retrying = BootFailure::retrying("The Docker daemon is not running yet.", 2, 5);
+        assert!(!retrying.is_terminal());
+        assert_eq!(
+            respawn_decision(
+                ProbeOutcome::Unreachable,
+                false,
+                established(),
+                DEAD_MISS_THRESHOLD,
+                2,
+                retrying.is_terminal(),
+            ),
+            SuperviseAction::Respawn
+        );
+        assert!(BootFailure::terminal("A newer Lucidos migrated this database.").is_terminal());
+    }
+
+    #[test]
+    fn a_retrying_failure_is_what_the_splash_says() {
+        // The secondary half of the 2026-08-03 bug: the failure arm cleared the
+        // phase and set nothing, so the splash sat on "Workspace starting…" while
+        // the actual reason was buried in the picker's tooltip.
+        let retrying = BootFailure::retrying("The Docker daemon is not running yet.", 2, 5);
+        assert_eq!(
+            splash_label(Some(&retrying), Some(BootPhase::ProvisioningDatabase)),
+            "The Docker daemon is not running yet. Retrying… (attempt 2 of 5)",
+            "the reason must outrank the phase it failed during"
+        );
+        // No failure: unchanged phase narration.
+        assert_eq!(
+            splash_label(None, Some(BootPhase::Migrating)),
+            BootPhase::Migrating.label()
+        );
+        assert_eq!(splash_label(None, None), boot_phase::DEFAULT_LABEL);
+        // A terminal failure is rendered by `failed_page`, never as an
+        // auto-refreshing label.
+        let terminal = BootFailure::terminal("A newer Lucidos migrated this database.");
+        assert_eq!(
+            splash_label(Some(&terminal), None),
+            boot_phase::DEFAULT_LABEL
         );
     }
 

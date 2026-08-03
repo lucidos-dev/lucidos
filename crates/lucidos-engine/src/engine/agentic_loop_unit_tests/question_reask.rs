@@ -30,10 +30,15 @@ mod question_reask_tests {
     }
 
     #[test]
-    fn cap_is_bounded_and_below_iteration_cap() {
+    fn cap_is_bounded_and_below_the_default_tool_call_cap() {
         // Sanity: the re-ask cap is a small positive bound, far under the outer
-        // MAX_ITERATIONS backstop. Both operands are consts, so assert at compile time.
+        // tool-call backstop. Both operands are consts, so assert at compile time.
+        //
+        // This guards the DEFAULT cap, not the configured one: the tool-call cap
+        // is a user setting with no ceiling and a floor of 1, so a user who sets
+        // it to 1 has deliberately chosen for the backstop to fire before this
+        // guard. What must not drift is the unconfigured relationship.
         const { assert!(MAX_QUESTION_REASK >= 1) };
-        const { assert!(MAX_QUESTION_REASK < super::super::MAX_ITERATIONS) };
+        const { assert!(MAX_QUESTION_REASK < crate::core::DEFAULT_MAX_TOOL_CALLS) };
     }
 }

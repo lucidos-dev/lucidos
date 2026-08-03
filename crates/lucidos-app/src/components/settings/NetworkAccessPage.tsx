@@ -159,7 +159,6 @@ export function NetworkAccessPage() {
               <input
                 class="device-name-input"
                 type="text"
-                inputMode="numeric"
                 placeholder={placeholder}
                 value={address}
                 aria-invalid={addressInvalid}

@@ -186,6 +186,9 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // ToolResult already covers that for the started case, and
         // completion happens outside any LLM turn).
         "BackgroundBashStarted" | "BackgroundBashCompleted" => EventClass::Metadata,
+        // Command-guard checkpoint lifecycle: a pure card / audit projection,
+        // so neither bumps status or activity (ADR 0002, Phase 4).
+        "CommandCheckpointed" | "CommandCheckpointReverted" => EventClass::Metadata,
         "CodingAgentTextStreamed"
         | "CodingAgentThoughtStreamed"
         | "CodingAgentToolCalled"
@@ -315,6 +318,9 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         "BackgroundBashCompleted",
         // Engine-internal Flash enrichment for MessageReceived images.
         "ImageDescribed",
+        // Command-guard checkpoint lifecycle (ADR 0002, Phase 4).
+        "CommandCheckpointed",
+        "CommandCheckpointReverted",
     ]
 }
 
@@ -542,7 +548,16 @@ pub fn resolve_transition(
         // attached images. Emitted one or more iterations after the
         // originating MessageReceived (which already moved the section);
         // a transition here would re-open a thread the user just settled.
-        | "ImageDescribed" => no_change,
+        | "ImageDescribed"
+        // Command-guard checkpoint lifecycle (ADR 0002, Phase 4). Both are
+        // mid-turn bookkeeping over an Undo card: the checkpoint is taken while
+        // the turn is already running, and the revert is a button on that card.
+        // Neither moves the section or the status. Without these entries the bus
+        // rejected the typed emit, so the events never persisted, the Undo card
+        // never rendered, and every guarded command leaked its git checkpoint
+        // ref because only the undo path deletes it.
+        | "CommandCheckpointed"
+        | "CommandCheckpointReverted" => no_change,
         _ => violation("Unknown event type"),
     }?;
 
@@ -664,8 +679,7 @@ pub fn is_blocking(
 
 /// A thread "needs attention" iff its state requires a user action to
 /// progress. Same shape as `is_blocking` but DROPS the `Running` clause:
-/// a running descendant is delegated work (belongs to Active), not pending
-/// attention (would belong to Review).
+/// a running descendant is delegated work, not pending attention.
 ///
 /// Concretely:
 /// - `WaitingForUserAnswer` — user must answer the question / permission
@@ -675,11 +689,14 @@ pub fn is_blocking(
 ///   carve-out as `is_blocking` clause 3.
 ///
 /// Drives `thread_summaries.attention_descendant_count`, which bubbles
-/// transitively up the ancestor chain so any thread with a
-/// "needs-attention" descendant routes to Review via `display_section`.
+/// transitively up the ancestor chain, so a thread with a "needs-attention"
+/// descendant is kept in `DisplaySection::Current` by `display_section` even
+/// once archived. Running and attention-needing threads share that one
+/// section; what separates them in the UI is the per-row status icon versus
+/// the attention badge and its drawer filter, both fed by this count.
 /// Relationship: `is_blocking = is_attention_needing OR status == Running`.
 /// `Archive`-button gating still uses `is_blocking` so a Running descendant
-/// keeps the button hidden — only the section routing splits them.
+/// keeps the button hidden.
 ///
 /// **SQL mirrors** — keep in sync when the predicate changes:
 /// - `event_bus_projection_propagation.rs::rebuild_blocking_descendant_count`

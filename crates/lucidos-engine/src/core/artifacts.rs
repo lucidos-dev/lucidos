@@ -167,6 +167,18 @@ impl ArtifactManager {
         })
     }
 
+    /// The shared repo handle, for tests that need to stall a commit in flight.
+    /// Every commit method below locks it, so holding it parks an in-flight
+    /// snapshot exactly where two concurrent artifact commits park each other,
+    /// with no test-only branch in the production path. Used by
+    /// `a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish`
+    /// to keep [`Self::commit_all_dirty`]'s blocking closure running after its
+    /// caller has walked away.
+    #[cfg(test)]
+    pub(crate) fn repo_handle_for_test(&self) -> Arc<Mutex<Repository>> {
+        self.repo.clone()
+    }
+
     fn write_artifact(
         &self,
         relative_path: &str,
@@ -387,10 +399,31 @@ impl ArtifactManager {
 
     /// Stage and commit all dirty files under data/ (artifacts, apps, etc.).
     /// Returns Some(commit_sha) if there were changes, None if clean.
+    ///
+    /// Holds `REPO_WORKTREE_MUTEX` for the real lifetime of the snapshot.
+    /// Staging all of `data/` records anything missing from the working tree as a
+    /// deletion, so a snapshot taken while a merge has published `main` but not
+    /// yet synced the repo root commits the just-merged files as deleted, onto
+    /// main. The guard is MOVED INTO the blocking closure rather than held around
+    /// the `await`, because `spawn_blocking` cannot be cancelled: a caller whose
+    /// future is dropped (the 30s ceiling in `Engine::commit_dirty_logged`, or
+    /// any other cancellation) would otherwise free the exclusion with this
+    /// closure still writing the index.
+    ///
+    /// The lock lives here rather than at the call site so no caller can forget
+    /// it or scope it too narrowly, and for that reason a caller must NOT hold
+    /// `REPO_WORKTREE_MUTEX` across this call. The single-path commit helpers
+    /// above deliberately take no lock at all: they stage one named path onto the
+    /// current head, so they cannot record an unrelated deletion.
     pub async fn commit_all_dirty(&self, message: &str) -> Result<Option<String>, git2::Error> {
+        let worktree_guard = crate::engine::git_ops::lock_repo_worktree_owned().await;
         let repo = self.repo.clone();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
+            // Rebound so it is captured by the closure and dropped when the
+            // closure returns, on every path out of it. That drop point is the
+            // whole guarantee.
+            let _worktree_guard = worktree_guard;
             let repo = repo.lock().unwrap();
             let mut index = repo.index()?;
             super::reset_index_to_head(&repo, &mut index)?;

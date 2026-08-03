@@ -260,12 +260,29 @@ pub(super) async fn cancel_rebuild_memory(
     )
 }
 
+/// Snapshot of where the background embedding-model loader has got to.
+///
+/// The live signal is the `EmbeddingModelStatusChanged` SSE frame, but a client
+/// that loads DURING a cold first-run download (the normal case on a fresh
+/// workspace, where the download starts at engine boot and the app connects
+/// seconds later) has missed every frame so far. This is how it catches up, and
+/// it serves the identical shape.
+pub(super) async fn get_embedding_model_status(
+    State(state): State<AppState>,
+) -> Json<crate::memory::EmbeddingModelStatus> {
+    Json(state.embedder.status())
+}
+
 /// Routes for the `/memory/*` surface.
 pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/memory/stats", get(get_memory_stats))
         .route("/memory/entries", get(get_memory_entries))
         .route("/memory/source", get(get_memory_source))
+        .route(
+            "/memory/embedding-model-status",
+            get(get_embedding_model_status),
+        )
         .route(
             "/memory/rebuild",
             post(rebuild_memory).delete(cancel_rebuild_memory),

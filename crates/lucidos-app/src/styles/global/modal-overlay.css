@@ -35,10 +35,10 @@
 
 /* While the UI is blocked, nothing may float above the dim blocker except the
    toast container (--z-toast). The elements that outrank the overlay in normal
-   use all sit at the tooltip layer (--z-tooltip = 10000, kept that high so a
-   modal never clips them): the JS tooltip, a pseudo-fullscreen app iframe, and
-   the landscape-rotate lock. UiBlockingOverlay flags :root[data-ui-blocked] so
-   they step aside while blocked. */
+   use both sit at the tooltip layer (--z-tooltip = 10000, kept that high so a
+   modal never clips them): the JS tooltip and a pseudo-fullscreen app iframe.
+   UiBlockingOverlay flags :root[data-ui-blocked] so they step aside while
+   blocked. */
 
 /* Tooltip is transient — hide it outright (a ghost behind the 50% scrim would
    look broken). inert already stops new tooltips firing (the hover targets are
@@ -50,8 +50,7 @@
 /* Full-screen opaque panels: drop below the overlay (don't hide) so the dim
    scrim covers them and the toast stays visible, then they pop back to the top
    when the block ends. */
-:root[data-ui-blocked] .app-ui-inline.app-ui-fullscreen,
-:root[data-ui-blocked] .landscape-lock {
+:root[data-ui-blocked] .app-ui-inline.app-ui-fullscreen {
     z-index: calc(var(--z-modal) - 1) !important;
 }
 

@@ -35,15 +35,70 @@ fail() { echo "  FAIL: $*"; FAIL=$((FAIL+1)); }
 pass() { echo "  ok:   $*"; PASS=$((PASS+1)); }
 
 # ── seam override ──────────────────────────────────────────────────────
-# When SYNTHETIC_PS is set, the reaper samples our synthetic rows; otherwise it
-# falls back to the real `ps` so unconverted tests still work.
+# The reaper only ever samples our synthetic rows. An empty SYNTHETIC_PS means
+# "no candidates", NOT "scan the machine": this seam must never reach the real
+# `ps`, because every row it emits is a real SIGKILL target.
+#
+# It used to fall back to the real `ps`, and on 2026-08-03 that killed two
+# Claude Code sessions. A test that set SYNTHETIC_PS="" to assert "clean host
+# returns 0" fed the whole host process table into the kill path, and this suite
+# does not source ports.sh, so the is_protected_host_pid backstop was undefined
+# and its `command -v` guard skipped it. Fail closed, matching the same seam in
+# e2e_lock_test.sh.
 SYNTHETIC_PS=""
 _reaper_list_processes() {
-    if [ -n "$SYNTHETIC_PS" ]; then
-        printf '%s\n' "$SYNTHETIC_PS"
-    else
-        ps -Aww -o pid=,rss=,command= 2>/dev/null
+    [ -n "$SYNTHETIC_PS" ] || return 0
+    printf '%s\n' "$SYNTHETIC_PS"
+}
+
+# ── kill shim (ADR 0025; the ports_test.sh pattern) ────────────────────
+# Running a scripts/lib test is in the same hazard class as a broad pkill, so
+# the raw builtin may never send a lethal signal to a pid this test did not
+# spawn. A blocked attempt is recorded and FAILS the suite at exit: a guard that
+# silently swallowed the attempt would let the next selection bug read as green.
+KILL_SHIM_LOG="$SANDBOX/blocked-kills.log"
+: > "$KILL_SHIM_LOG"
+
+# A pid is the test's own if spawn_sleeper created it, or if it descends from
+# this script. The descendant arm covers the backgrounded reaper loop that
+# start_webkit_reaper forks (and the `sleep` child inside it), so
+# stop_webkit_reaper still works without the suite bookkeeping those pids by
+# hand. Anything descended from this script is by definition something this
+# script created.
+_shim_is_ours() {
+    local pid="$1" hops=0
+    case " $SPAWNED " in *" $pid "*) return 0 ;; esac
+    while [ -n "$pid" ] && [ "$pid" -gt 1 ] 2>/dev/null; do
+        [ "$pid" = "$$" ] && return 0
+        pid=$(ps -o ppid= -p "$pid" 2>/dev/null | tr -d ' ')
+        hops=$((hops + 1))
+        [ "$hops" -gt 25 ] && break
+    done
+    return 1
+}
+
+kill() {
+    local arg sig="" pids="" pid
+    for arg in "$@"; do
+        case "$arg" in
+            -*) sig="$arg" ;;
+            *)  pids="$pids $arg" ;;
+        esac
+    done
+    # A liveness probe is harmless by definition, and the reaper cannot work
+    # without it.
+    if [ "$sig" = "-0" ]; then
+        command kill "$@"
+        return $?
     fi
+    for pid in $pids; do
+        if ! _shim_is_ours "$pid"; then
+            printf '%s\n' "${sig:--TERM}:$pid" >> "$KILL_SHIM_LOG"
+            echo "  webkit_reaper_test: BLOCKED lethal kill ${sig:--TERM} to pid $pid, which this test did not spawn" >&2
+            return 1
+        fi
+    done
+    command kill "$@"
 }
 
 # ── helpers ────────────────────────────────────────────────────────────
@@ -95,6 +150,11 @@ assert_alive() {
 WEBKIT_PATH="/Users/x/Library/Caches/ms-playwright/webkit-2287/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebContent"
 CHROMIUM_PATH="/Users/x/Library/Caches/ms-playwright/chromium-1187/chrome-mac/Chromium.app/Contents/MacOS/Chromium"
 SAFARI_PATH="/Applications/Safari.app/Contents/MacOS/Safari"
+# A Claude Code process: argv[0] is the CC binary, and the matcher token appears
+# far down its argv because the engine embeds the thread history into a huge
+# --append-system-prompt. This is the exact shape that got SIGKILLed on
+# 2026-08-03, so it stays as a fixture, not just as a comment.
+CLAUDE_CODE_CMD="/Users/x/.local/bin/claude --output-format stream-json --append-system-prompt THREAD HISTORY: the leaked binary lives at ~/Library/Caches/ms-playwright/webkit-2287/com.apple.WebKit.GPU.xpc/Contents/MacOS/com.apple.WebKit.GPU.Development and reached 18.9 GB"
 
 # ── Test 1: selection — kill the over-cap WebKit match, leave the rest ──
 test_selection() {
@@ -156,6 +216,30 @@ $untagged 7340032 $WEBKIT_PATH"
 
     assert_dead  "$tagged"   "process matching custom token"
     assert_alive "$untagged" "WebKit process NOT matching custom token"
+
+    SYNTHETIC_PS=""
+}
+
+# ── Test 3b: mentioning the path is not being the process ──────────────
+# The 2026-08-03 regression. The matcher is tested against argv[0], so a process
+# that merely QUOTES the browsers-cache path somewhere in its arguments must
+# never be a candidate, however far over the cap it is. Without this the reaper
+# SIGKILLs the Claude Code session that is reading this file.
+test_argv0_only_never_matches_a_mention() {
+    echo "test: a process that only MENTIONS the browsers path is never a candidate"
+    local cc browser
+    spawn_sleeper; cc=$SLEEPER_PID
+    spawn_sleeper; browser=$SLEEPER_PID
+
+    # Both wildly over the cap. Only the one actually RUNNING a browser binary
+    # may be reaped.
+    SYNTHETIC_PS="$cc 9437184 $CLAUDE_CODE_CMD
+$browser 9437184 $WEBKIT_PATH --inspector-pipe"
+
+    E2E_WEBKIT_RSS_CAP_MB=6144 reap_once >/dev/null 2>&1
+
+    assert_alive "$cc"      "Claude Code process quoting the path in its argv"
+    assert_dead  "$browser" "real WebKit child (argv[0] under the cache)"
 
     SYNTHETIC_PS=""
 }
@@ -255,7 +339,20 @@ test_start_stop_lifecycle() {
     local loop_pid="${WEBKIT_REAPER_PID:-}"
     stop_webkit_reaper >/dev/null 2>&1
 
-    if [ -n "$loop_pid" ] && kill -0 "$loop_pid" 2>/dev/null; then
+    # stop_webkit_reaper SIGTERMs the loop, and the loop is disowned, so the
+    # `wait` inside it returns immediately rather than reaping. Signal delivery,
+    # the loop's TERM trap and its exit are all asynchronous, so poll for the
+    # exit the same bounded way assert_dead does instead of racing it.
+    local _ stopped=0
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -n "$loop_pid" ] || break
+        if ! kill -0 "$loop_pid" 2>/dev/null || is_dead "$loop_pid"; then
+            stopped=1
+            break
+        fi
+        sleep 0.1
+    done
+    if [ -n "$loop_pid" ] && [ "$stopped" != "1" ]; then
         fail "reaper loop $loop_pid still alive after stop"
     else
         pass "reaper loop stopped"
@@ -290,15 +387,51 @@ test_disable_knob() {
     fi
 }
 
+# ── Test 8: a whitespace match token disarms the guard, loudly ─────────
+test_whitespace_match_warns() {
+    echo "test: start_webkit_reaper warns when the match token contains whitespace"
+    local out_file="$SANDBOX/whitespace-warning.txt"
+    WEBKIT_REAPER_PID=""
+    SYNTHETIC_PS="99999 100 /bin/true"
+    # Redirect to a file rather than capturing with $(...): start_webkit_reaper
+    # backgrounds the loop, and a backgrounded child inherits the capture pipe,
+    # so the substitution would block until the loop exits (it never does).
+    E2E_WEBKIT_REAP_INTERVAL_S=1 E2E_WEBKIT_REAP_MATCH="ms playwright/webkit" \
+        start_webkit_reaper > "$out_file" 2>&1
+    stop_webkit_reaper >/dev/null 2>&1
+
+    if grep -q "WARNING.*whitespace" "$out_file"; then
+        pass "whitespace token warns that the guard is off"
+    else
+        fail "no warning for a whitespace match token (got: $(cat "$out_file"))"
+    fi
+
+    SYNTHETIC_PS=""
+}
+
 test_selection
 test_cap_configurable
 test_match_override
+test_argv0_only_never_matches_a_mention
 test_skips_self_and_init
 test_skips_reaper_own_pid
 test_interval_validation
 test_default_match
 test_start_stop_lifecycle
 test_disable_knob
+test_whitespace_match_warns
+
+# The kill shim must have blocked nothing. A test that tried to signal a process
+# it did not spawn is a hard failure, not a warning: that is precisely how this
+# suite SIGKILLed two Claude Code sessions on 2026-08-03.
+if [ -s "$KILL_SHIM_LOG" ]; then
+    echo ""
+    echo "  FAIL: the suite attempted a lethal signal to a pid it did not spawn:"
+    sed 's/^/         /' "$KILL_SHIM_LOG"
+    FAIL=$((FAIL + 1))
+else
+    pass "no lethal signal was attempted against a foreign process"
+fi
 
 echo ""
 echo "Passed: $PASS  Failed: $FAIL"

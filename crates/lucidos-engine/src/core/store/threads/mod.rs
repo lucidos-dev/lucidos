@@ -95,6 +95,18 @@ pub struct ThreadSummary {
     /// so the tooltip is accurate even right after the user acts.
     pub last_agent_action: chrono::DateTime<chrono::Utc>,
     pub message_count: i64,
+    /// Whether the user parked this thread in the Saved section
+    /// (`thread_summaries.is_saved`).
+    ///
+    /// `GET /api/v1/threads` also conveys this structurally, by returning saved
+    /// threads in its own `saved` array, and the drawer still reads it from
+    /// there. The field exists because the by-id read paths have no such array:
+    /// `GET /api/v1/threads/:id` returns one bare summary, and a client
+    /// bootstrapping a single thread from it (a notification tap landing on a
+    /// thread outside the loaded window) would otherwise have to either guess
+    /// `false` or re-fetch the whole grouped payload. Both sources read this same
+    /// column, so they cannot disagree.
+    pub saved: bool,
     /// Thread section: "archived" (history/saved), "inbox" (needs user attention).
     /// Stored in `thread_summaries.archive_state` column; aliased to `section` in
     /// SELECTs to keep the JSON wire format stable.
@@ -534,6 +546,7 @@ impl EventStore {
                     last_user_action: r.last_user_action,
                     last_agent_action: r.last_agent_action,
                     message_count: r.message_count,
+                    saved: r.is_saved,
                     section: r.section,
                     active_children_count: r.active_children_count,
                     total_children_count: r.total_children_count,

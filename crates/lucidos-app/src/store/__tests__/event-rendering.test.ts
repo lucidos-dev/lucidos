@@ -13,7 +13,7 @@ describe('getCollapsedVisibleEvents', () => {
   it('shows only events from last text block onwards', () => {
     const events: ResponseEvent[] = [
       { type: 'text', md: 'early text' },
-      { type: 'step', description: 'search', success: true },
+      { type: 'step', description: 'search', outcome: 'success' },
       { type: 'text', md: 'final answer' },
     ];
     const { visibleEvents, needsFallback } = getCollapsedVisibleEvents(events);
@@ -24,7 +24,7 @@ describe('getCollapsedVisibleEvents', () => {
 
   it('returns all events if no text blocks', () => {
     const events: ResponseEvent[] = [
-      { type: 'step', description: 'search', success: true },
+      { type: 'step', description: 'search', outcome: 'success' },
     ];
     const { visibleEvents, needsFallback } = getCollapsedVisibleEvents(events);
     expect(visibleEvents).toHaveLength(1);
@@ -39,8 +39,8 @@ describe('getCollapsedVisibleEvents', () => {
 
   it('preserves image events even when they appear before the last text block', () => {
     const events: ResponseEvent[] = [
-      { type: 'step', description: 'Thinking', success: true },
-      { type: 'step', description: 'generate_image', success: true },
+      { type: 'step', description: 'Thinking', outcome: 'success' },
+      { type: 'step', description: 'generate_image', outcome: 'success' },
       { type: 'image', base64: 'abc123', mime_type: 'image/jpeg', index: 2 },
       { type: 'text', md: 'Here is the generated image!' },
     ];
@@ -54,7 +54,7 @@ describe('getCollapsedVisibleEvents', () => {
     const events: ResponseEvent[] = [
       { type: 'text', md: 'Engine response' },
       { type: 'section_break', channel: 'claude_code' },
-      { type: 'step', description: 'Edit file.rs', success: true },
+      { type: 'step', description: 'Edit file.rs', outcome: 'success' },
       { type: 'text', md: 'CC output' },
     ];
     const { visibleEvents } = getCollapsedVisibleEvents(events);
@@ -110,7 +110,7 @@ describe('mergeAdjacentTextEvents', () => {
     const events: ResponseEvent[] = [
       { type: 'text', md: 'before ' },
       { type: 'text', md: 'tool' },
-      { type: 'step', description: 'read_file', success: true },
+      { type: 'step', description: 'read_file', outcome: 'success' },
       { type: 'text', md: 'after tool' },
     ];
     const merged = mergeAdjacentTextEvents(events);
@@ -148,7 +148,7 @@ describe('mergeAdjacentTextEvents', () => {
 
   it('handles only non-text events', () => {
     const events: ResponseEvent[] = [
-      { type: 'step', description: 'search', success: true },
+      { type: 'step', description: 'search', outcome: 'success' },
       { type: 'image', base64: 'abc', mime_type: 'image/jpeg', index: 1 },
     ];
     const merged = mergeAdjacentTextEvents(events);

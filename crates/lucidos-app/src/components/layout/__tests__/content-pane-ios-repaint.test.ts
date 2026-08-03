@@ -80,10 +80,14 @@ describe('ContentPane iOS resume repaint', () => {
     // its data. The notification detail keys `viewKey` per notification, so each
     // prev/next chevron tap paid it too. Reported as lag opening notifications.
     //
-    // The wake already fires visibilitychange + pageshow + focus, so the resume
-    // path gets three superseding attempts on its own and needs no navigation
-    // fallback. Reintroducing one means first making scroll consumers ignore the
-    // repaint nudge.
+    // As of 2026-08-03 that cost is gone: `useHideOnScroll` skips scroll events
+    // inside the nudge window (`isRepaintNudging`), and the offset is written on
+    // its two consumer elements as a `transform` rather than on `:root` as a
+    // `top`, so a nudge no longer moves the header or forces a layout.
+    //
+    // This test still holds, on the reason that outlived the regression: the wake
+    // already fires visibilitychange + pageshow + focus, so the resume path gets
+    // three superseding attempts on its own and needs no navigation fallback.
     //
     // Stated as "exactly one repaint call site, and it is inside a mount-once
     // effect". That covers the burst, a second plain toggle, and any future

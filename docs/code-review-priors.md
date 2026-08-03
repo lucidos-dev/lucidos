@@ -247,6 +247,42 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-engine/src/core/mod.rs`,
   `crates/lucidos-engine/src/engine/command_permission.rs`.)
 
+- **The legacy `tailscale serve` form omits `--bg` deliberately, and the
+  asymmetry with the current form is the point.** In `serve_arg_forms`
+  (`crates/lucidos-app/src/mobile.rs`) the current form is
+  `serve --bg --https=443 <target>` and the fallback is `serve https / <target>`
+  with no `--bg`. A reviewer (Codex flagged this P1) may read the missing flag as
+  an oversight that leaves the fallback running in the foreground under an
+  unbounded `output()`. The flag genuinely does not exist on the CLIs the
+  fallback targets: Tailscale's 1.52 rework **inverted** the default, and before
+  it `serve` wrote persistent config with no foreground concept and no `--bg`, so
+  adding the flag would break exactly the pre-1.52 installs the fallback is for.
+  The foreground hazard is real but belongs to a different population, a CLI
+  between 1.52 and the removal of the old syntax, which parses the positional
+  form AND defaults to foreground. That is handled by the deadline in
+  `run_serve_attempt` (`SERVE_TIMEOUT`), not by the flag. Re-flag only with
+  evidence that a pre-1.52 CLI accepted `--bg`, or that the deadline was removed.
+  (`crates/lucidos-app/src/mobile.rs`.)
+
+- **`ProvisionError`'s `From<BoxError>` defaulting every unclassified
+  provisioning failure to `Transient` is the deliberate direction, not a silent
+  default.** A reviewer reading `crates/lucidos-gateway/src/postgres.rs` sees a
+  blanket conversion that assigns a *meaning* (retryable) to an error nobody
+  classified, and CLAUDE.md's "No Silent Defaults" rule looks like it applies.
+  The asymmetry is the point, and it is ADR-recorded (0014, 2026-08-03): the two
+  wrong answers cost wildly different amounts. A wrong `Transient` spends a
+  bounded, backed-off retry budget (~2 minutes) and then latches with the same
+  message it would have shown immediately. A wrong `Terminal` makes the
+  workspace unopenable for the lifetime of the gateway process, which is the
+  2026-08-03 bug this typing exists to fix: one `docker run` failure during a
+  login race killed both autostart workspaces until the user intervened. The
+  default also has to be the safe one for the classification to be extendable at
+  all, since an unvisited `?` inherits it. Re-flag only if the retry stops being
+  bounded, or with a specific failure that is provably unfixable and still
+  arrives through the default rather than through an explicit
+  `ProvisionError::terminal`. (`crates/lucidos-gateway/src/postgres.rs`,
+  `crates/lucidos-gateway/src/server.rs::provision_failure_action`.)
+
 ## Frontend
 
 - **`serverDraft` letting an inbound compose report overwrite a newer PUT ack is
@@ -452,6 +488,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   loaded is deliberate** (documented at each site): filter *options* would
   mislabel as "(deleted)" without the registry; this is not Loadable
   masking of displayed data.
+- **SSE-driven status signals are `signal<T | null>`, not `Loadable<T>`.**
+  `memoryRebuildProgress`, `backupProgress`, `recoveryProgress` and
+  `embeddingModelStatus` all follow this. The `Loadable<T>` rule governs a
+  view's async DATA source, where "loading" and "failed" must render
+  differently from "empty". These are live status feeds whose primary writer is
+  the event stream, with a REST snapshot as a secondary writer for a client
+  that connected mid-operation; `null` means "nothing known yet", which
+  correctly renders as no indicator. There is no fourth state any consumer
+  would branch on, and a failed snapshot read is the frontend.md best-effort
+  telemetry carve-out (an unsolicited startup/resume probe, self-recovering via
+  the next frame). Re-flag only if one of these gains a view that must
+  distinguish "still loading" from "read failed".
 - **`threadMap` never evicts threads in-session — by design.** Discarded
   drafts stay with `state='discarded'` (replays would 410 otherwise); page
   reload is the eviction. Consequently `perThread` bump signals and
@@ -1134,6 +1182,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   across the HTTP boundary.
   (`crates/lucidos-engine/src/engine/tools/scheduler.rs`,
   `crates/lucidos-engine/src/engine/engine_impl/trigger_runs.rs`.)
+
+- **`upload_staged_assets` still `--clobber`s its artifacts while the previous
+  `latest.json` is live, and that is the deliberate residual.** Reviewers see
+  `gh release upload … --clobber` and note that on a corrective re-upload
+  (`release.sh --attach-notarized` swapping in the stapled DMG) the release
+  already carries a manifest, which stays readable for the seconds its payload
+  is being deleted and re-uploaded. That is true, it is documented at the site,
+  and the two obvious closes are worse: removing the manifest first turns a
+  possible 404 on the payload into a guaranteed one on the manifest for the
+  whole upload, and skipping artifacts already on the release needs an identity
+  test GitHub does not offer (it exposes no asset checksum, and name-plus-size
+  would admit shipping a stale updater payload). The change that mattered is
+  done: the FIRST publish no longer advertises a payload before it exists, which
+  is where the 8h06m v0.16.0 window came from. Re-flag only with a way to make
+  the re-attach upload just the DMG, which is a change to what `release.sh` asks
+  for rather than to how this function honours it.
+  (`scripts/lib/release_upload.sh`, F8 in
+  `docs/audits/2026-08-02-macos-update-path-audit.md`.)
 
 ## Settled architecture questions
 

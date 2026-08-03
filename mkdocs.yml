@@ -1,6 +1,6 @@
 site_name: Lucidos
 site_url: https://docs.lucidos.dev
-site_description: Documentation for Lucidos — a local, event-driven, AI-native operating system.
+site_description: Documentation for Lucidos, a local AI OS that builds and runs the apps and automations you describe.
 repo_url: https://github.com/lucidos-dev/lucidos
 repo_name: lucidos-dev/lucidos
 

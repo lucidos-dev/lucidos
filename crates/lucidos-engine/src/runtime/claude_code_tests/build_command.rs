@@ -762,3 +762,86 @@ fn format_user_input_with_images_uses_blocks() {
     assert_eq!(content[1]["source"]["data"], "deadbeef");
     assert_eq!(parsed["session_id"], "default");
 }
+
+// ── CC byte-idle streaming deadline (CC_BYTE_STREAM_IDLE_TIMEOUT_MS) ────────
+// CC's own SSE watchdog aborts a turn after 300s of zero bytes and reports
+// `API Error: Stream idle timeout - no chunks received`, which is TERMINAL:
+// no non-streaming fallback, at most one retry and only while nothing but
+// thinking has been produced. A 200k+ token cache-cold prompt is silent on the
+// wire for longer than that (measured 303s twice on 2026-08-02). The engine's
+// own inactivity watchdog covers the same silence with a RECOVERABLE outcome,
+// so CC's deadline has to be the outer one.
+// See docs/investigations/2026-08-02-cc-stream-idle-timeout.md.
+
+#[test]
+fn build_command_raises_cc_byte_idle_deadline_past_the_engine_watchdog() {
+    // The ordering IS the fix: whichever deadline is shorter decides what a
+    // provider stall costs. Engine watchdog first => kill plus auto-resume via
+    // ContinuationRequested. CC watchdog first => dead thread. Asserted against
+    // the real constant so the two cannot drift into the wrong order.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let cmd = build_command(&test_spawn_args(p, p, thread_id), None);
+    let env = collect_envs(&cmd);
+    let raw = env
+        .get(std::ffi::OsStr::new("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"))
+        .expect(
+            "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS must be set, or CC kills a stalled turn at 300s",
+        );
+    let ms: i64 = raw
+        .to_string_lossy()
+        .parse()
+        .expect("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS must be a number of milliseconds");
+    // BOTH engine silence detectors, not just the in-loop one: the external
+    // watchdog is the out-of-loop backstop for a session the run loop lost
+    // track of, and its decision is `Resume` / `ResumeIfRunning`, equally
+    // non-destructive. CC's deadline has to be outside whichever of the two
+    // fires last, or the destructive handler wins again for that case.
+    for (name, engine_limit) in [
+        (
+            "in-loop inactivity watchdog",
+            crate::engine::agent_session::lifecycle::WATCHDOG_INACTIVITY_LIMIT_MS,
+        ),
+        (
+            "external watchdog",
+            crate::engine::agent_session::external_watchdog::EXTERNAL_WATCHDOG_LIMIT_MS,
+        ),
+    ] {
+        assert!(
+            ms > engine_limit,
+            "CC's byte-idle deadline ({ms}ms) must exceed the engine's {name} \
+             ({engine_limit}ms) so a provider stall auto-resumes instead of failing the thread"
+        );
+    }
+    // CC clamps the value to [10_000, 1_800_000]; anything above the ceiling is
+    // silently reduced, so sending more would misrepresent the effective deadline.
+    assert!(
+        (10_000..=1_800_000).contains(&ms),
+        "CC clamps this env var to [10000, 1800000]ms; {ms}ms would not survive the clamp"
+    );
+}
+
+#[test]
+fn build_command_lets_a_workspace_env_var_override_the_byte_idle_deadline() {
+    // The deadline is a tunable default, not an engine contract, so it is set
+    // BEFORE apply_lucidos_env (which applies user vars first and lets anything
+    // written after it win). This test pins that placement: writing the env
+    // after apply_lucidos_env would make the value unoverridable without a
+    // rebuild, which is exactly what we don't want for a timeout knob.
+    let thread_id = uuid::Uuid::new_v4();
+    let p = std::path::Path::new("/tmp");
+    let user_env = vec![(
+        "CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS".to_string(),
+        "900000".to_string(),
+    )];
+    let mut args = test_spawn_args(p, p, thread_id);
+    args.user_env_vars = &user_env;
+    let cmd = build_command(&args, None);
+    let env = collect_envs(&cmd);
+    assert_eq!(
+        env.get(std::ffi::OsStr::new("CLAUDE_BYTE_STREAM_IDLE_TIMEOUT_MS"))
+            .map(|v| v.as_os_str()),
+        Some(std::ffi::OsStr::new("900000")),
+        "a workspace env var must override the engine's default byte-idle deadline"
+    );
+}

@@ -235,6 +235,36 @@ describe('update progress narration', () => {
     expect(storeSignals.appUpdateProgress.value).toBeNull();
   });
 
+  // The install destroyed the app on disk without landing a replacement (F9),
+  // which is NOT the same as an update that failed: there is nothing left to
+  // retry against, and the message already carries the reinstall instruction.
+  it('shows a bundle-swap failure verbatim, with no "Update failed" prefix', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'installing' });
+    emitProgress({
+      version: '2026.7.30',
+      phase: 'bundle-swap-failed',
+      message: 'The update failed and no runnable app is at /Applications/Lucidos.app: '
+        + 'the application bundle is gone. Reinstall Lucidos from the .dmg to recover.',
+    });
+    const { message, type, opts } = lastToast();
+    expect(type).toBe('error');
+    expect(message).not.toContain('Update failed');
+    expect(message).toContain('Reinstall Lucidos from the .dmg');
+    expect(opts.spinning).toBeFalsy();
+    expect(storeSignals.appUpdateProgress.value).toBeNull();
+  });
+
+  // A cancel re-offers the update because nothing was written; a destroyed
+  // bundle must not, because clicking "Update & restart" again would download
+  // and install into a location with no app in it.
+  it('does not re-offer the update after a bundle-swap failure', () => {
+    startAppUpdateChecks();
+    emitProgress({ version: '2026.7.30', phase: 'installing' });
+    emitProgress({ version: '2026.7.30', phase: 'bundle-swap-failed', message: 'gone' });
+    expect(lastToast().opts.action).toBeUndefined();
+  });
+
   // Nothing was written to disk, so the update is still there to install —
   // leaving the user with no affordance would strand them until the next poll.
   it('re-offers the update after a cancel', () => {

@@ -39,6 +39,20 @@ describe('parseAppId', () => {
   it('returns null for legacy /api/app/ prefix (route was relocated)', () => {
     expect(parseAppId('/api/app/habit-tracker/')).toBeNull();
   });
+
+  it('strips the gateway base path so /<slug>/app/<id>/ resolves', () => {
+    expect(parseAppId('/dev/app/habit-tracker/', '/dev')).toBe('habit-tracker');
+    expect(parseAppId('/dev/app/habit-tracker/index.html', '/dev')).toBe('habit-tracker');
+  });
+
+  it('still returns null behind the gateway for a non-app path', () => {
+    expect(parseAppId('/dev/index.html', '/dev')).toBeNull();
+    expect(parseAppId('/dev/api/app/habit-tracker/', '/dev')).toBeNull();
+  });
+
+  it('leaves the path alone when the base path does not match', () => {
+    expect(parseAppId('/app/habit-tracker/', '/other')).toBe('habit-tracker');
+  });
 });
 
 describe('scrollKey', () => {

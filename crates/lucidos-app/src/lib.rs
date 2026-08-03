@@ -1277,6 +1277,7 @@ pub fn run() {
         })
         .manage(device_id_store::DeviceIdStore::default())
         .manage(updater::AppUpdateRun::default())
+        .manage(mobile::MobileAccessRuns::default())
         .manage(DockBadgeNudge(Mutex::new(dock_badge_nudge_tx)))
         .invoke_handler(tauri::generate_handler![
             create_panel_webview,
@@ -1311,6 +1312,7 @@ pub fn run() {
             mobile::get_connect_info,
             mobile::tailscale_up,
             mobile::tailscale_serve,
+            mobile::cancel_tailscale_serve,
             device_id_store::get_or_create_device_id,
         ])
         .on_window_event(|window, event| {

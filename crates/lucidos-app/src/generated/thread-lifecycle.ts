@@ -81,6 +81,8 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   BackgroundBashStarted: 'metadata',
   BackgroundBashCompleted: 'metadata',
   ImageDescribed: 'metadata',
+  CommandCheckpointed: 'metadata',
+  CommandCheckpointReverted: 'metadata',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([

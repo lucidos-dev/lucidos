@@ -179,7 +179,8 @@ optional and each call merges into the existing config.
 
 ## Error Handling
 
-All async methods throw `SdkError` on failure:
+An async method that reaches the engine and gets a non-2xx answer throws
+`SdkError`:
 
 ```js
 class SdkError extends Error {
@@ -187,6 +188,27 @@ class SdkError extends Error {
   reason: string;
 }
 ```
+
+A call that never gets an answer rejects with a `DOMException` instead, and the
+`name` says which kind of nothing you got:
+
+| `err.name` | Meaning | What to do |
+|---|---|---|
+| `TimeoutError` | The SDK's own 10s deadline fired. | Treat as retryable. The request may or may not have reached the engine. |
+| `AbortError` | Something cancelled the request: an `AbortSignal` you passed in `init`, or the browser tearing down an in-flight fetch. | If you did not cancel it yourself, treat as retryable. |
+
+The `AbortError` case is routine on an installed iOS PWA: WebKit aborts every
+in-flight fetch when it suspends the page, which says nothing about your
+request. Retry an idempotent call rather than reporting it as a failure, and
+prefer retrying when the page comes back (`visibilitychange`, `pageshow`,
+`focus`) over retrying immediately, because a suspended page cannot reach the
+engine either.
+
+The two are deliberately distinguishable. WebKit rejects an aborted fetch with
+its own generic `AbortError` rather than the signal's reason, so the SDK
+re-stamps a fired deadline as `TimeoutError` to match what Chrome and Firefox
+deliver. A cancel you requested stays an `AbortError` even when the deadline
+fired in the same instant.
 
 ## lucidos.data — File Operations
 
@@ -853,6 +875,9 @@ interface ThreadSummary {
    *  response, an idle, a trigger fire/complete, or asking the user. */
   last_agent_action: string;
   message_count: number;
+  /** Whether the user parked this thread in the Saved section (stored in
+   *  thread_summaries.is_saved). */
+  saved: boolean;
   /** 'inbox' | 'archived' — stored in thread_summaries.archive_state. */
   section: string;
   active_children_count: number;

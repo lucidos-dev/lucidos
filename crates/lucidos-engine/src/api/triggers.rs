@@ -2,7 +2,7 @@ use super::*;
 
 use crate::core::PreferenceStore;
 use crate::engine::command_guard::SideEffectCategory;
-use crate::engine::event_bus::SystemEvent;
+use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
     EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
@@ -382,18 +382,18 @@ pub(super) async fn create_trigger(
             .expect("SideEffectCategory serialization is infallible");
     }
 
+    // Through the trigger write chokepoint, not `emit_user_system`: the
+    // registry must hold the new trigger before this 200 lands, or the
+    // client's next `GET /api/v1/triggers` can miss what it just created.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state
         .engine
-        .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
-            "[Triggers] TriggerCreated",
-            |actor| SystemEvent::TriggerCreated {
-                trigger_id: trigger_id_str.clone(),
-                payload,
-                actor,
-            },
+        .emit_trigger_write_or_log(
+            TriggerWrite::Created,
+            &trigger_id_str,
+            payload,
+            actor,
+            "[Triggers]",
         )
         .await;
 
@@ -532,18 +532,19 @@ pub(super) async fn update_trigger(
         );
     }
 
+    // Read-your-writes: the pause this request carries has to be visible to the
+    // very next request. `POST /api/v1/triggers/run` reads the registry to
+    // decide whether to refuse, so a subscriber-only apply lets a trigger the
+    // user just paused take a real off-schedule fire.
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state
         .engine
-        .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
-            "[Triggers] TriggerUpdated",
-            |actor| SystemEvent::TriggerUpdated {
-                trigger_id: trigger_id_str.clone(),
-                payload: update_payload,
-                actor,
-            },
+        .emit_trigger_write_or_log(
+            TriggerWrite::Updated,
+            &trigger_id_str,
+            update_payload,
+            actor,
+            "[Triggers]",
         )
         .await;
 
@@ -569,18 +570,15 @@ pub(super) async fn delete_trigger(
         return ApiResult::err(format!("Trigger '{}' not found", task_id));
     }
 
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     state
         .engine
-        .event_bus
-        .emit_user_system(
-            &headers,
-            &state.pool,
-            "[Triggers] TriggerDeleted",
-            |actor| SystemEvent::TriggerDeleted {
-                trigger_id: task_id.clone(),
-                payload: serde_json::json!({ "trigger_id": &task_id }),
-                actor,
-            },
+        .emit_trigger_write_or_log(
+            TriggerWrite::Deleted,
+            &task_id,
+            serde_json::json!({ "trigger_id": &task_id }),
+            actor,
+            "[Triggers]",
         )
         .await;
 

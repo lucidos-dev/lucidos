@@ -59,6 +59,21 @@ describe('buildAppLocalUrl', () => {
         ),
       ).toBe(`${BASE}/app/habit-tracker/icon.png`);
     });
+
+    // Behind the workspace gateway the iframe loads at `/<slug>/app/<id>/` and
+    // the base path is `/<slug>`. Without stripping it, the app id never parsed
+    // and every own-app asset fell through to the `/data/` mount, which does not
+    // honour `?thread_id=` (the WIP-preview 404 this rewrite exists to close).
+    it('matches behind the gateway, where the path carries a workspace slug', () => {
+      expect(
+        buildAppLocalUrl(
+          'apps/habit-tracker/icon.png',
+          '/dev/app/habit-tracker/',
+          '?thread_id=abc-123',
+          '/dev',
+        ),
+      ).toBe('/dev/app/habit-tracker/icon.png?thread_id=abc-123');
+    });
   });
 
   describe('returns null (caller falls through to /data/…)', () => {

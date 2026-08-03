@@ -52,7 +52,7 @@ function flattenSlides(deck: SlidesDeck): FlatSlide[] {
   let idx = 1;
   if (deck.sections) {
     for (const section of deck.sections) {
-      for (const slide of section.slides) {
+      for (const slide of section.slides ?? []) {
         result.push({ slide, sectionTitle: section.title, sectionColor: section.color, globalIndex: idx++ });
       }
     }

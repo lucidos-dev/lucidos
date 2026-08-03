@@ -14,10 +14,21 @@
 # manifest.json shape:
 #   { "version": "<N.N.N>",
 #     "source_commit": "<git rev-parse HEAD of the tree that was built>",
+#     "platform_key": "darwin-aarch64",        (REQUIRED; see below)
 #     "build_fingerprint": "v1:<hex>",         (optional; see below)
 #     "recipe_fingerprint": "v1:<hex>",        (optional; see below)
 #     "notarized": true|false,                 (optional; see below)
 #     "artifacts": [ { "name": "<basename>", "sha256": "<hex>" }, … ] }
+#
+# `platform_key` is the `latest.json` `platforms` key the updater looks itself up
+# under, and it describes the ARTIFACT (F10 in
+# docs/audits/2026-08-02-macos-update-path-audit.md). It used to be derived at
+# UPLOAD time from `uname -m`, which describes the host doing the upload, and a
+# mislabelled key fails silently: an updater whose target key is absent from
+# `platforms` reports "no update" rather than an error. Recording it here is what
+# also makes `--release-attach` honest, since that path deliberately has no `.app`
+# on disk to interrogate. Unlike the three optional keys, this one is REQUIRED:
+# `release_staging_verify` refuses a manifest without it.
 #
 # `notarized` records whether the staged DMG carries a stapled Apple ticket. It
 # is false only for a DEFERRED-DMG release (build-dmg.sh --defer-notarization),
@@ -44,6 +55,55 @@
 # the public mirror (build-dmg.sh's --release-build is a legitimate public path);
 # contrast release_signing.sh / release_events.sh, which ARE in EXCLUDE_PATHS.
 
+# release_staging_platform_key_for_binary <mach-o>: print the latest.json
+# `platforms` key the given Mach-O is for, derived from the FILE with `lipo
+# -archs`. This is the honest source: the staged app binary is the thing an
+# updater will actually run, and it is the same binary whether the run that
+# uploads it is on the build host or somewhere else entirely.
+#
+# A UNIVERSAL binary is a hard error rather than two keys, and rather than
+# silently taking the first arch. The rest of the bundle is single-arch by
+# construction: `stage_runtime_fetch_postgres` resolves ONE relocatable Postgres
+# per target triple, and every other Mach-O under RESOURCE_NAMES is built for one
+# triple too. So a fat `lucidos-app` inside a thin bundle would let us advertise
+# `darwin-x86_64` for a payload whose bundled Postgres is arm64-only, which is a
+# worse outcome than refusing. Making the whole bundle universal, or shipping two
+# single-arch releases, is the real answer and the message says so.
+release_staging_platform_key_for_binary() {
+    local binary="$1" archs
+    [ -f "$binary" ] || {
+        echo "ERROR: cannot derive the platform key: no such binary: $binary" >&2
+        return 1
+    }
+    command -v lipo >/dev/null 2>&1 || {
+        echo "ERROR: cannot derive the platform key: lipo is not on PATH (Xcode CLT)" >&2
+        return 1
+    }
+    archs="$(lipo -archs "$binary" 2>/dev/null | tr -s '[:space:]' ' ' | sed 's/^ //;s/ $//')" || archs=""
+    [ -n "$archs" ] || {
+        echo "ERROR: lipo could not read an architecture out of $binary" >&2
+        return 1
+    }
+    case "$archs" in
+        arm64|arm64e)   printf 'darwin-aarch64' ;;
+        x86_64)         printf 'darwin-x86_64' ;;
+        *\ *)
+            echo "ERROR: $binary is a universal binary ($archs)." >&2
+            echo "       Refusing to guess a single latest.json platform key for it, and refusing" >&2
+            echo "       to advertise both: the rest of the bundle is single-arch by construction" >&2
+            echo "       (one relocatable Postgres per target triple), so a second key would" >&2
+            echo "       promise an update whose bundled Postgres is for the other architecture." >&2
+            echo "       Ship one single-arch release per architecture, or make the WHOLE bundle" >&2
+            echo "       universal first and then teach this function to emit both keys." >&2
+            return 1
+            ;;
+        *)
+            echo "ERROR: unsupported architecture '$archs' in $binary" >&2
+            return 1
+            ;;
+    esac
+}
+
 # release_staging_sha256 <file> — print the lowercase hex SHA-256 of <file>.
 release_staging_sha256() {
     python3 - "$1" <<'PY'
@@ -60,12 +120,19 @@ PY
 # Write <dir>/manifest.json describing the already-staged artifacts <name…> (each
 # must exist at <dir>/<name>). sha256 is computed over the staged bytes.
 #
-# The optional build/recipe fingerprints and the notarized flag are passed
-# through the environment (RELEASE_STAGING_BUILD_FINGERPRINT /
-# RELEASE_STAGING_RECIPE_FINGERPRINT / RELEASE_STAGING_NOTARIZED) rather than as
-# positional arguments: the trailing <name…> is variadic, so a positional
-# addition would be ambiguous, and every existing caller (including three test
-# suites) keeps working untouched. Empty/unset means "not recorded".
+# The platform key, the build/recipe fingerprints and the notarized flag are
+# passed through the environment (RELEASE_STAGING_PLATFORM_KEY /
+# RELEASE_STAGING_BUILD_FINGERPRINT / RELEASE_STAGING_RECIPE_FINGERPRINT /
+# RELEASE_STAGING_NOTARIZED) rather than as positional arguments: the trailing
+# <name…> is variadic, so a positional addition would be ambiguous, and every
+# existing caller (including three test suites) keeps working untouched.
+# Empty/unset means "not recorded".
+#
+# RELEASE_STAGING_PLATFORM_KEY is the one whose absence is not survivable: a
+# manifest without it cannot say which `latest.json` key its payload belongs
+# under, so `release_staging_verify` refuses one. It is still written the same
+# absent-when-empty way as the rest, because "absent" is what lets that refusal
+# tell a pre-F10 manifest apart from a writer that recorded an empty string.
 #
 # RELEASE_STAGING_NOTARIZED takes "true" or "false"; anything else (including
 # unset) omits the key, which reads back as notarized. Both real writers set it
@@ -82,6 +149,7 @@ release_staging_write_manifest() {
         [ -f "$dir/$name" ] || { echo "ERROR: staged artifact '$dir/$name' is missing" >&2; return 1; }
     done
     DIR="$dir" VERSION="$version" COMMIT="$commit" \
+    PLATFORM_KEY="${RELEASE_STAGING_PLATFORM_KEY:-}" \
     BUILD_FP="${RELEASE_STAGING_BUILD_FINGERPRINT:-}" \
     RECIPE_FP="${RELEASE_STAGING_RECIPE_FINGERPRINT:-}" \
     NOTARIZED="${RELEASE_STAGING_NOTARIZED:-}" \
@@ -104,10 +172,15 @@ manifest = {
     "version": os.environ["VERSION"],
     "source_commit": os.environ["COMMIT"],
 }
-# Only emit the fingerprint keys when they were actually computed — an empty
-# string in the manifest would be indistinguishable from a real value to a
-# careless reader, and "absent" is the honest encoding of "not recorded".
-for key, env in (("build_fingerprint", "BUILD_FP"), ("recipe_fingerprint", "RECIPE_FP")):
+# Only emit these keys when they were actually computed. An empty string in the
+# manifest would be indistinguishable from a real value to a careless reader, and
+# "absent" is the honest encoding of "not recorded". For platform_key the
+# distinction is load-bearing rather than tidy: verify tells the two apart.
+for key, env in (
+    ("platform_key", "PLATFORM_KEY"),
+    ("build_fingerprint", "BUILD_FP"),
+    ("recipe_fingerprint", "RECIPE_FP"),
+):
     value = os.environ.get(env, "")
     if value:
         manifest[key] = value
@@ -170,11 +243,41 @@ release_staging_is_notarized() {
     [ "$value" != "false" ]
 }
 
-# release_staging_verify <dir> — confirm the manifest is present, every listed
-# artifact exists, and each artifact's recomputed sha256 matches the manifest.
-# Prints a clear error to stderr and returns non-zero on the first problem. This
-# is the integrity half of the guard (build-dmg.sh --release-attach runs it before
-# any upload; release.sh --publish-verified runs it before going public).
+# release_staging_platform_key <dir>: print the recorded latest.json platform key.
+# Non-zero when the manifest does not carry one, which is the same refusal
+# release_staging_verify gives and is worded the same way. Callers that are about
+# to BUILD a latest.json use this rather than a bare manifest_field read, so a
+# manifest predating the recording can never reach the generator as an empty
+# string.
+release_staging_platform_key() {
+    local dir="$1" value
+    value="$(release_staging_manifest_field "$dir" platform_key --optional 2>/dev/null || true)"
+    if [ -z "$value" ]; then
+        echo "ERROR: no platform_key in $dir/manifest.json." >&2
+        echo "       This staging predates platform-key recording, so nothing on disk says" >&2
+        echo "       which latest.json platforms key its updater payload belongs under." >&2
+        echo "       Re-stage the build (build-dmg.sh --release-build) rather than guessing." >&2
+        return 1
+    fi
+    printf '%s' "$value"
+}
+
+# release_staging_verify <dir>: confirm the manifest is present, records a
+# platform key, every listed artifact exists, and each artifact's recomputed
+# sha256 matches the manifest. Prints a clear error to stderr and returns non-zero
+# on the first problem. This is the integrity half of the guard (build-dmg.sh
+# --release-attach runs it before any upload; release.sh --publish-verified runs
+# it before going public).
+#
+# The platform-key half is an IDENTITY check in the spirit of
+# release_staging_assert_commit, not an integrity one, and it lives here because
+# this is the function every path already runs before publishing. Two refusals,
+# deliberately distinct (the precedent is release_notarize_resumable's treatment
+# of a pre-pairing handle): an ABSENT key means a manifest written before the key
+# existed, which is re-stageable; a PRESENT but empty or malformed one means a
+# writer that recorded nothing, which is a bug in this pipeline rather than an old
+# artifact. Collapsing them would send an operator to re-stage over a bug a
+# re-stage cannot fix.
 release_staging_verify() {
     local dir="$1"
     [ -f "$dir/manifest.json" ] || { echo "ERROR: staging manifest not found: $dir/manifest.json" >&2; return 1; }
@@ -191,6 +294,25 @@ def sha256(path):
 dir_ = os.environ["DIR"]
 with open(sys.argv[1], encoding="utf-8") as f:
     manifest = json.load(f)
+
+# The platform key (F10). Absent and empty are told apart on purpose: only one of
+# them is fixable by re-staging, and the other is a bug in the writer.
+if "platform_key" not in manifest:
+    sys.stderr.write(
+        "ERROR: staging manifest records no platform_key\n"
+        "       This manifest predates platform-key recording, so nothing in it says which\n"
+        "       latest.json platforms key its updater payload belongs under, and the upload\n"
+        "       would have to fall back to guessing from the upload host's architecture.\n"
+        "       Re-stage the build: build-dmg.sh --release-build\n")
+    sys.exit(1)
+platform_key = manifest["platform_key"]
+if not isinstance(platform_key, str) or not platform_key.strip():
+    sys.stderr.write(
+        "ERROR: staging manifest carries an empty platform_key (%r)\n"
+        "       This is NOT an old manifest: something wrote the key and recorded nothing in\n"
+        "       it. Re-staging would reproduce it. Fix the writer\n"
+        "       (release_staging_platform_key_for_binary) first.\n" % (platform_key,))
+    sys.exit(1)
 
 artifacts = manifest.get("artifacts")
 if not isinstance(artifacts, list) or not artifacts:

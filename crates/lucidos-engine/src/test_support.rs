@@ -283,3 +283,71 @@ pub async fn teardown_test_db(db_name: &str) {
         .await;
     admin_pool.close().await;
 }
+
+/// Reading the engine's own sources, for the repo's source-scan tripwires
+/// (`announced_surfaces_tests`, the trigger write chokepoint guard).
+///
+/// Rust is not parsed. These helpers only locate the *production* text of each
+/// file so a scan can look for a structure the codebase forbids. Test modules
+/// are excluded by path convention and each file is truncated at its first
+/// top-level `#[cfg(test)]`, because a fixture doing the forbidden thing is
+/// setup rather than a real call site.
+pub mod source_scan {
+    use std::path::{Path, PathBuf};
+
+    /// `crates/lucidos-engine/src`.
+    pub fn src_root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("src")
+    }
+
+    /// A path convention test module.
+    pub fn is_test_path(rel: &str) -> bool {
+        rel.split('/').any(|part| {
+            let base = part.strip_suffix(".rs").unwrap_or(part);
+            base == "tests" || base == "bin" || base.ends_with("_test") || base.ends_with("_tests")
+        })
+    }
+
+    /// Read a source file with its inline test module cut off. Inline
+    /// `mod tests` sits at the end of the file by convention, so truncating at
+    /// the first top-level `#[cfg(test)]` drops it whole.
+    pub fn read_production_source(path: &Path) -> String {
+        let text = std::fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        match text.find("\n#[cfg(test)]") {
+            Some(idx) => text[..idx].to_string(),
+            None => text,
+        }
+    }
+
+    /// Every non-test engine source, as `(path relative to src/, production text)`.
+    pub fn production_sources() -> Vec<(String, String)> {
+        let root = src_root();
+        let mut out = Vec::new();
+        let mut stack = vec![root.clone()];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("read_dir").flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                    continue;
+                }
+                if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(&root)
+                    .expect("under src")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                if is_test_path(&rel) {
+                    continue;
+                }
+                let text = read_production_source(&path);
+                out.push((rel, text));
+            }
+        }
+        out.sort();
+        out
+    }
+}

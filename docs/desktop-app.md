@@ -91,6 +91,27 @@ PostgreSQL 18 and compiles pgvector against it (the proven
 app,dmg`. The result is an **unsigned** `.dmg` under `target/release/bundle/dmg/`
 — Gatekeeper blocks it on other Macs (right-click → Open to run locally).
 
+**The `.app` inside it is signed with the stable dev identity, when you have
+one.** With no `APPLE_SIGNING_IDENTITY`, `build-dmg.sh` falls back to the
+self-signed `Lucidos Dev Code Signing` certificate that
+`./scripts/dev-codesign-setup.sh` creates (the same identity
+`scripts/lib/codesign.sh` already applies to the dev engine binary), signing the
+bundle inside-out exactly as the release path does. Without it, Tauri's ad-hoc
+output gives the bundle a *cdhash-anchored* designated requirement, so every
+rebuild is a new code identity and macOS re-prompts for, and discards, every
+permission you granted the last build. The dev identity is a stable certificate,
+so the requirement becomes `identifier "com.lucidos.app" and certificate leaf =
+H"…"` and one Allow click sticks. Run the setup script once; until then the build
+prints a hint and leaves the bundle ad-hoc, as before.
+
+It is a *fallback only*, in both directions: an explicit `APPLE_SIGNING_IDENTITY`
+always wins, and it can never carry a release. `--release*` asserts a Developer
+ID up front, and the staging gate refuses a payload with no Team Identifier,
+which a self-signed certificate never has. No hardened runtime and no secure
+timestamp are applied for it, deliberately: both exist to satisfy notarization,
+which this path never attempts, and the certificate-anchored requirement (the
+entire point) needs neither. The DMG itself stays unsigned either way.
+
 The lightweight packaging contract check runs without a macOS bundle build:
 
 ```bash
@@ -170,8 +191,11 @@ users download, and the *commit* CI gated on is the very object that lands on
 #   → build → codesign → notarize → staple, and STAGES the artifacts (.dmg,
 #     .app.tar.gz, .sig) + a manifest.json into
 #     <worktree>/.lucidos/release-staging/<version>/;
-#   → creates/refreshes the rc-<version> PRERELEASE at rc/<version> with the
-#     staged DMG + .sig, which fires the clean-machine dmg-verify gate.
+#   → creates/refreshes the rc-<version> DRAFT RELEASE at rc/<version> with the
+#     staged DMG + .sig, then DISPATCHES the clean-machine dmg-verify gate at it
+#     (`-f dmg_tag=rc-<version>`). A draft is never listed on the public
+#     releases page, and it fires no release event of its own, which is why the
+#     dispatch is explicit (ADR 0036).
 #     It STOPS here; the worktree + staging are left in place.
 
 #   ⏸  Mount / install / launch / click around the staged DMG.
@@ -189,7 +213,7 @@ users download, and the *commit* CI gated on is the very object that lands on
 #     LANDS the bump on local main (fast-forward, else cherry-pick, else a hard
 #     failure — never a skipped bump) → tags THAT commit locally → pushes main +
 #     the tag to `origin`, unforced → deletes the rc branch + the rc-<version>
-#     prerelease → cleans up the worktree + staging.
+#     draft release → cleans up the worktree + staging.
 #     The same tag name means a different object per remote, deliberately: the
 #     mirror's names the orphan (the Release + download URLs resolve through
 #     it), the local/origin one names the release commit on main. See ADR 0029.
@@ -215,6 +239,52 @@ The build/upload split lives in `build-dmg.sh`: `--release-build` (build + stage
 no upload) and `--release-attach` (verify staging + upload, no rebuild); the kept
 `--release` runs both back-to-back for the one-shot path (which has no rc gate).
 
+### The updater payload is repacked from the SIGNED app (the v0.19.0 bug)
+
+`cargo tauri build` packs `Lucidos.app.tar.gz` from the `.app` as the bundler
+leaves it, and `build-dmg.sh` deliberately runs that build with
+`APPLE_SIGNING_IDENTITY` removed from the **subprocess** env (Tauri's own
+codesign pass skips the ~200 loose Mach-O files in the relocatable Postgres tree,
+so the script signs the bundle itself, inside-out, afterwards). For the DMG this
+is invisible, because `refresh_dmg_payload` re-injects the signed app into it.
+Nothing did the same for the updater payload.
+
+So from the introduction of the signed path until v0.19.0, **every published
+`.app.tar.gz` contained an ad-hoc bundle**. The v0.19.0 payload, extracted from
+the release: `Signature=adhoc`, `TeamIdentifier=not set`, designated requirement
+`cdhash H"d3974ae45f…"`, no `Contents/_CodeSignature` at all. A cdhash-anchored
+requirement changes with every build and macOS TCC keys permission grants on code
+identity, so each auto-update silently destroyed every permission the user had
+granted, and users who had only ever auto-updated were running an app that
+`spctl` refuses to assess.
+
+The fix has three parts, in `scripts/lib/updater_payload.sh`:
+
+1. **Repack.** After `sign_app_bundle` and before `refresh_dmg_payload`, the
+   tarball is rebuilt from the signed `.app` and the `.sig` is regenerated over
+   the new bytes (a stale signature would make every updater reject the update).
+   The signer is `tauri_signer_sign_file`, the single `cargo tauri signer sign`
+   call site, shared with the release preflight's throwaway test-sign.
+2. **Prove it round-trips.** The repack extracts what it just wrote and runs
+   `codesign --verify --deep --strict` on the result, refusing to replace the
+   tarball if that fails. It also enforces the layout
+   `tauri-plugin-updater` needs: one top-level `.app` component (its extraction
+   strips the first path component blindly), no hard-link entries (it resolves a
+   hard link's target against the process CWD, not the extraction root, and
+   `bsdtar` emits hard links where Tauri's own tar writer never did) and no
+   AppleDouble `._` entries (they sit outside the `CodeResources` seal).
+3. **Gate publication on it.** `stage_release_artifacts` and
+   `upload_staged_assets` both extract the payload and assert its designated
+   requirement is Developer ID anchored (`anchor apple generic` plus
+   `certificate leaf[subject.OU]`) with a Team Identifier set. The verdict is
+   re-derived from the bytes at each point rather than recorded in the staging
+   manifest, so a staging dir produced by an older build, or a restamped
+   manifest, cannot launder an unsigned payload into a signed-looking one.
+
+The payload is packed **pre-staple**, which is the accepted cost already
+documented under the deferred DMG below and is what keeps a deferred release and
+an ordinary one producing the same artifact.
+
 ### Resumable notarization — Phase A survives losing the waiter
 
 Apple's notary service regularly takes longer than the process waiting on it
@@ -223,10 +293,12 @@ notarization can **never** be held in a foreground wait. The notarize stage
 therefore never runs `notarytool submit … --wait`. It:
 
 1. submits with `--no-wait` and reads the submission UUID immediately,
-2. **persists a resume handle before any waiting** —
-   `<repo-root>/.lucidos/release-state/notarize-<version>.json`, recording the
-   submission id, the absolute DMG path, its sha256 at submit time, the source
-   commit, and the submit timestamp (`scripts/lib/release_notarize.sh`),
+2. **persists a resume handle before any waiting**:
+   `<repo-root>/.lucidos/release-state/notarize-<version>.json`, recording which
+   of the two stages is outstanding, the submission id, the absolute path and
+   sha256 of the file that was submitted, the source commit, the submit
+   timestamp, and the updater payload the submission is paired with
+   (`scripts/lib/release_notarize.sh`),
 3. polls `notarytool info` until the status leaves `In Progress`,
 4. staples (idempotently — re-stapling an already-stapled DMG is fine), stages,
    and then **drops the handle**, so a later run can't resume a finished release.
@@ -271,8 +343,15 @@ notarization gates exactly **one** artifact:
 | artifact | consumed by | Gatekeeper assessment? |
 |---|---|---|
 | headless tarball + `.sha256` | `curl … \| sh` | no — `curl` sets no `com.apple.quarantine` |
-| `.app.tar.gz` + `.sig` + `latest.json` | in-app updater | no — the updater's download isn't quarantined; integrity is our minisign key; launch passes on the Developer ID signature |
+| `.app.tar.gz` + `.sig` + `latest.json` | in-app updater | no: the updater writes the bundle itself and sets no `com.apple.quarantine`, so Gatekeeper performs no assessment on launch; integrity is our minisign (Ed25519) key, which *is* checked |
 | **`.dmg`** | browser download | **yes** |
+
+Note (2026-08-02): the `.app.tar.gz` payload is currently ad-hoc signed rather
+than Developer ID signed, tracked as F1 in
+`docs/audits/2026-08-02-macos-update-path-audit.md` and being fixed in a separate
+change. It is not what the middle row turns on, though: the absence of a
+quarantine xattr is, so a signature on the payload is not the launch mechanism
+here and should not be cited as one after F1 lands.
 
 So a deferred release reaches every existing desktop user (auto-update) and
 every terminal install (tarball) with no notarization involved. Only a
@@ -300,7 +379,7 @@ The mode is **explicit and fail-closed**. Nothing falls back to it;
 upload in the same process, where no banner can be composed); and the pending
 state travels in the staging manifest's `notarized` field, so the banner, the
 site link and the cleanup all read the same fact as the bytes. The `rc-<ver>`
-prerelease is deliberately **not** created for a deferred build — `dmg-verify`
+draft release is deliberately **not** created for a deferred build, since `dmg-verify`
 asserts a stapled ticket, so arming a gate that must fail says nothing. It runs
 later against the published tag instead
 (`gh workflow run install-smoke.yml -f dmg_tag=v<version>`), dispatched by the
@@ -308,12 +387,11 @@ attach step.
 
 Two consequences worth knowing before using it. The updater tarball is built
 **pre-staple**, so anyone who auto-updates during the window runs an unstapled
-(but Developer ID signed) bundle permanently — invisible, since nothing assesses
-a non-quarantined bundle, and re-issuing a stapled tarball could not reach them
-anyway. And an `Invalid`/`Rejected` verdict now lands on an **already-public**
-asset: it can never be notarized, so pull it with `gh release delete-asset`,
-leave the banner up, and fix in a patch release. The attach step prints exactly
-that.
+bundle permanently: invisible, since nothing assesses a non-quarantined bundle,
+and re-issuing a stapled tarball could not reach them anyway. And an
+`Invalid`/`Rejected` verdict now lands on an **already-public** asset: it can
+never be notarized, so pull it with `gh release delete-asset`, leave the banner
+up, and fix in a patch release. The attach step prints exactly that.
 
 ### 1. Apple Developer ID + notarization
 
@@ -328,11 +406,21 @@ export APPLE_TEAM_ID="TEAMID"
 ```
 
 `build-dmg.sh` explicitly signs and verifies the bundled `lucidos-gateway` and
-`lucidos-engine` resource binaries, codesigns the `.app` with a hardened runtime
-(`--deep` also signs the nested Postgres binaries/libs), refreshes and signs the
-DMG payload, submits the `.dmg` to `notarytool`, polls for the verdict, and
-staples the ticket (see "Resumable notarization" above for why submit and wait are
-split). Without notarization, Gatekeeper blocks the download.
+`lucidos-engine` resource binaries and codesigns the `.app` with a hardened
+runtime (`--deep` also signs the nested Postgres binaries/libs). It then makes
+**two** notary submissions, in Apple's documented order: the `.app` is archived,
+submitted and **stapled**, and only then is the DMG payload refreshed around the
+stapled bundle, signed, submitted, polled and stapled in turn. Both are covered
+by one resume handle (see "Resumable notarization" above for why submit and wait
+are split). Without notarization, Gatekeeper blocks the download.
+
+The app half was added on 2026-08-02 and is why a release now waits for two Apple
+verdicts rather than one: `stapler staple` writes the ticket INTO the bundle, so
+the copy inside the DMG can only carry one if the DMG is built around an
+already-stapled app, and rewriting the image afterwards would void its own
+signature and ticket. Before that, no shipped DMG contained a stapled app and a
+DMG install's first launch had to reach Apple to be assessed. The cost, including
+what it does to `--defer-notarization`, is recorded in ADR 0033.
 
 An App Store Connect API key is used in preference to the Apple ID when
 `APPLE_API_KEY_PATH` + `APPLE_API_KEY_ID` are set (plus `APPLE_API_ISSUER_ID`,
@@ -376,8 +464,9 @@ v2 requires it for the macOS updater tarball), so you don't need to add it.
 `v<version>` on `github.com/lucidos-dev/lucidos` and uploads the `.dmg` (first
 install), the `.app.tar.gz`, its `.sig`, and a generated `latest.json` (asset
 uploads use `--clobber`, so re-running a release replaces them). The generated
-manifest looks like this — `signature` is the verbatim contents of the
-`.app.tar.gz.sig`, the single platform key is the host triple:
+manifest looks like this. `signature` is the verbatim contents of the
+`.app.tar.gz.sig`, and there is exactly ONE platform key, describing the
+**artifact**:
 
 ```json
 {
@@ -385,11 +474,24 @@ manifest looks like this — `signature` is the verbatim contents of the
   "notes": "What changed.",
   "pub_date": "2026-06-16T00:00:00Z",
   "platforms": {
-    "darwin-aarch64": { "signature": "<contents of .app.tar.gz.sig>", "url": "https://github.com/lucidos-dev/lucidos/releases/download/v0.10.0/Lucidos.app.tar.gz" },
-    "darwin-x86_64":  { "signature": "<contents of .app.tar.gz.sig>", "url": "https://github.com/lucidos-dev/lucidos/releases/download/v0.10.0/Lucidos.app.tar.gz" }
+    "darwin-aarch64": { "signature": "<contents of .app.tar.gz.sig>", "url": "https://github.com/lucidos-dev/lucidos/releases/download/v0.10.0/Lucidos.app.tar.gz" }
   }
 }
 ```
+
+That key used to be derived from `uname -m` at upload time, which describes the
+machine running the upload rather than the payload (F10 in
+`docs/audits/2026-08-02-macos-update-path-audit.md`), and a mislabelled key is a
+**silent** failure: an updater whose target key is absent from `platforms`
+reports "no update" rather than an error. It is now read off the staged app
+binary with `lipo -archs` at BUILD time and recorded as `platform_key` in the
+staging manifest, which is also the only shape that works for `--release-attach`
+(that path deliberately has no `.app` on disk). `release_staging_verify` refuses
+a manifest that records no key, so an old staging dir has to be re-staged rather
+than guessed at. A universal binary is refused outright rather than emitting two
+keys: the rest of the bundle is single-arch by construction (one relocatable
+Postgres per target triple), so a second key would advertise an update whose
+bundled Postgres is for the other architecture.
 
 `plugins.updater.endpoints` already points at
 `…/releases/latest/download/latest.json`, so a published Release is picked up by
@@ -510,8 +612,10 @@ Engine Statelessness).
 - **Mac side (scriptable after consent):** detect `tailscale`; if missing, guide
   the install (system VPN — needs user consent, can't be silent); run
   `tailscale up` (one-time tailnet login, or an auth key) then
-  `tailscale serve https / http://127.0.0.1:<port>` for an auto-renewed HTTPS
-  cert at `https://<machine>.<tailnet>.ts.net`. Full PWA + push, works off-LAN.
+  `tailscale serve --bg --https=443 http://127.0.0.1:<port>` for an auto-renewed
+  HTTPS cert at `https://<machine>.<tailnet>.ts.net`. Full PWA + push, works
+  off-LAN. (CLI 1.52 reworked that syntax; `system-knowhow/remote-access.md`
+  § Route B carries both forms and which CLI takes which.)
 - **Phone side (guided, not silent):** OS sandboxing prevents remote install/login
   — show a QR/link to install Tailscale and join the **same tailnet** (auth key
   can pre-authorize). Then open the `…ts.net` URL.

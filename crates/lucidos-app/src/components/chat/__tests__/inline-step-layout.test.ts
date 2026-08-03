@@ -47,4 +47,24 @@ describe('inline step layout (CSS regression)', () => {
     const block = getBlock('.inline-step .step-detail');
     expect(block).toContain('flex: 1 1 0');
   });
+
+  // A step killed mid-execution (the turn died before the tool reported a
+  // result) reads as "did not finish": muted and struck. Deliberately NOT the
+  // red .error treatment, which asserts the tool ran and returned a failure.
+  it('unfinished step is muted and struck, never the red failure treatment', () => {
+    const description = getBlock('.inline-step.unfinished .step-description');
+    expect(description).toContain('text-decoration: line-through');
+    expect(description).toContain('color: var(--text-muted)');
+
+    const icon = getBlock('.inline-step.unfinished .step-icon');
+    expect(icon).toContain('color: var(--text-muted)');
+    expect(icon).not.toContain('--accent-red');
+  });
+
+  // The shared .inline-step:hover rule lifts the description to --text-primary,
+  // which would undo the muting on exactly the row being inspected.
+  it('unfinished step stays muted on hover', () => {
+    const block = getBlock('.inline-step.unfinished:hover .step-description');
+    expect(block).toContain('color: var(--text-secondary)');
+  });
 });

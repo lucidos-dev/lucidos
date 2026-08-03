@@ -86,6 +86,15 @@ impl LucidosEngine {
         // Empty for chat turns. Consulted by the command guard only on the
         // `Trigger` channel to gate `IrreversibleDanger` commands.
         trigger_side_effect_grant: &[crate::engine::command_guard::SideEffectCategory],
+        // This turn's resolved per-turn tool-call cap (the `max_tool_calls`
+        // preference, defaulting to `DEFAULT_MAX_TOOL_CALLS`). Passed in rather
+        // than read here so the caller reads it ONCE and hands the same number
+        // to the system-prompt builder: the prompt states this cap to the model,
+        // and a prompt that names a different number than the loop enforces is
+        // exactly the kind of fabricated engine internal the prompt warns
+        // against. Passing it also freezes the cap for the turn, so a mid-turn
+        // Settings change cannot move it under a running loop.
+        max_tool_calls: usize,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         // EventMeta for this request — all persisted events in this cycle share the same context
         let meta = crate::engine::thread_events::EventMeta {
@@ -124,6 +133,12 @@ impl LucidosEngine {
         > = std::collections::HashMap::new();
 
         let mut iterations = 0;
+        // Tool calls made so far this turn, against `max_tool_calls`. Distinct
+        // from `iterations`, which counts LLM round-trips: one response can
+        // carry several tool calls, so the two diverge and only this one
+        // matches what the setting, the prompt and the terminator all call a
+        // "tool call".
+        let mut tool_calls_made = 0usize;
         // Capture before the loop pushes assistant/tool messages and shifts the index.
         // Maintained across iterations: trim pass 2 may remove older messages, which
         // shifts the captured index down by the number removed (handled below).
@@ -137,7 +152,7 @@ impl LucidosEngine {
         //
         // `explicit_image_idxs` — tool results holding an image the model asked
         // to see (`view_image` / `read_file`). Capped, because the model can
-        // issue up to MAX_ITERATIONS of these in one turn and pinned images are
+        // issue as many of these in one turn as its cap allows, and pinned images are
         // exempt from pass 0 by construction; a "describe every photo in this
         // folder" turn would otherwise accumulate hundreds of un-strippable
         // images and blow the context window.
@@ -194,7 +209,26 @@ impl LucidosEngine {
                 ));
             }
 
-            if iterations > MAX_ITERATIONS {
+            // Two backstops, because they catch different runaways.
+            //
+            // The user's cap: at most `max_tool_calls` calls, with the response
+            // that crosses the line completing first (every `tool_use` needs a
+            // matching `tool_result` or the provider rejects the next request,
+            // so a response's calls cannot be abandoned half-executed).
+            //
+            // The round backstop: several paths `continue` WITHOUT executing a
+            // tool call, so they never advance the count. Each is bounded on its
+            // own, but this keeps "the turn always ends" unconditional rather
+            // than a property of every path staying bounded forever. See
+            // `NON_TOOL_ROUND_SLACK`.
+            let cap_message = if tool_calls_made >= max_tool_calls {
+                Some(tool_call_cap_message(max_tool_calls))
+            } else if iterations > max_tool_calls.saturating_add(NON_TOOL_ROUND_SLACK) {
+                Some(round_backstop_message(iterations))
+            } else {
+                None
+            };
+            if let Some(cap_message) = cap_message {
                 let msg = emit_iteration_cap_response_generated(
                     &self.event_bus,
                     thread_id,
@@ -202,6 +236,7 @@ impl LucidosEngine {
                     images.clone(),
                     effective_model.clone(),
                     effective_effort.clone(),
+                    cap_message,
                 )
                 .await;
                 *terminator_emitted = true;
@@ -1178,7 +1213,7 @@ impl LucidosEngine {
                 // stuck loop. read_file / list_files are handled by their own
                 // content-deterministic branches above (they block identical
                 // *successful* re-reads, which this failure gate intentionally
-                // does not). All still bounded by MAX_ITERATIONS, and the
+                // does not). All still bounded by the tool-call cap, and the
                 // `bash_output(wait_secs)` server-side block remains the
                 // structural fix for the sleep-poll case.
                 let breaker_action = generic_breaker_action(consecutive_failing_call);
@@ -1252,6 +1287,12 @@ impl LucidosEngine {
             }
 
             for tool_call in &response.tool_calls {
+                // Count the CALL, not the round. One response can carry several
+                // tool calls (the system prompt asks for exactly that when
+                // writing N files), so counting iterations would let a cap of
+                // 500 pass well over 500 calls while every user-facing string
+                // says "tool calls".
+                tool_calls_made += 1;
                 // Mask any postgres password the LLM hardcoded into a `bash`
                 // command (or other tool) BEFORE it reaches the log line, the
                 // persisted `description`, or the persisted `args` — the
@@ -1263,8 +1304,8 @@ impl LucidosEngine {
                 let tool_desc = self.describe_tool(&tool_call.name, &redacted_args);
                 log!(
                     "[AgentLoop] Step {}/{}: {}",
-                    iterations,
-                    MAX_ITERATIONS,
+                    tool_calls_made,
+                    max_tool_calls,
                     tool_desc
                 );
 
@@ -1507,15 +1548,15 @@ impl LucidosEngine {
                     had_errors = true;
                     log!(
                         "[AgentLoop] Step {}/{}: Error, will retry: {}",
-                        iterations,
-                        MAX_ITERATIONS,
+                        tool_calls_made,
+                        max_tool_calls,
                         result
                     );
                 } else {
                     log!(
                         "[AgentLoop] Step {}/{}: Success",
-                        iterations,
-                        MAX_ITERATIONS
+                        tool_calls_made,
+                        max_tool_calls
                     );
                 }
 

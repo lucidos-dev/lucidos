@@ -839,6 +839,61 @@ async fn get_threads_by_ids_resolves_parent_title() {
     teardown_test_db(&db).await;
 }
 
+// -- saved plumbing through ThreadSummary ------------------------------------
+
+/// `get_threads_by_ids` carries `is_saved` onto `ThreadSummary.saved`.
+///
+/// `GET /api/v1/threads` also conveys saved structurally, by returning saved
+/// threads in its own `saved` array, but `GET /api/v1/threads/:id` hands back
+/// one bare summary with no such array. That endpoint is what bootstraps a
+/// single thread for a notification tap landing outside the loaded window, so
+/// without this field the client would have to guess `false` and a saved thread
+/// would show as unsaved in the drawer until the next grouped load.
+#[tokio::test]
+async fn thread_summary_includes_saved() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let saved_id = Uuid::new_v4();
+    let unsaved_id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+             (thread_id, title, source, message_count, last_activity, has_response, is_saved) \
+             VALUES ($1, 'Parked', 'chat', 1, NOW(), TRUE, TRUE), \
+                    ($2, 'Not parked', 'chat', 1, NOW(), TRUE, FALSE)",
+    )
+    .bind(saved_id)
+    .bind(unsaved_id)
+    .execute(&pool)
+    .await
+    .expect("insert thread_summaries");
+
+    let infos = store
+        .get_threads_by_ids(&[saved_id.to_string(), unsaved_id.to_string()])
+        .await
+        .expect("get_threads_by_ids");
+
+    let saved = infos
+        .iter()
+        .find(|t| t.thread_id == saved_id.to_string())
+        .expect("the saved row must come back");
+    let unsaved = infos
+        .iter()
+        .find(|t| t.thread_id == unsaved_id.to_string())
+        .expect("the unsaved row must come back");
+
+    assert!(
+        saved.saved,
+        "is_saved=TRUE in DB must surface as saved=true on ThreadSummary"
+    );
+    assert!(
+        !unsaved.saved,
+        "is_saved=FALSE in DB must surface as saved=false on ThreadSummary"
+    );
+
+    teardown_test_db(&db).await;
+}
+
 // -- coding_agent_has_diff plumbing through ThreadSummary / ThreadAggregate ----------
 
 /// `get_threads_by_ids` (the canonical "fetch one summary" read path) returns

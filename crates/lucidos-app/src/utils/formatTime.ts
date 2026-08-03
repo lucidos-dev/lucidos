@@ -17,6 +17,29 @@ export function formatDateTime(date: Date): string {
   });
 }
 
+/** How long something has been running: "8s", "2m 14s", "1h 03m".
+ *
+ *  A DURATION, not a point in time, so it takes milliseconds rather than a
+ *  `Date` and never touches the user's timezone. Seconds are kept in the minute
+ *  range because that is where the value is read as a live counter (the status
+ *  toast's build timer ticks once a second, and a counter that only changed each
+ *  minute would read as frozen); past an hour they are noise, so the hour form
+ *  zero-pads minutes instead and the string stops changing every second.
+ *
+ *  A negative or non-finite input clamps to "0s": the caller derives this from
+ *  clock arithmetic, and a "-3s" build age is worse than a momentarily stalled
+ *  one. */
+export function formatElapsed(ms: number): string {
+  if (!Number.isFinite(ms) || ms <= 0) return '0s';
+  const totalSeconds = Math.floor(ms / 1000);
+  const seconds = totalSeconds % 60;
+  const minutes = Math.floor(totalSeconds / 60) % 60;
+  const hours = Math.floor(totalSeconds / 3600);
+  if (hours > 0) return `${hours}h ${String(minutes).padStart(2, '0')}m`;
+  if (minutes > 0) return `${minutes}m ${seconds}s`;
+  return `${seconds}s`;
+}
+
 /** "just now", "5m ago", "3h ago", "2d ago", or short date */
 export function formatTimeAgo(date: Date): string {
   const now = new Date();

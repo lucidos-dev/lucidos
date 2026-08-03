@@ -5,9 +5,9 @@
  * and is why that file's reasoning is reused here. The nav entry was filtered to
  * `isTauri() && enginePackaged.value`, so the page existed only inside the
  * packaged desktop app. Its whole purpose is getting the user onto their phone,
- * and its install half (what Tailscale buys you, Get Tailscale, the phone steps)
- * needs no Tauri IPC at all. Nothing failed: on a phone the row simply was not
- * there.
+ * and its phone-facing half (what Tailscale buys you, a Tailscale row for the
+ * reading device, the remaining steps) needs no Tauri IPC at all. Nothing
+ * failed: on a phone the row simply was not there.
  *
  * The machine-side half genuinely is desktop-only (`get_connect_info`,
  * `tailscale_up`, `tailscale_serve` are Tauri commands with no engine HTTP
@@ -62,16 +62,24 @@ describe('Mobile Access reachability', () => {
 
   it('skips the fetch off the desktop app rather than failing the pane', () => {
     // `toFailed(...)` here would render the error card INSTEAD of the whole
-    // page, blanking the install half that a phone came for. There is nothing
-    // to fetch off Tauri, so there is no failure to report.
+    // page, blanking the phone-facing half that a phone came for. There is
+    // nothing to fetch off Tauri, so there is no failure to report.
     expect(page).toContain('if (!showMachineHalf) return;');
     expect(page).not.toContain('Mobile access is only available in the desktop app.');
   });
 
-  it('shows the install half regardless of platform', () => {
-    // The ungated branch: the Tailscale intro and the phone steps render either
-    // way, with the install row addressed to whichever device is reading.
+  it('shows the phone-facing half regardless of platform', () => {
+    // The ungated branch: the Tailscale intro, a row for this device and the
+    // remaining steps render either way, addressed to whichever device is
+    // reading. Which row that is depends on the device, not the platform gate.
     expect(page).toContain('<InstallTailscaleRow onPhone={true} />');
     expect(page).toContain('<InstallTailscaleRow onPhone={false} />');
+  });
+
+  it('derives the phone-facing half from this device, not from a constant', () => {
+    // It used to be a constant, which told a phone reading over its own tailnet
+    // to install Tailscale. `phone-setup-state.test.ts` pins the derivation;
+    // this pins that the page actually feeds it the live inputs.
+    expect(page).toContain('phoneSetupState(window.location.hostname, isStandalone())');
   });
 });

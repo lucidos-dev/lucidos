@@ -42,14 +42,14 @@ describe('Flow: New chat message', () => {
     expect(exchangeResponseText(exchanges[0])).toBe('The answer is 4.');
     expect(exchangeSteps(exchanges[0])).toHaveLength(1);
     expect(exchangeSteps(exchanges[0])[0].description).toBe('Calculator');
-    expect(exchangeSteps(exchanges[0])[0].success).toBe(true);
+    expect(exchangeSteps(exchanges[0])[0].outcome).toBe('success');
 
     // Events should have step + text interleaved
     const events = exchangeResponseEvents(exchanges[0]);
     const stepEvents = events.filter(e => e.type === 'step');
     const textEvents = events.filter(e => e.type === 'text');
     expect(stepEvents).toHaveLength(1);
-    expect(stepEvents[0].success).toBe(true);
+    expect(stepEvents[0].outcome).toBe('success');
     expect(textEvents).toHaveLength(1);
     expect((textEvents[0] as { md: string }).md).toBe('The answer is 4.');
   });

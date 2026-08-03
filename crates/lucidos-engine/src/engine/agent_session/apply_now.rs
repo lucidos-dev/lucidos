@@ -478,7 +478,14 @@ impl LucidosEngine {
                     "[ApplyNow] ChangeApplyFailed (incomplete hardening)",
                 )
                 .await;
-                self.reset_worktree_and_idle(thread_id, worktree_path).await;
+                // Do NOT reset the worktree here. The apply was refused, so the
+                // change stays pending and the branch still holds every commit
+                // the agent made. `reset_worktree_and_idle` would move that
+                // branch ref to main and clean the tree, destroying the work
+                // and leaving a pending change pointing at an empty branch
+                // (recoverable only via reflog). Just return the session to
+                // idle so the user can harden and retry.
+                self.mark_session_idle(thread_id, worktree_path).await;
                 return Ok(());
             }
         }
@@ -1061,13 +1068,27 @@ impl LucidosEngine {
     }
 
     /// Reset worktree to main and re-enter idle state.
+    ///
     /// Used after apply, discard, and no-commits to keep the session alive.
+    /// ONLY safe when the branch's work is already on main (or there is no
+    /// work): the worktree's HEAD is attached to the session branch, so
+    /// `reset --hard main` moves that BRANCH REF and `clean -fd` wipes the
+    /// tree. On a path where the change is still pending, call
+    /// [`Self::mark_session_idle`] instead.
     pub(crate) async fn reset_worktree_and_idle(&self, thread_id: Uuid, worktree_path: &Path) {
-        use crate::engine::event_bus::BusEvent;
-        use crate::engine::thread_events::{EventMeta, ThreadEvent};
-
         let _ = git_cmd(&["reset", "--hard", "main"], worktree_path).await;
         let _ = git_cmd(&["clean", "-fd"], worktree_path).await;
+        self.mark_session_idle(thread_id, worktree_path).await;
+    }
+
+    /// Re-enter the idle state WITHOUT touching the worktree or the branch.
+    ///
+    /// The half of [`Self::reset_worktree_and_idle`] that is always safe. Use it
+    /// when the session must go back to idle but the branch still holds commits
+    /// the user owns.
+    pub(crate) async fn mark_session_idle(&self, thread_id: Uuid, worktree_path: &Path) {
+        use crate::engine::event_bus::BusEvent;
+        use crate::engine::thread_events::{EventMeta, ThreadEvent};
 
         let cc_sid = {
             let mut sessions = self.agent_sessions.lock().await;

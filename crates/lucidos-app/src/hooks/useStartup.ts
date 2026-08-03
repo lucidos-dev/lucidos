@@ -10,7 +10,7 @@ import { loadTriggers, loadHistoricalTriggers } from '../store/actions/triggers'
 import { loadTriggerGroups } from '../store/actions/triggerGroups';
 import { loadThreadQueue } from '../store/actions/threadQueue';
 import { loadRepositories } from '../store/actions/chat';
-import { loadPreferences } from '../store/actions/preferences';
+import { loadPreferences, flushPendingPreferenceWrites } from '../store/actions/preferences';
 import { loadPinnedApps } from '../store/actions/pinnedApps';
 import { connectThreadEvents, disconnectThreadEvents } from '../store/actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loading';
@@ -19,6 +19,11 @@ import { setupNativePushTapRouting } from '../store/actions/native-push';
 import { startDevicePresenceTracking } from '../store/actions/device-presence';
 import { startAppUpdateChecks, stopAppUpdateChecks, recheckAppUpdateOnResume } from '../store/actions/app-update';
 import { startEngineUpdateChecks, stopEngineUpdateChecks, checkEngineVersion } from '../store/actions/engine-update';
+import {
+  loadEmbeddingModelStatus,
+  subscribeToTailscaleServeProgress,
+  unsubscribeFromTailscaleServeProgress,
+} from '../store/actions/backgroundActivity';
 import { startScrollVisibilityHandler } from '../components/chat/scrollState';
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
@@ -102,6 +107,16 @@ export function useStartup(): void {
       void checkEngineVersion();
     }).catch(() => { /* loadPreferences sets Loadable failed internally — UI shows the error */ });
     void loadPinnedApps();
+    // Snapshot the embedding-model load. On a fresh workspace the ~465 MB
+    // download starts at engine boot, seconds before this document exists, so
+    // every SSE frame so far has already been missed; without this read the
+    // status toast would not open until the next one arrives, and a warm
+    // workspace would never learn the model is ready.
+    void loadEmbeddingModelStatus();
+    // An Expose run narrates itself over a Tauri event, and it outlives the pane
+    // that started it, so the listener belongs at startup beside the updater's
+    // rather than on the Mobile Access page.
+    void subscribeToTailscaleServeProgress();
     loadAllThreads().catch(() => {
       // Retry after 3s — covers transient network failures on initial load.
       // If this also fails, the 5s health poll will keep retrying.
@@ -475,6 +490,12 @@ export function useStartup(): void {
       // (absolute-navigate URL on iOS, notificationclick elsewhere), so there's
       // no in-app rescue toast to surface here.
       void loadUnreadNotifications();
+      // Re-send any preference write the engine never received. WebKit aborts
+      // in-flight fetches when it suspends the page, so a settings change made
+      // just before backgrounding is applied on this device but missing on the
+      // server; resume is the first moment it can land. No-op when nothing is
+      // parked. See store/actions/preferences.ts.
+      void flushPendingPreferenceWrites();
       // Check for SW updates on resume — iOS PWA never reloads, so this is the
       // only chance to detect new versions after the initial page load.
       navigator.serviceWorker?.getRegistration().then(reg => reg?.update()).catch(() => {});
@@ -493,6 +514,10 @@ export function useStartup(): void {
       // current for the whole poll interval after a release. Throttled inside
       // (window focus fires constantly); a no-op outside the Tauri client.
       void recheckAppUpdateOnResume();
+      // And the embedding model, for the same reason as the engine build: a
+      // suspended PWA missed every transient status frame, so re-read the
+      // snapshot rather than trusting the last one seen before backgrounding.
+      void loadEmbeddingModelStatus();
       // Probe the SW for liveness too — a wedged SW won't accept update()
       // either, so resume is the natural moment to detect and recover.
       checkSwHealth().catch(() => { /* best-effort recovery; next probe retries */ });
@@ -571,6 +596,7 @@ export function useStartup(): void {
       stopSwProbe();
       if (heartbeatInterval) clearInterval(heartbeatInterval);
       stopAppUpdateChecks();
+      unsubscribeFromTailscaleServeProgress();
       stopEngineUpdateChecks();
       clearTimeout(initialHealthCheck);
       window.removeEventListener('message', onAppFrameMessage);

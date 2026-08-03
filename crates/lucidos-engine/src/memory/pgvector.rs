@@ -3,7 +3,27 @@ use serde::{Deserialize, Serialize};
 use sqlx::PgPool;
 use uuid::Uuid;
 
+/// Width of `memory_entries.embedding` on a workspace created by THIS build.
+///
+/// Only used in the `CREATE TABLE IF NOT EXISTS` below, which means it does not
+/// govern an existing workspace: that column keeps whatever width it was created
+/// with, forever, and changing this constant would not migrate it. So nothing
+/// may assume the loaded model's width equals this. Ask
+/// [`PgVectorIndex::embedding_column_dimensions`] what the table actually has.
 const VECTOR_DIM: i32 = 384;
+
+/// Pull `N` out of a rendered pgvector column type, e.g. `vector(384)`.
+/// `None` for anything else, including a width-less `vector` (pgvector allows
+/// an unconstrained column, which imposes no width to disagree with).
+fn parse_vector_dimensions(rendered: &str) -> Option<usize> {
+    let inner = rendered.trim().strip_prefix("vector")?.trim();
+    inner
+        .strip_prefix('(')?
+        .strip_suffix(')')?
+        .trim()
+        .parse()
+        .ok()
+}
 
 /// Format a vector as a pgvector literal — `[1.0,2.0,...]`.
 /// pgvector accepts this string form via the `::vector` cast in queries.
@@ -90,6 +110,40 @@ impl PgVectorIndex {
         let index = Self { pool };
         index.init_schema().await?;
         Ok(index)
+    }
+
+    /// The width `memory_entries.embedding` ACTUALLY has, read from the live
+    /// table rather than assumed from [`VECTOR_DIM`].
+    ///
+    /// This is what a loaded model has to agree with. The table is created
+    /// `IF NOT EXISTS`, so a workspace provisioned by an older build keeps its
+    /// original width and no constant in this binary describes it. Without the
+    /// check, a model of a different width installs fine and then every insert
+    /// and every re-embed UPDATE fails on a dimension mismatch, with
+    /// `reembed_stale` aborting its sweep (correctly, to avoid an infinite
+    /// loop) and telling nobody: memory quietly stops taking writes.
+    ///
+    /// Parsed out of `format_type`'s `vector(N)` rather than read from
+    /// `atttypmod` directly, so it does not depend on how pgvector chooses to
+    /// encode the modifier. `None` when the table or column is absent (a
+    /// brand-new workspace mid-provision), which is not a mismatch.
+    pub async fn embedding_column_dimensions(
+        &self,
+    ) -> Result<Option<usize>, Box<dyn std::error::Error + Send + Sync>> {
+        let rendered: Option<String> = sqlx::query_scalar(
+            r#"
+            SELECT format_type(a.atttypid, a.atttypmod)
+            FROM pg_attribute a
+            WHERE a.attrelid = to_regclass('memory_entries')
+              AND a.attname = 'embedding'
+              AND NOT a.attisdropped
+            "#,
+        )
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten();
+
+        Ok(rendered.and_then(|t| parse_vector_dimensions(&t)))
     }
 
     /// Initialize the pgvector extension and create tables.
@@ -927,6 +981,56 @@ mod get_by_id_tests {
             missing.is_none(),
             "unknown id must return None, not an entry"
         );
+
+        teardown_test_db(&db_name).await;
+    }
+}
+
+#[cfg(test)]
+mod embedding_dimension_tests {
+    use super::*;
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    /// The parse has to survive whatever `format_type` renders, and must not
+    /// invent a width for an unconstrained column (which imposes none).
+    #[test]
+    fn parses_only_a_width_constrained_vector_type() {
+        assert_eq!(parse_vector_dimensions("vector(384)"), Some(384));
+        assert_eq!(parse_vector_dimensions("vector(1024)"), Some(1024));
+        assert_eq!(parse_vector_dimensions(" vector(768) "), Some(768));
+        // pgvector allows a width-less column; nothing to disagree with.
+        assert_eq!(parse_vector_dimensions("vector"), None);
+        // Never guess from a different type.
+        assert_eq!(parse_vector_dimensions("halfvec(384)"), None);
+        assert_eq!(parse_vector_dimensions("text"), None);
+        assert_eq!(parse_vector_dimensions("vector(oops)"), None);
+    }
+
+    /// Read the width from the LIVE table, not from `VECTOR_DIM`: an existing
+    /// workspace keeps whatever width its column was created with, and the
+    /// dimension guard has to judge a model against that.
+    #[tokio::test]
+    async fn reports_the_live_columns_width() {
+        let (pool, db_name) = setup_test_db().await;
+
+        // Before the table exists there is no column, which is not a mismatch.
+        let bare = PgVectorIndex { pool: pool.clone() };
+        assert_eq!(bare.embedding_column_dimensions().await.unwrap(), None);
+
+        let index = PgVectorIndex::new(pool.clone()).await.unwrap();
+        assert_eq!(
+            index.embedding_column_dimensions().await.unwrap(),
+            Some(VECTOR_DIM as usize),
+            "a freshly created table reports the width this build creates"
+        );
+
+        // A workspace whose column was created at a different width must
+        // report THAT, which is the whole point of asking the table.
+        sqlx::query("ALTER TABLE memory_entries ALTER COLUMN embedding TYPE vector(7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(index.embedding_column_dimensions().await.unwrap(), Some(7));
 
         teardown_test_db(&db_name).await;
     }

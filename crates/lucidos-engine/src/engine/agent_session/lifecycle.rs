@@ -293,6 +293,45 @@ pub(super) fn should_auto_commit_on_cleanup(
     !should_discard && matches!(last_terminal, Some(TerminalKind::Generated))
 }
 
+/// Whether the session-end path may delete this thread's worktree directory.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum WorktreeRemoval {
+    /// Every condition was POSITIVELY established. Safe to remove.
+    Remove,
+    /// Keep the worktree; the string is the reason, for the log.
+    Keep(&'static str),
+}
+
+/// Decide whether a **Discard** may delete the worktree the session ran in.
+///
+/// Discard is the only session end that reclaims a worktree at all. Every other
+/// one leaves the tree for the background `WorktreeCleanup` worker, the single
+/// owner of reclamation (ADR 0035). So this function does not ask whether the
+/// work looks spent, whether the turn ended cleanly, or whether git can confirm
+/// the tree is live: the user already answered all of that by clicking Discard,
+/// and the branch is deleted alongside the tree.
+///
+/// One question is still worth asking, and it is the reason this is a function
+/// rather than a bare `git worktree remove`: **is this tree actually ours?**
+/// Claude Code can `git checkout` inside its own worktree, so a Discard aimed at
+/// the session's branch must not delete a tree now sitting on someone else's.
+/// `worktree_branch` is `None` for a detached HEAD or an unreadable one, and
+/// neither is a positive match. That is the "unknown never authorizes
+/// destruction" rule from `.claude/rules/rust.md` applied at the last remaining
+/// destructive site on this path.
+pub(super) fn discarded_worktree_removal(
+    worktree_branch: Option<&str>,
+    session_branch: &str,
+) -> WorktreeRemoval {
+    match worktree_branch {
+        Some(b) if b == session_branch => WorktreeRemoval::Remove,
+        Some(_) => WorktreeRemoval::Keep("worktree is checked out on a different branch"),
+        None => WorktreeRemoval::Keep(
+            "could not read which branch the worktree is on (detached HEAD, or git gave no answer)",
+        ),
+    }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum ConflictResolutionCleanupAction {
     Apply,
@@ -623,7 +662,15 @@ pub(super) fn reset_per_turn_flags(
 /// destroyed user work. The opt-in design fires for the dead-socket case
 /// it was designed for and stays out of every other legitimate-silence
 /// case.
-pub(super) const WATCHDOG_INACTIVITY_LIMIT_MS: i64 = 10 * 60 * 1000;
+///
+/// `pub(crate)` (not `pub(super)`) because this limit only produces the
+/// non-destructive outcome (kill plus auto-resume via `ContinuationRequested`)
+/// when it is SHORTER than Claude Code's own byte-idle streaming deadline,
+/// which ends the turn with a terminal `ResponseFailed` instead. The runtime
+/// sets that deadline (`runtime::claude_code::CC_BYTE_STREAM_IDLE_TIMEOUT_MS`)
+/// and asserts the ordering against this constant, so the two cannot drift into
+/// the wrong order silently.
+pub(crate) const WATCHDOG_INACTIVITY_LIMIT_MS: i64 = 10 * 60 * 1000;
 
 /// Hard ceiling for the `tools_in_flight > 0` carve-out. The normal limit
 /// (`WATCHDOG_INACTIVITY_LIMIT_MS` / `EXTERNAL_WATCHDOG_LIMIT_MS`) skips while a
@@ -818,3 +865,7 @@ mod classify_tests;
 #[cfg(test)]
 #[path = "lifecycle_tests/watchdog.rs"]
 mod watchdog_tests;
+
+#[cfg(test)]
+#[path = "lifecycle_tests/worktree_removal.rs"]
+mod worktree_removal_tests;

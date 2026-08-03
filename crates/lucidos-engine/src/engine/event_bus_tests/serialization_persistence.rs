@@ -122,6 +122,14 @@ fn other_system_events_not_persisted() {
     }
     .is_persisted());
     assert!(!SystemEvent::NotificationsAllRead { actor: None }.is_persisted());
+    assert!(!SystemEvent::EmbeddingModelStatusChanged {
+        model_id: "multilingual-e5-small".into(),
+        load_state: crate::memory::EmbeddingModelLoadState::Downloading {
+            downloaded_bytes: 1,
+            total_bytes: 2,
+        },
+    }
+    .is_persisted());
     assert!(!SystemEvent::MemoryRebuildProgress {
         processed: 0,
         total: 0,

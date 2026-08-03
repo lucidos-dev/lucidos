@@ -87,6 +87,18 @@ reachable writer of an announced surface, real event names, and live exemptions.
   HTTP handler emits `TriggerCreated` and the scheduler materializes state from
   the event, so there is no direct write to forget an emit for. That is the
   stronger pattern; this ADR is the retrofit for surfaces not built that way.
+
+  **Amended 2026-08-03.** Event-first, yes, but that says nothing about *when*
+  the materialization becomes visible, and the answer was "whenever the
+  scheduler's subscriber task next ran". A write returned while the in-memory
+  trigger registry still held pre-write state, so a `PUT {"paused": true}` that
+  answered `success: true` could be followed by a run request that fired the
+  trigger it had just paused. Triggers now go through a write chokepoint that
+  emits and then applies the registry projection before returning
+  (`engine/trigger_writes.rs`, mirroring `trigger_group_writes.rs`), which makes
+  the surface read-your-writes without changing who owns the emit. The
+  reachability-not-atomicity boundary below is unchanged: the event commits
+  first, and the apply follows it.
 - **Two `data/` helpers still announce at the call site.**
   `write_batch_and_commit` (a bulk import announces once as
   `RepositoryImported`, not once per file) and `commit_data_path` (a commit-only

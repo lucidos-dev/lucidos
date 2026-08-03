@@ -16,7 +16,7 @@ vi.mock('../../hooks/sw-update', () => ({
 import { checkEngineVersion, handleFrontendUpdateDeferred, handleFrontendUpdateStranded, handleEngineBuildStateChanged, DEFERRED_HINT_STALE_AFTER_MS } from './engine-update';
 import { engineVersionStatus, rebuildEngine } from '../../api/client';
 import { noteSwitchBuildId, wasSwitchDismissed, markSwitchDismissed } from '../../hooks/sw-update';
-import { toasts, engineVersionReady, engineBuilding, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
+import { toasts, engineVersionReady, engineBuilding, engineBuildDetail, engineRestarting, preferences, showToast, dismissToast, FRONTEND_UPDATE_DEFERRED_TOAST_KEY, FRONTEND_UPDATE_STRANDED_TOAST_KEY } from '../store';
 
 const mockStatus = vi.mocked(engineVersionStatus);
 const mockWasSwitchDismissed = vi.mocked(wasSwitchDismissed);
@@ -32,6 +32,8 @@ function status(over: Partial<{
   build_state: 'idle' | 'building' | 'ready' | 'failed';
   source_behind_head: boolean;
   shared_build_in_progress: boolean;
+  build_elapsed_ms: number;
+  pending_commits: { total: number; subjects: string[] };
 }> = {}) {
   return {
     build_id: 'eng123',
@@ -294,6 +296,80 @@ describe('checkEngineVersion — new-version surface (arrival coupled, INV-C; di
     expect(toast?.action?.label).toBe('Retry build');
     toast?.action?.onClick();
     expect(mockRebuild).toHaveBeenCalled();
+  });
+});
+
+/** `engineBuilding` and `engineBuildDetail` are written by one helper, because
+ *  `pollEngineVersion` decides "not building" on three separate paths and two
+ *  independent assignments is how a stale narration outlives its build. That
+ *  already happened here once: a toast reading "Building new version" survived a
+ *  build that had already failed. */
+describe('checkEngineVersion: the build narration cannot outlive the build', () => {
+  beforeEach(() => {
+    mockStatus.mockReset();
+    mockWasSwitchDismissed.mockReset();
+    mockWasSwitchDismissed.mockReturnValue(false);
+    mockNoteSwitchBuildId.mockReset();
+    mockRebuild.mockReset();
+    mockRebuild.mockResolvedValue(undefined);
+    toasts.value = [];
+    engineVersionReady.value = false;
+    engineBuilding.value = false;
+    engineBuildDetail.value = null;
+    engineRestarting.value = false;
+    preferences.value = { status: 'loaded', data: {} };
+  });
+
+  it('carries the elapsed time and the commits while a build runs', async () => {
+    mockStatus.mockResolvedValue(status({
+      build_state: 'building',
+      source_behind_head: true,
+      build_elapsed_ms: 42_000,
+      pending_commits: { total: 2, subjects: ['fix: one', 'docs: two'] },
+    }));
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(true);
+    expect(engineBuildDetail.value?.elapsedMs).toBe(42_000);
+    expect(engineBuildDetail.value?.pendingCommits?.total).toBe(2);
+    // Anchored on the CLIENT clock at receipt, which is what lets the counter
+    // advance between polls without comparing two machines' clocks.
+    expect(engineBuildDetail.value?.anchoredAt).toBeLessThanOrEqual(Date.now());
+  });
+
+  it.each([
+    ['the build failed', status({ source_behind_head: true, build_state: 'failed' })],
+    ['the build finished', status({ build_state: 'idle' })],
+    ['this is a packaged build', status({ packaged: true })],
+  ])('clears both halves once %s', async (_case, next) => {
+    mockStatus.mockResolvedValue(status({
+      build_state: 'building',
+      build_elapsed_ms: 42_000,
+      pending_commits: { total: 1, subjects: ['fix: one'] },
+    }));
+    await checkEngineVersion();
+    expect(engineBuildDetail.value).not.toBeNull();
+
+    mockStatus.mockResolvedValue(next);
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(false);
+    expect(engineBuildDetail.value).toBeNull();
+  });
+
+  /** A co-located peer's build spins the badge, but the engine reports no
+   *  elapsed for it (its own `build_state` is idle). The detail exists so the
+   *  commit list still shows; the timer does not. */
+  it("reports a peer's build with commits but no timer", async () => {
+    mockStatus.mockResolvedValue(status({
+      build_state: 'idle',
+      shared_build_in_progress: true,
+      source_behind_head: true,
+      update_available: false,
+      pending_commits: { total: 1, subjects: ['fix: one'] },
+    }));
+    await checkEngineVersion();
+    expect(engineBuilding.value).toBe(true);
+    expect(engineBuildDetail.value?.elapsedMs).toBeNull();
+    expect(engineBuildDetail.value?.pendingCommits?.subjects).toEqual(['fix: one']);
   });
 });
 

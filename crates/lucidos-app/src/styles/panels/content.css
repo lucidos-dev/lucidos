@@ -68,10 +68,11 @@
     border-bottom: none;
 }
 
+/* Unread is signalled by the tinted surface alone. A colored left border here
+   would be the banned left-accent stripe (.claude/rules/frontend.md F18). */
 .notification-item.unread {
     opacity: 1; /* Unread notifications are full opacity */
     background: rgba(88, 166, 255, 0.05);
-    border-left: 0.1875rem solid var(--accent);
 }
 
 @media (hover: hover) {

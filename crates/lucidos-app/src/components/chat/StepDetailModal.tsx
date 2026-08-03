@@ -289,7 +289,7 @@ export function StepDetailModal() {
   const step = stepDetailModal.value;
   if (!step) return null;
 
-  const status = stepStatus(step.success);
+  const status = stepStatus(step.outcome);
   const showFull = step.full && step.full !== step.description;
   const snap = step.contextCapture;
 
@@ -310,6 +310,14 @@ export function StepDetailModal() {
           )}
         </div>
         <div class="step-detail-description">{highlightEllipsis(step.description)}</div>
+        {/* "Did not finish" alone doesn't say whose fault it was. Spell out
+            that nothing was reported back, so the empty result area below
+            reads as a consequence rather than a second mystery. */}
+        {step.outcome === 'unfinished' && (
+          <div class="step-detail-note">
+            {'The turn ended before this tool reported a result, so what it did (if anything) was not recorded.'}
+          </div>
+        )}
         {step.detail && <div class="step-detail-detail">{highlightEllipsis(step.detail)}</div>}
         {showFull && <pre class="step-detail-full">{step.full}</pre>}
         {step.thinkingText && (

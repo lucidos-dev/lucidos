@@ -1,7 +1,7 @@
 import { API, json, text } from './_core';
 import { lucidos } from '@lucidos/sdk';
 import type { AuthType, EmailAccountInfo, Notification, OAuthAccountInfo } from '../../store/types';
-import type { AgentBinariesResponse, ApiResult, CredentialsListResponse, DeviceInfo, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse } from '../types';
+import type { AgentBinariesResponse, ApiResult, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
 export function getNotifications(params?: {
@@ -257,6 +257,13 @@ export async function rebuildMemory(force = false): Promise<void> {
 
 export async function cancelMemoryRebuild(): Promise<void> {
   await json(`${API}/memory/rebuild`, { method: 'DELETE' });
+}
+
+/** Snapshot of the background embedding-model load. The live signal is the
+ *  `EmbeddingModelStatusChanged` SSE frame; this is how a client that connected
+ *  mid-download catches up, and it returns the identical shape. */
+export function getEmbeddingModelStatus(): Promise<EmbeddingModelStatus> {
+  return json(`${API}/memory/embedding-model-status`);
 }
 
 // --- Email ---

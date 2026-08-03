@@ -657,8 +657,27 @@
         position: sticky;
         /* Tracks the header's bottom edge via CSS vars from useHideOnScroll.
            The offset extends past -headerHeight by titleHeight so the title
-           bar scrolls fully off-screen at the same speed as the header. */
-        top: calc(var(--mobile-header-height, 3rem) + var(--mobile-header-offset, 0rem));
+           bar scrolls fully off-screen at the same speed as the header.
+
+           The live offset rides `transform`, NOT `top`. useHideOnScroll rewrites
+           --mobile-header-offset on essentially every scroll frame; feeding a
+           LAYOUT property meant each write dirtied layout, so the very next
+           scroll event's `scrollTop` read forced a synchronous style+layout flush
+           of the whole transcript. That read/write pair, once per scroll event on
+           the largest DOM in the app, is why hide-on-scroll janked on the thread
+           while staying smooth on the threads drawer and the content pane, which
+           hold far fewer nodes and no consumer of this var at all. A transform is
+           composited, so the write no longer invalidates layout.
+
+           Safe as a transform here because it makes this row the containing block
+           for any `position: fixed` descendant: the only one is the ⋯ menu, which
+           already portals to <body> for exactly this reason (see OverflowMenu).
+
+           Equivalent at rest and in motion: the row only unsticks at scrollTop 0,
+           where the offset is 0, so the translate is never applied to a row
+           sitting in normal flow. */
+        top: var(--mobile-header-height, 3rem);
+        transform: translateY(var(--mobile-header-offset, 0rem));
         z-index: 2;
         /* Stretch to full width, cancelling .thread-content's horizontal padding */
         margin-left: -0.75rem;
@@ -908,12 +927,27 @@
        The 0.75rem gap below the bar mirrors .scroll-to-bottom's 0.75rem
        bottom inset (input-messages.css) — the wrap's bottom edge is flush
        with the prompt box, so both chevrons keep the same distance to
-       their neighboring chrome. */
+       their neighboring chrome.
+
+       Split into a static `top` plus a `transform` for the live offset, for the
+       reason spelled out on .mobile-thread-title-row above: --mobile-header-offset
+       is rewritten on essentially every scroll frame, so it must never reach a
+       layout property. Keeping BOTH of this var's consumers transform-only makes
+       that a property of the var rather than a rule-by-rule habit.
+
+       Algebraically identical to the max() nest it replaces, via
+       max(A, B + x) == B + max(A - B, x) with
+         A = safe-area + 0.75rem                       (dynamic-island floor)
+         B = headerHeight + titleHeight + 0.75rem      (resting position)
+         x = max(offset, -headerHeight)                (offset, clamped)
+       so A - B collapses to safe-area - headerHeight - titleHeight (the two
+       0.75rem terms cancel). */
     .mobile-swipe-pane .scroll-to-top {
-        top: max(
-            calc(env(safe-area-inset-top, 0px) + 0.75rem),
-            calc(var(--mobile-header-height, 3rem) + max(var(--mobile-header-offset, 0rem), calc(-1 * var(--mobile-header-height, 3rem))) + var(--mobile-thread-title-height, 2.75rem) + 0.75rem)
-        );
+        top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.75rem);
+        transform: translateY(max(
+            calc(env(safe-area-inset-top, 0px) - var(--mobile-header-height, 3rem) - var(--mobile-thread-title-height, 2.75rem)),
+            max(var(--mobile-header-offset, 0rem), calc(-1 * var(--mobile-header-height, 3rem)))
+        ));
     }
 
     /* Hide thread title bar on mobile — app header handles navigation */
@@ -1119,43 +1153,41 @@
     }
 }
 
-/* ─── Landscape lock ─── */
-/* Hidden by default; shown only on phones in landscape orientation.
+/* ─── Phone in landscape ─── */
+/* Rotation is ignored: a phone held sideways is not an error state, so there
+   is no lock screen and the layout just follows the viewport it lands in.
+   Most phones are wider than the 768px line in landscape and therefore get the
+   desktop split, which suits the wide content (diffs, previews, images) people
+   rotate to read in the first place. A full-screen "Please rotate your device
+   to portrait" overlay used to sit here instead.
+
    Detection: orientation:landscape + max-height:500px catches all phones
    (height in landscape is ~300-450px) without triggering on tablets
    (height ≥768px in landscape) or short desktop windows (orientation
-   is normally portrait or square at typical desktop heights). */
-.landscape-lock {
-    display: none;
-}
+   is normally portrait or square at typical desktop heights).
 
+   Two things the width-gated mobile blocks above can no longer supply, since a
+   landscape phone sits on the far side of that gate:
+     - The notch / rounded-corner insets. `viewport-fit=cover` (index.html)
+       extends the layout under the cutout, and only landscape has non-zero
+       left/right insets, so the shell reserves them here rather than letting
+       the pane edges clip. Accepted cost: the shell's content box no longer
+       starts at x=0, but `--divider-x` (panels/shell.css) carries a `100%`
+       term that a position:fixed consumer resolves against the whole
+       viewport, so the desktop drawer scrim and the toast centering land up
+       to one inset off the divider they track. Cosmetic, and only here;
+       rebasing --divider-x on a shell-width variable would rework the whole
+       header positioning system for it.
+     - `html { overflow: hidden }`, which keeps iOS from scrolling the document
+       out from under the prompt when the keyboard opens. */
 @media (orientation: landscape) and (max-height: 500px) and (hover: none) and (pointer: coarse) {
-    .landscape-lock {
-        display: flex;
-        position: fixed;
-        inset: 0;
-        z-index: var(--z-tooltip);
-        background: var(--bg-primary);
-        flex-direction: column;
-        align-items: center;
-        justify-content: center;
-        gap: 1rem;
-        padding: 1rem;
-        color: var(--text-primary);
-        text-align: center;
-        -webkit-user-select: none;
-        user-select: none;
+    html {
+        overflow: hidden;
     }
 
-    .landscape-lock svg {
-        width: 3rem;
-        height: 3rem;
-        color: var(--accent);
-    }
-
-    .landscape-lock p {
-        margin: 0;
-        font-size: var(--font-size-xl);
-        color: var(--text-secondary);
+    .app-shell {
+        padding-left: env(safe-area-inset-left, 0px);
+        padding-right: env(safe-area-inset-right, 0px);
+        padding-bottom: env(safe-area-inset-bottom, 0px);
     }
 }

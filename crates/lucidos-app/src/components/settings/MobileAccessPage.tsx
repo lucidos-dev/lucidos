@@ -1,6 +1,11 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { showToast, enginePackaged } from '../../store/store';
-import { isTauri, isIOS, isAndroid } from '../../utils/platform';
+import { showToast, enginePackaged, tailscaleServeRun } from '../../store/store';
+import {
+  beginTailscaleServeRun,
+  clearTailscaleServeRun,
+  applyTailscaleServeProgress,
+} from '../../store/actions/backgroundActivity';
+import { isTauri, isIOS, isAndroid, isStandalone } from '../../utils/platform';
 import { openExternalUrl } from '../../utils/openExternalUrl';
 import {
   getConnectInfo,
@@ -149,6 +154,47 @@ export function tailscaleRowState(ts: TailscaleInfo): TailscaleRowState {
   return { kind: 'expose', canRun: ts.cli_available, magicDnsName: ts.magic_dns_name };
 }
 
+/** Pure: did the device READING this page reach it over the tailnet?
+ *
+ *  A MagicDNS name resolves only on a device signed in to the tailnet that owns
+ *  it, so being served at `<machine>.<tailnet>.ts.net` is proof that Tailscale
+ *  is installed and connected right here. Same rule {@link tailscaleRowState}
+ *  applies to the Mac: demonstrable tailnet membership always beats an install
+ *  offer.
+ *
+ *  Deliberately NOT extended to a bare `100.64/10` host. That range is real
+ *  CGNAT space an ISP can hand to a physical interface, so an address alone
+ *  proves nothing without the interface check the Mac-side read does; we cannot
+ *  see the phone's interfaces from here. Matching the range in TypeScript would
+ *  also fork a predicate that lives once, in `lucidos-tailscale`. An unproven
+ *  host keeps the install offer, which is the harmless way to be wrong. */
+export function isTailnetHostname(hostname: string): boolean {
+  return hostname.toLowerCase().endsWith('.ts.net');
+}
+
+/** How far THIS device has got, for the half of the page that needs no Mac.
+ *
+ *  The address field is `hostname`, never `host`: it carries
+ *  `location.hostname`, and a `location.host` would drag a `:port` in behind
+ *  the `.ts.net` suffix and read as unproven. */
+export type PhoneSetupState =
+  /** No proof of a tailnet: offer the install, then the full steps. */
+  | { kind: 'install' }
+  /** On the tailnet, read in a browser tab: one step left. */
+  | { kind: 'add-to-home-screen'; hostname: string }
+  /** On the tailnet, running as the installed PWA: nothing left. */
+  | { kind: 'ready'; hostname: string };
+
+/** Pure: derive the phone-facing half from how this device got here. Takes the
+ *  hostname and the standalone flag as arguments so it is testable without a
+ *  `location` or a display-mode media query. */
+export function phoneSetupState(hostname: string, standalone: boolean): PhoneSetupState {
+  if (!isTailnetHostname(hostname)) return { kind: 'install' };
+  return standalone
+    ? { kind: 'ready', hostname }
+    : { kind: 'add-to-home-screen', hostname };
+}
+
 interface MobileAccessInfo {
   connect: ConnectInfo;
   gatewayBind: string;
@@ -202,6 +248,63 @@ function InstallTailscaleRow({ onPhone }: { onPhone: boolean }) {
   );
 }
 
+/** The Tailscale row for the device reading the page, when that device is not
+ *  the Mac.
+ *
+ *  The install offer is one of three answers, not the only one: a phone that
+ *  reached this page over its tailnet has already done that step, and telling it
+ *  to install Tailscale is both wrong and the loudest thing on the screen. */
+function PhoneTailscaleRow({ state }: { state: PhoneSetupState }) {
+  if (state.kind === 'install') return <InstallTailscaleRow onPhone={true} />;
+  return (
+    <div class="list-rows">
+      <div class="list-row">
+        <div class="list-row-info">
+          <div class="title">Tailscale is connected on this device</div>
+          <div class="list-row-details">
+            You are reading this over your tailnet, at <strong>{state.hostname}</strong>, so this
+            device is already signed in to the same tailnet as your Mac. Nothing to install.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/** The remaining setup steps for the device reading the page. Each state drops
+ *  the steps it can see are already done. */
+function PhoneStepsSection({ state }: { state: PhoneSetupState }) {
+  const title = state.kind === 'ready' ? 'This phone is set up' : 'Getting Lucidos onto this phone';
+  return (
+    <div class="settings-section">
+      <div class="settings-section-title" data-search-anchor="mobile-access:phone">{title}</div>
+      {state.kind === 'install' && (
+        <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
+          <li>Install Tailscale here and sign in to the <strong>same tailnet</strong> as your Mac.</li>
+          <li>
+            On your Mac, open <strong>Settings → Mobile Access</strong> and copy the{' '}
+            <strong>Tailscale</strong> address it shows. Send it to yourself and open it here.
+          </li>
+          <li>Add that page to your home screen to install Lucidos and turn on push.</li>
+        </ol>
+      )}
+      {state.kind === 'add-to-home-screen' && (
+        <p class="settings-section-desc">
+          Tailscale is connected and you are already on the right address, so one step is left:
+          add this page to your home screen. That installs Lucidos and turns on push
+          notifications.
+        </p>
+      )}
+      {state.kind === 'ready' && (
+        <p class="settings-section-desc">
+          Lucidos is installed here and reaches your Mac over Tailscale, so it works off your home
+          network. Nothing left to do.
+        </p>
+      )}
+    </div>
+  );
+}
+
 /**
  * Mobile Access settings.
  *
@@ -209,10 +312,12 @@ function InstallTailscaleRow({ onPhone }: { onPhone: boolean }) {
  *
  * - **Machine-side** (Connect URLs, Sign in, Expose) needs the packaged desktop
  *   app: those are Tauri commands with no engine HTTP equivalent.
- * - **The install half** (what Tailscale buys you, Get Tailscale, the phone
- *   steps) needs nothing, and is shown everywhere. This page exists to get the
- *   user onto their phone, so gating the phone-facing half behind the desktop
- *   app made it unreachable from the one device it is written for.
+ * - **The phone-facing half** (what Tailscale buys you, the Tailscale row for
+ *   this device, the remaining steps) needs nothing, and is shown everywhere.
+ *   This page exists to get the user onto their phone, so gating it behind the
+ *   desktop app made it unreachable from the one device it is written for. It
+ *   reads its own state off the host this device reached the page on, so a
+ *   phone already on the tailnet is never told to install Tailscale.
  *
  * We use `tailscale serve` (tailnet-private HTTPS), never `funnel` (public):
  * the engine has no inbound API auth.
@@ -222,15 +327,26 @@ export function MobileAccessPage() {
   // build has no gateway on the stable port, so its connect URLs would be a
   // guess.
   const showMachineHalf = isTauri() && enginePackaged.value;
+  // Non-null exactly when the phone-facing half is the one rendering: the Mac
+  // has real detection behind `get_connect_info`, this device has the address
+  // it is being served on.
+  const phone: PhoneSetupState | null = showMachineHalf
+    ? null
+    : phoneSetupState(window.location.hostname, isStandalone());
   const [info, setInfo] = useState<Loadable<MobileAccessInfo>>({ status: 'not-loaded' });
-  const [busy, setBusy] = useState<null | 'up' | 'serve'>(null);
+  const [busy, setBusy] = useState<null | 'up'>(null);
+  // The Expose run's state lives in the store, not here: a run can spend minutes
+  // waiting for a tailnet approval, it narrates itself on the brand badge and the
+  // status toast from anywhere in the app, and a page-local flag would be lost
+  // the moment the user navigated away and came back to a still-running setup.
+  const serveRunning = tailscaleServeRun.value !== null;
   const [authKey, setAuthKey] = useState('');
   const showLoading = useDelayedLoading(info);
 
   const reload = useCallback(() => {
     // Not a swallowed error: off the desktop app there is nothing to fetch, so
     // there is no failure to report. Setting a failed state here would blank the
-    // install half, which is exactly the half a phone came for.
+    // phone-facing half, which is exactly the half a phone came for.
     if (!showMachineHalf) return;
     setInfo({ status: 'loading' });
     // The gateway bind decides whether the LAN URL is reachable at all
@@ -247,6 +363,15 @@ export function MobileAccessPage() {
 
   useEffect(() => { reload(); }, [reload]);
 
+  // Both failure toasts show the error verbatim, with NO action prefix of their
+  // own. Every error `mobile.rs` returns already names what failed: the CLI
+  // probe's "The Tailscale command-line tool isn't available", the tailnet and
+  // MagicDNS preconditions, both "reported success but ..." post-conditions,
+  // and `run_checked`'s "tailscale <cmd> failed: <stderr>". Re-framing them here
+  // stuttered ("Tailscale serve failed: tailscale serve failed: Error: the CLI
+  // for serve and funnel has changed"), which buried the CLI's own advice, and
+  // that advice is the whole payload when a syntax change is the cause. Add
+  // context to the Rust message instead of a prefix here.
   const onUp = useCallback(async () => {
     setBusy('up');
     try {
@@ -254,22 +379,40 @@ export function MobileAccessPage() {
       setAuthKey('');
       reload();
     } catch (e) {
-      showToast(`Tailscale sign-in failed: ${errorDetail(e)}`, 'error');
+      showToast(errorDetail(e), 'error');
     } finally {
       setBusy(null);
     }
   }, [authKey, reload]);
 
+  // Expose is narrated by the shared background-activity surface (the spinning
+  // brand badge, and the status toast behind it), not by this promise: the run
+  // can legitimately wait minutes for a tailnet approval, and every step it
+  // passes through arrives as a progress frame. So the outcome toast comes from
+  // the terminal frame, and the `catch` here covers only what Rust could not
+  // report at all (a rejected invoke, an ACL denial, a dead bridge). Same
+  // division of labour as `installAppUpdate`.
   const onServe = useCallback(async () => {
-    setBusy('serve');
+    if (tailscaleServeRun.value) return;
+    beginTailscaleServeRun();
     try {
       const url = await tailscaleServe();
-      showToast(`Engine exposed at ${url}`, 'success');
+      // A still-set run means the terminal frame never arrived: the progress
+      // subscription failed, or the whole run finished before it was installed.
+      // Settling from the resolved URL is what stops the badge spinning forever
+      // over a run that has already succeeded.
+      if (tailscaleServeRun.value) {
+        applyTailscaleServeProgress({ phase: 'done', url });
+      }
       reload();
     } catch (e) {
-      showToast(`Tailscale serve failed: ${errorDetail(e)}`, 'error');
-    } finally {
-      setBusy(null);
+      // A frame already narrated this (and cleared the run), so say nothing
+      // twice. A still-set run means no frame arrived, and then this is the only
+      // report there will be.
+      if (tailscaleServeRun.value) {
+        clearTailscaleServeRun();
+        showToast(errorDetail(e), 'error');
+      }
     }
   }, [reload]);
 
@@ -410,14 +553,14 @@ export function MobileAccessPage() {
               {serving
                 ? <>Reachable at <strong>{row.url}</strong> with an auto-renewed cert.</>
                 : row.canRun
-                  ? 'Sets up tailnet HTTPS for the engine, which is what enables the installable PWA and push.'
+                  ? 'Sets up tailnet HTTPS for the engine, which is what enables the installable PWA and push. Setup runs in the background and reports on the Lucidos badge, and it may ask you to enable Serve for your tailnet.'
                   : 'Your phone can already reach the plain-HTTP address above. HTTPS is what adds the installable PWA and push, and it needs `tailscale serve`. Install the Tailscale command-line tool to set it up: use Install CLI in the Tailscale app, or `brew install tailscale`.'}
             </div>
           </div>
           {row.canRun && (
             <div class="list-row-actions">
-              <button class="action-btn action-btn-confirm" disabled={busy === 'serve'} onClick={onServe}>
-                {busy === 'serve' ? 'Setting up…' : (serving ? 'Re-apply' : 'Expose')}
+              <button class="action-btn action-btn-confirm" disabled={serveRunning} onClick={onServe}>
+                {serveRunning ? 'Setting up…' : (serving ? 'Re-apply' : 'Expose')}
               </button>
             </div>
           )}
@@ -438,30 +581,21 @@ export function MobileAccessPage() {
           stays tailnet-private (we use <code>serve</code>, not <code>funnel</code>), so the engine
           is never exposed to the public internet.
         </p>
-        {showMachineHalf ? tailscaleActionRow() : <InstallTailscaleRow onPhone={true} />}
+        {phone ? <PhoneTailscaleRow state={phone} /> : tailscaleActionRow()}
       </div>
 
-      <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="mobile-access:phone">
-          {showMachineHalf ? 'On your phone' : 'Getting Lucidos onto this phone'}
-        </div>
-        {showMachineHalf ? (
+      {phone ? <PhoneStepsSection state={phone} /> : (
+        <div class="settings-section">
+          <div class="settings-section-title" data-search-anchor="mobile-access:phone">
+            On your phone
+          </div>
           <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
             <li>Install the Tailscale app and sign in to the <strong>same tailnet</strong> as this Mac.</li>
             <li>Open the <strong>Tailscale</strong> URL above (copy it / send it to yourself).</li>
             <li>Add it to your home screen to install the Lucidos PWA and enable push.</li>
           </ol>
-        ) : (
-          <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
-            <li>Install Tailscale here and sign in to the <strong>same tailnet</strong> as your Mac.</li>
-            <li>
-              On your Mac, open <strong>Settings → Mobile Access</strong> and copy the{' '}
-              <strong>Tailscale</strong> address it shows. Send it to yourself and open it here.
-            </li>
-            <li>Add that page to your home screen to install Lucidos and turn on push.</li>
-          </ol>
-        )}
-      </div>
+        </div>
+      )}
     </>
   );
 }

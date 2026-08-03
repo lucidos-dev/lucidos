@@ -157,6 +157,18 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
     showToast(`Update failed: ${frame.message}`, 'error', { key: UPDATE_TOAST_KEY });
     return;
   }
+  if (frame.phase === 'bundle-swap-failed') {
+    // The install destroyed the app on disk without landing a replacement, so
+    // this is not "the update failed, try again": there is nothing left to try
+    // against. The Rust message is already a full account with the recovery path
+    // in it, so it is shown verbatim rather than prefixed, and the update is
+    // deliberately NOT re-offered the way a cancel re-offers it. Same
+    // clear-before-toast ordering as `failed`, for the same reason.
+    appUpdateProgress.value = null;
+    installing = false;
+    showToast(frame.message, 'error', { key: UPDATE_TOAST_KEY });
+    return;
+  }
   appUpdateProgress.value = frame;
   const narration = appUpdateNarration(frame);
   showToast(narration.message, 'info', {

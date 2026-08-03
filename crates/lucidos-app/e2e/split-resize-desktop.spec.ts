@@ -1,5 +1,5 @@
 import { test, expect, type Page } from './fixtures';
-import { assertHealthy, navigateToApp, openThreadDrawer } from './helpers';
+import { assertHealthy, navigateToApp, openThreadDrawer, DRAWER_TOGGLE_LABEL } from './helpers';
 
 /** Free divider drags with a deferred snap (SplitLayout / DrawerDivider +
  *  splitHelpers): a drag lands exactly where the pointer drops it; ~400ms
@@ -191,7 +191,9 @@ test.describe('Split layout — free drag with deferred snap', () => {
 
     // openDrawerAndSettle opened the drawer; the toggle is a plain show/hide, so
     // this second click simply hides it (no focus stage in between).
-    await page.locator('button[aria-label="Show or hide thread drawer"]:visible').first().click();
+    // Prefix match: the label carries a " (N needing attention)" suffix whenever
+    // the thread list is hidden and something is waiting on the user.
+    await page.locator(`button[aria-label^="${DRAWER_TOGGLE_LABEL}"]:visible`).first().click();
     // The drawer header must pass through intermediate widths: it stays
     // mounted and its width rides --content-offset through the transition.
     // The old conditional render unmounted it at toggle time — width would

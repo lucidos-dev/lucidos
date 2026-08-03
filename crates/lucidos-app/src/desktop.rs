@@ -209,15 +209,16 @@ fn stop_workspace_engines(app_data: &Path) {
 // ── Path resolution (shared by both roles) ──────────────────────────────────
 
 /// Resolve the bundle's `Resources` dir relative to the executable. In a
-/// macOS `.app` the executable is `Contents/MacOS/Lucidos` and resources live
-/// in `Contents/Resources/`, which is exactly what the client's
-/// `resource_dir()` returns — so the service resolves the same bundle.
+/// macOS `.app` the executable is `Contents/MacOS/lucidos-app` (Tauri names the
+/// bundle from `productName` but the binary inside it from the crate, so the two
+/// differ) and resources live in `Contents/Resources/`, which is exactly what the
+/// client's `resource_dir()` returns, so the service resolves the same bundle.
 fn resource_dir_from_exe() -> io::Result<PathBuf> {
     resource_dir_for_exe(&std::env::current_exe()?)
 }
 
 fn resource_dir_for_exe(exe: &Path) -> io::Result<PathBuf> {
-    // <Contents>/MacOS/Lucidos -> <Contents>/MacOS -> <Contents>
+    // <Contents>/MacOS/lucidos-app -> <Contents>/MacOS -> <Contents>
     let contents = exe
         .parent()
         .and_then(|macos| macos.parent())
@@ -347,6 +348,29 @@ const GATEWAY_PERMISSIONS: &[&str] = &[
 ///    webviews showing arbitrary third-party sites live inside the main window.
 ///  * `local(false)` — the local app URL is `capabilities/default.json`'s job;
 ///    this capability speaks only for the gateway origin.
+///
+/// **What is in the grant set, spelled out (F12).** [`GATEWAY_PERMISSIONS`]
+/// includes `updater:default`, and that pulls in `plugin:updater|download_and_install`.
+/// So the honest statement of what this capability grants is not "the app can
+/// update itself" but "anything answering on `http://localhost:<port>` can drive
+/// a signed bundle swap and a full stack restart", and those are different
+/// sentences. Nothing else in the set reaches as far.
+///
+/// The residual is narrow and it is ACCEPTED rather than unnoticed. The origin is
+/// plain HTTP on loopback with no authentication, so a local process that bound
+/// the port BEFORE the gateway did would receive this window's IPC. Three things
+/// keep that from being reachable in practice: [`launch`] navigates only after
+/// the gateway answers its health check, the gateway holds the port for the life
+/// of the service, and a squatter would have to win the port on a machine where
+/// the user already trusts every local process with their workspace data anyway.
+/// The two obvious hardenings both cost more than they buy: dropping
+/// `updater:default` would move the update path off the window that shows it, and
+/// authenticating loopback would put a shared secret in a page the gateway itself
+/// serves.
+///
+/// Read this before widening [`GATEWAY_PERMISSIONS`]: the question to ask of a
+/// new entry is not whether the frontend needs it, but what it hands to whoever
+/// answers on that port.
 pub(crate) fn gateway_capability(port: u16) -> tauri::ipc::CapabilityBuilder {
     GATEWAY_PERMISSIONS.iter().fold(
         tauri::ipc::CapabilityBuilder::new("gateway")

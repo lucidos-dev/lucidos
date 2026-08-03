@@ -7,6 +7,7 @@ import {
   renderAuditSection,
   renderEngineExplainerSection,
   renderInitiatorRow,
+  renderOriginSection,
 } from './MessageRoutePanel';
 import type { Exchange, StoredEvent } from '../../store/thread-events';
 
@@ -107,9 +108,45 @@ describe('resolveOrigin', () => {
     });
   });
 
-  it('returns undefined when ContinuationStarted has no origin field set (legacy DB row)', () => {
+  // Regression: an auto-resume records neither `origin` nor `actor` (the device
+  // that pressed Switch is on the teardown ResponseAborted, not here), so the
+  // popover rendered a bare "Unknown" over a chip that already read "Lucidos
+  // Engine". Only the engine can raise a ContinuationStarted nobody clicked, so
+  // the missing field is a legacy gap, not an unknown actor.
+  it('defaults ContinuationStarted with no origin and no actor to the engine (auto-resume / legacy DB row)', () => {
     const ev: StoredEvent = { type: 'ContinuationStarted', branch: 'x' };
-    expect(resolveOrigin(exch(ev))).toBeUndefined();
+    expect(resolveOrigin(exch(ev))).toEqual({
+      kind: 'engine',
+      reason: { kind: 'continuation_started' },
+    });
+  });
+
+  it('defaults MissingHardeningDetected / MergeConflictDetected with no origin to their engine reason', () => {
+    expect(resolveOrigin(exch({ type: 'MissingHardeningDetected' }))).toEqual({
+      kind: 'engine',
+      reason: { kind: 'missing_hardening' },
+    });
+    expect(resolveOrigin(exch({ type: 'MergeConflictDetected', files: ['a.rs'] }))).toEqual({
+      kind: 'engine',
+      reason: { kind: 'merge_conflict' },
+    });
+  });
+
+  // The intrinsic default must not shadow a real actor: a user-clicked Continue
+  // still has to read "You" on its device, not "Lucidos Engine".
+  it('prefers a persisted origin over the intrinsic engine default', () => {
+    const ev: StoredEvent = {
+      type: 'MergeConflictDetected',
+      origin: { kind: 'device', device_id: 'd1', label: 'Chrome on Mac' },
+    };
+    expect(resolveOrigin(exch(ev))).toEqual({ kind: 'device', device_id: 'd1', label: 'Chrome on Mac' });
+  });
+
+  // ResponseAborted is deliberately NOT in the intrinsic map: its own branch in
+  // renderOriginSection keys on `origin === undefined` to render the System
+  // attribution plus the typed AbortCause.
+  it('leaves ResponseAborted unattributed so its System branch still fires', () => {
+    expect(resolveOrigin(exch({ type: 'ResponseAborted', cause: 'engine_shutdown' }))).toBeUndefined();
   });
 
   // Regression: when the user clicks Continue on an interrupted CC thread the
@@ -605,6 +642,88 @@ describe('renderEngineExplainerSection', () => {
   });
   it('scheduler renders nothing (trigger renderer handles it)', () => {
     expect(renderEngineExplainerSection({ kind: 'scheduler', trigger_id: 't' })).toBeNull();
+  });
+});
+
+describe('renderOriginSection', () => {
+  const origin = (userEvent: StoredEvent): string =>
+    JSON.stringify(renderOriginSection(exch(userEvent), undefined, () => undefined));
+
+  // Regression: the auto-resume after a *Switch to new version* records the
+  // pressing device on the teardown ResponseAborted, so the resume boundary
+  // itself has no actor and no origin. The popover rendered a bare "Unknown"
+  // under a chip that read "Lucidos Engine", even though the event carries a
+  // typed `reason` that fully explains it.
+  it('names the engine and the switch for an auto-resumed ContinuationStarted', () => {
+    const s = origin({ type: 'ContinuationStarted', branch: '', reason: 'auto_resume_after_switch' });
+    expect(s).toContain('Issued by');
+    expect(s).toContain('Lucidos Engine');
+    expect(s).toContain('Why this resumed');
+    expect(s).toMatch(/Switch to new version/i);
+    expect(s).not.toContain('Unknown');
+  });
+
+  it('keeps the engine attribution when a legacy resume recorded no reason', () => {
+    const s = origin({ type: 'ContinuationStarted', branch: '' });
+    expect(s).toContain('Lucidos Engine');
+    // No event-level reason to be precise about, so it falls through to the
+    // generic engine explanation rather than inventing a specific cause.
+    expect(s).not.toContain('Why this resumed');
+    expect(s).toContain('Why the engine acted');
+    expect(s).not.toContain('Unknown');
+  });
+
+  // Regression: the reason-keyed explainer must LAYER OVER the engine one, not
+  // replace it. A row that persisted `origin: engine{continuation_started}` but
+  // no event-level reason used to render the engine explanation and has to keep
+  // rendering it.
+  it('falls back to the persisted engine reason when the event recorded no reason', () => {
+    const s = origin({
+      type: 'ContinuationStarted',
+      branch: '',
+      origin: { kind: 'engine', reason: { kind: 'continuation_started' } },
+    });
+    expect(s).toContain('Why the engine acted');
+    expect(s).toMatch(/auto-resumed/i);
+  });
+
+  // The generic fallback is reached by chat and trigger resumes too, so it must
+  // not name a coding agent.
+  it('does not claim a Claude Code session in the generic resume explanation', () => {
+    expect(origin({ type: 'ContinuationStarted', branch: '' })).not.toMatch(/Claude Code/);
+  });
+
+  // The device that clicked Continue still owns the turn: it must read as its
+  // own device, never as the engine.
+  it('attributes a user-clicked Continue to the clicking device, not the engine', () => {
+    const s = origin({
+      type: 'ContinuationStarted',
+      branch: '',
+      reason: 'user_clicked_continue',
+      actor: { kind: 'device', device_id: 'd1', label: 'iOS Safari PWA' },
+    });
+    expect(s).toContain('iOS Safari PWA');
+    expect(s).not.toContain('Lucidos Engine');
+    expect(s).toMatch(/You clicked Continue/);
+  });
+
+  it('names the engine on a legacy MergeConflictDetected that predates the origin field', () => {
+    const s = origin({ type: 'MergeConflictDetected', files: ['a.rs'] });
+    expect(s).toContain('Lucidos Engine');
+    expect(s).toContain('Why the engine acted');
+    expect(s).not.toContain('Unknown');
+  });
+
+  // The System branch must survive the intrinsic-engine default above it.
+  it('still renders the System attribution for an actor-less ResponseAborted', () => {
+    const s = origin({ type: 'ResponseAborted', cause: 'engine_shutdown' });
+    expect(s).toContain('System');
+    expect(s).toContain('Why the response stopped');
+    expect(s).not.toContain('Unknown');
+  });
+
+  it('still falls back to Unknown for a genuinely unattributed event', () => {
+    expect(origin({ type: 'MessageReceived', text: 'hi', mode: 'human' })).toContain('Unknown');
   });
 });
 

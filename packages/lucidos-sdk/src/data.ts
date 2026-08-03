@@ -130,7 +130,7 @@ export function buildAppLocalUrl(
   search: string,
   baseUrl: string,
 ): string | null {
-  const appId = parseAppId(pathname);
+  const appId = parseAppId(pathname, baseUrl);
   if (!appId) return null;
   const prefix = `apps/${appId}/`;
   if (!path.startsWith(prefix)) return null;

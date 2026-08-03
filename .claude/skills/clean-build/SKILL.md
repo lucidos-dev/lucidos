@@ -117,47 +117,101 @@ with a one-line justification.
 
 ## Documented exceptions
 
-The repo carries a small number of attributes that look like silencers
-but are not. Each one must have a one-line comment explaining why it is
-there. If you find one without a justification, fix the underlying code
-instead and remove the annotation.
+The repo carries annotations that look like silencers but are not. Each
+one must have a comment explaining why it is there. If you find one
+without a justification, fix the underlying code instead and remove the
+annotation.
 
-The currently-accepted categories — anything not on this list is fair
-game to remove and re-fix:
+**Re-derive the inventory; do not trust the list below on sight.** It is
+a snapshot of file names, and file names move. By 2026-08-03 it had
+drifted three ways at once: a whole `#[allow(deprecated)]` category was
+missing, `UrlPreviewInline.tsx` was still listed for an `eslint-disable`
+it no longer carried, and three of the four real `eslint-disable` sites
+were absent. Nothing had ever checked it. So a clean-build run
+regenerates the real inventory first and updates this section in the same
+run whenever the two disagree:
 
-- **`#[allow(clippy::too_many_arguments)]`** on internal helpers that
-  legitimately need that many parameters (event constructors, runtime
-  spawn helpers, `LucidosEngine::new`'s boot wiring). The refactor cost
-  outweighs the lint value. Each occurrence stays in place; the
-  justification is the function's role — and the strongest form of it,
+```sh
+# Rust: every allow attribute, grouped by lint
+git ls-files '*.rs' | xargs grep -ho '#\[allow([^)]*)\]' | sort | uniq -c | sort -rn
+# TS: eslint-disable sites (the *.ts/*.tsx filter keeps prose mentions out)
+git ls-files '*.ts' '*.tsx' | xargs grep -n 'eslint-disable'
+# TS: @ts-expect-error scale
+git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
+```
+
+The currently-accepted categories, counted as of 2026-08-03. Anything not
+on this list is fair game to remove and re-fix:
+
+- **`#[allow(clippy::too_many_arguments)]`**, 74 sites across 47 files,
+  by far the largest category. Internal helpers that legitimately need
+  that many parameters (event constructors, runtime spawn helpers,
+  scheduler entry points, `LucidosEngine::new`'s boot wiring). The
+  refactor cost outweighs the lint value. Each occurrence stays in place;
+  the justification is the function's role, and the strongest form of it,
   which `LucidosEngine::new` carries, is that no two parameters share a
   type, so the argument swap the lint guards against cannot compile.
-- **`#[allow(dead_code)]`** on test scaffolding (`scenario_tests.rs`,
-  `plugins.rs` test helpers) and intentionally-unused dispatcher
-  variants (`spawn_dispatcher.rs`). One-line comment required at each
-  site.
-- **`#[allow(clippy::large_enum_variant)]`** on `BusEvent` — the variant
-  size is dominated by the inner event payload; boxing every variant to
-  flatten the enum would hurt every hot-path emit.
-- **`#[allow(clippy::format_in_format_args)]`** in `populate_memory.rs`
-  test-data generation where readability of the nested `format!` calls
-  trumps the lint.
-- **`// @ts-expect-error — Node APIs available at runtime via Vitest,
-  no @types/node in project`** in `crates/lucidos-app/**/*.test.ts`.
-  The expectation is real: TS does not know about Node globals, but
-  Vitest provides them. Adding `@types/node` to the project would
-  contaminate the browser type-graph.
-- **`// eslint-disable-next-line react-hooks/exhaustive-deps`** in
-  `UrlPreviewInline.tsx` and `useLoadableFetch.ts` where the deps list
-  is intentionally narrow.
+- **`#[allow(dead_code)]`**, 5 sites: intentionally-unused dispatcher
+  variants (`agent_session/spawn_dispatcher.rs`, two of them) and test
+  scaffolding (`thread_lifecycle_tests/scenario_tests.rs`,
+  `change_ops_engine_origin_stamping_tests.rs`, `tools/plugins/mod.rs`).
+  One-line comment required at each site.
+- **`#[allow(clippy::large_enum_variant)]`**, 1 site: `BusEvent` in
+  `engine/event_bus/mod.rs`. The variant size is dominated by the inner
+  event payload; boxing every variant to flatten the enum would hurt
+  every hot-path emit.
+- **`#[allow(clippy::format_in_format_args)]`**, 3 sites, all in
+  `bin/populate_memory.rs` test-data generation, where readability of the
+  nested `format!` calls trumps the lint. One of the three shares an
+  attribute with `too_many_arguments`, so a naive per-lint count reports
+  only two.
+- **`#[allow(deprecated)]`**, 1 site: `lucidos-app/src/notifications.rs`,
+  on `activateIgnoringOtherApps:`. Its replacement, the parameterless
+  `activate()`, exists only on macOS 14+ while the app targets macOS 11+
+  (see `tauri.conf.json`), so the deprecated cross-version call is the
+  correct one to keep.
+- **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
+  `@types/node` in project**, 151 sites across 52 files, every one of them
+  a `*.test.ts` (none in `.test.tsx`). The expectation is real: TS does
+  not know about Node globals, but Vitest provides them. Adding
+  `@types/node` to the project would contaminate the browser type-graph.
+  Only the first site in a file spells the reason out; the rest say
+  `same`, which counts as justified because it points at an explanation
+  in the same file.
+- **`// eslint-disable-next-line`**, 8 sites across 4 files and 4 rules:
+  `react-hooks/exhaustive-deps` in `hooks/useLoadableFetch.ts` (the deps
+  list is intentionally narrow), `no-console` five times in
+  `utils/perfProbe.ts` (permanent console-based perf instrumentation,
+  whose module doc says exactly that), `@typescript-eslint/no-implied-eval`
+  in `sw.test.ts` (the test evaluates service-worker source through `new
+  Function`), and `@typescript-eslint/no-explicit-any` in
+  `components/chat/__tests__/prompt-vdom-keys.test.ts` (a `VNode<any>`
+  alias for VDOM-key assertions). **No eslint config ships in this repo**,
+  so phase 5 always skips and none of these suppress anything today. They
+  are kept rather than deleted because each would be correct the moment a
+  config lands. Do not "clean them up" on the grounds that they are
+  currently inert.
 
 The audit rule: every `#[allow(...)]`, `@ts-expect-error`, or
-`// eslint-disable*` MUST sit directly under context that explains it —
+`// eslint-disable*` MUST sit directly under context that explains it,
 either a `///` doc comment whose content makes the lint's allowance
 self-evident (e.g. a doc that names the schema columns the wide function
 mirrors), or an explicit `//` line that explains why the lint applies
 here. A bare annotation with no comment above is forbidden. If you find
-one — fix the code and remove the annotation.
+one, fix the code and remove the annotation.
+
+Check that mechanically rather than by eye. This prints every Rust allow
+whose preceding non-attribute line is not a comment, and must print
+nothing:
+
+```sh
+for f in $(git ls-files '*.rs'); do awk -v F="$f" '
+  { l[NR]=$0 }
+  END { for (i=1;i<=NR;i++) if (l[i] ~ /#\[allow\(/ && l[i] !~ /\/\//) {
+      j=i-1; while (j>=1 && l[j] ~ /^[[:space:]]*#\[/) j--
+      if (!(j>=1 && l[j] ~ /^[[:space:]]*(\/\/|\*|\/\*)/)) printf "%s:%d:%s\n", F, i, l[i]
+    } }' "$f"; done
+```
 
 ## Out of scope
 

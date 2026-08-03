@@ -107,11 +107,11 @@ Determine:
 - needs_memory: Does answering this require the user's long-term memory (past conversations, projects, preferences, personal facts)? true whenever the message references past conversations, "earlier today", "what we discussed", "the research", "last time", or any prior interaction — even if the request also involves a tool action like saving to a file. false ONLY for greetings, time queries, general knowledge, or pure tool commands that don't reference any past content (e.g. "create an empty file", "what time is it").
 - needs_file_list: Does answering this require knowing what files exist in the workspace? false for greetings, time queries, memory-only questions.
 - needs_credentials: Does this conversation involve external APIs, tokens, authentication, or services that might need credentials? Consider the full conversation topic, not just the latest message. A follow-up like "try again" or "the token should be active" in a conversation about API access still needs credentials.
-- sub_queries: If needs_memory is true, decompose into search queries about the TOPIC or CONTENT being referenced, NOT about the action being requested. Strip away action verbs like "save", "summarize", "write" and focus on the subject matter. For example, "save research about Compile" → ["Compile AS", "Compile selskap analyse"]. If needs_memory is false, return empty array.
+- sub_queries: If needs_memory is true, decompose into search queries about the TOPIC or CONTENT being referenced, NOT about the action being requested. Strip away action verbs like "save", "summarize", "write" and focus on the subject matter. For example, "save research about Example Org" → ["Example Org", "Example Org company analysis"]. If needs_memory is false, return empty array.
 
 Return ONLY a JSON object, no markdown fences, no extra text.
 Example (memory needed): {"needs_memory": true, "needs_file_list": false, "needs_credentials": false, "sub_queries": ["habit tracker progress", "weekly exercise routine"]}
-Example (referencing past content): {"needs_memory": true, "needs_file_list": true, "needs_credentials": false, "sub_queries": ["Compile AS", "Compile selskap analyse"]}
+Example (referencing past content): {"needs_memory": true, "needs_file_list": true, "needs_credentials": false, "sub_queries": ["Example Org", "Example Org company analysis"]}
 Example (no memory): {"needs_memory": false, "needs_file_list": false, "needs_credentials": false, "sub_queries": []}"#;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,7 +413,15 @@ pub(crate) fn is_fabricated_engine_internal_claim(text: &str) -> bool {
     // Normalize "tool-call(s)" → "tool call(s)" so we only branch on one form.
     let lower = text.to_lowercase().replace("tool-call", "tool call");
 
-    if lower.contains("max_iterations") || lower.contains("agentic_loop.rs") {
+    // Internal SYMBOL names only. `max_iterations` is the pre-rename name and
+    // stays listed so historical claims still filter on a memory rebuild;
+    // `default_max_tool_calls` is what it became. Deliberately NOT the bare
+    // `max_tool_calls`: that is a real user-facing preference key now, so "the
+    // user set max_tool_calls to 2000" is a legitimate fact to remember.
+    if lower.contains("max_iterations")
+        || lower.contains("default_max_tool_calls")
+        || lower.contains("agentic_loop.rs")
+    {
         return true;
     }
 
@@ -647,6 +655,29 @@ mod tests {
                 text
             );
         }
+    }
+
+    /// The symbol list follows the `MAX_ITERATIONS` rename, and stops there.
+    /// `default_max_tool_calls` is the renamed internal constant and filters;
+    /// `max_tool_calls` on its own is now a real user-facing preference key, so
+    /// a fact about the user changing it is legitimate memory and must survive.
+    ///
+    /// The last case documents a deliberate false positive: phrase the same
+    /// setting as "per-turn tool call limit" and it filters, because that
+    /// wording is indistinguishable from the fabricated claims above. Losing it
+    /// costs nothing; the current value lives in the preference, not in memory.
+    #[test]
+    fn test_filter_follows_the_rename_without_eating_the_preference_key() {
+        assert!(is_fabricated_engine_internal_claim(
+            "The turn stopped at DEFAULT_MAX_TOOL_CALLS."
+        ));
+        assert!(
+            !is_fabricated_engine_internal_claim("Set max_tool_calls to 2000 in Settings."),
+            "the preference key is a legitimate thing to remember the user changing"
+        );
+        assert!(is_fabricated_engine_internal_claim(
+            "Raised the per-turn tool call limit."
+        ));
     }
 
     #[test]

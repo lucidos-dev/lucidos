@@ -328,6 +328,14 @@ pub struct ThreadQueue {
     pool: PgPool,
     bus: EventBus,
     trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+    /// Needed because the overflow guard performs a real trigger write
+    /// (`TriggerDisabled`) through the trigger write chokepoint, which owns
+    /// both halves of the registry projection: the in-memory map and the
+    /// on-disk `trigger.toml`.
+    workspace_path: std::path::PathBuf,
+    /// The engine's `trigger_write_lock`, shared so the overflow guard's write
+    /// serializes against every other trigger write rather than racing them.
+    trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
     /// Installed via [`Self::attach_engine`] after `Arc::new(engine)` —
     /// executes admitted entries. Test fixtures install mocks.
     executor: OnceLock<Arc<dyn ThreadQueueExecutor>>,
@@ -341,12 +349,16 @@ impl ThreadQueue {
         pool: PgPool,
         bus: EventBus,
         trigger_configs: Arc<std::sync::RwLock<HashMap<String, TriggerConfig>>>,
+        workspace_path: std::path::PathBuf,
+        trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
         policy: CapacityPolicy,
     ) -> Self {
         Self {
             pool,
             bus,
             trigger_configs,
+            workspace_path,
+            trigger_write_lock,
             executor: OnceLock::new(),
             engine: OnceLock::new(),
             state: tokio::sync::Mutex::new(QueueState {
@@ -624,20 +636,24 @@ impl ThreadQueue {
                     state.queued.push_back(entry);
                     state.policy.max_queued_per_trigger
                 };
-                // Pause through the bus — the scheduler's trigger subscriber
-                // flips the in-memory config, exactly as a user pause would.
-                self.bus
-                    .emit_or_log(
-                        BusEvent::System(SystemEvent::TriggerDisabled {
-                            trigger_id: trigger_id.clone(),
-                            payload: serde_json::json!({
-                                "reason": "thread-queue overflow",
-                            }),
-                            actor: None,
-                        }),
-                        "[ThreadQueue] TriggerDisabled (overflow)",
-                    )
-                    .await;
+                // Pause through the trigger write chokepoint, exactly as a user
+                // pause would: the event is the record, and the registry is
+                // flipped before this returns so the very next admission
+                // decision already sees the trigger paused.
+                crate::engine::trigger_writes::TriggerRegistryWriter {
+                    event_bus: &self.bus,
+                    trigger_configs: &self.trigger_configs,
+                    workspace_path: &self.workspace_path,
+                    write_lock: &self.trigger_write_lock,
+                }
+                .write_or_log(
+                    crate::engine::trigger_writes::TriggerWrite::Disabled,
+                    &trigger_id,
+                    serde_json::json!({ "reason": "thread-queue overflow" }),
+                    None,
+                    "[ThreadQueue] (overflow)",
+                )
+                .await;
                 self.notify(
                     format!("{trigger_label} paused — queue overflow"),
                     format!(

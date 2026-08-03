@@ -7,9 +7,10 @@ import {
   notificationsLoadingMore,
   panelOverlay,
   viewingNotification,
+  notificationDetailPending,
   activeMenuItem,
 } from '../store';
-import { toFailed, setLoadingIfFresh } from '../types';
+import { toFailed, setLoadingIfFresh, type Notification } from '../types';
 import { savePreference } from './preferences';
 import { syncWorkspaceAppBadge } from './app-badge';
 import { revealContentPane } from './pane';
@@ -96,10 +97,52 @@ function removeFromUnread(id: string): boolean {
 
 /** True when the inbox browse list is loaded AND already holds this row — i.e.
  *  the detail's prev/next chevrons (which walk `notifications`) have a list with
- *  this notification in it to step from. */
+ *  this notification in it to step from.
+ *
+ *  Deliberately NOT the same question as `findLoadedNotification`: this one is
+ *  about the CHEVRONS' list, which must be `notifications` specifically (the
+ *  unread set drops a row the instant it's marked read, so chevrons walking it
+ *  would die on the open). `findLoadedNotification` asks whether we hold the row
+ *  at all, from either list. Keep them separate. */
 function browseListHas(id: string): boolean {
   const list = notifications.value;
   return list.status === 'loaded' && list.data.some((n) => n.id === id);
+}
+
+/** The already-loaded row for `id`, from whichever list holds it, or null.
+ *
+ *  Both lists carry WHOLE notifications, not summaries: the inbox list query
+ *  (`NotificationStore::get_filtered`) and the single-row query (`get_by_id`)
+ *  select an identical column list and serialize the same `Notification`, so a
+ *  loaded row IS what `GET /api/v1/notification?id=` would return. Re-fetching
+ *  it buys nothing and costs a full round-trip (400-800ms on an iOS PWA over
+ *  Tailscale, 1100-1800ms on the first packet after the phone radio resumes,
+ *  see system-knowhow/notifications.md §3), spent before ANY pixel moves, since
+ *  the overlay/reveal/nav-push all sit behind the await. That is the reported
+ *  "lag opening a notification, with no user feedback".
+ *
+ *  This is the same call `navigateToNotification` already makes for the detail's
+ *  prev/next chevrons (see its doc comment); the primary open path had been left
+ *  on the fetch. The unread set is checked too because the "Unread" tab renders
+ *  it rather than the browse list (since the badge/list single-sourcing), so on
+ *  that tab it is the ONLY list holding the row the user just tapped. */
+function findLoadedNotification(id: string): Notification | null {
+  for (const list of [notifications.value, unreadNotifications.value]) {
+    if (list.status !== 'loaded') continue;
+    const row = list.data.find((n) => n.id === id);
+    if (row) return row;
+  }
+  return null;
+}
+
+/** Land a notification in the content pane: overlay, reveal, nav entry.
+ *  Shared by the memory-first open and the fetched one so the two can't drift.
+ *  A missing `revealContentPane` is a silent no-op on mobile and a missing
+ *  `pushNavState` breaks panel Back (see `.claude/rules/frontend.md`). */
+function openNotificationDetail(notification: Notification): void {
+  panelOverlay.value = { type: 'notification-detail', notification };
+  revealContentPane();
+  pushNavState();
 }
 
 /** Flip a single row to read in the inbox browse list (display only — the badge
@@ -305,32 +348,49 @@ export async function viewNotification(id: string): Promise<void> {
   // 10s (no detail panel, no second toast — the tap looks dead).
   _lastViewedId = id;
   _lastViewedAt = now;
+
   try {
-    const notification = await getNotification(id);
-    if (notification) {
-      // Open the detail in the content pane (not a modal): set the overlay,
-      // reveal the pane, and push a nav entry so panel Back returns to the
-      // inbox list and a reload restores the open detail. Mirrors openUrl /
-      // openFilePreview.
-      panelOverlay.value = { type: 'notification-detail', notification };
+    // Memory first. When either list already holds the row it IS the full
+    // notification (see findLoadedNotification), so the detail lands on this
+    // tick with no network at all: the inbox row tap, the warm push tap, and
+    // the toast [Open] for a row the page has seen all become instant.
+    let notification = findLoadedNotification(id);
+    if (!notification) {
+      // Genuine miss (the cold push-tap deep link, before the unread set has
+      // loaded), so a round-trip is unavoidable. Reveal the pane on the tap and
+      // flag the fetch: ContentPane renders the detail's own skeleton, gated
+      // past SPINNER_DELAY_MS so a fast open still shows nothing rather than a
+      // flash. The overlay stays unwritten until a real notification is in hand,
+      // so a failure leaves no phantom nav entry behind.
+      notificationDetailPending.value = id;
       revealContentPane();
-      pushNavState();
-      // Deep-link / push-tap opens land here without the inbox browse list ever
-      // having been loaded (the user never opened the Notifications panel), so
-      // the detail's prev/next chevrons would sit permanently disabled — they
-      // walk `notifications` and resolve currentIndex === -1. Load it now when it
-      // doesn't already hold this row. Load BEFORE marking read: the just-pushed
-      // row is still unread server-side, so it's returned under either filter
-      // ('all' or 'unread'); the subsequent mark-read only flips the loaded row
-      // in place (markBrowseRowRead never removes it), so currentIndex stays
-      // valid and the chevrons can walk the inbox. In-app opens from the panel
-      // already have the list loaded with this row, so they skip the fetch.
-      if (!browseListHas(id)) await loadNotifications();
-      markReadOptimistic(id);
+      notification = await getNotification(id);
     }
+    if (!notification) return;
+    // Open the detail in the content pane (not a modal): set the overlay,
+    // reveal the pane, and push a nav entry so panel Back returns to the
+    // inbox list and a reload restores the open detail. Mirrors openUrl /
+    // openFilePreview.
+    openNotificationDetail(notification);
+    // Deep-link / push-tap opens land here without the inbox browse list ever
+    // having been loaded (the user never opened the Notifications panel), so
+    // the detail's prev/next chevrons would sit permanently disabled: they walk
+    // `notifications` and resolve currentIndex === -1. Load it now when it
+    // doesn't already hold this row. Load BEFORE marking read: the just-pushed
+    // row is still unread server-side, so it's returned under either filter
+    // ('all' or 'unread'); the subsequent mark-read only flips the loaded row
+    // in place (markBrowseRowRead never removes it), so currentIndex stays
+    // valid and the chevrons can walk the inbox. In-app opens from the panel
+    // already have the list loaded with this row, so they skip the fetch.
+    if (!browseListHas(id)) await loadNotifications();
+    markReadOptimistic(id);
   } catch (error) {
     _lastViewedId = null;
     showToast('Failed to load notification: ' + errorDetail(error), 'error');
+  } finally {
+    // Guarded so a slow first fetch settling after the user has tapped a second
+    // notification doesn't clear the second one's skeleton out from under it.
+    if (notificationDetailPending.value === id) notificationDetailPending.value = null;
   }
 }
 

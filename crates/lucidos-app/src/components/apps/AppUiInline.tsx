@@ -5,6 +5,7 @@ import { ExitFullscreenIcon } from '../shared/icons';
 import { viewportIsMobile } from '../../utils/viewport';
 import { useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { navigateAppIframe } from './iframeNav';
+import { EdgeSwipeZones } from '../layout/EdgeSwipeZones';
 
 /** How long the load cover lingers, fading out, after the frame's `load`. A
  *  little longer than its CSS opacity transition (var(--duration-normal) =
@@ -120,9 +121,19 @@ export function AppUiInline({ layout }: { layout: 'desktop' | 'mobile' }) {
   return (
     <div class={`app-ui-inline${isPseudo ? ' app-ui-fullscreen' : ''}`}>
       {isPseudo && (
-        <button class="pseudo-fullscreen-exit icon-btn" onClick={exitPseudoFullscreen} aria-label="Exit fullscreen">
-          <ExitFullscreenIcon />
-        </button>
+        <>
+          <button class="pseudo-fullscreen-exit icon-btn" onClick={exitPseudoFullscreen} aria-label="Exit fullscreen">
+            <ExitFullscreenIcon />
+          </button>
+          {/* The swipe panes carry these strips too, but this overlay is
+              position:fixed at var(--z-tooltip) over the whole viewport and
+              covers them, so an edge touch went straight into the app iframe
+              and WebKit's native back gesture in the standalone iOS PWA claimed
+              it: a swipe from the left edge left fullscreen. Re-hang them here
+              so the host sees the touch and can preventDefault it. They do NOT
+              bring the pane swipe back, which stays off while fullscreen. */}
+          {layout === 'mobile' && <EdgeSwipeZones />}
+        </>
       )}
       {frameSrc && <AppFrame key={refreshKey} src={frameSrc} />}
     </div>

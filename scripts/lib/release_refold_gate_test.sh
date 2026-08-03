@@ -63,6 +63,11 @@ new_case() {
     printf '%s' "$dir"
 }
 
+# Every fixture manifest needs a platform key, because release_staging_verify
+# refuses one without it (F10) and the re-fold's restamp reads it back to carry
+# it forward.
+export RELEASE_STAGING_PLATFORM_KEY="darwin-aarch64"
+
 # Stage a "completed Phase A" for the repo at its current HEAD.
 stage_at_head() {
     local repo="$1" staging="$2" commit fp recipe

@@ -13,10 +13,11 @@
 //!
 //! What is NOT here is deliberate:
 //! - **Internal / managed-elsewhere keys** ([`INTERNAL_KEYS`]) — the command
-//!   guard safety toggles, backup config, keybindings, debug toggles — are
-//!   rejected by `set_preference` with a hint pointing the user at the right
-//!   Settings surface. The agent must not be able to disable its own command
-//!   guard.
+//!   guard safety toggles, the per-turn tool-call cap, backup config,
+//!   keybindings, debug toggles. These are rejected by `set_preference` with a
+//!   hint pointing the user at the right Settings surface. The agent must not
+//!   be able to disable its own command guard, nor to raise the backstop over
+//!   its own agentic loop.
 //! - **Secrets** never live in `preferences` (they go through credentials), so
 //!   no catalog entry is a secret.
 //!
@@ -349,6 +350,7 @@ pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("command_guard", "the command guard is the safety gate over the agent's own bash/python — toggle it in Settings → Permissions, not via set_preference"),
     ("command_guard_judge", "managed in Settings → Permissions (Command Safety)"),
     ("model_command_judge", "managed in Settings → Permissions (Command Safety)"),
+    ("max_tool_calls", "the per-turn tool-call cap is the backstop over your own agentic loop, so you must not raise your own limit; the user changes it in Settings → Models → Chat & Triggers"),
     ("capture_context", "a debug-only context-capture toggle; change it in Settings if you really need to"),
     ("backup_last_run", "internal backup state, not a setting"),
     ("keybindings", "keyboard shortcuts are managed in Settings → Keyboard Shortcuts"),
@@ -517,6 +519,21 @@ mod tests {
     fn command_guard_is_not_settable_but_has_a_hint() {
         assert!(lookup("command_guard").is_none());
         assert!(internal_hint("command_guard").is_some());
+    }
+
+    /// Same shape as the command-guard test above, and for the same reason: the
+    /// per-turn tool-call cap is the backstop over the agent's own loop, so the
+    /// agent must not be able to raise it. It still gets an actionable hint
+    /// rather than "unknown key", because explaining where the human changes it
+    /// is exactly what the agent should do when asked.
+    #[test]
+    fn max_tool_calls_is_not_settable_but_has_a_hint() {
+        assert!(lookup("max_tool_calls").is_none());
+        let hint = internal_hint("max_tool_calls").expect("must carry a hint");
+        assert!(
+            hint.contains("Settings"),
+            "the hint must point at the Settings surface, got: {hint}"
+        );
     }
 
     #[test]

@@ -25,8 +25,16 @@ answer is **one**:
 | artifact | consumed by | Gatekeeper assessment? |
 |---|---|---|
 | headless tarball + `.sha256` | `curl … \| sh` | **no** — `curl` sets no `com.apple.quarantine`, so nothing is assessed |
-| `.app.tar.gz` + `.sig` + `latest.json` | Tauri in-app updater | **no** — the updater's own download isn't quarantined; integrity is our minisign key; launch passes on the Developer ID signature |
+| `.app.tar.gz` + `.sig` + `latest.json` | Tauri in-app updater | **no**: the updater writes the bundle itself and sets no `com.apple.quarantine`, so Gatekeeper performs no assessment on launch; integrity is our minisign (Ed25519) key, which *is* checked |
 | **`.dmg`** | browser download | **yes** |
+
+Note (2026-08-02): the `.app.tar.gz` payload was ad-hoc signed rather than
+Developer ID signed for every release through v0.19.0 (F1 in
+`docs/audits/2026-08-02-macos-update-path-audit.md`), and is repacked from the
+signed bundle as of that day. That was worth fixing on its own merits, but it is
+not what the middle row turns on: the absence of a quarantine xattr is. So a
+signature on the payload is not the launch mechanism here and must not be cited
+as one, now that it exists any more than when it did not.
 
 Gatekeeper's notarization check is driven by the quarantine extended attribute,
 which the *downloading application* opts into — browsers, Mail, AirDrop. Neither
@@ -122,7 +130,9 @@ labelled and the advertised download path never points at it.
   fire the usual way.** Rejected: a prerelease sitting above the GA release on
   the public releases page is more confusing than a dispatch input, and it
   muddies `release_promote_preflight`'s "the rc is the thing being promoted"
-  semantics.
+  semantics. (ADR 0036 later removed the premise: the rc release is a DRAFT now,
+  so it is never publicly listed, and since a draft fires no event the dispatch
+  input above is what arms the rc gate too.)
 - **Re-issue a stapled updater tarball at attach time.** Rejected: it would
   invalidate the staged `.sig` that `latest.json` already advertises, and it
   cannot reach the users it would be for (see Consequences).

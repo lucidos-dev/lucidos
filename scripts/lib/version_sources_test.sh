@@ -61,8 +61,12 @@ fi
 # Deliberately shape-based, not a list of known offenders: the point is to catch
 # the file nobody thought of. Scoped to the tracked tree, minus the places where
 # a version literal is legitimate:
-#   CHANGELOG.md / docs/plans / docs/adr — historical records; they SHOULD name
-#     the version they describe, and rewriting history is the actual bug.
+#   CHANGELOG.md / docs/plans / docs/adr / docs/audits: historical records. They
+#     SHOULD name the version they describe, and rewriting history is the actual
+#     bug. docs/audits joined the list on 2026-08-02, when the first audit landed
+#     and immediately reddened this gate: its findings are per-release evidence
+#     (`CFBundleShortVersionString = 0.19.0`, a shasum of a named tarball), which
+#     is the same class as a CHANGELOG entry and must not move when RELEASE does.
 #   *.lock, package-lock.json, node_modules — dependency versions, not ours.
 #   .github/dependabot.yml: same class, it exists to reason about THIRD-PARTY
 #     versions (the glib/gtk/tao/tauri resolution chain), so every literal in it
@@ -103,6 +107,7 @@ if git grep -nIwE '[0-9]+\.[0-9]+\.[0-9]+' -- \
     ':(exclude)install.sh' \
     ':(exclude)docs/plans' \
     ':(exclude)docs/adr' \
+    ':(exclude)docs/audits' \
     ':(exclude)*.lock' \
     ':(exclude)*package-lock.json' \
     ':(exclude).github/dependabot.yml' \
@@ -144,6 +149,7 @@ echo "test: no prose announces which release line the project is currently on"
 git grep -nIiE "(currently (on|at|the)|is now on|we are on|latest release is|current version is)[^.]{0,40}[0-9]+\.[0-9]+\.?[0-9x]*" \
   -- '*.md' \
   ':(exclude)CHANGELOG.md' ':(exclude)docs/plans' ':(exclude)docs/adr' \
+  ':(exclude)docs/audits' \
   ':(exclude)scripts/lib/version_sources_test.sh' \
   > "$STALE_FILE" 2>/dev/null || true
 stale_count="$(wc -l < "$STALE_FILE" | tr -d '[:space:]')"

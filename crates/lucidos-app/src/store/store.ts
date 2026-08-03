@@ -119,6 +119,18 @@ export const viewingNotification = computed(() => {
   return o?.type === 'notification-detail' ? o.notification : null;
 });
 
+/** The notification whose detail is being FETCHED, or null. Set only on
+ *  `viewNotification`'s miss path, where neither loaded list holds the row (the
+ *  cold push-tap deep link) and a round-trip stands between the tap and the
+ *  panel.
+ *
+ *  Deliberately NOT a `panelOverlay` variant. `panelOverlay` is the panel nav
+ *  stack's unit of history (`pushNavState` / `restoreState` / `overlaysEqual`),
+ *  so a speculative write would leave a phantom entry that Back walks onto when
+ *  the fetch fails. Keeping the pending state beside it means the overlay is
+ *  still only ever written with a real notification in hand. */
+export const notificationDetailPending = signal<string | null>(null);
+
 export function closeInlineForm(): void {
   // Trigger forms reset the list scroll on close (Save/Cancel/Escape) so the
   // user lands at the top instead of the row they just edited. Other form
@@ -492,6 +504,20 @@ export const threadSearchResults = signal<Loadable<import('../api/threads').Thre
 // --- Event-driven thread store ---
 export const threadMap = signal<Map<string, ThreadState>>(new Map());
 export const threadsLoaded = signal(false);
+/** The thread `focusThreadOrBootstrapResult` is currently fetching metadata for,
+ *  or null. Set only on the miss path, where the thread is not in `threadMap`
+ *  yet and a round-trip stands between the user's tap and anything appearing.
+ *
+ *  Two readers, both about that window:
+ *   - The bootstrap focuses the thread OPTIMISTICALLY, so the pane moves on the
+ *     tap and `ThreadView` renders its existing delay-gated skeleton instead of
+ *     a dead interval. That is what a notification tap navigating to a thread
+ *     outside the loaded window used to have none of.
+ *   - `ThreadView` clears a `focusedThreadId` whose thread isn't in the map once
+ *     `threadsLoaded` is true (stale-pointer cleanup). It must NOT do that to a
+ *     thread whose metadata is still in flight, or the optimistic focus would be
+ *     undone on the very next render. This signal is the exemption. */
+export const bootstrappingThreadId = signal<string | null>(null);
 /** Thread IDs whose title was set by a ThreadTitleGenerated event (authoritative). */
 export const generatedTitleIds = new Set<string>();
 /** Whether the server has more older threads to load (infinite scroll). */
@@ -1458,7 +1484,14 @@ function scheduleAutoDismiss(key: string, autoDismissMs: number | undefined): vo
  *  mistaken for the user dismissing the prompt, which would wrongly suppress it
  *  for that build. `dismissToast` (the user path) layers the side effects on top. */
 export function removeToast(key: string): void {
-  toasts.value = toasts.value.filter((t) => t.key !== key);
+  // Only REASSIGN when that key is actually showing: a fresh array notifies
+  // every subscriber even when it removed nothing, and callers that keep a toast
+  // in lockstep with a signal make exactly that no-op call on their happy path
+  // (retracting the "preferences aren't reaching the engine" banner runs on
+  // every successful save). Timer cleanup below stays unconditional.
+  if (toasts.value.some((t) => t.key === key)) {
+    toasts.value = toasts.value.filter((t) => t.key !== key);
+  }
   const timer = keyedDismissTimers.get(key);
   if (timer) {
     clearTimeout(timer);
@@ -1558,6 +1591,7 @@ export const stepDetailModal = signal<StepDetailModalState>(null);
 // so importers keep using `from '../store/store'`. ---
 export * from './imagePopup';
 export * from './messageRoutePanel';
+export * from './backgroundActivity';
 
 // --- Memory rebuild progress ---
 /** Updated from SSE memory_rebuilding events. null = not rebuilding. */
@@ -1590,6 +1624,11 @@ export const engineVersionReady = signal(false);
 // reports `build_state === 'building'` — a background rebuild kicked off by Apply
 // is in progress but not yet ready to switch onto. Drives the spinning-refresh
 // brand badge. Always false in packaged builds (no background build there).
+// What the toast can say ABOUT that build (elapsed time, the commits it will
+// bring) rides `engineBuildDetail`, which lives with the other background-activity
+// feeds in `store/backgroundActivity.ts`. Both are written by the single
+// `setEngineBuilding` writer in `store/actions/engine-update.ts`, so the boolean
+// and the narration cannot drift apart.
 export const engineBuilding = signal(false);
 
 /** Whether a new engine version is actually READY to switch onto — the honest
@@ -1626,6 +1665,12 @@ export function engineNewVersionReady(): boolean {
 // without a chat-changes ↔ engine-update import cycle — the switch progress toast
 // then replaces it as the single version surface.
 export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
+
+// Toast key for a failed thread-list refresh. Both surfacing sites (the SSE
+// resync in thread-sync.ts and the resume sync in connection.ts) share it so a
+// sustained outage replaces one toast instead of stacking a new one on every
+// 3s SSE reconnect.
+export const THREAD_LIST_REFRESH_TOAST_KEY = 'thread-list-refresh-failed';
 
 // Toast key for the "frontend change applied — takes effect on Switch" hint,
 // shown when the engine emits FrontendUpdateDeferred (a frontend-only Apply

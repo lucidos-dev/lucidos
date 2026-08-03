@@ -7,6 +7,7 @@ import {
   notificationsHasMore,
   notificationsLoadingMore,
   panelOverlay,
+  notificationDetailPending,
   activeMenuItem,
   toasts,
 } from '../store';
@@ -25,8 +26,9 @@ vi.mock('../../api/client', () => ({
 }));
 
 // viewNotification reveals the content pane and pushes a nav-history entry as a
-// side effect; neither is what these tests exercise (they pin the browse-list
-// load), and both reach for the DOM / localStorage. Stub them out.
+// side effect; both reach for the DOM / localStorage, so they are stubbed. They
+// are also asserted on (the memory-first open must not shed either), so the
+// stubs are imported below rather than left write-only.
 vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
 
@@ -60,6 +62,8 @@ const {
   resetViewDedup,
 } = await import('./notifications');
 const { getNotifications, getNotification, markNotificationRead, markAllNotificationsRead } = await import('../../api/client');
+const { revealContentPane } = await import('./pane');
+const { pushNavState } = await import('./navigation');
 const { isTauri } = await import('../../utils/platform');
 const { nudgeDockBadge } = await import('../../utils/tauri');
 const { syncWorkspaceAppBadge } = await import('./app-badge');
@@ -363,13 +367,174 @@ describe('viewNotification loads the inbox list so detail chevrons work', () => 
       status: 'loaded',
       data: [makeNotification('x', false), makeNotification('y', false)],
     };
-    (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
 
     await viewNotification('x');
 
     expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'x' } });
     // List already has the row — no redundant page fetch.
     expect(getNotifications).not.toHaveBeenCalled();
+  });
+});
+
+// The reported bug: "lag opening a notification, with no user feedback". Every
+// pixel of the response sat behind a detail GET that the loaded row could
+// already answer, because the list query and the single-row query select an
+// identical column list and serialize the same Notification. On an iOS PWA that
+// is a 400-1800ms dead interval per tap. The open must be synchronous whenever
+// either list holds the row; only a genuine miss may reach the network.
+describe('viewNotification opens from memory, without a detail GET', () => {
+  beforeEach(() => {
+    resetViewDedup();
+    panelOverlay.value = null;
+    notificationsFilter.value = 'all';
+    notifications.value = { status: 'not-loaded' };
+    seedUnread([]);
+    (getNotifications as Mock).mockReset();
+    (getNotifications as Mock).mockResolvedValue({ notifications: [], unread_count: 0, has_more: false });
+    (getNotification as Mock).mockReset();
+    (markNotificationRead as Mock).mockReset();
+    (markNotificationRead as Mock).mockResolvedValue({ success: true });
+    (revealContentPane as Mock).mockClear();
+    (pushNavState as Mock).mockClear();
+    notificationDetailPending.value = null;
+    toasts.value = [];
+  });
+
+  it('opens SYNCHRONOUSLY from the browse list, with no await and no fetch', () => {
+    notifications.value = {
+      status: 'loaded',
+      data: [makeNotification('x', false), makeNotification('y', false)],
+    };
+
+    // Deliberately NOT awaited: the panel must be up on this very tick, which is
+    // the whole point. An await here would hide a regression back to fetch-first.
+    void viewNotification('x');
+
+    expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'x' } });
+    expect(getNotification).not.toHaveBeenCalled();
+  });
+
+  it('opens SYNCHRONOUSLY from the unread set (the "Unread" tab renders that list)', () => {
+    // Since the badge/list single-sourcing, the Unread tab renders
+    // `unreadNotifications` and nothing loads the browse list under that filter,
+    // so the unread set is the ONLY list holding the row the user tapped.
+    notificationsFilter.value = 'unread';
+    seedUnread([makeNotification('u0', false), makeNotification('u1', false)]);
+
+    void viewNotification('u0');
+
+    expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'u0' } });
+    expect(getNotification).not.toHaveBeenCalled();
+  });
+
+  it('reveals the content pane and pushes a nav entry on the memory path too', () => {
+    // Skipping either is a silent no-op on mobile / a broken panel Back
+    // (.claude/rules/frontend.md), so the memory path must not shed them.
+    notifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
+
+    void viewNotification('x');
+
+    expect(revealContentPane).toHaveBeenCalled();
+    expect(pushNavState).toHaveBeenCalled();
+  });
+
+  it('still marks the row read on the memory path', async () => {
+    notifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
+
+    await viewNotification('x');
+
+    expect(markNotificationRead).toHaveBeenCalledWith('x');
+  });
+
+  it('falls back to the detail GET when NEITHER list holds the row (cold push tap)', async () => {
+    // Cold start: the deep link dispatches before loadUnreadNotifications lands,
+    // so there is genuinely nothing in memory to open from.
+    notifications.value = { status: 'not-loaded' };
+    unreadNotifications.value = { status: 'not-loaded' };
+    (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
+
+    await viewNotification('x');
+
+    expect(getNotification).toHaveBeenCalledWith('x');
+    expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'x' } });
+  });
+
+  it('falls back to the detail GET when the lists are loaded but lack the row', async () => {
+    notifications.value = { status: 'loaded', data: [makeNotification('other', true)] };
+    seedUnread([]);
+    (getNotification as Mock).mockResolvedValueOnce(makeNotification('x', false));
+
+    await viewNotification('x');
+
+    expect(getNotification).toHaveBeenCalledWith('x');
+    expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'x' } });
+  });
+
+  it('flags the pending fetch and reveals the pane on the miss path, then clears it', async () => {
+    // The one case left with a real wait. The pane is revealed on the tap and
+    // ContentPane fills it with the detail's own skeleton (delay-gated), rather
+    // than leaving the previous view up for the whole round-trip.
+    notifications.value = { status: 'not-loaded' };
+    unreadNotifications.value = { status: 'not-loaded' };
+    const gate = deferred<Notification>();
+    (getNotification as Mock).mockReturnValueOnce(gate.promise);
+
+    const pending = viewNotification('x');
+    expect(notificationDetailPending.value).toBe('x');
+    expect(revealContentPane).toHaveBeenCalled();
+    // The overlay is NOT written speculatively: a phantom nav entry would be
+    // left behind if the fetch failed.
+    expect(panelOverlay.value).toBeNull();
+
+    gate.resolve(makeNotification('x', false));
+    await pending;
+
+    expect(notificationDetailPending.value).toBeNull();
+    expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'x' } });
+  });
+
+  it('clears the pending flag and pushes no nav entry when the fetch fails', async () => {
+    notifications.value = { status: 'not-loaded' };
+    unreadNotifications.value = { status: 'not-loaded' };
+    (getNotification as Mock).mockRejectedValueOnce(new Error('engine down'));
+
+    await viewNotification('x');
+
+    expect(notificationDetailPending.value).toBeNull();
+    expect(panelOverlay.value).toBeNull();
+    expect(pushNavState).not.toHaveBeenCalled();
+    expect(toasts.value.some((t) => t.message.startsWith('Failed to load notification'))).toBe(true);
+  });
+
+  it('never flags a pending fetch on the memory path', async () => {
+    notifications.value = { status: 'loaded', data: [makeNotification('x', false)] };
+
+    await viewNotification('x');
+
+    expect(notificationDetailPending.value).toBeNull();
+  });
+
+  it('loads the browse list for the chevrons when only the unread set held the row', async () => {
+    // Unread tab: the row opened from `unreadNotifications`, but the detail's
+    // prev/next walk `notifications`, so that list still has to be fetched.
+    // It is fetched AFTER the panel is already up, never in front of it.
+    notificationsFilter.value = 'unread';
+    notifications.value = { status: 'not-loaded' };
+    seedUnread([makeNotification('u0', false)]);
+    (getNotifications as Mock).mockResolvedValueOnce({
+      notifications: [makeNotification('u0', false), makeNotification('u1', false)],
+      unread_count: 2,
+      has_more: false,
+    });
+
+    const pending = viewNotification('u0');
+    // Panel is up before the chevron-list fetch has settled.
+    expect(panelOverlay.value).toMatchObject({ type: 'notification-detail', notification: { id: 'u0' } });
+    await pending;
+
+    const list = notifications.value as Loadable<Notification[]>;
+    if (list.status !== 'loaded') throw new Error('expected the browse list to be loaded');
+    expect(list.data.some((n) => n.id === 'u0')).toBe(true);
   });
 });
 

@@ -1,5 +1,5 @@
 import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'preact/hooks';
-import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, promptAnimating, revealOnFocus, connectionStatus } from '../../store/store';
+import { focusedThreadId, threadMap, activeStreamingBuffer, threadsLoaded, bootstrappingThreadId, promptAnimating, revealOnFocus, connectionStatus } from '../../store/store';
 import { getThreadEventsBump } from '../../store/threadActivity';
 import { unfocusThread } from '../../store/actions/threads';
 import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/thread-loading';
@@ -780,7 +780,14 @@ export function ThreadView() {
         // navigation. ThreadView is mounted in the background on mobile (all
         // three panes mount), so revealing the thread pane here would swipe a
         // user on the content pane away mid-render.
-        if (threadsLoaded.value) {
+        //
+        // A thread being bootstrapped is exempt: focusThreadOrBootstrapResult
+        // focuses it optimistically so the tap is acknowledged while its
+        // metadata is in flight, and it is absent from the map for exactly that
+        // reason. Cleaning it up here would undo the focus on the next render
+        // and put the dead interval straight back. The bootstrap restores the
+        // prior focus itself if the thread turns out not to exist.
+        if (threadsLoaded.value && bootstrappingThreadId.value !== threadId) {
             unfocusThread({ revealPane: false });
         }
         // Waiting for the thread to appear in the map — same delayed-spinner

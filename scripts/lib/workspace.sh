@@ -1969,9 +1969,11 @@ start_engine() {
         exit 1
     fi
 
-    # Wait for engine to be ready. Cold boot does pgvector init, migrations,
-    # memory index load, and embedding model warmup — which can push past 30s
-    # on a fresh workspace or a slow disk. Give it 90s before declaring failure.
+    # Wait for engine to be ready. Cold boot does pgvector init, migrations and
+    # the memory index load, which can push past 30s on a fresh workspace or a
+    # slow disk. Give it 90s before declaring failure. (The embedding model is
+    # NOT in that window: it loads in the background and boot never waits on
+    # it.)
     # Re-read $ENGINE_PIDFILE each tick so a supervisor restart during
     # startup updates ENGINE_PID rather than failing the kill -0 check.
     echo -n "Waiting for engine"

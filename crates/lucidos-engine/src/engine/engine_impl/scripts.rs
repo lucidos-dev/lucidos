@@ -269,6 +269,24 @@ impl LucidosEngine {
     /// Commit all dirty data/ files with a 30s timeout, logging success/failure.
     /// Shared by all code paths that may produce dirty files (scripts, Claude Code, run_python).
     pub(crate) async fn commit_dirty_logged(&self, message: &str, context: &str) {
+        // `commit_all_dirty` stages ALL of data/, so it records anything missing
+        // from the working tree as a deletion. Taken while a merge has published
+        // main but not yet synced the repo root, it commits the just-merged files
+        // as deleted, straight onto main. REPO_WORKTREE_MUTEX makes the merge's
+        // publish+sync and that snapshot mutually exclusive.
+        //
+        // The exclusion is deliberately NOT taken here. `commit_all_dirty` holds
+        // it itself, across the `spawn_blocking` closure that does the libgit2
+        // work; a blocking task cannot be cancelled, so a guard scoped to this
+        // function would be released the instant the timeout below fires, leaving
+        // that closure writing the index with the lock free. Holding it here as
+        // well would just queue this call behind its own snapshot.
+        //
+        // The timeout therefore now bounds waiting for the exclusion as well as
+        // the snapshot itself, which is the ceiling this shared path (scripts,
+        // coding agents, run_python) wants: giving up while still queued starts
+        // no git work at all, and the next auto-commit picks the same files up,
+        // because it stages all of data/.
         match tokio::time::timeout(
             std::time::Duration::from_secs(30),
             self.artifact_manager.commit_all_dirty(message),

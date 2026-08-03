@@ -636,7 +636,7 @@ mod tests {
         // A mixed Apply's rebuild is in flight/ready → NOT safe (dist is for the
         // new engine; the Switch must advance client + engine together).
         assert!(!frontend_advance_is_safe(
-            &BuildState::Building,
+            &BuildState::building_now(),
             Some("engine1"),
             "engine1"
         ));

@@ -1,32 +1,8 @@
-.step {
-    padding: 0.25rem 0.5rem;
-    font-size: var(--font-size-sm);
-    color: var(--text-secondary);
-    display: flex;
-    align-items: flex-start;
-    gap: 0.5rem;
-}
-
+/* Steps render as `.inline-step` rows (further down); these two leaf classes
+   are the parts of one. */
 .step-icon {
     flex-shrink: 0;
     line-height: 1.4;
-}
-
-.step.success .step-icon {
-    color: var(--accent-green);
-}
-
-.step.error .step-icon {
-    color: var(--accent-red);
-}
-
-.step.pending .step-icon {
-    color: var(--text-muted);
-}
-
-.step.empty {
-    color: var(--text-muted);
-    font-style: italic;
 }
 
 .step-context {
@@ -118,6 +94,34 @@
    keep the text flush-left rather than leaving its inter-item gap. */
 .inline-step.pending .step-icon {
     display: none;
+}
+
+/* Killed mid-execution: the turn died (failed / aborted / canceled) while this
+   tool call was still running, so it never reported a result. Struck and muted
+   reads as "did not finish" at a glance, and is deliberately NOT the red
+   .error treatment: nothing reported a failure, the step simply stopped
+   existing. Its neighbours keep their green checks, so the row the kill landed
+   on is the one that stands out. */
+.inline-step.unfinished .step-icon {
+    color: var(--text-muted);
+}
+
+.inline-step.unfinished .step-description {
+    color: var(--text-muted);
+    text-decoration: line-through;
+}
+
+.inline-step.unfinished .step-detail {
+    text-decoration: line-through;
+}
+
+@media (hover: hover) {
+    /* The row stays muted on hover: the shared .inline-step:hover rule lifts
+       the description to --text-primary, which would undo the "this one did
+       not finish" signal on exactly the row being inspected. */
+    .inline-step.unfinished:hover .step-description {
+        color: var(--text-secondary);
+    }
 }
 
 
@@ -337,6 +341,16 @@
 
 .step-detail-status.pending {
     color: var(--text-muted);
+}
+
+.step-detail-status.unfinished {
+    color: var(--text-muted);
+}
+
+/* One-line explanation under the description for an unfinished step. */
+.step-detail-note {
+    color: var(--text-secondary);
+    font-size: var(--font-size-md);
 }
 
 .step-detail-timestamp {

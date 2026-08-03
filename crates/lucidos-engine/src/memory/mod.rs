@@ -1,13 +1,15 @@
 pub mod embedder_slot;
 pub mod extractor;
 pub mod fastembed;
+pub mod model_download;
 pub mod pgvector;
 pub mod provider;
 pub mod reembed;
 
-pub use embedder_slot::EmbedderSlot;
+pub use embedder_slot::{EmbedderSlot, EmbeddingModelLoadState, EmbeddingModelStatus};
 pub use extractor::{ExtractedFact, MemoryExtractor, QueryClassification, EXTRACTOR_VERSION};
 pub use fastembed::FastEmbedProvider;
+pub use model_download::{ensure_model_cached, DownloadFrame, ModelDownloadObserver};
 pub use pgvector::{MemoryEntry, MemorySource, MemoryStats, PgVectorIndex, SearchResult};
 pub use provider::EmbeddingProvider;
 

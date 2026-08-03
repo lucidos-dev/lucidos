@@ -434,7 +434,28 @@ async fn check_and_execute_missed(
     Ok(())
 }
 
-/// Handle a trigger lifecycle event from the EventBus subscriber.
+/// React to a trigger lifecycle event: arm or disarm its cron job.
+///
+/// **This function does not write the registry.** The write chokepoint
+/// (`engine::trigger_writes`) already materialized the event before the writing
+/// caller regained control; applying it a second time here would not be the
+/// harmless redundancy it looks like. A `TriggerCreated` re-apply rebuilds the
+/// config from its original payload, so a create immediately followed by a
+/// pause would be transiently un-paused again when this loop reached the older
+/// event, and the gap to the following `TriggerUpdated` spans real async work.
+/// One applier, ordered by the chokepoint's write lock, is the whole point.
+///
+/// So this reads the registry rather than the event, and reads it *after*
+/// taking `trigger_write_lock`. Both halves matter. The lock is what makes the
+/// read safe at all: `EventBus::emit` broadcasts from inside the chokepoint's
+/// locked span, so this handler can be woken before the apply has run, and
+/// blocking on the same lock is what guarantees it has. Reading current state
+/// rather than this event's state is then a feature: when several writes land
+/// in a burst, every pass arms the job from the newest config instead of
+/// re-deriving a stale one.
+///
+/// What only this function can do is the arming itself, because `tracked_tasks`
+/// belongs to the `SchedulerManager`, not the engine.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_trigger_event(
     event_type: &str,
@@ -445,24 +466,27 @@ pub(super) async fn handle_trigger_event(
     engine: &SharedEngine,
     shutdown_flag: &Arc<AtomicBool>,
 ) {
+    // `TriggerExecuted` reaches this function too (the subscriber routes the
+    // whole trigger family here) and does no work below, so it must not pay for
+    // the lock on every single trigger run.
+    if !crate::triggers::registry::TRIGGER_LIFECYCLE_EVENTS.contains(&event_type) {
+        return;
+    }
     let task_uuid = trigger_id_to_uuid(trigger_id);
+    // Guard dropped before any side effect below: `thread_queue.drain()` can
+    // itself perform a trigger write, which takes this same lock.
+    let config = {
+        let _applied = engine.trigger_write_lock.lock().await;
+        let snapshot = trigger_configs.read().unwrap().get(trigger_id).cloned();
+        snapshot
+    };
 
     match event_type {
         "TriggerCreated" => {
-            if let Ok(config) = TriggerConfig::from_created_payload(payload) {
-                let should_register = !config.paused && !config.schedule.is_empty();
-                {
-                    let mut configs = trigger_configs.write().unwrap();
-                    configs.insert(trigger_id.to_string(), config.clone());
-                }
-                // Mirror the definition to disk (derived read-model — ADR 0019).
-                crate::triggers::definition::write_trigger_definition(
-                    engine.workspace_path(),
-                    &config,
-                );
-                if should_register {
+            if let Some(config) = config.as_ref() {
+                if !config.paused && !config.schedule.is_empty() {
                     register_and_track(
-                        &config,
+                        config,
                         tracked_tasks,
                         engine,
                         shutdown_flag,
@@ -478,37 +502,11 @@ pub(super) async fn handle_trigger_event(
             }
         }
         "TriggerUpdated" => {
-            let config_snapshot;
-            let mut old_slug = None;
-            {
-                let mut configs = trigger_configs.write().unwrap();
-                if let Some(config) = configs.get_mut(trigger_id) {
-                    old_slug = Some(config.slug.clone());
-                    config.apply_update(payload);
-                    config_snapshot = Some(config.clone());
-                } else {
-                    config_snapshot = None;
-                }
-            }
-            if let Some(config) = config_snapshot {
-                // Re-project to disk; a slug rename leaves a stale file, so drop
-                // the old one (derived read-model — ADR 0019).
-                if let Some(old) = old_slug {
-                    if old != config.slug {
-                        crate::triggers::definition::remove_trigger_definition(
-                            engine.workspace_path(),
-                            &old,
-                        );
-                    }
-                }
-                crate::triggers::definition::write_trigger_definition(
-                    engine.workspace_path(),
-                    &config,
-                );
+            if let Some(config) = config.as_ref() {
                 cancel_tracked_task(tracked_tasks, task_uuid).await;
                 if !config.paused && !config.schedule.is_empty() {
                     register_and_track(
-                        &config,
+                        config,
                         tracked_tasks,
                         engine,
                         shutdown_flag,
@@ -523,16 +521,8 @@ pub(super) async fn handle_trigger_event(
             }
         }
         "TriggerDeleted" => {
-            let removed_slug = {
-                let mut configs = trigger_configs.write().unwrap();
-                configs.remove(trigger_id).map(|c| c.slug)
-            };
-            if let Some(slug) = removed_slug {
-                crate::triggers::definition::remove_trigger_definition(
-                    engine.workspace_path(),
-                    &slug,
-                );
-            }
+            // Unconditional: the chokepoint may already have removed the
+            // registry entry, but the cron job is still armed until we say so.
             let self_deleting = payload
                 .get("self_deleting")
                 .and_then(|v| v.as_bool())
@@ -549,20 +539,10 @@ pub(super) async fn handle_trigger_event(
             }
         }
         "TriggerEnabled" => {
-            let config_snapshot;
-            {
-                let mut configs = trigger_configs.write().unwrap();
-                if let Some(config) = configs.get_mut(trigger_id) {
-                    config.paused = false;
-                    config_snapshot = Some(config.clone());
-                } else {
-                    config_snapshot = None;
-                }
-            }
-            if let Some(config) = config_snapshot {
+            if let Some(config) = config.as_ref() {
                 if !config.schedule.is_empty() {
                     register_and_track(
-                        &config,
+                        config,
                         tracked_tasks,
                         engine,
                         shutdown_flag,
@@ -577,12 +557,8 @@ pub(super) async fn handle_trigger_event(
             }
         }
         "TriggerDisabled" => {
-            {
-                let mut configs = trigger_configs.write().unwrap();
-                if let Some(config) = configs.get_mut(trigger_id) {
-                    config.paused = true;
-                }
-            }
+            // Unconditional for the same reason as delete: disarming the job is
+            // this function's job whether or not the flag was already flipped.
             cancel_tracked_task(tracked_tasks, task_uuid).await;
             crate::log!("[Scheduler] Paused trigger: {}", trigger_id);
         }

@@ -136,7 +136,7 @@ describe('groupIntoExchanges — ActionRequired events as exchange boundaries', 
     const steps = exchangeSteps(mrEx, /* _isLast */ false, /* threadIdle */ false);
     const askStep = steps.find(s => s.description === 'Executing ask_user_question...');
     expect(askStep).toBeDefined();
-    expect(askStep!.success).toBe(true);
+    expect(askStep!.outcome).toBe('success');
   });
 
   it('multiple pauses in one CC turn produce one divider per pause (MP1)', () => {
@@ -702,13 +702,13 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
 
     // Thread is RUNNING (not idle) and the exchange has no terminal event.
     const events = exchangeResponseEvents(mr, 0, /* isLast */ false, /* threadIdle */ false);
-    expect(events.filter(e => e.type === 'step' && e.success === null)).toHaveLength(0);
+    expect(events.filter(e => e.type === 'step' && e.outcome === 'pending')).toHaveLength(0);
     // The bare trailing marker is noise once it can never resolve — same
     // treatment a completed exchange gets.
     const last = events[events.length - 1];
     expect(last.type === 'step' && last.description === 'Thinking').toBe(false);
     // The summary step list agrees with the inline one.
-    expect(exchangeSteps(mr, /* isLast */ false, /* threadIdle */ false).filter(s => s.success === null)).toHaveLength(0);
+    expect(exchangeSteps(mr, /* isLast */ false, /* threadIdle */ false).filter(s => s.outcome === 'pending')).toHaveLength(0);
   });
 
   it('leaves the live Thinking marker alone in the exchange that took the continuation', () => {
@@ -716,7 +716,7 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
     const ctc = exchanges[1];
     expect(ctc.continuationMoved).toBeFalsy();
     const events = exchangeResponseEvents(ctc, 0, /* isLast */ true, /* threadIdle */ false);
-    expect(events.filter(e => e.type === 'step' && e.success === null)).toHaveLength(1);
+    expect(events.filter(e => e.type === 'step' && e.outcome === 'pending')).toHaveLength(1);
     expect(exchangeStatus(ctc, '', /* isLast */ true, false, false, /* threadIdle */ false, false)).toBe('streaming');
   });
 
@@ -733,7 +733,7 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
     const mr = groupIntoExchanges(events)[0];
     expect(mr.continuationMoved).toBe(true);
     const rendered = exchangeResponseEvents(mr, 0, /* isLast */ false, /* threadIdle */ false);
-    const pending = rendered.filter(e => e.type === 'step' && e.success === null);
+    const pending = rendered.filter(e => e.type === 'step' && e.outcome === 'pending');
     expect(pending).toHaveLength(1);
     expect(pending[0].type === 'step' && pending[0].description).toBe('Executing ask_user_question...');
   });
@@ -754,7 +754,7 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
     const first = exchanges[0];
     expect(first.continuationMoved).toBeFalsy();
     const rendered = exchangeResponseEvents(first, 0, /* isLast */ false, /* threadIdle */ false);
-    const pending = rendered.filter(e => e.type === 'step' && e.success === null);
+    const pending = rendered.filter(e => e.type === 'step' && e.outcome === 'pending');
     expect(pending).toHaveLength(1);
     expect(pending[0].type === 'step' && pending[0].description).toBe('Thinking');
   });
@@ -774,7 +774,7 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
     const first = exchanges.find(e => e.userEvent._eventId === 'msg-1')!;
     expect(first.continuationMoved).toBe(true);
     const rendered = exchangeResponseEvents(first, 0, /* isLast */ false, /* threadIdle */ false);
-    expect(rendered.filter(e => e.type === 'step' && e.success === null)).toHaveLength(0);
+    expect(rendered.filter(e => e.type === 'step' && e.outcome === 'pending')).toHaveLength(0);
   });
 
   it('clears the mark when the handed-off exchange takes the continuation back', () => {
@@ -797,7 +797,7 @@ describe('continuationMoved — stale Thinking marker after a mid-flight handoff
     const followup = exchanges.find(e => e.userEvent._eventId === 'msg-2')!;
     expect(followup.continuationMoved).toBeFalsy();
     const rendered = exchangeResponseEvents(followup, 0, /* isLast */ true, /* threadIdle */ false);
-    expect(rendered.filter(e => e.type === 'step' && e.success === null)).toHaveLength(1);
+    expect(rendered.filter(e => e.type === 'step' && e.outcome === 'pending')).toHaveLength(1);
   });
 });
 
@@ -826,7 +826,7 @@ describe('groupIntoExchanges — CodingAgentToolResult routing across permission
     expect(aTypes).toContain('CodingAgentToolResult');
     const aSteps = exchangeResponseEvents(exA, 0, false, false).filter(e => e.type === 'step');
     const ghStep = aSteps.find(s => s.tool_name === 'Bash');
-    expect(ghStep?.success).toBe(true);
+    expect(ghStep?.outcome).toBe('success');
 
     const exB = exchanges[1];
     expect(exB.userEvent.type).toBe('CodingAgentPermissionRequest');
@@ -847,7 +847,7 @@ describe('groupIntoExchanges — CodingAgentToolResult routing across permission
     expect(exchanges).toHaveLength(1);
     const steps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step');
     const step = steps.find(s => s.tool_name === 'Bash');
-    expect(step?.success).toBe(true);
+    expect(step?.outcome).toBe('success');
   });
 });
 
@@ -886,12 +886,12 @@ describe('groupIntoExchanges — synthetic ToolResult routing via tool_called_ev
     const questionEx = exchanges.find(e => e.userEvent.type === 'UserQuestionAsked')!;
     expect(questionEx.steps.map(s => s.event.type)).not.toContain('ToolResult');
 
-    // Pairing succeeds: the InlineStep for the ToolCalled resolves (success
-    // becomes non-null after the ToolResult lands in the same exchange).
+    // Pairing succeeds: the InlineStep for the ToolCalled resolves (its
+    // outcome leaves 'pending' once the ToolResult lands in the same exchange).
     const mrResponseEvents = exchangeResponseEvents(mrEx);
     const askStep = mrResponseEvents.find(e => e.type === 'step' && e.tool_name === 'ask_user_question');
     expect(askStep).toBeDefined();
-    expect(askStep!.type === 'step' && askStep!.success).not.toBeNull();
+    expect(askStep!.type === 'step' && askStep!.outcome).toBe('success');
   });
 
   it('synthetic ToolResult without tool_called_event_id falls back to current-exchange routing', () => {

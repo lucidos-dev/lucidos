@@ -703,6 +703,14 @@ pub(super) async fn app_server_driver_task(
 
     // Reap the child. The persistent process has no clean-exit path of its
     // own — the driver kills it on wind-down (a no-op if it already died).
+    // It is its own process-group leader (`isolate_in_process_group` at spawn),
+    // so signalling only the leader would orphan everything the session
+    // spawned; tear the group down first, as the CC driver does.
+    #[cfg(unix)]
+    if let Some(pid) = child_pid {
+        super::spawn_env::graceful_kill_child_process_group(pid, std::time::Duration::from_secs(3))
+            .await;
+    }
     let _ = child.start_kill();
     let wait_result =
         match tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await {

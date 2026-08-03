@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -119,6 +119,19 @@ const EXTERNAL_LINK_TARGET_OPTIONS: Array<{ value: ExternalLinkTarget; label: st
   { value: 'safari', label: 'Safari' },
   { value: 'ask', label: 'Ask (share sheet)' },
   { value: 'in-app', label: 'In-app view' },
+];
+
+// Presets for the per-turn tool-call cap. The dropdown is `freeText`, so these
+// are a starting point rather than the allowed set: any number can be typed,
+// and there is no maximum (see `MAX_TOOL_CALLS_MIN`).
+const MAX_TOOL_CALLS_OPTIONS = [
+  { value: '50', label: '50' },
+  { value: '100', label: '100' },
+  { value: '250', label: '250' },
+  { value: '500', label: '500 (default)' },
+  { value: '1000', label: '1000' },
+  { value: '2000', label: '2000' },
+  { value: '5000', label: '5000' },
 ];
 
 const IMAGE_MODELS = [
@@ -792,6 +805,37 @@ export function SettingsView() {
   }
 
   function modelsSection() {
+    const maxToolCalls = currentMaxToolCalls();
+
+    /** The dropdown is `freeText`, so this takes whatever the user typed. Only
+     *  a whole number is a cap; anything else is rejected with a toast rather
+     *  than silently coerced, because a silent coercion of "1oo" to 1 would set
+     *  a cap far tighter than the user meant. Integers only, matching the
+     *  engine's `parse::<usize>()` (a bare `parseInt` would read "12.5" as 12).
+     *  Below the floor is a typo more often than an intent, but the floor is
+     *  what the engine would apply anyway, so it saves rather than rejects. */
+    function handleMaxToolCallsChange(raw: string) {
+      const trimmed = raw.trim();
+      if (!/^\d+$/.test(trimmed)) {
+        showToast(`"${raw}" is not a whole number of tool calls`, 'error');
+        return;
+      }
+      const parsed = Number(trimmed);
+      // Not the policy ceiling this setting deliberately omits: past
+      // MAX_SAFE_INTEGER, JS rounds the number, so saving it would store
+      // something other than what was typed (see MAX_TOOL_CALLS_REPRESENTABLE).
+      if (parsed > MAX_TOOL_CALLS_REPRESENTABLE) {
+        showToast(
+          `${trimmed} is too large to store exactly (max ${MAX_TOOL_CALLS_REPRESENTABLE.toLocaleString()})`,
+          'error',
+        );
+        return;
+      }
+      const next = Math.max(MAX_TOOL_CALLS_MIN, parsed);
+      if (next === maxToolCalls) return;
+      void setMaxToolCalls(next);
+    }
+
     return (
       <>
         <div class="settings-section">
@@ -811,6 +855,26 @@ export function SettingsView() {
               value={reasoningEffort.value}
               onChange={(v) => void setReasoningEffort(v)}
             />
+          </div>
+          <div class="settings-row" data-search-anchor="models:max-tool-calls">
+            <span class="settings-row-label">Max tool calls</span>
+            <Dropdown
+              options={MAX_TOOL_CALLS_OPTIONS}
+              value={String(maxToolCalls)}
+              freeText
+              placeholder="e.g. 500"
+              onChange={handleMaxToolCallsChange}
+            />
+          </div>
+          <div class="settings-row-note">
+            How many tool calls the agent may make in a single turn before the
+            engine stops it. Hitting the limit is not an error: the turn ends
+            with a message you can continue from by sending anything. There's no
+            maximum, but the cap is what bounds a runaway turn, and it's roughly
+            how long one can run. {maxToolCalls.toLocaleString()} allows up to
+            about {estimateTurnDuration(maxToolCalls)} of work, and cost grows
+            faster than time because every step resends the conversation.
+            Applies to chat and triggers alike.
           </div>
         </div>
         <div class="settings-section">

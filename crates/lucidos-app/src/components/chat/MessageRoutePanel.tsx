@@ -13,6 +13,7 @@ import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { Overlay } from '../shared/Overlay';
 import { loadedOr } from '../../store/types';
 import {
+  ENGINE_LABEL,
   exchangeResponseModel,
   exchangeReasoningEffort,
   displayModelName,
@@ -25,13 +26,45 @@ import {
   legacyOrigin,
   PENDING_TITLE_PLACEHOLDER,
   sortEventsChronologically,
+  SYSTEM_LABEL,
   type Exchange,
   type EngineReason,
   type MessageOrigin,
   type StoredEvent,
   type ThreadMeta,
 } from '../../store/thread-events';
-import { describeAbortCause, describeCancelCause, describeEngineReason } from '../../utils/engineEventExplainers';
+import {
+  describeAbortCause,
+  describeCancelCause,
+  describeContinuationReason,
+  describeEngineReason,
+} from '../../utils/engineEventExplainers';
+
+/** Boundary events the engine is the ONLY possible issuer of, mapped to the
+ *  `EngineReason` that names why. An unattributed row of one of these types is
+ *  not an unknown actor, so the popover synthesizes the reason instead of
+ *  falling through to the bare "Unknown" (which also contradicted the chip,
+ *  since `actorInitiator` already labels an actor-less boundary "Lucidos
+ *  Engine").
+ *
+ *  Two different shapes land here, and both are engine-raised:
+ *  - `MissingHardeningDetected` / `MergeConflictDetected` always stamp the
+ *    matching `MessageOrigin::Engine` today (`change_ops_emitters.rs`), so a
+ *    bare row is a legacy one from before the field existed.
+ *  - `ContinuationStarted` is bare by *current* design on the chat and trigger
+ *    channels: `emit_resume_anchor` (`chat/rerun.rs`) writes `origin: None` on
+ *    every resume, carrying its attribution on `EventMeta.actor` instead.
+ *
+ *  So `ContinuationStarted` is in the map for the *actor-less* case only: a
+ *  user-clicked Continue stamps the clicking device on `actor`, and the branch
+ *  in `resolveOrigin` prefers that. Its explainer comes from the event's own
+ *  `reason` field where one was recorded, not from this coarser
+ *  `continuation_started`. */
+const INTRINSIC_ENGINE_REASON: Partial<Record<StoredEvent['type'], EngineReason>> = {
+  ContinuationStarted: { kind: 'continuation_started' },
+  MissingHardeningDetected: { kind: 'missing_hardening' },
+  MergeConflictDetected: { kind: 'merge_conflict' },
+};
 
 /** Takes the full Exchange so the divider-starter cases (UserQuestionAsked,
  *  CodingAgentPermissionRequest) can walk the exchange's steps for the matching
@@ -72,6 +105,10 @@ export function resolveOrigin(exchange: Exchange): MessageOrigin | undefined {
   if ('actor' in userEvent && userEvent.actor) {
     return userEvent.actor as MessageOrigin;
   }
+  // Nothing persisted: for a boundary only the engine can raise, that is a
+  // legacy row rather than an unknown actor. See INTRINSIC_ENGINE_REASON.
+  const intrinsic = INTRINSIC_ENGINE_REASON[userEvent.type];
+  if (intrinsic) return { kind: 'engine', reason: intrinsic };
   return undefined;
 }
 
@@ -203,7 +240,11 @@ function getLiveThreadTitle(threadId: string): string | undefined {
   return threadMap.value.get(threadId)?.meta.title;
 }
 
-function renderOriginSection(
+/** The popover's Origin half: WHO raised the turn, on what surface, and why.
+ *  Exported for unit tests, which assert the whole section rather than its
+ *  pieces because the wart it exists to prevent (a bare "Unknown" over an
+ *  attributed chip) is a property of the assembled panel. */
+export function renderOriginSection(
   exchange: Exchange,
   parentTitle: string | undefined,
   getLiveTitle: (threadId: string) => string | undefined,
@@ -223,9 +264,23 @@ function renderOriginSection(
   const origin = resolveOrigin(exchange);
   const channel = origin ? renderChannelSection(origin, parentTitle, getLiveTitle) : null;
   const audit = origin ? renderAuditSection(origin) : null;
-  const explainer = origin?.kind === 'engine'
-    ? renderEngineExplainerSection(origin.reason)
+  // Engine and system origins have no channel to disclose (they ARE the
+  // channel, which is why `renderChannelSection` returns null for both), so
+  // name the issuer here or the panel is an explainer paragraph with no "who"
+  // above it, out of step with every other origin kind.
+  const issuer = origin?.kind === 'engine' ? renderIssuedByRow(ENGINE_LABEL)
+    : origin?.kind === 'system' ? renderIssuedByRow(SYSTEM_LABEL)
+      : null;
+  // A resume boundary prefers its own `reason` field, which is finer-grained
+  // than the `continuation_started` EngineReason (that one would claim an
+  // engine restart even for a local hang recovery). It falls through to the
+  // persisted engine reason rather than replacing it, so a row that recorded
+  // an origin but no reason keeps the explanation it already rendered.
+  const continuationWhy = userEvent.type === 'ContinuationStarted'
+    ? renderExplainer('Why this resumed', describeContinuationReason(userEvent.reason))
     : null;
+  const explainer = continuationWhy
+    ?? (origin?.kind === 'engine' ? renderEngineExplainerSection(origin.reason) : null);
 
   // System-driven `ResponseAborted` (safety_net, engine_shutdown, …): the
   // device/api/v1/workspace/engine renderers above all return null for
@@ -240,14 +295,8 @@ function renderOriginSection(
     return (
       <section class="route-section">
         <h4>Origin</h4>
-        <div class="route-row">
-          <strong>Issued by</strong>
-          <span>System</span>
-        </div>
-        <div class="route-explainer">
-          <strong>Why the response stopped</strong>
-          <p>{describeAbortCause(userEvent.cause)}</p>
-        </div>
+        {renderIssuedByRow(SYSTEM_LABEL)}
+        {renderExplainer('Why the response stopped', describeAbortCause(userEvent.cause))}
       </section>
     );
   }
@@ -261,20 +310,14 @@ function renderOriginSection(
     return (
       <section class="route-section">
         <h4>Origin</h4>
-        <div class="route-row">
-          <strong>Issued by</strong>
-          <span>You</span>
-        </div>
+        {renderIssuedByRow('You')}
         {origin?.kind === 'device' && renderChannelSection(origin)}
-        <div class="route-explainer">
-          <strong>Why the response stopped</strong>
-          <p>{describeCancelCause(userEvent.cause)}</p>
-        </div>
+        {renderExplainer('Why the response stopped', describeCancelCause(userEvent.cause))}
       </section>
     );
   }
 
-  if (!initiatorRow && !channel && !audit && !explainer) {
+  if (!initiatorRow && !issuer && !channel && !audit && !explainer) {
     return (
       <section class="route-section">
         <h4>Origin</h4>
@@ -287,10 +330,39 @@ function renderOriginSection(
     <section class="route-section">
       <h4>Origin</h4>
       {initiatorRow}
+      {issuer}
       {channel}
       {audit}
       {explainer}
     </section>
+  );
+}
+
+/** Names WHO raised the turn, for the origin kinds that have no channel to
+ *  disclose (engine, system) and for the ones the panel attributes by event
+ *  type rather than by a persisted actor (`ResponseCanceled` is user-driven by
+ *  definition). Every other kind gets its identity from `renderChannelSection`. */
+function renderIssuedByRow(label: string): preact.JSX.Element {
+  return (
+    <div class="route-row">
+      <strong>Issued by</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+
+/** The popover's "why" paragraph. One heading per question the panel can
+ *  answer ("Why the response stopped", "Why this resumed", "Why the engine
+ *  acted"); the body comes from the matching `describe*` helper. Renders
+ *  nothing when the helper has no honest answer, so a caller can pass the
+ *  nullable result straight through. */
+function renderExplainer(heading: string, body: string | null): preact.JSX.Element | null {
+  if (!body) return null;
+  return (
+    <div class="route-explainer">
+      <strong>{heading}</strong>
+      <p>{body}</p>
+    </div>
   );
 }
 
@@ -475,14 +547,7 @@ export function renderAuditSection(origin: MessageOrigin): preact.JSX.Element | 
 /** Engine explainer: the "why" copy for engine-acted events. The heading is
  *  constant; the body comes from `describeEngineReason`. */
 export function renderEngineExplainerSection(reason: EngineReason): preact.JSX.Element | null {
-  const body = describeEngineReason(reason);
-  if (!body) return null;
-  return (
-    <div class="route-explainer">
-      <strong>Why the engine acted</strong>
-      <p>{body}</p>
-    </div>
-  );
+  return renderExplainer('Why the engine acted', describeEngineReason(reason));
 }
 
 function renderExecutorSection(

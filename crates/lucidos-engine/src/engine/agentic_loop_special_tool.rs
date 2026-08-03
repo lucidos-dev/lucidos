@@ -1039,7 +1039,13 @@ impl LucidosEngine {
                                 result: crate::core::sanitize_for_jsonb(&result),
                                 images: vec![],
                                 success: !is_error,
-                                tool_called_event_id: None,
+                                // Same pairing contract as the main agentic
+                                // loop: without the call's event id the
+                                // frontend cannot route this result to its
+                                // originating exchange, so an intent sub-loop
+                                // that asks a question left the caller's
+                                // "Executing ..." spinner pending forever.
+                                tool_called_event_id,
                             },
                             meta: EventMeta::NONE,
                         },

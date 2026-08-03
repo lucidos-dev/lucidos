@@ -75,35 +75,68 @@ export class SdkError extends Error {
   }
 }
 
+/** WebKit rejects an aborted fetch with its own `AbortError: Fetch is aborted`
+ *  rather than the signal's `reason`, so on iOS Safari and in the packaged
+ *  WKWebView a fired deadline is indistinguishable from a page-lifecycle cancel:
+ *  it reads as "request cancelled" to anything formatting the error. Re-stamp it
+ *  as the `TimeoutError` Chrome and Firefox already deliver, so the deadline
+ *  means the same thing on every engine. A caller's own abort wins when both
+ *  fired, because that one was deliberate.
+ *
+ *  Mirrors `fetchWithDefaults` in `crates/lucidos-app/src/api/client/_core.ts`.
+ *  Deliberately a second copy rather than a shared import: the SDK bundles
+ *  standalone for app iframes and cannot depend on the host app, and the host
+ *  half additionally gates GETs on `awaitEngineReady`. Change one, change the
+ *  other. */
+export function restampDeadline(
+  err: unknown,
+  timeoutSignal: AbortSignal,
+  timeoutMs: number,
+  callerSignal?: AbortSignal | null,
+): unknown {
+  if (err instanceof DOMException && err.name === 'AbortError'
+    && timeoutSignal.aborted && !callerSignal?.aborted) {
+    return new DOMException(`Request timed out after ${timeoutMs}ms`, 'TimeoutError');
+  }
+  return err;
+}
+
 async function rawFetch(
   path: string,
   init?: RequestInit,
   timeoutMs = 10000,
 ): Promise<Response> {
-  const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   const headers: Record<string, string> = {};
   if (_authToken) headers['Authorization'] = `Bearer ${_authToken}`;
 
   const normalized = path.startsWith('/') ? path : `/${path}`;
+  // `AbortSignal.timeout` rejects with a `TimeoutError`, which callers can tell
+  // apart from a deliberate `AbortError` cancel; the old manual AbortController
+  // could only ever produce the latter. A caller's `init.signal` is COMPOSED
+  // with the deadline rather than overwritten (the manual controller silently
+  // dropped it), so either can abort the request.
+  const timeoutSignal = AbortSignal.timeout(timeoutMs);
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeoutSignal]) : timeoutSignal;
+
+  let res: Response;
   try {
-    const res = await fetch(`${_baseUrl}${API_V1}${normalized}`, {
+    res = await fetch(`${_baseUrl}${API_V1}${normalized}`, {
       ...init,
-      signal: controller.signal,
+      signal,
       headers: { ...headers, ...(init?.headers as Record<string, string>) },
     });
-    if (!res.ok) {
-      let reason = res.statusText;
-      try {
-        const body = await res.json();
-        if (body?.error) reason = body.error;
-      } catch { /* body not JSON */ }
-      throw new SdkError(res.status, reason);
-    }
-    return res;
-  } finally {
-    clearTimeout(timeout);
+  } catch (err) {
+    throw restampDeadline(err, timeoutSignal, timeoutMs, init?.signal);
   }
+  if (!res.ok) {
+    let reason = res.statusText;
+    try {
+      const body = await res.json();
+      if (body?.error) reason = body.error;
+    } catch { /* body not JSON */ }
+    throw new SdkError(res.status, reason);
+  }
+  return res;
 }
 
 export async function request<T>(

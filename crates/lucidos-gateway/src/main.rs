@@ -33,6 +33,7 @@ macro_rules! log {
     };
 }
 
+mod boot_failure;
 mod boot_phase;
 mod build_id;
 mod control;

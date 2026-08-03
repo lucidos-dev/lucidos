@@ -23,6 +23,7 @@ use crate::core::DATA_DIR;
 use crate::engine::event_bus::{BusEvent, EventBusEmitter, SystemEvent};
 use crate::engine::thread_events::MessageOrigin;
 use crate::engine::tools::agent_tool_actor;
+use crate::engine::trigger_writes::TriggerWrite;
 use crate::engine::LucidosEngine;
 
 mod registry;
@@ -826,13 +827,30 @@ pub struct ConfirmedInstall {
 /// `actor` is the device/user who clicked Confirm; it's stamped onto the
 /// resulting `PluginInstalled` event so the popover shows a real device
 /// label instead of `device-<short>`.
-/// Emit one trigger lifecycle event, logging (not propagating) an emit error —
+/// Write one trigger lifecycle event, logging (not propagating) an emit error:
 /// trigger sync is a best-effort side effect of install/uninstall, never a
 /// reason to fail the whole operation.
-async fn emit_trigger_event(engine: &LucidosEngine, event: SystemEvent, ctx: &str) {
-    if let Err(e) = engine.event_bus.emit(BusEvent::System(event)).await {
-        log!("[Plugins] {} emit failed: {}", ctx, e);
-    }
+///
+/// Through the trigger write chokepoint, so a resync leaves the registry
+/// consistent before it moves on: the loop below diffs against
+/// `engine.trigger_configs`, and the uninstall path reads it too.
+async fn write_plugin_trigger(
+    engine: &LucidosEngine,
+    write: TriggerWrite,
+    trigger_id: &str,
+    payload: serde_json::Value,
+    actor: Option<MessageOrigin>,
+    reason: &str,
+) {
+    engine
+        .emit_trigger_write_or_log(
+            write,
+            trigger_id,
+            payload,
+            actor,
+            &format!("[Plugins] ({reason})"),
+        )
+        .await;
 }
 
 /// Re-sync a plugin's auto-registered triggers to its shipped `trigger.toml`
@@ -928,14 +946,13 @@ async fn resync_plugin_triggers(
     for (slug, def) in &resolved {
         if let Some((existing_id, _)) = existing.iter().find(|(_, s)| s == slug) {
             let payload = def.to_trigger_payload(existing_id, plugin_id);
-            emit_trigger_event(
+            write_plugin_trigger(
                 engine,
-                SystemEvent::TriggerUpdated {
-                    trigger_id: existing_id.clone(),
-                    payload,
-                    actor: actor.clone(),
-                },
-                "TriggerUpdated (plugin resync)",
+                TriggerWrite::Updated,
+                existing_id,
+                payload,
+                actor.clone(),
+                "plugin resync",
             )
             .await;
         } else if foreign_slugs.contains(slug) {
@@ -950,28 +967,26 @@ async fn resync_plugin_triggers(
         } else {
             let new_id = uuid::Uuid::new_v4().to_string();
             let payload = def.to_trigger_payload(&new_id, plugin_id);
-            emit_trigger_event(
+            write_plugin_trigger(
                 engine,
-                SystemEvent::TriggerCreated {
-                    trigger_id: new_id,
-                    payload,
-                    actor: actor.clone(),
-                },
-                "TriggerCreated (plugin auto-register)",
+                TriggerWrite::Created,
+                &new_id,
+                payload,
+                actor.clone(),
+                "plugin auto-register",
             )
             .await;
         }
     }
     for (existing_id, slug) in &existing {
         if !declared_slugs.contains(slug.as_str()) {
-            emit_trigger_event(
+            write_plugin_trigger(
                 engine,
-                SystemEvent::TriggerDeleted {
-                    trigger_id: existing_id.clone(),
-                    payload: serde_json::json!({ "trigger_id": existing_id }),
-                    actor: actor.clone(),
-                },
-                "TriggerDeleted (plugin resync)",
+                TriggerWrite::Deleted,
+                existing_id,
+                serde_json::json!({ "trigger_id": existing_id }),
+                actor.clone(),
+                "plugin resync",
             )
             .await;
         }
@@ -995,14 +1010,13 @@ async fn delete_plugin_triggers(
             .collect()
     };
     for id in owned {
-        emit_trigger_event(
+        write_plugin_trigger(
             engine,
-            SystemEvent::TriggerDeleted {
-                trigger_id: id.clone(),
-                payload: serde_json::json!({ "trigger_id": id }),
-                actor: actor.clone(),
-            },
-            "TriggerDeleted (plugin uninstall)",
+            TriggerWrite::Deleted,
+            &id,
+            serde_json::json!({ "trigger_id": id }),
+            actor.clone(),
+            "plugin uninstall",
         )
         .await;
     }

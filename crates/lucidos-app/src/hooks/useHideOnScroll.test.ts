@@ -1,11 +1,65 @@
 import { describe, it, expect, beforeEach } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 import { shouldKeepHeaderVisible, spacerHeightPx } from './useHideOnScroll';
+
+describe('--mobile-header-offset stays off the document root', () => {
+  // The var is rewritten on essentially every scroll frame. Custom properties
+  // inherit, so writing it on `documentElement` invalidated style for every node
+  // in the document, and the thread transcript is the largest tree in the app:
+  // that was a whole-document style recalc per frame, and the jank that survived
+  // moving the var off `top` onto `transform` (which removed only the LAYOUT
+  // half). It is written on its two consumer elements instead.
+  //
+  // A source scan rather than a behavioral test because the regression is about
+  // WHICH element is written, and this suite has no DOM (the scroll logic is
+  // exercised through the pure mirror below).
+  const hookSource = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), 'useHideOnScroll.ts'),
+    'utf8',
+  );
+
+  it('never sets the offset on documentElement', () => {
+    const rootWrites = hookSource.match(
+      /documentElement\.style\.setProperty\(\s*['"]--mobile-header-offset/g,
+    ) ?? [];
+    expect(rootWrites).toHaveLength(0);
+  });
+
+  it('writes the offset on both consumer elements', () => {
+    // Both, not one: the sticky title bar AND the scroll-to-top chevron read it
+    // (styles/mobile.css). Dropping either leaves that element at its resting
+    // position while the header scrolls away.
+    expect(hookSource).toMatch(/titleBarEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
+    expect(hookSource).toMatch(/chevronEl\?\.style\.setProperty\(\s*['"]--mobile-header-offset/);
+  });
+
+  it('keeps the offset off `top`, which would reinstate the forced layout', () => {
+    // The companion half of the fix, in CSS: both consumers take the offset on
+    // `transform` (composited) so the write cannot dirty layout. A `top` that
+    // reads the offset means the next scroll event's scrollTop read forces a
+    // synchronous style+layout flush of the whole transcript again.
+    const css = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../styles/mobile.css'),
+      'utf8',
+    );
+    const offsetOnTop = css.match(/top:[^;]*--mobile-header-offset/g) ?? [];
+    expect(offsetOnTop).toHaveLength(0);
+    expect(css).toMatch(/transform:\s*translateY\([^;]*--mobile-header-offset/);
+  });
+});
 
 // Tests scroll-delta and keyboard-suppression logic from useHideOnScroll.
 // Uses string pane identity instead of DOM .closest() traversal.
 function createScrollTracker(
   getActiveElement: () => { tagName: string; pane?: string } | null,
   getResizeMode: () => 'scroll' | 'ignore' = () => 'ignore',
+  isRepaintNudging: () => boolean = () => false,
+  isUserScrolling: () => boolean = () => false,
 ) {
   let prevScrollTop = 0;
   let headerOffset = 0;
@@ -39,6 +93,13 @@ function createScrollTracker(
       // Only suppress if the focused input is in the same pane as the scroll container
       if (active.pane === currentPane) return;
     }
+
+    // The iOS compositor-recovery nudge writes ±1px and puts it back a frame
+    // later. Skip WITHOUT advancing prevScrollTop, so the round trip leaves the
+    // baseline exactly where the user left it. A live drag overrides the window:
+    // a nudge is never written while the user scrolls, so suppressing then could
+    // only eat the user's own events.
+    if (isRepaintNudging() && !isUserScrolling()) return;
 
     const maxScroll = Math.max(0, scrollHeight - clientHeight);
     const clamped = Math.min(Math.max(0, scrollTop), maxScroll);
@@ -336,6 +397,141 @@ describe('useHideOnScroll programmatic scroll (scrollToBottom)', () => {
     tracker.applyScrollDelta(1470, 2000, 500);
     tracker.applyScrollDelta(1500, 2000, 500);
     expect(tracker.headerOffset).toBe(-30);
+  });
+});
+
+describe('useHideOnScroll iOS repaint nudge suppression', () => {
+  // `forceIOSRepaint` (utils/iosRepaint.ts) recovers a blanked WKWebView
+  // compositor layer by writing scrollTop ±1px and restoring it a frame later.
+  // Both writes fire a real scroll event on the container the header listens to.
+  // Reported on an iOS PWA, 2026-08-03: with "Keep header visible" off, the
+  // header shook while the user was doing nothing. On a streaming thread the
+  // nudge runs on a ~200ms throttle, so the shake is continuous.
+  let mockActive: { tagName: string; pane?: string } | null = null;
+  let nudging = false;
+  let userScrolling = false;
+
+  beforeEach(() => {
+    mockActive = null;
+    nudging = false;
+    userScrolling = false;
+  });
+
+  function trackerWithNudge() {
+    return createScrollTracker(
+      () => mockActive,
+      () => 'ignore',
+      () => nudging,
+      () => userScrolling,
+    );
+  }
+
+  /** Drive one nudge round trip at `scrollTop`. `forceIOSRepaint` nudges UP first
+   *  (`live > 0 ? live - 1 : live + 1`) and restores a frame later, so the legs
+   *  are -1 then +1. Asserting only the end state misses the bug: the twitch is
+   *  the intermediate leg, and the drift needs the legs in this exact order. */
+  function nudgeRoundTrip(
+    tracker: ReturnType<typeof createScrollTracker>,
+    scrollTop: number,
+    onFirstLeg?: () => void,
+  ) {
+    nudging = true;
+    tracker.applyScrollDelta(scrollTop - 1, 2000, 500);
+    onFirstLeg?.();
+    tracker.applyScrollDelta(scrollTop, 2000, 500);
+    nudging = false;
+  }
+
+  it('does not move the header on the nudge leg itself', () => {
+    // The twitch. Even where the round trip nets out symmetrically (header fully
+    // hidden, neither leg clamps), the -1px leg still revealed a pixel of header
+    // for a frame before the restore took it back.
+    const tracker = trackerWithNudge();
+    tracker.switchContainer(0, 'thread');
+    tracker.applyScrollDelta(400, 2000, 500);
+    expect(tracker.headerOffset).toBe(-48); // fully hidden
+
+    let midNudge = NaN;
+    nudgeRoundTrip(tracker, 400, () => { midNudge = tracker.headerOffset; });
+
+    expect(midNudge).toBe(-48);
+    expect(tracker.headerOffset).toBe(-48);
+  });
+
+  it('does not leave a fully visible header oscillating by a pixel', () => {
+    // The round trip does not even cancel once a leg clamps: with the header
+    // already fully visible, the -1px (reveal) leg clamps at 0 while the +1px
+    // (hide) leg is free to move, so the header settles a pixel low and then
+    // flips 0 to -1 on every nudge after that. At the ~200ms streaming repaint
+    // throttle that is a steady 1px shake with no user input at all.
+    const tracker = trackerWithNudge();
+    tracker.switchContainer(0, 'thread');
+    tracker.applyScrollDelta(400, 2000, 500); // hide the header
+    tracker.applyScrollDelta(300, 2000, 500); // scroll up 100 to reveal it fully
+    expect(tracker.headerOffset).toBe(0);
+
+    for (let i = 0; i < 20; i++) nudgeRoundTrip(tracker, 300);
+
+    expect(tracker.headerOffset).toBe(0);
+  });
+
+  it('folds a real scroll that races the nudge into the next event', () => {
+    // Why the skip must NOT advance prevScrollTop. The window can close over a
+    // genuine scroll (a fling starting as a nudge lands). Leaving the baseline
+    // alone defers that distance to the next event; advancing it would drop the
+    // movement on the floor and leave the header out of sync with the content.
+    const tracker = trackerWithNudge();
+    tracker.switchContainer(0, 'thread');
+    tracker.applyScrollDelta(400, 2000, 500);
+    tracker.applyScrollDelta(300, 2000, 500); // header fully visible at 300
+    expect(tracker.headerOffset).toBe(0);
+
+    nudging = true;
+    tracker.applyScrollDelta(400, 2000, 500); // user scrolls 100px inside the window
+    nudging = false;
+    tracker.applyScrollDelta(400, 2000, 500); // next event, same position
+
+    expect(tracker.headerOffset).toBe(-48); // the 100px still hid the header
+  });
+
+  it('still tracks a real scroll once the window closes', () => {
+    const tracker = trackerWithNudge();
+    tracker.switchContainer(0, 'thread');
+    nudgeRoundTrip(tracker, 1);
+
+    tracker.applyScrollDelta(30, 2000, 500);
+    expect(tracker.headerOffset).toBe(-30);
+  });
+
+  it('never suppresses a live drag, even inside the nudge window', () => {
+    // The two gates are duals: forceIOSRepaint refuses to WRITE a nudge while
+    // isUserScrolling(), so a scroll event arriving during a drag is the user's.
+    // Suppressing it would only make the header lag the finger, and lastNudgeAt
+    // is module-global, so a repaint of a DIFFERENT pane must not be able to
+    // freeze this pane's header mid-gesture.
+    const tracker = trackerWithNudge();
+    tracker.switchContainer(0, 'thread');
+
+    nudging = true;      // a nudge landed a moment ago (on some container)
+    userScrolling = true; // ...and the user is now dragging
+    tracker.applyScrollDelta(30, 2000, 500);
+
+    expect(tracker.headerOffset).toBe(-30); // tracked the finger, not suppressed
+  });
+
+  it('suppresses again once the drag window lapses', () => {
+    // The bypass must not latch: at rest is exactly where the shake lives.
+    const tracker = trackerWithNudge();
+    tracker.switchContainer(0, 'thread');
+    userScrolling = true;
+    tracker.applyScrollDelta(400, 2000, 500);
+    expect(tracker.headerOffset).toBe(-48);
+
+    userScrolling = false;
+    nudgeRoundTrip(tracker, 400, () => {
+      expect(tracker.headerOffset).toBe(-48);
+    });
+    expect(tracker.headerOffset).toBe(-48);
   });
 });
 

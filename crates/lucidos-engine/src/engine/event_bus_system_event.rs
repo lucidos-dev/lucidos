@@ -65,6 +65,20 @@ pub enum SystemEvent {
         total: usize,
         percent: usize,
     },
+    /// The background embedding-model loader moved on: a download progress
+    /// frame, or a transition between downloading / loading / ready / waiting /
+    /// failed. TRANSIENT (never persisted) and high-frequency during a cold
+    /// first run, like `MemoryRebuildProgress` and `BackupProgress`.
+    ///
+    /// Fields mirror `memory::EmbeddingModelStatus` exactly, because
+    /// `GET /api/v1/memory/embedding-model-status` serves the same shape as a
+    /// snapshot: a client that loads mid-download must read what the stream
+    /// would have told it. Pinned by
+    /// `embedding_model_status_event_matches_the_rest_snapshot`.
+    EmbeddingModelStatusChanged {
+        model_id: String,
+        load_state: crate::memory::EmbeddingModelLoadState,
+    },
     ChangesUpdated {
         pending: Vec<crate::core::changes::Change>,
         applied: Vec<crate::core::changes::Change>,
@@ -979,6 +993,7 @@ impl SystemEvent {
             Self::NotificationsAllRead { .. } => "NotificationsAllRead",
             Self::PreferencesChanged { .. } => "PreferencesChanged",
             Self::MemoryRebuildProgress { .. } => "MemoryRebuildProgress",
+            Self::EmbeddingModelStatusChanged { .. } => "EmbeddingModelStatusChanged",
             Self::ChangesUpdated { .. } => "ChangesUpdated",
             Self::BackupProgress { .. } => "BackupProgress",
             Self::BackupCompleted { .. } => "BackupCompleted",
@@ -1074,6 +1089,7 @@ impl SystemEvent {
         "NotificationsAllRead",
         "PreferencesChanged",
         "MemoryRebuildProgress",
+        "EmbeddingModelStatusChanged",
         "ChangesUpdated",
         "BackupProgress",
         "BackupCompleted",
@@ -1174,6 +1190,7 @@ impl SystemEvent {
             | Self::TimezoneSet { .. } => "preference",
             Self::ChangesUpdated { .. } | Self::ChangeDiscarded { .. } => "change",
             Self::MemoryRebuildProgress { .. }
+            | Self::EmbeddingModelStatusChanged { .. }
             | Self::BackupProgress { .. }
             | Self::BackupCompleted { .. }
             | Self::BackupFailed { .. }

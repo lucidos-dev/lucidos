@@ -197,30 +197,16 @@ pub(crate) fn remove_stranded_worktree(
     }
 }
 
-/// True iff the worktree has any uncommitted changes (tracked or untracked).
+/// True iff the worktree has any uncommitted changes (tracked or untracked),
+/// OR git could not say. Every caller uses this to decide whether a tree is
+/// safe to delete, so an unanswerable `git status` (path is no longer a work
+/// tree, a filter such as git-crypt failed, a spawn error, a timeout) counts as
+/// dirty: we don't silently nuke a tree we could not describe. The question
+/// itself lives in [`worktree_dirtiness`], shared with the session-end path.
 pub(crate) async fn is_worktree_dirty(worktree: &Path) -> bool {
-    match git_cmd(&["status", "--porcelain"], worktree).await {
-        Ok(o) if o.status.success() => !o.stdout.is_empty(),
-        Ok(o) => {
-            // `git status` failing usually means the path is no longer a git
-            // worktree (e.g. someone deleted `.git/worktrees/<name>` out of
-            // band). Treat as dirty so we don't silently nuke it.
-            log!(
-                "[WorktreeCleanup] git status failed in {}: {} — treating as dirty",
-                worktree.display(),
-                String::from_utf8_lossy(&o.stderr).trim()
-            );
-            true
-        }
-        Err(e) => {
-            log!(
-                "[WorktreeCleanup] git status errored in {}: {} — treating as dirty",
-                worktree.display(),
-                e
-            );
-            true
-        }
-    }
+    crate::engine::git_ops::worktree_dirtiness(worktree)
+        .await
+        .or_unknown(true)
 }
 
 /// Outcome of [`remove_worktree_and_optionally_delete_branch`].

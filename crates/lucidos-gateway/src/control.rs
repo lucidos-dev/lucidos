@@ -551,7 +551,11 @@ async fn set_boot_failure(
     reject_invalid_id(&id)?;
     let message = body.message.trim();
     if !message.is_empty() {
-        state.set_boot_failure(&id, message);
+        // Always TERMINAL: the engine only reports what it has classified as
+        // unfixable (its `boot_failure.rs` stays silent when in doubt, so the
+        // supervisor keeps retrying). The gateway's own provisioning failures are
+        // the ones that can be merely retrying.
+        state.set_boot_failure(&id, crate::boot_failure::BootFailure::terminal(message));
     }
     Ok(StatusCode::NO_CONTENT)
 }

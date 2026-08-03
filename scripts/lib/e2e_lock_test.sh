@@ -258,8 +258,15 @@ reset_lock_dir
 spawn_sleeper; wk=$SLEEPER_PID       # Playwright WebKit child
 spawn_sleeper; sf=$SLEEPER_PID       # user's own Safari
 spawn_sleeper; eng=$SLEEPER_PID      # e2e workspace engine (via pidfile)
+spawn_sleeper; cc=$SLEEPER_PID       # a Claude Code session that only MENTIONS the path
+# The cc row is the 2026-08-03 regression. Tokens are matched against argv[0], so
+# a process whose argv merely QUOTES the browsers-cache path is not a browser.
+# Claude Code carries the engine's thread history inside a huge
+# --append-system-prompt, and this branch SIGKILLs with no RSS threshold at all,
+# so a full-command-line match here kills the session that runs the suite.
 SYNTHETIC_PS="$wk /Users/x/Library/Caches/ms-playwright/webkit-2287/WebContent.app/Contents/MacOS/WebContent
-$sf /Applications/Safari.app/Contents/MacOS/Safari"
+$sf /Applications/Safari.app/Contents/MacOS/Safari
+$cc /Users/x/.local/bin/claude --append-system-prompt THREAD HISTORY: the leak lives under ms-playwright/webkit-2287/ and ms-playwright/chromium-1187/"
 echo "$eng" > "$E2E_WORKSPACE/.lucidos/engine.pid"
 scan_out="$(_e2e_list_orphans)"
 SYNTHETIC_PS=""
@@ -278,8 +285,32 @@ if printf '%s\n' "$scan_out" | grep -qx "engine $eng"; then
 else
     fail "e2e engine not detected via pidfile (scan: $scan_out)"
 fi
+if printf '%s\n' "$scan_out" | grep -q "$cc"; then
+    fail "Claude Code process wrongly flagged: argv MENTIONS the path, argv[0] does not (scan: $scan_out)"
+else
+    pass "process that only mentions the browsers path correctly ignored"
+fi
 rm -f "$E2E_WORKSPACE/.lucidos/engine.pid"
-kill -KILL "$wk" "$sf" "$eng" 2>/dev/null; wait 2>/dev/null
+kill -KILL "$wk" "$sf" "$eng" "$cc" 2>/dev/null; wait 2>/dev/null
+
+# ── 6b. A whitespace browsers path disarms the scan, loudly ──────────────
+# argv[0] is read up to the first space, so a PLAYWRIGHT_BROWSERS_PATH with a
+# space in it can never match. That is a blind orphan scan, which is exactly the
+# pile-up this lock prevents, so it must never happen silently.
+echo "Test 6b: whitespace browsers path warns that orphan detection is off"
+SYNTHETIC_PS=""
+PLAYWRIGHT_BROWSERS_PATH="/tmp/My Browsers/ms-playwright" \
+    _e2e_list_orphans > "$OUT_DIR"/test-6b.out 2> "$OUT_DIR"/test-6b.err
+if grep -q "WARNING.*whitespace.*OFF" "$OUT_DIR"/test-6b.err; then
+    pass "whitespace browsers path warns that orphan detection is off"
+else
+    fail "no warning for a whitespace browsers path (stderr: $(cat "$OUT_DIR"/test-6b.err))"
+fi
+if [ -s "$OUT_DIR"/test-6b.out ]; then
+    fail "warning leaked into the scan's stdout (would be parsed as an orphan)"
+else
+    pass "warning goes to stderr, leaving the scan's stdout parseable"
+fi
 
 # ── 7. Release only removes a lock we own ────────────────────────────────
 echo "Test 7: release does not remove another owner's lock"

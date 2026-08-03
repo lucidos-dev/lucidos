@@ -19,8 +19,8 @@
 //! on the [`PROGRESS_EVENT`] Tauri event, so the page can say what is happening and
 //! how far along it is (`crates/lucidos-app/src/store/actions/app-update.ts`).
 //! The phases are ordered: `checking` → `downloading` → `verifying` → `installing`
-//! → `restarting-services` → `relaunching`, with `cancelled` / `failed` as the two
-//! terminal off-ramps.
+//! → `restarting-services` → `relaunching`, with `cancelled`, `failed` and
+//! `bundle-swap-failed` as the three terminal off-ramps.
 //!
 //! **Only the download is cancellable.** Until the bytes are verified they exist
 //! only in memory, so abandoning them changes nothing on disk. Once the bundle
@@ -38,6 +38,8 @@
 //! launchd service to restart).
 
 use serde::Serialize;
+#[cfg(target_os = "macos")]
+use std::path::Path;
 use std::sync::Mutex;
 use tauri::async_runtime::JoinHandle;
 use tauri::{AppHandle, Emitter, State};
@@ -84,6 +86,17 @@ enum AppUpdatePhase {
     /// Terminal failure, carrying the reason (the page shows it — this runs on a
     /// click, so it is owed a real error, not a `console.warn`).
     Failed { message: String },
+    /// The install left no runnable app behind, so the swap destroyed the old
+    /// bundle without landing the new one. Raised from BOTH install outcomes: the
+    /// destructive upstream case reports `Err` (see [`installed_bundle_fault`]),
+    /// and the rarer one reports `Ok` over an app that is not there.
+    ///
+    /// Its own terminal phase rather than a [`AppUpdatePhase::Failed`] with a
+    /// longer string, because the two need different handling and not just
+    /// different wording: `failed` is retryable and this is not, the recovery is
+    /// a reinstall from the .dmg, and the page must not re-offer the update.
+    /// See [`bundle_swap_message`].
+    BundleSwapFailed { message: String },
 }
 
 /// One progress frame: the phase plus the version it applies to (`None` until the
@@ -112,15 +125,28 @@ fn emit(app: &AppHandle, version: Option<&str>, phase: AppUpdatePhase) {
 /// halves matter: the event gives the page a terminal phase even if the promise
 /// rejection races the teardown, and the returned string is what the caller's
 /// `catch` reports.
+///
+/// `phase` picks WHICH terminal phase carries the message. Ordinary failures go
+/// through [`fail`]; the bundle-swap case has its own phase because the page has
+/// to narrate it differently.
+fn fail_as(
+    app: &AppHandle,
+    version: Option<&str>,
+    phase: fn(String) -> AppUpdatePhase,
+    message: String,
+) -> String {
+    emit(app, version, phase(message.clone()));
+    message
+}
+
+/// [`fail_as`] with the ordinary [`AppUpdatePhase::Failed`].
 fn fail(app: &AppHandle, version: Option<&str>, message: String) -> String {
-    emit(
+    fail_as(
         app,
         version,
-        AppUpdatePhase::Failed {
-            message: message.clone(),
-        },
-    );
-    message
+        |message| AppUpdatePhase::Failed { message },
+        message,
+    )
 }
 
 /// A failed run, carrying the version it failed on when we had got far enough to
@@ -405,6 +431,168 @@ async fn check_and_download(
     Ok((update, bytes))
 }
 
+// ── Did the bundle swap actually land an app? ────────────────────────────────
+
+/// The main executable inside the `.app`, relative to the bundle root. Tauri
+/// derives `mainBinaryName` from the crate's binary name, NOT from
+/// `productName`, so the bundle is `Lucidos.app` and the executable inside it is
+/// `lucidos-app`. This is also the path `desktop::desired_plist` hands launchd as
+/// the job's `ProgramArguments`, which is what makes its absence a crash loop
+/// rather than a cosmetic problem.
+/// Derived from `CARGO_PKG_NAME` rather than spelled out, because a spelled-out
+/// name that drifted would not fail loudly here: the check would look for a path
+/// that cannot exist and report `bundle-swap-failed` on EVERY update, blocking
+/// all of them over a rename. `concat!` folds it at compile time, so a crate
+/// rename moves the constant with it.
+#[cfg(target_os = "macos")]
+const BUNDLE_MAIN_EXECUTABLE: &str = concat!("Contents/MacOS/", env!("CARGO_PKG_NAME"));
+
+/// What a post-install look at the swapped bundle found. Only
+/// [`BundleVerdict::Runnable`] lets the run go on to restart the service.
+#[cfg(target_os = "macos")]
+#[derive(Debug, PartialEq, Eq)]
+enum BundleVerdict {
+    /// The bundle is there and its main executable is present and executable.
+    Runnable,
+    /// Nothing at the bundle path at all: the swap deleted the old app and never
+    /// put a new one down.
+    BundleMissing,
+    /// The bundle directory exists but its main executable does not, so whatever
+    /// landed is not an app.
+    ExecutableMissing,
+    /// The main executable is there with no execute bit, which launchd can start
+    /// exactly as well as a missing one.
+    ExecutableNotExecutable,
+}
+
+#[cfg(target_os = "macos")]
+impl BundleVerdict {
+    /// The half-sentence naming what is wrong, or `None` when nothing is.
+    fn reason(&self) -> Option<String> {
+        match self {
+            Self::Runnable => None,
+            Self::BundleMissing => Some("the application bundle is gone".to_string()),
+            Self::ExecutableMissing => Some(format!(
+                "the bundle is there but {BUNDLE_MAIN_EXECUTABLE} is missing"
+            )),
+            Self::ExecutableNotExecutable => Some(format!(
+                "{BUNDLE_MAIN_EXECUTABLE} is there but is not executable"
+            )),
+        }
+    }
+}
+
+/// Is there a runnable app at `bundle`? Split out from
+/// [`installed_bundle_fault`] with the path as a parameter so the rule can be
+/// tested against a directory a test builds, rather than only against whatever
+/// this machine happens to have installed.
+#[cfg(target_os = "macos")]
+fn installed_bundle_verdict(bundle: &Path) -> BundleVerdict {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !bundle.is_dir() {
+        return BundleVerdict::BundleMissing;
+    }
+    let Ok(meta) = std::fs::metadata(bundle.join(BUNDLE_MAIN_EXECUTABLE)) else {
+        return BundleVerdict::ExecutableMissing;
+    };
+    if !meta.is_file() {
+        return BundleVerdict::ExecutableMissing;
+    }
+    // Any execute bit at all is the floor. The question being asked is "did the
+    // swap land a real executable", not "are these the ideal permissions", and a
+    // mode that grants execute to nobody is the only one that answers it no.
+    if meta.permissions().mode() & 0o111 == 0 {
+        return BundleVerdict::ExecutableNotExecutable;
+    }
+    BundleVerdict::Runnable
+}
+
+/// Where the plugin just swapped the bundle, derived the way the PLUGIN derives
+/// it: its own public `extract_path_from_executable` over `current_exe()`.
+///
+/// Both halves are deliberate. `UpdaterBuilder::build` sets `extract_path` from
+/// `current_exe()` whenever no `executable_path` override is given, and `lib.rs`
+/// registers the plugin with a bare `Builder::new().build()`, so this resolves
+/// the same path `Update::install` wrote to. Hardcoding `/Applications/Lucidos.app`
+/// instead would report a false failure for anyone running from `~/Applications`
+/// or a dev location, and would miss a real one for anyone whose install lives
+/// elsewhere.
+#[cfg(target_os = "macos")]
+fn installed_bundle_path() -> Result<std::path::PathBuf, String> {
+    let exe = tauri::utils::platform::current_exe()
+        .map_err(|e| format!("cannot resolve this app's own executable: {e}"))?;
+    tauri_plugin_updater::extract_path_from_executable(&exe).map_err(|e| {
+        format!(
+            "cannot resolve this app's bundle from {}: {e}",
+            exe.display()
+        )
+    })
+}
+
+/// What is wrong with the app on disk after an install attempt, as the middle of
+/// a sentence, or `None` when there is a runnable app there.
+///
+/// Upstream `tauri-plugin-updater` 2.10.1 moves the current `.app` into a
+/// `TempDir` and has no restore branch if the final rename fails, so a failed
+/// swap deletes the backup on the way out (`src/updater.rs:1253-1302`; written up
+/// for upstream in `docs/upstream-issues/tauri-plugin-updater-macos-no-rollback.md`).
+/// We ship that, and the blast radius here is bigger than a typical Tauri app's:
+/// the launchd job `gui/<uid>/com.lucidos.engine` has `KeepAlive=true` and its
+/// `ProgramArguments` point INTO the bundle, so kickstarting it onto a missing
+/// binary is a crash loop on a 10-second `ThrottleInterval` that takes the
+/// gateway, every workspace engine and the embedded Postgres down with it.
+/// Asking here turns a silent later-boot failure into an immediate one the user
+/// can act on.
+///
+/// **Fail closed on a path we cannot resolve.** Not knowing where the bundle is
+/// is exactly as informative as finding nothing there, and the recovery advice is
+/// the same either way. The case is close to unreachable in practice (`app.updater()`
+/// resolved the same path a moment earlier, or the install would never have run),
+/// so the cost of the strict direction is near zero and the cost of the lenient
+/// one is the crash loop this exists to prevent.
+#[cfg(target_os = "macos")]
+fn installed_bundle_fault() -> Option<String> {
+    match installed_bundle_path() {
+        Err(e) => Some(format!("Lucidos cannot tell where its own bundle is: {e}")),
+        Ok(bundle) => installed_bundle_verdict(&bundle)
+            .reason()
+            .map(|reason| format!("no runnable app is at {}: {reason}", bundle.display())),
+    }
+}
+
+/// The bundle layout above is a macOS one, and macOS is the only packaged shape
+/// Lucidos ships, so there is nothing to check anywhere else.
+#[cfg(not(target_os = "macos"))]
+fn installed_bundle_fault() -> Option<String> {
+    None
+}
+
+/// The user-facing [`AppUpdatePhase::BundleSwapFailed`] message.
+///
+/// Both callers compose through here so the recovery advice cannot drift apart,
+/// but the OPENING differs and that difference is the point. `install_error` is
+/// `Some` when the plugin itself reported failure, which is where the destructive
+/// upstream case actually lands: the old bundle was already in the `TempDir` when
+/// the final rename failed, and the `TempDir` took it away on the way out. So the
+/// same underlying disaster reaches us as an `Err`, and telling that user "the
+/// update reported success" would be a lie. It is `None` for the rarer shape
+/// where `install` returned `Ok` over an app that is not there.
+///
+/// Pure, so the wording the user actually reads is unit-tested rather than
+/// inspected.
+fn bundle_swap_message(fault: &str, install_error: Option<&str>) -> String {
+    let opening = match install_error {
+        Some(e) => format!("The update failed and {fault}. The installer reported: {e}."),
+        None => format!("The update reported success but {fault}."),
+    };
+    format!(
+        "{opening} Lucidos has NOT been restarted, so the background service keeps running \
+         the version it already loaded and your workspaces stay up until the machine reboots. \
+         Reinstall Lucidos from the .dmg to recover."
+    )
+}
+
 /// Install the available update and restart EVERYTHING onto the new version:
 /// download + swap the bundle, restart the launchd background service (gateway +
 /// engines + embedded Postgres) so it runs the NEW binaries, then relaunch the GUI
@@ -491,9 +679,47 @@ pub async fn install_app_update_and_restart(
             return Err(fail(&app, Some(&version), format!("install task: {e}")));
         }
     };
+    // BOTH outcomes have to ask the same question, and this one is the reason F9
+    // exists. Upstream moves the old bundle into a `TempDir`, and when the final
+    // rename fails it returns Err and drops the `TempDir`, deleting the backup.
+    // So the destructive case arrives here as an ERROR, not as a false success.
+    // Reporting it as an ordinary `failed` would tell a user whose app is gone to
+    // try again, which is the one thing that cannot work.
     if let Err(e) = outcome {
         run.release();
-        return Err(fail(&app, Some(&version), e.to_string()));
+        let e = e.to_string();
+        return Err(match installed_bundle_fault() {
+            None => fail(&app, Some(&version), e),
+            Some(fault) => fail_as(
+                &app,
+                Some(&version),
+                |message| AppUpdatePhase::BundleSwapFailed { message },
+                bundle_swap_message(&fault, Some(&e)),
+            ),
+        });
+    }
+
+    // The rarer shape: `install` returned Ok over an app that is not actually
+    // there (a partial unpack, or a swap that half-succeeded). Prove there is
+    // something runnable to restart INTO before touching the launchd job, because
+    // `restart_service()` is a `kickstart -k` against a KeepAlive job whose
+    // ProgramArguments point into that bundle, which is the crash loop this whole
+    // check exists to avoid.
+    //
+    // On failure the job is deliberately left ALONE rather than booted out, on
+    // both paths. The service that is running right now still holds the deleted
+    // inode, so it keeps serving the user's workspaces; `stop_service` would kill
+    // it AND remove the agent, and with no app on disk nothing could bring either
+    // back. Reinstalling from the .dmg restores the exact path the job already
+    // points at, so the untouched job is what makes the recovery a drag-and-drop.
+    if let Some(fault) = installed_bundle_fault() {
+        run.release();
+        return Err(fail_as(
+            &app,
+            Some(&version),
+            |message| AppUpdatePhase::BundleSwapFailed { message },
+            bundle_swap_message(&fault, None),
+        ));
     }
 
     // Window geometry is already current on disk: the debounced flush in `run()`
@@ -686,6 +912,216 @@ mod tests {
         assert!(
             matches!(*run.lock(), Phase::CancelPending),
             "the cancel must be remembered until the task exists",
+        );
+    }
+
+    // ── The post-install bundle check ────────────────────────────────────────
+
+    /// A throwaway directory that removes itself, so the bundle cases below can
+    /// be built on disk without depending on this machine's real install. Rolled
+    /// by hand because the crate has no dev-dependency on `tempfile` and one
+    /// helper is cheaper than pulling the tree in for it.
+    #[cfg(target_os = "macos")]
+    struct TempDir(std::path::PathBuf);
+
+    #[cfg(target_os = "macos")]
+    impl TempDir {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("lucidos-updater-{tag}-{unique}"));
+            std::fs::create_dir_all(&path).expect("create the temp dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Lay down `<root>/Lucidos.app/Contents/MacOS/lucidos-app` with `mode`, and
+    /// return the bundle root.
+    #[cfg(target_os = "macos")]
+    fn write_bundle(root: &Path, mode: u32) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let bundle = root.join("Lucidos.app");
+        let exe = bundle.join(BUNDLE_MAIN_EXECUTABLE);
+        std::fs::create_dir_all(exe.parent().expect("the executable has a parent"))
+            .expect("create Contents/MacOS");
+        std::fs::write(&exe, b"#!/bin/sh\n").expect("write the main executable");
+        std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(mode))
+            .expect("set the executable's mode");
+        bundle
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bundle_with_an_executable_main_binary_is_runnable() {
+        let tmp = TempDir::new("runnable");
+        let bundle = write_bundle(tmp.path(), 0o755);
+        assert_eq!(installed_bundle_verdict(&bundle), BundleVerdict::Runnable);
+    }
+
+    // The upstream failure this whole check exists for: the swap moved the old
+    // bundle into a TempDir, the final rename failed, and the TempDir took the
+    // backup with it. Nothing is at the path at all.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_vanished_bundle_is_reported_as_missing() {
+        let tmp = TempDir::new("vanished");
+        let bundle = tmp.path().join("Lucidos.app");
+        assert_eq!(
+            installed_bundle_verdict(&bundle),
+            BundleVerdict::BundleMissing
+        );
+    }
+
+    // A partial unpack leaves a directory tree that is not an app. Checking only
+    // that the bundle directory exists would call that a success and kickstart
+    // launchd onto nothing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_bundle_directory_without_its_main_binary_is_not_runnable() {
+        let tmp = TempDir::new("hollow");
+        let bundle = tmp.path().join("Lucidos.app");
+        std::fs::create_dir_all(bundle.join("Contents/Resources")).expect("create a hollow bundle");
+        assert_eq!(
+            installed_bundle_verdict(&bundle),
+            BundleVerdict::ExecutableMissing
+        );
+    }
+
+    // A directory where the executable should be is the same failure as no
+    // executable at all, and `metadata` succeeds on it, so the file-type test is
+    // what separates them.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_directory_standing_in_for_the_main_binary_is_not_runnable() {
+        let tmp = TempDir::new("dir-exe");
+        let bundle = tmp.path().join("Lucidos.app");
+        std::fs::create_dir_all(bundle.join(BUNDLE_MAIN_EXECUTABLE)).expect("create the stand-in");
+        assert_eq!(
+            installed_bundle_verdict(&bundle),
+            BundleVerdict::ExecutableMissing
+        );
+    }
+
+    // An unpack that dropped the mode bits produces a file launchd can no more
+    // start than a missing one, so "it exists" is not the question.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_main_binary_with_no_execute_bit_is_not_runnable() {
+        let tmp = TempDir::new("no-x");
+        let bundle = write_bundle(tmp.path(), 0o644);
+        assert_eq!(
+            installed_bundle_verdict(&bundle),
+            BundleVerdict::ExecutableNotExecutable
+        );
+    }
+
+    // Every non-runnable verdict has to be able to say what is wrong, since the
+    // message is the only thing the user gets. A reason-less failure would render
+    // as a blank half-sentence.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn every_failing_verdict_carries_a_reason_and_the_runnable_one_does_not() {
+        assert_eq!(BundleVerdict::Runnable.reason(), None);
+        for verdict in [
+            BundleVerdict::BundleMissing,
+            BundleVerdict::ExecutableMissing,
+            BundleVerdict::ExecutableNotExecutable,
+        ] {
+            let reason = verdict.reason().unwrap_or_default();
+            assert!(!reason.is_empty(), "{verdict:?} must explain itself");
+        }
+    }
+
+    // The whole point of resolving the path from the running executable rather
+    // than from a hardcoded /Applications: a user who runs from ~/Applications or
+    // a dev location must get a verdict about THEIR bundle.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_verdict_follows_the_bundle_wherever_it_lives() {
+        let tmp = TempDir::new("elsewhere");
+        let nested = tmp.path().join("Users/someone/Applications");
+        std::fs::create_dir_all(&nested).expect("create a non-/Applications location");
+        let bundle = write_bundle(&nested, 0o755);
+        assert_eq!(installed_bundle_verdict(&bundle), BundleVerdict::Runnable);
+    }
+
+    // The message is the whole user-visible product of this check, so its wording
+    // is tested rather than eyeballed. Both shapes must carry the fault and the
+    // recovery, and neither may claim the app was not restarted when it was.
+    #[test]
+    fn both_bundle_swap_messages_name_the_fault_and_the_recovery() {
+        let fault =
+            "no runnable app is at /Applications/Lucidos.app: the application bundle is gone";
+        for message in [
+            bundle_swap_message(fault, None),
+            bundle_swap_message(fault, Some("No such file or directory (os error 2)")),
+        ] {
+            assert!(message.contains(fault), "the fault must survive: {message}");
+            assert!(
+                message.contains("Reinstall Lucidos from the .dmg"),
+                "the recovery path must survive: {message}",
+            );
+            assert!(
+                message.contains("NOT been restarted"),
+                "the user must be told the running service was left alone: {message}",
+            );
+        }
+    }
+
+    // The destructive upstream case reaches us as an Err, so the message on that
+    // path must not open by claiming the update succeeded. Saying "the update
+    // reported success" to somebody whose app the installer just deleted is the
+    // specific lie this split exists to avoid.
+    #[test]
+    fn an_install_error_is_reported_as_a_failure_not_as_a_false_success() {
+        let with_error = bundle_swap_message("the bundle is gone", Some("cross-device link"));
+        assert!(
+            with_error.starts_with("The update failed and"),
+            "an install error must not be narrated as success: {with_error}",
+        );
+        assert!(
+            with_error.contains("cross-device link"),
+            "the installer's own reason must reach the user: {with_error}",
+        );
+
+        let without_error = bundle_swap_message("the bundle is gone", None);
+        assert!(
+            without_error.starts_with("The update reported success but"),
+            "an Ok install that landed nothing must say so: {without_error}",
+        );
+        assert!(
+            !without_error.contains("The installer reported"),
+            "there is no installer error to quote on the Ok path: {without_error}",
+        );
+    }
+
+    // The path resolution must agree with the plugin's, and the plugin's rule is
+    // "walk up out of Contents/MacOS". Asserting it against a synthetic exe path
+    // keeps the two from drifting without anyone noticing.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_plugin_resolves_a_bundle_exe_to_the_bundle_root() {
+        let exe = Path::new("/Users/me/Applications/Lucidos.app").join(BUNDLE_MAIN_EXECUTABLE);
+        let resolved = tauri_plugin_updater::extract_path_from_executable(&exe)
+            .expect("a bundled exe resolves to its bundle");
+        assert_eq!(
+            resolved,
+            Path::new("/Users/me/Applications/Lucidos.app"),
+            "the check must inspect the bundle the plugin swapped, not its Contents dir",
         );
     }
 }
