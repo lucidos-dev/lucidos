@@ -1272,12 +1272,13 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceT
         }));
       }
       flushThreadMap();  // Immediate — user needs to see the new thread now
-      // handleGlobalEvent has no bottom bump like handleThreadEvent does, so
-      // we must fire the per-thread bumps here for both threads whose
-      // pendingUserMessages just changed. Without these, the originating
-      // thread keeps painting the just-moved 'Requesting...' row, and the
-      // new CC thread doesn't render the seeded pendingUserMessages until
-      // its first real event lands.
+      // `handleThreadEvent`'s bottom bump only covers the thread the event
+      // ARRIVED on, and the transient-event path above it returns before
+      // reaching that bump at all, so fire the per-thread bumps here for both
+      // threads whose pendingUserMessages just changed. Without these, the
+      // originating thread keeps painting the just-moved 'Requesting...' row,
+      // and the new CC thread doesn't render the seeded pendingUserMessages
+      // until its first real event lands.
       if (movedMessages && currentThreadId) bumpThreadEvents(currentThreadId);
       bumpThreadEvents(e.cc_thread_id);
       break;

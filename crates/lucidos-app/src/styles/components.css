@@ -280,7 +280,19 @@
    visible when the dim overlay covers the header. */
 .toast-container {
     position: fixed;
-    top: calc(2.75rem + 0.5rem + env(safe-area-inset-top, 0px));
+    /* Start at the header's BOTTOM edge (--app-header-bottom, global/base.css)
+       plus the stack's gap. The container is position:fixed, so its top is
+       measured from the viewport: restating the header's own height here is what
+       put the stack inside the header on the packaged macOS build, where the
+       reclaimed title-bar band pushes the header ~28px down. The anchor carries
+       that band; mobile redefines it as its own fixed header's height.
+       The max() floor keeps the stack clear of the notch on mobile while the
+       keyboard is open and the header has slid off. It is inert on desktop and
+       on any device without a top inset, where env() resolves to 0. */
+    top: max(
+        calc(env(safe-area-inset-top, 0px) + 0.5rem),
+        calc(var(--app-header-bottom) + 0.5rem)
+    );
     left: 0;
     right: 0;
     z-index: var(--z-toast);

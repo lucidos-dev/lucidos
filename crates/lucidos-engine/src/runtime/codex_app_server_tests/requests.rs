@@ -96,8 +96,11 @@ fn sandbox_writable_roots_reach_the_thread_request() {
     // The app-server analog of the exec driver's --add-dir. Both entries are
     // load-bearing: without the shared git dir the workspace-write sandbox
     // blocks every `git commit` in a linked worktree, and without the
-    // workspace's data/ it blocks `lucidos data write` to the parent workspace
-    // (the 2026-07-26 nightly's EPERM, which lost two security findings).
+    // workspace's data/ it blocks a direct write into the parent workspace's
+    // data/ tree (`lucidos data path --mkdir`, an editor write to a resolved
+    // data path). That is the 2026-07-26 nightly's EPERM, which lost two
+    // security findings back when `lucidos data write` wrote the file itself;
+    // that command now PUTs to the engine and needs no writable root.
     let mut config = test_config();
     config.sandbox_writable_roots = vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
     let (_, params) = build_thread_request(&config, None);

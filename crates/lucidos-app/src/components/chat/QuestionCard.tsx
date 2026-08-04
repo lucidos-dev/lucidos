@@ -1,10 +1,11 @@
 import { signal, useSignal } from '@preact/signals';
-import { useEffect, useMemo } from 'preact/hooks';
+import { useEffect, useMemo, useRef } from 'preact/hooks';
 import { showToast } from '../../store/store';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
 import { renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
 import { preserveAtBottom } from './scrollState';
+import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 
 export type ResolvedAnswer =
   | { kind: 'Selected'; option_id: string }
@@ -131,7 +132,20 @@ function QuestionText({ question }: { question: string }) {
  *  initiator panel which provides the chrome (border, header, timestamp).
  *  Multi-select Submit lives in the prompt action row (PromptInput.tsx); the
  *  card just renders toggleable options and reads its optimistic / resolved
- *  state from module-level signals. */
+ *  state from module-level signals.
+ *
+ *  The card is the question and its options, nothing else. The two escapes that
+ *  need no option slot (typing, which routes to this question as a `FreeText`
+ *  answer, and Cancel) are named once, by the prompt textarea's placeholder:
+ *  `PLACEHOLDER_ANSWERING` in `prompt-input-helpers.ts`. A guide line under the
+ *  options said the same thing a few pixels above the field it pointed at, so
+ *  it is gone; do not reintroduce one (pinned by `question-card.test.tsx`).
+ *  Naming the escapes at all is load-bearing, which is why the placeholder
+ *  carries the whole sentence: there is no text-entry option kind, every option
+ *  resolves to its LABEL when picked, and an agent with nothing telling it
+ *  otherwise invents an "Other, I'll type it" row that hands that phrase back
+ *  as the user's answer. The agent-side half lives in the `ask_user_question`
+ *  tool description and the question rules in the engine prompts. */
 export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved, terminated }: QuestionBodyProps) {
   // Single-select keeps a local pending — nothing outside the card needs it.
   const localPending = useSignal<ResolvedAnswer | null>(null);
@@ -159,16 +173,12 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
       <div class="question-body" data-tool-use-id={toolUseId}>
         <QuestionText question={question} />
         {options.length > 0 && (
-          <div class="question-options">
-            {options.map(opt => (
-              <OptionButton
-                key={opt.id}
-                option={opt}
-                pressed={selected.includes(opt.id)}
-                onActivate={(id) => toggleMultiSelectedId(toolUseId, id)}
-              />
-            ))}
-          </div>
+          <LiveOptions
+            toolUseId={toolUseId}
+            options={options}
+            selectedIds={selected}
+            onActivate={(id) => toggleMultiSelectedId(toolUseId, id)}
+          />
         )}
       </div>
     );
@@ -187,15 +197,52 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
     <div class="question-body" data-tool-use-id={toolUseId}>
       <QuestionText question={question} />
       {options.length > 0 && (
-        <div class="question-options">
-          {options.map(opt => (
-            <OptionButton key={opt.id} option={opt} onActivate={onPick} />
-          ))}
-        </div>
+        <LiveOptions toolUseId={toolUseId} options={options} onActivate={onPick} />
       )}
-      {options.length === 0 && (
-        <div class="question-hint">Type your answer in the prompt below.</div>
-      )}
+    </div>
+  );
+}
+
+/** The option list of a LIVE question card, shared by the single- and
+ *  multi-select bodies. It is the card's *choice card* surface (see
+ *  `choiceCardNav.ts`): arrow keys step between options and the first option
+ *  takes DOM focus on arrival, so Enter answers without reaching for the mouse.
+ *  Only rendered while the question is unresolved and not terminated, which is
+ *  what keeps the marker (and therefore keyboard focus) off historical cards. */
+function LiveOptions({
+  toolUseId,
+  options,
+  selectedIds,
+  onActivate,
+}: {
+  toolUseId: string;
+  options: QuestionBodyProps['options'];
+  /** Toggled ids for a multi-select question; omitted for single-select, which
+   *  is what switches `OptionButton` between toggle and one-shot pick. */
+  selectedIds?: string[];
+  onActivate: (id: string) => void;
+}) {
+  const ref = useRef<HTMLDivElement>(null);
+  // Keyed on `toolUseId`, and latched inside `seedChoiceCardFocus` so it fires
+  // on the card's ARRIVAL only. A failed answer rolls the optimistic pending
+  // back, which remounts this component; without the latch that would re-seed
+  // option 0 over whichever option the user actually picked.
+  useEffect(() => { seedChoiceCardFocus(ref.current, toolUseId); }, [toolUseId]);
+  return (
+    <div
+      class="question-options"
+      data-role={CHOICE_CARD_ROLE}
+      ref={ref}
+      onKeyDown={(e) => handleChoiceCardKeyDown(e, ref.current)}
+    >
+      {options.map(opt => (
+        <OptionButton
+          key={opt.id}
+          option={opt}
+          pressed={selectedIds ? selectedIds.includes(opt.id) : undefined}
+          onActivate={onActivate}
+        />
+      ))}
     </div>
   );
 }

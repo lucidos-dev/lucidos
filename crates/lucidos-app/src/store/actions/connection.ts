@@ -1,5 +1,6 @@
-import { connectionStatus, dismissToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
+import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
 import { checkHealth, API_BASE, isTransportError } from '../../api/client';
+import type { HealthInfo } from '../../api/client';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
@@ -230,6 +231,70 @@ export async function handleRestartTimeout(): Promise<void> {
   showToast('Engine restart timed out', 'error');
 }
 
+/** Key of the one toast that names a database outage. Keyed so the 5s health
+ *  poll updates it in place instead of stacking a copy every tick. */
+export const DATABASE_UNREACHABLE_TOAST_KEY = 'database-unreachable';
+
+/** What to tell the user when the engine can't reach its database. Pure, so the
+ *  copy is testable and lives in exactly one place.
+ *
+ *  The remedy differs by deployment and we only claim the one we can support: a
+ *  dev workspace's Postgres is a Docker container (ADR 0014 §6/§7), so naming
+ *  Docker is a fact there. A packaged install runs a bundled Postgres it manages
+ *  itself, where "start Docker" would be actively misleading, so it gets the
+ *  condition without a guessed fix. */
+export function databaseUnreachableMessage(packaged: boolean): string {
+  const cause = "Lucidos can't reach its database, so nothing can load.";
+  return packaged ? cause : `${cause} Check that Docker is running.`;
+}
+
+/** Mirror `/health`'s `database_reachable` into the signal that drives the whole
+ *  degraded surface, and keep the authoritative toast in lockstep with it.
+ *
+ *  Absent (an older engine) reads as reachable: the client must never invent an
+ *  outage from a field the engine never sent.
+ *
+ *  Ordering is load-bearing. The signal is written BEFORE the toast so that
+ *  `workspaceUnavailable()` is already true when the toast is emitted (it opts in
+ *  via `showWhileUnavailable`, and everything else emitted this tick is
+ *  suppressed behind it), and the toast is retracted BEFORE the signal clears so
+ *  the retraction is not itself suppressed. `removeToast`, not `dismissToast`:
+ *  this is a signal-driven hide, not the user dismissing anything. */
+export function syncDatabaseReachability(health: HealthInfo): void {
+  const reachable = health.database_reachable !== false;
+  if (!reachable) {
+    databaseReachable.value = false;
+    showToast(databaseUnreachableMessage(health.packaged === true), 'error', {
+      key: DATABASE_UNREACHABLE_TOAST_KEY,
+      showWhileUnavailable: true,
+      // Not dismissable, and no auto-dismiss: it is the ONLY thing reporting an
+      // outage that may last as long as Docker is down, and it is what makes
+      // suppressing every other failure toast honest rather than silent. It
+      // retracts itself the moment the engine says the database is back.
+      dismissable: false,
+    });
+    return;
+  }
+  retireDatabaseClaim();
+}
+
+/** Drop the outage claim and its toast, returning the client to its normal
+ *  surface. Two callers, and the second is the one that is easy to miss.
+ *
+ *  The claim is evidence FROM the engine, so it cannot outlive our ability to
+ *  reach the engine. Once the connection settles to `disconnected` we can no
+ *  longer confirm or refute it, and leaving it set would strand an outage toast
+ *  under a red dot AND keep `workspaceUnavailable()` true, suppressing the
+ *  engine-level toasts that now own the story (an "Engine restart timed out"
+ *  among them, which does not opt in). So a settled disconnect retires it. */
+function retireDatabaseClaim(): void {
+  // Retract BEFORE clearing the signal, so the retraction is not itself
+  // suppressed. `removeToast`, not `dismissToast`: this is a signal-driven hide,
+  // not the user dismissing anything.
+  removeToast(DATABASE_UNREACHABLE_TOAST_KEY);
+  databaseReachable.value = true;
+}
+
 export async function checkConnection(): Promise<boolean> {
   const wasConnected = connectionStatus.value === 'connected';
   const healthResult = await checkHealth();
@@ -263,7 +328,7 @@ export async function checkConnection(): Promise<boolean> {
   // The in-flight restart status toast (initiateEngineRestart / restoreRestartToast)
   // shows a single stable message for the whole window — there is no build→swap
   // phase transition to advance here anymore. It stays up with its spinner via
-  // showDuringRestart until reconnect (started_at change) dismisses it below.
+  // showWhileUnavailable until reconnect (started_at change) dismisses it below.
 
   // When disconnected, require multiple consecutive successes before showing connected.
   // Prevents red→green flicker when the engine flaps during restarts.
@@ -285,6 +350,15 @@ export async function checkConnection(): Promise<boolean> {
   }
 
   connectionStatus.value = connected ? 'connected' : 'disconnected';
+  // A settled disconnect with NO health to speak for it retires any database
+  // claim: see `retireDatabaseClaim`. Both halves matter. The displayed status
+  // (not the raw probe result) keeps a blip inside the failure-tolerance window
+  // from flapping the toast; and `!health` keeps this off the reconnect path,
+  // where a loaded probe can still read `disconnected` during the
+  // MIN_RECONNECT_SUCCESSES hysteresis. There the fresh health below is the
+  // better evidence, so retiring first would only churn the signal false to true
+  // and back inside one tick.
+  if (!connected && !health) retireDatabaseClaim();
   if (health) {
     workspaceName.value = health.workspace;
     workspacePath.value = health.workspace_path;
@@ -294,6 +368,10 @@ export async function checkConnection(): Promise<boolean> {
     }
     lucidosReleaseDirty.value = health.release_dirty === true;
     enginePackaged.value = health.packaged === true;
+    // Before the fields below, and before anything else this tick can toast: a
+    // dead database is the cause of every other failure in flight, so the
+    // suppression window it opens has to be in place first.
+    syncDatabaseReachability(health);
     // Only an explicit `false` flips to unconfigured; absent (older engine) or
     // true keeps the configured default so onboarding never shows spuriously.
     llmConfigured.value = health.llm_configured !== false;

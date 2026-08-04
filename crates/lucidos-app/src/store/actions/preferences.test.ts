@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import { preferences, toasts } from '../store';
-import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN } from './preferences';
+import { applyTheme, applyFontFamily, applyUiScale, currentTheme, loadPreferences, welcomeSuggestionsDismissed, dismissWelcomeSuggestions, currentInAppBrowser, setInAppBrowser, inAppBrowserAvailable, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, savePreference, flushPendingPreferenceWrites, _pendingPreferenceKeysForTesting, _resetPendingPreferenceWritesForTesting, currentMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_DEFAULT, MAX_TOOL_CALLS_MIN, isBackupScheduleActive, backupIsActive, backupReminderHiddenByDismissal, backupReminderNextDismissal, backupReminderVisibleIn, backupReminderVisible, dismissBackupReminder, BACKUP_REMINDER_FOREVER, BACKUP_REMINDER_SNOOZE_MS } from './preferences';
 import * as apiClient from '../../api/client';
 import { ApiError } from '../../api/client';
 import type { ApiResult } from '../../api/types';
@@ -387,6 +387,132 @@ describe('welcomeSuggestionsDismissed — new-workspace welcome gate', () => {
     const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
 
     await dismissWelcomeSuggestions();
+
+    expect(spy).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The app-shell backup reminder's visibility rule.
+ *
+ * The property worth pinning is that it needs no endpoint of its own: the
+ * engine's GET /backup/schedule reports a schedule only for
+ * `(Some(cron), Some(provider)) if is_schedule_active(cron)`, and both are
+ * ordinary preference rows that GET /preferences already returns. So these
+ * predicates are a mirror of an engine rule, and drift between them is the bug
+ * to catch. The component-side tests live in
+ * `components/layout/__tests__/backup-reminder-banner.test.tsx`.
+ */
+describe('backup reminder: is backup actually on?', () => {
+  const T0 = Date.parse('2026-08-04T09:00:00Z');
+  const DAY_MS = 24 * 60 * 60 * 1000;
+  /** A workspace with automatic backup switched on. */
+  const BACKUP_ON = { backup_schedule: '0 0 3 * * *', backup_provider: 'google_drive' };
+
+  beforeEach(() => {
+    preferences.value = { status: 'not-loaded' };
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('mirrors core::backup::is_schedule_active for the cron half', () => {
+    expect(isBackupScheduleActive(undefined)).toBe(false);
+    expect(isBackupScheduleActive('')).toBe(false);
+    expect(isBackupScheduleActive('off')).toBe(false);
+    expect(isBackupScheduleActive('0 0 3 * * *')).toBe(true);
+    expect(isBackupScheduleActive('0 0 */12 * * *')).toBe(true);
+  });
+
+  it('requires BOTH an active cron and a provider', () => {
+    expect(backupIsActive(BACKUP_ON)).toBe(true);
+    expect(backupIsActive({})).toBe(false);
+    // A cron with nowhere to upload to.
+    expect(backupIsActive({ backup_schedule: '0 0 3 * * *' })).toBe(false);
+    // The shape left behind by picking a provider in Settings and never
+    // choosing a schedule, which backs up nothing.
+    expect(backupIsActive({ backup_provider: 'google_drive' })).toBe(false);
+    expect(backupIsActive({ backup_provider: 'google_drive', backup_schedule: 'off' })).toBe(false);
+  });
+
+  it('an unset dismissal is not a dismissal', () => {
+    expect(backupReminderHiddenByDismissal(undefined, T0)).toBe(false);
+    expect(backupReminderHiddenByDismissal('', T0)).toBe(false);
+  });
+
+  it('the first dismissal hides it for 30 days and no longer', () => {
+    const at = new Date(T0).toISOString();
+    expect(backupReminderHiddenByDismissal(at, T0)).toBe(true);
+    expect(backupReminderHiddenByDismissal(at, T0 + 29 * DAY_MS)).toBe(true);
+    expect(backupReminderHiddenByDismissal(at, T0 + BACKUP_REMINDER_SNOOZE_MS)).toBe(false);
+    expect(backupReminderHiddenByDismissal(at, T0 + 31 * DAY_MS)).toBe(false);
+  });
+
+  it('"forever" hides regardless of how long ago it was set', () => {
+    expect(backupReminderHiddenByDismissal(BACKUP_REMINDER_FOREVER, T0)).toBe(true);
+    expect(backupReminderHiddenByDismissal(BACKUP_REMINDER_FOREVER, T0 + 400 * DAY_MS)).toBe(true);
+  });
+
+  it('an unparseable dismissal fails towards SHOWING the warning', () => {
+    // Garbage can only arrive by hand-writing the preference. This is a
+    // data-loss warning, so an uninterpretable dismissal must not silence it,
+    // and the next dismiss overwrites the garbage with a real instant.
+    expect(backupReminderHiddenByDismissal('yesterday', T0)).toBe(false);
+    expect(backupReminderNextDismissal('yesterday', T0)).toBe(new Date(T0).toISOString());
+  });
+
+  it('records the instant on the first dismissal and forever on the second', () => {
+    expect(backupReminderNextDismissal(undefined, T0)).toBe(new Date(T0).toISOString());
+    expect(backupReminderNextDismissal('', T0)).toBe(new Date(T0).toISOString());
+    // The banner can only be back on screen because the snooze lapsed, so
+    // dismissing it again is the user saying it a second time.
+    const first = new Date(T0).toISOString();
+    expect(backupReminderNextDismissal(first, T0 + 31 * DAY_MS)).toBe(BACKUP_REMINDER_FOREVER);
+    expect(backupReminderNextDismissal(BACKUP_REMINDER_FOREVER, T0)).toBe(BACKUP_REMINDER_FOREVER);
+  });
+
+  it('backup being on beats any dismissal state', () => {
+    expect(backupReminderVisibleIn({}, T0)).toBe(true);
+    expect(backupReminderVisibleIn(BACKUP_ON, T0)).toBe(false);
+    expect(backupReminderVisibleIn({ ...BACKUP_ON, backup_reminder_dismissed: '' }, T0)).toBe(false);
+    // Switched back off after a dismissal whose snooze has since lapsed.
+    expect(backupReminderVisibleIn({ backup_reminder_dismissed: new Date(T0).toISOString() }, T0 + 31 * DAY_MS)).toBe(true);
+  });
+
+  it('fails closed while preferences are not loaded (no flash for returning users)', () => {
+    // Same reasoning as welcomeSuggestionsDismissed above, and it matters more
+    // on an iOS PWA, where the preferences fetch reruns on every resume.
+    for (const state of [
+      { status: 'not-loaded' } as const,
+      { status: 'loading' } as const,
+      { status: 'failed', error: 'network error' } as const,
+    ]) {
+      preferences.value = state;
+      expect(backupReminderVisible(T0)).toBe(false);
+    }
+    preferences.value = { status: 'loaded', data: {} };
+    expect(backupReminderVisible(T0)).toBe(true);
+  });
+
+  it('dismissBackupReminder writes the instant, then forever', async () => {
+    preferences.value = { status: 'loaded', data: {} };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+
+    await dismissBackupReminder(T0);
+    expect(spy).toHaveBeenCalledWith('backup_reminder_dismissed', new Date(T0).toISOString(), undefined);
+
+    // savePreference updates the local map optimistically, so the second
+    // dismissal reads the first one's value and escalates.
+    await dismissBackupReminder(T0 + 31 * DAY_MS);
+    expect(spy).toHaveBeenLastCalledWith('backup_reminder_dismissed', BACKUP_REMINDER_FOREVER, undefined);
+  });
+
+  it('dismissBackupReminder is a no-op while preferences are unloaded', async () => {
+    preferences.value = { status: 'not-loaded' };
+    const spy = vi.spyOn(apiClient, 'setPreference').mockResolvedValue(undefined as never);
+
+    await dismissBackupReminder(T0);
 
     expect(spy).not.toHaveBeenCalled();
   });

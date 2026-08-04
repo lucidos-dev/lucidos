@@ -94,3 +94,14 @@ export function openProviderSettings(): void {
   pushNavState();
   revealContentPane();
 }
+
+/** Deep-link to Settings → Backup in a single render. Used by the app-shell
+ *  backup reminder's "Set up backup" button. No scroll target: the page is short
+ *  and its health card, provider picker and schedule dropdown are all at the top,
+ *  which is exactly what someone arriving from the reminder came for. */
+export function openBackupSettings(): void {
+  setActiveMenu('settings');
+  settingsSubview.value = 'backup';
+  pushNavState();
+  revealContentPane();
+}

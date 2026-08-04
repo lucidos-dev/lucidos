@@ -106,6 +106,23 @@ export function getActiveScrollElement(): HTMLElement | null {
 let _resizeMode: 'scroll' | 'ignore' = 'ignore';
 let _suppressTimer: ReturnType<typeof setTimeout> | null = null;
 const SUPPRESSION_MS = 500;
+const PIN_FRAME_MS = 16;
+
+/** Frames the bottom-pinning loop may still run. Refilled by every
+ *  `extendSuppression`, decremented per frame, and a hard stop at 0 even while
+ *  `_resizeMode` is still 'scroll'.
+ *
+ *  It is a BACKSTOP, not the normal exit: the loop's ~16ms frames can only land
+ *  slower than the wall clock (never faster), so a live suppression window
+ *  always flips `_resizeMode` to 'ignore' first, exactly as before. The budget
+ *  only matters when the suppression timer never fires at all, which makes an
+ *  unbounded self-rescheduling loop unrepresentable rather than merely unlikely.
+ *  That happens whenever the two timers end up on different clocks: a page
+ *  suspend/resume dropping one, or a test that swaps in fake timers between the
+ *  loop's frames (a flake in the frontend suite, where an already-running real
+ *  loop rescheduled itself onto the fake clock and then spun forever inside
+ *  `runAllTimersAsync`, since its real suppression timer could not fire there). */
+let _pinFramesLeft = 0;
 
 /** Get current resize mode — 'scroll' means ResizeObserver should scroll
  *  to bottom instead of setting scrolledUp. */
@@ -114,8 +131,11 @@ export function getResizeMode() {
 }
 
 /** Extend the suppression window — called from ResizeObserver when in 'scroll'
- *  mode to keep the window alive while content is still rendering. */
+ *  mode to keep the window alive while content is still rendering. Refills the
+ *  pin loop's frame budget with the same window, so extending the suppression
+ *  extends both halves together. */
 export function extendSuppression() {
+  _pinFramesLeft = Math.ceil(SUPPRESSION_MS / PIN_FRAME_MS);
   if (_suppressTimer) clearTimeout(_suppressTimer);
   _suppressTimer = setTimeout(() => {
     _resizeMode = 'ignore';
@@ -392,10 +412,12 @@ export function scrollToBottom(opts?: { auto?: boolean }) {
   // Cancel any prior loop so only the latest call drives scrolling
   if (_scrollTimer !== null) clearTimeout(_scrollTimer);
 
-  // Continuous scroll loop — runs every ~16ms until suppression expires.
+  // Continuous scroll loop, running every ~PIN_FRAME_MS until the suppression
+  // window expires (or its frame budget runs out, whichever comes first: see
+  // `_pinFramesLeft`, the backstop for a suppression timer that never fires).
   // Re-resolves target each frame in case the visible element changed.
   const loop = () => {
-    if (_resizeMode !== 'scroll') {
+    if (_resizeMode !== 'scroll' || _pinFramesLeft <= 0) {
       // The loop clears awayFromBottom every iteration, so a final-frame
       // content grow without an onScroll/onResize would leave the chevron
       // stuck hidden. Reconcile against actual position on exit.
@@ -403,18 +425,28 @@ export function scrollToBottom(opts?: { auto?: boolean }) {
       if (el && el.scrollTop + el.clientHeight < el.scrollHeight - 2) {
         awayFromBottom.value = true;
       }
+      // Land in the state the suppression timer would have left behind. When
+      // the frame budget is what ended the loop, that timer is gone (dropped by
+      // a suspend, or on a clock that will never run it), so nothing else would
+      // ever flip the mode back: onScroll would stay suppressed and onResize
+      // would keep force-pinning the user to the bottom. In the ordinary exit
+      // the timer already did exactly this, so both lines are no-ops there.
+      _resizeMode = 'ignore';
+      if (_suppressTimer) clearTimeout(_suppressTimer);
+      _suppressTimer = null;
       _scrollTimer = null;
       return;
     }
+    _pinFramesLeft--;
     scrolledUp.value = false;
     awayFromBottom.value = false;
     const el = resolveTarget();
     if (el) {
       el.scrollTop = el.scrollHeight;
     }
-    _scrollTimer = setTimeout(loop, 16);
+    _scrollTimer = setTimeout(loop, PIN_FRAME_MS);
   };
-  _scrollTimer = setTimeout(loop, 16);
+  _scrollTimer = setTimeout(loop, PIN_FRAME_MS);
 
   extendSuppression();
 }
@@ -1018,13 +1050,46 @@ export function parseNavigatedTurn(
 export function isEventInViewport(eventId: string): boolean {
   if (!eventId || typeof document === 'undefined' || !document.querySelectorAll) return false;
   const matches = document.querySelectorAll<HTMLElement>(`[data-event-id="${CSS.escape(eventId)}"]`);
-  const viewportH = window.innerHeight || document.documentElement.clientHeight;
   for (const el of matches) {
-    if (!isElementVisible(el)) continue;
-    const r = el.getBoundingClientRect();
-    if (r.bottom > 0 && r.top < viewportH) return true;
+    if (isElementOnScreen(el)) return true;
   }
   return false;
+}
+
+/** True when `el` is actually on screen, not merely laid out. Two distinct
+ *  checks, and both are load-bearing: `isElementVisible` rejects the hidden
+ *  layout copy (0x0 rect) and anything inside a collapsed container, while the
+ *  rect test rejects an element scrolled or translated out of view. The second
+ *  is what a restored scroll position (`useScrollMemory`) needs, since a card
+ *  far below the fold is perfectly "visible" by the first test alone.
+ *
+ *  BOTH axes are tested, and each catches a different layout. Vertically, the
+ *  band is the ACTIVE SCROLL ELEMENT's when there is one rather than the
+ *  window's, because the transcript is inset by the app header above and the
+ *  prompt region below, so an element in either strip is inside
+ *  `window.innerHeight` while being completely hidden. Horizontally, the mobile
+ *  swipe layout keeps every pane mounted and merely translates the inactive
+ *  ones aside, so an element in an off-screen pane has a full-size rect and
+ *  passes every vertical test there is.
+ *
+ *  Shared by `isEventInViewport` (deep-link pulse, presence-pong
+ *  `event_in_viewport`) and `choiceCardNav`, which must never take DOM focus on
+ *  an off-screen choice: that would arm an Enter the user cannot see, and on a
+ *  permission card an unseen grant. */
+export function isElementOnScreen(el: HTMLElement): boolean {
+  if (!isElementVisible(el)) return false;
+  const scroller = getActiveScrollElement();
+  const bounds = scroller && isElementVisible(scroller)
+    ? scroller.getBoundingClientRect()
+    : {
+        top: 0,
+        bottom: window.innerHeight || document.documentElement.clientHeight,
+        left: 0,
+        right: window.innerWidth || document.documentElement.clientWidth,
+      };
+  const r = el.getBoundingClientRect();
+  return r.bottom > bounds.top && r.top < bounds.bottom
+    && r.right > bounds.left && r.left < bounds.right;
 }
 
 /** Suppress useAutoScroll for one render so a user-toggled panel collapse /

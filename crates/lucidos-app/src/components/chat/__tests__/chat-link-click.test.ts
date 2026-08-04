@@ -26,7 +26,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef } from '../../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, hasUrlScheme } from '../../../utils/linkifyPaths';
 import { renderMarkdown } from '../../../utils/renderMarkdown';
 import type { App } from '../../../store/types';
 
@@ -92,6 +92,7 @@ type Callbacks = {
   openApp: (app: App) => void;
   navigate: (req: { target: string }) => void;
   osOpen: (target: string) => void;
+  toast: (message: string) => void;
 };
 function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Callbacks): void {
   const t = e.target;
@@ -133,11 +134,23 @@ function runHandleLinkClick(e: ReturnType<typeof mkEvent>, apps: App[], cb: Call
       const a = apps.find(x => x.id === bareRef || x.name === bareRef);
       if (a) { e.preventDefault(); cb.openApp(a); return; }
     }
+    const dataPath = extractDataPathTarget(href);
+    if (dataPath) {
+      e.preventDefault();
+      cb.openArtifact(dataPath);
+      return;
+    }
     const localFile = extractLocalFileTarget(href);
     if (localFile) {
       e.preventDefault();
       cb.osOpen(localFile);
       return;
+    }
+    // Terminal guard: a scheme-less, non-fragment href reaches nothing in the
+    // SPA, so it must never navigate.
+    if (!hasUrlScheme(href) && !href.startsWith('#')) {
+      e.preventDefault();
+      cb.toast(href ? `Link "${href}" points nowhere in this workspace` : 'This link has no destination');
     }
   }
 }
@@ -149,6 +162,7 @@ describe('chat link click — the bug-report scenario', () => {
     openApp: ReturnType<typeof vi.fn>;
     navigate: ReturnType<typeof vi.fn>;
     osOpen: ReturnType<typeof vi.fn>;
+    toast: ReturnType<typeof vi.fn>;
   };
 
   beforeEach(() => {
@@ -158,6 +172,7 @@ describe('chat link click — the bug-report scenario', () => {
       openApp: vi.fn() as Callbacks['openApp'] & ReturnType<typeof vi.fn>,
       navigate: vi.fn() as Callbacks['navigate'] & ReturnType<typeof vi.fn>,
       osOpen: vi.fn() as Callbacks['osOpen'] & ReturnType<typeof vi.fn>,
+      toast: vi.fn() as Callbacks['toast'] & ReturnType<typeof vi.fn>,
     };
   });
 
@@ -215,18 +230,20 @@ describe('chat link click — the bug-report scenario', () => {
     'apps/work-tracker/styles.css',
     'apps/work-tracker/scripts/run.sh',
     'apps/work-tracker/nested/deep/file.json',
-  ])('FALLBACK sub-file: %s → does NOT intercept (sub-file should preview as artifact)', (href) => {
+  ])('FALLBACK sub-file: %s → previews as artifact, never opens the app', (href) => {
     const e = mkEvent(mkAnchor(href));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openApp).not.toHaveBeenCalled();
-    expect(e.defaultPrevented).toBe(false);
+    expect(cb.openArtifact).toHaveBeenCalledWith(href);
+    expect(e.defaultPrevented).toBe(true);
   });
 
-  it('does NOT intercept unknown app id — default navigation proceeds', () => {
+  it('unknown app id → previews the file, never navigates away', () => {
     const e = mkEvent(mkAnchor('apps/no-such-app/index.html'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openApp).not.toHaveBeenCalled();
-    expect(e.defaultPrevented).toBe(false);
+    expect(cb.openArtifact).toHaveBeenCalledWith('apps/no-such-app/index.html');
+    expect(e.defaultPrevented).toBe(true);
   });
 
   it('does NOT intercept external https URLs that happen to contain apps/', () => {
@@ -266,11 +283,12 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
-  it('does NOT intercept a bare href that names no known app', () => {
+  it('a bare href that names no known app is swallowed, not navigated', () => {
     const e = mkEvent(mkAnchor('README'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.openApp).not.toHaveBeenCalled();
-    expect(e.defaultPrevented).toBe(false);
+    expect(cb.toast).toHaveBeenCalledOnce();
+    expect(e.defaultPrevented).toBe(true);
   });
 
   it('a bare href that is a nav panel name routes to the panel, not a bare app', () => {
@@ -358,11 +376,12 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(true);
   });
 
-  it('does NOT intercept unknown panel name — default navigation proceeds', () => {
+  it('an unknown panel name is swallowed, not navigated', () => {
     const e = mkEvent(mkAnchor('unknown-panel'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.navigate).not.toHaveBeenCalled();
-    expect(e.defaultPrevented).toBe(false);
+    expect(cb.toast).toHaveBeenCalledOnce();
+    expect(e.defaultPrevented).toBe(true);
   });
 
   it('does NOT intercept external https URLs that happen to contain a panel name', () => {
@@ -462,11 +481,104 @@ describe('chat link click — the bug-report scenario', () => {
     expect(e.defaultPrevented).toBe(false);
   });
 
-  it('OS-OPEN: relative workspace path (data/…) is NOT OS-opened', () => {
+  it('OS-OPEN: relative workspace path (data/…) previews in-app, never OS-opens', () => {
     const e = mkEvent(mkAnchor('data/artifacts/report.pdf'));
     runHandleLinkClick(e, APPS, cb);
     expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(cb.openArtifact).toHaveBeenCalledWith('artifacts/report.pdf');
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  // ---------------------------------------------------------------------------
+  // The reported bug: `lucidos data write` lands an artifact and prints
+  // `[name](artifacts/<path>)` for the agent to paste. The artifacts cache is
+  // SSE-refreshed and does not have the path yet, so linkifyPaths leaves a raw
+  // relative href; with no data-path branch here the browser navigated to
+  // /<slug>/artifacts/... , the SPA fallback served the app shell, and the whole
+  // workspace reloaded.
+  // ---------------------------------------------------------------------------
+
+  it.each([
+    ['artifacts/pr-review/pr-1582/index.html', 'artifacts/pr-review/pr-1582/index.html'],
+    ['data/artifacts/report.html', 'artifacts/report.html'],
+    ['/artifacts/report.html', 'artifacts/report.html'],
+    ['/data/artifacts/report.html', 'artifacts/report.html'],
+    ['knowhow/myapp/notes.md', 'knowhow/myapp/notes.md'],
+    ['triggers/daily/run.md', 'triggers/daily/run.md'],
+    ['system-knowhow/js-sdk.md', 'system-knowhow/js-sdk.md'],
+    ['artifacts/report.html?v=2', 'artifacts/report.html'],
+    ['artifacts/report.html#top', 'artifacts/report.html'],
+  ])('DATA PATH %s → openArtifact(%s)', (href, expected) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.openArtifact).toHaveBeenCalledWith(expected);
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(e.defaultPrevented).toBe(true);
+  });
+
+  it.each([
+    '/artifacts/report.pdf',
+    '/knowhow/x.md',
+    '/triggers/daily/run.md',
+    '/system-knowhow/js-sdk.md',
+  ])('DATA PATH absolute %s is never handed to the OS opener', (href) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.osOpen).not.toHaveBeenCalled();
+    expect(cb.openArtifact).toHaveBeenCalledOnce();
+  });
+
+  // ---------------------------------------------------------------------------
+  // Terminal guard. The four branches above are a whitelist, and a whitelist is
+  // open at the bottom: every href nobody claimed used to escape to the browser
+  // and reload the workspace. Nothing scheme-less escapes any more.
+  // ---------------------------------------------------------------------------
+
+  it.each([
+    'README',
+    'some/unknown/path.md',
+    'unknown-panel',
+    'artifacts',          // a bare sub-tree is a directory, not a file
+    'config/apis.json',   // a real data/ sub-tree, but not one served for preview
+    '/data',
+  ])('CLOSED: unclaimed relative href %s is swallowed with a toast', (href) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
+    expect(e.defaultPrevented).toBe(true);
+    expect(cb.toast).toHaveBeenCalledOnce();
+    expect(cb.openApp).not.toHaveBeenCalled();
+    expect(cb.navigate).not.toHaveBeenCalled();
+    expect(cb.openArtifact).not.toHaveBeenCalled();
+    expect(cb.osOpen).not.toHaveBeenCalled();
+  });
+
+  it('CLOSED: the toast names the offending href', () => {
+    const e = mkEvent(mkAnchor('some/unknown/path.md'));
+    runHandleLinkClick(e, APPS, cb);
+    expect(cb.toast).toHaveBeenCalledWith(expect.stringContaining('some/unknown/path.md'));
+  });
+
+  it('CLOSED: an empty href is swallowed and reported without an empty name', () => {
+    // `[click here]()` renders `<a href="">`, which resolves to the current URL
+    // and reloads exactly like any other unclaimed relative href. It has to be
+    // swallowed, but it cannot be named.
+    const e = mkEvent(mkAnchor(''));
+    runHandleLinkClick(e, APPS, cb);
+    expect(e.defaultPrevented).toBe(true);
+    expect(cb.toast).toHaveBeenCalledWith('This link has no destination');
+  });
+
+  it.each([
+    '#section',            // in-page markdown anchor: navigates nothing
+    'https://example.com', // real external link
+    'http://example.com/x',
+    'mailto:a@example.com',
+    'tel:+4712345678',
+  ])('CLOSED: %s passes through untouched', (href) => {
+    const e = mkEvent(mkAnchor(href));
+    runHandleLinkClick(e, APPS, cb);
     expect(e.defaultPrevented).toBe(false);
+    expect(cb.toast).not.toHaveBeenCalled();
   });
 });
 
@@ -490,37 +602,80 @@ describe('chat link click — handler structure pin', () => {
     expect(body).toMatch(sequence);
   });
 
-  it('handleLinkClick uses extractAppIdFromHref, extractNavTargetFromHref, extractBareAppRef, and extractLocalFileTarget in the fallback branch', () => {
-    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*from.*linkifyPaths/);
+  it('handleLinkClick uses all five href extractors in the fallback branch', () => {
+    expect(chatExchangeSource).toMatch(/import.*extractAppIdFromHref.*extractNavTargetFromHref.*extractLocalFileTarget.*extractBareAppRef.*extractDataPathTarget.*from.*linkifyPaths/);
     expect(chatExchangeSource).toMatch(/extractAppIdFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractNavTargetFromHref\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractBareAppRef\(rawHref\)/);
+    expect(chatExchangeSource).toMatch(/extractDataPathTarget\(rawHref\)/);
     expect(chatExchangeSource).toMatch(/extractLocalFileTarget\(rawHref\)/);
   });
 
-  it('fallback branch calls openApp, handleNavigationRequest, and openLocalFile with preventDefault', () => {
+  it('fallback branch calls openApp, handleNavigationRequest, openFilePreview and openLocalFile with preventDefault', () => {
     const m = chatExchangeSource.match(/closest\('a'\)[\s\S]*?\n  \}\n/);
     expect(m).not.toBeNull();
     const body = m![0];
     expect(body).toContain('openApp(app)');
     expect(body).toContain('handleNavigationRequest({ target: navName })');
+    expect(body).toContain('openFilePreview(dataPath)');
     expect(body).toContain('openLocalFile(localFile)');
     expect(body).toContain('e.preventDefault()');
   });
 
-  it('the fallback extractors run in order: app → nav → bare-app-ref → OS-open', () => {
+  it('the fallback extractors run in order: app, nav, bare-app-ref, data-path, OS-open', () => {
     // extractLocalFileTarget must appear after the app/nav extractors, or an
     // absolute /apps/… or /notifications href could be handed to the OS instead
     // of routed in-app. extractBareAppRef must run AFTER nav so a reserved panel
     // name (`notifications`) keeps routing to its panel, and BEFORE the OS-open
     // so a bare app-id href never falls through to the disk opener.
+    // extractDataPathTarget sits between them: after bare-app-ref (which only
+    // ever claims single-segment hrefs, so they cannot collide) and before
+    // OS-open, so an absolute /artifacts/… is read as a workspace file rather
+    // than a disk path.
     const appIdx = chatExchangeSource.indexOf('extractAppIdFromHref(rawHref)');
     const navIdx = chatExchangeSource.indexOf('extractNavTargetFromHref(rawHref)');
     const bareIdx = chatExchangeSource.indexOf('extractBareAppRef(rawHref)');
+    const dataIdx = chatExchangeSource.indexOf('extractDataPathTarget(rawHref)');
     const fileIdx = chatExchangeSource.indexOf('extractLocalFileTarget(rawHref)');
     expect(appIdx).toBeGreaterThanOrEqual(0);
     expect(navIdx).toBeGreaterThan(appIdx);
     expect(bareIdx).toBeGreaterThan(navIdx);
-    expect(fileIdx).toBeGreaterThan(bareIdx);
+    expect(dataIdx).toBeGreaterThan(bareIdx);
+    expect(fileIdx).toBeGreaterThan(dataIdx);
+  });
+
+  it('the terminal guard is LAST and swallows every scheme-less href', () => {
+    // The whole point of the guard is that nothing follows it: it is the
+    // bottom of the whitelist. A new extractor added AFTER it would be dead
+    // code, and, worse, would read as covering a shape the guard already ate.
+    const m = chatExchangeSource.match(/function handleLinkClick[\s\S]*?\n  \}\n/);
+    expect(m, 'handleLinkClick not found in ChatExchange.tsx').not.toBeNull();
+    const body = m![0];
+    const guard = body.indexOf('showToast(');
+    expect(guard, 'terminal guard toast not found').toBeGreaterThan(0);
+    expect(body.indexOf('extractLocalFileTarget(rawHref)')).toBeLessThan(guard);
+    expect(body.slice(guard)).not.toMatch(/extract[A-Za-z]+\(rawHref\)/);
+    // It must gate on BOTH exemptions: a URL scheme and a pure fragment.
+    // `hasUrlScheme` is the shared helper, so the chat handler and the preview
+    // bridge can never disagree about what counts as a scheme.
+    expect(body).toContain('!hasUrlScheme(rawHref)');
+    expect(body).toContain("!rawHref.startsWith('#')");
+  });
+
+  it('no router re-implements the URL-scheme test inline', () => {
+    // Four copies of `/^[a-z][a-z0-9+.-]*:/i` existed across the chat handler,
+    // the two extractors, and the preview bridge. They are one exported
+    // `hasUrlScheme` now; an inline copy drifts the routers apart silently.
+    const sources = [
+      ['ChatExchange.tsx', chatExchangeSource],
+      ['linkifyPaths.ts', readFileSync(resolve(here, '../../../utils/linkifyPaths.ts'), 'utf-8')],
+      ['previewIframeLinks.ts', readFileSync(resolve(here, '../../files/previewIframeLinks.ts'), 'utf-8')],
+    ] as const;
+    for (const [name, src] of sources) {
+      const inline = src.match(/\/\^\[a-z\]\[a-z0-9\+\.-\]\*:\/i/g) ?? [];
+      // linkifyPaths.ts holds the ONE definition inside `hasUrlScheme`.
+      const allowed = name === 'linkifyPaths.ts' ? 1 : 0;
+      expect(inline.length, `${name} must not inline the scheme regex`).toBe(allowed);
+    }
   });
 });

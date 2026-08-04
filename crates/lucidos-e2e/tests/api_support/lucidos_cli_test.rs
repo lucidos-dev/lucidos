@@ -389,3 +389,98 @@ async fn notify_endpoint_rejects_whitespace_only_title() {
         resp.text().await.unwrap_or_default()
     );
 }
+
+/// `lucidos data write` must ANNOUNCE the write, not just land the bytes.
+///
+/// It used to `std::fs::write` the file directly: no `DataFileWritten`, no
+/// `Artifact*`, no git commit, no memory index entry. The frontend's artifact
+/// cache is refreshed by those events, so a freshly written artifact was
+/// unknown to it, and the chat link this very command prints then failed to
+/// resolve and reloaded the whole workspace on click. The write now goes
+/// through `PUT /api/v1/data/*path` (ADR 0032), and this proves the events
+/// really reach the store, which the CLI's own stub-server test cannot.
+#[test]
+fn data_write_announces_the_artifact_against_a_running_workspace() {
+    let bin = lucidos_bin();
+    let ws = workspace_path();
+    let marker = unique_marker("cli-data-write");
+    let rel = format!("artifacts/cli-e2e/{marker}.md");
+
+    let src = std::env::temp_dir().join(format!("{marker}.md"));
+    std::fs::write(&src, b"# announced\n").expect("write source file");
+
+    let out = Command::new(&bin)
+        .args(["data", "write", &rel, "--from"])
+        .arg(&src)
+        .env("LUCIDOS_WORKSPACE", &ws)
+        .output()
+        .expect("lucidos data write should run");
+    let _ = std::fs::remove_file(&src);
+    assert!(
+        out.status.success(),
+        "data write failed: stdout={}\nstderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout is the ready-to-paste chat link, bare store path, no scheme.
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout).trim(),
+        format!("[{marker}.md]({rel})")
+    );
+
+    // The bytes landed in the PARENT workspace, via the engine.
+    let landed = ws.join("data").join(&rel);
+    assert!(
+        landed.exists(),
+        "expected the file at {}, but it does not exist",
+        landed.display()
+    );
+
+    // The entity event fired, which is what refreshes the artifact list, feeds
+    // the memory index, and lets an `on_event: ArtifactCreated` trigger see it.
+    let artifact_rel = rel.strip_prefix("artifacts/").expect("artifacts-rooted");
+    assert!(
+        query_system_event_mentions(&bin, &ws, "ArtifactCreated", "artifact_path", artifact_rel),
+        "no ArtifactCreated carrying {artifact_rel}"
+    );
+
+    // And the API-origin audit event alongside it, carrying the store path.
+    assert!(
+        query_system_event_mentions(&bin, &ws, "DataFileWritten", "path", &rel),
+        "no DataFileWritten carrying {rel}"
+    );
+}
+
+/// True when a recent SYSTEM event of `event_type` carries `field == value`.
+///
+/// A system event's stored payload is the serde-tagged envelope
+/// (`{"type": "ArtifactCreated", "data": {…}}`), so the variant's own fields
+/// live under `data`. That is unlike a domain event from `events emit`, whose
+/// payload is the caller's object flat at the top level (see
+/// `emit_then_query_round_trip_against_running_workspace`, which reads
+/// `payload.summary` directly).
+fn query_system_event_mentions(
+    bin: &std::path::Path,
+    ws: &std::path::Path,
+    event_type: &str,
+    field: &str,
+    value: &str,
+) -> bool {
+    let out = Command::new(bin)
+        .args(["events", "query", "--type", event_type, "--limit", "50"])
+        .env("LUCIDOS_WORKSPACE", ws)
+        .output()
+        .expect("lucidos events query should run");
+    assert!(
+        out.status.success(),
+        "query {event_type} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let body: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("query stdout must be JSON");
+    body.as_array()
+        .expect("query response must be an array")
+        .iter()
+        .any(|ev| ev["payload"]["data"][field].as_str() == Some(value))
+}

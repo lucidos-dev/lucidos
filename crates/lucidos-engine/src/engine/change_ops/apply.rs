@@ -139,13 +139,25 @@ impl LucidosEngine {
         // already merged into main out-of-band (e.g. by an agentic loop calling
         // `git merge` directly). Only kicks in when the live branch is missing,
         // so live-branch flows (Tier 1/2/3) keep ownership of the merge.
+        //
+        // `or_unknown(true)` (branch assumed PRESENT when git could not be
+        // asked): entering this arm resolves the change as an already-applied
+        // no-op, and an unanswered probe must never authorize that
+        // (`.claude/rules/rust.md`). `git_cmd` returns `Err` for a spawn failure
+        // AND for its 30s timeout, which a saturated host really does hit on an
+        // ordinary `rev-parse`, so the old `.unwrap_or(false)` read "could not
+        // ask" as "branch gone" and could mark a pending change applied while
+        // its commits were never merged. Assuming the branch is there instead
+        // falls through to the normal apply path, which re-checks the ref below
+        // and fails loudly if it truly is missing.
         {
             let repo_root = std::path::PathBuf::from(&change.repo_root);
-            let branch_exists =
-                git_cmd(&["rev-parse", "--verify", &change.branch_name], &repo_root)
-                    .await
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
+            let branch_exists = crate::engine::git_ops::git_answer(
+                &["rev-parse", "--verify", &change.branch_name],
+                &repo_root,
+            )
+            .await
+            .or_unknown(true);
             if !branch_exists {
                 if let Some((pre_sha, post_sha)) =
                     find_branch_merge_in_main(&repo_root, &change.branch_name).await
@@ -402,10 +414,19 @@ impl LucidosEngine {
         let repo_root = std::path::PathBuf::from(&change.repo_root);
 
         // Validate branch exists — don't auto-discard, let the user decide
-        let branch_exists = git_cmd(&["rev-parse", "--verify", &change.branch_name], &repo_root)
-            .await
-            .map(|o| o.status.success())
-            .unwrap_or(false);
+        //
+        // `or_unknown(true)` (branch assumed PRESENT when git could not be
+        // asked): the `!branch_exists` arm tells the user the branch is gone and
+        // that the change "may need to be discarded manually", so a `rev-parse`
+        // that merely timed out would invite the user to throw away work that is
+        // still on disk. Assuming it is there costs a loud, accurate git error
+        // from the merge below instead.
+        let branch_exists = crate::engine::git_ops::git_answer(
+            &["rev-parse", "--verify", &change.branch_name],
+            &repo_root,
+        )
+        .await
+        .or_unknown(true);
         if !branch_exists {
             let msg = format!(
                 "Branch '{}' no longer exists. The change may need to be discarded manually.",

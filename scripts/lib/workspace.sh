@@ -20,6 +20,15 @@
 # Globals set by callers:
 #   SCRIPT_NAME  — basename of the calling script (for usage messages)
 
+# Sourced here rather than left to the caller: not every caller of
+# `setup_postgres` goes through preflight.sh (decommission-legacy-postgres.sh and
+# lib/e2e.sh don't), and the Docker-state vocabulary has to be available wherever
+# a `docker` call is about to happen. Include-guarded, so a caller that already
+# sourced it pays nothing.
+WORKSPACE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/docker.sh
+source "$WORKSPACE_LIB_DIR/docker.sh"
+
 # ── path_is_in_cc_worktree ──────────────────────────────────────────────
 # True (exit 0) when $1 lies inside a coding-agent worktree — one of the
 # `<workspace>/.lucidos/worktrees/<thread>/` copies the engine creates per
@@ -388,6 +397,12 @@ setup_postgres() {
     export LUCIDOS_WORKSPACE="$WORKSPACE"
     export LUCIDOS_PG_PORT="$PG_PORT"
 
+    # Re-probe rather than trust the launch preflight. Minutes of building can
+    # sit between the two (and lib/e2e.sh reaches here without a preflight at
+    # all), so a daemon that went away in between would otherwise surface as a
+    # raw `docker inspect`/`docker run` failure with no cause named.
+    report_docker_daemon_if_down || return 1
+
     if _legacy_postgres_exists; then
         _migrate_postgres_if_needed
         _migrate_postgres_volume_if_needed
@@ -481,6 +496,11 @@ _ensure_shared_postgres_container() {
             --label "lucidos.shared-postgres=true" \
             pgvector/pgvector:pg18 \
             postgres -c max_connections=500 >/dev/null; then
+            # A daemon that died between the probe above and this call is BY FAR
+            # the most common reason this fails, and `docker run`'s own message
+            # for it names a socket path rather than the condition. Name the
+            # condition first when that is what happened.
+            report_docker_daemon_if_down || true
             echo "ERROR: failed to start shared PostgreSQL container $container" >&2
             return 1
         fi

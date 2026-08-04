@@ -22,9 +22,13 @@ export async function loadTriggerGroups(): Promise<void> {
   }
 }
 
-/** Patch one group into the in-memory registry. Used by SSE handlers; also
- *  by mutation helpers that get the freshly-created/updated group back from
- *  the HTTP handler before the SSE event round-trips. */
+/** Patch one group into the in-memory registry. Used by the mutation helpers
+ *  below, which get the freshly-created/updated group back from the HTTP
+ *  handler before the SSE event round-trips, so the panel doesn't wait a
+ *  round-trip to show the change. The `TriggerGroup*` SSE arms do NOT come
+ *  through here: `entityReferences.ts` re-fetches the whole registry with
+ *  `loadTriggerGroups()` instead, since a group event can move member counts
+ *  on rows it doesn't name. */
 export function upsertTriggerGroup(group: TriggerGroup): void {
   const current = triggerGroups.value;
   if (current.status !== 'loaded') return;

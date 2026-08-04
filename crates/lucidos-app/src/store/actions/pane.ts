@@ -82,6 +82,9 @@ export function revealContentPane() {
  *  'drawer'/'thread' focus is left alone and drawer ↑/↓ browsing isn't
  *  disturbed. `reconcilePaneFocus` then pulls DOM keyboard focus into the thread
  *  pane (when it isn't already there) so the marker and real focus stay in sync.
+ *  Both thread-side callers take a `revealPane: false` opt-out for a focus
+ *  change that is bookkeeping rather than navigation (stale-pointer cleanup, the
+ *  post-archive hand-off), which must leave the visible pane alone.
  *  Unlike a raw `navigateToPane('thread')` this keeps the desktop half (focused
  *  pane group) honest — the reason a bare mobile-gated navigate is wrong here, the
  *  same way it is for content (see frontend.md). */

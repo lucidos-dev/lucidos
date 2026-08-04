@@ -41,13 +41,13 @@ describe('getCollapsedVisibleEvents', () => {
     const events: ResponseEvent[] = [
       { type: 'step', description: 'Thinking', outcome: 'success' },
       { type: 'step', description: 'generate_image', outcome: 'success' },
-      { type: 'image', base64: 'abc123', mime_type: 'image/jpeg', index: 2 },
+      { type: 'image', base64: 'abc123', mime_type: 'image/jpeg', prompt: 'a cowboy on a reindeer' },
       { type: 'text', md: 'Here is the generated image!' },
     ];
     const { visibleEvents } = getCollapsedVisibleEvents(events);
     const images = visibleEvents.filter(e => e.type === 'image');
     expect(images).toHaveLength(1);
-    expect((images[0] as { index: number }).index).toBe(2);
+    expect((images[0] as { base64: string }).base64).toBe('abc123');
   });
 
   it('preserves section_break events even when they appear before the last text block', () => {
@@ -149,7 +149,7 @@ describe('mergeAdjacentTextEvents', () => {
   it('handles only non-text events', () => {
     const events: ResponseEvent[] = [
       { type: 'step', description: 'search', outcome: 'success' },
-      { type: 'image', base64: 'abc', mime_type: 'image/jpeg', index: 1 },
+      { type: 'image', base64: 'abc', mime_type: 'image/jpeg' },
     ];
     const merged = mergeAdjacentTextEvents(events);
     expect(merged).toHaveLength(2);

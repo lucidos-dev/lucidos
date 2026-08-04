@@ -521,12 +521,47 @@ Clicking the toast runs `install_app_update_and_restart`, which restarts the WHO
 stack onto the new version, not just the window: `Update::download` + `install`
 (swap the bundle) → `desktop::restart_service()` (launchd `kickstart -k` → the service
 supervisor tears down the gateway, engines, then embedded Postgres → launchd
-respawns `--service` onto the NEW binaries → the fresh gateway re-spawns the
-engines) → `app.restart()` (the GUI client onto its new bytes). Order is
+respawns `--service` onto the NEW binaries → the fresh gateway brings the stopped
+engines back, see below) → the client relaunch onto its new bytes. Order is
 load-bearing — install first (new bytes on disk), then the service restart, then
-the never-returning client restart. Without the service restart the window would
+the never-returning client relaunch. Without the service restart the window would
 run new code against a still-old gateway/engine (the launchd service keeps the old
 images until something restarts it).
+
+**A restart brings back the workspaces it stopped** (`crates/lucidos-gateway/src/next_boot.rs`).
+The service teardown stops every workspace engine and the embedded Postgres,
+which is right for a full stop and wrong for a restart: the gateway that comes up
+afterwards re-adopts only engines that survived (none did) and spawns only
+`autostart` workspaces, so a workspace the user was sitting in stayed stopped,
+and its open page could not wake it either, because API traffic deliberately
+never lazy-starts a workspace (that guard is what makes the picker's Stop button
+stick). On 2026-08-03 a packaged Restart left the open workspace down for
+nine minutes until the page was reloaded by hand. So the teardown writes the ids it
+stopped to `<app-data>/.next-boot.json` and `boot_all` consumes that record
+(deleting it, so it is one-shot) and brings exactly those workspaces back
+**regardless of `autostart`**: that flag governs the boot posture, not whether a
+restart returns what it took. The same repair covers a gateway crash that launchd
+respawns. **"Quit and Stop Background Service" writes `{"quit": true}` BEFORE it
+calls `bootout`**, so the one teardown that means *stay down* records nothing;
+declaring the intent first makes that ordering structural rather than a race
+against how synchronous `bootout` is. A workspace stopped from the picker is not
+running at teardown, so it never enters the record and Stop still sticks.
+
+**The client relaunch goes through LaunchServices, so it comes back frontmost.**
+`desktop::schedule_relaunch_after_exit()` spawns a detached watcher that waits
+for this process to exit and then runs `/usr/bin/open -a <bundle>`; only if there
+is no `.app` around us (dev, an unbundled binary) or the watcher cannot be
+spawned does the path fall back to `app.restart()`. This is not decoration.
+`app.restart()` fork/execs the new binary, which never asks the system to
+activate it: the new instance can only land in front by inheriting the front slot
+from its dying parent, and it loses that race whenever it registers with the
+window server a moment too late. On 2026-08-03 the 0.20 → 0.20.1 update lost it
+by ~280 ms, the front slot went to the next app, and the updated client sat
+behind everything until the user Cmd+Tabbed to it. Launching *after* our exit
+means there is no slot to inherit and no race to lose, and waiting for that exit
+is also what keeps it to one instance (`open` against a live app activates it
+rather than launching another; `open -n` would overlap two clients). The
+**"Restart App"** action takes the same path.
 
 **The install narrates itself, phase by phase.** All of that takes long enough —
 a ~100 MB download, a signature check, a bundle swap, a service restart — that a

@@ -1,6 +1,23 @@
-//! In-memory registry for `run_bash_background` tasks. Holds only
-//! currently-running tasks; the dispatch site emits
-//! `BackgroundBashCompleted` and evicts on completion.
+//! In-memory registry for `run_bash_background` tasks. Holds running tasks
+//! plus recently-completed ones, so a `bash_output` drain that lands at the
+//! moment a task finishes still gets the final tail instead of an error.
+//!
+//! **Completing a task does not evict it.** The dispatch site reads a
+//! [`CompletionRecord`] to emit `BackgroundBashCompleted` and leaves the entry
+//! in place; eviction happens later, on the retention policy below. The two
+//! used to be one step, which is exactly how a drain arriving at the
+//! completion instant found no entry: the watcher removed the task, then built
+//! the event, then emitted it, so a drain landing in that window missed the
+//! registry AND the not-yet-written event row and surfaced as
+//! `unknown task_id`. Five scheduled trigger runs lost a successful result
+//! that way between 2026-07-29 and 2026-08-02.
+//!
+//! Retention is bounded on both axes, and swept lazily on every registry
+//! access so no background sweeper task is needed: nothing older than
+//! [`FINISHED_RETENTION_SECS`] past its `finished_at` survives, and at most
+//! [`MAX_RETAINED_FINISHED`] completed tasks are held at once. Past that
+//! window `bash_output` falls back to the persisted `BackgroundBashCompleted`
+//! row, which is the durable record.
 
 use crate::core::shell::{command_shell, TaskOutcome};
 use chrono::{DateTime, Utc};
@@ -26,9 +43,37 @@ pub const BASH_OUTPUT_MAX_WAIT_SECS: u32 = 120;
 const MAX_BUFFER_BYTES: usize = 1024 * 1024;
 const TRIM_TRIGGER_BYTES: usize = 2 * MAX_BUFFER_BYTES;
 
+/// How long a completed task stays drainable after `finished_at`.
+///
+/// The window that has to be covered is "task completes" to "the agent's next
+/// `bash_output` call". The completion watcher pushes a wake message to a
+/// parked coding agent the instant the task ends, so five minutes is generous
+/// by a wide margin. Past it the caller falls back to the persisted
+/// `BackgroundBashCompleted` row, which carries the same final output.
+///
+/// Time, rather than "evict once drained": drain-once ties eviction to a
+/// reader's action, so it both leaks tasks nobody drains (a timer would be
+/// needed anyway) and reintroduces the original race one drain narrower, since
+/// the registry serves concurrent waiters and the second one would find the
+/// entry gone. See `two_concurrent_waiters_on_same_task_both_eventually_return`.
+pub(super) const FINISHED_RETENTION_SECS: i64 = 300;
+
+/// Ceiling on retained completed tasks, so a long-lived engine that runs
+/// thousands of them doesn't accumulate their buffers. Oldest `finished_at`
+/// goes first: the newest completions are the ones an agent may still be about
+/// to drain.
+///
+/// Bounding by COUNT rather than by bytes is deliberate. [`Stream`] already
+/// caps each buffer at `MAX_BUFFER_BYTES`, so per-task memory is solved; a
+/// second byte-budget mechanism layered on top would be two things to reason
+/// about instead of one. Worst case here is 16 tasks times two streams at the
+/// ~2 MB trim trigger, and only if all sixteen maxed both buffers inside the
+/// same five minutes.
+pub(super) const MAX_RETAINED_FINISHED: usize = 16;
+
 #[derive(Clone)]
 pub struct BackgroundBashRegistry {
-    tasks: Arc<Mutex<HashMap<String, RunningTask>>>,
+    tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
 }
 
 /// One captured output stream: the retained bytes, how far the reader has
@@ -41,7 +86,7 @@ pub struct BackgroundBashRegistry {
 /// one where the other belongs understates the loss, and a truncation marker
 /// that understates is worse than none — it reads as a bound.
 #[derive(Default)]
-pub(super) struct Stream {
+struct Stream {
     bytes: Vec<u8>,
     /// Bytes already handed to a reader.
     cursor: usize,
@@ -78,8 +123,10 @@ impl Stream {
     }
 
     /// The whole retained buffer and everything the cap ever cut from it.
-    /// Used for the final `BackgroundBashCompleted` record.
-    pub(super) fn all(&self) -> (String, usize) {
+    /// Used for the final `BackgroundBashCompleted` record. Read-only: it
+    /// leaves the cursor alone, so building the completion event cannot
+    /// consume the output a pending drain is about to return.
+    fn all(&self) -> (String, usize) {
         (
             String::from_utf8_lossy(&self.bytes).to_string(),
             self.trimmed_total,
@@ -87,20 +134,34 @@ impl Stream {
     }
 }
 
-pub struct RunningTask {
-    pub(super) started_at: DateTime<Utc>,
-    pub(super) stdout: Stream,
-    pub(super) stderr: Stream,
+/// One background task: running, or completed and retained for a late drain.
+///
+/// Named for what it is rather than for the state it spends most of its life
+/// in. It was called `RunningTask` while completion and eviction were the same
+/// step, which made "finished" a state the type barely occupied; retention
+/// promotes it to a first-class one.
+struct BackgroundTask {
+    started_at: DateTime<Utc>,
+    stdout: Stream,
+    stderr: Stream,
     /// How the child ended. `None` until the watchdog writes it, in the same
     /// locked block as `finished_at` — so `finished_at.is_some()` and
     /// `outcome.is_some()` are always in step, and a still-running task can
     /// never present a status at all (as opposed to presenting a `0`).
-    pub(super) outcome: Option<TaskOutcome>,
-    pub(super) timed_out: bool,
-    pub(super) killed: bool,
-    /// Single source of truth for "has the watchdog finished?".
-    /// `None` = still running, `Some(t)` = finished at `t`.
-    pub(super) finished_at: Option<DateTime<Utc>>,
+    outcome: Option<TaskOutcome>,
+    timed_out: bool,
+    killed: bool,
+    /// Single source of truth for "has the watchdog finished?", and the clock
+    /// the retention sweep reads. `None` = still running, `Some(t)` = finished
+    /// at `t`, drainable until `t + FINISHED_RETENTION_SECS`.
+    finished_at: Option<DateTime<Utc>>,
+    /// Whether someone has taken this task's [`CompletionRecord`] yet, which
+    /// in production means the watcher is about to persist
+    /// `BackgroundBashCompleted`. Until then the completion exists nowhere but
+    /// here, so the retention CAP must leave the entry alone: dropping it
+    /// would lose the durable record entirely. Expiry ignores this flag, so
+    /// the exemption cannot pin memory. See [`sweep_finished`].
+    completion_recorded: bool,
     /// Thread that spawned this task. `None` for tests and engine-internal
     /// callers with no owning thread. Drives `has_running_for_thread` so the
     /// agent-session idle handler can keep CC alive while bg bash is still
@@ -108,7 +169,7 @@ pub struct RunningTask {
     /// waiting on its own `run_bash_background` tests was killed and the
     /// change auto-proposed as "done", which caused premature Apply + harden-
     /// from-scratch on click.
-    pub(super) thread_id: Option<Uuid>,
+    thread_id: Option<Uuid>,
     kill_signal: Option<tokio::sync::oneshot::Sender<()>>,
     /// Signals the final `finished_at` write, and ONLY that — a buffered
     /// chunk deliberately does not wake the waiter. `bash_output(wait_secs=N)`
@@ -120,13 +181,47 @@ pub struct RunningTask {
     /// The watchdog uses `notify_waiters`, which wakes every parked waiter
     /// but stores no permit. Waiters close that gap themselves by registering
     /// before re-reading `finished_at` — see `read_output_in_memory_wait`.
-    pub(super) finish_notify: Arc<Notify>,
+    finish_notify: Arc<Notify>,
 }
 
-impl RunningTask {
+impl BackgroundTask {
     fn is_finished(&self) -> bool {
         self.finished_at.is_some()
     }
+
+    /// True once the retention window has closed on a completed task. Always
+    /// false while it is running: an unfinished task is live state, never a
+    /// retention candidate, however long it has been going.
+    fn is_expired(&self, now: DateTime<Utc>) -> bool {
+        self.finished_at
+            .is_some_and(|at| (now - at).num_seconds() > FINISHED_RETENTION_SECS)
+    }
+}
+
+/// The final state of a completed task, read for the
+/// `BackgroundBashCompleted` event. Owned rather than a borrow so the dispatch
+/// site can build and emit the event without holding the registry lock, and
+/// deliberately NOT a removal: reading the final state and evicting the entry
+/// used to be the same call, which is what broke a drain arriving at the
+/// completion instant.
+///
+/// The two `*_dropped` counts are lifetime totals from [`Stream::all`] (every
+/// byte the buffer cap ever cut), not the per-window count a drain reports.
+#[derive(Debug, Clone)]
+pub struct CompletionRecord {
+    pub started_at: DateTime<Utc>,
+    pub finished_at: DateTime<Utc>,
+    /// A finished task always has an outcome (the watchdog writes it in the
+    /// same locked block as `finished_at`), so this is not optional. A status
+    /// the engine could not obtain is [`TaskOutcome::Unknown`], which renders
+    /// as words rather than as a `0`.
+    pub outcome: TaskOutcome,
+    pub timed_out: bool,
+    pub killed: bool,
+    pub stdout: String,
+    pub stdout_dropped: usize,
+    pub stderr: String,
+    pub stderr_dropped: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -170,12 +265,26 @@ impl BackgroundBashRegistry {
         }
     }
 
+    /// Take the registry lock, applying the retention policy on the way in.
+    ///
+    /// Every public method goes through here, which is what makes the sweep
+    /// lazy: retention needs no background task and no timer, and there is
+    /// exactly one place where "how long a completed task lives" is decided.
+    /// `drain_pipe` deliberately does NOT use it: that path locks per 8 KB
+    /// chunk on a hot loop and only ever touches its own still-running task.
+    async fn locked(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, BackgroundTask>> {
+        let mut tasks = self.tasks.lock().await;
+        sweep_finished(&mut tasks);
+        tasks
+    }
+
     /// Spawn a child process. Inserts the task into the registry before
     /// returning the task_id, eliminating the spawn/poll race a follow-up
     /// `bash_output` would otherwise hit. The returned receiver fires
-    /// when the watchdog marks the task finished — the dispatch site uses
-    /// it to emit `BackgroundBashCompleted` and call `take_finished` for
-    /// eviction.
+    /// when the watchdog marks the task finished, and the dispatch site uses
+    /// it to read a [`CompletionRecord`] and emit `BackgroundBashCompleted`.
+    /// That read does NOT evict: the entry stays drainable for
+    /// [`FINISHED_RETENTION_SECS`] afterwards.
     ///
     /// `thread_id` records the spawning thread so `has_running_for_thread`
     /// can answer "does this thread still have unfinished background bash?".
@@ -215,10 +324,10 @@ impl BackgroundBashRegistry {
         let (finish_tx, finish_rx) = tokio::sync::oneshot::channel::<()>();
 
         {
-            let mut tasks = self.tasks.lock().await;
+            let mut tasks = self.locked().await;
             tasks.insert(
                 task_id.clone(),
-                RunningTask {
+                BackgroundTask {
                     started_at: Utc::now(),
                     stdout: Stream::default(),
                     stderr: Stream::default(),
@@ -226,6 +335,7 @@ impl BackgroundBashRegistry {
                     timed_out: false,
                     killed: false,
                     finished_at: None,
+                    completion_recorded: false,
                     thread_id,
                     kill_signal: Some(kill_tx),
                     finish_notify: Arc::new(Notify::new()),
@@ -272,10 +382,12 @@ impl BackgroundBashRegistry {
                 }
             };
             // Wait for both drain tasks to flush remaining buffered bytes
-            // and hit EOF before signaling finish — otherwise the
-            // dispatch-site watcher could evict the registry entry while
-            // the drains are still racing the kernel pipe, losing the
-            // tail of stdout/stderr after a kill or timeout. Bound the
+            // and hit EOF before signaling finish. Otherwise the completion
+            // record the dispatch-site watcher reads (and the first drain
+            // after it) would be built while the pipe readers are still
+            // racing the kernel, losing the tail of stdout/stderr after a
+            // kill or timeout: `finished_at` is the flag every reader gates
+            // on, so it must not be set until the bytes are in. Bound the
             // join with a deadline so a stuck drain task never wedges
             // the watchdog (the OS pipe should always close after wait,
             // but we don't want that assumption to deadlock production).
@@ -309,9 +421,18 @@ impl BackgroundBashRegistry {
     }
 
     /// Drain the in-memory buffer for a running or recently-finished task.
-    /// Returns `None` when the task is unknown (caller should fall back to
-    /// the event-store query). The cursor advances by the bytes returned,
-    /// so the next call only sees newly-written output.
+    /// Returns `None` when the task is unknown, which now means one of two
+    /// things: it never existed, or its retention window has closed. Either
+    /// way the caller falls back to the event-store query, which serves the
+    /// second case from the persisted `BackgroundBashCompleted` row. The
+    /// cursor advances by the bytes returned, so the next call only sees
+    /// newly-written output.
+    ///
+    /// **A completed task is served here, not from the event store**, for as
+    /// long as it is retained. That is the whole point of retention: a drain
+    /// landing at the completion instant used to find nothing here and no
+    /// event row yet either, and surfaced to the agent as `unknown task_id`
+    /// even though the work had succeeded.
     ///
     /// With `wait > ZERO`, blocks server-side for the FULL `wait` unless
     /// the task finishes first, then drains everything that accumulated
@@ -342,7 +463,7 @@ impl BackgroundBashRegistry {
         // First check under the lock: is the task already finished (or is
         // this the legacy non-blocking drain)? If so, drain and return.
         let finish_notify = {
-            let mut tasks = self.tasks.lock().await;
+            let mut tasks = self.locked().await;
             let task = tasks.get_mut(task_id)?;
             if task.is_finished() || wait.is_zero() {
                 return Some(drain_snapshot(task));
@@ -362,24 +483,28 @@ impl BackgroundBashRegistry {
         tokio::pin!(notified);
         notified.as_mut().enable();
         {
-            let mut tasks = self.tasks.lock().await;
+            let mut tasks = self.locked().await;
             let task = tasks.get_mut(task_id)?;
             if task.is_finished() {
                 return Some(drain_snapshot(task));
             }
         }
         // Park until the watchdog signals finish, or the budget runs out.
-        // On timeout, fall through and return whatever accumulated.
+        // On timeout, fall through and return whatever accumulated. The task
+        // cannot have been swept from under us here: the sweep only touches
+        // finished tasks, and one that finishes during the wait has a
+        // `finished_at` of a moment ago.
         let _ = tokio::time::timeout(wait, notified).await;
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.locked().await;
         let task = tasks.get_mut(task_id)?;
         Some(drain_snapshot(task))
     }
 
     /// Cancel a running task. Returns `false` if the task is unknown or
-    /// already finished.
+    /// already finished, retained completions included: retention makes a
+    /// finished task readable, never killable.
     pub async fn kill(&self, task_id: &str) -> bool {
-        let mut tasks = self.tasks.lock().await;
+        let mut tasks = self.locked().await;
         let Some(task) = tasks.get_mut(task_id) else {
             return false;
         };
@@ -401,27 +526,59 @@ impl BackgroundBashRegistry {
     /// `run_bash_background` tests must stay alive until the tests finish,
     /// otherwise the change auto-proposes as "done" (premature Apply) and
     /// a click triggers a from-scratch harden in a fresh worktree.
+    ///
+    /// Retained completions are invisible here, and must stay that way: the
+    /// filter is on `!is_finished()`, not on presence in the map. A retained
+    /// task counted as running would pin a coding-agent session open for the
+    /// whole retention window after its work was already done.
     pub async fn has_running_for_thread(&self, thread_id: Uuid) -> bool {
-        let tasks = self.tasks.lock().await;
+        let tasks = self.locked().await;
         tasks
             .values()
             .any(|t| t.thread_id == Some(thread_id) && !t.is_finished())
     }
 
-    /// Remove and return a finished task's full state. Returns `None` if
-    /// the task is missing or still running. Used by the engine-side
-    /// watcher right before emitting `BackgroundBashCompleted`.
-    pub async fn take_finished(&self, task_id: &str) -> Option<RunningTask> {
-        let mut tasks = self.tasks.lock().await;
-        if !tasks.get(task_id).is_some_and(|t| t.is_finished()) {
-            return None;
-        }
-        tasks.remove(task_id)
+    /// Read a finished task's final state, for the `BackgroundBashCompleted`
+    /// event. Returns `None` if the task is missing or still running.
+    ///
+    /// **Reads, never removes.** This was `take_finished`, which did
+    /// `tasks.remove` and so made emitting the completion event and evicting
+    /// the entry the same step. The dispatch site's order is read, build,
+    /// emit, so a drain arriving anywhere in that span found neither the
+    /// registry entry (already gone) nor the event row (not yet written) and
+    /// reached the agent as `unknown task_id`. Eviction is now the retention
+    /// sweep's job alone.
+    ///
+    /// Taking the record is what makes the entry a candidate for the sweep's
+    /// cap: until the caller has this, the task's completion exists nowhere
+    /// durable, so the cap must not drop it. See [`sweep_finished`].
+    pub async fn completion_record(&self, task_id: &str) -> Option<CompletionRecord> {
+        let mut tasks = self.locked().await;
+        let task = tasks.get_mut(task_id)?;
+        let finished_at = task.finished_at?;
+        task.completion_recorded = true;
+        let (stdout, stdout_dropped) = task.stdout.all();
+        let (stderr, stderr_dropped) = task.stderr.all();
+        Some(CompletionRecord {
+            started_at: task.started_at,
+            finished_at,
+            // A finished task always has an outcome (written in the same
+            // locked block as `finished_at`). Defend anyway rather than
+            // unwrapping: `Unknown` is the honest reading, and it renders as
+            // words, not as a `0`.
+            outcome: task.outcome.unwrap_or(TaskOutcome::Unknown),
+            timed_out: task.timed_out,
+            killed: task.killed,
+            stdout,
+            stdout_dropped,
+            stderr,
+            stderr_dropped,
+        })
     }
 
     /// Test helper: poll-wait until the task is marked finished (or
-    /// timeout). Production callers don't need this — the dispatch site
-    /// uses an event-emitting watcher that drives `take_finished`.
+    /// timeout). Production callers don't need this: the dispatch site uses
+    /// an event-emitting watcher driven by the spawn-time finish receiver.
     #[cfg(test)]
     pub async fn wait_for_finish(&self, task_id: &str, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
@@ -438,13 +595,95 @@ impl BackgroundBashRegistry {
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
     }
+
+    /// Test helper: shift a task's timestamps `by` seconds into the past, so
+    /// the retention window can be exercised against the real
+    /// `FINISHED_RETENTION_SECS` without sleeping five minutes. Moves
+    /// `started_at` with `finished_at` so the task still looks like it ran for
+    /// as long as it did. Takes the raw lock, not `locked()`, so backdating
+    /// past the window doesn't sweep the entry before the caller can observe
+    /// the next access doing it.
+    #[cfg(test)]
+    pub async fn backdate_for_test(&self, task_id: &str, by: i64) {
+        let shift = chrono::Duration::seconds(by);
+        let mut tasks = self.tasks.lock().await;
+        let Some(task) = tasks.get_mut(task_id) else {
+            return;
+        };
+        task.started_at -= shift;
+        task.finished_at = task.finished_at.map(|at| at - shift);
+    }
+
+    /// Test helper: how many completed tasks the registry is currently
+    /// retaining, for the cap assertion.
+    #[cfg(test)]
+    pub async fn retained_finished_count(&self) -> usize {
+        self.locked()
+            .await
+            .values()
+            .filter(|t| t.is_finished())
+            .count()
+    }
+}
+
+/// Apply the retention policy: drop every completed task past
+/// [`FINISHED_RETENTION_SECS`], then, if more than
+/// [`MAX_RETAINED_FINISHED`] *recorded* completions remain, drop the oldest
+/// until the count is back at the cap.
+///
+/// Two kinds of entry are never touched, for the same reason: they are not
+/// retention candidates yet.
+///
+/// - **Running tasks**, however long they have been going. They are live
+///   state.
+/// - **Completions whose [`CompletionRecord`] has not been read**, on the CAP
+///   pass. That read is what the watcher does immediately before emitting
+///   `BackgroundBashCompleted`, so evicting one first would leave the task
+///   with no durable record at all: the watcher finds nothing, emits nothing,
+///   and every later `bash_output` reports an unknown task. That is the exact
+///   loss this whole change exists to prevent, so a burst of more than
+///   `MAX_RETAINED_FINISHED` simultaneous completions must overshoot the cap
+///   briefly rather than drop one.
+///
+/// The EXPIRY pass is deliberately unconditional, which is what keeps the
+/// overshoot bounded: an unread completion is a transient (the watcher is a
+/// spawned task already parked on the finish signal, so it reads within
+/// microseconds), and a five-minute window is many orders of magnitude longer
+/// than that. Gating expiry on the read too would pin an entry forever
+/// whenever a watcher never runs, and unbounded memory is the worse failure.
+fn sweep_finished(tasks: &mut HashMap<String, BackgroundTask>) {
+    let now = Utc::now();
+    tasks.retain(|_, t| !t.is_expired(now));
+
+    // Count before collecting. This runs on every registry lock, so the
+    // common case (nothing over the cap) must not clone an id per completion
+    // and sort them just to discover there was nothing to do.
+    let excess = tasks
+        .values()
+        .filter(|t| t.completion_recorded)
+        .count()
+        .saturating_sub(MAX_RETAINED_FINISHED);
+    if excess == 0 {
+        return;
+    }
+    let mut recorded: Vec<(DateTime<Utc>, String)> = tasks
+        .iter()
+        .filter(|(_, t)| t.completion_recorded)
+        .filter_map(|(id, t)| t.finished_at.map(|at| (at, id.clone())))
+        .collect();
+    // Oldest completion first: the newest are the ones an agent may still be
+    // about to drain, so they are the last to go.
+    recorded.sort_unstable_by(|a, b| a.0.cmp(&b.0));
+    for (_, id) in recorded.into_iter().take(excess) {
+        tasks.remove(&id);
+    }
 }
 
 /// Drain the per-task buffers since the previous cursor and advance
 /// the cursors. Shared by zero-wait and wait paths in
 /// `read_output_in_memory_wait` so cursor semantics live in exactly
 /// one place.
-fn drain_snapshot(task: &mut RunningTask) -> OutputSnapshot {
+fn drain_snapshot(task: &mut BackgroundTask) -> OutputSnapshot {
     let (stdout, stdout_dropped) = task.stdout.drain();
     let (stderr, stderr_dropped) = task.stderr.drain();
     // Measure to `finished_at` once the task is done so a late drain reports
@@ -464,7 +703,7 @@ fn drain_snapshot(task: &mut RunningTask) -> OutputSnapshot {
 }
 
 async fn drain_pipe<R: AsyncRead + Unpin + Send + 'static>(
-    tasks: Arc<Mutex<HashMap<String, RunningTask>>>,
+    tasks: Arc<Mutex<HashMap<String, BackgroundTask>>>,
     task_id: String,
     mut pipe: R,
     is_stderr: bool,
@@ -637,8 +876,256 @@ mod tests {
         );
     }
 
+    /// THE regression. A `bash_output` drain that lands at the moment a task
+    /// completes must return the final tail with `finished: true`, not
+    /// `unknown task_id`. Observed 5 times in 7 days against two scheduled
+    /// triggers: the task had both a `BackgroundBashStarted` and a
+    /// `BackgroundBashCompleted` with `exit_code: 0`, and the drain error
+    /// carried the completion timestamp to the second. Successful background
+    /// work was silently discarded and the trigger carried on without it.
+    ///
+    /// This replays the completion watcher's exact order: the watchdog marks
+    /// the task finished, the watcher reads the final state for
+    /// `BackgroundBashCompleted`, and only then does the drain arrive.
     #[tokio::test]
-    async fn take_finished_evicts_completed_task() {
+    async fn drain_after_completion_event_returns_the_final_tail() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo the-result",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                None,
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
+
+        // What `spawn_bash_completion_watcher` does before it emits.
+        let record = reg
+            .completion_record(&task_id)
+            .await
+            .expect("completion record for a finished task");
+        assert!(record.stdout.contains("the-result"));
+        assert_eq!(record.outcome, TaskOutcome::Exited(0));
+
+        // The drain that used to arrive one instant too late.
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("a completed task must still be drainable");
+        assert!(snap.finished, "a completed task must report finished");
+        assert!(
+            snap.stdout.contains("the-result"),
+            "the final tail was lost: {:?}",
+            snap.stdout
+        );
+        assert_eq!(snap.outcome, Some(TaskOutcome::Exited(0)));
+        assert!(!snap.timed_out);
+        assert!(!snap.killed);
+    }
+
+    /// The drain cursor is not reset by retention: a second drain inside the
+    /// window sees an empty window, still flagged `finished`. Without this the
+    /// registry would replay the whole buffer on every poll, which is the
+    /// context bloat the drain semantics exist to avoid.
+    #[tokio::test]
+    async fn repeat_drain_within_retention_is_empty_but_still_finished() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn("echo once", 5, std::path::Path::new("/tmp"), &[], None)
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
+
+        let first = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("first drain");
+        assert!(first.stdout.contains("once"));
+
+        let second = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("a retained task stays drainable");
+        assert!(
+            second.stdout.is_empty(),
+            "a repeat drain must not replay: {:?}",
+            second.stdout
+        );
+        assert!(second.finished);
+        assert_eq!(second.outcome, Some(TaskOutcome::Exited(0)));
+    }
+
+    /// Retention is bounded in time. Past the grace window the entry is swept
+    /// on the next registry access, and `bash_output` routes to the persisted
+    /// `BackgroundBashCompleted` row instead.
+    #[tokio::test]
+    async fn finished_task_is_evicted_after_the_grace_window() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn("echo stale", 5, std::path::Path::new("/tmp"), &[], None)
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
+        assert!(reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .is_some());
+
+        // One second past the window, so the boundary itself stays retained.
+        reg.backdate_for_test(&task_id, FINISHED_RETENTION_SECS + 1)
+            .await;
+
+        assert!(
+            reg.read_output_in_memory_wait(&task_id, Duration::ZERO)
+                .await
+                .is_none(),
+            "an expired task must be swept so the caller falls back to the event store"
+        );
+        assert!(reg.completion_record(&task_id).await.is_none());
+    }
+
+    /// Retention is bounded in count too, so a long-lived engine that runs
+    /// thousands of background tasks doesn't accumulate their buffers. The
+    /// oldest completions go first, because the newest are the ones an agent
+    /// might still be about to drain.
+    #[tokio::test]
+    async fn retained_finished_tasks_are_capped_keeping_the_newest() {
+        let reg = BackgroundBashRegistry::new();
+        let mut ids = Vec::new();
+        for i in 0..(MAX_RETAINED_FINISHED + 4) {
+            let (task_id, _finish_rx) = reg
+                .spawn(
+                    &format!("echo task{i}"),
+                    5,
+                    std::path::Path::new("/tmp"),
+                    &[],
+                    None,
+                )
+                .await
+                .expect("spawn");
+            assert!(reg.wait_for_finish(&task_id, Duration::from_secs(5)).await);
+            // Stand in for the completion watcher, which takes the record and
+            // persists `BackgroundBashCompleted`. Only a recorded completion
+            // is a cap candidate, so a test that skipped this would exercise
+            // the exemption instead of the cap.
+            assert!(reg.completion_record(&task_id).await.is_some());
+            // Order the completions deterministically: `finished_at` is written
+            // by the watchdog at real wall-clock time, and several short echoes
+            // can land inside the same clock tick. Earliest-spawned reads as
+            // oldest, and every offset stays inside the retention window so
+            // this test measures the cap and nothing else.
+            let seconds_ago = 64 - ids.len() as i64;
+            assert!(seconds_ago > 0 && seconds_ago < FINISHED_RETENTION_SECS);
+            reg.backdate_for_test(&task_id, seconds_ago).await;
+            ids.push(task_id);
+        }
+
+        assert_eq!(
+            reg.retained_finished_count().await,
+            MAX_RETAINED_FINISHED,
+            "retention must stop at the cap"
+        );
+        for old in &ids[..4] {
+            assert!(
+                reg.read_output_in_memory_wait(old, Duration::ZERO)
+                    .await
+                    .is_none(),
+                "the oldest completions are the ones evicted at the cap"
+            );
+        }
+        for recent in &ids[4..] {
+            assert!(
+                reg.read_output_in_memory_wait(recent, Duration::ZERO)
+                    .await
+                    .is_some(),
+                "the newest completions are the ones an agent may still drain"
+            );
+        }
+    }
+
+    /// The cap must never drop a completion whose watcher has not yet taken
+    /// its record. That entry is the ONLY copy: the watcher reads the record
+    /// and then emits `BackgroundBashCompleted`, so evicting it first leaves
+    /// the watcher with nothing to emit, no durable row, and every later
+    /// `bash_output` reporting an unknown task. It would reintroduce the exact
+    /// silent loss this change exists to remove, just through the cap instead
+    /// of through completion-as-eviction.
+    ///
+    /// Reachable whenever more than `MAX_RETAINED_FINISHED` tasks complete in
+    /// a burst before their watchers are scheduled, so the cap has to overshoot
+    /// rather than drop one. Expiry still bounds the overshoot.
+    #[tokio::test]
+    async fn cap_never_drops_a_completion_whose_record_was_not_taken() {
+        let reg = BackgroundBashRegistry::new();
+        let mut ids = Vec::new();
+        for i in 0..(MAX_RETAINED_FINISHED + 4) {
+            let (task_id, _finish_rx) = reg
+                .spawn(
+                    &format!("echo burst{i}"),
+                    5,
+                    std::path::Path::new("/tmp"),
+                    &[],
+                    None,
+                )
+                .await
+                .expect("spawn");
+            assert!(reg.wait_for_finish(&task_id, Duration::from_secs(5)).await);
+            // Deliberately do NOT take the record: every watcher is still
+            // waiting to be scheduled.
+            ids.push(task_id);
+        }
+
+        assert_eq!(
+            reg.retained_finished_count().await,
+            MAX_RETAINED_FINISHED + 4,
+            "the cap must overshoot rather than evict an unrecorded completion"
+        );
+        for id in &ids {
+            assert!(
+                reg.completion_record(id).await.is_some(),
+                "every watcher must still find its task to emit BackgroundBashCompleted"
+            );
+        }
+        // Once every record is taken, the cap applies again on the next access.
+        assert_eq!(reg.retained_finished_count().await, MAX_RETAINED_FINISHED);
+    }
+
+    /// Retention must not make a finished task read as running. The
+    /// agent-session idle handler keeps a coding agent alive while this is
+    /// true, so a retained task counted as running would pin the session open
+    /// for the whole grace window.
+    #[tokio::test]
+    async fn has_running_for_thread_is_false_for_a_retained_finished_task() {
+        let reg = BackgroundBashRegistry::new();
+        let my_thread = Uuid::new_v4();
+        let (task_id, _finish_rx) = reg
+            .spawn(
+                "echo done",
+                5,
+                std::path::Path::new("/tmp"),
+                &[],
+                Some(my_thread),
+            )
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
+
+        assert!(
+            !reg.has_running_for_thread(my_thread).await,
+            "a finished task must not register as running, retained or not"
+        );
+        // And it is still there, which is the whole point of retention.
+        assert!(reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .is_some());
+    }
+
+    #[tokio::test]
+    async fn completion_record_does_not_evict_the_task() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
             .spawn("echo done", 5, std::path::Path::new("/tmp"), &[], None)
@@ -647,16 +1134,51 @@ mod tests {
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
         assert!(finished);
 
-        let taken = reg.take_finished(&task_id).await.expect("take_finished");
-        assert!(taken.is_finished());
-        assert!(taken.stdout.all().0.contains("done"));
+        let record = reg
+            .completion_record(&task_id)
+            .await
+            .expect("completion record");
+        assert!(record.stdout.contains("done"));
 
-        // Second read should now miss — task evicted.
+        // Reading the final state must NOT be the same step as removing the
+        // entry: that coupling is what made a drain at the completion instant
+        // fail. Reading it twice is fine, and the task stays drainable.
+        assert!(reg.completion_record(&task_id).await.is_some());
         assert!(reg
             .read_output_in_memory_wait(&task_id, Duration::ZERO)
             .await
-            .is_none());
-        assert!(reg.take_finished(&task_id).await.is_none());
+            .is_some());
+    }
+
+    /// The completion record reads the whole retained buffer via
+    /// `Stream::all`, which must not move the drain cursor. If it did, the
+    /// watcher would consume the output a pending drain is waiting for and the
+    /// agent would see an empty tail for work that produced plenty.
+    #[tokio::test]
+    async fn completion_record_does_not_consume_the_drain_cursor() {
+        let reg = BackgroundBashRegistry::new();
+        let (task_id, _finish_rx) = reg
+            .spawn("echo payload", 5, std::path::Path::new("/tmp"), &[], None)
+            .await
+            .expect("spawn");
+        assert!(reg.wait_for_finish(&task_id, Duration::from_secs(3)).await);
+
+        assert!(reg
+            .completion_record(&task_id)
+            .await
+            .expect("completion record")
+            .stdout
+            .contains("payload"));
+
+        let snap = reg
+            .read_output_in_memory_wait(&task_id, Duration::ZERO)
+            .await
+            .expect("drain");
+        assert!(
+            snap.stdout.contains("payload"),
+            "building the completion event ate the pending drain: {:?}",
+            snap.stdout
+        );
     }
 
     #[tokio::test]
@@ -684,28 +1206,27 @@ mod tests {
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(8)).await;
         assert!(finished, "task did not finish within 8s after kill");
 
-        let taken = reg
-            .take_finished(&task_id)
+        let record = reg
+            .completion_record(&task_id)
             .await
-            .expect("take_finished after kill");
-        let out = taken.stdout.all().0;
+            .expect("completion record after kill");
         assert!(
-            out.contains("hello-before-kill"),
+            record.stdout.contains("hello-before-kill"),
             "stdout from before kill was lost: {:?}",
-            out
+            record.stdout
         );
-        assert!(taken.killed);
+        assert!(record.killed);
     }
 
     #[tokio::test]
-    async fn take_finished_returns_none_while_running() {
+    async fn completion_record_returns_none_while_running() {
         let reg = BackgroundBashRegistry::new();
         let (task_id, _finish_rx) = reg
             .spawn("sleep 5", 60, std::path::Path::new("/tmp"), &[], None)
             .await
             .expect("spawn");
         // Don't wait — task is still running.
-        assert!(reg.take_finished(&task_id).await.is_none());
+        assert!(reg.completion_record(&task_id).await.is_none());
         // Clean up so the spawned sleep doesn't outlive the test thread.
         reg.kill(&task_id).await;
     }
@@ -751,15 +1272,15 @@ mod tests {
             "running task spawned for my_thread must NOT leak to other_thread"
         );
 
-        // Kill + drain → registry evicts → has_running_for_thread flips back.
+        // Kill → the task is finished → has_running_for_thread flips back,
+        // whether or not the entry is still retained for a late drain.
         assert!(reg.kill(&task_id).await);
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(3)).await;
         assert!(finished);
-        let _ = reg.take_finished(&task_id).await;
 
         assert!(
             !reg.has_running_for_thread(my_thread).await,
-            "evicted task must NOT keep registering as running"
+            "a finished task must NOT keep registering as running"
         );
     }
 

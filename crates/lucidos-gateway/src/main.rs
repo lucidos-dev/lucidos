@@ -39,6 +39,7 @@ mod build_id;
 mod control;
 mod error;
 mod net_config;
+mod next_boot;
 mod postgres;
 mod proxy;
 mod registry;

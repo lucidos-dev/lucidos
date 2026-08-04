@@ -37,6 +37,46 @@
     background: var(--titlebar-strip-bg);
 }
 
+/* ─── App-shell banner (backup reminder) ─── */
+
+/* A persistent, dismissable bar between the header and the panes. Sticky in the
+   sense that matters here: it survives navigation and reload, and only a
+   dismissal (or switching backup on) retires it. Deliberately not a toast, which
+   reads as transient status in this app.
+
+   Two mount points, one per layout (BackupReminderBanner.tsx): a flow sibling in
+   .app-shell on desktop, and a child of the fixed .app-header on mobile, where a
+   flow sibling would sit behind the header. This rule serves both, since the
+   mobile header is already a stretch column.
+
+   A soft yellow wash over the surface with the neutral border kept, matching the
+   Settings backup health card's warning state. NO colored left stripe: banned
+   outright by .claude/rules/frontend.md. */
+.backup-reminder {
+    flex: none;
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    padding: var(--space-sm) var(--space-lg);
+    border-bottom: 1px solid var(--border-color);
+    background: color-mix(in srgb, var(--accent-yellow) 10%, var(--bg-secondary));
+    font-size: var(--font-size-sm);
+    color: var(--text-primary);
+}
+
+/* Takes the slack so the button and the close X sit at the trailing edge. It
+   wraps rather than truncating: a data-loss warning the user can only half-read
+   is worse than a two-line bar, and the desktop instance republishes its
+   measured height either way. */
+.backup-reminder-text {
+    flex: 1;
+    min-width: 0;
+}
+
+.backup-reminder-close {
+    flex: none;
+}
+
 /* ─── Content row (thread drawer + split layout) ─── */
 
 .content-row {
@@ -151,9 +191,12 @@
     user-select: none;
 }
 
+/* Height is the shared --app-header-height token (global/base.css) so that
+   anything anchored below the header (--app-header-bottom) tracks it instead of
+   restating the geometry. */
 .app-header {
     padding-top: calc(0.25rem + env(safe-area-inset-top, 0px));
-    height: calc(2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+    height: var(--app-header-height);
 }
 
 .pane-header-brand {

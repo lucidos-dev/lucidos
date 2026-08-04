@@ -108,16 +108,17 @@ fn root_cause(err: &reqwest::Error) -> String {
     last
 }
 
-/// Send `req`, fail on non-2xx, and write the response body to stdout.
-/// Shared between subcommands that POST/GET JSON to the engine and surface
-/// the response body verbatim (`events`, `notify`, …) — keeps error wording
-/// consistent via `format_request_error` (timeouts and connect failures get
-/// actionable hints instead of reqwest's generic "error sending request").
-pub(crate) fn send_and_print(
+/// Send `req`, fail on non-2xx, and return the response body.
+/// Shared error wording via `format_request_error` (timeouts and connect
+/// failures get actionable hints instead of reqwest's generic "error sending
+/// request"). Use this when the caller prints something OTHER than the raw
+/// body (`data write` prints a chat link); use `send_and_print` when the body
+/// itself is the output.
+pub(crate) fn send_expect_success(
     method: &str,
     url: &str,
     req: reqwest::blocking::RequestBuilder,
-) -> Result<(), BoxError> {
+) -> Result<String, BoxError> {
     let start = Instant::now();
     let resp = req
         .send()
@@ -129,7 +130,18 @@ pub(crate) fn send_and_print(
     if !status.is_success() {
         return Err(format!("{} {} returned {}: {}", method, url, status, text).into());
     }
-    println!("{}", text);
+    Ok(text)
+}
+
+/// Send `req`, fail on non-2xx, and write the response body to stdout.
+/// Shared between subcommands that POST/GET JSON to the engine and surface
+/// the response body verbatim (`events`, `notify`, …).
+pub(crate) fn send_and_print(
+    method: &str,
+    url: &str,
+    req: reqwest::blocking::RequestBuilder,
+) -> Result<(), BoxError> {
+    println!("{}", send_expect_success(method, url, req)?);
     Ok(())
 }
 

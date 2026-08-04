@@ -141,13 +141,6 @@ impl OpenAiResponsesSearch {
             client,
         })
     }
-
-    /// The model this backend sends. Exposed so the build path can assert it is
-    /// valid for *this* provider rather than whatever the user chats on — see
-    /// `provider_build::search_model_for`.
-    pub fn model(&self) -> &str {
-        &self.model
-    }
 }
 
 #[async_trait]

@@ -375,15 +375,43 @@ export function ResponsePanel({
   );
 }
 
-/** Generated image rendered inline in the response. */
+/** Cap a preview string at `max` characters, marking the cut with an ellipsis.
+ *  The one place the response's preview-truncation convention lives, so the
+ *  step ticker and the image tooltip clip the same way. */
+function clip(text: string, max: number): string {
+  return text.length > max ? `${text.slice(0, max - 1)}…` : text;
+}
+
+/** Longest prompt we surface as an image tooltip. A generation prompt runs to
+ *  several paragraphs routinely, and a tooltip that fills the pane is worse
+ *  than a short one; the untruncated prompt stays one click away in the
+ *  generating step's detail modal. */
+const IMAGE_PROMPT_SUMMARY_MAX = 240;
+
+/** A generated image's description: the prompt it came from, flattened to one
+ *  line and capped. Undefined when no prompt was recorded, which is what makes
+ *  the image carry NO tooltip rather than a meaningless one. */
+export function imagePromptSummary(prompt: string | undefined, max = IMAGE_PROMPT_SUMMARY_MAX): string | undefined {
+  const text = prompt?.replace(/\s+/g, ' ').trim();
+  if (!text) return undefined;
+  return clip(text, max);
+}
+
+/** Generated image rendered inline in the response.
+ *
+ *  The tooltip lives on the `<img>`, not on the block wrapper: the wrapper is
+ *  as wide as the response column, so anchoring there centered the tooltip
+ *  over empty space beside the picture. */
 export function GeneratedImage({ event }: { event: Extract<ResponseEvent, { type: 'image' }> }) {
   const src = `data:${event.mime_type};base64,${event.base64}`;
+  const summary = imagePromptSummary(event.prompt);
   return (
-    <div class="generated-image" data-tooltip={`thread:${event.index}`}>
+    <div class="generated-image">
       <img
         src={src}
         class="image-thumbnail"
-        alt="Generated image"
+        alt={summary ?? 'Generated image'}
+        data-tooltip={summary}
         loading="lazy"
       />
     </div>
@@ -394,7 +422,7 @@ export function GeneratedImage({ event }: { event: Extract<ResponseEvent, { type
  *  preview for a live Thinking step. The full text lives in the detail modal. */
 function lastLinePreview(text: string, max = 120): string {
   const line = text.split('\n').map(s => s.trim()).filter(Boolean).pop() ?? '';
-  return line.length > max ? `${line.slice(0, max - 1)}…` : line;
+  return clip(line, max);
 }
 
 export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {

@@ -15,6 +15,7 @@ import { revealContentPane } from './pane';
 import { pushNavState } from './navigation';
 import { isTauri } from '../../utils/platform';
 import { openExternalUrl } from '../../utils/openExternalUrl';
+import { DATA_PATH_PREFIXES } from '../../utils/linkifyPaths';
 import { openExternal } from '../../utils/tauri';
 import { errorDetail } from '../../utils/errorDetail';
 import { currentInAppBrowser } from './preferences';
@@ -120,8 +121,6 @@ export async function uploadFiles(files: FileList | File[]): Promise<void> {
 
 // --- Path normalization ---
 
-const DATA_PREFIXES = ['artifacts/', 'knowhow/', 'apps/', 'triggers/', 'system-knowhow/'];
-
 /** Ensure a data path starts with a known directory prefix.
  *  The navigate_ui tool may receive paths without the prefix — normalize
  *  to match the format expected by the /data/* static mount.
@@ -137,7 +136,7 @@ const DATA_PREFIXES = ['artifacts/', 'knowhow/', 'apps/', 'triggers/', 'system-k
  *  so a malformed `repo:` string still normalizes like any other data path. */
 export function normalizeDataPath(path: string): string {
   if (parseRepoPath(path)) return path;
-  if (DATA_PREFIXES.some(p => path.startsWith(p))) return path;
+  if (DATA_PATH_PREFIXES.some(p => path.startsWith(p))) return path;
   return `artifacts/${path}`;
 }
 

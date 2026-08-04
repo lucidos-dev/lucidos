@@ -127,7 +127,7 @@ export function NetworkAccessPage() {
           <div class="list-row">
             <div class="list-row-info">
               <div class="title">Inheriting the machine-wide bind</div>
-              <div class="list-row-details">
+              <div class="list-row-details list-row-details-prose">
                 Engines follow the gateway's bind:{' '}
                 <strong>{describeBind(data.gateway_bind)}</strong>. To set a bind
                 just for this workspace, turn off “Engines inherit gateway bind” in

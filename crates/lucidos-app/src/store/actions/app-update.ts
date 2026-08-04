@@ -178,7 +178,7 @@ function handleAppUpdateProgress(frame: AppUpdateProgress): void {
     // The last phases restart the launchd service, which kills the gateway
     // serving this page; without this the narration would be suppressed by the
     // very disconnection it is explaining.
-    showDuringRestart: true,
+    showWhileUnavailable: true,
     // Cancel IS the escape hatch while one exists, and once it doesn't there is
     // nothing to escape to — an X beside "Cancel" would just read as a second,
     // differently-behaved cancel.

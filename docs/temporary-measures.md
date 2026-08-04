@@ -61,24 +61,35 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 
 ### One-time mirror history rebuild script
 
-- **Added:** 2026-08-03
+- **Added:** 2026-08-03 (re-armed and wired to a gate 2026-08-04)
 - **Lives in:** `scripts/rebuild-mirror-history.sh`, listed in the `paths:`
-  frontmatter of `.claude/rules/build-release.md`.
+  frontmatter of `.claude/rules/build-release.md` and in
+  `RELEASE_TREE_EXCLUDE_PATHS`.
 - **Impermanent because:** It exists to run once. It rebuilds the public
-  mirror's `main` as a linear chain of the 34 published releases, replacing the
-  parentless orphans `release-to-lucidos.sh` has published since v0.7. Its
-  preconditions are pinned to that exact state (`EXPECTED_TAGS=34`,
+  mirror's `main` as a linear chain of the 36 published releases, replacing the
+  parentless commits `release-to-lucidos.sh` published from v0.7 through v0.20.1.
+  Its preconditions are pinned to that exact state (`EXPECTED_TAGS=36`,
   `FIRST_TAG=v0.7`, `main` == the newest tag's commit), so it refuses to run the
-  moment a 35th release lands. It is a repair, not a facility: chaining FUTURE
-  releases is a change to `release_tree.sh` and `release-to-lucidos.sh` that this
-  script deliberately does not make.
+  moment a 37th release lands, which forces a human re-review rather than a
+  silently longer chain. It remains a repair, not a facility: chaining FUTURE
+  releases is now done by the pipeline itself (ADR 0039), which is a change this
+  script still does not make.
+- **The ordering is enforced, not remembered.** Chaining onto a one-commit `main`
+  would only ever produce a two-commit `main`, so this has to land before the
+  next release. `release.sh`'s Phase A refuses to release while the mirror's
+  `main` carries fewer commits than it has `v*` tags
+  (`release_mirror_history_is_complete`), and that refusal names this script.
 - **Removal / resolution condition:** The rebuilt history is pushed and confirmed
   on the mirror (`git log --oneline lucidos/main | wc -l` reports the release
-  count rather than 1). Then delete the script and its `paths:` entry. If a
-  release cuts before that happens, add `scripts/rebuild-mirror-history.sh` to
-  `RELEASE_TREE_EXCLUDE_PATHS` first: the script sources `release_tree.sh`, which
-  is itself withheld from the mirror, so a published copy would have no lib to
-  source.
+  count rather than 1). Then delete the script, its `paths:` entry and its
+  `RELEASE_TREE_EXCLUDE_PATHS` entry. The Phase A precondition **stays**: it is
+  not part of this measure. It is a permanent invariant that self-maintains once
+  true, since every release adds exactly one commit and one tag.
+- **Note (2026-08-04):** v0.20.0 and v0.20.1 both cut before the rebuild landed,
+  so the mirror published this script at both tags with `release_tree.sh`
+  withheld, exactly the case the previous removal condition warned about. Adding
+  it to `RELEASE_TREE_EXCLUDE_PATHS` is done; the two published copies can do
+  nothing but print their own "runs from the internal checkout" refusal.
 - **Status:** open
 
 ### Batch `data/` writes announce once for the caller, not per file

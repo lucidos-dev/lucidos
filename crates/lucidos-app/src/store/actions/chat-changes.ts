@@ -187,11 +187,11 @@ export async function initiateEngineRestart(): Promise<void> {
   // recoverable non-event), so this is just a "why is it briefly unresponsive"
   // hint the user can dismiss. It carries a spinner (spinning: true) to signal
   // ongoing work. The wording is stable for the whole window (no build phase at
-  // restart time) and is chosen by `newVersion` above. showDuringRestart: true
+  // restart time) and is chosen by `newVersion` above. showWhileUnavailable: true
   // keeps it visible past the central suppression in showToast (which still eats
   // read-path / SW-update noise during the window); the key de-dupes and lets
   // started_at detection dismiss it on reconnect.
-  showToast(restartProgressMessage(newVersion), 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+  showToast(restartProgressMessage(newVersion), 'info', { key: RESTART_TOAST_KEY, showWhileUnavailable: true, spinning: true });
   try {
     if (enginePackaged.value && isTauri()) {
       // Drive launchd directly from the desktop shell — works even if the
@@ -338,7 +338,7 @@ export function restoreRestartToast(): void {
     // the persisted `newVersion`); checkConnection clears it all on reconnect.
     // syncRestartToast is intentionally NOT called — the engineRestarting guard
     // would suppress it anyway.
-    showToast(restartProgressMessage(inFlight.newVersion), 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+    showToast(restartProgressMessage(inFlight.newVersion), 'info', { key: RESTART_TOAST_KEY, showWhileUnavailable: true, spinning: true });
     return;
   }
 

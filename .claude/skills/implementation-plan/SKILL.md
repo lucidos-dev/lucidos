@@ -52,20 +52,25 @@ Write the plan to a new file `docs/plans/YYYY-MM-DD-<slug>.md` (date = today, sl
 
 **Ask with your question tool, never in prose** (`AskUserQuestion` on Claude Code, `ask_user_question` on the `lucidos` MCP server on Codex). Prose is what fails: told only to "present the plan and wait", the agent writes a summary, ends the turn, and the thread sits idle until the user types "approve" by hand. In the Lucidos UI the tool renders as clickable buttons, so approval is one tap.
 
-Use exactly one question, with these two options:
+Use exactly one question. `Approve` is always the first option. What goes in the second slot is a **floor, not a fixed shape**:
 
-| Option | Meaning |
-|---|---|
-| `Approve` | Start implementing the plan as written. |
-| `Request changes` | The user wants something reworked before implementation. |
+| Option | Meaning | When |
+|---|---|---|
+| `Approve` | Start implementing the plan as written. | Always, first. |
+| A fork of the plan (`Frontend only`, `Skip the migration`, …) | Approve a named variant. | Whenever the plan has a genuine fork: a narrower scope, one layer instead of two, a different approach. |
+| `Request changes` | Something needs reworking before implementation. | **Only** when the plan offers no real fork. Never alongside one. |
 
-Claude Code's tool requires **2-4 options**, so a lone `Approve` button cannot be expressed, and it is never needed: it adds an **"Other"** free-text escape to every question, so the user can also type a nuanced answer. (Codex's tool allows omitting options for free text; the same two labels are still the right shape.)
+Claude Code's tool requires **2-4 options**, so a lone `Approve` button cannot be expressed. That is the *only* reason `Request changes` exists as a default second option: it fills the mandatory slot while carrying a real "don't start yet" decision. A genuine fork fills the same slot better, because it satisfies the minimum **and** tells you what to do.
+
+Carrying `Request changes` as a *third* option beside a fork is the failure this rule prevents. It then means only "I will type what I want changed", which is the escape every card already has, and tapping it sends back the literal label so you have to re-ask what to change. That is precisely the dead-end shape the system prompt's NEVER AUTHOR AN "OTHER" OPTION rule bans, and a live card carried it on 2026-08-04 (`Approve` / `Frontend only` / `Request changes`).
+
+The user can type a nuanced answer straight into the prompt and it arrives as their answer to the question, so no "let me type it" option is ever needed in any form. Lucidos renders exactly the options you pass (CC's tool description promises an automatic "Other" option; Lucidos adds none). (Codex's tool allows omitting options for free text; the same shapes are still right.)
 
 This is a **DECISION** question, not a post-work confirmation, so the "never ask about work you've already done" rule in the system prompt does not apply to it. The distinction is concrete: source edits are *blocked* until it is answered, and a plan is a proposal about work that has NOT been done, so there is nothing to hand off yet.
 
 **Prose is not a lighter-touch version of the tool, it is silence.** The tool call is the only thing that parks the thread in `WaitingForUserAnswer`, and that state is the sole input to `thread_lifecycle::is_attention_needing`: it lights the needs-attention badge, keeps the thread in the Current section, bubbles up the ancestor chain, and is a fire condition for the "When agent needs me" trigger that notifies the user. A question typed into your final message ends the turn instead, so the thread is indistinguishable from a finished one and nobody is told you are waiting.
 
-When the user approves, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. If the user requests changes, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
+When the user approves, run `lucidos planned approve`. This flips the marker to gate-satisfying and unblocks source edits and Apply. **A fork answer is an approval too**: revise the plan file to the chosen variant, re-commit, then run `lucidos planned approve`. If the user requests changes instead, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed` until approved). When an invariant changes mid-implementation, update the file (per Workflow step 5).
 
 ```md
 ## Implementation Plan

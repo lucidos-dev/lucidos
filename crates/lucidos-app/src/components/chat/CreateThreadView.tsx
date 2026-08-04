@@ -19,7 +19,7 @@ import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange } from '../../store/thread-events';
-import { exchangeStatus as getExchangeStatus, exchangeImageCount, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, unresumedAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, unresumedAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
 import { forceIOSRepaint } from '../../utils/iosRepaint';
 
@@ -49,14 +49,14 @@ function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, ProposedCha
 
 const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeInfo>();
 
-/** Threads imageOffset + last model/effort across exchanges so each child sees its predecessors' state. */
+/** Threads the last model/effort across exchanges so each child sees its predecessors' state. */
 export function renderExchanges(
   exchanges: Exchange[],
   threadId: string,
   streamingBuffer: string,
   /** Windowing: emit DOM only for exchanges at this index or later. The loop
    *  still iterates the FULL array so every index-based decision (activeIdx,
-   *  queued run, unresumedAbort) and accumulator (imgOffset, prior model/effort)
+   *  queued run, unresumedAbort) and the prior model/effort accumulator
    *  stays correct — only `nodes.push` is gated. A large thread thus renders (and
    *  markdown-parses) just its visible tail; older exchanges materialize as the
    *  user scrolls up (see ThreadView's renderCount). Default 0 = render all (the
@@ -105,7 +105,6 @@ export function renderExchanges(
   const queuedIndices = new Set<number>(queuedOrder);
   const queuedCount = queuedOrder.length;
   const nodes: VNode[] = [];
-  let imgOffset = 0;
   let lastModel: string | undefined;
   let lastEffort: string | undefined;
 
@@ -147,7 +146,6 @@ export function renderExchanges(
         isQueued={isQueued}
         threadId={threadId}
         hasPriorActive={priorActive}
-        imageOffset={imgOffset}
         priorModel={lastModel}
         priorEffort={lastEffort}
         isUnresumedAbort={i === unresumedIdx}
@@ -163,7 +161,6 @@ export function renderExchanges(
   };
 
   const advance = (ex: Exchange): void => {
-    imgOffset += exchangeImageCount(ex);
     lastModel = exchangeResponseModel(ex) ?? lastModel;
     lastEffort = exchangeReasoningEffort(ex) ?? lastEffort;
   };

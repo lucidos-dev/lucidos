@@ -137,7 +137,9 @@ impl LucidosEngine {
     /// `run_bash_background(command, timeout_secs?)` — spawn a long-running
     /// shell command and return a `task_id` immediately. Emits
     /// `BackgroundBashStarted`; the watcher emits `BackgroundBashCompleted`
-    /// and evicts the entry when the child exits or the watchdog kills it.
+    /// when the child exits or the watchdog kills it. The registry entry
+    /// outlives that event by the retention window, so a `bash_output` drain
+    /// landing at the completion instant still gets the final tail.
     pub(crate) async fn execute_bash_background_tool(
         &self,
         args: &serde_json::Value,
@@ -205,9 +207,10 @@ impl LucidosEngine {
         .to_string())
     }
 
-    /// Awaits the registry watchdog's notify, evicts the finished task,
-    /// emits `BackgroundBashCompleted` with the final state, and — if the
-    /// owning CC session is still parked on this thread — pushes a synthetic
+    /// Awaits the registry watchdog's notify, reads the finished task's
+    /// [`CompletionRecord`], emits `BackgroundBashCompleted` with the final
+    /// state, and, if the owning CC session is still parked on this thread,
+    /// pushes a synthetic
     /// `AgentUserInput { kind: User }` onto its `msg_tx` so CC resumes the
     /// turn and reads the bash result via `bash_output`. The synthetic input
     /// flows through the standard `User`-kind path so `run_session` emits a
@@ -222,6 +225,12 @@ impl LucidosEngine {
     /// the wake, a CC that idled mid-/harden waiting on background tests
     /// stays alive forever — the engine never tells it the bash is done,
     /// and the user has to type a manual follow-up to break the deadlock.
+    ///
+    /// Reading the record does NOT evict the task. That coupling is what made
+    /// a drain landing anywhere between the read and the emit below miss both
+    /// the registry and the not-yet-written event row, and surface to the
+    /// agent as `unknown task_id` on work that had succeeded. The entry now
+    /// stays drainable until the registry's retention sweep takes it.
     pub(super) fn spawn_bash_completion_watcher(
         &self,
         thread_id: uuid::Uuid,
@@ -237,7 +246,7 @@ impl LucidosEngine {
             if finish_rx.await.is_err() {
                 return;
             }
-            let Some(task) = registry.take_finished(&task_id).await else {
+            let Some(record) = registry.completion_record(&task_id).await else {
                 log!("[BashBg] watcher fired but task {} already gone", task_id);
                 return;
             };
@@ -245,18 +254,9 @@ impl LucidosEngine {
                 let s = safe_command.as_str();
                 s[..s.floor_char_boundary(200)].to_string()
             };
-            // A finished task always has an outcome (the watchdog writes it in
-            // the same locked block as `finished_at`). Defend anyway rather
-            // than unwrapping: `Unknown` is the honest reading, and it renders
-            // as words, not as a `0`.
-            let outcome = task.outcome.unwrap_or(TaskOutcome::Unknown);
-            let timed_out = task.timed_out;
-            let killed = task.killed;
-            // The whole retained buffer, plus everything the buffer cap cut
-            // from it over the task's life — so the marker counts real loss
-            // and not just what the 100 KB tail cap trimmed here.
-            let (stdout_all, stdout_dropped) = task.stdout.all();
-            let (stderr_all, stderr_dropped) = task.stderr.all();
+            let outcome = record.outcome;
+            let timed_out = record.timed_out;
+            let killed = record.killed;
             let event = ThreadEvent::BackgroundBashCompleted {
                 task_id: task_id.clone(),
                 command: cmd_prefix.clone(),
@@ -266,10 +266,15 @@ impl LucidosEngine {
                 // once the task is evicted, and the drain path it must agree
                 // with keeps the tail. For a 40-minute build the last lines
                 // are the failure; the first are `Compiling serde`.
-                stdout: finalize_drain(&stdout_all, stdout_dropped),
-                stderr: finalize_drain(&stderr_all, stderr_dropped),
-                started_at: task.started_at,
-                finished_at: task.finished_at.unwrap_or_else(chrono::Utc::now),
+                //
+                // The record carries the whole retained buffer plus every byte
+                // the registry's buffer cap cut over the task's life, so the
+                // marker counts real loss and not just what the 100 KB tail
+                // cap trimmed here.
+                stdout: finalize_drain(&record.stdout, record.stdout_dropped),
+                stderr: finalize_drain(&record.stderr, record.stderr_dropped),
+                started_at: record.started_at,
+                finished_at: record.finished_at,
                 timed_out,
                 killed,
             };
@@ -485,11 +490,11 @@ impl LucidosEngine {
                     "killed": payload.get("killed").cloned().unwrap_or(serde_json::Value::Bool(false)),
                     // Same two time fields as the in-memory branch, so the LLM
                     // never has to guess how long the task ran just because the
-                    // registry entry was evicted before it drained. `waited_secs`
-                    // is measured, not assumed zero: we land here not only for an
-                    // unknown task_id (which returns without waiting) but also
-                    // when a task we DID block on finishes and the completion
-                    // watcher evicts it before the wait reacquires the lock.
+                    // registry entry was gone by the time it drained.
+                    // `waited_secs` is measured, not assumed zero: an unknown
+                    // task_id returns without waiting, but a drain that DID
+                    // block and then found the retention window closed spent
+                    // real time doing it.
                     "elapsed_secs": persisted_elapsed_secs(&payload),
                     "waited_secs": call_started.elapsed().as_secs(),
                 })

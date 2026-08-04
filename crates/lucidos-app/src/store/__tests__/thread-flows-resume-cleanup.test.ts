@@ -351,7 +351,7 @@ describe('chat follow-up while parent loop still running', () => {
 
     // Pending step (the second run_python) must NOT be auto-resolved to ✓
     // while the agent is still actively processing (thread still 'running').
-    const events = exchangeResponseEvents(exchanges[0], 0, /* isLast */ false);
+    const events = exchangeResponseEvents(exchanges[0], /* isLast */ false);
     const pythonSteps = events.filter(e => e.type === 'step' && /python/i.test((e as { description?: string }).description ?? ''));
     expect(pythonSteps).toHaveLength(2);
     const lastPython = pythonSteps[pythonSteps.length - 1] as { outcome: StepOutcome };
@@ -643,10 +643,10 @@ describe('CC waiting_for_user_answer: trailing Thinking cleanup in non-last exch
     const isPendingThinking = (e: { type: string; description?: string; outcome?: StepOutcome }) =>
       e.type === 'step' && e.description === 'Thinking' && e.outcome === 'pending';
 
-    const e2Events = exchangeResponseEvents(exchanges[1], 0, /* isLast */ false, threadIdle);
+    const e2Events = exchangeResponseEvents(exchanges[1], /* isLast */ false, threadIdle);
     expect(e2Events.filter(isPendingThinking)).toHaveLength(0);
 
-    const e3Events = exchangeResponseEvents(exchanges[2], 0, /* isLast */ false, threadIdle);
+    const e3Events = exchangeResponseEvents(exchanges[2], /* isLast */ false, threadIdle);
     expect(e3Events.filter(isPendingThinking)).toHaveLength(0);
 
     // E3 is stranded for a reason the fold can see without any thread-level
@@ -655,7 +655,7 @@ describe('CC waiting_for_user_answer: trailing Thinking cleanup in non-last exch
     // still reported as running. Quiescence remains the cleanup for exchanges
     // the fold does NOT mark (E2 above).
     expect(exchanges[2].continuationMoved).toBe(true);
-    const e3WhileRunning = exchangeResponseEvents(exchanges[2], 0, /* isLast */ false, /* threadIdle */ false);
+    const e3WhileRunning = exchangeResponseEvents(exchanges[2], /* isLast */ false, /* threadIdle */ false);
     expect(e3WhileRunning.filter(isPendingThinking)).toHaveLength(0);
   });
 });

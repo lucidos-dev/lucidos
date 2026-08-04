@@ -1,5 +1,5 @@
 import { test, expect, request as pwRequest } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, getBaseUrl } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, getBaseUrl, isMobileViewport } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -172,6 +172,96 @@ test.describe('CC permission prompt — Allow / Deny flow', () => {
       await expect(picked).toHaveText(/Deny/);
       await expect(picked).toBeDisabled();
       await expect(answered.locator('button.permission-btn-rejected', { hasText: /^Allow once$/ })).toBeDisabled();
+    } finally {
+      if (promptResponse) {
+        await promptResponse.catch(() => undefined);
+      }
+      await apiContext.dispose();
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
+  // The *choice card* keyboard contract (docs/glossary.md, choiceCardNav.ts).
+  // A permission card seeds "Allow once" rather than the leading Deny button:
+  // a keyboard user answering one overwhelmingly means to allow the single
+  // thing being asked about. That the seeded choice GRANTS is only acceptable
+  // because it is always ringed, so this test asserts the ring as hard as it
+  // asserts the resolution.
+  test('Allow once takes visible keyboard focus, arrows step, Enter resolves', async ({ page }) => {
+    test.skip(isMobileViewport(page), 'choice-card keyboard focus is desktop-only (no hardware keyboard on mobile)');
+    await assertHealthy(page);
+
+    const suffix = randomUUID().slice(0, 8);
+    const threadId = randomUUID();
+    const now = new Date().toISOString();
+
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Permission Keyboard E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'running', 'inbox', true, 0)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"edit my file","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-perm-kbd-e2e-${suffix}"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    const apiContext = await pwRequest.newContext({
+      baseURL: getBaseUrl(),
+      ignoreHTTPSErrors: true,
+    });
+    let promptResponse: Promise<Awaited<ReturnType<typeof apiContext.post>>> | undefined;
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+
+      const row = page.locator(`.thread-row:has-text("CC Permission Keyboard E2E ${suffix}")`).first();
+      await expect(row).toBeVisible({ timeout: 10_000 });
+      await row.click();
+      await ensureOnThreadPane(page);
+
+      promptResponse = apiContext.post('/api/v1/internal/permission-prompt', {
+        data: {
+          thread_id: threadId,
+          tool_use_id: `tu-perm-kbd-e2e-${suffix}`,
+          tool_name: 'Edit',
+          input: { file_path: `/tmp/cc-perm-kbd-e2e-${suffix}.txt` },
+        },
+      });
+
+      // The live card carries the choice-card marker; an answered or terminated
+      // one drops it, which is what keeps keyboard focus off historical cards.
+      const body = page.locator('.permission-body[data-role="card-choices"]:visible').first();
+      await expect(body).toBeVisible({ timeout: 15_000 });
+
+      const allowOnce = body.locator('button', { hasText: /^Allow once$/ });
+      const deny = body.locator('button', { hasText: /^Deny$/ });
+      await expect(allowOnce).toBeFocused({ timeout: 10_000 });
+
+      const ring = await page.evaluate(() => {
+        const el = document.activeElement as HTMLElement | null;
+        return el ? getComputedStyle(el).boxShadow : '';
+      });
+      expect(ring).not.toBe('');
+      expect(ring).not.toBe('none');
+
+      // Both axes drive the same prev/next walk in DOM order, which is what
+      // makes one rule work for this card's horizontal primary row and the
+      // question card's vertical list alike.
+      await page.keyboard.press('ArrowLeft');
+      await expect(deny).toBeFocused();
+      await page.keyboard.press('ArrowUp');
+      await expect(deny).toBeFocused();
+      await page.keyboard.press('ArrowRight');
+      await expect(allowOnce).toBeFocused();
+
+      await page.keyboard.press('Enter');
+
+      const resolved = await promptResponse;
+      promptResponse = undefined;
+      expect(resolved.status()).toBe(200);
+      expect((await resolved.json()).allowed).toBe(true);
+
+      const picked = page.locator('.permission-body-answered:visible button.permission-btn-picked').first();
+      await expect(picked).toHaveText(/Allow once/, { timeout: 10_000 });
     } finally {
       if (promptResponse) {
         await promptResponse.catch(() => undefined);

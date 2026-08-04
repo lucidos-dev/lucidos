@@ -4,12 +4,16 @@ import { engineRestarting, toasts, showToast } from '../store';
 // While the engine is restarting, in-flight read requests fail as the engine
 // goes down (a GET already past the awaitEngineReady gate, SSE, health poll).
 // showToast suppresses the resulting noise so only the "Restarting engine..."
-// status (which opts in via showDuringRestart) is visible — see the central guard
-// in store.ts. These pin the screenshot regression: the SW "New version
-// available" refresh prompt and the "Failed to fetch changes" error must NOT show
-// during a restart. (The UI is no longer deactivated during a restart, but this
-// read-noise suppression is unchanged — user-initiated write failures surface
-// elsewhere, e.g. a send's inline ResponseFailed, not via this path.)
+// status is visible; it opts in via `showWhileUnavailable`. See the central
+// guard in store.ts, `workspaceUnavailable()`, which covers a restart plus the
+// two other windows with the same shape (a committed packaged update, and an
+// unreachable database, covered by database-unreachable-surface.test.ts).
+//
+// These pin the screenshot regression: the SW "New version available" refresh
+// prompt and the "Failed to fetch changes" error must NOT show during a restart.
+// (The UI is no longer deactivated during a restart, but this read-noise
+// suppression is unchanged. User-initiated write failures surface elsewhere,
+// e.g. a send's inline ResponseFailed, not via this path.)
 
 beforeEach(() => {
   engineRestarting.value = false;
@@ -54,13 +58,13 @@ describe('toast suppression while engine is restarting', () => {
     expect(toast?.message).toBe('Before');
   });
 
-  it('lets the restart status toast through via showDuringRestart', () => {
+  it('lets the restart status toast through via showWhileUnavailable', () => {
     engineRestarting.value = true;
     showToast('Restarting engine...', 'info', {
       key: 'restart-required',
       spinning: true,
       dismissable: false,
-      showDuringRestart: true,
+      showWhileUnavailable: true,
     });
     const toast = toasts.value.find(t => t.message === 'Restarting engine...');
     expect(toast).toBeTruthy();

@@ -44,10 +44,19 @@ caps options at 4. The cap rides along by design. We keep it rather than diverge
   menu, at which point plain text — or splitting into two narrower questions — is
   genuinely the better surface.
 - **Free text is always the escape hatch.** The 4 buttons are the *common*
-  answers, never the *only* ones: the user can always type a custom reply, and the
-  prompt instructs the model to include an opt-out option. Overflow has a built-in
-  release valve (exactly what happened in the motivating thread — E/F were
-  reachable by typing the letter).
+  answers, never the *only* ones: the user can always type a custom reply, which
+  the engine routes to the pending question as a `FreeText` answer. Overflow has a
+  built-in release valve (in the motivating thread, E/F were reachable by typing
+  the letter). **That escape is the prompt textarea, never an option.** This bullet
+  originally also said "the prompt instructs the model to include an opt-out
+  option". On 2026-08-04 that instruction was deleted from every question-tool
+  surface and replaced with its opposite: the model must NOT author an "Other /
+  Let me type it" option, because there is no text-entry option kind and picking
+  one returns its *label* as the answer. A meaningful opt-out ("None of these") is
+  still a legitimate option; a text-entry escape never was one. The cap itself is
+  unaffected, and the escape hatch this bullet relies on is now named by the
+  prompt textarea's placeholder while a question is pending ("Type your answer,
+  or Cancel to ask something else."), which is the field the escape actually is.
 
 ## Consequences
 

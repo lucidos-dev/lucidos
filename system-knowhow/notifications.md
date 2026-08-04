@@ -131,7 +131,7 @@ The deadline value (`DEADLINE_MS` in `crates/lucidos-engine/src/scheduler/push.r
 
 - `is_active` is `isPageActive()` — visibilityState + hasFocus on desktop, visibilityState only on iOS PWA.
 - `focused_thread_id` is the current value of the `focusedThreadId` signal.
-- `event_in_viewport` is computed by the page: locate the source event in the DOM (e.g. `document.querySelector('[data-event-id="..."]')`); if absent (virtualized list, source event not rendered) → `false`; if present → `IntersectionObserver` / `getBoundingClientRect()` check.
+- `event_in_viewport` is computed by the page: locate the source event in the DOM (e.g. `document.querySelector('[data-event-id="..."]')`); if absent (virtualized list, source event not rendered) → `false`; if present → `IntersectionObserver` / `getBoundingClientRect()` check. The rect is intersected against the **transcript scroll container's** band, not the window's: the transcript is inset by the app header above and the prompt region below, so an event tucked behind either strip is inside `window.innerHeight` while being entirely hidden from the reader, and reporting it as visible would suppress the notification they needed.
 
 **Decision.** After `deadline_ms`, the engine has zero or more pongs.
 - `push_allowed = !any(pong.is_active for pong in pongs)`. Pongs are grouped by `device_id` and OR'd within a device (see §2 "Multi-tab" note); the OR across devices is the same operation.

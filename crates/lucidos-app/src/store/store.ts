@@ -174,7 +174,12 @@ export const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
   { key: 'accounts', label: 'Accounts' },
   { key: 'repositories', label: 'Repositories' },
   { key: 'marketplaces', label: 'Marketplaces' },
-  // Packaged desktop only — gated to isTauri() && enginePackaged in SettingsView.
+  // Listed on EVERY platform, deliberately: this page exists to get Lucidos
+  // onto another device, so the device it is written for must be able to reach
+  // it. Only the native-only controls inside it are gated (isTauri() &&
+  // enginePackaged, in the page itself); everything the page REPORTS works over
+  // plain HTTP. This comment claimed the opposite until 2026-08-04, and the page
+  // was written as though the claim were true.
   { key: 'mobile-access', label: 'Mobile Access' },
   { key: 'permissions', label: 'Permissions' },
   { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts' },
@@ -243,11 +248,21 @@ export const appUpdateProgress = signal<AppUpdateRunning | null>(null);
  *  is being swapped or the stack restarted, which kills the gateway under the
  *  page. The resulting connection/SSE failures would bury the narration, so —
  *  exactly as `engineRestarting` does for a restart — they are suppressed and
- *  only the update's own toast (`showDuringRestart`) stays on screen. */
+ *  only the update's own toast (`showWhileUnavailable`) stays on screen. */
 export const appUpdateCommitted = computed(() => {
   const phase = appUpdateProgress.value?.phase;
   return phase === 'installing' || phase === 'restarting-services' || phase === 'relaunching';
 });
+/** Can the engine reach its own database? Mirrored from `/health`'s
+ *  `database_reachable` by the connection poll; an older engine omits the field,
+ *  which reads as `true`, so nothing changes for one.
+ *
+ *  An engine outlives its database (quitting Docker Desktop is the everyday dev
+ *  case), and it keeps answering `/health` and streaming SSE while every query
+ *  behind it fails. Without this signal the ~20 startup loads each reported that
+ *  separately and the boot splash waited out its safety cap on a thread list that
+ *  could never arrive. See ADR 0037 and `engine::db_health`. */
+export const databaseReachable = signal(true);
 /** True when the connected engine is a packaged desktop build. Routes the
  *  "Restart" control (LaunchAgent kickstart vs. dev rebuild script) and gates
  *  the Tauri-only Mobile Access settings page. Set from /health. */
@@ -281,12 +296,6 @@ export const animationSpeed = signal(
 
 /** Slider position (-10..10) → speed multiplier (0.1x..10x) via 10^(v/10). */
 export const speedMultiplier = computed(() => Math.pow(10, animationSpeed.value / 10));
-
-// --- Chat ---
-export const isProcessing = computed(() => {
-  const status = activeThreadStatus.value;
-  return status === 'running';
-});
 
 // --- Threads ---
 export const threadDrawerOpen = signal(
@@ -711,14 +720,6 @@ export const activeExchanges = computed<Exchange[]>(() => {
   const thread = threadMap.peek().get(id);
   if (!thread) return [];
   return computeExchanges(thread);
-});
-
-export const activeThreadStatus = computed(() => {
-  const id = focusedThreadId.value;
-  if (!id) return 'idle' as ThreadStatus;
-  const thread = threadMap.value.get(id);
-  if (!thread) return 'idle' as ThreadStatus;
-  return effectiveThreadStatus(thread);
 });
 
 export const activeStreamingBuffer = computed(() => {
@@ -1417,24 +1418,41 @@ export const TOAST_AUTO_DISMISS_MS = 5_000;
  *  Map entry would survive until the setTimeout fires. */
 const keyedDismissTimers = new Map<string, ReturnType<typeof setTimeout>>();
 
-export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; progress?: number | null; autoDismissMs?: number; dismissable?: boolean; showDuringRestart?: boolean; noAutofocus?: boolean }) {
-  const { key, action, secondaryAction, onClick, spinning, progress, autoDismissMs, dismissable, showDuringRestart, noAutofocus } = opts ?? {};
-  // While the engine is restarting the UiBlockingOverlay covers the screen and
-  // every in-flight request fails as the engine goes down (changes fetch, SSE,
-  // health poll). Suppress the resulting failure/info toasts — including the
-  // service-worker "New version available" prompt the post-restart frontend
-  // rebuild triggers — so the only thing on screen is the "Restarting engine..."
-  // status (which opts in via showDuringRestart). Toasts emitted once the
-  // restart completes (engineRestarting flips back to false — e.g. the "Engine
-  // restarted" / "Restart failed" / "Engine restart timed out" toasts, each set
-  // after clearing the flag) show normally.
-  //
-  // A COMMITTED packaged update is the same situation reached a different way:
-  // installing the new bundle restarts the launchd service, which kills the
-  // gateway serving this page, so the same wave of connection/SSE failures
-  // arrives. Suppress it identically, or it buries the update's own narration in
-  // the seconds before the client re-execs.
-  if ((engineRestarting.value || appUpdateCommitted.value) && !showDuringRestart) return;
+/** Is the workspace unable to serve requests right now, for a reason that is
+ *  already stated on screen by one authoritative toast?
+ *
+ *  Three ways in, and they are the same situation reached differently: every
+ *  request in flight fails at once, all for one cause, and a per-request failure
+ *  toast adds nothing over the status toast already up.
+ *
+ *    • `engineRestarting`: the engine goes down under us (Apply & Restart), with
+ *      the UiBlockingOverlay covering the screen and the "Restarting engine…"
+ *      status toast narrating it.
+ *    • `appUpdateCommitted`: a packaged update past its point of no return
+ *      restarts the launchd service, killing the gateway serving this page.
+ *    • `!databaseReachable`: the engine is up and answering `/health`, but its
+ *      database is not, so every query behind it fails. This one can last as long
+ *      as Docker is down, which is exactly why one accurate toast beats twenty
+ *      inaccurate ones.
+ *
+ *  Suppression is only ever legitimate WITH that authoritative toast, which opts
+ *  in via `showWhileUnavailable`. Each producer above owns one. */
+export function workspaceUnavailable(): boolean {
+  return engineRestarting.value || appUpdateCommitted.value || !databaseReachable.value;
+}
+
+export function showToast(message: string, type: ToastType = 'info', opts?: { key?: string; action?: ToastAction; secondaryAction?: ToastAction; onClick?: () => void; spinning?: boolean; progress?: number | null; autoDismissMs?: number; dismissable?: boolean; showWhileUnavailable?: boolean; noAutofocus?: boolean }) {
+  const { key, action, secondaryAction, onClick, spinning, progress, autoDismissMs, dismissable, showWhileUnavailable, noAutofocus } = opts ?? {};
+  // While the workspace cannot serve requests, every in-flight request fails at
+  // once (changes fetch, SSE, health poll, the ~20 startup loads) and they all
+  // fail for the SAME reason. Suppress the resulting failure/info toasts,
+  // including the service-worker "New version available" prompt a post-restart
+  // frontend rebuild triggers, so the only thing on screen is the one status
+  // toast that names the cause, which opts in via showWhileUnavailable. See
+  // `workspaceUnavailable` for the three ways in. Toasts emitted once the window
+  // closes (e.g. the "Engine restarted" / "Restart failed" / "Engine restart
+  // timed out" toasts, each set after clearing the flag) show normally.
+  if (workspaceUnavailable() && !showWhileUnavailable) return;
   // If a key is provided, update an existing toast with the same key instead of creating a new one
   if (key) {
     const existing = toasts.value.find((t) => t.key === key);

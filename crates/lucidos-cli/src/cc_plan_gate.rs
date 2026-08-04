@@ -81,17 +81,29 @@ pub(crate) fn build_deny_json(file_path: &str) -> String {
 /// summary and ended the turn, and the thread sat idle until the user typed
 /// "approve" by hand (2026-08-02). Approval is a DECISION question, and this
 /// hook firing is the proof: source edits are blocked until it is answered.
+///
+/// The pair is stated as a FLOOR, not a fixed shape, matching
+/// `ASK_USER_QUESTION_RULE` / `IMPLEMENTATION_PLAN_RULE` in the engine's
+/// `agent_session::prompts` and the `implementation-plan` skill. Stated
+/// unconditionally (as it was until 2026-08-04), an agent that surfaced a real
+/// fork kept `Request changes` as a third button, which then meant only "I will
+/// type what I want changed": the dead-end shape the prompts' NEVER AUTHOR AN
+/// "OTHER" OPTION rule bans.
 pub(crate) fn build_awaiting_approval_json(file_path: &str) -> String {
     let reason = format!(
         "Edit blocked: the implementation plan on this branch is awaiting the user's approval. \
          Do NOT re-run the `implementation-plan` skill — the plan is already recorded. Present the \
          plan, then ASK FOR APPROVAL WITH THE `AskUserQuestion` TOOL, offering `Approve` and \
-         `Request changes`. Approval is a DECISION question, not a post-work confirmation: this \
-         very hook is blocking your edits until it is answered, so asking in plain prose leaves \
-         the thread idle. Once the user approves, run `lucidos planned approve` to unblock \
-         implementation, then retry your edit to `{path}`. If the user requests changes, revise \
-         the plan file under docs/plans/, re-commit, and ask again the same way (the marker stays \
-         `proposed` until approved).",
+         `Request changes`. That pair is a FLOOR: `Approve` first, `Request changes` second ONLY \
+         when the plan offers no real fork. If it offers one (a narrower scope, one layer instead \
+         of two), that fork takes the second slot and `Request changes` is dropped, never carried \
+         alongside it as a third. Approval is a DECISION question, not a post-work confirmation: \
+         this very hook is blocking your edits until it is answered, so asking in plain prose \
+         leaves the thread idle. Once the user approves, run `lucidos planned approve` to unblock \
+         implementation, then retry your edit to `{path}`. Picking a fork is an approval too: \
+         revise the plan file to that variant, re-commit, then run `lucidos planned approve`. If \
+         the user requests changes instead, revise the plan file under docs/plans/, re-commit, \
+         and ask again the same way (the marker stays `proposed` until approved).",
         path = file_path,
     );
     deny_envelope(&reason)
@@ -261,6 +273,14 @@ mod tests {
             "`AskUserQuestion`",
             "`Approve` and `Request changes`",
             "DECISION question",
+            // The pair is a FLOOR, described the same way here as in the two
+            // prompt rules and the skill: a plan that offers a real fork puts
+            // the fork in the second slot rather than pushing `Request changes`
+            // to a third, where it would mean only "I will type what I want
+            // changed" (2026-08-04). A fork answer is an approval, so this text
+            // must also say the marker can be flipped after revising the plan.
+            "that fork takes the second slot",
+            "Picking a fork is an approval too",
         ] {
             assert!(
                 reason.contains(needle),

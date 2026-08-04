@@ -68,9 +68,9 @@ export async function attachImageToActiveDraft(source: File): Promise<void> {
     await awaitThreadStarted(threadId);
     const { hash } = await uploadThreadBlob(threadId, file);
     // Mid-flight cancel: the user clicked X on the preview while we were
-    // uploading. `detachPendingUpload` returns null in that case — meaning
-    // `removePendingUpload` already revoked the URL — so we bail without
-    // committing the hash to the draft.
+    // uploading. `removePendingUpload` dropped the entry and revoked the URL,
+    // so `hasPendingUpload` reads false. Bail without committing the hash to
+    // the draft.
     if (!hasPendingUpload(threadId, localId)) return;
     // Promote: hand the blob URL ownership to the session map FIRST so
     // `getAttachedImages` will return it the moment the hash lands in the

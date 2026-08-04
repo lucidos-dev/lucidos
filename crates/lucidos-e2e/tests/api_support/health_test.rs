@@ -45,6 +45,11 @@ async fn health_has_expected_fields() {
         "release_dirty",
         // packaged-mode signal — drives the frontend's Restart routing.
         "packaged",
+        // Is the workspace database answering? The client renders one degraded
+        // surface off this instead of inferring an outage from N failed loads
+        // (ADR 0037). Absent would read as "reachable" on the client, so its
+        // presence is the contract.
+        "database_reachable",
     ] {
         assert!(
             body.get(field).is_some() && !body[field].is_null(),
@@ -58,5 +63,14 @@ async fn health_has_expected_fields() {
     assert_eq!(
         body["packaged"], false,
         "e2e engine is not a packaged build"
+    );
+    // The suite only runs against a booted engine, which by definition connected
+    // and migrated, so the honest value here is `true`. Asserting it also pins the
+    // type: the client treats anything other than an explicit `false` as reachable,
+    // so a stringly-typed "true" would silently mean the same thing and the
+    // degraded surface would never fire.
+    assert_eq!(
+        body["database_reachable"], true,
+        "a booted e2e engine can reach its database"
     );
 }

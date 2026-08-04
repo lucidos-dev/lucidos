@@ -121,13 +121,14 @@ async fn get_saved_threads_sorts_by_last_user_action_not_last_activity() {
     teardown_test_db(&db).await;
 }
 
-/// The per-source Archive window (`get_recent_threads`' `ROW_NUMBER`) selects the
-/// newest-`created_at` per source — the SAME axis the drawer's Archive section
-/// sorts and `get_older_threads` pages by, so the window/page seam is gap-free.
-/// With `per_source=1` and two archived threads where created_at diverges from
-/// BOTH last_user_action and last_activity, only the newest-CREATED one makes the
-/// cut. (Pre-fix the window ordered by last_user_action, which would have kept the
-/// other one — the thread the user touched later but created earlier.)
+/// The Archive window (`get_recent_threads`' `ROW_NUMBER`) selects the
+/// newest-`created_at` archived rows, on the SAME axis the drawer's Archive
+/// section sorts and `get_older_threads` pages by, so the window/page seam is
+/// gap-free. With `archive_limit=1` and two archived threads where created_at
+/// diverges from BOTH last_user_action and last_activity, only the
+/// newest-CREATED one makes the cut. (Pre-fix the window ordered by
+/// last_user_action, which would have kept the other one: the thread the user
+/// touched later but created earlier.)
 #[tokio::test]
 async fn get_recent_threads_archive_window_selects_by_created_at() {
     let (pool, db) = setup_test_db().await;
@@ -135,7 +136,7 @@ async fn get_recent_threads_archive_window_selects_by_created_at() {
 
     let newest_created = Uuid::new_v4(); // created last, never touched again
     let touched_later = Uuid::new_v4(); // created first, but user acted later
-                                        // Same source + both archived idle, so only the rn<=per_source window decides
+                                        // Both archived idle, so only the rn<=archive_limit window decides
                                         // inclusion. created_at is the ONLY axis under which `newest_created` wins.
     sqlx::query(
         "INSERT INTO thread_summaries \
@@ -161,7 +162,7 @@ async fn get_recent_threads_archive_window_selects_by_created_at() {
         recent.iter().map(|t| t.thread_id.as_str()).collect();
     assert!(
         returned.contains(newest_created.to_string().as_str()),
-        "the newest-CREATED archived thread must be in the per-source window; got {} entries",
+        "the newest-CREATED archived thread must be in the archive window; got {} entries",
         recent.len()
     );
     assert!(
@@ -365,7 +366,7 @@ async fn get_recent_threads_excludes_actionable_threads_beyond_window() {
     teardown_test_db(&db).await;
 }
 
-/// REVIEW must contain every inbox thread, not just the top-N per source.
+/// REVIEW must contain every inbox thread, not just the newest N.
 /// An inbox row is one the user hasn't dismissed; capping it would silently
 /// hide work — e.g. a CC thread whose subprocess crashed mid-flow without
 /// emitting a terminal event keeps `coding_agent_proposed=false` and would be
@@ -409,7 +410,7 @@ async fn get_recent_threads_returns_all_inbox_threads_beyond_window() {
     let needed = furthest_back.to_string();
     assert!(
         returned.contains(needed.as_str()),
-        "inbox thread at rn>per_source must surface; got {} entries",
+        "inbox thread at rn>archive_limit must surface; got {} entries",
         recent.len()
     );
     assert_eq!(

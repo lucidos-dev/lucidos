@@ -119,6 +119,60 @@ describe('scrollToBottom suppression', () => {
     setActiveScrollElement(null);
   });
 
+  it('the bottom-pin loop stops on its own when the suppression timer is lost', () => {
+    // The loop's normal exit is `_resizeMode` flipping to 'ignore', and a
+    // SEPARATE timer owns that flip. When the flip never arrives, the loop used
+    // to re-arm itself forever: a suspended page dropping the timer, or (how it
+    // surfaced) a test installing fake timers between two frames of a loop that
+    // was already running, leaving the loop on the fake clock and its
+    // suppression timer on the real one. The frontend suite flaked roughly one
+    // run in three with "Aborting after running 10000 timers" inside an
+    // unrelated compose test. The loop's frame budget is the backstop.
+    let writes = 0;
+    let internalScrollTop = 0;
+    const el: any = {
+      get scrollTop() { return internalScrollTop; },
+      set scrollTop(v: number) { internalScrollTop = v; writes++; },
+      scrollHeight: 2000,
+      clientHeight: 500,
+      getBoundingClientRect: () => ({ width: 400, height: 600 }),
+    };
+    setActiveScrollElement(el);
+
+    // Swallow the 500ms suppression timer (and only that one) so the mode flip
+    // can never come, while the 16ms frames stay on the clock.
+    let swallowed = 0;
+    const schedule = globalThis.setTimeout;
+    const spy = vi.spyOn(globalThis, 'setTimeout').mockImplementation(
+      ((fn: () => void, ms?: number) => {
+        if (ms === 500) { swallowed++; return 0 as any; }
+        return schedule(fn, ms);
+      }) as any,
+    );
+    scrollToBottom();
+    spy.mockRestore();
+    // Tripwire: if SUPPRESSION_MS ever stops being 500 the spy above swallows
+    // nothing, and this test would quietly go back to exercising the ordinary
+    // exit instead of the backstop.
+    expect(swallowed).toBe(1);
+    expect(getResizeMode()).toBe('scroll');
+
+    vi.advanceTimersByTime(10_000);
+    // One immediate write plus at most 500ms/16ms frames.
+    expect(writes).toBeGreaterThan(1);
+    expect(writes).toBeLessThanOrEqual(33);
+    // And the loop hands back the state the lost timer owed: staying in
+    // 'scroll' would suppress onScroll and keep onResize force-pinning the user
+    // to the bottom for the rest of the session.
+    expect(getResizeMode()).toBe('ignore');
+
+    // Dead, not merely slow.
+    const settled = writes;
+    vi.advanceTimersByTime(10_000);
+    expect(writes).toBe(settled);
+    setActiveScrollElement(null);
+  });
+
   it('full submit flow: scrollToBottom + new content + ResizeObserver = still at bottom', () => {
     const mockEl = mockScrollEl({ scrollTop: 200, scrollHeight: 2000 });
     setActiveScrollElement(mockEl);

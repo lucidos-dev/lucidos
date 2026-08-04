@@ -104,6 +104,27 @@ on:
         type: choice
         default: 'full'
         options: [full, payload]
+      # front-door only. WHICH RELEASE this dispatch was fired to verify, so the
+      # job stops trusting whichever Cloudflare POP happens to answer first.
+      #
+      # The post-publish dispatch arrives seconds after the site publisher
+      # deploys, i.e. squarely inside the window where POPs are mid propagation
+      # and two fetches of the same URL legitimately return two different
+      # releases. Rung 1 reads install.sh once and the install step reads it
+      # again, so without this input those two reads can be different releases
+      # and the asset preflight between them guarantees nothing (the 2026-08-03
+      # v0.20.1 run: both macOS legs verified 0.20.0's assets and then installed
+      # 0.20.1, whose tarball was not attached yet). Set it, and rung 1 waits for
+      # this runner's POP to actually serve that release before anything else
+      # runs.
+      #
+      # Empty is the default and stays a first-class case: the daily cron and a
+      # bare manual dispatch behave exactly as before, one read and no polling.
+      # A bare release number, as install.sh bakes it, NOT a v<ver> tag.
+      expect_version:
+        description: 'front-door: the release this dispatch verifies, e.g. 0.20.1 (empty = accept whatever the origin serves)'
+        type: string
+        default: ''
       # dmg-verify only, and now BOTH of that job's real triggers arrive here.
       #
       #   * the RC gate. Phase A puts the staged DMG on an rc-<ver> DRAFT release
@@ -807,10 +828,12 @@ jobs:
       image: ubuntu:22.04
     # The ceiling must always exceed the budgets it contains, and
     # front_door_gate_test.sh does that arithmetic from the literals in this
-    # file: FD_ASSET_WAIT_SECS (1800) + GW_HEALTH_TIMEOUT_SECS (900) leaves 900 s
-    # of 75 minutes for the install itself, the four uninstall rungs and the
-    # runner setup. It was 30 minutes before the asset preflight existed, which
-    # the preflight budget alone would have exhausted. A job timeout is a hard
+    # file, over all THREE waits: FD_EXPECT_VERSION_WAIT_SECS (600, and it can
+    # stack on the next one) + FD_ASSET_WAIT_SECS (1800) +
+    # GW_HEALTH_TIMEOUT_SECS (900) leaves 900 s of 75 minutes for the install
+    # itself, the four uninstall rungs and the runner setup. It was 30 minutes
+    # before the asset preflight existed, which the preflight budget alone would
+    # have exhausted. A job timeout is a hard
     # kill with no diagnosis, which is exactly the burying this file's guards
     # exist to prevent.
     timeout-minutes: 75
@@ -829,6 +852,11 @@ jobs:
       # $GITHUB_ENV; every later step reads THAT, under `set -u`, so a validation
       # step that never ran leaves nothing usable behind.
       FRONT_DOOR_INPUT: ${{ (github.event_name == 'push' && 'https://rc.lucidos.dev') || inputs.origin || 'https://lucidos.dev' }}
+      # The release this run was dispatched to verify, or empty. Only a dispatch
+      # can carry it: on the cron and on the rc/** push there is no `inputs`
+      # object at all, so this resolves to '' and rung 1 keeps its single-read
+      # behaviour. See the input's own comment for what it buys.
+      FD_EXPECT_VERSION: ${{ inputs.expect_version || '' }}
       # The RC origin sits behind Cloudflare Access. Every fetch of it must
       # present the `lucidos-ci-front-door` service token or the gate answers
       # 302 to a login page — which the payload sniff would correctly report as
@@ -866,6 +894,23 @@ jobs:
       # preflight, and 240 s sits far inside the 75-minute ceiling either way.
       FD_RC_VERSION_WAIT_SECS: '240'   # 4 min of propagation slack, then it is real
       FD_RC_VERSION_POLL_SECS: '30'    # so roughly 8 re-reads after the first fetch
+      # ── the expect_version convergence budget (rung 1, dispatch only) ────────
+      # ITS OWN BUDGET, deliberately not a reuse of the rc pair above. The two
+      # loops answer different questions against different origins (this one
+      # polls the PLAIN production URL, that one polls a nonced RC URL) and they
+      # wait out different phenomena, so tuning one must never silently retune
+      # the other. Generous at 10 minutes because the caller fires this dispatch
+      # within seconds of the deploy, which is the widest part of the
+      # propagation window; the same coarse 30 s poll, because these are plain
+      # cached GETs of a small file and not something to hammer.
+      #
+      # It CAN stack with FD_ASSET_WAIT_SECS (a POP that lags is exactly a POP
+      # whose release is new enough for the tarballs to still be attaching), so
+      # check the ceiling: 600 + 1800 + 900 health + 900 slack is 4200 s, inside
+      # the 75-minute (4500 s) job timeout. Nothing is spent on the settled path:
+      # a POP already serving the expected release matches on the first read.
+      FD_EXPECT_VERSION_WAIT_SECS: '600'   # 10 min of post-publish propagation slack
+      FD_EXPECT_VERSION_POLL_SECS: '30'    # so roughly 20 plain re-reads after the first
       # A stranger's shell has no LUCIDOS_* set, but this workflow's top-level env
       # block exports two for the --dev smoke job — and install.sh treats every
       # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
@@ -955,8 +1000,24 @@ jobs:
           # second, arbitrary variable for every later step.
           echo "FRONT_DOOR=$origin" >> "$GITHUB_ENV"
 
+          # ── the expected release, if the caller named one ─────────────────────
+          # Checked for SHAPE here rather than at the point of use, because a
+          # value of the wrong shape can never equal the served
+          # LUCIDOS_DEFAULT_VERSION and would therefore cost the entire
+          # convergence budget and then red for a reason that has nothing to do
+          # with the origin. A bare release number is what install.sh bakes and
+          # what the caller reads off the SitePublished payload, so a leading
+          # 'v' (the mistake a hand-typed dispatch actually makes) is refused by
+          # name. No normalisation: guessing what the caller meant is how a run
+          # ends up verifying a release nobody asked for.
+          if [ -n "${FD_EXPECT_VERSION:-}" ] && ! [[ "$FD_EXPECT_VERSION" =~ ^[0-9][A-Za-z0-9.+-]*$ ]]; then
+            echo "::error::refusing expect_version '$FD_EXPECT_VERSION'. It must be a bare release number exactly as install.sh bakes it (for example 0.20.1), not a tag (v0.20.1) and not a URL. Rung 1 compares it to the served LUCIDOS_DEFAULT_VERSION, so any other shape can never match and would only fail after the whole ${FD_EXPECT_VERSION_WAIT_SECS}s convergence budget."
+            exit 1
+          fi
+
           echo "origin: $origin"
           echo "mode:   $FD_MODE"
+          echo "expect: ${FD_EXPECT_VERSION:-(none: rung 1 accepts whatever this origin serves)}"
           if [ "$FD_MODE" = "full" ]; then
             echo "rungs:  1 (payload sniff), 2 (no HTML sourced), 3 (gateway health), 4 (frontend 200)"
           else
@@ -1189,10 +1250,82 @@ jobs:
             echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
           fi
 
-          # Exported only NOW, after the convergence loop, and exactly once. A
-          # write before the loop would pin the FIRST read, so every later
-          # consumer (the asset preflight, the LUCIDOS_INSTALL_URL parse) would
-          # see the stale version a retry had already replaced.
+          # ── this POP must serve the release we were dispatched to verify ──────
+          # WHY: rung 1 fetches install.sh ONCE, and the "Run the advertised
+          # command" step below fetches it AGAIN, independently, seconds or
+          # minutes later. Nothing pins those two fetches to the same release,
+          # and in the window right after a publish they legitimately disagree:
+          # Cloudflare POPs are mid propagation, so one read answers with the new
+          # release and the next with the old one. Everything in between, the
+          # asset preflight included, is then verifying a release the install
+          # will not download.
+          #
+          # That is not hypothetical. On 2026-08-03 the post-publish dispatch for
+          # v0.20.1 fired 28 s after the release published. The ubuntu leg read
+          # 0.20.1 here, its preflight waited out the ~14 min tarball attach
+          # window and it went green. Both macOS legs read 0.20.0 from a
+          # different POP, so their preflight passed on attempt 1 against the
+          # PREVIOUS release's assets, and then the install step re-fetched
+          # install.sh from a POP that had since flipped, resolved 0.20.1, and
+          # died on a tarball release-tarballs.yml had not attached yet. Nothing
+          # was broken in the shipped tree: the preflight verified one release
+          # and the install downloaded another.
+          #
+          # So when the caller tells us which release it dispatched us to verify,
+          # converge on it before exporting anything. An EMPTY input is the
+          # unchanged path and must stay one: the daily cron runs long after the
+          # assets have settled and must not gain a new way to red, and a manual
+          # dispatch with no input keeps its single read.
+          #
+          # THIS LOOP DELIBERATELY DOES NOT CACHE-BUST, and the contrast with the
+          # rc loop above is the load-bearing detail. Up there the nonce is
+          # right: payload mode STOPS after rung 1, so the nonced fetch is the
+          # last word, and forcing a cache MISS is the fastest route to the
+          # truth. Here it would be actively wrong. A '?cb=' query string is a
+          # DIFFERENT Cloudflare cache key, so converging on the nonced URL would
+          # prove nothing about the plain one, which is the URL the install step
+          # below actually fetches, and the drift this loop exists to close would
+          # stay wide open. What has to be asserted is the stranger-visible
+          # truth: this POP serves the expected release at $FRONT_DOOR/install.sh
+          # to a plain unadorned curl. So poll exactly that: no nonce, no
+          # Cache-Control, no Pragma. Do not "fix" this back into a nonce.
+          if [ -n "${FD_EXPECT_VERSION:-}" ]; then
+            ev_started="$(date +%s)"
+            ev_deadline=$(( ev_started + FD_EXPECT_VERSION_WAIT_SECS ))
+            ev_attempt=0
+            while [ "$served_version" != "$FD_EXPECT_VERSION" ]; do
+              if [ "$(date +%s)" -ge "$ev_deadline" ]; then
+                echo "::error::$FRONT_DOOR/install.sh still bakes $served_version after the full ${FD_EXPECT_VERSION_WAIT_SECS}s budget, but this run was dispatched to verify $FD_EXPECT_VERSION. The plain (deliberately un-nonced) URL was re-read $ev_attempt time(s) and never agreed. TWO CAUSES, and only the second is transient: either the site publisher has not deployed $FD_EXPECT_VERSION's installer to this origin at all (that deploy runs on the maintainer's machine off the SitePublished chain, not in CI, so no change in this repository can turn it green), or this runner's Cloudflare POP is still lagging after the whole budget, in which case a rerun lands on a POP that has caught up. Last read: $served_version. Expected: $FD_EXPECT_VERSION."
+                exit 1
+              fi
+              sleep "$FD_EXPECT_VERSION_POLL_SECS"
+              ev_attempt=$(( ev_attempt + 1 ))
+              # The PLAIN url, byte for byte what the install step will request.
+              FD_EFFECTIVE_URL="$(curl -fsSL "${FD_HDR[@]}" "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" -w '%{url_effective}')" \
+                || { echo "::error::could not re-read $FRONT_DOOR/install.sh while waiting for this runner's Cloudflare POP to serve $FD_EXPECT_VERSION"; exit 1; }
+              # The whole payload is re-validated, exactly as in the rc loop: the
+              # re-read copy is the one every later step reads out of $tmp, and a
+              # re-read that lands on the soft-404 landing page must be reported
+              # as HTML rather than swallowed as one more version mismatch.
+              assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh" || exit 1
+              served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+              if [ -z "$served_version" ]; then
+                echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the re-read $FRONT_DOOR/install.sh. This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+                exit 1
+              fi
+              echo "    re-read $ev_attempt at $(( $(date +%s) - ev_started ))s: this POP now serves $served_version (want $FD_EXPECT_VERSION)"
+            done
+            if [ "$ev_attempt" -gt 0 ]; then
+              echo "::warning::$FRONT_DOOR needed $ev_attempt plain re-read(s) over $(( $(date +%s) - ev_started ))s before this runner's Cloudflare POP served $FD_EXPECT_VERSION. The origin is fine: this is post-publish POP propagation, which is exactly the window the install step used to fall into unnoticed. Recorded here so the run does not read as a clean first-try pass."
+            fi
+            echo "    OK  $FRONT_DOOR serves $FD_EXPECT_VERSION to a plain unadorned fetch, which is what the install step will get too"
+          fi
+
+          # Exported only NOW, after BOTH convergence loops, and exactly once. A
+          # write before them would pin the FIRST read, so every later consumer
+          # (the asset preflight, the LUCIDOS_INSTALL_URL parse) would see the
+          # stale version a re-read had already replaced.
           echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
 
           # Which libs, from where — both READ OUT of the installer we just
@@ -1595,9 +1728,37 @@ jobs:
           # (download_failed) and the mandatory .sha256 sidecar, which dies with
           # its own wording. NOT the checksum MISMATCH, which means a corrupt or
           # tampered download and is a different verdict.
+          #
+          # AND ONE OF THESE IS NOT A DOWNLOAD FAILURE AT ALL. If the URL the
+          # installer died on names a DIFFERENT version than the one rung 1
+          # verified, the two independent fetches of install.sh landed on two
+          # different releases: rung 1 read one, the install step re-fetched and
+          # got the other, and the preflight in between certified assets nobody
+          # then downloaded. That is the front-door version-drift race, with its
+          # own cause (a Cloudflare POP flipping mid run) and its own fix (rung
+          # 1's expect_version convergence, which is what prevents it). Reporting
+          # it as a flat download failure is what sent the 2026-08-03 v0.20.1
+          # macOS legs to release-tarballs.yml over an asset the run had never
+          # verified, so name the real cause instead. The version comes out of
+          # the failing URL itself, and a URL it cannot be parsed from simply
+          # falls through to the plain verdict below: this branch is here to
+          # rename a failure, never to invent one.
           DOWNLOAD_FAIL_RE='Download failed:|could NOT fetch its checksum sidecar'
           assert_no_download_failure() {
             grep -qE "$DOWNLOAD_FAIL_RE" "$log" 2>/dev/null || return 0
+            # `-A 1` because the two aborts print their URL differently: the
+            # tarball one puts it on the same line as "Download failed:", the
+            # sidecar one on the line below its own wording.
+            local failed_version
+            failed_version="$(grep -A 1 -E "$DOWNLOAD_FAIL_RE" "$log" 2>/dev/null \
+                              | sed -n 's#.*/releases/download/v\([^/[:space:]]*\)/.*#\1#p' | head -n 1)"
+            if [ -n "$failed_version" ] && [ -n "${FD_SERVED_VERSION:-}" ] \
+               && [ "$failed_version" != "$FD_SERVED_VERSION" ]; then
+              echo "::error::FRONT-DOOR VERSION DRIFT, not a plain download failure. Rung 1 read $FD_SERVED_VERSION from $FRONT_DOOR/install.sh and the asset preflight verified THAT release's tarball, but the install step re-fetched the same URL and resolved $failed_version. The two fetches landed on different releases, so the preflight's guarantee never covered what was actually downloaded. This is the post-publish Cloudflare POP race: dispatch this workflow with expect_version set to the release being verified, and rung 1 waits for this runner's POP to serve it before the preflight or the install run."
+              grep -nE "$DOWNLOAD_FAIL_RE" "$log" | head -n 5 | sed 's/^/      /'
+              dump
+              exit 1
+            fi
             echo "::error::the installer could not fetch the release asset, AFTER the preflight found it published. This is a DOWNLOAD failure, not a gateway health failure: the gateway was never going to start."
             grep -nE "$DOWNLOAD_FAIL_RE" "$log" | head -n 5 | sed 's/^/      /'
             dump
@@ -1993,7 +2154,8 @@ jobs:
           - { runner: macos-15-intel, triple: x86_64-apple-darwin }
     runs-on: ${{ matrix.runner }}
     # Same arithmetic as `front-door`, asserted by front_door_gate_test.sh:
-    # FD_ASSET_WAIT_SECS + GW_HEALTH_TIMEOUT_SECS + 900 s of slack must fit.
+    # FD_EXPECT_VERSION_WAIT_SECS + FD_ASSET_WAIT_SECS + GW_HEALTH_TIMEOUT_SECS
+    # + 900 s of slack must fit.
     timeout-minutes: 75
     # Same reasoning as `front-door`: this job pipes remote code into a shell by
     # design, so it gets a token with no scopes at all.
@@ -2002,6 +2164,10 @@ jobs:
       # ── identical to `front-door` (see that job for the full reasoning) ──────
       FD_MODE: ${{ (github.event_name == 'push' && 'payload') || inputs.mode || 'full' }}
       FRONT_DOOR_INPUT: ${{ (github.event_name == 'push' && 'https://rc.lucidos.dev') || inputs.origin || 'https://lucidos.dev' }}
+      # The release this run was dispatched to verify, or empty on the cron and
+      # the rc/** push. Identical to `front-door`; the canonical note is on the
+      # input itself, and this job is where the drift it closes actually bit.
+      FD_EXPECT_VERSION: ${{ inputs.expect_version || '' }}
       RC_ACCESS_CLIENT_ID: ${{ secrets.RC_ACCESS_CLIENT_ID }}
       RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
       GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
@@ -2020,6 +2186,13 @@ jobs:
       # stacks with FD_ASSET_WAIT_SECS.
       FD_RC_VERSION_WAIT_SECS: '240'   # 4 min of propagation slack, then it is real
       FD_RC_VERSION_POLL_SECS: '30'    # so roughly 8 re-reads after the first fetch
+      # The expect_version convergence budget, identical to `front-door` (see
+      # that job for why it is its own pair rather than a reuse of the rc one,
+      # and for the ceiling arithmetic). This job is where the drift it closes
+      # actually bit: on v0.20.1 both macOS legs read the PREVIOUS release here
+      # while ubuntu read the new one off the same origin.
+      FD_EXPECT_VERSION_WAIT_SECS: '600'   # 10 min of post-publish propagation slack
+      FD_EXPECT_VERSION_POLL_SECS: '30'    # so roughly 20 plain re-reads after the first
       # A stranger's Mac has no LUCIDOS_* set, but this workflow's top-level env
       # block exports two for the --dev smoke job — and install.sh treats every
       # LUCIDOS_* as a flag. Blank them so this job reproduces a bare machine
@@ -2089,8 +2262,20 @@ jobs:
           # define a second, arbitrary variable for every later step.
           echo "FRONT_DOOR=$origin" >> "$GITHUB_ENV"
 
+          # ── the expected release, if the caller named one ─────────────────────
+          # Shape-checked here rather than at the point of use, verbatim from
+          # `front-door`: a value of the wrong shape can never equal the served
+          # LUCIDOS_DEFAULT_VERSION, so it would burn the entire convergence
+          # budget and then red for a reason that has nothing to do with the
+          # origin. No normalisation of a 'v' prefix, deliberately.
+          if [ -n "${FD_EXPECT_VERSION:-}" ] && ! [[ "$FD_EXPECT_VERSION" =~ ^[0-9][A-Za-z0-9.+-]*$ ]]; then
+            echo "::error::refusing expect_version '$FD_EXPECT_VERSION'. It must be a bare release number exactly as install.sh bakes it (for example 0.20.1), not a tag (v0.20.1) and not a URL. Rung 1 compares it to the served LUCIDOS_DEFAULT_VERSION, so any other shape can never match and would only fail after the whole ${FD_EXPECT_VERSION_WAIT_SECS}s convergence budget."
+            exit 1
+          fi
+
           echo "origin: $origin"
           echo "mode:   $FD_MODE"
+          echo "expect: ${FD_EXPECT_VERSION:-(none: rung 1 accepts whatever this origin serves)}"
           echo "triple: $TRIPLE"
           if [ "$FD_MODE" = "full" ]; then
             echo "rungs:  1 (payload sniff), 2 (no HTML sourced), 3 (gateway health), 4 (frontend 200)"
@@ -2309,9 +2494,69 @@ jobs:
             echo "    OK  the RC front door serves $served_version, matching $GITHUB_REF_NAME"
           fi
 
-          # Exported only NOW, after the convergence loop, and exactly once: a
-          # write before it would pin the FIRST read and hand every later
-          # consumer the stale version a retry had already replaced.
+          # ── this POP must serve the release we were dispatched to verify ──────
+          # The `front-door` job carries the canonical note. The short version:
+          # rung 1 fetches install.sh once and the install step fetches it AGAIN,
+          # independently, so in the post-publish window (when Cloudflare POPs are
+          # mid propagation) the two can land on different releases and the asset
+          # preflight between them then certifies a release nobody downloads.
+          #
+          # THIS JOB IS WHERE THAT BIT. On 2026-08-03, 28 s after v0.20.1
+          # published, both macOS legs read 0.20.0 here, passed the preflight on
+          # attempt 1 against the PREVIOUS release's assets, and then died when
+          # the install step re-fetched install.sh, got 0.20.1 from a POP that had
+          # since flipped, and asked for a tarball release-tarballs.yml had not
+          # attached yet. The ubuntu leg read 0.20.1 from the first fetch, waited
+          # out the attach window, and went green off the same origin.
+          #
+          # THIS LOOP DELIBERATELY DOES NOT CACHE-BUST, unlike the rc loop right
+          # above it, and that contrast is the load-bearing detail rather than an
+          # oversight. A '?cb=' nonce is a DIFFERENT Cloudflare cache key: it is
+          # correct up there, where payload mode stops after rung 1 and the
+          # nonced fetch is the last word, and wrong down here, where the install
+          # step fetches the PLAIN URL and converging on a nonced one would prove
+          # nothing about it. Poll exactly the URL the install step will request:
+          # no nonce, no Cache-Control, no Pragma. Do not "fix" it into a nonce.
+          #
+          # An EMPTY input keeps the old single-read behaviour exactly, so the
+          # daily cron (which runs long after the assets have settled) gains no
+          # new way to red.
+          if [ -n "${FD_EXPECT_VERSION:-}" ]; then
+            ev_started="$(date +%s)"
+            ev_deadline=$(( ev_started + FD_EXPECT_VERSION_WAIT_SECS ))
+            ev_attempt=0
+            while [ "$served_version" != "$FD_EXPECT_VERSION" ]; do
+              if [ "$(date +%s)" -ge "$ev_deadline" ]; then
+                echo "::error::$FRONT_DOOR/install.sh still bakes $served_version after the full ${FD_EXPECT_VERSION_WAIT_SECS}s budget, but this run was dispatched to verify $FD_EXPECT_VERSION. The plain (deliberately un-nonced) URL was re-read $ev_attempt time(s) and never agreed. TWO CAUSES, and only the second is transient: either the site publisher has not deployed $FD_EXPECT_VERSION's installer to this origin at all (that deploy runs on the maintainer's machine off the SitePublished chain, not in CI, so no change in this repository can turn it green), or this runner's Cloudflare POP is still lagging after the whole budget, in which case a rerun lands on a POP that has caught up. Last read: $served_version. Expected: $FD_EXPECT_VERSION."
+                exit 1
+              fi
+              sleep "$FD_EXPECT_VERSION_POLL_SECS"
+              ev_attempt=$(( ev_attempt + 1 ))
+              # The PLAIN url, byte for byte what the install step will request,
+              # with the Access headers in this job's bash-3.2-safe form.
+              FD_EFFECTIVE_URL="$(curl -fsSL ${FD_HDR[@]+"${FD_HDR[@]}"} "$FRONT_DOOR/install.sh" -o "$tmp/install.sh" -w '%{url_effective}')" \
+                || { echo "::error::could not re-read $FRONT_DOOR/install.sh while waiting for this runner's Cloudflare POP to serve $FD_EXPECT_VERSION"; exit 1; }
+              # The whole payload is re-validated, exactly as in the rc loop, so a
+              # re-read that lands on the soft-404 landing page is reported as
+              # HTML rather than swallowed as one more version mismatch.
+              assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh" || exit 1
+              served_version="$(sed -n 's/^LUCIDOS_DEFAULT_VERSION="\([^"]*\)".*/\1/p' "$tmp/install.sh" | head -n 1)"
+              if [ -z "$served_version" ]; then
+                echo "::error::could not parse LUCIDOS_DEFAULT_VERSION out of the re-read $FRONT_DOOR/install.sh. This check must never silently pass, so it fails closed."
+                grep -n '^LUCIDOS_DEFAULT_VERSION=' "$tmp/install.sh" || true
+                exit 1
+              fi
+              echo "    re-read $ev_attempt at $(( $(date +%s) - ev_started ))s: this POP now serves $served_version (want $FD_EXPECT_VERSION)"
+            done
+            if [ "$ev_attempt" -gt 0 ]; then
+              echo "::warning::$FRONT_DOOR needed $ev_attempt plain re-read(s) over $(( $(date +%s) - ev_started ))s before this runner's Cloudflare POP served $FD_EXPECT_VERSION. The origin is fine: this is post-publish POP propagation, which is exactly the window the install step used to fall into unnoticed. Recorded here so the run does not read as a clean first-try pass."
+            fi
+            echo "    OK  $FRONT_DOOR serves $FD_EXPECT_VERSION to a plain unadorned fetch, which is what the install step will get too"
+          fi
+
+          # Exported only NOW, after BOTH convergence loops, and exactly once: a
+          # write before them would pin the FIRST read and hand every later
+          # consumer the stale version a re-read had already replaced.
           echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"
 
           # Which libs, from where — both READ OUT of the installer we just
@@ -2691,9 +2936,34 @@ jobs:
           # entire health budget and then report the gateway rather than the
           # download. Both of install.sh's asset-fetch aborts are matched, but
           # not the checksum MISMATCH, which is a different verdict.
+          #
+          # AND ONE OF THESE IS NOT A DOWNLOAD FAILURE AT ALL, which is the other
+          # half of the 2026-08-03 v0.20.1 fix and matters most on these legs
+          # (they are the ones that hit it). When the URL the installer died on
+          # names a DIFFERENT version than rung 1 verified, the two independent
+          # fetches of install.sh landed on two different releases and the
+          # preflight certified assets nobody downloaded: a front-door
+          # version-drift race, prevented by rung 1's expect_version convergence
+          # and pointlessly attributed to release-tarballs.yml if reported as a
+          # flat download failure. A URL the version cannot be parsed from falls
+          # through to the plain verdict: this branch renames a failure, it never
+          # invents one. The canonical note is on the `front-door` job.
           DOWNLOAD_FAIL_RE='Download failed:|could NOT fetch its checksum sidecar'
           assert_no_download_failure() {
             grep -qE "$DOWNLOAD_FAIL_RE" "$log" 2>/dev/null || return 0
+            # `-A 1` because the two aborts print their URL differently: the
+            # tarball one puts it on the same line as "Download failed:", the
+            # sidecar one on the line below its own wording.
+            local failed_version
+            failed_version="$(grep -A 1 -E "$DOWNLOAD_FAIL_RE" "$log" 2>/dev/null \
+                              | sed -n 's#.*/releases/download/v\([^/[:space:]]*\)/.*#\1#p' | head -n 1)"
+            if [ -n "$failed_version" ] && [ -n "${FD_SERVED_VERSION:-}" ] \
+               && [ "$failed_version" != "$FD_SERVED_VERSION" ]; then
+              echo "::error::FRONT-DOOR VERSION DRIFT, not a plain download failure. Rung 1 read $FD_SERVED_VERSION from $FRONT_DOOR/install.sh and the asset preflight verified THAT release's tarball, but the install step re-fetched the same URL and resolved $failed_version. The two fetches landed on different releases, so the preflight's guarantee never covered what was actually downloaded. This is the post-publish Cloudflare POP race: dispatch this workflow with expect_version set to the release being verified, and rung 1 waits for this runner's POP to serve it before the preflight or the install run."
+              grep -nE "$DOWNLOAD_FAIL_RE" "$log" | head -n 5 | sed 's/^/      /'
+              dump
+              exit 1
+            fi
             echo "::error::the installer could not fetch the release asset, AFTER the preflight found it published. This is a DOWNLOAD failure, not a gateway health failure: the gateway was never going to start."
             grep -nE "$DOWNLOAD_FAIL_RE" "$log" | head -n 5 | sed 's/^/      /'
             dump

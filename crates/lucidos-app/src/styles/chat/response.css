@@ -946,13 +946,40 @@
     margin-top: 0.1875rem;
 }
 
+/* Two rules, and the split is the whole point. Same shape the toast's default
+   button uses: an UNGATED `:focus-visible` for ordinary keyboard focus, plus a
+   `hover: hover`-GATED plain `:focus` for the programmatic seed.
+
+   `:focus-visible` alone is not enough, because a live question card SEEDS
+   focus onto its first option the moment it arrives (see choiceCardNav.ts), and
+   the heuristic does not reliably fire for a programmatic focus with no
+   keystroke behind it: the ring would be missing exactly when the user most
+   needs to see what Enter is about to answer.
+
+   Plain `:focus` alone is not enough either, and this is the half a first pass
+   here got wrong. On touch the ring would LINGER: a tapped option on a
+   MULTI-select card only toggles a signal, so the card stays live and that
+   button stays mounted and focused indefinitely. (Single-select and the
+   permission cards resolve on the first tap, which unmounts or disables the
+   button, so only multi-select can strand it.) But gating the ONLY rule on
+   `hover: hover` strands the opposite user: an iPad with a keyboard and no
+   trackpad reports `hover: none`, so Tab would move focus with nothing on
+   screen to show for it. `.question-option` has no global `:focus-visible` rule
+   to fall back on the way `.action-btn` does, so it needs its own.
+
+   `choiceCardNav`'s seed gates on `hasHoverPointer()`, the JS mirror of the
+   media query, so the seed and the gated ring stay in lockstep. */
 .question-option:focus-visible {
-    /* Shared --focus-ring. */
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
 }
 
 @media (hover: hover) {
+    .question-option:focus {
+        outline: 0.125rem solid transparent;
+        box-shadow: var(--focus-ring);
+    }
+
     .question-option:hover {
         background: var(--picked-surface);
         border-color: color-mix(in srgb, var(--accent) 50%, var(--border-color));
@@ -976,12 +1003,6 @@
     font-size: var(--font-size-md);
     line-height: 1.45;
     word-break: break-word;
-}
-
-.question-hint {
-    color: var(--text-muted);
-    font-size: var(--font-size-md);
-    font-style: italic;
 }
 
 /* Highlighted: the picked option in Selected answers — accent tint, no border
@@ -1105,6 +1126,24 @@
     gap: 0.5rem;
     flex-wrap: wrap;
     justify-content: flex-end;
+}
+
+/* The gated half of what .question-option gets above: a LIVE permission card
+   seeds focus onto "Allow once" on arrival, so the ring has to show for a
+   programmatic focus that :focus-visible would skip. Scoped to the live card via
+   the choice-card marker so the rest of the app's .action-btn family keeps plain
+   :focus-visible (a persistent ring on every clicked Apply / Send would be
+   noise), and so a resolved card's disabled buttons stay ringless.
+
+   No sibling ungated `:focus-visible` rule is needed here, unlike
+   .question-option: these buttons ARE .action-btn, so the global
+   `.action-btn:focus-visible` in shared-components.css already rings ordinary
+   keyboard focus on a touch device with a keyboard attached. */
+@media (hover: hover) {
+    .permission-body[data-role="card-choices"] .action-btn:focus {
+        outline: 0.125rem solid transparent;
+        box-shadow: var(--focus-ring);
+    }
 }
 
 .permission-actions-secondary {

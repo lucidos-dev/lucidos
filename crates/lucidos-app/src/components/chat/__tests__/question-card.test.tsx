@@ -1,9 +1,17 @@
 import { describe, it, expect } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+import * as QuestionCardModule from '../QuestionCard';
 import {
   OptionIndicator,
   AnsweredBody,
   TerminatedQuestionBody,
 } from '../QuestionCard';
+import { PLACEHOLDER_ANSWERING } from '../prompt-input-helpers';
 import { vnodeToText } from './vnodeToText';
 
 describe('OptionIndicator', () => {
@@ -25,6 +33,29 @@ describe('OptionIndicator', () => {
     const multi = vnodeToText(OptionIndicator({ multiSelect: true, selected: true }));
     expect(single).toContain('question-option-indicator-selected');
     expect(multi).toContain('question-option-indicator-selected');
+  });
+});
+
+// The agent used to author an "Other, I'll type it" option because nothing on
+// a card with options said the two real escapes existed. Naming them is what
+// fixed that, but the card is the wrong surface for it: a guide line under the
+// options sat a few pixels above the textarea it pointed at, and said the same
+// thing that textarea's own placeholder says. The prompt owns the sentence now.
+describe('the card carries no hint of its own', () => {
+  const SOURCE = readFileSync(
+    resolve(dirname(fileURLToPath(import.meta.url)), '../QuestionCard.tsx'),
+    'utf8',
+  );
+
+  it('renders no hint element and exports no hint symbol', () => {
+    expect(SOURCE).not.toContain('class="question-hint"');
+    expect(Object.keys(QuestionCardModule).filter(k => /hint/i.test(k))).toEqual([]);
+  });
+
+  it('leaves both escapes to the prompt placeholder, in one sentence', () => {
+    expect(PLACEHOLDER_ANSWERING).toContain('Type your answer');
+    expect(PLACEHOLDER_ANSWERING).toContain('Cancel');
+    expect(PLACEHOLDER_ANSWERING.split('.').filter(s => s.trim()).length).toBe(1);
   });
 });
 

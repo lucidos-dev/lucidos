@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { showToast, enginePackaged, tailscaleServeRun } from '../../store/store';
 import {
@@ -16,6 +17,7 @@ import {
   type TailscaleInfo,
 } from '../../utils/tauri';
 import { getNetworkConfig } from '../../api/client';
+import type { NetworkConfigResponse } from '../../api/types';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { toFailed } from '../../store/types';
@@ -97,8 +99,20 @@ export function tailnetHttpUrl(
   port: number,
 ): string | null {
   if (!tailnetIp) return null;
+  return tailnetIsServed(gatewayBind, tailnetIp) ? `http://${tailnetIp}:${port}` : null;
+}
+
+/** Pure: does this bind actually put a listener on the tailnet address?
+ *
+ *  Extracted from {@link tailnetHttpUrl} so the prose that DESCRIBES tailnet
+ *  reachability cannot drift from the rule that decides whether to print a URL
+ *  for it. Being on a tailnet and being reachable on it are different facts,
+ *  and a row that conflates them advertises a dead address: under the packaged
+ *  loopback default nothing off this machine can connect, however healthy
+ *  Tailscale is. */
+export function tailnetIsServed(gatewayBind: string, tailnetIp: string): boolean {
   const bind = gatewayBind.trim();
-  return bind === 'all' || bind === tailnetIp ? `http://${tailnetIp}:${port}` : null;
+  return bind === 'all' || bind === tailnetIp;
 }
 
 /** Pure: the two plain-HTTP direct-access rows, derived TOGETHER so they cannot
@@ -154,50 +168,129 @@ export function tailscaleRowState(ts: TailscaleInfo): TailscaleRowState {
   return { kind: 'expose', canRun: ts.cli_available, magicDnsName: ts.magic_dns_name };
 }
 
-/** Pure: did the device READING this page reach it over the tailnet?
+/** What we can say about the machine running the engine, from the facts a
+ *  browser can reach.
  *
- *  A MagicDNS name resolves only on a device signed in to the tailnet that owns
- *  it, so being served at `<machine>.<tailnet>.ts.net` is proof that Tailscale
- *  is installed and connected right here. Same rule {@link tailscaleRowState}
- *  applies to the Mac: demonstrable tailnet membership always beats an install
- *  offer.
+ *  This is **concern 1** of the two this page answers, and it is a property of
+ *  the machine, never of the reader. `unknown` is a real state and not a
+ *  synonym for `no-tailnet`: claiming a machine is off the tailnet because a
+ *  fetch has not landed yet is a claim we cannot support. */
+export type HostTailnetState =
+  | { kind: 'on-tailnet'; ip: string }
+  | { kind: 'no-tailnet' }
+  | { kind: 'unknown' };
+
+/** Pure: derive the host's tailnet state from `GET /api/v1/network-config`.
  *
- *  Deliberately NOT extended to a bare `100.64/10` host. That range is real
- *  CGNAT space an ISP can hand to a physical interface, so an address alone
- *  proves nothing without the interface check the Mac-side read does; we cannot
- *  see the phone's interfaces from here. Matching the range in TypeScript would
- *  also fork a predicate that lives once, in `lucidos-tailscale`. An unproven
- *  host keeps the install offer, which is the harmless way to be wrong. */
-export function isTailnetHostname(hostname: string): boolean {
-  return hostname.toLowerCase().endsWith('.ts.net');
+ *  `detected_tailscale_ip` is the engine's own reading of its interface list
+ *  (`lucidos_tailscale::tailnet_ipv4`), which requires BOTH a Tailscale
+ *  interface and the `100.64/10` range. So it is an interface-checked fact
+ *  arriving over plain HTTP, which is what lets this section render in a
+ *  browser with no Tauri bridge at all. */
+export function hostTailnetState(
+  config: Loadable<{ detected_tailscale_ip: string | null }>,
+): HostTailnetState {
+  if (config.status !== 'loaded') return { kind: 'unknown' };
+  const ip = config.data.detected_tailscale_ip;
+  return ip ? { kind: 'on-tailnet', ip } : { kind: 'no-tailnet' };
 }
 
-/** How far THIS device has got, for the half of the page that needs no Mac.
+/** Pure: is this a MagicDNS name?
+ *
+ *  One of the three proofs behind {@link deviceSetupState}. A MagicDNS name
+ *  resolves only on a device signed in to the tailnet that owns it, so being
+ *  served at `<machine>.<tailnet>.ts.net` is proof that Tailscale is installed
+ *  and connected right here.
+ *
+ *  Deliberately does NOT match a bare `100.64/10` host. That range is real
+ *  CGNAT space an ISP can hand to a physical interface, so the range alone
+ *  proves nothing, and re-implementing the range test here would fork a
+ *  predicate that lives once, in `lucidos-tailscale`. The tailnet-address proof
+ *  is an equality check against what the engine reported, not a range match:
+ *  see {@link deviceSetupState}. */
+export function isTailnetHostname(hostname: string): boolean {
+  return hostname.trim().toLowerCase().endsWith('.ts.net');
+}
+
+/** Pure: was this page served by the very machine reading it?
+ *
+ *  Loopback is the one sound implication between the page's two concerns: a
+ *  request that never left the machine was answered by the engine host, so the
+ *  reader IS the host and concern 1 is the whole answer for it. Covers all of
+ *  `127.0.0.0/8` and the RFC 6761 `.localhost` tree, the latter because Tauri
+ *  serves its bundled assets from `tauri.localhost` off macOS. */
+export function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.trim().toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host === '::1') return true;
+  const v4 = /^(\d{1,3})\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.exec(host);
+  return v4 !== null && v4[1] === '127';
+}
+
+/** How far THIS device has got. **Concern 2** of the two, and a property of the
+ *  reader alone.
  *
  *  The address field is `hostname`, never `host`: it carries
  *  `location.hostname`, and a `location.host` would drag a `:port` in behind
  *  the `.ts.net` suffix and read as unproven. */
-export type PhoneSetupState =
-  /** No proof of a tailnet: offer the install, then the full steps. */
-  | { kind: 'install' }
-  /** On the tailnet, read in a browser tab: one step left. */
-  | { kind: 'add-to-home-screen'; hostname: string }
+export type DeviceSetupState =
+  /** The reader is the engine host, so there is no tailnet to join here. */
+  | { kind: 'same-machine' }
+  /** No proof of a tailnet: offer the Tailscale install, then the full steps. */
+  | { kind: 'join-tailnet' }
+  /** On the tailnet, but over plain HTTP, so the browser will not install
+   *  anything here however much we ask it to. The remaining step belongs to the
+   *  machine, not to this device: `tailscale serve`. */
+  | { kind: 'needs-https'; hostname: string }
+  /** On the tailnet, on a secure origin, read in a browser tab: one step left. */
+  | { kind: 'install-app'; hostname: string }
   /** On the tailnet, running as the installed PWA: nothing left. */
   | { kind: 'ready'; hostname: string };
 
-/** Pure: derive the phone-facing half from how this device got here. Takes the
- *  hostname and the standalone flag as arguments so it is testable without a
- *  `location` or a display-mode media query. */
-export function phoneSetupState(hostname: string, standalone: boolean): PhoneSetupState {
-  if (!isTailnetHostname(hostname)) return { kind: 'install' };
-  return standalone
-    ? { kind: 'ready', hostname }
-    : { kind: 'add-to-home-screen', hostname };
-}
-
-interface MobileAccessInfo {
-  connect: ConnectInfo;
-  gatewayBind: string;
+/** Pure: derive the reading device's state from how it got here.
+ *
+ *  Three proofs of tailnet membership, each sound on its own:
+ *
+ *  1. **Loopback**: the reader is the host (see {@link isLoopbackHostname}),
+ *     which short-circuits everything below. Whatever the host's tailnet state
+ *     is, it is reported by concern 1 and not by an install offer here.
+ *  2. **A MagicDNS name** ({@link isTailnetHostname}).
+ *  3. **The host's own tailnet address**, matched exactly. The engine read that
+ *     address off a Tailscale interface, and this request arrived at it, so
+ *     this device is on that tailnet. This is the proof the page was missing:
+ *     a gateway bound to its tailnet address serves every remote device at a
+ *     bare `100.x` host, and every one of them was being told to install
+ *     Tailscale.
+ *
+ *  Being on the tailnet is NOT the last question. `secureContext` decides which
+ *  step remains, because the installable app and push are gated on a secure
+ *  origin and a tailnet address over plain `http://` is not one. Telling such a
+ *  reader to install the app names a control their browser will never offer:
+ *  the actual remaining work is `tailscale serve` on the machine, which is
+ *  concern 1's business. (A `standalone` reader is on a secure origin by
+ *  construction, since a service worker cannot be registered otherwise, so that
+ *  branch is tested first and needs no flag of its own.)
+ *
+ *  Every input is passed in, so this is testable without a `location`, a
+ *  display-mode media query, `isSecureContext`, or a live engine. A `null` host
+ *  address costs proof 3 and nothing else, which is why a failed
+ *  `network-config` degrades this rather than breaking it. */
+export function deviceSetupState(device: {
+  hostname: string;
+  standalone: boolean;
+  secureContext: boolean;
+  hostTailnetIp: string | null;
+}): DeviceSetupState {
+  const hostname = device.hostname.trim();
+  if (isLoopbackHostname(hostname)) return { kind: 'same-machine' };
+  const onTailnet =
+    isTailnetHostname(hostname) ||
+    (device.hostTailnetIp !== null && hostname === device.hostTailnetIp.trim());
+  if (!onTailnet) return { kind: 'join-tailnet' };
+  if (device.standalone) return { kind: 'ready', hostname };
+  return device.secureContext
+    ? { kind: 'install-app', hostname }
+    : { kind: 'needs-https', hostname };
 }
 
 /** A connect URL with a copy-to-clipboard button. */
@@ -212,7 +305,7 @@ function UrlRow({ label, url, hint }: { label: string; url: string; hint?: strin
     <div class="list-row">
       <div class="list-row-info">
         <div class="title">{label}</div>
-        <div class="list-row-details">
+        <div class="list-row-details list-row-details-prose">
           <button class="mobile-access-url-button accent-link" onClick={copy}>{url}</button>
           {hint && <> &middot; {hint}</>}
         </div>
@@ -224,20 +317,39 @@ function UrlRow({ label, url, hint }: { label: string; url: string; hint?: strin
   );
 }
 
-/** How to get Tailscale, addressed to whichever device is reading.
+/** Is the device reading this a handset, i.e. one the "home screen" and "phone"
+ *  wording is actually true of?
  *
- *  Ungated on purpose: this half needs no Tauri IPC, and the person who most
- *  needs it is holding the phone. See the page docs. */
-function InstallTailscaleRow({ onPhone }: { onPhone: boolean }) {
+ *  A desktop browser installs a PWA from the address bar and has no home
+ *  screen, so calling it a phone is both wrong and the loudest thing on the
+ *  page. Matched on the same two flags {@link tailscaleDownloadUrl} routes on,
+ *  which is the only device question this file already knew how to answer. */
+function isHandset(): boolean {
+  return isIOS() || isAndroid();
+}
+
+/** How to get Tailscale on the device reading this.
+ *
+ *  Ungated on purpose: it needs no Tauri IPC, and the person who most needs it
+ *  is holding the device that lacks Tailscale. `onHost` distinguishes the two
+ *  callers, because the sentence differs: installing on the engine host is a
+ *  step towards serving Lucidos, installing on a client is a step towards
+ *  reaching it. */
+function InstallTailscaleRow({ onHost }: { onHost: boolean }) {
+  const handset = isHandset();
   return (
     <div class="list-rows">
       <div class="list-row">
         <div class="list-row-info">
-          <div class="title">{onPhone ? 'Install Tailscale on this device' : 'Install Tailscale'}</div>
-          <div class="list-row-details">
-            {onPhone
-              ? 'Then sign in to the same tailnet as your Mac. Tailscale is a VPN, so your phone will ask you to approve a VPN profile.'
-              : 'Tailscale is a system VPN, so macOS asks for your approval during install.'}
+          <div class="title">
+            {onHost ? 'Install Tailscale on this machine' : 'Install Tailscale on this device'}
+          </div>
+          <div class="list-row-details list-row-details-prose">
+            {onHost
+              ? 'Tailscale is a system VPN, so your OS asks for your approval during install. Sign in afterwards to put this machine on a tailnet.'
+              : handset
+                ? 'Then sign in to the same tailnet as the machine running Lucidos. Tailscale is a VPN, so your phone will ask you to approve a VPN profile.'
+                : 'Then sign in to the same tailnet as the machine running Lucidos. Tailscale is a system VPN, so your OS asks for your approval during install.'}
           </div>
         </div>
         <div class="list-row-actions">
@@ -248,57 +360,160 @@ function InstallTailscaleRow({ onPhone }: { onPhone: boolean }) {
   );
 }
 
-/** The Tailscale row for the device reading the page, when that device is not
- *  the Mac.
+/** One plain row of prose, which is most of what both concerns render.
  *
- *  The install offer is one of three answers, not the only one: a phone that
- *  reached this page over its tailnet has already done that step, and telling it
- *  to install Tailscale is both wrong and the loudest thing on the screen. */
-function PhoneTailscaleRow({ state }: { state: PhoneSetupState }) {
-  if (state.kind === 'install') return <InstallTailscaleRow onPhone={true} />;
+ *  The details slot is a sentence, so it takes `list-row-details-prose`: the
+ *  base class alone is a flex row of fields, which would make each inline
+ *  `<strong>`/`<code>` its own flex item and strand the punctuation after it. */
+function InfoRow({ title, children }: { title: string; children: ComponentChildren }) {
   return (
     <div class="list-rows">
       <div class="list-row">
         <div class="list-row-info">
-          <div class="title">Tailscale is connected on this device</div>
-          <div class="list-row-details">
-            You are reading this over your tailnet, at <strong>{state.hostname}</strong>, so this
-            device is already signed in to the same tailnet as your Mac. Nothing to install.
-          </div>
+          <div class="title">{title}</div>
+          <div class="list-row-details list-row-details-prose">{children}</div>
         </div>
       </div>
     </div>
   );
 }
 
+/** **Concern 1** as a browser can see it: is the machine running the engine on
+ *  a tailnet?
+ *
+ *  Reporting only. Every action that could change this answer (`tailscale up`,
+ *  `tailscale serve`) is a native command with no HTTP equivalent, so the
+ *  packaged app renders the action row instead of this one. The single
+ *  exception is the install offer, which is a link rather than an IPC call, and
+ *  is therefore worth showing to a reader who IS the host and can act on it.
+ *  Offering it to a remote reader would be a button aimed at the wrong machine.
+ *
+ *  Says only what `detected_tailscale_ip` supports. Serve state and the MagicDNS
+ *  name are not visible from here, so this row claims neither. `reachable` is a
+ *  SEPARATE fact from `on-tailnet` and must stay one: holding a tailnet address
+ *  says nothing about whether anything is listening on it. */
+function HostTailnetRow({
+  state,
+  readerIsHost,
+  reachable,
+}: {
+  state: HostTailnetState;
+  readerIsHost: boolean;
+  reachable: boolean;
+}) {
+  if (state.kind === 'unknown') {
+    return <InfoRow title="Checking this machine">Reading its Tailscale state.</InfoRow>;
+  }
+  if (state.kind === 'on-tailnet') {
+    return (
+      <InfoRow title="This machine is on a tailnet">
+        The machine running Lucidos holds the tailnet address <strong>{state.ip}</strong>.{' '}
+        {reachable
+          ? 'It is listening on that address, so any device signed in to the same tailnet can reach it there over plain HTTP.'
+          : 'It is NOT listening on that address though, so nothing off this machine can connect to it there yet: allow it in Network access, which takes effect after a restart.'}{' '}
+        Adding HTTPS with <code>tailscale serve</code> is what enables the installable app and
+        push. That needs the Tailscale command-line tool, and it works whatever the address above
+        says, since it proxies from this machine to <code>127.0.0.1</code>.
+      </InfoRow>
+    );
+  }
+  if (readerIsHost) return <InstallTailscaleRow onHost={true} />;
+  return (
+    <InfoRow title="This machine is not on a tailnet">
+      The machine running Lucidos has no tailnet address, so no device can reach it over Tailscale.
+      Install Tailscale there and sign it in to your tailnet.
+    </InfoRow>
+  );
+}
+
+/** **Concern 2**: has the device reading this joined the tailnet?
+ *
+ *  The install offer is one of four answers, not the only one. A device that
+ *  reached this page over its tailnet has already done that step, and a device
+ *  reading over loopback IS the engine host, for which the question does not
+ *  arise at all. */
+function DeviceTailscaleRow({ state }: { state: DeviceSetupState }) {
+  if (state.kind === 'join-tailnet') return <InstallTailscaleRow onHost={false} />;
+  if (state.kind === 'same-machine') {
+    return (
+      <InfoRow title="You are reading this on the machine that runs Lucidos">
+        There is no tailnet to join here: this is the machine itself. What matters is the section
+        above. Once this machine is on a tailnet, open its address on another device to carry on
+        there.
+      </InfoRow>
+    );
+  }
+  return (
+    <InfoRow title="Tailscale is connected on this device">
+      You are reading this over your tailnet, at <strong>{state.hostname}</strong>, so this device
+      is already signed in to the same tailnet as the machine running Lucidos. Nothing to install.
+    </InfoRow>
+  );
+}
+
 /** The remaining setup steps for the device reading the page. Each state drops
  *  the steps it can see are already done. */
-function PhoneStepsSection({ state }: { state: PhoneSetupState }) {
-  const title = state.kind === 'ready' ? 'This phone is set up' : 'Getting Lucidos onto this phone';
+function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
+  const handset = isHandset();
+  // Naming the destination beats naming a device class we would then get wrong:
+  // a desktop browser installs a PWA from the address bar and has no home
+  // screen, and this page is read from both.
+  const install = handset
+    ? 'Add it to your home screen to install Lucidos and turn on push notifications.'
+    : 'Install Lucidos from your browser (the install control in the address bar) to turn on push notifications.';
+  if (state.kind === 'same-machine') {
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="mobile-access:steps">
+          Getting Lucidos onto another device
+        </div>
+        <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
+          <li>Put this machine on a tailnet, and set up HTTPS for it with <code>tailscale serve</code>.</li>
+          <li>
+            Install Tailscale on the other device and sign in to the <strong>same tailnet</strong>.
+          </li>
+          <li>Open this machine's Tailscale address there, and install Lucidos from that page.</li>
+        </ol>
+      </div>
+    );
+  }
+  const title = state.kind === 'ready' ? 'This device is set up' : 'Getting Lucidos onto this device';
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="mobile-access:phone">{title}</div>
-      {state.kind === 'install' && (
+      <div class="settings-section-title" data-search-anchor="mobile-access:steps">{title}</div>
+      {state.kind === 'needs-https' && (
+        <p class="settings-section-desc">
+          Tailscale is connected and you are on the right address, but this one is plain{' '}
+          <code>http://</code>. Browsers gate the installable app and push notifications on a
+          secure origin, so neither is available here and no amount of asking will offer them.
+          The remaining step is on the machine, not on this device: set up HTTPS for it with{' '}
+          <code>tailscale serve</code>, then open the <code>https://</code> address it gives you.
+          Reading and chatting work fine at this address meanwhile.
+        </p>
+      )}
+      {state.kind === 'join-tailnet' && (
         <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
-          <li>Install Tailscale here and sign in to the <strong>same tailnet</strong> as your Mac.</li>
           <li>
-            On your Mac, open <strong>Settings → Mobile Access</strong> and copy the{' '}
+            Install Tailscale here and sign in to the <strong>same tailnet</strong> as the machine
+            running Lucidos.
+          </li>
+          <li>
+            On that machine, open <strong>Settings → Mobile Access</strong> and copy the{' '}
             <strong>Tailscale</strong> address it shows. Send it to yourself and open it here.
           </li>
-          <li>Add that page to your home screen to install Lucidos and turn on push.</li>
+          <li>{install}</li>
         </ol>
       )}
-      {state.kind === 'add-to-home-screen' && (
+      {state.kind === 'install-app' && (
         <p class="settings-section-desc">
-          Tailscale is connected and you are already on the right address, so one step is left:
-          add this page to your home screen. That installs Lucidos and turns on push
-          notifications.
+          Tailscale is connected and you are already on the right address, so one step is left.{' '}
+          {install}
         </p>
       )}
       {state.kind === 'ready' && (
         <p class="settings-section-desc">
-          Lucidos is installed here and reaches your Mac over Tailscale, so it works off your home
-          network. Nothing left to do.
+          Lucidos is installed here and reaches the machine it runs on over Tailscale, so it works
+          off your home network. Nothing left to do.
         </p>
       )}
     </div>
@@ -308,32 +523,40 @@ function PhoneStepsSection({ state }: { state: PhoneSetupState }) {
 /**
  * Mobile Access settings.
  *
- * Two halves, split by whether they need the Mac:
+ * **Two concerns, and they must not be muddled.** The page answers both, always,
+ * in this order:
  *
- * - **Machine-side** (Connect URLs, Sign in, Expose) needs the packaged desktop
- *   app: those are Tauri commands with no engine HTTP equivalent.
- * - **The phone-facing half** (what Tailscale buys you, the Tailscale row for
- *   this device, the remaining steps) needs nothing, and is shown everywhere.
- *   This page exists to get the user onto their phone, so gating it behind the
- *   desktop app made it unreachable from the one device it is written for. It
- *   reads its own state off the host this device reached the page on, so a
- *   phone already on the tailnet is never told to install Tailscale.
+ * 1. **Is the machine running the engine on a tailnet?** A property of the
+ *    machine. Read over plain HTTP from `GET /api/v1/network-config`
+ *    (`detected_tailscale_ip`), so it renders in any browser; upgraded on the
+ *    packaged desktop app to the full `get_connect_info` picture, which is the
+ *    only place the Sign in / Expose actions can exist.
+ * 2. **Has the device reading this joined that tailnet?** A property of the
+ *    reader, derived from the address it was served on. See
+ *    {@link deviceSetupState} for the three proofs.
+ *
+ * The page used to pick ONE of these by platform (`isTauri() &&
+ * enginePackaged`), which is the bug this structure replaces: a browser saw
+ * concern 2 alone, so a machine whose gateway is bound to its own tailnet
+ * address told every reader to install Tailscale, under a heading calling their
+ * laptop a phone, while the section that would have shown them the address to
+ * use was the one being suppressed.
+ *
+ * What varies by platform is how much each section can SAY, never whether it
+ * appears. Actions stay gated on the native bridge, because `tailscale up` and
+ * `tailscale serve` have no HTTP equivalent; reporting is not gated, because it
+ * never needed to be.
  *
  * We use `tailscale serve` (tailnet-private HTTPS), never `funnel` (public):
  * the engine has no inbound API auth.
  */
 export function MobileAccessPage() {
-  // The machine-side half needs the packaged always-on service; a dev Tauri
-  // build has no gateway on the stable port, so its connect URLs would be a
-  // guess.
+  // The Connect URLs and the Tailscale ACTIONS need the packaged always-on
+  // service; a dev Tauri build has no gateway on the stable port, so its
+  // connect URLs would be a guess. Reporting is not gated on this.
   const showMachineHalf = isTauri() && enginePackaged.value;
-  // Non-null exactly when the phone-facing half is the one rendering: the Mac
-  // has real detection behind `get_connect_info`, this device has the address
-  // it is being served on.
-  const phone: PhoneSetupState | null = showMachineHalf
-    ? null
-    : phoneSetupState(window.location.hostname, isStandalone());
-  const [info, setInfo] = useState<Loadable<MobileAccessInfo>>({ status: 'not-loaded' });
+  const [connectInfo, setConnectInfo] = useState<Loadable<ConnectInfo>>({ status: 'not-loaded' });
+  const [netConfig, setNetConfig] = useState<Loadable<NetworkConfigResponse>>({ status: 'not-loaded' });
   const [busy, setBusy] = useState<null | 'up'>(null);
   // The Expose run's state lives in the store, not here: a run can spend minutes
   // waiting for a tailnet approval, it narrates itself on the brand badge and the
@@ -341,24 +564,53 @@ export function MobileAccessPage() {
   // the moment the user navigated away and came back to a still-running setup.
   const serveRunning = tailscaleServeRun.value !== null;
   const [authKey, setAuthKey] = useState('');
-  const showLoading = useDelayedLoading(info);
+  const showLoading = useDelayedLoading(connectInfo);
+
+  // Concern 1, from whichever source this platform has. Concern 2 reads the
+  // host's address as ONE of its three proofs and is otherwise independent of
+  // it, so a `network-config` that never landed costs that one proof and leaves
+  // the rest of the derivation intact.
+  const host: HostTailnetState = showMachineHalf && connectInfo.status === 'loaded'
+    ? (connectInfo.data.tailscale.tailnet_ip
+        ? { kind: 'on-tailnet', ip: connectInfo.data.tailscale.tailnet_ip }
+        : { kind: 'no-tailnet' })
+    : hostTailnetState(netConfig);
+  const device: DeviceSetupState = deviceSetupState({
+    hostname: window.location.hostname,
+    standalone: isStandalone(),
+    secureContext: window.isSecureContext,
+    hostTailnetIp: host.kind === 'on-tailnet' ? host.ip : null,
+  });
+  // Reachability is NOT implied by tailnet membership: under a loopback bind
+  // nothing off this machine can connect, however healthy Tailscale is. Two
+  // ways to know it is served, and the first outranks the second, because a
+  // bind change only takes effect on restart and the config can therefore
+  // disagree with the live socket: this very page arrived at that address, or
+  // the configured bind covers it (the same rule `tailnetHttpUrl` applies
+  // before printing a URL).
+  const tailnetReachable =
+    host.kind === 'on-tailnet' &&
+    (window.location.hostname === host.ip ||
+      (netConfig.status === 'loaded' && tailnetIsServed(netConfig.data.gateway_bind, host.ip)));
 
   const reload = useCallback(() => {
-    // Not a swallowed error: off the desktop app there is nothing to fetch, so
-    // there is no failure to report. Setting a failed state here would blank the
-    // phone-facing half, which is exactly the half a phone came for.
+    // Fetched on EVERY platform: this is the only reading of concern 1 a
+    // browser has, and it is also what proves a remote device is on the tailnet
+    // when it reached us at a bare `100.x` address.
+    setNetConfig({ status: 'loading' });
+    getNetworkConfig().then(
+      (data) => setNetConfig({ status: 'loaded', data }),
+      (e) => setNetConfig(toFailed(e)),
+    );
+    // Not a swallowed error: off the desktop app there is nothing to fetch
+    // here, so there is no failure to report. Setting a failed state would
+    // render the error card for a bridge this platform was never going to have.
     if (!showMachineHalf) return;
-    setInfo({ status: 'loading' });
-    // The gateway bind decides whether the LAN URL is reachable at all
-    // (packaged defaults to loopback-only), so the row cannot render honestly
-    // without it — load both together and fail the pane loud on either.
-    const connectPromise = getConnectInfo();
-    const networkPromise = getNetworkConfig();
-    Promise.all([connectPromise, networkPromise])
-      .then(([connect, network]) =>
-        setInfo({ status: 'loaded', data: { connect, gatewayBind: network.gateway_bind } }),
-      )
-      .catch(e => setInfo(toFailed(e)));
+    setConnectInfo({ status: 'loading' });
+    getConnectInfo().then(
+      (data) => setConnectInfo({ status: 'loaded', data }),
+      (e) => setConnectInfo(toFailed(e)),
+    );
   }, [showMachineHalf]);
 
   useEffect(() => { reload(); }, [reload]);
@@ -416,17 +668,26 @@ export function MobileAccessPage() {
     }
   }, [reload]);
 
-  /** The Connect URLs section, plus its loading / failed states. Machine-side. */
+  /** The Connect URLs section, plus its loading / failed states. Machine-side.
+   *
+   *  Needs BOTH loads: the gateway bind decides whether a LAN or tailnet URL is
+   *  reachable at all (packaged defaults to loopback-only), so the rows cannot
+   *  render honestly without it. Hence one failure branch covering either, which
+   *  is what the single combined fetch used to buy. */
   function connectUrlsSection() {
-    if (info.status === 'failed') {
+    const failure =
+      connectInfo.status === 'failed' ? connectInfo.error
+      : netConfig.status === 'failed' ? netConfig.error
+      : null;
+    if (failure !== null) {
       return (
         <div class="settings-section">
           <div class="settings-section-title">Connect URLs</div>
-          <LoadableError noun="connect info" error={info.error} />
+          <LoadableError noun="connect info" error={failure} />
         </div>
       );
     }
-    if (info.status !== 'loaded') {
+    if (connectInfo.status !== 'loaded' || netConfig.status !== 'loaded') {
       if (!showLoading) return null;
       return (
         <div class="settings-section">
@@ -435,9 +696,9 @@ export function MobileAccessPage() {
         </div>
       );
     }
-    const { connect, gatewayBind } = info.data;
+    const connect = connectInfo.data;
     const { lan, tailnetUrl } = directAccessRows(
-      gatewayBind,
+      netConfig.data.gateway_bind,
       connect.lan_ip,
       connect.tailscale.tailnet_ip,
       connect.port,
@@ -462,7 +723,7 @@ export function MobileAccessPage() {
             <div class="list-row">
               <div class="list-row-info">
                 <div class="title">Local network</div>
-                <div class="list-row-details">
+                <div class="list-row-details list-row-details-prose">
                   Off — the gateway only listens on this Mac. Allow LAN access in Network access
                   (applies after a restart).
                 </div>
@@ -478,7 +739,7 @@ export function MobileAccessPage() {
             <div class="list-row">
               <div class="list-row-info">
                 <div class="title">Local network</div>
-                <div class="list-row-details">No LAN address detected</div>
+                <div class="list-row-details list-row-details-prose">No LAN address detected</div>
               </div>
             </div>
           )}
@@ -501,12 +762,44 @@ export function MobileAccessPage() {
     );
   }
 
-  /** The Tailscale action row for this Mac. Machine-side; null until loaded. */
-  function tailscaleActionRow() {
-    if (info.status !== 'loaded') return null;
-    const row = tailscaleRowState(info.data.connect.tailscale);
+  /** Concern 1's body, whichever source this platform reads it from.
+   *
+   *  A FAILED load is reported, never rendered as a permanent "Checking this
+   *  machine": `hostTailnetState` folds failed into `unknown` because there is
+   *  no honest tailnet answer to give, but "we could not ask" and "we have not
+   *  asked yet" read identically on screen, and the first is a swallowed error
+   *  (`.claude/rules/frontend.md` § No Hidden Errors). Same shape both sides,
+   *  since both sides can fail. */
+  function hostSection() {
+    if (showMachineHalf) return tailscaleActionRow();
+    if (netConfig.status === 'failed') {
+      return <LoadableError noun="this machine's Tailscale state" error={netConfig.error} />;
+    }
+    return (
+      <HostTailnetRow
+        state={host}
+        readerIsHost={device.kind === 'same-machine'}
+        reachable={tailnetReachable}
+      />
+    );
+  }
 
-    if (row.kind === 'get') return <InstallTailscaleRow onPhone={false} />;
+  /** Concern 1 with its actions, for the packaged desktop app. Falls back to
+   *  {@link HostTailnetRow} until the bridge answers, so the section is never
+   *  empty while `get_connect_info` runs its few seconds of probes. */
+  function tailscaleActionRow() {
+    if (connectInfo.status === 'failed') {
+      return <LoadableError noun="this machine's Tailscale state" error={connectInfo.error} />;
+    }
+    if (connectInfo.status !== 'loaded') {
+      // `unknown` renders neither claim, so `reachable` cannot be read here.
+      return <HostTailnetRow state={{ kind: 'unknown' }} readerIsHost={true} reachable={false} />;
+    }
+    const row = tailscaleRowState(connectInfo.data.tailscale);
+
+    // Reader and host are the same machine here by construction: this branch is
+    // the packaged desktop app, so the install offer is one it can act on.
+    if (row.kind === 'get') return <InstallTailscaleRow onHost={true} />;
 
     if (row.kind === 'sign-in') {
       return (
@@ -514,7 +807,7 @@ export function MobileAccessPage() {
           <div class="list-row repo-add-form">
             <div class="list-row-info" style={{ gap: '0.5rem' }}>
               <div class="title">Sign in to Tailscale</div>
-              <div class="list-row-details">
+              <div class="list-row-details list-row-details-prose">
                 {row.canRun
                   ? 'Opens a browser to join your tailnet. Optionally paste a pre-authorized auth key.'
                   : 'Open the Tailscale app in your menu bar and sign in there. This Mac has no Tailscale command-line tool, which is what we would need to do it for you.'}
@@ -549,7 +842,7 @@ export function MobileAccessPage() {
             <div class="title">
               {serving ? 'Serving the engine over Tailscale' : 'Expose the engine over Tailscale'}
             </div>
-            <div class="list-row-details">
+            <div class="list-row-details list-row-details-prose">
               {serving
                 ? <>Reachable at <strong>{row.url}</strong> with an auto-renewed cert.</>
                 : row.canRun
@@ -569,6 +862,10 @@ export function MobileAccessPage() {
     );
   }
 
+  // Two sections, both always rendered, in the order the setup happens: the
+  // machine has to be on a tailnet before joining one buys a device anything.
+  // Which of the two the reader can act on is a separate question from which of
+  // them is TRUE, and conflating those is what this page used to do.
   return (
     <>
       {showMachineHalf && connectUrlsSection()}
@@ -576,26 +873,30 @@ export function MobileAccessPage() {
       <div class="settings-section">
         <div class="settings-section-title" data-search-anchor="mobile-access:tailscale">Tailscale (recommended)</div>
         <p class="settings-section-desc">
-          Tailscale gives your phone a private, encrypted HTTPS link to your Mac that works off
-          your home network, which is what enables the installable PWA and push notifications. It
-          stays tailnet-private (we use <code>serve</code>, not <code>funnel</code>), so the engine
-          is never exposed to the public internet.
+          Tailscale gives your other devices a private, encrypted HTTPS link to the machine
+          running Lucidos that works off your home network, which is what enables the installable
+          PWA and push notifications. It stays tailnet-private (we use <code>serve</code>, not{' '}
+          <code>funnel</code>), so the engine is never exposed to the public internet. Two things
+          have to be true, and they are independent: the machine is on a tailnet, and the device
+          you want to use has joined it.
         </p>
-        {phone ? <PhoneTailscaleRow state={phone} /> : tailscaleActionRow()}
       </div>
 
-      {phone ? <PhoneStepsSection state={phone} /> : (
-        <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="mobile-access:phone">
-            On your phone
-          </div>
-          <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
-            <li>Install the Tailscale app and sign in to the <strong>same tailnet</strong> as this Mac.</li>
-            <li>Open the <strong>Tailscale</strong> URL above (copy it / send it to yourself).</li>
-            <li>Add it to your home screen to install the Lucidos PWA and enable push.</li>
-          </ol>
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="mobile-access:machine">
+          1. The machine running Lucidos
         </div>
-      )}
+        {hostSection()}
+      </div>
+
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="mobile-access:device">
+          2. This device
+        </div>
+        <DeviceTailscaleRow state={device} />
+      </div>
+
+      <DeviceStepsSection state={device} />
     </>
   );
 }

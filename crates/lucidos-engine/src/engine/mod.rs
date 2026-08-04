@@ -15,6 +15,7 @@ pub(crate) mod command_guard;
 pub(crate) mod command_judge;
 pub mod command_permission;
 mod context;
+pub mod db_health;
 pub mod engine_version;
 pub mod event_bus;
 mod frontend_refresh;
@@ -285,6 +286,13 @@ pub struct LucidosEngine {
     /// Acquired via `scheduler::BackupGuard::try_acquire`. POST /api/v1/backup
     /// returns 409 when the guard is held; the scheduled cron skips its tick.
     pub backup_in_progress: AtomicBool,
+    /// Is the workspace database answering? Written ONLY by the background probe
+    /// (`db_health::spawn_db_health_probe`) and read per request by
+    /// `GET /api/v1/health`, so a database outage adds no latency to the endpoint
+    /// the gateway health-checks. Starts `true`: the engine only reaches `serve`
+    /// after connecting and migrating, so anything else would be a claim without
+    /// evidence. See `engine::db_health` and ADR 0037.
+    database_reachable: AtomicBool,
     /// Dev-only background-rebuild state driving the "new version available"
     /// surface. Set by the Apply-triggered rebuild (Phase 2); read by
     /// `GET /api/v1/engine/version-status`. Idle in packaged (no source rebuild).
@@ -579,9 +587,11 @@ pub struct LucidosEngine {
     /// direct apply lands in sequence order, and the subscriber's ordered
     /// replay can then only agree with it.
     pub(crate) trigger_write_lock: Arc<tokio::sync::Mutex<()>>,
-    /// Live tasks for the `run_bash_background` chat tool. Holds only
-    /// currently-running tasks; finished tasks are persisted to the
-    /// events stream as `BackgroundBashCompleted` and evicted. See
+    /// Tasks for the `run_bash_background` chat tool: the running ones, plus
+    /// completions retained briefly so a `bash_output` drain arriving at the
+    /// completion instant still gets the final tail. Every finish is persisted
+    /// to the events stream as `BackgroundBashCompleted`, which is what serves
+    /// a drain after the retention window closes. See
     /// `tools/bash_background.rs`.
     pub(crate) bash_background: tools::bash_background::BackgroundBashRegistry,
     /// The *Thread Queue* — system-wide admission control for background

@@ -206,10 +206,21 @@ pub(super) async fn health(State(state): State<AppState>) -> Json<serde_json::Va
     let latest_engine_version = read_engine_version();
     let latest_tauri_app_version = read_app_version();
     Json(serde_json::json!({
+        // Deliberately still "ok" (and a 200) when `database_reachable` is false:
+        // this half is about the engine PROCESS, which is answering. Failing the
+        // endpoint would recruit the gateway's respawn machinery against a
+        // condition respawning cannot fix, and ADR 0014 forbids culling an alive
+        // engine. See `engine::db_health` and ADR 0037.
         "status": "ok",
         "workspace": workspace_name,
         "workspace_path": state.workspace_path.to_string_lossy(),
         "started_at": state.started_at.to_rfc3339(),
+        // Is the workspace database answering? An engine outlives its database
+        // (quitting Docker Desktop is the everyday dev case), and a client that
+        // could not tell held a black boot splash and then reported the outage
+        // once per failed load. Read from an atomic the background probe writes,
+        // so this never puts database latency on the health endpoint.
+        "database_reachable": state.engine.database_reachable(),
         "release": crate::LUCIDOS_RELEASE,
         "release_dirty": crate::LUCIDOS_RELEASE_DIRTY,
         "engine_version": engine_version,

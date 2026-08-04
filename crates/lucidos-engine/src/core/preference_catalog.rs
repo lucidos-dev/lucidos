@@ -341,6 +341,15 @@ pub const CATALOG: &[PrefSpec] = &[
         description: "How many of the most recent backups to keep in the provider; older ones are pruned after each successful backup.",
         side_effect: PrefSideEffect::None,
     },
+    PrefSpec {
+        key: "backup_reminder_dismissed",
+        label: "Backup reminder dismissed",
+        scope: PrefScope::Global,
+        value: PrefValue::Text,
+        default: "(unset: the reminder shows)",
+        description: "Dismissal state of the app-shell banner shown while backup is off (no active backup_schedule with a backup_provider). Three values: unset or empty means never dismissed, so the banner shows; an RFC 3339 instant means dismissed then, hidden for 30 days from that instant; 'forever' means dismissed a second time, hidden permanently. Set it to empty to bring the reminder back. The banner is only ever shown while backup is off, so enabling a schedule hides it whatever this says.",
+        side_effect: PrefSideEffect::None,
+    },
 ];
 
 /// Known preference keys the agent must NOT write, each with a hint pointing at

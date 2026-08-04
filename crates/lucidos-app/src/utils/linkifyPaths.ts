@@ -66,14 +66,31 @@ const HREF_ATTR = /\shref\s*=\s*(?:"([^"]*)"|'([^']*)')/i;
 const CLASS_ATTR = /\sclass\s*=\s*(?:"[^"]*"|'[^']*')/i;
 const DATA_PATH_ATTR = /\sdata-path\s*=\s*(?:"[^"]*"|'[^']*')/i;
 
-/** If the opening anchor tag points at a known artifact path (with or without
- *  a `data/` / `/data/` prefix), return a replacement opening tag that uses
- *  `class="artifact-link" data-path="…"` so the chat click handler routes the
- *  click through `openFilePreview` (content panel) instead of letting the
- *  browser navigate to the `/data/*` static mount as a top-level URL. Returns
- *  null when the href doesn't resolve to a known artifact — caller leaves the
- *  segment untouched. Visible text inside the anchor is preserved verbatim;
- *  other attributes (`title`, `target`, `rel`, …) are kept.
+/** If the opening anchor tag points at a workspace data file, return a
+ *  replacement opening tag that uses `class="artifact-link" data-path="…"` so
+ *  the chat click handler routes the click through `openFilePreview` (content
+ *  panel) instead of letting the browser navigate to the `/data/*` static mount
+ *  as a top-level URL. Returns null when the href isn't a data file at all, and
+ *  the caller leaves the segment untouched. Visible text inside the anchor is
+ *  preserved verbatim; other attributes (`title`, `target`, `rel`, …) are kept.
+ *
+ *  Two ways to resolve, in this order:
+ *
+ *  1. **The known-paths lookup**, which also CANONICALIZES: it maps the bare
+ *     form (`foo.md`) back to the full store path (`artifacts/foo.md`), which
+ *     shape alone can't do. So it has to run first.
+ *  2. **The shape** (`extractDataPathTarget`), for a path the cached artifact
+ *     list doesn't know. That list is a projection refreshed by SSE, and a file
+ *     the agent wrote seconds ago is routinely missing from it, so gating a
+ *     DELIBERATE markdown link on it means concluding "not a file" from a stale
+ *     cache. That is the failure `.claude/rules/frontend.md` names, and the one
+ *     that reloaded the whole workspace on a fresh `lucidos data write`
+ *     artifact. A path that really doesn't exist now dead-ends in the file
+ *     preview's own 404, which is recoverable; a top-level navigation is not.
+ *
+ *  Shape-based resolution is deliberately limited to anchors. The text-segment
+ *  linkifier below stays list-gated: it scans PROSE, where matching a path
+ *  shape would linkify every incidental mention.
  *
  *  We force `href="#"` on the rewritten anchor instead of dropping href
  *  entirely. iOS Safari (and iOS PWA in standalone mode) treats `<a>` without
@@ -81,7 +98,10 @@ const DATA_PATH_ATTR = /\sdata-path\s*=\s*(?:"[^"]*"|'[^']*')/i;
  *  `click` events, even with `cursor: pointer`, so the delegated chat click
  *  handler never fires and the user sees a dead link. `preventDefault` in
  *  the delegated handler suppresses the `#` scroll-to-top. */
-function rewriteArtifactAnchor(tag: string, pathLookup: Map<string, string>): string | null {
+function rewriteArtifactAnchor(
+  tag: string,
+  pathLookup: Map<string, string> | undefined,
+): string | null {
   const m = tag.match(HREF_ATTR);
   if (!m) return null;
   const href = m[1] ?? m[2];
@@ -89,7 +109,7 @@ function rewriteArtifactAnchor(tag: string, pathLookup: Map<string, string>): st
   let candidate = href;
   if (candidate.startsWith('/data/')) candidate = candidate.slice('/data/'.length);
   else if (candidate.startsWith('data/')) candidate = candidate.slice('data/'.length);
-  const fullPath = pathLookup.get(candidate);
+  const fullPath = pathLookup?.get(candidate) ?? extractDataPathTarget(href);
   if (!fullPath) return null;
   const escapedPath = fullPath.replace(/"/g, '&quot;');
   const stripped = tag
@@ -154,6 +174,73 @@ export function extractNavTargetFromHref(href: string): string | null {
   return NAV_TARGETS.has(candidate) ? candidate : null;
 }
 
+/** Does this href carry a URL scheme (`https:`, `mailto:`, `tel:`, `app:`,
+ *  `file:`, `data:`, …)? The single source of truth for that question across
+ *  every link router: the chat click handler's terminal guard, the preview
+ *  iframe bridge, and the href extractors here all key off it, so a scheme is
+ *  never claimed as a relative path in one place and left to the browser in
+ *  another. Deliberately matches ANY scheme rather than a known set: the point
+ *  is "not a relative path", and each caller decides what to do with the ones
+ *  it owns. */
+export function hasUrlScheme(href: string): boolean {
+  return /^[a-z][a-z0-9+.-]*:/i.test(href);
+}
+
+/** The `data/` sub-trees a workspace file can live in. Single source of truth
+ *  for both the href recognizer below and `normalizeDataPath` in
+ *  `store/actions/artifacts.ts`, which prefixes anything unprefixed with
+ *  `artifacts/`. `system-knowhow/` is engine-shipped and read-only, but it is
+ *  served by the same `/data/*` mount and previews the same way, so a link to
+ *  it must route in-app like any other. */
+export const DATA_PATH_PREFIXES: readonly string[] = [
+  'artifacts/',
+  'knowhow/',
+  'apps/',
+  'triggers/',
+  'system-knowhow/',
+];
+
+/** Recognize an href that points at a file under the workspace's `data/` tree,
+ *  by SHAPE rather than by membership of the cached artifact list. Returns the
+ *  normalized store path (`artifacts/report.html`), or null.
+ *
+ *  Accepted (with an optional `data/` / `/data/` prefix or a bare leading `/`,
+ *  and with any query string / fragment stripped):
+ *    - `artifacts/pr-review/pr-1582/index.html`, `data/knowhow/x/notes.md`
+ *    - `/artifacts/report.pdf`, `apps/todo/styles.css`
+ *
+ *  Rejected:
+ *    - any URL scheme (`https:`, `app:`, `file:`, `mailto:`): real links, or
+ *      another extractor's job
+ *    - a bare sub-tree name with nothing under it (`artifacts`, `artifacts/`,
+ *      `apps`), which is a directory rather than a file. `apps` / `triggers`
+ *      are also nav panel names, and the nav extractor runs first; this guard
+ *      means the two can't fight even if that order ever changes.
+ *    - anything outside the known sub-trees (`notifications`, `README`)
+ *
+ *  Why it exists: `lucidos data write` prints exactly this link shape for the
+ *  agent to paste, and the artifact rewriter used to resolve it against the
+ *  cached path list only. A file written moments ago is not in that cache, so
+ *  the anchor stayed a plain relative href, the browser navigated to
+ *  `/<slug>/artifacts/…`, and the SPA fallback served the app shell: the whole
+ *  workspace reloaded. Both the render-time rewriter and the click handler use
+ *  this so neither depends on cache warmth. */
+export function extractDataPathTarget(href: string): string | null {
+  // Any URL scheme disqualifies a data path, same test as extractBareAppRef.
+  if (hasUrlScheme(href)) return null;
+  let candidate = href;
+  if (candidate.startsWith('/data/')) candidate = candidate.slice('/data/'.length);
+  else if (candidate.startsWith('data/')) candidate = candidate.slice('data/'.length);
+  else if (candidate.startsWith('/')) candidate = candidate.slice(1);
+  const queryStart = candidate.search(/[?#]/);
+  if (queryStart !== -1) candidate = candidate.slice(0, queryStart);
+  const prefix = DATA_PATH_PREFIXES.find((p) => candidate.startsWith(p));
+  if (!prefix) return null;
+  // Nothing under the sub-tree, or a trailing slash: a directory, not a file.
+  if (candidate.length === prefix.length || candidate.endsWith('/')) return null;
+  return candidate;
+}
+
 /** Recognize an href that points at a REAL local filesystem location the OS
  *  should open directly — a `file://` URL or an absolute POSIX path
  *  (`/Users/…/foo.dmg`, `/Applications/…`). The release flow hands the user a
@@ -166,27 +253,40 @@ export function extractNavTargetFromHref(href: string): string | null {
  *  workspace route or an external web URL:
  *    - `file://…`                 → that URL (always a local file/dir)
  *    - `/Users/…`, `/Applications/…`, any other absolute path → that path
- *    - `/data/…`, `/data`         → null (engine static mount — artifact/nav own it)
- *    - `/apps/…`, `/apps`         → null (app/nav handlers own it)
+ *    - `/data/…`, `/data`         → null (engine static mount, artifact/nav own it)
+ *    - `/artifacts/…`, `/apps/…`, `/knowhow/…`, and the bare directory form of
+ *      each → null (a workspace data route, never a disk path)
  *    - `notifications`, `data/x`, `apps/x` (relative) → null (not absolute)
  *    - `https://…`, `http://…`    → null (keep browser / panel-webview behavior)
  *
- *  This runs AFTER the app / nav extractors in the click handler, so the
- *  workspace absolute routes they claim (`/apps/<id>/index.html`,
- *  `/notifications`, …) never reach here; the `/data` and `/apps` guards below
- *  cover the absolute sub-paths those extractors decline (an artifact sub-file
- *  like `/apps/<id>/styles.css`) so they're never mistaken for a disk path. */
+ *  This runs LAST in the click handler, after the app / nav / data-path
+ *  extractors, so the absolute workspace routes they claim never reach here.
+ *  The guards below are the belt to that braces: they keep an absolute data
+ *  route out of the OS opener on their own, so reordering the handler can't
+ *  turn `/artifacts/report.pdf` into a disk path. Derived from
+ *  `DATA_PATH_PREFIXES` rather than spelled out, so a new `data/` sub-tree is
+ *  covered here the moment it is added there. */
 export function extractLocalFileTarget(href: string): string | null {
   // file:// URL — unambiguously a local file or directory.
   if (/^file:\/\//i.test(href)) return href;
   // Absolute POSIX path. Exclude the workspace's own absolute routes so a
-  // `/data/…` or `/apps/…` link is never handed to the OS as a disk path.
+  // `/data/…` or `/artifacts/…` link is never handed to the OS as a disk path.
   if (href.startsWith('/')) {
-    if (href === '/data' || href.startsWith('/data/')) return null;
-    if (href === '/apps' || href.startsWith('/apps/')) return null;
-    return href;
+    return isWorkspaceAbsoluteRoute(href) ? null : href;
   }
   return null;
+}
+
+/** True when an absolute href addresses the workspace's own `data/` tree
+ *  (the `/data/*` static mount, or one of its sub-trees reached without the
+ *  `data/` segment) rather than a filesystem location. Matches both the
+ *  sub-path form (`/artifacts/x.md`) and the bare directory (`/artifacts`). */
+function isWorkspaceAbsoluteRoute(href: string): boolean {
+  if (href === '/data' || href.startsWith('/data/')) return true;
+  return DATA_PATH_PREFIXES.some((p) => {
+    const bare = `/${p.slice(0, -1)}`;
+    return href === bare || href.startsWith(`/${p}`);
+  });
 }
 
 /** Mirror of `rewriteArtifactAnchor` / `rewriteAppAnchor` for navigation
@@ -314,7 +414,7 @@ export function extractAppIdFromHref(href: string): string | null {
 export function extractBareAppRef(href: string): string | null {
   // Any URL scheme disqualifies a bare ref. `app:<id>` is handled upstream by
   // extractAppIdFromHref; `http(s):`, `mailto:`, `tel:`, `file:` are real links.
-  if (/^[a-z][a-z0-9+.-]*:/i.test(href)) return null;
+  if (hasUrlScheme(href)) return null;
   let candidate = href;
   if (candidate.startsWith('/')) candidate = candidate.slice(1);
   const queryStart = candidate.search(/[?#]/);
@@ -582,24 +682,32 @@ function applyCompiled(html: string, compiled: CompiledLinkify): string {
         insideAnchor++;
         // Rewriter order: app → nav → artifact.
         //
-        // App MUST run before artifact (the path list from lucidos.data.list()
-        // contains every app's index.html, so a permissive artifact rewriter
-        // would claim `apps/<id>/index.html` first and the click would land
-        // on openFilePreview instead of the running app — the "Link to <app>
-        // opens file preview" bug). App is strict (entry-points only), so
-        // sub-files like apps/<id>/scripts/run.sh return null and fall through
-        // to the artifact rewriter for the expected file-preview behavior.
+        // App MUST run before artifact, and this is now load-bearing rather
+        // than merely prudent. It used to hold because the path list from
+        // lucidos.data.list() contains every app's index.html, so a permissive
+        // artifact rewriter would claim `apps/<id>/index.html` and the click
+        // would land on openFilePreview instead of the running app (the
+        // "Link to <app> opens file preview" bug). The artifact rewriter now
+        // resolves by SHAPE, so it claims `apps/<id>/index.html` whether or not
+        // the list is loaded: only running the strict app rewriter first keeps
+        // an app entry point opening the app. App stays strict (entry points
+        // only), so sub-files like apps/<id>/scripts/run.sh fall through to the
+        // artifact rewriter for the expected file-preview behavior.
         //
         // Nav matches only bare panel names (`notifications`, `apps`, …) with
-        // optional `data/` prefix — no slash beyond the prefix. It can't
-        // collide with the app rewriter (which requires `apps/<id>...`) or
-        // the artifact rewriter (which requires a known path in pathLookup).
-        // Order within nav vs. app vs. artifact is therefore safe in any
-        // arrangement; we put nav between them for narrative clarity.
+        // an optional `data/` prefix and no slash beyond it. It still can't
+        // collide with either neighbour: the app rewriter requires
+        // `apps/<id>...`, and the artifact rewriter requires a non-empty
+        // remainder after a `data/` sub-tree prefix, so a bare `apps` or
+        // `triggers` is a directory to it and declined. Nav's position is
+        // therefore still free; we put it between them for narrative clarity.
         let rewritten: string | null = null;
         if (appIds) rewritten = rewriteAppAnchor(segments[i], appIds);
         if (!rewritten) rewritten = rewriteNavAnchor(segments[i]);
-        if (!rewritten && pathLookup) rewritten = rewriteArtifactAnchor(segments[i], pathLookup);
+        // Unconditional, NOT gated on `pathLookup`: the rewriter now also
+        // resolves a data path by shape, which is exactly what a workspace with
+        // an empty / not-yet-loaded artifact list needs.
+        if (!rewritten) rewritten = rewriteArtifactAnchor(segments[i], pathLookup);
         // A bare app-id/name href — `[Habit Tracker](habit-tracker)` — that the
         // strict rewriters and nav declined. Resolve it from the HREF against
         // the known app ids/names. Without this the browser navigates to the

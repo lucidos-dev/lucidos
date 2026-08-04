@@ -991,8 +991,3 @@ describe('upsertThread — updatedAt monotonic', () => {
     expect(map.get('t1')!.meta.updatedAt).toBe('2026-03-31T12:00:00Z');
   });
 });
-
-// ---------------------------------------------------------------------------
-// handleArchiveThread — focus next review thread
-// ---------------------------------------------------------------------------
-

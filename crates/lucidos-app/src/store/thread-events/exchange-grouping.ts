@@ -697,9 +697,9 @@ function foldSorted(sorted: SequencedEvent[]): GroupFoldState {
  *
  *  Position is not part of an Exchange's own state, so callers relying on
  *  position-derived props must not need a `touched` bump: the render pass
- *  recomputes `isLast` / `hasPriorActive` / `imageOffset` for every exchange and
- *  `chatExchangePropsEqual` compares each of them, so a reorder re-renders the
- *  affected panels on its own. */
+ *  recomputes `isLast` / `hasPriorActive` / `priorModel` / `priorEffort` for
+ *  every exchange and `chatExchangePropsEqual` compares each of them, so a
+ *  reorder re-renders the affected panels on its own. */
 function moveExchangeToEnd(exchanges: Exchange[], exchange: Exchange): void {
   const idx = exchanges.indexOf(exchange);
   if (idx === -1 || idx === exchanges.length - 1) return;

@@ -194,11 +194,19 @@ impl LucidosEngine {
     pub(crate) fn clean_response(&self, content: &str) -> String {
         let content = content.trim();
 
+        // Every arm is `starts_with`: this function REPLACES the whole assistant
+        // message, and its output is what `agentic_loop/run.rs` persists as
+        // `ResponseGenerated`. The `run_python({` arm used `contains`, so a turn
+        // that merely QUOTED a `run_python({...})` call anywhere in its prose
+        // (explaining the repeated-tool guard, say, which the chat system prompt
+        // documents) had its entire real answer thrown away and replaced with the
+        // canned line below. Only the raw-tool-echo shape this guard was written
+        // for starts with the token.
         if content.starts_with("Tool results:")
             || content.starts_with("[list_files]")
             || content.starts_with("[read_file]")
             || content.starts_with("[run_python]")
-            || content.contains("run_python({")
+            || content.starts_with("run_python({")
         {
             return "Task completed. Check the workspace for any created files.".to_string();
         }

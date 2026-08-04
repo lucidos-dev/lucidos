@@ -1,5 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { armCancelSettle, isCancelSettling, CANCEL_SETTLE_MS } from '../prompt-input-helpers';
+import {
+  armCancelSettle,
+  isCancelSettling,
+  computePromptEscapeAction,
+  CANCEL_SETTLE_MS,
+} from '../prompt-input-helpers';
 
 // Regression for the iOS-PWA accidental-abort bug (thread fe390597): the
 // prompt-row Send/Submit button morphs IN PLACE into a destructive Cancel/Stop
@@ -41,5 +46,28 @@ describe('post-submit cancel settle window', () => {
     expect(isCancelSettling()).toBe(true);
     vi.advanceTimersByTime(CANCEL_SETTLE_MS);
     expect(isCancelSettling()).toBe(false);
+  });
+});
+
+// Escape inside the composer is the keyboard twin of the row's red button, so
+// it inherits the same hazard the settle window exists for: Enter sends, and the
+// reflex Escape a beat later would abort the turn that Enter just started. It
+// reaches the textarea only when no overlay is open (the overlay stack handles
+// Escape first, in the capture phase, and stops propagation).
+describe('what Escape does in the prompt', () => {
+  it('cancels when there is a live turn or a pending card to cancel', () => {
+    expect(computePromptEscapeAction(true, false)).toBe('cancel');
+  });
+
+  it('blurs when there is nothing to cancel, as it always did', () => {
+    expect(computePromptEscapeAction(false, false)).toBe('blur');
+  });
+
+  it('does nothing during the settle window, so Enter then Escape cannot abort the new turn', () => {
+    expect(computePromptEscapeAction(true, true)).toBe('ignore');
+  });
+
+  it('still blurs during the settle window when there is nothing to cancel', () => {
+    expect(computePromptEscapeAction(false, true)).toBe('blur');
   });
 });

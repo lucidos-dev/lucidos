@@ -51,6 +51,29 @@ html {
     /* Layout */
     --divider-width: 0.1875rem;
     --content-max-width: 50rem;
+    /* Height of the desktop app header (.app-header, panels/shell.css): the
+       2.5rem .pane-header bar plus its 0.25rem top padding plus the safe-area
+       inset the header reserves. */
+    --app-header-height: calc(2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+    /* Viewport y of the app header's BOTTOM edge. Every position:fixed element
+       that must sit below the header anchors to this, because a fixed element's
+       top is measured from the viewport rather than from the header's flex slot.
+       It has to include --titlebar-inset: on the packaged macOS build
+       (titleBarStyle:"Overlay") the reclaimed title-bar band (.titlebar-strip)
+       sits ABOVE the header and pushes it down, so anything anchored to the bare
+       header height lands ~28px too high and overlaps the header controls. The
+       var is unset (0px) on web / PWA / non-macOS, so those are unchanged.
+       Mobile redefines this in mobile.css: its header is fixed at the viewport
+       top instead, so the anchor there is the measured header height alone. */
+    --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px));
+    /* Height of the app-shell banner that sits between the desktop header and
+       the panes (Settings-less chrome such as the backup reminder), published
+       live by the banner's own ResizeObserver and absent when no banner is up.
+       It is a term of the anchor above so the toast stack and the drawer clear
+       the banner instead of starting behind it. Mobile does NOT need it: there
+       the banner renders inside the fixed header, whose measured height
+       (--mobile-header-height) already includes it. */
+    --app-banner-height: 0px;
     /* Height of the desktop transcript's top fade (the mask that dissolves
        messages as they scroll up under the thread title header — see
        .thread-content in chat/input-messages.css). Shared so the deep-link /

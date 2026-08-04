@@ -948,7 +948,13 @@ export function WorkspacePicker() {
                               }}
                             >
                               <ClockIcon />
-                              <span>{w.autostart ? 'Starts with gateway' : 'Does not start with gateway'}</span>
+                              {/* States the CURRENT state, and states it in terms of
+                                  what the user gets. "Starts with gateway" named an
+                                  internal process the user never sees; what the
+                                  setting actually decides is whether this workspace
+                                  keeps working (triggers, scheduled tasks, coding
+                                  agents, notifications) while no window is open. */}
+                              <span>{w.autostart ? 'Runs in the background' : 'Only runs while open'}</span>
                             </button>
                             <button
                               class="ws-picker-menu-item"

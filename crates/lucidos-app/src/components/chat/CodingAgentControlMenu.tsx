@@ -457,7 +457,19 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     if (result === 'ok') {
       showToast(`${cmd.label} sent`, 'success');
       close();
+      return;
     }
+    if (result === 'pending') {
+      // 404: the session idle-exited between the menu render (which saw
+      // `has_active_session`) and this click, so nothing was delivered and, unlike
+      // `selectOption`, this form captures no pending preference to replay. Report
+      // the same verdict as the pre-flight guard above rather than no-op silently.
+      showToast(`${cmd.label} requires an active session`, 'error');
+      close();
+      return;
+    }
+    // 'error': sendCodingAgentControl already toasted the reason. Leave the form
+    // open so the typed value survives a retry.
   }
 
   const cmd = controlCommands.value.find(c => c.subtype === activeCommand.value);

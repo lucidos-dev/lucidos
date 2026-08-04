@@ -433,12 +433,21 @@ async fn ensure_venv_makes_python_bin_executable() {
 /// its OS child on drop unless `kill_on_drop(true)` is set.
 ///
 /// This test pins (b): drop the execute() future via tokio::select!
-/// against a 200ms cancel, then verify the python child has actually
+/// against a cancel, then verify the python child has actually
 /// exited (no zombie). Uses a marker file as the witness — if the
 /// subprocess survives the drop, it overwrites the marker after
 /// `time.sleep(2)`; if it was SIGKILL'd, the marker keeps its initial
 /// content. We check after 3s (longer than the python sleep) so a
 /// surviving child has had time to expose itself.
+///
+/// The cancel fires on the marker APPEARING, not on a fixed timer. A
+/// 500 ms head start was enough on an idle machine and not on a loaded
+/// one: under a full-suite run a cold interpreter had not reached step 1
+/// yet, so the marker never existed and the test failed at the read with
+/// `NotFound` (observed 2026-08-04, on a host where venv creation alone
+/// took 12 s). That failure measured host speed, not `kill_on_drop`.
+/// Waiting for the witness asserts the real property, and the python
+/// `sleep(2)` still leaves a wide margin before step 3 could run.
 #[tokio::test]
 async fn execute_kills_subprocess_when_future_dropped() {
     let dir = tempdir().unwrap();
@@ -462,8 +471,15 @@ async fn execute_kills_subprocess_when_future_dropped() {
 
     let token = tokio_util::sync::CancellationToken::new();
     let token_clone = token.clone();
+    let marker_watch = marker.clone();
     tokio::spawn(async move {
-        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        // Cancel as soon as step 1 is on disk. The deadline is a hang
+        // guard, not the trigger: reaching it means the interpreter never
+        // started, and the read below then reports that plainly.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while !marker_watch.exists() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
         token_clone.cancel();
     });
 

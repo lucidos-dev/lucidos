@@ -140,7 +140,14 @@ impl GatewayService {
         }
         let _ = self.gateway.kill();
         let _ = self.gateway.wait();
-        stop_workspace_engines(app_data);
+        // Record what we are about to stop so the NEXT gateway boot can bring it
+        // back. This teardown runs for a restart (`launchctl kickstart -k`, which
+        // is what the Restart control and the updater use) and for a crash
+        // respawn, not just for a permanent stop, and in those cases the user
+        // never asked for their workspaces to go away. Suppressed when the record
+        // already says `quit`. See `record_workspaces_to_restore`.
+        let stopped = stop_workspace_engines(app_data);
+        record_workspaces_to_restore(app_data, &stopped);
         // Stop the embedded cluster last — after the engines that connect to it —
         // so a permanent shutdown can never leave an orphaned `postgres` holding
         // the port + postmaster.pid for the next app version to trip over.
@@ -180,16 +187,23 @@ fn embedded_pg_stop_command(pg_bin: &Path, pg_lib: &Path, data: &Path) -> Comman
 }
 
 /// SIGUSR1 every workspace engine the gateway spawned (pidfiles under
-/// `<app-data>/workspaces/<id>/.lucidos/engine.pid`). Used on a full service stop
+/// `<app-data>/workspaces/<id>/.lucidos/engine.pid`), returning the ids of the
+/// ones that were actually alive. Used on a full service stop
 /// ("Quit and Stop Background Service"); the gateway leaves them running on its own
 /// SIGUSR1 so they
 /// can be re-adopted across a gateway restart, but an explicit stop tears the
 /// whole stack down.
-fn stop_workspace_engines(app_data: &Path) {
+///
+/// The returned ids are what the next boot owes the user
+/// ([`record_workspaces_to_restore`]), which is why liveness is checked rather
+/// than trusting the pidfile: a stale pidfile from an engine that died on its own
+/// would otherwise make a restart "restore" a workspace nobody was running.
+fn stop_workspace_engines(app_data: &Path) -> Vec<String> {
     let workspaces = app_data.join("workspaces");
     let Ok(entries) = std::fs::read_dir(&workspaces) else {
-        return;
+        return Vec::new();
     };
+    let mut stopped = Vec::new();
     for entry in entries.flatten() {
         let pidfile = entry.path().join(".lucidos/engine.pid");
         let Ok(contents) = std::fs::read_to_string(&pidfile) else {
@@ -197,12 +211,110 @@ fn stop_workspace_engines(app_data: &Path) {
         };
         if let Ok(pid) = contents.trim().parse::<i32>() {
             #[cfg(unix)]
-            // SAFETY: SIGUSR1 to a recorded engine pid; a dead pid returns ESRCH.
-            unsafe {
-                libc::kill(pid, libc::SIGUSR1);
+            {
+                // SAFETY: signal 0 checks for the process's existence without
+                // delivering anything; SIGUSR1 then asks a live engine to stop.
+                // A dead pid returns ESRCH from both.
+                let alive = unsafe { libc::kill(pid, 0) } == 0;
+                unsafe {
+                    libc::kill(pid, libc::SIGUSR1);
+                }
+                if alive {
+                    if let Some(id) = entry.file_name().to_str() {
+                        stopped.push(id.to_string());
+                    }
+                }
             }
             let _ = std::fs::remove_file(&pidfile);
         }
+    }
+    stopped
+}
+
+// ── What the next boot owes the user ────────────────────────────────────────
+
+/// The record the next gateway boot reads to decide which workspaces to bring
+/// back: `<app-data>/.next-boot.json`. The reader is `next_boot.rs` in the
+/// gateway crate, which this crate does not link, so the two spell the same
+/// filename and the same JSON and each pins it with a test.
+const NEXT_BOOT_FILE: &str = ".next-boot.json";
+
+fn next_boot_path(app_data: &Path) -> PathBuf {
+    app_data.join(NEXT_BOOT_FILE)
+}
+
+/// The `{"quit": true}` body: the last teardown was deliberate, restore nothing.
+const NEXT_BOOT_QUIT: &str = "{\"quit\":true}";
+
+/// Note down the workspaces the teardown just stopped, so the next gateway boot
+/// starts them again.
+///
+/// The point is that a restart must return what it took. `launchctl kickstart -k`
+/// (the Restart control, and the updater's service restart) and a crash respawn
+/// both run the same teardown as a permanent stop, and the gateway that comes up
+/// afterwards re-adopts only engines that survived, of which there are none. So
+/// without this the workspace the user was sitting in stays stopped, and its open
+/// page cannot even wake it: API traffic never lazy-starts a workspace, because
+/// that guard is what makes the picker's Stop button stick.
+///
+/// Skipped when the record already says `quit`: [`stop_service`] writes that
+/// BEFORE it signals launchd, so "Quit and Stop Background Service" stays quiet
+/// and the next launch is as lazy as it ever was.
+///
+/// Best-effort. Failing to write it costs a restart its workspaces, which is
+/// today's behaviour, and must never take the teardown down with it.
+fn record_workspaces_to_restore(app_data: &Path, ids: &[String]) {
+    let path = next_boot_path(app_data);
+    if quit_was_declared(&path) {
+        return; // A deliberate stop: leave the quit marker for the reader to clear.
+    }
+    if ids.is_empty() {
+        let _ = std::fs::remove_file(&path);
+        return;
+    }
+    match serde_json::to_string(&serde_json::json!({ "restore": ids })) {
+        Ok(body) => {
+            if let Err(e) = std::fs::write(&path, body) {
+                eprintln!("[service] could not record workspaces to restore: {e}");
+            }
+        }
+        Err(e) => eprintln!("[service] could not build the next-boot record: {e}"),
+    }
+}
+
+/// Does the record on disk say a deliberate stop is under way?
+///
+/// Parsed rather than substring-matched: a workspace can legitimately be called
+/// `quit`, and `{"restore":["quit"]}` must not read as one.
+fn quit_was_declared(path: &Path) -> bool {
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|record| record.get("quit")?.as_bool())
+        .unwrap_or(false)
+}
+
+/// Declare that the teardown about to happen is a deliberate full stop, so
+/// [`record_workspaces_to_restore`] writes nothing and the next launch starts
+/// nothing.
+///
+/// Written BEFORE the `bootout` that triggers the teardown, which is what makes
+/// the ordering structural: deleting the record afterwards would be a race
+/// against how synchronously `launchctl bootout` returns.
+fn declare_quit_intent(app_data: &Path) {
+    if let Err(e) = std::fs::write(next_boot_path(app_data), NEXT_BOOT_QUIT) {
+        eprintln!("[service] could not record the quit intent: {e}");
+    }
+}
+
+/// Drop the record, for when the teardown it was written for never happened.
+/// Only the gateway's boot normally consumes it, so an intent whose teardown
+/// fell through has to be taken back here or it silences the next real one.
+fn clear_next_boot_record(app_data: &Path) {
+    match std::fs::remove_file(next_boot_path(app_data)) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => eprintln!("[service] could not clear the next-boot record: {e}"),
     }
 }
 
@@ -810,13 +922,153 @@ pub fn restart_service() -> Result<(), String> {
 /// "Quit and Stop Background Service" path (menu-bar item / app menu). Removes the
 /// agent so it won't respawn; the next GUI launch re-installs and re-bootstraps
 /// it. No-op in development (no service).
+///
+/// This is the ONE teardown that means *stay down*, so it declares that first:
+/// the service's own teardown otherwise records its workspaces for the next boot
+/// to restore, which is right for a restart and wrong here. Declaring before the
+/// `bootout` (rather than clearing the record after it) is what keeps the
+/// ordering structural.
 pub fn stop_service() {
     if tauri::is_dev() {
         return;
     }
+    let app_data = match app_data_dir_from_env() {
+        Ok(app_data) => {
+            declare_quit_intent(&app_data);
+            Some(app_data)
+        }
+        Err(e) => {
+            eprintln!("[desktop] cannot resolve app-data for the quit intent: {e}");
+            None
+        }
+    };
     if let Err(e) = bootout_service() {
         eprintln!("[desktop] stop service failed: {e}");
+        // The service is still up, so the teardown this intent was written for
+        // never happens and nothing consumes the record. Left behind, it would
+        // silence the NEXT restart's restore list and put us straight back in the
+        // bug this exists to fix, so take it back.
+        if let Some(app_data) = &app_data {
+            clear_next_boot_record(app_data);
+        }
     }
+}
+
+// ── Relaunching the client (client role) ────────────────────────────────────
+
+/// Poll interval, in seconds, for the relaunch watcher's `kill -0` probe. A
+/// normal exit lands within a few probes; the interval only has to be short
+/// enough that the relaunch feels immediate.
+#[cfg(target_os = "macos")]
+const RELAUNCH_POLL_SECONDS: &str = "0.1";
+
+/// How many [`RELAUNCH_POLL_SECONDS`] probes the watcher makes before giving up
+/// on the client ever exiting: roughly five minutes.
+///
+/// This bounds the WATCHER's life, not the relaunch: a detached shell that could
+/// loop forever is the failure it exists to prevent. It is deliberately far
+/// longer than a shutdown takes, because giving up is giving up for good, and
+/// the launch is conditional on the client actually being gone. Launching on the
+/// timeout instead would spend the one relaunch on a still-live process (`open`
+/// would just activate it) and leave nothing to bring the client back when it
+/// finally did exit. A client still running after five minutes is not shutting
+/// down, and it needs no relaunch: it is on screen.
+#[cfg(target_os = "macos")]
+const RELAUNCH_WAIT_PROBES: u32 = 3000;
+
+/// Arrange for LaunchServices to relaunch this app once THIS process has
+/// exited. `Ok` means it is arranged and the caller MUST exit; `Err` means it
+/// isn't, and the caller must fall back to respawning the executable itself.
+///
+/// **Why LaunchServices instead of spawning the executable again.** Tauri's
+/// `process::restart` (and our own `restart_process`) fork/exec the binary
+/// directly, which never asks the system to activate the new instance. The only
+/// way such an instance lands in front is by inheriting the front slot from its
+/// dying parent, and that is a race it loses whenever it registers with the
+/// window server *after* the parent is gone. The 0.20 → 0.20.1 update on
+/// 2026-08-03 lost it by ~280ms: the old client died still frontmost, the front
+/// slot went to the next app, and the updated client sat behind everything until
+/// the user Cmd+Tabbed to it. `open` has LaunchServices launch the app the way a
+/// double-click does, which grants activation outright, and the watcher runs it
+/// strictly after we are gone, so there is no front slot to inherit and no race
+/// to lose.
+///
+/// **Why it waits for our exit** rather than launching straight away: `open`
+/// against a running app activates the running (here: dying) instance instead of
+/// launching a new one, and `open -n` would leave two clients overlapping. The
+/// wait is what keeps this to exactly one instance.
+///
+/// Development needs no special case: an unbundled `tauri dev` binary has no
+/// enclosing `.app`, so the resolution below fails and the caller falls back.
+#[cfg(target_os = "macos")]
+pub fn schedule_relaunch_after_exit() -> Result<(), String> {
+    let exe = std::env::current_exe().map_err(|e| format!("resolve this executable: {e}"))?;
+    let bundle = app_bundle_root_from_exe(&exe)
+        .ok_or_else(|| format!("{} is not inside a .app bundle", exe.display()))?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let script = relaunch_watcher_script(std::process::id(), &bundle, &args)?;
+    Command::new("/bin/sh")
+        .arg("-c")
+        .arg(&script)
+        .spawn()
+        .map_err(|e| format!("spawn the relaunch watcher: {e}"))?;
+    Ok(())
+}
+
+/// macOS is the only packaged GUI shape Lucidos ships, so there is nothing to
+/// arrange anywhere else and the caller keeps its own respawn.
+#[cfg(not(target_os = "macos"))]
+pub fn schedule_relaunch_after_exit() -> Result<(), String> {
+    Err("a LaunchServices relaunch is macOS-only".to_string())
+}
+
+/// The watcher script: wait (bounded) for `pid` to disappear and then, ONLY if
+/// it did, hand `bundle` to LaunchServices, forwarding `args` as the new
+/// instance's arguments.
+///
+/// The launch is guarded by a second `kill -0` rather than following the loop
+/// unconditionally, because the loop can also end at its ceiling. Launching then
+/// would aim `open` at a process that is still alive, which merely activates it,
+/// and the watcher would be gone by the time the client actually exited.
+///
+/// Pure, so the bound, the ordering (wait *then* launch) and the quoting are
+/// unit-tested rather than eyeballed. Errors on a path or argument that isn't
+/// valid UTF-8: it cannot be quoted into a shell word without corrupting it, and
+/// the caller's fallback passes `OsString`s through faithfully.
+#[cfg(target_os = "macos")]
+fn relaunch_watcher_script(
+    pid: u32,
+    bundle: &Path,
+    args: &[std::ffi::OsString],
+) -> Result<String, String> {
+    let bundle = bundle
+        .to_str()
+        .ok_or_else(|| format!("bundle path is not valid UTF-8: {}", bundle.display()))?;
+    let mut launch = format!("exec /usr/bin/open -a {}", sh_quote(bundle));
+    if !args.is_empty() {
+        launch.push_str(" --args");
+        for arg in args {
+            let arg = arg
+                .to_str()
+                .ok_or_else(|| "an argument is not valid UTF-8".to_string())?;
+            launch.push(' ');
+            launch.push_str(&sh_quote(arg));
+        }
+    }
+    Ok(format!(
+        "i=0; while [ $i -lt {RELAUNCH_WAIT_PROBES} ] && kill -0 {pid} 2>/dev/null; \
+         do sleep {RELAUNCH_POLL_SECONDS}; i=$((i+1)); done; \
+         kill -0 {pid} 2>/dev/null || {launch}"
+    ))
+}
+
+/// Quote `s` as one POSIX shell word. Single quotes take everything literally,
+/// so only an embedded single quote needs work: close, escape it, reopen. The
+/// bundle path comes from `current_exe()` and can be anywhere the user dragged
+/// the app, spaces and apostrophes included.
+#[cfg(target_os = "macos")]
+fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
 }
 
 // ── Uninstall (client role) ─────────────────────────────────────────────────
@@ -1416,6 +1668,258 @@ mod tests {
             None
         );
         assert_eq!(app_bundle_root_from_exe(Path::new("/lucidos")), None);
+    }
+
+    // ── The relaunch watcher ─────────────────────────────────────────────────
+
+    /// The script for a plain `/Applications` install with no arguments.
+    #[cfg(target_os = "macos")]
+    fn watcher_script(pid: u32) -> String {
+        relaunch_watcher_script(pid, Path::new("/Applications/Lucidos.app"), &[])
+            .expect("an ASCII path and no args build a script")
+    }
+
+    // The whole point of the watcher: LaunchServices must be asked only once we
+    // are gone. Launching while this process is alive would activate the DYING
+    // instance instead of starting a new one, which is the bug wearing a
+    // different hat.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_waits_for_our_exit_before_it_launches() {
+        let script = watcher_script(4242);
+        let probe = script.find("kill -0 4242").expect("it probes OUR pid");
+        let launch = script.find("/usr/bin/open").expect("it launches the app");
+        assert!(
+            probe < launch,
+            "the wait must precede the launch, got: {script}"
+        );
+    }
+
+    // The wait is bounded so an orphaned shell cannot loop forever, and the
+    // launch sits after the loop rather than inside it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_stops_waiting_eventually() {
+        let script = watcher_script(4242);
+        assert!(
+            script.contains(&format!("[ $i -lt {RELAUNCH_WAIT_PROBES} ]")),
+            "the wait must be bounded, got: {script}"
+        );
+        let done = script.rfind("done;").expect("the loop ends");
+        let launch = script.find("/usr/bin/open").expect("it launches the app");
+        assert!(done < launch, "the launch follows the loop: {script}");
+    }
+
+    // Reaching the ceiling is NOT a reason to launch. `open` against a client
+    // that is still alive would only activate it, and the watcher would then be
+    // gone by the time that client actually exited, so the relaunch would be
+    // spent on nothing and the app would stay closed.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_launches_only_once_the_client_is_actually_gone() {
+        let script = watcher_script(4242);
+        let done = script.rfind("done;").expect("the loop ends");
+        let guard = script[done..]
+            .find("kill -0 4242")
+            .map(|i| done + i)
+            .expect("the launch is guarded by a final liveness probe");
+        let launch = script.find("/usr/bin/open").expect("it launches the app");
+        assert!(
+            guard < launch,
+            "the guard must precede the launch: {script}"
+        );
+        assert!(
+            script[guard..launch].contains("||"),
+            "the launch must run only when that probe FAILS: {script}",
+        );
+    }
+
+    // The bundle path comes from `current_exe()`, so it is wherever the user
+    // dragged the app. An unquoted space would launch the wrong thing (or
+    // nothing) for anyone whose app is not in /Applications.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_quotes_an_awkward_bundle_path() {
+        let bundle = Path::new("/Users/me/My Apps/It's Lucidos.app");
+        let script = relaunch_watcher_script(1, bundle, &[]).expect("an awkward path still builds");
+        assert!(
+            script.contains(r#"open -a '/Users/me/My Apps/It'\''s Lucidos.app'"#),
+            "got: {script}"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn sh_quote_wraps_a_word_and_escapes_embedded_single_quotes() {
+        assert_eq!(
+            sh_quote("/Applications/Lucidos.app"),
+            "'/Applications/Lucidos.app'"
+        );
+        assert_eq!(sh_quote("it's"), r"'it'\''s'");
+    }
+
+    // `restart_app` re-execs with the arguments it was launched with, so the
+    // LaunchServices path has to carry them too, behind `--args`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_forwards_arguments_and_omits_the_flag_when_there_are_none() {
+        use std::ffi::OsString;
+
+        let bundle = Path::new("/Applications/Lucidos.app");
+        let args = vec![OsString::from("--flag"), OsString::from("a value")];
+        let with = relaunch_watcher_script(1, bundle, &args).expect("args build");
+        assert!(
+            with.ends_with(r#"--args '--flag' 'a value'"#),
+            "got: {with}"
+        );
+        assert!(!watcher_script(1).contains("--args"), "no args, no flag");
+    }
+
+    // A byte sequence that isn't UTF-8 cannot be quoted into a shell word
+    // without corrupting it. Refusing hands the caller back to its own respawn,
+    // which passes `OsString`s through faithfully.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_watcher_refuses_arguments_it_cannot_quote() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let args = vec![OsString::from_vec(vec![0x2d, 0x2d, 0xff])];
+        assert!(
+            relaunch_watcher_script(1, Path::new("/Applications/Lucidos.app"), &args).is_err(),
+            "a non-UTF-8 argument must not be silently mangled into the script",
+        );
+    }
+
+    // ── What the next boot owes the user ─────────────────────────────────────
+
+    /// A throwaway app-data dir that removes itself.
+    struct TempAppData(PathBuf);
+
+    impl TempAppData {
+        fn new(tag: &str) -> Self {
+            let unique = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("the clock is after the epoch")
+                .as_nanos();
+            let path = std::env::temp_dir().join(format!("lucidos-next-boot-{tag}-{unique}"));
+            std::fs::create_dir_all(&path).expect("create the temp app-data dir");
+            Self(path)
+        }
+
+        fn path(&self) -> &Path {
+            &self.0
+        }
+
+        fn record(&self) -> Option<String> {
+            std::fs::read_to_string(next_boot_path(&self.0)).ok()
+        }
+
+        /// Lay down `workspaces/<id>/.lucidos/engine.pid` holding `pid`.
+        fn write_pidfile(&self, id: &str, pid: u32) {
+            let dir = self.0.join("workspaces").join(id).join(".lucidos");
+            std::fs::create_dir_all(&dir).expect("create the workspace dir");
+            std::fs::write(dir.join("engine.pid"), pid.to_string()).expect("write the pidfile");
+        }
+    }
+
+    impl Drop for TempAppData {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // The record is read by the gateway crate, which shares no code with this
+    // one, so the shape can only drift silently. `next_boot.rs`'s
+    // `next_boot_record_shape_matches_the_writer` pins the other side.
+    #[test]
+    fn the_restore_record_is_the_shape_the_gateway_reads() {
+        let tmp = TempAppData::new("shape");
+        record_workspaces_to_restore(tmp.path(), &["myws".to_string()]);
+        assert_eq!(tmp.record().as_deref(), Some(r#"{"restore":["myws"]}"#));
+        assert_eq!(NEXT_BOOT_QUIT, r#"{"quit":true}"#);
+        assert_eq!(NEXT_BOOT_FILE, ".next-boot.json");
+    }
+
+    // "Quit and Stop Background Service" is the one teardown that means stay
+    // down, and it says so before it signals, so the teardown that follows must
+    // leave its marker alone rather than recording a restore over it.
+    #[test]
+    fn a_declared_quit_survives_the_teardown_that_follows_it() {
+        let tmp = TempAppData::new("quit");
+        declare_quit_intent(tmp.path());
+        record_workspaces_to_restore(tmp.path(), &["myws".to_string()]);
+        assert_eq!(tmp.record().as_deref(), Some(NEXT_BOOT_QUIT));
+    }
+
+    // A quit intent whose `bootout` failed describes a teardown that never
+    // happened, and nothing else clears it (only the gateway's boot consumes the
+    // record, and the service is still up). Left behind it would silence the next
+    // real restart's restore list.
+    #[test]
+    fn a_quit_intent_can_be_taken_back_when_the_stop_fails() {
+        let tmp = TempAppData::new("unquit");
+        declare_quit_intent(tmp.path());
+        clear_next_boot_record(tmp.path());
+        assert_eq!(tmp.record(), None);
+        // And a teardown after that records normally again.
+        record_workspaces_to_restore(tmp.path(), &["myws".to_string()]);
+        assert_eq!(tmp.record().as_deref(), Some(r#"{"restore":["myws"]}"#));
+    }
+
+    // A workspace may legitimately be called `quit`, and a restore list holding
+    // it must not read as a declared stop and silence the next teardown.
+    #[test]
+    fn a_workspace_named_quit_is_not_a_quit_intent() {
+        let tmp = TempAppData::new("named-quit");
+        record_workspaces_to_restore(tmp.path(), &["quit".to_string()]);
+        assert!(!quit_was_declared(&next_boot_path(tmp.path())));
+        record_workspaces_to_restore(tmp.path(), &["myws".to_string()]);
+        assert_eq!(tmp.record().as_deref(), Some(r#"{"restore":["myws"]}"#));
+    }
+
+    #[test]
+    fn clearing_a_record_that_is_not_there_is_fine() {
+        let tmp = TempAppData::new("noclear");
+        clear_next_boot_record(tmp.path());
+        assert_eq!(tmp.record(), None);
+    }
+
+    // Nothing was running, so nothing is owed: a leftover record from an earlier
+    // teardown must not resurrect workspaces this one never stopped.
+    #[test]
+    fn stopping_nothing_clears_any_stale_record() {
+        let tmp = TempAppData::new("empty");
+        record_workspaces_to_restore(tmp.path(), &["stale".to_string()]);
+        record_workspaces_to_restore(tmp.path(), &[]);
+        assert_eq!(tmp.record(), None);
+    }
+
+    // Liveness, not the pidfile's mere existence, decides what the restart owes:
+    // an engine that had already died is not something the user was running.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_engines_that_were_alive_are_recorded() {
+        let tmp = TempAppData::new("alive");
+        // A stand-in engine: our own child, which SIGUSR1 terminates by default.
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn a stand-in engine");
+        tmp.write_pidfile("live-ws", child.id());
+        // A pid that cannot exist (macOS caps pids well below this), standing in
+        // for a pidfile left behind by an engine that died on its own.
+        tmp.write_pidfile("stale-ws", 999_999);
+
+        let stopped = stop_workspace_engines(tmp.path());
+        assert_eq!(stopped, vec!["live-ws".to_string()]);
+        assert!(
+            !tmp.path()
+                .join("workspaces/live-ws/.lucidos/engine.pid")
+                .exists(),
+            "the pidfile is cleared either way",
+        );
+        let _ = child.wait();
     }
 
     #[cfg(target_os = "macos")]

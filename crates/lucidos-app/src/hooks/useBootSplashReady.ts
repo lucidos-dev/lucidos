@@ -1,6 +1,6 @@
 import { useEffect } from 'preact/hooks';
 import { effect } from '@preact/signals';
-import { connectionStatus, threadsLoaded } from '../store/store';
+import { connectionStatus, databaseReachable, threadsLoaded } from '../store/store';
 import {
   bootSplashPlaysNoReveal,
   bootSplashPresent,
@@ -57,6 +57,32 @@ export function remainingRevealMs(elapsedMs: number, revealSkipped: boolean): nu
  *  without the DOM/signals. */
 export function isWorkspaceReady(connection: ConnectionStatus, threads: boolean): boolean {
   return connection === 'connected' && threads;
+}
+
+/** May the boot splash come down? Ready is one way; the other is knowing the
+ *  load CANNOT finish, which is a different claim and needs its own evidence.
+ *
+ *  A connected engine whose database is unreachable answers `/health` (so the
+ *  connection is live) but cannot serve `/threads/list` (so `threadsLoaded` never
+ *  arrives). `isWorkspaceReady` alone therefore left the splash up for the full
+ *  {@link BOOT_SPLASH_SAFETY_MS}: a black screen reading "Loading…" for 15s,
+ *  which is the exact symptom this predicate exists to end. Coming down early
+ *  hands off to the app, where the one authoritative "can't reach its database"
+ *  toast is already on screen.
+ *
+ *  The evidence must be POSITIVE, never an absence. `databaseReachable` defaults
+ *  to `true` and only an explicit `false` from the engine flips it, so a slow
+ *  first health response still holds the splash rather than blinking it away.
+ *  That is the same mistake `delayedBootStatus` documents below, where deriving
+ *  "not started" from a missing connection accused a healthy workspace of being
+ *  down. Pure, so the whole table is testable without the DOM. */
+export function bootSplashShouldRelease(
+  connection: ConnectionStatus,
+  threads: boolean,
+  databaseIsReachable: boolean,
+): boolean {
+  if (isWorkspaceReady(connection, threads)) return true;
+  return connection === 'connected' && !databaseIsReachable;
 }
 
 /** The status word shown if the splash is STILL up after {@link STATUS_DELAY_MS}
@@ -163,7 +189,7 @@ export function useBootSplashReady(): void {
 
     const stop = effect(() => {
       if (dismissArmed) return;
-      if (!isWorkspaceReady(connectionStatus.value, threadsLoaded.value)) return;
+      if (!bootSplashShouldRelease(connectionStatus.value, threadsLoaded.value, databaseReachable.value)) return;
       dismissArmed = true;
       // Let the reveal finish at least once before dismissing.
       const remaining = remainingRevealMs(msSinceLoad(), bootSplashPlaysNoReveal());

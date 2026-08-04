@@ -7,7 +7,7 @@ import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
 import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
-import { artifacts, appsList, openImagePopupFromGroup, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
+import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
 import { preserveOnToggle } from './scrollState';
 import { openFilePreview, openLocalFile } from '../../store/actions/artifacts';
@@ -20,7 +20,7 @@ import { getEventToggleState, getCollapsedVisibleEvents, splitEventSections, has
 import { statusLabel as getStatusLabel, isActive as isStatusActive, isTerminated } from '../../store/exchange-status';
 import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef } from '../../utils/linkifyPaths';
+import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, hasUrlScheme } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
 import { ChangeBody, CheckpointCard, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
 import { TrashIcon } from '../shared/icons';
@@ -30,6 +30,10 @@ import { TrashIcon } from '../shared/icons';
 // artifacts/apps are not loaded.
 const NO_ARTIFACTS: string[] = [];
 const NO_APPS: App[] = [];
+
+/** Toast key for the terminal dead-link guard in `handleLinkClick`, so tapping
+ *  the same dead link repeatedly replaces the toast rather than stacking. */
+const DEAD_LINK_TOAST_KEY = 'chat-dead-link';
 
 /** The change_id this exchange pertains to, used to stamp `data-change-id` so
  *  the Changes panel can deep-link a row to its originating turn. The aggregate
@@ -60,7 +64,6 @@ interface Props {
   isLast: boolean;
   threadId: string;
   hasPriorActive?: boolean;
-  imageOffset?: number;
   priorModel?: string;
   priorEffort?: string;
   /** True when this exchange is the most recent ResponseAborted with no
@@ -99,7 +102,7 @@ interface Props {
   proposedChangeFileCount?: number;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, imageOffset = 0, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -111,7 +114,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const timestamp = exchangeTimestamp(exchange);
   const responseTextRaw = exchangeResponseText(exchange);
   const steps = exchangeSteps(exchange, isLast, threadIdle);
-  const events = exchangeResponseEvents(exchange, imageOffset, isLast, threadIdle);
+  const events = exchangeResponseEvents(exchange, isLast, threadIdle);
   const status = exchangeStatus(exchange, streamingBuffer, isLast, hasPriorActive, threadIsCC, threadIdle, threadAwaitingAnswer);
   const error = exchangeError(exchange);
 
@@ -220,6 +223,19 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           return;
         }
       }
+      // A path under the workspace's data/ tree (artifacts/, knowhow/, apps/,
+      // triggers/, system-knowhow/), recognized by SHAPE, so it works for a
+      // file the agent wrote seconds ago that the cached artifact list hasn't
+      // caught up with. That is precisely when linkifyPaths declines to rewrite
+      // and this fallback is the only thing standing between the click and a
+      // full workspace reload. Runs BEFORE the OS-open branch so an absolute
+      // /artifacts/… is never mistaken for a disk path.
+      const dataPath = extractDataPathTarget(rawHref);
+      if (dataPath) {
+        e.preventDefault();
+        openFilePreview(dataPath);
+        return;
+      }
       // A `file://` URL or an absolute filesystem path (a staged release .dmg
       // under ~/…/.lucidos/release-worktrees/, an /Applications/… folder, …) —
       // open it with the OS (mount the dmg / reveal the folder), NOT via the
@@ -232,6 +248,35 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         e.preventDefault();
         openLocalFile(localFile);
         return;
+      }
+      // TERMINAL GUARD: nothing above claimed this href. If it carries no URL
+      // scheme it is a relative link into the SPA, and there are no relative
+      // routes: the browser resolves it against the workspace base, the
+      // engine's SPA fallback answers with the app shell, and the whole
+      // workspace reloads. That reload has now been reported five times, once
+      // per href shape the LLM invented (`app:<id>`, a bare app id,
+      // `data/<panel>`, a bare `app`, a data path), because the branches above
+      // are a whitelist and a whitelist is open at the bottom. Closing it here
+      // means the next unrecognized shape is a toast the user can read, not a
+      // reload. See docs/adr/0038.
+      //
+      // Two things deliberately pass through: a URL scheme (http(s), mailto,
+      // tel, all real links the browser should handle) and a pure fragment
+      // (`#section`, an in-page markdown anchor, which navigates nothing).
+      //
+      // An EMPTY href is still swallowed, since `[text]()` resolves to the
+      // current URL and reloads exactly like any other unclaimed relative href.
+      // It just can't be named in the message. Keyed so tapping the same dead
+      // link twice replaces the toast instead of stacking a duplicate.
+      if (!hasUrlScheme(rawHref) && !rawHref.startsWith('#')) {
+        e.preventDefault();
+        showToast(
+          rawHref
+            ? `Link "${rawHref}" points nowhere in this workspace`
+            : 'This link has no destination',
+          'error',
+          { key: DEAD_LINK_TOAST_KEY },
+        );
       }
     }
   }
@@ -587,7 +632,6 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.isQueued !== next.isQueued) return false;
   if (prev.threadId !== next.threadId) return false;
   if (prev.hasPriorActive !== next.hasPriorActive) return false;
-  if (prev.imageOffset !== next.imageOffset) return false;
   if (prev.priorModel !== next.priorModel) return false;
   if (prev.priorEffort !== next.priorEffort) return false;
   if (prev.isUnresumedAbort !== next.isUnresumedAbort) return false;

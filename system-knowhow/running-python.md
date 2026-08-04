@@ -55,7 +55,15 @@ bash_output(task_id="abc", wait_secs=60)
 - Returns whatever accumulated on timeout with `finished: false` — decide whether to call again.
 - Use the full 120 s for anything long you're following; 30–60 s when you expect it to finish soon; 0 (or omit) for a quick liveness check between other actions.
 
-If `finished: true`, STOP polling. Subsequent calls fall back to the event store and re-return the full final stdout/stderr each time — wasted context.
+A drain that lands at the exact moment the task completes still returns the
+final tail with `finished: true`. The engine keeps a completed task drainable
+for a few minutes after it ends, so finishing mid-drain never costs you the
+result.
+
+If `finished: true`, STOP polling. Nothing new can arrive: inside that
+few-minute window a repeat call returns an empty window (you already drained
+the output), and after it, calls fall back to the event store and re-return the
+full final stdout/stderr each time, which is wasted context either way.
 
 ### Never estimate elapsed time — read it
 
@@ -63,7 +71,7 @@ Every drain reports two clocks, and they are the only ones you have:
 
 | Field | Meaning |
 |---|---|
-| `elapsed_secs` | How long the task has been running — its total runtime once `finished`. `null` only for a task that finished long enough ago to have been evicted from a pre-timestamp record. |
+| `elapsed_secs` | How long the task has been running, or its total runtime once `finished` (frozen at completion). `null` only when the result came from an old `BackgroundBashCompleted` record written before the engine stored the timestamp pair: an honest "unknown" rather than a fabricated `0`. |
 | `waited_secs` | How long **this one call** actually blocked. Well short of the `wait_secs` you asked for, with `finished: false`? The user sent a message — that cuts the wait so you can answer it. Nothing is broken. |
 
 Do not infer elapsed time from how long you *asked* to wait, or from how many
@@ -174,7 +182,7 @@ These all look reasonable in isolation; they fail the same way every time and wa
 2. **`os.chdir` + `sys.path.insert(0, ".")`** for importing app scripts. Use the absolute path via `$LUCIDOS_WORKSPACE` once — don't try four variants.
 3. **`subprocess.run(["python", "-c", code])`** from inside `run_python` to get a "fresh interpreter". You already are one. The subprocess won't see the venv's site-packages.
 4. **Re-spawning a background task to read its result** instead of calling `bash_output(task_id)`. The task is still running with a known id; drain it.
-5. **Polling `bash_output` after `finished: true`**. Each subsequent call replays the full final stdout/stderr from the event store, which is exactly the context bloat the drain semantics exist to avoid.
+5. **Polling `bash_output` after `finished: true`**. Nothing new can arrive. For the next few minutes each call returns an empty window, and after that each one replays the full final stdout/stderr from the event store, which is exactly the context bloat the drain semantics exist to avoid.
 
 ## Errors
 

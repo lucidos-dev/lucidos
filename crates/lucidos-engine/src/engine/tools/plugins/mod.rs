@@ -819,14 +819,6 @@ pub struct ConfirmedInstall {
     pub setup_thread_id: Option<uuid::Uuid>,
 }
 
-/// Pop the pending install, run the actual write step from the staged tree,
-/// and (if any `auth-modules/` files were written) auto-reload the proxy
-/// WASM signer map so the new module is live without an engine restart.
-/// Always uses `overwrite=true` because the user already saw the overwrite
-/// list in the install panel — clicking Confirm IS the consent. The
-/// `actor` is the device/user who clicked Confirm; it's stamped onto the
-/// resulting `PluginInstalled` event so the popover shows a real device
-/// label instead of `device-<short>`.
 /// Write one trigger lifecycle event, logging (not propagating) an emit error:
 /// trigger sync is a best-effort side effect of install/uninstall, never a
 /// reason to fail the whole operation.
@@ -1022,6 +1014,14 @@ async fn delete_plugin_triggers(
     }
 }
 
+/// Pop the pending install, run the actual write step from the staged tree,
+/// and (if any `auth-modules/` files were written) auto-reload the proxy
+/// WASM signer map so the new module is live without an engine restart.
+/// Always uses `overwrite=true` because the user already saw the overwrite
+/// list in the install panel: clicking Confirm IS the consent. The
+/// `actor` is the device/user who clicked Confirm; it's stamped onto the
+/// resulting `PluginInstalled` event so the popover shows a real device
+/// label instead of `device-<short>`.
 pub async fn confirm_pending_install(
     engine: &LucidosEngine,
     install_id: &str,
@@ -1226,11 +1226,6 @@ pub(crate) async fn cancel_pending_install_with_bus(
     Ok(())
 }
 
-/// Install a plugin from an already-unpacked directory. Pure orchestration —
-/// takes the workspace path and an event bus, so tests can inject a mock.
-/// Returns the install summary text plus the `data/`-relative paths that
-/// were written; the confirm endpoint uses the file list verbatim (no
-/// re-walk) for the auto-reload decision and the HTTP response.
 /// The `<slug>` of a `data/`-relative path iff it is `triggers/<slug>/trigger.toml`.
 fn plugin_trigger_slug(data_relative: &str) -> Option<&str> {
     let parts: Vec<&str> = data_relative.split('/').collect();
@@ -1265,6 +1260,11 @@ fn validate_plugin_triggers_event_driven(planned: &[PlannedFile]) -> Result<(), 
     Ok(())
 }
 
+/// Install a plugin from an already-unpacked directory. Pure orchestration:
+/// takes the workspace path and an event bus, so tests can inject a mock.
+/// Returns the install summary text plus the `data/`-relative paths that
+/// were written; the confirm endpoint uses the file list verbatim (no
+/// re-walk) for the auto-reload decision and the HTTP response.
 pub(crate) async fn install_from_unpacked_with_bus(
     workspace_path: &Path,
     bus: &dyn EventBusEmitter,

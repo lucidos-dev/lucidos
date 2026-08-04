@@ -80,14 +80,29 @@ contradicting §10). The corrected model:
   type-the-name confirm) is the only thing that removes an entry.
 - Each `Workspace` carries an **`autostart`** flag (registry field, picker
   toggle). On gateway boot, per workspace: an engine already answering health is
-  **re-adopted**; else an `autostart` workspace is **spawned**; else it is left
-  **stopped** (listed, started only on explicit open/launch). New workspaces
-  default `autostart=false` (manual, enabled only via the picker toggle).
+  **re-adopted**; else a workspace **the last teardown stopped** is brought back;
+  else an `autostart` workspace is **spawned**; else it is left
+  **stopped** (listed, started only on explicit open/launch).
   **First run** finds an empty registry, creates **nothing**, and the smart root
   serves the **picker** so the user names their first workspace ("personal" /
   "work" suggestions). *(Updated 2026-06-24: first run shows the picker rather
   than auto-creating an `autostart=true` `default` workspace — there is no longer
   any auto-created `default`.)*
+  *(Updated 2026-08-03, reversing "new workspaces default `autostart=false`":
+  they now default to **`true`**, and an existing registry is lifted to that
+  default once, stamped by a `version` field, in the packaged gateway only. The
+  original default made the always-on service a promise it did not keep: nothing
+  ran at login until somebody opened each workspace, so no triggers, no scheduled
+  tasks, no push. Dev is deliberately excluded, because its launcher seeds
+  `autostart: false` on purpose and migrating there would spawn every workspace
+  it has ever registered. The **restore** step above is separate and does NOT
+  consult the flag: the packaged service teardown stops every engine, so after a
+  `kickstart -k` restart or a crash respawn the gateway re-adopts nothing, and a
+  restart must return what it took. It reads `<app-data>/.next-boot.json`, which
+  that teardown writes and this boot consumes; "Quit and Stop Background Service"
+  declares `{"quit": true}` there before it signals, so the one teardown that
+  means stay down records nothing. See `crates/lucidos-gateway/src/next_boot.rs`
+  and `docs/plans/2026-08-03-a-restart-brings-the-workspaces-back.md`.)*
 - A document navigation to a registered-but-stopped workspace (`/<slug>/`)
   **lazy-starts** it and serves the existing boot-window page (§11) — so the
   picker's "Open" and a direct URL both work on a stopped workspace. API/SSE/

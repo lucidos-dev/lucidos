@@ -569,13 +569,17 @@ impl LucidosEngine {
             // Much faster than `npm ci` (~1-2s hardlink vs 2-10min install).
             //
             // The repo is an npm WORKSPACE (root package.json `workspaces:
-            // [crates/lucidos-app, packages/lucidos-sdk]`), so node_modules is
-            // hoisted to the REPO ROOT (`<repo>/node_modules`); there is NO
-            // `crates/lucidos-app/node_modules`. Provision the root tree — its
-            // workspace-member symlinks (e.g. `lucidos-app -> ../crates/lucidos-app`)
-            // are relative and resolve inside the worktree, and Node resolution
-            // walks up to `<wt>/node_modules`, so the members need no own copy.
-            // (Pointing at crates/lucidos-app here is what silently killed the
+            // [crates/lucidos-app, packages/lucidos-sdk]`), so MOST deps hoist
+            // to the REPO ROOT (`<repo>/node_modules`). Provision the root tree
+            // first: its workspace-member symlinks (e.g. `lucidos-app ->
+            // ../crates/lucidos-app`) are relative and resolve inside the
+            // worktree, and Node resolution walks up to `<wt>/node_modules`.
+            // The root tree is NOT the whole story though. An un-hoistable dep
+            // (notably `vitest`, which lives only in
+            // `crates/lucidos-app/node_modules`) sits in the MEMBER's own
+            // nested tree, so the member loop further below provisions those
+            // too; without it `npm test` in a worktree cannot find vitest.
+            // (Pointing the ROOT link at crates/lucidos-app is what silently killed the
             // fast path after the workspace migration: the marker was never
             // found, so every CC worktree fell back to a cold `npm ci` that
             // saturated disk I/O and timed out the concurrent git checkout —

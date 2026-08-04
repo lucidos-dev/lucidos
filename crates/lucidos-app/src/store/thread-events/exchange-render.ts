@@ -1,6 +1,6 @@
 import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
 import { isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
-import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserImageHashes, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
+import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
@@ -317,18 +317,6 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
   return steps;
 }
 
-/** Count images in an exchange (user-pasted + generated) for thread:N offset computation. */
-export function exchangeImageCount(exchange: Exchange): number {
-  let count = exchangeUserImageHashes(exchange).length;
-  for (const { event } of exchange.steps) {
-    if (event.type === 'ToolResult') {
-      const imgs = (event as { images?: string[] }).images;
-      if (imgs?.length) count += imgs.length;
-    }
-  }
-  return count;
-}
-
 /** Mark the last pending step in a ResponseEvent[] as completed and return it
  *  so callers can attach extra payload (tool result text, images). Optional
  *  `pred` narrows which pending step to resolve. */
@@ -347,7 +335,6 @@ function resolveLastPendingResponseStep(
 }
 
 /** Build ResponseEvent[] from exchange events (interleaved text + steps for rendering).
- *  `imageOffset` is the number of images in all previous exchanges (for thread:N numbering).
  *  @param _isLast — kept for caller compatibility; no longer drives spinner resolution
  *  on its own. See `threadIdle`.
  *  @param threadIdle — true when CC is not producing output (see
@@ -355,11 +342,9 @@ function resolveLastPendingResponseStep(
  *  flag to finalize pending steps. A non-last exchange can still be the one
  *  the engine is actively processing (chat mid-flight injection), so
  *  resolution must not trigger purely on `!isLast`. */
-export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isLast = true, threadIdle = false): ResponseEvent[] {
+export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threadIdle = false): ResponseEvent[] {
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
-  // Count images across the thread for thread:N numbering — starts after user images in this exchange
-  let imageCounter = imageOffset + exchangeUserImageHashes(exchange).length;
   let terminal: TerminalKind = null;
   // Set when the exchange completed via a text-less ResponseGenerated — a
   // benign empty completion (the model ended its turn cleanly with no text).
@@ -477,11 +462,14 @@ export function exchangeResponseEvents(exchange: Exchange, imageOffset = 0, _isL
           if (event._eventId) resolved.result_event_id = event._eventId;
           if (toolResult.result_stripped) resolved.result_stripped = true;
         }
-        // Render generated images inline
+        // Render generated images inline. Only `generate_image` ever puts bytes
+        // in a ToolResult (the `[GENERATED_IMAGE:]` sentinel), so the resolved
+        // step's un-elided primary arg IS the prompt: carry it onto the image so
+        // it can describe itself in a tooltip and in its alt text.
         if (toolResult.images?.length) {
+          const prompt = resolved?.tool_name === 'generate_image' ? resolved.full : undefined;
           for (const b64 of toolResult.images) {
-            imageCounter++;
-            events.push({ type: 'image', base64: b64, mime_type: 'image/jpeg', index: imageCounter });
+            events.push({ type: 'image', base64: b64, mime_type: 'image/jpeg', ...(prompt ? { prompt } : {}) });
           }
         }
         break;
@@ -1279,7 +1267,7 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   if (responseText) return 'streaming';
 
   const steps = exchangeSteps(exchange, isLast, threadIdle);
-  const events = exchangeResponseEvents(exchange, 0, isLast, threadIdle);
+  const events = exchangeResponseEvents(exchange, isLast, threadIdle);
   if (steps.length > 0 || events.length > 0) return 'streaming';
 
   return 'pending';

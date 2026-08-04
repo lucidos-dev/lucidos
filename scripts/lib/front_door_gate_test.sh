@@ -42,6 +42,22 @@
 #      verdict in the step. FD_SERVED_VERSION must be exported after that loop,
 #      or a retried version would be shadowed by the stale first read.
 #
+# And one more, from the v0.20.1 post-publish drift:
+#  11. when the caller names the release it dispatched the run to verify, the
+#      job's TWO fetches of install.sh (rung 1's, and the install step's
+#      independent re-fetch) are pinned to that ONE release: rung 1 converges on
+#      expect_version, bounded, before exporting FD_SERVED_VERSION, and a
+#      download failure naming a different version is reported as drift rather
+#      than as a flat download failure.
+#
+#      Its load-bearing half is a NEGATIVE, which is why it is pinned rather
+#      than left to the comment beside it: this loop polls the PLAIN url, with
+#      no nonce and no cache headers, exactly opposite to the rc loop in item 10.
+#      A '?cb=' query string is a different Cloudflare cache key, so converging
+#      on a nonced URL would prove nothing about the plain one the install step
+#      fetches. The contrast reads like an oversight and invites a "fix", so
+#      both halves are asserted: nonce present up there, absent down here.
+#
 # Hermetic and offline: it reads one tracked file and two tracked libs, makes no
 # network call, and runs no part of the workflow. Comment lines are stripped
 # before every assertion, so a job's own prose about a rule (the macOS job
@@ -113,6 +129,34 @@ step_code() {
 # line_with <fixed-string>: the first matching line number on stdin, or empty.
 line_with() { grep -F -m1 -- "$1" | cut -d: -f1; }
 
+# guarded_block <guard-needle>: on stdin a job's payload-sniff step, on stdout
+# ONLY the block that guard opens, from its own line to the matching `fi`.
+#
+# Two assertions need block SCOPE rather than a line number, and both would be
+# vacuous without it:
+#
+#   * the sniff step holds two re-read loops whose cache-busting rules are
+#     OPPOSITE, so a search over the whole step cannot tell which loop it
+#     matched, and a stray `cb=` from the rc loop would satisfy the "no nonce
+#     here" check without proving anything about the other loop;
+#   * "FD_SERVED_VERSION is exported after the loop" has to mean after the loop
+#     ENDS. Compared against the `while` line instead, an export moved INSIDE
+#     the body still passes while pinning whatever intermediate read the loop
+#     happened to be holding, which is the exact bug both loops exist to avoid.
+#
+# The terminator is a `fi` at the guard's own indentation (ten spaces, the depth
+# every `run:` body sits at); the nested `fi`s and the `done` are deeper.
+guarded_block() {
+  awk -v needle="$1" '
+    index($0, needle)                    { inblk = 1; print; next }
+    inblk && /^[0-9]+:          fi[ ]*$/ { print; exit }
+    inblk                                { print }
+  '
+}
+
+# block_end: on stdin a guarded_block, on stdout the line number of its `fi`.
+block_end() { tail -n 1 | cut -d: -f1; }
+
 # ── per-job assertions ────────────────────────────────────────────────────────
 for job in "${JOBS[@]}"; do
   echo
@@ -151,6 +195,10 @@ for job in "${JOBS[@]}"; do
   poll_secs="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*FD_ASSET_POLL_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
   health_secs="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*GW_HEALTH_TIMEOUT_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
   timeout_min="$(printf '%s\n' "$code" | sed -n 's/^[0-9]*:[[:space:]]*timeout-minutes:[[:space:]]*\([0-9]*\).*/\1/p' | head -n 1)"
+  # Parsed here rather than in section 11, because the ceiling arithmetic in
+  # section 6 needs it: this budget can STACK on the preflight's.
+  ev_wait="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*FD_EXPECT_VERSION_WAIT_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
+  ev_poll="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*FD_EXPECT_VERSION_POLL_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
 
   if [ -n "$wait_secs" ] && [ -n "$poll_secs" ]; then
     if [ "$poll_secs" -gt 0 ] && [ "$poll_secs" -le 60 ] && [ "$wait_secs" -ge 60 ] && [ "$wait_secs" -le 3600 ]; then
@@ -221,16 +269,20 @@ for job in "${JOBS[@]}"; do
   fi
 
   # ── 6. the budgets fit inside the ceiling ───────────────────────────────────
-  if [ -n "$wait_secs" ] && [ -n "$health_secs" ] && [ -n "$timeout_min" ]; then
-    needed=$((wait_secs + health_secs + SLACK_SECS))
+  # All THREE waits are counted, because the expect_version convergence can
+  # genuinely stack on the preflight: a POP still serving the previous release
+  # is exactly a POP whose new release is fresh enough for release-tarballs.yml
+  # to still be attaching its assets, so one run can spend both budgets in a row.
+  if [ -n "$wait_secs" ] && [ -n "$health_secs" ] && [ -n "$timeout_min" ] && [ -n "$ev_wait" ]; then
+    needed=$((ev_wait + wait_secs + health_secs + SLACK_SECS))
     ceiling=$((timeout_min * 60))
     if [ "$needed" -le "$ceiling" ]; then
-      pass "the budgets fit: ${wait_secs}s preflight + ${health_secs}s health + ${SLACK_SECS}s slack = ${needed}s <= ${ceiling}s (timeout-minutes: $timeout_min)"
+      pass "the budgets fit: ${ev_wait}s convergence + ${wait_secs}s preflight + ${health_secs}s health + ${SLACK_SECS}s slack = ${needed}s <= ${ceiling}s (timeout-minutes: $timeout_min)"
     else
       fail "the budgets do NOT fit: ${needed}s needed but timeout-minutes is $timeout_min (${ceiling}s). A job timeout is a hard kill with no diagnosis."
     fi
   else
-    fail "cannot do the timeout arithmetic: one of FD_ASSET_WAIT_SECS / GW_HEALTH_TIMEOUT_SECS / timeout-minutes is not a literal"
+    fail "cannot do the timeout arithmetic: one of FD_EXPECT_VERSION_WAIT_SECS / FD_ASSET_WAIT_SECS / GW_HEALTH_TIMEOUT_SECS / timeout-minutes is not a literal"
   fi
 
   # ── 7. an RC origin is refused, before any fetch, and never downgraded ──────
@@ -384,13 +436,129 @@ for job in "${JOBS[@]}"; do
     [ "$exp_ok" -eq 1 ] && pass "expiry still fails hard (line $exp_rc_line), naming the last-read and expected versions"
   fi
 
-  # The export must reflect whichever copy the loop finally accepted.
+  # The export must reflect whichever copy the loop finally accepted, so it is
+  # checked against the END of the push arm, not against its `while`. Compared
+  # against the `while`, an export moved INSIDE the body would still pass while
+  # pinning an intermediate read, which is the very shadowing this asserts on.
+  rc_block="$(printf '%s\n' "$sniff" | guarded_block '[ "${GITHUB_EVENT_NAME:-}" = "push" ]; then')"
+  rc_end_line="$(printf '%s\n' "$rc_block" | block_end)"
   env_line="$(printf '%s\n' "$sniff" | line_with 'echo "FD_SERVED_VERSION=$served_version" >> "$GITHUB_ENV"')"
   env_count="$(printf '%s\n' "$sniff" | grep -cF 'FD_SERVED_VERSION=$served_version')"
-  if [ -n "$env_line" ] && [ -n "$rc_loop_line" ] && [ "$env_line" -gt "$rc_loop_line" ] && [ "$env_count" -eq 1 ]; then
-    pass "FD_SERVED_VERSION is exported once, after the re-read loop (line $env_line, loop line $rc_loop_line)"
+  if [ -n "$env_line" ] && [ -n "$rc_end_line" ] && [ "$env_line" -gt "$rc_end_line" ] && [ "$env_count" -eq 1 ]; then
+    pass "FD_SERVED_VERSION is exported once, after the whole re-read block ends (line $env_line, block ends $rc_end_line)"
   else
-    fail "FD_SERVED_VERSION is exported at line ${env_line:-none} ($env_count time(s)), not exactly once after the re-read loop (${rc_loop_line:-missing}): a retried version would be shadowed by the stale first read"
+    fail "FD_SERVED_VERSION is exported at line ${env_line:-none} ($env_count time(s)), not exactly once after the re-read block ends (${rc_end_line:-missing}): a retried version would be shadowed by the stale first read"
+  fi
+
+  # ── 11. the two install.sh fetches are pinned to ONE release ────────────────
+  # Rung 1 reads the served installer once; the "Run the advertised command"
+  # step re-fetches the same URL independently, seconds or minutes later.
+  # Nothing tied those two reads to the same release, and in the post-publish
+  # window they legitimately disagree, which makes the asset preflight between
+  # them a guarantee about a release nobody then downloads. On v0.20.1 both
+  # macOS legs verified 0.20.0's assets and installed 0.20.1.
+  ev_block="$(printf '%s\n' "$sniff" | guarded_block 'if [ -n "${FD_EXPECT_VERSION:-}" ]; then')"
+  ev_guard_line="$(printf '%s\n' "$ev_block" | line_with 'if [ -n "${FD_EXPECT_VERSION:-}" ]; then')"
+  ev_loop_line="$(printf '%s\n' "$ev_block" | line_with 'while [ "$served_version" != "$FD_EXPECT_VERSION" ]')"
+  if [ -n "$ev_guard_line" ] && [ -n "$ev_loop_line" ] && [ "$ev_loop_line" -gt "$ev_guard_line" ] \
+     && printf '%s\n' "$code" | grep -qF 'FD_EXPECT_VERSION: ${{ inputs.expect_version'; then
+    pass "rung 1 converges on the dispatched release when one is named (guard line $ev_guard_line, loop line $ev_loop_line)"
+  else
+    fail "the payload-sniff step has no expect_version convergence behind a non-empty guard (guard ${ev_guard_line:-missing}, loop ${ev_loop_line:-missing}), or the job does not read the input: rung 1's version and the install step's would again be free to differ"
+  fi
+
+  # Parsed out of the file for the same reason the other budgets are: one this
+  # test hardcoded could silently diverge from the one the job spends.
+  if [ -n "$ev_wait" ] && [ -n "$ev_poll" ]; then
+    if [ "$ev_poll" -ge 15 ] && [ "$ev_poll" -le 60 ] && [ "$ev_wait" -gt "$ev_poll" ] && [ "$ev_wait" -le 1800 ]; then
+      pass "the expect_version budget is bounded and its interval is in band: wait ${ev_wait}s, poll ${ev_poll}s"
+    else
+      fail "the expect_version budget is out of band: wait ${ev_wait}s, poll ${ev_poll}s (want 15 <= poll <= 60 < wait <= 1800). Too tight and it cannot outlast the propagation window the dispatch fires into; too loose and it just makes an undeployed release slower to report."
+    fi
+  else
+    fail "FD_EXPECT_VERSION_WAIT_SECS / FD_EXPECT_VERSION_POLL_SECS are not both literal integers in this job's env: an unbounded or interpolated convergence is exactly what this asserts against"
+  fi
+
+  # THE NEGATIVE HALF, and the reason this section exists. The rc loop above
+  # MUST cache-bust and this one must NOT, so the assertion has to be that the
+  # nonce and the no-cache headers are ABSENT here. A '?cb=' query string is a
+  # different Cloudflare cache key: converging on the nonced URL would say
+  # nothing about the plain one, which is the only URL the install step ever
+  # requests, and the drift this loop closes would quietly stay open.
+  plain_ok=1
+  if ! printf '%s\n' "$ev_block" | grep -qF '"$FRONT_DOOR/install.sh" -o "$tmp/install.sh"'; then
+    plain_ok=0
+    fail "the expect_version re-read does not fetch the plain \$FRONT_DOOR/install.sh: it must poll the exact URL the install step will request, or converging proves nothing about it"
+  fi
+  if printf '%s\n' "$ev_block" | grep -qF 'cb='; then
+    plain_ok=0
+    fail "the expect_version re-read carries a cache-busting nonce. That is correct for the rc loop and wrong here: a '?cb=' query string is a DIFFERENT Cloudflare cache key, so it would converge on a URL the install step never fetches."
+  fi
+  if printf '%s\n' "$ev_block" | grep -qiE 'Cache-Control|Pragma'; then
+    plain_ok=0
+    fail "the expect_version re-read sends no-cache request headers. Same reason as the nonce: what has to be asserted is what a stranger's unadorned curl gets from this POP."
+  fi
+  [ "$plain_ok" -eq 1 ] && pass "the expect_version re-read polls the PLAIN url, with no nonce and no cache headers (the rc loop deliberately does the opposite)"
+
+  if printf '%s\n' "$ev_block" | grep -qF 'assert_shell_file "$tmp/install.sh" "$FRONT_DOOR/install.sh"'; then
+    pass "each convergence re-read re-validates the whole payload, so one landing on the soft-404 page is reported as HTML"
+  else
+    fail "the convergence re-read does not re-run assert_shell_file, so a re-read that lands on the landing page would be swallowed as one more version mismatch"
+  fi
+
+  # Expiry stays fatal and separates the two causes it cannot tell apart from
+  # the outside: nothing deployed, versus a POP still lagging.
+  ev_exp="$(printf '%s\n' "$ev_block" | grep -F 'never agreed' | head -n 1)"
+  if [ -z "$ev_exp" ]; then
+    fail "the convergence loop has no expiry error, so an undeployed release would either hang or pass"
+  else
+    ev_exp_line="${ev_exp%%:*}"
+    ev_ok=1
+    case "$ev_exp" in
+      *'TWO CAUSES'*) ;;
+      *) ev_ok=0; fail "the convergence expiry does not separate 'not deployed' from 'this POP is still lagging', which are the only two readings and want different responses" ;;
+    esac
+    case "$ev_exp" in
+      *'Last read: $served_version'*'Expected: $FD_EXPECT_VERSION'*) ;;
+      *) ev_ok=0; fail "the convergence expiry does not report both the last-read and the expected version" ;;
+    esac
+    case "$(sed -n "$((ev_exp_line + 1))p" "$WORKFLOW")" in
+      *'exit 1'*) ;;
+      *) ev_ok=0; fail "the convergence expiry at line $ev_exp_line is not immediately followed by 'exit 1': it must never degrade to a warning and let the install run unpinned" ;;
+    esac
+    [ "$ev_ok" -eq 1 ] && pass "convergence expiry fails hard (line $ev_exp_line), naming both causes and both versions"
+  fi
+
+  # Against the END of the block again, for the reason spelled out at
+  # guarded_block: an export INSIDE the body would pin an intermediate read.
+  ev_end_line="$(printf '%s\n' "$ev_block" | block_end)"
+  if [ -n "$env_line" ] && [ -n "$ev_end_line" ] && [ "$env_line" -gt "$ev_end_line" ]; then
+    pass "FD_SERVED_VERSION is exported after the convergence block ends too (line $env_line, block ends $ev_end_line)"
+  else
+    fail "FD_SERVED_VERSION is exported at line ${env_line:-none}, not after the convergence block ends (${ev_end_line:-missing}): the preflight would probe the version of an earlier read rather than the converged one"
+  fi
+
+  # A malformed input can never equal the served version, so it would cost the
+  # whole budget and then red for a reason that is not the origin's. Refused up
+  # front instead, in the same step and before the same first fetch as the
+  # hostile-origin allowlist.
+  validate="$(step_code "$job" "Resolve and validate the origin under test")"
+  shape_line="$(printf '%s\n' "$validate" | line_with 'refusing expect_version')"
+  if [ -n "$shape_line" ] && [ -n "$curl_line" ] && [ "$shape_line" -lt "$curl_line" ]; then
+    pass "a malformed expect_version is refused in the validate step (line $shape_line), before the first fetch (line $curl_line)"
+  else
+    fail "expect_version is not shape-checked before the first fetch (refusal ${shape_line:-missing}, first fetch ${curl_line:-none}): a v<ver> tag would burn the entire convergence budget before failing"
+  fi
+
+  # The residual drift, named as itself. The rename must not have EATEN the
+  # plain verdict: a download failure whose URL names the verified version is
+  # still a download failure.
+  if printf '%s\n' "$verify" | grep -qF 'FRONT-DOOR VERSION DRIFT' \
+     && printf '%s\n' "$verify" | grep -qF '[ "$failed_version" != "$FD_SERVED_VERSION" ]' \
+     && printf '%s\n' "$verify" | grep -qF 'This is a DOWNLOAD failure, not a gateway health failure'; then
+    pass "a download failure naming a different version than rung 1 verified is reported as drift, and the plain verdict still exists for the rest"
+  else
+    fail "assert_no_download_failure does not tell version drift from a download failure (or the rename replaced the plain verdict instead of preceding it), so the v0.20.1 shape would again point at release-tarballs.yml over an asset this run never verified"
   fi
 done
 

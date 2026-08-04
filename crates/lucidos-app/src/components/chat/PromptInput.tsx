@@ -28,14 +28,15 @@ import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgen
 import { LucidosControlMenu } from './LucidosControlMenu';
 import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, computeMorphMode, computeAnswerActionMode, dispatchSend, computeSubmitMultiCount, findPendingMultiSelectQuestion, findLatestPendingQuestion, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
 import { focusIfNeeded, composeHandlers } from './promptFocus';
+import { threadEntryFocusTarget } from './choiceCardNav';
 import { syncTextareaValue, shouldSkipSyncWhileEditing, promptOverrideSyncSeq } from './promptValueSync';
 import { effectiveCodingAgentBackend, effectiveSendMode } from './promptToggleMode';
-import { resizeTextarea, useFontMetricsResize, animateTextareaHeightFrom } from './promptResize';
+import { resizeTextarea, remeasureTextarea, isTextareaHeightAnimating, useFontMetricsResize, animateTextareaHeightFrom } from './promptResize';
 import { isMobile } from '../../utils/viewport';
 import { prefersReducedMotion } from '../../utils/platform';
 import { createTapGate } from '../../utils/tapGesture';
@@ -222,7 +223,12 @@ export function PromptInput() {
       }
     }
     if (!sameThread && !isMobile()) {
-      requestAnimationFrame(() => focusIfNeeded(el));
+      // A thread parked on a live choice card (a user question or a permission
+      // request) wants that card's default choice focused, not the prompt, so
+      // Enter answers straight away. threadEntryFocusTarget is the SINGLE place
+      // that decides between the two: the card's own mount seed also fires on a
+      // switch, and letting both decide independently would race on mount order.
+      requestAnimationFrame(() => focusIfNeeded(threadEntryFocusTarget(el)));
     }
     prevTidRef.current = tid;
     wasComposeViewRef.current = isComposeView;
@@ -238,7 +244,17 @@ export function PromptInput() {
 
   function handleKeyDown(e: KeyboardEvent) {
     if (e.key === 'Escape') {
-      inputRef.current?.blur();
+      // Escape reaches the textarea only when no overlay is open: the central
+      // overlay stack handles it first, in the capture phase, and stops
+      // propagation (see .claude/rules/frontend.md). So here it belongs to the
+      // composer, and means the same thing as the row's red button.
+      const action = computePromptEscapeAction(cancelTargetId !== null, isCancelSettling());
+      if (action === 'cancel') {
+        e.preventDefault();
+        cancelExchangeForTarget();
+      } else if (action === 'blur') {
+        inputRef.current?.blur();
+      }
       return;
     }
     if (e.key === 'Enter' && !e.shiftKey && !isMobile()) {
@@ -352,6 +368,24 @@ export function PromptInput() {
     // repeat tap can't land on it. See armCancelSettle.
     armCancelSettle();
     await beginSend(threadId, thread, msg, currentImages, { useCodingAgent, context });
+    restoreComposerFocus();
+  }
+
+  /** Put the caret back in the composer after a send. Sending is not leaving
+   *  the composer: the next follow-up usually comes straight after, and on the
+   *  compose→docked path the prompt is re-parented by the FLIP, which drops
+   *  focus on its own. Mobile is excluded because it deliberately blurred on
+   *  submit to drop the keyboard.
+   *
+   *  Only when nobody else has claimed focus in the meantime: the send is
+   *  awaited, so by the time this runs the user may have clicked into another
+   *  field, and a question card that arrived meanwhile seeds focus onto its own
+   *  options (threadEntryFocusTarget). Neither should be yanked back. */
+  function restoreComposerFocus() {
+    if (isMobile()) return;
+    const active = document.activeElement;
+    if (active && active !== document.body) return;
+    focusIfNeeded(inputRef.current);
   }
 
   useSignalEffect(() => {
@@ -501,12 +535,36 @@ export function PromptInput() {
   // image attachment + warn the user via toast until UserQuestionAnswered grows
   // an image_hashes field.
   const isAnsweringQuestion = focusedStatus === 'waiting_for_user_answer';
-  const rawPendingMultiQ = isAnsweringQuestion
-    ? findPendingMultiSelectQuestion(focusedThread)
-    : null;
-  const pendingMultiQ = rawPendingMultiQ && !pendingAnswers.has(rawPendingMultiQ.toolUseId)
-    ? rawPendingMultiQ
-    : null;
+  // One exchange walk serves both consumers: the multi-select Submit control
+  // and the placeholder. `waiting_for_user_answer` also covers coding-agent
+  // permission cards, which are NOT `UserQuestionAsked` and never absorb typed
+  // text, so the placeholder keys off an actual pending question rather than
+  // the status alone.
+  const rawPendingQ = isAnsweringQuestion ? findLatestPendingQuestion(focusedThread) : null;
+  // Drop an optimistically-answered question here, once, so every consumer
+  // agrees the user is done with it: Submit hides AND the placeholder stops
+  // inviting an answer during the click-to-SSE gap.
+  const pendingQ = rawPendingQ && !pendingAnswers.has(rawPendingQ.toolUseId) ? rawPendingQ : null;
+  const answeringQuestionCard = pendingQ !== null;
+  // A placeholder swap changes what the empty box has to fit without touching
+  // its value, which is the only thing resizeTextarea reacts to, so force a
+  // fresh measurement on each one. The answering placeholder is the reason: it
+  // is a whole sentence and wraps at phone widths, in a narrowed thread pane,
+  // and at large UI scales, so the box has to grow to it on arrival and back
+  // down on the answer.
+  //
+  // Except while the compose FLIP is easing the height: that animation inverts
+  // (parks the box at the height it came from, then transitions to the target it
+  // already rests at), so writing the target here would land the box on it
+  // before the transition starts and the ease would play over zero distance.
+  // Its target already accounts for the new placeholder, because the switch
+  // effect above runs first and resizeTextarea measures it.
+  const placeholder = promptPlaceholder(!!focusedThreadId.value, answeringQuestionCard);
+  useEffect(() => {
+    const el = inputRef.current;
+    if (el && !isTextareaHeightAnimating(el)) remeasureTextarea(el);
+  }, [placeholder]);
+  const pendingMultiQ = pendingQ?.multiSelect ? pendingQ : null;
   const multiSelectedIds = pendingMultiQ ? getMultiSelectedIds(pendingMultiQ.toolUseId) : [];
   const hasPendingMultiQ = pendingMultiQ !== null;
   // Submit consumes the typed text; queued upload sends also count as already
@@ -684,6 +742,7 @@ export function PromptInput() {
       clearPendingAnswer(pendingMultiQ.toolUseId);
       showToast('Could not send answer — please try again.', 'error');
     }
+    restoreComposerFocus();
   }
 
   const submitMultiCount = computeSubmitMultiCount(multiSelectedIds.length, composeText);
@@ -918,7 +977,7 @@ export function PromptInput() {
             data-role="prompt-input"
             data-thread-id={tid ?? ''}
             {...PROSE_TEXT_ATTRS}
-            placeholder={focusedThreadId.value ? 'Post a follow up…' : 'What can I help with?'}
+            placeholder={placeholder}
             rows={1}
             onInput={handleInput}
             onKeyDown={handleKeyDown}

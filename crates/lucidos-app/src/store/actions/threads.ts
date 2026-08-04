@@ -31,6 +31,15 @@ export interface FocusThreadOptions {
    *  Same scroll/suppression contract as `targetEventId`; ignored when
    *  `targetEventId` is also set. */
   targetChangeId?: string | null;
+  /** Default true: focusing a thread is navigation, so it surfaces the thread
+   *  pane (`revealThreadPane`: mobile swipes, desktop re-activates the Threads
+   *  pane group). Pass `false` for a focus change that is BOOKKEEPING rather
+   *  than navigation, i.e. the post-archive hand-off in `handleArchiveThread`.
+   *  There the focus moves to the next row so the thread pane isn't left
+   *  pointing at an archived thread, but the user never asked to go there, and
+   *  on mobile the thread drawer IS a pane, so revealing would swipe them off
+   *  the list they're triaging. Mirrors `unfocusThread({ revealPane: false })`. */
+  revealPane?: boolean;
 }
 
 export function focusThread(threadId: string, options?: FocusThreadOptions): void {
@@ -61,12 +70,13 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
 
   pushThreadNavState({ type: 'thread', id: threadId });
 
-  // Surface the focused thread on the pane the user is actually working in —
+  // Surface the focused thread on the pane the user is actually working in:
   // mobile swipes to the thread pane, desktop re-activates the Threads pane
   // group from the cross-group case. Without this, callers like toast onClick
   // and search would set the focused thread but leave the user on whichever
   // pane they were on. See `revealThreadPane` (the mirror of revealContentPane).
-  revealThreadPane();
+  // `revealPane: false` opts out for a bookkeeping focus change (see the option).
+  if (options?.revealPane !== false) revealThreadPane();
 
   if (targetEventId) {
     scrollToEventAndPulse(targetEventId);
@@ -117,7 +127,9 @@ export async function focusThreadOrBootstrapResult(
   const previousFocus = focusedThreadId.value;
   bootstrappingThreadId.value = threadId;
   setFocusedThread(threadId);
-  revealThreadPane();
+  // Same opt-out as the hit path above, so `revealPane: false` means the same
+  // thing whichever branch a caller lands on.
+  if (options?.revealPane !== false) revealThreadPane();
   let found: boolean;
   try {
     found = await ensureThreadByIdInMap(threadId);
@@ -178,17 +190,22 @@ export function focusThreadOrBootstrap(threadId: string, options?: FocusThreadOp
 /** Drop the focused thread → the thread pane shows the compose view.
  *
  *  `revealPane` (default true): also surface the thread pane, so the user-intent
- *  callers (the New-thread buttons, the new-chat shortcut, archiving the last
- *  review, a new-chat NavigationRequested) land the compose view on the pane the
- *  user is looking at — mobile swipes to it, desktop re-activates the Threads
- *  pane group from the content group. Mirrors focusThread; the callers that used
- *  to hand-pair `navigateToPane('thread')` no longer need to.
+ *  callers (the New-thread buttons, the new-chat shortcut, a new-chat
+ *  NavigationRequested) land the compose view on the pane the user is looking
+ *  at: mobile swipes to it, desktop re-activates the Threads pane group from the
+ *  content group. Mirrors focusThread; the callers that used to hand-pair
+ *  `navigateToPane('thread')` no longer need to.
  *
- *  Pass `{ revealPane: false }` for stale-pointer CLEANUP — ThreadView clears a
- *  focusedThreadId whose thread isn't in the map. ThreadView is mounted in the
- *  background on mobile (MobileSwipeContainer mounts all three panes), so a
- *  reveal there would yank a user on the content pane to the thread pane during
- *  render. Cleanup isn't navigation — it must not move the visible pane. */
+ *  Two callers pass `{ revealPane: false }`, both because the unfocus is not
+ *  navigation and must not move the visible pane:
+ *
+ *  - Stale-pointer CLEANUP: ThreadView clears a focusedThreadId whose thread
+ *    isn't in the map. ThreadView is mounted in the background on mobile
+ *    (MobileSwipeContainer mounts all three panes), so a reveal there would yank
+ *    a user on the content pane to the thread pane during render.
+ *  - The post-archive hand-off when the last review is dismissed
+ *    (`handleArchiveThread`), which must leave a user archiving from the thread
+ *    drawer there. See `FocusThreadOptions.revealPane`. */
 export function unfocusThread(opts?: { revealPane?: boolean }): void {
   setFocusedThread(null);
   revealOnFocus.value = false;
@@ -501,14 +518,19 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
 
   // The SSE `ThreadArchived` cascade arriving later just confirms what we
   // already did.
+  //
+  // Both branches move the focus WITHOUT revealing the thread pane: archiving
+  // is not navigation. The hand-off exists so the thread pane isn't left
+  // pointing at a thread that just left the list, not because the user asked to
+  // go there. On mobile the thread drawer is its own pane, so revealing swiped a
+  // user archiving row after row out of the list on every tap.
   const nextId = candidates.find(id => !cascade.has(id)) ?? null;
   if (nextId) {
     revealOnFocus.value = true;
-    focusThread(nextId);
+    focusThread(nextId, { revealPane: false });
   } else {
-    // Last review dismissed → land on the compose view. unfocusThread reveals
-    // the thread pane itself (keeps the drawer open), so no manual navigate.
-    unfocusThread();
+    // Last review dismissed → the thread pane falls back to the compose view.
+    unfocusThread({ revealPane: false });
   }
 
   try {
@@ -530,7 +552,9 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     // away during the in-flight API call — a user who picked a different
     // thread made a deliberate choice we shouldn't yank them out of.
     const stillOnAutoFocus = focusedThreadId.value === nextId;
-    if (stillOnAutoFocus && restored.has(threadId)) focusThread(threadId);
+    if (stillOnAutoFocus && restored.has(threadId)) {
+      focusThread(threadId, { revealPane: false });
+    }
     showToast(formatArchiveErrorToast(e), 'error');
   } finally {
     const next = new Set(archivingThreadIds.value);

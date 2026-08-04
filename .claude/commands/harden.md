@@ -212,6 +212,32 @@ Runs for **every** diff, with no fast path: the docs-only and CSS-only skips bel
 
 This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
 
+### Also always: the ADR gate
+
+```bash
+./scripts/check-adrs.sh
+```
+
+Also runs for **every** diff, not only ones touching `docs/adr/`. It is a
+whole-tree consistency check costing milliseconds, and running it
+unconditionally is what catches a duplicate ADR number that arrived through a
+**merge** rather than through this branch's own edits.
+
+`docs/adr/index.md` carries `merge=union` (see `.gitattributes`), which is what
+stops two branches appending an ADR line from conflicting, and that conflict was
+a recurring, guaranteed tax before 2026-08-04. Union keeps both lines but
+neither orders nor deduplicates them, so this gate covers the rest: a duplicate
+number (silent, because two ADRs with different filenames merge clean), an ADR
+with no index line or an index line with no ADR, an index left out of order by a
+union merge, and a missing required section.
+
+Out of order is the one it can repair: `./scripts/check-adrs.sh --fix`. A
+duplicate number is reported with both paths and the next free number, never
+auto-renumbered, because deciding which references are live and which are
+historical narration needs judgment. New ADRs come from `./scripts/adr-new.sh`,
+which allocates across `main`, every unmerged branch, and the working tree, and
+therefore cannot collide.
+
 ### Then the test suites
 
 Run the test suites for the layers touched on this branch.

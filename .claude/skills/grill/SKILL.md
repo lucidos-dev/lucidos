@@ -25,7 +25,7 @@ Ask each question via the `AskUserQuestion` tool, not as plain text.
 - Keep `header` to a short chip-style label (max 12 chars).
 - Use `multiSelect: true` only when choices genuinely aren't mutually exclusive.
 
-The user can always pick "Other" for free-text, so don't pad with junk options just to hit four — three sharp ones beats four with filler.
+The user can always type a free-text answer in the prompt instead of picking, so don't pad with junk options just to hit four: three sharp ones beats four with filler. That escape is the prompt textarea, NOT an option, so never add an "Other" / "Let me type it" choice. Lucidos renders exactly the options you pass, and picking one sends its label back as the answer, so that button would report "Other" as the user's decision.
 
 **Plain-text fallback:** if a question is genuinely open-ended and no 2+ plausible options exist (e.g. "paste the error message", "what's the API key"), ask in plain text. Use this fallback sparingly — most design questions have natural option sets.
 

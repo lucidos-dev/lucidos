@@ -20,9 +20,10 @@ use crate::boot_failure::BootFailure;
 use crate::boot_phase::{self, BootPhase};
 use crate::error::ApiError;
 use crate::net_config;
+use crate::next_boot;
 use crate::postgres::{self, PgBackend, PgHandle, ProvisionError, ProvisionErrorKind};
 use crate::proxy;
-use crate::registry::{self, Registry, Workspace, SIGIL};
+use crate::registry::{self, Registry, Workspace, REGISTRY_VERSION, SIGIL};
 use crate::stack::{self, Health, ProbeOutcome, StackRuntime, WorkspaceStatus};
 use crate::BoxError;
 use axum::body::Body;
@@ -568,23 +569,41 @@ impl GatewayState {
     /// failure-isolated. Per workspace:
     ///   * an engine already answering health is **re-adopted** (regardless of
     ///     `autostart`) — engine-statelessness across a gateway restart;
+    ///   * else a workspace the last teardown **stopped** is brought back
+    ///     (regardless of `autostart`): a restart must return what it took, and
+    ///     the packaged service kills every engine on its way out. See
+    ///     [`crate::next_boot`];
     ///   * else an `autostart` workspace is **spawned** (the always-on posture:
     ///     a login-launched packaged gateway brings up its auto-start workspaces);
     ///   * else it is **left stopped** — listed in the picker (via
     ///     [`Self::list_status`]'s no-stack branch) and started only on an
     ///     explicit open (lazy, [`Self::lazy_start`]) or launch.
     async fn boot_all(&self) {
+        // Consumed exactly once, here, before anything is brought up. Empty in
+        // dev, where nothing writes the record.
+        let restore: Arc<HashSet<String>> =
+            Arc::new(next_boot::take(self.app_data()).into_iter().collect());
+        if !restore.is_empty() {
+            let mut ids: Vec<&str> = restore.iter().map(String::as_str).collect();
+            ids.sort_unstable();
+            crate::log!(
+                "[Gateway] restoring {} workspace(s) the last shutdown stopped: {}",
+                ids.len(),
+                ids.join(", ")
+            );
+        }
         let workspaces: Vec<Workspace> = {
             let reg = self.inner.registry.lock().unwrap();
             reg.workspaces.clone()
         };
         let futures = workspaces.into_iter().map(|ws| {
             let me = self.clone();
+            let restore = Arc::clone(&restore);
             async move {
                 let running =
                     stack::probe_health(&me.inner.health_client, me.engine_scheme(), ws.port).await
                         == ProbeOutcome::Healthy;
-                if running || ws.autostart {
+                if should_bring_up(&ws, running, &restore) {
                     // bring_up itself re-adopts a healthy engine and only spawns
                     // when none is running, so this is correct for both cases.
                     me.bring_up(ws).await;
@@ -787,10 +806,12 @@ impl GatewayState {
     /// provisioning so a provisioning failure leaves a recoverable `Unhealthy`
     /// workspace (retry / delete from the picker) rather than vanishing.
     ///
-    /// New workspaces are created with `autostart = false`: the user opens this
-    /// one now, and whether it auto-starts on a future gateway boot is their
-    /// per-workspace picker toggle. (This is the sole creation path — there is no
-    /// auto-created bootstrap `default`; first run shows the picker.)
+    /// New workspaces are created with `autostart = true`: a workspace someone
+    /// bothered to create is one they want running, and the always-on service
+    /// only keeps its promise (triggers, scheduled tasks, coding-agent sessions,
+    /// push) for a workspace whose engine is up. The picker toggle turns it off
+    /// per workspace. This is the sole creation path: there is no auto-created
+    /// bootstrap `default`, and first run shows the picker.
     pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceStatus, BoxError> {
         let ws = {
             let mut reg = self.inner.registry.lock().unwrap();
@@ -803,7 +824,7 @@ impl GatewayState {
                 dir: format!("workspaces/{id}"),
                 port,
                 database_url: None,
-                autostart: false,
+                autostart: true,
             };
             reg.add(ws.clone())?;
             reg.save(&self.inner.registry_path)?;
@@ -1980,7 +2001,24 @@ pub async fn run() -> Result<(), BoxError> {
     );
     crate::log!("[Gateway] postgres backend: {:?}", pg_backend);
 
-    let registry = Registry::load(&registry_path)?;
+    let mut registry = Registry::load(&registry_path)?;
+    // Packaged only: lift a pre-versioning registry to the current autostart
+    // default, once (see `Registry::migrate_to_current`). Dev seeds
+    // `autostart: false` deliberately, so migrating there would spawn every
+    // workspace the launcher has ever registered. A failed save is logged, not
+    // fatal: the migration is a default, and refusing to boot the whole stack
+    // over it would be the worse outcome (it simply retries next boot).
+    if packaged {
+        if let Some(changed) = registry.migrate_to_current() {
+            crate::log!(
+                "[Gateway] registry migrated to v{REGISTRY_VERSION}: {changed} workspace(s) now \
+                 start with the background service (change it per workspace in the picker)"
+            );
+            if let Err(e) = registry.save(&registry_path) {
+                crate::log!("[Gateway] could not save the migrated registry: {e}");
+            }
+        }
+    }
     let state = GatewayState {
         inner: Arc::new(GatewayInner {
             app_data,
@@ -2230,6 +2268,18 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             (StatusCode::NOT_FOUND, format!("unknown workspace '{slug}'")).into_response()
         }
     }
+}
+
+/// Should [`GatewayState::boot_all`] bring this workspace up?
+///
+/// Pure, so the rule is unit-tested without spawning an engine. The three yeses
+/// are deliberately different questions: `healthy` is an engine that outlived
+/// the gateway and only needs re-adopting, `restore` is one the last teardown
+/// stopped and owes the user (see [`crate::next_boot`]), and `autostart` is the
+/// user's own boot posture. A restore does NOT consult `autostart`: a restart
+/// must return what it took, whatever the flag says.
+fn should_bring_up(ws: &Workspace, healthy: bool, restore: &HashSet<String>) -> bool {
+    healthy || restore.contains(&ws.id) || ws.autostart
 }
 
 /// True for a browser document navigation that should wake a stopped workspace.
@@ -2506,6 +2556,56 @@ fn raise_fd_limit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── What boot_all brings up ──────────────────────────────────────────────
+
+    fn workspace(id: &str, autostart: bool) -> Workspace {
+        Workspace {
+            id: id.to_string(),
+            name: id.to_string(),
+            dir: format!("workspaces/{id}"),
+            port: 5000,
+            database_url: None,
+            autostart,
+        }
+    }
+
+    // The bug this exists for: a packaged Restart stops every engine, so nothing
+    // is healthy and `autostart` alone leaves the workspace the user was sitting
+    // in stopped. A restore must not consult the flag.
+    #[test]
+    fn a_workspace_the_last_teardown_stopped_comes_back_without_autostart() {
+        let restore: HashSet<String> = ["myws".to_string()].into_iter().collect();
+        assert!(should_bring_up(&workspace("myws", false), false, &restore));
+    }
+
+    #[test]
+    fn a_healthy_or_autostart_workspace_comes_up_with_no_restore_record() {
+        let empty = HashSet::new();
+        assert!(
+            should_bring_up(&workspace("adopted", false), true, &empty),
+            "a surviving engine is re-adopted whatever the flag says",
+        );
+        assert!(should_bring_up(&workspace("always", true), false, &empty));
+    }
+
+    // The other half of the contract: Stop must stick. A workspace the user
+    // stopped is not running at teardown, so it is not in the record, and nothing
+    // else may start it.
+    #[test]
+    fn a_stopped_workspace_stays_stopped() {
+        let restore: HashSet<String> = ["other".to_string()].into_iter().collect();
+        assert!(!should_bring_up(
+            &workspace("stopped", false),
+            false,
+            &restore
+        ));
+        assert!(!should_bring_up(
+            &workspace("stopped", false),
+            false,
+            &HashSet::new()
+        ));
+    }
 
     /// A worktree-rooted engine binary is refused at boot with the corrective
     /// command — the 2026-07-26 self-perpetuating pin.

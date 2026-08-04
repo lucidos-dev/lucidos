@@ -198,9 +198,9 @@ pub enum ThreadEvent {
     /// tool produced the row. Paired with a later `BackgroundBashCompleted`.
     /// The two events are the durable audit trail of every long-running
     /// background task — `bash_output` reads from the in-memory registry
-    /// while a task runs and falls back to the `BackgroundBashCompleted`
-    /// payload after the task is evicted, regardless of which tool spawned
-    /// it.
+    /// while a task runs and for the few minutes its completion is retained
+    /// there, then falls back to the `BackgroundBashCompleted` payload,
+    /// regardless of which tool spawned it.
     BackgroundBashStarted {
         task_id: String,
         command: String,

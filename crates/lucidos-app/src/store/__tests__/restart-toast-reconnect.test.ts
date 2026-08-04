@@ -155,7 +155,7 @@ describe('restart toast survives network reconnect', () => {
     // is stable for the whole window — there is no build→swap phase transition.
     engineRestarting.value = true;
     toasts.value = [];
-    showToast('Starting new version…', 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+    showToast('Starting new version…', 'info', { key: RESTART_TOAST_KEY, showWhileUnavailable: true, spinning: true });
 
     // Old engine killed → a /health failure must NOT dismiss or reword the toast;
     // it stays with its spinner until reconnect (started_at change) clears it.

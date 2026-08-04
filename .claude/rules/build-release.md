@@ -136,7 +136,9 @@ event, and the rung logic is written once per host family:
   (`LucidosReleased` → DMG-link bump → `SitePublishRequested` → publisher →
   `SitePublished`) — so the webhook fires mid-deploy and would verify the
   *previous* origin, passing for the wrong reason. The publisher fires the
-  dispatch itself once `SitePublished` lands.
+  dispatch itself once `SitePublished` lands, and passes the release it just
+  deployed as the optional `expect_version` input, which is what pins the job's
+  two independent fetches of `install.sh` to one release (see below).
 - **`payload`** — rung 1 only, then stop green. Auto-runs on every push to
   `rc/**` against the **RC front door** (`https://rc.lucidos.dev`, its own Pages
   project, libs at `/scripts/lib/` on that host), so the soft-404 class is
@@ -307,9 +309,63 @@ until 06:21. Three faults in one shape, and all three are now covered:
   health polls, matching install.sh's own asset-fetch aborts (`Download failed:`
   and the checksum-sidecar one, not the checksum *mismatch*, which is a
   different verdict). It matters most on macOS, which deliberately has no
-  installer-exited fast-fail.
+  installer-exited fast-fail. Since 2026-08-03 it also reads the version out of
+  the URL the installer died on: when that differs from the one rung 1 verified,
+  the verdict is **front-door version drift** rather than a download failure
+  (next block). A URL it cannot parse a version from falls through to the plain
+  wording, so the branch renames a failure and never invents one.
 - **`timeout-minutes` is 75**, not 30: the ceiling has to exceed the budgets it
-  contains, and 1800 + 900 + 900 s of slack is 3600.
+  contains, and 1800 + 900 + 900 s of slack is 3600. The convergence budget in
+  the next block can stack on top of the preflight's (a lagging POP is exactly a
+  POP whose release is new enough for the tarballs to still be attaching), which
+  puts the worst case at 600 + 1800 + 900 + 900 = 4200 s, still inside the
+  4500 s ceiling. `front_door_gate_test.sh` does that arithmetic over all three
+  budgets rather than restating it.
+
+**The job's TWO fetches of `install.sh` are pinned to ONE release
+(2026-08-03).** The preflight above certifies the assets of whatever version
+rung 1 read, and that guarantee was void in the window it exists for. Rung 1
+reads the served installer ONCE; the "Run the advertised command" step
+re-fetches the same URL independently, seconds or minutes later; nothing tied
+the two reads to the same release. Right after a publish they legitimately
+disagree, because the dispatch fires within seconds of the deploy and Cloudflare
+POPs are mid propagation. On v0.20.1 the ubuntu leg read 0.20.1, waited out the
+attach window and went green, while BOTH macOS legs read 0.20.0, passed the
+preflight on attempt 1 against the PREVIOUS release's assets, and then died when
+the install step resolved 0.20.1 from a POP that had flipped. The shipped tree
+was fine every time: the preflight had verified a release nobody downloaded.
+
+The caller now names the release it dispatched the run to verify, through the
+optional **`expect_version`** input (a bare release number, never a `v<ver>`
+tag; shape-checked in the validate step so a typo fails there rather than after
+the whole budget). Rung 1 converges on it before exporting `FD_SERVED_VERSION`,
+bounded by `FD_EXPECT_VERSION_WAIT_SECS` (600 s) every
+`FD_EXPECT_VERSION_POLL_SECS` (30 s), re-running `assert_shell_file` on each
+re-read so a copy landing on the soft-404 page is reported as HTML instead of as
+one more mismatch, warning when convergence needed one, and failing closed with
+a message that separates "the publisher has not deployed this release" from
+"this POP is still lagging". The workspace trigger
+`verify-front-door-after-publish` passes the field, guarded on the
+`SitePublished` payload actually carrying a `release_version` (its `"?"`
+fallback would otherwise spend the budget waiting for a release nobody
+published). An EMPTY input is a first-class case that keeps the previous
+behaviour exactly, one read and no polling, which is what stops the daily cron
+(long after the assets have settled) gaining a new way to red.
+
+**No nonce, and its own budget: both deliberate, and the first is the one a
+future reader will "fix".** The budget is separate from `FD_RC_VERSION_*`
+because the two loops watch different origins for different phenomena, so tuning
+one must never retune the other. The nonce is the load-bearing difference. The
+rc loop above is RIGHT to cache-bust: payload mode stops after rung 1, so its
+nonced fetch is the last word and forcing a MISS is the fastest route to the
+truth. Here it would be actively wrong, because a `?cb=` query string is a
+DIFFERENT Cloudflare cache key: converging on the nonced URL would prove nothing
+about the plain one, and the plain one is the only URL the install step ever
+requests. What this loop has to assert is the stranger-visible truth, that this
+POP serves the expected release at `<origin>/install.sh` to an unadorned `curl`,
+so it polls exactly that. Because the contrast reads like an oversight, the
+drift test pins both halves: the nonce and no-cache headers present in the rc
+loop, absent in this one.
 
 **Both jobs are pinned by `scripts/lib/front_door_gate_test.sh`**, an offline
 drift test whose subject is the workflow file itself. It cannot be a unit test:
@@ -324,7 +380,23 @@ guards, and the rc version re-read (its bounded budget and interval band, the
 `cb=` nonce and no-cache header on the retry fetch, the retry staying scoped to
 the push/mismatch path while the empty-parse branch still exits immediately, the
 expiry still exiting rather than warning, and `FD_SERVED_VERSION` being exported
-after the loop). It strips comment lines first, so a job's prose about a rule (the macOS
+after the loop). It covers the `expect_version` convergence the same way, and
+one of those assertions is a NEGATIVE: its own bounded budget and interval band,
+the loop sitting behind a non-empty guard, the re-read fetching the plain
+`$FRONT_DOOR/install.sh` **with no `cb=` nonce and no cache headers** (the whole
+point of the loop, and the opposite of the rule one paragraph up), the payload
+re-validated on every re-read, the expiry naming both causes and still exiting,
+the export landing after this loop too, the malformed-input refusal preceding
+the first fetch, and the drift rename in `assert_no_download_failure` not having
+eaten the plain download verdict.
+
+Both export assertions compare against where the loop's block **ends**, not
+against its `while`, and that is not pedantry: compared against the `while`, an
+export moved INSIDE the body passes while pinning whatever intermediate read the
+loop was holding, which is the exact shadowing both loops exist to prevent. The
+`guarded_block` helper is what makes that checkable, and it is the same scoping
+that keeps the "no nonce here" assertion from being satisfied by the rc loop's
+nonce sitting a few lines above. It strips comment lines first, so a job's prose about a rule (the macOS
 job documents the ABSENCE of a `kill -0` fast-fail in words) can neither satisfy
 nor violate one, and it re-checks the preflight's URL construction against the
 tree's real `install_common.sh` + `headless_tarball.sh` and its download-failure
@@ -482,7 +554,8 @@ tree that is validated and a second tree that ships.
 
 **One strip implementation: `scripts/lib/release_tree.sh`.** It owns
 `RELEASE_TREE_EXCLUDE_PATHS` (internal-only paths: `docs/plans/`, `release.sh`,
-`release-to-lucidos.sh`, the `release_signing` / `release_events` /
+`release-to-lucidos.sh`, the one-time `rebuild-mirror-history.sh`, the
+`release_signing` / `release_events` / `release_main_sync` /
 `release_notes` libs, and `release_tree.sh` + its test — the lib withholds
 itself; each excluded lib is sourced by a shipping script only behind an
 `if [ -f … ]` with no-op stubs, or by an excluded caller only), the public
@@ -496,13 +569,18 @@ exactly how the 2026-07-28 leak came back.
 
 **Phase A (`release.sh --verify-build`)** arms both gate legs:
 
-1. builds the stripped tree from the release commit, **scans it**, commits it as
-   the orphan, and force-pushes it to `refs/heads/rc/<version>` — *before* the
+0. reads the mirror's `main` and its `v*` tag count, and **refuses the release**
+   unless `rev-list --count main` equals that tag count (see "the mirror's
+   `main` is a linear release history" below). This runs before the tree is
+   built, because it invalidates the whole release;
+1. builds the stripped tree from the release commit, **scans it**, commits it
+   **onto the mirror's `main`** (ADR 0039), and force-pushes it to
+   `refs/heads/rc/<version>`, *before* the
    DMG build, so `install-smoke.yml`'s slow Ubuntu/macOS source-install legs run
    concurrently with the build and the private-data guard refuses a leaking tree
    before 40 minutes of build time, not after;
-2. records `RC_COMMIT` in `verify-build-<version>.env` (alongside
-   `SOURCE_COMMIT`, `PR_NUMBER`, `PR_TITLE`), pinned locally at
+2. records `RC_COMMIT` **and `RC_PARENT`** in `verify-build-<version>.env`
+   (alongside `SOURCE_COMMIT`, `PR_NUMBER`, `PR_TITLE`), pinned locally at
    `refs/release-candidates/<version>` so the object can't be GC'd between phases;
 3. after staging, deletes + recreates the `rc-<version>` **draft release** at that
    branch with the staged DMG + updater `.sig`, then DISPATCHES the `dmg-verify`
@@ -521,31 +599,153 @@ A **notarize resume** reaches both steps too. **`release.sh --push-rc <version>`
 re-arms the gate from the recorded release commit with no rebuild (a failed
 push, a replaced rc, or a state file predating this flow). Both paths are
 idempotent: an unchanged candidate is a no-op push, and an existing remote rc
-whose *tree* matches is **adopted** rather than replaced, so a green gate is not
-thrown away.
+whose *tree* **and parent** both match is **adopted** rather than replaced, so a
+green gate is not thrown away. Parent equality is the half that matters since
+ADR 0039: "parentless" stopped being the safety property, and an object with the
+same tree but a different parent would put unscanned ancestry on the mirror.
 
 **Phase B (`release.sh --publish-verified`) promotes; it never rebuilds.**
 `release_promote_preflight` refuses, before the confirm prompt and before
 anything public, when: no `RC_COMMIT` was recorded, `rc/<version>` is gone from
 the mirror, the mirror's rc **moved** (someone re-pushed ⇒ the gate result is
-stale), `manifest.source_commit` ≠ the worktree HEAD, or any staged artifact's
-sha256 drifted. Then `release-to-lucidos.sh --promote-rc <sha>` re-asserts the
+stale), **no `RC_PARENT` was recorded** (a state file predating ADR 0039, whose
+candidate would flatten the history), **the mirror's `main` moved** off
+`RC_PARENT` (a release landed since, so the candidate's parent is stale),
+`manifest.source_commit` ≠ the worktree HEAD, or any staged artifact's
+sha256 drifted. It also **refuses the wrong arity**: the parent pair was
+appended to a five-argument signature, and a caller left at five would read two
+empty strings and skip the parent half in silence. Then
+`release-to-lucidos.sh --promote-rc <sha> --parent <sha>` re-asserts the
 unmoved rc, re-scans that commit's tree (the deterministic floor at the
-irreversible push), and force-pushes **that same object** to the mirror's `main`
-+ tags it `v<version>` **by SHA**, attaches the staged artifacts, and the rc
-branch + draft release are deleted.
+irreversible push), and pushes **that same object** to the mirror's `main`
+under a lease + tags it `v<version>` **by SHA**, attaches the staged artifacts,
+and the rc branch + draft release are deleted.
 
 The legacy one-shot (`release.sh <version>`, no phase flag) still builds its own
-tree from HEAD through the same lib and has no rc gate. Offline-tested by
+tree from HEAD through the same lib and has no rc gate; it resolves its parent
+from the mirror itself, at the point of publishing, and is held to **both** ADR
+0039 rules there (the shared `release_mirror_history_check`, and adopting a
+version the mirror already publishes rather than rebuilding it, which is what
+keeps a retry after a partial publish from adding a second commit for one tag).
+Offline-tested by
 `scripts/lib/release_tree_test.sh` (strip coverage, self-exclusion, guard
-fail-closed on both arms, commit determinism, all five preflight refusals, and
-the wiring that keeps the promotion a promotion).
+fail-closed on both arms, commit determinism with and without a parent, the
+full ancestry-guard matrix, both pure push/history comparators, every preflight
+refusal, an end-to-end rehearsal against a throwaway bare repo, and the wiring
+that keeps the promotion a promotion).
+
+#### The mirror's `main` is a linear release history (ADR 0039)
+
+Release N's published commit carries release N-1's as its **single** parent, so
+the mirror shows one commit per release and a release is ancestry-preserving
+rather than a history-replacing force-push. Until 2026-08-04 each release was a
+PARENTLESS commit force-pushed over the last, which is why the mirror showed a
+**one-commit history with 36 unrelated tags** and why every release broke every
+existing clone.
+
+What makes a parent safe is not that parents are harmless. A push sends every
+reachable object while `release_tree_scan` only inspects the **tip tree**, so
+ancestry genuinely could reach the mirror unscanned. It is that the parent is
+**required to be the object the mirror's own `main` already holds**, so the push
+adds nothing the public does not already have. `release_tree_is_orphan` became
+`release_tree_ancestry_is_published <repo> <commit> <expected-parent>`, which is
+the precise version of the property the blunt rule stood in for: at most one
+parent (a merge is refused, the history is strictly linear), that parent exactly
+the mirror's `main`, and no parent accepted only when the mirror has no `main`.
+Each refusal names which of the three it is, because the next move differs.
+
+Four things hold it together, all in `scripts/lib/release_tree.sh`:
+
+- **`release_mirror_branch`** is the ONE definition of the published branch name.
+  `release-to-lucidos.sh` assigns `BRANCH` from it after sourcing the lib rather
+  than carrying a literal, because the same name is also what
+  `release_mirror_main_sha` reads and what the lease is composed against.
+- **The parent is decided once**, in Phase A, and recorded as `RC_PARENT`. It is
+  part of the candidate's identity, so a rebuild onto a moved mirror is
+  deliberately a DIFFERENT object: the CI verdict on the old one does not carry
+  over to a different history.
+- **`release_main_push_decision <mirror-main> <candidate> <parent>`** picks one
+  of four words. `published` (main already IS the candidate) is the load-bearing
+  one: it is what keeps a retried publish idempotent, because the first
+  successful push moves `main` off the parent and a lease alone would then make
+  the second run refuse itself. `lease` pushes with
+  `--force-with-lease=refs/heads/main:<parent>`, which puts the precondition on
+  the SERVER at update time where the confirmation prompt cannot race it.
+  `create` is the empty-mirror bootstrap; `refuse` means a release landed since.
+- **`release_mirror_history_is_complete <commits> <tags>`** is the precondition,
+  and it is permanent rather than a one-time step. It refuses in BOTH
+  directions: fewer commits than release tags means the history is missing
+  releases (the pre-repair state: 1 against 36, with the refusal naming
+  `scripts/rebuild-mirror-history.sh`), more means something reached `main` that
+  no release published, which nothing in the pipeline can do. Once true it
+  self-maintains, since every release adds exactly one commit and one tag.
+  The count is necessary but **not sufficient**, so
+  `release_mirror_tags_are_on_main` runs after it: a tag rewritten onto an
+  unrelated commit, or one deleted while another is added, leaves the totals
+  equal while the history stops accounting for the releases it advertises. That
+  second half costs no extra fetch and creates no local ref, which is what makes
+  it affordable on the release path. Counting `main` already fetched it, and a
+  fetch brings everything REACHABLE, so a tag whose object is still absent is by
+  that fact not on `main`. Fetching the tags themselves is deliberately avoided:
+  `git fetch --tags` would plant the mirror's stripped commits under local `v*`
+  names, which is exactly the ADR 0029 regression. The count runs first so the
+  pre-repair state still gets its actionable "run the repair" message rather
+  than a list of 36 stray tags.
+  **Every publish path calls it**, through the one shared
+  `release_mirror_history_check`: Phase A before it builds a candidate, **Phase
+  B again in its promotion guard**, and the legacy one-shot before it builds its
+  own commit. The one-shot is the path with no rc gate, so it is exactly where a
+  missing check goes unnoticed. Phase B repeats Phase A's because the parent
+  check only proves `main` has not MOVED and says nothing about the tags, while
+  Phase A's verdict can be **days** old: a deferred release holds that window
+  open for as long as Apple takes, so a `v*` tag added, deleted or rewritten in
+  between would otherwise publish onto a history that no longer balances. Its
+  in-flight count is 1 exactly when the mirror already names the candidate, i.e.
+  a re-run after `main` was pushed and the tag push failed.
+
+**The one-shot also has to adopt, not rebuild.** Its re-runnability used to come
+entirely from the commit being parentless and deterministic (a retry rebuilt the
+identical object and the push was a no-op). A parent removes that, and the
+failure is silent and permanent: a retry after a partial publish reads the
+commit it just published as its own parent and builds a SECOND commit for the
+same version, which breaks the completeness check for every release after it.
+So a version the mirror already publishes **with an identical tree is adopted**
+(`release_mirror_tag_sha`, the same idiom Phase A uses for a matching rc), and a
+tag that exists with a **different** tree is refused: re-releasing one version
+with different content leaves the tag, the Release page and every download URL
+disagreeing, and the answer is a version bump.
+
+**The window between the two pushes is why the check takes an in-flight count,
+and why adoption is resolved BEFORE it.** Publishing is `main` first, then the
+tag; if the tag push fails, `main` legitimately carries one commit no tag names.
+Ordered the other way round, the retry whose only remaining job is to push that
+tag hits "more commits than releases" and is refused for the state it exists to
+repair, with no in-workflow escape and every later release refused too. That
+deadlock is worse than the stray-hand-push it was guarding against. So
+`release_mirror_history_is_complete <commits> <tags> <in-flight>` takes the
+count as a **required** argument (0 defaults to the deadlock; 1 would
+blanket-excuse a stray commit), Phase A always passes 0 because it pushes to
+`rc/<version>` and never to `main`, and the one-shot passes 1 only once it has
+proven `main` is its own untagged commit. Tree equality is the proof, and it is
+sound because a release commit always bumps `RELEASE`, `CHANGELOG.md` and
+`install.sh`, so two consecutive releases can never share a published tree.
+
+**The one-time repair still has to run once, by a human.** Chaining onto a
+one-commit `main` only ever yields a two-commit `main`, so
+`./scripts/rebuild-mirror-history.sh --push` rebuilds the 36 published releases
+as a chain first (atomic, leased per ref, with a rollback bundle and a typed
+confirmation). The precondition above is what makes that ordering enforced
+rather than remembered. The script is in `RELEASE_TREE_EXCLUDE_PATHS`: it
+sources `release_tree.sh`, which is withheld, so the copies published at v0.20.0
+and v0.20.1 can do nothing but print their own refusal. Delete it once the
+rebuilt history is on the mirror (`docs/temporary-measures.md`).
 
 ### The source side: main gets the bump, and the tag names it (ADR 0029)
 
 The same tag name means a **different object per remote**, deliberately: the
-mirror's `v<version>` names the stripped **orphan** (the Release and every
-download URL resolve through it), while the **local** and **`origin`** tag names
+mirror's `v<version>` names the **stripped published release commit** (the
+Release and every download URL resolve through it), while the **local** and
+**`origin`** tag names
 the release commit on **`main`**. So the mirror tag is pushed **by SHA**
 (`push --force <remote> <commit>:refs/tags/<tag>`), touching no local ref —
 creating it locally first is what left 26 of 27 `v*` tags outside main's history,

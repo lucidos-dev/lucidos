@@ -1,6 +1,7 @@
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
 
+use crate::http::{client as http_client, send_expect_success};
 use crate::workspace::{BoxError, Workspace};
 
 /// Sub-directories of the workspace's `data/` that the CLI accepts as
@@ -67,6 +68,47 @@ pub(crate) enum WriteSource {
     File(PathBuf),
 }
 
+/// Percent-encode a `data/`-rooted store path for use as URL path segments.
+/// Keeps `/` as the separator and the RFC 3986 unreserved set verbatim; encodes
+/// everything else. Without this a perfectly ordinary artifact name breaks the
+/// request: a space makes an invalid URL, and a `#` would be parsed as the
+/// start of a fragment and silently truncate the path. Axum percent-decodes
+/// `Path<String>` on the way in, so the engine sees the original bytes.
+fn encode_path_segments(path: &str) -> String {
+    let mut out = String::with_capacity(path.len());
+    for b in path.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", b)),
+        }
+    }
+    out
+}
+
+/// Write content to a `data/`-rooted path in the PARENT workspace.
+///
+/// Goes through the engine's `PUT /api/v1/data/*path` rather than writing the
+/// file directly, because that route is the *announced* write path: it commits
+/// the file to the `data/` repo and emits `DataFileWritten` plus, for an
+/// `artifacts/` path, the paired `Artifact*` entity event (ADR 0032, "a state
+/// write owns its announcement"). A direct `std::fs::write` here skipped all
+/// three, so a file this command created was invisible to the Files panel, to
+/// the memory index, to an `on_event: ArtifactCreated` trigger, and to git,
+/// until something else forced a reload. Worse, the chat link this very
+/// function prints then failed to resolve against the frontend's artifact cache
+/// and reloaded the whole workspace on click.
+///
+/// ADR 0032's registry (`core/announced_surfaces.rs`) covers `data/` writers in
+/// the ENGINE crate, so it could never have caught this one: the CLI is a
+/// separate binary. Routing through the engine makes it a caller of the
+/// registered writer instead of a second, unregistered one.
+///
+/// Consequence: this needs a running engine, like every other mutating
+/// subcommand (`events emit`, `notify`, `changes apply`). A failed write is a
+/// hard error and prints no chat link, rather than a silent local write nothing
+/// in the workspace knows about.
 pub(crate) fn cmd_write(
     ws: &Workspace,
     relative: &str,
@@ -74,10 +116,6 @@ pub(crate) fn cmd_write(
 ) -> Result<(), BoxError> {
     let normalized = normalize_data_path(relative)?;
     let abs = ws.data_dir().join(&normalized);
-    if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| format!("Failed to create parent dir {}: {}", parent.display(), e))?;
-    }
 
     let bytes = match source {
         WriteSource::Stdin => {
@@ -91,8 +129,16 @@ pub(crate) fn cmd_write(
             .map_err(|e| format!("Failed to read source file {}: {}", path.display(), e))?,
     };
 
-    std::fs::write(&abs, &bytes)
-        .map_err(|e| format!("Failed to write {}: {}", abs.display(), e))?;
+    let url = format!(
+        "{}/api/v1/data/{}",
+        ws.base_url(),
+        encode_path_segments(&normalized)
+    );
+    let req = http_client()?
+        .put(&url)
+        .header("Content-Type", "application/octet-stream")
+        .body(bytes);
+    send_expect_success("PUT", &url, req)?;
 
     // Echo the resolved absolute path on stderr so callers see exactly what was
     // written, keeping stdout clean for the clickable link below.
@@ -110,7 +156,6 @@ pub(crate) fn cmd_write(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
 
     fn ws_at(root: PathBuf) -> Workspace {
         Workspace {
@@ -163,15 +208,45 @@ mod tests {
         assert!(resolve_data_path(&ws, "   ").is_err());
     }
 
+    // Landing the bytes on disk (and creating parent dirs) is the engine's job
+    // now, not this file's: see `cmd_write`. Those assertions live in
+    // `tests/data_write_lands_in_parent.rs`, against a stub engine.
+
     #[test]
-    fn write_creates_parent_dirs() {
-        let tmp = tempdir().unwrap();
-        let ws = ws_at(tmp.path().to_path_buf());
-        let src = tmp.path().join("input.txt");
-        std::fs::write(&src, b"hello").unwrap();
-        cmd_write(&ws, "artifacts/deeply/nested/x.txt", WriteSource::File(src)).unwrap();
-        let written = tmp.path().join("data/artifacts/deeply/nested/x.txt");
-        assert_eq!(std::fs::read(&written).unwrap(), b"hello");
+    fn encode_path_segments_keeps_separators_and_unreserved_chars() {
+        assert_eq!(
+            encode_path_segments("artifacts/pr-review/pr_1582/index.html"),
+            "artifacts/pr-review/pr_1582/index.html"
+        );
+    }
+
+    #[test]
+    fn encode_path_segments_escapes_a_space() {
+        assert_eq!(
+            encode_path_segments("artifacts/quarterly report.md"),
+            "artifacts/quarterly%20report.md"
+        );
+    }
+
+    #[test]
+    fn encode_path_segments_escapes_the_fragment_and_query_markers() {
+        // Left raw, a `#` truncates the URL at the fragment and a `?` starts a
+        // query string, so the engine would receive a different path than the
+        // one written.
+        assert_eq!(
+            encode_path_segments("artifacts/a#b?c.md"),
+            "artifacts/a%23b%3Fc.md"
+        );
+    }
+
+    #[test]
+    fn encode_path_segments_escapes_non_ascii_bytewise() {
+        // Percent-encoding is defined over BYTES, so a multi-byte char becomes
+        // one escape per UTF-8 byte.
+        assert_eq!(
+            encode_path_segments("artifacts/å.md"),
+            "artifacts/%C3%A5.md"
+        );
     }
 
     #[test]
@@ -203,16 +278,5 @@ mod tests {
             chat_link("artifacts/report.html"),
             "[report.html](artifacts/report.html)"
         );
-    }
-
-    #[test]
-    fn write_normalizes_loose_filenames() {
-        let tmp = tempdir().unwrap();
-        let ws = ws_at(tmp.path().to_path_buf());
-        let src = tmp.path().join("input.txt");
-        std::fs::write(&src, b"data").unwrap();
-        cmd_write(&ws, "loose-name.txt", WriteSource::File(src)).unwrap();
-        let written = tmp.path().join("data/artifacts/loose-name.txt");
-        assert!(written.exists());
     }
 }

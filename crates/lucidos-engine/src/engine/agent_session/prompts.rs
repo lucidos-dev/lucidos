@@ -101,13 +101,18 @@ const IMPLEMENTATION_PLAN_RULE: &str = "IMPLEMENTATION PLAN: Before your FIRST c
     thread, ADRs, and code reconnaissance into `docs/plans/<date>-<slug>.md` and records a \
     PROPOSED plan marker via `lucidos planned mark --plan <path>`. A proposed plan does NOT \
     unblock editing: present the plan to the user, then ASK FOR APPROVAL WITH THE QUESTION TOOL \
-    named in the ASKING USERS section, offering `Approve` and `Request changes`. That is a \
-    DECISION question, not a post-work confirmation: the edit gate is closed until they answer, \
-    so approval asked in plain prose just leaves the thread sitting idle. Once the user approves, \
-    run `lucidos planned approve` to flip the marker to gate-satisfying. Only then do source \
-    edits and Apply unblock. If the user requests changes, revise the plan file, re-commit, and \
-    present it again, asking the same way (the marker stays proposed until approved). If this is \
-    genuinely a local fix, acknowledge that instead with \
+    named in the ASKING USERS section, offering `Approve` and `Request changes`. That pair is a \
+    FLOOR: `Approve` first, `Request changes` second ONLY when the plan offers no real fork. If \
+    it offers one (a narrower scope, one layer instead of two), that fork takes the second slot \
+    and `Request changes` is dropped, never carried alongside it as a third. The approval itself \
+    is a DECISION question, not a post-work confirmation: the edit gate is closed until they \
+    answer, so approval asked in plain prose just leaves the thread sitting idle. Once the user \
+    approves, run `lucidos planned approve` to flip the marker to gate-satisfying. Only then do \
+    source edits and Apply unblock. Picking a fork is an approval too: revise the plan file to \
+    that variant, re-commit, then run `lucidos planned approve`. If the user requests changes \
+    instead, revise the plan file, re-commit, and present it again, asking the same way (the \
+    marker stays proposed until approved). If this is genuinely a local fix, acknowledge that \
+    instead with \
     `lucidos planned mark --simple \"<one-line reason>\"` (no \
     approval needed). A gate-satisfying marker MUST exist before the change can be applied: Claude \
     Code blocks your first source edit until one is set and approved, and Apply refuses a \
@@ -223,8 +228,14 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// the `cc-plan-gate` hook blocks source edits until the answer arrives, and
 /// nothing is appliable yet. Keep the carve-out in sync with
 /// [`IMPLEMENTATION_PLAN_RULE`], `cc_plan_gate::build_awaiting_approval_json`
-/// and the `implementation-plan` skill, which all name the same
-/// `Approve` / `Request changes` option pair.
+/// and the `implementation-plan` skill, which all describe the same option
+/// FLOOR: `Approve` first, `Request changes` second ONLY when the plan offers
+/// no real fork, never a third slot beside one. Those surfaces stated the pair
+/// unconditionally until 2026-08-04, which produced a live three-option card
+/// (`Approve` / `Frontend only` / `Request changes`) whose last button meant
+/// only "I will type what I want changed". That is the exact shape the NEVER
+/// AUTHOR AN "OTHER" OPTION paragraph below bans, and it is redundant with the
+/// free-text escape the card already names.
 ///
 /// The general lesson from that same incident is the "WHY THE TOOL AND NOT
 /// PROSE" paragraph, and it is what makes the two halves cohere instead of
@@ -249,6 +260,21 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// hardening and merge-conflict sessions don't dialogue with the user. The
 /// regression test `chat_style_prompts_nudge_use_of_ask_user_question` pins both
 /// halves.
+///
+/// The "NEVER AUTHOR AN \"OTHER\" OPTION" paragraph exists to CONTRADICT Claude
+/// Code's own built-in tool description, which promises "there should be no
+/// 'Other' option, that will be provided automatically". CC's TUI provides one;
+/// Lucidos does not. The card renders exactly the options passed, and
+/// `agent_question::answer_kind_to_hook_value` resolves a `Selected` answer to
+/// the option's LABEL (via `lookup_option_label`), so an "Other, I'll type it"
+/// button hands that literal phrase back as the user's decision. The two real escapes (typing in the prompt
+/// textarea, which routes to the pending question as `FreeText`, and Cancel)
+/// are on every card already and are named to the user by the prompt
+/// textarea's own placeholder while a question is pending
+/// (`PLACEHOLDER_ANSWERING`). Mirrored into [`CODEX_ASK_USER_QUESTION_RULE`] (which
+/// REPLACES this whole constant for Codex, so the ban must be restated there,
+/// not appended here) and into the chat-side rule + `ask_user_question` tool
+/// description in `llm::tools::misc`; change them together.
 const ASK_USER_QUESTION_RULE: &str =
     "ASKING USERS: Use the `AskUserQuestion` tool when you need a DECISION from the \
      user to move forward — which of two approaches to take, an ambiguous requirement, a \
@@ -266,9 +292,27 @@ const ASK_USER_QUESTION_RULE: &str =
      APPROACH BEFORE YOU IMPLEMENT IT IS ALWAYS SUCH A DECISION: the plan is a proposal about \
      work you have NOT done, you cannot proceed without the answer, and there is nothing to hand \
      off yet. Route it through this tool with `Approve` and `Request changes` as the options. \
-     The tool requires at least two options, so a lone `Approve` button is not expressible, and \
-     you never need one: the user can always type free text through the \"Other\" escape the \
-     tool adds for them.\n\n\
+     That pair is a FLOOR, not a fixed shape. The tool requires at least two options, so a lone \
+     `Approve` button is not expressible, and `Request changes` fills the second slot when the \
+     plan offers no real fork. When it DOES offer one (a narrower scope, one layer \
+     instead of two, a different approach), make that fork the second option and DROP `Request \
+     changes`. The fork already satisfies the two-option minimum and carries a decision you can \
+     act on, while a third `Request changes` beside it means only \"I will type what I want \
+     changed\", which is the escape every card already has. `Approve` stays first either way. \
+     Picking a fork is still an approval: it approves that variant of the plan, and is not a \
+     rejection.\n\n\
+     NEVER AUTHOR AN \"OTHER\" OPTION: do not add an option meaning \"Other\", \"Something \
+     else\", \"Let me type it\" or \"I'll write my own answer\". Your tool description says an \
+     \"Other\" option is provided automatically. In Lucidos it is NOT: the card renders exactly \
+     the options you pass, every option is a label, and tapping one hands you that label back as \
+     the user's answer, so an \"Other, I'll type it\" button arrives as their decision and leaves \
+     you re-asking. Both escapes are on every card without you spending an option slot on them. \
+     The user can type any reply in the prompt textarea and it arrives as their answer to this \
+     question, and Cancel dismisses the question so they can steer you somewhere else. Options \
+     are for the pre-baked choices only. An option that carries a decision you can act on is a \
+     different thing and still welcome (\"None of these\", \"Neither, ask me later\", \"Cancel \
+     the deploy\"); what is banned is an option whose only meaning is \"I will type it \
+     instead\".\n\n\
      WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
      waiting. It parks the thread in the waiting-for-answer state, which is what lights the \
      needs-attention badge, keeps the thread in the live working set, and can push a \
@@ -448,7 +492,21 @@ const CODEX_ASK_USER_QUESTION_RULE: &str = "\
     landed and running — finish and hand it off instead so they can review it. \
     Approving a plan BEFORE you implement it is the opposite case: a DECISION you cannot \
     proceed without, about work you have NOT done. Always ask for plan approval through this \
-    tool, with `Approve` and `Request changes` as the options, never in plain prose. \
+    tool, with `Approve` and `Request changes` as the options, never in plain prose. That pair \
+    is a FLOOR: `Approve` comes first, and `Request changes` fills the second slot only when the \
+    plan offers no real fork. When it offers one (a narrower scope, one layer instead of \
+    two), make that fork the second option and drop `Request changes` rather than carrying it as \
+    a third, where it would mean only \"I will type what I want changed\". Picking a fork is \
+    still an approval: it approves that variant of the plan, and is not a rejection. \
+    NEVER AUTHOR AN \"OTHER\" OPTION: no option meaning \"Other\", \"Something else\" or \
+    \"Let me type it\". Every option is a label, and tapping one hands you that label back as \
+    the user's answer, so such a button arrives as their decision and leaves you re-asking. \
+    Both escapes are on every card without you spending an option slot: the user can type any \
+    reply in the prompt textarea and it arrives as their answer to this question, and Cancel \
+    dismisses the question so they can steer you elsewhere. Options are for the pre-baked \
+    choices only. An option carrying a decision you can act on is different and still welcome \
+    (\"None of these\", \"Neither, ask me later\"); what is banned is one whose only meaning is \
+    \"I will type it instead\". \
     WHY THE TOOL AND NOT PROSE: the tool call is the ONLY thing that tells Lucidos you are \
     waiting. It parks the thread in the waiting-for-answer state, which lights the \
     needs-attention badge, keeps the thread in the live working set, and can notify the user. A \
@@ -1000,6 +1058,20 @@ mod tests {
         "./scripts/stop.sh",
         "./scripts/web-dev.sh",
         "./scripts/e2e",
+        // The plan-marker vocabulary. External repos and app worktrees are
+        // exempt from the gate and have no `docs/plans/` convention, so
+        // `IMPLEMENTATION_PLAN_RULE` is left out of their prompts entirely
+        // (asserted separately, by the `exempt` list in
+        // `lucidos_source_prompts_carry_implementation_plan_rule_for_both_backends`;
+        // this list is checked against the external-repo prompts only).
+        // Neither token was named here until 2026-08-04, and the shared
+        // (environment-generic) `ASK_USER_QUESTION_RULE` briefly grew a
+        // "revise the plan file, then run `lucidos planned approve`" clause
+        // that rode into external prompts through the back door: the same
+        // leak `APPLY_CONFIRMATION_NOTE` was split out to prevent, via a
+        // different constant. Keep marker machinery in the plan rule.
+        "lucidos planned",
+        "docs/plans/",
     ];
 
     fn assert_no_lucidos_only_tokens(prompt: &str, label: &str) {
@@ -1549,6 +1621,33 @@ mod tests {
                      and name its option pair (missing: {needle:?})",
                 );
             }
+            // ...but that pair is a FLOOR, not a fixed shape. Stated
+            // unconditionally it produced a live three-option card
+            // (`Approve` / `Frontend only` / `Request changes`) whose last
+            // button meant only "I will type what I want changed", which the
+            // NEVER AUTHOR AN "OTHER" OPTION paragraph in the same rule bans
+            // (2026-08-04). A real fork satisfies the two-option minimum on its
+            // own, so `Request changes` must be dropped rather than pushed to a
+            // third slot.
+            // Needle is ask-rule-specific on purpose: `IMPLEMENTATION_PLAN_RULE`
+            // states the same floor in its own words ("takes the second slot"),
+            // so a bare "FLOOR" would pass on that rule alone.
+            assert!(
+                prompt.contains("make that fork the second option"),
+                "{label} must state that the approval option pair is a FLOOR, not a fixed \
+                 shape, so a real fork replaces `Request changes` instead of joining it",
+            );
+            // Without this, the floor rule leaves the agent unsure whether
+            // anything but a literal `Approve` counts as approval. Kept
+            // ENVIRONMENT-GENERIC on purpose: what to DO about it (revise the
+            // plan file, re-commit, `lucidos planned approve`) belongs to
+            // `IMPLEMENTATION_PLAN_RULE`, which external-repo and app-worktree
+            // prompts don't carry. Do not move that clause up here.
+            assert!(
+                prompt.contains("Picking a fork is still an approval"),
+                "{label} must say a fork answer approves that variant rather than rejecting \
+                 the plan (without naming the plan marker, which is Lucidos-source only)",
+            );
             // A prose question ends the turn, so the thread looks finished and
             // nothing tells the user someone is waiting. Only the tool call
             // parks it in `WaitingForUserAnswer`, which drives the
@@ -1563,6 +1662,34 @@ mod tests {
                 prompt.contains("NEVER parallel-call"),
                 "{label} must forbid parallel-calling `AskUserQuestion` alongside other \
                  tools (see ASK_USER_QUESTION_RULE)",
+            );
+            // CC's own tool description promises an "Other" option is "provided
+            // automatically". Lucidos provides none, and every option is a
+            // label, so an agent-authored "Other, I'll type it" hands that
+            // phrase back as the user's answer. The prompt must contradict the
+            // upstream promise outright, not stay silent about it.
+            for needle in [
+                "NEVER AUTHOR AN \"OTHER\" OPTION",
+                "In Lucidos it is NOT",
+                "prompt textarea",
+                "Cancel dismisses the question",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must ban the text-entry escape option and name the real escapes \
+                     (missing: {needle:?})",
+                );
+            }
+            assert!(
+                !prompt.contains("escape the tool adds for them"),
+                "{label} must not claim the tool auto-adds an \"Other\" escape. Lucidos \
+                 renders exactly the options passed",
+            );
+            // Banning the text-entry escape must not read as banning every
+            // opt-out: "None of these" is a decision the agent can act on.
+            assert!(
+                prompt.contains("None of these") && prompt.contains("still welcome"),
+                "{label} must keep a meaningful opt-out option legal",
             );
         }
     }
@@ -1670,6 +1797,14 @@ mod tests {
                 // section, never this rule.
                 "ASK FOR APPROVAL WITH THE QUESTION TOOL",
                 "`Approve` and `Request changes`",
+                // The pair is a FLOOR: a plan that offers a real fork puts the
+                // fork in the second slot instead of pushing `Request changes`
+                // to a third, where it would mean only "I will type what I want
+                // changed" (2026-08-04). And a fork answer is an approval, so
+                // the rule that owns `lucidos planned approve` has to say the
+                // agent may flip the marker after revising the plan to match.
+                "that fork takes the second slot",
+                "Picking a fork is an approval too",
             ] {
                 assert!(
                     base.contains(needle),
@@ -1745,6 +1880,22 @@ mod tests {
                 "{label} must name the same approval option pair as the skill and the \
                  cc-plan-gate deny message",
             );
+            // And describe it the same way: as a FLOOR. Both backends must say
+            // a real fork takes the second slot INSTEAD of `Request changes`,
+            // because the Codex swap replaces the whole CC rule and would
+            // otherwise keep prescribing an unconditional pair. Stated
+            // unconditionally, it produced a three-option card whose last
+            // button was the dead-end shape the same rule bans (2026-08-04).
+            for needle in [
+                "make that fork the second option",
+                "Picking a fork is still an approval",
+            ] {
+                assert!(
+                    prompt.contains(needle),
+                    "{label} must describe the option pair as a floor a real fork replaces, \
+                     and say a fork answer is an approval (missing: {needle:?})",
+                );
+            }
             // The general lesson, not just the plan-approval instance: a prose
             // question ends the turn, so the thread reads as finished and the
             // user is never told anyone is waiting. Only a tool call parks it
@@ -1960,6 +2111,22 @@ mod tests {
             "Codex prompt must keep the no-parallel-call question safety rule with the \
              available MCP tool name"
         );
+        // The Codex rule REPLACES the CC one wholesale, so every teaching that
+        // matters has to be restated here or Codex simply never sees it. The
+        // dead-end "Other" option is one of those: the card renders exactly the
+        // options passed, and tapping one returns its label as the answer.
+        for needle in [
+            "NEVER AUTHOR AN \"OTHER\" OPTION",
+            "prompt textarea",
+            "Cancel dismisses the question",
+            "None of these",
+        ] {
+            assert!(
+                codex.contains(needle),
+                "the Codex question rule must carry the no-escape-hatch-option ban too \
+                 (missing: {needle:?})",
+            );
+        }
         let codex_base = base.replace(ASK_USER_QUESTION_RULE, CODEX_ASK_USER_QUESTION_RULE);
         assert!(
             codex.starts_with(&codex_base),

@@ -17,7 +17,7 @@ describe('benign empty completion → neutral note', () => {
       step(2, { type: 'ToolResult', name: 'proxy_request', result: '{"status":"success"}' } as StoredEvent),
       step(3, { type: 'ResponseGenerated', text: '' }),
     ]);
-    const events = exchangeResponseEvents(exchange, 0, true, false);
+    const events = exchangeResponseEvents(exchange, true, false);
     expect(events.some(e => e.type === 'empty')).toBe(true);
     // The turn completed — not an error.
     expect(exchangeStatus(exchange, '', true)).toBe('done');
@@ -27,7 +27,7 @@ describe('benign empty completion → neutral note', () => {
     const exchange = makeExchange(msg(), [
       step(1, { type: 'ResponseGenerated', text: '' }),
     ]);
-    const events = exchangeResponseEvents(exchange, 0, true, false);
+    const events = exchangeResponseEvents(exchange, true, false);
     expect(events.some(e => e.type === 'empty')).toBe(true);
     expect(exchangeStatus(exchange, '', true)).toBe('done');
   });
@@ -37,7 +37,7 @@ describe('benign empty completion → neutral note', () => {
       step(1, { type: 'TextStreamed', text: 'Playing it now.' }),
       step(2, { type: 'ResponseGenerated', text: 'Playing it now.' }),
     ]);
-    const events = exchangeResponseEvents(exchange, 0, true, false);
+    const events = exchangeResponseEvents(exchange, true, false);
     expect(events.some(e => e.type === 'empty')).toBe(false);
   });
 
@@ -46,7 +46,7 @@ describe('benign empty completion → neutral note', () => {
       step(1, { type: 'ToolCalled', name: 'x', args: {} }),
       step(2, { type: 'ResponseGenerated', text: '[ENGINE-LIMIT] hit the per-turn cap' }),
     ]);
-    const events = exchangeResponseEvents(exchange, 0, true, false);
+    const events = exchangeResponseEvents(exchange, true, false);
     expect(events.some(e => e.type === 'empty')).toBe(false);
   });
 
@@ -55,7 +55,7 @@ describe('benign empty completion → neutral note', () => {
       step(1, { type: 'ToolCalled', name: 'x', args: {} }),
       step(2, { type: 'ResponseFailed', error: 'Model returned no response (stop_reason: max_tokens …).' }),
     ]);
-    const events = exchangeResponseEvents(exchange, 0, true, false);
+    const events = exchangeResponseEvents(exchange, true, false);
     expect(events.some(e => e.type === 'empty')).toBe(false);
     expect(exchangeStatus(exchange, '', true)).toBe('error');
   });

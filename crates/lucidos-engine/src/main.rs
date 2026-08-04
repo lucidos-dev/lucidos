@@ -965,6 +965,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // packaged / headless. See
     // `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
     let _served_frontend_sync = shared_engine.spawn_served_frontend_sync();
+    // Keep `/api/v1/health`'s `database_reachable` honest. An engine outlives its
+    // database (quitting Docker Desktop is the everyday case in dev), and without
+    // this the endpoint would keep reporting a healthy engine while every other
+    // request failed. Not dev-only: a packaged install's bundled Postgres can die
+    // too. See `engine::db_health` and ADR 0037.
+    let _db_health_probe = shared_engine.spawn_db_health_probe();
     let api_port = std::env::var("LUCIDOS_API_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())

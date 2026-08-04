@@ -46,7 +46,7 @@ vi.mock('../../api/client', () => ({
   listDevices: vi.fn().mockResolvedValue({ devices: [] }),
 }));
 
-const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay } = await import('./menu');
+const { switchMenuItem, openSettingsSubview, setActiveMenu, landOnAccountsWithOverlay, openBackupSettings } = await import('./menu');
 
 const fakeApp: App = {
   id: 'trip-planner',
@@ -270,5 +270,28 @@ describe('landOnAccountsWithOverlay', () => {
     expect(activeMenuItem.value).toBe('settings');
     expect(settingsSubview.value).toBe('accounts');
     expect(revealContentPane).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('openBackupSettings', () => {
+  beforeEach(() => {
+    activeMenuItem.value = 'files';
+    settingsSubview.value = 'main';
+    panelOverlay.value = null;
+    pushNavState.mockClear();
+    revealContentPane.mockClear();
+    navigateToPane.mockClear();
+  });
+
+  it('lands on Settings > Backup and reveals the content pane', () => {
+    // The app-shell backup reminder's "Set up backup" button. Without the
+    // reveal the tap is a silent no-op for a mobile user (who is looking at the
+    // thread pane) and leaves a desktop user's collapsed split unchanged, which
+    // reads as a dead button on both.
+    openBackupSettings();
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('backup');
+    expect(revealContentPane).toHaveBeenCalledTimes(1);
+    expect(pushNavState).toHaveBeenCalledTimes(1);
   });
 });

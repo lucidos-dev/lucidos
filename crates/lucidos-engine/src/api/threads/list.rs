@@ -129,8 +129,9 @@ pub(in crate::api) async fn list_threads(
     })?;
 
     // If the frontend has a focused thread, ensure it's in the response.
-    // The focused thread may be older than the recent 15 per source, not saved,
-    // and not actively processing — without this, reload would lose it.
+    // The focused thread may fall outside the global newest-30 archive slice
+    // fetched above, not be saved, and not be actively processing. Without
+    // this, reload would lose it.
     let focused_thread = if let Some(ref focused_id) = query.focused {
         let already_included = saved.iter().any(|t| t.thread_id == *focused_id)
             || recent.iter().any(|t| t.thread_id == *focused_id)

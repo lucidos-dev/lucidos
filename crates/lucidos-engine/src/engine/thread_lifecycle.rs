@@ -61,15 +61,20 @@ pub enum DisplaySection {
 pub enum ThreadStatus {
     Idle,
     Running,
-    /// Vestigial — no projection arm writes this anymore. Historical CC rows
-    /// where the user hasn't yet acted on a proposed change may still carry
-    /// it; kept on the enum so `ThreadStatus::parse` deserializes them
-    /// without falling back to Idle (the parse path's catch-all). New rows
-    /// settle to Idle and surface the "review required" state via
-    /// `coding_agent_proposed` (and `is_blocking` clause 3) instead — a
-    /// proposed change is an artifact for the user to review, not a parked
-    /// loop. For "loop is parked waiting for human input" see
-    /// `WaitingForUserAnswer`.
+    /// Written by exactly ONE site: `AbortCause::status_sql()`
+    /// (`thread_events/cause.rs`), whose non-`StaleSettle` arm maps to
+    /// `CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END`.
+    /// That fragment is interpolated into the `ResponseAborted` projection
+    /// arm, so an abort landing on a CC thread that already proposed a change
+    /// settles here rather than at `Failed`.
+    ///
+    /// Every OTHER settle path uses `STATUS_FROM_PROPOSED_CHANGE`, which is the
+    /// literal `'idle'`: a proposed change is an artifact for the user to
+    /// review, not a parked loop, so it surfaces via `coding_agent_proposed`
+    /// (and `is_blocking` clause 3) instead. Historical CC rows may also still
+    /// carry `waiting`, and `ThreadStatus::parse` deserializes them here rather
+    /// than falling through its catch-all to Idle. For "loop is parked waiting
+    /// for human input" see `WaitingForUserAnswer`.
     Waiting,
     /// CC paused on an `AskUserQuestion` tool call. The subprocess was killed
     /// after emitting `UserQuestionAsked`; resuming requires the user to

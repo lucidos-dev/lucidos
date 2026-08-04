@@ -50,14 +50,29 @@ impl LucidosEngine {
         };
 
         let pool = &self.pool;
-        let cron = PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE)
-            .await
-            .ok()
-            .flatten();
-        let provider = PreferenceStore::get(pool, PREF_BACKUP_PROVIDER)
-            .await
-            .ok()
-            .flatten();
+        // A read that FAILED is not "no schedule set". `.ok().flatten()` collapsed
+        // both into `None`, and the `_` arm below then reports
+        // "Schedule: off (automatic backups disabled)" to the agent, which relays
+        // it to the user as fact. Surface the unknown instead of a plausible
+        // default, per the no-silent-plausible-defaults rule.
+        let cron = match PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(format!(
+                    "Error: could not read the backup schedule preference: {}. Backup status is unknown; do not tell the user backups are off.",
+                    e
+                ))
+            }
+        };
+        let provider = match PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await {
+            Ok(v) => v,
+            Err(e) => {
+                return Ok(format!(
+                    "Error: could not read the backup provider preference: {}. Backup status is unknown; do not tell the user backups are off.",
+                    e
+                ))
+            }
+        };
         let retention = backup::get_retention_count(pool).await;
         let tz: chrono_tz::Tz = self.user_timezone().await.parse().unwrap_or(chrono_tz::UTC);
 

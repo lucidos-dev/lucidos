@@ -17,6 +17,9 @@ paths:
   - "scripts/test-engine.sh"
   - "scripts/lint-shell.sh"
   - "scripts/check-em-dashes.sh"
+  - "scripts/check-adrs.sh"
+  - "scripts/adr-new.sh"
+  - "scripts/lib/adr_scan*.sh"
   - "scripts/e2e*.sh"
   - "scripts/lib/workspace*.sh"
   - "scripts/lib/ports*.sh"
@@ -24,6 +27,7 @@ paths:
   - "scripts/lib/gateway_supervisor*.sh"
   - "scripts/lib/engine_supervisor*.sh"
   - "scripts/lib/codesign.sh"
+  - "scripts/lib/docker*.sh"
   - "scripts/lib/preflight.sh"
   - "scripts/lib/sleep.sh"
   - "scripts/lib/host_load_guard*.sh"
@@ -81,6 +85,40 @@ opt-in itself, and never starts a gateway.
 ./scripts/lint-shell.sh                   # ShellCheck over every tracked *.sh (= make lint-shell; part of make lint / make check)
 ./scripts/check-em-dashes.sh [--base <ref>]  # Fail if the branch ADDS a U+2014 / U+2015 (diff-scoped; /harden Phase 4.5 runs it for every diff). Rule + rationale: .claude/rules/no-em-dashes.md
 ```
+
+### One Docker-daemon probe, shared by preflight and provisioning
+
+`scripts/lib/docker.sh` owns the answer to "is the Docker daemon up?", and both
+shell callers go through it: `preflight.sh` at launch time and `workspace.sh`
+(`setup_postgres`, plus the `docker run` failure arm) at provision time.
+
+- **The probe is the exit status of `docker version --format {{.Server.Version}}`,
+  never a matched error string** (`classify_docker_probe`, pure, table-tested).
+  It deliberately mirrors `docker_daemon_state` in
+  `crates/lucidos-gateway/src/postgres.rs`, which is what decides whether a
+  workspace's provisioning failure is *retried* or *latched*. A shell half that
+  classified differently would tell the user one thing while the gateway did
+  another, so **keep the two in step**. `docker inspect` cannot serve here: it
+  exits 1 identically for "no such container" and "daemon down". The daemon's
+  error TEXT is read only to quote in the report.
+- **An unreachable daemon on macOS is OFFERED the remedy** (`Start Docker
+  Desktop? [Y/n]`, defaulting to yes because it starts an app the user already
+  installed), then waited out with a progress line up to
+  `DOCKER_START_TIMEOUT_S` (120s, Docker Desktop routinely needs 30-60s from a
+  cold login). Every other outcome (declined, non-interactive, `open` failed,
+  timed out, no CLI, non-Darwin) prints `docker_down_report` and exits 1. That
+  block names the condition, quotes the daemon, and reproduces the caller's own
+  command, because the two quiet lines it replaced scrolled past unnoticed and
+  the launch read as "the workspaces just didn't start" (ADR 0037).
+- **Non-Darwin gets the same hard check**, minus the offer. It previously got a
+  bare `command -v docker` warning that the launch then ignored.
+- **`docker_test.sh` is hermetic by construction**, and that is load-bearing
+  rather than tidy: this library's job is to run `docker` and `open -a Docker`.
+  The three host-touching functions are the only seams, they are stubbed for the
+  whole file, `docker`/`open`/`sleep` are shadowed to count bypasses, and
+  `assert_no_host_calls` fails the suite if one happened. Same posture as
+  `ports_test.sh`'s `kill` shim and `webkit_reaper_test.sh`'s `ps` feed, for the
+  same reason (ADR 0025).
 
 ### Shell lint (`make lint-shell`)
 

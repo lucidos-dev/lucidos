@@ -362,6 +362,18 @@ html:not([data-theme="light"]) .action-btn-confirm {
     min-width: 0;
 }
 
+/* Additive modifier for a details slot holding a SENTENCE rather than a set of
+   fields: class="list-row-details list-row-details-prose".
+   The base class is a flex row whose 0.75rem gap IS the separator between
+   fields, so every inline child of a sentence (a <strong> value, a <code>
+   command) becomes its own flex item: the text breaks around it, the gap opens
+   holes mid-sentence, and a trailing "." lands alone at the start of the next
+   line. Block flow restores normal inline wrapping. */
+.list-row-details-prose {
+    display: block;
+    line-height: 1.5;
+}
+
 .list-row-url {
     overflow: hidden;
     text-overflow: ellipsis;

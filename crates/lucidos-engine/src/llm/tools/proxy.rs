@@ -28,7 +28,7 @@ pub(super) fn proxy_tools() -> Vec<ToolDefinition> {
                     },
                     "path": {
                         "type": "string",
-                        "description": "Path appended to the configured base_url (e.g., '/Spisestua/play'). Optional — defaults to root."
+                        "description": "Path appended to the configured base_url (e.g., '/living-room/play'). Optional, defaults to root."
                     },
                     "method": {
                         "type": "string",

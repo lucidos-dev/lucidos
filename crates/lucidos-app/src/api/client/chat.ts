@@ -28,6 +28,11 @@ export interface HealthInfo {
    *  model picker to providers the user has set up. `null`/absent = don't filter
    *  (mock, or an older engine). Reflects a runtime credential swap. */
   configured_providers?: string[] | null;
+  /** Can the engine reach its own database? An engine outlives its database, so
+   *  it keeps answering this endpoint (200, `status: "ok"`) while every query
+   *  behind it fails. Absent on older engines, which reads as reachable: only an
+   *  explicit `false` puts the client into its degraded surface. ADR 0037. */
+  database_reachable?: boolean;
 }
 
 /** Probe `/api/v1/health`. Failed without `httpCode` = transport unreachable;

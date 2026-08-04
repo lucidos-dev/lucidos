@@ -14,7 +14,7 @@ import { apiUrl } from './_fetch';
  * Then from an app:
  *
  * ```ts
- * lucidos.proxy('sonos').fetch('/Spisestua/play');
+ * lucidos.proxy('sonos').fetch('/living-room/play');
  * lucidos.proxy('comfort').fetch('/api/v1/devices', { method: 'POST', body });
  * ```
  *

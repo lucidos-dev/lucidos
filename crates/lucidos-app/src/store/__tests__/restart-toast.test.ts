@@ -77,7 +77,7 @@ describe('restart-required state (no pre-switch toast)', () => {
     // the progress toast.
     engineRestarting.value = true;
     restartRequired.value = true;
-    showToast('Starting new version…', 'info', { key: RESTART_TOAST_KEY, showDuringRestart: true, spinning: true });
+    showToast('Starting new version…', 'info', { key: RESTART_TOAST_KEY, showWhileUnavailable: true, spinning: true });
 
     syncRestartToast();
 

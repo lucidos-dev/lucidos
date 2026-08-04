@@ -63,7 +63,7 @@ describe('post-apply CC continuation is visible between change banners', () => {
     // Cause #2: the change banner must be flagged as carrying continuation work…
     expect(changePanelHasContinuation(applyA)).toBe(true);
     // …and its response events must include the reply text.
-    const rendered = exchangeResponseEvents(applyA, 0, false, true);
+    const rendered = exchangeResponseEvents(applyA, false, true);
     const text = rendered
       .filter(e => e.type === 'text')
       .map(e => (e as { md: string }).md)

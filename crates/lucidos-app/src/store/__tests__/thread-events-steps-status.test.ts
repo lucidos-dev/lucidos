@@ -768,7 +768,7 @@ describe('tool description from event', () => {
     const ex1Steps = exchangeSteps(exchanges[0], /* isLast */ false, /* threadIdle */ true);
     expect(ex1Steps.filter(s => s.outcome === 'pending')).toHaveLength(0);
 
-    const ex1Events = exchangeResponseEvents(exchanges[0], 0, /* isLast */ false, /* threadIdle */ true);
+    const ex1Events = exchangeResponseEvents(exchanges[0], /* isLast */ false, /* threadIdle */ true);
     const pendingEvents = ex1Events.filter(e => e.type === 'step' && (e as { outcome: StepOutcome }).outcome === 'pending');
     expect(pendingEvents).toHaveLength(0);
   });

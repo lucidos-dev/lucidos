@@ -518,8 +518,10 @@ async fn remove_queued_message(
 }
 
 /// POST endpoint for chat with progress updates.
-/// Returns immediately with a message_id. All progress events are sent
-/// via the global SSE stream as ThreadEvent events.
+/// Returns immediately with an `event_id` (the response's only field; the
+/// legacy `message_id` name survives solely as a request-body serde alias on
+/// `ChatRequest::event_id`). All progress events are sent via the global SSE
+/// stream as ThreadEvent events.
 pub(super) async fn chat_submit(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,

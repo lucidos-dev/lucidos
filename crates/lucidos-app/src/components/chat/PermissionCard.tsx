@@ -1,9 +1,11 @@
 import type { ComponentChildren } from 'preact';
+import { useEffect, useRef } from 'preact/hooks';
 import { useSignal } from '@preact/signals';
 import { showToast } from '../../store/store';
 import { resolveCodingAgentPermission, resolveCommandPermission, resolveMcpPermission } from '../../store/actions/permissions';
 import type { PersistScope } from '../../store/thread-events';
 import { errorDetail } from '../../utils/errorDetail';
+import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
 
 interface PermissionEvent {
   request_id: string;
@@ -211,6 +213,19 @@ type ButtonSpec = {
   onClick: () => void;
 };
 
+/** Which choice a live permission card seeds keyboard focus onto when it
+ *  arrives (the *choice card* contract, see `choiceCardNav.ts`). `Deny` leads
+ *  the button row, but a keyboard user answering a permission card
+ *  overwhelmingly means to allow the one thing being asked about, so the seed
+ *  is "Allow once" rather than the first button. That the seeded choice GRANTS
+ *  is safe only because it is always ringed: `.permission-body[data-role=…]
+ *  .action-btn:focus` shows the focus ring for a programmatic seed, so Enter's
+ *  effect is on screen before it is pressed. Every card builder below includes
+ *  an `allow` spec, which is what makes one constant enough for all three.
+ *  Changing this value changes what a reflex Enter does to a permission
+ *  request, so it is pinned by `permission-card.test.tsx`. */
+export const DEFAULT_PERMISSION_CHOICE: PermissionChoice = 'allow';
+
 /** Render one permission button with answered/terminated state styling. Shared
  *  by both the coding-agent and command-guard cards. */
 function renderPermissionButton(
@@ -231,6 +246,9 @@ function renderPermissionButton(
       disabled={disabled}
       aria-pressed={state.answered ? isPicked : undefined}
       aria-label={spec.ariaLabel}
+      // Gated on `!disabled` so the marker never outlives the live card: an
+      // answered / terminated card must not advertise a focus seed target.
+      data-default-choice={spec.choice === DEFAULT_PERMISSION_CHOICE && !disabled ? 'true' : undefined}
     >
       {isPicked && <span class="permission-btn-check" aria-hidden="true">✓ </span>}
       {spec.label}
@@ -262,8 +280,27 @@ function PermissionBodyShell({
     : terminated ? ' permission-body-terminated'
     : '';
   const state = { selected, answered, terminated };
+  // A live card is a *choice card* (see `choiceCardNav.ts`): arrows step across
+  // its buttons (the primary row and every secondary row, in DOM order) and
+  // "Allow once" takes focus on arrival so Enter resolves it. The marker and the
+  // seed are both gated on live, so a resolved card is inert to the keyboard.
+  // The seed is latched to the card's ARRIVAL inside `seedChoiceCardFocus`.
+  // `live` is not a one-way flip: a failed resolve rolls the optimistic pending
+  // back and the card returns to live, which without the latch would drag focus
+  // to "Allow once" right after the user pressed Deny.
+  const live = !answered && !terminated;
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (live) seedChoiceCardFocus(ref.current, requestId);
+  }, [live, requestId]);
   return (
-    <div class={`permission-body${bodyStateClass}`} data-request-id={requestId}>
+    <div
+      class={`permission-body${bodyStateClass}`}
+      data-request-id={requestId}
+      data-role={live ? CHOICE_CARD_ROLE : undefined}
+      ref={ref}
+      onKeyDown={live ? (e) => handleChoiceCardKeyDown(e, ref.current) : undefined}
+    >
       <div class="permission-text">{question}</div>
       <div class="permission-actions">
         {primary.map(spec => renderPermissionButton(spec, state))}

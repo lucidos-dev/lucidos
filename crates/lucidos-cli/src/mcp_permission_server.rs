@@ -138,7 +138,11 @@ fn handle(
                         "options": {
                             "type": "array",
                             "items": { "type": "string" },
-                            "description": "2-4 short answer labels; omit for free-text"
+                            "description": "2-4 short answer labels; omit for free-text. \
+                                NEVER include an \"Other\" / \"Something else\" / \"Let me type \
+                                it\" label: there is no text-entry option, so tapping one just \
+                                sends you that label back as the answer. The user can always \
+                                type a reply in the prompt instead, or cancel the question."
                         },
                         "multi_select": {
                             "type": "boolean",
@@ -375,6 +379,32 @@ mod tests {
         // and Codex silently loses its question path.
         assert_eq!(tools[1]["name"], "ask_user_question");
         assert_eq!(tools[1]["inputSchema"]["required"][0], "question");
+    }
+
+    /// Codex reads this schema, not the engine's system prompt, when deciding
+    /// what to pass as `options`. There is no text-entry option kind, so an
+    /// "Other, I'll type it" label comes straight back as the user's answer.
+    /// Mirrors `CODEX_ASK_USER_QUESTION_RULE` in the engine's prompts.
+    #[test]
+    fn ask_user_question_options_schema_bans_a_text_entry_escape_label() {
+        let req = JsonRpcRequest {
+            id: Some(Value::from(3)),
+            method: "tools/list".to_string(),
+            params: Value::Null,
+        };
+        let resp = handle(&req, &dummy_client(), "http://unused", "tid").unwrap();
+        let options_desc = resp.result.unwrap()["tools"][1]["inputSchema"]["properties"]["options"]
+            ["description"]
+            .as_str()
+            .expect("options must document itself")
+            .to_string();
+        for needle in ["NEVER include an \"Other\"", "no text-entry option"] {
+            assert!(
+                options_desc.contains(needle),
+                "options description must ban the escape-hatch label (missing: {needle:?}): \
+                 {options_desc}"
+            );
+        }
     }
 
     #[test]

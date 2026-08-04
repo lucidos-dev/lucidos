@@ -285,6 +285,64 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
 
 ## Frontend
 
+- **Space on a focused choice-card button activates it; it does NOT type a
+  space into the prompt.** A reviewer tracing `shouldTypeToFocusPrompt`
+  (`hooks/useKeyboardShortcuts.ts`) sees that a bare Space with no modifiers on a
+  non-text-input target returns true, notes that a `<button>` is not a text
+  input, and concludes that Space on a seeded question option or permission
+  button gets swallowed into `execCommand('insertText', ' ')` instead of
+  activating the button, contradicting the choice-card contract. The clause that
+  refutes it is the one already in that predicate:
+  `!(e.key === ' ' && isThreadTranscript(e.target))`. `isThreadTranscript` is
+  `el.closest('.thread-content') !== null`, NOT an identity check on the scroll
+  region, and every card renders inside `.thread-content` (`ThreadView.tsx`
+  renders `renderExchanges(...)` as its children), so a choice button matches and
+  the carve-out fires. Enter is unaffected either way. Re-flag only if a card
+  surface moves outside `.thread-content` (a portal, an overlay), which would
+  break the carve-out for real.
+  (`hooks/useKeyboardShortcuts.ts`, `utils/dom.ts` `isThreadTranscript`,
+  `components/chat/ThreadView.tsx`.)
+
+- **`threadEntryFocusTarget` omitting the `activeElementIsIdle` guard that its
+  sibling seed applies is structural, not an oversight.** A reviewer may note
+  that `shouldSeedChoiceFocus` describes four clauses as "a refusal to steal
+  focus from something the user is doing", that `threadEntryFocusTarget` applies
+  only two of them (hover-pointer, prompt-has-text), and that the one it skips
+  guards the path whose target is a permission GRANT button, so an unrequested
+  navigation (a sibling thread's `NavigationRequested`, a notification deep link)
+  could park focus on "Allow once". The guard is inapplicable there by
+  construction: that function runs on a thread SWITCH, where the active element
+  is by definition whatever caused the switch (the drawer row just clicked, the
+  search result, the deep link), so an idle check is false on EVERY invocation
+  and the card would never be reached, including in the ordinary user-clicks-a-
+  waiting-thread case the feature exists for. The switch also already moved focus
+  before this change: the prior code called `focusIfNeeded(promptEl)`
+  unconditionally, so the delta is only WHERE focus lands, never whether it
+  moves. The residual risk is bounded by the always-visible ring
+  (`@media (hover: hover)` on `.permission-body[data-role="card-choices"]
+  .action-btn:focus`) plus the `isElementOnScreen` check, which together mean a
+  focused grant button is on screen and ringed. Re-flag only with a real signal
+  for "the user initiated this switch" to gate on, not with the asymmetry alone.
+  (`components/chat/choiceCardNav.ts`; `docs/plans/2026-08-04-choice-card-keyboard-focus.md`.)
+
+- **`extractLocalFileTarget` claiming a protocol-relative `//host/path` href is
+  the accepted residual, and every obvious close is worse.** A reviewer sees an
+  extractor documented as "absolute POSIX path" whose `href.startsWith('/')`
+  test also matches `//example.com/x`, which HTML resolves as a same-scheme URL,
+  and concludes a real external link is being handed to the OS opener. The read
+  is right; the consequence is not. On the web path `openLocalFile` is
+  `window.open(target, '_blank', 'noopener')`, so a protocol-relative URL opens
+  in a new tab, i.e. exactly the correct behavior. And returning `null` for `//`
+  makes it strictly worse: the chat handler's terminal guard (ADR 0038) is the
+  next branch, so a legitimate external link would be swallowed with a
+  "points nowhere" toast instead of opening. Closing it properly means teaching
+  the terminal guard about protocol-relative URLs as well, for an href shape no
+  model writes (they emit full `https://` URLs, and the bare-URL linkifier only
+  matches `https?://`). Re-flag only with a case where the Tauri branch's
+  `openExternal` is reached with one, or evidence the shape occurs in practice.
+  (`crates/lucidos-app/src/utils/linkifyPaths.ts`,
+  `crates/lucidos-app/src/components/chat/ChatExchange.tsx`.)
+
 - **`serverDraft` letting an inbound compose report overwrite a newer PUT ack is
   the accepted, self-healing trade-off — the alternative re-breaks the bug it was
   added for.** A reviewer (Codex flagged this P1) may note that
@@ -800,6 +858,43 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   tty → it hangs" has conflated stdin with stdout. The only invocation that
   makes fd 1 a non-tty is an explicit redirect (`curl … | sh > file`), which is
   not the documented path. (`install.sh`, `scripts/web-dev.sh` tail.)
+
+- **`sloc.awk` resets string state at every line break on purpose, and the
+  multi-line-string misreads that follow are the smaller error.** A reviewer
+  notices `classify()` takes one line at a time, so a line inside a Rust raw
+  string or a JS template literal that begins with `//` is booked as a comment,
+  and reasons that an unterminated `/*` in such a string could eat the rest of
+  the file. Both readings are correct about the mechanism and wrong about which
+  way to trade. Measured 2026-08-03: 57 Rust lines and 12 TypeScript lines
+  tree-wide, 0.02% of code, and 49 of the 57 are `//` comments inside JavaScript
+  embedded in a raw string, so they are comments by any reading. Carrying the
+  state means matching `r#"` to the `"#` with the same hash count and tracking
+  unterminated `"` across lines; getting that wrong books an entire file as
+  code and silently deletes its comment count, which is orders of magnitude
+  worse than 69 lines. Per-line reset confines every misparse to one line. The
+  runaway direction is already covered: the unterminated-block canary exits
+  non-zero and names the file, and it is silent across this whole tree. Re-flag
+  only with a measurement showing the multi-line share has grown materially, or
+  with a tracker whose failure mode is bounded. (`.claude/skills/project-stats/sloc.awk`
+  header § KNOWN LIMITS, fixtures in `sloc_test.sh`.)
+
+- **`sloc.awk` closes a Rust block comment at the FIRST `*/` even though Rust
+  block comments nest, and that is measured, not overlooked.** The language rule
+  is real, so a reviewer correctly observes that `/* outer /* inner */ tail */`
+  leaves ` tail */` read as code. Depth-counting was implemented on 2026-08-03
+  and reverted the same day on the numbers. This tree contains no nested block
+  comment; the only construct that ever incremented the counter was a false
+  `/*` inside the glob `'**/*.md'` in the system-prompt raw string
+  (`engine/chat/process/system_prompt.rs`, opened at the `r#"` on line 433).
+  Because closing then needed two `*/`, that single-line misparse ran on past
+  its own line and moved 5 lines of prompt text from code to comment, all of
+  them wrong. A false `/*` inside a string is common (globs, regexes, URLs) and
+  a nested comment is rare, so depth-counting amplifies the frequent error to
+  fix the rare one, and it forfeits the per-line confinement the entry above
+  depends on. Re-flag only alongside cross-line string tracking, which would
+  remove the false opens first, or with a real nested comment in the tree.
+  (`.claude/skills/project-stats/sloc.awk`, the `rust: block comments close at
+  the first */, deliberately` fixture in `sloc_test.sh`.)
 
 ## CI workflows
 

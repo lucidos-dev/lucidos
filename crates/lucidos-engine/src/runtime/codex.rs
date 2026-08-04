@@ -341,14 +341,21 @@ impl AgentRuntime for CodexRuntime {
 ///    pointing at `<main>/.git/worktrees/<x>`, so an in-agent `git commit`
 ///    writes outside the worktree. Omitted when git can't tell us (degrade).
 /// 2. **The workspace's `data/` tree.** Writing there is the documented
-///    contract for a coding-agent thread: `lucidos data write` /
-///    `lucidos data path` resolve under `<workspace>/data/`, and the workspace
+///    contract for a coding-agent thread: `lucidos data path` resolves under
+///    `<workspace>/data/` (and creates dirs with `--mkdir`), and the workspace
 ///    knowhow instructs agents to log follow-ups to
 ///    `artifacts/work-tracker/data.json`. That path is OUTSIDE the worktree, so
 ///    the macOS seatbelt refused it with `EPERM (os error 1)` — which is how
 ///    the 2026-07-26 nightly's Codex security pass silently failed to persist
 ///    two high-severity findings. Claude Code runs unsandboxed and never hit
 ///    it, so the contract looked like it worked.
+///
+///    `lucidos data write` was the headline case and no longer is: it PUTs to
+///    the engine's data API rather than touching the filesystem, so it clears
+///    the seatbelt on the network axis (`network_access=true`, set below) with
+///    no writable root at all. The grant stays for everything that still writes
+///    `data/` directly: `data path --mkdir`, and an agent's own editor tools or
+///    a script writing the resolved path.
 ///
 /// Scoped to `<workspace>/data`, deliberately **not** the workspace root: the
 /// root also holds `.lucidos/` (engine runtime, logs, pid files, the gateway
@@ -381,14 +388,19 @@ async fn sandbox_writable_roots(worktree: &Path, workspace: &Path) -> Vec<PathBu
     match std::fs::canonicalize(&data_dir).ok().filter(|d| d.is_dir()) {
         Some(dir) if widens_past_the_workspace(&dir, workspace) => crate::log!(
             "[Codex] {} resolves to {}, which contains the workspace — refusing \
-             to grant it; the sandbox will block `lucidos data write`",
+             to grant it; the sandbox will block direct writes into the parent \
+             workspace's data/ tree (`lucidos data path --mkdir`, editor writes \
+             to a resolved data path). `lucidos data write` is unaffected: it \
+             goes over HTTP",
             data_dir.display(),
             dir.display()
         ),
         Some(dir) => roots.push(dir),
         None => crate::log!(
             "[Codex] {} is not a reachable directory — the sandbox will block \
-             `lucidos data write` to the parent workspace",
+             direct writes into the parent workspace's data/ tree \
+             (`lucidos data path --mkdir`, editor writes to a resolved data \
+             path). `lucidos data write` is unaffected: it goes over HTTP",
             data_dir.display()
         ),
     }

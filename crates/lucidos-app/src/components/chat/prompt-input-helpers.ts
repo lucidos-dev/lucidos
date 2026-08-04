@@ -109,6 +109,28 @@ export function isCancelSettling(now: number = Date.now()): boolean {
   return until !== 0 && now < until;
 }
 
+// What Escape does while the prompt textarea has focus.
+//   cancel: there is something to cancel, so Escape is the keyboard twin of the
+//           row's red button: abort the running turn, or stamp the pending
+//           question `Canceled`.
+//   blur:   nothing to cancel (composing, or an idle thread). Escape drops the
+//           caret out of the composer, which is what it always did.
+//   ignore: the post-submit settle window. The destructive control is held
+//           disabled there so a laggy repeat tap can't abort the turn the user
+//           just started (see armCancelSettle), and Escape is the same hazard
+//           one key away: submit with Enter, reflex Escape, turn gone. Nothing
+//           happens for that window, deliberately, rather than falling through
+//           to `blur` and teaching the user that Escape sometimes only blurs.
+export type PromptEscapeAction = 'cancel' | 'blur' | 'ignore';
+
+export function computePromptEscapeAction(
+  hasCancelTarget: boolean,
+  settling: boolean,
+): PromptEscapeAction {
+  if (!hasCancelTarget) return 'blur';
+  return settling ? 'ignore' : 'cancel';
+}
+
 /** For a thread whose Cancel was clicked while a question was on screen, the
  *  `tool_use_id` of the question that was pending at click time. The cleanup
  *  effect (PromptInput) keys the optimistic `cancelingThreadIds` release off
@@ -210,6 +232,32 @@ export function computeAnswerActionMode(args: {
   return 'cancel';
 }
 
+// Prompt placeholders. Typing here while a question card is pending IS the
+// user's answer to it (the engine reroutes the text as `AnswerKind::FreeText`),
+// so the placeholder says so. Keyed on a pending question card rather than the
+// `waiting_for_user_answer` status, which also covers coding-agent permission
+// cards: those absorb no typed text, so "Type your answer" would be a lie.
+//
+// The answering placeholder names BOTH escapes that need no option slot, and it
+// is the only place either is named: the question card used to carry the same
+// sentence as a guide line under its options, a few pixels above this field,
+// which said it twice. Cancel earns its half of the sentence because nothing
+// else spells out what the red button does to a pending question (it stamps it
+// `Canceled` so the user can steer the agent somewhere else). Between the two
+// halves, this is why no agent needs to invent an "Other, I'll type it" option,
+// a card row that would just hand its own label back as the answer.
+export const PLACEHOLDER_NEW_THREAD = 'What can I help with?';
+export const PLACEHOLDER_FOLLOW_UP = 'Post a follow up…';
+export const PLACEHOLDER_ANSWERING = 'Type your answer, or Cancel to ask something else.';
+
+export function promptPlaceholder(
+  hasFocusedThread: boolean,
+  answeringQuestionCard: boolean,
+): string {
+  if (answeringQuestionCard) return PLACEHOLDER_ANSWERING;
+  return hasFocusedThread ? PLACEHOLDER_FOLLOW_UP : PLACEHOLDER_NEW_THREAD;
+}
+
 // Stamp cancelTargetId BEFORE invoking send. sendCompose's sync prefix
 // clears the draft and flips state→'active' (section buttons appear); if
 // cancelTargetId is still null at that render, morphMode resolves to
@@ -243,7 +291,13 @@ export function computeSubmitMultiCount(toggledCount: number, customAnswerText: 
  *  latest question is already answered: the engine serializes questions (one
  *  pending at a time via `walk_question_batch`), so an answered latest means
  *  nothing is pending. Callers must gate by status; this walks every exchange
- *  and is too expensive to run on every keystroke otherwise. */
+ *  and is too expensive to run on every keystroke otherwise.
+ *
+ *  One walk, two facts, deliberately: PromptInput needs both per render, and
+ *  derives each from the returned object rather than walking again. The
+ *  question's mere presence picks the answer-oriented placeholder; its
+ *  `multiSelect` picks the prompt-row Submit control (single-select answers
+ *  through the card itself, so the multi-submit path ignores it). */
 export function findLatestPendingQuestion(
   thread: ThreadState | undefined,
 ): { toolUseId: string; multiSelect: boolean } | null {
@@ -257,16 +311,6 @@ export function findLatestPendingQuestion(
     return { toolUseId: ue.tool_use_id, multiSelect: !!ue.multi_select };
   }
   return null;
-}
-
-/** Pending multi-select question, if the latest pending one is multi-select.
- *  Single-select questions answer through the card directly (no prompt-row
- *  Submit), so the multi-submit path ignores them. */
-export function findPendingMultiSelectQuestion(
-  thread: ThreadState | undefined,
-): { toolUseId: string } | null {
-  const q = findLatestPendingQuestion(thread);
-  return q && q.multiSelect ? { toolUseId: q.toolUseId } : null;
 }
 
 /** Whether the optimistic `cancelingThreadIds` flag should be released.

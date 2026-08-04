@@ -152,6 +152,7 @@ file). The class names are the contract:
 | `.title` | A list/panel/modal title |
 | `.segmented-control` + `.segmented-btn` (`.active`) | A toggle button group |
 | `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
+| `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields whose 0.75rem gap IS the separator between them, so a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`): under the bare flex class every inline `<strong>`/`<code>` becomes its own flex item, which opens gaps mid-sentence and strands the punctuation after the element at the start of the next line. |
 | `.markdown-content` | A container for rendered markdown (headings, tables, code, blockquotes) |
 | `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
@@ -388,7 +389,7 @@ Authentication is configured per-API and applied server-side — the iframe neve
 
 ```js
 // GET — unauthenticated local backend
-const res = await lucidos.proxy('sonos').fetch('/Spisestua/play');
+const res = await lucidos.proxy('sonos').fetch('/living-room/play');
 if (!res.ok) throw new Error(`Sonos: HTTP ${res.status}`);
 
 // POST JSON — auth header injected by engine

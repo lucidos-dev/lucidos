@@ -140,7 +140,7 @@ git ls-files '*.ts' '*.tsx' | xargs grep -n 'eslint-disable'
 git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-03. Anything not
+The currently-accepted categories, counted as of 2026-08-04. Anything not
 on this list is fair game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 74 sites across 47 files,
@@ -171,7 +171,7 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 151 sites across 52 files, every one of them
+  `@types/node` in project**, 160 sites across 55 files, every one of them
   a `*.test.ts` (none in `.test.tsx`). The expectation is real: TS does
   not know about Node globals, but Vitest provides them. Adding
   `@types/node` to the project would contaminate the browser type-graph.
@@ -212,6 +212,39 @@ for f in $(git ls-files '*.rs'); do awk -v F="$f" '
       if (!(j>=1 && l[j] ~ /^[[:space:]]*(\/\/|\*|\/\*)/)) printf "%s:%d:%s\n", F, i, l[i]
     } }' "$f"; done
 ```
+
+### Known exceptions
+
+Where "When to give up" (below) sends an unfixable finding. Kept inside
+`## Documented exceptions` so the two inventories read as one list.
+
+- **`packages/lucidos-sdk`'s own `npm run typecheck` cannot run, and no
+  phase above invokes it.** Recorded 2026-08-04. The npm workspace has two
+  JS members (`crates/lucidos-app` and `packages/lucidos-sdk`), but only
+  the app is gated by phases 3 and 4. Running the SDK's script directly
+  fails with eight `TS2307: Cannot find module 'vitest'` errors, one per
+  `packages/lucidos-sdk/src/*.test.ts`: the SDK's `tsconfig.json` includes
+  its whole `src` tree, its test files import `vitest`, and `vitest` is
+  declared only by `crates/lucidos-app` and pinned by `package-lock.json`
+  to `crates/lucidos-app/node_modules/vitest`, which the SDK's resolution
+  path never reaches. This is not a worktree-provisioning artifact: the
+  lockfile puts it there for a root `npm ci` too. Nothing in the repo calls
+  the script, so it has been inert rather than failing.
+
+  **Do not "fix" this by trimming the SDK tsconfig's `include`.** That
+  would drop the test files from type checking rather than type check
+  them. The real fix is to declare `vitest` as a devDependency of
+  `packages/lucidos-sdk` and regenerate the lockfile, which is a
+  dependency + lockfile change (ADR 0020) and belongs in its own commit,
+  not inside a clean-build run.
+
+  Coverage today, so the gap is not overstated: the SDK's **non-test**
+  sources are type checked transitively by phase 3, because
+  `crates/lucidos-app/node_modules/@lucidos/sdk` symlinks to the package
+  and its `types` field points at `src/index.ts`. The SDK's **test** files
+  are type checked by nothing, though they do execute: the app's
+  `vite.config.ts` adds `../../packages/lucidos-sdk/src/**/*.test.ts` to
+  the vitest include list, so `/run-tests` runs them.
 
 ## Out of scope
 

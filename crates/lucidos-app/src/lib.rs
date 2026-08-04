@@ -694,10 +694,19 @@ async fn webview_get_content(app: tauri::AppHandle) -> Result<serde_json::Value,
     Ok(serde_json::json!({ "title": title, "content": content }))
 }
 
-/// Restart the GUI **client** (re-exec the window shell). This does NOT touch
+/// Restart the GUI **client** (relaunch the window shell). This does NOT touch
 /// the always-on gateway service — that runs as a launchd LaunchAgent,
 /// independent of the window (see `desktop`). To restart the service itself,
 /// use `restart_service` (packaged) or `/api/v1/restart` (dev workspace stack).
+///
+/// A packaged build relaunches through LaunchServices so the new instance comes
+/// back FRONTMOST ([`desktop::schedule_relaunch_after_exit`] explains why a
+/// direct respawn does not). Every other case (dev, an unbundled binary, a
+/// watcher we could not spawn) falls back to replacing this process with a fresh
+/// one, which is what this command always did.
+///
+/// Sync command, so it runs on the main thread: both `save_window_state` and
+/// `cleanup_before_exit` require that.
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("Failed to get current exe: {e}"))?;
@@ -705,17 +714,69 @@ fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
 
     eprintln!("[Tauri] Restarting app: {:?} {:?}", exe, args);
 
-    // Persist geometry before the re-exec — the plugin's exit-time flush doesn't
-    // run on this path (we exec() over the process), so without this an in-session
-    // move/resize would be lost across the restart.
+    // Persist geometry before we go. The plugin's exit-time flush does not run on
+    // the exec path at all, so without this an in-session move/resize would be
+    // lost across the restart.
     if let Err(e) = app.save_window_state(window_state_flags()) {
         eprintln!("[Tauri] Failed to persist window state before restart: {e}");
+    }
+
+    match desktop::schedule_relaunch_after_exit() {
+        Ok(()) => {
+            // The watcher is armed and only fires once we are gone, so this exit
+            // IS the relaunch. Never fall through to the respawn below, or the
+            // watcher's `open` would find a live client and we would end up with
+            // two.
+            app.cleanup_before_exit();
+            std::process::exit(0);
+        }
+        Err(e) => eprintln!("[Tauri] No LaunchServices relaunch ({e}); respawning directly"),
     }
 
     app.cleanup_before_exit();
 
     // On Unix, exec() replaces the process in-place. On other platforms, spawn + exit.
     restart_process(&exe, &args)
+}
+
+/// Save the window geometry, then exit the client, from the MAIN thread, and
+/// never come back.
+///
+/// For a caller on the async runtime that has already arranged its own relaunch
+/// ([`desktop::schedule_relaunch_after_exit`]). Both halves need the main thread:
+/// `save_window_state` deadlocks off it (see [`persist_window_state_on_main`]),
+/// and `cleanup_before_exit` tears down webviews.
+///
+/// The save is explicit because `cleanup_before_exit` does NOT dispatch
+/// `RunEvent::Exit`, which is what normally drives the window-state plugin's own
+/// exit-time write. `app.restart()` went out through the real exit event and got
+/// that write for free; this path has to do it itself or a move/resize inside the
+/// debounce window would be lost across the relaunch. It runs inline rather than
+/// through [`persist_window_state_on_main`] because that helper posts its own
+/// main-thread task, which would never be reached: this closure exits first.
+///
+/// Parks instead of returning: the caller's next move would be its fallback
+/// respawn, and that would launch a second client alongside the one the watcher
+/// is about to bring up.
+pub(crate) fn exit_after_relaunch_scheduled(app: &tauri::AppHandle) -> ! {
+    let handle = app.clone();
+    if let Err(e) = app.run_on_main_thread(move || {
+        if let Err(e) = handle.save_window_state(window_state_flags()) {
+            eprintln!("[Tauri] Failed to persist window state before relaunch: {e}");
+        }
+        handle.cleanup_before_exit();
+        std::process::exit(0);
+    }) {
+        // The event loop is unreachable, so nothing will run the clean exit for
+        // us. Go without it: geometry is already on disk as of the last debounced
+        // flush, and a client that refuses to die would leave the watcher
+        // activating the version we just replaced.
+        eprintln!("[Tauri] Could not marshal the exit onto the main thread: {e}");
+        std::process::exit(0);
+    }
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 /// Open a URL in the system default browser (not the embedded webview). Used by

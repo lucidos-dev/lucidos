@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   BROAD_ALLOW_INEFFECTIVE,
+  DEFAULT_PERMISSION_CHOICE,
   inputTouchesProtectedPath,
   narrowPattern,
   permissionButtonState,
@@ -9,6 +10,18 @@ import {
   sessionLabel,
 } from '../PermissionCard';
 import { vnodeToText } from './vnodeToText';
+
+describe('DEFAULT_PERMISSION_CHOICE', () => {
+  it('seeds keyboard focus on "Allow once", not the leading Deny button', () => {
+    // This is what a reflex Enter does to a permission request, so it is pinned
+    // deliberately rather than left to button order. `Deny` leads the row, but a
+    // keyboard user answering a permission card overwhelmingly means to allow
+    // the one thing being asked about. The grant is never hidden: the seeded
+    // choice always carries a visible focus ring, per the choice-card contract
+    // in choiceCardNav.ts. Changing this value is a security-relevant decision.
+    expect(DEFAULT_PERMISSION_CHOICE).toBe('allow');
+  });
+});
 
 describe('BROAD_ALLOW_INEFFECTIVE', () => {
   it('contains the tools whose bare allowlist entry is silently ignored by CC', () => {

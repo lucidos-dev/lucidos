@@ -94,17 +94,6 @@ pub enum SubprocessOrigin {
     Subprocess { source_thread_id: Option<Uuid> },
 }
 
-impl SubprocessOrigin {
-    /// Source thread when this is a subprocess, else `None`. Lets callers
-    /// shovel the value into `MessageOrigin::Api.source_thread_id` directly.
-    pub fn source_thread_id(self) -> Option<Uuid> {
-        match self {
-            Self::Subprocess { source_thread_id } => source_thread_id,
-            Self::NotSubprocess => None,
-        }
-    }
-}
-
 /// Detect a request from a Lucidos-spawned subprocess by comparing the
 /// `HEADER_AGENT_ORIGIN_TOKEN` header to the engine-wide token. O(1)
 /// lock-free on the no-token fast path (one `OnceLock::get` + one

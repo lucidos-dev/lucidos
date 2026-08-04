@@ -67,7 +67,21 @@ $ lucidos data path knowhow/myapp/notes.md --mkdir
 
 ### `lucidos data write <relative> [--from <local-path> | -]`
 
-Write content to the resolved absolute path. Creates parent dirs automatically.
+Write content into the parent workspace's `data/` tree. Creates parent dirs
+automatically.
+
+The write goes through the engine (`PUT /api/v1/data/*path`) rather than
+touching the filesystem, so it needs a running engine, like `events emit` and
+`notify`. That is what makes the file *arrive* in the workspace rather than just
+appearing on disk: the engine commits it to the `data/` repo and announces it
+(`DataFileWritten`, plus `ArtifactCreated` / `ArtifactUpdated` under
+`artifacts/`), so the Files panel refreshes live, the memory index picks the
+file up, an `on_event: ArtifactCreated` trigger sees it, and the chat link below
+resolves. Content is limited to 100 MiB per write. A failed write is an error:
+the command exits non-zero and prints no link.
+
+Under the Codex sandbox this works without a writable-root grant, because it is
+an HTTP call rather than a write outside the worktree.
 
 ```bash
 # from a local file you generated elsewhere
@@ -597,7 +611,8 @@ lucidos planned mark --plan docs/plans/2026-06-19-my-change.md
 
 # Present the plan, then ask for approval with your question tool (AskUserQuestion on
 # Claude Code, ask_user_question on Codex; options `Approve` / `Request changes`), not in
-# prose. Once the user APPROVES, flip it to gate-satisfying:
+# prose. That pair is a floor: if the plan has a real fork, the fork takes the second
+# slot and `Request changes` is dropped. Once the user APPROVES, flip it to gate-satisfying:
 lucidos planned approve
 
 # Genuinely local fix that doesn't warrant a plan — acknowledge instead (no approval needed):
@@ -607,7 +622,7 @@ lucidos planned mark --simple "rename a misspelled variable"
 lucidos planned state
 ```
 
-`mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. **`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must present the plan and ask for approval **with its question tool** (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), never in prose: approval is a DECISION question the agent is blocked on, and asked in prose it leaves the thread idle until the user types "approve" by hand. Only after the user approves does the agent run `lucidos planned approve` to flip `proposed`→`planned` (gate-satisfying). If the user requests changes, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval. `planned` and `acknowledged_simple` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand (the `implementation-plan` skill drives them), but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
+`mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. **`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must present the plan and ask for approval **with its question tool** (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), never in prose: approval is a DECISION question the agent is blocked on, and asked in prose it leaves the thread idle until the user types "approve" by hand. That option pair is a **floor**, not a fixed shape: the question tool needs at least two options, so `Request changes` fills the second slot only when the plan offers no real fork. When it offers one (a narrower scope, one layer instead of two), that fork takes the slot and `Request changes` is dropped rather than carried as a third option, where it would mean only "I will type what I want changed". Only after the user approves does the agent run `lucidos planned approve` to flip `proposed`→`planned` (gate-satisfying); a fork answer is an approval too, so the agent revises the plan file to that variant, re-commits, and then flips it. If the user requests changes instead, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval. `planned` and `acknowledged_simple` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand (the `implementation-plan` skill drives them), but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
 
 ### `lucidos knowhow list`
 
@@ -673,7 +688,7 @@ Call a backend configured in `data/config/apis.json` through the engine. The eng
 
 ```bash
 # GET; body to stdout, exit 0 even on 4xx/5xx (curl convention)
-lucidos proxy sonos /Spisestua/play
+lucidos proxy sonos /living-room/play
 
 # POST with inline body
 lucidos proxy comfort /api/v1/devices -X POST \

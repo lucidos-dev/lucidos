@@ -266,17 +266,6 @@ impl TaskOutcome {
     }
 }
 
-/// Name for the signals worth spelling out. Anything unmapped falls through to
-/// a bare number in [`TaskOutcome::describe`], so the phrase never silently
-/// drops information.
-///
-/// Shared with `runtime::claude_code::format_exit_status`, which renders the
-/// same names for coding-agent subprocess deaths — one table so the two
-/// renderings can't drift apart.
-///
-/// `SIGPIPE` earns its place because enabling `pipefail` makes it user-visible:
-/// a producer whose consumer closes the pipe surfaces as `141`, and naming it
-/// is the difference between an actionable report and a mystery number.
 /// Decode an exit code in the `128 + signum` range to the signal it most likely
 /// stands for. `None` outside `129..=159` or for an unmapped signal, so an
 /// ordinary status is never dressed up as a signal.
@@ -288,6 +277,17 @@ fn probable_signal(code: i32) -> Option<&'static str> {
     }
 }
 
+/// Name for the signals worth spelling out. Anything unmapped falls through to
+/// a bare number in [`TaskOutcome::describe`], so the phrase never silently
+/// drops information.
+///
+/// Shared with `runtime::claude_code::format_exit_status`, which renders the
+/// same names for coding-agent subprocess deaths: one table so the two
+/// renderings can't drift apart.
+///
+/// `SIGPIPE` earns its place because enabling `pipefail` makes it user-visible:
+/// a producer whose consumer closes the pipe surfaces as `141`, and naming it
+/// is the difference between an actionable report and a mystery number.
 pub(crate) fn signal_name(sig: i32) -> Option<&'static str> {
     match sig {
         1 => Some("SIGHUP"),

@@ -87,10 +87,22 @@ describe('PromptInput refuses image attach while answering a UserQuestion', () =
     );
   });
 
-  it('rawPendingMultiQ derivation reuses isAnsweringQuestion instead of repeating the literal', () => {
+  it('the pending-question walk reuses isAnsweringQuestion instead of repeating the literal', () => {
+    // One gated walk feeds both consumers: `multiSelect` picks the prompt-row
+    // Submit control, and the question's mere presence picks the answering
+    // placeholder. Walking twice per keystroke is what the gate exists to
+    // avoid, so pin the derivation, not just the gate.
     expect(promptSource).toMatch(
-      /const\s+rawPendingMultiQ\s*=\s*isAnsweringQuestion/,
+      /const\s+rawPendingQ\s*=\s*isAnsweringQuestion\s*\?\s*findLatestPendingQuestion/,
     );
+    // Both consumers hang off the ONE optimism-filtered result, so a question
+    // the user just answered can neither keep Submit alive nor keep the
+    // placeholder asking for an answer.
+    expect(promptSource).toMatch(
+      /const\s+pendingQ\s*=\s*rawPendingQ\s*&&\s*!pendingAnswers\.has\(rawPendingQ\.toolUseId\)/,
+    );
+    expect(promptSource).toMatch(/const\s+answeringQuestionCard\s*=\s*pendingQ\s*!==\s*null/);
+    expect(promptSource).toMatch(/const\s+pendingMultiQ\s*=\s*pendingQ\?\.multiSelect/);
     // Make sure we did not accidentally leave a second literal compare laying
     // around — the derivation should be the single source of truth.
     const literalHits = promptSource.match(/focusedStatus\s*===\s*'waiting_for_user_answer'/g) ?? [];

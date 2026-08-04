@@ -150,7 +150,7 @@ effect(() => {
 // once per refresh and the spinner stays until the new page loads. Lives here as
 // an effect rather than in `refreshClient` so showing it doesn't pull `showToast`
 // into sw-update.ts — the store ↔ sw-update import cycle `clientRefreshing`'s
-// home deliberately avoids. dismissable/showDuringRestart match the restart
+// home deliberately avoids. dismissable/showWhileUnavailable match the restart
 // toast: it can't be closed mid-reload, and it survives the showToast
 // engine-restart suppression in the rare refresh-during-restart overlap.
 //
@@ -168,7 +168,7 @@ effect(() => {
   if (!clientRefreshing.value) return;
   untracked(() => {
     dismissToast('update-available');
-    showToast('Refreshing...', 'info', { key: 'refreshing', spinning: true, dismissable: false, showDuringRestart: true });
+    showToast('Refreshing...', 'info', { key: 'refreshing', spinning: true, dismissable: false, showWhileUnavailable: true });
   });
 });
 

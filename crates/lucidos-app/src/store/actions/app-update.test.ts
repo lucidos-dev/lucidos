@@ -204,7 +204,7 @@ describe('update progress narration', () => {
     expect(opts.progress).toBeCloseTo(0.25);
     // The gateway dies under the page in the last phases; without this opt-in the
     // narration would be suppressed by the disconnection it is explaining.
-    expect(opts.showDuringRestart).toBe(true);
+    expect(opts.showWhileUnavailable).toBe(true);
     expect((opts.secondaryAction as { label: string }).label).toBe('Cancel');
   });
 

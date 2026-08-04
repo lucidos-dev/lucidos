@@ -21,7 +21,7 @@ const ev = (event: Record<string, unknown>) => ({ seq: ++seq, event: { created: 
  *  and the inline step shimmer, given an exchange + the steps-expanded toggle +
  *  whether the response panel is collapsed (which hides the steps body). */
 function shimmerState(exchange: Exchange, showSteps: boolean, collapsed = false, streamingBuffer = '') {
-  const events = exchangeResponseEvents(exchange, 0, true, false);
+  const events = exchangeResponseEvents(exchange, true, false);
   const status = exchangeStatus(exchange, streamingBuffer, true, false, false, false, false);
   const hasSteps = events.some(e => e.type === 'step');
   const { className } = statusLabel(status, hasSteps);

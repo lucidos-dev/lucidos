@@ -226,10 +226,13 @@ fn every_sandbox_writable_root_becomes_an_add_dir() {
     // Two load-bearing holes in the workspace-write sandbox:
     //   /repo/.git  — a linked worktree's real git dir lives under the main
     //                 repo, so without it every in-agent `git commit` fails.
-    //   /ws/data    — `lucidos data write` lands in the PARENT workspace, which
-    //                 is outside the worktree. Without it the seatbelt returns
-    //                 EPERM (os error 1) — the 2026-07-26 nightly's Codex
-    //                 security pass lost two findings exactly this way.
+    //   /ws/data:     a direct write into the PARENT workspace's data/ tree
+    //                 (`lucidos data path --mkdir`, an editor write to a
+    //                 resolved data path) is outside the worktree. Without it
+    //                 the seatbelt returns EPERM (os error 1): the 2026-07-26
+    //                 nightly's Codex security pass lost two findings this way,
+    //                 back when `lucidos data write` wrote the file itself.
+    //                 That command now PUTs to the engine and needs no root.
     let mut config = test_config(Path::new("/tmp/wt"));
     config.sandbox_writable_roots = vec![PathBuf::from("/repo/.git"), PathBuf::from("/ws/data")];
     let cmd = build_codex_turn_command(&config, None, None, None, "p", &[]);

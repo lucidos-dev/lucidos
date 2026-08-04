@@ -51,12 +51,20 @@ pub struct Workspace {
     ///
     /// `true` → the engine is **auto-started** when the gateway (re)starts (the
     /// always-on posture: a packaged install's login-launched gateway brings up
-    /// its auto-start workspaces). `false` (the default for a newly-created
-    /// workspace; enabled only via the picker toggle) → the workspace is
-    /// **listed** in the picker
-    /// but its engine is started only on an explicit open/launch (lazy). An
-    /// already-running engine is re-adopted on gateway restart regardless of this
-    /// flag. Backward-compatible: a legacy entry with no field reads as `false`.
+    /// its auto-start workspaces, so triggers, scheduled tasks and push keep
+    /// working without anyone opening a window). This is the default for a
+    /// workspace created through the picker. `false` (what the dev launcher
+    /// seeds, and what the picker toggle can set) → the workspace is **listed**
+    /// in the picker but its engine is started only on an explicit open/launch
+    /// (lazy).
+    ///
+    /// It governs the BOOT posture and nothing else. An already-running engine is
+    /// re-adopted on gateway restart regardless, and a workspace the last
+    /// teardown stopped is restored regardless (see `crate::next_boot`): a
+    /// restart returns what it took whatever this says.
+    ///
+    /// Backward-compatible: a legacy entry with no field reads as `false`, and
+    /// [`Registry::migrate_to_current`] then lifts it to the current default.
     #[serde(default)]
     pub autostart: bool,
 }
@@ -74,11 +82,32 @@ impl Workspace {
     }
 }
 
+/// Schema version of the registry document, bumped when a load-time migration
+/// is added. `1` introduced the autostart default (see
+/// [`Registry::migrate_to_current`]).
+pub const REGISTRY_VERSION: u32 = 1;
+
 /// The on-disk registry document.
-#[derive(Serialize, Deserialize, Clone, Debug, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Registry {
+    /// What the document was written by, so a load-time migration runs exactly
+    /// once. A file written before versioning has no field and reads as `0`; a
+    /// registry created in memory starts at [`REGISTRY_VERSION`] (see the
+    /// hand-written `Default`, which serde's field default deliberately does not
+    /// share).
+    #[serde(default)]
+    pub version: u32,
     #[serde(default)]
     pub workspaces: Vec<Workspace>,
+}
+
+impl Default for Registry {
+    fn default() -> Self {
+        Self {
+            version: REGISTRY_VERSION,
+            workspaces: Vec::new(),
+        }
+    }
 }
 
 impl Registry {
@@ -95,6 +124,38 @@ impl Registry {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
             Err(e) => Err(format!("read {}: {e}", path.display()).into()),
         }
+    }
+
+    /// Bring a registry loaded from disk up to [`REGISTRY_VERSION`], returning
+    /// how many entries changed, or `None` when it was already current (nothing
+    /// to save).
+    ///
+    /// Version 1 lifts every entry to the autostart default. Nobody was ever
+    /// asked: `autostart: false` in an existing registry is the OLD default
+    /// rather than a decision, and leaving it means an always-on install stays
+    /// dark after every login, with no triggers, scheduled tasks or push until
+    /// somebody opens each workspace. A user who did deliberately turn it off
+    /// pays one toggle in the picker, which is the smaller harm. Running once,
+    /// stamped by the version, is what keeps a later deliberate `false` from
+    /// being flipped back on every boot.
+    ///
+    /// The caller decides WHEN this is appropriate: the packaged gateway runs it
+    /// at startup, while dev does not, because the dev launcher seeds
+    /// `autostart: false` on purpose and would otherwise find every workspace it
+    /// has ever launched spawning at once.
+    pub fn migrate_to_current(&mut self) -> Option<usize> {
+        if self.version >= REGISTRY_VERSION {
+            return None;
+        }
+        let mut changed = 0;
+        for ws in &mut self.workspaces {
+            if !ws.autostart {
+                ws.autostart = true;
+                changed += 1;
+            }
+        }
+        self.version = REGISTRY_VERSION;
+        Some(changed)
     }
 
     /// Persist the registry to `path` atomically (write a sibling temp file,
@@ -433,6 +494,69 @@ mod tests {
         assert_eq!(reg.workspaces.len(), 1);
         assert!(!reg.get("dev").unwrap().autostart);
         assert!(reg.get("dev").unwrap().database_url.is_none());
+    }
+
+    // ── The autostart default and its one-time migration ─────────────────────
+
+    /// A pre-versioning document: no `version`, entries written with the old
+    /// `autostart: false` default.
+    fn legacy_registry() -> Registry {
+        serde_json::from_str(
+            r#"{"workspaces":[
+                {"id":"myws","name":"myws","dir":"workspaces/myws","port":5001,"autostart":false},
+                {"id":"dev","name":"dev","dir":"workspaces/dev","port":5002,"autostart":true}
+            ]}"#,
+        )
+        .expect("the legacy shape parses")
+    }
+
+    #[test]
+    fn a_legacy_registry_reads_as_version_zero_and_migrates_to_the_new_default() {
+        let mut reg = legacy_registry();
+        assert_eq!(
+            reg.version, 0,
+            "a document with no version is pre-migration"
+        );
+        assert_eq!(reg.migrate_to_current(), Some(1), "one entry was flipped");
+        assert!(reg.get("myws").unwrap().autostart);
+        assert!(reg.get("dev").unwrap().autostart, "already on, left alone");
+        assert_eq!(reg.version, REGISTRY_VERSION);
+    }
+
+    // The stamp is the whole point: without it, every boot would flip a toggle
+    // the user had deliberately turned off, and the picker control would be a lie.
+    #[test]
+    fn a_migrated_registry_is_never_migrated_again() {
+        let mut reg = legacy_registry();
+        reg.migrate_to_current();
+        reg.get_mut("myws").unwrap().autostart = false; // a deliberate choice
+        assert_eq!(reg.migrate_to_current(), None, "already current");
+        assert!(
+            !reg.get("myws").unwrap().autostart,
+            "a deliberate off must survive every later boot",
+        );
+    }
+
+    #[test]
+    fn a_registry_created_in_memory_is_already_current() {
+        let mut reg = Registry::default();
+        assert_eq!(reg.version, REGISTRY_VERSION);
+        assert_eq!(reg.migrate_to_current(), None);
+    }
+
+    #[test]
+    fn the_version_round_trips_through_disk() {
+        let dir = std::env::temp_dir().join(format!("lucidos-reg-ver-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("workspaces.json");
+        let mut reg = legacy_registry();
+        reg.migrate_to_current();
+        reg.save(&path).unwrap();
+
+        let loaded = Registry::load(&path).unwrap();
+        assert_eq!(loaded.version, REGISTRY_VERSION);
+        assert!(loaded.get("myws").unwrap().autostart);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

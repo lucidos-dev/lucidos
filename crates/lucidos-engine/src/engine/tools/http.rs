@@ -188,7 +188,20 @@ impl LucidosEngine {
                             }
                         }
                     }
-                    body_text = response.text().await.unwrap_or_default();
+                    // A body-read failure (connection dropped mid-body, decode
+                    // error) is NOT a successful empty response. The old
+                    // `.unwrap_or_default()` left `body_text` empty and then
+                    // cleared `request_error` unconditionally on the next line,
+                    // so the tool reported success: with `output_path` set and a
+                    // 2xx status, the block below wrote a ZERO-BYTE artifact
+                    // over the user's file and announced it as an update.
+                    body_text = match response.text().await {
+                        Ok(t) => t,
+                        Err(e) => {
+                            request_error = Some(format!("reading response body: {}", e));
+                            break;
+                        }
+                    };
                     request_error = None;
 
                     // Retry on transient errors: 401, 429, 5xx

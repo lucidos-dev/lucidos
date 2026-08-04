@@ -2,6 +2,17 @@
 
 **Status:** Accepted (2026-07-30)
 
+**Amended by:** [0039: The public mirror's `main` is a linear release
+history](0039-the-public-mirror-is-a-linear-release-history.md). Read "the
+orphan" throughout this ADR as "the **published release commit**": since
+2026-08-04 it carries the previous release's published commit as its single
+parent, so the mirror's `main` is a chain rather than 36 unrelated objects.
+Nothing THIS ADR decides changes. The mirror's `v<version>` still names that
+stripped commit, it is still pushed **by SHA** so no local ref is created, and
+the local / `origin` tag still names the release commit on the internal `main`.
+The legacy orphan tags described under "Consequences" are also unchanged by
+0039: they are re-parented, not re-pointed, by the one-time repair.
+
 ## Context
 
 Lucidos publishes to two remotes:

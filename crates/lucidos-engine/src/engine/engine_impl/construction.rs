@@ -1189,6 +1189,11 @@ impl LucidosEngine {
             cancel_rebuild: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             backup_in_progress: AtomicBool::new(false),
+            // `true`, not `false`: reaching here means the pool connected and the
+            // migrator ran, so the database WAS answering a moment ago. Starting
+            // false would make every engine report an outage until its first
+            // probe lands. See `engine::db_health`.
+            database_reachable: AtomicBool::new(true),
             build_state: std::sync::RwLock::new(crate::engine::engine_version::BuildState::Idle),
             update_check: std::sync::Mutex::new(Default::default()),
             source_behind_cache: std::sync::Mutex::new(Default::default()),

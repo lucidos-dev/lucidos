@@ -5,8 +5,9 @@
 //! these accumulate forever — every dependency `npm install` runs again, every
 //! Cargo `target/` directory persists, and disk usage grows monotonically.
 //!
-//! Cleanup runs on a long timer (default 1 hour) and applies two tiers per
-//! thread, plus one global threshold alert.
+//! Cleanup runs on [`CLEANUP_INTERVAL`] (15 minutes) and applies three tiers
+//! per thread (Tier 0, Tier 1, Tier 2), plus sweeps for stranded, orphan-path
+//! and temporary worktrees, plus one global threshold alert.
 //!
 //! **Retention gate (the load-bearing policy).** A worktree is the user's warm
 //! working copy of a thread — reopening a thread with its worktree still on disk
@@ -31,6 +32,14 @@
 //! `276f5580` incident). See [`WorktreeCleanup::has_pending_fan_in`]. Tier 1 is
 //! exempt — it strips only regenerable build artifacts, leaving the worktree and
 //! the parent's ability to resume intact.
+//!
+//! - **Tier 0: full removal of zero-information worktrees.** When a thread has
+//!   been idle longer than [`TIER_0_GRACE`] AND has no pending change, a clean
+//!   `git status`, and a branch with no commits ahead of main, the whole
+//!   worktree is removed (and the branch with it when fully merged). This is
+//!   the tier that reclaims a thread's tree after Apply merged its work, and
+//!   per ADR 0035 it is why no session teardown needs to reclaim anything.
+//!   Emits `WorktreeCleaned { tier: 0, freed_bytes, branch_deleted }`.
 //!
 //! - **Tier 1 — strip regenerable build artifacts.** When a thread has been idle longer than
 //!   [`TIER_1_IDLE`] AND its worktree contains a `target/`, `node_modules/`,

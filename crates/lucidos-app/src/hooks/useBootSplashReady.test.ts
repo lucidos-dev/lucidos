@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import {
+  bootSplashShouldRelease,
   isWorkspaceReady,
   delayedBootStatus,
   remainingRevealMs,
@@ -35,6 +36,38 @@ describe('isWorkspaceReady', () => {
 
   it('is not ready when connected but threads have not loaded yet', () => {
     expect(isWorkspaceReady('connected', false)).toBe(false);
+  });
+});
+
+describe('bootSplashShouldRelease', () => {
+  it('releases on the ordinary ready path', () => {
+    expect(bootSplashShouldRelease('connected', true, true)).toBe(true);
+  });
+
+  it('holds while the load is still in progress', () => {
+    expect(bootSplashShouldRelease('connected', false, true)).toBe(false);
+  });
+
+  // The reported symptom: the engine answers /health so the connection is live,
+  // but its database is gone, so the thread list can never arrive. Waiting it out
+  // was 15s of a black screen reading "Loading…". Coming down hands off to the
+  // app, where the authoritative "can't reach its database" toast is already up.
+  it('releases when a connected engine reports its database unreachable', () => {
+    expect(bootSplashShouldRelease('connected', false, false)).toBe(true);
+  });
+
+  // The load-bearing negative case, and the same mistake delayedBootStatus
+  // already documents: the release must come from POSITIVE evidence. Nothing has
+  // been heard from the engine yet here, so the splash stands.
+  it('does not release on absence of evidence while the first probe is in flight', () => {
+    expect(bootSplashShouldRelease('connecting', false, true)).toBe(false);
+    expect(bootSplashShouldRelease('connecting', false, false)).toBe(false);
+  });
+
+  it('does not release for an unreachable ENGINE, which has its own escape', () => {
+    // A disconnected engine is the boot watchdog's / gateway escape's case, not
+    // this one; releasing here would drop the splash mid-cold-start on a blip.
+    expect(bootSplashShouldRelease('disconnected', false, false)).toBe(false);
   });
 });
 

@@ -173,10 +173,11 @@ mod tests {
 
     #[test]
     fn build_url_basic() {
-        let url = build_request_url("https://localhost:8443", "sonos", "/Spisestua/play").unwrap();
+        let url =
+            build_request_url("https://localhost:8443", "sonos", "/living-room/play").unwrap();
         assert_eq!(
             url,
-            "https://localhost:8443/api/v1/proxy/sonos/Spisestua/play"
+            "https://localhost:8443/api/v1/proxy/sonos/living-room/play"
         );
     }
 

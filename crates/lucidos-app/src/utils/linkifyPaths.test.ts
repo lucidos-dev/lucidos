@@ -259,11 +259,52 @@ describe('linkifyPaths', () => {
     expect(result).toContain('data-path="artifacts/foo.md"');
   });
 
-  it('leaves anchors whose href does not resolve to a known artifact alone', () => {
+  it('rewrites a data-path anchor the cached artifact list does NOT know', () => {
+    // The reported bug. `lucidos data write` lands a file and prints exactly
+    // this link for the agent to paste, but the artifacts cache is refreshed by
+    // SSE and does not have the path yet. Gating on the cache left a raw
+    // relative href, so the click navigated to /<slug>/artifacts/... and the
+    // SPA fallback reloaded the whole workspace. Resolved by shape instead.
     const html = '<p><a href="data/artifacts/unknown.md">link</a></p>';
     const result = linkifyPaths(html, ['artifacts/foo.md'], []);
-    expect(result).toContain('href="data/artifacts/unknown.md"');
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="artifacts/unknown.md"');
+    expect(result).not.toContain('href="data/artifacts/unknown.md"');
+  });
+
+  it('rewrites a data-path anchor with an EMPTY artifact list (nothing loaded yet)', () => {
+    const html = '<p><a href="artifacts/pr-review/pr-1582/index.html">report</a></p>';
+    const result = linkifyPaths(html, [], []);
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="artifacts/pr-review/pr-1582/index.html"');
+  });
+
+  it.each([
+    'knowhow/myapp/notes.md',
+    'triggers/daily/run.md',
+    'system-knowhow/js-sdk.md',
+    '/artifacts/report.pdf',
+    '/data/knowhow/x.md',
+    'artifacts/report.html?v=2',
+    'artifacts/report.html#top',
+  ])('rewrites the data-path shape %s even with no cached paths', (href) => {
+    const result = linkifyPaths(`<p><a href="${href}">x</a></p>`, [], []);
+    expect(result).toContain('class="artifact-link"');
+  });
+
+  it.each([
+    // A bare sub-tree is a directory, not a file. `apps` / `triggers` are also
+    // nav panels and are claimed earlier; the rest simply name no file.
+    'artifacts',
+    'artifacts/',
+    'README',
+    'some/unknown/path.md',
+    'https://example.com/artifacts/foo.md',
+  ])('leaves %s alone (not a data-path shape)', (href) => {
+    const html = `<p><a href="${href}">x</a></p>`;
+    const result = linkifyPaths(html, [], []);
     expect(result).not.toContain('artifact-link');
+    expect(result).toContain(`href="${href}"`);
   });
 
   it('leaves external-URL anchors alone even when artifact paths exist', () => {
@@ -468,21 +509,27 @@ describe('linkifyPaths', () => {
     expect(result).toContain('data-app-id="todo"');
   });
 
-  it('does NOT rewrite anchors for apps/<id>/<sub-file> (sub-files are real files, not app entry points)', () => {
-    // Sub-files under an app's folder are real files. Clicking should
-    // preview them, not open the app. Only the canonical entry — id,
-    // id/, id/index.html — routes to the app.
+  it('routes apps/<id>/<sub-file> to a file preview, not the app', () => {
+    // Sub-files under an app's folder are real files. Clicking should preview
+    // them, not open the app. Only the canonical entry (id, id/, id/index.html)
+    // routes to the app. The app rewriter declines the sub-file, and the
+    // artifact rewriter then claims it by shape.
     const html = '<p><a href="apps/todo/styles.css">Todo styles</a></p>';
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
     expect(result).not.toContain('class="app-link"');
-    expect(result).toContain('href="apps/todo/styles.css"');
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="apps/todo/styles.css"');
   });
 
-  it('leaves apps/<unknown-id>/index.html anchors alone', () => {
+  it('routes apps/<unknown-id>/index.html to a file preview, never the app', () => {
+    // The app gate stays strict (only a KNOWN id opens an app), but the href is
+    // still a path under data/apps/, so it previews as a file rather than
+    // escaping to the browser and reloading the workspace.
     const html = '<p><a href="apps/no-such-app/index.html">link</a></p>';
     const result = linkifyPaths(html, [], [{ name: 'Todo', id: 'todo' }]);
-    expect(result).toContain('href="apps/no-such-app/index.html"');
     expect(result).not.toContain('app-link');
+    expect(result).toContain('class="artifact-link"');
+    expect(result).toContain('data-path="apps/no-such-app/index.html"');
   });
 
   it('rewrites anchors with app:<id> custom-scheme href to app-link', () => {
@@ -761,17 +808,18 @@ describe('linkifyPaths caching', () => {
   });
 
   it('invalidates when the artifact/app list changes (new reference, new content)', () => {
-    // A deliberate app anchor: with no apps the strict rewriter declines and the
-    // href is left alone; once the app list contains it, the SAME html must
-    // rewrite to an app-link — proving the (paths, apps) change invalidates the
-    // cache. (Bare-text app-name scanning was removed, so this uses an anchor.)
+    // A deliberate app anchor: with no apps the strict app rewriter declines
+    // (the artifact rewriter then claims the path by shape, so it previews as a
+    // file); once the app list contains it, the SAME html must rewrite to an
+    // app-link, proving the (paths, apps) change invalidates the cache.
+    // (Bare-text app-name scanning was removed, so this uses an anchor.)
     const html = '<p><a href="apps/habit-tracker/index.html">Habit Tracker</a></p>';
     const before = linkifyPaths(html, [], []);
     expect(before).not.toContain('data-app-id');
-    expect(before).toContain('href="apps/habit-tracker/index.html"');
+    expect(before).toContain('data-path="apps/habit-tracker/index.html"');
     const after = linkifyPaths(html, [], [{ name: 'Habit Tracker', id: 'habit-tracker' }]);
     expect(after).toContain('data-app-id="habit-tracker"');
-    expect(after).not.toContain('href="apps/habit-tracker/index.html"');
+    expect(after).not.toContain('artifact-link');
   });
 
   it('cache:false produces the same output as the cached path but is not stored', () => {

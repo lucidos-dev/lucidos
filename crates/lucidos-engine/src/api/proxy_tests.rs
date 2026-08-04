@@ -310,7 +310,7 @@ fn is_redirect_status_covers_30x_we_follow() {
 #[test]
 fn has_traversal_passes_normal_paths() {
     assert!(!has_traversal(""));
-    assert!(!has_traversal("/Spisestua/play"));
+    assert!(!has_traversal("/living-room/play"));
     assert!(!has_traversal("api/v1/items?id=42"));
     // A literal segment that *contains* `..` but isn't `..` is fine.
     assert!(!has_traversal("foo..bar"));
@@ -321,16 +321,16 @@ fn has_traversal_passes_normal_paths() {
 #[test]
 fn build_url_handles_no_trailing_no_leading() {
     assert_eq!(
-        build_target_url("http://localhost:5005", "Spisestua/play", None),
-        "http://localhost:5005/Spisestua/play"
+        build_target_url("http://localhost:5005", "living-room/play", None),
+        "http://localhost:5005/living-room/play"
     );
 }
 
 #[test]
 fn build_url_handles_trailing_and_leading_slashes() {
     assert_eq!(
-        build_target_url("http://localhost:5005/", "/Spisestua/play", None),
-        "http://localhost:5005/Spisestua/play"
+        build_target_url("http://localhost:5005/", "/living-room/play", None),
+        "http://localhost:5005/living-room/play"
     );
 }
 

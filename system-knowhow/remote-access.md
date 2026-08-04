@@ -342,39 +342,73 @@ origin**. Useless on a phone, ideal for a second laptop.
 
 ## Settings → Mobile Access
 
-The page that drives all of this on the packaged desktop app. Point the user
-here before hand-running commands.
+The page that drives all of this. Point the user here before hand-running
+commands.
 
-**It has two halves, split by whether they need the Mac.**
+**It answers two independent questions, and never muddles them.** They are
+numbered on the page in the order the setup happens, because the first has to be
+true before the second buys anything:
 
-| Half | Contains | Shown |
+| Section | Question | Where the answer comes from |
 |---|---|---|
-| Machine-side | Connect URLs, Sign in to Tailscale, Expose | Packaged desktop app only |
-| Phone-facing | What Tailscale buys you, a Tailscale row for the reading device, the remaining steps | Everywhere, phone browsers and the PWA included |
+| 1. The machine running Lucidos | Is the engine's machine on a tailnet? | `detected_tailscale_ip` from `GET /api/v1/network-config` in any browser; the fuller `get_connect_info` probe on the packaged desktop app |
+| 2. This device | Has the device reading the page joined that tailnet? | The address this device was served on |
 
-The machine-side controls are native commands with no HTTP equivalent, so they
-cannot work in a browser. The phone-facing half needs nothing, and the phone is
-exactly where it is worth reading, so the page is reachable from a phone and
-rewords itself for whichever device opened it. **Get Tailscale** opens the App
-Store on iOS, the Play Store on Android, and `tailscale.com/download` otherwise.
+Both sections render **everywhere**, phone browsers and the installed PWA
+included. What varies by platform is how much each can say, never whether it
+appears. Only the **actions** are gated: Connect URLs, Sign in to Tailscale and
+Expose are native commands with no HTTP equivalent, so they exist on the
+packaged desktop app alone. **Get Tailscale** is a link rather than a bridge
+call, so it is offered wherever it can be acted on, and it opens the App Store
+on iOS, the Play Store on Android, and `tailscale.com/download` otherwise.
 
-**The phone-facing half reads the device it is running on**, so it never asks a
-phone to redo a step it has already done. Its evidence is the host that device
-was served on, since there is no Tauri bridge and no way to inspect a phone's
-interfaces from a web page:
+Do not restore the old shape, where the page chose **one** of the two by
+platform. A browser then saw section 2 alone, and a machine whose gateway is
+bound to its own tailnet address serves every remote device at a bare `100.x`
+host, so all of them were told to install Tailscale over a connection that only
+existed because Tailscale was working, while section 1 (which would have shown
+them the address) was the half being suppressed.
+
+**Section 2 reads the device it is running on**, so it never asks a device to
+redo a step it has already done. There is no Tauri bridge on a phone and no way
+to inspect its interfaces from a web page, so the evidence is the host it was
+served on, checked three ways:
 
 | How this device got here | The page shows |
 |---|---|
-| Any other address | **Get Tailscale**, then all three steps (install, copy the Mac's Tailscale address, add to home screen) |
-| A `*.ts.net` name, in a browser | "Tailscale is connected on this device", and the one step left: add to home screen |
-| A `*.ts.net` name, in the installed PWA | "Tailscale is connected on this device", and "This phone is set up" |
+| Loopback (`localhost`, `127.0.0.0/8`, `::1`, `*.localhost`) | "You are reading this on the machine that runs Lucidos". No install offer and no app-install step: this device IS the machine, so section 1 is its whole answer |
+| A `*.ts.net` name | "Tailscale is connected on this device" |
+| The exact `100.x` address section 1 reports for the machine | the same, for the same reason |
+| Any other address | **Get Tailscale**, then all three steps (install Tailscale, copy the machine's Tailscale address, install the app) |
 
-A MagicDNS name resolves only on a device signed in to the tailnet that owns it,
-so reading the page at one is proof that Tailscale is installed and working
-*here*. A bare `100.64/10` host is deliberately **not** treated as proof: that
-range is real CGNAT space an ISP can hand to a physical interface, and the
-interface check that settles it for the Mac cannot be run against the phone. An
-unproven host keeps the install offer, which is the harmless way to be wrong.
+**Being on the tailnet is not the last question.** Which step remains also
+depends on whether the origin is secure (`window.isSecureContext`), because the
+installable app and push are gated on that and Route A's `http://` tailnet
+address is not one:
+
+| On the tailnet, and… | The remaining step |
+|---|---|
+| a secure origin (`https`, or loopback), in a browser tab | install the app here |
+| plain `http://`, in a browser tab | **none, on this device.** The page says so and points at `tailscale serve` on the machine, because the browser will offer no install control here however the page words it |
+| already the installed app | nothing |
+
+Each proof is sound on its own. A MagicDNS name resolves only on a device signed
+in to the tailnet that owns it. A request that arrived at the machine's tailnet
+address arrived over that tailnet, and the address is trustworthy because the
+engine read it off a Tailscale **interface** (`lucidos_tailscale::tailnet_ipv4`
+requires the interface *and* the range), not out of the range. And a loopback
+request never left the machine.
+
+A bare `100.64/10` host that does **not** match the reported address is still
+deliberately not proof: that range is real CGNAT space an ISP can hand to a
+physical interface, and the interface check cannot be run against a remote
+device from here. An unproven host keeps the install offer, which is the
+harmless way to be wrong.
+
+**The page never calls a device a phone unless it is one.** It is read from a
+desktop browser as often as from a handset, and a desktop browser has no home
+screen, so the "add to home screen" wording is behind an iOS/Android check and
+the neutral phrasing is "install Lucidos".
 
 **Connect URLs** lists the addresses the engine answers on:
 
@@ -409,7 +443,9 @@ reverse lookup, so it reports correctly no matter how Tailscale was installed
   names the two ways to get one: Install CLI in the Tailscale app, or
   `brew install tailscale`.
 
-**The four states of the Tailscale section**, from those two independent facts:
+**The four states of section 1 on the packaged desktop app**, from those two
+independent facts. In a browser the same section reports the tailnet half of
+this and offers no action, because every action below is a native command:
 
 | Tailnet state | CLI | The page shows |
 |---|---|---|

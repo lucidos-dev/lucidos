@@ -1,0 +1,4 @@
+# The ADR index is an append-only list: keep both sides of a concurrent add
+# instead of conflicting. Safe only because the file is a pure list, never prose.
+# See docs/plans/2026-08-04-conflict-free-adr-index-and-numbering.md
+docs/adr/index.md merge=union

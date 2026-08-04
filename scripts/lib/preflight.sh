@@ -4,6 +4,12 @@
 #
 # UX: silent on the happy path. If a tool is missing we ask "Install <tool>? [y/N]"
 # without printing the install command — install on Y, exit on N for required tools.
+# The Docker DAEMON check follows the same shape (offer the remedy, don't just
+# name it) and lives in scripts/lib/docker.sh, shared with the provisioning half.
+
+PREFLIGHT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/docker.sh
+source "$PREFLIGHT_DIR/docker.sh"
 
 # Run an install command and re-check that the tool is now on PATH afterwards.
 # Distinguishes "install command failed" from "installed but not on PATH" so the
@@ -65,9 +71,15 @@ check_prereqs() {
     if [[ "$OSTYPE" != "darwin"* ]]; then
         # Linux/Windows: no auto-install, but warn on missing required tools.
         local t
-        for t in cargo sccache cmake docker node; do
+        for t in cargo sccache cmake node; do
             command -v "$t" >/dev/null 2>&1 || echo "Warning: '$t' not found in PATH." >&2
         done
+        # Docker is NOT one of those warnings: a bare "not found" that the launch
+        # then ignores is how a down daemon became an opaque `docker run failed:`
+        # a minute later. Non-Darwin gets the same hard check as macOS (report and
+        # exit), just without the offer to start it, since there is no `open -a`
+        # equivalent to offer.
+        ensure_docker_daemon
         return 0
     fi
 
@@ -94,14 +106,12 @@ check_prereqs() {
     _check_or_install psql "Used by helper scripts for DB introspection" \
         "brew install libpq && brew link --force libpq" recommended
 
-    # Docker daemon must be running before setup_postgres can connect.
-    if ! docker info >/dev/null 2>&1; then
-        local script="${SCRIPT_NAME:-this script}"
-        echo ""
-        echo "  Docker is installed but the daemon isn't running."
-        echo "  Open Docker Desktop and wait for it to start, then re-run $script." >&2
-        exit 1
-    fi
+    # The daemon must be ANSWERING before setup_postgres can connect. Having the
+    # CLI installed is not the same question, which is why this is a separate
+    # check from the `_check_or_install docker` above it. See docker.sh: it
+    # offers to start Docker Desktop rather than telling the user to go do it
+    # and start the launch over.
+    ensure_docker_daemon
 }
 
 # Tauri CLI (`cargo tauri`) — only tauri-dev.sh needs it, so it lives outside

@@ -12,6 +12,11 @@
 //! (gateway + per-workspace engines + embedded Postgres) AND the GUI client —
 //! rather than only relaunching the window.
 //!
+//! **The client comes back frontmost**, via `desktop::schedule_relaunch_after_exit`
+//! rather than `app.restart()`. That module documents why: a fork/exec'd
+//! relaunch has to win a race for the front slot against its own dying parent,
+//! and the updated client is left sitting behind everything when it loses.
+//!
 //! **The install narrates itself.** Downloading ~100 MB, verifying it, swapping the
 //! `.app` bundle and restarting the stack takes long enough that a silent `await`
 //! reads as a frozen app — which is exactly what it did until the progress
@@ -727,7 +732,8 @@ pub async fn install_app_update_and_restart(
     // multi-second download+install above. We deliberately do NOT call
     // `save_window_state` here — this runs on a Tokio worker thread, off the main
     // thread, where that call can deadlock the UI (see persist_window_state_on_main
-    // in lib.rs).
+    // in lib.rs). The final save happens on the way out instead, from the main
+    // thread, in `exit_after_relaunch_scheduled`.
     //
     // New bytes are on disk. Restart the whole background service onto them BEFORE
     // relaunching the client — `app.restart()` never returns.
@@ -736,8 +742,23 @@ pub async fn install_app_update_and_restart(
         eprintln!("[updater] background service restart failed: {e}");
     }
     // Relaunch the client onto its new bytes. Never returns.
+    //
+    // Through LaunchServices when we can, because `app.restart()` fork/execs the
+    // new binary and leaves it to inherit the front slot from this dying process,
+    // a race the updated client loses whenever it registers with the window
+    // server a moment too late. It then comes up BEHIND everything, which is what
+    // 0.20 → 0.20.1 did on 2026-08-03. See `desktop::schedule_relaunch_after_exit`.
     emit(&app, Some(&version), AppUpdatePhase::Relaunching);
-    app.restart();
+    match crate::desktop::schedule_relaunch_after_exit() {
+        // This command runs on the async runtime, so the exit is marshalled onto
+        // the main thread; it does not return, so `app.restart()` cannot also run
+        // and bring up a second client.
+        Ok(()) => crate::exit_after_relaunch_scheduled(&app),
+        Err(e) => {
+            eprintln!("[updater] no LaunchServices relaunch ({e}); respawning directly");
+            app.restart()
+        }
+    }
 }
 
 /// Abandon an in-flight app-update download. Only the check + download can be

@@ -1,7 +1,14 @@
 import { describe, it, expect } from 'vitest';
 import { exchangeResponseEvents, exchangeStatus, exchangeSteps, type AnswerKind, type Exchange, type ThreadEvent, type ThreadMeta, type ThreadState } from '../thread-events';
 import type { StoredEvent } from '../thread-events';
-import { findPendingMultiSelectQuestion, computeSubmitMultiCount } from '../../components/chat/PromptInput';
+import {
+  findLatestPendingQuestion,
+  computeSubmitMultiCount,
+  promptPlaceholder,
+  PLACEHOLDER_ANSWERING,
+  PLACEHOLDER_FOLLOW_UP,
+  PLACEHOLDER_NEW_THREAD,
+} from '../../components/chat/PromptInput';
 import type { StepOutcome } from '../types';
 
 function step(seq: number, event: Partial<StoredEvent> & { type: string }): { seq: number; event: StoredEvent } {
@@ -109,7 +116,7 @@ describe('exchangeStatus + spinner behavior around UserQuestionAsked', () => {
     ]);
 
     // The resume-marker Thinking step must still be a spinner (success: null).
-    const events = exchangeResponseEvents(ex, 0, true);
+    const events = exchangeResponseEvents(ex, true);
     const stepEvents = events.filter(e => e.type === 'step') as Array<{ description: string; outcome: StepOutcome }>;
     const trailingThinking = stepEvents[stepEvents.length - 1];
     expect(trailingThinking.description).toBe('Thinking');
@@ -149,7 +156,12 @@ describe('AnswerKind discriminated union', () => {
   });
 });
 
-describe('findPendingMultiSelectQuestion', () => {
+// PromptInput derives BOTH of its per-render question facts from this one
+// walk: `multiSelect` picks the prompt-row Submit control, and the mere
+// presence of a pending question switches the placeholder to the answering
+// one. A second walk per keystroke is what the helper's own gating comment
+// exists to avoid, so there is no separate multi-select finder to test.
+describe('findLatestPendingQuestion', () => {
   it('returns the toolUseId of the latest unanswered multi-select question', () => {
     const thread = buildThreadState([
       { type: 'MessageReceived', text: 'go', channel: 'claude_code' } as ThreadEvent,
@@ -163,7 +175,10 @@ describe('findPendingMultiSelectQuestion', () => {
         multi_select: true,
       } as ThreadEvent,
     ]);
-    expect(findPendingMultiSelectQuestion(thread)).toEqual({ toolUseId: 'tu_pending' });
+    expect(findLatestPendingQuestion(thread)).toEqual({
+      toolUseId: 'tu_pending',
+      multiSelect: true,
+    });
   });
 
   it('returns null when the multi-select question is already answered', () => {
@@ -184,10 +199,10 @@ describe('findPendingMultiSelectQuestion', () => {
         answer: { kind: 'MultiSelected', option_ids: ['opt-0'] },
       } as ThreadEvent,
     ]);
-    expect(findPendingMultiSelectQuestion(thread)).toBeNull();
+    expect(findLatestPendingQuestion(thread)).toBeNull();
   });
 
-  it('ignores single-select questions (those answer through the card directly)', () => {
+  it('reports a single-select question as pending but not multi-select', () => {
     const thread = buildThreadState([
       { type: 'MessageReceived', text: 'go', channel: 'claude_code' } as ThreadEvent,
       { type: 'SessionStarted', session_id: 'sess', branch: '' } as ThreadEvent,
@@ -200,11 +215,41 @@ describe('findPendingMultiSelectQuestion', () => {
         multi_select: false,
       } as ThreadEvent,
     ]);
-    expect(findPendingMultiSelectQuestion(thread)).toBeNull();
+    // Single-select answers through the card, so no prompt-row Submit. The
+    // placeholder still flips: typing is a valid freetext answer to it.
+    expect(findLatestPendingQuestion(thread)).toEqual({
+      toolUseId: 'tu_single',
+      multiSelect: false,
+    });
   });
 
   it('returns null for an undefined thread (focused thread missing from map)', () => {
-    expect(findPendingMultiSelectQuestion(undefined)).toBeNull();
+    expect(findLatestPendingQuestion(undefined)).toBeNull();
+  });
+});
+
+describe('promptPlaceholder', () => {
+  it('invites an answer while a question card is pending', () => {
+    expect(promptPlaceholder(true, true)).toBe(PLACEHOLDER_ANSWERING);
+  });
+
+  // The card renders the question and its options, nothing else, so this
+  // placeholder is the ONLY place the two escapes that need no option slot are
+  // named. Typing routes to the pending question as a `FreeText` answer; Cancel
+  // stamps it `Canceled`. Drop either half and an agent starts inventing an
+  // "Other, I'll type it" option, which just hands its label back as the answer.
+  it('names both escapes, since nothing on the card does', () => {
+    expect(PLACEHOLDER_ANSWERING).toBe('Type your answer, or Cancel to ask something else.');
+  });
+
+  // A permission card leaves the thread `waiting_for_user_answer` with no
+  // pending question, and typed text there is an ordinary message.
+  it('keeps the follow-up placeholder when no question card is pending', () => {
+    expect(promptPlaceholder(true, false)).toBe(PLACEHOLDER_FOLLOW_UP);
+  });
+
+  it('keeps the compose placeholder with no focused thread', () => {
+    expect(promptPlaceholder(false, false)).toBe(PLACEHOLDER_NEW_THREAD);
   });
 });
 

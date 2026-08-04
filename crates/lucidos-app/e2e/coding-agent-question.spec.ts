@@ -1,5 +1,5 @@
 import { test, expect } from './fixtures';
-import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane } from './helpers';
+import { navigateToApp, assertHealthy, openThreadDrawer, ensureOnThreadPane, isMobileViewport } from './helpers';
 import { psql } from './db-helpers';
 import { randomUUID } from 'crypto';
 
@@ -20,6 +20,29 @@ import { randomUUID } from 'crypto';
  * Spawning a real CC subprocess that emits AskUserQuestion is out of scope
  * for browser e2e — the parser-level wiring is covered by Rust unit tests.
  */
+
+/** How many pixels of the prompt's PLACEHOLDER are painted past the bottom of
+ *  the box, i.e. clipped by its `overflow-y: hidden` (0 = the whole thing is
+ *  readable). Runs in the page: renders the placeholder as a value in an
+ *  off-layout clone of the real textarea and compares the height that needs
+ *  against the height the box has. The card names neither escape any more, so
+ *  the sentence in the placeholder is the only thing that does, and it wraps at
+ *  phone widths and in a narrowed thread pane. */
+function placeholderOverflowPx(el: Element): number {
+  const ta = el as HTMLTextAreaElement;
+  const probe = ta.cloneNode() as HTMLTextAreaElement;
+  probe.value = ta.placeholder;
+  probe.removeAttribute('data-role');
+  Object.assign(probe.style, {
+    position: 'absolute', visibility: 'hidden', boxSizing: 'border-box',
+    width: `${ta.getBoundingClientRect().width}px`,
+    height: '0', minHeight: '0', maxHeight: 'none',
+  });
+  ta.parentElement!.appendChild(probe);
+  const needed = probe.scrollHeight;
+  probe.remove();
+  return Math.max(0, needed - ta.clientHeight);
+}
 test.describe('CC AskUserQuestion — interactive answer flow', () => {
   test('clicking an option flips the divider initiator panel in place', async ({ page }) => {
     await assertHealthy(page);
@@ -78,6 +101,31 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(pendingBody).toContainText(`Yes ${suffix}`);
       await expect(pendingBody).toContainText(`No ${suffix}`);
 
+      // The card is the question and its options, nothing else: no guide line
+      // under the answers.
+      await expect(pendingBody.locator('.question-hint')).toHaveCount(0);
+      await expect(pendingBody.locator('.question-option')).toHaveCount(2);
+      // The prompt is where the two escapes that need no option slot are named:
+      // typing (routed to this question as a freetext answer) and Cancel.
+      // Without them named somewhere the agent invents an "Other, I'll type it"
+      // option, which just sends that label back as the user's answer. Literal
+      // on purpose: an e2e spec can't import from `src/`, so this is the one
+      // deliberate duplicate of `PLACEHOLDER_ANSWERING` in
+      // `prompt-input-helpers.ts`. Change both together.
+      const promptInput = page.locator('[data-role="prompt-input"]:visible').first();
+      await expect(promptInput).toHaveAttribute(
+        'placeholder', 'Type your answer, or Cancel to ask something else.',
+      );
+      // The whole sentence has to be READABLE, which is not free: a textarea
+      // sizes to its VALUE, so `overflow-y: hidden` silently clips a placeholder
+      // that wraps, and this one does wrap on the phone viewports (56px needed
+      // against a 36px box, measured). Assert the box is as tall as rendering
+      // the placeholder as a value would need, which holds on every project
+      // rather than pinning a per-viewport number.
+      await expect.poll(
+        () => promptInput.evaluate(placeholderOverflowPx), { intervals: [200], timeout: 5_000 },
+      ).toBe(0);
+
       // Click the second option.
       await pendingBody.locator('.question-option').nth(1).click();
 
@@ -97,6 +145,23 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       await expect(selectedOption).toHaveCount(1);
       await expect(selectedOption).toContainText(`No ${suffix}`);
       await expect(answered.locator('.question-option-dimmed')).toHaveCount(1);
+      // Nothing left to answer, so the prompt stops inviting one.
+      await expect(promptInput).toHaveAttribute('placeholder', 'Post a follow up…');
+      // The extra height has to be given back too: it is written as inline px
+      // and a placeholder swap never touches the value resizeTextarea keys off,
+      // so without the re-measure the composer sits two lines tall with nothing
+      // left to answer. Compare the CONTENT box (clientHeight carries the
+      // padding) so the same assertion holds on desktop and phone alike.
+      await expect.poll(
+        () => promptInput.evaluate((el) => {
+          const ta = el as HTMLTextAreaElement;
+          const cs = getComputedStyle(ta);
+          const content = ta.clientHeight
+            - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom);
+          return content < parseFloat(cs.lineHeight) * 2;
+        }),
+        { intervals: [200], timeout: 5_000 },
+      ).toBe(true);
 
       // Exactly one divider initiator panel for this question — flipping
       // happens in-place, no duplicate panel materialized.
@@ -326,6 +391,152 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       // permission affordance — assert via class, not text, so the assertion
       // survives copy edits.
       await expect(answered.locator('.question-cancel-picked')).toBeVisible();
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
+  // Escape inside the composer is the keyboard twin of the red Cancel button:
+  // with a question pending it stamps that question `Canceled`, which is how the
+  // user steers the agent somewhere else without picking an option. The
+  // placeholder is what tells them Cancel is there at all, so the key that
+  // performs it has to actually perform it.
+  test('Escape in the prompt cancels the pending question', async ({ page }) => {
+    await assertHealthy(page);
+
+    const suffix = randomUUID().slice(0, 8);
+    const threadId = randomUUID();
+    const toolUseId = `tu-esc-e2e-${suffix}`;
+    const now = new Date().toISOString();
+
+    const payload = JSON.stringify({
+      tool_use_id: toolUseId,
+      cc_session_id: 'sess-esc-e2e',
+      question: `Escape question ${suffix}`,
+      options: [{ id: 'opt-0', label: `Yes ${suffix}` }],
+    }).replace(/'/g, "''");
+
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Escape Question E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-esc-e2e"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+
+      const row = page.locator(`.thread-row:has-text("CC Escape Question E2E ${suffix}")`).first();
+      await expect(row).toBeVisible({ timeout: 10_000 });
+      await row.click();
+      await ensureOnThreadPane(page);
+
+      const panel = page
+        .locator(`.initiator-panel-lucidos:visible:has(.question-text:has-text("Escape question ${suffix}"))`)
+        .first();
+      await expect(panel).toBeVisible({ timeout: 10_000 });
+
+      // Focus the prompt explicitly: arriving on a parked question seeds focus
+      // onto the card's first option instead (threadEntryFocusTarget), and this
+      // is about Escape from the COMPOSER.
+      const promptInput = page.locator('[data-role="prompt-input"]:visible').first();
+      await promptInput.focus();
+      await promptInput.press('Escape');
+
+      await expect.poll(
+        () => psql(`SELECT payload->'answer'->>'kind' FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered' AND payload->>'tool_use_id' = '${toolUseId}'`),
+        { intervals: [400], timeout: 10_000 },
+      ).toBe('Canceled');
+    } finally {
+      psql([
+        `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
+        `DELETE FROM thread_summaries WHERE thread_id = '${threadId}'`,
+      ].join(';\n'));
+    }
+  });
+
+  // The *choice card* keyboard contract (docs/glossary.md, choiceCardNav.ts).
+  // Opening a thread already parked on a question must land focus on the card
+  // rather than the prompt. That is `threadEntryFocusTarget` winning over the
+  // prompt's own thread-switch focus, which is the half that races if either
+  // side decides independently.
+  test('first option takes visible keyboard focus, arrows step, Enter answers', async ({ page }) => {
+    test.skip(isMobileViewport(page), 'choice-card keyboard focus is desktop-only (no hardware keyboard on mobile)');
+    await assertHealthy(page);
+
+    const suffix = randomUUID().slice(0, 8);
+    const threadId = randomUUID();
+    const toolUseId = `tu-kbd-e2e-${suffix}`;
+    const now = new Date().toISOString();
+
+    const payload = JSON.stringify({
+      tool_use_id: toolUseId,
+      cc_session_id: 'sess-kbd-e2e',
+      question: `Keyboard pick ${suffix}`,
+      options: [
+        { id: 'opt-0', label: `First ${suffix}` },
+        { id: 'opt-1', label: `Second ${suffix}` },
+        { id: 'opt-2', label: `Third ${suffix}` },
+      ],
+    }).replace(/'/g, "''");
+
+    psql([
+      `INSERT INTO thread_summaries (thread_id, title, source, last_activity, message_count, is_saved, has_response, status, archive_state, is_coding_agent, active_children_count) VALUES ('${threadId}', 'CC Question Keyboard E2E ${suffix}', 'claude_code', '${now}', 1, false, false, 'waiting_for_user_answer', 'inbox', true, 0)`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'MessageReceived', '{"text":"start","channel":"claude_code"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'SessionStarted', '{"session_id":"sess-kbd-e2e"}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+      `INSERT INTO events (id, event_type, payload, created, aggregate, aggregate_id, thread_id) VALUES ('${randomUUID()}', 'UserQuestionAsked', '${payload}'::jsonb, '${now}', 'thread', '${threadId}', '${threadId}')`,
+    ].join(';\n'));
+
+    try {
+      await navigateToApp(page);
+      await openThreadDrawer(page);
+
+      const row = page.locator(`.thread-row:has-text("CC Question Keyboard E2E ${suffix}")`).first();
+      await expect(row).toBeVisible({ timeout: 10_000 });
+      await row.click();
+      await ensureOnThreadPane(page);
+
+      const options = page
+        .locator(`.question-body[data-tool-use-id="${toolUseId}"]:visible .question-option`);
+      await expect(options).toHaveCount(3, { timeout: 10_000 });
+
+      // Seeded on the FIRST option, so Enter answers with no pointer at all.
+      await expect(options.nth(0)).toBeFocused({ timeout: 10_000 });
+
+      // ...and the focus is VISIBLE. This is why the CSS pairs an ungated
+      // :focus-visible with a hover-gated plain :focus: nothing the user
+      // pressed put focus here, and :focus-visible's heuristic alone would
+      // leave the ring off exactly when they most need to see what Enter is
+      // about to answer.
+      const ring = await page.evaluate(() => {
+        const el = document.activeElement as HTMLElement | null;
+        return el ? getComputedStyle(el).boxShadow : '';
+      });
+      expect(ring).not.toBe('');
+      expect(ring).not.toBe('none');
+
+      // Arrows step, and clamp rather than wrap at the top.
+      await page.keyboard.press('ArrowDown');
+      await expect(options.nth(1)).toBeFocused();
+      await page.keyboard.press('ArrowUp');
+      await expect(options.nth(0)).toBeFocused();
+      await page.keyboard.press('ArrowUp');
+      await expect(options.nth(0)).toBeFocused();
+      await page.keyboard.press('ArrowDown');
+      await page.keyboard.press('ArrowDown');
+      await expect(options.nth(2)).toBeFocused();
+
+      // Enter is the button's own native activation, no key handling of ours.
+      await page.keyboard.press('Enter');
+
+      await expect.poll(
+        () => psql(`SELECT payload->'answer'->>'option_id' FROM events WHERE thread_id = '${threadId}' AND event_type = 'UserQuestionAnswered' AND payload->>'tool_use_id' = '${toolUseId}'`),
+        { intervals: [400], timeout: 10_000 },
+      ).toBe('opt-2');
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

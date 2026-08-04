@@ -157,6 +157,21 @@ describe('classifyPreviewLink', () => {
     });
   });
 
+  it.each([
+    ['/artifacts/report.pdf', 'artifacts/report.pdf'],
+    ['/knowhow/myapp/notes.md', 'knowhow/myapp/notes.md'],
+    ['/triggers/daily/run.md', 'triggers/daily/run.md'],
+    ['/system-knowhow/js-sdk.md', 'system-knowhow/js-sdk.md'],
+    ['/apps/todo/styles.css', 'apps/todo/styles.css'],
+    ['/data/artifacts/report.pdf', 'artifacts/report.pdf'],
+  ])('previews the absolute workspace route %s instead of OS-opening it', (href, path) => {
+    // `extractLocalFileTarget` guards every `data/` sub-tree, not just `/data`
+    // and `/apps`, so a root-relative link inside a previewed document reaches
+    // the file branch below it. Before that widening, `/artifacts/report.pdf`
+    // was handed to the OS opener as a disk path that does not exist.
+    expect(classifyPreviewLink(href, ctx())).toEqual({ kind: 'file', path });
+  });
+
   it('resolves a sibling file against the previewed artifact folder', () => {
     expect(classifyPreviewLink('pr-1573.md', ctx())).toEqual({
       kind: 'file',

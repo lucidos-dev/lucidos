@@ -30,6 +30,7 @@ import {
   extractAppIdFromHref,
   extractNavTargetFromHref,
   extractLocalFileTarget,
+  hasUrlScheme,
 } from '../../utils/linkifyPaths';
 import { openFilePreview, openUrl, openLocalFile } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
@@ -43,8 +44,6 @@ const THREAD_SCHEME_RE = /^thread:(?:([a-zA-Z0-9_-]+)\/)?([0-9a-f-]+)$/;
 /** The cross-workspace landing fragment (`store/actions/cross-workspace.ts`),
  *  matched here against a link's own hash rather than `window.location`. */
 const THREAD_FRAGMENT_RE = /^#?thread=([0-9a-f-]+)$/;
-/** Any URL scheme, e.g. `mailto:`, `tel:`, `data:`. */
-const HAS_SCHEME_RE = /^[a-z][a-z0-9+.-]*:/i;
 
 /** What the host page a preview is embedded in resolves the preview's relative
  *  and fragment hrefs against, plus which artifact is being previewed. */
@@ -188,7 +187,7 @@ export function classifyPreviewLink(
   if (localFile) return { kind: 'local-file', target: localFile };
 
   // A scheme we don't own (`mailto:`, `tel:`, …): leave the browser to it.
-  if (HAS_SCHEME_RE.test(href)) return null;
+  if (hasUrlScheme(href)) return null;
 
   // A document that declares its OWN `<base href>` means its relative links to
   // resolve there, not against the folder it happens to be stored in.

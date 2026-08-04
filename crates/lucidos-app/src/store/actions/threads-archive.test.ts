@@ -120,9 +120,11 @@ describe('handleArchiveThread', () => {
     expect(focusedThreadId.value).toBe('t2');
   });
 
-  it('mobile: unfocuses and swipes to the thread pane when no more review threads remain', async () => {
-    // mobileView is a mobile-only concept, so this lands-on-compose behavior is
-    // a mobile scenario. unfocusThread → revealThreadPane navigates to 'thread'.
+  it('mobile: unfocuses but stays on the thread drawer when no more review threads remain', async () => {
+    // Archiving is not navigation: the user archived a row from the thread
+    // drawer (its own pane on mobile) and must stay there to keep triaging.
+    // unfocusThread({ revealPane: false }) leaves mobileView on 'threads'; the
+    // thread pane behind it falls back to the compose view.
     (globalThis as any).innerWidth = 375;
     const map = new Map<string, ThreadState>();
     map.set('t1', makeThreadState('t1', {
@@ -135,7 +137,51 @@ describe('handleArchiveThread', () => {
     await handleArchiveThread('t1');
 
     expect(focusedThreadId.value).toBeNull();
-    expect(mobileView.value).toBe('thread');
+    expect(mobileView.value).toBe('threads');
+  });
+
+  it('mobile: stays on the thread drawer when the focus hands off to the next thread', async () => {
+    // Same rule for the common case: archiving t1 from the thread drawer moves
+    // the focus to t2 (so the thread pane isn't left on an archived thread)
+    // without swiping the user off the list they're working through.
+    (globalThis as any).innerWidth = 375;
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    map.set('t2', makeThreadState('t2', {
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    threadMap.value = map;
+    focusThread('t1');
+    mobileView.value = 'threads';
+
+    await handleArchiveThread('t1');
+
+    expect(focusedThreadId.value).toBe('t2');
+    expect(mobileView.value).toBe('threads');
+  });
+
+  it('mobile: a rejected archive re-focuses without leaving the thread drawer', async () => {
+    // The rollback re-focuses the thread the API refused. That is bookkeeping
+    // too, so it must not swipe the user off the thread drawer either.
+    (globalThis as any).innerWidth = 375;
+    const map = new Map<string, ThreadState>();
+    map.set('t1', makeThreadState('t1', {
+      meta: { id: 't1', title: 'Thread t1', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:01Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    map.set('t2', makeThreadState('t2', {
+      meta: { id: 't2', title: 'Thread t2', channel: 'claude_code', saved: false, createdAt: '', updatedAt: '2026-01-01T00:00:00Z', status: 'waiting', codingAgentProposed: true, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, lastRevivedAt: '', messageCount: 1, section: 'inbox', activeChildrenCount: 0 },
+    }));
+    threadMap.value = map;
+    focusThread('t1');
+    mobileView.value = 'threads';
+    (archiveThread as ReturnType<typeof vi.fn>).mockRejectedValueOnce(new Error('nope'));
+
+    await handleArchiveThread('t1');
+
+    expect(focusedThreadId.value).toBe('t1');
+    expect(mobileView.value).toBe('threads');
   });
 
   it('does not focus prompt when dismissing the last review thread', async () => {

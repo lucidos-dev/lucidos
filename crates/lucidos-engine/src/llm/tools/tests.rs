@@ -151,6 +151,45 @@ fn ask_user_question_tool_is_in_default_set() {
     );
 }
 
+/// Regression guard for the reported card: a timezone question whose fourth
+/// option was "Other, I'll type it". There is no text-entry option kind, so
+/// `answer_kind_to_hook_value` resolves that pick to its LABEL and the model gets
+/// "Other, I'll type it" as the user's decision. The description used to say
+/// "Always include an option that lets the user opt out", which is what
+/// produced the button, so the ban has to replace it rather than sit beside it.
+#[test]
+fn ask_user_question_description_bans_a_text_entry_escape_option() {
+    let tools = get_default_tools();
+    let desc = &tools
+        .iter()
+        .find(|t| t.name == tn::ASK_USER_QUESTION)
+        .expect("ask_user_question must be in the default chat tool set")
+        .description;
+
+    for needle in [
+        "NEVER add an \"Other\"",
+        "no text-entry option",
+        "prompt textarea",
+        "Cancel dismisses the question",
+    ] {
+        assert!(
+            desc.contains(needle),
+            "description must ban the escape-hatch option and name the real escapes \
+             (missing: {needle:?}):\n{desc}"
+        );
+    }
+    assert!(
+        !desc.contains("Always include an option that lets the user opt out"),
+        "the opt-out instruction must be gone, it is what produced the button:\n{desc}"
+    );
+    // The ban is about TEXT-ENTRY escapes only. An option carrying a decision
+    // the agent can act on stays legal, or the agent drops real Cancel choices.
+    assert!(
+        desc.contains("None of these") && desc.contains("still welcome"),
+        "description must keep a meaningful opt-out option legal:\n{desc}"
+    );
+}
+
 /// Each question carries the CC-equivalent fields: `question` text, an
 /// `options` array of `{label, description?}`, and an optional
 /// `multiSelect` flag. `header` is the short chip CC uses to label the
@@ -347,6 +386,21 @@ fn bash_output_schema_advertises_wait_secs_and_steers_away_from_sleep_poll() {
     assert!(
         desc.contains("run_python"),
         "description must name run_python as the wrong place to poll: {desc:?}"
+    );
+
+    // The terminal contract, which is what the drain-at-completion fix makes
+    // honest. A drain landing at the instant a task finished used to return
+    // `unknown task_id`, so the agent lost successful work; the registry now
+    // retains the completion. Both halves of the promise have to survive a
+    // reword: the shape the agent looks for, and the instruction to stop once
+    // it sees it.
+    assert!(
+        desc.contains("finished=true"),
+        "description must name the finished=true terminal shape: {desc:?}"
+    );
+    assert!(
+        desc.contains("STOP polling"),
+        "description must still tell the agent to stop at finished=true: {desc:?}"
     );
 }
 

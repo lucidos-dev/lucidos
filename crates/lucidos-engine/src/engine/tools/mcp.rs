@@ -21,10 +21,25 @@ impl LucidosEngine {
                             .collect()
                     })
                     .unwrap_or_default();
-                let env: HashMap<String, String> = args
-                    .get("env")
-                    .and_then(|v| serde_json::from_value(v.clone()).ok())
-                    .unwrap_or_default();
+                // A malformed `env` must NOT degrade to "no env vars". LLMs
+                // routinely emit non-string values (`{"PORT": 3000}`), which fails
+                // `from_value`; the old `.ok().unwrap_or_default()` then dropped
+                // EVERY variable, so the server was registered and started without
+                // its API key and the failure surfaced much later as an opaque
+                // upstream auth error. Reject it here where the cause is obvious.
+                let env: HashMap<String, String> = match args.get("env") {
+                    None => HashMap::new(),
+                    Some(v) if v.is_null() => HashMap::new(),
+                    Some(v) => match serde_json::from_value(v.clone()) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            return Ok(format!(
+                                "Error: 'env' must be an object of string to string pairs (quote every value, e.g. {{\"PORT\": \"3000\"}}): {}",
+                                e
+                            ))
+                        }
+                    },
+                };
 
                 if id.is_empty() || server_name.is_empty() || command.is_empty() {
                     return Ok("Error: id, name, and command are required".to_string());

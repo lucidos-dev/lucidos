@@ -94,6 +94,19 @@ pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
 /// "never offer next-step alternatives." Mirrors the CC-side
 /// `ASK_USER_QUESTION_RULE` in `agent_session::prompts` (same spirit, chat-
 /// tuned wording — lowercase tool name, no CC-only PreToolUse caveats).
+///
+/// The "NEVER OFFER AN \"OTHER\" OPTION" paragraph is load-bearing, not
+/// stylistic: Lucidos has no text-entry option kind, and
+/// `agent_question::answer_kind_to_hook_value` resolves a `Selected` answer to
+/// the option's LABEL (via `lookup_option_label`), so an "Other, I'll type it"
+/// button hands that literal phrase back as the user's decision. The two
+/// real escapes (typing in the prompt textarea, which routes to the pending
+/// question as `FreeText`, and Cancel) are on every card already and are
+/// spelled out to the user by the prompt textarea's own placeholder while a
+/// question is pending (`PLACEHOLDER_ANSWERING`). Mirrored for coding
+/// agents by `agent_session::prompts::{ASK_USER_QUESTION_RULE,
+/// CODEX_ASK_USER_QUESTION_RULE}` and by the `ask_user_question` tool
+/// description in `llm::tools::misc`; change them together.
 pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      Use the `ask_user_question` tool for any question with 2-4 discrete \
      answers, including the binary yes/no case. The Lucidos UI renders the \
@@ -108,7 +121,21 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      whose `question` is missing and makes you re-ask, so fill it the first \
      time.\n\
      \n\
-     This applies at ANY point in your reply, not just the end — \
+     NEVER OFFER AN \"OTHER\" OPTION: do not add an option meaning \"Other\", \
+     \"Something else\", \"Let me type it\" or \"I'll write my own answer\". \
+     Lucidos has no text-entry option: every option is a label, so tapping \
+     that one just sends you the label back as the user's answer (\"Other, \
+     I'll type it\" arrives as their decision) and you are stuck re-asking. \
+     Both escapes are already on every card, without you spending an option \
+     slot on them. The user can type any reply in the prompt textarea and it \
+     arrives as their answer to this question, and Cancel dismisses the \
+     question so they can steer you somewhere else entirely. Options are for \
+     the pre-baked choices only. An option that carries a decision you can \
+     act on is a different thing and still welcome (\"None of these\", \
+     \"Neither, ask me later\", \"Cancel the deploy\"); what is banned is an \
+     option whose only meaning is \"I will type it instead\".\n\
+     \n\
+     THE TOOL APPLIES AT ANY POINT in your reply, not just the end: \
      mid-stream checkpoints (\"does the framing look right so far?\", \
      \"should I keep going with approach A?\") and end-of-turn alternatives \
      (\"what next? a, b, c, d?\", \"should I proceed with the sweep?\", \
@@ -390,19 +417,34 @@ TIMEZONE HANDLING:
         let mut missing_instructions = Vec::new();
         let mut missing_pref_keys = Vec::new();
         for (key, instruction, per_device) in mandatory_prefs {
-            let value = if *per_device {
+            // A read that FAILED is not a preference that is unset. `.ok().flatten()`
+            // collapsed both into `None`, and `None` here flips the whole turn into
+            // "SETUP REQUIRED, DO NOT PROCEED" below (plus the paired user-message
+            // reminder in `run.rs`), so one transient DB error refused the user's
+            // actual request and re-asked for a timezone they had already set.
+            // Treat an unreadable key as configured: a missed setup nag costs a
+            // prompt, a false refusal costs the turn.
+            let read = if *per_device {
                 if let Some(did) = device_id {
-                    PreferenceStore::get_for_device(&self.pool, key, did)
-                        .await
-                        .ok()
-                        .flatten()
+                    PreferenceStore::get_for_device(&self.pool, key, did).await
                 } else {
                     // No device context (child thread, scheduled task) — per-device
                     // prefs are irrelevant, treat as already configured
                     continue;
                 }
             } else {
-                PreferenceStore::get(&self.pool, key).await.ok().flatten()
+                PreferenceStore::get(&self.pool, key).await
+            };
+            let value = match read {
+                Ok(v) => v,
+                Err(e) => {
+                    log!(
+                        "[Chat] preference read failed for '{}': {}. Treating as configured so the turn is not refused",
+                        key,
+                        e
+                    );
+                    continue;
+                }
             };
             if value.is_none() {
                 missing_instructions.push(*instruction);
@@ -986,8 +1028,8 @@ Do NOT refuse to discuss the user's own personal information from their own file
 mod tests {
     use super::super::super::process_helpers::{APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE};
     use super::{
-        coding_surface_section, workspace_identity_section, NAMES_NOT_IDS_RULE,
-        WORKSPACE_ASSETS_KNOWHOW_RULE,
+        coding_surface_section, workspace_identity_section, ASK_USER_QUESTION_RULE,
+        NAMES_NOT_IDS_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
     };
     use std::path::{Path, PathBuf};
 
@@ -1299,6 +1341,43 @@ mod tests {
             rule.contains("A MARKDOWN LINK TARGET IS NOT PROSE")
                 && rule.contains("[Open thread](thread:<ws>/<uuid>)"),
             "rule must exempt markdown link targets so spawned-thread links survive:\n{rule}"
+        );
+    }
+
+    /// Regression guard for the reported card: a timezone question whose
+    /// fourth option was "Other, I'll type it". Lucidos has no text-entry
+    /// option, so tapping it returns that label as the user's answer. The rule
+    /// must ban the option, explain WHY (the label comes back as the answer),
+    /// and name both real escapes, or the agent keeps inventing the button to
+    /// fill a gap that does not exist.
+    #[test]
+    fn ask_user_question_rule_bans_a_text_entry_escape_option() {
+        let rule = ASK_USER_QUESTION_RULE;
+        for needle in [
+            "NEVER OFFER AN \"OTHER\" OPTION",
+            "Let me type it",
+            "no text-entry option",
+            "prompt textarea",
+            "Cancel dismisses the question",
+        ] {
+            assert!(
+                rule.contains(needle),
+                "rule must ban the escape-hatch option and name the real escapes (`{needle}`):\n{rule}"
+            );
+        }
+        // The sentence that produced the button lived in the `ask_user_question`
+        // tool description (retired there, pinned by its own test). Guard
+        // against it migrating here, where it would contradict the ban above.
+        assert!(
+            !rule.contains("Always include an option that lets the user opt out"),
+            "the retired opt-out instruction must not reappear in the chat rule:\n{rule}"
+        );
+        // An option carrying a real decision is NOT what this bans. Without the
+        // carve-out the agent reads it as "never offer an out" and drops
+        // legitimate Cancel-style choices.
+        assert!(
+            rule.contains("None of these") && rule.contains("still welcome"),
+            "rule must keep a meaningful opt-out option legal:\n{rule}"
         );
     }
 

@@ -190,7 +190,16 @@ export type ResponseEvent =
       thinkingText?: string;
     }
   | { type: 'section_break'; channel: string }
-  | { type: 'image'; base64: string; mime_type: string; index: number }
+  | {
+      type: 'image';
+      base64: string;
+      mime_type: string;
+      /** The un-elided `generate_image` prompt this image came from: its
+       *  description, used for the hover tooltip and the alt text. Absent when
+       *  the generating call's args weren't recorded, in which case the image
+       *  carries no tooltip at all. */
+      prompt?: string;
+    }
   | {
       type: 'question';
       tool_use_id: string;

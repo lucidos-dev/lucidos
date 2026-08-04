@@ -92,7 +92,7 @@ pub(crate) fn cmd_mark(ws: &Workspace, kind: MarkKind<'_>) -> Result<(), BoxErro
         // the Lucidos MCP server, and sending either after the other's tool
         // would strand a proposed plan with no way to get it approved.
         MarkKind::Plan(p) => println!(
-            "Plan recorded (awaiting approval): {} ({}). Present it, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), not in prose. Once approved, run `lucidos planned approve`.",
+            "Plan recorded (awaiting approval): {} ({}). Present it, then ask for approval with your question tool (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), not in prose. That pair is a floor: if the plan offers a real fork, that fork takes the second slot and `Request changes` is dropped rather than carried as a third. Once approved, run `lucidos planned approve`.",
             branch, p
         ),
         MarkKind::Simple(r) => println!("Simple change acknowledged: {} ({})", branch, r),

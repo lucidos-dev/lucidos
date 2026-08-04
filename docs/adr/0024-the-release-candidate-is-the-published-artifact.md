@@ -2,6 +2,14 @@
 
 - **Status** — Accepted
 - **Date** — 2026-07-28
+- **Amended by**: [0039: The public mirror's `main` is a linear release
+  history](0039-the-public-mirror-is-a-linear-release-history.md). The
+  "squashed-orphan commit" this ADR describes is no longer parentless: since
+  2026-08-04 it carries the previous release's published commit as its single
+  parent. Everything this ADR decides is unchanged, including the part 0039
+  leans on hardest, that the rc IS the published object. The parent is
+  therefore resolved in Phase A and baked into that object, never re-derived at
+  promotion time.
 
 ## Context
 

@@ -252,10 +252,22 @@ impl LucidosEngine {
 
         if let Some(change) = conflict_change {
             // Conflict resolution cleanup — merge happened in a worktree, ff-merge to main.
-            let has_unmerged = git_cmd(&["diff", "--name-only", "--diff-filter=U"], &cwd)
-                .await
-                .map(|o| !o.stdout.is_empty())
-                .unwrap_or(true);
+            // `or_unknown(true)` (assume conflicts REMAIN when git could not be
+            // asked): a `false` here is what lets `conflict_resolution_cleanup_action`
+            // return `Apply` and ff-merge this tree into main, so an unanswered
+            // probe must not produce it (`.claude/rules/rust.md`). Via
+            // `git_answer_when_ok`, a non-zero exit is Unknown too, not a "no":
+            // `git diff` exits non-zero when the path is not a work tree or a
+            // filter blew up, which says nothing about unresolved conflicts.
+            // Assuming conflicts remain costs an Abort, and the change stays
+            // pending for the user to retry.
+            let has_unmerged = crate::engine::git_ops::git_answer_when_ok(
+                &["diff", "--name-only", "--diff-filter=U"],
+                &cwd,
+                |o| !o.stdout.is_empty(),
+            )
+            .await
+            .or_unknown(true);
 
             let wt_str = cwd.to_string_lossy();
 

@@ -763,6 +763,96 @@ export function dismissWelcomeSuggestions(): Promise<void> {
   return savePreference('welcome_suggestions_dismissed', 'true');
 }
 
+// --- Backup reminder banner ---
+//
+// The banner asks "have you switched backup on?", and the answer is already in
+// this map: `GET /backup/schedule` decides it as `is_schedule_active(cron) &&
+// provider.is_some()`, and both are ordinary preference rows that
+// `GET /preferences` returns. So the banner needs no endpoint of its own and no
+// poll, and because `set_backup_schedule` writes through `PreferenceStore::set`
+// (which announces `PreferencesChanged` → `loadPreferences`), enabling backup
+// retracts it live on every connected device.
+//
+// Deliberately NOT backup *health*: a schedule that exists but whose runs are
+// failing is the Settings health card's job. Keeping this to "is it on?" is what
+// lets one dismissal mean one thing.
+
+/** Mirror of the engine's `core::backup::is_schedule_active`: a schedule counts
+ *  as active when it is neither empty nor the literal "off". */
+export function isBackupScheduleActive(schedule: string | undefined): boolean {
+  return !!schedule && schedule !== 'off';
+}
+
+/** Whether automatic backup is switched on, by the same rule the engine's
+ *  `GET /backup/schedule` uses: an active cron AND a provider. Either half
+ *  missing means off (a provider picked with no schedule backs nothing up). */
+export function backupIsActive(prefs: Record<string, string>): boolean {
+  return isBackupScheduleActive(prefs['backup_schedule']) && !!prefs['backup_provider'];
+}
+
+/** How long the FIRST dismissal silences the reminder. */
+export const BACKUP_REMINDER_SNOOZE_MS = 30 * 24 * 60 * 60 * 1000;
+
+/** The value a SECOND dismissal writes: silenced for good. */
+export const BACKUP_REMINDER_FOREVER = 'forever';
+
+/** Whether the recorded dismissal still hides the reminder at `now`.
+ *
+ *  An unparseable value reads as NOT dismissed. This is a data-loss warning, so
+ *  garbage in the preference must fail towards showing it, and the next dismiss
+ *  then counts as the first and overwrites the garbage with a real instant. */
+export function backupReminderHiddenByDismissal(value: string | undefined, now: number): boolean {
+  if (!value) return false;
+  if (value === BACKUP_REMINDER_FOREVER) return true;
+  const at = Date.parse(value);
+  if (Number.isNaN(at)) return false;
+  return now - at < BACKUP_REMINDER_SNOOZE_MS;
+}
+
+/** The value to write when the user dismisses.
+ *
+ *  Nothing valid recorded yet → the first dismissal, which records the instant
+ *  and snoozes 30 days. Already carrying an instant → this is the second
+ *  dismissal (the snooze must have expired for the banner to be back on screen),
+ *  so silence it for good.
+ *
+ *  Already `forever` stays `forever`. Unreachable from the UI (a permanently
+ *  dismissed banner is never on screen to dismiss again), but the alternative is
+ *  a function that DOWNGRADES a permanent dismissal into a fresh 30-day snooze,
+ *  which is the wrong direction for a silence the user asked for twice. */
+export function backupReminderNextDismissal(value: string | undefined, now: number): string {
+  if (value === BACKUP_REMINDER_FOREVER) return BACKUP_REMINDER_FOREVER;
+  const dismissedOnce = !!value && !Number.isNaN(Date.parse(value));
+  return dismissedOnce ? BACKUP_REMINDER_FOREVER : new Date(now).toISOString();
+}
+
+/** Pure core of the banner's visibility, over a loaded preference map. */
+export function backupReminderVisibleIn(prefs: Record<string, string>, now: number): boolean {
+  if (backupIsActive(prefs)) return false;
+  return !backupReminderHiddenByDismissal(prefs['backup_reminder_dismissed'], now);
+}
+
+/** Whether the app-shell backup reminder belongs on screen right now. Fails
+ *  CLOSED while preferences are unloaded or failed, so it never flashes during
+ *  the startup fetch at a user who already silenced it (same reasoning as
+ *  `welcomeSuggestionsDismissed`). */
+export function backupReminderVisible(now: number = Date.now()): boolean {
+  if (preferences.value.status !== 'loaded') return false;
+  return backupReminderVisibleIn(preferences.value.data, now);
+}
+
+/** Record a dismissal: snooze on the first, silence for good on the second.
+ *  A no-op while preferences are unloaded, which is unreachable from the UI
+ *  (the banner is hidden in that state, so there is nothing to click). */
+export function dismissBackupReminder(now: number = Date.now()): Promise<void> {
+  if (preferences.value.status !== 'loaded') return Promise.resolve();
+  const next = backupReminderNextDismissal(
+    preferences.value.data['backup_reminder_dismissed'],
+    now,
+  );
+  return savePreference('backup_reminder_dismissed', next);
+}
+
 // --- Command guard (ADR 0002) ---
 
 /** Master toggle for the command guard (the bash/python safety gate). Defaults

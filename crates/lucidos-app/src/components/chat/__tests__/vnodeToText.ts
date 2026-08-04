@@ -4,7 +4,15 @@ import type { ComponentChildren, VNode } from 'preact';
  *  assertions — no DOM, no preact-render-to-string. `class` and `disabled`
  *  are surfaced because the card tests assert on them. Function components
  *  are invoked with their props so nested helpers like OptionContent /
- *  OptionIndicator render into the flat string. */
+ *  OptionIndicator render into the flat string.
+ *
+ *  Because that invocation is a bare call and not a render, a component that
+ *  uses HOOKS throws "Hook can only be invoked from render methods" here. Only
+ *  hook-free components can be passed in: on the card surfaces that means
+ *  `AnsweredBody` / `TerminatedQuestionBody` / `OptionIndicator`
+ *  and the `render*Question` helpers, but NOT `QuestionBody`, `LiveOptions`,
+ *  `PermissionBody`, or `PermissionBodyShell`, which hold focus-seed state.
+ *  Assert on those through the browser e2e specs instead. */
 export function vnodeToText(node: ComponentChildren): string {
   if (node === null || node === undefined || typeof node === 'boolean') return '';
   if (typeof node === 'string' || typeof node === 'number') return String(node);

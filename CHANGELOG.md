@@ -1,5 +1,36 @@
 # Changelog
 
+## v0.21.0 — 2026-08-04
+
+### Added
+
+- Question cards and permission cards are keyboard drivable. One choice holds focus the moment the card appears, so Enter answers it; the arrow keys step between choices, and the focus ring is visible wherever a choice is seeded.
+- A reminder bar appears when backups are off, with a link straight to the backup setting. Dismiss it and it stays dismissed.
+
+### Changed
+
+- Live question cards name the two escapes on the card itself: type any reply in the prompt, or cancel the question. The dead-end "Other" option is gone from every question the model can ask.
+- The workspace picker setting says what it decides, that the workspace keeps working while no window is open. New workspaces default to it, and existing workspaces are lifted to that default once.
+- Mobile Access reports the engine host's tailnet state separately from the device you are reading on, and stops offering an install to a browser that will refuse it.
+- Lucidos tells you when its database is unreachable. Health reports the database separately from the process, the boot splash stops waiting instead of hanging, one toast names the outage, and the launcher offers to start Docker when Docker is what is down.
+- Toasts are anchored to the bottom edge of the header, so they clear whatever the header is currently showing.
+- Each published release on the public mirror is now a child of the previous one. Clones of the repository keep working across releases instead of breaking on every publish.
+
+### Fixed
+
+- The prompt no longer jumps a line as its placeholder changes; the placeholder is measured, and the measurement stands down while the card animation eases.
+- The hint on a question card reads in the prompt, where the answer is typed, instead of under the answers.
+- A link in the chat can no longer reload the whole workspace.
+- Prose detail rows in Settings flow inline instead of being laid out as fields.
+- A generated image is described by what it shows, not by its position in the thread.
+- On mobile, archiving from the thread drawer stays in the drawer instead of swiping to the thread pane.
+- The scroll pin at the bottom of a thread cannot spin when its suppression timer is lost.
+- Quitting the desktop app parses the quit intent instead of matching a substring, saves window geometry on the way out, and comes back frontmost after a relaunch.
+- Restarting the gateway brings back the workspaces it stopped.
+- A background task stays drainable after it completes, so a drain that lands on the finish still returns the output.
+- Concurrent ADR writes no longer collide on the same number.
+- The backup reminder measures against the root font size at measure time, so it follows the UI scale.
+- Dependency: rand 0.8.5 to 0.8.7 (GHSA-cq8v-f236-94qc).
 ## v0.20.1 — 2026-08-03
 
 ### Fixed

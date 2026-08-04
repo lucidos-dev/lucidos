@@ -383,7 +383,7 @@ pub(crate) struct NotifyArgs {
 pub(crate) struct ProxyCliArgs {
     /// Name of the proxy entry in `data/config/apis.json`.
     pub(crate) name: String,
-    /// Request path (e.g. `/Spisestua/play`). Empty / missing = root.
+    /// Request path (e.g. `/living-room/play`). Empty / missing = root.
     #[arg(default_value = "")]
     pub(crate) path: String,
     /// HTTP method (GET, POST, PUT, DELETE, PATCH, …).

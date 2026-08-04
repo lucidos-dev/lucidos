@@ -9,6 +9,19 @@
         overflow: hidden;
     }
 
+    /* Mobile's below-header anchor (see global/base.css for the desktop one).
+       The mobile header is position:fixed at the viewport top, so it OVERLAYS
+       the reclaimed macOS title-bar band rather than sitting below it, and its
+       bottom edge is simply its own height. That height is measured live into
+       --mobile-header-height by useHideOnScroll (it varies with the safe-area
+       inset, and drops to the inset alone while the keyboard pushes the header
+       off); the fallback covers the frames before the first measurement.
+       Redefined at the 768px layout line, not the 600px cosmetic one, so the
+       anchor flips exactly when the header layout it describes does. */
+    :root {
+        --app-header-bottom: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+    }
+
     /* iOS long-press near container edges auto-selects the nearest block
        element (rendering as a thin vertical highlight). Suppress globally,
        then re-enable on content surfaces where selecting text is the point. */
@@ -37,7 +50,10 @@
 /* Drawer */
 .drawer-backdrop {
     position: fixed;
-    top: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+    /* Lands on the header's bottom edge on BOTH layouts: the anchor already
+       carries the desktop title-bar band and the mobile measured height, so the
+       desktop block below no longer needs its own copy. */
+    top: var(--app-header-bottom);
     left: 0;
     right: 0;
     bottom: 0;
@@ -48,7 +64,10 @@
 
 .drawer {
     position: fixed;
-    top: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+    /* Same below-header anchor as its backdrop above. Desktop re-anchors the
+       panel to the backdrop instead (position:absolute; top:0), so this is the
+       mobile geometry in practice. */
+    top: var(--app-header-bottom);
     left: 0;
     bottom: 0;
     width: fit-content;
@@ -177,13 +196,9 @@
 /* Desktop: drawer emerges from the split divider, scoped to panel area */
 @media (min-width: 769px) {
     .drawer-backdrop {
-        /* The backdrop is position:fixed, so its top is measured from the
-           viewport, not the header's flex slot. It must land at the header's
-           BOTTOM edge: the reclaimed macOS title-bar strip (--titlebar-inset,
-           0px off the macOS Tauri build) sits above the header and pushes it
-           down, so the offset has to include it — without it the menu rendered
-           ~28px too high and overlapped the header controls in the Tauri app. */
-        top: calc(var(--titlebar-inset, 0px) + 2.5rem + 0.25rem + env(safe-area-inset-top, 0px));
+        /* `top` comes from the shared --app-header-bottom anchor on the base
+           rule; only the left edge is desktop-specific (the drawer emerges from
+           the split divider rather than the viewport edge). */
         left: calc(var(--divider-x) + var(--divider-width));
         overflow: hidden;
     }
@@ -356,13 +371,10 @@
     }
 
     .toast-container {
-        /* Below the fixed header, above the thread title row.
-           When keyboard is open --mobile-header-height drops to 0 —
-           max() keeps the toast below the safe-area (notch). */
-        top: max(
-            calc(env(safe-area-inset-top, 0px) + 0.5rem),
-            calc(var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px))) + 0.5rem)
-        );
+        /* `top` (below the fixed header, above the thread title row) comes from
+           the shared --app-header-bottom anchor on the base rule, which the
+           mobile :root above resolves to this header's measured height. Only the
+           side insets are phone-specific. */
         left: max(0.75rem, env(safe-area-inset-left, 0px));
         right: max(0.75rem, env(safe-area-inset-right, 0px));
     }

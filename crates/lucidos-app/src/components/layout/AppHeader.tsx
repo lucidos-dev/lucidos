@@ -10,7 +10,9 @@ import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
 import { unfocusThread } from '../../store/actions/threads';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane, focusPane } from '../../store/actions/pane';
+import { focusPromptNow } from '../chat/promptFocus';
 import { MobileAppHeader } from './MobileAppHeader';
+import { BackupReminderBanner } from './BackupReminderBanner';
 import { SwipeTouch } from '../../utils/swipe';
 import { PanelNav } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
@@ -104,6 +106,21 @@ function isInteractive(el: HTMLElement): boolean {
   const brandLabel = el.closest('[data-role="control-panel-toggle"]');
   if (brandLabel && el !== brandLabel) return true;
   return false;
+}
+
+/** A click on the thread pane's header. It focuses the pane (the wash) AND puts
+ *  the caret in the composer: the header band is the largest neutral surface on
+ *  that side, and lighting the wash without moving DOM focus left the user
+ *  typing into nothing. Clicks on a control are that control's (isInteractive),
+ *  so they keep only the pane focus: Search Everywhere opens an overlay with its
+ *  own input, the brand label opens the control panel, and the compose button
+ *  focuses the prompt itself from inside the touch gesture. Desktop only, like
+ *  the pane-focus half: on mobile this tap would raise the keyboard over the
+ *  conversation the user is reading. */
+function onThreadHeaderClick(e: MouseEvent) {
+  focusPane('thread');
+  if (isMobile() || isInteractive(e.target as HTMLElement)) return;
+  focusPromptNow();
 }
 
 /** Window-drag gate (Tauri desktop): the whole header band drags the window,
@@ -257,13 +274,13 @@ export function AppHeader() {
             <ThreadsHeader />
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
-            <div class="collapsed-thread-actions" onClick={() => focusPane('thread')}>
+            <div class="collapsed-thread-actions" onClick={onThreadHeaderClick}>
               <ThreadToggleButton />
               <ThreadNav showTooltip />
             </div>
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
-            <span class="pane-header-brand" onClick={() => focusPane('thread')}>
+            <span class="pane-header-brand" onClick={onThreadHeaderClick}>
               <div class="thread-nav-group">
                 <ThreadToggleButton />
                 <ThreadNav showTooltip />
@@ -345,6 +362,16 @@ export function AppHeader() {
             <ContentHeaderActions />
           </div>
         </div>
+
+        {/* Mobile's backup reminder lives INSIDE the header, because the mobile
+            header is position:fixed and a sibling in the shell's flow would sit
+            behind it. As a header child it rides along for free: useHideOnScroll
+            observes this element's border box, so --mobile-header-height grows to
+            include the bar, and with it the mobile --app-header-bottom and every
+            pane's ::before spacer. It also hides and returns with the header on
+            scroll, which is right for chrome. The desktop copy is a flow sibling
+            in App.tsx; each renders only under its own viewport. */}
+        <BackupReminderBanner layout="mobile" />
       </header>
     </>
   );

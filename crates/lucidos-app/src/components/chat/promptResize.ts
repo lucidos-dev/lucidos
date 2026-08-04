@@ -10,8 +10,44 @@ import { useEffect } from 'preact/hooks';
 
 const cache = new WeakMap<HTMLTextAreaElement, { height: number; len: number }>();
 
+/** The height the box needs to show its PLACEHOLDER whole, or 0 when it has
+ *  none / is showing a value instead.
+ *
+ *  A textarea sizes to its VALUE, so a placeholder that wraps is simply painted
+ *  past the bottom edge and clipped (the composer is `overflow-y: hidden`).
+ *  Short placeholders always fit; the answering one is a whole sentence and
+ *  wraps at phone widths, in a narrowed thread pane (`MIN_THREAD_PANE_PX` is
+ *  300px, narrower than a phone), and at large UI scales. That is why it is
+ *  measured rather than reserved as a CSS floor: the number of lines is a
+ *  function of the box width, the user's font family and a UI scale that runs
+ *  75%-200%, and no fixed rem value covers that grid.
+ *
+ *  Measured on a clone rather than by borrowing the real element's `value`,
+ *  which would fire the editing pipeline and, on iOS, leave the keyboard's
+ *  shift state stale (see `.claude/rules/frontend.md` on programmatic clears). */
+function placeholderHeight(el: HTMLTextAreaElement): number {
+  const parent = el.parentElement;
+  if (!el.placeholder || el.value.length > 0 || !parent || !el.cloneNode) return 0;
+  const probe = el.cloneNode() as HTMLTextAreaElement;
+  probe.value = el.placeholder;
+  // Out of flow at the real width, floors and caps off, so scrollHeight is the
+  // wrapped text's own height. `data-role` goes: for the one synchronous moment
+  // the probe is attached, it must not answer a prompt-input query.
+  probe.removeAttribute?.('data-role');
+  Object.assign(probe.style, {
+    position: 'absolute', visibility: 'hidden', boxSizing: 'border-box',
+    width: `${el.getBoundingClientRect?.().width ?? 0}px`,
+    height: '0', minHeight: '0', maxHeight: 'none',
+  });
+  parent.appendChild(probe);
+  const needed = probe.scrollHeight;
+  probe.remove();
+  return needed;
+}
+
 /** Apply final height, manage overflow-y, cache, return whether height changed. */
-function applyHeight(el: HTMLTextAreaElement, contentHeight: number, prevHeight: number, curLen: number): boolean {
+function applyHeight(el: HTMLTextAreaElement, measured: number, prevHeight: number, curLen: number): boolean {
+  const contentHeight = Math.max(measured, placeholderHeight(el));
   el.style.height = contentHeight + 'px';
   el.style.overflowY = 'hidden';
   const rendered = el.offsetHeight;
@@ -57,11 +93,41 @@ export function resizeTextarea(el: HTMLTextAreaElement): boolean {
   return applyHeight(el, el.scrollHeight, prevHeight, curLen);
 }
 
+/** Force a fresh measurement, bypassing the fast path.
+ *
+ *  {@link resizeTextarea} decides what to do from the VALUE (did it grow, shrink,
+ *  jump), so it no-ops when the value is unchanged, even if what the box has to
+ *  fit changed underneath it. The PLACEHOLDER is exactly that case: swapping the
+ *  short compose one for the answering sentence (and back, when the question is
+ *  answered) never touches the value, so without this the box keeps the height
+ *  measured for the previous placeholder, clipping the new one on the way in and
+ *  sitting two lines tall on the way out.
+ *
+ *  Callers must stand down while {@link isTextareaHeightAnimating} is true. */
+export function remeasureTextarea(el: HTMLTextAreaElement): boolean {
+  const prevHeight = cache.get(el)?.height ?? 0;
+  el.style.height = '0';
+  return applyHeight(el, el.scrollHeight, prevHeight, el.value.length);
+}
+
 /** Cancels the in-flight height animation on a given textarea, if any. Keyed by
  *  element so a rapid second switch can tear the first animation's listener +
  *  timer down before starting its own — otherwise the stale `finish` would fire
  *  later and snap the box back to the previous switch's target height. */
 const pendingHeightAnim = new WeakMap<HTMLTextAreaElement, () => void>();
+
+/** True while {@link animateTextareaHeightFrom} owns this textarea's height.
+ *
+ *  Anything that would write a freshly measured height must stand down until it
+ *  finishes. The animation works by inverting (park the box at the height it
+ *  came FROM, then transition to the target it already rests at), so a write
+ *  landing in that window puts the box AT the target before the transition
+ *  starts and the ease plays out over no distance at all: transition engaged,
+ *  nothing moved. Standing down loses nothing, because the target the animation
+ *  is easing toward was itself measured after the change. */
+export function isTextareaHeightAnimating(el: HTMLTextAreaElement): boolean {
+  return pendingHeightAnim.has(el);
+}
 
 /** Smoothly animate a textarea's height from a previous inline height to the one
  *  it currently rests at. The caller must have ALREADY applied the final height
