@@ -154,7 +154,7 @@ function AgentRow({
 }
 
 /**
- * Settings → System → Coding agents: where each coding agent's CLI binary
+ * Settings → Coding Agents → Binaries: where each coding agent's CLI binary
  * resolves from, with an optional per-agent path override.
  *
  * Detection is LIVE (recomputed by the engine per request) — only an explicit
@@ -194,8 +194,8 @@ export function CodingAgentBinariesSection() {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="system:coding-agents">
-        Coding agents
+      <div class="settings-section-title" data-search-anchor="coding-agents:binaries">
+        Binaries
       </div>
       <p class="settings-section-desc">
         Which <code>claude</code> / <code>codex</code> binary coding-agent threads run. Auto-detection

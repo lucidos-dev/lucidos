@@ -1,5 +1,5 @@
 import { effect, untracked } from '@preact/signals';
-import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
+import { pageTitle, animationSpeed, stepsExpanded, detailsExpanded, expandedFolders, threadDrawerOpen, selectedScope, notificationsFilter, collapsedExchanges, collapsedInitiators, filePreviewSource, diffWholeFile, diffSideBySide, filePreviewEditing, previewFile, viewingNotification, repoSelectedChangeId, inputMode, showToast, dismissToast, applyAllInProgress, engineRestarting, SELECTED_CHANGE_KEY } from './store';
 import { clientRefreshing } from '../hooks/sw-update';
 import { cancelApplyAllBatch } from './actions/chat-changes';
 import { handleRestartTimeout } from './actions/connection';
@@ -92,6 +92,12 @@ effect(() => {
 // Persist source-vs-rendered preview toggle (md/html/csv/svg + diff view)
 effect(() => {
   localStorage.setItem('lucidos-file-preview-source', String(filePreviewSource.value));
+});
+
+// Persist the side-by-side diff toggle. Deliberately NOT in the reset below: it
+// is a way of reading diffs, not a per-file override like diffWholeFile.
+effect(() => {
+  localStorage.setItem('lucidos-diff-side-by-side', String(diffSideBySide.value));
 });
 
 // Reset transient preview toggles whenever the previewed file changes (or the

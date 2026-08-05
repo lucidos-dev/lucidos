@@ -110,7 +110,7 @@ describe('installScrollMemory', () => {
       writable: true,
       configurable: true,
     });
-    (window as any).scrollTo = vi.fn();
+    (window as unknown as { scrollTo: unknown }).scrollTo = vi.fn();
     Object.defineProperty(window, 'scrollY', { value: 0, writable: true, configurable: true });
     Object.defineProperty(document.documentElement, 'scrollHeight', {
       value: 5000,

@@ -27,6 +27,15 @@ html {
     --z-sticky: 200;
     --z-drawer: 300;
     --z-control-panel: 2200;
+    /* A pseudo-fullscreen app panel (.app-ui-fullscreen, the CSS fallback used
+       where the Fullscreen API is unavailable) covers the header chrome (2200)
+       and is covered by the modal layer (2300). Both halves are load-bearing:
+       fullscreen means the app owns the screen, but the host's own modals and
+       toasts are the only way it can talk to the reader, so they must still
+       paint over it. It sat at --z-tooltip until 2026-08-05, which is why an
+       app's lucidos.ui.previewFile / confirm / prompt / toast rendered behind
+       the app and the reader's click looked like it did nothing. */
+    --z-app-fullscreen: 2250;
     /* Modal overlays must sit above the floating header chrome (2200) so the
        dim backdrop actually covers it — otherwise header buttons punch
        through, show tooltips on hover, and outside-click never lands on the
@@ -51,6 +60,26 @@ html {
     /* Layout */
     --divider-width: 0.1875rem;
     --content-max-width: 50rem;
+    /* The thread pane's horizontal gutter, shared by the transcript
+       (.thread-content) and the composer below it (.prompt-area). The two must
+       carry the SAME left inset and the SAME right inset, or the composer box
+       stops lining up with the turn content it sits under. A step off the
+       --space-* scale below (the thread pane's own gutter, one step tighter than
+       the content pane's --space-lg), named for the coupling it carries. */
+    --thread-pane-gutter: var(--space-md);
+    /* Width the platform reserves for a classic (layout-consuming) scrollbar,
+       published in px at boot by utils/scrollbarGutter.ts and re-measured when
+       the UI scale changes (our ::-webkit-scrollbar width is rem-sized). It is
+       0px wherever scrollbars are overlay: iOS, and macOS unless the system is
+       set to always show them.
+
+       The transcript scrolls and the composer does not, so the transcript's
+       centered content is shifted left by half this width relative to any
+       non-scrolling sibling. `.thread-content` reserves it unconditionally via
+       `overflow-y: scroll` + `scrollbar-gutter: stable` (so a short thread
+       doesn't shift when it grows past one screen), and every sibling that must
+       line up with the transcript adds it to its own right inset. */
+    --scrollbar-gutter-width: 0px;
     /* Height of the desktop app header (.app-header, panels/shell.css): the
        2.5rem .pane-header bar plus its 0.25rem top padding plus the safe-area
        inset the header reserves. */
@@ -79,7 +108,7 @@ html {
        .thread-content in chat/input-messages.css). Shared so the deep-link /
        navigation scroll clearance (.chat-exchange scroll-margin-top in
        chat/response.css) lands an element BELOW this band, not inside it where
-       its top / focus-marker border would be faded out. */
+       its top / focus-marker highlight would be faded out. */
     --thread-top-fade: 1.5rem;
     /* Height of the mobile transcript's top fade — the gradient below the sticky
        thread-title bar (.mobile-thread-title-row::after in mobile.css) that
@@ -88,17 +117,26 @@ html {
        lands clear of it. Mobile's desktop-mask analog; kept a touch shorter. */
     --mobile-title-fade: 0.75rem;
     /* How far the navigation focus marker (.nav-focus-stuck, host-components.css)
-       reaches beyond a turn's box: outline-offset (0.1875rem) + outline width
-       (0.1875rem). The transcript reserves this much extra room past each fade
-       (top padding past --thread-top-fade, bottom padding past --prompt-fade) so
-       a marker on the first/last turn clears the fade instead of being dissolved
-       by it — the "highlight border isn't fully visible on the top/bottom turn"
-       report. Keep in sync with .nav-focus-stuck if its outline changes. */
+       reaches beyond a turn's box. The marker is a background wash whose visible
+       edge IS the box, plus a glow blooming past it; this is the reach the
+       transcript reserves for that bloom, as extra room past each fade (top
+       padding past --thread-top-fade, bottom padding past --prompt-fade) so a
+       marker on the first/last turn clears the fade instead of being dissolved by
+       it (the "highlight border isn't fully visible on the top/bottom turn"
+       report). Deliberately kept at the old outline frame's exact reach (its
+       0.1875rem offset + 0.1875rem width) rather than grown to the glow's full
+       1.5rem blur: growing it would push every deep-link landing further down the
+       transcript, and a soft halo half-dissolved in a fade is invisible in a way a
+       clipped hard outline was not. Keep in sync with .nav-focus-stuck if the
+       HARD-EDGED part of the marker changes: this token and the marker's paint are
+       coupled, and nothing else in the tree records that. (The soft glow is
+       deliberately allowed to exceed it, per the paragraph above, so a change to the
+       blur radius alone is not a reason to move this.) */
     --nav-focus-reach: 0.375rem;
     /* Desktop floating scroll chevrons (.scroll-to-top / .scroll-to-bottom in
        chat/input-messages.css). Since these were pulled IN from the right gutter
        to sit OVER the centered transcript (fix 956b47519), a deep-link / turn-nav
-       landing near the top would tuck the element (and its focus-marker outline)
+       landing near the top would tuck the element (and its focus-marker glow)
        right under the up-chevron with no room. Shared here so the landing
        clearance (.chat-exchange scroll-margin-top, chat/response.css) is computed
        from the chevron's OWN size + top inset and can never drift from it. */
@@ -114,6 +152,29 @@ html {
        up against the same edge. Also the UNIFORM gap the navigation focus marker
        leaves to a turn's content on all four sides (chat/response.css). */
     --turn-body-inset: 0.4rem;
+    /* Distance from a NESTED thread-pane surface's outer edge to its content.
+       Two of them stack on the --turn-body-inset edge above: a question /
+       change card inside a turn (.question-option) and the composer box below
+       the transcript (.prompt-box). The composer docks directly under the
+       cards, so their CONTENT has to start at the same x. Matching the outer
+       box edges alone still leaves the typed text a few px right of the card
+       text it sits under, which is what reads as "the composer is misaligned
+       on the left". Each surface subtracts its OWN border, because the card's
+       is a 1px hairline and the composer's is the thicker
+       --prompt-box-border-width focus ring. Value = the card's historical
+       1px + 0.875rem. */
+    --turn-surface-inset: calc(0.875rem + 1px);
+    /* .prompt-box's border (panels/previews.css). A token because the composer's
+       inner padding is derived from --turn-surface-inset MINUS this, so the two
+       cannot be changed independently without moving the composer's content off
+       the card content edge. Deliberately px, not the 0.125rem it used to be
+       (the rem rule exempts border widths, and the card's hairline is a literal
+       1px for the same reason): a border width is snapped to a whole unit before
+       layout, so a rem value that lands on 2.25px or 2.5px at a scaled root is
+       rounded by an amount the calc above cannot see, and the composer's text
+       drifts back off the card edge by a fraction of a px. Chromium snaps to
+       whole CSS px, WebKit to device px, so the drift also differed per engine. */
+    --prompt-box-border-width: 2px;
     /* Vertical feed-rhythm padding on every transcript turn (.initiator-panel /
        .response-panel in chat/input-messages.css) — the space between adjacent
        turns (there is no divider line). Named so the navigation focus marker can

@@ -149,7 +149,7 @@ pub(super) fn resolve_binary_override(
     if !p.is_file() {
         return Err(format!(
             "configured {agent_label} binary '{path}' does not exist or is not a file — \
-             fix or clear the '{pref_key}' setting (Settings → System → Coding agents)"
+             fix or clear the '{pref_key}' setting (Settings → Coding Agents)"
         )
         .into());
     }
@@ -162,7 +162,7 @@ pub(super) fn resolve_binary_override(
         if !executable {
             return Err(format!(
                 "configured {agent_label} binary '{path}' is not executable — \
-                 fix or clear the '{pref_key}' setting (Settings → System → Coding agents)"
+                 fix or clear the '{pref_key}' setting (Settings → Coding Agents)"
             )
             .into());
         }
@@ -170,7 +170,7 @@ pub(super) fn resolve_binary_override(
     Ok(p)
 }
 
-/// Place the spawned agent child in its OWN process group (Unix).
+/// Place a spawned child in its OWN process group (Unix).
 ///
 /// The engine installs a SIGTERM *ignorer* (see `main.rs`) so accidental
 /// `kill`s — a CC `Bash`-tool/test that signals the group, an external
@@ -183,18 +183,23 @@ pub(super) fn resolve_binary_override(
 /// child in its own group is the root-cause fix: a signal delivered to the
 /// engine's process group can never reach a process in a different group.
 ///
+/// Coding-agent spawns are the original caller. The dev background engine build
+/// (`engine::engine_version::run_engine_build`) uses it for the other half of the
+/// same contract: a group is the only handle that reaches the `cargo` GRANDCHILD
+/// when a coalescing Apply supersedes the build.
+///
 /// `process_group(0)` makes the child the leader of a fresh group
 /// (`pgid == child pid`). It is applied via `POSIX_SPAWN_SETPGROUP` — no
 /// `pre_exec` hook — so the fast `posix_spawn` spawn path is preserved.
 /// The engine's deliberate teardown still reaches the whole subtree by
 /// signalling the child's group explicitly (see `signal_child_process_group`).
 #[cfg(unix)]
-pub(super) fn isolate_in_process_group(cmd: &mut tokio::process::Command) {
+pub(crate) fn isolate_in_process_group(cmd: &mut tokio::process::Command) {
     cmd.process_group(0);
 }
 
 #[cfg(not(unix))]
-pub(super) fn isolate_in_process_group(_cmd: &mut tokio::process::Command) {}
+pub(crate) fn isolate_in_process_group(_cmd: &mut tokio::process::Command) {}
 
 /// Signal the agent child's process *group* (negative pid) so the agent AND
 /// every descendant it spawned (`Bash` tools, `cargo`/`rustc`, …) are torn
@@ -252,6 +257,30 @@ pub(super) async fn graceful_kill_child_process_group(pid: u32, grace: std::time
 
 #[cfg(not(unix))]
 pub(super) async fn graceful_kill_child_process_group(_pid: u32, _grace: std::time::Duration) {}
+
+/// SIGKILL a child's whole process group, synchronously.
+///
+/// The `Drop`-safe sibling of [`graceful_kill_child_process_group`]: a drop
+/// handler cannot await, so a caller tearing a subtree down from `Drop` (the dev
+/// background engine build, cancelled by a coalescing Apply) gets the force half
+/// only. That is the right trade for a build: `cargo` is crash-safe by
+/// construction (atomic renames plus fingerprints), so it has no teardown worth
+/// granting a SIGTERM grace, and the alternative is leaving it compiling against
+/// the shared `target/` with nothing left to reap it. Prefer the graceful
+/// variant wherever the caller CAN await.
+///
+/// Same reaping caveat as [`signal_child_process_group`]: only call it while the
+/// child is still unreaped, or a recycled pid makes this signal an unrelated
+/// group.
+pub(crate) fn kill_child_process_group_now(pid: u32) {
+    signal_child_process_group(pid, KILL_SIGNAL);
+}
+
+/// `SIGKILL`, named so the non-Unix build has something to compile against.
+#[cfg(unix)]
+const KILL_SIGNAL: i32 = libc::SIGKILL;
+#[cfg(not(unix))]
+const KILL_SIGNAL: i32 = 9;
 
 /// Drain remaining stderr from an agent child (up to 4 KB).
 ///

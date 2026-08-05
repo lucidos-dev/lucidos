@@ -1,6 +1,8 @@
 import { switchMenuItem, openSettingsSubview, setActiveMenu } from './menu';
 import { openAppById } from './apps';
-import { openFilePreview, openUrl, normalizeDataPath } from './artifacts';
+import { openFilePreview, openUrl } from './artifacts';
+import { resolveFileTarget } from './fileTarget';
+import { openOAuthAuthorizationUrl } from './oauth';
 import { navigateToTrigger } from './triggers';
 import { focusThreadOrBootstrap, unfocusThread } from './threads';
 import { pushNavState } from './navigation';
@@ -8,7 +10,7 @@ import { revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { focusPromptNow } from '../../components/chat/promptFocus';
-import { showToast, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel } from '../store';
+import { showToast, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
 
@@ -48,6 +50,9 @@ export function describeNavTarget(nav: {
   target: string;
   app_id?: string;
   file_path?: string;
+  purpose?: string;
+  line?: number;
+  line_end?: number;
   settings_view?: string;
 }): string {
   switch (nav.target) {
@@ -61,12 +66,20 @@ export function describeNavTarget(nav: {
       // A repo-encoded path (`repo:<repoId>:file:<path>`) names the repo file
       // it points at — the raw encoding would read as a uuid soup in the toast.
       const repo = parseRepoPath(nav.file_path);
-      return `file "${repo?.path ?? nav.file_path}"`;
+      // A cited line is the point of the jump, so the offer names it the way
+      // the citation did (`file "src/main.rs:510"`). A range collapses to its
+      // first line: the offer is a destination, not a selection.
+      const range = normalizeLineRange(nav.line, nav.line_end);
+      const at = range ? `:${range.start}` : '';
+      return `file "${repo?.path ?? nav.file_path}${at}"`;
     }
     case 'trigger':
       return 'a trigger';
     case 'url':
-      return 'a link';
+      // An OAuth authorization page is worth naming: unlike an ordinary link it
+      // EXPIRES (the engine's callback listener gives up after 120s), so a user
+      // deciding whether to tap Open needs to know this one is time-bounded.
+      return nav.purpose === 'oauth' ? 'a sign-in page (expires shortly)' : 'a link';
     case 'new-app':
       return 'the new-app form';
     case 'new-trigger':
@@ -75,7 +88,8 @@ export function describeNavTarget(nav: {
       return 'a new chat';
     case 'settings': {
       if (!nav.settings_view) return 'settings';
-      const label = settingsSubviewLabel(nav.settings_view as SettingsNavKey);
+      const view = aliasRetiredSettingsSubview(nav.settings_view);
+      const label = settingsSubviewLabel(view as SettingsNavKey);
       return `${label ?? nav.settings_view} settings`;
     }
     case 'app-store':
@@ -100,7 +114,13 @@ export function handleNavigationRequest(nav: {
   settings_view?: string;
   app_id?: string;
   file_path?: string;
+  line?: number;
+  line_end?: number;
   url?: string;
+  /** Why this URL is being opened. Only `'oauth'` is meaningful today: it marks
+   *  an authorization page whose in-app panel should close once the flow lands.
+   *  Absent for every ordinary link. */
+  purpose?: string;
   id?: string;
   event_id?: string;
   prompt?: string;
@@ -144,11 +164,21 @@ export function handleNavigationRequest(nav: {
     case 'settings':
       switchMenuItem('settings');
       if (nav.settings_view) {
-        // Validate against the renderable set, don't trust the input — an
+        // A request from OUTSIDE this build can name a subview a restructure
+        // has since moved: a stored notification's deep link, an app compiled
+        // against an older SDK `SettingsViewTarget`, an LLM working from a
+        // stale schema. Alias those onto the category that absorbed them
+        // (`repositories` → Coding Agents, `mobile-access` → Access, …) so an
+        // old payload still lands where the user expects.
+        //
+        // Then validate against the renderable set, don't trust the input: an
         // unknown subview would otherwise land on a blank settings panel
         // (a silent error). Fail loud instead; we still showed Settings home.
-        if (isRenderableSettingsView(nav.settings_view)) {
-          openSettingsSubview(nav.settings_view as SettingsNavKey);
+        // The toast names what the CALLER sent, not the alias, so the sender
+        // can see which value was wrong.
+        const view = aliasRetiredSettingsSubview(nav.settings_view);
+        if (isRenderableSettingsView(view)) {
+          openSettingsSubview(view as SettingsNavKey);
         } else {
           showToast(`Unknown settings section: "${nav.settings_view}"`, 'error');
         }
@@ -179,13 +209,31 @@ export function handleNavigationRequest(nav: {
         showToast('Navigation target missing file_path', 'error');
         break;
       }
-      const filePath = normalizeDataPath(nav.file_path);
+      // One resolver for the locator and its line rules, shared with the
+      // app-facing preview modal so the two surfaces address exactly the same
+      // set of files (see `resolveFileTarget`).
+      const { path: filePath, range } = resolveFileTarget(nav.file_path, nav.line, nav.line_end);
       // A repo-encoded path (`repo:<repoId>:file:<path>`) opens a file from a
       // registered repository clone rather than the workspace data tree, and
       // needs that repo bound before the panel mounts — see
       // openEncodedRepoFilePreview, which returns false for anything else so a
       // plain data path falls through to the /data/* preview.
       if (!openEncodedRepoFilePreview(filePath)) openFilePreview(filePath);
+      // A cited line, applied AFTER the open: both openers deliberately clear
+      // `selectedLines` so a previous file's range can't leak onto this one, and
+      // openFilePreview resets `filePreviewSource`. Setting the range here is
+      // what keeps that clearing intact while still landing on the line.
+      //
+      // Source view is forced because a format that renders (markdown, CSV, SVG)
+      // has no lines to highlight. Without it, every citation into a markdown
+      // file would silently ignore its line. A target that can never show lines
+      // (a PDF, an image, a diff) resolves to a null range and just opens, which
+      // is the documented degradation: an unusable line never withholds the file.
+      if (range) {
+        filePreviewSource.value = true;
+        selectedLines.value = range;
+        lineScrollTarget.value = range.start;
+      }
       break;
     }
     case 'trigger':
@@ -254,7 +302,16 @@ export function handleNavigationRequest(nav: {
         showToast('Navigation target missing url', 'error');
         break;
       }
-      openUrl(nav.url);
+      // `purpose: 'oauth'` marks the one URL that has an end: an authorization
+      // page the provider will redirect to the loopback callback. Recording it
+      // is what lets `handleOAuthAccountConnected` close the in-app browser
+      // panel afterwards, instead of leaving the user on a dead callback page
+      // inside the app. Every other URL is just opened.
+      if (nav.purpose === 'oauth') {
+        openOAuthAuthorizationUrl(nav.url);
+      } else {
+        openUrl(nav.url);
+      }
       break;
     default:
       // Unknown target — log via toast so a future schema drift surfaces

@@ -6,7 +6,9 @@ use crate::engine::thread_events::ActorMode;
 use crate::engine::LucidosEngine;
 
 impl LucidosEngine {
-    /// Spawn a regular Lucidos thread as a child of the given parent.
+    /// Spawn a regular Lucidos thread, optionally as a child of the given
+    /// parent (a `relation: "top"` spawn passes no parent and is nobody's
+    /// child; it still records its spawning thread in `origin`).
     ///
     /// Non-async to avoid Send issues with `&self` across await points in
     /// nested spawn contexts.
@@ -18,6 +20,11 @@ impl LucidosEngine {
     /// caller already emitted it and incremented active_children_count).
     /// `model` / `reasoning_effort` — chat-mode prefs to inherit; `None` falls
     /// through to the engine's `LUCIDOS_MODEL` env default.
+    /// `origin`: who launched this thread, for the route popover. Only used on
+    /// the fallback path where the eager emit failed and this call emits the
+    /// MessageReceived itself, so it must match what the eager emit would have
+    /// stamped. Independent of `parent_thread_id`: a `relation: "top"` spawn
+    /// carries an origin with no linkage.
     ///
     /// Returns the child thread id plus the processing task's `JoinHandle` —
     /// the Thread Queue executor awaits it so the spawn's capacity slot is
@@ -33,6 +40,7 @@ impl LucidosEngine {
         caller_title: Option<&str>,
         model: Option<String>,
         reasoning_effort: Option<String>,
+        origin: Option<crate::engine::thread_events::MessageOrigin>,
     ) -> Result<(Uuid, tokio::task::JoinHandle<()>), Box<dyn std::error::Error + Send + Sync>> {
         let explicit_title = caller_title
             .map(str::trim)
@@ -123,7 +131,7 @@ impl LucidosEngine {
                     // just one this task didn't emit.
                     pre_emitted_origin.map(PreEmittedOrigin::Message),
                     None,
-                    None,
+                    origin,
                 )
                 .await
             {

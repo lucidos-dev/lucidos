@@ -462,10 +462,18 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'read_file': return str('path') ? `Read ${basename(str('path'))}` : 'Read file';
     case 'write_file': return str('path') ? `Write ${basename(str('path'))}` : 'Write file';
     case 'edit_file': return str('path') ? `Edit ${basename(str('path'))}` : 'Edit file';
-    case 'list_files': return str('path') ? `List ${str('path')}` : 'List files';
+    // `list_files` declares `"properties": {}` (`llm/tools/file.rs`), so it takes
+    // no arguments at all and the old `path` lookup could never match. Rust's own
+    // `describe_tool` renders it as a constant for the same reason.
+    case 'list_files': return 'List files';
     case 'copy_file': return str('destination') ? `Copy to ${basename(str('destination'))}` : 'Copy file';
     case 'delete_file': return str('path') ? `Delete ${basename(str('path'))}` : 'Delete file';
-    case 'import_file': return str('url') ? `Import ${basename(str('url'))}` : 'Import file';
+    // `source_path` is `import_file`'s only argument (required, see
+    // `llm/tools/file.rs`), and it is what Rust's own `describe_tool` and the
+    // sibling `fullCommandForEngineTool` above both read. The old `url` key
+    // does not exist on the payload, so this arm always fell through to the
+    // bare "Import file" and the row disagreed with its own hover tooltip.
+    case 'import_file': return str('source_path') ? `Import ${basename(str('source_path'))}` : 'Import file';
     case 'run_bash': return str('command') ? describeRun(str('command')) : 'Run bash';
     case 'run_python': return str('code') ? describeRun(str('code')) : (str('description') || 'Run Python');
     case 'execute_intent': return str('intent_id') ? `Run intent: ${str('intent_id')}` : 'Run intent';
@@ -477,7 +485,10 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'send_email': return str('subject') ? `Email: ${str('subject')}` : 'Send email';
     case 'read_emails': return 'Read emails';
     case 'read_email': return 'Read email';
-    case 'fetch_news': return str('query') ? `News: ${str('query')}` : 'Fetch news';
+    // `topic` is `fetch_news`'s search term (required, see `llm/tools/web.rs`),
+    // and it is what Rust's own `describe_tool` reads. There is no `query` key
+    // on the payload.
+    case 'fetch_news': return str('topic') ? `News: ${str('topic')}` : 'Fetch news';
     case 'browser_open': return str('url') ? `Open ${str('url').split('/').slice(0, 3).join('/')}` : 'Open browser';
     case 'browser_extract': return 'Extract page content';
     case 'browser_click': return str('selector') ? `Click ${str('selector')}` : 'Click element';
@@ -495,13 +506,18 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'refresh_file': return str('path') ? `Refresh ${basename(str('path'))}` : 'Refresh file';
     case 'refresh_app': { const n = str('app_name') || str('app_id'); return n ? `Refresh ${n}` : 'Refresh app'; }
     case 'capture_app': { const n = str('app_name') || str('app_id'); return n ? `Capture ${n}` : 'Capture app'; }
-    case 'request_credential': return str('provider') ? `Request ${str('provider')} credential` : 'Request credential';
+    // `service_name` is what `request_credential` takes (required, see
+    // `llm/tools/misc.rs`); `provider` belongs to `connect_oauth_account`.
+    case 'request_credential': return str('service_name') ? `Request ${str('service_name')} credential` : 'Request credential';
     case 'configure_email': return 'Configure email';
     case 'connect_oauth_account': return str('provider') ? `Connect ${str('provider')}` : 'Connect account';
     case 'navigate_ui': {
       const target = str('target');
       if (target === 'app' || target === 'app-ui') { const n = str('app_name') || str('app_id'); return n ? `Open ${n}` : 'Open app'; }
-      if (target === 'file') return str('path') ? `Open ${basename(str('path'))}` : 'Open file';
+      // `file_path` is `navigate_ui`'s file argument (see `get_navigate_ui_tool`
+      // in `llm/tools/misc.rs`, and `handleNavigationRequest` which consumes the
+      // same payload). There is no `path` key on it.
+      if (target === 'file') return str('file_path') ? `Open ${basename(str('file_path'))}` : 'Open file';
       if (target === 'url') return str('url') ? `Open ${str('url').split('/').slice(0, 3).join('/')}` : 'Open URL';
       return target ? `Open ${target}` : 'Navigate UI';
     }
@@ -578,9 +594,12 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'enable_push_notifications': return 'Enable push notifications';
     case 'setup_mcp_server': return str('name') ? `Setup MCP: ${str('name')}` : 'Setup MCP server';
     case 'list_mcp_servers': return 'List MCP servers';
-    case 'start_mcp_server': return str('name') ? `Start MCP: ${str('name')}` : 'Start MCP server';
-    case 'stop_mcp_server': return str('name') ? `Stop MCP: ${str('name')}` : 'Stop MCP server';
-    case 'remove_mcp_server': return str('name') ? `Remove MCP: ${str('name')}` : 'Remove MCP server';
+    // start/stop/remove address an already-registered server by `id` (only
+    // `setup` takes a `name`). Both the `mcp` domain in `capability_manifest`
+    // and the executor in `engine/tools/mcp.rs` read `id`.
+    case 'start_mcp_server': return str('id') ? `Start MCP: ${str('id')}` : 'Start MCP server';
+    case 'stop_mcp_server': return str('id') ? `Stop MCP: ${str('id')}` : 'Stop MCP server';
+    case 'remove_mcp_server': return str('id') ? `Remove MCP: ${str('id')}` : 'Remove MCP server';
     case 'list_apps': return 'List apps';
     case 'list_triggers': return 'List triggers';
     case 'update_trigger': return str('name') ? `Update trigger: ${str('name')}` : 'Update trigger';

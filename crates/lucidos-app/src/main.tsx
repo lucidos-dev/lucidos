@@ -10,6 +10,7 @@ import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installNoAutofill } from './utils/noAutofill';
 import { installNoDrag } from './utils/noDrag';
+import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
 import { invoke } from './utils/tauri';
@@ -60,6 +61,12 @@ installNoAutofill();
 // badge + translucent text/image ghost) that otherwise flashes while dragging
 // the window by the header. See utils/noDrag.ts. No-op off Tauri.
 installNoDrag();
+// Publish --scrollbar-gutter-width before the first render: the chat composer
+// sizes its horizontal inset off it to stay aligned with the transcript, whose
+// scrollbar takes that width out of the content box on classic-scrollbar
+// platforms. The inline FOUC script has already applied the UI scale, so the
+// rem-sized scrollbar measures at its final width here.
+publishScrollbarGutter();
 
 // E2E test hook — Playwright opens an app by id from `page.evaluate`. The
 // real `openApp(app: App)` requires an `App` object that the test doesn't

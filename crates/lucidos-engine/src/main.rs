@@ -685,35 +685,13 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         log!("[Startup] Failed to reset orphaned waiting threads: {}", e);
     }
 
-    // Reconcile active_children_count in either drift direction. Over-count: a
-    // child Claude Code session canceled before emitting CodingAgentIdled leaves the
-    // parent with a stale non-zero count. Under-count: recovery's synthetic
-    // `CodingAgentIdled{reason=engine_restart_interrupt}` decrements as if the
-    // child were terminal, but the child is only parked — the user's Continue
-    // click re-increments via the `ContinueSignal` projection. If the user
-    // restarts again before clicking Continue, the now-zero count stays stuck
-    // without this sweep (the projection's +1 fires once per park/resume pair,
-    // not as a safety net for drifted rows). The `> 0` guard the prior version
-    // carried would skip exactly the rows that need repair.
-    if let Err(e) = sqlx::query(
-        "WITH running_child_counts AS ( \
-             SELECT parent_thread_id, COUNT(*) AS cnt \
-             FROM thread_summaries \
-             WHERE parent_thread_id IS NOT NULL AND status = 'running' \
-             GROUP BY parent_thread_id \
-         ), \
-         parents AS ( \
-             SELECT DISTINCT parent_thread_id AS thread_id \
-             FROM thread_summaries WHERE parent_thread_id IS NOT NULL \
-         ) \
-         UPDATE thread_summaries p \
-         SET active_children_count = COALESCE(rc.cnt, 0)::int \
-         FROM parents pa LEFT JOIN running_child_counts rc \
-              ON rc.parent_thread_id = pa.thread_id \
-         WHERE p.thread_id = pa.thread_id \
-           AND p.active_children_count != COALESCE(rc.cnt, 0)::int",
+    // Reconcile active_children_count in either drift direction. The query and
+    // the reasons it exists live with the in-tx reconcile it has to agree with
+    // (`EventBus::rebuild_active_children_count`), so the two cannot drift
+    // apart on what "in flight" means.
+    if let Err(e) = lucidos_engine::engine::event_bus::EventBus::rebuild_active_children_count(
+        shared_engine.pool(),
     )
-    .execute(shared_engine.pool())
     .await
     {
         log!("[Startup] Failed to reconcile active_children_count: {}", e);
@@ -888,7 +866,14 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // ever lost anyway. Crash-interrupted threads were NOT queued (they keep the
     // manual Continue affordance), so this never re-runs work that may have
     // crashed the engine.
-    shared_engine.resume_pending_switches().await;
+    // The returned ids are what `settle_unresumed_switch_threads` must NOT touch
+    // (see its docs: `ContinuationRequested` is invisible to a query-based
+    // exclusion), so they are held until the floor runs at the end of boot.
+    let mut resumed_switch_threads: std::collections::HashSet<uuid::Uuid> = shared_engine
+        .resume_pending_switches()
+        .await
+        .into_iter()
+        .collect();
 
     // Start the external watchdog. Scans agent_sessions every 30 s from
     // outside any per-thread `select!` — catches the May-2026 "stuck for
@@ -929,7 +914,18 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Thread Queue slot. It must also follow `recover_orphan_tool_calls` (far
     // above), or the re-entered turn rebuilds an unpaired `tool_use` block and the
     // provider rejects the call.
-    shared_engine.resume_pending_chat_switches().await;
+    resumed_switch_threads.extend(shared_engine.resume_pending_chat_switches().await);
+
+    // Boot floor: every *Switch to new version* promises the interrupted thread a
+    // resume, and the UI withholds its Continue button on the strength of that
+    // promise. Both drains above have now had their turn, so anything still
+    // holding an unkept promise (over the chat resume cap, a resume that errored,
+    // a branch recovery skipped, an archived thread no sweep selects) gets the
+    // promise WITHDRAWN here, which hands its Continue affordance back. Runs
+    // before the API server accepts traffic, so the user never sees the gap.
+    shared_engine
+        .settle_unresumed_switch_threads(&resumed_switch_threads)
+        .await;
 
     // Use the engine's shared pool for scheduler
     let pool = shared_engine.pool().clone();

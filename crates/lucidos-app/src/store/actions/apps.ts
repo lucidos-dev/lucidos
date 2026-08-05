@@ -391,6 +391,22 @@ export function getVisibleAppFrame(): HTMLIFrameElement | null {
   return fallback;
 }
 
+/** The panel wrapping the visible app iframe: the element native fullscreen is
+ *  requested on, and the one the host's overlay layer is portaled into while it
+ *  is fullscreen.
+ *
+ *  Resolved from `getVisibleAppFrame` rather than by a second query, so the two
+ *  cannot disagree about which app is on screen (that function carries the
+ *  prefer-non-zero-dimensions tolerance for the transient duplicate frames a
+ *  layout swap leaves behind).
+ *
+ *  Fullscreen is requested on the PANEL and not on the iframe because an iframe
+ *  renders no DOM children: with the iframe fullscreen there is nowhere for the
+ *  host to put a modal, and a fullscreen element is painted alone. */
+export function getVisibleAppPanel(): HTMLElement | null {
+  return getVisibleAppFrame()?.closest<HTMLElement>('[data-role="app-ui-panel"]') ?? null;
+}
+
 /** Exit CSS-based pseudo-fullscreen mode. */
 export function exitPseudoFullscreen(): void {
   appPseudoFullscreen.value = false;

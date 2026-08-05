@@ -1,5 +1,51 @@
 # Changelog
 
+## v0.22.0 — 2026-08-05
+
+### Added
+
+- **An app can show a file without navigating away from itself.** `lucidos.ui.previewFile({ file_path, line, line_end })` opens a read-only preview modal over the app, with the same rendering, highlighting and line numbers the Files panel shows, plus an Open in Files link that promotes the glance into full navigation at the same lines. Dismissed by Esc, a click outside it, or its close control.
+- **A file opens at a line, scrolled to and highlighted.** `lucidos.ui.navigate('file', …)` and the `navigate_ui` tool take `line` and `line_end` (1-based, `line_end` inclusive) alongside `file_path`. The line lands as the same selection a click on the line number makes, so it can be sent into a chat message as context. A format that renders (markdown, CSV, SVG) switches to its source view, and a line the file cannot honour opens the file at the top.
+- **A `repo:` link inside an HTML or markdown artifact opens the file.** An `<a href="repo:<id>:file:<path>#L510-L520">` routes through the same navigation, so an agent-written report full of citations works as a plain artifact rather than having to be an app.
+- **A repository file can be previewed at a named revision.** A locator can say which revision it means: `repo:<repoId>:file#<ref>:<path>`, where `<ref>` is a branch, tag or sha. The same spelling works from `lucidos.ui.previewFile`, from `lucidos.ui.navigate('file', …)`, from the `navigate_ui` tool, and from a `repo:` link, where a line suffix can follow it. Leave the `#<ref>` off and you get `HEAD`.
+- **A repository diff can be read side by side, the original next to the changed file.** A toggle in the preview header switches the unified hunks for two columns aligned row for row, with a filler where one side has no line. It appears over the hunks themselves and only on a surface wide enough for two columns of code, so a phone and a narrow content pane keep the unified view. The choice is remembered across files and reloads.
+- **A thread can follow up on a child thread it spawned.** The `follow_up_child_thread` tool, `lucidos threads follow-up` on the CLI, `lucidos.threads.followUp` in the SDK, and a matching HTTP route all send a message to one of the caller's own direct children: redirect one going the wrong way, hand it something a sibling learned, or tell a stalled one to continue. A follow-up does not consume a child slot, and `lucidos threads list --my-children` lists a parent's own children with their status.
+- **A coding-agent branch is named after the thread that produced it**, so the branch on the repo says which session it came from.
+
+### Changed
+
+- **Settings is grouped into Assistant, Workspace, and This device.** Model, permission and coding-agent settings sit under Assistant; accounts, locale, marketplaces, access, devices and system under Workspace; appearance, behavior and keyboard shortcuts under This device. Links into a retired section are redirected to where the setting now lives.
+- **The workspace file preview shows numbered lines, like the repository preview.** Source, JSON, plain text, and the Source view of a markdown, CSV or SVG file are line-numbered and click-selectable, and a selected range travels with the next chat message.
+- **A diff citation previewed from an app shows the file at that change**, not at `HEAD`.
+- **Landing on a deep link paints a spotlight highlight** over the event or row you were sent to, which fades out on its own.
+- **A credential carries the OAuth provider's own authorize parameters**, so a provider that spells "issue a refresh token" in its own way gets what it needs at authorization time.
+- **A connected OAuth account reports who connected it**, including providers whose userinfo endpoint only answers POST.
+- **The Accounts page says what each of its two sections is for**, and the Backup page links to the one that connects a backup destination.
+- **A pushed notification's body is truncated to what the device will accept**, so a long message still arrives everywhere instead of being dropped by the platform.
+- **A release on the public mirror is created as a draft and published only once every platform tarball is attached**, so a clone or an installer never sees a half-populated release.
+- **A thread interrupted by switching provider or model reads as paused, not failed.** Its dot is neutral rather than red, and Continue appears only when the engine is not going to resume the turn itself.
+
+### Fixed
+
+- An app's text is the size Lucidos's text is. It defaults to the type scale's body step, still in `rem`, so it tracks the UI-scale setting.
+- What an app shows you is visible when the app is fullscreen. A file preview, a confirmation, a prompt or a toast raised by an app now draws above it in both the fallback and the real browser fullscreen, and Escape does one thing per press.
+- An app opened in its own tab reports that it cannot show a preview, which lets the app fall back to opening the file properly.
+- Waking the app no longer fills the screen with thread-refresh toasts. A wake marks non-focused threads stale and refetches on focus, and a fan-out failure raises one card rather than one per thread.
+- Stop is honored during turn setup, and a re-submitted follow-up shows as running.
+- A coding-agent turn survives a dropped API connection: it resumes instead of ending silently, and stands down when a follow-up is already queued.
+- A notification deep link lands on the exact step it names, and says so when the target no longer exists.
+- Backups to Dropbox check their scopes before running, and the Grant access button reconnects with the full set.
+- The OAuth authorization page opens in the browser you configured, and the Connect button keeps its success feedback.
+- Question and permission cards keep a typed answer across a fullscreen change.
+- The composer box aligns with the transcript's content edges, and its text sits on the card content edge.
+- Archive sits second-last in the thread overflow menu, out of reach of a mis-tap.
+- The camera is released when a capture context is refused.
+- When no image provider is configured, the message names the real remedy.
+- A rebuild hands the build lock over instead of racing for it, and collects the temporary files a killed build leaves behind.
+- Memory pagination is clamped at both ends.
+- OAuth tokens stay out of the log, and a sandbox that cannot be enforced fails loudly instead of degrading silently.
+- A resume promised on a provider switch is withdrawn when the boot cannot keep it, so a thread never sits waiting on a resume that will not come.
+- A step row's context counter stays on one line instead of wrapping.
 ## v0.21.0 — 2026-08-04
 
 ### Added

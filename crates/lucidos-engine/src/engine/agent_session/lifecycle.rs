@@ -173,11 +173,15 @@ pub(super) fn is_user_question_tool(name: &str) -> bool {
 
 /// User-facing error message for the empty-response branch of `classify_result`.
 /// Surfaces an OOM-killed bash (exit 137), a SIGTERM'd subprocess (exit 143), or
-/// any other path where CC produces a Result with no real assistant text. Without
-/// this branch the empty Result classifies as `Generated` and the turn looks
-/// successful in the UI even though the user got nothing back.
+/// any other path where the backend produces a Result with no real assistant
+/// text. Without this branch the empty Result classifies as `Generated` and the
+/// turn looks successful in the UI even though the user got nothing back.
+///
+/// Worded for the coding agent generically rather than for Claude Code:
+/// `classify_result` runs for both backends (`run_session` is backend-agnostic),
+/// so naming one of them would mislabel every Codex turn that lands here.
 pub(super) const EMPTY_RESPONSE_ERROR: &str =
-    "Claude Code produced no visible response — the session ended without a real \
+    "The coding agent produced no visible response: the session ended without a real \
      assistant message. This usually means a tool call was killed (OOM with exit 137, \
      SIGTERM with exit 143, or similar). The work is incomplete; re-prompt with a \
      narrower scope.";
@@ -417,9 +421,12 @@ pub(super) fn conflict_abort_deletes_temp_state(
 /// positional bools is a silent-transposition hazard at exactly the call site
 /// where a transposition kills a live session.
 ///
-/// `Copy` so the call site can evaluate the predicate twice off one value — once
-/// as-is, once with the veto forced off — to detect that the confirmed attach is
-/// what saved the session, without restating the other seven fields.
+/// `Copy` because one value feeds BOTH predicates at the call site:
+/// [`is_stale_resume_signal`] and [`is_resume_settle_result`] read these
+/// identical eight fields and differ only in which way `resume_attach_confirmed`
+/// points, so restating them per call is exactly the transposition hazard above.
+/// (The settle predicate takes one FURTHER argument, deliberately not a field
+/// here; its doc says why.)
 #[derive(Clone, Copy)]
 pub(super) struct StaleResumeInputs {
     /// This turn asked the backend to `--resume` a specific session id.
@@ -479,6 +486,66 @@ pub(super) struct StaleResumeInputs {
 pub(super) fn is_stale_resume_signal(i: StaleResumeInputs) -> bool {
     i.has_resume_session
         && !i.resume_attach_confirmed
+        && i.result_text_empty
+        && i.buffered_text_empty
+        && i.no_prior_results_this_turn
+        && i.no_tool_calls_this_turn
+        && i.user_message_present
+        && !i.cc_error
+}
+
+/// True when an arriving `Result` closes the backend's own **resume-settle
+/// turn** rather than the turn we asked for. It is [`is_stale_resume_signal`]
+/// with the veto satisfied instead of absent: the SAME empty output shape, on a
+/// resume the backend structurally confirmed it attached to.
+///
+/// A `--resume` frequently has leftovers to settle before it will look at our
+/// stdin. `claude --print --resume` injects a synthetic `Continue from where you
+/// left off.` / `No response requested.` pair to close a tool_use orphaned by
+/// the previous session's death, and it drains any `<task-notification>` that
+/// session queued for a background Bash. Each of those is a full turn to CC, so
+/// each ends with its own `result` on the wire, and the first one can land
+/// BEFORE our prompt is even dequeued.
+///
+/// Such a Result must not terminate our turn, because our turn has not run yet.
+/// Treating it as the terminal is what swallowed a user's message on 2026-08-05:
+/// the settle Result classified as `Failed` via [`EMPTY_RESPONSE_ERROR`] (an OOM
+/// diagnosis for a turn that never made an API call), and the idle path then
+/// killed the subprocess 137 ms after CC had dequeued the user's follow-up and
+/// started answering it. The answer was never produced and the message was never
+/// re-queued. The 2026-07-29 veto had already stopped the same shape from
+/// *cancelling* the healthy session; the call site just logged it and fell
+/// through to the classification.
+///
+/// The run loop's response is to skip the Result entirely: no terminal, no idle,
+/// no teardown, keep reading events. What arrives next is the real turn.
+///
+/// `no_api_call_this_turn` is what makes that skip safe, and it is a SEPARATE
+/// argument rather than a ninth `StaleResumeInputs` field on purpose. The eight
+/// fields describe output SHAPE, and the shape of a settle turn is identical to
+/// the shape of a model that was asked our prompt and answered with nothing:
+/// skipping the latter would discard a real terminal and strand the turn until
+/// the inactivity watchdog fired ten minutes later. A `Usage` event separates
+/// them structurally, because it is emitted per real API call and only for one
+/// (the parser drops all-zero usage frames, which is exactly what a
+/// `<synthetic>` message carries), so zero of them proves the backend never
+/// asked the model anything and therefore cannot be answering us. It stays out
+/// of the struct because [`is_stale_resume_signal`] must keep reading exactly
+/// the eight fields it reads today: a dead `--resume` starts a FRESH
+/// conversation and may well call the model before echoing nothing back, so
+/// requiring zero API calls there could break the `dev/bf997e21` recovery.
+///
+/// Every shared field carries the same weight it does in the stale heuristic,
+/// and for the same reasons: a tool call or streamed text proves the backend is
+/// working on OUR prompt, a `cc_error` is a real failure to report, and a Result
+/// later in the session is a genuine turn boundary.
+/// `no_prior_results_this_turn` doubles as the bound: the call site records the
+/// skipped Result, so a session can skip at most one, which is all a resume
+/// settles.
+pub(super) fn is_resume_settle_result(i: StaleResumeInputs, no_api_call_this_turn: bool) -> bool {
+    no_api_call_this_turn
+        && i.has_resume_session
+        && i.resume_attach_confirmed
         && i.result_text_empty
         && i.buffered_text_empty
         && i.no_prior_results_this_turn
@@ -809,6 +876,71 @@ pub(super) fn safety_net_action(
         return SafetyNetAction::EmitContinuationRequested;
     }
     SafetyNetAction::EmitAbortedSafetyNet
+}
+
+/// How many times in a row the engine will auto-resume a turn the backend ended
+/// on a transient upstream API failure, before it stops and lets the red dot
+/// stand.
+///
+/// The budget is CONSECUTIVE: a `ResponseGenerated` or a new user message resets
+/// it (see `api_error_auto_resumes_spent`), so a long unattended session that
+/// hits a drop every few hours never exhausts it. Three attempts with no
+/// successful turn in between is no longer a transient drop, it is a broken
+/// upstream, and resuming again just burns the user's quota against a wall.
+pub(super) const MAX_API_ERROR_AUTO_RESUMES: i64 = 3;
+
+/// True when a terminal is a TRANSIENT upstream failure the session can be
+/// resumed past, as opposed to a deterministic one that would fail identically
+/// on every retry.
+///
+/// The signature is Claude Code's own `API Error` prefix, which is already the
+/// contract `claude_code_parse.rs` uses to decide that string is a real failure
+/// reason at all (`API Error: 500 {…}`, `API Error: Stream idle timeout`, `API
+/// Error: Connection closed mid-response.`). Matching the PREFIX rather than a
+/// loose substring is what keeps a turn that merely mentions an api error in
+/// prose out of the retry path, and it is the same rule on both sides so the two
+/// cannot drift into disagreeing about what the string means.
+///
+/// Everything else is deliberately excluded. `error_max_turns` reproduces
+/// exactly. `No conversation found with session ID` is handled far earlier by
+/// the stale-resume path and can never succeed on a re-resume. The empty-response
+/// failure is a killed tool, which a resume would just re-run. This is a
+/// tolerance for an unstructured backend error string, registered in
+/// `docs/temporary-measures.md`.
+pub(super) fn is_transient_api_failure(terminal: &TerminalKind) -> bool {
+    matches!(terminal, TerminalKind::Failed { error } if error.trim_start().starts_with("API Error"))
+}
+
+/// Decide whether the post-loop finalize should emit
+/// `ContinuationRequested{auto_resume_after_api_error}` so the spawn dispatcher
+/// re-enters this session via `--resume`.
+///
+/// Every gate here is a refusal, and each one names a path that owns the thread
+/// instead:
+///
+/// * Not a transient upstream failure (see [`is_transient_api_failure`]). A
+///   `Generated` turn needs no resume, a `Canceled` one was stopped by the user,
+///   an `Aborted` one is already someone else's recovery, and a deterministic
+///   `Failed` would reproduce.
+/// * Budget spent (`MAX_API_ERROR_AUTO_RESUMES`): the upstream is not blipping,
+///   it is down.
+/// * Engine shutdown: recovery re-adopts in-flight threads after restart, and a
+///   continuation emitted into a dying engine races that.
+/// * Conflict-resolution session: it carries an apply's merge duty and a parked
+///   actor, and its cleanup decides hand-off-vs-abort from the watchdog's own
+///   flags. Adding a third continuation source to that interlock is deliberately
+///   out of scope, so an API drop mid-merge still aborts the merge and leaves the
+///   change pending for the user to Apply again.
+pub(super) fn auto_resume_after_api_error(
+    terminal: &Option<TerminalKind>,
+    resumes_spent: i64,
+    is_shutdown: bool,
+    is_conflict_session: bool,
+) -> bool {
+    terminal.as_ref().is_some_and(is_transient_api_failure)
+        && resumes_spent < MAX_API_ERROR_AUTO_RESUMES
+        && !is_shutdown
+        && !is_conflict_session
 }
 
 /// Pure tick outcome. Fires (`Fire`) when CC is mid-turn (`!is_waiting`), no

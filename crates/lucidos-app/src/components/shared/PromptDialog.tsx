@@ -2,10 +2,40 @@ import { useEffect, useRef } from 'preact/hooks';
 import { promptState } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
+import { trapDialogTab } from './dialogFocusTrap';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+
+/** What the reader has typed into the prompt that is currently open, kept
+ *  outside the component so it survives a REMOUNT of the same prompt.
+ *
+ *  The input is deliberately uncontrolled (no re-render per keystroke), so its
+ *  text lives only in the DOM node, and a remount seeds a fresh node from
+ *  `defaultValue`. That is right when a new prompt replaces this one and wrong
+ *  when it is the same prompt landing in a new place: the overlay layer
+ *  re-parents into and out of a fullscreen app panel (`OverlayLayer`), which
+ *  remounts everything under it, so leaving fullscreen mid-answer used to reset
+ *  what the reader had written.
+ *
+ *  Keyed on the prompt's `resolve` closure, which is fresh per `showPrompt`
+ *  call: same closure means the same question, so the draft applies; a different
+ *  one is a different question and seeds from its own `defaultValue`. Cleared on
+ *  close so a later prompt can never inherit it. */
+let openPromptDraft: { resolve: unknown; value: string } | null = null;
+
+/** What the input is seeded with on (re)mount: the draft when it belongs to
+ *  THIS prompt, else the prompt's own default. Pure, and exported for the test
+ *  that pins both halves. */
+export function promptInputSeed(
+  draft: { resolve: unknown; value: string } | null,
+  resolve: unknown,
+  defaultValue: string | undefined,
+): string {
+  return (draft && draft.resolve === resolve ? draft.value : defaultValue) ?? '';
+}
 
 function close(value: string | null) {
   const state = promptState.peek();
+  openPromptDraft = null;
   state.resolve?.(value);
   promptState.value = { visible: false, message: '' };
 }
@@ -22,7 +52,7 @@ export function PromptDialog() {
 
     const input = dialogRef.current?.querySelector<HTMLInputElement | HTMLTextAreaElement>('.prompt-input');
     if (input) {
-      input.value = state.defaultValue ?? '';
+      input.value = promptInputSeed(openPromptDraft, state.resolve, state.defaultValue);
       input.focus();
       input.select();
     }
@@ -40,23 +70,7 @@ export function PromptDialog() {
         close(el?.value ?? '');
         return;
       }
-      if (e.key !== 'Tab') return;
-      const root = dialogRef.current;
-      if (!root) return;
-      const focusables = root.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      );
-      if (focusables.length === 0) return;
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      }
+      trapDialogTab(e, dialogRef.current);
     }
     document.addEventListener('keydown', handleKey);
     return () => {
@@ -78,6 +92,11 @@ export function PromptDialog() {
     close(el?.value ?? '');
   }
 
+  function recordDraft(e: Event) {
+    const el = e.currentTarget as HTMLInputElement | HTMLTextAreaElement;
+    openPromptDraft = { resolve: state.resolve, value: el.value };
+  }
+
   return (
     <Overlay
       open
@@ -91,10 +110,12 @@ export function PromptDialog() {
         <p class="confirm-message">{state.message}</p>
         {/* The answer is free-form natural language (the dialog is driven by the
             LLM's ask-the-user payload), so both branches are prose fields. */}
+        {/* `onInput` records the draft (see openPromptDraft) and nothing else:
+            the field stays uncontrolled, so typing still costs no re-render. */}
         {state.multiline ? (
-          <textarea class="prompt-input prompt-textarea" placeholder={state.placeholder} rows={4} {...PROSE_TEXT_ATTRS} />
+          <textarea class="prompt-input prompt-textarea" placeholder={state.placeholder} rows={4} onInput={recordDraft} {...PROSE_TEXT_ATTRS} />
         ) : (
-          <input type="text" class="prompt-input" placeholder={state.placeholder} {...PROSE_TEXT_ATTRS} />
+          <input type="text" class="prompt-input" placeholder={state.placeholder} onInput={recordDraft} {...PROSE_TEXT_ATTRS} />
         )}
         <div class="confirm-actions">
           <div class="confirm-actions-right">

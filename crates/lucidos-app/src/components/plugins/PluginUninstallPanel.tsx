@@ -6,11 +6,14 @@ import {
 } from '../../store/actions/plugin-uninstall';
 
 export function PluginUninstallPanel() {
+  // Hook before the early return, same as `PluginInstallPanel`: a hook called
+  // after it is a rules-of-hooks violation that only survives because this
+  // component has exactly one, so the index realigns by luck.
+  const [busy, setBusy] = useState(false);
   const form = activeInlineForm.value;
   if (form?.type !== 'plugin-uninstall') return null;
 
   const req = form.request;
-  const [busy, setBusy] = useState(false);
 
   // The action fns always closeInlineForm() in their own finally (unmounting
   // this panel), so busy normally never resets visibly — but reset in a finally

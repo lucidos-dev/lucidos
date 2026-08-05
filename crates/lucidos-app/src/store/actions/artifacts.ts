@@ -5,6 +5,8 @@ import {
   panelOverlay,
   webviewInitialUrl,
   filePreviewSource,
+  selectedLines,
+  lineScrollTarget,
   showToast,
   dismissToast,
   parseRepoPath,
@@ -144,6 +146,16 @@ export function normalizeDataPath(path: string): string {
 
 export function openFilePreview(path: string, opts?: { preserveSource?: boolean }): void {
   if (!opts?.preserveSource) filePreviewSource.value = false;
+  // Drop any line selection and pending scroll from the file being replaced.
+  // Both previews render `selectedLines`, so without this a range picked in one
+  // file would highlight whatever rows happen to sit at those numbers in the
+  // next one, and a scroll request that never found its file (a load error, a
+  // format with no source view) would fire on an unrelated file later.
+  // `openRepoFilePreview` clears the same pair on its own path, which sets
+  // panelOverlay directly for its push-vs-replace logic. The navigate-to-a-line
+  // router deliberately sets its range AFTER calling in here.
+  selectedLines.value = null;
+  lineScrollTarget.value = null;
   panelOverlay.value = { type: 'file-preview', path };
   localStorage.setItem('file-preview-open', path);
   revealContentPane();

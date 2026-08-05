@@ -38,7 +38,7 @@ export function ModelsManager() {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="models:manage">Manage Models</div>
+      <div class="settings-section-title" data-search-anchor="models:manage">Manage models</div>
       {loadable.status === 'failed' && (
         <LoadableError noun="models" error={loadable.error} />
       )}
@@ -118,7 +118,10 @@ export function ModelsManager() {
               </div>
               <div class="settings-row">
                 <span class="settings-row-label" />
-                <span class="list-row-details">
+                {/* A sentence, not a row of fields, so it takes the prose
+                    modifier: the base class is a flex row whose 0.75rem gap is
+                    the field separator (`.claude/rules/frontend.md`). */}
+                <span class="list-row-details list-row-details-prose">
                   Tokens. Left blank, the engine guesses from the model id — and it
                   has no rule for OpenRouter, Gemini, or local models, so they are
                   treated as 200k however large they really are.

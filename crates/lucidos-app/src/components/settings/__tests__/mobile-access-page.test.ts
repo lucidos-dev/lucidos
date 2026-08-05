@@ -1,6 +1,12 @@
 /**
- * Mobile Access must be reachable from the device it is written for, and must
- * answer BOTH of its questions there.
+ * The Mobile Access page must answer BOTH of its questions on every platform,
+ * and gate only its native-only controls.
+ *
+ * Renamed from `mobile-access-row-reachable.test.ts` when the nav-level half of
+ * this guard moved to `settings-nav-structure.test.ts`: no Settings category is
+ * platform-gated at all now, which is a stronger rule than "this one row is
+ * listed everywhere". What stays here is the PAGE's own behaviour, plus the one
+ * assertion that `access` is still what renders it.
  *
  * The first bug this pins is the same shape as
  * `external-links-row-reachable.test.ts`, and is why that file's reasoning is
@@ -42,16 +48,14 @@ describe('Mobile Access reachability', () => {
   const nav = stripComments(SETTINGS_VIEW);
   const page = stripComments(PAGE);
 
-  it('does not gate its nav entry on the desktop app', () => {
-    // Any `key === 'mobile-access'` branch in the nav filter is a regression:
-    // the row must list everywhere, because a phone is a first-class reader.
-    expect(nav).not.toMatch(/key === 'mobile-access'/);
-  });
-
   it('still lists the entry, rather than having quietly lost it', () => {
-    // The opposite failure of the one above: deleting the filter branch AND the
-    // entry would also make the assertion above pass.
-    expect(nav).toContain(`case 'mobile-access': return <MobileAccessPage />;`);
+    // The page lives under the `access` category now, beside the network bind
+    // it used to deep-link into. The nav-level half of this guard (no category
+    // is platform-gated at all) moved to `settings-nav-structure.test.ts`; what
+    // stays here is that this page is what `access` actually renders, because
+    // deleting the case would satisfy that rule too.
+    expect(nav).toContain(`case 'access': return accessSection();`);
+    expect(nav).toContain('<MobileAccessPage />');
   });
 
   it('gates the native-only CONTROLS inside the page instead', () => {

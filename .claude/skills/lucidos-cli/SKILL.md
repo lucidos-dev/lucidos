@@ -107,7 +107,7 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 {"status":"applied","change_id":"fbcc4a3a-...","applied_commit":"9b1a...","commits_applied":3, ...}
 ```
 
-**Always use this instead of hand-rolling the HTTP call.** A `Bash` block that runs `curl -X POST .../api/v1/changes/<id>/apply` from inside this worktree ships without the subprocess-origin headers, so the engine stamps `Api { mode: Human }` and the UI shows the resulting Apply card as **"You"** — wrongly attributing your action to the user. The CLI forwards `x-lucidos-agent-origin-token` and `x-lucidos-source-thread-id` from the engine-injected env vars, so the card correctly says "Lucidos Agent" with the source thread linked.
+**Always use this instead of hand-rolling the HTTP call.** A `Bash` block that runs `curl -X POST .../api/v1/changes/<id>/apply` from inside this worktree ships without the subprocess-origin headers, so the engine stamps `Api { mode: Human }` and the UI shows the resulting Apply card as **"You"**, wrongly attributing your action to the user. The CLI forwards `x-lucidos-agent-origin-token` from the engine-injected env var, so the card correctly says "Lucidos Agent" with the source thread linked. That one header carries both facts: the token is bound to the thread it was minted for, and the engine reads the source thread off the token itself.
 
 `status` is `applied`, `noop`, `hardening`, or `conflict`. See `docs/apply-change-api.md` for the full response shape. Exit non-zero on transport / HTTP error with the engine's error body on stderr.
 

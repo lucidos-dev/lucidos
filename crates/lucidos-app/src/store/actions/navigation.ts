@@ -5,6 +5,7 @@ import {
   panelOverlay,
   webviewInitialUrl,
   wipPreviewThreadId,
+  migrateSettingsSubview,
 } from '../store';
 import type { SettingsSubview, InlineForm, PanelOverlay } from '../store';
 import type { MenuItem } from '../types';
@@ -130,9 +131,19 @@ function captureState(): NavEntry {
 }
 
 /** Migrate old NavEntry format (separate fields) to new format (overlay union).
- *  Old entries from localStorage may have inlineForm/app/filePath/etc. instead of overlay. */
+ *  Old entries from localStorage may have inlineForm/app/filePath/etc. instead of overlay.
+ *
+ *  The `settingsSubview` needs migrating on BOTH paths, including the
+ *  already-overlay-shaped early return: the persisted stack outlives the upgrade
+ *  that renames a subview, and `renderSubview` falls through to `null` for a key
+ *  it no longer knows, so a raw restore lands on a blank Settings panel with no
+ *  error. `migrateSettingsSubview` maps a retired key onto the category that
+ *  absorbed it and anything unrecognised onto `main`. */
 function migrateEntry(raw: Record<string, unknown>): NavEntry {
-  if ('overlay' in raw) return raw as unknown as NavEntry;
+  if ('overlay' in raw) {
+    const entry = raw as unknown as NavEntry;
+    return { ...entry, settingsSubview: migrateSettingsSubview(entry.settingsSubview) };
+  }
   let overlay: PanelOverlay = null;
   if (raw.inlineForm) {
     overlay = { type: 'form', form: raw.inlineForm as InlineForm };
@@ -147,7 +158,7 @@ function migrateEntry(raw: Record<string, unknown>): NavEntry {
   }
   return {
     menuItem: (raw.menuItem as MenuItem) ?? 'files',
-    settingsSubview: (raw.settingsSubview as SettingsSubview) ?? 'main',
+    settingsSubview: migrateSettingsSubview(raw.settingsSubview),
     overlay,
     wipPreviewThreadId: (raw.wipPreviewThreadId as string | null | undefined) ?? null,
   };

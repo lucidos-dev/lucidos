@@ -1117,3 +1117,146 @@ async fn spawn_refuses_when_user_checked_out_different_branch() {
     _pool.close().await;
     teardown_test_db(&_db_name).await;
 }
+
+/// Seed one `ContinuationRequested{auto_resume_after_api_error}`, i.e. spend one
+/// unit of the transient-API-drop auto-resume budget.
+async fn spend_one_api_error_resume(bus: &EventBus, thread_id: Uuid) {
+    emit(
+        bus,
+        thread_id,
+        ThreadEvent::ContinuationRequested {
+            reason: crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON.to_string(),
+        },
+    )
+    .await;
+}
+
+/// The budget counts only its OWN reason, and only on its own thread. A
+/// watchdog recovery or another thread's storm must not spend a thread's
+/// transient-API-drop attempts.
+#[tokio::test]
+async fn api_error_budget_counts_only_its_own_reason_and_thread() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let other_thread = Uuid::new_v4();
+    let reason = crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON;
+
+    seed_session_started(&bus, thread_id, "sess-budget", "claude-code/budget").await;
+    assert_eq!(
+        api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+        0,
+        "a thread that never dropped has its full budget"
+    );
+
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ContinuationRequested {
+            reason: crate::engine::agent_recovery::AUTO_RECOVERY_AFTER_HANG_REASON.to_string(),
+        },
+    )
+    .await;
+    seed_session_started(&bus, other_thread, "sess-other", "claude-code/other").await;
+    spend_one_api_error_resume(&bus, other_thread).await;
+
+    assert_eq!(
+        api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+        0,
+        "a hang recovery here and an API-drop resume on another thread spend nothing"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The budget is CONSECUTIVE: it accumulates across back-to-back drops up to the
+/// cap, and a completed turn wipes it. Without the reset, a long unattended
+/// session that survives one drop an hour would eventually refuse to recover
+/// from a drop it had every reason to.
+#[tokio::test]
+async fn api_error_budget_accumulates_then_resets_on_a_completed_turn() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let reason = crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON;
+
+    seed_session_started(&bus, thread_id, "sess-storm", "claude-code/storm").await;
+    for expected in 1..=crate::engine::agent_session::lifecycle::MAX_API_ERROR_AUTO_RESUMES {
+        spend_one_api_error_resume(&bus, thread_id).await;
+        assert_eq!(
+            api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+            expected,
+            "consecutive drops must accumulate"
+        );
+    }
+    assert!(
+        !crate::engine::agent_session::lifecycle::auto_resume_after_api_error(
+            &Some(
+                crate::engine::agent_session::lifecycle::TerminalKind::Failed {
+                    error: "API Error: Connection closed mid-response.".to_string(),
+                }
+            ),
+            api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+            false,
+            false,
+        ),
+        "the exhausted budget must stop the next auto-resume"
+    );
+
+    emit(
+        &bus,
+        thread_id,
+        ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+    )
+    .await;
+    assert_eq!(
+        api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+        0,
+        "a completed turn is real progress and restores the full budget"
+    );
+
+    spend_one_api_error_resume(&bus, thread_id).await;
+    assert_eq!(
+        api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+        1,
+        "counting resumes from the reset point, not from the thread's start"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A new user message is the other reset: the user has seen the failure and
+/// asked for something anyway, so the thread starts over with a full budget.
+#[tokio::test]
+async fn api_error_budget_resets_on_a_new_user_message() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let reason = crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON;
+
+    seed_session_started(&bus, thread_id, "sess-msg", "claude-code/msg").await;
+    spend_one_api_error_resume(&bus, thread_id).await;
+    spend_one_api_error_resume(&bus, thread_id).await;
+    assert_eq!(
+        api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+        2
+    );
+
+    // `seed_session_started` opens with a MessageReceived, which is the reset.
+    seed_session_started(&bus, thread_id, "sess-msg-2", "claude-code/msg").await;
+    assert_eq!(
+        api_error_auto_resumes_spent(&pool, thread_id, reason).await,
+        0,
+        "a follow-up from the user restores the budget"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

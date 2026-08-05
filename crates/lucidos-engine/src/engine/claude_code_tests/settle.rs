@@ -145,7 +145,8 @@ async fn settle_stuck_running_thread_no_op_when_already_settled() {
     let thread_id = Uuid::new_v4();
 
     seed_running_cc_thread(&bus, thread_id).await;
-    // First settle transitions running → failed.
+    // First settle transitions running → idle (the StaleSettle cause routes to
+    // the cancel-style status mapping; see the test above).
     assert!(
         settle_stuck_running_thread(&pool, &bus, thread_id, Some(user_device_actor()))
             .await

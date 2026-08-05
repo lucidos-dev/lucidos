@@ -73,7 +73,7 @@ pub(crate) const PREF_COMMAND_GUARD_JUDGE: &str = "command_guard_judge";
 /// trigger alike) before the agentic loop stops with its `[ENGINE-LIMIT]`
 /// terminator. Human-only: it is in `preference_catalog::INTERNAL_KEYS`, since
 /// the cap is the backstop over the agent's own loop and the agent must not be
-/// able to raise it. Changed in Settings, Models, Chat & Triggers.
+/// able to raise it. Changed in Settings, Models, Chat & triggers.
 pub const PREF_MAX_TOOL_CALLS: &str = "max_tool_calls";
 
 /// The per-turn tool-call cap when `max_tool_calls` is unset. Was the hardcoded

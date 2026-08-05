@@ -83,6 +83,24 @@ pub const ANSWERED_AFTER_IDLE_REASON: &str = "answered_after_idle";
 /// user gets an automatic `--resume` without having to click Continue.
 pub const AUTO_RECOVERY_AFTER_HANG_REASON: &str = "auto_recovery_after_hang";
 
+/// Tag stamped on `ContinuationRequested.reason` when the backend ended a turn
+/// on a TRANSIENT upstream API failure (its own `API Error: …` message, e.g. a
+/// connection closed mid-response) and the engine resumes the session instead of
+/// leaving the thread dead behind a red dot.
+///
+/// This closes an asymmetry, not a new policy: when the same network failure
+/// manifests as SILENCE, the hung-subprocess watchdog already kills the
+/// subprocess and auto-resumes via `AUTO_RECOVERY_AFTER_HANG_REASON`. Only the
+/// case where the backend notices the drop first, and reports it, had no
+/// recovery, so two unattended nightly runs sat dead for four and eight hours on
+/// 2026-08-04 waiting for a human to type anything at all.
+///
+/// Unlike the watchdog reasons this one is BOUNDED
+/// (`MAX_API_ERROR_AUTO_RESUMES`), because the trigger is a failure the backend
+/// might reproduce immediately: a persistently broken upstream must surface,
+/// not loop. See `auto_resume_after_api_error`.
+pub const AUTO_RESUME_AFTER_API_ERROR_REASON: &str = "auto_resume_after_api_error";
+
 /// Tag stamped on `ContinuationRequested.reason` when recovery auto-resumes an
 /// in-flight coding-agent thread after a **user-initiated** *Switch to new
 /// version* (detected by a device-attributed teardown `ResponseAborted`). A crash
@@ -104,6 +122,11 @@ pub const AUTO_RESUME_AFTER_SWITCH_REASON: &str = "auto_resume_after_switch";
 /// to the existing `UserQuestionAsked` exchange instead of being mislabeled
 /// as a recovery.
 ///
+/// `auto_resume_after_api_error` opts in for the same reason the watchdog does:
+/// the turn genuinely ended (its `ResponseFailed` is already in the timeline),
+/// and what follows is a new attempt at the same work, which the user should see
+/// as its own boundary rather than as text appended to the failed answer.
+///
 /// Default-deny on unknown / missing reasons: a future `ContinuationRequested`
 /// reason must opt-in explicitly rather than inheriting a "Resumed after
 /// engine restart" boundary by accident.
@@ -113,6 +136,7 @@ pub fn continue_should_open_resume_exchange(reason: Option<&str>) -> bool {
         Some(USER_CLICKED_CONTINUE_REASON)
             | Some(AUTO_RECOVERY_AFTER_HANG_REASON)
             | Some(AUTO_RESUME_AFTER_SWITCH_REASON)
+            | Some(AUTO_RESUME_AFTER_API_ERROR_REASON)
     )
 }
 
@@ -236,7 +260,7 @@ pub(crate) async fn cleanup_stale_worktree(wt_path: &Path) {
     .await;
 }
 
-/// Resolve which thread an orphaned `claude-code/*` worktree (found by the
+/// Resolve which thread an orphaned coding-agent worktree (found by the
 /// recovery scan) should be surfaced under as a resumable Claude Code session.
 /// Returns the thread that a recorded `SessionStarted` / pending change maps
 /// `branch_name` to, or `None` when no thread owns the branch.

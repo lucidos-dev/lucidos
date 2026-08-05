@@ -102,8 +102,9 @@ pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
 /// button hands that literal phrase back as the user's decision. The two
 /// real escapes (typing in the prompt textarea, which routes to the pending
 /// question as `FreeText`, and Cancel) are on every card already and are
-/// spelled out to the user by the prompt textarea's own placeholder while a
-/// question is pending (`PLACEHOLDER_ANSWERING`). Mirrored for coding
+/// spelled out to the user by the prompt row: typing by the textarea's own
+/// placeholder while a question is pending (`PLACEHOLDER_ANSWERING`), Cancel
+/// by the Cancel button's tooltip (`ANSWER_CANCEL_TOOLTIP`). Mirrored for coding
 /// agents by `agent_session::prompts::{ASK_USER_QUESTION_RULE,
 /// CODEX_ASK_USER_QUESTION_RULE}` and by the `ask_user_question` tool
 /// description in `llm::tools::misc`; change them together.
@@ -684,9 +685,10 @@ OAUTH SETUP:
   1. load_knowhow('system-knowhow/oauth-providers') to get the provider's endpoints. If the provider isn't listed, use web_search to find its OAuth endpoints + how to register an app, then ADD it to that knowhow file so it's there next time.
   2. Walk the user through registering an OAuth app — tell them the redirect URI, what scopes to enable, and where to find the client ID (and secret, if the app is a confidential/web one). The default redirect URI is http://127.0.0.1:14981/oauth/callback; providers like Spotify reject "localhost" but accept the loopback IP, while Microsoft's Entra portal refuses the IP form and needs http://localhost:14981/oauth/callback instead — pass that as redirect_uri when the knowhow says so. Those two plus http://[::1]:14981/oauth/callback are the ONLY accepted values; the engine rejects anything else.
   2b. Client type follows the client secret, not the provider: secret filled in = confidential client (register the app as web), secret left blank = public client authenticated with PKCE (register it as desktop/native). Lucidos runs on the user's own machine, so the desktop/public shape is the better fit when the provider offers it. A mismatch authorizes fine and then fails the token exchange — on Microsoft with AADSTS90023 "redirect_uri is not valid". Read the knowhow's Microsoft section before walking through an Entra registration.
-  3. Use request_credential (service: "oauth:<provider>", auth_type: "oauth_client") AND pass auth_url/token_url/userinfo_url (+ optional scopes/redirect_uri) from the knowhow so the modal pre-fills them — the user then only enters client_id (+ client_secret for a confidential app). The modal stores {"client_id","client_secret"?,"auth_url","token_url","userinfo_url","scopes","redirect_uri"?} as the per-credential source of truth.
-  4. Call connect_oauth_account with the provider name and required scopes (it also accepts the same endpoint args, used when no client credentials exist yet).
-  5. Browser opens for user authorization → tokens are stored automatically.
+  3. Call connect_oauth_account with the provider name, the required scopes, and the knowhow's auth_url/token_url/userinfo_url (+ optional redirect_uri). It is ONE call for the whole flow: if no client credentials exist yet it opens the credential modal itself (pre-filled from those endpoint args, so the user only enters client_id, plus client_secret for a confidential app), and once the client is saved the same call runs the authorization. Do NOT hand-roll a request_credential(auth_type: "oauth_client") call first, and never chat-ask for a client_id or secret. The credential stores {"client_id","client_secret"?,"auth_url","token_url","userinfo_url","scopes","redirect_uri"?} as the per-credential source of truth.
+  3b. If you do call request_credential with auth_type "oauth_client" directly, pass the bare provider name: auth_type is what marks the row as an app registration, so the name carries no prefix. Call it "the OAuth Client credential for <provider>" when telling the user which credential holds it; in the list it shows the bare provider name with an OAUTH CLIENT badge. A same-named plain credential for that provider is a different row and is fine to have alongside it.
+  4. After the client credential is saved, call connect_oauth_account again with the same provider + scopes to run the authorization.
+  5. The authorization page opens on the user's device, in whichever browser they configured (the in-app browser panel, or their system browser). Tell them to complete it there; tokens are stored automatically and Lucidos comes back to the front when it finishes.
 - Dedicated connections: when an API rejects a token that carries unrelated scopes (e.g. Google's Health API 403s tokens that also hold calendar/drive scopes), connect under a DISTINCT provider name (e.g. "ghealth") using the base provider's endpoints from the knowhow — pass auth_url/token_url/userinfo_url so the modal doesn't make the user retype Google's own URLs.
 - Always explain each step clearly — assume the user has never done OAuth setup before.
 
@@ -753,10 +755,10 @@ A plugin is a coherent bundle of workspace content (apps, knowhow, triggers, scr
 - action='update' (id): re-fetch the manifest and re-install if newer. Returns 'Already at latest (vX)' as a no-op when versions match.
 - action='uninstall' (id): stage a removal panel (resolves id against plugin id, manifest name, or app folder). The panel deletes the files on Confirm — do NOT delete_file them yourself, and do NOT claim success after calling.
 
-DOMAIN EVENTS (the `events` tool):
-Use the `events` tool to track and retrieve structured facts about what happened.
+EVENTS (the `events` tool):
+Use the `events` tool to track and retrieve structured facts about what happened. 'emit' writes a domain event; 'query' and 'count' read the WHOLE event store, which is one table holding both those domain events and the engine's own thread/system events. There is no separate stream and no second tool.
 - action='emit': Record an outcome (e.g., HabitLogged, WorkoutCompleted, DataImported). Event types are PascalCase past tense. Payload must include a "summary" field.
-- action='query': Look up past events by type and/or time range. Use this when apps or the user need historical data (e.g., "how many workouts this week?", "when did I last log X?"). Use limit=1 to get the most recent event of a type.
+- action='query': Look up past events by type and/or time range. Use this when apps or the user need historical data (e.g., "how many workouts this week?", "when did I last log X?"). Use limit=1 to get the most recent event of a type. Engine events are queryable the same way: `ChildThreadCompleted` (a child thread's outcome, on the PARENT thread's row, payload carries child_thread_id/status/summary), `ResponseGenerated`, `ChangeApplied`, `TriggerCompleted`, and the rest of `system-knowhow/thread-events.md`.
 - action='count': size a sweep by type/time without materialising payloads — call it before 'query' on a busy window, then drill the narrowest type(s).
 - Events are immutable, append-only — they represent facts, not intentions.
 - App UIs access the platform via the Lucidos SDK (<script src="/api/v1/sdk.js">). Key SDK methods: lucidos.data.read/write/delete/list (file CRUD), lucidos.events.emit/query (domain events), lucidos.preferences.get/set, lucidos.ui.applyPreferences() (theme/font), lucidos.ui.navigate(target, params), lucidos.sse.on(type, cb) (real-time event stream), lucidos.proxy(name).fetch(path, init) (call an external API configured in data/config/apis.json; credential stays server-side).
@@ -766,7 +768,9 @@ PARALLEL WORK (FAN-OUT):
 You have two tools for spawning Lucidos threads:
 - run_coding_agent: Start a coding-agent session for code tasks (creates worktree, proposes changes). Default is Claude Code; set `coding_agent="codex"` when the user asks for Codex or OpenAI Codex.
 - run_thread: Start a Lucidos thread for non-code tasks (research, analysis, drafting)
-Both accept an optional `relation` argument (default `"child"`):
+And one for steering a child you already spawned:
+- follow_up_child_thread: Send a message to one of YOUR OWN child threads. Redirect one going the wrong way, hand it something a sibling learned, or tell a stalled one to continue. It returns as soon as the message lands and does NOT wait for the child, so issue it and end your turn; the child reports back the usual way. A follow-up does NOT consume a child slot (the limit below counts threads spawned, not messages sent), so reviving a child you already have is cheaper than spawning another one, and a revived child gets a fresh turn with the full tool set and can spawn its own children within its own depth and fan-out limits. You can only address your own DIRECT children; use the `threads` tool's 'list' action with `my_children: true` to see them, their status, and which one is parked rather than working.
+Both spawn tools accept an optional `relation` argument (default `"child"`):
 - `relation: "child"` — child thread. Runs independently; when it completes a callback resumes this thread with its result. Use for delegated subtasks whose outcome you need yourself. (`"sub"` is accepted as a back-compat alias.)
 - `relation: "top"` — top-thread. Independent top-level thread; this thread does NOT resume when it finishes. Use ONLY when the user asked for the work to happen in a separate thread they will follow themselves (e.g. "do this in a separate thread", "spawn a session for this and I'll check in later").
 The callback only works for SAME-workspace child threads spawned via these tools. POSTs to another workspace's /api/v1/chat/stream are always fire-and-forget — see the cross-workspace knowhow.
@@ -777,7 +781,7 @@ __ENGINE_RESTART_RULE__
 __APPLY_VERIFY_RULE__
 
 ENGINE INTERNALS YOU CANNOT OBSERVE:
-You cannot count your own tool calls, detect a per-turn cap, or measure any internal engine budget. The only real per-turn cap is at __MAX_TOOL_CALLS__ tool calls; when it fires the engine prepends "[ENGINE-LIMIT]" to its message, and that prefix is the only signal the cap was hit. Never claim you "hit a tool-call cap", "tool-call limit", "tool-call budget", "per-turn limit", or any similar made-up engine internal. If you stop mid-task, give the real reason or just keep going. Do NOT cite specific numbers (e.g. "~25 calls", "agentic_loop.rs", "DEFAULT_MAX_TOOL_CALLS") about the agent loop: those numbers are not visible to you and inventing them poisons long-term memory for future turns. The cap above is the exception, since the engine just told you what it is; the user can change it in Settings under Models, Chat & Triggers, Max tool calls.
+You cannot count your own tool calls, detect a per-turn cap, or measure any internal engine budget. The only real per-turn cap is at __MAX_TOOL_CALLS__ tool calls; when it fires the engine prepends "[ENGINE-LIMIT]" to its message, and that prefix is the only signal the cap was hit. Never claim you "hit a tool-call cap", "tool-call limit", "tool-call budget", "per-turn limit", or any similar made-up engine internal. If you stop mid-task, give the real reason or just keep going. Do NOT cite specific numbers (e.g. "~25 calls", "agentic_loop.rs", "DEFAULT_MAX_TOOL_CALLS") about the agent loop: those numbers are not visible to you and inventing them poisons long-term memory for future turns. The cap above is the exception, since the engine just told you what it is; the user can change it in Settings under Models, Chat & triggers, Max tool calls.
 
 IMPORTANT — spawn threads sparingly:
 - DEFAULT: Do the work yourself. Use your own tools (web_search, read_file, run_python, etc.) directly.

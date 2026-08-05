@@ -69,6 +69,21 @@ pub enum ThreadQueueRequest {
         /// not re-emit it.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         pre_emitted_origin: Option<Uuid>,
+        /// Who launched this thread, for the message route popover. Carried
+        /// separately from `parent_thread_id` because a `relation: "top"`
+        /// spawn has an origin but deliberately no callback linkage (see
+        /// `agentic_loop_special_tool::spawn_origin`). Persisted with the
+        /// request so a spawn that queues across a restart keeps it; absent on
+        /// rows written before the field existed, which fall back to the
+        /// linkage-derived origin in `synthesize_legacy_origin`.
+        ///
+        /// MUST be an `ActorMode::Agent` origin (or `None`): both emit sites
+        /// pass `ActorMode::Agent`, and `make_message_received` `.expect()`s on
+        /// a mode mismatch, so a `Device` origin here would panic the spawn
+        /// rather than mislabel it. That is why the plugin setup thread passes
+        /// `None` instead of the clicking device.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
     },
     /// `run_coding_agent` LLM tool — coding-agent thread spawn.
     CodingAgent {
@@ -90,6 +105,11 @@ pub enum ThreadQueueRequest {
         app_id: Option<String>,
         #[serde(default = "default_coding_agent")]
         coding_agent: CodingAgent,
+        /// Who launched this thread. Same split as `SubThread::origin`:
+        /// attribution for the popover, independent of the callback linkage
+        /// above, and Agent-mode for the same reason.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        origin: Option<MessageOrigin>,
     },
     /// Agent/Engine-mode `POST /api/v1/chat/submit` that starts a NEW thread —
     /// cross-workspace task POSTs and `lucidos spawn-thread` CLI calls.
@@ -260,6 +280,90 @@ mod tests {
         }
     }
 
+    /// A queued spawn can wait behind capacity and be re-fired after a restart,
+    /// so the attribution has to survive the jsonb round-trip. Both spawn kinds,
+    /// in the top-relation shape: origin present, callback linkage absent.
+    #[test]
+    fn spawn_requests_round_trip_attribution_without_linkage() {
+        use crate::engine::thread_events::ThreadDirection;
+
+        let origin = Some(MessageOrigin::ThreadLink {
+            thread_id: Uuid::new_v4(),
+            title: None,
+            spawning_event_id: Some(Uuid::new_v4()),
+            mode: ActorMode::Agent,
+            direction: ThreadDirection::Parent,
+        });
+
+        let sub = ThreadQueueRequest::SubThread {
+            prompt: "run it".into(),
+            child_thread_id: Uuid::new_v4(),
+            parent_thread_id: None,
+            spawning_event_id: None,
+            title: None,
+            model: None,
+            reasoning_effort: None,
+            pre_emitted_origin: None,
+            origin: origin.clone(),
+        };
+        let back: ThreadQueueRequest =
+            serde_json::from_value(serde_json::to_value(&sub).unwrap()).unwrap();
+        match back {
+            ThreadQueueRequest::SubThread {
+                origin: o,
+                parent_thread_id,
+                ..
+            } => {
+                assert_eq!(o, origin);
+                assert_eq!(parent_thread_id, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+
+        let cc = ThreadQueueRequest::CodingAgent {
+            prompt: "run it".into(),
+            cc_thread_id: Uuid::new_v4(),
+            image_hashes: vec![],
+            device_id: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            repo_id: None,
+            title: None,
+            app_id: None,
+            coding_agent: CodingAgent::ClaudeCode,
+            origin: origin.clone(),
+        };
+        let back: ThreadQueueRequest =
+            serde_json::from_value(serde_json::to_value(&cc).unwrap()).unwrap();
+        match back {
+            ThreadQueueRequest::CodingAgent {
+                origin: o,
+                parent_thread_id,
+                ..
+            } => {
+                assert_eq!(o, origin);
+                assert_eq!(parent_thread_id, None);
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    /// Rows written before the field existed must still deserialize, falling
+    /// back to the linkage-derived origin rather than failing the requeue.
+    #[test]
+    fn a_request_without_the_origin_field_still_deserializes() {
+        let json = serde_json::json!({
+            "type": "sub-thread",
+            "prompt": "legacy",
+            "child_thread_id": Uuid::new_v4(),
+        });
+        let back: ThreadQueueRequest = serde_json::from_value(json).unwrap();
+        match back {
+            ThreadQueueRequest::SubThread { origin, .. } => assert_eq!(origin, None),
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
     #[test]
     fn summary_prefers_trigger_name_and_truncates_prompts() {
         let req = ThreadQueueRequest::Cron {
@@ -281,6 +385,7 @@ mod tests {
             model: None,
             reasoning_effort: None,
             pre_emitted_origin: None,
+            origin: None,
         };
         let s = req.summary(None);
         assert!(

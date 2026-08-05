@@ -123,11 +123,6 @@ pub struct ArtifactManager {
 }
 
 impl ArtifactManager {
-    /// Resolve a relative artifact path to its full filesystem path.
-    pub fn artifact_path(&self, relative_path: &str) -> PathBuf {
-        self.workspace_path.join(ARTIFACTS_DIR).join(relative_path)
-    }
-
     pub fn new(workspace_path: PathBuf) -> Result<Self, git2::Error> {
         let artifacts_path = workspace_path.join(ARTIFACTS_DIR);
         if let Err(e) = fs::create_dir_all(&artifacts_path) {

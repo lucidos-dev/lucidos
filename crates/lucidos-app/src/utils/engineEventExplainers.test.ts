@@ -7,8 +7,10 @@ import {
 } from './engineEventExplainers';
 import {
   CONTINUATION_AUTO_RECOVERY_REASON,
+  CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
   CONTINUATION_USER_CLICKED_REASON,
+  continuationStartedSummary,
   type AbortCause,
   type CancelCause,
 } from '../store/thread-events';
@@ -112,6 +114,24 @@ describe('describeContinuationReason', () => {
 
   it('attributes a user-clicked Continue to the user', () => {
     expect(describeContinuationReason(CONTINUATION_USER_CLICKED_REASON)).toMatch(/^You clicked Continue/);
+  });
+
+  // An upstream drop is a LOCAL interruption too: the engine resumed one
+  // session, it did not restart. The explainer also has to say the retrying is
+  // bounded, or a user watching it resume twice has no way to know it will ever
+  // stop.
+  it('explains an api-error auto-resume without claiming a restart', () => {
+    const text = describeContinuationReason(CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON);
+    expect(text).not.toBeNull();
+    expect(text).toMatch(/dropped/i);
+    expect(text).toMatch(/nothing restarted/i);
+    expect(text).toMatch(/few times|at most/i);
+  });
+
+  // The turn header keys off the same reason and must agree with the popover.
+  it('labels the api-error resume an interruption in the turn header too', () => {
+    expect(continuationStartedSummary(CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON, undefined))
+      .toBe('Resumed after an interruption');
   });
 
   it('returns null for an unrecorded or unrecognized reason rather than inventing one', () => {

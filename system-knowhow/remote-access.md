@@ -1,6 +1,6 @@
 ---
 name: Remote Access & HTTPS
-description: Use when the user wants to reach Lucidos from a phone, tablet, or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "Serve is not enabled on your tailnet", "reverse proxy". Covers the Settings > Mobile Access page and what each of its controls does, the Expose run and the tailnet approval it can wait on, finding which gateway is listening on which port, the three routes to HTTPS (tailscale serve, mkcert, plain HTTP over the tunnel), and the per-device certificate trust steps.
+description: Use when the user wants to reach Lucidos from a phone, tablet, or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "Serve is not enabled on your tailnet", "reverse proxy". Covers the Settings > Access page and what each of its controls does, the Expose run and the tailnet approval it can wait on, finding which gateway is listening on which port, the three routes to HTTPS (tailscale serve, mkcert, plain HTTP over the tunnel), and the per-device certificate trust steps.
 ---
 
 # Remote Access & HTTPS
@@ -192,12 +192,12 @@ tailscale serve status                                   # verify the mapping
 tailscale cert mymac.tailnet-name.ts.net                 # provision/inspect the cert
 ```
 
-The packaged desktop app does this for the user: **Settings → Mobile Access**
+The packaged desktop app does this for the user: **Settings → Access**
 runs `tailscale serve --bg --https=443 http://127.0.0.1:<port>` behind its
 **Expose** button, waits out the tailnet approval above if one is needed, and
 then shows the resulting `https://mymac.tailnet-name.ts.net` URL. Prefer
 pointing the user there over hand-running commands when they are on the packaged
-app. See § Settings → Mobile Access below for what the page can and cannot do,
+app. See § Settings → Access below for what the page can and cannot do,
 and § The Expose run for the steps it goes through.
 
 **`serve` syntax changed in CLI 1.52, and the old form has since been removed.**
@@ -340,10 +340,13 @@ Other mkcert gotchas:
 app including push, with no certificate at all, because **localhost is a secure
 origin**. Useless on a phone, ideal for a second laptop.
 
-## Settings → Mobile Access
+## Settings → Access
 
 The page that drives all of this. Point the user here before hand-running
-commands.
+commands. It was called **Mobile Access** until 2026-08-05, when the **Network
+access** bind setting (previously a Settings → System subpanel this page had to
+deep-link into) moved onto the bottom of it: reaching this engine from another
+device is one question, and its two halves now sit together.
 
 **It answers two independent questions, and never muddles them.** They are
 numbered on the page in the order the setup happens, because the first has to be
@@ -416,7 +419,8 @@ the neutral phrasing is "install Lucidos".
   here, which is Route D.
 - **Local network**: shown only when the gateway is bound beyond loopback. Plain
   HTTP, so no PWA install and no push. Bound to loopback (the packaged default)
-  the row points at Settings → Network access instead of printing a dead URL.
+  the row points at the **Network access** section further down this same page
+  instead of printing a dead URL.
 - **Tailscale**: the tailnet IP over plain HTTP until `serve` is configured, and
   the `https://...ts.net` URL once it is. See the detection trap below for why
   the HTTPS one appears only after serving is proven.
@@ -527,7 +531,7 @@ The inverse trap exists too: a `serve` mapping that *exists* does not prove it
 works, because the certificate may never have provisioned (the account toggle
 above).
 
-The Mobile Access page now follows this rule rather than guessing: it publishes
+The Access page now follows this rule rather than guessing: it publishes
 the `https://...ts.net` URL only after probing **port 443 on the tailnet
 address** and finding something answering. Before that it shows the plain-HTTP
 tailnet URL, which is honest about what works today. It previously showed the
@@ -556,7 +560,7 @@ bound beyond loopback. `tailscale serve` does not, since it proxies locally.
 - Machine-global config lives in `~/.lucidos/network.toml`:
   `[gateway] bind = "loopback" | "all" | "<IP>"` plus `[engine] inherit`.
 - Edit it from the **workspace picker → Settings → Network access** (the
-  gateway bind), or per workspace in **Settings → System → Network access** (the
+  gateway bind), or per workspace in **Settings → Access → Network access** (the
   engine bind, when `inherit` is off).
 - `./install.sh --bind all` writes the same file.
 - Default is **loopback**, and a malformed value fails safe to loopback, never

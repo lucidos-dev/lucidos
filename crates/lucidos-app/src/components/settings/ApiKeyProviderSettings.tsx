@@ -2,6 +2,7 @@ import { useState } from 'preact/hooks';
 import type { ComponentChildren } from 'preact';
 import { credentials } from '../../store/store';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
+import { findProviderCredential } from './providerCredential';
 
 /** Shared block for a provider that authenticates with a single API key stored
  *  as an `api_key` credential (OpenAI, OpenRouter). The secret is write-only —
@@ -20,10 +21,7 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
   note: ComponentChildren;
 }) {
   const credLoadable = credentials.value;
-  const existing =
-    credLoadable.status === 'loaded'
-      ? credLoadable.data.find((c) => c.service_name === service)
-      : undefined;
+  const existing = findProviderCredential(credLoadable, service);
 
   const [secret, setSecret] = useState('');
   const [saving, setSaving] = useState(false);
@@ -44,12 +42,16 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
       <div class="settings-row">
         <span class="settings-row-label">
           {label}
-          {existing && <span class="list-row-details"> · configured</span>}
+          {/* `.list-row-details` is `display: flex`, so this span is a block box
+              inside the label's line and renders UNDER it. A manual "·" glue
+              would therefore be stranded at the start of that new line, the
+              same artifact the rule in `.claude/rules/frontend.md` names. */}
+          {existing && <span class="list-row-details">configured</span>}
         </span>
         {existing && (
           <button
             class="action-btn action-btn-danger"
-            onClick={() => void deleteCredential(service)}
+            onClick={() => void deleteCredential(existing.id, service)}
           >
             Remove
           </button>

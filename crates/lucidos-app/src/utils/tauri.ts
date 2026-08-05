@@ -144,6 +144,23 @@ export async function dismissNativeNotification(opts: {
 }
 
 /**
+ * Bring the native main window to the front (Rust `focus_main_window`): leave
+ * menu-bar-only, unminimize, show, focus, activate frontmost. The same reshow the
+ * tray's "Open Lucidos" and a notification tap perform.
+ *
+ * For the one flow that finishes OUTSIDE the app: an OAuth authorization the
+ * user completes in a browser, after which they'd otherwise be left on the
+ * callback tab with Lucidos behind it. Not a general "focus me" the page may
+ * call freely. A window that fronts itself on a background event is a nuisance,
+ * so keep callers to "this device started it, the user clicked seconds ago,
+ * fires once". Best-effort: errors are swallowed (there is no window to front on
+ * a failed IPC, and the connection itself already succeeded). Only call when
+ * isTauri() is true. */
+export function focusMainWindow(): void {
+  invoke('focus_main_window').catch(() => {});
+}
+
+/**
  * Wake the native dock-badge loop for an immediate recompute (Rust
  * `nudge_dock_badge` command). The page calls this from its notification SSE
  * handler so the macOS dock badge updates the instant a notification is read —
@@ -369,13 +386,6 @@ export type TailscaleServeProgress =
   | { phase: 'done'; url: string }
   | { phase: 'failed'; message: string }
   | { phase: 'cancelled' };
-
-/** A frame describing a run still IN FLIGHT. The three terminal phases END a run
- *  rather than describe one, so the badge drops them and the toast settles. */
-export type TailscaleServeRunning = Exclude<
-  TailscaleServeProgress,
-  { phase: 'done' | 'failed' | 'cancelled' }
->;
 
 /** Listen for a Tauri event. Returns an unlisten function. Only call when isTauri() is true. */
 export function listen<T>(event: string, handler: (e: { payload: T }) => void): Promise<() => void> {

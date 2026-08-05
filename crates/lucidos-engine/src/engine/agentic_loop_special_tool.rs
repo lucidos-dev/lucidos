@@ -94,6 +94,36 @@ pub(crate) fn parse_coding_agent(
     }
 }
 
+/// The ATTRIBUTION half of a spawn: the `MessageOrigin` to stamp on the spawned
+/// thread's first `MessageReceived` so the message route popover names and links
+/// the thread that launched it.
+///
+/// Takes no [`Relation`], and that is the invariant rather than an oversight:
+/// both relations were launched by the same thread and the popover should say so
+/// either way. Only the CALLBACK half varies, in [`Relation::spawn_linkage`].
+/// For `Child` this is exactly what `synthesize_legacy_origin` would have built
+/// from the linkage, so a child spawn's persisted payload is unchanged; for
+/// `Top` it is the same origin carried *without* linkage, which is the fix.
+///
+/// `direction: Parent` because from the spawned thread's point of view the
+/// linked thread is the one that started it, whatever the relation. Origin
+/// without linkage is an established shape here, not a new one:
+/// `build_follow_up_message` (`chat/child_follow_up.rs`) already emits a
+/// `MessageReceived` this way so a follow-up attributes to the parent without
+/// re-counting the child.
+pub(crate) fn spawn_origin(
+    spawning_thread_id: Uuid,
+    tool_called_event_id: Option<Uuid>,
+) -> Option<crate::engine::thread_events::MessageOrigin> {
+    Some(crate::engine::thread_events::MessageOrigin::ThreadLink {
+        thread_id: spawning_thread_id,
+        title: None,
+        spawning_event_id: tool_called_event_id,
+        mode: ActorMode::Agent,
+        direction: crate::engine::thread_events::ThreadDirection::Parent,
+    })
+}
+
 fn coding_agent_label(agent: crate::runtime::CodingAgent) -> &'static str {
     match agent {
         crate::runtime::CodingAgent::ClaudeCode => "Claude Code",
@@ -106,6 +136,13 @@ impl Relation {
     /// into the spawn helpers. `Child` carries the spawning thread + tool
     /// call event through; `Top` drops both so the spawned thread has no
     /// parent linkage and `notify_parent_if_child` early-returns.
+    ///
+    /// This is the CALLBACK half of a spawn, and it is deliberately not the
+    /// same thing as [`spawn_origin`]: the linkage answers "do I report back to
+    /// them" (callback + `active_children_count` + the projection's
+    /// `parent_thread_id`), the origin answers "who launched me" (display
+    /// attribution). Collapsing the two is what made a `Top` spawn render its
+    /// Origin as "Unknown".
     pub(crate) fn spawn_linkage(
         self,
         spawning_thread_id: Uuid,
@@ -367,6 +404,7 @@ impl LucidosEngine {
                 }
                 let (parent_thread_id, spawning_event_id) =
                     relation.spawn_linkage(thread_id, tool_called_event_id);
+                let origin = spawn_origin(thread_id, tool_called_event_id);
 
                 // `folder` is the new canonical parameter; `repo` is the
                 // deprecated alias kept for one release (temporary measure —
@@ -556,6 +594,7 @@ impl LucidosEngine {
                     title: caller_title.map(str::to_string),
                     app_id: spawn_app_id,
                     coding_agent,
+                    origin,
                 };
                 let outcome = self.thread_queue.submit(request, None, None).await;
                 Some(if outcome.admitted {
@@ -580,6 +619,7 @@ impl LucidosEngine {
                 };
                 let (parent_thread_id, spawning_event_id) =
                     relation.spawn_linkage(thread_id, tool_called_event_id);
+                let origin = spawn_origin(thread_id, tool_called_event_id);
                 Some(
                     match LucidosEngine::check_thread_recursion_guard(&self.pool, thread_id).await {
                         Err(guard_err) => format!("Error: {}", guard_err),
@@ -605,6 +645,7 @@ impl LucidosEngine {
                                     model: chat_model,
                                     reasoning_effort: chat_effort,
                                     pre_emitted_origin: None,
+                                    origin,
                                 };
                             let outcome = self.thread_queue.submit(request, None, None).await;
                             if outcome.admitted {
@@ -1133,5 +1174,111 @@ mod tests {
         );
         assert!(text.contains("Codex session"), "{text}");
         assert!(!text.contains("Claude Code"), "{text}");
+    }
+
+    // --- linkage vs attribution --------------------------------------------
+
+    /// A `Top` spawn reports back to nobody: no parent linkage, so
+    /// `notify_parent_if_child` early-returns and the projection's spawn branch
+    /// never bumps the spawning thread's counts.
+    #[test]
+    fn top_spawn_carries_no_callback_linkage() {
+        let spawning_thread = Uuid::new_v4();
+        let tool_call = Uuid::new_v4();
+        assert_eq!(
+            Relation::Top.spawn_linkage(spawning_thread, Some(tool_call)),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn child_spawn_carries_the_callback_linkage() {
+        let spawning_thread = Uuid::new_v4();
+        let tool_call = Uuid::new_v4();
+        assert_eq!(
+            Relation::Child.spawn_linkage(spawning_thread, Some(tool_call)),
+            (Some(spawning_thread), Some(tool_call))
+        );
+    }
+
+    /// The bug this pair of methods exists to prevent: a `Top` spawn dropped the
+    /// linkage AND the attribution, so its route popover said "Unknown". The
+    /// origin names the spawning thread regardless of relation.
+    #[test]
+    fn every_spawn_is_attributed_to_its_spawning_thread() {
+        use crate::engine::thread_events::{MessageOrigin, ThreadDirection};
+        let spawning_thread = Uuid::new_v4();
+        let tool_call = Uuid::new_v4();
+        let expected = MessageOrigin::ThreadLink {
+            thread_id: spawning_thread,
+            title: None,
+            spawning_event_id: Some(tool_call),
+            mode: ActorMode::Agent,
+            direction: ThreadDirection::Parent,
+        };
+        assert_eq!(
+            spawn_origin(spawning_thread, Some(tool_call)),
+            Some(expected)
+        );
+    }
+
+    /// `make_message_received` `.expect()`s on an origin whose `mode()` disagrees
+    /// with the carried `ActorMode`, and both spawn paths emit with
+    /// `ActorMode::Agent`. Pin the pairing so a drift is a failed test rather
+    /// than a panic in the Thread Queue prepare hook.
+    #[test]
+    fn spawn_origin_mode_matches_the_agent_emit_sites() {
+        let origin = spawn_origin(Uuid::new_v4(), None).expect("always Some");
+        assert_eq!(origin.mode(), ActorMode::Agent);
+    }
+
+    /// A child spawn's payload must not change: the explicit origin has to equal
+    /// what `synthesize_legacy_origin` built from its linkage before this split
+    /// existed. Compared through a real `MessageReceived`, which is where the
+    /// two meet.
+    #[test]
+    fn child_spawn_origin_equals_what_legacy_synthesis_produced() {
+        use crate::engine::thread_events::ThreadEvent;
+        let spawning_thread = Uuid::new_v4();
+        let tool_call = Uuid::new_v4();
+        let workspace = std::path::Path::new("/tmp/lucidos-test-ws");
+        let (parent_thread_id, spawning_event_id) =
+            Relation::Child.spawn_linkage(spawning_thread, Some(tool_call));
+
+        // `explicit_origin: None` takes the legacy-synthesis branch.
+        let synthesized = crate::engine::chat::make_message_received(
+            workspace,
+            "do the thing",
+            None,
+            None,
+            None,
+            parent_thread_id,
+            spawning_event_id,
+            ActorMode::Agent,
+            None,
+            None,
+            None,
+        );
+        let explicit = crate::engine::chat::make_message_received(
+            workspace,
+            "do the thing",
+            None,
+            None,
+            None,
+            parent_thread_id,
+            spawning_event_id,
+            ActorMode::Agent,
+            None,
+            None,
+            spawn_origin(spawning_thread, Some(tool_call)),
+        );
+        let (
+            ThreadEvent::MessageReceived { origin: a, .. },
+            ThreadEvent::MessageReceived { origin: b, .. },
+        ) = (&synthesized, &explicit)
+        else {
+            panic!("make_message_received returns MessageReceived");
+        };
+        assert_eq!(a, b, "a child spawn's persisted origin must be unchanged");
     }
 }

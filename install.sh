@@ -13,10 +13,11 @@
 # and spawns the engine — the same runtime model as the macOS .app). First run is
 # seconds, not minutes.
 #
-#   The tarballs are built by .github/workflows/release-tarballs.yml and attached
-#   to each published GitHub Release automatically (release: published trigger).
-#   They land ~30 min AFTER the Release is cut, so a download run started in that
-#   window can still 404 on a brand-new version. Alternatives if it does:
+#   The tarballs are built by .github/workflows/release-tarballs.yml on the v*
+#   tag push and attached to the Release while it is still a DRAFT, which is
+#   only published once all four are on it. So every visible release carries
+#   them: there is no window in which a brand-new version 404s. Alternatives if
+#   a download fails anyway:
 #     • --version <older>       install the previous release's tarball
 #     • --dev / --source        build from source (clones + compiles)
 #     • --from-tarball <path>   install a tarball you built with scripts/build-headless.sh
@@ -40,7 +41,7 @@
 # copy the user actually piped in (see the piped branch below). release.sh
 # rewrites this line in the same step that bumps RELEASE; install_test.sh and
 # version_sources_test.sh assert the two match.
-LUCIDOS_DEFAULT_VERSION="0.21.0"
+LUCIDOS_DEFAULT_VERSION="0.22.0"
 # Where a PIPED dash run re-fetches itself from. A mirror that serves this script
 # under its own domain (lucidos.dev) rewrites this line at publish time so the
 # re-fetch pulls THE SAME copy, not whatever github main happens to hold.
@@ -364,11 +365,10 @@ download_failed() {
     die "Download failed: $url
 
        Likely causes:
-         • The release is brand new. CI attaches the per-platform tarballs
-           (.github/workflows/release-tarballs.yml) ~30 min AFTER the GitHub
-           Release is published, so a run started in that window still 404s.
          • No tarball was published for this platform. The published triples are
-           macOS arm64/x86_64 and Linux x86_64/aarch64.
+           macOS arm64/x86_64 and Linux x86_64/aarch64. A release is held as a
+           draft until all four are attached, so this means it was published
+           deliberately incomplete or the asset was removed.
          • The network / a proxy blocked github.com.
 
        Working alternatives:
@@ -749,7 +749,7 @@ VERTEX_REGION=$VERTEX_REGION"
 # (e.g. from `tailscale cert`, mkcert, or a real CA) makes the gateway serve
 # https so remote devices get the full experience. Remote reachability itself is
 # separate: the gateway binds loopback-only until changed via --bind (which
-# writes the machine-global network.toml) or Settings → System → Network access.
+# writes the machine-global network.toml) or Settings → Access → Network access.
 
 # tls_enabled — true iff both TLS paths were supplied (validated below).
 tls_enabled() { [ -n "$LUCIDOS_TLS_CERT" ] && [ -n "$LUCIDOS_TLS_KEY" ]; }
@@ -1435,7 +1435,7 @@ Flags:
                         worker, PWA install, web push notifications — over https;
                         plain http limits those to localhost. Works with certs from
                         'tailscale cert', mkcert, or a real CA. Remote reachability
-                        itself is separate: --bind (or Settings → System → Network
+                        itself is separate: --bind (or Settings → Access → Network
                         access; the gateway binds loopback-only by default). Like
                         provider creds, TLS is baked from THIS run's flags — re-run
                         with them when re-registering, or the service reverts to http.
@@ -1484,10 +1484,10 @@ Stop + remove with ./uninstall.sh --name <slug> (or ./install.sh --uninstall);
 add --purge to also delete data. Both are repo scripts and the runtime lays down
 no copy, so a piped install needs uninstall.sh downloaded from the repository.
 
-NOTE: CI attaches the per-platform tarballs to each published GitHub Release
-~30 min after it is cut, so a download started in that window can still 404 on a
-brand-new version. Then use --version <older-version>, retry shortly, or fall
-back to --dev / --from-tarball <path>.
+NOTE: every published GitHub Release carries the per-platform tarballs: CI
+attaches them while the release is still a draft, and it is published only once
+all four are on it. If a download 404s anyway, use --version <older-version> or
+fall back to --dev / --from-tarball <path>.
 EOF
 }
 

@@ -167,7 +167,7 @@ impl ModelStore {
     }
 
     /// Toggle a model's enabled flag without touching its other fields. Works on
-    /// builtin rows too (the disable-only path). Returns whether a row existed.
+    /// builtin rows too (the disable-only path).
     /// Returns `None` when no such model exists, `Some(changed)` otherwise.
     /// `rows_affected` cannot answer "changed": Postgres writes a new tuple
     /// version even when the value is identical. The self-join reads the

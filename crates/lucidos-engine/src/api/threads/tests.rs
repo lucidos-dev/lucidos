@@ -18,6 +18,18 @@ fn row(event_type: &str, payload: serde_json::Value) -> ThreadEventRow {
     }
 }
 
+/// `Router::route` inserts into matchit eagerly and PANICS on a conflict, so
+/// simply building the router is the assertion. Worth a test of its own
+/// because the `/threads` surface mixes two path-param names (`:thread_id` on
+/// most routes, `:id` on the bare leaf and its two children) and the rule that
+/// makes that legal is narrow: only ONE bare `/threads/<param>` leaf may
+/// exist. A future route that gets the name wrong takes the whole engine down
+/// at startup, which is a bad place to find out.
+#[test]
+fn the_threads_router_builds_with_both_path_param_names() {
+    let _router = super::router();
+}
+
 #[test]
 fn read_time_strip_replaces_image_content_in_tool_result() {
     let huge_b64 = "A".repeat(2 * 1024 * 1024);

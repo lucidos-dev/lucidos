@@ -113,7 +113,18 @@ function applyEventRules(agg: ThreadAggregate, event: ThreadEvent | TransientEve
   if (setRunning.has(t)) out.status = 'running';
   else if (setIdle.has(t)) out.status = 'idle';
   else if (t === 'ResponseFailed') out.status = 'failed';
-  else if (t === 'ResponseAborted') out.status = out.codingAgentProposed ? 'waiting' : 'failed';
+  // Mirrors `AbortCause::status_sql()`: a TRANSIENT cause (an engine restart
+  // interrupted the turn) settles at 'paused', a real failure at 'failed', and
+  // 'stale_settle' at the cancel-style idle/waiting. Pending changes override
+  // every arm.
+  else if (t === 'ResponseAborted') {
+    const cause = (event as { cause?: string }).cause;
+    out.status = out.codingAgentProposed
+      ? 'waiting'
+      : cause === 'stale_settle' ? 'idle'
+      : cause === 'engine_shutdown' || cause === 'recovery_after_restart' ? 'paused' as ThreadStatus
+      : 'failed';
+  }
   else if (t === 'UserQuestionAsked' || t === 'CodingAgentPermissionRequest' || t === 'CommandPermissionRequested' || t === 'McpPermissionRequested') out.status = 'waiting_for_user_answer' as ThreadStatus;
   else if (conditionalWaitingIdle.has(t)) out.status = out.codingAgentProposed ? 'waiting' : 'idle';
 

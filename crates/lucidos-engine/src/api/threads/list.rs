@@ -218,6 +218,26 @@ pub struct ListThreadSummariesQuery {
     /// handler; the count handler ignores it.
     #[serde(default)]
     pub limit: Option<i64>,
+    /// Restrict to the direct children of this thread id. Always a literal
+    /// uuid: HTTP has no ambient caller, so there is no "self" to resolve. The
+    /// LLM tool's `my_children` argument is the surface that resolves the
+    /// caller's own id, from its ambient `thread_id`.
+    #[serde(default)]
+    pub parent: Option<String>,
+}
+
+/// Parse the `parent` query param. A malformed uuid is a 400 rather than a
+/// silent "no filter", which would quietly return the whole workspace.
+fn parse_parent_filter(raw: &Option<String>) -> Result<Option<uuid::Uuid>, (StatusCode, String)> {
+    match raw.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(None),
+        Some(s) => s.parse::<uuid::Uuid>().map(Some).map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid parent thread id: {s}"),
+            )
+        }),
+    }
 }
 
 fn canonical_source_filter_value(value: String) -> String {
@@ -256,6 +276,7 @@ pub(in crate::api) async fn list_thread_summaries(
     Query(q): Query<ListThreadSummariesQuery>,
 ) -> Result<Json<Vec<ThreadSummary>>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
+    let parent = parse_parent_filter(&q.parent)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let summaries = state
         .engine
@@ -263,6 +284,7 @@ pub(in crate::api) async fn list_thread_summaries(
         .list_thread_summaries(ThreadSummaryFilters {
             active: q.active,
             sources: sources.as_deref(),
+            parent,
             limit,
         })
         .await
@@ -278,7 +300,7 @@ pub(in crate::api) async fn list_thread_summaries(
 
 /// GET /api/v1/threads/:id — a single thread's summary by id (404 if the
 /// id isn't in the projection). Registered on the same `/threads/:id` leaf as
-/// `delete_thread` (see `create_router`), so the param name is `:id`. The
+/// `delete_thread` (see `api::threads::router`), so the param name is `:id`. The
 /// lightweight by-id complement to `/api/v1/threads/list`: the message-route
 /// popover uses it to resolve a cross-workspace Origin's thread name from the
 /// *source* workspace's engine
@@ -317,6 +339,7 @@ pub(in crate::api) async fn count_thread_summaries(
     Query(q): Query<ListThreadSummariesQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
+    let parent = parse_parent_filter(&q.parent)?;
     let count = state
         .engine
         .event_store()
@@ -326,6 +349,7 @@ pub(in crate::api) async fn count_thread_summaries(
         .count_thread_summaries(ThreadSummaryFilters {
             active: q.active,
             sources: sources.as_deref(),
+            parent,
             limit: 0,
         })
         .await

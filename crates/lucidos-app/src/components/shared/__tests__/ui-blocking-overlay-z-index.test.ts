@@ -68,16 +68,33 @@ describe('ui-blocking overlay z-index (only toasts above the blocker)', () => {
     expect(flipPortalZ).toBeGreaterThan(TOKENS['z-control-panel']);
   });
 
+  // A fullscreen app owns the screen. Before --z-app-fullscreen existed the
+  // panel sat at --z-tooltip and was above the portal by a mile; at 2250 the
+  // ordering has to be stated, or a drawer thread whose status changes flies
+  // across an app the reader put in fullscreen.
+  it('a flying drawer thread stays below a fullscreen app panel', () => {
+    expect(flipPortalZ).toBeLessThan(TOKENS['z-app-fullscreen']);
+  });
+
   it('only the toast layer sits above the blocking overlay', () => {
     expect(TOKENS['z-toast']).toBeGreaterThan(overlayZ);
   });
 
-  it('tooltip-layer elements are pulled below the overlay while blocked', () => {
-    // Both --z-tooltip (10000) consumers, the JS tooltip and a pseudo-fullscreen
-    // app iframe, outrank the overlay in normal use; :root[data-ui-blocked]
-    // makes them step aside. (A third one, the landscape rotate lock, was
-    // deleted when rotation stopped being an error state.)
+  it('the tooltip layer is pulled below the overlay while blocked', () => {
+    // The JS tooltip is the one --z-tooltip (10000) consumer that outranks the
+    // overlay in normal use; :root[data-ui-blocked] makes it step aside. (Two
+    // others are gone: the landscape rotate lock, deleted when rotation stopped
+    // being an error state, and a pseudo-fullscreen app panel, which moved to
+    // --z-app-fullscreen so host modals and toasts can paint over a fullscreen
+    // app.)
     expect(modalCss).toMatch(/:root\[data-ui-blocked\]\s+#tooltip\s*\{[^}]*display:\s*none/);
-    expect(modalCss).toMatch(/:root\[data-ui-blocked\][^{]*\.app-ui-fullscreen/);
+  });
+
+  // The pseudo-fullscreen app panel needs no data-ui-blocked override anymore:
+  // it is below the blocker by construction. An override reintroduced here
+  // would mean the panel had climbed back above the modal layer.
+  it('a pseudo-fullscreen app panel needs no override, being below the blocker', () => {
+    expect(TOKENS['z-app-fullscreen']).toBeLessThan(overlayZ);
+    expect(modalCss).not.toMatch(/:root\[data-ui-blocked\][^{]*\.app-ui-fullscreen/);
   });
 });

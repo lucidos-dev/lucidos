@@ -25,15 +25,38 @@ use crate::engine::thread_lifecycle::{self, ArchiveState, ThreadType};
 /// `coding_agent_proposed` column (and `is_blocking` clause 3) instead.
 pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = "'idle'";
 
-/// Wrap a `status` target so a `'failed'` verdict already on the row survives.
+/// The `status` values that are a **verdict about how the turn ended**, rather
+/// than a resting state the next event may freely overwrite. Both are written by
+/// exactly one place each: `'failed'` by `ResponseFailed` and by
+/// `AbortCause::status_sql()`'s non-transient arm, `'paused'` by that same
+/// function's transient arm (an engine restart interrupted the turn).
 ///
-/// `'failed'` is a *terminal verdict* about the turn (`ResponseFailed`, or a
-/// `ResponseAborted` whose cause maps to failed). Only a real start event —
-/// `MessageReceived`, `CodingAgentUserMessageSent`, `UserPromptInjected`,
-/// `CodingAgentPromptSent`, `ContinuationRequested`, … — may clear it, because
+/// They share this list because they share the hazard: each is emitted at the
+/// moment a coding-agent turn dies, and each is followed by that turn's trailing
+/// events. See [`preserving_verdict`].
+pub(super) const PRESERVED_STATUS_VERDICTS: &[&str] = &["failed", "paused"];
+
+/// [`PRESERVED_STATUS_VERDICTS`] as a SQL `IN (...)` body. Every name is a
+/// compile-time literal, so there is nothing to parameterize and nothing to
+/// escape. Built once: the projection interpolates it on every status write.
+pub(super) static PRESERVED_STATUS_VERDICTS_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        PRESERVED_STATUS_VERDICTS
+            .iter()
+            .map(|v| format!("'{v}'"))
+            .collect::<Vec<_>>()
+            .join(",")
+    });
+
+/// Wrap a `status` target so a verdict already on the row survives.
+///
+/// A verdict (see [`PRESERVED_STATUS_VERDICTS`]) is a statement about how the
+/// turn ended: it failed, or an engine restart interrupted it. Only a real start
+/// event (`MessageReceived`, `CodingAgentUserMessageSent`, `UserPromptInjected`,
+/// `CodingAgentPromptSent`, `ContinuationRequested`, …) may clear one, because
 /// only those mean new work was actually requested. Every event that merely
-/// *closes out* the failed turn has to leave the verdict alone, or the red
-/// error dot disappears from the thread list while the failure still stands.
+/// *closes out* the ended turn has to leave the verdict alone, or the status dot
+/// reverts to idle while the interruption or failure still stands.
 ///
 /// This matters far more for coding agents than for the Lucidos Agent, which
 /// is why the two channels visibly disagreed before this was applied
@@ -49,8 +72,11 @@ pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = "'idle'";
 /// stays as-is and this guard lives in the projection SQL — see the note on
 /// `CodingAgentIdled` there. The `terminal_events_never_set_running`
 /// invariant is unaffected.
-pub(super) fn preserving_failed(target: &str) -> String {
-    format!("CASE WHEN status = 'failed' THEN 'failed' ELSE {target} END")
+pub(super) fn preserving_verdict(target: &str) -> String {
+    format!(
+        "CASE WHEN status IN ({verdicts}) THEN status ELSE {target} END",
+        verdicts = &*PRESERVED_STATUS_VERDICTS_SQL,
+    )
 }
 
 /// SET fragment that clears every CC-state column on `thread_summaries` —

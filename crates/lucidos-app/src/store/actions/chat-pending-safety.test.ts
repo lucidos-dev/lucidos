@@ -19,7 +19,7 @@ import { refreshThreadEvents } from './thread-loading';
 // other consumers in chat.ts's import graph are unaffected.
 vi.mock('./thread-loading', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./thread-loading')>();
-  return { ...actual, refreshThreadEvents: vi.fn().mockResolvedValue(undefined) };
+  return { ...actual, refreshThreadEvents: vi.fn().mockResolvedValue(true) };
 });
 
 function makeThread(id = 'thread-1'): ThreadState {
@@ -166,7 +166,10 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
   });
 
   it('keeps a stale pending message when the safety refetch FAILS, and retries', async () => {
-    vi.mocked(refreshThreadEvents).mockRejectedValue(new Error('contention'));
+    // Resolves FALSE, not rejects. `refreshThreadEvents` catches every path, so
+    // the rejection this used to mock is a shape it cannot produce: the gate
+    // read as always-succeeded in production while looking tested here.
+    vi.mocked(refreshThreadEvents).mockResolvedValue(false);
     const thread = makeThread();
     // Old enough that clearStalePendingMessages WOULD drop it — proving the
     // survival is due to the refetch-failure gate, not the recency window.
@@ -188,7 +191,7 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
   });
 
   it('force-clears a stale pending message when the safety refetch SUCCEEDS but the event is genuinely absent', async () => {
-    vi.mocked(refreshThreadEvents).mockResolvedValue(undefined);
+    vi.mocked(refreshThreadEvents).mockResolvedValue(true);
     const thread = makeThread();
     const staleTime = new Date(Date.now() - PENDING_MESSAGE_SAFETY_MS - 1000).toISOString();
     thread.pendingUserMessages.push({ text: 'never-persisted', eventId: 'e-gone', created: staleTime });
@@ -202,8 +205,29 @@ describe('schedulePendingCleanup gates force-clear on refetch success', () => {
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
   });
 
+  it('stops retrying after the cap but KEEPS the unconfirmed row', async () => {
+    vi.mocked(refreshThreadEvents).mockResolvedValue(false);
+    const thread = makeThread();
+    const staleTime = new Date(Date.now() - PENDING_MESSAGE_SAFETY_MS - 1000).toISOString();
+    thread.pendingUserMessages.push({ text: 'msg3', eventId: 'e-3', created: staleTime });
+    threadMap.value = new Map([['thread-1', thread]]);
+
+    schedulePendingCleanup('thread-1', 'e-3');
+    // Well past the cap: the polling must stop, and the row must survive it.
+    await vi.advanceTimersByTimeAsync(PENDING_MESSAGE_SAFETY_MS * 10);
+
+    expect(refreshThreadEvents).toHaveBeenCalledTimes(3);
+    // Running out of tries proves no more than one failure did, and dropping
+    // here would silently delete a message the engine may well have persisted.
+    expect(thread.pendingUserMessages).toHaveLength(1);
+    // Marked, so it stops counting as a turn in flight: a bare kept row pins
+    // effectiveThreadStatus on 'running' for the life of the page.
+    expect(thread.pendingUserMessages[0].unconfirmed).toBe(true);
+    expect(effectiveThreadStatus(thread)).not.toBe('running');
+  });
+
   it('stops retrying once the pending message is gone (SSE caught up)', async () => {
-    vi.mocked(refreshThreadEvents).mockRejectedValue(new Error('contention'));
+    vi.mocked(refreshThreadEvents).mockResolvedValue(false);
     const thread = makeThread();
     thread.pendingUserMessages.push({ text: 'msg2', eventId: 'e-2', created: new Date().toISOString() });
     threadMap.value = new Map([['thread-1', thread]]);

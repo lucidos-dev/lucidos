@@ -7,6 +7,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
 import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../models';
 import { isIOS, isIOSPwa, isTauri } from '../../utils/platform';
+import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { setTitlebarColor } from '../../utils/tauri';
 
 export type Theme = 'light' | 'dark' | 'system';
@@ -269,6 +270,11 @@ export function applyUiScale(scale: number): void {
   const clamped = clampUiScale(scale);
   localStorage.setItem('lucidos-ui-scale', String(clamped));
   document.documentElement.style.setProperty('--user-ui-scale', `${clamped}%`);
+  // The scrollbar gutter is published in px but our ::-webkit-scrollbar width is
+  // authored in rem, so it changes with the root font size this line just moved.
+  // Re-measure, or the composer stops lining up with the transcript at any scale
+  // other than the one that was live at boot.
+  publishScrollbarGutter();
 }
 
 export function currentUiScale(): number {

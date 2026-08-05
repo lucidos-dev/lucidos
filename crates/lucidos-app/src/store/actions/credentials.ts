@@ -33,8 +33,9 @@ export function openAddCredential(): void {
   pushNavState();
 }
 
-export function openEditCredential(serviceName: string): void {
-  landOnAccountsWithOverlay({ type: 'form', form: { type: 'credential', editing: serviceName } });
+/** `id`, not the service name: a name no longer identifies one row. */
+export function openEditCredential(id: string): void {
+  landOnAccountsWithOverlay({ type: 'form', form: { type: 'credential', editing: id } });
   pushNavState();
 }
 
@@ -96,21 +97,26 @@ export async function submitNewCredential(
   );
 }
 
-/** Update every editable field of an existing credential. */
+/** Update every editable field of an existing credential, addressed by `id`. */
 export async function submitCredentialEdit(
-  service: string,
+  id: string,
   body: UpdateCredentialBody
 ): Promise<boolean> {
-  return runCredentialSave(() => updateCredential(service, body), 'Failed to update credential');
+  return runCredentialSave(() => updateCredential(id, body), 'Failed to update credential');
 }
 
-export async function deleteCredential(serviceName: string): Promise<void> {
+/**
+ * Delete by `id`. The service name is still passed, for the confirm prompt
+ * only: "Delete credentials for \"google\"?" is what the user can act on, and
+ * a uuid in a dialog is not.
+ */
+export async function deleteCredential(id: string, serviceName: string): Promise<void> {
   if (!(await showConfirm(`Delete credentials for "${serviceName}"?`))) {
     return;
   }
 
   try {
-    const data = await deleteCredentialApi(serviceName);
+    const data = await deleteCredentialApi(id);
     if (data.success) {
       await loadCredentials();
     } else {

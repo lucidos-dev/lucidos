@@ -153,8 +153,17 @@ function toastAction(action: ActivityAction | undefined) {
       return {
         label: action.label,
         onClick: () => {
-          // The outcome arrives as a `cancelled` frame; nothing to await here.
-          void cancelTailscaleServe().catch(() => {});
+          // The outcome arrives as a `cancelled` frame, so there is nothing to
+          // await on the happy path. A REJECTED invoke emits no frame at all
+          // though (a dead bridge, an ACL denial), so the run would keep
+          // spinning with the user's click swallowed. The user pressed a
+          // button, so they are owed the reason (.claude/rules/frontend.md:
+          // the telemetry carve-out never covers a mutating user intent). The
+          // run is deliberately left set: Rust may still be tearing it down,
+          // and clearing it here would claim a cancel that did not happen.
+          void cancelTailscaleServe().catch((e) => {
+            showToast(`Couldn't cancel: ${String(e)}`, 'error');
+          });
         },
       };
   }

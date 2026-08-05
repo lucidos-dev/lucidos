@@ -190,10 +190,12 @@ impl LucidosEngine {
     /// idempotency gate in `emit_response_canceled` can't suppress it here (the
     /// abort above carries no `request_event_id` to match on). Having both is
     /// harmless: the exchange label prefers Aborted over Canceled regardless of
-    /// order, and the `thread_summaries.status` column — which IS last-write-wins
-    /// — keeps the abort's `'failed'` because the `ResponseCanceled` projection
-    /// arm is `preserving_failed`. Both halves are load-bearing; the status half
-    /// used to be missing, which erased the interrupted thread's red error dot.
+    /// order, and the `thread_summaries.status` column
+    /// (and IS last-write-wins) keeps the abort's verdict: `'paused'`, since
+    /// `EngineShutdown` is a transient cause, preserved because the
+    /// `ResponseCanceled` projection arm is `preserving_verdict`. Both halves
+    /// are load-bearing; the status half used to be missing, which erased the
+    /// interrupted thread's status dot.
     ///
     /// Stamps `actor: System` so the AbortPanel renders ⚙ System — the host
     /// system killed these in-flight responses (engine shutdown). The
@@ -267,8 +269,12 @@ impl LucidosEngine {
     /// then cancels remaining sessions.
     pub async fn shutdown_agent_sessions(&self) {
         // Mark all sessions as shutting down and collect their interrupt/stop handles.
-        // CC cleanup reads `shutting_down` to emit SessionEnded { reason: "shutdown" }
-        // instead of "completed" — the frontend uses this to show "Aborted".
+        // The flag is what makes the teardown boundary an abort rather than a cancel:
+        // `stop_terminal_kind` reads it and yields `Aborted(EngineShutdown)`, which the
+        // frontend renders as "Response interrupted" and recovery reads back as the
+        // *Switch to new version* fingerprint. It does NOT produce a `SessionEnded`
+        // (the post-loop cleanup bails out early during shutdown), and the retired
+        // `SessionEndReason::Completed` this comment used to contrast with is long gone.
         let sessions: Vec<(
             uuid::Uuid,
             std::sync::Arc<tokio::sync::Notify>,

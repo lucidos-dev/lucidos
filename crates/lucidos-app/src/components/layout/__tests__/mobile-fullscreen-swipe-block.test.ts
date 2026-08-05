@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 //      requires the touch to REACH the host, which requires an element above
 //      the app iframe at the screen edge. The `.edge-swipe-zone` strips do that
 //      job in the normal layout, but they live in `.mobile-swipe-pane` and the
-//      fullscreen overlay (z-index: var(--z-tooltip), inset 0) covers them, so
+//      fullscreen overlay (z-index: var(--z-app-fullscreen), inset 0) covers them, so
 //      an edge touch went straight into the iframe, the host saw nothing, and
 //      WebKit claimed the gesture: a swipe from the left edge navigated the
 //      joint session history and surfaced a snapshot of the app from before it

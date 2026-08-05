@@ -273,6 +273,93 @@
     }
 }
 
+/* File preview modal (components/files/FilePreviewModal.tsx): a read-only
+   glance at a cited file, over whatever the content pane is showing, opened by
+   an app through `lucidos.ui.previewFile`. Bigger than the confirm dialog
+   because it holds a real file preview, and a fixed height rather than a
+   max-height so the line-numbered source (`.repo-file-content` /
+   `.file-preview-inline`, both `height: 100%`) has a definite box to scroll
+   inside. `--app-height` is set by MobileSwipeContainer so iOS Safari shrinks
+   correctly when the keyboard opens (raw `100vh` does not). */
+.file-preview-modal {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-lg);
+    width: min(60rem, 92vw);
+    height: min(45rem, calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)));
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    color: var(--text-primary);
+    font-family: var(--font-ui);
+}
+
+.file-preview-modal-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-lg);
+    padding: var(--space-md) var(--space-lg);
+    border-bottom: 1px solid var(--border-color);
+    flex-shrink: 0;
+}
+
+/* min-width: 0 so the path below can ellipsize instead of widening the modal. */
+.file-preview-modal-title {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+}
+
+.file-preview-modal-name {
+    font-size: var(--font-size-md);
+    font-weight: 600;
+}
+
+.file-preview-modal-detail {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.file-preview-modal-actions {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin-left: auto;
+    flex-shrink: 0;
+}
+
+/* The escalation is a secondary affordance beside the file name, not a second
+   heading. `.accent-link` is `font: inherit`, which took the panel's base size
+   and left "Open in Files" competing with the name it sits next to. One step
+   down reads as a link and still gives a comfortable tap target (the detail
+   line's --font-size-xs would not). */
+.file-preview-modal-actions .accent-link {
+    font-size: var(--font-size-sm);
+}
+
+/* The preview components render full-bleed (no gutter), the same way they do in
+   the content pane. `min-height: 0` is what lets a flex child actually scroll
+   rather than pushing the modal taller than its box. */
+.file-preview-modal-body {
+    flex: 1;
+    min-height: 0;
+    overflow: auto;
+    display: flex;
+    flex-direction: column;
+}
+
+/* `flex-basis: auto` so a rendered document (`.repo-file-rendered`, which has no
+   height of its own) grows and scrolls the body, while a line-numbered source
+   view keeps its `height: 100%` and scrolls inside itself. */
+.file-preview-modal-body > * {
+    flex: 1 0 auto;
+    min-height: 0;
+}
+
 /* Toast notifications — positioned below header. The container spans the full
    width; each toast is then centered over the pane it was born under (desktop
    block below). Mobile shows one pane at a time, so the full width is correct

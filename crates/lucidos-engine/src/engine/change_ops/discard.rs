@@ -1,6 +1,7 @@
 use super::*;
 use crate::engine::git_ops::{
-    auto_commit_safe_files_if_dirty, find_worktree_for_branch, is_merge_of_branch_into_main,
+    auto_commit_safe_files_if_dirty, find_worktree_for_branch, git_answer,
+    is_merge_of_branch_into_main,
 };
 
 impl LucidosEngine {
@@ -366,14 +367,20 @@ impl LucidosEngine {
                         .trim()
                         .to_string();
 
-                    // If the branch tip is an ancestor of HEAD, its commits were fast-forwarded into main
-                    let is_ancestor = git_cmd(
+                    // If the branch tip is an ancestor of HEAD, its commits were
+                    // fast-forwarded into main.
+                    //
+                    // `or_unknown(false)`: a `true` here runs `git revert` against
+                    // the repo root, so an unanswered probe (spawn failure or the
+                    // 30s `git_cmd` timeout) must not authorize it. `false` falls
+                    // through to the loud "could not find commits for branch"
+                    // error below, which the user can retry.
+                    let is_ancestor = git_answer(
                         &["merge-base", "--is-ancestor", &branch_sha, "HEAD"],
                         repo_root,
                     )
                     .await
-                    .map(|o| o.status.success())
-                    .unwrap_or(false);
+                    .or_unknown(false);
 
                     if is_ancestor && base_sha != branch_sha {
                         return self

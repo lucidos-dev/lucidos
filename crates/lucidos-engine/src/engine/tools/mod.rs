@@ -38,6 +38,27 @@ use crate::llm::tool_names as tn;
 /// pre-typed dispatch silently stamped those as `success: true`).
 pub(crate) type ToolOutcome = Result<String, String>;
 
+/// What the agent is told after landing on Settings → System → Backup.
+///
+/// A tool result describing a screen is a promise about that screen, and this
+/// one had rotted into the opposite: it advertised a cloud-backup list and an
+/// in-app Restore button (both gone, restore moved to the workspace picker) and
+/// implied the page connects the provider account. Settings → Accounts owns
+/// that, and a 2026-08-05 session sent a user hunting for accounts on the Backup
+/// page because two sources (this string and `system-knowhow/backups.md`) said
+/// so. Kept as a named const so `backup_navigation_names_the_accounts_page`
+/// can pin it.
+const BACKUP_SETTINGS_NAVIGATED: &str = "Navigated to Settings → System → Backup. The UI shows:\n\
+     - A health card: last run outcome, last cloud backup + age, staleness warning\n\
+     - The provider dropdown (Google Drive / Dropbox), and a red line linking to \
+       Settings → Accounts when the selected provider has no connected account\n\
+     - 'Back up now', the schedule dropdown, and the retention dropdown\n\
+     - Show/generate the encryption key (required to restore, cannot be recovered)\n\
+     This page does NOT connect the provider account, and has no account UI at all: \
+     that is Settings → Accounts, and it is the only place to do it. Do not tell the \
+     user to connect an account here. Restore is not in the app either, it happens \
+     from the workspace picker.";
+
 /// Lift a raw `String` tool result into a `ToolOutcome` using the legacy
 /// "starts with `Error:`" convention. Single source for the legacy lift —
 /// `to_outcome`, the plugin-tool branch, and the special-tool / read-cache
@@ -174,9 +195,10 @@ impl LucidosEngine {
             tn::ENV_VARS | tn::SET_ENVIRONMENT_VARIABLE => self.execute_env_vars(name, args).await,
             tn::MANAGE_MODELS => to_outcome(self.execute_manage_models(args).await),
             tn::WEB_SEARCH | tn::FETCH_NEWS => to_outcome(self.execute_web_tool(name, args).await),
-            tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => {
-                to_outcome(self.execute_credential_tool(name, args).await)
-            }
+            tn::REQUEST_CREDENTIAL | tn::CONNECT_OAUTH_ACCOUNT => to_outcome(
+                self.execute_credential_tool(name, args, thread_id, device_id)
+                    .await,
+            ),
             tn::CREATE_APP | tn::LIST_APPS | tn::LOAD_KNOWHOW => {
                 to_outcome(self.execute_app_tool(name, args, thread_id).await)
             }
@@ -212,8 +234,11 @@ impl LucidosEngine {
             tn::EMIT_EVENT => self.execute_emit_event(args).await,
             tn::QUERY_EVENTS => self.execute_query_events(args).await,
             tn::COUNT_EVENTS => self.execute_count_events(args).await,
-            tn::LIST_THREADS => self.execute_list_threads(args).await,
-            tn::COUNT_THREADS => self.execute_count_threads(args).await,
+            tn::FOLLOW_UP_CHILD_THREAD => {
+                self.execute_follow_up_child_thread(args, thread_id).await
+            }
+            tn::LIST_THREADS => self.execute_list_threads(args, thread_id).await,
+            tn::COUNT_THREADS => self.execute_count_threads(args, thread_id).await,
             tn::LIST_CHANGES => self.execute_list_changes().await,
             tn::APPLY_CHANGE => self.execute_apply_change(args, thread_id).await,
             tn::LIST_THREAD_QUEUE => self.execute_list_thread_queue().await,
@@ -258,6 +283,54 @@ impl LucidosEngine {
         todo::todo_write_impl(&self.event_bus, args, thread_id).await
     }
 
+    /// Resolve the turn's originating device into a `MessageOrigin` for
+    /// device-scoping an emitted event.
+    ///
+    /// The device that sent the prompt that triggered this turn, so the frontend
+    /// can act only on the screen the user is actually at. A turn with no device
+    /// (trigger / scheduled / background) yields `None`, which the frontend
+    /// reads as "unscoped" and falls back to its focused-thread / offer
+    /// behaviour.
+    pub(crate) async fn turn_device_actor(
+        &self,
+        device_id: Option<&str>,
+    ) -> Option<crate::engine::thread_events::MessageOrigin> {
+        let did = device_id?;
+        let label = crate::core::DeviceStore::display_name(&self.pool, did)
+            .await
+            .unwrap_or_else(|| crate::core::devices::resolve_device_name(None, did));
+        Some(crate::engine::thread_events::MessageOrigin::Device {
+            device_id: did.to_string(),
+            label,
+        })
+    }
+
+    /// Ask the frontend to navigate. The one emitter of `NavigationRequested`
+    /// from a tool call, so every navigate is device-scoped the same way.
+    ///
+    /// Two callers: `navigate_ui` (the agent moving the UI) and the OAuth flow
+    /// (handing the authorization URL to whichever browser the user configured,
+    /// rather than the engine shelling out to one).
+    pub(crate) async fn request_navigation(
+        &self,
+        payload: &serde_json::Value,
+        thread_id: uuid::Uuid,
+        device_id: Option<&str>,
+    ) -> Result<(), String> {
+        let actor = self.turn_device_actor(device_id).await;
+        self.event_bus
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id,
+                event: crate::engine::thread_events::ThreadEvent::NavigationRequested {
+                    payload: serde_json::to_string(payload).unwrap_or_default(),
+                },
+                meta: crate::engine::thread_events::EventMeta::with_actor(actor),
+            })
+            .await
+            .map(|_| ())
+            .map_err(|e| format!("failed to emit NavigationRequested: {}", e))
+    }
+
     async fn execute_navigate_ui(
         &self,
         args: &serde_json::Value,
@@ -276,43 +349,15 @@ impl LucidosEngine {
             args.get("id").and_then(|v| v.as_str()),
             device_id
         );
-        // Stamp the originating device (the device that sent the prompt that
-        // triggered this turn) so the frontend can scope the navigate to it —
-        // an agent navigate must act only on the device the thread is being used
-        // from, not every device viewing the thread. A turn with no device
-        // (trigger / scheduled / background) leaves the actor None, so the
-        // frontend falls back to its focused-thread / offer behavior.
-        let actor = match device_id {
-            Some(did) => {
-                let label = crate::core::DeviceStore::display_name(&self.pool, did)
-                    .await
-                    .unwrap_or_else(|| crate::core::devices::resolve_device_name(None, did));
-                Some(crate::engine::thread_events::MessageOrigin::Device {
-                    device_id: did.to_string(),
-                    label,
-                })
-            }
-            None => None,
-        };
-        if let Err(e) = self
-            .event_bus
-            .emit(crate::engine::event_bus::BusEvent::Thread {
-                thread_id,
-                event: crate::engine::thread_events::ThreadEvent::NavigationRequested {
-                    payload: serde_json::to_string(args).unwrap_or_default(),
-                },
-                meta: crate::engine::thread_events::EventMeta::with_actor(actor),
-            })
-            .await
-        {
-            return Err(format!("Error: failed to emit NavigationRequested: {}", e));
+        if let Err(e) = self.request_navigation(args, thread_id, device_id).await {
+            return Err(format!("Error: {}", e));
         }
 
         // Return contextual help so the LLM knows what the UI offers
         let settings_view = args.get("settings_view").and_then(|v| v.as_str());
         if target == "settings" && settings_view == Some("models") {
             return Ok("Navigated to Settings → Models. The UI shows:\n\
-                - The active Chat & Triggers model (the model picker) and reasoning effort\n\
+                - The active Chat & triggers model (the model picker) and reasoning effort\n\
                 - Image generation and background-task models (title, image description, memory)\n\
                 - Providers (Anthropic, OpenAI, OpenRouter, local) and the model registry\n\
                 Tell the user they can change the active model from the picker here. To switch \
@@ -321,14 +366,7 @@ impl LucidosEngine {
                 .to_string());
         }
         if target == "settings" && settings_view == Some("backup") {
-            return Ok("Navigated to Backup & Restore settings. The UI shows:\n\
-                - Connected backup providers (e.g. Google Drive)\n\
-                - A list of available cloud backups with dates\n\
-                - Buttons to create a new backup or restore from an existing one\n\
-                - The user's encryption key (needed for restore)\n\
-                Tell the user they can pick a backup from the list and restore it directly — \
-                no manual downloading or uploading needed."
-                .to_string());
+            return Ok(BACKUP_SETTINGS_NAVIGATED.to_string());
         }
         if target == "settings" && settings_view == Some("environment-variables") {
             return Ok(
@@ -347,8 +385,17 @@ impl LucidosEngine {
             if url.is_empty() {
                 return Err("Error: url is required when target is 'url'".to_string());
             }
+            // Deliberately does NOT claim "the internal browser panel". Where the
+            // URL lands is the client's decision (`openUrl`): the in-app panel
+            // only when the user has that preference on in the desktop app,
+            // otherwise their system browser or a new tab. Naming one of the
+            // three had the agent telling users to look at a panel that was
+            // never going to open.
             return Ok(format!(
-                "Opened {} in the internal browser panel. The user can now see this page.",
+                "Asked the user's device to open {}. It opens wherever they have \
+                 configured links to open (the in-app browser panel, their system \
+                 browser, or a new tab), so refer to it as their browser rather than \
+                 naming one.",
                 url
             ));
         }
@@ -632,11 +679,105 @@ impl LucidosEngine {
         }
     }
 
+    /// LLM tool: redirect a child thread this thread already spawned.
+    ///
+    /// `caller_thread_id` is `execute_tool`'s ambient thread, never an
+    /// argument. That is what makes the authorization ladder in
+    /// `chat::child_follow_up` a real boundary here rather than an accounting
+    /// one: the model can pick which child to address, but it cannot pick who
+    /// it is.
+    async fn execute_follow_up_child_thread(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
+        use crate::engine::chat::child_follow_up::ChildFollowUpError;
+
+        let raw_id = args
+            .get("thread_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Error: follow_up_child_thread needs a thread_id. It is the child's uuid, from \
+                 the run_thread / run_coding_agent result, a completion card, or the threads \
+                 tool's 'list' action with my_children: true."
+                    .to_string()
+            })?;
+        let child_thread_id: uuid::Uuid = raw_id.parse().map_err(|_| {
+            format!(
+                "Error: '{raw_id}' is not a thread id. follow_up_child_thread addresses a child \
+                 by uuid, never by title: titles are not unique, and a fuzzy match would \
+                 silently deliver to the wrong child. List your own children with the threads \
+                 tool's 'list' action and my_children: true."
+            )
+        })?;
+        let message = args
+            .get("message")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                "Error: follow_up_child_thread needs a non-empty message. It lands in the \
+                 child's conversation as a message from you."
+                    .to_string()
+            })?;
+
+        let Some(engine) = self.try_clone_arc() else {
+            return Err(
+                "Error: follow_up_child_thread is unavailable on this engine instance.".to_string(),
+            );
+        };
+        match engine
+            .follow_up_child_thread(
+                Some(caller_thread_id),
+                child_thread_id,
+                message,
+                None,
+                None,
+                None,
+            )
+            .await
+        {
+            // Names the child by TITLE, never by uuid, so the model's prose
+            // stays uuid-free by default (a uuid means nothing to the user:
+            // no screen is labelled with one).
+            Ok(ack) => Ok(format!(
+                "Sent to \"{}\". {}",
+                ack.child_title,
+                ack.delivered_to.describe()
+            )),
+            // Each refusal tells the model what to do instead, and none of them
+            // leaks whose child a thread is beyond "not yours".
+            Err(e @ ChildFollowUpError::NotYourChild(_)) => Err(format!(
+                "Error: {e} List your own children with the threads tool's 'list' action and \
+                 my_children: true, then address one of those."
+            )),
+            Err(e @ ChildFollowUpError::UnknownChild(_)) => Err(format!(
+                "Error: {e} Check the id against the threads tool's 'list' action with \
+                 my_children: true."
+            )),
+            Err(e @ ChildFollowUpError::ChildDiscarded(_)) => Err(format!(
+                "Error: {e} Spawn a fresh thread with run_thread or run_coding_agent instead."
+            )),
+            Err(e @ ChildFollowUpError::SelfTarget(_)) => Err(format!("Error: {e}")),
+            Err(e) => Err(format!("Error: {e}")),
+        }
+    }
+
     /// LLM tool: list thread summaries for the workspace. Mirrors
     /// `GET /api/v1/threads/list` and `lucidos threads list`.
-    async fn execute_list_threads(&self, args: &serde_json::Value) -> ToolOutcome {
+    ///
+    /// `caller_thread_id` is `execute_tool`'s ambient thread, which the model
+    /// cannot set. It is what `my_children: true` resolves to.
+    async fn execute_list_threads(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
         let active = args.get("active").and_then(|v| v.as_bool());
         let sources = parse_source_arg(args.get("source"));
+        let parent = parent_filter_arg(args, caller_thread_id);
         let limit = args
             .get("limit")
             .and_then(|v| v.as_i64())
@@ -647,6 +788,7 @@ impl LucidosEngine {
             .list_thread_summaries(crate::core::store::ThreadSummaryFilters {
                 active,
                 sources: sources.as_deref(),
+                parent,
                 limit,
             })
             .await
@@ -663,14 +805,20 @@ impl LucidosEngine {
 
     /// LLM tool: count thread summaries matching the same filters as
     /// `list_threads`. Returns `{ "count": N }`.
-    async fn execute_count_threads(&self, args: &serde_json::Value) -> ToolOutcome {
+    async fn execute_count_threads(
+        &self,
+        args: &serde_json::Value,
+        caller_thread_id: uuid::Uuid,
+    ) -> ToolOutcome {
         let active = args.get("active").and_then(|v| v.as_bool());
         let sources = parse_source_arg(args.get("source"));
+        let parent = parent_filter_arg(args, caller_thread_id);
         match self
             .event_store
             .count_thread_summaries(crate::core::store::ThreadSummaryFilters {
                 active,
                 sources: sources.as_deref(),
+                parent,
                 limit: 0,
             })
             .await
@@ -1017,17 +1165,50 @@ pub(crate) fn build_query_events_response(
         if let Some(obj) = wrapper.as_object_mut() {
             obj.insert(
                 "hint".into(),
-                serde_json::Value::String(
-                    "result truncated to fit byte_limit. Narrow by aggregate_id, \
-                     shorten the time window with since/until, or call count_events \
-                     first to size the sweep before drilling. Do not retry with a \
-                     larger byte_limit unless you have already narrowed the query."
-                        .into(),
-                ),
+                serde_json::Value::String(QUERY_EVENTS_TRUNCATION_HINT.into()),
             );
         }
     }
     wrapper.to_string()
+}
+
+/// The narrowing arguments [`QUERY_EVENTS_TRUNCATION_HINT`] tells the model to
+/// reach for. Test-only: it is the claim
+/// `truncation_hint_names_only_real_query_arguments` checks in both directions,
+/// that each name really is a property of the `events` domain's `query`
+/// operation, and that the hint really does mention it.
+#[cfg(test)]
+const QUERY_EVENTS_HINT_FILTERS: &[&str] = &["event_type", "since", "until"];
+
+/// What `query_events` says when its result didn't fit `byte_limit`.
+///
+/// It must only ever name arguments the tool accepts. It previously said
+/// "Narrow by aggregate_id", and `aggregate_id` is a real COLUMN on the
+/// `events` table but not an argument of this tool, so the advice sent the
+/// model into a retry with an ignored parameter and an identical truncated
+/// result.
+const QUERY_EVENTS_TRUNCATION_HINT: &str =
+    "result truncated to fit byte_limit. Narrow with event_type, shorten the \
+     time window with since/until, or call count_events first to size the sweep \
+     before drilling. Do not retry with a larger byte_limit unless you have \
+     already narrowed the query.";
+
+/// Resolve the parent filter for `list_threads` / `count_threads`.
+///
+/// The wire shape is a boolean-shaped `my_children`, NOT a `parent` uuid the
+/// model supplies and not a `"self"` sentinel that means something different on
+/// each surface. The caller's own thread id is ambient
+/// (`execute_tool`'s `thread_id`), so a model asking for "my children" cannot
+/// name a thread that is not its own: impossible states made impossible rather
+/// than validated after the fact.
+///
+/// The HTTP surface takes a literal `parent` uuid instead, because it has no
+/// ambient caller to resolve.
+fn parent_filter_arg(args: &serde_json::Value, caller_thread_id: uuid::Uuid) -> Option<uuid::Uuid> {
+    args.get("my_children")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+        .then_some(caller_thread_id)
 }
 
 /// Parse the `source` arg accepted by `list_threads` / `count_threads`.

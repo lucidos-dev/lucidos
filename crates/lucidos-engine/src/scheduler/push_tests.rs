@@ -530,6 +530,515 @@ fn declarative_notification_data_carries_hash_navigate_url_for_chrome_sw() {
     assert!(nav_sw.contains(&format!("thread={}", tid)));
 }
 
+// §4.5 payload-size guard. A long body used to sink the push for EVERY
+// subscription: `build()` refuses to encrypt a plaintext over the transport
+// ceiling, and the send loop only logged the Err. These tests drive the real
+// `web_push` builder so they fail exactly where production failed.
+
+/// Encrypt `payload` through the real `web_push` builder: the same
+/// `set_payload` + `build()` pair `fan_out_to_web_push` runs, which is where
+/// the ceiling is enforced. A throwaway P-256 keypair stands in for the
+/// browser's subscription keys; nothing leaves the process.
+fn build_real_web_push_message(payload: &str) -> Result<(), web_push::WebPushError> {
+    use base64::Engine as _;
+    use p256::ecdsa::SigningKey;
+    use p256::elliptic_curve::rand_core::OsRng;
+
+    let signing_key = SigningKey::random(&mut OsRng);
+    let point = signing_key.verifying_key().to_encoded_point(false);
+    let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    let sub_info = web_push::SubscriptionInfo::new(
+        "https://example.com/push/test-endpoint".to_string(),
+        b64.encode(point.as_bytes()),
+        b64.encode([7u8; 16]),
+    );
+
+    let mut msg_builder = web_push::WebPushMessageBuilder::new(&sub_info);
+    msg_builder.set_payload(web_push::ContentEncoding::Aes128Gcm, payload.as_bytes());
+    msg_builder.build().map(|_| ())
+}
+
+/// The 2026-08-05 production case: notification "Nightly pipeline: GREEN ✅"
+/// with a 2862-char body. Built with a realistic gateway scope URL, a
+/// navigate tap and all three deep-link ids, because every one of those
+/// inflates the envelope around the body.
+fn overflowing_notification_body(char_len: usize) -> String {
+    // Realistic prose (spaces to snap to, an emoji near the tail) rather than
+    // one repeated char, so the whitespace-boundary and UTF-8 paths are live.
+    let unit = "The nightly pipeline finished green across every shard. ";
+    let mut body = String::new();
+    while body.chars().count() + unit.chars().count() <= char_len {
+        body.push_str(unit);
+    }
+    while body.chars().count() < char_len {
+        body.push('x');
+    }
+    assert_eq!(body.chars().count(), char_len);
+    body
+}
+
+fn real_world_overflow_payload(body: &str) -> serde_json::Value {
+    let nid = uuid::Uuid::new_v4();
+    let tid = uuid::Uuid::new_v4();
+    let eid = uuid::Uuid::new_v4();
+    let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
+    build_push_payload_fitted(
+        "Nightly pipeline: GREEN ✅",
+        body,
+        Some(nid),
+        Some("ci-watch"),
+        Some(tid),
+        Some(eid),
+        &tap,
+        Some("https://lucidos.test/dev/"),
+        Some(7),
+    )
+}
+
+#[test]
+fn s4_5_crate_ceiling_constant_matches_what_build_actually_enforces() {
+    // The crate's error text says "maximum payload size of 3070 characters
+    // exceeded", but `http_ece.rs` rejects at `content.len() > 3052` BYTES of
+    // the plaintext we hand `set_payload`. Budgeting against the number in the
+    // message would still overflow, so pin the real threshold from both sides.
+    let at_ceiling = "a".repeat(MAX_PUSH_PAYLOAD_BYTES);
+    assert!(
+        build_real_web_push_message(&at_ceiling).is_ok(),
+        "MAX_PUSH_PAYLOAD_BYTES is below what the crate accepts"
+    );
+    let over_ceiling = "a".repeat(MAX_PUSH_PAYLOAD_BYTES + 1);
+    assert!(
+        matches!(
+            build_real_web_push_message(&over_ceiling),
+            Err(web_push::WebPushError::PayloadTooLarge)
+        ),
+        "MAX_PUSH_PAYLOAD_BYTES is above what the crate accepts"
+    );
+}
+
+#[test]
+fn s4_5_overflowing_body_still_builds_a_deliverable_message() {
+    let body = overflowing_notification_body(2862);
+    let unfitted = build_push_payload(
+        "Nightly pipeline: GREEN ✅",
+        &body,
+        Some(uuid::Uuid::new_v4()),
+        Some("ci-watch"),
+        Some(uuid::Uuid::new_v4()),
+        Some(uuid::Uuid::new_v4()),
+        &Tap::Modal,
+        Some("https://lucidos.test/dev/"),
+        Some(7),
+    )
+    .to_string();
+    assert!(
+        unfitted.len() > MAX_PUSH_PAYLOAD_BYTES,
+        "test body no longer overflows ({} B), pick a longer one",
+        unfitted.len()
+    );
+    // The production failure itself, reproduced: the pre-guard envelope is what
+    // `build()` rejected twice on 2026-08-05, once per live subscription.
+    assert!(
+        matches!(
+            build_real_web_push_message(&unfitted),
+            Err(web_push::WebPushError::PayloadTooLarge)
+        ),
+        "the unguarded payload must still be the failure this fix is for"
+    );
+
+    let payload = real_world_overflow_payload(&body).to_string();
+    assert!(
+        payload.len() <= MAX_PUSH_PAYLOAD_BYTES,
+        "fitted payload is {} B, over the {} B ceiling",
+        payload.len(),
+        MAX_PUSH_PAYLOAD_BYTES
+    );
+    assert!(
+        build_real_web_push_message(&payload).is_ok(),
+        "the real web_push builder still rejects the fitted payload"
+    );
+}
+
+#[test]
+fn s4_5_truncated_body_is_marked_and_shorter_than_the_original() {
+    let body = overflowing_notification_body(2862);
+    let payload = real_world_overflow_payload(&body);
+    let sent = payload["notification"]["body"].as_str().unwrap();
+    assert!(
+        sent.len() < body.len(),
+        "an overflowing body must be cut, got {} B of {} B",
+        sent.len(),
+        body.len()
+    );
+    assert!(
+        sent.ends_with(TRUNCATION_MARKER),
+        "a cut body must carry the truncation marker, got tail: {:?}",
+        &sent[sent.floor_char_boundary(sent.len().saturating_sub(24))..]
+    );
+    assert!(
+        body.starts_with(sent.trim_end_matches(TRUNCATION_MARKER).trim_end()),
+        "the kept prefix must be the original body's prefix, unmodified"
+    );
+}
+
+#[test]
+fn s4_5_short_body_passes_through_byte_identical() {
+    // The common case must be untouched: same bytes the pre-guard engine sent.
+    let nid = uuid::Uuid::new_v4();
+    let tid = uuid::Uuid::new_v4();
+    let tap = nav_thread(&tid.to_string(), None);
+    let body = "Pick one of the three options";
+    let unfitted = build_push_payload(
+        "Claude is asking",
+        body,
+        Some(nid),
+        Some("habit-tracker"),
+        Some(tid),
+        None,
+        &tap,
+        Some("https://lucidos.test/dev/"),
+        Some(2),
+    );
+    let fitted = build_push_payload_fitted(
+        "Claude is asking",
+        body,
+        Some(nid),
+        Some("habit-tracker"),
+        Some(tid),
+        None,
+        &tap,
+        Some("https://lucidos.test/dev/"),
+        Some(2),
+    );
+    assert_eq!(
+        fitted.to_string(),
+        unfitted.to_string(),
+        "a body that already fits must be passed through unmodified"
+    );
+    assert_eq!(fitted["notification"]["body"], body);
+}
+
+#[test]
+fn s4_5_truncation_is_utf8_safe_with_multibyte_content() {
+    // The real bodies carry emoji ("✅", 3 bytes each). Cutting on a byte index
+    // would panic here; the guard must land on a char boundary and keep the
+    // string valid UTF-8 no matter where the budget falls.
+    for pad in 0..64usize {
+        let mut body = "✅".repeat(1200);
+        body.push_str(&"é".repeat(pad));
+        body.push_str(&"✅".repeat(200));
+        let payload = build_push_payload_fitted(
+            "Pipeline ✅",
+            &body,
+            Some(uuid::Uuid::new_v4()),
+            None,
+            Some(uuid::Uuid::new_v4()),
+            None,
+            &Tap::Modal,
+            Some("https://lucidos.test/dev/"),
+            Some(1),
+        );
+        let sent = payload["notification"]["body"].as_str().unwrap();
+        assert!(
+            std::str::from_utf8(sent.as_bytes()).is_ok(),
+            "truncated body must stay valid UTF-8"
+        );
+        let serialized = payload.to_string();
+        assert!(
+            serialized.len() <= MAX_PUSH_PAYLOAD_BYTES,
+            "pad={pad}: fitted payload is {} B, over the ceiling",
+            serialized.len()
+        );
+        assert!(build_real_web_push_message(&serialized).is_ok());
+    }
+}
+
+#[test]
+fn s4_5_truncation_preserves_every_structural_envelope_field() {
+    // Only the body may shrink. The deep-link machinery (both navigate forms),
+    // the dedup tag, the declarative magic and the app badge must survive
+    // intact: a truncation that ate any of them would break the tap path
+    // instead of the banner text.
+    let body = overflowing_notification_body(2862);
+    let nid = uuid::Uuid::new_v4();
+    let tid = uuid::Uuid::new_v4();
+    let eid = uuid::Uuid::new_v4();
+    let tap = nav_thread(&tid.to_string(), Some(&eid.to_string()));
+    let payload = build_push_payload_fitted(
+        "Nightly pipeline: GREEN ✅",
+        &body,
+        Some(nid),
+        Some("ci-watch"),
+        Some(tid),
+        Some(eid),
+        &tap,
+        Some("https://lucidos.test/dev/"),
+        Some(7),
+    );
+
+    assert_eq!(payload["web_push"], 8030);
+    assert_eq!(payload["app_badge"], 7);
+    let notif = &payload["notification"];
+    assert_eq!(notif["title"], "Nightly pipeline: GREEN ✅");
+    assert_eq!(notif["tag"], nid.to_string());
+
+    let nav_ios = notif["navigate"].as_str().unwrap();
+    assert!(nav_ios.starts_with("https://lucidos.test/dev/?"));
+    assert!(nav_ios.contains(&format!("notification={nid}")));
+    assert!(nav_ios.contains(&format!("thread={tid}")));
+    assert!(nav_ios.contains(&format!("event={eid}")));
+    assert!(nav_ios.contains("tap="));
+
+    let data = &notif["data"];
+    let nav_sw = data["navigate"].as_str().unwrap();
+    assert!(nav_sw.starts_with('#'));
+    assert_eq!(nav_ios.split_once('?').unwrap().1, &nav_sw[1..]);
+    assert_eq!(data["notification_id"], nid.to_string());
+    assert_eq!(data["app_id"], "ci-watch");
+    assert_eq!(data["thread_id"], tid.to_string());
+    assert_eq!(data["event_id"], eid.to_string());
+    assert_eq!(data["tap"]["kind"], "navigate");
+    assert_eq!(data["tap"]["to"]["id"], tid.to_string());
+}
+
+#[test]
+fn s4_5_wake_payload_of_an_overflowing_body_also_builds() {
+    // The Layer-3 wake carries the same envelope plus `wake: true`, so it is
+    // strictly LARGER than the original send: a body that just fits the push
+    // still blew the wake up. Budget for the flag.
+    use crate::scheduler::notifications::Notification;
+    let tid = uuid::Uuid::new_v4();
+    let eid = uuid::Uuid::new_v4();
+    let n = Notification {
+        id: uuid::Uuid::new_v4(),
+        task_id: None,
+        app_id: Some("ci-watch".into()),
+        thread_id: Some(tid),
+        event_id: Some(eid),
+        title: "Nightly pipeline: GREEN ✅".into(),
+        message: overflowing_notification_body(2862),
+        read: false,
+        created_at: chrono::Utc::now(),
+        tap: nav_thread(&tid.to_string(), Some(&eid.to_string())),
+    };
+    let payload = build_wake_payload(&n, Some("https://lucidos.test/dev/"), Some(7)).to_string();
+    assert!(
+        payload.len() <= MAX_PUSH_PAYLOAD_BYTES,
+        "fitted wake payload is {} B, over the ceiling",
+        payload.len()
+    );
+    assert!(build_real_web_push_message(&payload).is_ok());
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&payload).unwrap()["wake"],
+        true
+    );
+}
+
+#[test]
+fn s4_5_wake_budget_is_tighter_than_the_original_send() {
+    // Pins the reason the wake needs its own measurement: the `wake: true`
+    // sibling costs bytes, so the wake keeps strictly less body than the push
+    // it mirrors. Measured on the same notification content.
+    use crate::scheduler::notifications::Notification;
+    let tid = uuid::Uuid::new_v4();
+    let body = overflowing_notification_body(2862);
+    let n = Notification {
+        id: uuid::Uuid::new_v4(),
+        task_id: None,
+        app_id: None,
+        thread_id: Some(tid),
+        event_id: None,
+        title: "Nightly pipeline: GREEN ✅".into(),
+        message: body.clone(),
+        read: false,
+        created_at: chrono::Utc::now(),
+        tap: Tap::Modal,
+    };
+    let wake = build_wake_payload(&n, Some("https://lucidos.test/dev/"), Some(7));
+    let send = build_push_payload_fitted(
+        &n.title,
+        &body,
+        Some(n.id),
+        None,
+        Some(tid),
+        None,
+        &n.tap,
+        Some("https://lucidos.test/dev/"),
+        Some(7),
+    );
+    let wake_body = wake["notification"]["body"].as_str().unwrap();
+    let send_body = send["notification"]["body"].as_str().unwrap();
+    assert!(
+        wake_body.len() < send_body.len(),
+        "the wake must budget for its own `wake: true` flag: wake kept {} B, send kept {} B",
+        wake_body.len(),
+        send_body.len()
+    );
+}
+
+#[test]
+fn s4_5_escape_heavy_body_keeps_what_actually_fits() {
+    // JSON escaping is not a fixed cost, so the budget cannot be arithmetic: a
+    // `"` costs two serialized bytes and a control char six. Correcting one
+    // estimate by the observed overflow collapses here (the overflow exceeds
+    // the body itself, the correction saturates to zero) and shipped an EMPTY
+    // banner while hundreds of characters would have fitted. The search must
+    // find the real largest body instead.
+    // (label, repeated unit, serialized bytes that unit costs)
+    for (label, unit, serialized_cost) in [
+        ("control chars", "\u{1}", 6usize),
+        ("quotes", "\"", 2),
+        ("newline-separated lines", "ok\n", 4),
+    ] {
+        let body = unit.repeat(2862 / unit.len());
+        let payload = build_push_payload_fitted(
+            "Nightly pipeline",
+            &body,
+            Some(uuid::Uuid::new_v4()),
+            None,
+            None,
+            None,
+            &Tap::Modal,
+            Some("https://lucidos.test/dev/"),
+            Some(7),
+        );
+        let serialized = payload.to_string();
+        assert!(
+            serialized.len() <= MAX_PUSH_PAYLOAD_BYTES,
+            "{label}: fitted payload is {} B, over the ceiling",
+            serialized.len()
+        );
+        assert!(build_real_web_push_message(&serialized).is_ok());
+
+        // What genuinely fits: the target less the envelope, divided by what
+        // each unit costs serialized. Anything close to that is a good fit; an
+        // empty (or near-empty) body is the bug this test exists for.
+        let envelope = build_push_payload(
+            "Nightly pipeline",
+            "",
+            Some(uuid::Uuid::new_v4()),
+            None,
+            None,
+            None,
+            &Tap::Modal,
+            Some("https://lucidos.test/dev/"),
+            Some(7),
+        )
+        .to_string()
+        .len();
+        let theoretical =
+            (TRUNCATED_PAYLOAD_TARGET_BYTES - envelope) / serialized_cost * unit.len();
+        let kept = payload["notification"]["body"]
+            .as_str()
+            .unwrap()
+            .trim_end_matches(TRUNCATION_MARKER)
+            .len();
+        assert!(
+            kept * 4 >= theoretical * 3,
+            "{label}: kept only {kept} B of about {theoretical} B that fit"
+        );
+    }
+}
+
+#[test]
+fn s4_5_envelope_inside_the_safety_reserve_still_keeps_what_fits() {
+    // The narrow band where the envelope alone lands between the truncation
+    // target and the hard ceiling, so NO candidate can hit the target. The
+    // reserve is deliberate slack, not a second ceiling: it must never cost
+    // deliverable text, so the search falls back to the hard ceiling and the
+    // banner still carries the body it has room for.
+    let nid = uuid::Uuid::new_v4();
+    let envelope_of = |title: &str| {
+        build_push_payload(
+            title,
+            "",
+            Some(nid),
+            None,
+            None,
+            None,
+            &Tap::Modal,
+            None,
+            Some(1),
+        )
+        .to_string()
+        .len()
+    };
+    let mut title = String::new();
+    while envelope_of(&title) <= TRUNCATED_PAYLOAD_TARGET_BYTES {
+        title.push('T');
+    }
+    let envelope = envelope_of(&title);
+    assert!(
+        envelope > TRUNCATED_PAYLOAD_TARGET_BYTES && envelope <= MAX_PUSH_PAYLOAD_BYTES,
+        "test setup: envelope of {envelope} B is not inside the reserve band"
+    );
+
+    let payload = build_push_payload_fitted(
+        &title,
+        &overflowing_notification_body(2862),
+        Some(nid),
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        None,
+        Some(1),
+    );
+    let serialized = payload.to_string();
+    assert!(
+        serialized.len() <= MAX_PUSH_PAYLOAD_BYTES,
+        "fitted payload is {} B, over the ceiling",
+        serialized.len()
+    );
+    assert!(build_real_web_push_message(&serialized).is_ok());
+    assert!(
+        !payload["notification"]["body"].as_str().unwrap().is_empty(),
+        "the reserve must not cost the whole body when the envelope eats into it"
+    );
+}
+
+#[test]
+fn s4_5_envelope_alone_over_the_ceiling_degrades_instead_of_panicking() {
+    // Pathological input: the title alone (which is NEVER truncated, being the
+    // banner heading) blows the ceiling, so there is no body budget left at all.
+    // The guard must hand back an empty body rather than panic or underflow.
+    let title = "T".repeat(MAX_PUSH_PAYLOAD_BYTES + 500);
+    let payload = build_push_payload_fitted(
+        &title,
+        &overflowing_notification_body(2862),
+        Some(uuid::Uuid::new_v4()),
+        None,
+        None,
+        None,
+        &Tap::Modal,
+        Some("https://lucidos.test/dev/"),
+        Some(1),
+    );
+    assert_eq!(
+        payload["notification"]["body"], "",
+        "with no budget left the body must be dropped entirely"
+    );
+    assert_eq!(payload["notification"]["title"], title);
+}
+
+#[test]
+fn s4_5_body_fits_exactly_at_the_ceiling_is_not_truncated() {
+    // Boundary: a payload landing exactly ON the ceiling is deliverable, so the
+    // guard must pass it through rather than shave it "just in case".
+    let mut body = String::new();
+    let build = |b: &str| {
+        build_push_payload("T", b, None, None, None, None, &Tap::Modal, None, None).to_string()
+    };
+    while build(&body).len() < MAX_PUSH_PAYLOAD_BYTES {
+        body.push('a');
+    }
+    assert_eq!(build(&body).len(), MAX_PUSH_PAYLOAD_BYTES);
+    let fitted =
+        build_push_payload_fitted("T", &body, None, None, None, None, &Tap::Modal, None, None);
+    assert_eq!(fitted["notification"]["body"], body);
+    assert!(build_real_web_push_message(&fitted.to_string()).is_ok());
+}
+
 // §2 Step A — decide_push_allowed unit tests. The matrix says the
 // engine sends the OS push iff no candidate device is "active" right
 // now; multi-tab same-device pongs OR within the device.

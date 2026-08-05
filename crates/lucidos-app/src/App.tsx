@@ -7,6 +7,7 @@ import { AppHeader } from './components/layout/AppHeader';
 import { BackupReminderBanner } from './components/layout/BackupReminderBanner';
 import { Drawer } from './components/layout/Drawer';
 import { MobileSwipeContainer } from './components/layout/MobileSwipeContainer';
+import { OverlayLayer } from './components/layout/OverlayLayer';
 import { ConfirmDialog } from './components/shared/ConfirmDialog';
 import { PromptDialog } from './components/shared/PromptDialog';
 import { ThreadDrawer } from './components/drawer/ThreadDrawer';
@@ -27,6 +28,7 @@ import {
   messageRoutePanel,
   stepDetailModal,
   searchEverywhereOpen,
+  filePreviewModal,
 } from './store/store';
 import { scaleModalOpen } from './components/shared/scaleModalState';
 import { viewportIsMobile } from './utils/viewport';
@@ -37,6 +39,7 @@ const MessageRoutePanel = lazyComponent(() => import('./components/chat/MessageR
 const StepDetailModal = lazyComponent(() => import('./components/chat/StepDetailModal').then(m => m.StepDetailModal));
 const ScaleModal = lazyComponent(() => import('./components/shared/ScaleModal').then(m => m.ScaleModal));
 const SearchEverywhere = lazyComponent(() => import('./components/search/SearchEverywhere').then(m => m.SearchEverywhere));
+const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.FilePreviewModal));
 
 // Each overlay sits in its own slot so the signal subscription is leaf-scoped:
 // a flip re-renders the slot, not all of App and its descendants.
@@ -44,6 +47,10 @@ function ImagePopupSlot()        { return popupImage.value           ? <ImagePop
 function MessageRoutePanelSlot() { return messageRoutePanel.value    ? <MessageRoutePanel /> : null; }
 function StepDetailModalSlot()   { return stepDetailModal.value      ? <StepDetailModal />   : null; }
 function ScaleModalSlot()        { return scaleModalOpen.value       ? <ScaleModal />        : null; }
+// Slot-gated for a second reason beyond the leaf-scoped subscription: it keeps
+// the file preview renderers (which the content pane already lazy-loads) out of
+// the initial bundle for every user who never opens an app that previews a file.
+function FilePreviewModalSlot()  { return filePreviewModal.value     ? <FilePreviewModal />  : null; }
 
 // FileSearchModal and SearchEverywhere render a hidden shell instead of
 // unmounting when closed (avoids will-change:transform ghost pixels on iOS
@@ -103,17 +110,28 @@ export function App() {
         )}
       </div>
 
-      {/* Overlays -- rendered outside the split layout */}
-      <FileSearchModalSlot />
-      <Toast />
+      {/* Overlays -- rendered outside the split layout.
+
+          The layered group below moves as a unit into a natively fullscreen app
+          panel, because a fullscreen element is painted alone and nothing
+          outside its subtree can be seen at any z-index. Keeping them together
+          is what preserves their z-order. The drop dispatcher (renders null) and
+          the UI blocker (inerts its own siblings, so it must stay a child of the
+          app root) are deliberately outside the layer, and OverlayLayer's doc
+          comment says why. */}
+      <OverlayLayer>
+        <FileSearchModalSlot />
+        <Toast />
+        <ImagePopupSlot />
+        <MessageRoutePanelSlot />
+        <ConfirmDialog />
+        <PromptDialog />
+        <StepDetailModalSlot />
+        <FilePreviewModalSlot />
+        <ScaleModalSlot />
+        <SearchEverywhereSlot />
+      </OverlayLayer>
       <DropZone />
-      <ImagePopupSlot />
-      <MessageRoutePanelSlot />
-      <ConfirmDialog />
-      <PromptDialog />
-      <StepDetailModalSlot />
-      <ScaleModalSlot />
-      <SearchEverywhereSlot />
       <UiBlockingOverlay />
     </>
   );

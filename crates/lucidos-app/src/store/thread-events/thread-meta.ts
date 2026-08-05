@@ -262,7 +262,10 @@ export type ThreadState = {
   /** Optimistic user messages shown before real SSE events arrive.
    *  Each entry is removed when its corresponding MessageReceived event arrives
    *  from SSE, matched by the client-generated event_id UUID. */
-  pendingUserMessages: Array<{ text: string; eventId: string; created: string; image_hashes?: string[] }>;
+  /** `unconfirmed` marks a row the safety refetch gave up on: the send was
+   *  never confirmed and the row is kept so the text stays visible, but it no
+   *  longer counts as a turn in flight (see `effectiveThreadStatus`). */
+  pendingUserMessages: Array<{ text: string; eventId: string; created: string; image_hashes?: string[]; unconfirmed?: boolean }>;
 };
 
 /** Build a fresh `ThreadState` for optimistic / SSE-bootstrapped threads.
@@ -382,17 +385,24 @@ export const isExcludedFromSections = (t: ThreadState): boolean =>
  *        blocking the agent. Most critical (nothing progresses until the user
  *        answers), so these float to the very top.
  *    1 — other CTA: codingAgentProposed (a change is ready to review) or Failed
- *        (the last response errored). The user should act, but no agent is
- *        stalled waiting on them.
+ *        (the last response errored), or Paused (an engine restart interrupted
+ *        the turn). The user should act, but no agent is stalled waiting on
+ *        them.
  *    2 — no CTA: running, idle, etc.
- *  Tiers 0 and 1 together are "needs attention" (the count badges); tier 0 is
- *  the most-critical subset. The caller passes the status to consult — every
- *  caller (the drawer's family-aware sort via `computeFamilyKeys`, the attention
- *  view, and the post-archive focus picker) uses `effectiveThreadStatus`, which
- *  honors optimistic archiving + pending sends. */
+ *  Tier 0 is the most-critical subset. Every caller (the drawer's family-aware
+ *  sort via `computeFamilyKeys`, the attention view, and the post-archive focus
+ *  picker) passes `effectiveThreadStatus`, which honors optimistic archiving and
+ *  pending sends.
+ *
+ *  Tier 1 is deliberately WIDER than `threadNeedsAttention`, which covers tier 0
+ *  plus Failed but neither Paused nor codingAgentProposed (that one has its own
+ *  Review view). This is a sort key, not a badge: floating a paused thread to
+ *  the top of Current costs the user nothing, whereas counting one in the
+ *  needs-attention badge would light it on every version switch, for work the
+ *  engine is about to resume by itself. */
 export function reviewTier(t: ThreadState, status: ThreadStatus): 0 | 1 | 2 {
   if (status === 'waiting_for_user_answer') return 0;
-  if (t.meta.codingAgentProposed || status === 'failed') return 1;
+  if (t.meta.codingAgentProposed || status === 'failed' || status === 'paused') return 1;
   return 2;
 }
 

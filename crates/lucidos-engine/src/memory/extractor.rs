@@ -193,13 +193,6 @@ impl MemoryExtractor {
         self
     }
 
-    /// Access the underlying Flash provider for lightweight LLM tasks. Returns
-    /// the concrete `VertexProvider` because callers (e.g. grounded web search)
-    /// use Vertex-only methods not on the `LlmProvider` trait.
-    pub fn provider(&self) -> &VertexProvider {
-        &self.provider
-    }
-
     /// Build the provider for a background-task model, routed by model id:
     /// `gpt-*` → OpenAI (requires [`Self::with_openai_key`]); everything else →
     /// Vertex (Gemini / Vertex-served Claude), preserving the prior behavior.

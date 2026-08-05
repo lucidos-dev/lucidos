@@ -18,7 +18,7 @@ use std::path::Path;
 /// picks ONE candidate by existence with no fall-through, listing it would
 /// poison every Mac that has the app, which is every Mac that has Tailscale at
 /// all. That is not hypothetical: it shipped, and it is what made **Settings ->
-/// Mobile Access** show a Sign in button that silently did nothing on a machine
+/// Access** show a Sign in button that silently did nothing on a machine
 /// already on its tailnet.
 ///
 /// macOS users get a real CLI from Homebrew or from the app's own

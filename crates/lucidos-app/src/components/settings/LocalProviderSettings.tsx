@@ -6,6 +6,7 @@ import {
   setLocalBaseUrl,
   DEFAULT_LOCAL_BASE_URL,
 } from '../../store/actions/preferences';
+import { findProviderCredential } from './providerCredential';
 
 const LOCAL_SERVICE = 'local';
 
@@ -23,10 +24,7 @@ export function LocalProviderSettings() {
   // Subscribe to preference + credential signals.
   preferences.value;
   const credLoadable = credentials.value;
-  const existing =
-    credLoadable.status === 'loaded'
-      ? credLoadable.data.find((c) => c.service_name === LOCAL_SERVICE)
-      : undefined;
+  const existing = findProviderCredential(credLoadable, LOCAL_SERVICE);
 
   const saved = currentLocalBaseUrl();
   const [url, setUrl] = useState(saved);
@@ -69,12 +67,16 @@ export function LocalProviderSettings() {
       <div class="settings-row">
         <span class="settings-row-label">
           Local (OpenAI-compatible)
-          {existing && <span class="list-row-details"> · key configured</span>}
+          {/* `.list-row-details` is `display: flex`, so this span is a block box
+              inside the label's line and renders UNDER it. A manual "·" glue
+              would therefore be stranded at the start of that new line, the
+              same artifact the rule in `.claude/rules/frontend.md` names. */}
+          {existing && <span class="list-row-details">key configured</span>}
         </span>
         {existing && (
           <button
             class="action-btn action-btn-danger"
-            onClick={() => void deleteCredential(LOCAL_SERVICE)}
+            onClick={() => void deleteCredential(existing.id, LOCAL_SERVICE)}
           >
             Remove key
           </button>

@@ -18,9 +18,17 @@ import { parseSecret, buildSecret, emptyFields, type CredentialFields } from './
 import { LoadableError } from '../shared/LoadableError';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 
-/** Strip the `email:` prefix the engine uses for email-account credentials. */
-function emailAccountName(service: string): string {
-  return service.startsWith('email:') ? service.slice('email:'.length) : service;
+/** The `email_accounts.name` an `email_password` credential belongs to.
+ *
+ *  Normally the identity function: the service name IS the account name, since
+ *  `auth_type` carries what the old `email:` prefix used to say. The strip is
+ *  the frontend half of the `credential-email-prefix-fallback` temporary
+ *  measure (`docs/temporary-measures.md`), for the rows the prefix migration had
+ *  to leave alone because their bare name was already taken. Without it, opening
+ *  such a credential for edit 404s on the server-settings fetch. Mirrors
+ *  `EmailStore::account_name_for_credential`; remove the two together. */
+function emailAccountName(serviceName: string): string {
+  return serviceName.startsWith('email:') ? serviceName.slice('email:'.length) : serviceName;
 }
 
 export function CredentialModal() {
@@ -52,6 +60,11 @@ interface EditData {
 /** Loads the current secret value + email settings for an edit, then renders
  *  the form pre-filled. The secret is fetched via the same endpoint the copy
  *  buttons use — no new exposure. */
+/** `editing` is the credential's `id`, not its service name: a name no longer
+ *  identifies one row (an `oauth_client` registration may share it with an API
+ *  key), and the form can change `auth_type`, so even name-plus-type could not
+ *  name the row being edited. The service name for display comes off the
+ *  resolved row instead. */
 function CredentialEditLoader({ editing }: { editing: string }) {
   const credLoadable = credentials.value;
   const [data, setData] = useState<Loadable<EditData>>({ status: 'not-loaded' });
@@ -62,12 +75,13 @@ function CredentialEditLoader({ editing }: { editing: string }) {
 
   const creds = loadedOr(credLoadable, []);
   const existingCred =
-    credLoadable.status === 'loaded' ? creds.find((c) => c.service_name === editing) ?? null : null;
+    credLoadable.status === 'loaded' ? creds.find((c) => c.id === editing) ?? null : null;
 
   useEffect(() => {
     if (credLoadable.status !== 'loaded') return;
     if (!existingCred) {
-      setData({ status: 'failed', error: `Credential "${editing}" not found` });
+      // No id in the message: it names nothing the user can look up.
+      setData({ status: 'failed', error: 'Credential not found' });
       return;
     }
     let cancelled = false;
@@ -78,7 +92,7 @@ function CredentialEditLoader({ editing }: { editing: string }) {
         const fields = parseSecret(existingCred.auth_type, secret.auth_value);
         const emailInfo =
           existingCred.auth_type === 'email_password'
-            ? await getEmailAccount(emailAccountName(editing))
+            ? await getEmailAccount(emailAccountName(existingCred.service_name))
             : null;
         if (!cancelled) setData({ status: 'loaded', data: { fields, emailInfo } });
       } catch (e) {
@@ -150,7 +164,8 @@ function CredentialFormInner({
   initialFields,
   emailInfo,
 }: CredentialFormInnerProps) {
-  const initialService = editing || request?.service || '';
+  // `editing` is an id, so the name shown comes off the resolved row.
+  const initialService = existingCred?.service_name || request?.service || '';
   const initialBaseUrl = existingCred?.base_url || request?.base_url || '';
   const initialAuthType = existingCred?.auth_type || request?.auth_type || 'api_key';
   const initialAuthHeader = existingCred?.auth_header || 'Authorization';
@@ -167,6 +182,10 @@ function CredentialFormInner({
   const initialAuthUrl = initialFields.authUrl || oauthDefaults?.auth_url || '';
   const initialTokenUrl = initialFields.tokenUrl || oauthDefaults?.token_url || '';
   const initialUserinfoUrl = initialFields.userinfoUrl || oauthDefaults?.userinfo_url || '';
+  const initialUserinfoMethod =
+    initialFields.userinfoMethod || oauthDefaults?.userinfo_method || 'GET';
+  const initialAuthorizeParams =
+    initialFields.authorizeParams || oauthDefaults?.authorize_params || '';
   const initialScopes = initialFields.scopes || oauthDefaults?.scopes || '';
   const initialRedirectUri = initialFields.redirectUri || oauthDefaults?.redirect_uri || '';
 
@@ -184,6 +203,8 @@ function CredentialFormInner({
   const authUrlRef = useRef<HTMLInputElement>(null);
   const tokenUrlRef = useRef<HTMLInputElement>(null);
   const userinfoUrlRef = useRef<HTMLInputElement>(null);
+  const [userinfoMethod, setUserinfoMethod] = useState<string>(initialUserinfoMethod);
+  const authorizeParamsRef = useRef<HTMLInputElement>(null);
   const scopesRef = useRef<HTMLInputElement>(null);
   const redirectUriRef = useRef<HTMLInputElement>(null);
   // Email server settings
@@ -243,6 +264,8 @@ function CredentialFormInner({
       authUrl: authUrlRef.current?.value.trim() || '',
       tokenUrl: tokenUrlRef.current?.value.trim() || '',
       userinfoUrl: userinfoUrlRef.current?.value.trim() || '',
+      userinfoMethod,
+      authorizeParams: authorizeParamsRef.current?.value.trim() || '',
       scopes: scopesRef.current?.value.trim() || '',
       redirectUri: redirectUriRef.current?.value.trim() || '',
     };
@@ -449,6 +472,38 @@ function CredentialFormInner({
               <div class="form-group">
                 <label>Userinfo URL <span class="form-hint">(optional)</span></label>
                 <input ref={userinfoUrlRef} type="url" defaultValue={initialUserinfoUrl} placeholder="https://api.example.com/v1/me" />
+              </div>
+              <div class="form-group">
+                <label>Userinfo method</label>
+                <Dropdown
+                  options={[
+                    { value: 'GET', label: 'GET' },
+                    { value: 'POST', label: 'POST' },
+                  ]}
+                  value={userinfoMethod}
+                  onChange={setUserinfoMethod}
+                />
+                <div class="form-hint">
+                  Leave on GET unless the provider's userinfo endpoint refuses it. Dropbox's
+                  does: <code>users/get_current_account</code> is POST-only. Getting this
+                  wrong costs only the account's name and email, never the connection.
+                </div>
+              </div>
+              <div class="form-group">
+                <label>Authorization parameters <span class="form-hint">(optional)</span></label>
+                <input
+                  ref={authorizeParamsRef}
+                  type="text"
+                  defaultValue={initialAuthorizeParams}
+                  placeholder="access_type=offline&prompt=consent"
+                />
+                <div class="form-hint">
+                  Extra parameters added to the authorization URL, which is where a provider
+                  spells "issue a refresh token" its own way. Leave blank for
+                  <code>access_type=offline&amp;prompt=consent</code>; Dropbox instead needs
+                  <code>token_access_type=offline</code>, and without it its token expires in
+                  hours with nothing to renew it. Write <code>none</code> to send neither.
+                </div>
               </div>
               <div class="form-group">
                 <label>Default Scopes <span class="form-hint">(optional, space-separated)</span></label>

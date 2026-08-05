@@ -137,10 +137,14 @@ body {
     background: var(--bg-primary);
     color: var(--text-primary);
     font-family: var(--font-ui);
-    /* Inherit the root font-size (var(--user-ui-scale, 100%)) like the host
-       shell's body — base.css sets no explicit body font-size, so a hardcoded
-       value here made every app's base text smaller than Lucidos and made the
-       user's UI-scale preference look like it was being ignored. */
+    /* The type scale's body step, so text an app doesn't size explicitly lands
+       where the host shell's body text does. It is a `rem`, so it still tracks
+       the user's UI-scale preference through the root font-size above. An
+       earlier removal of this declaration assumed otherwise, and left unstyled
+       app text falling to the raw root (`1rem`, 18px at a 112.5% scale), a size
+       nothing in the host renders at: every app came out a scale step larger
+       than Lucidos, with proportionally looser line spacing on top. */
+    font-size: var(--font-size-md);
     line-height: 1.5;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;

@@ -50,7 +50,7 @@ describe('settings search — keyboard shortcuts', () => {
 });
 
 describe('settings search — Permissions section', () => {
-  it('finds the Command Safety rows by name', () => {
+  it('finds the Command safety rows by name', () => {
     const guard = getSettingsSearchResults('command guard', 20);
     expect(guard.some((r) => r.id === 'command-safety:guard')).toBe(true);
     const judge = getSettingsSearchResults('judge model', 20);
@@ -62,7 +62,7 @@ describe('settings search — Permissions section', () => {
     expect(getSettingsSearchResults('claude code permissions', 20).some((r) => r.id === 'permissions:claude-code')).toBe(true);
   });
 
-  it('resolves a Command Safety entry to the permissions subview with its anchor', () => {
+  it('resolves a Command safety entry to the permissions subview with its anchor', () => {
     const entry = findSettingsEntry('command-safety:guard');
     expect(entry?.subview).toBe('permissions');
     expect(entry?.anchor).toBe('command-safety:guard');

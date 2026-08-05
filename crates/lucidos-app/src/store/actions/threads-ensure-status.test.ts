@@ -28,12 +28,12 @@ vi.hoisted(() => {
 });
 
 import { makeThreadState } from './threads-test-helpers';
-import { type ThreadState } from '../thread-events';
+import { PENDING_TITLE_PLACEHOLDER, type ThreadState } from '../thread-events';
 import { fetchThreads, fetchThreadById } from '../../api/threads';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { _resetComposeDraftsForTesting } from '../composeDrafts';
-import { archivingThreadIds, bootstrappingThreadId, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts } from '../store';
-import { ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
+import { archivingThreadIds, bootstrappingThreadId, connectionStatus, databaseReachable, focusedThreadId, generatedTitleIds, mobileView, resetCodingAgentPendingPreferences, threadDrawerOpen, threadMap, threadsLoaded, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY } from '../store';
+import { _resetThreadEventsFailuresForTesting, clearThreadFetchGuards, ensureThreadByIdInMap, ensureThreadInMap, loadAllThreads, upsertThread } from './thread-loading';
 import { focusThread, focusThreadOrBootstrapResult } from './threads';
 
 // Mock the API module
@@ -676,21 +676,33 @@ describe('event replay must not override API status', () => {
 // ---------------------------------------------------------------------------
 // refreshThreadEvents — retry once on transient DOMException / transport error
 // ---------------------------------------------------------------------------
-// The runResumeSync / resyncLoadedThreads paths fire Promise.all of
-// refreshThreadEvents for every loaded thread on SSE reconnect, iOS PWA wake,
-// or right after an engine restart. On iOS Safari, the browser cancels
-// in-flight fetches mid-flight (suspend/resume, lifecycle, network change) —
-// surfacing as AbortError — and fails the first request on a stale HTTP/2
-// connection — surfacing as TypeError "Load failed". A single retry covers the
-// transient case; if both attempts still fail transiently we stay silent
-// because SSE recovers. Without this the user gets one "Failed to refresh
-// thread events" toast per affected thread, which can mean dozens of toasts in
-// a single wake cycle. Mirrors the retry-on-TimeoutError pattern in
-// refreshChangesState.
+// The runResumeSync / resyncLoadedThreads paths fan refreshThreadEvents out over
+// every loaded thread on SSE reconnect, iOS PWA wake, or right after an engine
+// restart. On iOS Safari the browser cancels in-flight fetches mid-flight
+// (suspend/resume, lifecycle, network change), surfacing as AbortError; fails
+// the first request on a stale HTTP/2 connection, surfacing as TypeError "Load
+// failed"; and over a dropped tunnel the request hangs until the 10s client
+// deadline fires, surfacing as TimeoutError. A single retry covers the
+// recoverable case, and a failure that survives it stays silent because none of
+// those three say anything about the engine and the connection dot owns a
+// sustained outage.
+//
+// A VERDICT (the engine answered and refused) still reaches the user, through
+// one keyed card for the whole fan-out whose copy counts the affected threads.
+// The unkeyed per-thread card this replaced was the reported symptom: a column
+// of `request timed out` toasts, one per thread, none auto-dismissing.
 
 describe('refreshThreadEvents — retry on transient DOMException / transport error', () => {
   beforeEach(() => {
     toasts.value = [];
+    _resetThreadEventsFailuresForTesting();
+    clearThreadFetchGuards();
+    // The verdict branch is gated on a reachable engine (the dot owns outages),
+    // and the signal's own default is 'connecting'.
+    connectionStatus.value = 'connected';
+    // showToast suppresses everything while the workspace is unavailable; one
+    // case below drives that deliberately, so reset it for the rest.
+    databaseReachable.value = true;
   });
 
   function setupLoadedThread(): void {
@@ -795,7 +807,7 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
   });
 
-  it('still shows the toast when both attempts fail with a non-Abort DOMException (e.g. TimeoutError)', async () => {
+  it('silences both-timed-out, the exact card the user reported', async () => {
     setupLoadedThread();
     const { fetchThreadEvents } = await import('../../api/threads');
     const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
@@ -808,13 +820,15 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     await refreshThreadEvents('t1');
 
     expect(mock).toHaveBeenCalledTimes(2);
-    const toast = toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'));
-    expect(toast).toBeTruthy();
-    expect(toast!.message).toBe('Failed to refresh thread events for "Refresh Retry Thread": request timed out');
-    expect(toast!.type).toBe('error');
+    // This case used to assert the opposite, on the reasoning that waiting the
+    // full 10s window and getting nothing is a stronger signal than a cancel.
+    // True of one request; false of a fan-out, which fires one per loaded thread
+    // and so turns one dropped tunnel into N identical `request timed out` cards.
+    // The connection dot reports the outage, once.
+    expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
   });
 
-  it('does not retry on a non-DOMException error (e.g. 500) — surfaces immediately', async () => {
+  it('surfaces a verdict immediately (no retry) under the shared key', async () => {
     setupLoadedThread();
     const { fetchThreadEvents } = await import('../../api/threads');
     const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
@@ -827,6 +841,387 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
     expect(mock).toHaveBeenCalledTimes(1);
     const toast = toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'));
     expect(toast!.message).toBe('Failed to refresh thread events for "Refresh Retry Thread": boom');
+    expect(toast!.type).toBe('error');
+    expect(toast!.key).toBe(THREAD_EVENTS_REFRESH_TOAST_KEY);
+  });
+
+  it('reports ten verdict failures as ONE card that counts them', async () => {
+    const map = new Map<string, ThreadState>();
+    for (let i = 0; i < 10; i++) {
+      map.set(`v${i}`, makeThreadState(`v${i}`, {
+        meta: { id: `v${i}`, title: `Verdict Thread ${i}` },
+        eventsLoaded: true,
+        lastDbSeq: 1,
+      }));
+    }
+    threadMap.value = map;
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await Promise.all([...map.keys()].map(id => refreshThreadEvents(id)));
+
+    // The reported symptom was a column of near-identical cards, one per thread,
+    // none of them auto-dismissing. One card, and it counts rather than naming
+    // one of ten arbitrarily.
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for 10 threads: boom');
+  });
+
+  it('counts a thread with no title yet rather than falling back to its id', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('untitled', makeThreadState('untitled', {
+      meta: { id: 'untitled', title: PENDING_TITLE_PLACEHOLDER },
+      eventsLoaded: true,
+      lastDbSeq: 1,
+    }));
+    threadMap.value = map;
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('untitled');
+
+    // A raw thread id in user-facing copy names nothing the user can look up.
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for 1 thread: boom');
+    expect(toasts.value[0].message).not.toContain('untitled');
+  });
+
+  it('records nothing and shows no card while the engine is unreachable', async () => {
+    setupLoadedThread();
+    connectionStatus.value = 'disconnected';
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('t1');
+
+    // The dot already says the engine is unreachable. A card per thread on top
+    // of it is the same fact told N more times.
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('a transient failure never joins the failing set, so a later verdict counts only itself', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('blip', makeThreadState('blip', {
+      meta: { id: 'blip', title: 'Blipped Thread' }, eventsLoaded: true, lastDbSeq: 1,
+    }));
+    map.set('real', makeThreadState('real', {
+      meta: { id: 'real', title: 'Refused Thread' }, eventsLoaded: true, lastDbSeq: 1,
+    }));
+    threadMap.value = map;
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockImplementation((id: string) => id === 'blip'
+      ? Promise.reject(new DOMException('timeout', 'TimeoutError'))
+      : Promise.reject(new Error('boom')));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('blip');
+    await refreshThreadEvents('real');
+
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for "Refused Thread": boom');
+  });
+
+  it('recounts on a partial recovery instead of freezing the count it was raised with', async () => {
+    const map = new Map<string, ThreadState>();
+    for (const id of ['a', 'b', 'c']) {
+      map.set(id, makeThreadState(id, {
+        meta: { id, title: `Thread ${id.toUpperCase()}` }, eventsLoaded: true, lastDbSeq: 1,
+      }));
+    }
+    threadMap.value = map;
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('a');
+    await refreshThreadEvents('b');
+    await refreshThreadEvents('c');
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for 3 threads: boom');
+
+    mock.mockReset();
+    mock.mockResolvedValue(noNewEventsSnapshot());
+    await refreshThreadEvents('a');
+    // Two are still behind, so the card stands, but "3" is now a provably wrong
+    // number and must not survive the recovery.
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for 2 threads: boom');
+
+    await refreshThreadEvents('b');
+    // Down to one, so the card can name it again.
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for "Thread C": boom');
+
+    await refreshThreadEvents('c');
+    // Now false of everyone.
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('coalesces two fan-out refreshes of the same thread, so a slow failure cannot outlive a fast success', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    let settleFirst: (v: unknown) => void = () => {};
+    mock
+      .mockImplementationOnce(() => new Promise(res => { settleFirst = res; }))
+      .mockRejectedValue(new Error('boom'));
+
+    // A wake's runResumeSync and an SSE Lagged resync both target this thread.
+    const { refreshThreadEvents } = await import('./thread-loading');
+    const first = refreshThreadEvents('t1', { coalesce: true });
+    const second = refreshThreadEvents('t1', { coalesce: true });
+    settleFirst(noNewEventsSnapshot());
+    await Promise.all([first, second]);
+
+    // The second call is dropped rather than racing: it would otherwise double
+    // the requests the pool exists to bound, and if its failure settled last it
+    // would record a verdict for a thread that had just refreshed cleanly.
+    expect(mock).toHaveBeenCalledTimes(1);
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('a read-after-write caller always issues its own request, even alongside a fan-out', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    let settleFanOut: (v: unknown) => void = () => {};
+    mock
+      .mockImplementationOnce(() => new Promise(res => { settleFanOut = res; }))
+      .mockResolvedValue(noNewEventsSnapshot());
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    const fanOut = refreshThreadEvents('t1', { coalesce: true });
+    // Several callers treat a resolved refresh as read-after-write PROOF:
+    // `schedulePendingCleanup` force-drops a pending message on it,
+    // `checkConnection`'s empty-thread recovery spends one of three budgeted
+    // attempts, and the cancel / queued-message heals need a request issued
+    // after their own POST returned. Coalescing any of those into an in-flight
+    // request that predates the write would make the proof a lie.
+    await refreshThreadEvents('t1');
+    expect(mock).toHaveBeenCalledTimes(2);
+
+    settleFanOut(noNewEventsSnapshot());
+    await fanOut;
+  });
+
+  it('an attempt whose guard was reset mid-flight does not release the newer attempt', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    const settle: Array<(v: unknown) => void> = [];
+    mock.mockImplementation(() => new Promise(res => { settle.push(res); }));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    const first = refreshThreadEvents('t1', { coalesce: true });
+    // A second resume lands while the first fan-out is still in flight. Both the
+    // 1s coalescing gate and `resumeInFlight` expire well before a slow refresh
+    // settles, so the guard is reset and a fresh attempt is admitted.
+    clearThreadFetchGuards();
+    const second = refreshThreadEvents('t1', { coalesce: true });
+    expect(mock).toHaveBeenCalledTimes(2);
+
+    // The older attempt finishes. Its release must not free the newer one's
+    // slot, or a third attempt would pile on with two already in flight.
+    settle[0](noNewEventsSnapshot());
+    await first;
+    await refreshThreadEvents('t1', { coalesce: true });
+    expect(mock).toHaveBeenCalledTimes(2);
+
+    settle[1](noNewEventsSnapshot());
+    await second;
+    // Once the owner releases, the thread is refreshable again.
+    const third = refreshThreadEvents('t1', { coalesce: true });
+    expect(mock).toHaveBeenCalledTimes(3);
+    settle[2](noNewEventsSnapshot());
+    await third;
+  });
+
+  it('a superseded attempt reports nothing, whichever way it settles', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    const { refreshThreadEvents } = await import('./thread-loading');
+
+    // Older attempt FAILS after a newer one already refreshed cleanly and
+    // RELEASED its claim: raising a card off it would report a thread that is up
+    // to date. The claim is gone by then, so only the report high-water mark can
+    // still tell that a newer conclusion has landed.
+    mock.mockReset();
+    let failOld: (e: unknown) => void = () => {};
+    mock.mockImplementationOnce(() => new Promise((_res, rej) => { failOld = rej; }))
+      .mockResolvedValue(noNewEventsSnapshot());
+    const old1 = refreshThreadEvents('t1', { coalesce: true });
+    clearThreadFetchGuards();
+    await refreshThreadEvents('t1', { coalesce: true });
+    failOld(new Error('boom'));
+    await old1;
+    expect(toasts.value).toHaveLength(0);
+
+    // Older attempt SUCCEEDS after a newer one failed: retracting the card
+    // would hide a failure that is still true.
+    _resetThreadEventsFailuresForTesting();
+    clearThreadFetchGuards();
+    toasts.value = [];
+    mock.mockReset();
+    let succeedOld: (v: unknown) => void = () => {};
+    mock.mockImplementationOnce(() => new Promise(res => { succeedOld = res; }))
+      .mockRejectedValue(new Error('boom'));
+    const old2 = refreshThreadEvents('t1', { coalesce: true });
+    clearThreadFetchGuards();
+    await refreshThreadEvents('t1', { coalesce: true });
+    expect(toasts.value).toHaveLength(1);
+    succeedOld(noNewEventsSnapshot());
+    await old2;
+    expect(toasts.value).toHaveLength(1);
+  });
+
+  it('still reports a verdict when the newer attempt settled without concluding anything', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    let failOld: (e: unknown) => void = () => {};
+    mock.mockImplementationOnce(() => new Promise((_res, rej) => { failOld = rej; }))
+      // The newer attempt dies transiently on both tries, so it reports nothing
+      // and simply releases its claim.
+      .mockRejectedValue(new DOMException('aborted', 'AbortError'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    const older = refreshThreadEvents('t1', { coalesce: true });
+    clearThreadFetchGuards();
+    await refreshThreadEvents('t1', { coalesce: true });
+    failOld(new Error('boom'));
+    await older;
+
+    // Gating on the live claim would have swallowed this genuine verdict: the
+    // newer attempt released the claim without ever concluding anything.
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain('boom');
+  });
+
+  it('a recovery never RAISES a card that was suppressed while the failures were real', async () => {
+    // The engine keeps answering /health while its database is down, so the dot
+    // stays green and every fetch 500s into the failing map as a verdict. But
+    // showToast drops everything while `workspaceUnavailable()` holds, because
+    // the database toast is the one authoritative surface. Nothing may then turn
+    // the RECOVERY into the moment a brand-new sticky card appears, carrying a
+    // now-stale reason and counting down as the rest of the threads catch up.
+    const map = new Map<string, ThreadState>();
+    for (const id of ['x', 'y', 'z']) {
+      map.set(id, makeThreadState(id, { meta: { id, title: id }, eventsLoaded: true, lastDbSeq: 1 }));
+    }
+    threadMap.value = map;
+    databaseReachable.value = false;
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('database unreachable'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    for (const id of ['x', 'y', 'z']) await refreshThreadEvents(id);
+    expect(toasts.value).toHaveLength(0);
+
+    databaseReachable.value = true;
+    mock.mockReset();
+    mock.mockResolvedValue(noNewEventsSnapshot());
+    await refreshThreadEvents('x');
+
+    expect(toasts.value).toHaveLength(0);
+    await refreshThreadEvents('y');
+    await refreshThreadEvents('z');
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('shows the newest reason when a thread fails again with a different one', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('p', makeThreadState('p', { meta: { id: 'p', title: 'P' }, eventsLoaded: true, lastDbSeq: 1 }));
+    map.set('q', makeThreadState('q', { meta: { id: 'q', title: 'Q' }, eventsLoaded: true, lastDbSeq: 1 }));
+    threadMap.value = map;
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    mock.mockRejectedValue(new Error('boom'));
+    await refreshThreadEvents('p');
+    mock.mockRejectedValue(new Error('500 Internal Server Error'));
+    await refreshThreadEvents('q');
+    // `Map.set` on an existing key keeps its ORIGINAL position, so re-recording
+    // p has to move it to the end or the card would keep reporting q's reason.
+    mock.mockRejectedValue(new Error('connection reset'));
+    await refreshThreadEvents('p');
+
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for 2 threads: connection reset');
+  });
+
+  it('retracts a lone failing thread the moment it is removed, with no later fetch to prune it', async () => {
+    setupLoadedThread();
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { refreshThreadEvents, forgetThreadEventsFailures } = await import('./thread-loading');
+    await refreshThreadEvents('t1');
+    expect(toasts.value).toHaveLength(1);
+
+    // The reconcile-on-read backstop only runs when a LATER fetch settles, and
+    // the only failing thread leaves none to settle: nothing fetches it again,
+    // and with no other loaded thread nothing fetches at all. So the removal
+    // site cleans up directly.
+    const pruned = new Map(threadMap.value);
+    pruned.delete('t1');
+    threadMap.value = pruned;
+    forgetThreadEventsFailures('t1');
+
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('drops a thread that leaves the map, so its card cannot outlive it', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('doomed', makeThreadState('doomed', {
+      meta: { id: 'doomed', title: 'Rolled Back' }, eventsLoaded: true, lastDbSeq: 1,
+    }));
+    map.set('kept', makeThreadState('kept', {
+      meta: { id: 'kept', title: 'Kept' }, eventsLoaded: true, lastDbSeq: 1,
+    }));
+    threadMap.value = map;
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('doomed');
+    await refreshThreadEvents('kept');
+    expect(toasts.value[0].message).toBe('Failed to refresh thread events for 2 threads: boom');
+
+    // sendMessage deletes the row of an optimistic thread whose send failed.
+    // Nothing will ever fetch it again, so an entry keyed on it would hold the
+    // card open forever at a count including a thread the user cannot see.
+    const pruned = new Map(threadMap.value);
+    pruned.delete('doomed');
+    threadMap.value = pruned;
+
+    mock.mockReset();
+    mock.mockResolvedValue(noNewEventsSnapshot());
+    await refreshThreadEvents('kept');
+
+    expect(toasts.value).toHaveLength(0);
   });
 
   it('does not toast or retry on success', async () => {
@@ -841,6 +1236,194 @@ describe('refreshThreadEvents — retry on transient DOMException / transport er
 
     expect(mock).toHaveBeenCalledTimes(1);
     expect(toasts.value.find(t => t.message?.startsWith('Failed to refresh thread events'))).toBeUndefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// loadThreadEvents: same verdict / delivery-failure split as the refresh above
+// ---------------------------------------------------------------------------
+// loadAllThreads fans this out over the focused thread plus every active and
+// saved one, on boot and on every wake, so it storms the same way. Its transient
+// branch is silent for the same reasons AND because the user is already told by
+// the two surfaces that can act on it: `eventsLoadFailed` paints the focused
+// thread's own failed empty state, and the resume sync retries every thread
+// carrying the flag.
+
+describe('loadThreadEvents: verdict vs delivery failure', () => {
+  beforeEach(() => {
+    toasts.value = [];
+    _resetThreadEventsFailuresForTesting();
+    clearThreadFetchGuards();
+    connectionStatus.value = 'connected';
+    const map = new Map<string, ThreadState>();
+    map.set('L1', makeThreadState('L1', { meta: { id: 'L1', title: 'Load Thread' } }));
+    threadMap.value = map;
+  });
+
+  /** loadThreadEvents makes three attempts with a 1s then 2s backoff. Fake
+   *  timers keep that off the wall clock without weakening the assertion. */
+  async function runLoad(threadId: string): Promise<void> {
+    const { loadThreadEvents } = await import('./thread-loading');
+    vi.useFakeTimers();
+    try {
+      const done = loadThreadEvents(threadId);
+      await vi.advanceTimersByTimeAsync(5000);
+      await done;
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it('stays silent when all three attempts time out, but still records the failure on the thread', async () => {
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new DOMException('timeout', 'TimeoutError'));
+
+    await runLoad('L1');
+
+    expect(mock).toHaveBeenCalledTimes(3);
+    expect(toasts.value).toHaveLength(0);
+    // The flag is what ThreadView renders and what runResumeSync retries, so it
+    // must be set on the silent branch too.
+    expect(threadMap.value.get('L1')!.eventsLoadFailed).toBe(true);
+  });
+
+  it('raises one keyed card on a verdict', async () => {
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    await runLoad('L1');
+
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toBe('Failed to load thread events for "Load Thread": boom');
+    expect(toasts.value[0].key).toBe(THREAD_EVENTS_LOAD_TOAST_KEY);
+    expect(threadMap.value.get('L1')!.eventsLoadFailed).toBe(true);
+  });
+
+  it('never leaves a load card over a thread another attempt already loaded', async () => {
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { loadThreadEvents } = await import('./thread-loading');
+    vi.useFakeTimers();
+    try {
+      const failing = loadThreadEvents('L1');
+      // A resume cleared the guard and put a second load on this thread; it
+      // lands successfully while this one is still working through its backoff.
+      await vi.advanceTimersByTimeAsync(1500);
+      threadMap.value.get('L1')!.eventsLoaded = true;
+      await vi.advanceTimersByTimeAsync(5000);
+      await failing;
+    } finally {
+      vi.useRealTimers();
+    }
+
+    // The thread is loaded and rendering, so this attempt's failure describes
+    // nothing the user can see, and must neither card it nor re-flag it.
+    expect(toasts.value).toHaveLength(0);
+    expect(threadMap.value.get('L1')!.eventsLoadFailed).toBe(false);
+  });
+
+  it('a refresh that started before a full load cannot re-raise the card it retracted', async () => {
+    const map = threadMap.value;
+    map.set('R1', makeThreadState('R1', {
+      meta: { id: 'R1', title: 'Raced Thread' }, eventsLoaded: true, lastDbSeq: 1,
+    }));
+    threadMap.value = new Map(map);
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+
+    // The focused-thread recovery refreshes R1 while the ThreadView watchdog
+    // reloads it: both fire on the same "loaded but empty" condition.
+    let failRefresh: (e: unknown) => void = () => {};
+    mock.mockImplementationOnce(() => new Promise((_res, rej) => { failRefresh = rej; }));
+    const { refreshThreadEvents, loadThreadEvents } = await import('./thread-loading');
+    const refreshing = refreshThreadEvents('R1');
+
+    // The full load lands: it carries no `after`, so it holds everything a
+    // refresh would have fetched.
+    threadMap.value.get('R1')!.eventsLoaded = false;
+    mock.mockResolvedValue({ events: [], currentAggregate: null });
+    await loadThreadEvents('R1');
+    expect(toasts.value).toHaveLength(0);
+
+    failRefresh(new Error('boom'));
+    await refreshing;
+
+    // Without the load claiming the report high-water mark, this stale verdict
+    // would card a thread that is holding the whole snapshot, with nothing left
+    // to retract it.
+    expect(toasts.value).toHaveLength(0);
+  });
+
+  it('a load never lowers the refresh report mark below what already reported', async () => {
+    const map = threadMap.value;
+    map.set('R2', makeThreadState('R2', {
+      meta: { id: 'R2', title: 'Marked Thread' }, eventsLoaded: true, lastDbSeq: 1,
+    }));
+    threadMap.value = new Map(map);
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+
+    const { refreshThreadEvents, loadThreadEvents } = await import('./thread-loading');
+    // A load starts first, so it holds the LOWEST token of the three.
+    let settleLoad: (v: unknown) => void = () => {};
+    mock.mockImplementationOnce(() => new Promise(res => { settleLoad = res; }));
+    threadMap.value.get('R2')!.eventsLoaded = false;
+    const loading = loadThreadEvents('R2');
+    threadMap.value.get('R2')!.eventsLoaded = true;
+
+    // A middle refresh is still in flight when a newer one reports a verdict.
+    let failMiddle: (e: unknown) => void = () => {};
+    mock.mockImplementationOnce(() => new Promise((_res, rej) => { failMiddle = rej; }));
+    const middle = refreshThreadEvents('R2');
+    mock.mockRejectedValue(new Error('newest'));
+    await refreshThreadEvents('R2');
+    expect(toasts.value[0].message).toContain('newest');
+
+    // The load lands last. A bare `set` here would lower the mark to the load's
+    // start-time token and re-admit the middle attempt.
+    settleLoad({ events: [], currentAggregate: null });
+    await loading;
+    failMiddle(new Error('stale middle'));
+    await middle;
+
+    expect(toasts.value.some(t => t.message?.includes('stale middle'))).toBe(false);
+  });
+
+  it('a load card and a refresh card coexist, and neither retracts the other', async () => {
+    const map = threadMap.value;
+    map.set('R1', makeThreadState('R1', {
+      meta: { id: 'R1', title: 'Refresh Thread' }, eventsLoaded: true, lastDbSeq: 1,
+    }));
+    threadMap.value = new Map(map);
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    mock.mockRejectedValue(new Error('boom'));
+
+    const { refreshThreadEvents } = await import('./thread-loading');
+    await refreshThreadEvents('R1');
+    await runLoad('L1');
+
+    expect(toasts.value.map(t => t.key).sort()).toEqual(
+      [THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY].sort(),
+    );
+
+    // A landed refresh says nothing about the thread whose history never
+    // arrived, so it must leave that card alone.
+    mock.mockReset();
+    mock.mockResolvedValue({ events: [], currentAggregate: null });
+    await refreshThreadEvents('R1');
+
+    expect(toasts.value.map(t => t.key)).toEqual([THREAD_EVENTS_LOAD_TOAST_KEY]);
   });
 });
 

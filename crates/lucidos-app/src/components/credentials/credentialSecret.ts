@@ -15,6 +15,14 @@ export interface CredentialFields {
   authUrl: string;
   tokenUrl: string;
   userinfoUrl: string;
+  /** `'POST'` for a provider whose userinfo endpoint refuses GET (Dropbox's
+   *  `users/get_current_account`). Blank means the OIDC default, GET. */
+  userinfoMethod: string;
+  /** Extra authorization-URL parameters, `key=value&key=value`. Blank means the
+   *  engine's default (`access_type=offline&prompt=consent`); this is where a
+   *  provider's own spelling of "issue a refresh token" goes, e.g. Dropbox's
+   *  `token_access_type=offline`. */
+  authorizeParams: string;
   scopes: string;
   /** Blank means the default loopback callback URI. */
   redirectUri: string;
@@ -30,6 +38,8 @@ export function emptyFields(): CredentialFields {
     authUrl: '',
     tokenUrl: '',
     userinfoUrl: '',
+    userinfoMethod: '',
+    authorizeParams: '',
     scopes: '',
     redirectUri: '',
   };
@@ -48,6 +58,8 @@ export function parseSecret(authType: AuthType, authValue: string): CredentialFi
     f.authUrl = pick(p, 'auth_url');
     f.tokenUrl = pick(p, 'token_url');
     f.userinfoUrl = pick(p, 'userinfo_url');
+    f.userinfoMethod = pick(p, 'userinfo_method');
+    f.authorizeParams = pick(p, 'authorize_params');
     f.scopes = pick(p, 'scopes');
     f.redirectUri = pick(p, 'redirect_uri');
   } else if (authType === 'password') {
@@ -76,6 +88,8 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
       !f.authUrl &&
       !f.tokenUrl &&
       !f.userinfoUrl &&
+      !f.userinfoMethod &&
+      !f.authorizeParams &&
       !f.scopes &&
       !f.redirectUri
     ) {
@@ -90,6 +104,12 @@ export function buildSecret(authType: AuthType, f: CredentialFields): string {
     if (f.authUrl) blob.auth_url = f.authUrl;
     if (f.tokenUrl) blob.token_url = f.tokenUrl;
     if (f.userinfoUrl) blob.userinfo_url = f.userinfoUrl;
+    // Only when it differs from the default. Storing `GET` explicitly would put
+    // a key on every credential to say what its absence already says.
+    if (f.userinfoMethod && f.userinfoMethod.toUpperCase() !== 'GET') {
+      blob.userinfo_method = f.userinfoMethod.toUpperCase();
+    }
+    if (f.authorizeParams) blob.authorize_params = f.authorizeParams;
     if (f.scopes) blob.scopes = f.scopes;
     if (f.redirectUri) blob.redirect_uri = f.redirectUri;
     return JSON.stringify(blob);

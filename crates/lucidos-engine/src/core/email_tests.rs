@@ -520,3 +520,40 @@ async fn imap_connect_times_out_with_descriptive_error_when_server_stalls() {
     );
     hold.abort();
 }
+
+/// The credential's service name IS the `email_accounts.name` now: `auth_type`
+/// carries what the old `email:` prefix said, so nothing spells it twice.
+#[test]
+fn account_name_is_the_credential_service_name() {
+    assert_eq!(EmailStore::account_name_for_credential("work"), "work");
+    assert_eq!(
+        EmailStore::account_name_for_credential("Telenor"),
+        "Telenor"
+    );
+}
+
+/// The stranded-row case, which real data hits: a workspace holding BOTH an
+/// `email:Telenor` mailbox password and a separate `Telenor` credential of
+/// another type keeps the prefixed name, because `email_password` may not shadow
+/// a name. Its `email_accounts` row is still called `Telenor`, so resolving the
+/// account by the service name verbatim would find nothing: the edit form's
+/// settings fetch 404s, and the password write silently touches zero rows while
+/// reporting success. Temporary measure, removed with the
+/// `get_email_password` fallback.
+#[test]
+fn account_name_strips_a_prefix_the_migration_had_to_leave() {
+    assert_eq!(
+        EmailStore::account_name_for_credential("email:Telenor"),
+        "Telenor"
+    );
+}
+
+/// Case is preserved: `email_accounts.name` is matched exactly, so folding it
+/// would detach the credential from its mailbox.
+#[test]
+fn account_name_preserves_case() {
+    assert_eq!(
+        EmailStore::account_name_for_credential("email:MixedCase"),
+        "MixedCase"
+    );
+}

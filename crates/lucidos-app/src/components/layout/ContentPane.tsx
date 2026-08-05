@@ -1,5 +1,6 @@
-import { useEffect, useRef } from 'preact/hooks';
-import { activeMenuItem, panelOverlay, notificationDetailPending, parseRepoPath, type PanelOverlay } from '../../store/store';
+import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
+import { activeMenuItem, panelOverlay, notificationDetailPending, parseRepoPath } from '../../store/store';
+import { contentViewKey } from './contentViewKey';
 import { useScrollMemory, contentScrollKey } from '../../hooks/useScrollMemory';
 import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { SkeletonProvider } from '../shared/Skeleton';
@@ -21,17 +22,13 @@ const AppUiInline = lazyComponent(() => import('../apps/AppUiInline').then(m => 
 const InlineForm = lazyComponent(() => import('./InlineForm').then(m => m.InlineForm));
 const NotificationDetailInline = lazyComponent(() => import('../notifications/NotificationDetailInline').then(m => m.NotificationDetailInline));
 
-// Per-overlay scoping so scroll resets when switching between, say, two file
-// previews. Returns null when there's nothing to key on, so the hook skips.
-function contentViewKey(active: string | null, overlay: PanelOverlay): string | null {
-  if (overlay) {
-    if (overlay.type === 'file-preview') return `file:${overlay.path}`;
-    if (overlay.type === 'url-preview') return `url:${overlay.url}`;
-    if (overlay.type === 'notification-detail') return `notification:${overlay.notification.id}`;
-    return overlay.type;
-  }
-  return active;
-}
+/** How long the navigation cover stays mounted. Matches its CSS clear animation
+ *  (`--duration-normal` = 200ms) plus a little slack, so the element survives
+ *  its own fade and then leaves. It is also the fuse that unmounts the cover
+ *  when no animation runs at all: under `prefers-reduced-motion: reduce` the CSS
+ *  drops the animation, and an `animationend`-driven unmount would then never
+ *  fire and leave the pane covered forever. */
+const NAV_COVER_MS = 250;
 
 /** The one view the iOS repaint below skips. The app-ui body is `overflow: hidden`
  *  with an iframe child, so it is not the scroll container that blanks, and the
@@ -78,6 +75,39 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
   // resetOnEmpty: this body hosts every view; without it, a stale scrollTop
   // from the prior view persists on the DOM and reappears when content grows.
   useScrollMemory(bodyRef, viewKey ? contentScrollKey(viewKey) : null, { resetOnEmpty: true });
+
+  // Every content-pane navigation fades its view in from behind an opaque theme
+  // surface, the same crossfade an app open has had since `.app-ui-cover`. What
+  // it buys generically is what it bought there: the swap frame is never seen.
+  // A view switch unmounts the old subtree, mounts a lazy chunk that may not
+  // have arrived, restores a remembered scrollTop and lets the new view's own
+  // skeleton settle, and all of that used to hard-cut in front of the user.
+  //
+  // A COVER rather than a fade on the content itself, for the reason
+  // AppUiInline.test.ts spells out: half the views in this pane host an iframe
+  // (app UI, file / url / repo previews), and a frame WebKit has to
+  // re-composite up from transparent is the shape of the iOS paint-loss bugs
+  // this pane keeps hitting. The cover is a sibling with its own layer, so no
+  // view's own compositing is touched, and it uncovers whatever the view has
+  // painted rather than waiting on it. Nothing here delays content by a frame.
+  //
+  // A keyed element replaying a CSS ANIMATION, not a mounted element
+  // transitioning a class: a transition needs the opaque state to reach the
+  // screen before the clearing class lands, which from a Preact commit is a
+  // double-rAF dance that silently degrades to a hard cut when it loses the
+  // race. A fresh element's animation starts from its own first frame, always.
+  const [coverKey, setCoverKey] = useState<string | null>(null);
+  const coveredKeyRef = useRef(viewKey);
+  useLayoutEffect(() => {
+    if (coveredKeyRef.current === viewKey) return;
+    coveredKeyRef.current = viewKey;
+    // Navigating to nothing (the pane emptying as a thread takes over) has no
+    // arriving view, so there is nothing to cover.
+    if (viewKey === null) { setCoverKey(null); return; }
+    setCoverKey(viewKey);
+    const fuse = setTimeout(() => setCoverKey(null), NAV_COVER_MS);
+    return () => clearTimeout(fuse);
+  }, [viewKey]);
 
   // iOS PWA paint loss (see utils/iosRepaint.ts for the mechanism).
   // `.content-pane-body` is an `overflow-y: auto` scroll container, so WKWebView
@@ -137,9 +167,13 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
         {overlay?.type === 'form' && <InlineForm />}
         {overlay?.type === 'app-ui' && <AppUiInline layout={layout} />}
         {overlay?.type === 'file-preview' && (() => {
+          // The whole parsed locator, not four props teased out of it: it
+          // carries a per-mode qualifier (the diff's change id, the file's git
+          // ref) that the preview needs, and passing it whole is what keeps the
+          // two mutually-exclusive halves from having to be reassembled here.
           const repo = parseRepoPath(overlay.path);
           return repo
-            ? <RepoFilePreviewWithSidebar repoId={repo.repoId} mode={repo.mode} path={repo.path} changeId={repo.changeId} layout={layout} />
+            ? <RepoFilePreviewWithSidebar locator={repo} layout={layout} />
             : <FilePreviewInline path={overlay.path} layout={layout} />;
         })()}
         {overlay?.type === 'url-preview' && <UrlPreviewInline url={overlay.url} layout={layout} />}
@@ -170,6 +204,15 @@ export function ContentPane({ layout }: { layout: 'desktop' | 'mobile' }) {
           </>
         )}
       </div>
+      {/* Outside `.content-pane-body`, so it covers the pane's viewport rather
+          than scrolling away with the body's content, and so a remembered
+          scrollTop being restored underneath it stays hidden. Keyed on the view
+          it is covering: a navigation arriving mid-fade replaces the element
+          and restarts the animation from opaque, instead of inheriting the
+          outgoing one's progress. */}
+      {coverKey !== null && (
+        <div key={coverKey} class="content-nav-cover" aria-hidden="true" />
+      )}
     </div>
   );
 }

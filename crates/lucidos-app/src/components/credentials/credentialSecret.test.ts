@@ -117,4 +117,32 @@ describe('buildSecret', () => {
     const rebuilt = buildSecret('oauth_client', parseSecret('oauth_client', stored));
     expect(JSON.parse(rebuilt)).toEqual(JSON.parse(stored));
   });
+
+  // `userinfo_method` exists for Dropbox, whose userinfo endpoint is POST-only.
+  // GET is the default, so it must NOT be written: a key on every credential
+  // saying what its absence already says is drift waiting to happen.
+  it('stores userinfo_method only when it differs from the GET default', () => {
+    const base = { ...emptyFields(), clientId: 'id' };
+    expect(JSON.parse(buildSecret('oauth_client', base))).not.toHaveProperty('userinfo_method');
+    expect(
+      JSON.parse(buildSecret('oauth_client', { ...base, userinfoMethod: 'GET' })),
+    ).not.toHaveProperty('userinfo_method');
+    expect(
+      JSON.parse(buildSecret('oauth_client', { ...base, userinfoMethod: 'post' })).userinfo_method,
+    ).toBe('POST');
+  });
+
+  it('round-trips a POST userinfo credential', () => {
+    const stored = JSON.stringify({
+      client_id: 'k8f2m9qxz1abc4d',
+      auth_url: 'https://www.dropbox.com/oauth2/authorize',
+      token_url: 'https://api.dropboxapi.com/oauth2/token',
+      userinfo_url: 'https://api.dropboxapi.com/2/users/get_current_account',
+      userinfo_method: 'POST',
+    });
+    const parsed = parseSecret('oauth_client', stored);
+    expect(parsed.userinfoMethod).toBe('POST');
+    expect(JSON.parse(buildSecret('oauth_client', parsed))).toEqual(JSON.parse(stored));
+  });
+
 });

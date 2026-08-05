@@ -71,7 +71,7 @@ export function deleteEnvVarApi(name: string): Promise<ApiResult> {
   });
 }
 
-// --- Coding agent binaries (Settings → System → Coding agents) ---
+// --- Coding agent binaries (Settings → Coding Agents) ---
 export function getCodingAgentBinaries(): Promise<AgentBinariesResponse> {
   return json(`${API}/coding-agents/binaries`);
 }
@@ -116,11 +116,19 @@ export interface UpdateCredentialBody {
   env_var_name?: string;
 }
 
+// The three verbs that act on an EXISTING credential take its `id`, not its
+// service name. A name stopped being a unique handle when `auth_type` became
+// the discriminator: an OAuth app registration may share a name with an API key
+// for the same provider. Editing needs the id for a sharper reason still, since
+// the form can change `auth_type`, so even name-plus-type cannot identify the
+// row being edited. `createCredential` stays name-keyed because it is an upsert
+// and the row has no id yet.
+
 export function updateCredential(
-  service: string,
+  id: string,
   body: UpdateCredentialBody
 ): Promise<ApiResult> {
-  return json(`${API}/credentials?service=${encodeURIComponent(service)}`, {
+  return json(`${API}/credentials?id=${encodeURIComponent(id)}`, {
     method: 'PUT',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
@@ -128,17 +136,17 @@ export function updateCredential(
 }
 
 export function deleteCredentialApi(
-  service: string
+  id: string
 ): Promise<ApiResult> {
-  return json(`${API}/credentials?service=${encodeURIComponent(service)}`, {
+  return json(`${API}/credentials?id=${encodeURIComponent(id)}`, {
     method: 'DELETE',
   });
 }
 
 export function getCredentialValue(
-  service: string
+  id: string
 ): Promise<{ auth_type: string; auth_value: string }> {
-  return json(`${API}/credential-value?service=${encodeURIComponent(service)}`);
+  return json(`${API}/credential-value?id=${encodeURIComponent(id)}`);
 }
 
 export function getEmailAccount(name: string): Promise<EmailAccountInfo> {
@@ -314,7 +322,6 @@ export interface BackupProviderInfo {
   name: string;
   connected: boolean;
   ready: boolean;
-  required_scope: string;
   /** Web URL to this provider's backups folder ("View backups folder" link), or null. */
   folder_url: string | null;
 }

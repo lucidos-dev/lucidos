@@ -36,28 +36,35 @@ const NAVIGATE_TARGETS: &[&str] = &[
     "url",
 ];
 
-/// Single source of truth for the `navigate_ui` `settings_view` enum — the
+/// Single source of truth for the `navigate_ui` `settings_view` enum: the
 /// Settings sub-sections the agent may deep-link to. The SDK `SettingsViewTarget`
 /// type is GENERATED from this list (same generated file as `NAVIGATE_TARGETS`).
-/// Deliberately excludes the platform-gated `mobile-access` / `experimental`
-/// subviews (hidden from the user's own nav off-platform; the LLM has no reliable
-/// platform signal). Every value here must be a renderable subview in
-/// `SettingsView.renderSubview` — a frontend Vitest cross-check pins that.
+/// Every value here must be a renderable subview in `SettingsView.renderSubview`,
+/// and a frontend Vitest cross-check pins that.
+///
+/// This is now the COMPLETE set of top-level Settings categories plus the System
+/// subpanels. It used to omit four of them because they were platform-gated
+/// categories the LLM had no signal for; as of the 2026-08-05 restructure no
+/// category is platform-gated (only rows inside one are), so nothing has to be
+/// withheld. See `docs/plans/2026-08-05-settings-information-architecture.md`.
 const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
     "models",
-    "appearance",
-    "devices",
-    "accounts",
-    "repositories",
-    "marketplaces",
     "permissions",
-    "keyboard-shortcuts",
+    "coding-agents",
+    "accounts",
+    "locale",
+    "marketplaces",
+    "access",
+    "devices",
     "system",
+    "appearance",
+    "keyboard-shortcuts",
     "thread-queue",
     "backup",
     "memory",
     "disk-usage",
     "environment-variables",
+    "debugging",
 ];
 
 /// Tool for navigating the Lucidos UI to a specific panel, app, or file.
@@ -71,12 +78,12 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
                 "target": {
                     "type": "string",
                     "enum": NAVIGATE_TARGETS,
-                    "description": "Navigation target. Use 'files', 'apps', 'app-store', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. 'app-store' opens the Plugins panel, where users browse and install apps and other plugins from marketplaces (they uncheck the panel's 'Installed only' filter to see installable ones; refer to it as the 'Plugins panel', never the retired 'App Store' or 'Store'). Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL in the internal browser panel. For a Settings sub-section, use target 'settings' with the 'settings_view' arg."
+                    "description": "Navigation target. Use 'files', 'apps', 'app-store', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. 'app-store' opens the Plugins panel, where users browse and install apps and other plugins from marketplaces (they uncheck the panel's 'Installed only' filter to see installable ones; refer to it as the 'Plugins panel', never the retired 'App Store' or 'Store'). Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL on the user's device, in whichever browser they have configured (the in-app panel, their system browser, or a new tab). For a Settings sub-section, use target 'settings' with the 'settings_view' arg."
                 },
                 "settings_view": {
                     "type": "string",
                     "enum": NAVIGABLE_SETTINGS_VIEWS,
-                    "description": "Which Settings sub-section to open. Only used when target is 'settings'. 'models' = chat/image/background model settings (use this for questions about the current model), 'appearance' = theme/font/scale, 'permissions' = command guard + allowlists, 'keyboard-shortcuts', 'devices', 'accounts' = credentials + OAuth, 'repositories', 'marketplaces'. Under Settings → System: 'system', 'backup', 'memory', 'disk-usage', 'environment-variables', 'thread-queue'. Omit to land on the Settings home list."
+                    "description": "Which Settings sub-section to open. Only used when target is 'settings'. 'models' = chat/image/background model settings (use this for questions about the current model), 'permissions' = command guard + allowlists, 'coding-agents' = claude/codex binary paths + registered repositories, 'accounts' = credentials + OAuth, 'locale' = language + timezone, 'marketplaces', 'access' = reaching this engine from another device (connect URLs, Tailscale, network bind), 'devices', 'appearance' = theme/font/scale + where links open, 'keyboard-shortcuts'. Under Settings → System: 'system', 'backup', 'memory', 'disk-usage', 'environment-variables', 'thread-queue', 'debugging'. Omit to land on the Settings home list."
                 },
                 "app_id": {
                     "type": "string",
@@ -84,7 +91,15 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "File path to preview, including the directory prefix (e.g. 'artifacts/research/notes.md', 'knowhow/domain/guide.md'). Required when target is 'file'."
+                    "description": "File path to preview, including the directory prefix (e.g. 'artifacts/research/notes.md', 'knowhow/domain/guide.md'). Required when target is 'file'. A file in a registered repository clone uses the encoded form 'repo:<repoId>:file:<repo-relative path>' instead, which reads the clone's current HEAD; to read it at a particular revision, name that revision in the mode segment: 'repo:<repoId>:file#<ref>:<repo-relative path>', where <ref> is a branch, tag or sha. Every segment must be non-empty."
+                },
+                "line": {
+                    "type": "integer",
+                    "description": "Line to open the file at, 1-based. The preview scrolls it into view and highlights it, the same as clicking the line number. Only used when target is 'file'. Use it whenever you cite a specific line, so the reader lands on it instead of the top of the file. A file that renders (markdown, CSV, SVG) switches to its source view so the line is visible."
+                },
+                "line_end": {
+                    "type": "integer",
+                    "description": "Last line of the highlighted range, 1-based and inclusive. Omit to highlight the single line given by 'line'. Only used when target is 'file'."
                 },
                 "id": {
                     "type": "string",
@@ -176,7 +191,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "service_name": {
                         "type": "string",
-                        "description": "Name of the service (e.g., 'oura', 'github', 'notion')"
+                        "description": "Name of the service (e.g., 'oura', 'github', 'notion'). For auth_type 'oauth_client' the credential is ALWAYS stored as 'oauth:<provider>' whatever you pass here (that is the only name the OAuth flow reads), so refer to it that way afterwards and never imply a second plain '<provider>' entry should exist."
                     },
                     "prompt": {
                         "type": "string",
@@ -189,7 +204,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "auth_type": {
                         "type": "string",
                         "enum": ["api_key", "bearer", "basic", "password", "oauth_client"],
-                        "description": "Type of authentication. Use 'password' for username+password (injected as Basic auth), 'oauth_client' for OAuth client_id (+ client_secret for a confidential client). For oauth_client, first load_knowhow('system-knowhow/oauth-providers') and pass auth_url/token_url/userinfo_url (+ optional scopes/redirect_uri) so the modal pre-fills them and the user only enters client_id+client_secret. The client secret is OPTIONAL: leaving it blank makes Lucidos a public client that authenticates with PKCE instead — the right shape when the provider's app registration is a desktop/native app. Omit the endpoint args only for a provider not yet in that knowhow (then the user types the URLs by hand once). Default: api_key"
+                        "description": "Type of authentication. Use 'password' for username+password (injected as Basic auth), 'oauth_client' for OAuth client_id (+ client_secret for a confidential client). PREFER connect_oauth_account over calling this with 'oauth_client': that tool opens the same modal itself when no client exists and then runs the authorization, so it is one call instead of two and cannot land the client under the wrong name. If you do use this, first load_knowhow('system-knowhow/oauth-providers') and pass auth_url/token_url/userinfo_url (+ optional scopes/redirect_uri) so the modal pre-fills them and the user only enters client_id+client_secret. The client secret is OPTIONAL: leaving it blank makes Lucidos a public client that authenticates with PKCE instead, which is the right shape when the provider's app registration is a desktop/native app. Omit the endpoint args only for a provider not yet in that knowhow (then the user types the URLs by hand once). Default: api_key"
                     },
                     "auth_url": {
                         "type": "string",
@@ -202,6 +217,15 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "userinfo_url": {
                         "type": "string",
                         "description": "oauth_client only, optional. OAuth userinfo endpoint from the oauth-providers knowhow."
+                    },
+                    "userinfo_method": {
+                        "type": "string",
+                        "enum": ["GET", "POST"],
+                        "description": "oauth_client only, optional. HTTP method for userinfo_url. Omit for the OIDC default GET; pass 'POST' only when the knowhow's row says so (Dropbox's users/get_current_account is POST-only). Wrong value costs only the connected account's name/email, never the connection."
+                    },
+                    "authorize_params": {
+                        "type": "string",
+                        "description": "oauth_client only, optional. Extra authorization-URL parameters in key=value&key=value form, copied verbatim from the knowhow row's authorize_params column. This is where a provider spells 'issue a refresh token' its own way (Dropbox needs token_access_type=offline, without which its token expires in hours and cannot be renewed). Omit to send Google's 'access_type=offline&prompt=consent', which is the default and what every existing connection uses."
                     },
                     "scopes": {
                         "type": "string",
@@ -248,7 +272,16 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
                     },
                     "userinfo_url": {
                         "type": "string",
-                        "description": "Optional. OAuth userinfo endpoint from the oauth-providers knowhow — pre-fills the credential modal when it opens."
+                        "description": "Optional. OAuth userinfo endpoint from the oauth-providers knowhow; pre-fills the credential modal when it opens. Without one the connected account reports no email, so pass it whenever the knowhow has it."
+                    },
+                    "userinfo_method": {
+                        "type": "string",
+                        "enum": ["GET", "POST"],
+                        "description": "Optional. HTTP method for userinfo_url. Omit for the OIDC default GET; pass 'POST' only when the knowhow's row says so (Dropbox's users/get_current_account is POST-only)."
+                    },
+                    "authorize_params": {
+                        "type": "string",
+                        "description": "Optional. Extra authorization-URL parameters in key=value&key=value form, from the knowhow row's authorize_params column; pre-fills the credential modal when it opens. This is how a provider asks for a refresh token in its own spelling (Dropbox: token_access_type=offline). Omit for the default 'access_type=offline&prompt=consent'."
                     },
                     "base_url": {
                         "type": "string",

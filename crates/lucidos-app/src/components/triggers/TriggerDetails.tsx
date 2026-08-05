@@ -618,7 +618,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                   ))}
                 </div>
                 <div class="form-hint">
-                  Only used when Command Safety is on (Settings → Permissions). This trigger runs unattended, so it can't be asked to approve a risky command. Grant only the irreversible side-effects its intent genuinely needs — anything else is blocked and the run fails. Leave all off if it only reads, computes, or writes inside the workspace.
+                  Only used when command safety is on (Settings → Permissions). This trigger runs unattended, so it can't be asked to approve a risky command. Grant only the irreversible side-effects its intent genuinely needs: anything else is blocked and the run fails. Leave all off if it only reads, computes, or writes inside the workspace.
                 </div>
               </div>
             </>

@@ -29,7 +29,7 @@ phase of `EventBus::emit`, does two things:
 
 1. **Persists** a typed `ChildThreadCompleted` event on the *parent* thread (the
    durable record — its projection arm also flips the child's
-   `parent_callback_sent` in the same transaction).
+   `parent_callback_pending` in the same transaction).
 2. **Fires** an in-memory `ParentCallback` over an unbounded mpsc channel
    (`parent_callback_tx`). The consumer
    (`start_parent_callback_listener` → `notify_parent_of_child_completion`)
@@ -41,8 +41,9 @@ The channel is **in-memory only**. On engine restart `parent_callback_rx` is
 recreated empty, so an un-consumed wake is lost. There was **no boot-recovery
 sweep** that re-derives the wake from the persisted `ChildThreadCompleted`
 (`notify_parent_of_child_completion` had exactly one caller — the live
-listener). The child's `parent_callback_sent` flag means the callback was
-**delivered to the channel**, not **processed by the parent**.
+listener). The child's `parent_callback_pending` flag means the callback for
+this run is still owed: it is cleared when the wake reaches the channel, not
+when the parent processes it.
 
 ### Two weaknesses
 
@@ -208,7 +209,7 @@ resumability intact, so a parent can still resume — it just re-installs deps.
 - **Persist the wake as a Thread Queue entry** (the explicit alternative).
   Rejected: the `ChildThreadCompleted` event is *already* the durable record;
   adding a second persisted representation of the same fact invites the two to
-  disagree (the exact class of bug the in-tx `parent_callback_sent` marker was
+  disagree (the exact class of bug the in-tx `parent_callback_pending` marker was
   introduced to kill). The boot sweep re-derives the wake from the one source of
   truth with no second write. The Thread Queue earns its persistence because a
   background spawn has no other durable home (ADR 0007); a fan-in wake does.
@@ -225,6 +226,34 @@ resumability intact, so a parent can still resume — it just re-installs deps.
   Rejected: contradicts the documented `Relation::Top` contract and would resurrect
   top-level threads the user detached on purpose. The `parent_thread_id`
   discriminator already encodes the intent; honour it.
+**Amended 2026-08-05.** The marker was renamed from `parent_callback_sent` to
+`parent_callback_pending` and its polarity inverted (migration
+`20260805123727_rename_parent_callback_sent_to_pending.sql`), because the old
+name stated a permanent historical fact while the semantics are per-run: the
+marker is written again every time the child is revived, so what it actually
+tracks is whether the parent has been told about the child's *current* turn. The
+three mentions above are updated in place. The rename also makes the
+missing-parent retry write honest: there the card IS persisted and only the wake
+was skipped, so "no callback was sent" was false while "the parent callback is
+still pending" is exactly true. Two further alternatives were weighed and
+rejected for the same reason this section already rejects a second persisted
+representation of the fan-in:
+
+- **A counter (`outstanding_callbacks` as an integer).** Rejected: a child never
+  owes two cards at once, since callbacks are serialized by the child's own turn,
+  so any per-child count is 0 or 1. The count that genuinely matters already
+  exists on the other side of the edge as the parent's `active_children_count`,
+  recomputed from ground truth by `reconcile_parent_active_children_count`. A
+  second numeric copy of the same quantity is a thing that can drift from the
+  authoritative one.
+- **A generation marker (`run_seq` on the child plus `callback_run`, dedup by
+  equality).** Rejected: it would make a missed clear structurally impossible
+  rather than merely tested against, which is a real gain, but it does not pay
+  for itself. A missed clear is not a silent failure mode in this repo, because a
+  pending change is reviewed before it merges. Against that it costs a wider
+  migration (two columns, one of them monotonic) and an edit to every start arm
+  to bump the sequence.
+
 - **WONTFIX — already covered by `975296a82` / `d819482c6` / `93db58de9`.**
   Rejected with evidence: those commits keep worktrees warm and make resume
   self-heal, but **none re-delivers a wake lost to an engine restart** (B1) and

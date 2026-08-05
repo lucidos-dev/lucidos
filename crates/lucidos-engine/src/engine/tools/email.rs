@@ -194,7 +194,13 @@ impl LucidosEngine {
                 .map_err(|e| format!("Error: {}", e))?;
 
                 Ok(credential_request_payload(
-                    &format!("email:{}", name),
+                    // The account name verbatim: `auth_type = email_password`
+                    // is what marks this as a mailbox password, so the name no
+                    // longer carries an `email:` prefix to say the same thing
+                    // (`20260805134838_drop_credential_name_prefixes_use_auth_type.sql`).
+                    // It must match `email_accounts.name` byte for byte, which
+                    // is how `update_password` finds the row.
+                    name,
                     &format!("Enter the app password for {}", email_address),
                     &format!("smtp://{}", smtp_host),
                     "email_password",

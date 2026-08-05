@@ -230,7 +230,18 @@ impl ThreadEvent {
     pub fn indexable_text(&self) -> Option<&str> {
         match self {
             Self::MessageReceived { text, .. } => Some(text),
-            Self::UserPromptInjected { text, .. } => Some(text),
+            // A `UserPromptInjected` carrying `injected_message_id` is an
+            // ACKNOWLEDGEMENT of a `MessageReceived` that is already persisted
+            // and already indexed, with the same text copied verbatim. Indexing
+            // it again files the user's sentence into memory twice. The engine
+            // mode (a resume note, a legacy child-thread callback) carries no
+            // such id and is the only original content here, so it stays.
+            Self::UserPromptInjected {
+                text,
+                injected_message_id: None,
+                ..
+            } => Some(text),
+            Self::UserPromptInjected { .. } => None,
             Self::ResponseGenerated { text, .. } => Some(text),
             Self::ResponseCanceled { text, .. } => Some(text),
             Self::ResponseAborted { text, .. } => Some(text),

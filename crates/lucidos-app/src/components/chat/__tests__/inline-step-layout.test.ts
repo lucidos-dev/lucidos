@@ -48,6 +48,16 @@ describe('inline step layout (CSS regression)', () => {
     expect(block).toContain('flex: 1 1 0');
   });
 
+  // Regression: the context counter wrapped to three lines ("178k /", "1000k",
+  // "(18%)") on a phone, tripling the height of every step row. It is a
+  // fixed-width fact, so it neither wraps nor shrinks; the description
+  // ellipsizes to make room.
+  it('step-context must not wrap or shrink', () => {
+    const block = getBlock('.inline-step .step-context');
+    expect(block).toContain('white-space: nowrap');
+    expect(block).toContain('flex-shrink: 0');
+  });
+
   // A step killed mid-execution (the turn died before the tool reported a
   // result) reads as "did not finish": muted and struck. Deliberately NOT the
   // red .error treatment, which asserts the tool ran and returned a failure.

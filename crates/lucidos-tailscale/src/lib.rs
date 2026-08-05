@@ -5,7 +5,7 @@
 //!
 //! Three crates need some of this. `lucidos-gateway` and `lucidos-engine` want
 //! the tailnet address to offer as a network-bind hint; `lucidos-app` wants the
-//! full picture for **Settings -> Mobile Access**. Each grew its own copy, so a
+//! full picture for **Settings -> Access**. Each grew its own copy, so a
 //! `PATH` fix on 2026-07-31 landed in two of them and missed the third, which
 //! is the bug this crate was extracted to end.
 //!

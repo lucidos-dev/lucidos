@@ -35,7 +35,8 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 
 /// The per-workspace engine bind, stored as the `network_bind` preference
-/// (an `INTERNAL` key — set via Settings → Network access, never by the agent).
+/// (an `INTERNAL` key: set via Settings → Access → Network access, never by the
+/// agent).
 pub const NETWORK_BIND_PREF_KEY: &str = "network_bind";
 
 /// The resolved bind scope for a process.

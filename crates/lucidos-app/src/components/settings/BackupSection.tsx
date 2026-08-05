@@ -2,6 +2,9 @@ import { type VNode } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { backupProgress, backupStatusVersion, showToast } from '../../store/store';
 import { grantOAuthScope } from '../../store/actions/oauth';
+import { PROVIDER_SCOPES, oauthProviderFor } from './backupProviderScopes';
+import { openConnectedAccountsSettings } from '../../store/actions/menu';
+import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
 import { Dropdown } from '../shared/Dropdown';
@@ -60,13 +63,22 @@ function scheduleLabel(cron: string): string {
   return match ? match.label : cron;
 }
 
-/** Map backup provider IDs to the OAuth scopes needed for backup. */
-const PROVIDER_SCOPES: Record<string, string> = {
-  google_drive: 'https://www.googleapis.com/auth/drive.file',
-};
-
 /** How often to re-poll /backup/status while a backup is still running. */
 const STATUS_POLL_MS = 4000;
+
+/** Hand backup setup to the agent, with a prompt that names the parts the page
+ *  can't do for the user (connecting the provider account, saving the key).
+ *  Routed through `handleNavigationRequest` rather than poking compose directly
+ *  so it clears the settings overlay, allocates a fresh draft and focuses the
+ *  prompt exactly like every other new-chat entry point. */
+function askLucidosToSetUpBackups(): void {
+  handleNavigationRequest({
+    target: 'new-chat',
+    prompt:
+      'Help me set up encrypted backups: pick a provider, connect the account, '
+      + 'choose a schedule, and make sure I save the encryption key.',
+  });
+}
 
 type LiveProgress = { phase: string; progress: number; total: number } | null;
 
@@ -301,9 +313,14 @@ export function BackupSection() {
     const info = selectedProviderInfo();
     if (!info) return;
     const scopes = PROVIDER_SCOPES[info.id];
-    if (!scopes) return;
+    if (!scopes) {
+      // A provider with no scope entry cannot be granted anything, and a button
+      // that quietly does nothing is worse than one that says why.
+      showToast(`No backup permissions are defined for ${info.name}`, 'error');
+      return;
+    }
     setGranting(true);
-    const ok = await grantOAuthScope(info.id === 'google_drive' ? 'google' : info.id, scopes);
+    const ok = await grantOAuthScope(oauthProviderFor(info.id), scopes);
     if (ok) {
       // Refresh providers to update ready state
       try {
@@ -442,6 +459,20 @@ export function BackupSection() {
 
   return (
     <div class="settings-section">
+      {/* Backup setup is spread over two pages (the schedule here, the provider
+          account in Settings → Accounts) and one irreversible obligation (save
+          the encryption key). That is exactly the shape the agent is good at
+          walking someone through, and it can do the connecting itself, so offer
+          the hand-off instead of leaving the page as the only route. */}
+      <p class="settings-section-desc">
+        Encrypted backups of this workspace, uploaded to your own cloud storage. Restore
+        happens from the workspace picker, not from here.{' '}
+        <button class="accent-link" onClick={askLucidosToSetUpBackups}>
+          Ask Lucidos to set this up
+        </button>{' '}
+        if you would rather be walked through it.
+      </p>
+
       {backupHealthCard({
         status: statusLoadable,
         liveProgress: progress,
@@ -465,8 +496,15 @@ export function BackupSection() {
       </div>
 
       {providerInfo && !providerInfo.connected && (
-        <div style="font-size: var(--font-size-xs); color: var(--accent-red); margin-bottom: 0.5rem;">
-          Connect your {providerInfo.name} account in Settings → Accounts to enable backups.
+        // Still an error state (nothing uploads until an account is connected),
+        // but now with a way out of it. This was static prose naming a path,
+        // which left the user to walk it themselves; the button lands them on
+        // the Connected accounts section directly.
+        <div class="backup-not-connected-row">
+          <span>No {providerInfo.name} account connected, so backups cannot upload.</span>
+          <button class="action-btn action-btn-confirm" onClick={openConnectedAccountsSettings}>
+            Connect {providerInfo.name}
+          </button>
         </div>
       )}
 
@@ -523,7 +561,7 @@ export function BackupSection() {
       </div>
       {scheduleLoaded && schedule !== 'off' && (
         <div style="font-size: var(--font-size-xs); color: var(--text-muted); margin-top: 0.25rem;">
-          Scheduled backups run at the selected time in your timezone (set in Settings → System → Locale).
+          Scheduled backups run at the selected time in your timezone (set in Settings → Locale).
         </div>
       )}
 

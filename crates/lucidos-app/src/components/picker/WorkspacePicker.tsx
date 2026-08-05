@@ -97,7 +97,7 @@ const RESTORE_PHASE_LABELS: Record<string, string> = {
 /** Quick-fill names offered in the create form while the name field is empty —
  *  the first-run "name your first workspace" nudge. Clicking one fills the
  *  (editable) field; the user still confirms with Create. */
-export const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
+const WORKSPACE_NAME_SUGGESTIONS = ['personal', 'work'] as const;
 
 /* ── Inline icons (kept local so the picker stays self-contained) ─────────── */
 

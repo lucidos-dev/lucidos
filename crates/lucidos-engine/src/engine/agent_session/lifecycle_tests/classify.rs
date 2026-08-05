@@ -344,6 +344,180 @@ fn fresh_session_is_never_stale_resume() {
     }));
 }
 
+/// The resume-settle baseline is the stale one with the veto SATISFIED: same
+/// empty shape, on a resume the backend structurally confirmed. Exactly the turn
+/// `confirmed_attach_is_never_stale_resume` protects from cancellation, seen from
+/// the other side, so the two baselines differ in one field on purpose.
+fn settle_baseline() -> StaleResumeInputs {
+    StaleResumeInputs {
+        resume_attach_confirmed: true,
+        ..stale_baseline()
+    }
+}
+
+/// THE SWALLOWED-FOLLOW-UP REGRESSION GUARD (2026-08-05, thread `6398bb2f`).
+/// The user pressed Stop, then sent a follow-up. The resumed CC drained a
+/// `<task-notification>` left queued by the killed session, closed that turn with
+/// a `<synthetic>` "No response requested." (nothing on the wire: no text, no
+/// tool call, no API call), and emitted a `result` for it 18 ms before our prompt
+/// was dequeued. Classifying that Result as ours reported an OOM that never
+/// happened and killed the subprocess 137 ms after CC had started answering the
+/// user. The Result belongs to the settle turn; the run loop must skip it.
+///
+/// The thread's events confirm the no-API-call half empirically: not one
+/// `ContextCaptured` between `SessionStarted` at 03:47:47 and the
+/// `ResponseFailed` five seconds later.
+#[test]
+fn confirmed_attach_with_no_activity_is_a_resume_settle_result() {
+    assert!(is_resume_settle_result(settle_baseline(), true));
+}
+
+/// THE OTHER HALF OF THAT GUARD. A model that WAS asked our prompt and answered
+/// with nothing produces the identical eight-field shape, and skipping it would
+/// discard a real terminal and strand the turn at `running` until the inactivity
+/// watchdog fired ten minutes later. The API call is what tells them apart:
+/// one `Usage` frame means the backend asked the model something, so whatever
+/// came back is an answer to us, however empty. It falls through to
+/// `classify_result` and fails honestly.
+#[test]
+fn an_empty_answer_that_cost_an_api_call_is_not_a_settle_turn() {
+    assert!(!is_resume_settle_result(settle_baseline(), false));
+}
+
+/// With no API call made, the two predicates read the same eight fields and are
+/// mutually exclusive on `resume_attach_confirmed`: such a resumed turn is either
+/// a dead session to respawn or a settle turn to skip, never both and never
+/// neither. Pinning it here is what stops a future edit from making one shape
+/// fall through to the empty-response `Failed` again.
+#[test]
+fn stale_resume_and_resume_settle_partition_the_empty_resumed_turn() {
+    for confirmed in [true, false] {
+        let i = StaleResumeInputs {
+            resume_attach_confirmed: confirmed,
+            ..stale_baseline()
+        };
+        assert_ne!(
+            is_stale_resume_signal(i),
+            is_resume_settle_result(i, true),
+            "attach_confirmed={confirmed} must land in exactly one of the two"
+        );
+    }
+}
+
+/// A tool call proves the backend is working on OUR prompt rather than settling
+/// leftovers, the same aliveness signal that vetoes the stale verdict. Skipping
+/// here would drop a real (if terse) turn's terminal on the floor.
+#[test]
+fn resume_settle_needs_zero_tool_calls() {
+    assert!(!is_resume_settle_result(
+        StaleResumeInputs {
+            no_tool_calls_this_turn: false,
+            ..settle_baseline()
+        },
+        true
+    ));
+}
+
+/// A `cc_error` is a real failure to report (an upstream drop, a 5xx). Skipping
+/// it would hide the failure AND leave the loop waiting for a Result that is
+/// never coming.
+#[test]
+fn resume_settle_never_swallows_a_reported_error() {
+    assert!(!is_resume_settle_result(
+        StaleResumeInputs {
+            cc_error: true,
+            ..settle_baseline()
+        },
+        true
+    ));
+}
+
+/// THE BOUND. The call site records the skipped Result, so
+/// `no_prior_results_this_turn` is false for every Result after it and the skip
+/// cannot repeat. Without this a backend that only ever emits empty Results
+/// would wedge the thread at `running` instead of failing it.
+#[test]
+fn only_the_first_result_of_a_session_can_be_a_settle_turn() {
+    assert!(!is_resume_settle_result(
+        StaleResumeInputs {
+            no_prior_results_this_turn: false,
+            ..settle_baseline()
+        },
+        true
+    ));
+}
+
+/// Either text channel carrying content means the turn produced an answer.
+/// `text` is the Result's own payload (the slash-command path), `buffered` is
+/// what streamed as Message events; a settle turn has neither.
+#[test]
+fn resume_settle_needs_both_text_channels_empty() {
+    assert!(!is_resume_settle_result(
+        StaleResumeInputs {
+            result_text_empty: false,
+            ..settle_baseline()
+        },
+        true
+    ));
+    assert!(!is_resume_settle_result(
+        StaleResumeInputs {
+            buffered_text_empty: false,
+            ..settle_baseline()
+        },
+        true
+    ));
+}
+
+/// A fresh spawn has no leftovers to settle: nothing was interrupted and no
+/// notification is queued, so an empty Result there is a real (empty) turn and
+/// must classify normally.
+#[test]
+fn fresh_session_has_no_settle_turn_to_skip() {
+    assert!(!is_resume_settle_result(
+        StaleResumeInputs {
+            has_resume_session: false,
+            ..settle_baseline()
+        },
+        true
+    ));
+}
+
+/// An engine-internal warm-up resume sends no user content, so there is no
+/// pending answer to protect. `is_silent_resume` already returns that Result to
+/// `classify_result` as a no-op; the settle skip must not claim it too and
+/// suppress a turn boundary the loop still needs.
+#[test]
+fn silent_resume_is_not_a_settle_turn() {
+    assert!(!is_resume_settle_result(
+        StaleResumeInputs {
+            user_message_present: false,
+            ..settle_baseline()
+        },
+        true
+    ));
+}
+
+/// The OOM case `EMPTY_RESPONSE_ERROR` was written for stays a failure. A killed
+/// Bash tool leaves tool calls behind, so the settle predicate refuses it and
+/// `classify_result` still lands `Failed`.
+#[test]
+fn oom_killed_turn_still_fails_rather_than_being_skipped() {
+    let oom_shaped = StaleResumeInputs {
+        no_tool_calls_this_turn: false,
+        ..settle_baseline()
+    };
+    assert!(!is_resume_settle_result(oom_shaped, true));
+    assert_eq!(
+        classify_result(false, false, false, false, None, true),
+        (
+            Some(TerminalKind::Failed {
+                error: EMPTY_RESPONSE_ERROR.to_string()
+            }),
+            true
+        )
+    );
+}
+
 /// CC's EXPLICIT session-not-found error IS a definitive stale-resume signal —
 /// the one whitelisted `cc_error` string, because re-resuming a gone session can
 /// never succeed. This is the exact error from dev/bf997e21 (a mid-flight

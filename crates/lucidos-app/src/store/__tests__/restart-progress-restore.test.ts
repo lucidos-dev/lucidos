@@ -20,8 +20,13 @@ vi.mock('../actions/thread-sync', () => ({
 }));
 vi.mock('../actions/thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
-  refreshThreadEvents: vi.fn().mockResolvedValue(undefined),
-  clearForcedRetries: vi.fn(),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
+  // runResumeSync retries every thread carrying `eventsLoadFailed` through
+  // this, so the reference is read on every resume even when nothing is
+  // flagged; the mock proxy throws on an undeclared export.
+  loadThreadEvents: vi.fn().mockResolvedValue(undefined),
+  clearThreadFetchGuards: vi.fn(),
+  markLoadedThreadsStale: vi.fn(),
 }));
 vi.mock('../actions/chat-changes', async () => {
   const actual = await vi.importActual('../actions/chat-changes') as any;

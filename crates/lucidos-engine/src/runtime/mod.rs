@@ -8,7 +8,7 @@ mod codex_app_server_parse;
 mod codex_parse;
 pub mod lucidos_cli;
 pub mod python;
-mod spawn_env;
+pub(crate) mod spawn_env;
 
 pub use agent_runtime::{
     AgentEvent, AgentInput, AgentPermissionRequest, AgentRuntime, CodingAgent, ControlRequest,
@@ -29,7 +29,7 @@ pub(crate) fn is_packaged() -> bool {
 }
 
 /// Effective resolution of a coding agent's CLI binary — the payload of
-/// `GET /api/v1/coding-agents/binaries` (Settings → System → Coding agents). Live
+/// `GET /api/v1/coding-agents/binaries` (Settings → Coding Agents). Live
 /// detection, recomputed per request: only an explicit user override is ever
 /// persisted (the `coding_agent_*_path` preference), so a Homebrew upgrade or
 /// installer move self-heals instead of leaving a stale stored path.

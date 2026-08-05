@@ -901,3 +901,137 @@ async fn upstream_unreachable_returns_502() {
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
 }
+
+/// An `apis.json` entry may name an OAuth client registration explicitly (a
+/// `script_handshake` layer whose script runs its own exchange).
+/// `CredentialStore::get` is deliberately blind to `oauth_client`, so without
+/// the typed second attempt the layer 502s on a credential that plainly exists.
+#[tokio::test]
+async fn fetch_required_credential_resolves_an_oauth_client_by_name() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    seed_credential(
+        &pool,
+        "acme",
+        "https://api.acme.test",
+        crate::core::AuthType::OauthClient,
+        "{\"client_id\":\"cid\"}",
+    )
+    .await;
+
+    let cred = fetch_required_credential(&pool, "acme")
+        .await
+        .expect("an explicitly named oauth client must resolve");
+    assert_eq!(cred.auth_type, crate::core::AuthType::OauthClient);
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The live-config regression. A `data/config/apis.json` written before
+/// 2026-08-05 spells the credential `oauth:<provider>`, and the prefix migration
+/// renames the row to `<provider>`. `data/config/` is user data no DB migration
+/// can rewrite, so without this tolerance every request through that API starts
+/// 502ing the moment the engine restarts. Temporary measure
+/// (`credential-oauth-prefix-tolerance`).
+#[tokio::test]
+async fn fetch_required_credential_tolerates_a_legacy_oauth_prefixed_name() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    seed_credential(
+        &pool,
+        "ghealth",
+        "https://healthcare.googleapis.test",
+        crate::core::AuthType::OauthClient,
+        "{\"client_id\":\"cid\"}",
+    )
+    .await;
+
+    let cred = fetch_required_credential(&pool, "oauth:ghealth")
+        .await
+        .expect("the pre-migration spelling must still resolve");
+    assert_eq!(cred.service_name, "ghealth");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// The tolerance must not invent a credential. A name that matches nothing under
+/// either spelling still fails, and the error names what was asked for.
+#[tokio::test]
+async fn fetch_required_credential_still_reports_a_genuinely_missing_one() {
+    use crate::test_support::{setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+
+    let err = fetch_required_credential(&pool, "oauth:nothing-here")
+        .await
+        .expect_err("nothing to resolve");
+    assert!(
+        err.1.contains("oauth:nothing-here"),
+        "the error must name the credential the config asked for: {}",
+        err.1
+    );
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}
+
+/// An explicitly named `oauth_client` DOES inject. The list-taking
+/// `credential_env_vars` skips the type because the blanket fan-out would
+/// broadcast a `client_secret` into every subprocess for no reader; a layer the
+/// user pointed at one credential is the opposite case, and injecting nothing
+/// there would be a configured secret silently going missing.
+#[test]
+fn an_explicitly_named_oauth_client_still_injects_its_env_vars() {
+    use crate::core::credentials::{credential_env_vars, credential_env_vars_for};
+    use crate::core::{AuthType, Credential};
+
+    let cred = Credential {
+        id: uuid::Uuid::new_v4(),
+        service_name: "acme".to_string(),
+        base_url: "https://api.acme.test".to_string(),
+        auth_type: AuthType::OauthClient,
+        auth_value: "{\"client_id\":\"cid\"}".to_string(),
+        auth_header: "Authorization".to_string(),
+        env_var_name: None,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    assert_eq!(
+        credential_env_vars_for(cred.clone()),
+        vec![(
+            "CRED_ACME".to_string(),
+            "{\"client_id\":\"cid\"}".to_string()
+        )]
+    );
+    assert!(
+        credential_env_vars(vec![cred]).is_empty(),
+        "the blanket fan-out still skips it"
+    );
+}
+
+/// The tolerance must not become a case-insensitive match on every miss. A
+/// config naming `Stripe` where no such credential exists must stay a miss, even
+/// when an unrelated `stripe` OAuth registration is present: resolving it would
+/// silently send a `{client_id, ...}` blob as the API's auth header.
+#[tokio::test]
+async fn fetch_required_credential_does_not_case_fold_a_non_prefixed_miss() {
+    use crate::test_support::{seed_credential, setup_test_db, teardown_test_db};
+    let (pool, db) = setup_test_db().await;
+    seed_credential(
+        &pool,
+        "stripe",
+        "https://api.stripe.test",
+        crate::core::AuthType::OauthClient,
+        "{\"client_id\":\"cid\"}",
+    )
+    .await;
+
+    fetch_required_credential(&pool, "Stripe")
+        .await
+        .expect_err("a differently-cased name is a different credential");
+
+    pool.close().await;
+    teardown_test_db(&db).await;
+}

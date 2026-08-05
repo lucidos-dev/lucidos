@@ -17,7 +17,7 @@ import { loadArtifacts } from './artifacts';
 import { removePinnedAppLocal, loadPinnedApps } from './pinnedApps';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
-import { loadOAuthAccounts } from './oauth';
+import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
 import { loadDevices, devices, getDeviceId } from './devices';
 
@@ -220,11 +220,21 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
     // `OAuthStore::{connect,delete}`, so the browser tab that ran the flow and
     // every other device converge without a reload. A token refresh
     // deliberately emits nothing: nothing user-visible changed.
+    // Connecting does more than refresh the list: on the device that STARTED
+    // the flow it also closes the callback page if it's in the in-app browser
+    // panel, toasts which account landed, and fronts the window. The user's
+    // attention is in a browser at that moment. See `handleOAuthAccountConnected`.
     case 'OAuthAccountConnected':
+      handleOAuthAccountConnected(data as {
+        provider?: string;
+        email?: string | null;
+        actor?: { kind?: string; device_id?: string } | null;
+      });
+      break;
     case 'OAuthAccountDeleted':
       if (oauthAccounts.value.status === 'loaded') void loadOAuthAccounts();
       break;
-    // Registered-repositories list (Settings → Repositories). Only Add/Remove
+    // Registered-repositories list (Settings → Coding Agents). Only Add/Remove
     // change it, and both carry repo_id. The engine emits them from INSIDE its
     // single registry write path (`RepositoryStore::{register,unregister}`), not
     // per call site, so every way a repo can appear reaches this arm: the HTTP

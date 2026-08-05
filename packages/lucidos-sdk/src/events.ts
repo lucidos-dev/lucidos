@@ -8,13 +8,29 @@ export interface EventQuery {
   limit?: number;
 }
 
+/**
+ * One row from the workspace's event store, as returned by
+ * `lucidos.events.query`. Mirrors the engine's `EventRow`
+ * (`crates/lucidos-engine/src/core/events.rs`), which is the source of truth.
+ *
+ * The query reads the WHOLE `events` table: workspace-emitted domain events
+ * (`HabitCompleted`) and engine thread/system events (`ChildThreadCompleted`,
+ * `ResponseGenerated`, `ChangeApplied`) live in one table and come back from
+ * one call. See `system-knowhow/thread-events.md` § "One table, two enums".
+ */
 export interface LucidosEvent {
   id: string;
   event_type: string;
   payload: Record<string, unknown>;
   created: string;
-  aggregate?: string;
-  aggregate_id?: string;
+  /**
+   * The thread this event belongs to. Present on engine thread events only
+   * (for `ChildThreadCompleted` it is the PARENT thread); absent, not null,
+   * on workspace-emitted domain events and other system events.
+   */
+  thread_id?: string;
+  /** Monotonic insertion order across the workspace. Always present here. */
+  sequence: number;
 }
 
 export interface EmitOptions {

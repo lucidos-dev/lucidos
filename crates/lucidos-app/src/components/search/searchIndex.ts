@@ -3,6 +3,7 @@ import type { SearchResultItem } from '../../api/client';
 import { SHORTCUT_DEFS, bindingSearchText } from '../../utils/shortcuts';
 import { displayBinding, bindingFor } from '../../store/actions/keybindings';
 import { isMobile } from '../../utils/viewport';
+import { isTauri } from '../../utils/platform';
 // The one definition of "this client can actually act on the external-link
 // target", shared with the Settings row and its nav entry so search can never
 // offer a result that lands on nothing.
@@ -36,8 +37,12 @@ interface SettingsSearchEntry {
   /** Only surfaced on an INSTALLED iOS PWA, for the same reason as the two
    *  above. Strictly narrower than `mobileOnly`: a narrow desktop window and
    *  mobile Chrome both pass `isMobile()` but are not standalone iOS, and the
-   *  rows behind this flag (External links) render only there. */
+   *  row behind this flag (Appearance & Behavior → Links → Open links in)
+   *  renders only there. */
   iosPwaOnly?: boolean;
+  /** Only surfaced under Tauri, for the same reason again: the in-app browser
+   *  opens a desktop webview, so its toggle renders nowhere else. */
+  tauriOnly?: boolean;
 }
 
 /**
@@ -47,16 +52,18 @@ interface SettingsSearchEntry {
  * Keep this list in sync with the labels rendered in SettingsView.tsx and BackupSection.tsx.
  */
 const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
-  // Top-level subviews
+  // Top-level subviews (one per SETTINGS_NAV_ITEMS entry)
   { id: 'models', label: 'Models', subview: 'models', path: 'Settings' },
-  { id: 'appearance', label: 'Appearance', subview: 'appearance', path: 'Settings' },
-  { id: 'links', label: 'Links', subview: 'links', path: 'Settings', keywords: 'links external browser safari open', iosPwaOnly: true },
-  { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings' },
-  { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
-  { id: 'repositories', label: 'Repositories', subview: 'repositories', path: 'Settings' },
   { id: 'permissions', label: 'Permissions', subview: 'permissions', path: 'Settings', keywords: 'permissions security command guard safety allowlist claude code lucidos agent bash python tools' },
-  { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
+  { id: 'coding-agents', label: 'Coding Agents', subview: 'coding-agents', path: 'Settings', keywords: 'coding agent claude code codex binary path cli repository repositories git worktree' },
+  { id: 'accounts', label: 'Accounts', subview: 'accounts', path: 'Settings' },
+  { id: 'locale', label: 'Locale', subview: 'locale', path: 'Settings', keywords: 'language timezone region locale time zone' },
+  { id: 'marketplaces', label: 'Marketplaces', subview: 'marketplaces', path: 'Settings', keywords: 'marketplace plugin catalog install source registry' },
+  { id: 'access', label: 'Access', subview: 'access', path: 'Settings', keywords: 'mobile access remote phone tailscale tailnet connect url network bind lan' },
+  { id: 'devices', label: 'Devices', subview: 'devices', path: 'Settings' },
   { id: 'system', label: 'System', subview: 'system', path: 'Settings', keywords: 'connection status workspace path api versions build uptime restart refresh update' },
+  { id: 'appearance', label: 'Appearance & Behavior', subview: 'appearance', path: 'Settings', keywords: 'appearance interface behavior theme font scale links browser' },
+  { id: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', subview: 'keyboard-shortcuts', path: 'Settings', keywords: 'keybindings hotkeys shortcut' },
 
   // System subpanels
   { id: 'backup', label: 'Backup', subview: 'backup', path: 'Settings → System' },
@@ -75,48 +82,64 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'system:connection', label: 'Connection', subview: 'system', path: 'Settings → System', anchor: 'system:connection', keywords: 'status workspace path api url' },
   { id: 'system:versions', label: 'Versions', subview: 'system', path: 'Settings → System', anchor: 'system:versions', keywords: 'lucidos engine client build release uptime' },
   { id: 'system:maintenance', label: 'Maintenance', subview: 'system', path: 'Settings → System', anchor: 'system:maintenance', keywords: 'restart rebuild refresh update client engine' },
-  { id: 'system:locale', label: 'Locale', subview: 'system', path: 'Settings → System', anchor: 'system:locale', keywords: 'language timezone region locale' },
-  { id: 'system:coding-agents', label: 'Coding agents', subview: 'system', path: 'Settings → System', anchor: 'system:coding-agents', keywords: 'coding agent claude codex binary path cli override auto-detect' },
-  { id: 'system:language', label: 'Language', subview: 'system', path: 'Settings → System → Locale', anchor: 'system:language', keywords: 'language locale respond reply' },
-  { id: 'system:timezone', label: 'Timezone', subview: 'system', path: 'Settings → System → Locale', anchor: 'system:timezone', keywords: 'timezone time zone iana triggers schedule' },
+
+  // Locale subview
+  { id: 'locale:language', label: 'Language', subview: 'locale', path: 'Settings → Locale', anchor: 'locale:language', keywords: 'language locale respond reply' },
+  { id: 'locale:timezone', label: 'Timezone', subview: 'locale', path: 'Settings → Locale', anchor: 'locale:timezone', keywords: 'timezone time zone iana triggers schedule' },
+
+  // Coding Agents subview
+  { id: 'coding-agents:binaries', label: 'Binaries', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:binaries', keywords: 'coding agent claude codex binary path cli override auto-detect' },
+  { id: 'coding-agents:repositories', label: 'Repositories', subview: 'coding-agents', path: 'Settings → Coding Agents', anchor: 'coding-agents:repositories', keywords: 'repository repositories git local clone register external repo' },
+
+  // Access subview
+  { id: 'access:urls', label: 'Connect URLs', subview: 'access', path: 'Settings → Access', anchor: 'access:urls', keywords: 'connect url localhost lan tailnet address phone open elsewhere', tauriOnly: true, packagedOnly: true },
+  { id: 'access:tailscale', label: 'Tailscale', subview: 'access', path: 'Settings → Access', anchor: 'access:tailscale', keywords: 'tailscale tailnet vpn magicdns serve https sign in' },
+  { id: 'access:network', label: 'Network access', subview: 'access', path: 'Settings → Access', anchor: 'access:network', keywords: 'network bind loopback lan address listen expose engine' },
 
   // Models subview
-  { id: 'models:chat', label: 'Chat', subview: 'models', path: 'Settings → Models', anchor: 'models:chat' },
-  { id: 'models:image-generation', label: 'Image Generation', subview: 'models', path: 'Settings → Models', anchor: 'models:image-generation' },
-  { id: 'models:background-tasks', label: 'Background Tasks', subview: 'models', path: 'Settings → Models', anchor: 'models:background-tasks' },
+  { id: 'models:chat', label: 'Chat & triggers', subview: 'models', path: 'Settings → Models', anchor: 'models:chat' },
+  { id: 'models:image-generation', label: 'Image generation', subview: 'models', path: 'Settings → Models', anchor: 'models:image-generation' },
+  { id: 'models:background-tasks', label: 'Background tasks', subview: 'models', path: 'Settings → Models', anchor: 'models:background-tasks' },
   { id: 'models:vertex-ai', label: 'Vertex AI', subview: 'models', path: 'Settings → Models → Providers', anchor: 'models:vertex-ai', keywords: 'vertex gcloud gcp google adc region' },
   { id: 'models:providers', label: 'Providers', subview: 'models', path: 'Settings → Models', anchor: 'models:providers', keywords: 'providers vertex anthropic openai openrouter local gcloud gcp google api key direct credential gpt claude' },
-  { id: 'models:reasoning', label: 'Reasoning', subview: 'models', path: 'Settings → Models → Chat', anchor: 'models:reasoning' },
-  { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:title-generation' },
-  { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:image-description' },
-  { id: 'models:memory-context', label: 'Memory & context', subview: 'models', path: 'Settings → Models → Background Tasks', anchor: 'models:memory-context' },
+  { id: 'models:reasoning', label: 'Reasoning', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:reasoning' },
+  { id: 'models:max-tool-calls', label: 'Max tool calls', subview: 'models', path: 'Settings → Models → Chat & triggers', anchor: 'models:max-tool-calls', keywords: 'max tool calls cap limit turn runaway budget' },
+  { id: 'models:title-generation', label: 'Title generation', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:title-generation' },
+  { id: 'models:image-description', label: 'Image description', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:image-description' },
+  { id: 'models:memory-context', label: 'Memory & context', subview: 'models', path: 'Settings → Models → Background tasks', anchor: 'models:memory-context' },
   { id: 'models:region', label: 'Region', subview: 'models', path: 'Settings → Models → Providers → Vertex AI', anchor: 'models:region' },
 
-  // Links subview
-  { id: 'links:external-links', label: 'External links', subview: 'links', path: 'Settings → Links', anchor: 'links:external-links', keywords: 'external links browser safari share sheet in-app web view open link default browser', iosPwaOnly: true },
-  { id: 'links:external-links-target', label: 'Open links in', subview: 'links', path: 'Settings → Links → External links', anchor: 'links:external-links-target', keywords: 'safari ask share sheet in-app browser open link', iosPwaOnly: true },
-
-  // Appearance subview
-  { id: 'appearance:theme', label: 'Theme', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:theme' },
-  { id: 'appearance:typography', label: 'Typography', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:typography' },
-  { id: 'appearance:mode', label: 'Mode', subview: 'appearance', path: 'Settings → Appearance → Theme', anchor: 'appearance:mode' },
-  { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:font' },
-  { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance → Typography', anchor: 'appearance:ui-scale' },
-  { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance', anchor: 'appearance:mobile', mobileOnly: true },
-  { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance → Mobile', anchor: 'appearance:mobile-header-sticky', mobileOnly: true },
+  // Appearance & Behavior subview (Links absorbed the retired Links and
+  // Experimental categories, so its two rows keep their own platform flags)
+  { id: 'appearance:theme', label: 'Theme', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:theme' },
+  { id: 'appearance:typography', label: 'Typography', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:typography' },
+  { id: 'appearance:mode', label: 'Mode', subview: 'appearance', path: 'Settings → Appearance & Behavior → Theme', anchor: 'appearance:mode' },
+  { id: 'appearance:font', label: 'Font', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:font' },
+  { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:ui-scale' },
+  { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:mobile', mobileOnly: true },
+  { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance & Behavior → Mobile', anchor: 'appearance:mobile-header-sticky', mobileOnly: true },
+  // No entry for the Links SECTION itself: it renders only when one of the two
+  // rows below does, and `visible` ANDs its flags, so a section entry could not
+  // express "iOS PWA OR Tauri" without a one-off predicate. The rows carry the
+  // gates, and the `appearance` top-level entry keeps `links` in its keywords so
+  // a search for it still lands somewhere true.
+  { id: 'appearance:external-link-target', label: 'Open links in', subview: 'appearance', path: 'Settings → Appearance & Behavior → Links', anchor: 'appearance:external-link-target', keywords: 'external links safari ask share sheet in-app browser open link default browser', iosPwaOnly: true },
+  { id: 'appearance:in-app-browser', label: 'Open links in the in-app browser', subview: 'appearance', path: 'Settings → Appearance & Behavior → Links', anchor: 'appearance:in-app-browser', keywords: 'in-app browser pane experimental drawer external link', tauriOnly: true },
 
   // Backup subview (restore moved to the workspace picker — no in-app entry)
   { id: 'backup:provider', label: 'Provider', subview: 'backup', path: 'Settings → System → Backup', anchor: 'backup:provider' },
 
   // Accounts subview
-  { id: 'accounts:credentials', label: 'Credentials', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:credentials' },
-  { id: 'accounts:oauth', label: 'OAuth', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:oauth' },
+  { id: 'accounts:credentials', label: 'Credentials', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:credentials', keywords: 'api key token password secret oauth client app registration' },
+  // Renamed from "OAuth", which named the protocol rather than the thing. The
+  // old word stays searchable via keywords so nobody loses the entry.
+  { id: 'accounts:connected', label: 'Connected accounts', subview: 'accounts', path: 'Settings → Accounts', anchor: 'accounts:connected', keywords: 'oauth connect sign in google microsoft github dropbox account authorize reconnect disconnect' },
 
-  // Permissions subview (Command Safety + the two allowlist editors)
-  { id: 'command-safety', label: 'Command Safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
-  { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command Safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
-  { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command Safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
-  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command Safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku' },
+  // Permissions subview (Command safety + the two allowlist editors)
+  { id: 'command-safety', label: 'Command safety', subview: 'permissions', path: 'Settings → Permissions', anchor: 'command-safety', keywords: 'command guard safety bash python shell judge' },
+  { id: 'command-safety:guard', label: 'Command guard', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:guard', keywords: 'command guard safety bash python shell' },
+  { id: 'command-safety:judge', label: 'LLM judge', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge', keywords: 'command guard llm judge' },
+  { id: 'command-safety:judge-model', label: 'Judge model', subview: 'permissions', path: 'Settings → Permissions → Command safety', anchor: 'command-safety:judge-model', keywords: 'command guard judge model haiku' },
   { id: 'permissions:lucidos', label: 'Lucidos Agent permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:lucidos', keywords: 'lucidos agent command allowlist bash python always allow auto allow' },
   { id: 'permissions:claude-code', label: 'Claude Code permissions', subview: 'permissions', path: 'Settings → Permissions', anchor: 'permissions:claude-code', keywords: 'claude code coding agent tool permissions allowed tools allowlist' },
 ];
@@ -150,7 +173,8 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
   const visible = (e: SettingsSearchEntry) =>
     (!e.mobileOnly || isMobile())
     && (!e.packagedOnly || enginePackaged.value)
-    && (!e.iosPwaOnly || externalLinkTargetConfigurable());
+    && (!e.iosPwaOnly || externalLinkTargetConfigurable())
+    && (!e.tauriOnly || isTauri());
   const matches = q
     ? allSettingsEntries().filter(e => visible(e) && `${e.label} ${e.keywords ?? ''}`.toLowerCase().includes(q))
     : SETTINGS_SEARCH_INDEX.filter(visible);
@@ -165,4 +189,12 @@ export function getSettingsSearchResults(query: string, limit: number): SearchRe
 
 export function findSettingsEntry(id: string): SettingsSearchEntry | undefined {
   return allSettingsEntries().find(e => e.id === id);
+}
+
+/** Ids of the STATIC index (not the synthesized per-shortcut entries, which are
+ *  uniform and anchor-less). Exists so the settings-nav guard can walk every
+ *  entry and check its subview is live and its anchor is rendered, without this
+ *  module exporting the whole array. */
+export function settingsSearchEntryIds(): string[] {
+  return SETTINGS_SEARCH_INDEX.map(e => e.id);
 }

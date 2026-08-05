@@ -14,16 +14,16 @@ use crate::core::oauth;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Registry entry: (id, name, oauth_provider, required_scope, constructor).
-/// The constructor receives the pool AND the entry's `required_scope`, so a
-/// provider carries the scope it must verify in preflight without a second
-/// source of truth.
+/// Registry entry: (id, name, oauth_provider, required_scopes, constructor).
+/// The constructor receives the pool AND the entry's `required_scopes`, so the
+/// readiness verdict the Settings page renders and the preflight the backup runs
+/// are checking one list rather than two that can disagree.
 type BackupProviderEntry = (
     &'static str,
     &'static str,
     &'static str,
-    &'static str,
-    fn(PgPool, &'static str) -> Box<dyn BackupProvider>,
+    &'static [&'static str],
+    fn(PgPool, &'static [&'static str]) -> Box<dyn BackupProvider>,
 );
 
 /// Preference key for the backup cron schedule expression.
@@ -56,18 +56,25 @@ pub async fn get_retention_count(pool: &PgPool) -> usize {
         .unwrap_or(DEFAULT_BACKUP_RETENTION)
 }
 
-/// Static registry of all backup providers: (id, name, oauth_provider, required_scope, constructor).
+/// Static registry of all backup providers: (id, name, oauth_provider, required_scopes, constructor).
 const PROVIDERS: &[BackupProviderEntry] = &[
     (
         "google_drive",
         "Google Drive",
         "google",
-        "drive",
-        |pool, scope| Box::new(google_drive::GoogleDriveBackupProvider::new(pool, scope)),
+        google_drive::BACKUP_SCOPES,
+        |pool, scopes| Box::new(google_drive::GoogleDriveBackupProvider::new(pool, scopes)),
     ),
-    ("dropbox", "Dropbox", "dropbox", "", |pool, _scope| {
-        Box::new(dropbox::DropboxBackupProvider::new(pool))
-    }),
+    (
+        "dropbox",
+        "Dropbox",
+        "dropbox",
+        // Empty until 2026-08-05, which made every connected Dropbox account
+        // read as ready however narrow its grant and pushed the failure all the
+        // way to `files/create_folder_v2` returning a 400 mid-backup.
+        dropbox::BACKUP_SCOPES,
+        |pool, scopes| Box::new(dropbox::DropboxBackupProvider::new(pool, scopes)),
+    ),
 ];
 
 /// The valid backup provider ids — the agent-settable `backup_provider`
@@ -80,22 +87,101 @@ pub struct ProviderMeta {
     pub id: &'static str,
     pub name: &'static str,
     pub oauth_provider: &'static str,
-    /// Substring that must appear in the OAuth account's scopes for the provider to be ready.
-    /// Empty string means no specific scope is required beyond being connected.
-    pub required_scope: &'static str,
+    /// Every scope substring that must appear in the OAuth account's scopes for
+    /// the provider to be ready. Empty slice means connecting is enough.
+    ///
+    /// This is the SAME list the provider's preflight checks, deliberately: when
+    /// readiness gated on one scope and preflight demanded three, an account
+    /// holding only the first read as ready (so the page hid *Grant access* and
+    /// enabled *Back up now*) and then failed preflight telling the user to
+    /// reconnect, with no button left on the page to do it.
+    pub required_scopes: &'static [&'static str],
 }
 
 /// List all registered backup providers with their metadata.
 pub fn list_providers() -> Vec<ProviderMeta> {
     PROVIDERS
         .iter()
-        .map(|(id, name, oauth, scope, _)| ProviderMeta {
+        .map(|(id, name, oauth, scopes, _)| ProviderMeta {
             id,
             name,
             oauth_provider: oauth,
-            required_scope: scope,
+            required_scopes: scopes,
         })
         .collect()
+}
+
+/// Look up one provider's metadata by id. `None` for an id not in [`PROVIDERS`].
+pub fn provider_meta(provider_id: &str) -> Option<ProviderMeta> {
+    list_providers().into_iter().find(|m| m.id == provider_id)
+}
+
+/// Does a granted-scope string carry `required`?
+///
+/// Substring rather than token match, deliberately: Google's registry entry is
+/// the fragment `"drive"`, which has to match the full
+/// `https://www.googleapis.com/auth/drive.file` URL. Dropbox's scopes are whole
+/// names (`files.content.write`), where the two readings coincide. An empty
+/// requirement always passes.
+pub fn scopes_include(granted: &str, required: &str) -> bool {
+    required.is_empty() || granted.contains(required)
+}
+
+/// Which of `required` a granted-scope string is missing, in the order the
+/// provider declared them so a message reads the same every time.
+///
+/// The ONE place the scope question is answered. Both providers' preflights and
+/// [`provider_readiness`] call it with the same registry list, which is what
+/// stops the page and the backup disagreeing about whether an account works.
+pub fn missing_scopes(granted: &str, required: &'static [&'static str]) -> Vec<&'static str> {
+    required
+        .iter()
+        .copied()
+        .filter(|s| !scopes_include(granted, s))
+        .collect()
+}
+
+/// Whether a backup provider can actually upload right now.
+///
+/// Both halves of "is this working?" in one value: is the OAuth account
+/// connected at all, and does that account carry the scope the provider needs.
+/// Shared by the Settings page (`api::backup::list_providers`, which renders the
+/// dropdown and the red "connect your account" line) and by the agent's
+/// `get_backup_status`, so the human and the agent can never be told different
+/// things about the same provider. Before this existed only the page knew, and
+/// an agent reported a Dropbox backup as fully configured while its upload leg
+/// had no account behind it (2026-08-05).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderReadiness {
+    /// An OAuth account row exists for this provider.
+    pub connected: bool,
+    /// Connected AND the account's scopes carry every one of the provider's
+    /// `required_scopes`.
+    pub ready: bool,
+}
+
+/// Resolve [`ProviderReadiness`] for one provider.
+///
+/// A DB error propagates rather than degrading to "not connected": a transient
+/// failure must not be reported to a user (or an agent) as a missing account.
+pub async fn provider_readiness(
+    pool: &PgPool,
+    meta: &ProviderMeta,
+) -> Result<ProviderReadiness, BoxError> {
+    let account = oauth::OAuthStore::get_by_provider(pool, meta.oauth_provider)
+        .await
+        .map_err(|e| -> BoxError {
+            format!(
+                "Failed to query OAuth account for {}: {e}",
+                meta.oauth_provider
+            )
+            .into()
+        })?;
+    let connected = account.is_some();
+    let ready = account
+        .as_ref()
+        .is_some_and(|a| missing_scopes(&a.scopes, meta.required_scopes).is_empty());
+    Ok(ProviderReadiness { connected, ready })
 }
 
 /// Create a backup provider by ID.
@@ -103,14 +189,20 @@ pub fn get_provider(provider_id: &str, pool: &PgPool) -> Result<Box<dyn BackupPr
     PROVIDERS
         .iter()
         .find(|(id, _, _, _, _)| *id == provider_id)
-        .map(|(_, _, _, scope, ctor)| ctor(pool.clone(), scope))
+        .map(|(_, _, _, scopes, ctor)| ctor(pool.clone(), scopes))
         .ok_or_else(|| format!("Unknown backup provider: {}", provider_id))
 }
 
-/// Get an OAuth token for a backup provider, refreshing if needed.
-pub async fn get_oauth_token(pool: &PgPool, provider: &str) -> Result<String, BoxError> {
+/// Get the connected OAuth account for a backup provider, refreshing its token
+/// if needed. Callers that only want the token use [`get_oauth_token`]; the
+/// whole account is what a scope preflight needs, since the granted `scopes`
+/// live on the row.
+pub async fn get_oauth_account(
+    pool: &PgPool,
+    provider: &str,
+) -> Result<oauth::OAuthAccount, BoxError> {
     use crate::core::oauth::AccountLookupError;
-    let account = oauth::get_account_with_fresh_token(pool, provider)
+    oauth::get_account_with_fresh_token(pool, provider)
         .await
         .map_err(|e| -> BoxError {
             match e {
@@ -121,8 +213,12 @@ pub async fn get_oauth_token(pool: &PgPool, provider: &str) -> Result<String, Bo
                 .into(),
                 AccountLookupError::DbError(err) | AccountLookupError::RefreshFailed(err) => err,
             }
-        })?;
-    Ok(account.access_token)
+        })
+}
+
+/// Get an OAuth token for a backup provider, refreshing if needed.
+pub async fn get_oauth_token(pool: &PgPool, provider: &str) -> Result<String, BoxError> {
+    Ok(get_oauth_account(pool, provider).await?.access_token)
 }
 
 /// Metadata for a single backup stored by a provider.

@@ -736,8 +736,9 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
             .await
             .unwrap();
     assert_eq!(
-        after_abort, "failed",
-        "ResponseAborted with coding_agent_proposed=false must mark the thread failed"
+        after_abort, "paused",
+        "an EngineShutdown abort is transient, so a thread with \
+         coding_agent_proposed=false settles at paused"
     );
 
     // 4. Tool-orphan sweep emits the synthetic ToolResult (system actor) to
@@ -767,9 +768,9 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
             .await
             .unwrap();
     assert_eq!(
-        after_synthetic, "failed",
-        "system-actor synthetic ToolResult must not resurrect status to 'running' — \
-         the recovery backfill is not live activity"
+        after_synthetic, "paused",
+        "system-actor synthetic ToolResult must not resurrect status to 'running'. \
+         The recovery backfill is not live activity."
     );
 
     // 5. Sanity check: a live (no-actor) ToolResult arriving while the
@@ -848,7 +849,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
 /// Runs both backends: the drain lives in the backend-agnostic
 /// `agent_session` layer, so Codex produces the identical shape.
 #[tokio::test]
-async fn interrupted_coding_agent_thread_keeps_failed_status() {
+async fn interrupted_coding_agent_thread_keeps_paused_status() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
@@ -933,8 +934,9 @@ async fn interrupted_coding_agent_thread_keeps_failed_status() {
         .unwrap();
         assert_eq!(
             status_of(thread_id).await,
-            "failed",
-            "[{agent}] ResponseAborted must mark the interrupted thread failed"
+            "paused",
+            "[{agent}] an EngineShutdown abort is TRANSIENT, so it must settle the \
+             interrupted thread at paused, never at the red failed"
         );
 
         // 3. The dying subprocess's trailing output. Live activity (no actor),
@@ -963,9 +965,9 @@ async fn interrupted_coding_agent_thread_keeps_failed_status() {
         .unwrap();
         assert_eq!(
             status_of(thread_id).await,
-            "failed",
+            "paused",
             "[{agent}] trailing drain output must not resurrect the aborted turn \
-             to 'running' — the abort is the turn's terminal verdict"
+             to 'running'. The abort is the turn's verdict."
         );
 
         // 4. The idle that closes the interrupted turn.
@@ -988,9 +990,9 @@ async fn interrupted_coding_agent_thread_keeps_failed_status() {
         .unwrap();
         assert_eq!(
             status_of(thread_id).await,
-            "failed",
+            "paused",
             "[{agent}] CodingAgentIdled must not downgrade the interrupted \
-             turn's error status to 'idle'"
+             turn's paused verdict to 'idle'"
         );
 
         // 5. …nor may the session teardown that follows it.
@@ -1005,9 +1007,9 @@ async fn interrupted_coding_agent_thread_keeps_failed_status() {
         .unwrap();
         assert_eq!(
             status_of(thread_id).await,
-            "failed",
+            "paused",
             "[{agent}] SessionEnded must not downgrade the interrupted turn's \
-             error status to 'idle'"
+             paused verdict to 'idle'"
         );
 
         // 6. The verdict is sticky, not wedged: resuming clears it.
@@ -1098,7 +1100,7 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     })
     .await
     .unwrap();
-    assert_eq!(status_of(thread_id).await, "failed");
+    assert_eq!(status_of(thread_id).await, "paused");
 
     // `cancel_all_threads` wakes the agentic loop's cancel arm moments later.
     bus.emit(BusEvent::Thread {
@@ -1116,9 +1118,9 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     .unwrap();
     assert_eq!(
         status_of(thread_id).await,
-        "failed",
+        "paused",
         "the loop's phantom ResponseCanceled must not clear the interrupted \
-         thread's error status — the abort is the turn's verdict"
+         thread's status. The abort is the turn's verdict."
     );
 
     // A cancel of a genuinely new turn still settles the thread: the start

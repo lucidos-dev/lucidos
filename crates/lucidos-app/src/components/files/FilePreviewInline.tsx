@@ -1,8 +1,8 @@
-import { useState, useEffect } from 'preact/hooks';
+import { useState, useEffect, useMemo } from 'preact/hooks';
 import { artifactRevision, filePreviewSource, filePreviewEditing, openImagePopup, showToast } from '../../store/store';
 import { lucidos } from '@lucidos/sdk';
 import { renderMarkdown } from '../../utils/renderMarkdown';
-import { syntaxHighlightJson, syntaxHighlightCode, CODE_EXTS } from '../../utils/syntaxHighlight';
+import { highlightFileLines } from '../../utils/syntaxHighlight';
 import { renderCsvTable } from '../../utils/csv';
 import { SlidesPreview } from './SlidesPreview';
 import { isMobile, viewportIsMobile } from '../../utils/viewport';
@@ -12,6 +12,7 @@ import { openFilePreview, refreshFilePreview } from '../../store/actions/artifac
 import { RENDERABLE_EXTS, TEXT_EXTS, IMAGE_EXTS, VIDEO_EXTS, AUDIO_EXTS, isEditableDataFile } from './previewExts';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+import { LineNumberedCode, fileRows } from './LineNumberedCode';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 import {
   bridgePreviewIframeLinks,
@@ -149,6 +150,39 @@ function FileEditor({ path, url }: { path: string; url: string }) {
   );
 }
 
+/** One entry of line-numbered source per line of `content`, or `[]` when this
+ *  file renders richly instead (markdown, a CSV table, slides, an HTML iframe)
+ *  and there is nothing to number.
+ *
+ *  Exported for tests. Kept pure and out of the component so the branch that
+ *  decides "rendered vs source" is checkable without a DOM.
+ *
+ *  `highlightFileLines` closes and reopens highlight spans at each line break,
+ *  which is what makes a multi-line string or comment survive being split into
+ *  rows. It escapes (rather than highlights) any extension it has no language
+ *  for, so plain text and markdown source come through safely escaped.
+ *
+ *  Nothing is reformatted on the way in, JSON included. A numbered line has to
+ *  be the file's OWN line: a `path:42` citation, and the range this view hands
+ *  to `currentChatContext`, both name lines in the file on disk, so numbering a
+ *  pretty-printed copy would point at code that isn't there. (The repo preview
+ *  has always shown JSON as written, for the same reason.) */
+export function sourceLinesFor(content: string, ext: string, sourceMode: boolean): string[] {
+  if (sourceMode) {
+    // The Source toggle's own language mapping, unchanged: markdown and CSV
+    // have no registered grammar and fall through to escaped text, SVG is XML,
+    // and anything else here is HTML (which includes a `.slides` deck).
+    const lang = ext === 'md' ? 'markdown' : ext === 'csv' ? 'text' : ext === 'svg' ? 'xml' : 'html';
+    return highlightFileLines(content, lang);
+  }
+  // The rich-render set, minus nothing: an SVG only reaches here in sourceMode
+  // (it renders as an <img> otherwise), so the branch above has already claimed
+  // it. Derived rather than restated so a new renderable extension is covered
+  // the moment it's added there.
+  if (RENDERABLE_EXTS.includes(ext)) return [];
+  return highlightFileLines(content, ext);
+}
+
 function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string; sourceMode: boolean; path: string }) {
   const { loadable, showLoading } = useLoadableFetch<string>(
     () => fetch(url).then(r => {
@@ -156,6 +190,11 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
       return r.text();
     }),
     [url],
+  );
+  const loaded = loadable.status === 'loaded' ? loadable.data : null;
+  const sourceRows = useMemo(
+    () => fileRows(loaded === null ? [] : sourceLinesFor(loaded, ext, sourceMode)),
+    [loaded, ext, sourceMode],
   );
 
   if (loadable.status === 'failed') {
@@ -170,11 +209,10 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
   if (loadable.status !== 'loaded') return showLoading ? <div class="loading-spinner" /> : null;
   const content = loadable.data;
 
-  if (sourceMode) {
-    const lang = ext === 'md' ? 'markdown' : ext === 'csv' ? 'text' : ext === 'svg' ? 'xml' : 'html';
-    if (lang === 'text') return <pre class="file-preview-code">{content}</pre>;
-    return <pre class="file-preview-code" dangerouslySetInnerHTML={{ __html: syntaxHighlightCode(content, lang) }} />;
-  }
+  // The Source view wins over every rich render below: it is what the Source
+  // toggle asks for, and what a navigate carrying a line sets so the cited line
+  // is actually on screen to highlight.
+  if (sourceMode) return <LineNumberedCode rows={sourceRows} />;
 
   // An `about:srcdoc` document resolves relative and fragment hrefs against the
   // HOST page's URL, so an artifact's own `#section` link or `img/chart.png` ref
@@ -214,18 +252,11 @@ function TextContent({ ext, url, sourceMode, path }: { ext: string; url: string;
       />
     );
   }
-  if (ext === 'json') {
-    try {
-      const formatted = JSON.stringify(JSON.parse(content), null, 2);
-      return <pre class="file-preview-code" dangerouslySetInnerHTML={{ __html: syntaxHighlightJson(formatted) }} />;
-    } catch {
-      return <pre class="file-preview-code">{content}</pre>;
-    }
-  }
   if (ext === 'csv') return <div dangerouslySetInnerHTML={{ __html: renderCsvTable(content) }} />;
   if (ext === 'slides') return <SlidesPreview content={content} />;
-  if (CODE_EXTS.includes(ext)) return <pre class="file-preview-code" dangerouslySetInnerHTML={{ __html: syntaxHighlightCode(content, ext) }} />;
-  return <pre class="file-preview-code">{content}</pre>;
+  // Everything else (code, JSON, plain text, and any unknown-but-textual file)
+  // is line-numbered source, the same view the repo preview shows.
+  return <LineNumberedCode rows={sourceRows} />;
 }
 
 /** `knowhow/lucidos-ops/foo.md` → `lucidos-ops/foo`; same for `system-knowhow/`.

@@ -167,7 +167,11 @@ impl ScriptHandshakeLayer {
         let mut env_vars = match &self.credential {
             Some(name) => {
                 let cred = fetch_required_credential(&self.pool, name).await?;
-                crate::core::credentials::credential_env_vars(vec![cred])
+                // `_for`, not the list version: the user named THIS credential
+                // on this layer, so an `oauth_client` must still inject. The
+                // list version's skip is about the blanket every-secret fan-out
+                // into every subprocess, which this is not.
+                crate::core::credentials::credential_env_vars_for(cred)
             }
             None => Vec::new(),
         };

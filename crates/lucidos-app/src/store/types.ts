@@ -412,6 +412,11 @@ export type AuthType = 'api_key' | 'bearer' | 'basic' | 'password' | 'oauth_clie
 
 // A credential
 export interface CredentialInfo {
+  /** Primary key. The handle for every verb that acts on an EXISTING row
+   *  (edit, delete, copy-value), because `service_name` stopped being unique
+   *  when `auth_type` became the discriminator: an `oauth_client` app
+   *  registration may share a name with an API key for the same provider. */
+  id: string;
   service_name: string;
   base_url: string;
   auth_type: AuthType;
@@ -586,6 +591,12 @@ export interface CredentialRequest {
     auth_url?: string;
     token_url?: string;
     userinfo_url?: string | null;
+    /** `'POST'` for a provider whose userinfo endpoint refuses GET. Absent
+     *  means the OIDC default, GET. */
+    userinfo_method?: string;
+    /** Extra authorization-URL parameters, `key=value&key=value`. Absent means
+     *  the engine's default (`access_type=offline&prompt=consent`). */
+    authorize_params?: string;
     scopes?: string;
     /** Loopback callback URI to register with the provider. Absent means the
      *  engine's default (`http://127.0.0.1:14981/oauth/callback`). */

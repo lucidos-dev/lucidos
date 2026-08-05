@@ -61,9 +61,11 @@ function timezoneOptions(current: string): DropdownOption[] {
   return zones.map((z) => ({ value: z, label: z }));
 }
 
-/** Language + timezone — global (workspace-wide) preferences, surfaced in
- *  Settings → System so they're not LLM-only (the agent sets them via
- *  set_preference; this is the human-facing control). */
+/** Language + timezone: global (workspace-wide) preferences, surfaced as their
+ *  own Settings category so they're not LLM-only (the agent sets them via
+ *  set_preference; this is the human-facing control). They rendered under
+ *  Settings → System until 2026-08-05, which buried two of the most
+ *  looked-for settings there are under a diagnostics page. */
 export function LocaleSection() {
   const language = currentLanguage();
   const timezone = currentTimezone();
@@ -75,8 +77,8 @@ export function LocaleSection() {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="system:locale">Locale</div>
-      <div class="settings-row" data-search-anchor="system:language">
+      <div class="settings-section-title">Locale</div>
+      <div class="settings-row" data-search-anchor="locale:language">
         <span class="settings-row-label">Language</span>
         <Dropdown
           options={languageOptions}
@@ -91,7 +93,7 @@ export function LocaleSection() {
         can still write in any language; replies come in the language set here, or
         match yours when left on Auto.
       </div>
-      <div class="settings-row" data-search-anchor="system:timezone">
+      <div class="settings-row" data-search-anchor="locale:timezone">
         <span class="settings-row-label">Timezone</span>
         <Dropdown
           options={timezoneOptions(timezone)}

@@ -130,7 +130,12 @@ entry per trigger (see *Cron coalescing* above).
 `ThreadQueued` / `ThreadQueueAdmitted` / `ThreadQueueDropped` /
 `ThreadQueueCompleted`). Coding-agent requests persist the selected backend
 (`claude-code` default, `codex` when requested), so queue drain and restart
-requeue do not silently fall back to Claude Code. On engine restart:
+requeue do not silently fall back to Claude Code. Both spawn kinds
+(`sub-thread`, `coding-agent`) also persist their attribution (`origin`), so a
+spawn that waited behind capacity or was re-fired after a restart still names
+its *spawning thread* in the message route popover. It is separate from
+`parent_thread_id` because a *top-thread* has an origin and no callback linkage;
+entries queued before the field existed simply carry none. On engine restart:
 
 - `queued` entries are reloaded as-is.
 - `admitted` entries are work that died with the old process: trigger fires

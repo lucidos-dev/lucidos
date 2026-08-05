@@ -116,7 +116,7 @@ impl LucidosEngine {
                     Some(s) if !s.is_empty() => s.to_string(),
                     _ => return Err("Error: source is required".to_string()),
                 };
-                super::lift_legacy_string(self.prepare_install_request(&source_str).await)
+                super::lift_legacy_string(stage_install_request(self, &source_str).await)
             }
             crate::llm::tool_names::REGISTER_PLUGIN_MARKETPLACE => {
                 self.register_plugin_marketplace_tool(args, thread_id).await
@@ -168,7 +168,7 @@ impl LucidosEngine {
                 {
                     return Ok(format!("Already at latest (v{})", installed_version));
                 }
-                super::lift_legacy_string(self.prepare_install_request(&source).await)
+                super::lift_legacy_string(stage_install_request(self, &source).await)
             }
             crate::llm::tool_names::UNINSTALL_PLUGIN => {
                 let id = match args.get("id").and_then(|v| v.as_str()) {
@@ -257,29 +257,21 @@ impl LucidosEngine {
         serde_json::to_string_pretty(&response)
             .map_err(|e| format!("Error: serialize marketplace registration: {e}"))
     }
-
-    /// Stage `source_str` into a temp dir, validate the manifest + tree,
-    /// register the result in `pending_installs`, and return the
-    /// `[PLUGIN_INSTALL_REQUEST]` sentinel so the agentic loop intercepts it.
-    /// Runs the sync fetch (git clone or zip extract) on the blocking pool
-    /// so the tool dispatcher's tokio worker stays free.
-    async fn prepare_install_request(&self, source_str: &str) -> String {
-        let workspace = self.workspace_path.clone();
-        let pending = self.pending_installs.clone();
-        let source = source_str.to_string();
-        match tokio::task::spawn_blocking(move || {
-            prepare_install_request(&workspace, &pending, &source)
-        })
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => format!("Error: install staging task panicked: {}", e),
-        }
-    }
 }
 
 type PendingInstallsMap = std::sync::Mutex<std::collections::HashMap<String, PendingInstall>>;
 
+/// Stage `source_str` into a temp dir, validate the manifest + tree, register
+/// the result in `pending_installs`, and return the
+/// `[PLUGIN_INSTALL_REQUEST]` sentinel so the agentic loop (or the Plugins
+/// panel's HTTP handler) surfaces the confirm panel. Runs the sync fetch (git
+/// clone or zip extract) on the blocking pool so the caller's tokio worker
+/// stays free.
+///
+/// Both entry points share this one body: the `install_plugin` / `update_plugin`
+/// LLM tools above and `api::plugins`'s panel route. They used to be two
+/// byte-identical copies (a `LucidosEngine` method and this free function),
+/// which is one place for a fix to land in and another to be forgotten.
 pub(crate) async fn stage_install_request(engine: &LucidosEngine, source_str: &str) -> String {
     let workspace = engine.workspace_path.clone();
     let pending = engine.pending_installs.clone();
@@ -1164,6 +1156,11 @@ fn build_setup_thread_request(
         model: None,
         reasoning_effort: None,
         pre_emitted_origin: None,
+        // No launching THREAD to attribute to: an install is a user action, and
+        // stamping the clicking device would be the `mode: Agent` mismatch this
+        // function's doc comment describes. Distinct from a `relation: "top"`
+        // spawn, which has no linkage but does have a spawning thread.
+        origin: None,
     }
 }
 

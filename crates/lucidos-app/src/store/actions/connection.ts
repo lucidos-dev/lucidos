@@ -1,9 +1,10 @@
-import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
+import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
 import { checkHealth, API_BASE, isTransportError } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
 import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
-import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearForcedRetries } from './thread-loading';
+import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
+import { runWithConcurrency } from '../../utils/concurrentPool';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
 import { flushUndeliveredComposeDrafts } from './compose';
@@ -104,11 +105,21 @@ const MAX_EMPTY_REFRESHES = 3;
  *  survive every focus event. The form's data lives on `panelOverlay` and is
  *  persisted via the nav stack, so reconnect doesn't need to refetch it. */
 function runResumeSync(): void {
-  // Reset forced-retry tracking so the watchdog can retry threads again.
-  // On iOS Safari PWA, the app stays alive for days without a full reload.
-  // Without this, forcedRetries accumulates permanently and the watchdog
-  // timer in ThreadView can never retry a thread that had a transient failure.
-  clearForcedRetries();
+  // Reset the per-thread fetch guards. On iOS Safari PWA the app stays alive
+  // for days without a full reload, so without this the retry caps accumulate
+  // permanently (the ThreadView watchdog can never retry a thread that had a
+  // transient failure) and a fetch WebKit left hanging through a suspension
+  // blocks its thread forever.
+  clearThreadFetchGuards();
+  // Record that every loaded thread may have missed events while this device
+  // was not listening. Set here, at the TOP, because only a fetch that STARTS
+  // after a mark may clear it (see `staleMarkedAtToken`): the focused thread's
+  // refresh below and `loadAllThreads`' eager loads at the bottom both have to
+  // be on the far side of this line, or each would land holding a snapshot that
+  // predates the gap and leave its mark standing. Note the adjacency:
+  // `clearThreadFetchGuards` deliberately does NOT reset the marks, or the call
+  // above would undo this one.
+  markLoadedThreadsStale();
 
   void loadUnreadNotifications();
   // Re-send any compose draft the engine never received. Paired with the same
@@ -121,36 +132,54 @@ function runResumeSync(): void {
   connectThreadEvents();
   refreshChangesState();
 
-  // Incrementally refresh already-loaded threads (append-only event log —
-  // existing events stay, we just fetch what's new via ?after=maxSeq).
-  // Focused thread awaited first for immediate UX, rest in parallel.
+  // Incrementally refresh the FOCUSED thread (append-only event log: existing
+  // events stay, we just fetch what's new via ?after=maxSeq). It is the one
+  // thread whose staleness the user can see, so it is the one thread worth a
+  // request now. Every other loaded thread was marked above and catches up when
+  // the user opens it (`refreshStaleThreadEvents`, called from `focusThread`).
   //
-  // The `.catch(() => {})` swallows are safe carve-outs only because
-  // `refreshThreadEvents` (thread-loading.ts) toasts user-visible failures
-  // itself via `showToast` after retrying — the outer catch keeps the parallel
-  // fan-out from rejecting the unhandled-promise tracker; per-thread errors
-  // already surfaced inside.
+  // This used to be one request per loaded thread, bounded to four at a time.
+  // Bounding turned a burst into a queue but still spent a request on every
+  // thread in the map, none of which the user was looking at, and none of which
+  // contributes anything to the drawer that the `loadAllThreads` below does not
+  // already refresh from `thread_summaries`. Marking removes them instead.
+  //
+  // `refreshThreadEvents` never rejects (it catches every path and reports its
+  // own failures), so this needs no rejection-tracker silencer. Coalesced
+  // because a `Lagged` resync can be running against the same thread.
   const focused = focusedThreadId.value;
   const map = threadMap.value;
-  const loadedIds: string[] = [];
   const failedIds: string[] = [];
   for (const [id, t] of map.entries()) {
-    if (t.eventsLoaded) loadedIds.push(id);
-    else if (t.eventsLoadFailed) failedIds.push(id);
+    if (!t.eventsLoaded && t.eventsLoadFailed) failedIds.push(id);
   }
 
   if (focused && map.get(focused)?.eventsLoaded) {
-    refreshThreadEvents(focused).then(() => {
-      const rest = loadedIds.filter(id => id !== focused);
-      if (rest.length > 0) Promise.all(rest.map(refreshThreadEvents)).catch(() => {});
-    }).catch(() => {});
-  } else if (loadedIds.length > 0) {
-    Promise.all(loadedIds.map(refreshThreadEvents)).catch(() => {});
+    void refreshThreadEvents(focused, { coalesce: true });
   }
 
-  // Retry threads whose initial load failed — loadThreadEvents resets
+  // Retry threads whose initial load failed. `loadThreadEvents` resets
   // eventsLoadFailed and does a full load (lastDbSeq is still 0).
-  for (const id of failedIds) void loadThreadEvents(id);
+  //
+  // This one stays EAGER and pooled, where the refresh above went lazy, and the
+  // difference is the failure card rather than the fetch: a thread carrying
+  // `eventsLoadFailed` may be counted by the load card, and this retry landing
+  // is what retracts it, so deferring to focus would leave the card standing for
+  // threads the user never opens. It is also where the burst risk now lives:
+  // these are FULL snapshots, up to three attempts each, and the set is largest
+  // at exactly the wrong moment, since an outage during boot or a wake flags
+  // every eagerly-loaded thread (the transient give-up still sets the flag, so
+  // the retry can find them). Unbounded, the next resume would fire all of them
+  // down a link that has only just come back.
+  //
+  // Focused first: `failedIds` comes out of plain map order, and a full snapshot
+  // is three attempts behind a 10s deadline plus backoff, so without this the
+  // thread the user is looking at can sit minutes behind background snapshots
+  // that render nothing.
+  const retryIds = focused && failedIds.includes(focused)
+    ? [focused, ...failedIds.filter(id => id !== focused)]
+    : failedIds;
+  void runWithConcurrency(retryIds, THREAD_EVENTS_FETCH_CONCURRENCY, loadThreadEvents);
 
   // Also load thread list to pick up any brand-new threads. `loadAllThreads`
   // REJECTS on a failed GET and has no Loadable or toast of its own, so surface
@@ -434,7 +463,9 @@ export async function checkConnection(): Promise<boolean> {
     if (focusedId) {
       const ft = threadMap.value.get(focusedId);
       if (ft && ft.eventsLoaded && ft.events.size === 0 && ft.pendingUserMessages.length === 0) {
-        // refreshThreadEvents surfaces failures via showToast itself.
+        // refreshThreadEvents owns its own reporting: a verdict reaches the
+        // user through its single keyed card, and a transient rejection is
+        // deliberately silent (the connection dot owns a sustained outage).
         if (!emptyRefreshState || emptyRefreshState.id !== focusedId) {
           emptyRefreshState = { id: focusedId, count: 1 };
           void refreshThreadEvents(focusedId);

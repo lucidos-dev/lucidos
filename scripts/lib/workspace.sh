@@ -1612,6 +1612,39 @@ publish_launch_binary() {
     fi
 }
 
+# Delete publish temps left behind by a build that was KILLED mid-publish.
+#
+# `publish_launch_binary` removes its own temp on every failure it can observe,
+# but the engine SIGKILLs the whole build process group when a second Apply
+# supersedes a build (`engine_version::BuildProcessGroupGuard`), and no trap
+# catches SIGKILL. A kill landing inside the copy/sign window therefore strands
+# a `*.tmp.<pid>` that nothing ever collects, and a debug engine binary is
+# ~250 MB of it. Nothing launches from a temp, so this is disk hygiene rather
+# than correctness.
+#
+# Scoped by the PID IN THE NAME, not by age. A temp whose shell is still alive
+# belongs to a publish in flight, and a human `web-dev.sh -b` is deliberately
+# not coordinated by the engine's build lock, so deleting one would break that
+# build's rename. A dead pid cannot be publishing anything. A recycled pid just
+# means the temp survives until the next publish, which is the safe direction.
+prune_dead_launch_temps() {
+    local dest_dir="$1" tmp pid
+    for tmp in "$dest_dir"/*.tmp.*; do
+        # Unmatched glob comes through literally; a temp may also vanish under us.
+        [ -f "$tmp" ] || continue
+        pid="${tmp##*.tmp.}"
+        case "$pid" in
+            '' | *[!0-9]*) continue ;;
+        esac
+        # `if` rather than `&&`, so a dead pid is a plain false and never trips
+        # the caller's errexit.
+        if kill -0 "$pid" 2>/dev/null; then
+            continue
+        fi
+        rm -f "$tmp"
+    done
+}
+
 # Publish the engine + gateway + CLI from cargo's uplift dir into the launch
 # dir. Returns non-zero when the engine or the gateway could not be published.
 # The engine + gateway are signed on the way in (see publish_launch_binary);
@@ -1619,6 +1652,7 @@ publish_launch_binary() {
 publish_launch_binaries() {
     local src_dir="$1" dest_dir="$2"
     local rc=0
+    prune_dead_launch_temps "$dest_dir"
     publish_launch_binary "$src_dir/lucidos-engine" "$dest_dir/lucidos-engine" sign || rc=1
     publish_launch_binary "$src_dir/lucidos-gateway" "$dest_dir/lucidos-gateway" sign || rc=1
     # The `lucidos` CLI must sit NEXT TO the engine: find_lucidos_cli_dir

@@ -424,35 +424,45 @@ async fn user_actor_resolved_unknown_device_id_falls_back_to_short_label() {
 // and stamps `MessageOrigin::Api { mode: Agent, source_thread_id }` so
 // the timeline says "Lucidos Agent" (not "You") and the popover links
 // back to the spawning thread.
+//
+// The token is now **thread-bound**: it is minted per spawn and its own
+// prefix names the thread, so `source_thread_id` is authenticated rather
+// than claimed. Everything below the first four tests exists because that
+// binding has to be unforgeable, not merely present.
 
-/// Helper: install a known token for the duration of the test.
-/// `init_agent_origin_token` is idempotent (`OnceLock::set`), so the
+/// Helper: install a known secret for the duration of the test.
+/// `init_agent_origin_secret` is idempotent (`OnceLock::set`), so the
 /// first test to run wins for the whole process. Tests that need to
-/// assert the no-token-installed path use the bare `subprocess_origin`
+/// assert the no-secret-installed path use the bare `subprocess_origin`
 /// without going through this helper.
-fn install_test_token() -> &'static str {
-    init_agent_origin_token("subprocess-test-token".to_string());
-    agent_origin_token().expect("token installed")
+fn install_test_secret() {
+    init_agent_origin_secret("subprocess-test-secret".to_string());
+}
+
+/// A token minted for `thread_id`, exactly as a spawn would hand it out.
+fn token_for(thread_id: Option<Uuid>) -> String {
+    install_test_secret();
+    mint_agent_origin_token(thread_id).expect("secret installed")
 }
 
 #[test]
 fn subprocess_origin_not_subprocess_with_no_token_header() {
-    install_test_token();
+    install_test_secret();
     let h = headers_with(&[("user-agent", "curl/8.7.1")]);
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
 }
 
 #[test]
 fn subprocess_origin_not_subprocess_with_wrong_token() {
-    install_test_token();
+    install_test_secret();
     let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, "not-the-real-token")]);
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
 }
 
 #[test]
 fn subprocess_origin_subprocess_with_matching_token_no_thread() {
-    let token = install_test_token();
-    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, token)]);
+    let token = token_for(None);
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
@@ -463,47 +473,132 @@ fn subprocess_origin_subprocess_with_matching_token_no_thread() {
 
 #[test]
 fn subprocess_origin_subprocess_with_matching_token_and_thread_id() {
-    let token = install_test_token();
     let source = Uuid::new_v4();
-    let h = headers_with(&[
-        (HEADER_AGENT_ORIGIN_TOKEN, token),
-        (HEADER_SOURCE_THREAD_ID, &source.to_string()),
-    ]);
+    let token = token_for(Some(source));
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
             source_thread_id: Some(source)
-        }
+        },
+        "the token's own prefix is the source thread; no other input names it"
     );
 }
 
+/// The whole point of the binding. Take a token that verifies, swap its
+/// thread prefix for another thread's id, and the MAC no longer covers
+/// what it claims, so the request is not a subprocess at all.
+///
+/// Before the binding this was the hole: the thread id rode on its own
+/// unverified header, so any subprocess could name any thread and every
+/// gate reading `source_thread_id` was decorative.
 #[test]
-fn subprocess_origin_ignores_malformed_thread_id() {
-    // Malformed source-thread-id is dropped silently — request is still a
-    // subprocess; popover just won't link.
-    let token = install_test_token();
-    let h = headers_with(&[
-        (HEADER_AGENT_ORIGIN_TOKEN, token),
-        (HEADER_SOURCE_THREAD_ID, "not-a-uuid"),
-    ]);
+fn a_tampered_thread_prefix_is_not_a_subprocess() {
+    let mine = Uuid::new_v4();
+    let theirs = Uuid::new_v4();
+    let token = token_for(Some(mine));
+    let mac = token.rsplit_once('.').expect("minted token has a mac").1;
+    let forged = format!("{theirs}.{mac}");
+
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &forged)]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::NotSubprocess,
+        "re-pointing a valid token at another thread must not authenticate"
+    );
+}
+
+/// Two threads spawned by the same engine get different tokens, and
+/// neither authenticates as the other. (Distinct from the test above: that
+/// one splices a MAC onto a foreign prefix, this one presents a whole,
+/// internally consistent token minted for a different thread.)
+#[test]
+fn a_token_minted_for_one_thread_does_not_authenticate_another() {
+    let a = Uuid::new_v4();
+    let b = Uuid::new_v4();
+    let token_a = token_for(Some(a));
+    let token_b = token_for(Some(b));
+    assert_ne!(
+        token_a, token_b,
+        "tokens must be per-thread, not per-engine"
+    );
+
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token_a)]);
     assert_eq!(
         subprocess_origin(&h),
         SubprocessOrigin::Subprocess {
-            source_thread_id: None
-        }
+            source_thread_id: Some(a)
+        },
+        "a token authenticates as exactly the thread it was minted for"
     );
 }
 
+/// A thread-bound token cannot be edited down to the thread-less sentinel
+/// to shed its identity, because the sentinel is signed like any other
+/// prefix.
 #[test]
-fn subprocess_origin_env_vars_with_token_and_thread_id_emits_both() {
-    install_test_token();
+fn a_thread_bound_token_cannot_be_downgraded_to_the_sentinel() {
+    let token = token_for(Some(Uuid::new_v4()));
+    let mac = token.rsplit_once('.').expect("minted token has a mac").1;
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &format!("-.{mac}"))]);
+    assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
+}
+
+/// Every malformed shape is refused rather than partially trusted. A
+/// missing separator, an empty MAC, a non-hex MAC and a truncated MAC each
+/// reach a different early return.
+#[test]
+fn a_malformed_token_is_not_a_subprocess() {
+    let source = Uuid::new_v4();
+    let token = token_for(Some(source));
+    let (prefix, mac) = token.rsplit_once('.').expect("minted token has a mac");
+
+    for (label, candidate) in [
+        ("no separator", prefix.to_string()),
+        ("empty mac", format!("{prefix}.")),
+        ("non-hex mac", format!("{prefix}.{}", "z".repeat(mac.len()))),
+        (
+            "truncated mac",
+            format!("{prefix}.{}", &mac[..mac.len() - 2]),
+        ),
+        ("empty prefix", format!(".{mac}")),
+        ("mac only", mac.to_string()),
+    ] {
+        let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &candidate)]);
+        assert_eq!(
+            subprocess_origin(&h),
+            SubprocessOrigin::NotSubprocess,
+            "{label} must not authenticate"
+        );
+    }
+}
+
+#[test]
+fn subprocess_origin_env_vars_binds_the_token_to_the_thread() {
+    install_test_secret();
     let tid = Uuid::new_v4();
     let vars = subprocess_origin_env_vars(Some(tid));
     let map: std::collections::HashMap<_, _> = vars.into_iter().collect();
+
+    let token = map
+        .get(ENV_AGENT_ORIGIN_TOKEN)
+        .expect("spawn env carries a token");
     assert_eq!(
-        map.get(ENV_AGENT_ORIGIN_TOKEN).map(String::as_str),
-        Some("subprocess-test-token")
+        token,
+        &mint_agent_origin_token(Some(tid)).expect("secret installed"),
+        "the spawn env's token must be the one minted for this thread"
     );
+    // And it round-trips through the wire: what the spawn hands out is what
+    // the engine reads back.
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, token)]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: Some(tid)
+        }
+    );
+    // `LUCIDOS_THREAD_ID` still ships, for the subprocess-side consumers
+    // that read it directly. The engine no longer reads it back.
     assert_eq!(
         map.get(ENV_SOURCE_THREAD_ID).map(String::as_str),
         Some(tid.to_string().as_str())
@@ -511,11 +606,23 @@ fn subprocess_origin_env_vars_with_token_and_thread_id_emits_both() {
 }
 
 #[test]
-fn subprocess_origin_env_vars_without_thread_id_emits_token_only() {
-    install_test_token();
+fn subprocess_origin_env_vars_without_a_thread_binds_the_sentinel() {
+    install_test_secret();
     let vars = subprocess_origin_env_vars(None);
-    assert!(vars.iter().any(|(k, _)| *k == ENV_AGENT_ORIGIN_TOKEN));
+    let map: std::collections::HashMap<_, _> = vars.iter().cloned().collect();
     assert!(vars.iter().all(|(k, _)| *k != ENV_SOURCE_THREAD_ID));
+
+    let token = map
+        .get(ENV_AGENT_ORIGIN_TOKEN)
+        .expect("a thread-less spawn still gets a token");
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, token)]);
+    assert_eq!(
+        subprocess_origin(&h),
+        SubprocessOrigin::Subprocess {
+            source_thread_id: None
+        },
+        "a scheduled script authenticates as a subprocess with no thread"
+    );
 }
 
 // Shared serialization for tests that mutate process-wide LUCIDOS_API_PORT.
@@ -696,12 +803,11 @@ fn build_origin_subprocess_overrides_human_to_agent_api() {
     // With the subprocess token in headers, the resulting actor MUST
     // be stamped as Api { mode: Agent, source_thread_id } instead of
     // bleeding through as Api { mode: Human } (which the UI renders as "You").
-    let token = install_test_token();
     let source = Uuid::new_v4();
+    let token = token_for(Some(source));
     let h = headers_with(&[
         ("user-agent", "curl/8.7.1"),
-        (HEADER_AGENT_ORIGIN_TOKEN, token),
-        (HEADER_SOURCE_THREAD_ID, &source.to_string()),
+        (HEADER_AGENT_ORIGIN_TOKEN, &token),
     ]);
     let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
     match origin {
@@ -735,10 +841,10 @@ fn build_origin_subprocess_overrides_device_id_too() {
     // A subprocess could also send the device-id header (the run_bash
     // shell inherits engine env; the agent could read it). Subprocess
     // origin still wins — agent actions never appear as "You".
-    let token = install_test_token();
+    let token = token_for(Some(Uuid::new_v4()));
     let h = headers_with(&[
         ("user-agent", "curl/8.7.1"),
-        (HEADER_AGENT_ORIGIN_TOKEN, token),
+        (HEADER_AGENT_ORIGIN_TOKEN, &token),
         ("x-lucidos-device-id", "should-be-ignored"),
     ]);
     let origin = build_message_origin(
@@ -769,8 +875,8 @@ fn build_origin_cross_workspace_caller_still_wins_over_subprocess() {
     // Cross-workspace calls go through their own resolution (Workspace
     // origin); a subprocess token presented on the SAME request would be
     // confusing but the cross-workspace contract is "caller wins".
-    let token = install_test_token();
-    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, token)]);
+    let token = token_for(Some(Uuid::new_v4()));
+    let h = headers_with(&[(HEADER_AGENT_ORIGIN_TOKEN, &token)]);
     let origin = build_message_origin(
         &h,
         ActorMode::Human,
@@ -799,13 +905,12 @@ async fn user_actor_resolved_subprocess_token_overrides_device_lookup() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
     crate::test_support::seed_device(&pool, "real-device", Some("Mozilla"), Some("My MacBook"))
         .await;
-    let token = install_test_token();
     let source = Uuid::new_v4();
+    let token = token_for(Some(source));
     let h = headers_with(&[
         ("user-agent", "curl/8.7.1"),
         (HEADER_DEVICE_ID, "real-device"),
-        (HEADER_AGENT_ORIGIN_TOKEN, token),
-        (HEADER_SOURCE_THREAD_ID, &source.to_string()),
+        (HEADER_AGENT_ORIGIN_TOKEN, &token),
     ]);
     let actor = user_actor_resolved(&h, &pool, None).await;
     match actor {

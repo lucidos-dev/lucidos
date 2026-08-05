@@ -65,7 +65,7 @@ describe('Flow: New chat message', () => {
     const exchanges = getExchanges(map, id);
     expect(exchanges).toHaveLength(1);
     expect(exchangeStatus(exchanges[0], '', true)).toBe('error');
-    expect(exchangeError(exchanges[0])).toBe('API rate limit exceeded');
+    expect(exchangeError(exchanges[0])?.message).toBe('API rate limit exceeded');
   });
 
   it('streaming buffer shows in last exchange', () => {
@@ -448,7 +448,7 @@ describe('Flow: Disconnected message', () => {
     expect(exchanges).toHaveLength(1);
     expect(exchangeUserMessage(exchanges[0])).toBe('My message');
     expect(exchangeStatus(exchanges[0], '', true)).toBe('error');
-    expect(exchangeError(exchanges[0])).toBe('Disconnected from engine');
+    expect(exchangeError(exchanges[0])?.message).toBe('Disconnected from engine');
   });
 });
 
@@ -565,7 +565,7 @@ describe('Flow: Thread status', () => {
     expect(exchanges).toHaveLength(2);
     expect(exchangeUserMessage(exchanges[1])).toBe('Now fix tests');
     expect(exchangeStatus(exchanges[1], '', true)).toBe('error');
-    expect(exchangeError(exchanges[1])).toContain('already running');
+    expect(exchangeError(exchanges[1])?.message).toContain('already running');
   });
 
   it('revived CC thread shows correct exchange count', () => {

@@ -531,6 +531,29 @@ fn repo_name_expr(id_text_expr: &str) -> String {
 static THREAD_COLS: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| thread_cols("t"));
 
 impl EventStore {
+    /// The name the user sees for a thread: its title once one exists, else a
+    /// truncated first message. Exactly [`format_display_title`], so a
+    /// coding-agent branch is named after the same string the thread drawer
+    /// shows rather than a second, drifting notion of "the thread's name".
+    ///
+    /// `None` when the thread has no projection row yet; empty when it has one
+    /// with neither field (a thread addressed by id before its first message
+    /// landed). Both leave the caller to supply its own fallback.
+    pub async fn thread_display_title(&self, thread_id: uuid::Uuid) -> Option<String> {
+        let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
+            "SELECT title, first_message FROM thread_summaries WHERE thread_id = $1",
+        )
+        .bind(thread_id)
+        .fetch_optional(&self.pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!("[ThreadStore] thread_display_title query failed: {}", e);
+            None
+        });
+        let (title, first_message) = row?;
+        Some(format_display_title(title, first_message))
+    }
+
     fn rows_to_thread_summaries(
         rows: Vec<ThreadRow>,
     ) -> Result<Vec<ThreadSummary>, Box<dyn std::error::Error + Send + Sync>> {
@@ -600,6 +623,14 @@ pub struct ThreadSearchResult {
 pub struct ThreadSummaryFilters<'a> {
     pub active: Option<bool>,
     pub sources: Option<&'a [String]>,
+    /// Restrict to the direct children of this thread. `None` is no filter.
+    ///
+    /// Direct children only (`parent_thread_id`), never the recursive ancestor
+    /// CTE: a parent addresses the level below it, which is what a star
+    /// topology at each level means. This is the read side of a parent
+    /// orchestrating its own fan-out, and it is how the Lucidos Agent recovers
+    /// a child's `thread_id` after history trimming drops the spawn result.
+    pub parent: Option<uuid::Uuid>,
     pub limit: i64,
 }
 

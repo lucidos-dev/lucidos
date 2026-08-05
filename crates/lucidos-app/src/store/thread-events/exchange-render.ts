@@ -736,29 +736,75 @@ export function changePanelHasContinuation(exchange: Exchange): boolean {
   );
 }
 
-/** Get the error message from a failed exchange. */
-export function exchangeError(exchange: Exchange): string {
-  for (const { event } of exchange.steps) {
-    if (event.type === 'ResponseFailed') return event.error;
-  }
-  return '';
+/** The failure card's content: what a `ResponseFailed` step says, and which
+ *  event said it. */
+export interface ExchangeError {
+  /** `ResponseFailed.error`, the text rendered in the card. */
+  message: string;
+  /** The `ResponseFailed`'s OWN event id. `ChatExchange` stamps it on the card
+   *  as `data-event-id`, which is what makes a notification deep-link to a
+   *  failure resolve (`scrollToEventAndPulse`) and pulse the card itself.
+   *  `ResponseFailed` is a step, not an exchange starter, so the exchange root's
+   *  `data-event-id` carries a different event entirely. Absent on legacy rows
+   *  and on the client-synthesized transport-failure event (`actions/chat.ts`),
+   *  neither of which any notification points at. */
+  eventId?: string;
 }
 
-/** Index of the last (newest) ResponseAborted exchange that has NO later
- *  ContinuationStarted exchange anywhere in the thread. Used by AbortPanel to
- *  decide whether to render the Continue button — only the unresumed abort
- *  shows it; older aborts that the user already continued past are inert.
+/** The error a failed exchange carries, or null when it didn't fail. */
+export function exchangeError(exchange: Exchange): ExchangeError | null {
+  for (const { event } of exchange.steps) {
+    if (event.type === 'ResponseFailed') return { message: event.error, eventId: event._eventId };
+  }
+  return null;
+}
+
+/** True for the teardown boundary of a user-initiated *Switch to new version*:
+ *  an `engine_shutdown` abort stamped with the device that clicked Switch.
  *
- *  Stale-settle aborts (engine cleanup of a stuck-but-already-gone process,
- *  fired by the user's Stop/Apply/Discard/Archive/Interrupt click) are
- *  treated like ContinuationStarted: they terminate the scan with `null`.
- *  Clicking Continue would re-run work the user just deliberately stopped. */
-export function unresumedAbortIndex(exchanges: Exchange[]): number | null {
+ *  This is the TypeScript mirror of the backend's `SWITCH_TEARDOWN_ABORT_SQL`
+ *  (`agent_recovery/recovery.rs`), which is the single definition both resume
+ *  gates key on: `switch_was_user_initiated` for coding agents and
+ *  `switch_resume_candidates` for chat / trigger threads. Both halves of the
+ *  pair are load-bearing on the backend, so both are checked here. A device
+ *  actor alone is not the fingerprint: `stale_settle` deliberately carries the
+ *  actor of whichever button exposed a stuck row.
+ *
+ *  Matching means the engine has PROMISED to resume this turn, which is why the
+ *  Continue button is withheld (see `continuableAbortIndex`). The promise is
+ *  kept or withdrawn by the engine, never guessed at here: a boot that declines
+ *  to resume the thread emits a fresh `recovery_after_restart` abort, which does
+ *  not match this and re-arms the button. */
+export function abortPromisesAutoResume(ev: ThreadEvent): boolean {
+  return ev.type === 'ResponseAborted'
+    && ev.cause === 'engine_shutdown'
+    && ev.actor?.kind === 'device';
+}
+
+/** Index of the newest ResponseAborted exchange the user may Continue from, or
+ *  `null` when the thread offers no Continue button. Used by AbortPanel: only
+ *  this exchange renders the button, and older aborts the user already
+ *  continued past are inert.
+ *
+ *  Three ways the scan ends in `null`:
+ *
+ *  - A later `ContinuationStarted`: the turn was already resumed.
+ *  - A stale-settle abort (engine cleanup of a stuck-but-already-gone process,
+ *    fired by the user's Stop/Apply/Discard/Archive/Interrupt click). Clicking
+ *    Continue would re-run work the user just deliberately stopped.
+ *  - A switch-teardown abort (see `abortPromisesAutoResume`): the engine is
+ *    auto-resuming this turn, so offering the button races its own recovery.
+ *    That race is what the user hit on 2026-08-05: the button sat there for the
+ *    whole teardown-plus-restart window and their click landed nine seconds in,
+ *    turning an engine-attributed "Resumed after engine restart" into a
+ *    human-attributed "Continued the response". */
+export function continuableAbortIndex(exchanges: Exchange[]): number | null {
   for (let i = exchanges.length - 1; i >= 0; i--) {
     const ev = exchanges[i].userEvent;
     if (ev.type === 'ContinuationStarted') return null;
     if (ev.type === 'ResponseAborted') {
       if (ev.cause === 'stale_settle') return null;
+      if (abortPromisesAutoResume(ev)) return null;
       return i;
     }
   }
@@ -1127,8 +1173,27 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // the prior exchange (req_id-routed there). The placeholder reads as 'done'
   // and is excluded from the 'interrupted' carve-out below (the "↳" continues-
   // below arrow is wrong — the answer is above, not below).
+  //
+  // "Lives in the prior exchange" is the whole claim, and there is one shape
+  // where it is false: the UPI's own `request_event_id` naming THIS exchange's
+  // MessageReceived. Then the turn is anchored right here and its steps are on
+  // their way in. That is the orphan re-entry (`announce_orphan_batch` in the
+  // engine's `api/chat.rs`), where a follow-up queued behind a cancelled turn
+  // is re-submitted as a turn of its own; read as a placeholder it rendered
+  // "Done ✓" for the whole gap before the first step arrived, on the one panel
+  // that WAS being worked on.
+  //
+  // Both ids must be PRESENT to draw that conclusion. A legacy row carries
+  // neither, and two `undefined`s comparing equal would revoke the placeholder
+  // from exactly the case it was written for, dropping it through to the stale
+  // detector and a misleading "Aborted ⚠".
   const onlyStep = exchange.steps.length === 1 ? exchange.steps[0].event : undefined;
-  const isAbsorbedUpiPlaceholder = onlyStep?.type === 'UserPromptInjected' && !!onlyStep.injected_message_id;
+  const upiRequestId = (onlyStep as { request_event_id?: string } | undefined)?.request_event_id;
+  const anchorId = exchange.userEvent._eventId;
+  const announcesThisExchange = !!upiRequestId && !!anchorId && upiRequestId === anchorId;
+  const isAbsorbedUpiPlaceholder = onlyStep?.type === 'UserPromptInjected'
+    && !!onlyStep.injected_message_id
+    && !announcesThisExchange;
 
   // Stale exchange: the thread's projection says quiescent, but this exchange
   // has steps and no terminal event. The agentic loop (or the coding-agent

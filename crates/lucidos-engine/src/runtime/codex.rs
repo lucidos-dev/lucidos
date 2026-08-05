@@ -427,9 +427,23 @@ fn widens_past_the_workspace(resolved_data: &Path, workspace: &Path) -> bool {
 /// blocked by the sandbox; the engine's auto-commit (which runs unsandboxed)
 /// still captures the work.
 async fn resolve_git_common_dir(worktree: &Path) -> Option<PathBuf> {
-    let out = crate::engine::git_ops::git_cmd(&["rev-parse", "--git-common-dir"], worktree)
+    let out = match crate::engine::git_ops::git_cmd(&["rev-parse", "--git-common-dir"], worktree)
         .await
-        .ok()?;
+    {
+        Ok(out) => out,
+        // `git_cmd` returns `Err` for a spawn failure AND for its 30s timeout,
+        // and on a saturated host the timeout is the likelier of the two. It
+        // must not degrade the sandbox silently: without this line the user
+        // sees in-agent `git commit` blocked with nothing in the log saying why.
+        Err(e) => {
+            crate::log!(
+                "[Codex] git rev-parse --git-common-dir could not run in {} ({}): sandbox will block in-agent git commits",
+                worktree.display(),
+                e
+            );
+            return None;
+        }
+    };
     if !out.status.success() {
         crate::log!(
             "[Codex] git rev-parse --git-common-dir failed in {} — sandbox will block in-agent git commits",
@@ -439,6 +453,10 @@ async fn resolve_git_common_dir(worktree: &Path) -> Option<PathBuf> {
     }
     let raw = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if raw.is_empty() {
+        crate::log!(
+            "[Codex] git rev-parse --git-common-dir returned nothing in {}: sandbox will block in-agent git commits",
+            worktree.display()
+        );
         return None;
     }
     let path = PathBuf::from(&raw);

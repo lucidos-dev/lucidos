@@ -13,8 +13,10 @@ pub const MODEL_MULTILINGUAL_E5_SMALL: &str = "multilingual-e5-small";
 pub const DEFAULT_MODEL: &str = MODEL_MULTILINGUAL_E5_SMALL;
 
 pub struct FastEmbedProvider {
-    /// std::sync::Mutex so we can use spawn_blocking without holding an async lock.
-    /// This avoids serializing all concurrent embedding requests.
+    /// std::sync::Mutex (not a tokio one) so the inference can run inside
+    /// `spawn_blocking` without a lock ever being held across an `.await`.
+    /// Concurrent embed calls DO serialize on it: there is one `TextEmbedding`
+    /// session and `embed` takes `&self` on it for the whole inference.
     model: Arc<std::sync::Mutex<TextEmbedding>>,
     dimensions: usize,
     model_id: String,
@@ -107,12 +109,20 @@ pub(crate) fn init_error_message(
     id: &str,
     cause: String,
 ) -> Box<dyn std::error::Error + Send + Sync> {
-    let cache = std::env::var("FASTEMBED_CACHE_DIR")
-        .unwrap_or_else(|_| ".fastembed_cache (relative to the workspace)".to_string());
+    // Name the whole resolution ORDER rather than one env var. `fastembed`
+    // reads `HF_HOME` first (see `model_download::cache_dir`, which mirrors its
+    // `pull_from_hf`), so reporting only `FASTEMBED_CACHE_DIR` sent a user with
+    // `HF_HOME` set to pre-seed a directory fastembed never looks in. The
+    // default is also CWD-relative, not workspace-relative. Interpolating the
+    // resolved path is deliberately avoided on top of that: this string is what
+    // `is_model_fetch_failure` classifies on, and a cache path containing a
+    // marker word would make every init failure read as a fetch failure.
     format!(
         "embedding model '{id}' failed to initialize: {cause}. First boot fetches it from the \
-         Hugging Face model hub — check outbound HTTPS (and the system CA bundle), or pre-seed \
-         the model cache ({cache}) from a machine that already has it."
+         Hugging Face model hub, so check outbound HTTPS (and the system CA bundle), or pre-seed \
+         the model cache from a machine that already has it. The cache directory is $HF_HOME when \
+         set, else $FASTEMBED_CACHE_DIR, else .fastembed_cache relative to the engine's working \
+         directory."
     )
     .into()
 }

@@ -295,3 +295,99 @@ describe('lucidos.ui.prompt', () => {
     expect(postMessage).not.toHaveBeenCalled();
   });
 });
+
+describe('lucidos.ui.previewFile', () => {
+  let origParent: unknown;
+  let postMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    origParent = (globalThis as { parent?: unknown }).parent;
+    postMessage = vi.fn();
+    (globalThis as { parent?: unknown }).parent = { postMessage };
+  });
+  afterEach(() => {
+    (globalThis as { parent?: unknown }).parent = origParent;
+    vi.unstubAllGlobals();
+    vi.useRealTimers();
+  });
+
+  /** Replay the host's answer for the request the SDK just posted. */
+  function replyToLastPreview(reply: { ok: boolean; error?: string }) {
+    const calls = postMessage.mock.calls;
+    const sent = calls[calls.length - 1][0] as { id: string };
+    globalThis.dispatchEvent(
+      Object.assign(new Event('message'), {
+        data: { type: 'lucidos:ui:preview-file:result', id: sent.id, ...reply },
+      }),
+    );
+  }
+
+  it('posts the locator and its lines, and resolves once the host is showing it', async () => {
+    const p = ui.previewFile({ file_path: 'repo:r-1:file:src/main.rs', line: 510, line_end: 520 });
+    const sent = postMessage.mock.calls[0][0];
+    expect(sent.type).toBe('lucidos:ui:preview-file');
+    expect(typeof sent.id).toBe('string');
+    expect(sent.payload).toEqual({ file_path: 'repo:r-1:file:src/main.rs', line: 510, line_end: 520 });
+    replyToLastPreview({ ok: true });
+    await expect(p).resolves.toBeUndefined();
+  });
+
+  it('omits lines that were not given', async () => {
+    const p = ui.previewFile({ file_path: 'artifacts/notes.md' });
+    expect(postMessage.mock.calls[0][0].payload).toEqual({
+      file_path: 'artifacts/notes.md', line: undefined, line_end: undefined,
+    });
+    replyToLastPreview({ ok: true });
+    await p;
+  });
+
+  // A non-numeric line is dropped here rather than shipped: the host applies the
+  // documented degradation to what it receives, and there is no reason to make
+  // it reject something the SDK can see is not a line.
+  it('drops a non-numeric line rather than forwarding it', async () => {
+    const p = ui.previewFile({ file_path: 'artifacts/notes.md', line: '12' as unknown as number });
+    expect(postMessage.mock.calls[0][0].payload.line).toBeUndefined();
+    replyToLastPreview({ ok: true });
+    await p;
+  });
+
+  it('rejects with the host reason when the host refuses', async () => {
+    const p = ui.previewFile({ file_path: 'artifacts/notes.md' });
+    replyToLastPreview({ ok: false, error: 'previewFile: file_path must be a non-empty string' });
+    await expect(p).rejects.toThrow('file_path must be a non-empty string');
+  });
+
+  it('throws on a missing or empty file_path, without posting', async () => {
+    await expect(ui.previewFile({ file_path: '' })).rejects.toThrow(TypeError);
+    await expect(ui.previewFile({} as unknown as { file_path: string })).rejects.toThrow(TypeError);
+    expect(() => ui.previewFile(null as unknown as { file_path: string })).toThrow(TypeError);
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  // Bounds a lost reply so the pending map can't leak. A second reply arriving
+  // late finds no resolver and is dropped, rather than settling twice.
+  it('rejects and forgets the request when the host never answers', async () => {
+    vi.useFakeTimers();
+    const p = ui.previewFile({ file_path: 'artifacts/notes.md' });
+    const rejection = expect(p).rejects.toThrow('did not respond');
+    await vi.advanceTimersByTimeAsync(60_000);
+    await rejection;
+    // The entry is gone: a late reply resolves nothing and throws nothing.
+    expect(() => replyToLastPreview({ ok: true })).not.toThrow();
+  });
+
+  // A popped-out app (its own tab) has no host shell around it, so there is no
+  // modal to show. It must NOT quietly fall back to `navigate`: that goes
+  // through the engine and lands in whichever OTHER window is running the
+  // shell, so the reader would see nothing while a different window navigated
+  // its Files panel, and the promise would resolve as if it had worked. The
+  // rejection is what lets the app decide (its documented catch escalates).
+  it('standalone (no host parent): rejects instead of driving another window', async () => {
+    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    vi.stubGlobal('fetch', vi.fn(async () => new Response(null, { status: 200 })));
+    await expect(ui.previewFile({ file_path: 'artifacts/notes.md', line: 3 }))
+      .rejects.toThrow('no host to show the preview');
+    expect(fetch).not.toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+});

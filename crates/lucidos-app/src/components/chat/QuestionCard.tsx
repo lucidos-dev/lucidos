@@ -135,17 +135,18 @@ function QuestionText({ question }: { question: string }) {
  *  state from module-level signals.
  *
  *  The card is the question and its options, nothing else. The two escapes that
- *  need no option slot (typing, which routes to this question as a `FreeText`
- *  answer, and Cancel) are named once, by the prompt textarea's placeholder:
- *  `PLACEHOLDER_ANSWERING` in `prompt-input-helpers.ts`. A guide line under the
- *  options said the same thing a few pixels above the field it pointed at, so
- *  it is gone; do not reintroduce one (pinned by `question-card.test.tsx`).
- *  Naming the escapes at all is load-bearing, which is why the placeholder
- *  carries the whole sentence: there is no text-entry option kind, every option
- *  resolves to its LABEL when picked, and an agent with nothing telling it
- *  otherwise invents an "Other, I'll type it" row that hands that phrase back
- *  as the user's answer. The agent-side half lives in the `ask_user_question`
- *  tool description and the question rules in the engine prompts. */
+ *  need no option slot are named by the prompt row instead: typing (which routes
+ *  to this question as a `FreeText` answer) by the prompt textarea's placeholder,
+ *  `PLACEHOLDER_ANSWERING` in `prompt-input-helpers.ts`, and Cancel by the
+ *  prompt row's Cancel tooltip, `ANSWER_CANCEL_TOOLTIP` in `PromptInput.tsx`. A
+ *  guide line under the options said the same thing a few pixels above the field
+ *  it pointed at, so it is gone; do not reintroduce one (pinned by
+ *  `question-card.test.tsx`). Naming the escapes at all is load-bearing: there
+ *  is no text-entry option kind, every option resolves to its LABEL when picked,
+ *  and an agent with nothing telling it otherwise invents an "Other, I'll type
+ *  it" row that hands that phrase back as the user's answer. The agent-side half
+ *  lives in the `ask_user_question` tool description and the question rules in
+ *  the engine prompts. */
 export function QuestionBody({ threadId, toolUseId, question, options, multiSelect, resolved, terminated }: QuestionBodyProps) {
   // Single-select keeps a local pending — nothing outside the card needs it.
   const localPending = useSignal<ResolvedAnswer | null>(null);

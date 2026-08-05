@@ -1,6 +1,8 @@
 import { useEffect } from 'preact/hooks';
 import { checkConnection, handleResume, bounceToPickerIfStranded } from '../store/actions/connection';
 import { loadArtifacts, openUrl } from '../store/actions/artifacts';
+import { openFilePreviewModal, filePreviewRequestError, filePreviewBlockedReason } from '../store/actions/filePreviewModal';
+import { syncAppFullscreenHost } from '../store/appFullscreenHost';
 import { loadUnreadNotifications, loadNotifications } from '../store/actions/notifications';
 import { syncWorkspaceAppBadge } from '../store/actions/app-badge';
 import { loadApps } from '../store/actions/apps';
@@ -411,18 +413,59 @@ export function useStartup(): void {
           title?: unknown; message?: unknown; okLabel?: unknown; cancelLabel?: unknown; danger?: unknown;
           type?: unknown; durationMs?: unknown; dismissable?: unknown; key?: unknown;
           defaultValue?: unknown; placeholder?: unknown; multiline?: unknown;
+          file_path?: unknown; line?: unknown; line_end?: unknown;
         };
       } | null;
       if (!data || typeof data !== 'object') return;
-      if (data.type !== 'lucidos:ui:confirm' && data.type !== 'lucidos:ui:toast' && data.type !== 'lucidos:ui:prompt') return;
+      if (
+        data.type !== 'lucidos:ui:confirm' && data.type !== 'lucidos:ui:toast'
+        && data.type !== 'lucidos:ui:prompt' && data.type !== 'lucidos:ui:preview-file'
+      ) return;
       const payload = data.payload;
       if (!payload || typeof payload !== 'object') return;
-      if (typeof payload.message !== 'string' || payload.message.length === 0) return;
 
       // Reject messages from any iframe that isn't a current app iframe,
       // so nested iframes (embeds, ads) can't trigger host modals / toasts.
+      // Ahead of every branch below, deliberately: a frame we don't know gets no
+      // host chrome and no reply, whatever it asked for.
       const source = event.source as Window | null;
       if (!source || !isKnownAppFrame(source)) return;
+
+      // File preview: a read-only modal over the app, carrying a locator rather
+      // than a message. Answered as soon as we have decided, since the SDK's
+      // promise resolves when the preview is showing (not when it is dismissed).
+      if (data.type === 'lucidos:ui:preview-file') {
+        if (typeof data.id !== 'string') return;
+        // Re-derive where host chrome renders before deciding: the refusal below
+        // and the portal that would act on it must be reading the same instant,
+        // and the layer's target is published from a component render, which can
+        // lag a fullscreen transition by a frame.
+        syncAppFullscreenHost();
+        // The request itself, then whether the host can put anything on screen
+        // at all (it cannot render over a fullscreen element it does not own).
+        // A refusal is the honest answer: a resolved promise with no visible
+        // modal is what made this fail silently.
+        const error = filePreviewRequestError(payload) ?? filePreviewBlockedReason();
+        if (!error) {
+          openFilePreviewModal({
+            file_path: payload.file_path as string,
+            line: payload.line,
+            line_end: payload.line_end,
+          });
+        }
+        try {
+          source.postMessage(
+            { type: 'lucidos:ui:preview-file:result', id: data.id, ok: error === null, error: error ?? undefined },
+            '*',
+          );
+        } catch {
+          // Source iframe may have unloaded, so drop the reply silently.
+        }
+        return;
+      }
+
+      // Confirm, toast and prompt all carry a message and are useless without one.
+      if (typeof payload.message !== 'string' || payload.message.length === 0) return;
 
       // Toast — fire-and-forget; no id, no result reply.
       if (data.type === 'lucidos:ui:toast') {

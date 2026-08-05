@@ -596,3 +596,448 @@ async fn last_turn_ended_cleanly_distinguishes_terminal_kinds() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
+
+/// Regression: a coding-agent turn the user **canceled** must classify as `idle`,
+/// not `running`, so the next engine restart leaves it alone.
+///
+/// Reported 2026-08-04: the user clicked Stop nine seconds into a turn, the
+/// timeline showed "Canceled" and a "Response canceled" panel, and then, at the
+/// next engine restart nearly four hours later, a "System / Response interrupted"
+/// panel with a **Continue** button appeared underneath it. You cannot interrupt
+/// a response that already ended.
+///
+/// Cause: [`BRANCH_CLASSIFICATION_SQL`]'s lifecycle scan only knew
+/// `SessionStarted / CodingAgentIdled / SessionEnded / ResponseGenerated`, so
+/// the newest *recognised* event on that thread stayed the `SessionStarted`
+/// from before the Stop. `recover_orphaned_worktrees` read that as "a turn was
+/// in flight when the engine died" and emitted the boundary
+/// `ResponseAborted{recovery_after_restart}` + `CodingAgentIdled{engine_restart_interrupt}`
+/// pair that renders the panel.
+///
+/// The cases below pin both directions: every way a turn can *end* classifies
+/// `idle`, and every way one can still be *in flight* classifies `running`.
+/// The `running` half matters as much as the `idle` half, because
+/// over-classifying as idle would silently kill crash recovery and the
+/// *Switch to new version* auto-resume.
+#[tokio::test]
+async fn canceled_turn_classifies_idle_so_restart_does_not_reopen_it() {
+    use crate::engine::agent_recovery::BRANCH_CLASSIFICATION_SQL;
+    use crate::engine::thread_events::{AbortCause, CancelCause, SessionEndReason};
+    use std::collections::HashMap;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    // Start a CC session on `branch` and return its thread id.
+    let start = |branch: &str| {
+        let branch = branch.to_string();
+        let bus = bus.clone();
+        let meta = cc_meta.clone();
+        async move {
+            let thread_id = Uuid::new_v4();
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::SessionStarted {
+                    coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                    session_id: format!("sid-{branch}"),
+                    branch,
+                    repo_id: None,
+                    coding_agent_kind: Default::default(),
+                    coding_agent_folder: String::new(),
+                    app_id: None,
+                },
+                meta,
+            })
+            .await
+            .expect("emit succeeds")
+            .expect("event persisted");
+            thread_id
+        }
+    };
+    let emit = |thread_id: Uuid, event: ThreadEvent| {
+        let bus = bus.clone();
+        let meta = cc_meta.clone();
+        async move {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta,
+            })
+            .await
+            .expect("emit succeeds")
+            .expect("event persisted");
+        }
+    };
+    let canceled_by_user = ThreadEvent::ResponseCanceled {
+        text: String::new(),
+        images: Vec::new(),
+        model: None,
+        reasoning_effort: None,
+        cause: CancelCause::UserStop,
+    };
+
+    // idle: the reported shape. Stop mid-turn, before CC ever reached an idle.
+    let user_stopped = start("claude-code/user-stopped").await;
+    emit(user_stopped, canceled_by_user.clone()).await;
+
+    // idle: same, but the turn failed instead of being canceled. Identical hole
+    // in the old scan set, identical nonsense panel.
+    let failed = start("claude-code/failed").await;
+    emit(
+        failed,
+        ThreadEvent::ResponseFailed {
+            error: "stream ended".into(),
+        },
+    )
+    .await;
+
+    // idle: a session that panicked and ended. `SessionEnded` was in the old
+    // scan set but matched NEITHER classification arm, and the caller treats
+    // "in neither set" as in-flight.
+    let panicked = start("claude-code/panicked").await;
+    emit(
+        panicked,
+        ThreadEvent::SessionEnded {
+            reason: SessionEndReason::Panic,
+        },
+    )
+    .await;
+
+    // idle: the oldest rows carry no `reason` key at all. They deserialize as
+    // LegacyNonTerminal, which is terminal, and the classifier's reason filter
+    // must not silently drop them on three-valued logic (`NULL IN (...)`).
+    //
+    // Inserted raw rather than through the bus on purpose: `SessionEnded.reason`
+    // has `#[serde(default = ...)]`, not `skip_serializing_if`, so every event
+    // the bus can emit today carries the key. A reason-less row is only
+    // reachable as historical data, and this is the shape the query has to
+    // survive. (Same precedent as `worktree_cleanup_tests::insert_old_event`.)
+    let legacy_no_reason = start("claude-code/legacy-no-reason").await;
+    sqlx::query(
+        "INSERT INTO events (id, event_type, payload, thread_id, aggregate, aggregate_id) \
+         VALUES ($1, 'SessionEnded', '{}'::jsonb, $2, 'thread', $2::text)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(legacy_no_reason)
+    .execute(&pool)
+    .await
+    .expect("legacy reason-less SessionEnded row inserts");
+
+    // running: a turn genuinely in flight when the engine died (no terminal at
+    // all). This is what the interrupt panel + Continue exist for.
+    start("claude-code/mid-turn").await;
+
+    // running: the *Switch to new version* teardown boundary. `ResponseAborted`
+    // must NOT count as turn-ended, or `switch_was_user_initiated` never gets
+    // the chance to auto-resume it.
+    let switched = start("claude-code/switched").await;
+    emit(
+        switched,
+        ThreadEvent::ResponseAborted {
+            text: String::new(),
+            images: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            cause: AbortCause::EngineShutdown,
+        },
+    )
+    .await;
+
+    // running: CC answered a stale `--resume` with an empty Result. The engine
+    // retries against a fresh session, so this SessionEnded is transient.
+    let stale_resume = start("claude-code/stale-resume").await;
+    emit(
+        stale_resume,
+        ThreadEvent::SessionEnded {
+            reason: SessionEndReason::StaleResume,
+        },
+    )
+    .await;
+
+    // running: the switch teardown boundary followed by a shutdown-reason
+    // SessionEnded. No production site emits that pair today (teardown yields
+    // Aborted(EngineShutdown) and stops there), but the variant is live and it
+    // is the SessionEnded-shaped twin of the boundary: if it ever lands, it must
+    // not turn a resumable switch into an idle branch.
+    let switched_then_session_ended = start("claude-code/switched-then-session-ended").await;
+    emit(
+        switched_then_session_ended,
+        ThreadEvent::ResponseAborted {
+            text: String::new(),
+            images: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            cause: AbortCause::EngineShutdown,
+        },
+    )
+    .await;
+    emit(
+        switched_then_session_ended,
+        ThreadEvent::SessionEnded {
+            reason: SessionEndReason::Shutdown,
+        },
+    )
+    .await;
+
+    // running: canceled, then the user sent a follow-up that was still running
+    // when the engine died. A terminal only ends the turn it terminates.
+    let canceled_then_resumed = start("claude-code/canceled-then-resumed").await;
+    emit(canceled_then_resumed, canceled_by_user).await;
+    emit(
+        canceled_then_resumed,
+        ThreadEvent::CodingAgentUserMessageSent {
+            text: "actually, carry on".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+        },
+    )
+    .await;
+
+    let rows: Vec<(Option<String>, Option<String>)> = sqlx::query_as(&BRANCH_CLASSIFICATION_SQL)
+        .fetch_all(&pool)
+        .await
+        .expect("branch classification query runs");
+    let status: HashMap<String, String> = rows
+        .into_iter()
+        .filter_map(|(branch, status)| Some((branch?, status?)))
+        .collect();
+
+    for (branch, expected, why) in [
+        (
+            "claude-code/user-stopped",
+            "idle",
+            "the user already ended this turn with Stop; a restart must not \
+             re-open it as \"Response interrupted\" with a Continue button",
+        ),
+        (
+            "claude-code/failed",
+            "idle",
+            "the turn ended on an error the user already saw; there is nothing \
+             to continue",
+        ),
+        (
+            "claude-code/panicked",
+            "idle",
+            "SessionEnded is terminal; landing in neither set made the caller \
+             treat it as in-flight",
+        ),
+        (
+            "claude-code/legacy-no-reason",
+            "idle",
+            "a reason-less SessionEnded is LegacyNonTerminal, so the reason \
+             filter must keep it rather than NULL it out of the scan",
+        ),
+        (
+            "claude-code/mid-turn",
+            "running",
+            "no terminal at all: this is the genuine mid-turn crash the \
+             interrupt panel exists for",
+        ),
+        (
+            "claude-code/switched",
+            "running",
+            "the switch teardown boundary must stay resumable, or \
+             Switch to new version silently stops resuming work",
+        ),
+        (
+            "claude-code/stale-resume",
+            "running",
+            "a stale --resume is retried against a fresh session; the \
+             SessionEnded is transient, not a turn boundary",
+        ),
+        (
+            "claude-code/switched-then-session-ended",
+            "running",
+            "a shutdown-reason SessionEnded is the engine going away mid-turn, \
+             so it must not cancel out the switch boundary that precedes it",
+        ),
+        (
+            "claude-code/canceled-then-resumed",
+            "running",
+            "the follow-up turn was in flight; a terminal only ends the turn \
+             it terminates",
+        ),
+    ] {
+        assert_eq!(
+            status.get(branch).map(String::as_str),
+            Some(expected),
+            "branch {branch} must classify as {expected}: {why}"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A *Switch to new version* promises the interrupted thread a resume, and the
+/// UI withholds its Continue button on the strength of that promise. So a
+/// promise the boot cannot keep has to be WITHDRAWN before the API server opens,
+/// or the thread sits `paused` with no way forward.
+///
+/// The floor takes the resumed set BY ID rather than re-deriving it: a
+/// coding-agent resume has only emitted `ContinuationRequested` when this runs,
+/// and that type is deliberately absent from `THREAD_START_EVENTS_SQL`, so a
+/// query-only exclusion would re-abort a thread that is resuming correctly.
+#[tokio::test]
+async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
+    use crate::engine::agent_recovery::settle_unresumed_switch_threads;
+    use crate::engine::thread_events::{AbortCause, MessageOrigin};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let device = MessageOrigin::Device {
+        device_id: "d1".into(),
+        label: "My iPhone".into(),
+    };
+
+    // Three threads interrupted by the same switch: one this boot resumed, one it
+    // silently declined (over the chat cap / a failed resume / a skipped branch),
+    // and one that was archived while its turn was in flight.
+    let resumed = Uuid::new_v4();
+    let declined = Uuid::new_v4();
+    let archived = Uuid::new_v4();
+    for thread_id in [resumed, declined, archived] {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                text: "do the thing".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: crate::engine::thread_events::ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .expect("emit succeeds")
+        .expect("event persisted");
+
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ResponseAborted {
+                text: "interrupted by an engine restart".into(),
+                images: Vec::new(),
+                model: None,
+                reasoning_effort: None,
+                cause: AbortCause::EngineShutdown,
+            },
+            meta: EventMeta {
+                actor: Some(device.clone()),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .expect("emit succeeds")
+        .expect("event persisted");
+    }
+
+    // Archived DURING the turn, which is the only shape that reaches the floor:
+    // the Archive button's own `ThreadArchived` would settle the status and take
+    // the thread out of `paused` altogether. Neither resume drain selects an
+    // archived thread, so without the floor its switch abort stays the newest
+    // boundary forever and unarchiving surfaces a paused thread whose Continue
+    // button no later boot could restore.
+    sqlx::query("UPDATE thread_summaries SET archive_state = 'archived' WHERE thread_id = $1")
+        .bind(archived)
+        .execute(&pool)
+        .await
+        .expect("archive the thread");
+
+    // The teardown abort is transient, so every thread reads `paused`, never
+    // `failed`: nothing has gone wrong yet, the engine just went away.
+    for thread_id in [resumed, declined, archived] {
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_one(&pool)
+                .await
+                .expect("summary row exists");
+        assert_eq!(
+            status, "paused",
+            "a switch teardown must settle the thread at paused, not failed"
+        );
+    }
+
+    let withdrawals = |thread_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 \
+                   AND event_type = 'ResponseAborted' \
+                   AND payload->>'cause' = 'recovery_after_restart'",
+            )
+            .bind(thread_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .expect("count query")
+        }
+    };
+
+    settle_unresumed_switch_threads(&pool, &bus, &std::collections::HashSet::from([resumed])).await;
+
+    assert_eq!(
+        withdrawals(resumed).await,
+        0,
+        "the thread this boot IS resuming must keep its promise: withdrawing it \
+         would hand the user a Continue button for a turn already back in flight"
+    );
+    assert_eq!(
+        withdrawals(declined).await,
+        1,
+        "the thread this boot declined must have its promise withdrawn, which is \
+         what re-arms its Continue button"
+    );
+    assert_eq!(
+        withdrawals(archived).await,
+        1,
+        "an archived thread is selected by NEITHER resume drain, so the floor is \
+         its only chance: excluding it here is a permanent dead end"
+    );
+
+    // The resumed thread's spawn lands its `ContinuationStarted`, which IS in
+    // `THREAD_START_EVENTS_SQL`, so from here on the query alone excludes it.
+    bus.emit(BusEvent::Thread {
+        thread_id: resumed,
+        event: ThreadEvent::ContinuationStarted {
+            branch: String::new(),
+            origin: None,
+            reason: Some(crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON.into()),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // Idempotent: the withdrawal is itself a ResponseAborted, so the declined
+    // thread no longer matches "the newest abort is a switch abort". Without
+    // that clause the floor would re-fire on every boot forever, since nothing
+    // supersedes the original switch abort in the START-event sense. Run with an
+    // EMPTY resumed set so only the query's own guards can hold the line.
+    settle_unresumed_switch_threads(&pool, &bus, &std::collections::HashSet::new()).await;
+    assert_eq!(
+        withdrawals(declined).await,
+        1,
+        "a second boot must not stack another withdrawal on the same abort"
+    );
+    assert_eq!(
+        withdrawals(resumed).await,
+        0,
+        "a thread resumed on an earlier boot is superseded by its own \
+         ContinuationStarted and must never be swept"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

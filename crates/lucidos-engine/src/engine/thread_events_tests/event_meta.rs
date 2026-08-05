@@ -110,6 +110,42 @@ fn indexable_text_returns_content_for_chat_events() {
     assert_eq!(canceled.indexable_text(), Some("partial"));
 }
 
+/// A `UserPromptInjected` is indexable only when it carries ORIGINAL text.
+///
+/// With `injected_message_id` set it is an acknowledgement of a
+/// `MessageReceived` that is already persisted and already indexed, with the
+/// text copied verbatim, so indexing it too files the user's sentence into
+/// memory twice. Every mid-flight injection has that shape, and so does every
+/// orphan re-entry (`api::chat::announce_orphan_batch`). Without the id it is
+/// an engine-authored note (a continuation resume summary, a legacy
+/// child-thread callback) and is the only record of its own content.
+#[test]
+fn indexable_text_skips_an_injection_that_echoes_a_persisted_message() {
+    let echo = ThreadEvent::UserPromptInjected {
+        text: "and the totals too".into(),
+        mode: ActorMode::Human,
+        origin: None,
+        injected_message_id: Some(uuid::Uuid::new_v4()),
+    };
+    assert_eq!(
+        echo.indexable_text(),
+        None,
+        "an acknowledgement of an already-indexed MessageReceived must not be indexed again"
+    );
+
+    let engine_note = ThreadEvent::UserPromptInjected {
+        text: "Reminded the model about 3 prior tool calls".into(),
+        mode: ActorMode::Engine,
+        origin: None,
+        injected_message_id: None,
+    };
+    assert_eq!(
+        engine_note.indexable_text(),
+        Some("Reminded the model about 3 prior tool calls"),
+        "an engine note is original content with no MessageReceived behind it"
+    );
+}
+
 /// Image descriptions carry real content the user shared (a screenshot, a
 /// ticket, a photo). Memory indexing keys off `indexable_text()`, so the
 /// description must surface there — otherwise a "what's this?" + screenshot

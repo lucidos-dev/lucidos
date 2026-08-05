@@ -2,10 +2,12 @@ import { Fragment } from 'preact';
 import type { ComponentChild } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
-import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
+import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
+import { sideBySideDiffAvailable } from '../../store/diffBody';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
-import { getAppFrameSrc, getVisibleAppFrame, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
-import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon } from '../shared/icons';
+import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
+import { nativeFullscreenElement } from '../../store/appFullscreenHost';
+import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
 import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
@@ -96,13 +98,13 @@ function renderMenuAction(a: HeaderActionSpec, ctx: OverflowMenuContext): Compon
 
 /** Shared action buttons for the content side of the header (used by both mobile and desktop). */
 export function ContentHeaderActions() {
-  // Track native fullscreen state (standard + webkit-prefixed)
+  // Track native fullscreen state. `nativeFullscreenElement` is the one reader
+  // of both spellings (store/appFullscreenHost.ts), shared with the overlay
+  // layer so the header and the layer can never disagree about what is
+  // fullscreen.
   const [isNativeFullscreen, setIsNativeFullscreen] = useState(false);
   useEffect(() => {
-    const handler = () => {
-      const doc = document as unknown as Record<string, unknown>;
-      setIsNativeFullscreen(!!(doc.fullscreenElement || doc.webkitFullscreenElement));
-    };
+    const handler = () => setIsNativeFullscreen(nativeFullscreenElement() !== null);
     document.addEventListener('fullscreenchange', handler);
     document.addEventListener('webkitfullscreenchange', handler);
     return () => {
@@ -133,7 +135,7 @@ export function ContentHeaderActions() {
     const doc = document as unknown as Record<string, unknown>;
 
     // Exit native fullscreen
-    if (doc.fullscreenElement || doc.webkitFullscreenElement) {
+    if (nativeFullscreenElement() !== null) {
       if (typeof doc.exitFullscreen === 'function') {
         (doc.exitFullscreen as () => Promise<void>)().catch(() => { /* user is exiting; failure is benign */ });
       } else if (typeof doc.webkitExitFullscreen === 'function') {
@@ -148,19 +150,51 @@ export function ContentHeaderActions() {
       return;
     }
 
-    // Try native fullscreen on the iframe, fall back to CSS pseudo-fullscreen
+    // Try native fullscreen on the app PANEL (not the iframe), fall back to CSS
+    // pseudo-fullscreen. The panel is the target because a natively fullscreen
+    // element is painted alone, and an iframe renders no DOM children: with the
+    // iframe fullscreen the host had nowhere to put its own modals and toasts,
+    // so an app's previewFile / confirm / prompt showed nothing. The panel can
+    // hold them, and OverlayLayer portals them in.
     const frame = getVisibleAppFrame();
     if (!frame) return;
 
-    const anyFrame = frame as unknown as Record<string, unknown>;
-    const request = (typeof anyFrame.requestFullscreen === 'function' && anyFrame.requestFullscreen.bind(frame))
-      || (typeof anyFrame.webkitRequestFullscreen === 'function' && anyFrame.webkitRequestFullscreen.bind(frame));
+    // No panel to go fullscreen INSIDE means the host would have nowhere to
+    // paint its overlays there, so take the CSS fallback rather than leaving the
+    // button dead: pseudo-fullscreen is a stacking question, and
+    // --z-app-fullscreen already puts the host's modals and toasts above it.
+    const panel = getVisibleAppPanel();
+    if (!panel) {
+      appPseudoFullscreen.value = true;
+      return;
+    }
+
+    const anyPanel = panel as unknown as Record<string, unknown>;
+    const request = (typeof anyPanel.requestFullscreen === 'function' && anyPanel.requestFullscreen.bind(panel))
+      || (typeof anyPanel.webkitRequestFullscreen === 'function' && anyPanel.webkitRequestFullscreen.bind(panel));
 
     if (request) {
-      (request() as Promise<void>).then(() => frame.focus()).catch(() => {
-        // Native request failed (common on iOS) — use CSS fallback
+      // `Promise.resolve` + try/catch, not a bare `.then`: the UNPREFIXED
+      // request returns a promise, but `webkitRequestFullscreen` returns void,
+      // so calling `.then` on the result throws a TypeError synchronously on a
+      // prefixed-only engine, inside the click handler, taking the CSS fallback
+      // in the catch down with it and leaving the button dead. (A prefixed
+      // engine reports failure through `webkitfullscreenerror` instead, which
+      // this does not observe; the user's next press still falls back.)
+      //
+      // Focus the frame, not the panel: fullscreen moves focus to the element
+      // that requested it, and the app is what the user is about to type into.
+      try {
+        Promise.resolve(request() as Promise<void> | undefined)
+          .then(() => frame.focus())
+          .catch(() => {
+            // Native request rejected (common on iOS), so use the CSS fallback.
+            appPseudoFullscreen.value = true;
+          });
+      } catch {
+        // Threw synchronously (a disallowed request): same fallback.
         appPseudoFullscreen.value = true;
-      });
+      }
     } else {
       // Fullscreen API completely unavailable — CSS fallback
       appPseudoFullscreen.value = true;
@@ -250,6 +284,21 @@ export function ContentHeaderActions() {
           icon: () => (wholeFile ? <DiffIcon /> : <FileIcon />),
           onClick: () => { diffWholeFile.value = !wholeFile; },
           extraClass: 'diff-whole-file-toggle',
+        });
+      }
+      // Side-by-side is a rendering of the HUNKS, so it is offered only when the
+      // hunks are what's showing (not the whole merged file, not the rendered
+      // markdown diff) and only where two columns fit. Both conditions are the
+      // body's own (`diffBodyKind`, `diffFitsSideBySide`), so the control cannot
+      // appear over a view it would do nothing to.
+      if (sideBySideDiffAvailable.value) {
+        const sideBySideOn = diffSideBySide.value;
+        addAction({
+          key: 'diff-side-by-side',
+          label: sideBySideOn ? 'Show unified' : 'Show side by side',
+          icon: () => (sideBySideOn ? <DiffIcon /> : <SideBySideColumnsIcon />),
+          onClick: () => { diffSideBySide.value = !sideBySideOn; },
+          extraClass: 'diff-side-by-side-toggle',
         });
       }
       if (hasRendered) {

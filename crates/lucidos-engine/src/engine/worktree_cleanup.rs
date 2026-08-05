@@ -953,7 +953,7 @@ impl WorktreeCleanup {
         let freed_gb = freed_bytes as f64 / BYTES_PER_GB;
         let title = "Lucidos reclaimed disk space".to_string();
         let message = format!(
-            "Your machine is critically low on disk ({:.1} GB free). Lucidos reclaimed {:.1} GB by stripping build artifacts from idle Claude Code worktrees. \
+            "Your machine is critically low on disk ({:.1} GB free). Lucidos reclaimed {:.1} GB from idle coding-agent worktrees. \
              Close saved threads or remove unused worktrees from Settings → Disk Usage to reclaim more.",
             free_gb, freed_gb,
         );

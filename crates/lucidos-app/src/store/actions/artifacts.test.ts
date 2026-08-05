@@ -136,3 +136,40 @@ describe('loadArtifacts — previously-open file preview restore', () => {
     expect(localStorage.getItem('file-preview-open')).toBeNull();
   });
 });
+
+// Both file previews render `selectedLines`, so a range picked in one file must
+// not survive into the next: it would highlight whatever rows happen to sit at
+// those numbers. Same for a pending scroll that never found its file (a load
+// error, a format with no source view), which would otherwise fire later on an
+// unrelated file.
+describe('openFilePreview clears the previous file line state', () => {
+  beforeEach(async () => {
+    const { panelOverlay } = await import('../store');
+    panelOverlay.value = null;
+    localStorage.clear();
+  });
+
+  it('drops the selection and the pending scroll', async () => {
+    const { selectedLines, lineScrollTarget } = await import('../store');
+    const { openFilePreview } = await import('./artifacts');
+    selectedLines.value = { start: 5, end: 10 };
+    lineScrollTarget.value = 5;
+
+    openFilePreview('artifacts/other.md');
+
+    expect(selectedLines.value).toBeNull();
+    expect(lineScrollTarget.value).toBeNull();
+  });
+
+  it('drops them on the reload restore path too', async () => {
+    const { selectedLines, lineScrollTarget } = await import('../store');
+    const { openFilePreview } = await import('./artifacts');
+    selectedLines.value = { start: 5, end: 10 };
+    lineScrollTarget.value = 5;
+
+    openFilePreview('artifacts/other.md', { preserveSource: true });
+
+    expect(selectedLines.value).toBeNull();
+    expect(lineScrollTarget.value).toBeNull();
+  });
+});

@@ -16,7 +16,8 @@
 //! - `apps` — create/list/refresh/capture + load_knowhow
 //! - `notifications` — send (reading/clearing the inbox is the grouped tool below)
 //! - `memory` — dismiss-from-context (correction is the grouped `memory` tool)
-//! - `threads` — run_thread, run_coding_agent (list/count is the grouped `threads` tool)
+//! - `threads`: run_thread, run_coding_agent, follow_up_child_thread
+//!   (list/count is the grouped `threads` tool)
 //! - `web` — web_search, fetch_news
 //! - `proxy` — reload_proxy_modules, proxy_request, http_request
 //! - `images` — save_thread_image, generate_image
@@ -34,7 +35,8 @@
 //! (list/apply), `thread_queue` (list/update_policy; run-now/drop are CLI-only),
 //! `memory` (correct/correct_by_id; stats/entries/source are CLI-only),
 //! `env_vars` (list/set/delete; `set_environment_variable` is the back-compat
-//! alias to `set`), `threads` (list/count; run_thread/run_coding_agent stay standalone),
+//! alias to `set`), `threads` (list/count; the run_thread / run_coding_agent /
+//! follow_up_child_thread family stays standalone),
 //! `manage_models` (list/add/enable/disable/remove; the `models` domain),
 //! `manage_repositories` (add/list/remove; the `repositories` domain). Their
 //! retired flat tool names (`read_notifications`, `create_trigger`,
@@ -104,15 +106,15 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     tools.extend(email::email_tools()); // configure/send/read emails + save attachment
     tools.extend(apps::app_tools()); // create_app, list_apps, load_knowhow, refresh_file, refresh_app, capture_app
     tools.extend(misc::connect_oauth_tools()); // connect_oauth_account
-    tools.extend(threads::spawn_tools()); // run_thread, run_coding_agent
+    tools.extend(threads::spawn_tools()); // run_thread, run_coding_agent, follow_up_child_thread
                                           // correct_memory/correct_memory_by_id are the grouped `memory` manifest tool
                                           // (spliced via capability_manifest::llm_tools()).
     tools.extend(misc::execute_intent_tools()); // execute_intent
                                                 // emit/query/count events and list/apply changes are the grouped `events` /
                                                 // `changes` manifest tools (spliced via capability_manifest::llm_tools()).
                                                 // list_threads/count_threads are the grouped `threads` manifest tool (spliced
-                                                // via capability_manifest::llm_tools()); run_thread/run_coding_agent stay
-                                                // standalone above (threads::spawn_tools()).
+                                                // via capability_manifest::llm_tools()); run_thread / run_coding_agent /
+                                                // follow_up_child_thread stay standalone above (threads::spawn_tools()).
                                                 // list_thread_queue/update_thread_queue_policy are the grouped `thread_queue`
                                                 // manifest tool (spliced via capability_manifest::llm_tools()).
                                                 // plugin + MCP management are the grouped `plugins` / `mcp` manifest tools

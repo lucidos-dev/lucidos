@@ -16,10 +16,13 @@ export interface ThreadSummary {
   section: string;
   active_children_count: number;
   total_children_count: number;
-  /** 'idle' | 'running' | 'waiting' | 'failed' | 'waiting_for_user_answer'.
+  /** 'idle' | 'running' | 'waiting' | 'paused' | 'failed' |
+   *  'waiting_for_user_answer'.
    *  Active = 'running' | 'waiting_for_user_answer' (the agentic loop is
    *  mid-flow). `waiting` is NOT active — it means the coding agent has stopped and
-   *  proposed changes the user must act on; the loop has paused. */
+   *  proposed changes the user must act on; the loop has paused. Neither is
+   *  `paused`, which means an engine restart interrupted the turn: it either
+   *  resumes on its own or offers the user a Continue button. */
   status: string;
   coding_agent_has_diff: boolean;
   coding_agent_proposed: boolean;
@@ -50,6 +53,12 @@ export interface ThreadsListOptions {
   source?: string;
   /** Server clamps to 1..=1000 (default 100). */
   limit?: number;
+  /** Thread id. Restrict to that thread's DIRECT children only, never its
+   *  grandchildren. Same filter the `lucidos threads list --parent` CLI flag
+   *  and the `list_threads` LLM tool's `my_children` argument use; the tool
+   *  resolves it from its own calling thread, while an app has to name one.
+   *  A malformed uuid is a 400, never a silently unfiltered list. */
+  parent?: string;
 }
 
 function buildListQuery(opts?: ThreadsListOptions): string {
@@ -58,6 +67,7 @@ function buildListQuery(opts?: ThreadsListOptions): string {
   if (opts.active !== undefined) params.set('active', String(opts.active));
   if (opts.source) params.set('source', opts.source);
   if (opts.limit !== undefined) params.set('limit', String(opts.limit));
+  if (opts.parent) params.set('parent', opts.parent);
   const s = params.toString();
   return s ? `?${s}` : '';
 }

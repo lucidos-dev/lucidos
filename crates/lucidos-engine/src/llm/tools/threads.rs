@@ -1,7 +1,12 @@
-//! LLM-facing schemas for the thread-spawning tools (run_thread,
-//! run_coding_agent). Thread INTROSPECTION (list_threads / count_threads) is the
-//! grouped `threads` manifest tool (built from `crate::capability_manifest`); the
-//! flat names stay wired as back-compat aliases in `execute_tool`.
+//! LLM-facing schemas for the thread tools a parent uses to run its own
+//! fan-out: the two spawn tools (run_thread, run_coding_agent) and the
+//! follow-up that redirects a child already spawned
+//! (follow_up_child_thread). All three are standalone per the
+//! hot-single-purpose guardrail asserted in `llm/tools/tests.rs`.
+//!
+//! Thread INTROSPECTION (list_threads / count_threads) is the grouped `threads`
+//! manifest tool (built from `crate::capability_manifest`); the flat names stay
+//! wired as back-compat aliases in `execute_tool`.
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
@@ -21,7 +26,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "title": {
                         "type": "string",
-                        "description": "Optional short descriptive title (3-6 words) for the thread. When provided, the system will not auto-generate a title. Recommended so the thread list is meaningful at a glance."
+                        "description": "Short descriptive title (3-6 words) for the thread. When provided, the system will not auto-generate a title. Set it: this is how you will refer to this child later, in your own prose and in the result of follow_up_child_thread, and it is what makes the thread list meaningful at a glance."
                     },
                     "relation": {
                         "type": "string",
@@ -59,7 +64,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Target workspace basename (e.g. \"dev\", \"myws\"). Omit (or set to the current workspace name) for the default same-workspace spawn. When set to a different workspace, the tool POSTs to that workspace's engine and the coding-agent session lands there. Cross-workspace requires `relation=\"top\"` (child-thread auto-resume callbacks across workspaces are unsupported). The `repo` parameter then resolves in the TARGET workspace's repo registry — make sure the repo is registered there."
+                        "description": "Target workspace basename (e.g. \"dev\", \"myws\"). Omit (or set to the current workspace name) for the default same-workspace spawn. When set to a different workspace, the tool POSTs to that workspace's engine and the coding-agent session lands there. Cross-workspace requires `relation=\"top\"` (child-thread auto-resume callbacks across workspaces are unsupported). The `folder` parameter then resolves in the TARGET workspace's repo registry, so make sure the repo is registered there."
                     },
                     "allowed_tools": {
                         "type": "string",
@@ -80,7 +85,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "title": {
                         "type": "string",
-                        "description": "Optional short descriptive title (3-6 words) for the spawned coding-agent thread. When provided, the system will not auto-generate a title. Recommended so the thread list is meaningful at a glance."
+                        "description": "Short descriptive title (3-6 words) for the spawned coding-agent thread. When provided, the system will not auto-generate a title. Set it: this is how you will refer to this child later, in your own prose and in the result of follow_up_child_thread, and it is what makes the thread list meaningful at a glance."
                     },
                     "relation": {
                         "type": "string",
@@ -91,8 +96,49 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                 "required": ["prompt"]
             }),
         },
+        ToolDefinition {
+            name: tn::FOLLOW_UP_CHILD_THREAD.to_string(),
+            description: FOLLOW_UP_CHILD_THREAD_DESCRIPTION.to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "thread_id": {
+                        "type": "string",
+                        "description": "The child thread's uuid. Get it from the run_thread / run_coding_agent result, from a completion card, or from the threads tool's 'list' action with my_children: true. Titles are not accepted: they are not unique, and a fuzzy match would silently deliver to the wrong child."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "What to tell the child. Write it as an instruction to the child, not as a description of the child: it lands in the child's conversation as a message from you."
+                    }
+                },
+                "required": ["thread_id", "message"]
+            }),
+        },
     ]
 }
+
+/// Kept out of the `vec!` so the invariants below can assert on it by name
+/// rather than by digging the tool back out of the list.
+const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
+    "Send a follow-up message to a child thread YOU already spawned: redirect one that is ",
+    "going the wrong way, hand it something a sibling learned, or tell a stalled one to ",
+    "continue. Cheaper than spawning a replacement, and it does NOT consume a child slot, so ",
+    "reviving an existing child is the right move when you are near the per-thread limit.\n\n",
+    "Returns as soon as the message is on the child's timeline. It does NOT wait for the child ",
+    "to finish: the child reports back the way it always does, by resuming this thread with a ",
+    "completion when its turn ends. So issue the follow-up, then end your turn.\n\n",
+    "You can only address your OWN direct children (not a sibling, not a grandchild, not a ",
+    "thread someone else spawned). Refer to the child by TITLE in anything you write for the ",
+    "user; the uuid is an addressing detail and never belongs in your prose.\n\n",
+    "Three things to know before you call it:\n",
+    "- It RESOLVES ANY PENDING PERMISSION CARD on the child as superseded. If a human was ",
+    "about to approve a tool call there, your redirect cancels that request.\n",
+    "- If the child is parked on a question, your message is NOT an answer to it. The child ",
+    "will not read the message until a human answers, and the result says so.\n",
+    "- A follow-up racing the child's own finish can produce a completion card for the turn ",
+    "you interrupted. That does not mean the redirect failed; the redirected turn reports ",
+    "separately when it ends."
+);
 
 #[cfg(test)]
 mod tests {
@@ -116,6 +162,93 @@ mod tests {
             coding_agent["enum"],
             serde_json::json!(["claude-code", "codex"])
         );
+    }
+
+    /// The tool exposes NO caller-thread argument. The caller is
+    /// `execute_tool`'s ambient `thread_id`, which the model cannot set, and
+    /// that is the whole reason the authorization ladder is a real boundary
+    /// rather than an accounting one: the model picks which child to address,
+    /// never who it is.
+    #[test]
+    fn follow_up_tool_exposes_no_caller_thread_argument() {
+        let tools = spawn_tools();
+        let follow_up = tools
+            .iter()
+            .find(|tool| tool.name == tn::FOLLOW_UP_CHILD_THREAD)
+            .expect("follow_up_child_thread tool must be registered");
+
+        let props = follow_up.parameters["properties"]
+            .as_object()
+            .expect("properties object");
+        let mut names: Vec<&str> = props.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        assert_eq!(
+            names,
+            ["message", "thread_id"],
+            "the tool takes the child and the message and nothing else: any \
+             caller-thread argument would let the model claim to be someone else"
+        );
+        assert_eq!(
+            follow_up.parameters["required"],
+            serde_json::json!(["thread_id", "message"])
+        );
+    }
+
+    /// Three side effects the model has to know about before it redirects a
+    /// child, all user-visible and none of them obvious from the verb.
+    #[test]
+    fn follow_up_tool_description_warns_about_its_side_effects() {
+        let tools = spawn_tools();
+        let follow_up = tools
+            .iter()
+            .find(|tool| tool.name == tn::FOLLOW_UP_CHILD_THREAD)
+            .expect("follow_up_child_thread tool must be registered");
+        let d = &follow_up.description;
+
+        assert!(
+            d.contains("RESOLVES ANY PENDING PERMISSION CARD"),
+            "a redirect resolves the child's pending permission cards as \
+             superseded, which can cancel a request a human was about to \
+             approve:\n{d}"
+        );
+        assert!(
+            d.contains("parked on a question"),
+            "a follow-up to a question-parked child is not read until a human \
+             answers:\n{d}"
+        );
+        assert!(
+            d.contains("does not mean the redirect failed"),
+            "a follow-up racing the child's own finish can produce a card for \
+             the turn it interrupted:\n{d}"
+        );
+        assert!(
+            d.contains("does NOT consume a child slot"),
+            "reviving an existing child is cheaper than spawning another:\n{d}"
+        );
+        assert!(
+            d.contains("by TITLE"),
+            "user-facing prose never names a thread by uuid:\n{d}"
+        );
+    }
+
+    /// The title is the handle a parent uses to refer to a child later, so both
+    /// spawn tools have to say so rather than calling it merely "Recommended".
+    #[test]
+    fn both_spawn_tools_say_the_title_is_how_you_refer_to_the_child() {
+        for name in [tn::RUN_THREAD, tn::RUN_CODING_AGENT] {
+            let tools = spawn_tools();
+            let tool = tools
+                .iter()
+                .find(|t| t.name == name)
+                .expect("spawn tool must be registered");
+            let title = tool.parameters["properties"]["title"]["description"]
+                .as_str()
+                .expect("title description");
+            assert!(
+                title.contains("how you will refer to this child later"),
+                "{name}'s title description must state what the title is FOR:\n{title}"
+            );
+        }
     }
 
     /// The `folder`-less form means "edit Lucidos itself", which only exists on

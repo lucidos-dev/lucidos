@@ -7,8 +7,8 @@
 
 use axum::http::{HeaderMap, HeaderName, HeaderValue};
 use lucidos_engine::api::actor::{
-    agent_origin_token, build_message_origin, init_agent_origin_token, subprocess_origin,
-    SubprocessOrigin, HEADER_AGENT_ORIGIN_TOKEN, HEADER_DEVICE_ID, HEADER_SOURCE_THREAD_ID,
+    build_message_origin, init_agent_origin_secret, mint_agent_origin_token, subprocess_origin,
+    SubprocessOrigin, HEADER_AGENT_ORIGIN_TOKEN, HEADER_DEVICE_ID,
 };
 use lucidos_engine::engine::thread_events::{ActorMode, MessageOrigin};
 use uuid::Uuid;
@@ -24,13 +24,13 @@ fn headers(pairs: &[(&str, &str)]) -> HeaderMap {
     h
 }
 
-/// Install a known token for the integration test run. `OnceLock::set`
-/// inside `init_agent_origin_token` makes the first writer win, so
-/// re-running this in the same process picks up the existing value — the
-/// helper returns whatever the lock holds.
-fn ensure_token() -> &'static str {
-    init_agent_origin_token("subprocess-integration-token".to_string());
-    agent_origin_token().expect("token installed at least once")
+/// Mint a thread-bound origin token for the integration test run, exactly
+/// as a spawn would. `OnceLock::set` inside `init_agent_origin_secret`
+/// makes the first writer win, so re-running this in the same process
+/// signs under whatever secret the lock already holds.
+fn token_for(thread_id: Option<Uuid>) -> String {
+    init_agent_origin_secret("subprocess-integration-secret".to_string());
+    mint_agent_origin_token(thread_id).expect("secret installed at least once")
 }
 
 /// Reproduce the exact request shape from the in-the-wild incident: a
@@ -40,12 +40,11 @@ fn ensure_token() -> &'static str {
 /// as `Api { mode: Human }` (also renders "You").
 #[test]
 fn subprocess_curl_into_different_thread_stamps_agent_api_actor() {
-    let token = ensure_token();
     let source_thread = Uuid::new_v4(); // thread A — the agent's own thread
+    let token = token_for(Some(source_thread));
     let h = headers(&[
         ("user-agent", "curl/8.7.1"),
-        (HEADER_AGENT_ORIGIN_TOKEN, token),
-        (HEADER_SOURCE_THREAD_ID, &source_thread.to_string()),
+        (HEADER_AGENT_ORIGIN_TOKEN, &token),
     ]);
 
     // The request body would carry mode=Human (curl's default) — but the
@@ -96,11 +95,11 @@ fn subprocess_curl_into_different_thread_stamps_agent_api_actor() {
 /// it beats device-id resolution.
 #[test]
 fn subprocess_token_beats_device_id_header() {
-    let token = ensure_token();
+    let token = token_for(Some(Uuid::new_v4()));
     let h = headers(&[
         ("user-agent", "curl/8.7.1"),
         (HEADER_DEVICE_ID, "some-real-device-id"),
-        (HEADER_AGENT_ORIGIN_TOKEN, token),
+        (HEADER_AGENT_ORIGIN_TOKEN, &token),
     ]);
 
     let origin = build_message_origin(
@@ -133,7 +132,7 @@ fn subprocess_token_beats_device_id_header() {
 /// untouched. (Critical for back-compat with non-subprocess HTTP callers.)
 #[test]
 fn external_curl_without_token_resolves_to_human_api_as_before() {
-    ensure_token();
+    token_for(None);
     let h = headers(&[("user-agent", "curl/8.7.1")]);
 
     let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
@@ -160,12 +159,45 @@ fn external_curl_without_token_resolves_to_human_api_as_before() {
 /// the process can't know it). Resolves on the external-curl path.
 #[test]
 fn wrong_token_is_not_recognised_as_subprocess() {
-    ensure_token();
-    let h = headers(&[
-        (HEADER_AGENT_ORIGIN_TOKEN, "definitely-not-the-real-token"),
-        (HEADER_SOURCE_THREAD_ID, &Uuid::new_v4().to_string()),
-    ]);
+    token_for(None);
+    let h = headers(&[(
+        HEADER_AGENT_ORIGIN_TOKEN,
+        &format!("{}.definitely-not-the-real-mac", Uuid::new_v4()),
+    )]);
     assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
+}
+
+/// The end-to-end shape of the thread binding, at the integration layer:
+/// a subprocess of thread A that re-points its own token at thread B is
+/// not a subprocess at all, so `build_message_origin` falls through to the
+/// external-caller path instead of stamping B.
+#[test]
+fn a_subprocess_cannot_stamp_a_thread_its_token_was_not_minted_for() {
+    let mine = Uuid::new_v4();
+    let theirs = Uuid::new_v4();
+    let token = token_for(Some(mine));
+    let mac = token.rsplit_once('.').expect("minted token has a mac").1;
+    let h = headers(&[
+        ("user-agent", "curl/8.7.1"),
+        (HEADER_AGENT_ORIGIN_TOKEN, &format!("{theirs}.{mac}")),
+    ]);
+
+    assert_eq!(subprocess_origin(&h), SubprocessOrigin::NotSubprocess);
+    let origin = build_message_origin(&h, ActorMode::Human, None, None, None, None, None, None);
+    match origin {
+        Some(MessageOrigin::Api {
+            mode,
+            source_thread_id,
+            ..
+        }) => {
+            assert_eq!(mode, ActorMode::Human, "a forger is an external caller");
+            assert_eq!(
+                source_thread_id, None,
+                "no thread may be stamped from a token that does not cover it"
+            );
+        }
+        other => panic!("expected Api {{ mode: Human }}, got {:?}", other),
+    }
 }
 
 /// JSON round-trip on the new `source_thread_id` field. Persisted event

@@ -68,7 +68,7 @@ describe('turn header gutter', () => {
     expect(declarationValue(footer, 'padding')).toBe('0.5rem 0 0');
   });
 
-  // The nav focus marker outline hugs the panel box with a fixed outline-offset,
+  // The nav focus marker washes the panel box edge to edge,
   // so the gap it shows on each side equals that side's padding. The horizontal
   // sides are symmetric in the base layout (left inset on the content, right
   // inset on the panel — pinned above), so the marker rule only normalizes the
@@ -88,9 +88,9 @@ describe('turn header gutter', () => {
     expect(declarationValue(block, 'padding')).toBe(
       'var(--turn-body-inset) var(--turn-body-inset) var(--turn-body-inset) 0',
     );
-    // NO rightward box growth: a negative margin-right here pushes the marker's
-    // border into the .thread-content gutter until it sits flush against the
-    // pane's right edge while the left keeps its breathing room — the "border
+    // NO rightward box growth: a negative margin-right here pushes the marker
+    // into the .thread-content gutter until it sits flush against the
+    // pane's right edge while the left keeps its breathing room, the "border
     // is all the way to the right" report. The base right inset (pinned above)
     // makes the growth unnecessary.
     expect(declarationValue(block, 'margin-right')).toBeUndefined();
@@ -109,9 +109,9 @@ describe('turn header gutter', () => {
 
   // Keyboard ⌘↑/⌘↓ turn-nav marks the WHOLE TURN (.chat-exchange, TURN_SELECTOR in
   // scrollState.ts), not an inner panel — so the panel rule above never fires for it.
-  // Without a counterpart rule the outline hugged the exchange while the panel's feed
+  // Without a counterpart rule the wash filled the exchange while the panel's feed
   // padding + left inset leaked through (top/bottom ~2× the sides, right gap collapsed
-  // to the outline offset) — the asymmetry the panel rule already fixed for deep-links.
+  // to nothing), the asymmetry the panel rule already fixed for deep-links.
   // The exchange rule normalizes every side to var(--turn-body-inset): a uniform
   // exchange padding, the inner left inset stripped, the first/last panel's feed
   // padding dropped, and the feed rhythm handed back as exchange margin. It can NOT

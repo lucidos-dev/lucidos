@@ -6,16 +6,18 @@
 //! them together exactly as the original single function did.
 
 use crate::core::{PreferenceStore, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY};
+use crate::engine::agentic_loop::{meta_with_cancel_actor, terminal_result, until_canceled};
 use crate::engine::context::{
     agent_context_char_budget, tool_definitions_chars, trim_history_from_oldest,
 };
-use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
+use crate::engine::thread_events::{ActorMode, CancelCause, EventChannel, MessageOrigin};
 use crate::engine::types::*;
-use crate::engine::LucidosEngine;
+use crate::engine::{InjectedPrompt, LucidosEngine, ThreadGuard};
 use crate::llm::{
     get_default_tools, get_image_generation_tool, get_notification_tool,
     get_save_thread_image_tool, get_view_image_tool, Message,
 };
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
@@ -85,6 +87,19 @@ pub(super) fn message_can_answer_pending_question(
         && !user_message.is_empty()
         && mode == ActorMode::Human
         && pre_emitted_origin.is_none()
+}
+
+/// The constant inputs the setup-cancel exit needs, built once before the
+/// turn's first phase so each cancel checkpoint in the setup is a one-liner.
+/// See `LucidosEngine::cancel_during_setup`.
+struct SetupCancel {
+    thread_id: Uuid,
+    request_id: Uuid,
+    /// The turn's response meta (`request_event_id` + channel), so the
+    /// terminator binds to the same exchange the loop's own cancel would.
+    meta: crate::engine::thread_events::EventMeta,
+    model: Option<String>,
+    effort: Option<String>,
 }
 
 impl LucidosEngine {
@@ -853,6 +868,51 @@ impl LucidosEngine {
                 .await;
         }
 
+        // ── Turn setup ──────────────────────────────────────────────────────
+        //
+        // Everything from here to `run_agentic_loop` assembles the turn's
+        // context: history load, query classification (an LLM call), memory
+        // retrieval, the system prompt, the context sections. On a big thread
+        // that is tens of seconds, and none of it used to look at
+        // `cancel_token`. The first check was the loop's own pre-iteration arm,
+        // so a Stop pressed here did nothing until the whole phase finished
+        // (observed: 32s of "Canceling…" with not one event emitted).
+        //
+        // So every long await below is raced against the token via
+        // `until_canceled`, and the short ones get a plain `is_cancelled()`
+        // checkpoint. Each of those is a pure READ: losing the race drops the
+        // future, which is only safe because none of them emits an event or
+        // writes anything. The exit routes through `cancel_during_setup`, which
+        // emits the terminator AND runs the shared turn tail, so a follow-up
+        // typed during the setup is still recovered and re-submitted.
+        let response_channel: Option<EventChannel> = if is_trigger {
+            Some(EventChannel::Trigger)
+        } else {
+            None
+        };
+        let cancel_exit = SetupCancel {
+            thread_id,
+            request_id,
+            meta: crate::engine::thread_events::EventMeta {
+                request_event_id: Some(origin_id),
+                channel: response_channel,
+                ..crate::engine::thread_events::EventMeta::NONE
+            },
+            // Mirrors the agentic loop's own cancel arm: the turn's resolved
+            // model, or the provider default when the request carried none.
+            model: {
+                let provider = self.current_provider();
+                let m = model_override.unwrap_or(provider.default_model());
+                (!m.is_empty()).then(|| m.to_string())
+            },
+            effort: reasoning_effort.map(str::to_string),
+        };
+        if cancel_token.is_cancelled() {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
+        }
+
         // Snapshot RwLock values once per request
         let user_timezone = self.user_timezone.read().await.clone();
         let user_language = self.user_language.read().await.clone();
@@ -868,22 +928,30 @@ impl LucidosEngine {
         // Resume tool blocks + conversation history + per-thread loaded
         // knowhow, all derived from a single events fetch (see
         // `load_chat_history`).
-        let super::history::ChatHistoryLoad {
-            resume_tool_blocks,
-            loaded_knowhow_docs,
-            mut history_context,
-            conversation_summary,
-            history_image_hashes,
-        } = self
-            .load_chat_history(
+        let Some(history_load) = until_canceled(
+            &cancel_token,
+            self.load_chat_history(
                 is_trigger,
                 is_new_thread,
                 thread_id,
                 &thread_id_str,
                 user_message,
                 &memory_model_pref,
-            )
-            .await;
+            ),
+        )
+        .await
+        else {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
+        };
+        let super::history::ChatHistoryLoad {
+            resume_tool_blocks,
+            loaded_knowhow_docs,
+            mut history_context,
+            conversation_summary,
+            history_image_hashes,
+        } = history_load;
 
         // Build extraction context for tool execution (artifact writes, imports)
         let base_ctx = self.extraction_context_base().await;
@@ -900,29 +968,40 @@ impl LucidosEngine {
                 } else {
                     Some(conversation_summary.as_str())
                 };
-                classify_or_fallback(extractor.classify_query(
-                    user_message,
-                    ctx,
-                    Some(&memory_model_pref),
-                ))
+                // The single slowest step of the setup on a warm thread: a
+                // full LLM round-trip before any of the turn's own events exist.
+                let Some(classification) = until_canceled(
+                    &cancel_token,
+                    classify_or_fallback(extractor.classify_query(
+                        user_message,
+                        ctx,
+                        Some(&memory_model_pref),
+                    )),
+                )
                 .await
+                else {
+                    return Ok(self
+                        .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                        .await);
+                };
+                classification
             } else {
                 crate::memory::QueryClassification::default()
             }
         };
 
         // Retrieve relevant context from memory (skipped if classification says not needed)
-        let response_meta = crate::engine::thread_events::EventMeta {
-            request_event_id: Some(origin_id),
-            channel: if is_trigger {
-                Some(EventChannel::Trigger)
-            } else {
-                None
-            },
-            ..crate::engine::thread_events::EventMeta::NONE
+        let response_meta = cancel_exit.meta.clone();
+        let Some((mut memory_context, memory_results)) = until_canceled(
+            &cancel_token,
+            self.retrieve_context(user_message, &classification),
+        )
+        .await
+        else {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
         };
-        let (mut memory_context, memory_results) =
-            self.retrieve_context(user_message, &classification).await;
 
         // Emit MemorySearched step so the frontend can show it
         if classification.needs_memory {
@@ -949,21 +1028,47 @@ impl LucidosEngine {
         // the backstop under a running loop.
         let max_tool_calls = crate::core::PreferenceStore::max_tool_calls(&self.pool).await;
 
-        let (system_prompt, missing_pref_keys, image_provider_available) = self
-            .build_chat_system_prompt(
+        let Some((system_prompt, missing_pref_keys, image_provider_available)) = until_canceled(
+            &cancel_token,
+            self.build_chat_system_prompt(
                 &user_timezone,
                 &user_language,
                 device_id,
                 is_trigger,
                 &trigger,
                 max_tool_calls,
-            )
-            .await;
+            ),
+        )
+        .await
+        else {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
+        };
 
         if !memory_context.is_empty() {
             log!(@Memory, "Retrieved {}KB of context", memory_context.len() / 1024);
         }
 
+        let Some(context_sections) = until_canceled(
+            &cancel_token,
+            self.build_chat_context_sections(super::context_sections::ChatContextInputs {
+                classification: &classification,
+                user_profile: &user_profile,
+                device_id,
+                event_device: device_name.as_deref(),
+                app_context: app_context.as_ref(),
+                file_context: file_context.as_deref(),
+                url_context: url_context.as_ref(),
+                parent_thread_id,
+            }),
+        )
+        .await
+        else {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
+        };
         let super::context_sections::ChatContextSections {
             file_list_context,
             profile_context,
@@ -975,18 +1080,7 @@ impl LucidosEngine {
             file_context_section,
             url_context_section,
             thread_depth_context,
-        } = self
-            .build_chat_context_sections(super::context_sections::ChatContextInputs {
-                classification: &classification,
-                user_profile: &user_profile,
-                device_id,
-                event_device: device_name.as_deref(),
-                app_context: app_context.as_ref(),
-                file_context: file_context.as_deref(),
-                url_context: url_context.as_ref(),
-                parent_thread_id,
-            })
-            .await;
+        } = context_sections;
 
         let mut tools = get_default_tools();
         tools.push(get_notification_tool());
@@ -1006,13 +1100,21 @@ impl LucidosEngine {
         // MCP server management is the grouped `mcp` manifest tool (spliced via
         // llm_tools() above). Discovered tools from running MCP servers are added
         // separately below.
+        //
+        // The one setup await that is checkpointed rather than raced: it can be
+        // mid-RPC to a running MCP server, and dropping it there is not the pure
+        // read the other phases are. So the checkpoint goes AFTER it, where it
+        // catches a Stop that landed during the RPC. Before it the check would
+        // be near-dead, since the preceding phase is raced and would already
+        // have exited. The two remaining awaits (stopped-server summaries, the
+        // capture preference) are in-memory / single-row and are followed
+        // immediately by the loop's own pre-iteration check.
         tools.extend(self.mcp_manager.get_tool_definitions().await);
-
-        let response_channel: Option<EventChannel> = if is_trigger {
-            Some(EventChannel::Trigger)
-        } else {
-            None
-        };
+        if cancel_token.is_cancelled() {
+            return Ok(self
+                .cancel_during_setup(&cancel_exit, guard, &mut injection_rx)
+                .await);
+        }
 
         // Budget for messages = model-derived total budget minus system prompt + tool
         // definitions overhead. The budget scales with the resolved model's context
@@ -1268,27 +1370,93 @@ impl LucidosEngine {
             .await;
         }
 
-        // Recover messages that the fast-path send (above) landed on
-        // `injection_tx` after the loop's last try_recv() but before the turn
-        // went idle — without this they'd be silently lost when injection_rx
-        // is dropped on function return. `finalize_turn_and_drain_injections`
-        // drops the guard FIRST (removing the handle from active_threads under
-        // the same lock the fast-path send takes) and only THEN drains, so a
-        // follow-up racing this teardown is either buffered-and-recovered here
-        // or rejected → caller's slow path. It is never acknowledged into a
-        // channel nobody drains. Attach to the result so chat_submit can
-        // re-submit the orphans as regular follow-ups (= the next turn).
-        let orphans = Self::finalize_turn_and_drain_injections(guard, &mut injection_rx);
-        let orphans =
-            crate::engine::filter_removed_queued_prompts(&self.pool, thread_id, orphans).await;
-        if !orphans.is_empty() {
-            log!("[Chat] {} orphaned injection(s) after agentic loop exit for thread {} — will re-submit as follow-ups",
-                orphans.len(), thread_id);
-        }
+        let orphans = self
+            .drain_turn_orphans(thread_id, guard, &mut injection_rx)
+            .await;
 
         result.map(|mut r| {
             r.orphaned_injections = orphans;
             r
         })
+    }
+
+    /// The turn tail EVERY exit shares, normal or cancelled.
+    ///
+    /// Recovers messages that the fast-path send landed on `injection_tx` after
+    /// the loop's last try_recv() but before the turn went idle. Without this
+    /// they'd be silently lost when injection_rx is dropped on function return.
+    /// `finalize_turn_and_drain_injections` drops the guard FIRST (removing the
+    /// handle from active_threads under the same lock the fast-path send takes)
+    /// and only THEN drains, so a follow-up racing this teardown is either
+    /// buffered-and-recovered here or rejected → caller's slow path. It is never
+    /// acknowledged into a channel nobody drains. The caller attaches the result
+    /// to its `ProcessResult` so `chat_submit` can re-submit the orphans as
+    /// regular follow-ups (= the next turn).
+    ///
+    /// A cancel during setup goes through here too: a Stop must end the current
+    /// turn, never swallow the follow-up the user typed while it was unwinding.
+    async fn drain_turn_orphans(
+        &self,
+        thread_id: Uuid,
+        guard: ThreadGuard,
+        injection_rx: &mut mpsc::UnboundedReceiver<InjectedPrompt>,
+    ) -> Vec<InjectedPrompt> {
+        let orphans = Self::finalize_turn_and_drain_injections(guard, injection_rx);
+        let orphans =
+            crate::engine::filter_removed_queued_prompts(&self.pool, thread_id, orphans).await;
+        if !orphans.is_empty() {
+            log!(
+                "[Chat] {} orphaned injection(s) after turn exit for thread {}, re-submitting as follow-ups",
+                orphans.len(),
+                thread_id
+            );
+        }
+        orphans
+    }
+
+    /// A user Stop observed during the turn's SETUP phase, before the agentic
+    /// loop ever ran.
+    ///
+    /// Emits the same terminator the loop's pre-iteration cancel arm would have
+    /// (`ResponseCanceled { UserStop }`, empty body, actor drained from the
+    /// per-thread handle so the timeline records which device clicked Stop),
+    /// then runs the shared turn tail. Setup is where the wait actually is on a
+    /// large thread: history load, query classification, memory retrieval and
+    /// context assembly can run for tens of seconds, and until 2026-08-04
+    /// nothing in there looked at the token, so "Canceling…" hung for the whole
+    /// of it and the terminator landed BELOW the follow-up the user had typed
+    /// meanwhile. See
+    /// `docs/plans/2026-08-04-chat-stop-honored-during-turn-setup.md`.
+    async fn cancel_during_setup(
+        &self,
+        cancel: &SetupCancel,
+        guard: ThreadGuard,
+        injection_rx: &mut mpsc::UnboundedReceiver<InjectedPrompt>,
+    ) -> ProcessResult {
+        crate::engine::thread_events::emit_response_canceled(
+            &self.event_bus,
+            &self.pool,
+            cancel.thread_id,
+            CancelCause::UserStop,
+            String::new(),
+            vec![],
+            cancel.model.clone(),
+            cancel.effort.clone(),
+            meta_with_cancel_actor(self, cancel.thread_id, &cancel.meta),
+            "[Chat] ResponseCanceled (cancel during turn setup)",
+        )
+        .await;
+        let orphans = self
+            .drain_turn_orphans(cancel.thread_id, guard, injection_rx)
+            .await;
+        let mut result = terminal_result(
+            String::new(),
+            vec![],
+            cancel.request_id,
+            cancel.thread_id,
+            false,
+        );
+        result.orphaned_injections = orphans;
+        result
     }
 }

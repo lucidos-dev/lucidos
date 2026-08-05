@@ -124,6 +124,15 @@ pub(super) async fn create_credential(
     Json(request): Json<CreateCredentialRequest>,
 ) -> Json<ApiResult> {
     let auth_type = AuthType::parse(&request.auth_type);
+    // Normalized at this boundary too, not just on the LLM tool path: typing
+    // `oauth:google` into the Add Credential form must land on the same row as
+    // typing `google`, or the form recreates the duplicate-credential incident
+    // by hand. See `oauth::client_provider_name`.
+    let service_name = if auth_type == AuthType::OauthClient {
+        crate::core::oauth::client_provider_name(&request.service_name)
+    } else {
+        request.service_name.clone()
+    };
     // Optional custom env var name — validated like a user env var (valid shape +
     // not engine-reserved). Empty/whitespace → None (default CRED_<NAME>).
     let env_var_name = request
@@ -144,7 +153,7 @@ pub(super) async fn create_credential(
     match CredentialStore::upsert(
         &state.pool,
         &state.engine.event_bus,
-        &request.service_name,
+        &service_name,
         &request.base_url,
         auth_type,
         &request.auth_value,
@@ -160,15 +169,16 @@ pub(super) async fn create_credential(
             // credentials table, so a failed sync must surface as an error (the
             // edit path in `update_credential` does the same) rather than report
             // a false success while email silently breaks.
+            // The service name IS the account name now; the helper only differs
+            // for a row the prefix migration had to leave alone.
             if auth_type == AuthType::EmailPassword {
-                if let Some(account_name) = request.service_name.strip_prefix("email:") {
-                    use crate::core::EmailStore;
-                    if let Err(e) =
-                        EmailStore::update_password(&state.pool, account_name, &request.auth_value)
-                            .await
-                    {
-                        return ApiResult::err(format!("Failed to update email password: {}", e));
-                    }
+                use crate::core::EmailStore;
+                let account_name = EmailStore::account_name_for_credential(&service_name);
+                if let Err(e) =
+                    EmailStore::update_password(&state.pool, account_name, &request.auth_value)
+                        .await
+                {
+                    return ApiResult::err(format!("Failed to update email password: {}", e));
                 }
             }
             ApiResult::ok()
@@ -183,13 +193,13 @@ pub(super) async fn create_credential(
 /// table — the create path does the same, and the edit path must match it.
 pub(super) async fn update_credential(
     State(state): State<AppState>,
-    Query(query): Query<ServiceQuery>,
+    Query(query): Query<CredentialIdQuery>,
     headers: HeaderMap,
     Json(request): Json<UpdateCredentialRequest>,
 ) -> Json<ApiResult> {
     use crate::core::EmailStore;
 
-    let service = query.service;
+    let id = query.id;
     let auth_type = AuthType::parse(&request.auth_type);
 
     // Empty string means "keep the current secret" — same contract the
@@ -223,7 +233,7 @@ pub(super) async fn update_credential(
     match CredentialStore::update(
         &state.pool,
         &state.engine.event_bus,
-        &service,
+        id,
         &base_url,
         auth_type,
         request.auth_header.as_deref(),
@@ -233,45 +243,42 @@ pub(super) async fn update_credential(
     )
     .await
     {
-        Ok(true) => {
+        // `update` hands back the row's service name, which for an
+        // `email_password` credential IS the `email_accounts.name` (the `email:`
+        // prefix that used to wrap it is gone). The id in the query cannot
+        // supply it, which is why the store returns it.
+        Ok(Some(service_name)) => {
             if auth_type == AuthType::EmailPassword {
-                if let Some(account_name) = service.strip_prefix("email:") {
-                    if let Some(email) = &request.email {
-                        if let Err(e) = EmailStore::upsert(
-                            &state.pool,
-                            account_name,
-                            &email.email_address,
-                            &email.imap_host,
-                            email.imap_port,
-                            &email.smtp_host,
-                            email.smtp_port,
-                            &email.username,
-                            email.use_tls,
-                            email.require_send_confirmation,
-                        )
-                        .await
-                        {
-                            return ApiResult::err(format!(
-                                "Failed to update email account: {}",
-                                e
-                            ));
-                        }
+                let account_name = EmailStore::account_name_for_credential(&service_name);
+                if let Some(email) = &request.email {
+                    if let Err(e) = EmailStore::upsert(
+                        &state.pool,
+                        account_name,
+                        &email.email_address,
+                        &email.imap_host,
+                        email.imap_port,
+                        &email.smtp_host,
+                        email.smtp_port,
+                        &email.username,
+                        email.use_tls,
+                        email.require_send_confirmation,
+                    )
+                    .await
+                    {
+                        return ApiResult::err(format!("Failed to update email account: {}", e));
                     }
-                    if let Some(value) = new_secret {
-                        if let Err(e) =
-                            EmailStore::update_password(&state.pool, account_name, value).await
-                        {
-                            return ApiResult::err(format!(
-                                "Failed to update email password: {}",
-                                e
-                            ));
-                        }
+                }
+                if let Some(value) = new_secret {
+                    if let Err(e) =
+                        EmailStore::update_password(&state.pool, account_name, value).await
+                    {
+                        return ApiResult::err(format!("Failed to update email password: {}", e));
                     }
                 }
             }
             ApiResult::ok()
         }
-        Ok(false) => ApiResult::err(format!("Credential '{}' not found", service)),
+        Ok(None) => ApiResult::err("Credential not found".to_string()),
         Err(e) => ApiResult::err(format!("Failed to update credential: {}", e)),
     }
 }
@@ -298,18 +305,17 @@ pub(super) async fn get_email_account(
 /// Get a credential's auth value (for copying client ID/secret)
 pub(super) async fn get_credential_value(
     State(state): State<AppState>,
-    Query(query): Query<ServiceQuery>,
+    Query(query): Query<CredentialIdQuery>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let service = query.service;
-    match CredentialStore::get(&state.pool, &service).await {
+    // By id, not name: `CredentialStore::get` is deliberately blind to
+    // `oauth_client` rows, so a name-keyed copy-value could never reach the
+    // client ID / secret the OAuth Client row's own Copy buttons ask for.
+    match CredentialStore::get_by_id(&state.pool, query.id).await {
         Ok(Some(cred)) => Ok(Json(serde_json::json!({
             "auth_type": cred.auth_type.to_string(),
             "auth_value": cred.auth_value,
         }))),
-        Ok(None) => Err((
-            StatusCode::NOT_FOUND,
-            format!("Credential '{}' not found", service),
-        )),
+        Ok(None) => Err((StatusCode::NOT_FOUND, "Credential not found".to_string())),
         Err(e) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("Failed to get credential: {}", e),
@@ -320,15 +326,14 @@ pub(super) async fn get_credential_value(
 /// Delete a credential
 pub(super) async fn delete_credential(
     State(state): State<AppState>,
-    Query(query): Query<ServiceQuery>,
+    Query(query): Query<CredentialIdQuery>,
     headers: HeaderMap,
 ) -> Json<ApiResult> {
-    let service = query.service;
     // `delete` emits `CredentialDeleted` itself; resolve the device actor for it.
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
-    match CredentialStore::delete(&state.pool, &state.engine.event_bus, &service, actor).await {
+    match CredentialStore::delete(&state.pool, &state.engine.event_bus, query.id, actor).await {
         Ok(true) => ApiResult::ok(),
-        Ok(false) => ApiResult::err(format!("Credential '{}' not found", service)),
+        Ok(false) => ApiResult::err("Credential not found".to_string()),
         Err(e) => ApiResult::err(format!("Failed to delete credential: {}", e)),
     }
 }
@@ -674,6 +679,7 @@ pub(super) async fn delete_oauth_account(
 /// listener for the callback. Returns `{ auth_url }` for the frontend to open.
 pub(super) async fn reauthorize_oauth(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(body): Json<serde_json::Value>,
 ) -> Json<ApiResult> {
     let provider = match body["provider"].as_str() {
@@ -686,18 +692,22 @@ pub(super) async fn reauthorize_oauth(
     };
 
     // Check if client credentials exist before starting the OAuth flow
-    let cred_service = format!("oauth:{}", provider);
-    match CredentialStore::get(&state.pool, &cred_service).await {
+    let cred_service = crate::core::oauth::client_provider_name(&provider);
+    match CredentialStore::get_oauth_client(&state.pool, &cred_service).await {
         Ok(None) => return ApiResult::needs_credentials(&provider),
         Err(e) => return ApiResult::err(format!("Failed to check credentials: {}", e)),
         Ok(Some(_)) => {}
     }
 
+    // The device clicking Connect is the one to bring back to the front when the
+    // authorization lands, so it rides along to `OAuthAccountConnected`.
+    let initiator = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match crate::core::oauth::prepare_oauth_flow(
         &state.pool,
         &state.engine.event_bus,
         &provider,
         &scopes,
+        initiator,
     )
     .await
     {
@@ -830,7 +840,7 @@ pub(super) struct SetNetworkConfigRequest {
 }
 
 /// GET /api/v1/network-config — the per-workspace engine bind + the inherited
-/// machine-global gateway bind, for Settings → System → Network access.
+/// machine-global gateway bind, for Settings → Access → Network access.
 pub(super) async fn get_network_config(
     State(state): State<AppState>,
 ) -> Result<Json<NetworkConfigResponse>, (StatusCode, String)> {
@@ -1313,7 +1323,7 @@ pub(super) fn router() -> Router<AppState> {
                 .put(update_env_var)
                 .delete(delete_env_var),
         )
-        // Per-workspace engine network bind (Settings → System → Network
+        // Per-workspace engine network bind (Settings → Access → Network
         // access). The machine-global gateway bind + inherit toggle live on the
         // gateway control plane (`/~/api/v1/control/network-config`).
         .route(

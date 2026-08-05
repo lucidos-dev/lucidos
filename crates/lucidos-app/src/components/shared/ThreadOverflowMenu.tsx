@@ -7,11 +7,15 @@ import { handleSaveThread, handleUnsaveThread } from '../../store/actions/thread
 import { threadMap, effectiveThreadStatus } from '../../store/store';
 import { threadInfoRows } from '../drawer/threadRowInfo';
 
-/** Per-thread overflow (⋯) menu for a STARTED thread — a Pin/Unpin toggle and a
- *  conditional Archive action first, then Copy thread reference / Copy thread
- *  title / Download thread, with the Info row auto-appended by <OverflowMenu>.
+/** Per-thread overflow (⋯) menu for a STARTED thread: a Pin/Unpin toggle first,
+ *  then Copy thread reference / Copy thread title / Download thread, then the
+ *  conditional Archive action, with the Info row auto-appended by <OverflowMenu>.
  *  Built on the shared <OverflowMenu> shell (trigger + anchored menu/Info
  *  popovers + keyboard roving + the full dismiss/Escape/inert contract).
+ *
+ *  **Archive sits second-last, right above Info.** It is the one mutating action
+ *  here, so it stays off the top of the menu, where a stray tap (or the
+ *  keyboard-open's focus landing on the first item) would reach it.
  *
  *  **Pin/Unpin shows only on a keyboard-open.** Every inline pin button sitting
  *  next to a ⋯ trigger is mouse-only (`tabindex=-1`), so the menu is the
@@ -50,21 +54,13 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
         const archiveAction = resolveThreadActions(threadId).find((a) => a.kind === 'archive');
         return (
           <>
-            {(showPin || archiveAction) && (
+            {showPin && (
               <>
-                {showPin && (
-                  <button type="button" class="thread-overflow-item" role="menuitem"
-                    onClick={run(() => { if (saved) void handleUnsaveThread(threadId); else void handleSaveThread(threadId); })}>
-                    <PinIcon filled={saved} />
-                    {saved ? 'Unpin thread' : 'Pin thread'}
-                  </button>
-                )}
-                {archiveAction && (
-                  <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void archiveAction.invoke(); })}>
-                    <ArchiveIcon />
-                    Archive
-                  </button>
-                )}
+                <button type="button" class="thread-overflow-item" role="menuitem"
+                  onClick={run(() => { if (saved) void handleUnsaveThread(threadId); else void handleSaveThread(threadId); })}>
+                  <PinIcon filled={saved} />
+                  {saved ? 'Unpin thread' : 'Pin thread'}
+                </button>
                 <div class="thread-overflow-divider" role="separator" />
               </>
             )}
@@ -80,6 +76,15 @@ export function ThreadOverflowMenu({ threadId, title, stopPropagation, extraClas
               <DownloadIcon />
               Download thread
             </button>
+            {archiveAction && (
+              <>
+                <div class="thread-overflow-divider" role="separator" />
+                <button type="button" class="thread-overflow-item" role="menuitem" onClick={run(() => { void archiveAction.invoke(); })}>
+                  <ArchiveIcon />
+                  Archive
+                </button>
+              </>
+            )}
           </>
         );
       }}

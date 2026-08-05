@@ -1,17 +1,19 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
-// thread-loading is the side-effect we're verifying — capture both calls.
+// thread-loading is the side-effect we're verifying: capture all three calls.
 const loadAllThreads = vi.fn(async () => {});
 const refreshThreadEvents = vi.fn(async (_id: string) => {});
-vi.mock('./thread-loading', () => ({ loadAllThreads, refreshThreadEvents }));
+const markLoadedThreadsStale = vi.fn();
+vi.mock('./thread-loading', () => ({ loadAllThreads, refreshThreadEvents, markLoadedThreadsStale }));
 
-// Stub the threadMap signal so the test can set fixture state without pulling
-// in the full store graph (which depends on browser-only modules).
+// Stub the threadMap + focusedThreadId signals so the test can set fixture state
+// without pulling in the full store graph (which depends on browser-only modules).
 const threadMap = signal(new Map<string, { meta: { id: string }; eventsLoaded: boolean }>());
+const focusedThreadId = signal<string | null>(null);
 vi.mock('../store', () => ({
   threadMap,
-  focusedThreadId: signal<string | null>(null),
+  focusedThreadId,
   changes: signal([]),
   appliedChanges: signal([]),
   changesHasMore: signal(false),
@@ -71,27 +73,62 @@ describe('resyncLoadedThreads', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     threadMap.value = new Map();
+    focusedThreadId.value = null;
   });
 
-  it('refreshes thread metadata and calls refreshThreadEvents for each loaded thread', async () => {
+  it('refreshes thread metadata, then the focused thread only', async () => {
     threadMap.value = new Map([
       ['thread-a', { meta: { id: 'thread-a' }, eventsLoaded: true }],
       ['thread-b', { meta: { id: 'thread-b' }, eventsLoaded: false }],
       ['thread-c', { meta: { id: 'thread-c' }, eventsLoaded: true }],
     ]);
+    focusedThreadId.value = 'thread-c';
+
+    await resyncLoadedThreads();
+
+    // The metadata read is what repairs the drawer after an SSE gap (the stuck
+    // "Thinking" spinner this function exists for reads `meta.status`), and it
+    // covers every thread in one request. Only the transcript on screen needs
+    // its events now; the rest are marked and catch up on focus.
+    expect(loadAllThreads).toHaveBeenCalledTimes(1);
+    expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
+    expect(refreshThreadEvents.mock.calls.map((c) => c[0])).toEqual(['thread-c']);
+  });
+
+  it('marks without refreshing anything when no thread is focused', async () => {
+    // An SSE drop reconnects every 3s and each reopen ran this. On a workspace
+    // this size, unbounded, it put every request on one connection and one radio
+    // wake, racing the same 10s client deadline down a link that had only just
+    // come back; bounded, it queued the same burst. Now there is no burst.
+    threadMap.value = new Map(
+      Array.from({ length: 20 }, (_, i) => [`t${i}`, { meta: { id: `t${i}` }, eventsLoaded: true }] as const),
+    );
 
     await resyncLoadedThreads();
 
     expect(loadAllThreads).toHaveBeenCalledTimes(1);
-    expect(refreshThreadEvents).toHaveBeenCalledTimes(2);
-    const refreshedIds = refreshThreadEvents.mock.calls.map((c) => c[0]).sort();
-    expect(refreshedIds).toEqual(['thread-a', 'thread-c']);
+    expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
+    expect(refreshThreadEvents).not.toHaveBeenCalled();
+  });
+
+  it('does not refresh a focused thread whose events never loaded', async () => {
+    // `refreshThreadEvents` would decline it (there is no `lastDbSeq` to fetch
+    // after); the full load is `focusThread`'s / the retry's business.
+    threadMap.value = new Map([
+      ['thread-a', { meta: { id: 'thread-a' }, eventsLoaded: false }],
+    ]);
+    focusedThreadId.value = 'thread-a';
+
+    await resyncLoadedThreads();
+
+    expect(refreshThreadEvents).not.toHaveBeenCalled();
   });
 
   it('coalesces concurrent calls into one network round-trip', async () => {
     threadMap.value = new Map([
       ['thread-a', { meta: { id: 'thread-a' }, eventsLoaded: true }],
     ]);
+    focusedThreadId.value = 'thread-a';
 
     // Three callers race — only one resync should actually run.
     await Promise.all([
@@ -101,6 +138,7 @@ describe('resyncLoadedThreads', () => {
     ]);
 
     expect(loadAllThreads).toHaveBeenCalledTimes(1);
+    expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
   });
 });

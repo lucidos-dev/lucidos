@@ -38,8 +38,8 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const availableThreadActionsCases = cases.filter((c): c is AvailableThreadActionsCase => c.fn === 'availableThreadActions');
 
     it(`has exhaustive coverage (${availableThreadActionsCases.length} cases)`, () => {
-      // 2 thread types × 5 statuses × 2 sections × 2 pending × 2 descendantsBlockArchive × 2 hasUnsentDraft × 2 isSaved = 320
-      expect(availableThreadActionsCases.length).toBe(320);
+      // 2 thread types × 6 statuses × 2 sections × 2 pending × 2 descendantsBlockArchive × 2 hasUnsentDraft × 2 isSaved = 384
+      expect(availableThreadActionsCases.length).toBe(384);
     });
 
     for (const tc of availableThreadActionsCases) {
@@ -65,8 +65,8 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const displaySectionCases = cases.filter((c): c is DisplaySectionCase => c.fn === 'displaySection');
 
     it(`has exhaustive coverage (${displaySectionCases.length} cases)`, () => {
-      // 2 sections × 5 statuses × 2 saved × 2 activeChildren × 2 pending × 2 attentionDescendants = 160
-      expect(displaySectionCases.length).toBe(160);
+      // 2 sections × 6 statuses × 2 saved × 2 activeChildren × 2 pending × 2 attentionDescendants = 192
+      expect(displaySectionCases.length).toBe(192);
     });
 
     for (const tc of displaySectionCases) {

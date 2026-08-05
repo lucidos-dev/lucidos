@@ -15,6 +15,7 @@ function destinationDeps() {
     focusPrompt: vi.fn(),
     switchMenuItem: vi.fn(),
     openSettingsSubview: vi.fn(),
+    scrollToSetting: vi.fn(),
   };
 }
 
@@ -46,7 +47,10 @@ describe('compose destination final selection focus', () => {
     expect(deps.apply).not.toHaveBeenCalled();
     expect(deps.focusPrompt).not.toHaveBeenCalled();
     expect(deps.switchMenuItem).toHaveBeenCalledWith('settings');
-    expect(deps.openSettingsSubview).toHaveBeenCalledWith('repositories');
+    // Repositories share the Coding Agents page with the binaries that run
+    // them, so the jump names the page AND the section it wants inside it.
+    expect(deps.openSettingsSubview).toHaveBeenCalledWith('coding-agents');
+    expect(deps.scrollToSetting).toHaveBeenCalledWith('coding-agents:repositories');
   });
 
   it('writes the coding agent to the focused draft, never a global, and focuses the prompt', () => {

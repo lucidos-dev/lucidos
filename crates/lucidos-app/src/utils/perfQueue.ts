@@ -142,7 +142,9 @@ export function flushPerfQueue(keepalive = false): void {
       body: JSON.stringify(samples),
       keepalive,
     })
-      .then((res) => { if (!res.ok) { /* server rejected — drop; retry can't help */ } })
+      // Only a NETWORK failure re-buffers. A non-ok response means the server
+      // rejected the batch (a 400 over the length cap, say), so retrying the
+      // same bytes cannot help and the samples are dropped.
       .catch(() => requeueFailed(batch));
   } catch {
     // Synchronous fetch throw (e.g. fetch undefined) — re-buffer like a network

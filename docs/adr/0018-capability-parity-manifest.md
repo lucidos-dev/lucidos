@@ -65,6 +65,38 @@ mechanism preventing a capability from landing on one surface and not the others
 - The CLI generator routes through the gateway-safe `http.rs` client, so generated
   commands can never re-introduce the curl/port/prefix traps that motivated this.
 
+## Amendment, 2026-08-05: the `threads` domain's CLI is hand-written, and cannot currently be otherwise
+
+The "we give up the freedom to hand-roll a one-off CLI command" consequence above
+has one standing exception, recorded here so it is not rediscovered as an
+oversight, and so nobody flips a flag expecting it to work.
+
+`THREADS_DOMAIN.cli` is `false` and its `list` / `count` CLI arms are
+hand-written. Adding a third capability to that family (`threads follow-up`,
+`POST /api/v1/threads/:thread_id/follow-up`) did not add a manifest operation,
+for two reasons that are properties of the generator rather than preferences:
+
+1. **The generator filters at the domain level first.**
+   `codegen.rs` iterates `domains().iter().filter(|d| d.cli)` and only then
+   `.filter(|o| o.on_cli(d))`. So an operation flagged `cli: Some(true)` inside a
+   `cli: false` domain generates **nothing at all**, while `on_cli` still reports
+   `true`. The manifest entry would declare a surface that does not exist, which
+   is worse than no entry.
+2. **The domain cannot be flipped without inventing arguments.** `THREADS_OPS`
+   declares `args: &[]` for both `list` and `count`; their filters
+   (`active`, `source`, `limit`, and now `parent`) live only in `llm_schema`,
+   which the CLI generator never reads. Flipping `THREADS_DOMAIN.cli = true`
+   would therefore generate a flagless `threads list` and a `ThreadsCmd` enum
+   colliding with the hand-written one, i.e. a regression plus a build break.
+
+Folding the domain in properly means declaring those filters as real `Arg`s so
+the LLM schema and the CLI flags derive from one list. That is worth doing and is
+not blocked by anything; it is simply larger than the change that surfaced it.
+Until then the family stays hand-written **together** (the standalone
+`run_thread` / `run_coding_agent` / `follow_up_child_thread` LLM tools, the three
+`lucidos threads` arms, the hand-written routes), which is at least internally
+consistent: no operation is half-generated.
+
 ## Alternatives considered
 
 - **Per-tool hand-wiring (status quo).** Rejected — it *is* the drift that caused

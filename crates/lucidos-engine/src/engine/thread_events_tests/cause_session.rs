@@ -144,3 +144,62 @@ fn session_ended_reason_serialization() {
         }
     }
 }
+
+/// Every `AbortCause` states which side of the verdict split it lands on, so a
+/// new variant cannot inherit `failed` (or `paused`) by default. Adding one
+/// fails this test until its status is decided deliberately.
+///
+/// The three outcomes: `StaleSettle` uses the cancel-style mapping (nothing was
+/// running), a TRANSIENT cause is `paused` (an engine restart interrupted the
+/// turn and either resumes it or offers Continue), everything else is `failed`.
+#[test]
+fn abort_cause_status_sql_splits_transient_from_failed() {
+    const PAUSED: &str = "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'paused' END";
+    const FAILED: &str = "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END";
+
+    for (cause, expected) in [
+        (AbortCause::EngineShutdown, PAUSED),
+        (AbortCause::RecoveryAfterRestart, PAUSED),
+        (AbortCause::SafetyNet, FAILED),
+        (AbortCause::ProcessKilled, FAILED),
+        (AbortCause::SessionDropped, FAILED),
+        (AbortCause::Unknown, FAILED),
+        (
+            AbortCause::StaleSettle,
+            crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE,
+        ),
+    ] {
+        assert_eq!(
+            cause.status_sql(),
+            expected,
+            "{:?} maps to the wrong thread_summaries.status fragment",
+            cause
+        );
+    }
+}
+
+/// The verdict split is DERIVED from `is_transient()`, not from a second list
+/// that could drift out of step with it. A cause the enum calls transient (a
+/// fresh `SessionStarted` is expected) must never surface the red error dot.
+#[test]
+fn transient_abort_causes_are_exactly_the_paused_ones() {
+    for cause in [
+        AbortCause::EngineShutdown,
+        AbortCause::SafetyNet,
+        AbortCause::RecoveryAfterRestart,
+        AbortCause::ProcessKilled,
+        AbortCause::StaleSettle,
+        AbortCause::SessionDropped,
+        AbortCause::Unknown,
+    ] {
+        if cause == AbortCause::StaleSettle {
+            continue; // Settles a row whose process was already gone: no verdict.
+        }
+        assert_eq!(
+            cause.is_transient(),
+            cause.status_sql().contains("'paused'"),
+            "{:?}: transience and the paused verdict must agree",
+            cause
+        );
+    }
+}

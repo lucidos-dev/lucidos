@@ -215,7 +215,7 @@ service_render_network_toml() {
 #                  Tailscale 100.x address.
 # [engine].inherit  true  = every workspace engine binds the gateway's
 #                          bind; false = each engine reads its own
-#                          per-workspace bind (Settings -> Network access).
+#                          per-workspace bind (Settings -> Access).
 
 [gateway]
 bind = "$bind"
@@ -254,7 +254,7 @@ service_runtime_env_pairs() {
 # already strips them from spawned engines (gateway terminates TLS). https is
 # what gives a NON-localhost device a secure context — service worker, PWA
 # install, and web push all require one, so a remote phone/laptop needs this
-# (plus the Settings → System → Network access bind) to get notifications.
+# (plus the Settings → Access → Network access bind) to get notifications.
 service_tls_env_pairs() {
     printf 'LUCIDOS_TLS_CERT=%s\n' "$1"
     printf 'LUCIDOS_TLS_KEY=%s\n' "$2"

@@ -84,8 +84,8 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `coding_agent_default` | global | `claude-code` \| `codex` | `claude-code` | Default coding agent the compose picker pre-selects. |
 | `coding_agent_claude_path` | global | absolute path | (auto-detected) | Path to the `claude` CLI for Claude Code threads. Unset = auto-detect (`~/.local/bin`, `~/.claude/local`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
 | `coding_agent_codex_path` | global | absolute path | (auto-detected) | Path to the `codex` CLI for Codex threads. Unset = auto-detect (`~/.local/bin`, Homebrew, PATH). A set path that doesn't resolve fails the spawn naming this key — never a silent fallback. |
-| `backup_schedule` | global | 6-field cron (in the user's timezone) or `off` | `off` | Automatic backup schedule. E.g. `0 0 3 * * *` = daily 03:00, `0 0 3 * * 0` = weekly Sun 03:00, `0 0 */12 * * *` = every 12h. Fires in the user's `timezone`. Requires `backup_provider` set + connected. |
-| `backup_provider` | global | `google_drive` \| `dropbox` | (unset) | Cloud destination. The account must be connected in Settings → System → Backup (OAuth) before a scheduled backup can upload. |
+| `backup_schedule` | global | 6-field cron (in the user's timezone) or `off` | `off` | Automatic backup schedule. E.g. `0 0 3 * * *` = daily 03:00, `0 0 3 * * 0` = weekly Sun 03:00, `0 0 */12 * * *` = every 12h. Fires in the user's `timezone`. Requires `backup_provider` set AND its account connected (see that key). |
+| `backup_provider` | global | `google_drive` \| `dropbox` | (unset) | Cloud destination. Setting this connects NOTHING: the account is connected with `connect_oauth_account`, or by the user in **Settings → Accounts** (never on the Backup page, which has no account UI). Until then backups run and the upload fails. `get_backup_status` reports whether the account is connected. |
 | `backup_retention` | global | number 1–50 | `5` | How many recent backups to keep; older ones are pruned after each successful backup. |
 | `backup_reminder_dismissed` | global | empty \| an RFC 3339 instant \| `forever` | (unset) | Dismissal state of the app-shell banner shown while backup is off (no active `backup_schedule` with a `backup_provider`). Unset/empty = never dismissed, banner shows. An RFC 3339 instant = dismissed then, hidden for 30 days from it. `forever` = dismissed a second time, hidden for good. Set it to empty to bring the reminder back. The banner only ever shows while backup is off, so enabling a schedule hides it whatever this says. |
 | `theme` | device | `light` \| `dark` \| `system` | `dark` | Color theme for the calling device. |
@@ -111,14 +111,14 @@ surface):
   calls, not replies, so three calls in one reply spend three of them.
   Defaults to `500`;
   the user may set any number (there is no ceiling, and a value below `1` is
-  raised to `1`). Changed in Settings → Models → Chat & Triggers, never via
+  raised to `1`). Changed in Settings → Models → Chat & triggers, never via
   `set_preference`: this is the backstop over your own loop, so you must not
   raise your own limit. You still cannot observe your own tool-call count while
   a turn runs; the `[ENGINE-LIMIT]` prefix is the only signal the cap was hit.
 - `keybindings` — Settings → Keyboard Shortcuts.
 - `capture_context` — a debug-only toggle.
 - `network_bind` — this workspace's engine network bind (`loopback` / `all` /
-  a specific tailnet IP). A security setting changed in Settings → System →
+  a specific tailnet IP). A security setting changed in Settings → Access →
   Network access, never via `set_preference`. Takes effect on the next engine
   restart. (The machine-global gateway bind + the engine-inherit toggle live in
   `~/.lucidos/network.toml`, not here.)

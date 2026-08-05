@@ -140,11 +140,18 @@ pub struct Operation {
     /// domain via [`domain_for_tool`] so cached prompts/threads still work.
     /// `None` for brand-new operations with no predecessor.
     ///
-    /// It doubles as the **handler key** in a domain that dispatches by flat
-    /// name (`triggers`, `trigger_groups`, `preferences` route every action
-    /// through [`Domain::legacy_tool_for_action`]). A new operation in one of
-    /// those domains therefore needs a name here even with no predecessor to
-    /// supersede, or `grouped_legacy_name` rejects it as an unknown action.
+    /// It doubles as the **handler key** in every domain that dispatches by
+    /// flat name, which is most of them. `triggers`, `trigger_groups` and
+    /// `preferences` have bespoke handler arms
+    /// (`engine/tools/mod.rs`); the generic `grouped_legacy_name` path covers
+    /// the rest (`mcp`, `plugins`, `events`, `changes`, `threads`,
+    /// `thread_queue`, `memory`), and it also resolves the action via
+    /// [`Domain::legacy_tool_for_action`]. Either way a new operation in a
+    /// grouped domain needs a name here even with no predecessor to supersede,
+    /// or the dispatch rejects it as an unknown action. (This paragraph named
+    /// only the three bespoke domains until 2026-08-05, which read as an
+    /// exhaustive list and made the alias look like decoration everywhere
+    /// else.)
     pub llm_alias: Option<&'static str>,
     /// Raw JSON *properties object* this operation contributes to the grouped
     /// LLM tool schema, used verbatim when the LLM-facing shape diverges from
@@ -1039,11 +1046,14 @@ const EVENTS_OPS: &[Operation] = &[
 const EVENTS_DOMAIN: Domain = Domain {
     name: "events",
     tool_name: "events",
-    tool_summary: "Work with the workspace's domain-event store. 'emit' records an immutable \
+    tool_summary: "Work with the workspace's event store. 'emit' records an immutable \
         past-tense fact (payload must include a 'summary'); 'query' reads events newest-first \
         (honours a 128 KB byte budget — narrow on truncation); 'count' sizes a sweep by type/time \
         without materialising payloads. On a busy workspace, 'count' first, then 'query' the \
-        narrowest type(s) — do NOT enumerate everything into context.",
+        narrowest type(s): do NOT enumerate everything into context. 'query' and 'count' see the \
+        WHOLE store, not just what the workspace emitted: domain events AND the engine's own \
+        thread/system events (ChildThreadCompleted, ResponseGenerated, ChangeApplied, \
+        TriggerCompleted) are rows in one table, so there is no second stream to reach for.",
     llm: true,
     // The `lucidos events` CLI is a richer hand-written command (before/after
     // cursors); not regenerated. No SDK consumer. Grouped LLM tool only.
@@ -1531,11 +1541,13 @@ const ENV_VARS_DOMAIN: Domain = Domain {
 const THREADS_LIST_LLM_SCHEMA: &str = r#"{
   "active": {"type":"boolean","description":"When true, restrict to threads where the agentic loop is mid-flow (running or waiting_for_user_answer); when false, invert. Omit for no filter. Note: 'waiting' is NOT active (the coding agent stopped and proposed changes)."},
   "source": {"type":"string","description":"Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent' (legacy 'claude_code' also accepted). Omit for all."},
+  "my_children": {"type":"boolean","description":"When true, restrict to threads THIS thread spawned as children (its direct children only, not grandchildren). Resolved from the calling thread, so it needs no id. Use it to recover a child's thread_id, to see which of your children are still working, and to spot one parked on a question."},
   "limit": {"type":"integer","description":"Maximum number of threads to return (1-1000, default 100)."}
 }"#;
 const THREADS_COUNT_LLM_SCHEMA: &str = r#"{
   "active": {"type":"boolean","description":"When true, count only threads mid-flow (running or waiting_for_user_answer); when false, the inverse. Omit for total count."},
-  "source": {"type":"string","description":"Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent'. Omit for all."}
+  "source": {"type":"string","description":"Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent'. Omit for all."},
+  "my_children": {"type":"boolean","description":"When true, restrict to threads THIS thread spawned as children (its direct children only, not grandchildren). Resolved from the calling thread, so it needs no id. Use it to recover a child's thread_id, to see which of your children are still working, and to spot one parked on a question."}
 }"#;
 
 const THREADS_OPS: &[Operation] = &[
@@ -1576,9 +1588,12 @@ const THREADS_DOMAIN: Domain = Domain {
     tool_name: "threads",
     tool_summary: "Introspect threads. 'list' returns thread summaries newest-first (thread_id, \
         title, channel, status, last_activity, parent/trigger ids); 'count' returns just the \
-        matching count. Both take the same optional filters (active, source, limit) — far cheaper \
-        than query_events for 'what threads exist / their status'. To START a thread, use the \
-        separate run_thread / run_coding_agent tools.",
+        matching count. Both take the same optional filters (active, source, my_children, limit) \
+        and are far cheaper than query_events for 'what threads exist / their status'. \
+        'my_children: true' scopes either one to the threads THIS thread spawned, which is how \
+        you recover a child's thread_id and see which of your children are still working. To \
+        START a thread, use the separate run_thread / run_coding_agent tools; to REDIRECT one you \
+        already spawned, use follow_up_child_thread.",
     llm: true,
     // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
     // and no SDK consumer needs this. Grouped LLM tool only.

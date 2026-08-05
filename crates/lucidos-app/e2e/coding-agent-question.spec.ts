@@ -105,23 +105,22 @@ test.describe('CC AskUserQuestion — interactive answer flow', () => {
       // under the answers.
       await expect(pendingBody.locator('.question-hint')).toHaveCount(0);
       await expect(pendingBody.locator('.question-option')).toHaveCount(2);
-      // The prompt is where the two escapes that need no option slot are named:
-      // typing (routed to this question as a freetext answer) and Cancel.
-      // Without them named somewhere the agent invents an "Other, I'll type it"
-      // option, which just sends that label back as the user's answer. Literal
-      // on purpose: an e2e spec can't import from `src/`, so this is the one
-      // deliberate duplicate of `PLACEHOLDER_ANSWERING` in
-      // `prompt-input-helpers.ts`. Change both together.
+      // The prompt row is where the two escapes that need no option slot are
+      // named: typing (routed to this question as a freetext answer) by this
+      // placeholder, and Cancel by the Cancel button's tooltip. Without them
+      // named somewhere the agent invents an "Other, I'll type it" option, which
+      // just sends that label back as the user's answer. Literal on purpose: an
+      // e2e spec can't import from `src/`, so this is the one deliberate
+      // duplicate of `PLACEHOLDER_ANSWERING` in `prompt-input-helpers.ts`.
+      // Change both together.
       const promptInput = page.locator('[data-role="prompt-input"]:visible').first();
-      await expect(promptInput).toHaveAttribute(
-        'placeholder', 'Type your answer, or Cancel to ask something else.',
-      );
-      // The whole sentence has to be READABLE, which is not free: a textarea
-      // sizes to its VALUE, so `overflow-y: hidden` silently clips a placeholder
-      // that wraps, and this one does wrap on the phone viewports (56px needed
-      // against a 36px box, measured). Assert the box is as tall as rendering
-      // the placeholder as a value would need, which holds on every project
-      // rather than pinning a per-viewport number.
+      await expect(promptInput).toHaveAttribute('placeholder', 'Type custom answer here…');
+      // The placeholder has to be READABLE, which is not free: a textarea sizes
+      // to its VALUE, so `overflow-y: hidden` silently clips a placeholder that
+      // wraps, and this is the longest of the three (it wraps in a narrowed
+      // thread pane and at large UI scales). Assert the box is as tall as
+      // rendering the placeholder as a value would need, which holds on every
+      // project rather than pinning a per-viewport number.
       await expect.poll(
         () => promptInput.evaluate(placeholderOverflowPx), { intervals: [200], timeout: 5_000 },
       ).toBe(0);

@@ -1,6 +1,6 @@
 //! Tests for the teardown boundary emit — the per-thread body of
 //! `abort_in_flight_for_restart`'s coding-agent bucket
-//! (`emit_cc_teardown_abort_unless_question_parked`).
+//! (`emit_teardown_abort_unless_question_parked`).
 //!
 //! The invariant under test (decision 7 of
 //! `docs/plans/2026-07-01-new-engine-version-switch-flow.md`): a coding-agent

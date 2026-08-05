@@ -236,19 +236,20 @@ export function computeAnswerActionMode(args: {
 // user's answer to it (the engine reroutes the text as `AnswerKind::FreeText`),
 // so the placeholder says so. Keyed on a pending question card rather than the
 // `waiting_for_user_answer` status, which also covers coding-agent permission
-// cards: those absorb no typed text, so "Type your answer" would be a lie.
+// cards: those absorb no typed text, so inviting an answer there would be a lie.
 //
-// The answering placeholder names BOTH escapes that need no option slot, and it
-// is the only place either is named: the question card used to carry the same
-// sentence as a guide line under its options, a few pixels above this field,
-// which said it twice. Cancel earns its half of the sentence because nothing
-// else spells out what the red button does to a pending question (it stamps it
-// `Canceled` so the user can steer the agent somewhere else). Between the two
-// halves, this is why no agent needs to invent an "Other, I'll type it" option,
-// a card row that would just hand its own label back as the answer.
+// The answering placeholder names the typing escape, and says "custom answer"
+// rather than "your answer" on purpose: it has to read as a peer of the card's
+// options, not as composer chrome the eye skips. It is kept to one short line
+// for the same reason. A longer one wraps to two lines at 125% UI scale in
+// monospace on a phone, and a long line of grey text is the most skipped thing
+// on screen. The other escape is named by the lone Cancel button's tooltip in
+// PromptInput.tsx (`ANSWER_CANCEL_TOOLTIP`). Between the two, nothing on the
+// card needs an "Other, I'll type it" option row, which would just hand its own
+// label back as the answer.
 export const PLACEHOLDER_NEW_THREAD = 'What can I help with?';
 export const PLACEHOLDER_FOLLOW_UP = 'Post a follow up…';
-export const PLACEHOLDER_ANSWERING = 'Type your answer, or Cancel to ask something else.';
+export const PLACEHOLDER_ANSWERING = 'Type custom answer here…';
 
 export function promptPlaceholder(
   hasFocusedThread: boolean,

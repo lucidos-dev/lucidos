@@ -1,6 +1,6 @@
 import type { ComponentChildren } from 'preact';
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { showToast, enginePackaged, tailscaleServeRun } from '../../store/store';
+import { showToast, enginePackaged, tailscaleServeRun, settingsScrollTarget } from '../../store/store';
 import {
   beginTailscaleServeRun,
   clearTailscaleServeRun,
@@ -18,7 +18,6 @@ import {
 } from '../../utils/tauri';
 import { getNetworkConfig } from '../../api/client';
 import type { NetworkConfigResponse } from '../../api/types';
-import { openSettingsSubview } from '../../store/actions/menu';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
@@ -75,7 +74,7 @@ export type LanRowState =
  *  bind serves exactly that IP (plus loopback), so the row shows the bound
  *  IP's URL rather than the detected LAN IP (which may be a different,
  *  unreachable interface). Config-based, same "takes effect after restart"
- *  caveat as Settings → Network access. */
+ *  caveat as the Network access section below it on this page. */
 export function lanRowState(gatewayBind: string, lanIp: string | null, port: number): LanRowState {
   const bind = gatewayBind.trim();
   if (bind === '' || bind === 'loopback') return { kind: 'disabled' };
@@ -464,7 +463,7 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
   if (state.kind === 'same-machine') {
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="mobile-access:steps">
+        <div class="settings-section-title" data-search-anchor="access:steps">
           Getting Lucidos onto another device
         </div>
         <ol class="settings-section-desc" style={{ paddingLeft: '1.25rem', lineHeight: 1.7 }}>
@@ -480,7 +479,7 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
   const title = state.kind === 'ready' ? 'This device is set up' : 'Getting Lucidos onto this device';
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="mobile-access:steps">{title}</div>
+      <div class="settings-section-title" data-search-anchor="access:steps">{title}</div>
       {state.kind === 'needs-https' && (
         <p class="settings-section-desc">
           Tailscale is connected and you are on the right address, but this one is plain{' '}
@@ -498,7 +497,7 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
             running Lucidos.
           </li>
           <li>
-            On that machine, open <strong>Settings → Mobile Access</strong> and copy the{' '}
+            On that machine, open <strong>Settings → Access</strong> and copy the{' '}
             <strong>Tailscale</strong> address it shows. Send it to yourself and open it here.
           </li>
           <li>{install}</li>
@@ -521,7 +520,8 @@ function DeviceStepsSection({ state }: { state: DeviceSetupState }) {
 }
 
 /**
- * Mobile Access settings.
+ * The mobile-access half of Settings -> Access (the network bind is the other
+ * half, rendered after this page by `accessSection`).
  *
  * **Two concerns, and they must not be muddled.** The page answers both, always,
  * in this order:
@@ -705,7 +705,7 @@ export function MobileAccessPage() {
     );
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="mobile-access:urls">Connect URLs</div>
+        <div class="settings-section-title" data-search-anchor="access:urls">Connect URLs</div>
         <p class="settings-section-desc">
           The engine runs as an always-on background service and is reachable at these addresses.
           Open one on another device to use Lucidos from your phone.
@@ -729,7 +729,12 @@ export function MobileAccessPage() {
                 </div>
               </div>
               <div class="list-row-actions">
-                <button class="action-btn" onClick={() => openSettingsSubview('network-access')}>
+                {/* Network access is a section further down THIS page now (both
+                    halves of "reach this engine from elsewhere" live under
+                    Settings → Access), so this scrolls rather than switching
+                    subview. `settingsScrollTarget` drives the scroll-and-mark
+                    effect in SettingsView. */}
+                <button class="action-btn" onClick={() => { settingsScrollTarget.value = 'access:network'; }}>
                   Network access
                 </button>
               </div>
@@ -871,7 +876,7 @@ export function MobileAccessPage() {
       {showMachineHalf && connectUrlsSection()}
 
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="mobile-access:tailscale">Tailscale (recommended)</div>
+        <div class="settings-section-title" data-search-anchor="access:tailscale">Tailscale (recommended)</div>
         <p class="settings-section-desc">
           Tailscale gives your other devices a private, encrypted HTTPS link to the machine
           running Lucidos that works off your home network, which is what enables the installable
@@ -883,14 +888,14 @@ export function MobileAccessPage() {
       </div>
 
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="mobile-access:machine">
+        <div class="settings-section-title" data-search-anchor="access:machine">
           1. The machine running Lucidos
         </div>
         {hostSection()}
       </div>
 
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="mobile-access:device">
+        <div class="settings-section-title" data-search-anchor="access:device">
           2. This device
         </div>
         <DeviceTailscaleRow state={device} />

@@ -269,9 +269,10 @@ const BACKGROUND_PROCESS_RULE: &str = "BACKGROUND PROCESSES DON'T SURVIVE A TURN
 /// the option's LABEL (via `lookup_option_label`), so an "Other, I'll type it"
 /// button hands that literal phrase back as the user's decision. The two real escapes (typing in the prompt
 /// textarea, which routes to the pending question as `FreeText`, and Cancel)
-/// are on every card already and are named to the user by the prompt
-/// textarea's own placeholder while a question is pending
-/// (`PLACEHOLDER_ANSWERING`). Mirrored into [`CODEX_ASK_USER_QUESTION_RULE`] (which
+/// are on every card already and are named to the user by the prompt row:
+/// typing by the textarea's own placeholder while a question is pending
+/// (`PLACEHOLDER_ANSWERING`), Cancel by the Cancel button's tooltip
+/// (`ANSWER_CANCEL_TOOLTIP`). Mirrored into [`CODEX_ASK_USER_QUESTION_RULE`] (which
 /// REPLACES this whole constant for Codex, so the ban must be restated there,
 /// not appended here) and into the chat-side rule + `ask_user_question` tool
 /// description in `llm::tools::misc`; change them together.

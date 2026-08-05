@@ -1,20 +1,11 @@
-/* Steps render as `.inline-step` rows (further down); these two leaf classes
-   are the parts of one. */
+/* Steps render as `.inline-step` rows (further down); this leaf class is a
+   part of one. `.step-context`, its sibling leaf, is defined only in that
+   section: every property of a bare `.step-context` rule here was shadowed by
+   the `.inline-step` one, since the only element carrying the class is inside
+   an `.inline-step` row. */
 .step-icon {
     flex-shrink: 0;
     line-height: 1.4;
-}
-
-.step-context {
-    margin-left: 0.5rem;
-    color: var(--text-muted);
-    font-size: 0.85em;
-}
-
-/* Trimmed = content was cut to fit the budget. A neutral marker, not a
-   caution — nothing is wrong, so --accent-notable rather than --accent-yellow. */
-.step-context.trimmed {
-    color: var(--accent-notable);
 }
 
 
@@ -159,12 +150,21 @@
     content: '\2014\00a0';
 }
 
+/* The context counter is a fixed-width fact, so it never wraps and never
+   shrinks: wrapped, "178k / 1000k (18%)" took three lines on a phone and
+   tripled the height of every step row. The row absorbs the width by
+   ellipsizing the description instead, and on mobile the counter itself is
+   rendered as the percentage alone (`contextLabel`). */
 .inline-step .step-context {
     margin-left: 0.25rem;
     color: var(--text-muted);
     font-size: 0.85em;
+    white-space: nowrap;
+    flex-shrink: 0;
 }
 
+/* Trimmed = content was cut to fit the budget. A neutral marker, not a
+   caution, so --accent-notable rather than --accent-yellow. */
 .inline-step .step-context.trimmed {
     color: var(--accent-notable);
 }

@@ -138,6 +138,7 @@ fn sub_thread_request(child_thread_id: Uuid) -> ThreadQueueRequest {
         model: None,
         reasoning_effort: None,
         pre_emitted_origin: None,
+        origin: None,
     }
 }
 

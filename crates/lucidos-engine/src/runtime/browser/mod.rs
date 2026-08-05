@@ -100,7 +100,13 @@ impl HeadlessBlocklist {
 }
 
 /// Tracks sites the user has logged into via the persistent browser profile.
-/// Included in the system prompt so the LLM knows which sites have active sessions.
+///
+/// Deliberately NOT surfaced to the LLM: the table is populated from whatever
+/// the user's persistent browser profile happens to hold a session for, which
+/// is unfiltered browsing data. The prompt section that listed it was removed
+/// (see the note in `engine::chat::process::system_prompt`, and
+/// `.claude/rules/no-private-data.md`). It exists so `browser_forget_login`
+/// can act on a domain the user names explicitly.
 pub struct BrowserLogins;
 
 impl BrowserLogins {
@@ -140,12 +146,6 @@ impl BrowserLogins {
             .execute(pool)
             .await?;
         Ok(())
-    }
-
-    pub async fn list(pool: &PgPool) -> Result<Vec<(String, String)>, sqlx::Error> {
-        sqlx::query_as("SELECT domain, label FROM browser_logins ORDER BY domain")
-            .fetch_all(pool)
-            .await
     }
 
     pub async fn clear(pool: &PgPool) -> Result<(), sqlx::Error> {

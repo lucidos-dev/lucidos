@@ -156,8 +156,8 @@ pub async fn pipeline_invalidate_for_retry(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::api::hex::hex_lower;
     use crate::api::proxy_auth_layer::*;
-    use crate::api::proxy_hex::hex_lower;
     use axum::http::HeaderName;
     use bytes::Bytes;
     use std::sync::Arc;

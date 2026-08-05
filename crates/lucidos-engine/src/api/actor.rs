@@ -9,8 +9,9 @@
 //! fields up front, then bundle them into a `CallerOrigin` and pass it here.
 //!
 //! Resolution order (mode = `Human`):
-//! 1. **Subprocess origin** (`X-Lucidos-Agent-Origin-Token` header matches the
-//!    per-engine-startup token) → `Api { mode: Agent, source_thread_id }`. A
+//! 1. **Subprocess origin** (`X-Lucidos-Agent-Origin-Token` header carries a
+//!    thread-bound origin token that verifies) → `Api { mode: Agent,
+//!    source_thread_id }`, the thread the token was minted for. A
 //!    Lucidos-spawned subprocess (CC, run_bash, run_python, scheduled script,
 //!    `lucidos` CLI) calling back into the engine is an agent action, never the
 //!    user — stamp honestly so the timeline shows "Lucidos Agent" instead of
@@ -30,9 +31,34 @@
 //! Caller fields are user-controllable — treat as a display hint only,
 //! never for authorization. The subprocess token is process-local secret state
 //! (env-injected) and IS authoritative for "did this request come from a
-//! Lucidos-spawned process". `source_thread_id` from `X-Lucidos-Source-Thread-Id`
-//! is display attribution only: any subprocess can claim any source thread id.
+//! Lucidos-spawned process".
+//!
+//! ## The token is thread-bound, so `source_thread_id` is authenticated
+//!
+//! It did not used to be. The engine minted one token per startup and handed
+//! the same value to every subprocess, then read the thread id off a separate
+//! `X-Lucidos-Source-Thread-Id` header that nothing verified, so the token
+//! proved "a Lucidos subprocess sent this" and nothing about *which thread*.
+//! Any subprocess could claim any source thread id, which made every gate that
+//! reads `source_thread_id` (`api::chat::subprocess_chat_legitimate`,
+//! `api::internal::coding_agent_diff_refresh`,
+//! `engine::cc_permission::resolve_attend_mode`) an accounting boundary rather
+//! than an authorization one.
+//!
+//! Now each spawn gets its own **thread-bound origin token**, minted by
+//! [`mint_agent_origin_token`] and shaped `"<thread-id>.<mac>"` (or
+//! `"-.<mac>"` for a thread-less spawn), where the MAC is over the prefix under
+//! a per-startup secret. [`subprocess_origin`] recomputes and verifies it, and
+//! the **prefix is the source thread id**. There is no second input left to
+//! disagree with the token, so there is no claim left to forge: a subprocess
+//! can only present the token it was handed, and that token names exactly one
+//! thread. The old header is gone.
+//!
+//! A token that does not verify is [`SubprocessOrigin::NotSubprocess`], never a
+//! subprocess with weaker attribution. The failure is a downgrade in
+//! attribution, never an upgrade in reach.
 
+use super::hex;
 use crate::engine::thread_events::{ActorMode, MessageOrigin, ThreadDirection};
 use sqlx::PgPool;
 use std::sync::OnceLock;
@@ -43,40 +69,76 @@ use uuid::Uuid;
 /// Frontend's `json()` helper sets this from `getDeviceId()`.
 pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 
-/// Header forwarded by the `lucidos` CLI carrying the per-engine-startup
-/// token; matched against [`AGENT_ORIGIN_TOKEN`] by [`subprocess_origin`].
+/// Header forwarded by the `lucidos` CLI carrying the thread-bound origin
+/// token; verified against [`AGENT_ORIGIN_SECRET`] by [`subprocess_origin`].
 pub const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
 
-/// Header carrying the spawning thread id when a subprocess calls back into
-/// the engine. Only trusted when paired with a valid
-/// `HEADER_AGENT_ORIGIN_TOKEN`; surfaced as `MessageOrigin::Api.source_thread_id`.
-pub const HEADER_SOURCE_THREAD_ID: &str = "x-lucidos-source-thread-id";
-
-/// Env-var name for the subprocess-origin token. Engine sets it; CLI forwards
-/// it as [`HEADER_AGENT_ORIGIN_TOKEN`]. The CLI mirrors this literal because
-/// it can't depend on the engine crate (no `lucidos-common`); rename the
-/// engine side and the CLI's `crates/lucidos-cli/src/http.rs` constant must
-/// follow in lockstep.
+/// Env-var name for the thread-bound origin token. Engine sets it; CLI
+/// forwards it as [`HEADER_AGENT_ORIGIN_TOKEN`]. The CLI mirrors this literal
+/// because it can't depend on the engine crate (no `lucidos-common`); rename
+/// the engine side and the CLI's `crates/lucidos-cli/src/http.rs` constant must
+/// follow in lockstep. The *value* is opaque to every client (all of them copy
+/// the env var into the header without inspecting it), so its shape can change
+/// without touching the CLI, the Python shim, or a coding-agent session.
 pub const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
 
 /// Env-var name for the spawning thread id. Same engine/CLI mirror rule as
 /// [`ENV_AGENT_ORIGIN_TOKEN`].
+///
+/// This is **not** how the engine learns the source thread: that comes from
+/// the token itself (see the module docs). The variable stays because plenty
+/// of subprocess-side code reads it for its own purposes: the Python runtime
+/// shim, the Codex MCP child config, and `lucidos spawn-thread`'s
+/// `caller_thread_id` default.
 pub const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
 
-/// Per-startup secret. `OnceLock::set` is first-writer-wins, which matches
-/// the production invariant (engine startup writes once); test harnesses
-/// that reboot the engine in the same process keep the first token.
-static AGENT_ORIGIN_TOKEN: OnceLock<String> = OnceLock::new();
+/// Token prefix standing in for "this subprocess has no thread context"
+/// (scheduled scripts). Not a valid uuid, so it can never collide with a real
+/// thread id, and it is signed like any other prefix so a thread-less token
+/// cannot be edited into a thread-bound one.
+const NO_THREAD_PREFIX: &str = "-";
 
-/// Install the per-engine-startup token. Idempotent.
-pub fn init_agent_origin_token(token: String) {
-    let _ = AGENT_ORIGIN_TOKEN.set(token);
+/// Per-startup HMAC key. `OnceLock::set` is first-writer-wins, which matches
+/// the production invariant (engine startup writes once); test harnesses
+/// that reboot the engine in the same process keep the first secret.
+static AGENT_ORIGIN_SECRET: OnceLock<String> = OnceLock::new();
+
+/// Install the per-engine-startup secret. Idempotent.
+pub fn init_agent_origin_secret(secret: String) {
+    let _ = AGENT_ORIGIN_SECRET.set(secret);
 }
 
-/// Read the installed token; `None` before [`init_agent_origin_token`] is
-/// called (no-token path leaves device/api resolution unchanged).
-pub fn agent_origin_token() -> Option<&'static str> {
-    AGENT_ORIGIN_TOKEN.get().map(String::as_str)
+/// A `Hmac<Sha256>` primed with the installed secret and `prefix`; `None`
+/// before [`init_agent_origin_secret`] is called (the no-token path leaves
+/// device/api resolution unchanged).
+///
+/// The single derivation site. Minting finalizes it to hex and verification
+/// hands it the presented bytes, so the two cannot drift into computing
+/// different things.
+fn origin_mac(prefix: &str) -> Option<hmac::Hmac<sha2::Sha256>> {
+    use hmac::Mac;
+    let secret = AGENT_ORIGIN_SECRET.get()?;
+    let mut mac = hmac::Hmac::<sha2::Sha256>::new_from_slice(secret.as_bytes())
+        .expect("HMAC accepts a key of any length");
+    mac.update(prefix.as_bytes());
+    Some(mac)
+}
+
+/// Mint a thread-bound origin token for a subprocess spawned on behalf of
+/// `thread_id` (or with no thread context). `None` before the secret is
+/// installed.
+///
+/// The **only** place a token is constructed. Every subprocess surface reaches
+/// it through [`subprocess_origin_env_vars`], so a new one cannot ship with an
+/// unbound token.
+pub fn mint_agent_origin_token(thread_id: Option<Uuid>) -> Option<String> {
+    use hmac::Mac;
+    let prefix = match thread_id {
+        Some(tid) => tid.to_string(),
+        None => NO_THREAD_PREFIX.to_string(),
+    };
+    let mac = hex::hex_lower(&origin_mac(&prefix)?.finalize().into_bytes());
+    Some(format!("{prefix}.{mac}"))
 }
 
 /// Outcome of subprocess-origin detection. The two-variant shape forces
@@ -94,28 +156,53 @@ pub enum SubprocessOrigin {
     Subprocess { source_thread_id: Option<Uuid> },
 }
 
-/// Detect a request from a Lucidos-spawned subprocess by comparing the
-/// `HEADER_AGENT_ORIGIN_TOKEN` header to the engine-wide token. O(1)
-/// lock-free on the no-token fast path (one `OnceLock::get` + one
-/// `HeaderMap::get`).
+/// Detect a request from a Lucidos-spawned subprocess by verifying the
+/// thread-bound origin token in `HEADER_AGENT_ORIGIN_TOKEN`. Lock-free and
+/// allocation-free on the overwhelmingly common path (a browser request with
+/// no such header): one `HeaderMap::get` and out, without touching the secret.
+/// A request that does present a token costs one split, one hex decode and one
+/// HMAC.
+///
+/// The token's own prefix is the source thread, so nothing about the request
+/// besides the token influences the answer. Anything that fails to verify is
+/// `NotSubprocess`: an unrecognised caller falls through to the ordinary
+/// device/api resolution, which is the right answer for a forger (it holds no
+/// Lucidos-issued credential, so it is an external API caller).
 pub fn subprocess_origin(headers: &axum::http::HeaderMap) -> SubprocessOrigin {
-    let Some(expected) = AGENT_ORIGIN_TOKEN.get().map(String::as_str) else {
-        return SubprocessOrigin::NotSubprocess;
-    };
     let Some(presented) = headers
         .get(HEADER_AGENT_ORIGIN_TOKEN)
         .and_then(|v| v.to_str().ok())
     else {
         return SubprocessOrigin::NotSubprocess;
     };
-    if presented != expected {
+    // `rsplit_once` rather than `split_once`: the MAC is hex and carries no
+    // dot, so the LAST dot is the separator even if a future prefix grows one.
+    let Some((prefix, presented_mac)) = presented.rsplit_once('.') else {
+        return SubprocessOrigin::NotSubprocess;
+    };
+    let (Some(mac), Some(presented_bytes)) = (origin_mac(prefix), hex::hex_decode(presented_mac))
+    else {
+        return SubprocessOrigin::NotSubprocess;
+    };
+    // `verify_slice` is the library's constant-time comparison, which is why
+    // the presented MAC is decoded to bytes rather than compared as hex text.
+    if hmac::Mac::verify_slice(mac, &presented_bytes).is_err() {
         return SubprocessOrigin::NotSubprocess;
     }
-    let source_thread_id = headers
-        .get(HEADER_SOURCE_THREAD_ID)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| Uuid::parse_str(s).ok());
-    SubprocessOrigin::Subprocess { source_thread_id }
+    if prefix == NO_THREAD_PREFIX {
+        return SubprocessOrigin::Subprocess {
+            source_thread_id: None,
+        };
+    }
+    // A verified prefix that is not the sentinel was minted from a `Uuid`, so
+    // this parse only fails if the secret leaked, in which case refusing is
+    // the right answer anyway.
+    match Uuid::parse_str(prefix) {
+        Ok(tid) => SubprocessOrigin::Subprocess {
+            source_thread_id: Some(tid),
+        },
+        Err(_) => SubprocessOrigin::NotSubprocess,
+    }
 }
 
 /// Build the env vars every Lucidos-spawned subprocess receives so the
@@ -126,13 +213,21 @@ pub fn subprocess_origin(headers: &axum::http::HeaderMap) -> SubprocessOrigin {
 /// without origin attribution — which is exactly how the original incident
 /// would re-grow.
 ///
-/// `thread_id = None` produces just the token (scheduled scripts with no
-/// thread context); `Some(tid)` adds the source-thread-id env so callbacks
-/// can deep-link back to the spawning thread.
+/// The token is **bound to `thread_id`**: a subprocess spawned for thread A
+/// receives a token that authenticates as A and as nothing else, which is what
+/// makes `MessageOrigin::Api.source_thread_id` an authenticated fact rather
+/// than a claim. This is the only caller of [`mint_agent_origin_token`], so a
+/// new subprocess surface cannot ship with an unbound token.
+///
+/// `thread_id = None` mints the thread-less token (scheduled scripts with no
+/// thread context) and emits no `LUCIDOS_THREAD_ID`; `Some(tid)` also emits it,
+/// for the subprocess-side consumers that read it directly (the Python shim,
+/// the Codex MCP child config, `lucidos spawn-thread`). The engine itself never
+/// reads it back off a request.
 pub fn subprocess_origin_env_vars(thread_id: Option<Uuid>) -> Vec<(&'static str, String)> {
     let mut vars = Vec::with_capacity(2);
-    if let Some(token) = agent_origin_token() {
-        vars.push((ENV_AGENT_ORIGIN_TOKEN, token.to_string()));
+    if let Some(token) = mint_agent_origin_token(thread_id) {
+        vars.push((ENV_AGENT_ORIGIN_TOKEN, token));
     }
     if let Some(tid) = thread_id {
         vars.push((ENV_SOURCE_THREAD_ID, tid.to_string()));

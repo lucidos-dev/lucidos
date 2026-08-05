@@ -65,6 +65,12 @@ function validateRecents(recents: SearchResultItem[]): SearchResultItem[] {
       case 'threads':
         return threadMap.value.has(item.id);
       case 'settings':
+        // Recents are persisted verbatim, so an id retired by a Settings
+        // restructure outlives the build that had it. `handleSelect` does
+        // `if (!entry) break`, which closes the palette and navigates nowhere:
+        // the same silent dead end the persisted nav stack got
+        // `migrateSettingsSubview` for. Drop the row instead of listing it.
+        return findSettingsEntry(item.id) !== undefined;
       case 'changes':
         return true;
     }

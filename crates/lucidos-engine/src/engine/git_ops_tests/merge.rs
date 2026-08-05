@@ -40,6 +40,67 @@ fn merge_direction_filter_rejects_unrelated_branches() {
     ));
 }
 
+/// The prefix hazard the thread-named branch scheme makes routine: a duplicate
+/// slug gets `-2`, so `…-fix-auth` is a literal prefix of `…-fix-auth-2`. A
+/// substring match would report the FIRST branch as merged when only the second
+/// was, and `apply_change` would then resolve the user's Apply as an
+/// already-applied no-op, silently dropping their commits.
+#[test]
+fn merge_direction_filter_rejects_a_numbered_sibling_branch() {
+    let branch = "lucidos-claude-code-repo-lucidos-fix-auth";
+
+    assert!(!is_merge_of_branch_into_main(
+        "a1b2c3d4 Merge branch 'lucidos-claude-code-repo-lucidos-fix-auth-2'",
+        branch,
+    ));
+    // And the other direction: a merge of the shorter branch is still found
+    // when the longer one exists.
+    assert!(is_merge_of_branch_into_main(
+        "a1b2c3d4 Merge branch 'lucidos-claude-code-repo-lucidos-fix-auth'",
+        branch,
+    ));
+    // The same hazard was already latent under the legacy prefix.
+    assert!(!is_merge_of_branch_into_main(
+        "a1b2c3d4 Merge branch 'claude-code/foobar'",
+        "claude-code/foo",
+    ));
+}
+
+/// Git allows non-ASCII branch names, and an external-repo session can adopt
+/// one. Scanning past an unbounded match must step by a whole character: a
+/// byte-wise step lands mid-codepoint and panics the next slice, taking the
+/// whole apply down.
+#[test]
+fn merge_direction_filter_survives_a_non_ascii_branch_name() {
+    // The first occurrence is left-flanked by `-`, so it is NOT bounded and the
+    // scan has to advance past it.
+    assert!(!is_merge_of_branch_into_main(
+        "a1b2c3d4 Merge branch 'lucidos-é-fix'",
+        "é-fix",
+    ));
+    // A genuinely bounded occurrence of the same name is still found.
+    assert!(is_merge_of_branch_into_main(
+        "a1b2c3d4 Merge branch 'é-fix'",
+        "é-fix",
+    ));
+}
+
+/// The `into <branch>` rejection has to be token-bounded too, or a merge of
+/// main INTO `x-2` would suppress a genuine merge of `x`.
+#[test]
+fn merge_direction_filter_ignores_main_merged_into_a_sibling() {
+    let branch = "lucidos-codex-repo-lucidos-fix";
+
+    assert!(is_merge_of_branch_into_main(
+        "a1b2c3d4 Merge branch 'lucidos-codex-repo-lucidos-fix' into main",
+        branch,
+    ));
+    assert!(!is_merge_of_branch_into_main(
+        "a1b2c3d4 Merge branch 'main' into lucidos-codex-repo-lucidos-fix",
+        branch,
+    ));
+}
+
 /// Finds an out-of-band `--no-ff` merge commit and returns
 /// `(pre = parent1 = old main, post = merge commit)`.
 /// This is the apply_change idempotency fast-path.
@@ -650,19 +711,39 @@ async fn a_timed_out_auto_commit_snapshot_still_excludes_a_concurrent_publish() 
 
 /// The retry is scoped to lock collisions: a command that fails for its own
 /// reasons must come back on the first attempt, not after the full budget.
+///
+/// The ceiling is CALIBRATED against this host, not a fixed millisecond count.
+/// What the retry costs is `INDEX_LOCK_RETRIES` backoffs of sleep plus that many
+/// extra `git` forks, and only the sleep half is predictable: a fork that takes
+/// 90ms on an idle machine took 838ms during a full-suite run (which forks
+/// constantly), so the old flat 500ms bound was measuring fork latency and
+/// failed on load alone. Timing one bare `git_cmd` of the same failing command
+/// first prices a fork here and now, and the assertion rides on that.
 #[tokio::test]
 async fn git_cmd_await_index_lock_does_not_retry_a_real_failure() {
     let (_tmp, repo) = make_test_repo().await;
+    let failing = ["checkout", "-f", "no-such-branch"];
+
+    // One un-retried fork of the identical command: the cost floor.
+    let control_started = std::time::Instant::now();
+    assert!(!git_cmd(&failing, &repo).await.unwrap().status.success());
+    let one_fork = control_started.elapsed();
 
     let started = std::time::Instant::now();
-    let out = git_cmd_await_index_lock(&["checkout", "-f", "no-such-branch"], &repo)
-        .await
-        .unwrap();
+    let out = git_cmd_await_index_lock(&failing, &repo).await.unwrap();
+    let elapsed = started.elapsed();
+
     assert!(!out.status.success());
+    // Burning the budget costs INDEX_LOCK_RETRIES sleeps AND that many more
+    // forks, so it overshoots this by an order of magnitude. Deliberately loose
+    // enough to absorb one slow fork: on a loaded host, fork jitter is larger
+    // than a single 50ms backoff, so no wall-clock bound can tell one stray
+    // retry from none, and pretending otherwise is what made this flake.
+    let ceiling = one_fork * 2 + INDEX_LOCK_RETRIES * INDEX_LOCK_BACKOFF / 2;
     assert!(
-        started.elapsed() < std::time::Duration::from_millis(500),
-        "a non-lock failure must not burn the retry budget, took {:?}",
-        started.elapsed()
+        elapsed < ceiling,
+        "a non-lock failure must not burn the retry budget: took {elapsed:?}, \
+         ceiling {ceiling:?} (one fork measured {one_fork:?})"
     );
 }
 

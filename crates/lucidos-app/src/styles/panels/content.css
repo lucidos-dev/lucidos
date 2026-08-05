@@ -527,6 +527,58 @@
     pointer-events: none;
 }
 
+/* --- Side-by-side diff (original left, changed right) --- */
+
+/* The two columns are siblings in ONE flow, so they scroll vertically together
+   with the `.diff-view` above and stay aligned row for row: `.line-content` is
+   `white-space: pre`, so every row is exactly one line tall on both sides.
+   `align-items: start` keeps a column whose horizontal scrollbar adds height
+   from stretching its neighbour's rows out of step. */
+.side-by-side-diff {
+    display: flex;
+    align-items: start;
+}
+
+/* Each column scrolls HORIZONTALLY on its own (a long line must not widen the
+   other side), but never vertically: that belongs to `.diff-view`, which is
+   what keeps the two in step. `overflow-y: hidden` is required rather than
+   `visible`, which CSS would compute back to `auto` next to a non-visible
+   overflow-x and give each column its own vertical scrollbar. Nothing is
+   actually clipped: the column's height is its content's. */
+.side-by-side-diff-side {
+    flex: 1 1 50%;
+    min-width: 0;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: 0.5rem 0;
+}
+
+.side-by-side-diff-side + .side-by-side-diff-side {
+    border-left: 1px solid var(--border-color);
+}
+
+/* Same tints as the unified view's `.diff-line-addition` / `-deletion`, so the
+   two renderings read as the same diff. */
+.side-by-side-diff-addition {
+    background: color-mix(in srgb, var(--accent-green) 20%, transparent);
+}
+
+.side-by-side-diff-deletion {
+    background: color-mix(in srgb, var(--accent-red) 20%, transparent);
+}
+
+/* A row that only exists to keep the columns aligned: no line, no number, and
+   visibly not part of either file. */
+.side-by-side-diff-filler {
+    background: var(--bg-secondary);
+}
+
+/* The `@@` header sits on both sides, matching `.diff-hunk-header`. */
+.side-by-side-diff-hunk-header {
+    color: var(--text-muted);
+    background: var(--bg-tertiary);
+}
+
 /* --- Rendered diff (markdown with change marks) --- */
 
 .rendered-diff {
@@ -678,6 +730,18 @@
 
 @media (hover: hover) {
     .line-number:hover { color: var(--text-primary); }
+}
+
+/* A column of the side-by-side diff numbers the OLD file on the left and the
+   NEW file on the right, so a click cannot mean one file-level selection. The
+   gutter is inert there (see `LineSelectionMode` in LineNumberedCode.tsx), and
+   must not advertise otherwise. */
+.line-numbered-static .line-number {
+    cursor: default;
+}
+
+@media (hover: hover) {
+    .line-numbered-static .line-number:hover { color: var(--text-muted); }
 }
 
 .line-content {
@@ -872,7 +936,15 @@
 
 .prompt-area {
     position: relative;
-    padding: 0 1.15rem 0.75rem 0.75rem;
+    /* Same horizontal box as the transcript above (.thread-content), which is
+       what lets the composer inside line up with the turn content: the shared
+       --thread-pane-gutter on both sides, plus the scroll gutter the transcript
+       loses on the right (0 on overlay-scrollbar platforms). Keep it symmetric;
+       the old asymmetric 1.15rem right padding also pushed the centered
+       composer half its excess off the transcript's centre line. */
+    padding-left: var(--thread-pane-gutter);
+    padding-right: calc(var(--thread-pane-gutter) + var(--scrollbar-gutter-width));
+    padding-bottom: 0.75rem;
     flex-shrink: 0;
     margin-top: auto;
     /* Dissolve transcript content into the prompt: an opaque base plus a

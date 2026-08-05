@@ -92,8 +92,8 @@ pub(crate) fn repo_root_above(exe: &Path) -> Option<PathBuf> {
 ///
 ///  - startup skips registering the reserved `Lucidos` repository
 ///    (`engine_impl::construction`) — without the gate it would register the
-///    *workspace* dir, because [`crate::git_ops::main_worktree`] falls back to
-///    the cwd;
+///    *workspace* dir, because [`crate::engine::git_ops::main_worktree`] falls
+///    back to the cwd;
 ///  - `/api/v1/health`'s `packaged` flag (`api::history::is_packaged`
 ///    delegates here), which is how the compose destination picker decides to
 ///    hide the "Lucidos source" target;

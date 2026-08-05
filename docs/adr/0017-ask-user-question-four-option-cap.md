@@ -55,8 +55,9 @@ caps options at 4. The cap rides along by design. We keep it rather than diverge
   one returns its *label* as the answer. A meaningful opt-out ("None of these") is
   still a legitimate option; a text-entry escape never was one. The cap itself is
   unaffected, and the escape hatch this bullet relies on is now named by the
-  prompt textarea's placeholder while a question is pending ("Type your answer,
-  or Cancel to ask something else."), which is the field the escape actually is.
+  prompt textarea's placeholder while a question is pending ("Type custom answer
+  here…"), which is the field the escape actually is. Cancel, the other escape
+  that needs no option slot, is named by the prompt row's Cancel tooltip.
 
 ## Consequences
 

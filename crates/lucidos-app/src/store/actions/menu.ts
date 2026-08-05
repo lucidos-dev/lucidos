@@ -105,3 +105,21 @@ export function openBackupSettings(): void {
   pushNavState();
   revealContentPane();
 }
+
+/** Deep-link to Settings → Accounts → Connected accounts and scroll to it.
+ *
+ *  The trip a backup user has to make and previously could not: the Backup page
+ *  has no account UI, so a provider with nothing signed in shows a line pointing
+ *  at Accounts. That line was static prose naming a path, which is a route the
+ *  user has to walk themselves (and one a 2026-08-05 session got wrong by
+ *  naming the Backup page instead). Now it is a link that lands them on the
+ *  section. Mirrors `openProviderSettings`, including the
+ *  `settingsScrollTarget` scroll-and-highlight. */
+export function openConnectedAccountsSettings(): void {
+  setActiveMenu('settings');
+  settingsSubview.value = 'accounts';
+  void loadCredentials();
+  settingsScrollTarget.value = 'accounts:connected';
+  pushNavState();
+  revealContentPane();
+}

@@ -8,7 +8,7 @@ description: Shell command available on PATH for any subprocess Lucidos spawns (
 A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos spawns — Python scripts, bash scripts, coding-agent sessions (Claude Code or Codex). Use it whenever a script needs to:
 
 - write files into the workspace's `data/` directory
-- emit or query domain events on the workspace's event store
+- emit a domain event, or query the workspace's event store (which holds engine thread/system events alongside domain events, and `events query` returns both)
 - list or count *thread summaries* in the workspace — useful for "is anything still running?" gates in triggers
 - spawn a new *thread* — a chat thread, or a *coding-agent thread* on a repo or an app folder (`--cc` for Claude Code, `--codex` / `--coding-agent codex` for Codex, `--folder data/apps/<id>` for app worktrees) — `lucidos spawn-thread`
 - list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
@@ -123,14 +123,24 @@ The CLI prints the server's JSON response on stdout (`{"success": true, "event_i
 
 GET events from the parent workspace's event store. Outputs the raw JSON array on stdout, newest-first.
 
+This reads the **whole** store, not only what the workspace emitted: engine thread and system events (`ChildThreadCompleted`, `ResponseGenerated`, `ChangeApplied`, `TriggerCompleted`) are rows in the same table and come back from the same query. See `system-knowhow/thread-events.md` § "One table, two enums".
+
 ```bash
 $ lucidos events query --type AnalysisCompleted --limit 1 | jq '.[0]'
 {
   "id": "...",
   "event_type": "AnalysisCompleted",
   "payload": { "summary": "UA analysis for ...", "artifact": "artifacts/..." },
-  "created": "2026-04-20T12:00:00Z"
+  "created": "2026-04-20T12:00:00Z",
+  "sequence": 91240
 }
+```
+
+Every row carries `id`, `event_type`, `payload`, `created` and `sequence`. A row that belongs to a thread also carries `thread_id`; domain events omit the key entirely (they are not thread-scoped).
+
+```bash
+# Engine events read the same way. thread_id here is the PARENT thread.
+$ lucidos events query --type ChildThreadCompleted --limit 1 | jq '.[0] | {thread_id, status: .payload.status, child: .payload.child_thread_title}'
 ```
 
 `--since` / `--until` are ISO 8601 (e.g. `2026-04-01T00:00:00Z`). `--limit` is clamped to `1..=1000` server-side, default 100.
@@ -185,7 +195,7 @@ $ lucidos events count --type ToolResult --since 2026-05-18T00:00:00Z
 
 `byte_total` is `SUM(octet_length(payload::text))` — the raw payload byte sum, a reliable proxy for the token cost of a corresponding `lucidos events query` call. Use this before `query` on busy workspaces to budget which types to drill into (the recurring `workspace-learning` recipe failure that motivated this CLI was a `query --type ToolResult --limit 300` call returning 2.3 MB and blowing the next-turn prompt cap).
 
-### `lucidos threads list [--active] [--source <list>] [--limit N]`
+### `lucidos threads list [--active] [--source <list>] [--limit N] [--parent <uuid> | --my-children]`
 
 List thread summaries from the parent workspace. Outputs the raw JSON array on stdout, newest-first by `last_activity`. Each row is a full `ThreadSummary` — the same shape returned by the `list_threads` LLM tool and by `lucidos.threads.list()` in the JS SDK, and the same shape the projection stores in `thread_summaries`.
 
@@ -195,15 +205,22 @@ $ lucidos threads list --active --limit 5 | jq '.[].title'
 "Refactor settings dialog"
 ```
 
-- `--active` restricts to threads where the agentic loop is mid-flow — status `running` or `waiting_for_user_answer`. Status `waiting` is **not** active: it means the coding-agent thread has stopped and proposed changes the user must act on (the loop has paused). Status `failed` is also excluded — the response is over.
+- `--active` restricts to threads where the agentic loop is mid-flow: status `running` or `waiting_for_user_answer`. Status `waiting` is **not** active: it means the coding-agent thread has stopped and proposed changes the user must act on (the loop has paused). Status `failed` is also excluded (the response is over), and so is `paused`: an engine restart interrupted that turn, and it either resumes on its own or waits for the user to click Continue.
 - `--source` is a comma-separated list of `chat`, `trigger`, `coding-agent`. Legacy `claude_code` is also accepted. Omit for all sources.
 - `--limit` clamps to `1..=1000` server-side, default 100.
+- `--parent <uuid>` restricts to that thread's **direct** children only, never its grandchildren. A malformed uuid is a 400, never a silently unfiltered list.
+- `--my-children` is shorthand for `--parent` with the calling thread's own id, read from `$LUCIDOS_THREAD_ID`. Use it to recover a child's `thread_id`, to see which of your children are still working, and to spot one parked on a question. Outside a Lucidos-spawned subprocess it has nothing to resolve to and errors, rather than quietly listing the whole workspace. Pass the two together and the command refuses: one filter, one answer.
+
+```bash
+# Which of my own children are still working, and what are they called?
+$ lucidos threads list --my-children --active | jq -r '.[] | "\(.status)\t\(.title)\t\(.thread_id)"'
+```
 
 Use this from a script that needs to react to thread state — e.g. "is anything still running before I fire this trigger?" — without reconstructing it from raw `query_events`. The projection already tracks per-thread status; the list endpoint is just a read off it.
 
-### `lucidos threads count [--active] [--source <list>]`
+### `lucidos threads count [--active] [--source <list>] [--parent <uuid> | --my-children]`
 
-Count thread summaries matching the same filters as `list`. Outputs `{"count": N}` on stdout.
+Count thread summaries matching the same filters as `list`, including the two child filters. Outputs `{"count": N}` on stdout.
 
 ```bash
 # How many active threads in the workspace?
@@ -217,6 +234,31 @@ $ if [ "$(lucidos threads count --active | jq .count)" -eq 0 ]; then
 ```
 
 Cheaper than materialising the full list just to read `.length` on big workspaces.
+
+### `lucidos threads follow-up --thread <child-uuid> --message <M> [--event-id <E>]`
+
+Send a message to one of **this thread's own child threads**: redirect one going the wrong way, hand it something a sibling learned, or tell a stalled one to continue. This is the *child follow-up* edge, the one privileged cross-thread write. Wraps `POST /api/v1/threads/<child>/follow-up`.
+
+```bash
+# Redirect the child that is taking the wrong approach.
+$ lucidos threads follow-up \
+    --thread 9c1f2b40-... \
+    --message "Skip the CSV path entirely, the source is a live API."
+{"child_thread_id":"9c1f2b40-...","child_title":"Import the sales figures",
+ "delivered_to":"running",
+ "detail":"The child was mid-turn, so this queues behind its current work or steers it."}
+```
+
+The ack prints as raw JSON on stdout, like every other `lucidos threads` subcommand. `child_title` is how you should refer to the child afterwards: a uuid names nothing the user can see.
+
+Four things worth knowing:
+
+- **You can only address your own DIRECT children.** No siblings, no grandchildren, no arbitrary thread. There is no flag for saying who you are: the engine reads the calling thread off the *thread-bound origin token* this subprocess was spawned with, then looks the relationship up from the child's own row. A thread that is not yours is a 403 whatever you claim.
+- **It returns as soon as the message lands, and does not wait for the child.** The child reports back the usual way, as a completion card on its parent. The ack's `delivered_to` says which of three things happened: `running` (the child was mid-turn, so the message queues behind its work or steers it), `waiting-for-user-answer` (parked on a question or permission card, so **a human must answer before it reads this**), or `revived` (it was not working, so a fresh turn starts now). `detail` is the same thing in a sentence.
+- **Address the child by uuid, never by title.** Titles are not unique, and a fuzzy match would silently deliver to the wrong child. Find the id with `lucidos threads list --my-children`. The ack carries `child_title`, so refer to the child by that afterwards rather than by the uuid you typed.
+- **A follow-up consumes no child slot.** The fan-out limit counts threads spawned, not messages sent, so reviving a child you already have is cheaper than spawning another one.
+
+`--event-id` defaults from `$LUCIDOS_EVENT_ID` and stamps the child's message-route panel so the follow-up links back to the originating event.
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--cc | --codex | --coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
 
@@ -527,7 +569,7 @@ List pending and recently-applied *changes*. Wraps `GET /api/v1/changes` and ech
 
 ```bash
 $ lucidos changes list
-{"pending":[{"id":"fbcc4a3a-...","branch_name":"claude-code/...","description":"fix: …","status":"pending",...}],"applied":[...],"total_pending":1,"restart_required":false,"restart_groups":[],"client_update_available":false,"has_more_applied":false}
+{"pending":[{"id":"fbcc4a3a-...","branch_name":"lucidos-claude-code-repo-lucidos-fix-...","description":"fix: …","status":"pending",...}],"applied":[...],"total_pending":1,"restart_required":false,"restart_groups":[],"client_update_available":false,"has_more_applied":false}
 
 # Find the single pending change's id (e.g. in a build → apply pipeline):
 $ CID=$(lucidos changes list | jq -r '.pending[0].id')
@@ -566,7 +608,7 @@ Two 409s are refusals rather than errors, and both name the resolution: the chan
 
 #### Why use the CLI instead of hand-rolled urllib / curl
 
-The CLI auto-forwards two subprocess-origin headers (`x-lucidos-agent-origin-token`, `x-lucidos-source-thread-id`) that the engine reads to stamp the resulting `ChangeApplied` event as `Api { mode: Agent, source_thread_id }`. Without them, the engine falls through to `Api { mode: Human }` and the UI renders the apply card as **"You"** — wrongly attributing an agent action to the user. A `run_python` block that calls `urllib.request.urlopen("https://localhost:.../api/v1/changes/<id>/apply")` will hit this bug because urllib doesn't read the env vars on its own.
+The CLI auto-forwards the subprocess-origin header (`x-lucidos-agent-origin-token`) that the engine reads to stamp the resulting `ChangeApplied` event as `Api { mode: Agent, source_thread_id }`. The token is *thread-bound*: the engine mints one per spawn and reads the spawning thread off the token itself, so one header carries both facts. Without it, the engine falls through to `Api { mode: Human }` and the UI renders the apply card as **"You"**, wrongly attributing an agent action to the user. A `run_python` block that calls `urllib.request.urlopen("https://localhost:.../api/v1/changes/<id>/apply")` will hit this bug because urllib doesn't read the env var on its own.
 
 ```python
 # ❌ Wrong — the User-Agent on the request is "Python-urllib/X.Y" and the UI says "You"
@@ -589,16 +631,20 @@ curl -k -X POST "https://localhost:$LUCIDOS_API_PORT/api/v1/changes/$CID/apply"
 lucidos changes apply "$CID"
 ```
 
-If a script genuinely needs to call the HTTP endpoint directly (test harness, external tool that can't shell out to the CLI), forward both headers explicitly and build the base URL from `$LUCIDOS_API_BASE_URL`:
+If a script genuinely needs to call the HTTP endpoint directly (test harness, external tool that can't shell out to the CLI), forward the token header and build the base URL from `$LUCIDOS_API_BASE_URL`:
 
 ```bash
 curl -k -X POST \
   -H "x-lucidos-agent-origin-token: $LUCIDOS_AGENT_ORIGIN_TOKEN" \
-  -H "x-lucidos-source-thread-id: $LUCIDOS_THREAD_ID" \
   "${LUCIDOS_API_BASE_URL:-https://localhost:$LUCIDOS_API_PORT}/api/v1/changes/$CID/apply"
 ```
 
-Use `$LUCIDOS_API_BASE_URL` (set by the engine on every spawned subprocess) rather than building the URL from `$LUCIDOS_API_PORT` yourself: under the workspace gateway (ADR 0014) the engine binds a **loopback HTTP** port and the user-facing port belongs to the gateway, which routes the workspace under `/<slug>/` — a bare `https://localhost:$LUCIDOS_API_PORT/api/v1/...` request there never reaches the engine (the gateway resolves the first path segment as a workspace slug). `$LUCIDOS_API_BASE_URL` is the exact base the engine answers on (loopback `http://` under the gateway; `https://` self-signed in the legacy single-engine model, which `-k` / `_create_unverified_context()` accepts). The fallback to `$LUCIDOS_API_PORT` covers older engines that predate the var. The token env var is process-local secret state set by the engine on every spawned subprocess; the thread id is set when the subprocess has a spawning thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
+Forward `$LUCIDOS_AGENT_ORIGIN_TOKEN` **verbatim**. It is an opaque
+credential bound to this thread, and rewriting any part of it (in
+particular the thread id in its prefix) makes it fail verification, which
+downgrades the attribution back to "You".
+
+Use `$LUCIDOS_API_BASE_URL` (set by the engine on every spawned subprocess) rather than building the URL from `$LUCIDOS_API_PORT` yourself: under the workspace gateway (ADR 0014) the engine binds a **loopback HTTP** port and the user-facing port belongs to the gateway, which routes the workspace under `/<slug>/`, so a bare `https://localhost:$LUCIDOS_API_PORT/api/v1/...` request there never reaches the engine (the gateway resolves the first path segment as a workspace slug). `$LUCIDOS_API_BASE_URL` is the exact base the engine answers on (loopback `http://` under the gateway; `https://` self-signed in the legacy single-engine model, which `-k` / `_create_unverified_context()` accepts). The fallback to `$LUCIDOS_API_PORT` covers older engines that predate the var. The token env var is process-local secret state set by the engine on every spawned subprocess, minted for that subprocess's own thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
 
 ### `lucidos planned mark (--plan <path> | --simple "<reason>")` / `lucidos planned approve` / `lucidos planned state`
 
@@ -716,7 +762,7 @@ Output is the response body on **stdout**. With `--include`, the status line and
 |---|---|
 | Call a backend the workspace will reuse | `lucidos proxy` (configure once in `apis.json`, then no auth in script) |
 | One-off `curl` to a service the workspace will never reuse | Plain `curl` (no proxy entry needed) |
-| Emit/query domain events | `lucidos events …` |
+| Emit a domain event, or query the event store (domain AND engine events) | `lucidos events …` |
 | Write a file under `data/` | `lucidos data write …` |
 | Push a notification to the user from a script | `lucidos notify --title … --message …` |
 | Find a pending change's id from a script | `lucidos changes list` (read `.pending[].id`; don't scan `ChangeProposed` events) |

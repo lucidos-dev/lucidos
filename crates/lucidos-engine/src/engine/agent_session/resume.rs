@@ -420,6 +420,61 @@ pub(crate) async fn lookup_latest_cc_session_id(
     .filter(|s| !s.is_empty())
 }
 
+/// Event types that reset the transient-API-drop auto-resume budget. Either one
+/// means the thread made real progress since the last drop: the user asked for
+/// something new, or a turn actually completed. Kept as one SQL fragment so
+/// [`api_error_auto_resumes_spent`]'s two halves cannot drift.
+const API_ERROR_BUDGET_RESET_EVENTS: &str = "'MessageReceived', 'ResponseGenerated'";
+
+/// How many `ContinuationRequested{auto_resume_after_api_error}` this thread has
+/// already spent CONSECUTIVELY, i.e. since its last user message or completed
+/// turn. Compared against `lifecycle::MAX_API_ERROR_AUTO_RESUMES` by
+/// `auto_resume_after_api_error`.
+///
+/// The count lives in the events table rather than on the session because each
+/// auto-resume tears the old session down and the continuation spawns a NEW one:
+/// an in-memory counter would reset itself on exactly the transition it is meant
+/// to count, and the loop would be unbounded. Event-sourced also means it
+/// survives an engine restart mid-storm.
+///
+/// A query error yields `MAX_API_ERROR_AUTO_RESUMES`, i.e. "budget spent". An
+/// unknown count must not authorize another spawn: the cost of being wrong that
+/// way is an unbounded resume loop against a broken upstream, while the cost of
+/// the other way is one red dot the user can clear with Continue.
+pub(crate) async fn api_error_auto_resumes_spent(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+    reason: &str,
+) -> i64 {
+    let q = format!(
+        "SELECT COUNT(*) FROM events \
+         WHERE thread_id = $1 \
+           AND event_type = 'ContinuationRequested' \
+           AND payload->>'reason' = $2 \
+           AND sequence > COALESCE(( \
+                 SELECT MAX(sequence) FROM events \
+                 WHERE thread_id = $1 AND event_type IN ({}) \
+               ), 0)",
+        API_ERROR_BUDGET_RESET_EVENTS,
+    );
+    match sqlx::query_scalar::<_, i64>(&q)
+        .bind(thread_id)
+        .bind(reason)
+        .fetch_one(pool)
+        .await
+    {
+        Ok(n) => n,
+        Err(e) => {
+            log!(
+                "[AgentSession] Failed to count api-error auto-resumes for {}: {}. Treating the budget as spent.",
+                thread_id,
+                e
+            );
+            crate::engine::agent_session::lifecycle::MAX_API_ERROR_AUTO_RESUMES
+        }
+    }
+}
+
 /// Claude Code's default config dir when `CLAUDE_CONFIG_DIR` is unset: `$HOME/.claude`.
 ///
 /// Used to record the EFFECTIVE config dir of a fresh session that ran without an

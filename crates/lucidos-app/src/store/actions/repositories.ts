@@ -4,14 +4,17 @@ import {
   repoSelectedChangeId, repoChanges, repoChangesLoadingMore,
   activeMenuItem, repositories, showToast,
   panelOverlay, parseRepoPath, encodeRepoPath, SELECTED_CHANGE_KEY,
-  threadMap, type RepoDiff,
+  threadMap, type RepoDiff, type RepoLocator,
 } from '../store';
 import { listRepoFiles, getChangeDiff, getChangeById, getRepoChanges, getThreadCcDiff, ApiError } from '../../api/client';
 import type { Change, ThreadCcDiff } from '../../api/client';
 import { toFailed, loadedOr, setLoadingIfFresh } from '../types';
 import { openFilePreview } from './artifacts';
 import { revealContentPane } from './pane';
-import { loadRepositories } from './chat';
+// From the module that DEFINES it, not chat.ts's back-compat re-export: the
+// loader was split out of chat.ts precisely so a consumer needn't pull chat's
+// transitive tree (connection, chat-changes, ...) in behind it.
+import { loadRepositories } from './repositoriesLoader';
 import { pushNavState, replaceNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 import { appIdFromFolder } from '../../utils/appIdFromFolder';
@@ -195,7 +198,9 @@ export async function viewChangeDiff(change: Change): Promise<void> {
 export async function loadChangeContext(change: Change): Promise<void> {
   if (repositories.value.status !== 'loaded') await loadRepositories();
   if (repositories.value.status === 'failed') {
-    showToast('Failed to load repositories', 'error');
+    // Carry the reason the Loadable already holds: a bare generic drops the
+    // last link of the error chain (.claude/rules/frontend.md, no hidden errors).
+    showToast(`Failed to load repositories: ${repositories.value.error}`, 'error');
     return;
   }
   const repos = loadedOr(repositories.value, []);
@@ -297,12 +302,15 @@ export function openRepoFilePreview(path: string, mode: 'file' | 'diff'): void {
   // Snapshot before mutating panelOverlay so the push-vs-replace decision
   // sees the *previous* overlay type.
   const replaceInPlace = panelOverlay.value?.type === 'file-preview';
-  const changeId = mode === 'diff' ? repoSelectedChangeId.value ?? undefined : undefined;
+  // No `ref` on the file locator: the panel is bound to one repository, so
+  // `RepoFilePreview` reads its files at that repository's pending coding-agent
+  // branch. Naming a ref here is for callers from OUTSIDE the panel, which have
+  // no such binding to fall back on.
+  const locator: RepoLocator = mode === 'diff'
+    ? { repoId, mode, changeId: repoSelectedChangeId.value ?? undefined, path }
+    : { repoId, mode, path };
   selectedLines.value = null;
-  panelOverlay.value = {
-    type: 'file-preview',
-    path: encodeRepoPath(repoId, mode, path, changeId),
-  };
+  panelOverlay.value = { type: 'file-preview', path: encodeRepoPath(locator) };
   revealContentPane();
   if (replaceInPlace) replaceNavState();
   else pushNavState();
@@ -325,13 +333,12 @@ export function openRepoFilePreview(path: string, mode: 'file' | 'diff'): void {
  *  open B's on click. `switchRepoSource` wipes repoDiff/repoPending/repoFiles
  *  synchronously, so the stale sidebar is gone before the overlay mounts.
  *  Already on that repo → keep the user's change selection (mirrors
- *  `loadChangeContext`). Either way the line selection is dropped, as
- *  `openRepoFilePreview` does, so a prior file's highlighted range can't leak
- *  onto this one. */
+ *  `loadChangeContext`). Either way the line selection is dropped, so a prior
+ *  file's highlighted range can't leak onto this one; that clearing lives in
+ *  `openFilePreview` below, which every path out of here goes through. */
 export function openEncodedRepoFilePreview(encoded: string): boolean {
   const parsed = parseRepoPath(encoded);
   if (!parsed) return false;
-  selectedLines.value = null;
   if (repoSource.value !== parsed.repoId) void switchRepoSource(parsed.repoId);
   openFilePreview(encoded);
   return true;
@@ -355,7 +362,9 @@ export async function viewThreadCcDiff(threadId: string): Promise<void> {
 
   if (repositories.value.status !== 'loaded') await loadRepositories();
   if (repositories.value.status === 'failed') {
-    showToast('Failed to load repositories', 'error');
+    // Carry the reason the Loadable already holds: a bare generic drops the
+    // last link of the error chain (.claude/rules/frontend.md, no hidden errors).
+    showToast(`Failed to load repositories: ${repositories.value.error}`, 'error');
     return;
   }
 

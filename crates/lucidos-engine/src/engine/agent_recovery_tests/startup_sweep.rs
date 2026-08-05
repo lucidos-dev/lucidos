@@ -926,5 +926,3 @@ mod switch_classification {
         teardown_test_db(&db_name).await;
     }
 }
-
-// -- end_stale_waiting_session branch-deletion regression ----------------------

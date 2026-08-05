@@ -71,6 +71,36 @@ where
     }
 }
 
+/// Race a **read-only** future against the per-thread cancel token, yielding
+/// `None` when the token wins. The turn's setup phase (history load, query
+/// classification, memory retrieval, system-prompt and context assembly) uses
+/// this so a user Stop ends the turn from wherever it is, instead of only at
+/// the agentic loop's pre-iteration check. On a large thread that setup is tens
+/// of seconds, and every one of them was spent with the UI stuck on
+/// "Canceling…" (see
+/// `docs/plans/2026-08-04-chat-stop-honored-during-turn-setup.md`).
+///
+/// **Only wrap a pure read.** Losing the race DROPS the inner future, so a call
+/// that emits an event, writes the DB, or touches the filesystem must never go
+/// through here: it would be torn down half-done with no record. That is the
+/// difference from `run_tool_with_cancel` above, which deliberately returns an
+/// `Err` outcome rather than nothing precisely so its caller can still emit the
+/// paired `ToolResult`.
+///
+/// `biased` for the same reason `run_tool_with_cancel` needs it: an
+/// instantly-ready future must not win against an already-cancelled token, or a
+/// Stop leaks one more phase of work.
+pub(crate) async fn until_canceled<F>(cancel_token: &CancellationToken, fut: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    tokio::select! {
+        biased;
+        _ = cancel_token.cancelled() => None,
+        v = fut => Some(v),
+    }
+}
+
 #[derive(Debug)]
 pub(crate) enum InjectedPromptGroup {
     UserText(Vec<InjectedPrompt>),
@@ -713,10 +743,29 @@ pub(crate) fn match_sentinel(text: &str) -> Option<SentinelMatch> {
         let after = &text[prefix.len()..];
         let rel_start = after.find('{')?;
         let payload = after[rel_start..].to_string();
+        let mut redacted_text = redacted.map(str::to_string);
+        // Name the credential the modal is collecting. The redaction hides the
+        // payload, so without this the model knows a modal opened but not what
+        // it stores, and has to guess: on 2026-08-05 `connect_oauth_account`
+        // reopened a modal because the client had been saved under `dropbox`
+        // instead of `oauth:dropbox`, and the agent narrated a theory rather
+        // than the fact. The service name is engine-authored (see
+        // `oauth::client_service_name`), not user text.
+        if prefix == CREDENTIAL_REQUEST_PREFIX {
+            if let Some(service) = serde_json::from_str::<serde_json::Value>(&payload)
+                .ok()
+                .and_then(|v| v["service"].as_str().map(str::to_string))
+                .filter(|s| !s.is_empty())
+            {
+                if let Some(t) = redacted_text.as_mut() {
+                    t.push_str(&format!(" It saves the credential as \"{service}\"."));
+                }
+            }
+        }
         return Some(SentinelMatch {
             label,
             event: ctor(payload),
-            redacted_text: redacted.map(str::to_string),
+            redacted_text,
         });
     }
     None
@@ -1135,7 +1184,7 @@ pub(crate) const NON_TOOL_ROUND_SLACK: usize = 100;
 pub(crate) fn tool_call_cap_message(max_tool_calls: usize) -> String {
     format!(
         "[ENGINE-LIMIT] Per-turn limit of {} tool calls reached. Send any message to continue \
-         from here, or raise the limit in [Settings](settings) under Models, Chat & Triggers, \
+         from here, or raise the limit in [Settings](settings) under Models, Chat & triggers, \
          Max tool calls.",
         max_tool_calls
     )

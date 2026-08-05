@@ -7,7 +7,7 @@
 use crate::support::{unique_marker, workspace_path};
 use std::process::Command;
 
-fn lucidos_bin() -> std::path::PathBuf {
+pub(crate) fn lucidos_bin() -> std::path::PathBuf {
     // Integration tests live at target/<profile>/deps/<test-binary>. The
     // sibling `lucidos` CLI binary sits at target/<profile>/lucidos. We can
     // find it by walking up two directories from the current test executable.

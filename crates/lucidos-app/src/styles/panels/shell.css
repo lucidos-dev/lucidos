@@ -331,8 +331,15 @@
     /* The base .thread-content padding reserves room past the top/prompt fades
        for a focus marker; neither applies to the compact welcome (mask killed,
        no scroll), so drop back to a tight padding instead of the large fade
-       clearance. */
-    padding: 0.5rem 0.75rem 0.75rem;
+       clearance. The horizontal inset still has to match `.prompt-area`'s so the
+       welcome lines up with the composer directly below it, scroll gutter
+       included: `overflow: visible` here means the base rule's
+       `scrollbar-gutter: stable` reserves nothing, so add it explicitly. */
+    padding:
+        0.5rem
+        calc(var(--thread-pane-gutter) + var(--scrollbar-gutter-width))
+        0.75rem
+        var(--thread-pane-gutter);
 }
 
 .compose-empty .prompt-area {
@@ -366,6 +373,45 @@
 .content-pane-body:focus,
 .content-pane-body:focus-visible {
     outline: none;
+}
+
+/* The content-pane navigation cover: an opaque theme surface that every
+   arriving content-pane view fades in from. Generalises `.app-ui-cover`
+   (panels/previews.css), which did the same for an app open; the difference is
+   what ends it. The app cover waits on the frame's `load` because it is hiding
+   a document the host does not author, while this one is purely the switch
+   frame and clears on its own animation. Mounted keyed by ContentPane.tsx,
+   which says why it is a cover rather than a fade on the content.
+
+   Named a cover, never a "reveal": `revealContentPane()` is an established and
+   entirely different thing in this pane (swipe to it on mobile, focus its pane
+   group on desktop), and one word for two mechanisms is drift. Every other
+   surface that hides a not-yet-ready view is a cover too (`.app-ui-cover`, the
+   quiet boot cover).
+
+   z-index over `.content-pane-body`, and far below `--z-app-fullscreen`: a
+   fullscreen app must not be covered by the pane it escaped. */
+.content-nav-cover {
+    position: absolute;
+    inset: 0;
+    z-index: 1;
+    background: var(--bg-primary);
+    pointer-events: none;
+    animation: content-nav-cover-clear var(--duration-normal) ease-out forwards;
+}
+
+@keyframes content-nav-cover-clear {
+    from { opacity: 1; }
+    to { opacity: 0; }
+}
+
+/* No animation, and transparent from the first frame: the element is still
+   mounted for NAV_COVER_MS, so it must not be visible while it waits. */
+@media (prefers-reduced-motion: reduce) {
+    .content-nav-cover {
+        animation: none;
+        opacity: 0;
+    }
 }
 
 

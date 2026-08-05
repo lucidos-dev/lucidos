@@ -410,9 +410,13 @@ function reconcileApplyingNow(pending: Change[], applied: Change[]): void {
  *  noise. The engine is reachable via SSE (which keeps the list live) and the next
  *  runResumeSync re-syncs; the connection dot (connection.ts, debounced ~20s) is
  *  the honest sustained-outage surface, so a per-fetch toast here is just noise.
- *  A TimeoutError that survives the retry still surfaces — that's the stronger
- *  "waited the full window and got nothing" signal. Mirrors `refreshThreadEvents`
- *  (thread-loading.ts). */
+ *  A TimeoutError that survives the retry still surfaces: that's the stronger
+ *  "waited the full window and got nothing" signal, and this is ONE request per
+ *  wake, so the deadline really is evidence about the endpoint. Mirrors
+ *  `loadUnreadNotifications`. It deliberately no longer mirrors the two
+ *  per-thread event fetches (thread-loading.ts): those are fanned out one
+ *  request per loaded thread, so a single outage fires every deadline at once
+ *  and they treat a timeout as transient. */
 export function refreshChangesState(): void {
   apiFetchChanges({ limit: 15 })
     .catch(e => {
@@ -466,7 +470,8 @@ export function refreshChangesState(): void {
       // the view to a failed state) — the next runResumeSync re-syncs, SSE keeps
       // the list live while connected, and the connection dot is the honest
       // sustained-outage surface. A TimeoutError still surfaces (see the retry
-      // doc above). Mirrors `refreshThreadEvents`.
+      // doc above), which is where this parts company with the per-thread event
+      // fetches: theirs are a fan-out, so a timeout says nothing about them.
       if (isAbortError(e) || isTransportError(e)) return;
       changes.value = toFailed<Change[]>(e);
       appliedChanges.value = toFailed<Change[]>(e);

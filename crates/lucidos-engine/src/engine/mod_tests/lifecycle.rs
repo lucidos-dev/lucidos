@@ -520,5 +520,3 @@ async fn idle_wait_exits_on_token_cancel() {
         .unwrap();
     assert_eq!(result, "token_cancelled");
 }
-
-// --- Injection channel tests ---

@@ -248,7 +248,7 @@ describe('Phantom thread prevention', () => {
 
   it('ChildrenCountChanged with section flip applies the section change', () => {
     // Regression guard for the broken-short-circuit bug: when a CC child fires
-    // ResponseFailed/ResponseCanceled after callback_already_sent, the backend
+    // ResponseFailed/ResponseCanceled once parent_callback_pending is FALSE, the backend
     // calls update_parent_after_child_terminal(decrement=false, surface_to_inbox=true)
     // — counts stay equal but archive_state flips to 'inbox'. Earlier short-
     // circuit would have dropped the section change. With the cleaner targeted

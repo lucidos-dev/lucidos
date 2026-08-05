@@ -1,6 +1,6 @@
 ---
 name: Backups
-description: How Lucidos backs up a workspace — what's included (workspace files + .git + a database dump, NOT ~/.lucidos), the encrypted-archive pipeline, the schedule (a cron expression in the USER'S timezone), and how the agent reads status with get_backup_status and changes the schedule/provider/retention with set_preference. Covers the encryption key (auto-generated, must be stored to restore), retention/pruning, run history + duration, staleness, and that restore happens from the workspace picker (not the engine). Load when the user asks about backups — "when's my next/last backup", "how big/long are backups", "back up to Dropbox", "change the backup time", "is my backup stale".
+description: How Lucidos backs up a workspace, what's included (workspace files + .git + a database dump, NOT ~/.lucidos), the encrypted-archive pipeline, the schedule (a cron expression in the USER'S timezone), and how the agent reads status with get_backup_status and changes the schedule/provider/retention with set_preference. Covers which Settings page owns which half (the backup itself is Settings → System → Backup; the provider ACCOUNT is connected only in Settings → Accounts, never on the Backup page), that setting backup_provider connects nothing on its own, which scopes each provider needs (Dropbox needs four, permitted in its App Console first, and a reconnect after any change there), the encryption key (auto-generated, must be stored to restore), retention/pruning, run history + duration, staleness, and that restore happens from the workspace picker (not the engine). Load when the user asks about backups: "when's my next/last backup", "how big/long are backups", "back up to Dropbox", "change the backup time", "is my backup stale".
 ---
 
 # Backups
@@ -47,22 +47,83 @@ The schedule, provider, and retention are ordinary agent-settable preferences:
 | Key | Value | Meaning |
 |---|---|---|
 | `backup_schedule` | a 6-field cron, or `off` | When automatic backups run (user's timezone). `off` disables them. |
-| `backup_provider` | `google_drive` \| `dropbox` | Where to upload. The account must be connected in Settings → System → Backup (OAuth). |
+| `backup_provider` | `google_drive` \| `dropbox` | Where to upload. The account itself is connected in **Settings → Accounts**, not here. |
 | `backup_retention` | `1`–`50` | How many recent backups to keep; older ones are pruned after each success. |
 
 Set them with `set_preference` — e.g. `set_preference(key="backup_schedule",
 value="0 0 3 * * *")` then `set_preference(key="backup_provider",
 value="google_drive")`. The change re-registers the schedule immediately (no
-restart). Enabling a schedule with no connected provider will let backups run but
-the upload fails until the user connects the provider in Settings → System →
-Backup.
+restart). Enabling a schedule with no connected account will let backups run but
+the upload fails.
+
+## Where each half is configured (do not mix these up)
+
+Two different Settings pages own two different halves, and telling the user the
+wrong one is the single most common way this flow goes wrong:
+
+| What | Where | What lives there |
+|---|---|---|
+| **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the encryption key, and a health card (last run, last cloud backup, staleness). |
+| **The provider account** | **Settings → Accounts** | The *Connected accounts* list. This is the ONLY place a Google / Dropbox account is connected, and the only place its OAuth app registration is stored. |
+
+The Backup page has no account UI at all. It shows a red line linking to
+Settings → Accounts when the selected provider has no connected account. So:
+
+- Never tell the user to "connect Dropbox in Settings → System → Backup". There
+  is nothing to connect there and they will not find it.
+- Setting `backup_provider` does NOT connect anything. Check
+  `get_backup_status` after setting it: it reports whether that provider's
+  account is connected, and backups are not actually working until it says so.
+- If it is not connected, connect it yourself with `connect_oauth_account`
+  (see `system-knowhow/oauth-providers.md`), or send the user to
+  Settings → Accounts. Do not report the setup as complete before then.
+
+## What each provider's account needs
+
+A connected account is not automatically a *working* account: it also has to
+carry the scopes the backup uses. The Backup page reports that as its own state
+(connected but not ready) and offers **Grant access**, which re-runs the
+authorization with the right scopes. `get_backup_status` reports the same thing.
+
+**Google Drive** needs `https://www.googleapis.com/auth/drive.file`. A Google
+account connected for calendar or mail alone will not upload.
+
+**Dropbox** needs four scopes, and one extra step nothing else in Lucidos has:
+
+| Scope | Used for |
+|---|---|
+| `files.content.write` | Creating the backups folder, uploading, pruning old backups |
+| `files.content.read` | Downloading an archive when restoring |
+| `files.metadata.read` | Listing backups, which drives pruning and the health card |
+| `account_info.read` | Naming the connected account |
+
+The extra step: **the Permissions tab of the user's app in the Dropbox App
+Console has to permit each of those first**, because an authorization request can
+only narrow what the console allows, never widen it. And **enabling a permission
+there does not change an account that is already connected**: the existing token
+and grant keep the scopes they were issued with, so after changing the console
+the user must reconnect (Settings → Accounts, or *Grant access* on the Backup
+page). A token refresh will not do it, since refreshing renews the scopes the
+token already has.
+
+So when a Dropbox backup fails with *"does not have the required scope
+'files.content.write'"*, the fix is both halves in order: enable the permissions
+in the App Console, then reconnect. Telling the user only to tick the box leaves
+them looking at the same error.
+
+While you are there: a Dropbox client registration also needs
+`authorize_params: token_access_type=offline`, or the connection carries no
+refresh token and stops working within hours. See
+`system-knowhow/oauth-providers.md`.
 
 ## Reading status — `get_backup_status`
 
 Call **`get_backup_status`** (read-only, no arguments) to report:
 
 - the schedule + the **next** scheduled run (computed in the user's timezone),
-- the provider and retention,
+- the provider and retention, **and whether that provider's account is
+  connected** (the upload leg fails until it is, so treat a not-connected
+  verdict as "backups are not set up yet"),
 - the **last** run with its **duration** and (on success) filename + size,
 - a **recent run history** (start/finish/size for each — the durable record lives
   in the `BackupCompleted` / `BackupFailed` events),

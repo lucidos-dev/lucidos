@@ -1,5 +1,5 @@
 //! Handler for the `manage_repositories` tool: the agent-facing path to the
-//! registered-repository registry (Settings → Repositories). Wraps
+//! registered-repository registry (Settings → Coding Agents). Wraps
 //! `RepositoryStore` and emits the same `Repository{Added,Removed}` events the
 //! HTTP CRUD does (`api::repositories`), so the durable `repo_names` projection
 //! stays current and every open client refreshes its repository list over SSE

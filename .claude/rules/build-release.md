@@ -63,7 +63,7 @@ artifact**, and that is the complete list of what belongs there:
 | workflow | fires on | verifies |
 |---|---|---|
 | `install-smoke.yml` | push to `rc/**`, a `dmg_tag` dispatch (the RC draft gate, ADR 0036), `release: prereleased/released/published`, manual, weekly + daily cron | clean-machine `install.sh`, the notarized DMG, the tarball install, the live `lucidos.dev` front door (Linux + both macOS architectures) including its advertised **uninstall** paths, the RC front door's payloads, and **route parity between the two front doors** |
-| `release-tarballs.yml` | `v*` tag push, `release: published`, manual | the per-triple headless tarball build |
+| `release-tarballs.yml` | `v*` tag push, manual | the per-triple headless tarball build, and attaching it to that tag's release (still a DRAFT at the time) |
 
 **Nothing in there DEPLOYS, and that is a second rule, not a coincidence of the
 first.** Publishing to a `lucidos.dev` origin runs on the maintainer's machine off
@@ -293,7 +293,13 @@ until 06:21. Three faults in one shape, and all three are now covered:
   It polls the tarball **and** its `.sha256` (install.sh's checksum step is
   mandatory and fails closed, so a missing sidecar is just as fatal) with a
   one-byte range request, `FD_ASSET_POLL_SECS: '30'`, bounded by
-  `FD_ASSET_WAIT_SECS: '1800'`. The URL is what install.sh will really fetch: the
+  `FD_ASSET_WAIT_SECS: '300'`. **That budget stopped being a wait for a build on
+  2026-08-04**: a release is now created as a DRAFT and published only once
+  `release-tarballs.yml` has attached all four tarballs, so this absorbs CDN
+  propagation and nothing else. It was 1800 s, then 3600 s for one day (after
+  v0.21.0's Intel tarball landed 3m33s past the old ceiling), both sized for an
+  attach window that no longer exists. `front_door_gate_test.sh` caps it at
+  900 s so re-inflating it reds a test rather than a release. The URL is what install.sh will really fetch: the
   version comes from rung 1's parse of the **served** installer's baked
   `LUCIDOS_DEFAULT_VERSION` (what a piped run resolves, since no checkout means
   no adjacent `RELEASE`), the base URL is **derived** from the served
@@ -303,8 +309,13 @@ until 06:21. Three faults in one shape, and all three are now covered:
   its payloads to a stable `$RUNNER_TEMP/front-door-payloads` instead of a
   `mktemp -d`, so the preflight consumes what it already fetched rather than
   asking the origin a second time.
-- **Expiry fails fast**, naming both URLs and the `release-tarballs` window, and
-  never reaches the gateway poll.
+- **Expiry fails fast**, naming both URLs and `release-tarballs`, and never
+  reaches the gateway poll. Its wording is now the opposite advice: a PUBLISHED
+  release missing an asset is a fault rather than a race, so the message says
+  the release is complete by construction and names the two real causes (it was
+  published with `--allow-missing-tarballs`, or the asset was removed). The
+  drift test pins that, because "wait longer" was correct under the old
+  ordering and is misdirection under this one.
 - **`assert_no_download_failure`** joins `assert_no_html_payload` inside both
   health polls, matching install.sh's own asset-fetch aborts (`Download failed:`
   and the checksum-sidecar one, not the checksum *mismatch*, which is a
@@ -315,11 +326,11 @@ until 06:21. Three faults in one shape, and all three are now covered:
   (next block). A URL it cannot parse a version from falls through to the plain
   wording, so the branch renames a failure and never invents one.
 - **`timeout-minutes` is 75**, not 30: the ceiling has to exceed the budgets it
-  contains, and 1800 + 900 + 900 s of slack is 3600. The convergence budget in
-  the next block can stack on top of the preflight's (a lagging POP is exactly a
-  POP whose release is new enough for the tarballs to still be attaching), which
-  puts the worst case at 600 + 1800 + 900 + 900 = 4200 s, still inside the
-  4500 s ceiling. `front_door_gate_test.sh` does that arithmetic over all three
+  contains, and 300 + 900 + 900 s of slack is 2100. The convergence budget in
+  the next block can stack on top of the preflight's, which puts the worst case
+  at 600 + 300 + 900 + 900 = 2700 s, well inside the 4500 s ceiling. It went
+  30 -> 75 when the preflight arrived, 75 -> 105 while the preflight's own
+  budget was an hour, and back to 75 with that hour. `front_door_gate_test.sh` does that arithmetic over all three
   budgets rather than restating it.
 
 **The job's TWO fetches of `install.sh` are pinned to ONE release
@@ -533,7 +544,11 @@ Pure helpers are offline-tested by `scripts/lib/stage_runtime_test.sh`. The `luc
 
 **Headless tarball — Linux + macOS unsigned (`build-headless.sh`).** The Tauri-free build path (step 2 of `docs/plans/2026-06-30-installer-step2-linux-tarball.md`). Runs the shared staging for the **host** triple — no `cargo tauri build`, no `.app`, no DMG, no codesigning — then reuses `headless_tarball_emit` for the same `lucidos-<version>-<triple>.tar.gz` + `.sha256`. On **Linux** this is THE release build path; on **macOS** it produces an UNSIGNED tarball (use `build-dmg.sh --emit-tarball` for the signed one). It compiles natively, so `--triple` must equal the host — cross-arch artifacts come from the CI matrix's per-arch runners. Flags: `--triple`, `--out-dir` (default `.lucidos/release-staging/<version>/`), `--version` (default RELEASE → tauri.conf.json → 0.0.0), `--check`. Offline-tested by `scripts/lib/build_headless_test.sh`.
 
-**Linux tarballs via CI (`.github/workflows/release-tarballs.yml`).** A `workflow_dispatch` + `v*`-tag-`push` matrix over the four target triples (`x86_64-unknown-linux-gnu` is the must-work entry; macOS x86_64 + Linux aarch64 are best-effort; `fail-fast: false`). Each entry runs `build-headless.sh` on a **native** runner — the Linux entries INSIDE an `ubuntu:22.04` container (the **glibc 2.35 floor**: a binary built on the raw 24.04 runner image refuses to start on Ubuntu 22.04 / Debian 12 / RHEL 9 with `GLIBC_2.3x not found`, and the same-machine tarball-smoke can't see it), guarded by an "Assert portability floor" step that fails the build if any staged binary references a `GLIBC`/`GLIBCXX`/`CXXABI` symbol version above that floor. Every entry uploads the tarball + `.sha256` as a **workflow artifact**. It never creates or tags a Release — but the "attach to an existing Release" step **does fire automatically** for a PUBLISHED, non-prerelease Release (`rc-<version>` prereleases are excluded by the `prerelease == false` guard, so the RC gate never sees these), which is what makes `install.sh`'s default download path work at all: `release.sh --publish-verified` cuts the Release with the DMG, and this run ADDS the Linux + macOS headless tarballs to it **~30 min later**. That lag is user-visible — a `curl … | sh` started inside the window 404s — so the installer's failure message names it first. A manual `workflow_dispatch` with `attach_to_release=true` (+ `attach_tag`, or a tag ref) is the backfill arm. Upload goes through the raw GitHub REST API with `curl`, NOT `gh release upload`: the Linux matrix entries run inside the `ubuntu:22.04` container, which has no `gh`.
+**Linux tarballs via CI (`.github/workflows/release-tarballs.yml`).** A `workflow_dispatch` + `v*`-tag-`push` matrix over the four target triples (`x86_64-unknown-linux-gnu` is the must-work entry; macOS x86_64 + Linux aarch64 are best-effort; `fail-fast: false`). Each entry runs `build-headless.sh` on a **native** runner, with the Linux entries INSIDE an `ubuntu:22.04` container (the **glibc 2.35 floor**: a binary built on the raw 24.04 runner image refuses to start on Ubuntu 22.04 / Debian 12 / RHEL 9 with `GLIBC_2.3x not found`, and the same-machine tarball-smoke can't see it), guarded by an "Assert portability floor" step that fails the build if any staged binary references a `GLIBC`/`GLIBCXX`/`CXXABI` symbol version above that floor. Every entry uploads the tarball + `.sha256` as a **workflow artifact**, and then ATTACHES them to the release carrying the pushed tag. It never creates or tags a Release.
+
+**The TAG PUSH is what attaches, and the release it attaches to is a DRAFT (2026-08-04).** There used to be a third trigger, `release: types: [published]`, and it produced the whole problem: the Release went public with only the DMG, that publish event started a SECOND full build of the same four tarballs (v0.21.0 ran 30926097107 on the tag push and 30926100020 on the release event, two seconds apart), and the tarballs landed 11 to 35 minutes later. Inside that window the advertised `curl … | sh` genuinely 404s. Now `release-to-lucidos.sh` creates the Release as a draft, this run attaches to it, and the publish waits for all four (ADR 0042, and Phase B under "the release candidate IS the published artifact" below). The `release:` trigger is gone: it cannot start the build any more (a draft fires no webhook) and keeping it would mean publishing the draft kicked off a duplicate 35-minute build that re-attached over files already there. A manual `workflow_dispatch` with `attach_to_release=true` (+ `attach_tag`, or a tag ref) is the backfill arm, and it is what `release_draft_wait_for_assets` dispatches when a run finishes having attached nothing.
+
+**Finding the release needs a LISTING, not the tag endpoint.** `GET /repos/{owner}/{repo}/releases/tags/{tag}` does not resolve a DRAFT (a draft has no tag ref), so the step pages `GET /releases` and matches `tag_name`, which also means `permissions: contents: write` is load-bearing for READING: GitHub lists drafts only to a caller with push access. Two refusals keep the rc gate out of it: a resolved tag beginning `rc-`, and a release whose `prerelease` is true. Upload goes through the raw GitHub REST API with `curl`, NOT `gh release upload`: the Linux matrix entries run inside the `ubuntu:22.04` container, which has no `gh`. Offline-tested by `scripts/lib/release_tarballs_gate_test.sh`, which also asserts the matrix triples equal `release_draft_triples` so a platform cannot be added to one and silently missed by the other.
 
 **The macOS headless tarballs on a Release are the UNSIGNED CI ones**, including the one a Mac's `curl … | sh` downloads. `build-dmg.sh`'s upload attaches exactly the DMG + `Lucidos.app.tar.gz` + `.sig` + `latest.json`, and `release.sh` never passes `--emit-tarball`, so the local SIGNED headless tarball exists as a capability but is never attached to anything.
 
@@ -618,8 +633,13 @@ empty strings and skip the parent half in silence. Then
 `release-to-lucidos.sh --promote-rc <sha> --parent <sha>` re-asserts the
 unmoved rc, re-scans that commit's tree (the deterministic floor at the
 irreversible push), and pushes **that same object** to the mirror's `main`
-under a lease + tags it `v<version>` **by SHA**, attaches the staged artifacts,
-and the rc branch + draft release are deleted.
+under a lease + tags it `v<version>` **by SHA**, creates the GA Release as a
+**DRAFT**, attaches the staged artifacts, WAITS for `release-tarballs.yml` to
+attach the four per-platform tarballs, publishes the draft and only then emits
+`LucidosReleased`; the rc branch + rc draft release are deleted afterwards. That
+wait is where a release now spends 25 to 45 minutes, and it is resumable:
+nothing is public while it runs, so an interrupted one costs
+`release.sh --publish-draft <version>` and no rebuild (ADR 0042).
 
 The legacy one-shot (`release.sh <version>`, no phase flag) still builds its own
 tree from HEAD through the same lib and has no rc gate; it resolves its parent
@@ -902,7 +922,7 @@ Banner + changelog-section text live in `scripts/lib/release_notes.sh` — **one
 
 **Port resolution (idempotent; port is changeable).** Pinned `--port P`: use P if free or already this instance's, else **fail closed** (a foreigner holds it). Bare on an existing instance: reuse its recorded `<data>/port`. Bare on a NEW instance: auto-pick the first free port from 5252 up (stepping around a running `.app`). After registering, a **health check** polls `http(s)://localhost:<port>/~/api/v1/health` (`LUCIDOS_HEALTH_TIMEOUT`, default 120s; `curl -k`, scheme follows the TLS opt-in) and fails loud with a logs hint if it never answers.
 
-**TLS opt-in (`--tls-cert`/`--tls-key`, env `LUCIDOS_TLS_CERT`/`LUCIDOS_TLS_KEY`).** Both-or-neither, files must exist (fail closed). When supplied, the pairs are appended to the service/foreground env (`service_tls_env_pairs`) so the bundled gateway serves **https** — which is what gives a NON-localhost device a secure context (service worker, PWA install, web push all require one; plain http limits them to localhost). Works with `tailscale cert` / mkcert / CA certs. Engines still never see `LUCIDOS_TLS_*` (the gateway strips them — it terminates TLS, ADR 0014), and `restart_via_gateway` tolerates the scheme mismatch via `peer_scheme_order()`. Remote reachability is separate (`--bind` below, or Settings → System → Network access; loopback-only default unchanged). Like provider creds, TLS is baked from THAT run's flags — a re-run without them reverts the service to plain http.
+**TLS opt-in (`--tls-cert`/`--tls-key`, env `LUCIDOS_TLS_CERT`/`LUCIDOS_TLS_KEY`).** Both-or-neither, files must exist (fail closed). When supplied, the pairs are appended to the service/foreground env (`service_tls_env_pairs`) so the bundled gateway serves **https**, which is what gives a NON-localhost device a secure context (service worker, PWA install, web push all require one; plain http limits them to localhost). Works with `tailscale cert` / mkcert / CA certs. Engines still never see `LUCIDOS_TLS_*` (the gateway strips them: it terminates TLS, ADR 0014), and `restart_via_gateway` tolerates the scheme mismatch via `peer_scheme_order()`. Remote reachability is separate (`--bind` below, or Settings → Access → Network access; loopback-only default unchanged). Like provider creds, TLS is baked from THAT run's flags: a re-run without them reverts the service to plain http.
 
 **macOS CLT preflight (download / from-tarball paths).** `install.sh` probes `xcode-select -p` on Darwin and **warns (never dies)** when the Command Line Tools are absent: chat works, but coding agents / Apply / `run_python` shell out to git + python3, whose `/usr/bin` shims error until CLT is installed. The engine mirrors this at boot (`git_preflight` + `python_preflight` in `main.rs`, warn-only) and startup-augments its own process PATH with the common user-install bin dirs (`core::user_path::augment_process_path` — Homebrew, `/usr/local/bin`, `~/.local/bin`, npm-global; dedupe ⇒ no-op on a dev shell PATH) so bare-name tools (`claude`/`codex` fallbacks, chat bash/python shell-outs, stdio MCP servers) resolve under the launchd minimal PATH exactly as in dev. Agent children additionally get the bundled `LUCIDOS_PG_BIN_DIR` PATH-prepended (`spawn_env::agent_path_prefixes`) so the advertised bare `psql -c '…'` works inside coding-agent threads on a packaged install, mirroring what `workspace_script_env_vars` already did for chat bash/python tools.
 
@@ -959,4 +979,4 @@ the bug, which is why the original one did not catch it.
 
 **Env/flags:** `--name`/`LUCIDOS_INSTANCE`, `--version`/`LUCIDOS_VERSION`, `--base-url`/`LUCIDOS_RELEASE_BASE_URL` (default `https://github.com/lucidos-dev/lucidos/releases/download/v<version>`), `--prefix`/`LUCIDOS_PREFIX`, `--port`/`LUCIDOS_PORT` (default 5252), `--bind`/`LUCIDOS_BIND`, `--tls-cert`/`LUCIDOS_TLS_CERT` + `--tls-key`/`LUCIDOS_TLS_KEY` (https opt-in), `--no-service`/`LUCIDOS_NO_SERVICE`, `--force`/`LUCIDOS_FORCE`, `--no-launch`/`LUCIDOS_NO_LAUNCH`, `--uninstall`/`--list`/`--all`/`--purge`, `LUCIDOS_HEALTH_TIMEOUT`, `LUCIDOS_LAUNCHD_TIMEOUT` (macOS, default 30s: how long an unload waits for a booted-out job to actually leave the domain). Provider creds (`OPENAI_API_KEY`/`VERTEX_PROJECT_ID`/`VERTEX_REGION`) are exported into the foreground gateway and **baked into the service env (mode 600)** when supplied. The env-as-flag contract means a dev shell that exports `LUCIDOS_TLS_CERT/KEY` (every engine-spawned subprocess does) silently configures TLS on a manual install run; the offline test suites `unset` them.
 
-**Caveat (the ~30 min attach window):** every published Release carries the four per-platform tarballs, but `release-tarballs.yml` attaches them **after** the Release is cut, so a default download of a brand-new version 404s until it lands — the failure message names that window first and offers `--version <older>` / `--dev` / `--from-tarball`. Offline-tested by `scripts/lib/install_test.sh` (download/extract path) and `scripts/lib/service_test.sh` (service.sh pure helpers + the foreground/degrade/register/uninstall wiring, all faked — no real launchd/systemd).
+**Every published Release carries the four per-platform tarballs, at the moment it becomes visible (2026-08-04).** `release-tarballs.yml` attaches them to the release while it is still a DRAFT, and the publish waits for all four, so the old ~30 minute window in which a brand-new version 404s is gone. `download_failed` no longer names it and now names the causes that remain: a platform that was never published (a release cut with `--allow-missing-tarballs`, or an asset removed since), or the network. Offline-tested by `scripts/lib/install_test.sh` (download/extract path) and `scripts/lib/service_test.sh` (service.sh pure helpers + the foreground/degrade/register/uninstall wiring, all faked, with no real launchd or systemd).

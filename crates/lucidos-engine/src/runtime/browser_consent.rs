@@ -587,14 +587,18 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
                 });
             }
 
-            // Debug: return info about what's in this frame
+            // Debug: return info about what's in this frame.
+            // origin + pathname, never location.href: the query string and
+            // fragment of a frame the agent happens to be on can carry an
+            // OAuth `code` / `access_token` / `id_token`, and this value goes
+            // straight into an engine log line below.
             const bodyText = (document.body?.innerText || '').substring(0, 200);
             const buttonCount = document.querySelectorAll('button').length;
             return JSON.stringify({
                 debug: true,
                 bodyPreview: bodyText.replace(/\n/g, ' ').substring(0, 100),
                 buttonCount: buttonCount,
-                url: location.href
+                url: location.origin + location.pathname
             });
         })()
         "#;
@@ -603,14 +607,15 @@ async fn find_consent_button_in_frames(page: &Page) -> Option<(f64, f64, String)
     for &idx in &frame_indices {
         let frame_id = &frame_ids[idx];
         let frame_url = &frame_urls[idx];
+        // Drop the query string and fragment before logging: an OAuth callback
+        // frame carries `code` / `access_token` / `id_token` there, and the
+        // 60-char cap is a length guard, not redaction (a short host leaves the
+        // token well inside it). The origin + path is all the log needs.
+        let logged_url = frame_url.split(['?', '#']).next().unwrap_or(frame_url);
         log!(
             "[BrowserConsent] Searching frame {}: {}",
             idx,
-            if frame_url.len() > 60 {
-                &frame_url[..frame_url.floor_char_boundary(60)]
-            } else {
-                frame_url
-            }
+            &logged_url[..logged_url.floor_char_boundary(60)]
         );
         // Use Runtime.evaluate with the frame's context
         // We need to get the execution context for this frame

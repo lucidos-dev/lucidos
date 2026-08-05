@@ -6,11 +6,13 @@ use crate::engine::agent_session::prompts::{
     conflict_resolution_system_prompt, external_repo_recovery_system_prompt,
     external_repo_system_prompt, recovery_system_prompt, worktree_system_prompt,
 };
-use crate::engine::agent_session::spawn::{resolve_branch_for_resume, BranchResolution};
+use crate::engine::agent_session::spawn::{
+    resolve_branch_for_resume, BranchResolution, FreshBranch,
+};
 use crate::engine::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use crate::engine::git_ops::{
     add_paths_to_worktree_exclude, catchup_with_main, install_coding_agent_diff_hook,
-    resolve_worktree_base, worktree_add, worktree_current_branch,
+    resolve_worktree_base, worktree_add, worktree_current_branch, BranchScope,
 };
 use crate::engine::LucidosEngine;
 use std::path::{Path, PathBuf};
@@ -101,6 +103,10 @@ impl LucidosEngine {
         is_app_spawn: bool,
         is_external_repo: bool,
         external_repo_name: Option<String>,
+        // The registered repository's name, for the `repo-<name>` branch scope.
+        // `None` for an app spawn (apps aren't in the registry) and for an
+        // unregistered Lucidos source checkout.
+        repo_name: Option<String>,
         workspace_name: &str,
         repo_root: &std::path::Path,
         repo_id: &Option<String>,
@@ -178,23 +184,41 @@ impl LucidosEngine {
             // Normal mode: create an isolated worktree.
             // If resuming an idle session, reuse the previous branch (preserving its changes)
             // instead of creating a fresh branch that starts empty.
+            //
+            // A fresh branch is named for its thread:
+            // `lucidos-<agent>-<app|repo>-<name>-<slug>`. The scope segment is
+            // the app id for an app coding-agent thread and the registered
+            // repository's name otherwise, so `git branch -a` is greppable by
+            // what the thread works on. A resumed branch keeps whatever name it
+            // was born with, including the legacy `claude-code/*` shape.
+            let thread_name = self
+                .event_store
+                .thread_display_title(thread_id)
+                .await
+                .unwrap_or_default();
+            let scope = match app_spawn_id {
+                Some(ref app_id) => BranchScope::App(app_id.clone()),
+                None => BranchScope::Repo(
+                    repo_name.unwrap_or_else(|| BranchScope::LUCIDOS_REPO.to_string()),
+                ),
+            };
             let BranchResolution {
-                mut branch_name,
+                branch_name,
                 reusing_branch,
                 resume_session_id: validated_sid,
-            } = resolve_branch_for_resume(repo_root, resume_session_id, resume_branch.as_deref())
-                .await;
+            } = resolve_branch_for_resume(
+                &FreshBranch {
+                    repo_root,
+                    agent: coding_agent,
+                    scope,
+                    thread_name: &thread_name,
+                    thread_id,
+                },
+                resume_session_id,
+                resume_branch.as_deref(),
+            )
+            .await;
             resume_session_id = validated_sid;
-            // App coding-agent threads use a different branch shape so a
-            // `git branch -a` on the workspace git is greppable by app id.
-            // Only override fresh branches; resumed branches keep their
-            // existing name (which already encodes the app id from the
-            // first spawn).
-            if is_app_spawn && !reusing_branch {
-                if let Some(ref app_id) = app_spawn_id {
-                    branch_name = crate::engine::git_ops::generate_app_branch_name(app_id);
-                }
-            }
 
             // Caller-supplied worktree path wins over branch-based lookup —
             // see the `resume_worktree_path` parameter doc. The validity check
@@ -306,7 +330,7 @@ impl LucidosEngine {
                             // (e.g. `git checkout -b feature-1234`). Adopt it
                             // when its history contains our last commit.
                             // Internal threads keep the strict refusal so
-                            // Apply has a stable claude-code/<id> branch.
+                            // Apply has a stable engine-named branch.
                             let adopted = if is_external_repo {
                                 crate::engine::agent_session::external_edits::try_adopt_renegade_branch(
                                     existing,
@@ -362,7 +386,7 @@ impl LucidosEngine {
 
             // Resolve the base ref the new worktree branches from. NEVER `HEAD`
             // for a Lucidos-source spawn: a shared checkout parked on an
-            // unrelated in-flight `claude-code/*` branch would otherwise leak
+            // unrelated in-flight `lucidos-*` branch would otherwise leak
             // that branch's commits into this thread as phantom "pending
             // changes". External repos keep the origin-or-HEAD contract.
             let worktree_base_branch = resolve_worktree_base(repo_root, is_external_repo).await;

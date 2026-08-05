@@ -8,10 +8,33 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 /// Allow/deny matrix for a subprocess-originated chat POST. Allowed:
-/// `lucidos spawn-thread` (`mode = Agent|Engine`, `parent_thread_id == source`)
-/// and same-thread follow-up (`target_thread_id == source`). Denied: any
-/// `mode = Human` (agents never claim user identity) and cross-thread agent
-/// posts (the original incident shape).
+/// `lucidos spawn-thread` (`mode = Agent|Engine`, `parent_thread_id == source`,
+/// and the target does not exist yet) and same-thread follow-up
+/// (`target_thread_id == source`). Denied: any `mode = Human` (agents never
+/// claim user identity) and cross-thread agent posts (the original incident
+/// shape).
+///
+/// `source_thread_id` is authenticated: it comes off the thread-bound origin
+/// token, which a subprocess cannot re-point at another thread (see
+/// `api::actor`). Before that binding, both allowing arms were forgeable and
+/// this whole matrix was accounting rather than authorization.
+///
+/// ## Why the spawn arm also requires a target that does not exist
+///
+/// `parent_matches_source` says "I am spawning a child". Nothing in the
+/// *parent* claim constrains the *target*, so without the `!target_exists`
+/// conjunct a subprocess in thread S could post into ANY existing thread by
+/// naming it as the target and naming itself as the parent. That is the same
+/// cross-thread injection the `target_matches_source` arm refuses, reached
+/// through the other arm, and it is the last route by which an authenticated
+/// subprocess could write into a thread it does not own. It would also make
+/// `POST /threads/:thread_id/follow-up`'s refusal ladder bypassable: a caller
+/// refused there could post the same message here.
+///
+/// `lucidos spawn-thread` is unaffected. It generates a fresh client-side uuid
+/// and sends it with `parent_thread_id`, so the target provably does not
+/// exist (`crates/lucidos-cli/src/spawn_thread.rs`, and
+/// `spawn_thread_with_a_pregenerated_id_is_still_allowed` below).
 ///
 /// Pure function — unit-testable without booting a router.
 pub(crate) fn subprocess_chat_legitimate(
@@ -19,6 +42,7 @@ pub(crate) fn subprocess_chat_legitimate(
     source_thread_id: Option<Uuid>,
     target_thread_id: Option<Uuid>,
     parent_thread_id: Option<Uuid>,
+    target_exists: bool,
 ) -> bool {
     let target_matches_source = target_thread_id.is_some() && target_thread_id == source_thread_id;
     let parent_matches_source = match (parent_thread_id, source_thread_id) {
@@ -27,7 +51,47 @@ pub(crate) fn subprocess_chat_legitimate(
     };
     match mode {
         ActorMode::Human => false,
-        ActorMode::Agent | ActorMode::Engine => target_matches_source || parent_matches_source,
+        ActorMode::Agent | ActorMode::Engine => {
+            target_matches_source || (parent_matches_source && !target_exists)
+        }
+    }
+}
+
+/// Announce every orphan in `batch` as `UserPromptInjected`, anchored on the
+/// batch's first message (the turn the re-process runs under).
+///
+/// The batch is announced WHOLE, not `[1..]`, and two things ride on that.
+///
+/// **The projection.** An orphan's `MessageReceived` was persisted before the
+/// terminator that ended the previous turn, so the re-process passes
+/// `PreEmittedOrigin::EngineReentry` and emits no starter event. That leaves
+/// `UserPromptInjected` as the only event in the whole re-processed turn whose
+/// lifecycle rule is `StatusRule::Set(ThreadStatus::Running)`. Skipping the
+/// first orphan therefore left a thread that was actively working projected
+/// `idle` for the entire turn: the user saw a finished-looking thread that
+/// silently produced an answer a minute later.
+///
+/// **The timeline.** The client absorbs a UPI into the `MessageReceived` it
+/// names via `injected_message_id` (so no duplicate panel renders) and
+/// re-anchors that exchange to the ingestion point. Without the first orphan's
+/// UPI, a follow-up that arrived before a `ResponseCanceled` stayed ABOVE the
+/// cancel boundary and rendered "Done ✓" while it was the turn being worked on.
+///
+/// See `docs/plans/2026-08-04-chat-stop-honored-during-turn-setup.md`.
+async fn announce_orphan_batch(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    batch: &[InjectedPrompt],
+) {
+    let Some(first) = batch.first() else {
+        return;
+    };
+    let base_meta = EventMeta {
+        request_event_id: first.event_id,
+        ..EventMeta::NONE
+    };
+    for orphan in batch {
+        crate::engine::emit_user_prompt_injected_event(bus, thread_id, &base_meta, orphan).await;
     }
 }
 
@@ -62,19 +126,7 @@ pub(crate) async fn process_orphan_chain(
 
             let (text, images, mode, spawning_event_id, origin_event_id) =
                 if matches!(&first.kind, crate::engine::InjectedPromptKind::UserText) {
-                    let base_meta = crate::engine::thread_events::EventMeta {
-                        request_event_id: first.event_id,
-                        ..crate::engine::thread_events::EventMeta::NONE
-                    };
-                    for orphan in orphans.iter().skip(1) {
-                        crate::engine::emit_user_prompt_injected_event(
-                            &engine.event_bus,
-                            thread_id,
-                            &base_meta,
-                            orphan,
-                        )
-                        .await;
-                    }
+                    announce_orphan_batch(&engine.event_bus, thread_id, &orphans).await;
                     (
                         crate::engine::coalesced_user_text_for_reprocess(&orphans),
                         crate::engine::coalesced_images_for_reprocess(&orphans),
@@ -173,15 +225,20 @@ fn resolve_file_ctx(
     file_context: Option<&super::FileContext>,
     repo_file_context: Option<&super::RepoFileContext>,
 ) -> Option<String> {
-    file_context.map(|ctx| ctx.path.clone()).or_else(|| {
-        repo_file_context.map(|ctx| {
-            if let Some((start, end)) = ctx.lines {
-                format!("[repo:{}] {}:{}-{}", ctx.repo_id, ctx.path, start, end)
-            } else {
-                format!("[repo:{}] {}", ctx.repo_id, ctx.path)
-            }
+    file_context
+        .map(|ctx| match ctx.lines {
+            Some((start, end)) => format!("{}:{}-{}", ctx.path, start, end),
+            None => ctx.path.clone(),
         })
-    })
+        .or_else(|| {
+            repo_file_context.map(|ctx| {
+                if let Some((start, end)) = ctx.lines {
+                    format!("[repo:{}] {}:{}-{}", ctx.repo_id, ctx.path, start, end)
+                } else {
+                    format!("[repo:{}] {}", ctx.repo_id, ctx.path)
+                }
+            })
+        })
 }
 
 /// Parsed spawn / caller UUIDs returned by `validate_mode_and_spawn`.
@@ -550,6 +607,35 @@ pub(super) async fn chat_submit(
     // Parse target thread id up front so the subprocess gate can see it.
     let target_thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
 
+    // The target's projection row, read ONCE and used twice: the subprocess
+    // gate needs to know whether the target already exists (see
+    // `subprocess_chat_legitimate`), and the mode/repo continuity lock further
+    // down needs the rest of the columns. Reading it here rather than there is
+    // what lets the gate run before any work happens; the continuity check
+    // stays exactly where it was and just stops issuing its own query.
+    //
+    // Keyed on `target_thread_id`, the id the CALLER named. The continuity
+    // check's `thread_id` is the same value in every case that can match a
+    // row: it is `target_thread_id` outright on two branches, and on the app
+    // branch it is `target_thread_id.unwrap_or_else(Uuid::new_v4)`, whose
+    // fresh uuid can never be in `thread_summaries` anyway.
+    let existing_thread_row: Option<(String, String, Option<String>, Option<String>)> =
+        match target_thread_id {
+            Some(tid) => sqlx::query_as(
+                "SELECT state, source, cc_repo_id, coding_agent \
+                 FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(tid)
+            .fetch_optional(state.engine.pool())
+            .await
+            .map_err(|e| {
+                log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?,
+            None => None,
+        };
+    let thread_exists = existing_thread_row.is_some();
+
     // Subprocess gate — see `subprocess_chat_legitimate` for the matrix.
     // Skipped on the cross-workspace path: those requests have their own
     // origin contract (Workspace variant) and don't route through the
@@ -563,13 +649,15 @@ pub(super) async fn chat_submit(
                 source_thread_id,
                 target_thread_id,
                 parent_thread_id,
+                thread_exists,
             ) {
                 log!(
-                    "[Chat] Rejecting subprocess chat POST: mode={:?}, source_thread={:?}, target_thread={:?}, parent_thread={:?}",
+                    "[Chat] Rejecting subprocess chat POST: mode={:?}, source_thread={:?}, target_thread={:?}, parent_thread={:?}, target_exists={}",
                     mode,
                     source_thread_id,
                     target_thread_id,
-                    parent_thread_id
+                    parent_thread_id,
+                    thread_exists
                 );
                 return Err(StatusCode::FORBIDDEN);
             }
@@ -909,36 +997,27 @@ pub(super) async fn chat_submit(
     // races the debounced PUT; reading the lagged source as authoritative
     // here surfaces as a 409 ("Thread is locked to X mode") on Send. The
     // lock only applies once the thread has actually been sent.
-    let mut thread_exists = false;
-    if let Some(tid) = thread_id {
-        let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
-            "SELECT state, source, cc_repo_id, coding_agent FROM thread_summaries WHERE thread_id = $1",
-        )
-        .bind(tid)
-        .fetch_optional(state.engine.pool())
-        .await
-        .map_err(|e| {
-            log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
+    //
+    // The row itself was read above, before the subprocess gate, which needed
+    // `thread_exists`. Only the check lives here.
+    if let (Some(tid), Some((state_str, source, existing_repo, existing_agent))) =
+        (thread_id, existing_thread_row)
+    {
+        let existing_state = ThreadState::from_db_str(&state_str).map_err(|e| {
+            log!("[Chat] thread_summaries.state for {} invalid: {}", tid, e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
-        thread_exists = row.is_some();
-        if let Some((state_str, source, existing_repo, existing_agent)) = row {
-            let existing_state = ThreadState::from_db_str(&state_str).map_err(|e| {
-                log!("[Chat] thread_summaries.state for {} invalid: {}", tid, e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
-            if !existing_state.can_change_mode() {
-                if let Err((sc, msg)) = validate_thread_continuity(
-                    Some(&source),
-                    existing_repo.as_deref(),
-                    existing_agent.as_deref(),
-                    use_coding_agent,
-                    repo_id.as_deref(),
-                    coding_agent,
-                ) {
-                    log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
-                    return Err(sc);
-                }
+        if !existing_state.can_change_mode() {
+            if let Err((sc, msg)) = validate_thread_continuity(
+                Some(&source),
+                existing_repo.as_deref(),
+                existing_agent.as_deref(),
+                use_coding_agent,
+                repo_id.as_deref(),
+                coding_agent,
+            ) {
+                log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
+                return Err(sc);
             }
         }
     }

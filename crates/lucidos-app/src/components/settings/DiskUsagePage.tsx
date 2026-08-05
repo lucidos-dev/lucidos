@@ -249,13 +249,13 @@ function WorktreeRowView({
           {' '}
           {title}
         </div>
+        {/* Four FIELDS, separated by `.list-row-details`' own 0.75rem flex gap.
+            No manual "·" glue: each dot would be its own anonymous flex item
+            and pick the gap up on both sides, double-spacing the row. */}
         <div class="list-row-details">
           <span data-tooltip={row.worktree_path}>{formatBytes(row.size_bytes)}</span>
-          {' · '}
           <span data-tooltip="Share of total worktree disk usage">{pct}%</span>
-          {' · '}
           <span>{last}</span>
-          {' · '}
           <StatusBadge row={row} />
         </div>
       </div>

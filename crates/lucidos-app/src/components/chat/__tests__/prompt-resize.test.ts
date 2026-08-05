@@ -176,18 +176,18 @@ describe('resizeTextarea', () => {
 
   // A textarea sizes to its VALUE, so an empty box measures one line however
   // long the placeholder is, and the composer's `overflow-y: hidden` clips the
-  // rest. The answering placeholder is a whole sentence and wraps at phone
-  // widths, in a narrowed thread pane, and at large UI scales.
+  // rest. The answering placeholder is the longest of the three, so it wraps in
+  // a narrowed thread pane and at large UI scales where the others do not.
   it('grows an empty box to fit a placeholder that wraps', () => {
     const el = createMockTextarea({ minHeight: 36, maxHeight: 400, contentHeight: 36, value: '' });
-    withPlaceholder(el, 'Type your answer, or Cancel to ask something else.', () => 56);
+    withPlaceholder(el, 'Type custom answer here…', () => 56);
     resizeTextarea(el);
     expect(el.style.height).toBe('56px');
   });
 
   it('ignores the placeholder once the field carries a value', () => {
     const el = createMockTextarea({ minHeight: 36, maxHeight: 400, contentHeight: 36, value: 'ok' });
-    withPlaceholder(el, 'Type your answer, or Cancel to ask something else.', () => 56);
+    withPlaceholder(el, 'Type custom answer here…', () => 56);
     resizeTextarea(el);
     expect(el.style.height).toBe('36px');
   });
@@ -202,7 +202,7 @@ describe('resizeTextarea', () => {
     resizeTextarea(el);
     expect(el.style.height).toBe('36px');
 
-    needed = 56; // a question arrives: the placeholder is now a whole sentence
+    needed = 56; // a question arrives: the placeholder is now the longer one
     expect(resizeTextarea(el)).toBe(false);
     expect(el.style.height).toBe('36px');
 
@@ -213,7 +213,7 @@ describe('resizeTextarea', () => {
   it('remeasures back down when the question is answered', () => {
     const el = createMockTextarea({ minHeight: 36, maxHeight: 400, contentHeight: 36, value: '' });
     let needed = 56;
-    withPlaceholder(el, 'Type your answer, or Cancel to ask something else.', () => needed);
+    withPlaceholder(el, 'Type custom answer here…', () => needed);
     resizeTextarea(el);
     expect(el.style.height).toBe('56px');
 

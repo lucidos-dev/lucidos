@@ -18,7 +18,7 @@ export const PANE_TRANSITION_MS = 300;
 /** Pause between releasing a divider and the snap-to-minimum/hidden
  *  animation, so the layout visibly settles where the user dropped it
  *  before correcting itself. */
-export const SNAP_DELAY_MS = 400;
+const SNAP_DELAY_MS = 400;
 
 /** While a divider drag is live. CSS keys off this to disable the header /
  *  drawer geometry transitions so all three panels and their header regions
@@ -139,7 +139,7 @@ let snapAnimateTimer: ReturnType<typeof setTimeout> | null = null;
  *  repeated calls (a held keyboard-resize chord) reset the timer instead of
  *  stacking removals — an earlier call's removal must not fire mid-way
  *  through the latest call's transition and cut it short. */
-export function triggerSnapAnimate() {
+function triggerSnapAnimate() {
   const container = document.querySelector('.split-layout') as HTMLElement | null;
   if (!container) return;
   container.classList.add('snap-animate');

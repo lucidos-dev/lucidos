@@ -912,8 +912,12 @@ impl LucidosEngine {
                 .await
                 .map_err(|e| format!("glob_files task panicked: {}", e))?;
                 match result {
+                    // The `Error:` prefix is load-bearing: `lift_legacy_string`
+                    // keys the ToolResult success bit off it, so a message that
+                    // merely starts with "Error " would reach the model stamped
+                    // as a SUCCESSFUL call.
                     Ok(r) => Ok(serde_json::to_string(&r)
-                        .unwrap_or_else(|e| format!("Error serializing result: {}", e))),
+                        .unwrap_or_else(|e| format!("Error: serializing glob result: {}", e))),
                     Err(e) => Ok(format!("Error: {}", e)),
                 }
             }
@@ -957,8 +961,9 @@ impl LucidosEngine {
                 .await
                 .map_err(|e| format!("grep_files task panicked: {}", e))?;
                 match result {
+                    // Same `Error:` prefix contract as `glob_files` above.
                     Ok(r) => Ok(serde_json::to_string(&r)
-                        .unwrap_or_else(|e| format!("Error serializing result: {}", e))),
+                        .unwrap_or_else(|e| format!("Error: serializing grep result: {}", e))),
                     Err(e) => Ok(format!("Error: {}", e)),
                 }
             }

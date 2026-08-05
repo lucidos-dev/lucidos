@@ -8,9 +8,10 @@
  *    decisive "is it JS re-render or DOM layout?" signal.
  *  - Long tasks: fallback duration when LoAF is unavailable.
  *
- * Quiet by default — only logs at/above the thresholds, so a snappy workspace
- * stays silent. No `import.meta.env.DEV` gate: `web-dev.sh`
- * serves a production-style `vite build` where DEV is false.
+ * Quiet by default: past one activation banner at startup, it logs only
+ * at/above the thresholds, so a snappy workspace produces no further lines. No
+ * `import.meta.env.DEV` gate: `web-dev.sh` serves a production-style
+ * `vite build` where DEV is false.
  *
  * PERMANENT debug tooling (not a temporary measure). Built for the `click-lag`
  * investigation (resolved 2026-06-30 — see docs/temporary-measures.md), but

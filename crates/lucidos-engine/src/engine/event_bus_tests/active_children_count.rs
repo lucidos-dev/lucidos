@@ -193,10 +193,10 @@ async fn test_cc_child_session_ended_without_idle_decrements_parent() {
 /// Regression: a CC sub-thread that fails its agentic loop emits
 /// `ResponseFailed` *and then* `CodingAgentIdled` in rapid succession.
 /// Before this fix, ResponseFailed went through the `should_callback` path
-/// (which marks `parent_callback_sent = true`) but NOT the `should_decrement`
+/// (which clears `parent_callback_pending`) but NOT the `should_decrement`
 /// path, so the parent's `active_children_count` stayed at 1. The follow-up
 /// `CodingAgentIdled` then early-returned via the dedup guard
-/// (`is_coding_agent && callback_already_sent && CodingAgentIdled`) and never
+/// (`is_coding_agent && !parent_callback_pending && CodingAgentIdled`) and never
 /// got a chance to decrement either. Result: the parent pulses as "waiting
 /// for children" indefinitely even though no child is actually running.
 #[tokio::test]
@@ -508,17 +508,17 @@ async fn test_cc_user_message_re_increments_parent_after_idle() {
 /// re-increment. Sequence:
 ///
 ///   1. CC child idles → `notify_parent_if_child` decrements parent to 0 and
-///      sets `parent_callback_sent=TRUE` on the child.
+///      clears `parent_callback_pending` on the child.
 ///   2. User types a follow-up → `reincrement_parent_active_count_if_revived`
 ///      bumps parent back to 1.
 ///   3. CC child idles AGAIN.
 ///
 /// At step 3 the dedup guard in `notify_parent_if_child`
-/// (`is_coding_agent && callback_already_sent && CodingAgentIdled`)
+/// (`is_coding_agent && !parent_callback_pending && CodingAgentIdled`)
 /// short-circuits and the decrement is skipped — so the parent's counter is
 /// stuck at 1 forever and the drawer shows the parent as having an active
-/// sub-thread while the child is actually Idle. The revive helper must therefore also clear
-/// `parent_callback_sent=FALSE` in the same tx, so the next terminal event
+/// sub-thread while the child is actually Idle. The revive helper must therefore also set
+/// `parent_callback_pending=TRUE` in the same tx, so the next terminal event
 /// is a fresh first-idle from the dedup's perspective.
 #[tokio::test]
 async fn test_cc_second_idle_after_revive_decrements_parent_again() {
@@ -529,7 +529,7 @@ async fn test_cc_second_idle_after_revive_decrements_parent_again() {
     emit_cc_session_started(&bus, child_id).await;
     assert_active_children(&pool, parent_id, 1, "baseline: 1 active CC child").await;
 
-    // First idle: decrements parent + marks parent_callback_sent.
+    // First idle: decrements parent + clears parent_callback_pending.
     emit_cc_idle(&bus, child_id, false, None).await;
     assert_active_children(
         &pool,
@@ -618,6 +618,548 @@ async fn test_cc_child_proposed_change_does_not_block_parent_active() {
         1,
         "parent blocking_descendant_count stays at 1 — proposed change blocks archive \
          via is_blocking clause 3"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Read the child's `parent_callback_pending` marker.
+async fn callback_pending(pool: &PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar("SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Count the persisted completion cards on a parent.
+async fn completion_cards(pool: &PgPool, parent_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Park `thread_id` on a user question.
+async fn emit_question_asked(bus: &EventBus, thread_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAsked {
+            tool_use_id: Uuid::new_v4().to_string(),
+            cc_session_id: "test-session".into(),
+            question: "which way?".into(),
+            options: vec![],
+            worktree_path: None,
+            multi_select: false,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// Hazard 12, the live half: a parent redirects a coding-agent child that is
+/// mid-turn. The follow-up's `MessageReceived` lands while the child is still
+/// `running`, so no revive is owed; the interrupted turn idles and takes the
+/// card with it; then the child picks the follow-up off `msg_tx` and emits a
+/// non-empty `CodingAgentPromptSent` for the redirected turn. That turn's own
+/// completion has to reach the parent too, or the parent hears only about the
+/// turn it interrupted and never about the work it asked for.
+#[tokio::test]
+async fn followed_up_live_coding_agent_child_reports_its_own_completion() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "baseline: the child is running").await;
+
+    // The follow-up lands on a live child: MessageReceived with no
+    // parent_thread_id, the shape the coding-agent fast path emits.
+    emit_cc_message_received(&bus, child_id, None, "go the other way").await;
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "a follow-up to a RUNNING child owes no re-increment",
+    )
+    .await;
+
+    // Turn 1 reaches its boundary and takes the first card with it.
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        completion_cards(&pool, parent_id).await,
+        1,
+        "the interrupted turn reports once"
+    );
+    assert_active_children(&pool, parent_id, 0, "and the count comes down").await;
+
+    // The child picks the queued follow-up off msg_tx and starts the
+    // redirected turn.
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::CodingAgentPromptSent {
+            text: "go the other way".into(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    assert!(
+        callback_pending(&pool, child_id).await,
+        "a start event means the parent has not been told about THIS turn"
+    );
+    assert_active_children(&pool, parent_id, 1, "and the child is in flight again").await;
+
+    // Turn 2 completes.
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        completion_cards(&pool, parent_id).await,
+        2,
+        "the redirected turn must report its own completion"
+    );
+    assert_active_children(&pool, parent_id, 0, "and the count comes down again").await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Hazard 12's `ContinuationRequested` twin: a human clicking Continue on a
+/// coding-agent child is a start event too. The arm does its own inline
+/// re-increment but never touched the marker, so the resumed turn's
+/// `CodingAgentIdled` hit the dedup guard and the parent was never told.
+#[tokio::test]
+async fn continue_on_a_coding_agent_child_reports_its_completion() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        completion_cards(&pool, parent_id).await,
+        1,
+        "first turn reports"
+    );
+    assert_active_children(&pool, parent_id, 0, "and decrements").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ContinuationRequested {
+            reason: "user clicked Continue".into(),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    assert_active_children(&pool, parent_id, 1, "Continue re-increments the parent").await;
+    assert!(
+        callback_pending(&pool, child_id).await,
+        "and owes the parent a card for the continued turn"
+    );
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        completion_cards(&pool, parent_id).await,
+        2,
+        "the continued turn must report its own completion"
+    );
+    assert_active_children(&pool, parent_id, 0, "and decrement").await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The dedup guard's stated purpose must survive the marker's new predicate: a
+/// coding-agent child can emit `CodingAgentIdled` more than once for the same
+/// turn (auto-harden, background agents), and an extra idle with NO intervening
+/// start event is still swallowed. This is a regression test for the flip and
+/// for the start-event predicate at the same time.
+#[tokio::test]
+async fn extra_idle_without_a_start_event_is_still_deduped() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    assert_eq!(
+        completion_cards(&pool, parent_id).await,
+        1,
+        "three idles with no start event between them are one completion"
+    );
+    assert_active_children(&pool, parent_id, 0, "and one decrement").await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The one genuinely open membership question, settled here by card count. The
+/// question-resume marker at `agent_question.rs` emits an EMPTY
+/// `CodingAgentPromptSent` purely so the timeline shows a Thinking step; it
+/// asserts no new agent intent, and its own arm already skips the status write
+/// for that reason. Treating it as a start event would re-arm the marker after
+/// a card was already sent, so the auto-harden / background-agent idle the
+/// dedup guard exists for would produce a spurious second card.
+#[tokio::test]
+async fn an_empty_resume_marker_is_not_a_start_event() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        completion_cards(&pool, parent_id).await,
+        1,
+        "the turn reports once"
+    );
+
+    // A background agent asks for a permission, the human resolves it, and the
+    // resume marker fires with empty text.
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::CodingAgentPromptSent {
+            text: String::new(),
+            coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+    assert!(
+        !callback_pending(&pool, child_id).await,
+        "an empty resume marker asserts no new agent intent, so it must not \
+         re-arm the parent callback"
+    );
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        completion_cards(&pool, parent_id).await,
+        1,
+        "so the trailing idle is still deduped, exactly as it is today"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Hazard 8(a): the revive gate skipped the re-increment only for a `running`
+/// child, but the in-flight set the reconcile counts is
+/// `{running, waiting_for_user_answer}`. A child parked on a question or a
+/// permission card is therefore still counted in the parent's
+/// `active_children_count`, and an Agent-mode message landing on it
+/// re-incremented, over-counting by one. A human's message would have been
+/// routed to `UserQuestionAnswered` instead, which is why the bug was latent;
+/// an agent follow-up deliberately falls through to the injection path.
+#[tokio::test]
+async fn question_parked_child_follow_up_does_not_double_count() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_question_asked(&bus, child_id).await;
+
+    let status: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(child_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(status, "waiting_for_user_answer", "the child is parked");
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "a parked child is still in flight: nothing decremented it",
+    )
+    .await;
+
+    emit_cc_message_received(&bus, child_id, None, "while you wait, also do this").await;
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "a follow-up to a parked child must not re-increment: the counter was \
+         never decremented",
+    )
+    .await;
+    assert!(
+        callback_pending(&pool, child_id).await,
+        "but the start event still arms the marker",
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Hazard 8(a) from the other side. The startup reconcile filtered
+/// `status = 'running'` alone, so every boot recomputed a parent's
+/// `active_children_count` WITHOUT a child parked on a question or a
+/// permission card, contradicting the in-tx reconcile. Question-parked threads
+/// are deliberately preserved across a restart and `UserQuestionAnswered` does
+/// not re-increment, so the under-count persisted until some sibling terminal
+/// fired the in-tx reconcile.
+///
+/// Behaviour change, deliberate: after a restart a parent whose child is parked
+/// keeps counting that child as active, which is what the in-tx reconcile has
+/// always said.
+#[tokio::test]
+async fn question_parked_child_survives_the_startup_reconcile() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_question_asked(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "the parked child is in flight").await;
+
+    EventBus::rebuild_active_children_count(&pool)
+        .await
+        .unwrap();
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "the startup reconcile must agree with the in-tx one: a parked child \
+         is still in flight",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The startup reconcile still repairs real drift in both directions.
+#[tokio::test]
+async fn startup_reconcile_repairs_a_drifted_active_children_count() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    // Over-count: the child is running but the parent claims two.
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 2 WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    EventBus::rebuild_active_children_count(&pool)
+        .await
+        .unwrap();
+    assert_active_children(&pool, parent_id, 1, "over-count repaired").await;
+
+    // Under-count: the child is still running but the parent claims zero.
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 0 WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    EventBus::rebuild_active_children_count(&pool)
+        .await
+        .unwrap();
+    assert_active_children(&pool, parent_id, 1, "under-count repaired").await;
+
+    // A child that really did finish drops the parent back to zero.
+    emit_cc_idle(&bus, child_id, false, None).await;
+    sqlx::query("UPDATE thread_summaries SET active_children_count = 3 WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    EventBus::rebuild_active_children_count(&pool)
+        .await
+        .unwrap();
+    assert_active_children(&pool, parent_id, 0, "an idle child counts for nothing").await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The revive gate's own stated reason: an idle coding-agent child holding a
+/// pending change is `is_blocking = true` via clause 3, so an `is_blocking`
+/// gate would skip the re-increment it needs. Widening the gate to the
+/// in-flight set must not disturb that, because `waiting` (the status a
+/// proposed change parks at) is outside the in-flight set exactly as `idle` is.
+#[tokio::test]
+async fn follow_up_to_a_coding_agent_child_holding_a_pending_change() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    emit_cc_idle(&bus, child_id, true, None).await;
+    assert_active_children(&pool, parent_id, 0, "the child's work is done").await;
+    let proposed: bool = sqlx::query_scalar(
+        "SELECT coding_agent_proposed FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(child_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(proposed, "the child left a pending change");
+
+    emit_cc_message_received(&bus, child_id, None, "revise it").await;
+
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "a child holding a pending change still re-increments on revive",
+    )
+    .await;
+    assert!(
+        callback_pending(&pool, child_id).await,
+        "and owes the parent a card for the revised turn"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A `relation: "top"` spawn stamps a `ThreadLink` origin naming its spawning thread
+/// so the message route popover can link back, but carries NO
+/// `parent_thread_id`. The counting and callback paths key on the linkage, and
+/// this pins that they keep doing so: the spawning thread must not grow a child, must
+/// not be owed a card, and must not be woken when the spawned thread finishes.
+///
+/// This is the counting-side half of the display fix. If either path ever
+/// starts reading `origin` instead, the spawning thread's drawer sprouts an
+/// "N sub-threads" badge for work it deliberately fired and forgot.
+#[tokio::test]
+async fn attribution_without_linkage_counts_no_child_and_wakes_nobody() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let spawning_thread_id = Uuid::new_v4();
+    let spawned_id = Uuid::new_v4();
+
+    bus.emit(BusEvent::Thread {
+        thread_id: spawning_thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: "spawn something independent".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    // The top-spawn shape: origin names the spawning thread, linkage is absent.
+    bus.emit(BusEvent::Thread {
+        thread_id: spawned_id,
+        event: ThreadEvent::MessageReceived {
+            text: "independent work".into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Agent,
+            model: None,
+            reasoning_effort: None,
+            origin: Some(MessageOrigin::ThreadLink {
+                thread_id: spawning_thread_id,
+                title: None,
+                spawning_event_id: Some(Uuid::new_v4()),
+                mode: ActorMode::Agent,
+                direction: crate::engine::thread_events::ThreadDirection::Parent,
+            }),
+        },
+        meta: EventMeta {
+            channel: Some(EventChannel::Chat),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .unwrap();
+
+    assert_children_counters(
+        &pool,
+        spawning_thread_id,
+        0,
+        0,
+        "attribution alone must not make the spawning thread a parent",
+    )
+    .await;
+    let projected_parent: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_thread_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(spawned_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        projected_parent, None,
+        "the projection reads the linkage field, not the origin"
+    );
+    assert!(
+        !callback_pending(&pool, spawned_id).await,
+        "a top spawn owes nobody a report"
+    );
+
+    bus.emit(BusEvent::Thread {
+        thread_id: spawned_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let mut callbacks = vec![];
+    while let Ok(cb) = callback_rx.try_recv() {
+        callbacks.push(cb);
+    }
+    assert!(
+        callbacks.is_empty(),
+        "the spawning thread must not be woken by a thread it fired and forgot: {callbacks:?}"
+    );
+    assert_eq!(
+        completion_cards(&pool, spawning_thread_id).await,
+        0,
+        "and gets no child-completion card"
     );
 
     pool.close().await;

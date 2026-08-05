@@ -66,10 +66,11 @@ interface Props {
   hasPriorActive?: boolean;
   priorModel?: string;
   priorEffort?: string;
-  /** True when this exchange is the most recent ResponseAborted with no
-   *  later ContinuationStarted in the thread — the only one that shows the
-   *  Continue button. */
-  isUnresumedAbort?: boolean;
+  /** True when this exchange is the abort the user may resume from, the only
+   *  one that shows the Continue button. See `continuableAbortIndex`: a
+   *  switch-teardown abort the engine is auto-resuming is deliberately not
+   *  continuable. */
+  isContinuableAbort?: boolean;
   /** True when this is a chat follow-up the user typed while the agent was busy
    *  — it's queued behind the active turn and not yet ingested. Computed in
    *  `renderExchanges` (it needs thread-level busy state + the active-exchange
@@ -102,7 +103,7 @@ interface Props {
   proposedChangeFileCount?: number;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isUnresumedAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -476,7 +477,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       // panel down on first open (mirrors the body's ChangeProposed seed).
       exchange.userEvent.type === 'ChangeApplied',
     );
-  } else if (isAbortPanel && isUnresumedAbort) {
+  } else if (isAbortPanel && isContinuableAbort) {
     initiatorActions = <ContinueButton threadId={threadId} />;
   }
   const executor = describeExecutor(threadIsCC, threadCodingAgent);
@@ -592,9 +593,22 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       )}
 
       {error && (
-        <div class="exchange-error">
+        // The failure card is addressed by the `ResponseFailed`'s OWN event id,
+        // not the exchange's. A notification raised by a failure deep-links to
+        // that event, and `ResponseFailed` is folded into the owning exchange as
+        // a terminal step (`REQUEST_ID_ROUTED_TYPES`), so the root's
+        // `data-event-id` above is the turn's STARTER and would never match.
+        // Stamping the card makes `scrollToEventAndPulse` land on and pulse the
+        // failure itself rather than the whole turn, and `isEventInViewport`
+        // report it (the notification in-app matrix's Row 1 auto-mark-read).
+        // The card is the only step-level surface that needs this today: every
+        // other deep-linkable event either starts its own exchange or, for a
+        // change, is addressed by `data-change-id`. Inline steps are NOT stamped
+        // on purpose, since the "Show steps" toggle can hide them, so an id
+        // there would resolve only sometimes.
+        <div class="exchange-error" data-event-id={error.eventId || undefined}>
           <strong>Event stream error</strong>
-          <p>{error}</p>
+          <p>{error.message}</p>
         </div>
       )}
     </div>
@@ -634,7 +648,7 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.hasPriorActive !== next.hasPriorActive) return false;
   if (prev.priorModel !== next.priorModel) return false;
   if (prev.priorEffort !== next.priorEffort) return false;
-  if (prev.isUnresumedAbort !== next.isUnresumedAbort) return false;
+  if (prev.isContinuableAbort !== next.isContinuableAbort) return false;
   if (prev.threadIsCC !== next.threadIsCC) return false;
   if (prev.threadCodingAgent !== next.threadCodingAgent) return false;
   if (prev.threadIdle !== next.threadIdle) return false;

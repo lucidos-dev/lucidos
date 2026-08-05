@@ -41,6 +41,9 @@ import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, i
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
 import { sendMessage } from './chat';
+// Cycle-safe: `compose -> chat -> thread-loading -> compose` already exists, and
+// this is a function declaration called at runtime, never at module init.
+import { forgetThreadEventsFailures } from './thread-loading';
 import type { ChatContext } from './chatContext';
 import { markHashesAsSent } from '../../components/chat/pastedImages';
 import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
@@ -760,6 +763,11 @@ function rollbackOptimistic(threadId: string): void {
   const next = new Map(threadMap.value);
   next.delete(threadId);
   threadMap.value = next;
+  // The optimistic row is inserted with `eventsLoaded: true`, so a wake or an
+  // SSE resync during the `ensureThreadStarted` window can refresh it and record
+  // a verdict against it. Removing the row owes those maps the same cleanup as
+  // `sendMessage`'s rollback: nothing will ever fetch this thread again.
+  forgetThreadEventsFailures(threadId);
   clearDraft(threadId);
 }
 

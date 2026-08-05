@@ -34,24 +34,18 @@
 }
 
 /* While the UI is blocked, nothing may float above the dim blocker except the
-   toast container (--z-toast). The elements that outrank the overlay in normal
-   use both sit at the tooltip layer (--z-tooltip = 10000, kept that high so a
-   modal never clips them): the JS tooltip and a pseudo-fullscreen app iframe.
-   UiBlockingOverlay flags :root[data-ui-blocked] so they step aside while
-   blocked. */
+   toast container (--z-toast). One element outranks the overlay in normal use:
+   the JS tooltip, at --z-tooltip = 10000, kept that high so a modal never clips
+   it. UiBlockingOverlay flags :root[data-ui-blocked] so it steps aside while
+   blocked. (A pseudo-fullscreen app panel used to be the second one and needed
+   the same treatment; it now sits at --z-app-fullscreen, below the blocker and
+   below every modal, so it needs no override.) */
 
 /* Tooltip is transient — hide it outright (a ghost behind the 50% scrim would
    look broken). inert already stops new tooltips firing (the hover targets are
    inert), so this only clears one already on screen when the block began. */
 :root[data-ui-blocked] #tooltip {
     display: none !important;
-}
-
-/* Full-screen opaque panels: drop below the overlay (don't hide) so the dim
-   scrim covers them and the toast stays visible, then they pop back to the top
-   when the block ends. */
-:root[data-ui-blocked] .app-ui-inline.app-ui-fullscreen {
-    z-index: calc(var(--z-modal) - 1) !important;
 }
 
 /* While any <Overlay> is open, the main UI behind it goes inert — no hover
@@ -73,13 +67,31 @@
    would otherwise fall through to `#app` and the dismiss-via-outside-click path
    couldn't resolve a target inside the app). `pointer-events` inherits, so every
    descendant of an inert child is inert too; panels/anchors re-set it to `auto`.
-   Driven by `data-overlay-open` on <html>, ref-counted in `Overlay.tsx`. */
+   Driven by `data-overlay-open` on <html>, ref-counted in `Overlay.tsx`.
+
+   `[data-overlay-layer]` is the third exemption, and it exists because the
+   overlay layer does NOT always render outside `.app-shell`: while an app is
+   natively fullscreen, `OverlayLayer` portals the whole group into the
+   fullscreen app panel (the only place the browser will paint it), which is
+   deep inside `.app-shell` and therefore inherits the inert. The exemption puts
+   the layer back where it started, and no further: everything under it is host
+   chrome. */
 :root[data-overlay-open] .app-shell > * {
     pointer-events: none;
 }
 :root[data-overlay-open] [data-overlay-panel],
-:root[data-overlay-open] [data-overlay-anchor] {
+:root[data-overlay-open] [data-overlay-anchor],
+:root[data-overlay-open] [data-overlay-layer] {
     pointer-events: auto;
+}
+
+/* The overlay layer's mount inside a natively fullscreen app panel (rendered by
+   AppUiInline, filled by OverlayLayer). It generates no box of its own: its
+   children are the same position:fixed scrims and toast container that sit at
+   the app root when nothing is fullscreen, so the mount must not become a flex
+   item of the app panel or a hit target over the app. */
+.app-overlay-layer {
+    display: contents;
 }
 
 /* Reduced motion: disable non-essential transitions globally */

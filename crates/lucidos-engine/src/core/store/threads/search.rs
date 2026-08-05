@@ -25,9 +25,9 @@ impl EventStore {
 
         // Search query joins `best_scores b` against `thread_summaries s`, so
         // the FROM alias is `s` instead of the default `t`. SearchRow below
-        // ignores the `is_saved` / `has_response` columns the helper also
-        // emits — they cost two extra DB bytes per row and avoid a parallel
-        // copy of the column list.
+        // reads `is_saved` but ignores `has_response`, the one column the shared
+        // helper emits that a search result has no use for: the extra DB byte
+        // per row is cheaper than a parallel copy of the column list.
         let thread_cols_prefixed = thread_cols("s");
 
         let sql = format!(

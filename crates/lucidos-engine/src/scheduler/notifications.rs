@@ -105,6 +105,17 @@ pub struct NavigateUi {
     pub app_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_path: Option<String>,
+    /// First line to select in the file preview, 1-based. Only meaningful with
+    /// `target: File`. The page-side router validates and silently ignores a
+    /// line it can't use (0, negative, past the end of the file) rather than
+    /// refusing to open the file: a citation's line number is the part that
+    /// goes stale, and the file is still what the reader asked for.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    /// Last line of the selected range, 1-based and INCLUSIVE. Omit for a
+    /// single line. Only meaningful alongside `line`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

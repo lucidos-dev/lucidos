@@ -28,6 +28,21 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   before the SIGKILL. Re-flag only if a caller starts reaping the child before
   or during the call. (`runtime/spawn_env.rs`, `runtime/claude_code.rs`.)
 
+- **The API-drop auto-resume cannot reset its own budget, so it cannot loop
+  forever.** `api_error_auto_resumes_spent` (`agent_session/resume.rs`) counts
+  `ContinuationRequested{auto_resume_after_api_error}` newer than the thread's
+  last `MessageReceived` or `ResponseGenerated`, and a reviewer reasonably
+  worries that the resume it authorizes injects
+  `CONTINUE_RESUME_USER_MESSAGE` into the subprocess and so lands a
+  `MessageReceived` that zeroes the count on every pass. It does not: the
+  continuation is delivered on the spawn path, not the chat path, and emits
+  `ContinuationRequested` → `ContinuationStarted` → `SessionStarted` with no
+  `MessageReceived` anywhere (verified against a live
+  `auto_recovery_after_hang` sequence, which uses the identical dispatch).
+  Consecutive drops therefore accumulate to `MAX_API_ERROR_AUTO_RESUMES` and
+  stop. Re-flag only if the continuation dispatch starts emitting a
+  `MessageReceived` for its injected text.
+
 - **`starts_with`-guarded byte slicing is boundary-safe.** Sites like the
   Result-flush in `agent_session/run_session/run.rs` slice
   `result_trimmed[buf_trimmed.len()..]` only inside an
@@ -283,6 +298,39 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `ProvisionError::terminal`. (`crates/lucidos-gateway/src/postgres.rs`,
   `crates/lucidos-gateway/src/server.rs::provision_failure_action`.)
 
+- **`CredentialStore::get` and `find_by_url` excluding `oauth_client` is the
+  contract, not a missed row.** Both carry `AND auth_type <> 'oauth_client'`, and
+  a fresh reviewer reads that as a lookup that can silently miss a credential the
+  user configured. It is deliberate and load-bearing in two directions. Since
+  `20260805134838_drop_credential_name_prefixes_use_auth_type.sql`, `oauth_client`
+  is the ONE type permitted to shadow a `service_name` (partial unique index), so
+  an unfiltered bare-name `get` would return either row arbitrarily, and the five
+  bare-name readers all want the other one: the four provider keys in
+  `llm/provider_build.rs` (`anthropic`, `openai`, `openrouter`, `local`) and the
+  `apis.json` resolvers. And an OAuth client registration's `auth_value` is a
+  `{client_id, client_secret, ...}` JSON blob that is never a usable auth header,
+  so `find_by_url` handing one to an outbound request could only leak the secret
+  and fail the call. Callers that genuinely want one say so:
+  `get_oauth_client` / `get_typed`, and `fetch_required_credential`'s explicit
+  second attempt for an `apis.json` entry that names one. Re-flag only if the
+  partial index is dropped (making names globally unique again) or if a bare-name
+  caller appears that legitimately wants the registration. (`core/credentials.rs`,
+  `api/proxy.rs::fetch_required_credential`.)
+
+- **The prefix migration renaming a duplicate to `<name> (unreachable
+  duplicate)` is not data loss, and not arbitrary.** Reviewers ask why it does
+  not simply leave a colliding pair alone, the way the migration it supersedes
+  did. Because leaving it alone INVERTS which row is live: before the migration
+  every OAuth read resolves `oauth:<provider>`, so the prefixed row is the live
+  registration and the bare one is unreachable by every code path; stranding the
+  pair would hand the bare name to the dead row and break refresh on the working
+  connection. Stranding is only acceptable when it preserves the status quo. The
+  dead row is renamed rather than deleted because a migration must not destroy a
+  secret the user typed, and the rename always happens (an occupied archival name
+  falls back to a primary-key-suffixed one) because skipping it reintroduces the
+  inversion. Re-flag only with a case where the bare row is provably the live
+  one. (`migrations/20260805134838_drop_credential_name_prefixes_use_auth_type.sql`.)
+
 ## Frontend
 
 - **Space on a focused choice-card button activates it; it does NOT type a
@@ -420,14 +468,37 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   atypically tall `.initiator-panel` (a user prompt taller than the viewport) the
   pulsed `.response-panel` can land below the fold. This is deliberate: the scroll
   MUST target the `.chat-exchange` because only it carries the `scroll-margin-top`
-  gap that keeps the focus border from being clipped under the fixed header /
+  gap that keeps the focus highlight from being clipped under the fixed header /
   sticky title (commit `9884ece31`) — retargeting the scroll to the pulse panel
   would regress that. The pulse-vs-scroll split is inherent to scoping the
   highlight (fixing the original "whole turn highlighted" bug); the below-fold
   case needs the tall-initiator edge AND is degraded feedback, not a broken
-  landing (the user still scrolls to the exchange; the sticky border persists on
+  landing (the user still scrolls to the exchange; the sticky highlight persists on
   the panel). Re-flag only with a concrete fix that keeps the `.chat-exchange`
   scroll-margin behavior intact. (`components/chat/scrollState.ts`.)
+  **Amended 2026-08-05:** "only the `.chat-exchange` carries the
+  `scroll-margin-top`" is no longer the whole rule. A STEP-level event carries
+  its own `data-event-id` on the card that renders it (today the `ResponseFailed`
+  failure card), and `chat/response.css` now gives `.chat-exchange [data-event-id]`
+  the same clearance at all three breakpoints, so that deep-link scrolls to AND
+  pulses the card, with no pulse-vs-scroll split at all. The prior still holds
+  unchanged for the two split cases: an exchange-START event (scroll the turn,
+  pulse its `.initiator-panel`) and every `data-change-id` landing. A reviewer
+  proposing to retarget THOSE scrolls at the pulsed panel is still wrong.
+- **The deep-link deadline's recovery scroll does NOT reintroduce the yank that
+  `ad48eadad` removed.** A reviewer reading that commit ("Deadline now cleans up
+  only instead of forcing a scroll-to-bottom; the prior unconditional fallback
+  would yank a user who scrolled to read history during the 4s window") may flag
+  the recovery added on 2026-08-05 as undoing it. It doesn't: what that commit
+  removed was an UNCONDITIONAL snap, and the recovery is gated on exactly the
+  case it named. The scroll runs only when no *user action* was seen since the
+  wait began (`watchUserAction`, `utils/userAction.ts`), so a user who scrolled
+  away is left where they are; only the warning toast fires for them, being the
+  sole remaining signal that the link was dead. The silence the commit left
+  behind was itself the reported bug (a notification tap that resolved nothing
+  looked broken). Re-flag only if the gate stops covering a real scroll gesture,
+  or if the scroll fires on a resolved / superseded claim.
+  (`components/chat/scrollState.ts`.)
 - **Turn-nav anchors on the marked turn when present, and only falls back to
   `scrollTop + gap` scroll-position stepping when there's no marker.** Turn-nav
   (`components/chat/scrollState.ts`) lands a turn's top `gap` px below the
@@ -526,11 +597,18 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   — the same node — and `stopPropagation()` does not suppress other
   listeners on the same node (only `stopImmediatePropagation` would). The
   recorder always receives Escape regardless of registration order.
-- **`connection.ts`'s `.catch(() => {})` chains are documented
-  rejection-tracker silencers**, not swallowed errors —
-  `refreshThreadEvents` toasts user-visible failures itself after retrying.
-  The justifying comments at the call sites are the carve-out contract
-  (`.claude/rules/frontend.md` § best-effort telemetry).
+- **`refreshThreadEvents` owns its own user-facing surface, and cannot
+  reject.** A genuine verdict reaches the user through one keyed card for the
+  whole fan-out; a transient rejection (a cancel, the client deadline, a
+  stale-connection `TypeError`) is deliberately silent, because the fan-out
+  issues one request per loaded thread and the debounced connection dot owns a
+  sustained outage. The justifying comments at the call sites are the carve-out
+  contract (`.claude/rules/frontend.md` § best-effort telemetry). Because every
+  path is caught, a `.catch` on a call to it is dead code rather than a
+  silencer: the ones in `connection.ts` and `chat.ts` were removed on
+  2026-08-04, and `schedulePendingCleanup` reads its `Promise<boolean>` return
+  instead (a `.catch` there had made the force-drop unconditional). Don't
+  reintroduce one.
 - **The heartbeat's `invoke('heartbeat').catch(() => {})` (useStartup, main.tsx)
   is a local no-op, not a swallowed IPC failure.** Since the tauri 2.11 ACL
   regression, `invoke` itself (`utils/tauri.ts`) records every outcome through
@@ -750,6 +828,95 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   versioned shell with a real updater). Pinned by
   `components/settings/clientVersionSource.test.ts`; re-flag only if the web client
   gains a genuine version of its own.
+
+- **The file preview modal closes on a `panelOverlay` IDENTITY change, and that
+  is not over-eager.** `FilePreviewModal`'s `useSignalEffect` compares
+  `panelOverlay.value` against the object captured when the preview opened, so a
+  reviewer reasonably asks what happens when the overlay is re-set to an
+  equivalent value: the modal would close for a non-navigation. Every writer of
+  `panelOverlay` was walked, and there is no such writer. Each one is either a
+  real navigation (`openApp`, `openFilePreview`, `openUrl`, the form/notification
+  openers, `setActiveMenu`), a teardown (`entityReferences` nulling the overlay
+  when the open app/file is deleted underneath), or history restore
+  (`navigation.restoreState`), and in all three, closing a glance layered over
+  the old pane is the wanted behaviour, Back included. The app-refresh path that
+  WOULD re-set an equal app-ui overlay does not exist: `AppUiRefreshRequested`
+  goes through `appRefreshKey`, never `panelOverlay`. A value-equality check
+  would be strictly worse here, since it would keep the glance alive across a
+  genuine re-navigation to the same file. Re-flag only if a writer appears that
+  re-sets `panelOverlay` for a non-navigation reason.
+  (`components/files/FilePreviewModal.tsx`, `store/actions/filePreviewModal.ts`.)
+
+- **The preview modal mutating `filePreviewSource` / `selectedLines` /
+  `lineScrollTarget` / `filePreviewEditing` is a scoped BORROW, not shared-state
+  leakage.** Those four are the Files panel's view state, and the modal writes
+  all four on open, which looks like one surface reaching into another's state.
+  It snapshots them first and restores them in `closeFilePreviewModal`, and the
+  panel's preview is never mounted while the modal is up (the modal is reachable
+  only from an app iframe, so the content pane is showing that app), so there is
+  no concurrent reader. The one close that does NOT restore is the
+  navigation-triggered one (`{ navigated: true }`), and that asymmetry is
+  load-bearing rather than an oversight: `openFilePreview` clears the selection,
+  the scroll target and the source toggle BEFORE it sets `panelOverlay`, so by
+  the time the modal's watcher sees the overlay change the borrowed signals
+  already belong to the destination, and handing the snapshot back would paint
+  the panel's pre-modal highlight onto the file just opened. The escalation
+  closes before it navigates, so it restores normally. It is deliberate over threading a selection + scroll +
+  source-mode triple as props through `FilePreviewInline`, `RepoFileText` and
+  `LineNumberedCode`, which would widen the panel's own code for no panel
+  benefit. Pinned by the restore cases in
+  `store/actions/filePreviewModal.test.ts`. Re-flag only if a second surface can
+  read those signals while the modal is open.
+  (`store/actions/filePreviewModal.ts`, `docs/plans/2026-08-05-file-preview-modal-from-an-app.md`.)
+
+- **The navigation focus marker's entrance bloom does NOT revert `96b2c8e2a`,
+  which removed an entrance animation "per user request".** A reviewer running
+  `git log` on `styles/global/host-components.css` will find that commit deleting
+  a `nav-focus-fill` keyframe at the user's explicit ask, then find
+  `nav-focus-spotlight-on` added back on 2026-08-05, and reasonably call it a
+  silent reversal. It is not: the user asked for the bloom directly in the thread
+  that repainted the marker from an outline frame into a background highlight, as
+  an approved fork of `docs/plans/2026-08-05-nav-focus-marker-spotlight-highlight.md`
+  ("Approve, with the bloom"). A later explicit instruction outranks an earlier
+  one. The two animations are also not the same thing, which is why the old
+  request does not carry over, and the distinction is the DESTINATION, not the
+  direction: `nav-focus-fill` ramped DOWN to **transparent**, so the fill was
+  purely an entrance flourish and missing it (a glance away, a slow iOS load)
+  meant missing it entirely, with only the border left behind.
+  `nav-focus-spotlight-on` ends at the marker's **persistent resting wash**, which
+  then stays until the user acts. A look-away can miss the half-second turn-on; it
+  cannot miss the marker. Be precise about what IS given up, so a reviewer reading
+  `96b2c8e2a`'s literal words ("shown instantly on landing") finds them addressed:
+  instant-on is genuinely gone, and that is the deliberate content of the later
+  request. (The first cut of the repaint was additionally
+  decay-only, starting brighter and settling down, so it was never missable at
+  any frame. The user then asked for a real turn-on, and it ramps up from
+  transparent as of 2026-08-05. The persistence is what makes that safe, and it is
+  the property to defend: a ramp ending in nothing is the thing `fd61d7af9`
+  removed.) The ramp's shape is pinned by
+  `components/shared/__tests__/nav-focus-marker-paint.test.ts`. Known and accepted
+  alongside it: `⌘↑`/`⌘↓` turn-nav marks a different element per press, so
+  stepping through a transcript turns on once per press, which is wanted here (it
+  is what draws the eye to the new landing). Re-flag only if the user asks for the
+  entrance animation to go away again. (`styles/global/host-components.css`.)
+
+- **A test that awaits a frame under `vi.useFakeTimers()` is NOT broken by
+  `src/test-setup.ts`'s synchronous `requestAnimationFrame` stub.** A reviewer who
+  finds that stub (`(cb) => { cb(0); return 0; }`) will conclude that any
+  same-tick assertion made after an event which schedules an rAF must fail,
+  because the callback would already have run. It does not, for two independent
+  reasons: the stub is installed only `if (typeof globalThis.requestAnimationFrame
+  === 'undefined')`, and `vi.useFakeTimers()` replaces `requestAnimationFrame` with
+  a timer-driven one for the duration of the suite regardless, so
+  `vi.advanceTimersByTime(n)` is what runs the callback. Verified by probe on
+  2026-08-05 (a throwaway spec asserting the callback has NOT run immediately after
+  scheduling, then HAS run after an advance, passed on both counts). The canonical
+  users are the navigation focus marker's ref-lifetime cases in
+  `components/shared/__tests__/focusMarker.test.ts`, which assert that
+  `navFocusElement()` survives the dismissing event and is null one frame later.
+  Re-flag only with evidence that the Vitest config stopped faking rAF, in which
+  case those tests fail loudly rather than silently.
+  (`crates/lucidos-app/src/test-setup.ts`, `components/shared/__tests__/focusMarker.test.ts`.)
 
 ## Scripts (bash)
 
@@ -1075,6 +1242,31 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if the token is added to one of those two served files without the
   doc row. (`styles/global/base.css`, `crates/lucidos-engine/src/api/sdk.rs`.)
 
+- **The app iframe's `body` carries an explicit `font-size` and the host's does
+  NOT. That asymmetry is deliberate, and deleting it to "restore parity" is a
+  bug that has already shipped once.** The two files mirror each other by
+  construction (`sdk_iframe.css` repeats base.css's token blocks under "keep in
+  sync with base.css" markers), so a reviewer comparing them side by side reads
+  the extra declaration as drift. It is not, because the two documents are not
+  symmetric in what fills them: every text element in the host shell is
+  explicitly sized from a `--font-size-*` token, so the host body's computed size
+  is a value nothing actually renders at, whereas an app's prose is whatever the
+  app author wrote, and anything they did not size falls straight through to it.
+  Leave the declaration off and that fallthrough is the raw root (`1rem`, 18px at
+  a 112.5% UI scale) against a chat message body of `--font-size-sm` and a
+  documented app body step of `--font-size-md`. That is exactly what happened:
+  `2a742266b` (2026-06-19) dropped a `body { font-size: 0.875rem }` reasoning
+  that it "made app text permanently smaller and the user's UI-scale preference
+  look ignored", and both halves were wrong. `0.875rem` is a `rem`, so it tracked
+  the root the whole time, and 14px was at the TOP of the host's range rather
+  than below it. The measurement was against the host body's *computed* size
+  instead of against any pixel the host paints. Restored as `--font-size-md`, the
+  documented body step, on 2026-08-05 after a user reported apps rendering a
+  scale step larger than their threads. Pinned by
+  `api::sdk::tests::iframe_body_is_sized_from_the_type_scale`. Re-flag only if
+  the host shell starts rendering real body text at the unstyled root size.
+  (`crates/lucidos-engine/src/api/sdk_iframe.css`, `styles/global/base.css`.)
+
 - **`openScaleModal` deliberately does NOT blur the UI-scale trigger button, and
   the trigger uses plain `.settings-option`.** A reviewer (Codex did) may flag
   that the value button stays `:focus`'d under the full-screen scale modal, so a
@@ -1295,6 +1487,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   for rather than to how this function honours it.
   (`scripts/lib/release_upload.sh`, F8 in
   `docs/audits/2026-08-02-macos-update-path-audit.md`.)
+
+- **A Settings `data-search-anchor` must render UNCONDITIONALLY, never inside a
+  `Loadable`'s loaded branch.** This entry was first written the other way round,
+  dismissing the concern, and the escape clause it left ("re-flag only with a
+  caller that can realistically fire before its target's data loads") was
+  satisfied within the same change: adding `access:network` and
+  `coding-agents:repositories` to the search index gave both anchors a caller,
+  Search Everywhere, that fires from a COLD Settings open. `SettingsView`'s
+  scroll effect does one `querySelector` on the commit where the subview mounts
+  and then clears `settingsScrollTarget` whether or not it matched, and its deps
+  (`[settingsScrollTarget.value, settingsSubview.value]`) do not change when a
+  child's fetch lands, so there is no retry: the jump silently drops the user at
+  the top of a long page. Both sites now render the section header (and its
+  anchor) in every state and gate only the body. A source scan cannot catch a
+  regression here (an anchor inside a never-taken branch still reads as
+  present), so this ledger entry is the guard: when you add an anchor, check it
+  is outside the Loadable.
+  (`crates/lucidos-app/src/components/settings/NetworkAccessPage.tsx`,
+  `SettingsView.tsx` `repositoriesSection`.)
 
 ## Settled architecture questions
 

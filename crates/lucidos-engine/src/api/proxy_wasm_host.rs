@@ -440,7 +440,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::proxy_hex::hex_lower;
+    use crate::api::hex::hex_lower;
 
     // Test vectors below come from RFC 4231 (HMAC-SHA-2) and RFC 3174 (SHA-1)
     // / FIPS 180-2 (SHA-256/512).

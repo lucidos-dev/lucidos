@@ -21,6 +21,9 @@ import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgent
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
 import { MarketplacesSection } from './MarketplacesSection';
 import { MobileAccessPage } from './MobileAccessPage';
+import { NetworkAccessPage } from './NetworkAccessPage';
+import { LocaleSection } from './LocaleSection';
+import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { SystemPage } from './SystemPage';
 import { isTauri } from '../../utils/platform';
 import { viewportIsMobile } from '../../utils/viewport';
@@ -252,9 +255,11 @@ function DeviceRow({ device, editingId, setEditingId }: {
           )}
           {isCurrent && <span class="device-badge">This device</span>}
         </div>
+        {/* Two FIELDS, separated by `.list-row-details`' own 0.75rem flex gap.
+            No manual middle-dot glue: it would be its own anonymous flex item
+            and pick the gap up on both sides (see the oauth row's note below). */}
         <SkText class="list-row-details" as="div" w="14rem">
           <span>{parseUserAgent(device?.user_agent ?? null)}</span>
-          {' \u00b7 '}
           {device && (
             <span data-tooltip={formatDateTime(new Date(device.last_seen_at))}>
               {formatTimeAgo(new Date(device.last_seen_at))}
@@ -491,14 +496,14 @@ export function SettingsView() {
       el.scrollIntoView({ block: 'center', behavior: 'smooth' });
       // The anchor can sit on a settings row, a row LABEL span, or a section
       // title. Land the focus marker on the enclosing .settings-row when there is
-      // one so the sticky border wraps the whole row (its CSS gives it a uniform
+      // one so the sticky highlight washes the whole row (its CSS gives it a uniform
       // gap on all four sides — a bare label span can't take the marker's vertical
       // margin trick); a section-title anchor (no enclosing row) keeps the marker
       // on itself, where it's already padded uniformly.
       const markEl = (el.closest('.settings-row') as HTMLElement | null) ?? el;
-      // Shared navigation focus marker — a sticky border that fades out on the
-      // user's next action (components/shared/focusMarker.ts). Same look as chat
-      // + plugins.
+      // Shared navigation focus marker: a sticky background highlight that fades out
+      // on the user's next action (components/shared/focusMarker.ts). Same look as
+      // chat + plugins.
       applyNavFocus(markEl);
       // Land keyboard focus on the targeted row's control (e.g. the Language
       // dropdown) so a Search Everywhere jump lands focus on the setting itself,
@@ -628,13 +633,32 @@ export function SettingsView() {
   function accountsSection() {
     return (
       <>
+        {/* Both sections carry a one-line explainer. They used to be bare
+            "Credentials" and "OAuth" headings, which left a user with no way to
+            tell what the difference was, or why connecting Dropbox had produced
+            an entry in each (2026-08-05). Credentials is the secret store;
+            Connected accounts is the sign-in list. */}
         <div class="settings-section accounts-section">
-          <div class="settings-section-title" data-search-anchor="accounts:credentials">Credentials</div>
-          {credentialsSection()}
+          <div class="settings-section-title" data-search-anchor="accounts:connected">Connected accounts</div>
+          <p class="settings-section-desc">
+            Services you have signed in to, so Lucidos can act on your behalf. Signing in
+            happens here, in your browser, and Lucidos keeps the resulting access.
+          </p>
+          {oauthSection()}
         </div>
         <div class="settings-section accounts-section">
-          <div class="settings-section-title" data-search-anchor="accounts:oauth">OAuth</div>
-          {oauthSection()}
+          <div class="settings-section-title" data-search-anchor="accounts:credentials">Credentials</div>
+          {/* Deliberately does NOT spell out the `oauth:<provider>` service
+              name. That name is the storage key, and the row title drops the
+              prefix on purpose (see `credentialRowLabel`), so naming it here
+              sent the user looking for a string that appears nowhere on the
+              screen. The row explains itself instead: provider title, type
+              badge, and a note saying which account it belongs to. */}
+          <p class="settings-section-desc">
+            Secrets Lucidos stores for you: API keys, tokens and passwords, and the
+            OAuth app registrations behind the accounts above.
+          </p>
+          {credentialsSection()}
         </div>
       </>
     );
@@ -682,42 +706,87 @@ export function SettingsView() {
   function repositoriesSection() {
     const repoLoadable = repositories.value;
 
-    if (repoLoadable.status === 'failed') {
-      return <div class="list-rows"><LoadableError noun="repositories" error={repoLoadable.error} /></div>;
-    }
-    if (repoLoadable.status !== 'loaded') {
-      return null;
-    }
+    // The section header renders in EVERY state, because it carries
+    // `data-search-anchor="coding-agents:repositories"` and that anchor is a
+    // navigation target (Search Everywhere, and the compose picker's "Register
+    // a repository" row). `SettingsView`'s scroll effect below does one
+    // `querySelector` on the commit where the subview mounts and then clears
+    // the target whether or not it matched, so an anchor that waits for a fetch
+    // is missed on a cold open and the jump silently lands at the top of the
+    // page. Only the LIST is Loadable-gated.
+    const rows =
+      repoLoadable.status === 'failed'
+        ? <LoadableError noun="repositories" error={repoLoadable.error} />
+        : repoLoadable.status !== 'loaded'
+          ? null
+          : (
+            <>
+              {repoLoadable.data.map(repo => (
+                <div class="list-row" key={repo.id}>
+                  <div class="list-row-info">
+                    <div class="title">{repo.name}</div>
+                    <div class="list-row-details">{repo.path}</div>
+                  </div>
+                  <div class="list-row-actions">
+                    <button class="action-btn action-btn-danger" onClick={async () => {
+                      if (await showConfirm(`Remove "${repo.name}"?`, 'Remove')) {
+                        try {
+                          const res = await mutatingFetch(`${API}/repositories/${repo.id}`, { method: 'DELETE' });
+                          await throwIfNotOk(res);
+                          void loadRepositories();
+                        } catch (e) {
+                          showToast(`Failed to remove repository: ${errorDetail(e)}`, 'error');
+                        }
+                      }
+                    }}>Remove</button>
+                  </div>
+                </div>
+              ))}
+              <AddRepositoryForm />
+            </>
+          );
 
     return (
       <div class="settings-section">
-        <div class="settings-section-title">Repositories</div>
+        <div class="settings-section-title" data-search-anchor="coding-agents:repositories">Repositories</div>
         <p class="settings-section-desc">Register local git repositories for Claude Code sessions.</p>
-        <div class="list-rows">
-          {repoLoadable.data.map(repo => (
-            <div class="list-row" key={repo.id}>
-              <div class="list-row-info">
-                <div class="title">{repo.name}</div>
-                <div class="list-row-details">{repo.path}</div>
-              </div>
-              <div class="list-row-actions">
-                <button class="action-btn action-btn-danger" onClick={async () => {
-                  if (await showConfirm(`Remove "${repo.name}"?`, 'Remove')) {
-                    try {
-                      const res = await mutatingFetch(`${API}/repositories/${repo.id}`, { method: 'DELETE' });
-                      await throwIfNotOk(res);
-                      void loadRepositories();
-                    } catch (e) {
-                      showToast(`Failed to remove repository: ${errorDetail(e)}`, 'error');
-                    }
-                  }
-                }}>Remove</button>
-              </div>
-            </div>
-          ))}
-          <AddRepositoryForm />
-        </div>
+        <div class="list-rows">{rows}</div>
       </div>
+    );
+  }
+
+  /** Coding Agents: which `claude` / `codex` binary a coding-agent thread runs,
+   *  and which repositories it may run in. Two halves of the same setup that
+   *  used to sit in different places (the binaries under System → Overview, the
+   *  repositories as their own top-level category). */
+  function codingAgentsSection() {
+    return (
+      <>
+        <CodingAgentBinariesSection />
+        {repositoriesSection()}
+      </>
+    );
+  }
+
+  /** Access: how you reach this engine from somewhere else. The mobile-access
+   *  guide and the engine's network bind are two halves of one question, and
+   *  the guide's own "Local network is off" row used to have to deep-link into
+   *  System → Network access to finish the job. Now it scrolls.
+   *
+   *  The two halves each fetch `GET /api/v1/network-config` on mount, so opening
+   *  this page costs two requests for one payload. Left as two independent
+   *  `Loadable`s deliberately, because they read DISJOINT fields (the guide uses
+   *  `gateway_bind` / `detected_tailscale_ip`, the bind editor uses
+   *  `engine_bind` / `inherit`) and the call is a cheap local one. That
+   *  disjointness is the invariant: give both halves a field in common and one
+   *  side goes stale after the other's Save, at which point the fetch has to be
+   *  hoisted into a single owner rather than duplicated. */
+  function accessSection() {
+    return (
+      <>
+        <MobileAccessPage />
+        <NetworkAccessPage />
+      </>
     );
   }
 
@@ -734,7 +803,7 @@ export function SettingsView() {
     const judgeOn = currentCommandGuardJudge();
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="command-safety">Command Safety</div>
+        <div class="settings-section-title" data-search-anchor="command-safety">Command safety</div>
         <div class="settings-row" data-search-anchor="command-safety:guard">
           <span class="settings-row-label">Command guard</span>
           <LoadableToggle
@@ -765,7 +834,7 @@ export function SettingsView() {
     );
   }
 
-  /** Permissions subview: the Command Safety guard plus the two per-agent
+  /** Permissions subview: the command safety guard plus the two per-agent
    *  command/tool allowlists, each an editable + deletable list. */
   function permissionsSection() {
     return (
@@ -839,7 +908,7 @@ export function SettingsView() {
     return (
       <>
         <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="models:chat">Chat &amp; Triggers</div>
+          <div class="settings-section-title" data-search-anchor="models:chat">Chat &amp; triggers</div>
           <div class="settings-row">
             <span class="settings-row-label">Model</span>
             <Dropdown
@@ -878,7 +947,7 @@ export function SettingsView() {
           </div>
         </div>
         <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="models:image-generation">Image Generation</div>
+          <div class="settings-section-title" data-search-anchor="models:image-generation">Image generation</div>
           <div class="settings-row">
             <span class="settings-row-label">Model</span>
             <Dropdown
@@ -889,7 +958,7 @@ export function SettingsView() {
           </div>
         </div>
         <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="models:background-tasks">Background Tasks</div>
+          <div class="settings-section-title" data-search-anchor="models:background-tasks">Background tasks</div>
           <div class="settings-row" data-search-anchor="models:title-generation">
             <span class="settings-row-label">Title generation</span>
             <Dropdown
@@ -928,6 +997,11 @@ export function SettingsView() {
     );
   }
 
+  /** Appearance & Behavior: how the client looks and behaves on this device.
+   *  The label gained "& Behavior" when link routing moved in, since where a
+   *  link opens is behaviour rather than display. The key stays `appearance`,
+   *  the standard name for this category and the head noun of the label, the
+   *  same way "Chat & triggers" is anchored `models:chat`. */
   function appearanceSection() {
     const theme = currentTheme();
     const font = currentFontFamily();
@@ -970,7 +1044,7 @@ export function SettingsView() {
         </div>
         {/* The mobile header (and its hide-on-scroll behavior) only exists at the
             ≤768px breakpoint, so this toggle does nothing observable on desktop.
-            Gate the whole section on the reactive viewport signal — it appears /
+            Gate the whole section on the reactive viewport signal: it appears /
             disappears live as the viewport crosses the breakpoint. The preference
             is global, so it's set from a mobile-width viewport where its effect is
             visible. */}
@@ -990,78 +1064,81 @@ export function SettingsView() {
             </div>
           </div>
         )}
+        {linksSection()}
       </>
     );
   }
 
-  function experimentalSection() {
+  /** Links: where a link opens when you tap it. ONE section for one user
+   *  question, with a platform-conditional ROW for each answer:
+   *
+   *   - the external-link target, on an installed iOS PWA (the only client
+   *     where the choice has any effect: see `externalLinkTargetConfigurable`);
+   *   - the in-app browser, under Tauri (the webview it opens is desktop-only).
+   *
+   *  Those two used to be separate top-level categories, `Links` and
+   *  `Experimental`, each gated so it vanished off its platform. That is how the
+   *  external-link setting shipped unreachable on the one platform it applies
+   *  to: it sat inside `Experimental`, whose nav entry was `isTauri()`-only. The
+   *  gating now lives HERE, on the rows, and the category above it
+   *  (Appearance & Behavior) renders Theme + Typography unconditionally, so no
+   *  page can come up empty.
+   *  Pinned by `__tests__/settings-nav-structure.test.ts`. */
+  function linksSection() {
+    const showExternalTarget = externalLinkTargetConfigurable();
+    const showInAppBrowser = isTauri();
+    if (!showExternalTarget && !showInAppBrowser) return null;
     // Gate the toggle on the loaded status so it mounts in its persisted
     // position rather than animating across on reload (see `LoadableToggle`).
     const loaded = preferences.value.status === 'loaded';
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="experimental:in-app-browser">In-app browser</div>
-        <p class="settings-section-desc">
-          Open links inside the app in a built-in browser pane instead of your
-          system browser, and add a Browser entry to the menu drawer.
-          Experimental: the in-app browser has rough edges, so it's off by
-          default.
-        </p>
-        <div class="settings-row" data-search-anchor="experimental:in-app-browser-toggle">
-          <span class="settings-row-label">Open links in the in-app browser</span>
-          <LoadableToggle
-            loaded={loaded}
-            checked={currentInAppBrowser()}
-            onChange={(c) => void setInAppBrowser(c)}
-          />
-        </div>
-      </div>
-    );
-  }
-
-  /** Links: how Lucidos routes links. Its nav entry is gated on having
-   *  something to show (see the `navItems` filter), so it never opens onto an
-   *  empty panel. */
-  function linksSection() {
-    return <>{externalLinksSection()}</>;
-  }
-
-  /** Only rendered on an installed iOS PWA, the one client where the choice has
-   *  any effect. See `externalLinkTargetConfigurable`.
-   *
-   *  Lives under **Links**, NOT Experimental: the Experimental nav row is
-   *  itself filtered to `isTauri()` (its toggles are desktop-webview-only), so a
-   *  section placed there is unreachable on the one platform this setting is
-   *  for. Not Appearance either, which is display preferences; where a link
-   *  opens is behaviour. */
-  function externalLinksSection() {
-    if (!externalLinkTargetConfigurable()) return null;
-    return (
-      <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="links:external-links">External links</div>
-        <p class="settings-section-desc">
-          Where a link to another site goes when you tap it. Installed on the
-          home screen, iOS would otherwise trap every link in an in-app view with
-          no address bar and no shared Safari session. iOS gives web apps no way
-          to reach your default-browser setting directly, so "Ask" is the option
-          that lets iOS itself offer every browser you have installed.
-        </p>
-        {/* The per-link override is iOS's OWN long-press menu, not something we
-            render: suppressing it to draw our own would cost Copy Link, Share
-            and Add to Reading List alongside Open in Safari. Naming it here is
-            the documented way to make it discoverable. */}
-        <p class="settings-section-desc">
-          For a one-off, long-press any link instead: iOS offers Open in Safari,
-          Copy and Share without changing this setting.
-        </p>
-        <div class="settings-row" data-search-anchor="links:external-links-target">
-          <span class="settings-row-label">Open links in</span>
-          <Dropdown
-            options={EXTERNAL_LINK_TARGET_OPTIONS}
-            value={currentExternalLinkTarget()}
-            onChange={(v) => void setExternalLinkTarget(v as ExternalLinkTarget)}
-          />
-        </div>
+        <div class="settings-section-title" data-search-anchor="appearance:links">Links</div>
+        {showExternalTarget && (
+          <>
+            <p class="settings-section-desc">
+              Where a link to another site goes when you tap it. Installed on the
+              home screen, iOS would otherwise trap every link in an in-app view with
+              no address bar and no shared Safari session. iOS gives web apps no way
+              to reach your default-browser setting directly, so "Ask" is the option
+              that lets iOS itself offer every browser you have installed.
+            </p>
+            {/* The per-link override is iOS's OWN long-press menu, not something we
+                render: suppressing it to draw our own would cost Copy Link, Share
+                and Add to Reading List alongside Open in Safari. Naming it here is
+                the documented way to make it discoverable. */}
+            <p class="settings-section-desc">
+              For a one-off, long-press any link instead: iOS offers Open in Safari,
+              Copy and Share without changing this setting.
+            </p>
+            <div class="settings-row" data-search-anchor="appearance:external-link-target">
+              <span class="settings-row-label">Open links in</span>
+              <Dropdown
+                options={EXTERNAL_LINK_TARGET_OPTIONS}
+                value={currentExternalLinkTarget()}
+                onChange={(v) => void setExternalLinkTarget(v as ExternalLinkTarget)}
+              />
+            </div>
+          </>
+        )}
+        {showInAppBrowser && (
+          <>
+            <p class="settings-section-desc">
+              Open links inside the app in a built-in browser pane instead of your
+              system browser, and add a Browser entry to the menu drawer.
+              Experimental: the in-app browser has rough edges, so it's off by
+              default.
+            </p>
+            <div class="settings-row" data-search-anchor="appearance:in-app-browser">
+              <span class="settings-row-label">Open links in the in-app browser</span>
+              <LoadableToggle
+                loaded={loaded}
+                checked={currentInAppBrowser()}
+                onChange={(c) => void setInAppBrowser(c)}
+              />
+            </div>
+          </>
+        )}
       </div>
     );
   }
@@ -1076,16 +1153,14 @@ export function SettingsView() {
       case 'devices': return devicesSection();
       case 'accounts': return accountsSection();
       case 'backup': return <SystemPage panel="backup" />;
-      case 'repositories': return repositoriesSection();
+      case 'coding-agents': return codingAgentsSection();
+      case 'locale': return <LocaleSection />;
       case 'marketplaces': return <MarketplacesSection />;
-      case 'mobile-access': return <MobileAccessPage />;
+      case 'access': return accessSection();
       case 'permissions': return permissionsSection();
-      case 'links': return linksSection();
-      case 'experimental': return experimentalSection();
       case 'keyboard-shortcuts': return <KeyboardShortcutsSection />;
       case 'disk-usage': return <SystemPage panel="disk-usage" />;
       case 'environment-variables': return <SystemPage panel="environment-variables" />;
-      case 'network-access': return <SystemPage panel="network-access" />;
       case 'debugging': return <SystemPage panel="debugging" />;
       default: return null;
     }
@@ -1099,28 +1174,25 @@ export function SettingsView() {
     );
   }
 
-  // Mobile Access is listed everywhere, deliberately. Its machine-side controls
-  // (connect URLs, Sign in, Expose) are Tauri commands and the page hides them
-  // off the packaged desktop app, but its other half explains how to get
-  // Tailscale and Lucidos onto a phone, and the phone is where that is worth
-  // reading. Gating the row on `isTauri()` made the phone-facing half reachable
-  // only from the Mac.
-  // Experimental hosts desktop-only toggles (the in-app browser webview exists
-  // only under Tauri), so it's hidden in Chrome/PWA.
-  const navItems = SETTINGS_NAV_ITEMS.filter(({ key }) => {
-    if (key === 'experimental') return isTauri();
-    // Links holds only platform-conditional rows today, so list it exactly when
-    // one of them would render. Listing it unconditionally would open an empty
-    // panel; the External links row it carries applies to an installed iOS PWA
-    // only.
-    if (key === 'links') return externalLinkTargetConfigurable();
-    return true;
-  });
-
+  // EVERY nav item is rendered on EVERY platform. There is deliberately no
+  // filter here: a category that disappears per-device gives the app a
+  // different shape per device, makes "go to Settings → X" false for most
+  // users, and is how the iOS external-link setting once became unreachable on
+  // the only platform it applies to (it sat inside Experimental, whose row was
+  // isTauri()-gated). Platform gating belongs to a row or section INSIDE a
+  // category, where an absent control just means one fewer row on a page that
+  // still has others. See `linksSection` and the SETTINGS_NAV_ITEMS comment;
+  // pinned by `__tests__/settings-nav-structure.test.ts`.
+  //
+  // Groups are contiguous in SETTINGS_NAV_ITEMS, so a heading is emitted
+  // whenever the group changes rather than by pre-bucketing the list.
   return (
     <div class="content-view active settings-panel">
-      {navItems.map(({ key, label }) => (
-        <div class="settings-section" key={key}>
+      {SETTINGS_NAV_ITEMS.map(({ key, label, group }, i) => (
+        <div class="settings-section settings-nav-item" key={key}>
+          {group !== SETTINGS_NAV_ITEMS[i - 1]?.group && (
+            <div class="settings-nav-group-title">{group}</div>
+          )}
           <div class="settings-section-title settings-nav-row" onClick={() => openSettingsSubview(key)}>
             <span>{label}</span>
             <ChevronRightIcon />

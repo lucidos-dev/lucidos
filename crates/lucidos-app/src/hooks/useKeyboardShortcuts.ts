@@ -4,6 +4,7 @@ import { focusPromptNow } from '../components/chat/promptFocus';
 import { searchEverywhereOpen, focusedPane, toggleExchangeCollapsed, toggleInitiatorCollapsed } from '../store/store';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { dismissTopOverlay, overlayStack } from '../store/overlayStack';
+import { nativeFullscreenElement } from '../store/appFullscreenHost';
 import { runCloseCascade } from '../store/actions/threadActions';
 import { matchShortcut } from '../store/actions/keybindings';
 import type { ShortcutId } from '../utils/shortcuts';
@@ -97,6 +98,14 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
 };
 
 /** Non-destructive Escape policy, in priority order:
+ *  0. while an element is NATIVELY fullscreen, stand down entirely: the browser
+ *     takes this Escape to exit fullscreen and no handler can stop it (Escape is
+ *     excluded from the events that grant the user activation a re-request would
+ *     need, and the only way to consume the close request first is the top
+ *     layer, which the overlay layer deliberately does not use). Acting anyway
+ *     would make one Escape do two things: close the overlay AND drop the app
+ *     out of fullscreen. Standing down leaves it doing one, and the overlay is
+ *     then plainly visible in the normal layout for the next Escape to close.
  *  1. dismiss the top registered overlay (modal / confirm / pseudo-fullscreen),
  *  2. else, if the focused text input manages its own Escape (`data-escape-self`),
  *     leave focus alone so its keydown handler can run — used by inputs where a
@@ -105,10 +114,28 @@ const SHORTCUT_ACTIONS: Record<ShortcutId, () => void> = {
  *  3. else blur a focused text input (the universal "Esc defocuses" gesture),
  *  4. else no-op — Escape NEVER touches the focused thread or discards work.
  *  Returns which branch fired so the caller can preventDefault/stopPropagation
- *  appropriately. Exported for unit testing. */
+ *  appropriately. The stand-down has its own value, `'fullscreen'`, because it
+ *  is NOT the same as `'noop'`: the capture-phase dispatcher must still
+ *  `stopPropagation` on it. `<Overlay>` installs its own bubble-phase Escape
+ *  listener through `useDismissOnOutside`, which dismisses unconditionally, and
+ *  it is normally shadowed by the `stopPropagation` the `'dismissed'` branch
+ *  does. Falling through silently would let that listener close the overlay
+ *  after all, which is the double action this branch exists to prevent (caught
+ *  by the fullscreen e2e). It must NOT `preventDefault`, since the UA's own
+ *  fullscreen exit is the one thing that should still happen.
+ *
+ *  Exported for unit testing, which is why `nativeFullscreen` is a parameter
+ *  with a live-read default.
+ *
+ *  Pseudo-fullscreen is NOT covered by rule 0 and must not be: it is painted in
+ *  the normal layer and dismissed through this same stack, where LIFO already
+ *  gives the right answer (it registers before the overlay, so the overlay pops
+ *  first and fullscreen survives). */
 export function dispatchEscape(
   active: Element | null,
-): 'dismissed' | 'self-managed' | 'blurred' | 'noop' {
+  nativeFullscreen: boolean = nativeFullscreenElement() !== null,
+): 'dismissed' | 'self-managed' | 'blurred' | 'noop' | 'fullscreen' {
+  if (nativeFullscreen) return 'fullscreen';
   if (dismissTopOverlay()) return 'dismissed';
   if (isTextInput(active)) {
     if ((active as HTMLElement).hasAttribute?.('data-escape-self')) return 'self-managed';
@@ -207,10 +234,12 @@ export function dispatchPreviewIframeShortcut(e: KeyboardEvent): boolean {
   }
   if (e.key === 'Escape') {
     // activeElement is the host <iframe> (focus is inside it) — not a text input,
-    // so the policy dismisses any open host overlay and otherwise no-ops.
+    // so the policy dismisses any open host overlay and otherwise no-ops. The
+    // fullscreen stand-down counts as not consumed here: the host did nothing
+    // and the browser's own fullscreen exit must be left alone.
     const result = dispatchEscape(document.activeElement);
     if (result === 'dismissed' || result === 'blurred') e.preventDefault();
-    return result !== 'noop';
+    return result === 'dismissed' || result === 'blurred' || result === 'self-managed';
   }
   return false;
 }
@@ -285,6 +314,13 @@ export function useKeyboardShortcuts(): void {
       const result = dispatchEscape(document.activeElement);
       if (result === 'dismissed') {
         e.preventDefault();
+        e.stopPropagation();
+      } else if (result === 'fullscreen') {
+        // The browser is taking this Escape to leave fullscreen, so no page
+        // handler may act on it: stop it here rather than let it reach
+        // `<Overlay>`'s own bubble-phase Escape (which would close the overlay
+        // and make one keypress do two things). Deliberately no preventDefault,
+        // which is what leaves the UA's fullscreen exit alone.
         e.stopPropagation();
       } else if (result === 'blurred') {
         e.preventDefault();

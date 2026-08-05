@@ -65,7 +65,7 @@ vi.mock('../../components/chat/scrollState', () => ({
 }));
 
 vi.mock('./thread-loading', () => ({
-  refreshThreadEvents: vi.fn().mockResolvedValue(undefined),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('./devices', () => ({

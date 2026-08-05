@@ -250,8 +250,17 @@ impl LucidosEngine {
     /// exists, so the emit can't happen inside recovery). Engine-attributed
     /// (`actor: None`): the resume is a recovery consequence, not a device click,
     /// and the "Resumed" boundary keeps the Lucidos-mark chip.
-    pub async fn resume_pending_switches(&self) {
+    ///
+    /// Returns the thread ids whose resume this boot has taken responsibility
+    /// for, which `settle_unresumed_switch_threads` needs to EXCLUDE. The
+    /// dispatcher has not emitted `ContinuationStarted` yet when the floor runs,
+    /// and `ContinuationRequested` is deliberately absent from
+    /// `THREAD_START_EVENTS_SQL`, so a query-only exclusion would re-abort a
+    /// thread that is resuming correctly. The skip branch below still counts as
+    /// actuated: the dispatcher's startup orphan re-dispatch owns that resume.
+    pub async fn resume_pending_switches(&self) -> Vec<uuid::Uuid> {
         let ids = std::mem::take(&mut *self.pending_switch_resumes.lock().unwrap());
+        let mut actuated = Vec::with_capacity(ids.len());
         for thread_id in ids {
             // A prior boot may have left this thread an unactuated
             // ContinuationRequested (emitted but never spawned — the zombie
@@ -270,9 +279,17 @@ impl LucidosEngine {
                      the dispatcher's startup orphan re-dispatch owns the resume; skipping duplicate emit",
                     thread_id
                 );
+                actuated.push(thread_id);
                 continue;
             }
-            crate::engine::thread_events::emit_continuation_requested_or_log(
+            // Only a request that actually PERSISTED counts as actuated. An emit
+            // that errored or was rejected leaves nothing for the dispatcher to
+            // act on, so the thread must stay visible to
+            // `settle_unresumed_switch_threads`, which withdraws the promise and
+            // gives the user their Continue button back. Pushing it regardless
+            // would suppress that button forever on the one path where the
+            // resume provably did not happen.
+            let requested = crate::engine::thread_events::emit_continuation_requested_or_log(
                 &self.event_bus,
                 thread_id,
                 crate::engine::agent_recovery::AUTO_RESUME_AFTER_SWITCH_REASON,
@@ -280,7 +297,11 @@ impl LucidosEngine {
                 "[Recovery] ContinuationRequested (auto-resume after switch)",
             )
             .await;
+            if requested {
+                actuated.push(thread_id);
+            }
         }
+        actuated
     }
 
     /// Current background-rebuild state.
@@ -671,17 +692,19 @@ impl LucidosEngine {
     /// the *Switch to new version* flow. The running engine keeps serving; when the
     /// rebuild finishes, its on-disk binary's build-id differs from the running
     /// `ENGINE_BUILD_ID` (surfaced via `version_status`) → the frontend surfaces
-    /// "New version available". A second call **coalesces**: the in-flight build is aborted (its
-    /// child is `kill_on_drop`, so the cargo process dies) and a fresh build starts,
-    /// so the build always reflects the latest merged source. No-op in packaged —
-    /// it never rebuilds from source (its "new version" is the release updater).
+    /// "New version available". A second call **coalesces**: the in-flight build is
+    /// aborted (killing its whole build process group) and a fresh build starts, so
+    /// the build always reflects the latest merged source. No-op in packaged, which
+    /// never rebuilds from source (its "new version" is the release updater).
     pub fn trigger_background_rebuild(self: &Arc<Self>) {
         if crate::runtime::is_packaged() {
             return;
         }
         let generation = self.build_generation.fetch_add(1, Ordering::SeqCst) + 1;
-        // Coalesce: abort any running build task; its child is kill_on_drop.
-        if let Some(old) = self.build_task.lock().unwrap().take() {
+        // Coalesce: abort any running build task. Its child dies with it
+        // (`kill_on_drop` plus the process-group kill in `run_engine_build`).
+        let superseded = self.build_task.lock().unwrap().take();
+        if let Some(old) = &superseded {
             old.abort();
         }
         // Stamped once here, so the state the SSE poke reports and the state the
@@ -696,6 +719,24 @@ impl LucidosEngine {
             // window (iOS suspends the timer on a backgrounded PWA), so the spinner
             // badge never showed. See engine_version::emit_build_state_changed.
             engine.emit_build_state_changed(&building).await;
+            // HAND THE BUILD LOCK OVER, don't race it. `abort()` only REQUESTS
+            // cancellation: the superseded task drops its `flock` guard when it
+            // next reaches an await point, which is strictly after `abort()`
+            // returns. Probing the checkout-shared lock without waiting for that
+            // reads the dying build's own guard as "a peer is building", returns
+            // `SkippedLocked` → `BuildState::Idle`, and leaves NO build running at
+            // all, so the user gets the manual "New engine version pending /
+            // Rebuild" toast until the ~10s self-heal tick starts the build for
+            // real. Three back-to-back Applies did exactly that on 2026-08-05.
+            //
+            // Awaiting the handle resolves only once the task has stopped and its
+            // locals (the lock guard among them) are dropped. Bounded without a
+            // timeout because every await in that task is cancel-safe and already
+            // unblocked at cancellation: the SSE emit, the lock wait's sleep, and
+            // `Child::wait`. An already-finished build resolves immediately.
+            if let Some(old) = superseded {
+                let _ = old.await;
+            }
             let outcome = run_engine_build(&workspace).await;
             // Only the latest generation updates state — a superseded build's
             // completion is ignored (a newer build is already `Building`).
@@ -759,6 +800,78 @@ enum EngineBuildOutcome {
 /// whole build; dropping it releases the lock.
 fn try_acquire_engine_build_lock() -> Option<std::fs::File> {
     try_lock_file(&engine_build_lock_path()?)
+}
+
+/// How long [`run_engine_build`] waits for the checkout-shared build lock before
+/// concluding a co-located engine owns it.
+///
+/// A single instantaneous try is not a verdict, it is a sample. Two things make
+/// a FREE lock read as held for a few milliseconds: a build this one just
+/// superseded may still be dropping its guard, and any concurrently-forked
+/// subprocess transiently inherits the open file description until it reaches
+/// `exec` (the same effect the lock tests' `eventually` helper exists for). Both
+/// resolve in milliseconds, while a genuine peer build runs for a minute or more,
+/// so a short wait separates the two without slowing either down.
+const BUILD_LOCK_WAIT: Duration = Duration::from_secs(3);
+
+/// Poll interval while waiting for [`BUILD_LOCK_WAIT`]. `flock` has no async
+/// notification, so the wait is a poll; fine at this granularity for something
+/// that either resolves in milliseconds or not at all.
+const BUILD_LOCK_POLL: Duration = Duration::from_millis(50);
+
+/// [`try_lock_file`] with a bounded retry, for the one caller that must not
+/// mistake a millisecond of contention for a peer build. Returns the held guard,
+/// or `None` when `wait` elapsed with the lock still held. Path- and
+/// duration-parameterized so the timing is unit-testable without a checkout.
+async fn acquire_engine_build_lock_waiting(
+    lock_path: &std::path::Path,
+    wait: Duration,
+) -> Option<std::fs::File> {
+    let deadline = Instant::now() + wait;
+    loop {
+        if let Some(guard) = try_lock_file(lock_path) {
+            return Some(guard);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(BUILD_LOCK_POLL).await;
+    }
+}
+
+/// SIGKILLs the build's process group if the build future is DROPPED, i.e. when
+/// a coalescing Apply aborts it.
+///
+/// `kill_on_drop(true)` reaches only the direct child, which is `web-dev.sh`. The
+/// `cargo` it spawned is a grandchild and survives, so before this guard a rapid
+/// series of Applies left superseded builds compiling against the shared
+/// `target/` alongside the live one, each one slowing the build the user is
+/// actually waiting on (three overlapping runs finishing 1m30s apart were visible
+/// in the dev engine log on 2026-08-05).
+///
+/// Disarmed the moment the child is reaped: after `wait` the pid, and with it the
+/// group id, can be recycled, and signalling a recycled group would hit unrelated
+/// processes (see `spawn_env::signal_child_process_group`).
+///
+/// SIGKILL is untrappable, so a kill landing inside the launch-binary publish
+/// leaves its `*.tmp.<pid>` behind. That is disk only, never a corrupt binary:
+/// the publish copies and signs a temp and reaches the launch path solely
+/// through `mv -f`. `prune_dead_launch_temps` (`scripts/lib/workspace.sh`)
+/// collects the residue on the next publish.
+struct BuildProcessGroupGuard(Option<u32>);
+
+impl BuildProcessGroupGuard {
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for BuildProcessGroupGuard {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0 {
+            crate::runtime::spawn_env::kill_child_process_group_now(pid);
+        }
+    }
 }
 
 /// Path of the checkout-shared engine-build lock, or `None` when the checkout
@@ -1012,11 +1125,11 @@ async fn current_head_sha() -> Option<String> {
 }
 
 /// Run `web-dev.sh --engine-build -w <ws>` to rebuild the engine binary on disk,
-/// appending output to the workspace engine log. `kill_on_drop` so a coalescing
-/// abort kills the cargo process instead of orphaning it. Holds the
-/// checkout-shared build lock for the whole build so co-located engines can't run
-/// concurrent cargo builds on the same `target/`; returns `SkippedLocked` when a
-/// peer already holds it.
+/// appending output to the workspace engine log. The build runs in its own
+/// process group so a coalescing abort kills `cargo` too, not just the script
+/// (see [`BuildProcessGroupGuard`]). Holds the checkout-shared build lock for the
+/// whole build so co-located engines can't run concurrent cargo builds on the
+/// same `target/`; returns `SkippedLocked` when a peer already holds it.
 async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
     // Elect a single builder across co-located engines (see the lock helper).
     // Held (via `_build_lock`) until this function returns. When the checkout
@@ -1024,11 +1137,14 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
     // uncoordinated (fail-open) rather than never building; only a genuinely
     // held lock means a peer is building (→ SkippedLocked).
     let _build_lock = match engine_build_lock_path() {
-        Some(path) => match try_lock_file(&path) {
+        Some(path) => match acquire_engine_build_lock_waiting(&path, BUILD_LOCK_WAIT).await {
             Some(guard) => Some(guard),
             None => {
                 crate::log!(
-                    "[Rebuild] engine build already in progress on this checkout — skipping (a co-located workspace is building)"
+                    "[Rebuild] the checkout-shared engine build lock stayed held for {}s, \
+                     skipping this build (a co-located workspace is building; its build \
+                     advances the shared binary for us too)",
+                    BUILD_LOCK_WAIT.as_secs()
                 );
                 return EngineBuildOutcome::SkippedLocked;
             }
@@ -1046,6 +1162,9 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
     let log_path = workspace.join(".lucidos/engine.log");
     let mut cmd = tokio::process::Command::new(&script);
     cmd.args(["-w", &ws, "--engine-build"]).kill_on_drop(true);
+    // Own process group, so a coalescing abort can reach the `cargo` grandchild
+    // and not just this script. See `BuildProcessGroupGuard`.
+    crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
     if let Ok(f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -1060,14 +1179,27 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
             }
         }
     }
-    match cmd.status().await {
+    // `spawn` + `wait` rather than `status`, so the pid is in hand for the
+    // group-kill guard before the wait can be cancelled.
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            crate::log!("[Rebuild] failed to spawn engine build: {e}");
+            return EngineBuildOutcome::Failed;
+        }
+    };
+    let mut group_guard = BuildProcessGroupGuard(child.id());
+    let status = child.wait().await;
+    // Reaped: the pid may now be recycled, so the group must not be signalled.
+    group_guard.disarm();
+    match status {
         Ok(status) if status.success() => EngineBuildOutcome::Succeeded,
         Ok(status) => {
             crate::log!("[Rebuild] engine build exited {status}");
             EngineBuildOutcome::Failed
         }
         Err(e) => {
-            crate::log!("[Rebuild] failed to spawn engine build: {e}");
+            crate::log!("[Rebuild] engine build could not be waited on: {e}");
             EngineBuildOutcome::Failed
         }
     }
@@ -1076,10 +1208,12 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_id_commit, classify_pending_commits, commit_is_strict_ancestor, disk_upgrade_verdict,
-        lock_held_at, parse_pending_commits, self_heal_is_wedged, try_lock_file, BuildState,
+        acquire_engine_build_lock_waiting, build_id_commit, classify_pending_commits,
+        commit_is_strict_ancestor, disk_upgrade_verdict, lock_held_at, parse_pending_commits,
+        self_heal_is_wedged, try_lock_file, BuildProcessGroupGuard, BuildState,
         PENDING_COMMIT_SUBJECT_CAP,
     };
+    use std::time::Duration;
 
     /// Poll `cond` until it holds, up to ~2 s.
     ///
@@ -1106,6 +1240,115 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         false
+    }
+
+    /// A lock that frees DURING the wait is acquired, not reported as a peer
+    /// build. This is the regression: a build superseded by a coalescing Apply
+    /// is still dropping its guard when the replacement probes, and a single
+    /// instantaneous try turned that millisecond into `SkippedLocked` →
+    /// `BuildState::Idle`, leaving no build running at all (2026-08-05).
+    #[tokio::test]
+    async fn build_lock_wait_rides_out_a_holder_that_is_about_to_release() {
+        let dir = std::env::temp_dir().join(format!("lucidos-lockwait-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".lucidos-engine-build.lock");
+
+        let held = eventually_acquire(&path);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            drop(held);
+        });
+        assert!(
+            acquire_engine_build_lock_waiting(&path, Duration::from_secs(5))
+                .await
+                .is_some(),
+            "a lock released partway through the wait must be acquired, not read as a peer build"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other direction, so the wait can't paper over a genuine peer build:
+    /// a lock held for the whole window still yields `None` (→ `SkippedLocked`,
+    /// and the peer-build spinner rather than a second concurrent cargo).
+    #[tokio::test]
+    async fn build_lock_wait_gives_up_on_a_holder_that_never_releases() {
+        let dir = std::env::temp_dir().join(format!("lucidos-lockheld-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".lucidos-engine-build.lock");
+
+        let _held = eventually_acquire(&path);
+        assert!(
+            acquire_engine_build_lock_waiting(&path, Duration::from_millis(150))
+                .await
+                .is_none(),
+            "a lock held for the whole wait must still report the peer build"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A coalescing abort must take the GRANDCHILD down with the script.
+    /// `kill_on_drop` reaps only the direct child (`web-dev.sh`), so before the
+    /// group guard a superseded build left its `cargo` compiling against the
+    /// shared `target/` next to the live build. Modelled with a shell that
+    /// backgrounds a `sleep` and waits on it, which is the same shape.
+    #[tokio::test]
+    async fn dropping_the_build_group_guard_kills_the_grandchild() {
+        let dir = std::env::temp_dir().join(format!("lucidos-buildgroup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pid_file = dir.join("grandchild.pid");
+
+        let mut cmd = tokio::process::Command::new("sh");
+        cmd.arg("-c")
+            .arg(format!(
+                "sleep 60 & echo $! > {}; wait",
+                pid_file.to_string_lossy()
+            ))
+            .kill_on_drop(true);
+        crate::runtime::spawn_env::isolate_in_process_group(&mut cmd);
+        let mut child = cmd.spawn().expect("spawn the group leader");
+
+        let grandchild = read_pid_when_written(&pid_file).expect("grandchild pid");
+        assert!(pid_is_alive(grandchild), "the grandchild must start alive");
+
+        // Exactly what a cancelled build future does: guard first (declared
+        // last), then the child.
+        drop(BuildProcessGroupGuard(child.id()));
+        child.start_kill().ok();
+        child.wait().await.ok();
+
+        assert!(
+            eventually(|| !pid_is_alive(grandchild)),
+            "the group kill must reach the grandchild; kill_on_drop alone leaves it running"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Poll for the pid the shell writes once it has backgrounded its child.
+    fn read_pid_when_written(path: &std::path::Path) -> Option<i32> {
+        for _ in 0..200 {
+            if let Ok(text) = std::fs::read_to_string(path) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    return Some(pid);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
+    }
+
+    /// `ps -p` rather than `kill(pid, 0)`, to keep the test free of `unsafe`.
+    /// The grandchild is reparented to init when its shell dies, so init reaps
+    /// it and it leaves the table outright rather than lingering as a zombie.
+    fn pid_is_alive(pid: i32) -> bool {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
     }
 
     /// The load-bearing single-builder invariant: while one holder has the build

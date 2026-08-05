@@ -61,6 +61,23 @@ pub(crate) fn credential_request_with_defaults(
     credential_request_envelope(payload)
 }
 
+/// The service name a `request_credential` call actually writes under.
+///
+/// For `oauth_client` this is NOT the agent's `service_name` verbatim: it is
+/// lowercased and any leading `oauth:` is stripped, so an agent that still says
+/// `oauth:google` (the spelling the chat system prompt used for as long as the
+/// tool existed) lands on the same row as one that says `google`. See
+/// `oauth::client_provider_name`. Every other auth type keeps its name exactly,
+/// because that name is what `CRED_<NAME>` env injection and `apis.json` service
+/// lookups key off.
+fn requested_service_name(service_name: &str, auth_type: &str) -> String {
+    if auth_type == "oauth_client" {
+        oauth::client_provider_name(service_name)
+    } else {
+        service_name.to_string()
+    }
+}
+
 /// Collect the optional oauth endpoint + scopes args an agent passes (looked up
 /// from `system-knowhow/oauth-providers.md`) into a `defaults` map. Blank/absent
 /// args are dropped so they never pre-fill an empty field.
@@ -72,6 +89,8 @@ fn oauth_defaults_from_args(
         "auth_url",
         "token_url",
         "userinfo_url",
+        "userinfo_method",
+        "authorize_params",
         "scopes",
         "redirect_uri",
     ] {
@@ -83,10 +102,16 @@ fn oauth_defaults_from_args(
 }
 
 impl LucidosEngine {
+    /// `thread_id` + `device_id` are here for `connect_oauth_account`: the
+    /// authorization page is opened by the user's own client (see
+    /// [`Self::request_navigation`]), so the flow needs to know which thread to
+    /// emit on and which device is actually in front of the user.
     pub(crate) async fn execute_credential_tool(
         &self,
         name: &str,
         args: &serde_json::Value,
+        thread_id: uuid::Uuid,
+        device_id: Option<&str>,
     ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
         match name {
             "request_credential" => {
@@ -98,6 +123,9 @@ impl LucidosEngine {
                 if service_name.is_empty() || prompt.is_empty() || base_url.is_empty() {
                     return Ok("Error: service_name, prompt, and base_url are required".to_string());
                 }
+
+                let service_name = requested_service_name(service_name, auth_type);
+                let service_name = service_name.as_str();
 
                 // Optional custom env var name to pre-fill the modal with. Validate
                 // it the same way the Settings UI does (the API boundary re-validates
@@ -114,8 +142,19 @@ impl LucidosEngine {
                     }
                 }
 
-                // Check if credential already exists
-                if let Ok(Some(_)) = CredentialStore::get(&self.pool, service_name).await {
+                // Check if credential already exists. Typed, because an
+                // `oauth_client` row is the one type allowed to share a name
+                // with another credential: a bare-name check would report a
+                // Google API key as "already configured" when the agent is
+                // asking for the Google app registration, and never open the
+                // modal.
+                let existing = CredentialStore::get_typed(
+                    &self.pool,
+                    service_name,
+                    crate::core::AuthType::parse(auth_type),
+                )
+                .await;
+                if let Ok(Some(_)) = existing {
                     return Ok(format!(
                         "Credentials for '{}' are already configured. You can proceed with API requests.",
                         service_name
@@ -149,8 +188,8 @@ impl LucidosEngine {
                 }
 
                 // Check if client credentials exist for this provider
-                let cred_service = format!("oauth:{}", provider);
-                if CredentialStore::get(&self.pool, &cred_service)
+                let cred_service = oauth::client_provider_name(&provider);
+                if CredentialStore::get_oauth_client(&self.pool, &cred_service)
                     .await?
                     .is_none()
                 {
@@ -170,6 +209,8 @@ impl LucidosEngine {
                         auth_url: str_arg("auth_url"),
                         token_url: str_arg("token_url"),
                         userinfo_url: str_arg("userinfo_url"),
+                        userinfo_method: str_arg("userinfo_method"),
+                        authorize_params: str_arg("authorize_params"),
                         scopes: Some(scopes.to_string()),
                         redirect_uri: str_arg("redirect_uri"),
                     };
@@ -178,14 +219,56 @@ impl LucidosEngine {
                     )));
                 }
 
-                let (email, _display_name, _merged_scopes) =
-                    oauth::run_oauth_flow(&self.pool, &self.event_bus, &provider, scopes).await?;
+                // The engine does NOT open the browser. It asks the user's own
+                // device to, so the authorization page lands wherever they
+                // configured links to open. Shelling out to macOS `open` here
+                // ignored that preference and did nothing at all on Linux.
+                // `purpose: "oauth"` is what lets the client close the in-app
+                // browser panel again once the flow lands, instead of leaving
+                // the user on a dead callback page inside the app. See
+                // `oauthAuthPanelUrl` in store/actions/oauth.ts.
+                let open_auth_url = async |auth_url: &str| {
+                    self.request_navigation(
+                        &serde_json::json!({
+                            "target": "url",
+                            "url": auth_url,
+                            "purpose": "oauth",
+                        }),
+                        thread_id,
+                        device_id,
+                    )
+                    .await
+                    .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                        format!("could not open the authorization page: {e}").into()
+                    })
+                };
+                let (email, _display_name, _merged_scopes) = oauth::run_oauth_flow(
+                    &self.pool,
+                    &self.event_bus,
+                    &provider,
+                    scopes,
+                    // Same device the authorization page was handed to: it is the
+                    // one to bring back to the front when the flow lands.
+                    self.turn_device_actor(device_id).await,
+                    open_auth_url,
+                )
+                .await?;
 
-                let email_display = email.as_deref().unwrap_or("unknown");
-                Ok(format!(
-                    "Successfully connected {} account ({}).",
-                    provider, email_display
-                ))
+                match email.as_deref() {
+                    Some(email) => Ok(format!(
+                        "Successfully connected {provider} account ({email})."
+                    )),
+                    // The provider gave no userinfo endpoint, or it did not
+                    // return an email. Say that, rather than reporting the
+                    // account as literally named "unknown" and sending the agent
+                    // off to curl the provider's API to find out who it is.
+                    None => Ok(format!(
+                        "Successfully connected the {provider} account. The provider did not \
+                         report which account it is (no userinfo endpoint configured for \
+                         {provider}, or it returned no email), so do not guess or go looking \
+                         for one: just say the {provider} account is connected."
+                    )),
+                }
             }
             _ => Ok(format!("Unknown credential tool: {}", name)),
         }
@@ -315,6 +398,53 @@ mod tests {
         );
         let parsed = parse_payload(&result);
         assert_eq!(parsed["env_var_name"], "APPLE_PASSWORD");
+    }
+
+    /// The exact 2026-08-05 call that produced two Dropbox credentials:
+    /// `request_credential(service_name: "dropbox", auth_type: "oauth_client")`.
+    /// Both spellings an agent might use have to reach ONE row, or the user is
+    /// back to holding two credentials for one provider.
+    #[test]
+    fn oauth_client_requests_normalize_to_the_bare_provider() {
+        assert_eq!(requested_service_name("dropbox", "oauth_client"), "dropbox");
+        // The spelling the system prompt taught for as long as the tool existed.
+        assert_eq!(
+            requested_service_name("oauth:dropbox", "oauth_client"),
+            "dropbox"
+        );
+    }
+
+    /// Normalization is scoped to `oauth_client`. Every other type keeps its
+    /// name verbatim: it is what `CRED_<NAME>` injection and `apis.json` service
+    /// lookups resolve, so rewriting it would break live scripts.
+    #[test]
+    fn non_oauth_credentials_keep_their_name_verbatim() {
+        for auth_type in ["api_key", "bearer", "basic", "password", "email_password"] {
+            assert_eq!(
+                requested_service_name("dropbox", auth_type),
+                "dropbox",
+                "{auth_type} must not be renamed"
+            );
+        }
+        assert_eq!(
+            requested_service_name("email:work", "email_password"),
+            "email:work"
+        );
+    }
+
+    /// The envelope the modal receives carries the canonical name, so the row
+    /// the user saves is the row the OAuth flow later reads.
+    #[test]
+    fn the_modal_payload_carries_the_normalized_oauth_name() {
+        let result = credential_request_with_defaults(
+            &requested_service_name("Dropbox", "oauth_client"),
+            "Paste your Dropbox App key into Client ID.",
+            "https://api.dropboxapi.com",
+            "oauth_client",
+            serde_json::Map::new(),
+            None,
+        );
+        assert_eq!(parse_payload(&result)["service"], "dropbox");
     }
 
     #[test]

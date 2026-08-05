@@ -11,8 +11,8 @@ export function errorDetail(err: unknown): string {
 
 /** True when a fetch rejected because the request was *cancelled* — an
  *  `AbortError` DOMException — rather than because it failed or timed out. The
- *  background read paths (`refreshChangesState`, `loadUnreadNotifications`,
- *  `refreshThreadEvents`) attach no manual `AbortController`, so an AbortError
+ *  background read paths (`refreshChangesState`, `loadUnreadNotifications`)
+ *  attach no manual `AbortController`, so an AbortError
  *  there is never user-initiated: it's the browser cancelling an in-flight
  *  request when an iOS PWA freezes/backgrounds mid-fetch or the connection
  *  resets on a radio handoff. That carries no reachability signal and the next
@@ -25,6 +25,13 @@ export function errorDetail(err: unknown): string {
  *  timeout fires `TimeoutError` (distinct — it survives the retry and still
  *  surfaces/escalates as the stronger "waited the full window and got nothing"
  *  signal).
+ *
+ *  That last distinction only holds for a read issued ONCE per wake, which is
+ *  why the two per-thread event fetches in `store/actions/thread-loading.ts` no
+ *  longer draw the line here and gate on the wider `isTransientFetchError`
+ *  instead. They are fanned out one request per loaded thread, so one dropped
+ *  tunnel fires every client deadline at once and the timeout stops being
+ *  evidence about the engine: it is just what an outage looks like on a fan-out.
  *
  *  Two WRITE paths reach the same conclusion by a different route, because a
  *  write that got no answer is still owed a re-send rather than a toast:

@@ -17,8 +17,8 @@ use uuid::Uuid;
 
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_result, idle_action, is_definitive_session_not_found, is_silent_resume,
-    is_stale_resume_signal, may_touch_change_state_at_idle, reset_per_turn_flags,
+    classify_result, idle_action, is_definitive_session_not_found, is_resume_settle_result,
+    is_silent_resume, is_stale_resume_signal, may_touch_change_state_at_idle, reset_per_turn_flags,
     should_auto_commit_on_cleanup, terminal_clears_user_hit_stop, terminate_decision,
     watchdog_gate, IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, WatchdogGate,
     WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
@@ -495,6 +495,7 @@ impl LucidosEngine {
                 is_app_spawn,
                 is_external_repo,
                 external_repo_name,
+                repo_name.clone(),
                 &workspace_name,
                 &repo_root,
                 &repo_id,
@@ -653,7 +654,7 @@ impl LucidosEngine {
                 })
                 .or_else(default_claude_config_dir)
         });
-        // User-configured agent binary path (Settings → System → Coding agents).
+        // User-configured agent binary path (Settings → Coding Agents).
         // Resolved here — the spawn orchestration has the pool — and validated
         // inside the runtime's spawn, which fails loud naming the setting on a
         // path that doesn't resolve (never a silent fallback to probing).
@@ -1014,6 +1015,19 @@ impl LucidosEngine {
         // counter is exactly "tool calls before the first Result." Prevents the
         // 2026-07-02 false stale-resume → duplicate-process bug.
         let mut tool_calls_seen: u32 = 0;
+        // Count backend->model API calls seen before the first `Result`, read as
+        // `no_api_call_this_turn` by `is_resume_settle_result`. A `Usage` event is
+        // emitted per real API call and ONLY for one: the parser drops all-zero
+        // usage frames, and a backend's `<synthetic>` message (the injected
+        // `Continue from where you left off.` / `No response requested.` pair, a
+        // drained task-notification) carries exactly that. So zero here is
+        // positive proof no model call happened, which is what separates "this
+        // Result closes the backend's own resume-settle turn" from "the model was
+        // asked our prompt and answered with nothing". Those two shapes are
+        // otherwise identical, and skipping the second would strand the turn until
+        // the inactivity watchdog fired. Session-scoped for the same reason
+        // `tool_calls_seen` is: the settle skip only fires on the first Result.
+        let mut api_calls_seen: u32 = 0;
         // The session id the backend reported at `Init` — i.e. the conversation
         // it ACTUALLY attached to. Compared against `resume_session_id` to prove
         // a `--resume` landed on the live conversation, which vetoes the
@@ -1166,6 +1180,28 @@ impl LucidosEngine {
                             // and process exit. Convert to orphaned injections so the
                             // caller re-processes them instead of showing "interrupted".
                             let orphans = lost_followups_to_orphans(drain_lost_followups(&mut msg_rx));
+
+                            // A turn the backend ended on a transient upstream
+                            // `API Error` resumes itself instead of leaving a red dot
+                            // nobody is watching. This arm is the site that matters:
+                            // a reported drop always arrives as a real Result, so the
+                            // turn idles and returns HERE, never reaching the post-loop
+                            // `finalize_direct_agent` where the recovery originally
+                            // (and only) lived. See the helper's doc comment.
+                            //
+                            // Position is load-bearing: after the Result arm emitted
+                            // this turn's `CodingAgentIdled`, after the subprocess is
+                            // gone and the session dropped from `agent_sessions` just
+                            // above, and after the follow-up drain, whose result
+                            // decides whether anything else is already coming.
+                            self.maybe_auto_resume_after_api_error(
+                                thread_id,
+                                &last_terminal_kind,
+                                &meta,
+                                conflict_change.is_some(),
+                                !orphans.is_empty(),
+                            )
+                            .await;
 
                             return Ok(ProcessResult {
                                 response: String::new(),
@@ -1522,6 +1558,10 @@ impl LucidosEngine {
                             cache_read_tokens,
                             cache_creation_tokens,
                         } => {
+                            // A usage frame reaches us only for a real API call
+                            // (the parser drops all-zero ones), so this is the
+                            // proof-of-model-call the resume-settle skip reads.
+                            api_calls_seen = api_calls_seen.saturating_add(1);
                             // Sections stay empty — CC doesn't expose its
                             // system prompt or tool schemas via stream-json.
                             // CC strips the [1m] suffix on the per-message
@@ -1684,21 +1724,47 @@ impl LucidosEngine {
                                             user_message_present: !user_message.is_empty(),
                                             cc_error: cc_error.is_some(),
                                         };
-                                        // Loud only when the veto is what saved the
-                                        // session — the turn's SHAPE said "stale" and the
-                                        // confirmed attach overruled it. That is the
-                                        // 2026-07-29 signature; logging every healthy
-                                        // resume would bury it.
-                                        if stale_inputs.resume_attach_confirmed
-                                            && is_stale_resume_signal(StaleResumeInputs {
-                                                resume_attach_confirmed: false,
-                                                ..stale_inputs
-                                            })
-                                        {
+                                        // The turn's SHAPE said "stale", the confirmed
+                                        // attach overruled it, and no API call was made:
+                                        // this Result closes the backend's own
+                                        // resume-settle turn (an orphaned tool_use being
+                                        // closed out, a queued task-notification being
+                                        // drained), not ours. Our prompt may not even be
+                                        // dequeued yet, so ending the turn here reports a
+                                        // failure that did not happen AND kills the
+                                        // subprocess mid-answer (the 2026-08-05 swallowed
+                                        // follow-up). Skip it and keep reading; the real
+                                        // Result is still coming.
+                                        if is_resume_settle_result(stale_inputs, api_calls_seen == 0) {
                                             log!(
-                                                "[AgentSession] thread {} resumed sid={} and the backend confirmed the attach, but the turn looked empty — NOT a stale resume (synthetic-turn Result or a silent model)",
+                                                "[AgentSession] thread {} resumed sid={} and the backend confirmed the attach, but this Result carries no text, no tool call and no error: it closes the resume-settle turn, not ours. Skipping it and waiting for the real Result.",
                                                 thread_id,
                                                 resume_session_id.as_deref().unwrap_or("")
+                                            );
+                                            // Record it so the skip cannot repeat:
+                                            // `no_prior_results_this_turn` goes false, so
+                                            // any further Result classifies normally.
+                                            result_texts.push(text.clone());
+                                            continue 'event_loop;
+                                        }
+                                        // Same empty shape, same confirmed attach, but the
+                                        // backend DID call the model, so whatever came back
+                                        // is an answer to our prompt however empty. It
+                                        // classifies below (an empty one lands
+                                        // `EMPTY_RESPONSE_ERROR`). Logged because it is the
+                                        // one shape a wrong skip here would strand at
+                                        // `running` until the watchdog: if a spurious
+                                        // empty-response failure is ever reported, this
+                                        // line is what says the settle skip considered the
+                                        // turn and the API call is what ruled it out.
+                                        if api_calls_seen > 0
+                                            && is_resume_settle_result(stale_inputs, true)
+                                        {
+                                            log!(
+                                                "[AgentSession] thread {} resumed sid={} and produced an empty Result with no tool calls, but {} API call(s) were made: it answers our prompt, not a resume-settle turn. Classifying it.",
+                                                thread_id,
+                                                resume_session_id.as_deref().unwrap_or(""),
+                                                api_calls_seen
                                             );
                                         }
                                         if is_stale_resume_signal(stale_inputs)

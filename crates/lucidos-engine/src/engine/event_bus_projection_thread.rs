@@ -11,11 +11,12 @@
 use uuid::Uuid;
 
 use super::super::{
-    preserving_failed, BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
+    preserving_verdict, BusEvent, EventBus, CLEAR_CODING_AGENT_FLAGS, STATUS_FROM_PROPOSED_CHANGE,
 };
 use super::propagation::{
-    load_blocking_sample, propagate_blocking_change, reconcile_parent_active_children_count,
-    reconcile_proposal_lifecycle_end, reincrement_parent_active_count_if_revived,
+    load_blocking_sample, mark_parent_callback_pending, propagate_blocking_change,
+    reconcile_parent_active_children_count, reconcile_proposal_lifecycle_end,
+    reincrement_parent_active_count_if_revived,
 };
 use crate::core::store::LegacyInitiator;
 use crate::engine::thread_events::{
@@ -164,11 +165,20 @@ impl EventBus {
                 } else {
                     (0, msg_initiator)
                 };
+                // `parent_callback_pending = ($4 IS NOT NULL)` is load-bearing,
+                // not tidiness. The storage default is FALSE (a top-level
+                // thread owes no parent a card), so without this write a fresh
+                // coding-agent child would sit at FALSE, the dedup early-return
+                // in `notify_parent_if_child` would match its very first
+                // `CodingAgentIdled`, and its first card would never be sent.
+                // The CASE in the conflict arm covers a spawn landing on a
+                // pre-existing row, and leaves a parentless row alone.
                 sqlx::query(
-                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state)
-                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW(), 'active')
+                    r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state, parent_callback_pending)
+                       VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW(), 'active', $4 IS NOT NULL)
                        ON CONFLICT (thread_id) DO UPDATE
                        SET last_activity = NOW(),
+                           parent_callback_pending = CASE WHEN $4 IS NOT NULL THEN TRUE ELSE thread_summaries.parent_callback_pending END,
                            -- Attributed recency: a human follow-up bumps
                            -- last_user_action (the drawer sort key); an
                            -- agent/engine follow-up bumps last_agent_action.
@@ -224,6 +234,12 @@ impl EventBus {
                     // bypasses the inline +1 above and must re-increment
                     // via the helper if the prior terminal event already
                     // decremented the parent.
+                    //
+                    // Two operations under two different gates, which is why
+                    // they are separate calls: a follow-up always owes the
+                    // parent a card for the turn it starts, but it only owes a
+                    // re-increment when the child had left the in-flight set.
+                    mark_parent_callback_pending(tx, thread_id).await?;
                     if let Some(pid) = reincrement_parent_active_count_if_revived(
                         tx,
                         thread_id,
@@ -457,21 +473,24 @@ impl EventBus {
                 // means the Diff button is enabled the moment CC idles with
                 // a diff, regardless of whether `ChangeProposed` has fired.
                 //
-                // `preserving_failed` keeps a `failed` verdict: a CC turn that
+                // `preserving_verdict` keeps the turn's verdict. A CC turn that
                 // ends in failure emits `ResponseFailed` (→ status='failed')
                 // immediately followed by this `CodingAgentIdled` in the SAME
                 // turn (`classify_result` returns `emit_idle=true` for every
-                // non-shutdown Result, including the Failed kind), and an
-                // interrupted turn emits `ResponseAborted` then this idle.
+                // non-shutdown Result, including the Failed kind), and a turn
+                // an engine restart interrupted emits `ResponseAborted`
+                // (→ status='paused') then this idle. The restart case is the
+                // sharper one: recovery emits the idle ITSELF, one boot later,
+                // so nothing in the turn's own lifetime protects the verdict.
                 // Without the guard this bookkeeping idle would downgrade
-                // 'failed' → 'idle' and erase the red error dot in the thread
-                // list. The terminal event owns the turn's status; this idle
-                // only parks the thread when the turn didn't already fail. A
-                // later follow-up (`CodingAgentUserMessageSent` → 'running')
-                // clears 'failed' before the next idle, so the failure can't
-                // wedge the thread. Mirrors the `CASE WHEN status='running'`
-                // preservation the `ChangeProposed` arm uses for the same
-                // class of reason.
+                // 'failed' or 'paused' to 'idle' and erase the status dot in
+                // the thread list. The terminal event owns the turn's status;
+                // this idle only parks the thread when the turn didn't already
+                // fail or pause. A later follow-up
+                // (`CodingAgentUserMessageSent` → 'running') clears the verdict
+                // before the next idle, so neither can wedge the thread.
+                // Mirrors the `CASE WHEN status='running'` preservation the
+                // `ChangeProposed` arm uses for the same class of reason.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      has_response = TRUE, \
@@ -479,7 +498,7 @@ impl EventBus {
                      coding_agent_has_diff = $3, \
                      status = {} \
                      WHERE thread_id = $1",
-                    preserving_failed(STATUS_FROM_PROPOSED_CHANGE)
+                    preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
                 ))
                 .bind(thread_id)
                 .bind(is_external_repo)
@@ -489,7 +508,7 @@ impl EventBus {
                 // See ResponseGenerated for the IN-TX broadcast rationale.
                 // `reconcile_parent_active_children_count` is idempotent —
                 // safe even on a second CC idle whose out-of-tx decrement
-                // was already deduped via `parent_callback_sent`.
+                // was already deduped via `parent_callback_pending`.
                 if let Some(pid) =
                     reconcile_parent_active_children_count(tx, thread_id).await?
                 {
@@ -561,7 +580,9 @@ impl EventBus {
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
-                // Revive: if the child was previously not 'running' (typically
+                // Start event: the parent owes a card for the turn this begins.
+                mark_parent_callback_pending(tx, thread_id).await?;
+                // Revive: if the child had left the in-flight set (typically
                 // 'idle' after a CodingAgentIdled that already decremented the
                 // parent via notify_parent_if_child), the user follow-up flips
                 // it back. Bounce the parent's active_children_count up so the
@@ -683,8 +704,9 @@ impl EventBus {
                 // appears in archive (a canceled response is still a response —
                 // the user should see the thread).
                 //
-                // `preserving_failed` covers the shutdown sweep's ordering:
-                // `shutdown_active_threads` emits `ResponseAborted` (→ 'failed')
+                // `preserving_verdict` covers the shutdown sweep's ordering:
+                // `shutdown_active_threads` emits `ResponseAborted` (→ 'paused',
+                // since an `EngineShutdown` cause is transient)
                 // with NO `request_event_id`, then cancels the loop, whose own
                 // `ResponseCanceled` DOES carry one — so `emit_response_canceled`'s
                 // idempotency gate can't match the two and the phantom cancel
@@ -692,13 +714,14 @@ impl EventBus {
                 // the exchange label (`exchangeStatus` checks aborted before
                 // canceled, order-independently) but the status column is
                 // last-write-wins, so without this guard the sweep walked an
-                // interrupted chat thread's red dot back to 'idle'. A cancel of
-                // a genuinely new turn is preceded by a start event that already
-                // cleared 'failed', so a real Stop still settles the thread.
+                // interrupted chat thread's status dot back to 'idle'. A cancel
+                // of a genuinely new turn is preceded by a start event that
+                // already cleared the verdict, so a real Stop still settles the
+                // thread.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET has_response = TRUE, \
                      status = {} WHERE thread_id = $1",
-                    preserving_failed(STATUS_FROM_PROPOSED_CHANGE)
+                    preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -735,17 +758,18 @@ impl EventBus {
                 // request. Flipping to terminal here would render the exchange
                 // as "Aborted" until the retry's SessionStarted lands.
                 //
-                // `preserving_failed` for the same reason as `CodingAgentIdled`
+                // `preserving_verdict` for the same reason as `CodingAgentIdled`
                 // above: the session teardown that follows a failed or
-                // interrupted turn is bookkeeping, and must not walk the red
-                // error dot back to 'idle'. `SessionEnded` is coding-agent-only,
-                // so without the guard an interrupted coding-agent thread lost
-                // the verdict an interrupted Lucidos Agent thread keeps.
+                // interrupted turn is bookkeeping, and must not walk the
+                // status dot back to 'idle'. `SessionEnded` is
+                // coding-agent-only, so without the guard an interrupted
+                // coding-agent thread lost the verdict an interrupted Lucidos
+                // Agent thread keeps.
                 if !reason.is_transient() {
                     sqlx::query(&format!(
                         "UPDATE thread_summaries SET has_response = TRUE, \
                          status = {} WHERE thread_id = $1",
-                        preserving_failed(STATUS_FROM_PROPOSED_CHANGE)
+                        preserving_verdict(STATUS_FROM_PROPOSED_CHANGE)
                     ))
                     .bind(thread_id)
                     .execute(&mut **tx)
@@ -877,6 +901,12 @@ impl EventBus {
                     .bind(thread_id)
                     .execute(&mut **tx)
                     .await?;
+                    // A real prompt is a start event, so the parent owes a card
+                    // for the turn it begins. This is what makes a follow-up
+                    // the child picks off `msg_tx` after the interrupted turn
+                    // idled report its OWN completion, rather than the parent
+                    // hearing only about the turn it redirected away from.
+                    mark_parent_callback_pending(tx, thread_id).await?;
                     // Engine-synthesized prompts (hardening, conflict recovery)
                     // can land on an already-idled CC child whose terminal
                     // event already decremented the parent. Same revive
@@ -906,6 +936,13 @@ impl EventBus {
                 .bind(thread_id)
                 .execute(&mut **tx)
                 .await?;
+
+                // Continue is a start event, so the parent owes a card for the
+                // turn it begins. Without this the resumed turn's
+                // `CodingAgentIdled` hits the dedup guard in
+                // `notify_parent_if_child` and the parent is never told: this
+                // arm re-increments below but never touched the marker.
+                mark_parent_callback_pending(tx, thread_id).await?;
 
                 // Re-increment parent's `active_children_count`: the synthetic
                 // `CodingAgentIdled{reason=engine_restart_interrupt}` that
@@ -964,9 +1001,10 @@ impl EventBus {
                 // way. Mirrors `status_transitions()` for these event types — see
                 // `thread_lifecycle.rs`.
                 //
-                // The bump is `preserving_failed`, so it can revive a thread
+                // The bump is `preserving_verdict`, so it can revive a thread
                 // that drifted to 'idle'/'waiting' but never one whose turn
-                // already carries a terminal `failed` verdict. That case is
+                // already carries a verdict ('failed', or the 'paused' an
+                // engine restart writes). That case is
                 // routine for a coding agent and impossible for the Lucidos
                 // Agent, which is why only the latter used to keep its error
                 // dot after an interruption: the restart teardown emits
@@ -1005,17 +1043,20 @@ impl EventBus {
                     .await?;
                 } else {
                     // `last_revived_at` tracks the bump, so it must skip
-                    // exactly the rows the bump skips — a preserved 'failed'
-                    // thread was not revived and must not reshuffle the
-                    // IN PROGRESS sort order.
+                    // exactly the rows the bump skips: a preserved verdict
+                    // ('failed' or 'paused') means the thread was not revived
+                    // and must not reshuffle the IN PROGRESS sort order. The
+                    // exclusion list is built from the same constant the bump
+                    // itself keys on, so the two cannot drift apart.
                     sqlx::query(&format!(
                         "UPDATE thread_summaries SET last_activity = NOW(), \
                          last_agent_action = NOW(), \
-                         last_revived_at = CASE WHEN status NOT IN ('running', 'failed') \
+                         last_revived_at = CASE WHEN status NOT IN ('running', {verdicts}) \
                                                 THEN NOW() ELSE last_revived_at END, \
-                         status = {} \
+                         status = {status} \
                          WHERE thread_id = $1",
-                        preserving_failed("'running'")
+                        verdicts = &*crate::engine::event_bus::PRESERVED_STATUS_VERDICTS_SQL,
+                        status = preserving_verdict("'running'"),
                     ))
                     .bind(thread_id)
                     .execute(&mut **tx)
@@ -1171,9 +1212,9 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
-            // Child-completion fan-in landing on the parent. Mark the child's
-            // `parent_callback_sent` HERE — in the same transaction as the
-            // event INSERT — so the marker and the event cannot disagree. A
+            // Child-completion fan-in landing on the parent. Clear the child's
+            // `parent_callback_pending` HERE, in the same transaction as the
+            // event INSERT, so the marker and the event cannot disagree. A
             // separate post-emit UPDATE (the old shape in
             // `notify_parent_if_child`) left a crash window where the typed
             // event committed but the marker didn't; the next terminal event
@@ -1185,7 +1226,7 @@ impl EventBus {
                 child_thread_id, ..
             } => {
                 sqlx::query(
-                    "UPDATE thread_summaries SET parent_callback_sent = TRUE \
+                    "UPDATE thread_summaries SET parent_callback_pending = FALSE \
                      WHERE thread_id = $1",
                 )
                 .bind(child_thread_id)

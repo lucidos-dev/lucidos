@@ -2,6 +2,7 @@ import { signal } from '@preact/signals';
 import { prefersReducedMotion } from '../../utils/platform';
 import { isMobile } from '../../utils/viewport';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
+import { watchUserAction } from '../../utils/userAction';
 
 /** Shared scroll-position signals for the chat area.
  *  ThreadView and CreateThreadView are mounted twice each (desktop SplitLayout
@@ -26,7 +27,7 @@ export const notAtTop = signal(false);
  *  DOM), so a deep-link target above the window would never render for
  *  scrollToSelectorAndPulse to find. ThreadView reads this and renders ALL
  *  exchanges while it's true (and keeps them rendered afterwards, so the user
- *  isn't snapped when it clears). A signal (not the plain `_pendingEventScrollTarget`
+ *  isn't snapped when it clears). A signal (not the plain `_pendingEventScrollClaim`
  *  var) so the render subscribes. */
 export const deepLinkRenderAll = signal(false);
 /** True once the transcript is scrolled even slightly from the very top (2px
@@ -529,8 +530,13 @@ const EVENT_RESOLVE_DEADLINE_MS = 4000;
  *  glide. Released earlier if `scrollend` fires first. */
 const SCROLL_SETTLE_FALLBACK_MS = 1000;
 
-/** The event id a notification deep-link is currently resolving a scroll to,
- *  or null when no deep-link scroll is in flight.
+/** The notification deep-link currently resolving a scroll, or null when none is
+ *  in flight. Identified by a fresh OBJECT per call, never by what it is
+ *  scrolling to: two taps on the SAME notification inside the resolve window
+ *  produce the same target, so a target-keyed claim let the FIRST call's
+ *  deadline mistake the second call's claim for its own, release it, and run the
+ *  give-up recovery over a navigation that was still live. Object identity
+ *  cannot collide, so "is the claim still mine" is exact.
  *
  *  Plain mutable variable (not a signal) like `_resizeMode` / `_activeScrollElement`:
  *  it's read imperatively inside ThreadView's events-load effect and
@@ -545,13 +551,13 @@ const SCROLL_SETTLE_FALLBACK_MS = 1000;
  *  tryResolve() succeeds synchronously, and no eventsLoaded transition fires —
  *  which is why the bug only showed for unfocused threads.) Mirrors how a saved
  *  scroll position suppresses the same auto-scroll via `hasSavedScroll`. */
-let _pendingEventScrollTarget: string | null = null;
+let _pendingEventScrollClaim: object | null = null;
 
 /** True while a notification deep-link is waiting for its target event to
  *  render (or to scroll to it). Auto-scroll-to-bottom callers defer to it so
  *  they don't override the deep-link's scroll. */
 export function hasPendingEventScroll(): boolean {
-  return _pendingEventScrollTarget !== null;
+  return _pendingEventScrollClaim !== null;
 }
 
 /* The deep-link focus marker (the "focus stick") is the shared navigation focus
@@ -590,8 +596,9 @@ function pinHeaderForScroll(): void {
   }, HEADER_PIN_MS);
 }
 
-/** `selector` resolves the SCROLL target (the `.chat-exchange`, which carries
- *  the scroll-margin-top). `pulseTarget`, when given, narrows the PULSE highlight
+/** `selector` resolves the SCROLL target (a `.chat-exchange`, or an addressable
+ *  card inside one; both carry the landing scroll-margin-top, see
+ *  chat/response.css). `pulseTarget`, when given, narrows the PULSE highlight
  *  to a descendant of that target so a sibling panel in the same exchange isn't
  *  highlighted too — a string is a plain descendant selector (an event deep-link
  *  scopes it to `.initiator-panel`, the event itself, not the agent response
@@ -604,35 +611,49 @@ function scrollToSelectorAndPulse(
   selector: string,
   preferLast = false,
   pulseTarget?: string | ((target: HTMLElement) => HTMLElement | null),
+  onUnresolved?: () => void,
 ): void {
   if (!selector || typeof document === 'undefined' || !document.querySelectorAll) return;
 
   let resolved = false;
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let observer: MutationObserver | null = null;
+  /** Set once the user takes over during the wait (see `watchUserAction`).
+   *  Gates the deadline's fallback scroll only: someone who scrolled away to
+   *  read history while the deep-link resolved must not be yanked to the bottom
+   *  4s later. Armed on the ASYNC path only, below, so the window is exactly
+   *  "since we started waiting". */
+  let userTookOver = false;
+  let stopWatchingUser: (() => void) | null = null;
+  /** This call's claim identity. See `_pendingEventScrollClaim`: an object, so
+   *  that re-opening the SAME notification within the resolve window is two
+   *  distinguishable claims rather than one indistinguishable selector. */
+  const claim = {};
 
   // Claim the deep-link scroll so the auto-scroll-to-bottom paths defer (see
-  // _pendingEventScrollTarget). The claim is held until the deadline below —
-  // NOT released the instant the scroll lands — because the same render that
+  // _pendingEventScrollClaim). The claim is held until the deadline below, and
+  // NOT released the instant the scroll lands, because the same render that
   // finally shows the event also re-fires ThreadView's events-load effect (on
   // the hasExchanges 0→N flip) and a late ResizeObserver pin, both of which
   // would snap to the bottom a beat after the deep-link scroll. Gating those on the
   // claim (not on scrolledUp) is what lets the events-load effect keep its
   // separate slow-load scrolledUp recovery.
-  _pendingEventScrollTarget = selector;
+  _pendingEventScrollClaim = claim;
   // Force ThreadView to render the FULL exchange list so a windowed-out target
   // can render for tryResolve/the MutationObserver to find. Stays true until the
   // claim releases; ThreadView keeps the thread fully rendered afterward so the
   // user isn't snapped back to the windowed tail mid-read.
   deepLinkRenderAll.value = true;
 
-  // Release this call's claim — but only if it's still ours. A second deep-link
-  // started mid-flight has overwritten the slot with its own target; its own
+  // Release this call's claim, but only if it's still ours. A second deep-link
+  // started mid-flight has overwritten the slot with its own claim; its own
   // release handles that one. Without the guard, this call's deadline would
-  // clear the newer claim and let an auto-scroll-to-bottom override it.
+  // clear the newer claim and let an auto-scroll-to-bottom override it (and,
+  // since the deadline now recovers rather than giving up silently, snap the
+  // user to the bottom and report a failure over a live navigation).
   const releaseClaim = () => {
-    if (_pendingEventScrollTarget === selector) {
-      _pendingEventScrollTarget = null;
+    if (_pendingEventScrollClaim === claim) {
+      _pendingEventScrollClaim = null;
       deepLinkRenderAll.value = false;
     }
   };
@@ -645,6 +666,10 @@ function scrollToSelectorAndPulse(
     if (deadlineTimer !== null) {
       clearTimeout(deadlineTimer);
       deadlineTimer = null;
+    }
+    if (stopWatchingUser) {
+      stopWatchingUser();
+      stopWatchingUser = null;
     }
   };
 
@@ -720,8 +745,8 @@ function scrollToSelectorAndPulse(
         ? (target.querySelector?.(pulseTarget) as HTMLElement | null)
         : pulseTarget?.(target) ?? null;
     const pulseEl = pulseTarget ? pulseChild ?? target : target;
-    // Apply the shared navigation focus marker — a sticky border that stays until
-    // the user takes any action, then fades out. The settle guard defers the
+    // Apply the shared navigation focus marker: a sticky background highlight that
+    // stays until the user takes any action, then fades out. The settle guard defers the
     // dismissal while THIS deep-link's own smooth scroll is still settling
     // (hasPendingEventScroll), so the landing scroll can't self-clear the marker.
     applyNavFocus(pulseEl, { settleGuard: hasPendingEventScroll });
@@ -738,6 +763,11 @@ function scrollToSelectorAndPulse(
     holdClaimUntilScrollSettles();
     return;
   }
+
+  // From here on we are WAITING, so start counting the user's own input: a
+  // fallback scroll at the deadline must stand down if they took over. Torn
+  // down by stopWatching (the deadline always runs it, resolved or not).
+  stopWatchingUser = watchUserAction(() => { userTookOver = true; });
 
   // body, not .thread-content: Preact's positional diff can't preserve the
   // loading-branch .thread-content across ThreadView's loading→loaded swap
@@ -758,26 +788,80 @@ function scrollToSelectorAndPulse(
     }
   });
   observer.observe(document.body, { childList: true, subtree: true });
-  // Deadline: the event resolved a moment ago (load settled) or never rendered
-  // (e.g. the source event isn't a rendered chat exchange). Either way, stop
-  // watching and release the claim. Bookkeeping only — it deliberately does NOT
-  // force a scroll-to-bottom: the auto-scroll paths were suppressed during the
-  // wait, so the thread stays where the load (or the deep-link scroll) left it. A late
-  // snap here would yank a user who scrolled to read history during the window.
+  // Deadline. Two outcomes reach it, and only one of them is a failure.
+  //
+  //  - The target DID render and `tryResolve` landed on it (the observer path).
+  //    The timer then exists purely to release the claim, which kept the
+  //    post-resolve re-renders suppressed. Nothing else to do.
+  //  - The target NEVER rendered: it isn't in this thread, it renders nothing at
+  //    all, or the thread was still loading when the window closed. That is a
+  //    dead deep-link, and it used to end here in silence, leaving the tap
+  //    looking broken with no feedback whatsoever. Now it lands the user on the
+  //    thread's most recent turn (the transcript's bottom) and tells them the
+  //    event could not be found, via the caller's `onUnresolved` (scrollState
+  //    stays free of the `store` import; see `parseNavigatedTurn`).
+  //
+  // The no-late-yank guarantee the silent give-up was protecting is kept, and
+  // made exact: the fallback SCROLL is suppressed when the user took over during
+  // the wait, so someone who scrolled back to read history is left where they
+  // are. The message still fires in that case, since it is then the only signal
+  // that the link failed.
+  //
+  // A deep-link superseded mid-flight (`wasOurs` false) reports nothing: the
+  // newer one owns the claim, the viewport and the outcome now.
   deadlineTimer = setTimeout(() => {
+    const wasOurs = _pendingEventScrollClaim === claim;
     stopWatching();
     releaseClaim();
+    if (resolved || !wasOurs) return;
+    if (!userTookOver) scrollToBottom();
+    onUnresolved?.();
   }, EVENT_RESOLVE_DEADLINE_MS);
 }
 
-/** Land on the chat exchange carrying `data-event-id` — a notification deep-link
- *  scrolling to the exact event that raised it (e.g. a `UserQuestionAsked`). The
- *  pulse is scoped to the exchange's `.initiator-panel` (the event itself), not
- *  the whole `.chat-exchange`, so the agent response rendered below the event in
- *  the same exchange isn't highlighted too. */
-export function scrollToEventAndPulse(eventId: string): void {
+/** Shared options for the two deep-link entry points below. */
+export interface DeepLinkOptions {
+  /** Called when the deep-link's target never renders and the resolve deadline
+   *  expires: a dead link the user has to be told about. The MESSAGE is the
+   *  caller's, not this module's, because `scrollState` deliberately stays free
+   *  of the heavy `store` import (`showToast` lives there) so its lean importers
+   *  keep working, the same constraint `parseNavigatedTurn` documents. This
+   *  module owns the recovery SCROLL; the caller owns the words. */
+  onUnresolved?: () => void;
+}
+
+/** Land on the element carrying `data-event-id`: a notification deep-link
+ *  scrolling to the exact event that raised it. Two shapes of match, and the
+ *  pulse scope differs per match, so the scope is resolved as a function.
+ *
+ *   - **An exchange-start event** (`UserQuestionAsked`, `CodingAgentPermissionRequest`,
+ *     `CredentialRequested`, `McpConsentRequested`, …) stamps the whole
+ *     `.chat-exchange` (`ChatExchange`'s root). Narrow the pulse to its
+ *     `.initiator-panel` (the event itself), so the agent response rendered
+ *     below it in the same turn isn't highlighted too.
+ *   - **A step-level event** stamps the specific card that renders it, today the
+ *     `ResponseFailed` failure card (`.exchange-error`). That element already IS
+ *     the subject, so it must NOT be narrowed: there is no `.initiator-panel`
+ *     inside it, and narrowing to a sibling panel would highlight the wrong
+ *     thing (or, on a card that happened to contain one, an unrelated descendant).
+ *
+ *  Discriminating on the match rather than relying on the `?? target` fallback
+ *  keeps the intent explicit; the fallback still covers a degenerate exchange
+ *  with no `.initiator-panel`.
+ *
+ *  `onUnresolved` is called when the event never renders inside the resolve
+ *  deadline (see the deadline in `scrollToSelectorAndPulse`). */
+export function scrollToEventAndPulse(eventId: string, opts?: DeepLinkOptions): void {
   if (!eventId) return;
-  scrollToSelectorAndPulse(`[data-event-id="${CSS.escape(eventId)}"]`, false, '.initiator-panel');
+  scrollToSelectorAndPulse(
+    `[data-event-id="${CSS.escape(eventId)}"]`,
+    false,
+    (target) =>
+      (target.matches?.('.chat-exchange')
+        ? target.querySelector?.('.initiator-panel')
+        : null) as HTMLElement | null,
+    opts?.onUnresolved,
+  );
 }
 
 /** Land on the chat exchange carrying `data-change-id` — the Changes panel
@@ -799,10 +883,15 @@ export function scrollToEventAndPulse(eventId: string): void {
  *     recognised by its `initiator-panel-change-*` accent class.
  *  When the chosen panel is absent (a degenerate exchange missing it, or a test
  *  DOM fake) the pulse falls back to the whole target via the `?? target` in
- *  scrollToSelectorAndPulse. */
+ *  scrollToSelectorAndPulse.
+ *
+ *  Takes the same `onUnresolved` as the event deep-link, and for the same
+ *  reason: both run through one `scrollToSelectorAndPulse` deadline, so a change
+ *  whose turn never renders gets the identical recovery (land on the newest turn,
+ *  say so) with no second implementation to keep in step. */
 const CHANGE_RESOLUTION_INITIATOR =
   '.initiator-panel-change-applied,.initiator-panel-change-discarded,.initiator-panel-change-reverted,.initiator-panel-change-failed';
-export function scrollToChangeAndPulse(changeId: string): void {
+export function scrollToChangeAndPulse(changeId: string, opts?: DeepLinkOptions): void {
   if (!changeId) return;
   scrollToSelectorAndPulse(
     `[data-change-id="${CSS.escape(changeId)}"]`,
@@ -811,6 +900,7 @@ export function scrollToChangeAndPulse(changeId: string): void {
       (target.querySelector?.(CHANGE_RESOLUTION_INITIATOR)
         ? target.querySelector?.('.initiator-panel')
         : target.querySelector?.('.response-panel')) as HTMLElement | null,
+    opts?.onUnresolved,
   );
 }
 
@@ -818,7 +908,7 @@ export function scrollToChangeAndPulse(changeId: string): void {
  *  focus (no target event) calls this so the prior deep-link's suppression
  *  can't leak onto the newly-focused thread's load. */
 export function clearPendingEventScroll(): void {
-  _pendingEventScrollTarget = null;
+  _pendingEventScrollClaim = null;
   deepLinkRenderAll.value = false;
   // A plain focus / explicit scroll is deliberate engagement elsewhere — drop any
   // persistent focus marker so it can't leak onto the next thread or linger.
@@ -846,7 +936,7 @@ const TURN_NAV_FALLBACK_GAP_PX = 8;
 
 /** Room to leave above a turn landed by keyboard turn-nav — the SAME clearance the
  *  deep-link / notification navigation gets for free from `.chat-exchange`'s CSS
- *  `scroll-margin-top` (the top fade band + header stack + focus-border gap; see
+ *  `scroll-margin-top` (the top fade band + header stack + focus-highlight gap; see
  *  chat/response.css). Turn-nav animates to an explicit scroll position rather than
  *  via `scrollIntoView`, so `scroll-margin-top` doesn't apply automatically — it
  *  reads the computed value here so both navigation paths share one source of
@@ -998,8 +1088,8 @@ export function stepThreadTurn(direction: 1 | -1): void {
   scrolledUp.value = !landsAtBottom;
   awayFromBottom.value = !landsAtBottom;
 
-  // Mark the landed turn with the shared navigation focus marker (flash + a
-  // border that sticks until the user's next scroll gesture). clearPendingEventScroll
+  // Mark the landed turn with the shared navigation focus marker (a background
+  // highlight that sticks until the user's next scroll gesture). clearPendingEventScroll
   // above already cleared any prior marker via clearNavFocus, so this is a clean
   // supersede; no settleGuard — the animateScroll below is programmatic (emits no
   // wheel/touch/keydown), so it can't self-clear, and a real user scroll should.
@@ -1043,10 +1133,14 @@ export function parseNavigatedTurn(
   return { threadId, userSeq, kind };
 }
 
-/** True when the chat exchange with the given `data-event-id` is currently
- *  in the visible viewport on this device. Filters dual-mount copies via
- *  isElementVisible — the hidden layout's copy reports a 0×0 rect and
- *  would otherwise win the visibility check on the wrong layout. */
+/** True when the element with the given `data-event-id` is currently in the
+ *  visible viewport on this device: the `.chat-exchange` for an exchange-start
+ *  event, or the card that renders it for a step-level event (the
+ *  `ResponseFailed` failure card). Both are stamped by `ChatExchange`, so the
+ *  notification in-app matrix's "already looking at it" check works for either.
+ *  Filters dual-mount copies via isElementVisible: the hidden layout's copy
+ *  reports a 0×0 rect and would otherwise win the visibility check on the wrong
+ *  layout. */
 export function isEventInViewport(eventId: string): boolean {
   if (!eventId || typeof document === 'undefined' || !document.querySelectorAll) return false;
   const matches = document.querySelectorAll<HTMLElement>(`[data-event-id="${CSS.escape(eventId)}"]`);

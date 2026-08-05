@@ -2,6 +2,7 @@ import { useEffect, useRef } from 'preact/hooks';
 import { confirmState } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
 import { Overlay } from './Overlay';
+import { trapDialogTab } from './dialogFocusTrap';
 
 function resolve(value: boolean) {
   const state = confirmState.peek();
@@ -31,23 +32,7 @@ export function ConfirmDialog() {
         resolve(true);
         return;
       }
-      if (e.key !== 'Tab') return;
-      const root = dialogRef.current;
-      if (!root) return;
-      const focusables = root.querySelectorAll<HTMLElement>(
-        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
-      );
-      if (focusables.length === 0) return;
-      const first = focusables[0];
-      const last = focusables[focusables.length - 1];
-      const active = document.activeElement as HTMLElement | null;
-      if (e.shiftKey && active === first) {
-        e.preventDefault();
-        last.focus();
-      } else if (!e.shiftKey && active === last) {
-        e.preventDefault();
-        first.focus();
-      }
+      trapDialogTab(e, dialogRef.current);
     }
     document.addEventListener('keydown', handleKey);
     return () => {

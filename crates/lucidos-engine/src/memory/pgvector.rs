@@ -370,38 +370,6 @@ impl PgVectorIndex {
         Ok(rows)
     }
 
-    /// Search for similar entries using cosine similarity, filtered by minimum importance
-    pub async fn search(
-        &self,
-        query_embedding: &[f32],
-        min_importance: f32,
-        limit: usize,
-    ) -> Result<SearchResult, Box<dyn std::error::Error + Send + Sync>> {
-        let embedding_str = to_pgvector_literal(query_embedding);
-
-        let rows = sqlx::query(
-            r#"
-            SELECT id, source, topic, summary, importance, entities, src_created_at, created_at
-            FROM memory_entries
-            WHERE importance >= $1
-            ORDER BY embedding <=> $2::vector
-            LIMIT $3
-            "#,
-        )
-        .bind(min_importance)
-        .bind(&embedding_str)
-        .bind(limit as i64)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let entries = rows
-            .iter()
-            .map(|row| row_to_memory_entry(row))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        Ok(SearchResult { entries })
-    }
-
     /// Search by embedding and return cosine similarity scores alongside entries.
     /// Similarity is 1.0 - cosine_distance (1.0 = identical, 0.0 = orthogonal).
     pub async fn search_with_scores(
@@ -639,11 +607,6 @@ impl PgVectorIndex {
         rows.into_iter()
             .map(|(v,)| serde_json::to_string(&v).map_err(Into::into))
             .collect()
-    }
-
-    /// Get a reference to the connection pool
-    pub fn pool(&self) -> &PgPool {
-        &self.pool
     }
 
     /// Paginated list of memory entries with optional source type filter.

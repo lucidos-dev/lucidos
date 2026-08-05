@@ -196,3 +196,62 @@ mod run_tool_with_cancel_tests {
         );
     }
 }
+
+/// `until_canceled` is the setup-phase sibling of `run_tool_with_cancel`: same
+/// `biased` race, but it yields `None` instead of a typed error because the
+/// caller has no paired event to emit, it simply ends the turn. See the chat
+/// turn setup in `engine/chat/process/run.rs`.
+mod until_canceled_tests {
+    use crate::engine::agentic_loop::until_canceled;
+    use std::time::{Duration, Instant};
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn passes_the_value_through_when_not_cancelled() {
+        let cancel_token = CancellationToken::new();
+        let fut = async { 7u32 };
+        assert_eq!(until_canceled(&cancel_token, fut).await, Some(7));
+    }
+
+    /// The `biased` contract. A Stop that landed while the previous phase was
+    /// finishing must end the turn, even though the next phase's future happens
+    /// to be instantly ready. Without `biased`, tokio picks fairly and the turn
+    /// leaks one more phase of setup past the user's click.
+    #[tokio::test]
+    async fn pre_cancelled_token_wins_over_an_instantly_ready_future() {
+        let cancel_token = CancellationToken::new();
+        cancel_token.cancel();
+        let fut = async { 7u32 };
+        assert_eq!(until_canceled(&cancel_token, fut).await, None);
+    }
+
+    /// The regression contract: the whole point is that a Stop is observed
+    /// WHILE a long phase is in flight (a classification LLM call, a memory
+    /// search on a big thread), not after it returns.
+    #[tokio::test]
+    async fn cancel_aborts_a_long_phase_without_waiting_for_it() {
+        let cancel_token = CancellationToken::new();
+        let cancel_clone = cancel_token.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            cancel_clone.cancel();
+        });
+
+        let slow_phase = async {
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            7u32
+        };
+
+        let start = Instant::now();
+        let result = until_canceled(&cancel_token, slow_phase).await;
+        let elapsed = start.elapsed();
+
+        assert_eq!(result, None);
+        assert!(
+            elapsed < Duration::from_millis(500),
+            "a Stop during turn setup must not wait out the phase (got {:?}); \
+             this is the ~30s of \"Canceling…\" the wrapper exists to end",
+            elapsed
+        );
+    }
+}

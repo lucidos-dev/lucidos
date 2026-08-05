@@ -67,7 +67,10 @@ vi.mock('../../components/chat/scrollState', () => ({
 }));
 
 vi.mock('./thread-loading', () => ({
-  refreshThreadEvents: vi.fn().mockResolvedValue(undefined),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
+  // The rollback under test removes the row, so it also clears that thread's
+  // entry in the thread-events failure maps.
+  forgetThreadEventsFailures: vi.fn(),
 }));
 
 vi.mock('./devices', () => ({

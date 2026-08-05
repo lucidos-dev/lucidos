@@ -116,7 +116,16 @@ impl LucidosEngine {
         let provider = self
             .current_image_provider()
             .await
-            .ok_or("No image provider configured. Set OPENAI_API_KEY or VERTEX_PROJECT_ID.")?;
+            // Both keys are already-resolved chains (a stored credential, then
+            // the env var, then the Codex CLI for OpenAI; ADC and gcloud for
+            // Vertex), so naming only the env vars sends a user who configured
+            // the provider in Settings to fix the wrong thing. This one reaches
+            // the user in chat rather than the log, which is why it matters most.
+            .ok_or(
+                "No image provider configured. Add an OpenAI key under Settings, Models, \
+                 Providers (or set OPENAI_API_KEY), or configure Google Cloud (set \
+                 VERTEX_PROJECT_ID or run `gcloud auth application-default login`).",
+            )?;
 
         let prompt = args
             .get("prompt")

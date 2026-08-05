@@ -188,39 +188,14 @@ pub struct TriggerConfig {
     pub plugin_id: Option<String>,
 }
 
-/// Convert a human-facing trigger name to a stable kebab-case slug.
+/// Convert a human-facing trigger name to a stable kebab-case slug, guaranteeing
+/// a non-empty result by falling back to the first 8 chars of the trigger UUID
+/// (dashes stripped) when the name slugifies to empty (e.g. `"!!!"`).
 ///
-/// - NFKD-normalize then strip combining marks ("Café" → "cafe")
-/// - Lowercase ASCII alphanumerics; collapse other runs to `-`
-/// - Trim leading/trailing dashes
-///
-/// Returns `""` if the name is empty after stripping (e.g. `"!!!"`); pair with
-/// [`slugify_trigger_name_with_fallback`] to get a guaranteed non-empty slug.
-pub fn slugify_trigger_name(name: &str) -> String {
-    use unicode_normalization::UnicodeNormalization;
-    let normalized: String = name
-        .nfkd()
-        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-        .collect();
-    let mut out = String::with_capacity(normalized.len());
-    let mut last_dash = true;
-    for c in normalized.chars() {
-        if c.is_ascii_alphanumeric() {
-            out.push(c.to_ascii_lowercase());
-            last_dash = false;
-        } else if !last_dash {
-            out.push('-');
-            last_dash = true;
-        }
-    }
-    out.trim_matches('-').to_string()
-}
-
-/// Like [`slugify_trigger_name`] but guarantees a non-empty result by falling
-/// back to the first 8 chars of the trigger UUID (dashes stripped) when the
-/// name slugifies to empty (e.g. `"!!!"`).
+/// The slugification itself is [`crate::core::slug::slugify_kebab`], shared with
+/// coding-agent branch naming; only the trigger-specific fallback lives here.
 pub fn slugify_trigger_name_with_fallback(name: &str, uuid: &str) -> String {
-    let s = slugify_trigger_name(name);
+    let s = crate::core::slug::slugify_kebab(name);
     if s.is_empty() {
         let no_dashes = uuid.replace('-', "");
         let suffix: String = no_dashes.chars().take(8).collect();

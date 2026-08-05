@@ -65,7 +65,7 @@ vi.mock('../../components/chat/scrollState', () => ({
 }));
 
 vi.mock('./thread-loading', () => ({
-  refreshThreadEvents: vi.fn().mockResolvedValue(undefined),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
 }));
 
 vi.mock('./devices', () => ({
@@ -112,7 +112,7 @@ describe('sendMessage transport-error handling', () => {
     const exchanges = groupIntoExchanges(thread!.events);
     expect(exchanges).toHaveLength(1);
     expect(exchangeUserMessage(exchanges[0])).toBe('important question');
-    expect(exchangeError(exchanges[0])).not.toBe('');
+    expect(exchangeError(exchanges[0])?.message).toBeTruthy();
   });
 
   it('error message wording is honest about scope (no "engine disconnected" claim)', async () => {
@@ -122,7 +122,7 @@ describe('sendMessage transport-error handling', () => {
 
     const tid = focusedThreadId.value!;
     const exchanges = groupIntoExchanges(threadMap.value.get(tid)!.events);
-    const errorText = exchangeError(exchanges[0]);
+    const errorText = exchangeError(exchanges[0])!.message;
     expect(errorText.toLowerCase()).not.toContain('disconnected');
     expect(errorText.toLowerCase()).toMatch(/could not reach|unable to reach|cannot reach/);
   });
@@ -138,7 +138,7 @@ describe('sendMessage transport-error handling', () => {
     const tid = focusedThreadId.value!;
     const exchanges = groupIntoExchanges(threadMap.value.get(tid)!.events);
     expect(exchanges).toHaveLength(1);
-    expect(exchangeError(exchanges[0])).not.toBe('');
+    expect(exchangeError(exchanges[0])?.message).toBeTruthy();
   });
 
   it('stale isConnected=false + submitChat resolving → normal exchange, no false-positive failure', async () => {
@@ -152,7 +152,7 @@ describe('sendMessage transport-error handling', () => {
     const thread = threadMap.value.get(tid)!;
     const exchanges = groupIntoExchanges(thread.events);
     for (const ex of exchanges) {
-      expect(exchangeError(ex)).toBe('');
+      expect(exchangeError(ex)).toBeNull();
     }
   });
 });

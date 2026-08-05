@@ -3,18 +3,23 @@ use std::time::{Duration, Instant};
 use crate::workspace::BoxError;
 
 // Header + env-var names mirror the engine's `api::actor` consts. CLI can't
-// depend on the engine crate (no `lucidos-common`), so these four literals
+// depend on the engine crate (no `lucidos-common`), so these literals
 // must be kept in lockstep with their counterparts there. A rename on
 // either side without the matching follow-up silently breaks subprocess
 // attribution — `lucidos-e2e/tests/api_support/lucidos_cli_test.rs` is the
 // integration backstop.
+//
+// The token's *value* is opaque here on purpose. The engine mints it bound
+// to the spawning thread, and its own prefix is what names that thread, so
+// the CLI never has to state who it is and there is no `--from` flag for it
+// to get wrong. There used to be a second `x-lucidos-source-thread-id`
+// header carrying the thread id; it was unverifiable (any subprocess could
+// claim any thread) and the engine no longer reads one.
 pub(crate) const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
-pub(crate) const HEADER_SOURCE_THREAD_ID: &str = "x-lucidos-source-thread-id";
 const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
-const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
 
-/// Forward the subprocess-origin headers when the matching env vars are in
-/// scope (i.e. we're inside a Lucidos-spawned subprocess). Engine recognises
+/// Forward the thread-bound origin token when the matching env var is in
+/// scope (i.e. we're inside a Lucidos-spawned subprocess). Engine verifies
 /// the token and stamps mutating events as Agent-origin instead of "You".
 fn default_headers_from_env() -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
@@ -23,18 +28,13 @@ fn default_headers_from_env() -> reqwest::header::HeaderMap {
             h.insert(HEADER_AGENT_ORIGIN_TOKEN, v);
         }
     }
-    if let Ok(thread_id) = std::env::var(ENV_SOURCE_THREAD_ID) {
-        if let Ok(v) = reqwest::header::HeaderValue::from_str(&thread_id) {
-            h.insert(HEADER_SOURCE_THREAD_ID, v);
-        }
-    }
     h
 }
 
 /// Blocking HTTP client preconfigured for the local Lucidos engine.
 /// Accepts the engine's self-signed cert because the target is `localhost`.
-/// Auto-forwards the subprocess-origin headers when the matching env vars
-/// are present (i.e., we're inside a Lucidos-spawned subprocess).
+/// Auto-forwards the thread-bound origin token when the matching env var
+/// is present (i.e., we're inside a Lucidos-spawned subprocess).
 pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
     reqwest::blocking::Client::builder()
         .danger_accept_invalid_certs(true)
@@ -47,8 +47,8 @@ pub(crate) fn client() -> Result<reqwest::blocking::Client, BoxError> {
 /// blocking timeout because `/api/v1/internal/permission-prompt` waits for the
 /// user's click. With the default timeout, every prompt fails after 30s and
 /// CC pivots to a `Bash` heredoc (in `--allowedTools`) that bypasses the
-/// gate entirely. Same subprocess-origin header forwarding as `client()` —
-/// the permission server is an engine endpoint and benefits from the same
+/// gate entirely. Same origin-token forwarding as `client()`: the
+/// permission server is an engine endpoint and benefits from the same
 /// honest attribution.
 pub(crate) fn permission_prompt_client() -> Result<reqwest::blocking::Client, BoxError> {
     reqwest::blocking::Client::builder()
@@ -214,89 +214,72 @@ mod tests {
         &LOCK
     }
 
-    /// Both env vars set → both headers populated. This is the agent path:
-    /// engine recognises the token, stamps the resulting event as
-    /// `Api { mode: Agent, source_thread_id }`, the UI says "Lucidos Agent"
-    /// (not "You") and the popover links back to the spawning thread.
+    /// Token env var set → the origin-token header is populated. This is
+    /// the agent path: the engine verifies the thread-bound token, stamps the
+    /// resulting event as `Api { mode: Agent, source_thread_id }` from the
+    /// token's own prefix, the UI says "Lucidos Agent" (not "You") and the
+    /// popover links back to the spawning thread.
     #[test]
-    fn default_headers_from_env_populates_both_headers_when_env_set() {
+    fn default_headers_from_env_forwards_the_origin_token() {
         let _guard = env_lock().lock().unwrap();
-        let tid = "00000000-0000-0000-0000-000000000abc";
+        let token = "00000000-0000-0000-0000-000000000abc.deadbeef";
         // SAFETY: process-wide env mutation gated by env_lock().
         unsafe {
-            std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, "header-test-token");
-            std::env::set_var(ENV_SOURCE_THREAD_ID, tid);
+            std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, token);
         }
         let headers = default_headers_from_env();
         unsafe {
             std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
-            std::env::remove_var(ENV_SOURCE_THREAD_ID);
         }
         assert_eq!(
             headers
                 .get(HEADER_AGENT_ORIGIN_TOKEN)
                 .and_then(|v| v.to_str().ok()),
-            Some("header-test-token"),
+            Some(token),
             "agent-origin-token header missing when env var is set"
-        );
-        assert_eq!(
-            headers
-                .get(HEADER_SOURCE_THREAD_ID)
-                .and_then(|v| v.to_str().ok()),
-            Some(tid),
-            "source-thread-id header missing when env var is set"
         );
     }
 
-    /// Neither env var set → neither header populated. Terminal users running
-    /// `lucidos ...` by hand (no subprocess context) get the honest path: the
-    /// engine stamps `Api { mode: Human }`, the UI says "You".
+    /// The token is forwarded VERBATIM. The CLI must not parse, re-derive or
+    /// otherwise touch it: its prefix is what authenticates the caller thread,
+    /// so any client-side rewriting would be the CLI stating who it is, which
+    /// is exactly the capability the thread binding removes.
+    #[test]
+    fn default_headers_from_env_does_not_rewrite_the_token() {
+        let _guard = env_lock().lock().unwrap();
+        // Deliberately not a well-formed token. The CLI has no opinion.
+        let opaque = "whatever.the.engine.minted";
+        // SAFETY: process-wide env mutation gated by env_lock().
+        unsafe {
+            std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, opaque);
+        }
+        let headers = default_headers_from_env();
+        unsafe {
+            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
+        }
+        assert_eq!(
+            headers
+                .get(HEADER_AGENT_ORIGIN_TOKEN)
+                .and_then(|v| v.to_str().ok()),
+            Some(opaque)
+        );
+        assert_eq!(headers.len(), 1, "no second origin header may be sent");
+    }
+
+    /// Env var unset → no header. Terminal users running `lucidos ...` by
+    /// hand (no subprocess context) get the honest path: the engine stamps
+    /// `Api { mode: Human }`, the UI says "You".
     #[test]
     fn default_headers_from_env_yields_empty_when_env_unset() {
         let _guard = env_lock().lock().unwrap();
         // SAFETY: process-wide env mutation gated by env_lock().
         unsafe {
             std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
-            std::env::remove_var(ENV_SOURCE_THREAD_ID);
         }
         let headers = default_headers_from_env();
         assert!(
-            headers.get(HEADER_AGENT_ORIGIN_TOKEN).is_none(),
-            "agent-origin-token must be absent when env var unset"
-        );
-        assert!(
-            headers.get(HEADER_SOURCE_THREAD_ID).is_none(),
-            "source-thread-id must be absent when env var unset"
-        );
-    }
-
-    /// Token set, thread id absent → token flows alone. This is the
-    /// scheduled-script path: subprocess runs without a thread context, so
-    /// the request still stamps `Api { mode: Agent }` but with
-    /// `source_thread_id: None`. Without this, schedule-driven applies would
-    /// fall through to `Api { mode: Human }`.
-    #[test]
-    fn default_headers_from_env_includes_token_without_thread_id() {
-        let _guard = env_lock().lock().unwrap();
-        // SAFETY: process-wide env mutation gated by env_lock().
-        unsafe {
-            std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, "scheduled-token");
-            std::env::remove_var(ENV_SOURCE_THREAD_ID);
-        }
-        let headers = default_headers_from_env();
-        unsafe {
-            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
-        }
-        assert_eq!(
-            headers
-                .get(HEADER_AGENT_ORIGIN_TOKEN)
-                .and_then(|v| v.to_str().ok()),
-            Some("scheduled-token"),
-            "token header missing"
-        );
-        assert!(
-            headers.get(HEADER_SOURCE_THREAD_ID).is_none(),
-            "thread-id header must be absent when env var unset"
+            headers.is_empty(),
+            "no origin header may be sent outside a Lucidos-spawned subprocess"
         );
     }
 

@@ -19,9 +19,9 @@ export function currentChatContext(): ChatContext | null {
   }
 
   const file = previewFile.value;
+  const sel = selectedLines.value;
   const repo = file ? parseRepoPath(file) : null;
   if (repo) {
-    const sel = selectedLines.value;
     return {
       repo_file_context: {
         repo_id: repo.repoId,
@@ -32,7 +32,10 @@ export function currentChatContext(): ChatContext | null {
   }
 
   if (file) {
-    return { file_context: { path: file } };
+    // A workspace data file carries its line selection too: both previews show
+    // the same line-numbered source view, so a range picked in one must reach
+    // the message the same way it does in the other.
+    return { file_context: { path: file, lines: sel ? [sel.start, sel.end] : undefined } };
   }
 
   return null;

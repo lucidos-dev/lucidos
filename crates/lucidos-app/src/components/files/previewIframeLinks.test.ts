@@ -188,6 +188,78 @@ describe('classifyPreviewLink', () => {
     expect(classifyPreviewLink('', ctx())).toBeNull();
     expect(classifyPreviewLink('   ', ctx())).toBeNull();
   });
+
+  // `repo:` is a URL scheme, so before this arm the guard above handed a repo
+  // citation back to the browser and the link dead-ended. That is why a report
+  // citing repo code had to be published as an app rather than as an artifact.
+  describe('a repo-encoded citation', () => {
+    const ENCODED = 'repo:repo-1:file:src/main.rs';
+
+    it('routes a bare repo file', () => {
+      expect(classifyPreviewLink(ENCODED, ctx())).toEqual({ kind: 'repo-file', filePath: ENCODED });
+    });
+
+    it('carries a single cited line', () => {
+      expect(classifyPreviewLink(`${ENCODED}#L510`, ctx())).toEqual({
+        kind: 'repo-file',
+        filePath: ENCODED,
+        line: 510,
+        lineEnd: undefined,
+      });
+    });
+
+    it.each([
+      ['#L510-L520', 510, 520],
+      ['#L510-520', 510, 520],
+    ])('carries a cited range written as %s', (frag, line, lineEnd) => {
+      expect(classifyPreviewLink(`${ENCODED}${frag}`, ctx()))
+        .toEqual({ kind: 'repo-file', filePath: ENCODED, line, lineEnd });
+    });
+
+    it('keeps a path that contains colons intact', () => {
+      const weird = 'repo:repo-1:file:src/weird:name.rs';
+      expect(classifyPreviewLink(`${weird}#L7`, ctx()))
+        .toEqual({ kind: 'repo-file', filePath: weird, line: 7, lineEnd: undefined });
+    });
+
+    // Two `#` in one href, and they mean different things: the one inside the
+    // mode segment names the revision, the trailing one names the line. The
+    // line suffix is `$`-anchored and stripped before `parseRepoPath` is asked,
+    // so the two never compete.
+    it('carries a named ref and a cited range together', () => {
+      const atRef = 'repo:repo-1:file#origin/main:src/main.rs';
+      expect(classifyPreviewLink(`${atRef}#L10-L20`, ctx()))
+        .toEqual({ kind: 'repo-file', filePath: atRef, line: 10, lineEnd: 20 });
+    });
+
+    it('routes a bare repo file at a named ref', () => {
+      const atRef = 'repo:repo-1:file#v1.2.0:src/main.rs';
+      expect(classifyPreviewLink(atRef, ctx())).toEqual({ kind: 'repo-file', filePath: atRef });
+    });
+
+    // parseRepoPath stays the single predicate: a structurally incomplete
+    // encoding is not a repo path, so the href falls through to the existing
+    // scheme guard and the browser keeps it, exactly as before.
+    it.each([
+      'repo::file:src/main.rs',
+      'repo:repo-1:file:',
+      'repo:repo-1:weird:a.md',
+      'repo:repo-1:file#:src/main.rs',
+      'repo:',
+    ])('declines the malformed encoding %s', (href) => {
+      expect(classifyPreviewLink(href, ctx())).toBeNull();
+    });
+
+    // Only `#L<n>` is a line reference. Anything else stays part of the path,
+    // which then 404s in the preview: the same choice the data-path branch
+    // makes, and better than letting the iframe navigate to the app shell.
+    it('does not read a non-line fragment as a line', () => {
+      expect(classifyPreviewLink(`${ENCODED}#section`, ctx())).toEqual({
+        kind: 'repo-file',
+        filePath: `${ENCODED}#section`,
+      });
+    });
+  });
 });
 
 describe('resolvePreviewRelativePath', () => {
@@ -384,6 +456,18 @@ describe('bridgePreviewIframeLinks', () => {
     const e = click(fakeContentDoc(), 'https://example.com/docs');
     expect(e.defaultPrevented).toBe(true);
     expect(mocks.openUrl).toHaveBeenCalledWith('https://example.com/docs');
+  });
+
+  // The whole point of the repo arm: a citation written in an artifact lands on
+  // the cited line, through the same navigate router the SDK call reaches.
+  it('routes a repo citation through the navigate router, lines and all', () => {
+    const e = click(fakeContentDoc(), 'repo:repo-1:file:src/main.rs#L510-L520');
+    expect(e.defaultPrevented).toBe(true);
+    expect(mocks.handleNavigationRequest).toHaveBeenCalledWith(
+      { target: 'file', file_path: 'repo:repo-1:file:src/main.rs', line: 510, line_end: 520 },
+      { source: 'a file preview' },
+    );
+    expect(mocks.openFilePreview).not.toHaveBeenCalled();
   });
 
   it('leaves an unclaimed href and a non-anchor click completely alone', () => {

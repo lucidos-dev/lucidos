@@ -3,6 +3,7 @@ import { credentials } from '../../store/store';
 import { Dropdown } from '../shared/Dropdown';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
 import type { AuthType } from '../../store/types';
+import { findProviderCredential } from './providerCredential';
 
 const ANTHROPIC_SERVICE = 'anthropic';
 const ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
@@ -23,10 +24,7 @@ const AUTH_KINDS = [
  *  and `OpenAiProviderSettings` share one section header. */
 export function AnthropicProviderSettings() {
   const credLoadable = credentials.value;
-  const existing =
-    credLoadable.status === 'loaded'
-      ? credLoadable.data.find((c) => c.service_name === ANTHROPIC_SERVICE)
-      : undefined;
+  const existing = findProviderCredential(credLoadable, ANTHROPIC_SERVICE);
 
   const [authKind, setAuthKind] = useState<string>('api_key');
   const [secret, setSecret] = useState('');
@@ -53,14 +51,18 @@ export function AnthropicProviderSettings() {
       <div class="settings-row">
         <span class="settings-row-label">
           Anthropic (direct)
+          {/* `.list-row-details` is `display: flex`, so this span is a block box
+              inside the label's line and renders UNDER it. A manual "·" glue
+              would therefore be stranded at the start of that new line, the
+              same artifact the rule in `.claude/rules/frontend.md` names. */}
           {existing && (
-            <span class="list-row-details"> · configured ({existing.auth_type})</span>
+            <span class="list-row-details">configured ({existing.auth_type})</span>
           )}
         </span>
         {existing && (
           <button
             class="action-btn action-btn-danger"
-            onClick={() => void deleteCredential(ANTHROPIC_SERVICE)}
+            onClick={() => void deleteCredential(existing.id, ANTHROPIC_SERVICE)}
           >
             Remove
           </button>

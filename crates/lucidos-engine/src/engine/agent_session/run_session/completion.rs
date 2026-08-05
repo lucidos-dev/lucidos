@@ -1,12 +1,14 @@
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_session_end_action, conflict_abort_deletes_temp_state,
-    conflict_resolution_cleanup_action, discarded_worktree_removal, should_auto_commit_on_cleanup,
-    ConflictResolutionCleanupAction, SafetyNetAction, SessionEndAction, TerminalKind,
-    WorktreeRemoval,
+    auto_resume_after_api_error, classify_session_end_action, conflict_abort_deletes_temp_state,
+    conflict_resolution_cleanup_action, discarded_worktree_removal, is_transient_api_failure,
+    should_auto_commit_on_cleanup, ConflictResolutionCleanupAction, SafetyNetAction,
+    SessionEndAction, TerminalKind, WorktreeRemoval, MAX_API_ERROR_AUTO_RESUMES,
 };
-use crate::engine::agent_session::resume::change_description_fallback;
+use crate::engine::agent_session::resume::{
+    api_error_auto_resumes_spent, change_description_fallback,
+};
 use crate::engine::change_ops::branch_is_hardened;
 use crate::engine::git_ops::{
     auto_commit_preserving_marker, branch_changed_files, commits_in_range, consume_harden_marker,
@@ -62,6 +64,107 @@ async fn remove_discarded_worktree(
 }
 
 impl LucidosEngine {
+    /// Emit `ContinuationRequested{auto_resume_after_api_error}` when the turn
+    /// ended on a TRANSIENT upstream failure the backend reported itself (its
+    /// own `API Error: …`, e.g. a connection closed mid-response). Resume the
+    /// session rather than leaving the thread dead behind a red dot: when the
+    /// identical network failure shows up as SILENCE the watchdog already does
+    /// exactly this, and the only reason the reported flavour had no recovery
+    /// is that it arrives as a natural turn terminator instead of a hang. Two
+    /// unattended runs sat dead for four and eight hours on 2026-08-04 for want
+    /// of it.
+    ///
+    /// Bounded, unlike the watchdog's: see `auto_resume_after_api_error`.
+    ///
+    /// **Called from BOTH ways a session run can end**, and it has to be, which
+    /// is the whole reason this is a helper rather than an inline block. The
+    /// first version lived only in `finalize_direct_agent` and therefore never
+    /// ran once: a turn that ends with a Result goes idle, and the idle-exit arm
+    /// of the event loop returns straight out of `run_direct_agent` without
+    /// reaching the post-loop finalize (see the call in `run.rs`). A reported
+    /// API drop is always that shape, so the recovery was dead on arrival for
+    /// four consecutive incidents. See
+    /// `docs/plans/2026-08-05-api-drop-auto-resume-emit-site-unreachable.md`.
+    ///
+    /// The two call sites are mutually exclusive by construction (the idle-exit
+    /// arm returns, every other exit breaks into finalize), so one
+    /// `run_direct_agent` invocation emits at most one continuation and no
+    /// idempotence guard is needed.
+    ///
+    /// Both sites also call it after their follow-up drain and pass
+    /// `followups_queued`, because this recovery is for the UNATTENDED case. A
+    /// drained follow-up is re-submitted by the caller, so the thread is already
+    /// going to be driven, and resuming on top of it would inject "continue from
+    /// where you left off" beside the user's real message.
+    ///
+    /// Both sites call this AFTER the turn's own `CodingAgentIdled` and after
+    /// the subprocess is torn down. The ordering is load-bearing twice over: a
+    /// `ContinuationRequested` is only re-dispatched at startup while no CC
+    /// lifecycle event follows it (`CC_LIFECYCLE_EVENTS_SQL`), so emitting
+    /// before the idle would make the durable orphan floor skip a request that
+    /// was never dispatched; and emitting while the subprocess is still alive
+    /// would race the spawn dispatcher into a session that is about to be
+    /// cancelled.
+    pub(super) async fn maybe_auto_resume_after_api_error(
+        &self,
+        thread_id: Uuid,
+        last_terminal_kind: &Option<TerminalKind>,
+        meta: &crate::engine::thread_events::EventMeta,
+        is_conflict_session: bool,
+        followups_queued: bool,
+    ) {
+        let resumes_spent = if last_terminal_kind
+            .as_ref()
+            .is_some_and(is_transient_api_failure)
+        {
+            api_error_auto_resumes_spent(
+                self.pool(),
+                thread_id,
+                crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON,
+            )
+            .await
+        } else {
+            0
+        };
+        if !auto_resume_after_api_error(
+            last_terminal_kind,
+            resumes_spent,
+            self.is_shutting_down(),
+            is_conflict_session,
+        ) {
+            return;
+        }
+        // Someone is already coming. A follow-up drained at either exit is
+        // re-submitted by the caller (`process_orphan_chain`), so the thread
+        // gets driven regardless, and a continuation on top of it would inject
+        // "continue from where you left off" alongside the user's actual
+        // message and open a resume boundary they never asked for. Same
+        // reasoning the budget encodes by resetting on `MessageReceived`: a new
+        // message is progress, and this recovery is only for the unattended
+        // case where nothing else will move the thread.
+        if followups_queued {
+            log!(
+                "[AgentSession] thread {} ended on a transient upstream API failure, but a follow-up is already queued for it: leaving the thread to that message rather than resuming",
+                thread_id,
+            );
+            return;
+        }
+        log!(
+            "[AgentSession] thread {} ended on a transient upstream API failure ({} of {} auto-resumes already spent): resuming the session instead of leaving it failed",
+            thread_id,
+            resumes_spent,
+            MAX_API_ERROR_AUTO_RESUMES,
+        );
+        crate::engine::thread_events::emit_continuation_requested_or_log(
+            &self.event_bus,
+            thread_id,
+            crate::engine::agent_recovery::AUTO_RESUME_AFTER_API_ERROR_REASON,
+            meta.actor.clone(),
+            "[AgentSession] ContinuationRequested (auto-resume after transient API failure)",
+        )
+        .await;
+    }
+
     /// Completion / teardown lifecycle stage of `run_direct_agent`, extracted
     /// from the driver: runs after the event loop exits. Marks the session
     /// exited, drains lost follow-ups, fires the safety net, then performs
@@ -179,6 +282,15 @@ impl LucidosEngine {
                 .await;
             }
         }
+
+        self.maybe_auto_resume_after_api_error(
+            thread_id,
+            &last_terminal_kind,
+            meta,
+            conflict_change.is_some(),
+            !cc_orphans.is_empty(),
+        )
+        .await;
 
         // Make sure the runtime task tears down its child process — driver
         // already drained and logged stderr inside its own task.
@@ -351,12 +463,17 @@ impl LucidosEngine {
                 }
                 ConflictResolutionCleanupAction::Apply => {
                     let apply_actor = self.pending_apply_actors.take(change.id);
-                    // Ensure merge is committed
-                    let merge_committed = git_cmd(&["rev-parse", "MERGE_HEAD"], &cwd)
-                        .await
-                        .map(|o| !o.status.success())
-                        .unwrap_or(false);
-                    if !merge_committed {
+                    // Is the merge still open? `MERGE_HEAD` resolves only while
+                    // it is. `or_unknown(true)`: an unanswered probe re-runs
+                    // `git commit --no-edit`, which is harmless on an
+                    // already-committed merge, whereas the other default would
+                    // skip the commit and let `ff_merge_to_main` below publish
+                    // a half-finished merge (`.claude/rules/rust.md`).
+                    let merge_in_progress =
+                        crate::engine::git_ops::git_answer(&["rev-parse", "MERGE_HEAD"], &cwd)
+                            .await
+                            .or_unknown(true);
+                    if merge_in_progress {
                         // ff_merge_to_main below will surface the user-visible
                         // failure if the merge stays uncommitted, but the log
                         // here preserves the original git stderr so a stuck
@@ -523,7 +640,7 @@ impl LucidosEngine {
                 // Detect if the Claude Code session switched to a different branch inside the
                 // worktree (e.g. created a feature branch in an external repo). If so,
                 // use the actual branch for the change proposal instead of the tracked
-                // claude-code/* branch — that branch has no commits.
+                // engine-named branch: that branch has no commits.
                 let actual_branch = worktree_current_branch(wt).await;
                 let base = default_local_branch(&repo_root).await;
                 let effective_branch = if let Some(ref actual) = actual_branch {

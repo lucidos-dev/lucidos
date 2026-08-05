@@ -792,27 +792,69 @@ pub(super) async fn query_events(
     }
 }
 
-/// Well-known persisted event types — always available even in empty workspaces.
+/// Well-known persisted event types, always offered by `/events/types` even on
+/// a workspace whose `events` table has no row of that type yet.
+///
+/// This list is what makes an event *discoverable*: the trigger-config
+/// `on_event:` dropdown (`fetchEventTypes` →
+/// `crates/lucidos-app/src/components/triggers/TriggerDetails.tsx`) is the
+/// merge of this constant with `distinct_event_types()`. A type that is absent
+/// here cannot be subscribed to from the UI until the workspace happens to
+/// produce one, which on a fresh install is exactly backwards: the useful
+/// subscriptions are the ones you want wired up BEFORE the thing has happened.
+/// `ChildThreadCompleted` was the reported case.
+///
+/// Membership rule, so additions stay auditable: a name belongs here iff a
+/// trigger subscribed to it would actually fire. In practice that means it must
+/// be a **`ThreadEvent`** variant that is persisted and not on the
+/// `ThreadEvent::is_per_token_streaming` blocklist.
+///
+/// **No `SystemEvent` name belongs here**, however useful it sounds. The
+/// scheduler's `BusEvent::System` arm routes exactly one variant to the trigger
+/// matcher, `SystemEvent::DomainEvent` (see `start_trigger_event_subscriber` in
+/// `crates/lucidos-engine/src/scheduler/mod.rs`); the `Trigger*` lifecycle
+/// variants go to `handle_trigger_event`, which is the scheduler's own
+/// bookkeeping and not the matcher, and everything else falls through `_ => {}`.
+/// So seeding e.g. `NotificationCreated` or `TriggerExecuted` offers a
+/// subscription that can never fire. `TriggerCompleted` and `TriggerStarted`
+/// ARE here, and legitimately: both names exist on `ThreadEvent` too, and it is
+/// the thread-side emit that reaches the matcher.
+///
+/// Kept sorted; `known_event_types_are_triggerable_thread_events` holds the
+/// ordering and enforces the rule.
 const KNOWN_EVENT_TYPES: &[&str] = &[
+    "BackgroundBashCompleted",
+    "BackgroundBashStarted",
     "ChangeApplied",
     "ChangeApplyFailed",
     "ChangeDiscarded",
+    "ChangeHardened",
     "ChangeProposed",
     "ChangeReverted",
+    "ChildThreadCompleted",
     "CodingAgentIdled",
+    "CodingAgentPermissionRequest",
     "CodingAgentUserMessageSent",
+    "CommandPermissionRequested",
+    "ContinuationStarted",
+    "CredentialRequested",
+    "McpPermissionRequested",
     "MergeConflictDetected",
     "MessageReceived",
-    "NotificationCreated",
     "ResponseAborted",
     "ResponseCanceled",
     "ResponseFailed",
     "ResponseGenerated",
-    "TriggerCompleted",
-    "TriggerStarted",
     "SessionEnded",
     "SessionStarted",
+    "ThreadArchived",
+    "ThreadStarted",
     "ThreadTitleGenerated",
+    "TriggerCompleted",
+    "TriggerStarted",
+    "UserQuestionAnswered",
+    "UserQuestionAsked",
+    "WorktreeCleaned",
 ];
 
 /// Return known event types merged with any additional types from the database.
@@ -1089,6 +1131,94 @@ mod tests {
                 "{name} should be allowed as a domain event",
             );
         }
+    }
+
+    /// Every seeded name must be one a trigger can actually fire on.
+    ///
+    /// `/events/types` feeds the trigger `on_event:` dropdown, so a name the
+    /// matcher never sees doesn't fail loudly: it offers the user a
+    /// subscription that silently never fires. Two ways to get that wrong, and
+    /// this test covers both.
+    ///
+    /// A **typo or retired name** is caught by requiring
+    /// `thread_lifecycle::classify_event` to recognise the string. That matcher
+    /// is keyed on `ThreadEvent` variant names (plus their legacy aliases) and
+    /// returns `None` for everything else.
+    ///
+    /// A **`SystemEvent` name** is caught by the same requirement, and this is
+    /// the subtle half. The scheduler's `BusEvent::System` arm forwards exactly
+    /// one variant to the matcher, `SystemEvent::DomainEvent`; `Trigger*`
+    /// lifecycle variants go to the scheduler's own bookkeeping and the rest
+    /// fall through `_ => {}`. So a `SystemEvent`-only name like
+    /// `NotificationCreated` or `TriggerExecuted` is unsubscribable no matter
+    /// how plausible it reads, and `classify_event` rejects it because it is
+    /// not a `ThreadEvent`. (`TriggerCompleted` / `TriggerStarted` pass because
+    /// those names exist on BOTH enums and it is the thread-side emit that
+    /// reaches the matcher.)
+    ///
+    /// This is still a containment check, not a derivation: it cannot say "a
+    /// new triggerable variant landed and nobody seeded it". Deriving the list
+    /// needs variant enumeration neither enum offers today, see
+    /// `docs/plans/2026-08-05-event-read-surface-drift.md` § D7.
+    #[test]
+    fn known_event_types_are_triggerable_thread_events() {
+        for name in KNOWN_EVENT_TYPES {
+            assert!(
+                crate::engine::thread_lifecycle::classify_event(name).is_some(),
+                "KNOWN_EVENT_TYPES entry '{name}' is not a ThreadEvent name \
+                 (thread_lifecycle::classify_event returned None). If it is a \
+                 SystemEvent, it does not belong here at all: the scheduler only \
+                 forwards SystemEvent::DomainEvent to the trigger matcher, so the \
+                 on_event: dropdown would offer a subscription that can never fire.",
+            );
+        }
+
+        // The scheduler's other gate: `ThreadEvent::is_per_token_streaming`
+        // variants are dropped before the matcher, so seeding one would be the
+        // same broken promise by a different route.
+        for streaming in [
+            "TextStreamed",
+            "ThoughtStreamed",
+            "CodingAgentTextStreamed",
+            "CodingAgentThoughtStreamed",
+        ] {
+            assert!(
+                !KNOWN_EVENT_TYPES.contains(&streaming),
+                "'{streaming}' is on the is_per_token_streaming blocklist; the \
+                 matcher never sees it, so it must not be offered as an on_event: \
+                 target.",
+            );
+        }
+    }
+
+    /// The constant is kept sorted and duplicate-free so additions stay
+    /// reviewable. (`event_types` sorts its merged output regardless, so this
+    /// is about the source, not the response.)
+    #[test]
+    fn known_event_types_is_sorted_and_unique() {
+        let mut sorted = KNOWN_EVENT_TYPES.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(
+            KNOWN_EVENT_TYPES,
+            &sorted[..],
+            "keep KNOWN_EVENT_TYPES in alphabetical order",
+        );
+        sorted.dedup();
+        assert_eq!(
+            sorted.len(),
+            KNOWN_EVENT_TYPES.len(),
+            "KNOWN_EVENT_TYPES contains a duplicate",
+        );
+    }
+
+    /// Regression: `ChildThreadCompleted` was missing from the seed list, so a
+    /// workspace could only subscribe a trigger to a child thread's outcome
+    /// after one had already completed and `distinct_event_types()` picked the
+    /// name up from the table. Wanting to be notified when a child thread
+    /// finishes is precisely a thing you wire up beforehand.
+    #[test]
+    fn known_event_types_seeds_child_thread_completed() {
+        assert!(KNOWN_EVENT_TYPES.contains(&"ChildThreadCompleted"));
     }
 
     #[test]

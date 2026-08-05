@@ -22,6 +22,15 @@ export interface NavigateUi {
   settings_view?: SettingsViewTarget;
   app_id?: string;
   file_path?: string;
+  /** Line to open the file at, 1-based. The preview scrolls it into view and
+   *  highlights it, exactly as a click on that line number does. Only used with
+   *  `target: 'file'`. A line the file can't honour (0, negative, past its end,
+   *  or a format with no source view such as a PDF) is ignored and the file
+   *  opens at the top. */
+  line?: number;
+  /** Last line of the highlighted range, 1-based and INCLUSIVE. Omit for a
+   *  single line. Only used alongside `line`. */
+  line_end?: number;
   id?: string;
   url?: string;
   event_id?: string;

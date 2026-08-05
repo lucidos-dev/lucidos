@@ -1,5 +1,6 @@
 import {
   CONTINUATION_AUTO_RECOVERY_REASON,
+  CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON,
   CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON,
   CONTINUATION_USER_CLICKED_REASON,
   type AbortCause,
@@ -68,6 +69,8 @@ export function describeContinuationReason(reason: string | undefined): string |
       return 'The agent session stopped responding, or a stray signal killed it. Nothing restarted: the engine relaunched that one session and carried on.';
     case CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON:
       return 'You chose Switch to new version, which stopped this response mid-flight. The engine resumed it automatically once the new version was up.';
+    case CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON:
+      return 'The connection to the model dropped part-way through the response above, so that turn failed incomplete. Nothing restarted: the engine picked the session back up and carried on. It will do this a few times in a row at most, then leave the failure standing.';
     default:
       return null;
   }

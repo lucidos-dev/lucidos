@@ -1,20 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import type { ComponentChildren, VNode } from 'preact';
 import { highlightEllipsis } from '../highlightEllipsis';
-
-/** Walk the rendered children into a tag-tagged string so we can assert which
- *  spans got the `.ellipsis-marker` class without booting a DOM. Mirrors the
- *  walker in permission-card.test.tsx. */
-function vnodeToText(node: ComponentChildren): string {
-  if (node === null || node === undefined || typeof node === 'boolean') return '';
-  if (typeof node === 'string' || typeof node === 'number') return String(node);
-  if (Array.isArray(node)) return node.map(vnodeToText).join('');
-  const v = node as VNode<{ children?: ComponentChildren; class?: string }>;
-  const tag = typeof v.type === 'string' ? v.type : '';
-  const cls = v.props?.class ? ` class="${v.props.class}"` : '';
-  const inner = vnodeToText(v.props?.children);
-  return tag ? `<${tag}${cls}>${inner}</${tag}>` : inner;
-}
+// The shared walker flattens a vnode tree to a tag-tagged string (surfacing
+// `class`), which is what lets these tests assert which spans got
+// `.ellipsis-marker` without booting a DOM.
+import { vnodeToText } from './vnodeToText';
 
 describe('highlightEllipsis', () => {
   it('returns plain text when there is no ellipsis to mark', () => {

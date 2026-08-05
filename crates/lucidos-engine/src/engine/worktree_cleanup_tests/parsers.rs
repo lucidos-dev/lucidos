@@ -570,7 +570,3 @@ async fn tier_0_skips_thread_with_live_agent_session() {
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
-
-// ---------------------------------------------------------------------------
-// `worktree_git_admin_missing` — stranded detection (pure, no DB).
-// ---------------------------------------------------------------------------

@@ -364,3 +364,188 @@ async fn get_by_id_returns_404_for_unknown_thread() {
         "an unknown thread id must 404, not return an empty 200"
     );
 }
+
+/// Seed a `thread_summaries` row that is a child of `parent`.
+async fn seed_child_row(
+    pool: &sqlx::PgPool,
+    title: &str,
+    parent: uuid::Uuid,
+    status: ThreadStatus,
+) -> uuid::Uuid {
+    let id = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+            (thread_id, title, first_message, source, initiator, \
+             created_at, last_activity, message_count, status, parent_thread_id, depth) \
+         VALUES ($1, $2, $2, 'chat', 'system', NOW(), NOW(), 1, $3, $4, 1)",
+    )
+    .bind(id)
+    .bind(title)
+    .bind(status.as_str())
+    .bind(parent)
+    .execute(pool)
+    .await
+    .expect("seed child thread_summaries");
+    id
+}
+
+/// The read side of a parent orchestrating its own fan-out. Without it the
+/// model's only recovery from losing a child's `thread_id` (history trimming
+/// drops the oldest tool results first, so a fan-out orchestrator's spawn
+/// results are the first to go) is to spawn a duplicate child.
+#[tokio::test]
+async fn list_parent_filter_returns_only_that_parents_direct_children() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let marker = unique_marker("api-threads-list-parent");
+
+    let parent = seed_summary_row(
+        &pool,
+        &format!("{marker}-parent"),
+        "chat",
+        ThreadStatus::Running,
+    )
+    .await;
+    let other_parent = seed_summary_row(
+        &pool,
+        &format!("{marker}-other"),
+        "chat",
+        ThreadStatus::Running,
+    )
+    .await;
+    let child_a = seed_child_row(
+        &pool,
+        &format!("{marker}-child-a"),
+        parent,
+        ThreadStatus::Running,
+    )
+    .await;
+    let child_b = seed_child_row(
+        &pool,
+        &format!("{marker}-child-b"),
+        parent,
+        ThreadStatus::Idle,
+    )
+    .await;
+    let _grandchild = seed_child_row(
+        &pool,
+        &format!("{marker}-grandchild"),
+        child_a,
+        ThreadStatus::Running,
+    )
+    .await;
+    let _stranger = seed_child_row(
+        &pool,
+        &format!("{marker}-stranger"),
+        other_parent,
+        ThreadStatus::Running,
+    )
+    .await;
+
+    let url = format!(
+        "{}/api/v1/threads/list?parent={parent}&limit=1000",
+        base_url()
+    );
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("parent request")
+        .json()
+        .await
+        .expect("invalid JSON");
+
+    let mut ids: Vec<&str> = body
+        .as_array()
+        .expect("list response must be a JSON array")
+        .iter()
+        .filter_map(|r| r["thread_id"].as_str())
+        .collect();
+    ids.sort_unstable();
+    let mut expected = [child_a.to_string(), child_b.to_string()];
+    expected.sort();
+    assert_eq!(
+        ids,
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "parent= must return exactly the direct children: no grandchild, no \
+         other parent's child, and not the parent itself"
+    );
+
+    // Composes with the other filters rather than replacing them.
+    let url = format!(
+        "{}/api/v1/threads/list?parent={parent}&active=true&limit=1000",
+        base_url()
+    );
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("parent+active request")
+        .json()
+        .await
+        .expect("invalid JSON");
+    let ids: Vec<&str> = body
+        .as_array()
+        .expect("array")
+        .iter()
+        .filter_map(|r| r["thread_id"].as_str())
+        .collect();
+    assert_eq!(
+        ids,
+        [child_a.to_string().as_str()],
+        "parent= composes with active=true: only the child still working"
+    );
+}
+
+#[tokio::test]
+async fn count_honours_the_parent_filter() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let marker = unique_marker("api-threads-count-parent");
+
+    let parent = seed_summary_row(
+        &pool,
+        &format!("{marker}-parent"),
+        "chat",
+        ThreadStatus::Running,
+    )
+    .await;
+    for i in 0..3 {
+        seed_child_row(
+            &pool,
+            &format!("{marker}-child-{i}"),
+            parent,
+            ThreadStatus::Running,
+        )
+        .await;
+    }
+
+    let url = format!("{}/api/v1/threads/count?parent={parent}", base_url());
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("count request")
+        .json()
+        .await
+        .expect("invalid JSON");
+    assert_eq!(
+        body["count"].as_i64(),
+        Some(3),
+        "count must apply the same parent filter as list"
+    );
+}
+
+/// A malformed `parent` is a 400, never a silent "no filter" that would return
+/// the whole workspace when the caller asked for one thread's children.
+#[tokio::test]
+async fn list_rejects_a_malformed_parent() {
+    let client = http_client();
+    let url = format!("{}/api/v1/threads/list?parent=not-a-uuid", base_url());
+    let response = client.get(&url).send().await.expect("parent request");
+    assert_eq!(
+        response.status().as_u16(),
+        400,
+        "a malformed parent id must be rejected, not ignored"
+    );
+}

@@ -927,10 +927,14 @@ fn apply_time_reconcile_lives_in_apply_change_gated_not_in_handler_or_emitter() 
 /// a binary older than the merge.
 ///
 /// A SECOND trigger site is not merely redundant, it re-breaks the feature:
-/// `trigger_background_rebuild` coalesces by aborting the in-flight build, and
-/// the aborted task's `flock` guard may not have dropped before the replacement
-/// probes it — the replacement then reads `SkippedLocked`, falls back to
-/// `BuildState::Idle`, and no build runs at all.
+/// `trigger_background_rebuild` coalesces by aborting the in-flight build, so a
+/// duplicate throws away a compile that was already most of the way to the
+/// Switch and starts it over. It used to be worse. Until 2026-08-05 the
+/// replacement probed the checkout-shared build lock before the aborted task had
+/// dropped its guard, read `SkippedLocked`, fell back to `BuildState::Idle`, and
+/// left no build running at all. `trigger_background_rebuild` now awaits the
+/// superseded task first, so a duplicate site costs a rebuild instead of losing
+/// one entirely.
 #[test]
 fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
     let emitters = include_str!("../change_ops_emitters.rs");
@@ -957,9 +961,9 @@ fn apply_time_dev_refresh_lives_only_on_the_shared_change_applied_emit() {
         assert!(
             !src.contains("trigger_background_rebuild()")
                 && !src.contains("refresh_served_frontend_after_rebuild()"),
-            "{label} must NOT trigger the rebuild / frontend re-snapshot directly — \
-             emit_change_applied owns it. A second trigger site can abort the first \
-             build into a SkippedLocked no-op, leaving no build running at all."
+            "{label} must NOT trigger the rebuild / frontend re-snapshot directly. \
+             emit_change_applied owns it: a second trigger site aborts the in-flight \
+             build and starts the whole compile over."
         );
     }
 }

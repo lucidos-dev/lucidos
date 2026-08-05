@@ -6,18 +6,26 @@
 //! requests through the engine to a configured backend, optionally injecting
 //! an auth header sourced from the credential store.
 //!
-//! Configured via `data/config/apis.json`:
+//! Configured via `data/config/apis.json`. `auth` is a *pipeline* of layers
+//! (see `proxy_pipeline_config::PipelineConfig`); the legacy single-variant
+//! `{"type": "bearer", "credential": …}` shape no longer deserializes and is
+//! rewritten in place at startup by
+//! `proxy_migration::migrate_apis_json_if_needed`:
 //! ```json
 //! {
 //!   "sonos":   { "base_url": "http://localhost:5005" },
 //!   "comfort": { "base_url": "https://accsmart.panasonic.com",
-//!                "auth": { "type": "bearer", "credential": "comfort-cloud" } }
+//!                "auth": { "pipeline": [
+//!                  { "type": "static_credential",
+//!                    "kind": "bearer",
+//!                    "credential": "comfort-cloud" }
+//!                ] } }
 //! }
 //! ```
 
 use super::*;
 
-use crate::api::proxy_hex::hex_lower;
+use crate::api::hex::hex_lower;
 use crate::api::proxy_pipeline_config::{LayerConfig, PipelineConfig};
 use crate::core::{Credential, CredentialStore};
 use axum::body::{Body, Bytes};
@@ -304,11 +312,43 @@ pub(crate) async fn resolve_proxy_target(
 /// failures to the same `(StatusCode, String)` error shape every auth path
 /// uses. The single source of truth for "this credential must exist and be
 /// non-empty, or the proxy can't proceed".
+///
+/// Resolves an OAuth client registration too, which `CredentialStore::get` is
+/// deliberately blind to. An `apis.json` entry may name one explicitly (a
+/// `script_handshake` layer whose script does its own token exchange), and it is
+/// named rather than merely present, so the ambiguity `get`'s exclusion exists
+/// to prevent does not arise here.
+///
+/// **Temporary measure (`credential-oauth-prefix-tolerance` in
+/// `docs/temporary-measures.md`).** A config written before 2026-08-05 spells
+/// that name `oauth:<provider>`, which is now stored as just `<provider>`. The
+/// fallback keeps those entries working: without it a live `apis.json` 502s on
+/// every request the moment the prefix migration runs, and `data/config/` is
+/// user data no DB migration can rewrite.
 pub(crate) async fn fetch_required_credential(
     pool: &sqlx::PgPool,
     name: &str,
 ) -> Result<Credential, (StatusCode, String)> {
-    match CredentialStore::get(pool, name).await {
+    let found = match CredentialStore::get(pool, name).await {
+        Ok(Some(c)) => Ok(Some(c)),
+        Ok(None) => {
+            // Normalize ONLY a name that actually carries the legacy prefix.
+            // Running every miss through `client_provider_name` would also
+            // lowercase it, so a config naming `Stripe` (no such credential)
+            // would silently resolve an unrelated `stripe` OAuth registration
+            // and the proxy would send a `{client_id, ...}` blob as its auth
+            // header. A miss must stay a miss unless the name is one of the two
+            // spellings of the same thing.
+            let lookup = if name.trim().to_lowercase().starts_with("oauth:") {
+                crate::core::oauth::client_provider_name(name)
+            } else {
+                name.to_string()
+            };
+            CredentialStore::get_typed(pool, &lookup, crate::core::AuthType::OauthClient).await
+        }
+        Err(e) => Err(e),
+    };
+    match found {
         Ok(Some(c)) if c.auth_value.is_empty() => Err((
             StatusCode::BAD_GATEWAY,
             format!("proxy auth credential '{}' has an empty value", name),

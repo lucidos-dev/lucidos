@@ -230,7 +230,16 @@ async fn resume_falls_back_when_branch_deleted() {
     assert!(!exists, "Deleted branch should not exist");
 
     // The code should fall back to creating a new branch
-    let new_branch = crate::engine::agent_session::generate_cc_branch_name();
+    let new_branch = crate::engine::git_ops::allocate_coding_agent_branch(
+        repo,
+        crate::runtime::CodingAgent::ClaudeCode,
+        &crate::engine::git_ops::BranchScope::Repo(
+            crate::engine::git_ops::BranchScope::LUCIDOS_REPO.to_string(),
+        ),
+        "deleted branch fallback",
+        uuid::Uuid::new_v4(),
+    )
+    .await;
     let wt_path = tmp.path().join("worktree-fresh");
     let result = git_cmd(
         &[

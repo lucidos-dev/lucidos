@@ -27,7 +27,17 @@ pub(crate) use recovery::{
 // halves of the auto-resume contract cannot drift apart.
 #[cfg(test)]
 pub(crate) use recovery::switch_was_user_initiated;
-pub(crate) use recovery::{SWITCH_TEARDOWN_ABORT_SQL, THREAD_START_EVENTS_SQL};
+// The running-vs-idle branch classifier, so its regression tests exercise the
+// production SQL rather than a hand-copied paraphrase of it.
+#[cfg(test)]
+pub(crate) use recovery::BRANCH_CLASSIFICATION_SQL;
+pub(crate) use recovery::{switch_abort_unsuperseded_sql, SWITCH_TEARDOWN_ABORT_SQL};
+// The boot floor that withdraws a resume promise this boot could not keep, so a
+// switch-interrupted thread never sits paused with no Continue button. `main.rs`
+// reaches it through `LucidosEngine::settle_unresumed_switch_threads`; the free
+// function is re-exported for the tests, which drive it against a seeded pool.
+#[cfg(test)]
+pub(crate) use recovery::settle_unresumed_switch_threads;
 
 #[cfg(test)]
 #[path = "../agent_recovery_tests/scenarios.rs"]

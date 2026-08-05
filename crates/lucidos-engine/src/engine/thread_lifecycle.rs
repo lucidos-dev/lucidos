@@ -62,11 +62,12 @@ pub enum ThreadStatus {
     Idle,
     Running,
     /// Written by exactly ONE site: `AbortCause::status_sql()`
-    /// (`thread_events/cause.rs`), whose non-`StaleSettle` arm maps to
-    /// `CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END`.
+    /// (`thread_events/cause.rs`), whose non-`StaleSettle` arms map to
+    /// `CASE WHEN coding_agent_proposed THEN 'waiting' ELSE <verdict> END`.
     /// That fragment is interpolated into the `ResponseAborted` projection
     /// arm, so an abort landing on a CC thread that already proposed a change
-    /// settles here rather than at `Failed`.
+    /// settles here rather than at `Paused` / `Failed`: a change ready to
+    /// review outranks both the interruption and the failure.
     ///
     /// Every OTHER settle path uses `STATUS_FROM_PROPOSED_CHANGE`, which is the
     /// literal `'idle'`: a proposed change is an artifact for the user to
@@ -81,9 +82,29 @@ pub enum ThreadStatus {
     /// answer (or cancel), at which point the engine respawns CC with
     /// `--resume` and feeds the answer back as a `tool_result`.
     WaitingForUserAnswer,
+    /// The turn was interrupted by an engine restart and has not resumed. Set by
+    /// `AbortCause::status_sql()` for the two causes `AbortCause::is_transient()`
+    /// calls transient: the teardown boundary of a *Switch to new version*
+    /// (`EngineShutdown`) and the boot sweep's crash boundary
+    /// (`RecoveryAfterRestart`).
+    ///
+    /// Nothing failed here, which is the whole point of the variant: before it
+    /// existed both causes landed on `Failed`, so switching versions painted every
+    /// in-flight thread with the red error dot for work the engine was about to
+    /// resume by itself. Distinct from `WaitingForUserAnswer` (the loop is parked
+    /// on a question the user must answer) and from `Waiting` (a change is sitting
+    /// in review): a paused turn resumes on its own after a switch, or offers the
+    /// manual Continue button when the boot declines to resume it.
+    ///
+    /// A verdict, not a resting state: like `Failed`, it must survive the trailing
+    /// events of the dying turn (see `preserving_verdict`), or recovery's own
+    /// `CodingAgentIdled` walks it straight back to `Idle`.
+    Paused,
     /// Last response failed (model error, quota exceeded, etc.). Distinct from
     /// `Waiting` so the UI can show an error indicator instead of the changes
-    /// dot. Cleared when the user sends another message (→ `Running`).
+    /// dot, and from `Paused` so an interruption the engine expects to resume
+    /// isn't reported as an error. Cleared when the user sends another message
+    /// (→ `Running`).
     Failed,
 }
 
@@ -94,6 +115,7 @@ impl ThreadStatus {
             Self::Running => "running",
             Self::Waiting => "waiting",
             Self::WaitingForUserAnswer => "waiting_for_user_answer",
+            Self::Paused => "paused",
             Self::Failed => "failed",
         }
     }
@@ -107,6 +129,7 @@ impl ThreadStatus {
             "running" => Self::Running,
             "waiting" => Self::Waiting,
             "waiting_for_user_answer" => Self::WaitingForUserAnswer,
+            "paused" => Self::Paused,
             "failed" => Self::Failed,
             _ => Self::Idle,
         }
@@ -956,10 +979,16 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
-        // System interruption — surfaces in REVIEW with the same red error
-        // indicator as ResponseFailed, unless a Claude Code session left pending
-        // changes (then 'waiting' → changes dot wins, since reviewing the
-        // changes is more actionable than acknowledging the interrupt).
+        // System interruption. Approximate on purpose: this table has no cause
+        // axis, and `AbortCause::status_sql()` splits three ways. `StaleSettle`
+        // maps to 'idle' (engine cleanup of a row whose process was already
+        // gone), and a TRANSIENT cause (`EngineShutdown`, `RecoveryAfterRestart`)
+        // maps to 'paused' rather than 'failed', because an engine restart
+        // interrupted the turn and did not fail it. The row below states the
+        // remaining, genuinely-failed case; the cause split lives in the
+        // projection next to `is_transient()`. Pending changes override every
+        // arm to 'waiting': reviewing the changes is more actionable than
+        // acknowledging the interrupt.
         (
             "ResponseAborted",
             StatusTransition {

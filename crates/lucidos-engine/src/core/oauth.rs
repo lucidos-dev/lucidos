@@ -89,12 +89,50 @@ pub struct OAuthClientOverrides {
     pub auth_url: Option<String>,
     pub token_url: Option<String>,
     pub userinfo_url: Option<String>,
+    /// `"POST"` when the provider's userinfo endpoint refuses GET (Dropbox).
+    /// Omit for the OIDC default. See [`UserinfoMethod`].
+    pub userinfo_method: Option<String>,
+    /// Extra authorization-URL parameters in `key=value&key=value` form, e.g.
+    /// the provider's own spelling of "issue a refresh token". Omit to keep
+    /// [`DEFAULT_AUTHORIZE_PARAMS`]. See [`AuthorizeParams`].
+    pub authorize_params: Option<String>,
     pub scopes: Option<String>,
     /// Loopback callback URI to register with this provider. Omit for the
     /// default (`127.0.0.1`); supply the `localhost` form only for a provider
     /// that won't accept the IP literal. See `default_redirect_uri` and the
     /// oauth-providers knowhow.
     pub redirect_uri: Option<String>,
+}
+
+/// Normalize the credential name for a provider's OAuth client registration.
+///
+/// This is what remains of `client_service_name`, which used to manufacture the
+/// name `oauth:<provider>` because `credentials.service_name` was the table's
+/// only unique key and a bare `google` could not be both an API key and an app
+/// registration. `auth_type` is the discriminator now
+/// (`20260805134838_drop_credential_name_prefixes_use_auth_type.sql`), so the
+/// name is just the provider and the whole canonicalization apparatus is gone.
+///
+/// Two things survive, and both are about a caller getting it wrong rather than
+/// about the key:
+///
+/// * **Lowercasing**, so `Dropbox` and `dropbox` cannot address two
+///   registrations. `connect_oauth_account` already lowercases its argument.
+/// * **Stripping a leading `oauth:`**, because agents and knowhow in the wild
+///   still say `oauth:<provider>`: the chat system prompt said it for as long as
+///   the tool has existed, and on 2026-08-05 an agent passed a bare `dropbox`
+///   even so. A caller passing either spelling must land on the same row rather
+///   than create a second one, which was the incident.
+pub fn client_provider_name(name: &str) -> String {
+    let name = name.trim().to_lowercase();
+    // A bare `oauth:` strips to nothing, and an empty service name is not a
+    // credential anyone can address. Keep the input so the caller's own
+    // emptiness check (or the store's NOT NULL) rejects it visibly, rather than
+    // manufacturing a row named "".
+    match name.strip_prefix("oauth:") {
+        Some(rest) if !rest.is_empty() => rest.to_string(),
+        _ => name,
+    }
 }
 
 /// Build the credential-request JSON the frontend modal opens for an
@@ -106,7 +144,7 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
         .clone()
         .unwrap_or_else(|| format!("https://{provider}.com"));
     let mut request = serde_json::json!({
-        "service": format!("oauth:{provider}"),
+        "service": client_provider_name(provider),
         "prompt": format!("Enter your OAuth client credentials for {provider}."),
         "base_url": base_url,
         "auth_type": "oauth_client",
@@ -118,6 +156,8 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
         ("auth_url", &overrides.auth_url),
         ("token_url", &overrides.token_url),
         ("userinfo_url", &overrides.userinfo_url),
+        ("userinfo_method", &overrides.userinfo_method),
+        ("authorize_params", &overrides.authorize_params),
         ("scopes", &overrides.scopes),
         ("redirect_uri", &overrides.redirect_uri),
     ] {
@@ -286,7 +326,6 @@ impl OAuthStore {
         .await
     }
 
-    /// Update tokens after a refresh
     /// Refresh an account's tokens in place.
     ///
     /// Deliberately silent, and registered as the one `oauth_accounts`
@@ -476,9 +515,9 @@ pub async fn get_account_with_fresh_token(
 
 /// Build `OAUTH_*` environment variables from connected OAuth accounts.
 /// For each account: `OAUTH_{PROVIDER}_ACCESS_TOKEN` (always),
-/// `OAUTH_{PROVIDER}_EMAIL` (if known). Provider name is uppercased and
-/// `-` / `.` / space → `_` so a hyphenated provider lands as a legal
-/// identifier in shell.
+/// `OAUTH_{PROVIDER}_EMAIL` (if known). The provider name goes through
+/// [`crate::core::env_var_segment`], the same transform `CRED_*` uses, so any
+/// provider lands as a legal identifier in shell.
 ///
 /// Used by both subprocess injection (`build_script_env_vars` for
 /// run_python / run_bash / scheduled scripts) and the proxy
@@ -487,11 +526,7 @@ pub async fn get_account_with_fresh_token(
 pub fn account_env_vars(accounts: Vec<OAuthAccount>) -> Vec<(String, String)> {
     let mut env_vars = Vec::new();
     for account in accounts {
-        let provider = account
-            .provider
-            .to_uppercase()
-            .replace(['-', ' ', '.'], "_");
-        let prefix = format!("OAUTH_{}", provider);
+        let prefix = format!("OAUTH_{}", crate::core::env_var_segment(&account.provider));
         env_vars.push((format!("{}_ACCESS_TOKEN", prefix), account.access_token));
         if let Some(email) = account.email {
             env_vars.push((format!("{}_EMAIL", prefix), email));
@@ -693,6 +728,115 @@ impl ClientAuth {
     }
 }
 
+/// The extra authorization-URL parameters a provider needs, beyond the ones the
+/// protocol itself defines.
+///
+/// This exists because "ask for a refresh token" has no standard spelling.
+/// Google reads `access_type=offline` (plus `prompt=consent` to re-issue the
+/// refresh token on a repeat authorization); Dropbox reads
+/// `token_access_type=offline` and returns a four-hour access token and NO
+/// refresh token without it. Those two strings were a single hardcoded literal
+/// until 2026-08-05, which meant every Dropbox connection was silently
+/// unrefreshable: `refresh_oauth_if_needed` could only report "OAuth token
+/// expired but no refresh token available", so a scheduled backup worked on the
+/// evening it was set up and never again.
+///
+/// So the value is credential data, one per registration, documented per
+/// provider in `system-knowhow/oauth-providers.md`. No provider name appears in
+/// this module (CLAUDE.md § "No provider-specific instructions in code"); the
+/// registry that knows them is knowhow the agent reads.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AuthorizeParams(Vec<(String, String)>);
+
+/// What a credential with no `authorize_params` sends. Google's spelling,
+/// because every credential stored before the key existed was authorized with
+/// exactly this and Google needs both halves to re-issue a refresh token.
+/// Absent must therefore mean "unchanged", never "nothing".
+pub const DEFAULT_AUTHORIZE_PARAMS: &str = "access_type=offline&prompt=consent";
+
+/// The opt-out, for a provider strict enough to reject a parameter it does not
+/// know. Without it, [`DEFAULT_AUTHORIZE_PARAMS`] would be unavoidable.
+const AUTHORIZE_PARAMS_NONE: &str = "none";
+
+/// Parameters the flow itself owns. A credential is agent- and user-writable, so
+/// letting it set these would let a stored value rewrite the loopback
+/// `redirect_uri` the callback listener is bound to, or narrow the `scope` the
+/// caller asked for, from a field that reads like provider trivia.
+const RESERVED_AUTHORIZE_KEYS: &[&str] = &[
+    "client_id",
+    "redirect_uri",
+    "response_type",
+    "scope",
+    "code_challenge",
+    "code_challenge_method",
+];
+
+impl AuthorizeParams {
+    /// Parse the credential's `authorize_params`, in `key=value&key=value` form.
+    ///
+    /// Absent or blank means [`DEFAULT_AUTHORIZE_PARAMS`]; the literal `none`
+    /// means send nothing extra. Both halves of each pair are percent-decoded
+    /// here and re-encoded on the way out, so a value carrying `&` or `=`
+    /// survives the round trip as one value instead of splitting into further
+    /// parameters.
+    ///
+    /// Errors rather than dropping a bad pair: this runs before the browser
+    /// opens, and a silently ignored parameter would surface as a provider
+    /// behaving inexplicably (no refresh token, an unexpected consent screen)
+    /// with nothing to point at.
+    pub fn parse(raw: Option<&str>) -> Result<Self, String> {
+        let raw = raw.map(str::trim).unwrap_or_default();
+        let raw = if raw.is_empty() {
+            DEFAULT_AUTHORIZE_PARAMS
+        } else if raw.eq_ignore_ascii_case(AUTHORIZE_PARAMS_NONE) {
+            return Ok(Self(Vec::new()));
+        } else {
+            raw
+        };
+
+        let mut pairs = Vec::new();
+        for part in raw.split('&').filter(|p| !p.trim().is_empty()) {
+            let (key, value) = part.split_once('=').ok_or_else(|| {
+                format!("authorize_params entry '{part}' is not in key=value form")
+            })?;
+            let key = decode_param(key.trim());
+            let value = decode_param(value.trim());
+            if key.is_empty() {
+                return Err(format!("authorize_params entry '{part}' has an empty key"));
+            }
+            if RESERVED_AUTHORIZE_KEYS
+                .iter()
+                .any(|r| key.eq_ignore_ascii_case(r))
+            {
+                return Err(format!(
+                    "authorize_params may not set '{key}': the OAuth flow owns it"
+                ));
+            }
+            pairs.push((key, value));
+        }
+        Ok(Self(pairs))
+    }
+
+    /// Append the pairs to an authorization URL that already carries a query.
+    fn append_to(&self, url: &mut String) {
+        for (key, value) in &self.0 {
+            url.push('&');
+            url.push_str(&urlencoding::encode(key));
+            url.push('=');
+            url.push_str(&urlencoding::encode(value));
+        }
+    }
+}
+
+/// Percent-decode one half of an `authorize_params` pair, leaving it as written
+/// when it is not valid encoding (a bare `%` is far likelier to be a literal
+/// than a typo worth failing the whole flow over).
+fn decode_param(raw: &str) -> String {
+    urlencoding::decode(raw)
+        .map(|s| s.into_owned())
+        .unwrap_or_else(|_| raw.to_string())
+}
+
 /// Build the provider's authorization URL.
 ///
 /// `code_challenge` is appended only for a public client, so a confidential
@@ -703,18 +847,20 @@ fn build_authorize_url(
     redirect_uri: &str,
     scopes: &str,
     auth: &ClientAuth,
+    extra: &AuthorizeParams,
 ) -> String {
     // Some authorization endpoints already carry a query (Azure AD B2C pins its
     // user flow with `?p=…`), so appending a second `?` would corrupt the URL.
     let separator = if auth_url.contains('?') { '&' } else { '?' };
     let mut url = format!(
-        "{}{}client_id={}&redirect_uri={}&response_type=code&scope={}&access_type=offline&prompt=consent",
+        "{}{}client_id={}&redirect_uri={}&response_type=code&scope={}",
         auth_url,
         separator,
         urlencoding::encode(client_id),
         urlencoding::encode(redirect_uri),
         urlencoding::encode(scopes),
     );
+    extra.append_to(&mut url);
     if let Some(challenge) = auth.code_challenge() {
         url.push_str(&format!(
             "&code_challenge={}&code_challenge_method=S256",
@@ -950,8 +1096,8 @@ pub async fn refresh_oauth_if_needed(
         None => return Err("OAuth token expired but no refresh token available".into()),
     };
 
-    let cred_service = format!("oauth:{}", account.provider);
-    let client_cred = super::CredentialStore::get(pool, &cred_service)
+    let cred_service = client_provider_name(&account.provider);
+    let client_cred = super::CredentialStore::get_oauth_client(pool, &cred_service)
         .await?
         .ok_or_else(|| format!("No client credentials found for {}", cred_service))?;
 
@@ -1199,8 +1345,71 @@ async fn respond_to_browser(stream: &mut tokio::net::TcpStream, status: &str, bo
     }
 }
 
+/// The page the provider's redirect lands on.
+///
+/// This is the last thing the user sees before coming back to Lucidos, and for a
+/// while it was two unstyled `<h2>`s reading "Authorization successful!" on a
+/// default-white page, which looks like a debug stub rather than the end of a
+/// flow. It now says which provider, what state the connection is in, and what
+/// to do next, on a page that matches the app's dark surface.
+///
+/// **`provider` is the only interpolated value and it is engine-side** (it comes
+/// from the tool call / the credential name, never from the callback query).
+/// Nothing the provider sends in the redirect is rendered: echoing an
+/// attacker-controllable `error_description` into HTML we serve would be an
+/// injection sink for no benefit, so the failure page says "return to Lucidos"
+/// and the real reason goes to the engine. Keep it that way.
+///
+/// Note the timing: this is written at callback receipt, BEFORE the code is
+/// exchanged, so it cannot claim the account is connected or name it. "Finishing
+/// the connection" is the honest tense.
+fn callback_page(provider: &str, ok: bool) -> String {
+    let (heading, detail) = if ok {
+        (
+            "Authorization complete",
+            "Lucidos is finishing the connection. You can close this tab.",
+        )
+    } else {
+        (
+            "Authorization failed",
+            "Nothing was connected. Return to Lucidos for the details.",
+        )
+    };
+    // `provider` is a bare identifier (`dropbox`, `ghealth`), but escape it
+    // anyway so this stays safe if a caller ever passes something richer.
+    let provider = provider
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;");
+    let title = if provider.is_empty() {
+        "Lucidos".to_string()
+    } else {
+        format!("Lucidos {provider}")
+    };
+    format!(
+        "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
+         <title>{title}</title><style>\
+         :root{{color-scheme:dark light}}\
+         body{{margin:0;min-height:100vh;display:flex;align-items:center;\
+         justify-content:center;background:#16181d;color:#e6e8ee;\
+         font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}\
+         main{{max-width:26rem;padding:2rem;text-align:center}}\
+         h1{{font-size:1.25rem;margin:0 0 .5rem}}\
+         p{{margin:0;color:#9aa1b1}}\
+         .who{{margin-top:1rem;font-size:.8125rem;color:#6f7788}}\
+         </style></head><body><main>\
+         <h1>{heading}</h1><p>{detail}</p>\
+         <p class=\"who\">{provider}</p>\
+         </main></body></html>"
+    )
+}
+
 /// Wait for the provider's redirect and extract the authorization code.
-async fn wait_for_oauth_callback(listener: CallbackListener) -> Result<String, BoxError> {
+async fn wait_for_oauth_callback(
+    listener: CallbackListener,
+    provider: &str,
+) -> Result<String, BoxError> {
     loop {
         let mut stream = listener.accept().await?;
         // A connection that misbehaves is discarded, never fatal — a reset or
@@ -1235,22 +1444,15 @@ async fn wait_for_oauth_callback(listener: CallbackListener) -> Result<String, B
         }
 
         let result = parse_callback_query(query);
-        let (status, body) = match result {
-            Ok(_) => (
-                "200 OK",
-                "<html><body><h2>Authorization successful!</h2>\
-                 <p>You can close this tab and return to Lucidos.</p></body></html>",
-            ),
-            // The provider's reason goes to the engine, not into this page —
-            // echoing an attacker-controllable query value into HTML we serve
-            // would be an injection sink for no benefit.
-            Err(_) => (
-                "400 Bad Request",
-                "<html><body><h2>Authorization failed</h2>\
-                 <p>Return to Lucidos for the details.</p></body></html>",
-            ),
+        // The provider's own reason goes to the engine, never into this page.
+        // See `callback_page` for why nothing from `query` is rendered.
+        let status = if result.is_ok() {
+            "200 OK"
+        } else {
+            "400 Bad Request"
         };
-        respond_to_browser(&mut stream, status, body).await;
+        let body = callback_page(provider, result.is_ok());
+        respond_to_browser(&mut stream, status, &body).await;
         return result;
     }
 }
@@ -1271,11 +1473,17 @@ pub struct PreparedOAuthFlow {
 ///
 /// The caller is responsible for opening `auth_url` (e.g. in the user's browser).
 /// Await `result_rx` to get the flow outcome.
+///
+/// `initiator` is the device that started the flow, carried through to the
+/// `OAuthAccountConnected` event so the frontend can bring THAT device back to
+/// the front when the authorization lands (see `handleOAuthAccountConnected`).
+/// `None` for an engine-internal flow, which the frontend reads as "not mine".
 pub async fn prepare_oauth_flow(
     pool: &PgPool,
     event_bus: &EventBus,
     provider: &str,
     scopes: &str,
+    initiator: Option<MessageOrigin>,
 ) -> Result<PreparedOAuthFlow, BoxError> {
     use crate::core::CredentialStore;
 
@@ -1288,8 +1496,8 @@ pub async fn prepare_oauth_flow(
     };
 
     // Look up client credentials
-    let cred_service = format!("oauth:{}", provider);
-    let client_cred = CredentialStore::get(pool, &cred_service)
+    let cred_service = client_provider_name(provider);
+    let client_cred = CredentialStore::get_oauth_client(pool, &cred_service)
         .await?
         .ok_or_else(|| format!("No OAuth client credentials found for {}", cred_service))?;
 
@@ -1320,6 +1528,10 @@ pub async fn prepare_oauth_flow(
     let userinfo_url = client_config["userinfo_url"]
         .as_str()
         .map(|s| s.to_string());
+    let userinfo_method = UserinfoMethod::parse(client_config["userinfo_method"].as_str());
+    // Resolved here, with the other credential reads, so a malformed value
+    // fails before the loopback listener binds and the browser opens.
+    let authorize_params = AuthorizeParams::parse(client_config["authorize_params"].as_str())?;
 
     // The ONE redirect URI for this flow. Resolved before anything else so a
     // bad override fails fast instead of producing a browser redirect the
@@ -1332,8 +1544,14 @@ pub async fn prepare_oauth_flow(
 
     // Build authorization URL with merged scopes, from the same redirect_uri
     // the exchange below will send.
-    let auth_request_url =
-        build_authorize_url(&auth_url, &client_id, &redirect_uri, &merged_scopes, &auth);
+    let auth_request_url = build_authorize_url(
+        &auth_url,
+        &client_id,
+        &redirect_uri,
+        &merged_scopes,
+        &auth,
+        &authorize_params,
+    );
 
     crate::log!(
         "[OAuth] Prepared {} authorization URL ({} client), listener on port {}, redirect_uri {}",
@@ -1348,13 +1566,14 @@ pub async fn prepare_oauth_flow(
     let pool = pool.clone();
     let event_bus = event_bus.clone();
     let provider = provider.to_string();
+    let initiator = initiator.clone();
 
     tokio::spawn(async move {
         let result = async {
             // Wait for callback (with 120s timeout)
             let code = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
-                wait_for_oauth_callback(listener),
+                wait_for_oauth_callback(listener, &provider),
             )
             .await
             .map_err(|_| "OAuth authorization timed out after 120 seconds".to_string())?
@@ -1368,7 +1587,7 @@ pub async fn prepare_oauth_flow(
 
             // Fetch userinfo (best-effort — failures downgrade to None inside)
             let (email, display_name) = if let Some(ref url) = userinfo_url {
-                fetch_userinfo(url, &token_resp.access_token).await
+                fetch_userinfo(url, &token_resp.access_token, userinfo_method).await
             } else {
                 (None, None)
             };
@@ -1394,7 +1613,7 @@ pub async fn prepare_oauth_flow(
                 token_resp.refresh_token.as_deref(),
                 token_expiry,
                 granted_scopes,
-                None,
+                initiator,
             )
             .await
             .map_err(|e| format!("Failed to store OAuth account: {}", e))?;
@@ -1419,24 +1638,42 @@ pub async fn prepare_oauth_flow(
     })
 }
 
-/// Run the full OAuth flow end-to-end (used by LLM tool calls where the backend
-/// opens the browser directly). Calls `prepare_oauth_flow` then opens the URL.
-pub async fn run_oauth_flow(
+/// Run the full OAuth flow end-to-end, handing `auth_url` to `open_auth_url` at
+/// the moment the loopback listener is already bound.
+///
+/// **The engine does not open browsers.** This used to `std::process::Command`
+/// out to macOS `open`, which was wrong twice over: it ignored the user's
+/// in-app-browser preference (the authorization page appeared in the system
+/// browser on a machine configured for the panel, 2026-08-05) and it silently
+/// did nothing at all on Linux, where the headless tarball also runs. Deciding
+/// where a URL is displayed belongs to the client, which knows the platform and
+/// the preference, so the caller supplies an opener. Today's only caller emits a
+/// `NavigationRequested` scoped to the device whose prompt started the turn, and
+/// the frontend's `openUrl` picks the panel, the OS opener, or a new tab.
+///
+/// The opener runs AFTER `prepare_oauth_flow` has bound the listener, so the
+/// callback can never arrive before something is listening for it.
+pub async fn run_oauth_flow<F>(
     pool: &PgPool,
     event_bus: &EventBus,
     provider: &str,
     scopes: &str,
-) -> Result<(Option<String>, Option<String>, String), BoxError> {
-    let prepared = prepare_oauth_flow(pool, event_bus, provider, scopes).await?;
+    initiator: Option<MessageOrigin>,
+    open_auth_url: F,
+) -> Result<(Option<String>, Option<String>, String), BoxError>
+where
+    F: AsyncFnOnce(&str) -> Result<(), BoxError>,
+{
+    let prepared = prepare_oauth_flow(pool, event_bus, provider, scopes, initiator).await?;
 
-    // Open browser (macOS — only used from LLM tool calls, not from frontend)
-    crate::log!("[OAuth] Opening browser for {} authorization", provider);
-    if let Err(e) = std::process::Command::new("open")
-        .arg(&prepared.auth_url)
-        .spawn()
-    {
-        crate::log!("[OAuth] Failed to spawn browser via 'open': {}", e);
-    }
+    crate::log!(
+        "[OAuth] Handing {} authorization URL to the client to open",
+        provider
+    );
+    // A failed hand-off is fatal to the flow, not best-effort: nothing will ever
+    // reach the callback, so waiting out the 120s timeout would only turn a
+    // precise error into "authorization timed out".
+    open_auth_url(&prepared.auth_url).await?;
 
     // Wait for the background task to complete
     prepared
@@ -1446,6 +1683,51 @@ pub async fn run_oauth_flow(
         .map_err(|e| e.into())
 }
 
+/// Whether a provider's userinfo endpoint is fetched with GET or POST.
+///
+/// GET is the OIDC norm and stays the default, so every credential written
+/// before this existed keeps working untouched. Dropbox is why the alternative
+/// exists: `users/get_current_account` is POST-only, so it was recorded as
+/// having *no* userinfo endpoint at all, and a connected Dropbox account
+/// reported itself as "unknown" (the agent resorted to a raw `curl` to find out
+/// whose account it was, 2026-08-05).
+///
+/// Read from the credential's optional `userinfo_method` key. Chosen explicitly
+/// rather than sniffed from a 400-then-retry: a silent method fallback would
+/// hide a genuinely broken endpoint behind a second request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UserinfoMethod {
+    Get,
+    Post,
+}
+
+impl UserinfoMethod {
+    /// Parse the credential's `userinfo_method`. Absent, blank, or unrecognized
+    /// all mean GET: the endpoint's method is not worth failing a completed
+    /// authorization over, and every pre-existing credential omits the key.
+    pub fn parse(raw: Option<&str>) -> Self {
+        match raw.map(str::trim).unwrap_or_default().to_ascii_uppercase() {
+            m if m == "POST" => Self::Post,
+            _ => Self::Get,
+        }
+    }
+}
+
+/// The display name in a userinfo response.
+///
+/// Two shapes in the wild: OIDC's flat `"name": "Jane Doe"`, and a nested object
+/// (Dropbox returns `{"name": {"display_name": …, "given_name": …}}`). Reading
+/// only the flat form left the nested case as no name at all.
+fn userinfo_display_name(body: &serde_json::Value) -> Option<String> {
+    let name = body.get("name")?;
+    if let Some(flat) = name.as_str() {
+        return Some(flat.to_string());
+    }
+    name.get("display_name")
+        .and_then(|v| v.as_str())
+        .map(String::from)
+}
+
 /// Fetch user info (email, name) from a userinfo endpoint.
 /// Returns (email, display_name). Best-effort: any error along the way
 /// (network, non-success status, JSON parse) is logged and downgraded to
@@ -1453,10 +1735,19 @@ pub async fn run_oauth_flow(
 async fn fetch_userinfo(
     userinfo_url: &str,
     access_token: &str,
+    method: UserinfoMethod,
 ) -> (Option<String>, Option<String>) {
     let client = bounded_http_client();
-    let resp = match client
-        .get(userinfo_url)
+    let request = match method {
+        UserinfoMethod::Get => client.get(userinfo_url),
+        // No body and no `Content-Type`, deliberately. Dropbox rejects an empty
+        // body with a JSON content type ("could not decode input as JSON") and
+        // rejects `{}` as well ("expected null, got value"); omitting the header
+        // entirely is the shape it accepts, and it is also the most neutral
+        // thing to send any other POST userinfo endpoint.
+        UserinfoMethod::Post => client.post(userinfo_url),
+    };
+    let resp = match request
         .header("Authorization", format!("Bearer {}", access_token))
         .header("Accept", "application/json")
         .send()
@@ -1483,7 +1774,7 @@ async fn fetch_userinfo(
     };
 
     let email = body.get("email").and_then(|v| v.as_str()).map(String::from);
-    let name = body.get("name").and_then(|v| v.as_str()).map(String::from);
+    let name = userinfo_display_name(&body);
 
     (email, name)
 }

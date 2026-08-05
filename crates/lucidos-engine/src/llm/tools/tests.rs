@@ -637,6 +637,7 @@ fn consolidated_flat_tools_are_not_advertised() {
         tn::GREP_FILES,
         tn::RUN_THREAD,
         tn::RUN_CODING_AGENT,
+        tn::FOLLOW_UP_CHILD_THREAD,
     ] {
         assert!(
             default_names.contains(&standalone),

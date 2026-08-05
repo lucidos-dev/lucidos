@@ -85,7 +85,7 @@ pub(crate) async fn load_blocking_sample(
 }
 
 /// Recompute the direct parent's `active_children_count` from children
-/// still in flight (`status IN ('running', 'waiting_for_user_answer')`).
+/// still in flight, per the shared `active_thread_statuses()` predicate.
 /// Returns the parent's `thread_id` when one exists (so the caller can
 /// rebroadcast the parent's aggregate over SSE), or `None` when
 /// `child_id` has no parent.
@@ -130,12 +130,13 @@ pub(crate) async fn reconcile_parent_active_children_count(
              SELECT COUNT(*) AS cnt \
              FROM thread_summaries c \
              WHERE c.parent_thread_id = $1 \
-               AND c.status IN ('running', 'waiting_for_user_answer') \
+               AND c.status = ANY($2) \
          ) rc \
          WHERE p.thread_id = $1 \
            AND p.active_children_count != COALESCE(rc.cnt, 0)::int",
     )
     .bind(pid)
+    .bind(&crate::core::store::active_thread_statuses()[..])
     .execute(&mut **tx)
     .await?;
     Ok(Some(pid))
@@ -157,11 +158,55 @@ pub(crate) async fn reconcile_proposal_lifecycle_end(
     Ok(())
 }
 
+/// Arm the child's `parent_callback_pending` marker because a **start event**
+/// arrived: `MessageReceived`, `CodingAgentUserMessageSent`,
+/// `UserPromptInjected`, a non-empty `CodingAgentPromptSent`, or
+/// `ContinuationRequested`. That is the set `preserving_verdict`
+/// (`event_bus/mod.rs`) already names as "new work was actually requested".
+///
+/// The marker means "the parent has NOT yet been told about the child's
+/// **current** turn", so a start event owes the parent a fresh card while a
+/// mere extra `CodingAgentIdled` (auto-harden, a background agent) does not.
+/// Keeping that distinction is what leaves the dedup guard in
+/// `notify_parent_if_child` doing its stated job.
+///
+/// Deliberately NOT a start event: the **empty** `CodingAgentPromptSent`
+/// question-resume marker (`agent_question::emit_resume_marker_for_cc_answer`).
+/// It exists only so the timeline shows a Thinking step and asserts no new
+/// agent intent, which is why its own projection arm already skips the status
+/// write. Arming the marker there would re-open the parent callback after a
+/// card was already sent, so the very extra idle the dedup guard exists for
+/// would produce a spurious second card. Pinned by
+/// `an_empty_resume_marker_is_not_a_start_event`.
+///
+/// This is gated differently from the re-increment below, which is why the two
+/// are separate operations: the marker does not care whether the child was in
+/// flight, only that new work was requested. A parked child that receives a
+/// follow-up owes its parent a card for the resulting turn even though its
+/// place on the parent's counter was never given up.
+///
+/// `AND parent_thread_id IS NOT NULL` keeps the write off a parentless row,
+/// which under this polarity would otherwise be told it owes some parent a
+/// card. The storage default is FALSE for exactly that reason.
+pub(crate) async fn mark_parent_callback_pending(
+    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    child_id: Uuid,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE thread_summaries SET parent_callback_pending = TRUE \
+         WHERE thread_id = $1 AND parent_thread_id IS NOT NULL",
+    )
+    .bind(child_id)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 /// Bump the direct parent's `active_children_count` when an event flipped
-/// `child_id` from a non-running state back to `status='running'`. Returns
-/// `Some(parent_id)` when the bump happened (so the caller can add it to
-/// the SSE rebroadcast list), `None` when the child was already running
-/// (idempotent on duplicates) or has no parent.
+/// `child_id` from a state outside the in-flight set back to
+/// `status='running'`. Returns `Some(parent_id)` when the bump happened (so the
+/// caller can add it to the SSE rebroadcast list), `None` when the child was
+/// already in flight (idempotent on duplicates) or has no parent.
 ///
 /// Why an explicit re-increment per revive arm rather than a generic
 /// function-boundary delta: the terminal-event decrement runs out-of-tx
@@ -169,41 +214,42 @@ pub(crate) async fn reconcile_proposal_lifecycle_end(
 /// event lands the parent's counter is already at zero — there is no
 /// in-tx prev/curr "delta" the projection can derive from.
 ///
-/// Gate is `prev_sample.status == Running`, NOT `is_blocking()` (which
-/// the sibling `ContinuationRequested` arm uses): the user-driven bug
-/// case is an idle CC child with a pending change (`is_blocking=true`
-/// via clause 3) receiving a follow-up, and an `is_blocking` gate would
-/// incorrectly skip the re-increment. Conversely, NOT called from
-/// `UserQuestionAnswered` / `CodingAgentPermissionResolved`: those
-/// transitions resume from `WaitingForUserAnswer`, where the parent
-/// counter was never decremented (the corresponding Asked event isn't
-/// terminal), so re-incrementing would double-count.
+/// The gate is the shared in-flight predicate (`active_thread_statuses()`,
+/// the single definition `reconcile_parent_active_children_count` also uses),
+/// NOT `is_blocking()` (which the sibling `ContinuationRequested` arm uses):
+/// the user-driven bug case is an idle CC child with a pending change
+/// (`is_blocking=true` via clause 3) receiving a follow-up, and an
+/// `is_blocking` gate would incorrectly skip the re-increment.
+///
+/// Two ways a child can already be counted, and both must skip:
+/// - `Running`, the obvious one.
+/// - `WaitingForUserAnswer`. This function is not called from
+///   `UserQuestionAnswered` / `CodingAgentPermissionResolved` (those resume
+///   from a parked state where the counter was never decremented, because the
+///   corresponding Asked event is not terminal), but a `MessageReceived` can
+///   land on a parked child directly: a human's message would be routed to
+///   `UserQuestionAnswered` instead, while an **Agent**-mode message
+///   deliberately falls through to the injection path, which is exactly what a
+///   parent's child follow-up is. Re-incrementing there over-counts by one
+///   until the child's own next terminal reconciles it away.
 pub(crate) async fn reincrement_parent_active_count_if_revived(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     child_id: Uuid,
     prev_sample: &Option<BlockingSample>,
 ) -> Result<Option<Uuid>, sqlx::Error> {
-    let was_running = prev_sample
+    let was_in_flight = prev_sample
         .as_ref()
-        .map(|s| matches!(s.status, ThreadStatus::Running))
+        .map(|s| crate::core::store::active_thread_statuses().contains(&s.status.as_str()))
         .unwrap_or(false);
-    if was_running {
+    if was_in_flight {
         return Ok(None);
     }
-    // Clear the child's `parent_callback_sent` so the NEXT terminal event
-    // passes the dedup guard in `notify_parent_if_child` and decrements
-    // the parent again — without this the dedup short-circuits the second
-    // idle of a revived child and the parent's counter stays stuck at 1
-    // while the child is actually Idle. RETURNING folds the
-    // parent_thread_id lookup into the same roundtrip.
-    let parent_id: Option<Uuid> = sqlx::query_scalar(
-        "UPDATE thread_summaries SET parent_callback_sent = FALSE \
-         WHERE thread_id = $1 RETURNING parent_thread_id",
-    )
-    .bind(child_id)
-    .fetch_optional(&mut **tx)
-    .await?
-    .flatten();
+    let parent_id: Option<Uuid> =
+        sqlx::query_scalar("SELECT parent_thread_id FROM thread_summaries WHERE thread_id = $1")
+            .bind(child_id)
+            .fetch_optional(&mut **tx)
+            .await?
+            .flatten();
     let Some(pid) = parent_id else {
         return Ok(None);
     };
@@ -345,6 +391,54 @@ pub(crate) async fn propagate_blocking_change(
 }
 
 impl EventBus {
+    /// Recompute every parent's `active_children_count` from ground truth.
+    ///
+    /// Called at engine startup to repair drift in either direction.
+    /// Over-count: a child coding-agent session canceled before emitting
+    /// `CodingAgentIdled` leaves the parent with a stale non-zero count.
+    /// Under-count: recovery's synthetic
+    /// `CodingAgentIdled{reason=engine_restart_interrupt}` decrements as if the
+    /// child were terminal, but the child is only parked, and the user's
+    /// Continue click re-increments via the projection. If the user restarts
+    /// again before clicking Continue, the now-zero count stays stuck without
+    /// this sweep (the projection's `+1` fires once per park/resume pair, not
+    /// as a safety net for drifted rows). A `> 0` guard would skip exactly the
+    /// rows that need repair.
+    ///
+    /// Uses the shared `active_thread_statuses()` predicate, the same one
+    /// `reconcile_parent_active_children_count` uses in-tx. It filtered
+    /// `status = 'running'` alone until 2026-08-05, which meant every boot
+    /// recomputed a parent's count *without* a child parked on a question or a
+    /// permission card, contradicting the in-tx reconcile. Question-parked
+    /// threads are deliberately preserved across a restart and
+    /// `UserQuestionAnswered` does not re-increment (by design, see the revive
+    /// helper's doc), so that under-count persisted until some sibling terminal
+    /// fired the reconcile.
+    pub async fn rebuild_active_children_count(pool: &sqlx::PgPool) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "WITH active_child_counts AS ( \
+                 SELECT parent_thread_id, COUNT(*) AS cnt \
+                 FROM thread_summaries \
+                 WHERE parent_thread_id IS NOT NULL AND status = ANY($1) \
+                 GROUP BY parent_thread_id \
+             ), \
+             parents AS ( \
+                 SELECT DISTINCT parent_thread_id AS thread_id \
+                 FROM thread_summaries WHERE parent_thread_id IS NOT NULL \
+             ) \
+             UPDATE thread_summaries p \
+             SET active_children_count = COALESCE(rc.cnt, 0)::int \
+             FROM parents pa LEFT JOIN active_child_counts rc \
+                  ON rc.parent_thread_id = pa.thread_id \
+             WHERE p.thread_id = pa.thread_id \
+               AND p.active_children_count != COALESCE(rc.cnt, 0)::int",
+        )
+        .bind(&crate::core::store::active_thread_statuses()[..])
+        .execute(pool)
+        .await?;
+        Ok(())
+    }
+
     /// Recompute `thread_summaries.blocking_descendant_count` AND
     /// `thread_summaries.attention_descendant_count` for every row from
     /// scratch via a recursive CTE that walks each thread's transitive

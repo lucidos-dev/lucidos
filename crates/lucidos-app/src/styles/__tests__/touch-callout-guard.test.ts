@@ -1,7 +1,7 @@
 /**
  * `-webkit-touch-callout: none` suppresses iOS's long-press menu. On an
  * installed iOS PWA that menu is the ONLY per-link escape to a real browser
- * (Open in Safari, alongside Copy Link and Share), and Settings → Links points
+ * (Open in Safari, alongside Copy Link and Share), and Settings → Appearance & Behavior → Links points
  * users at it as the one-off override for the `external_link_target` default.
  *
  * We deliberately do NOT render our own long-press menu: replacing the native
@@ -90,7 +90,7 @@ describe('iOS long-press callout suppression', () => {
       unexpected,
       'A new `-webkit-touch-callout: none` suppresses iOS\'s long-press menu, and the '
       + 'property INHERITS. If any link can appear in that subtree, this removes the only '
-      + 'per-link "Open in Safari" an installed PWA has, which Settings → Links tells users '
+      + 'per-link "Open in Safari" an installed PWA has, which Settings → Appearance & Behavior → Links tells users '
       + 'to use. Prove no anchor lives there, then add the selector to ALLOWED with a reason.',
     ).toEqual([]);
   });

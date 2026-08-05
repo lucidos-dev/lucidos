@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, activeInlineForm, connectionStatus } from '../store';
+import { panelOverlay, activeInlineForm, connectionStatus, focusedThreadId, threadMap, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
 import type { CredentialRequest, EmailConfirmRequest } from '../types';
+import { makeThreadState } from './threads-test-helpers';
 
 // Mock all external dependencies so handleResume can run in isolation.
 vi.mock('../../api/client', () => ({
@@ -16,8 +17,14 @@ vi.mock('./thread-sync', () => ({
 }));
 vi.mock('./thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
-  refreshThreadEvents: vi.fn().mockResolvedValue(undefined),
-  clearForcedRetries: vi.fn(),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
+  // runResumeSync retries every thread carrying `eventsLoadFailed` through
+  // this; the mock proxy throws on an undeclared export the moment that line
+  // runs, so omitting it turns a behavioural assertion into a mock error as
+  // soon as a fixture sets the flag.
+  loadThreadEvents: vi.fn().mockResolvedValue(undefined),
+  clearThreadFetchGuards: vi.fn(),
+  markLoadedThreadsStale: vi.fn(),
 }));
 vi.mock('./chat-changes', () => ({
   refreshChangesState: vi.fn(),
@@ -107,5 +114,84 @@ describe('handleResume preserves credential request form', () => {
       expect(form.request?.prompt).toContain('1. Go to https://dev.helius.xyz/dashboard');
       expect(form.request?.prompt).toContain('2. Copy API Key');
     }
+  });
+});
+
+describe('handleResume thread-events refresh', () => {
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+  });
+
+  function loadedThreads(ids: string[]): void {
+    threadMap.value = new Map(ids.map(id => [id, makeThreadState(id, { eventsLoaded: true })]));
+  }
+
+  it('refreshes the focused thread and marks the rest instead of fetching them', async () => {
+    loadedThreads(['bg-1', 'bg-2', 'focused', 'bg-3']);
+    focusedThreadId.value = 'focused';
+    const { refreshThreadEvents, markLoadedThreadsStale } = await import('./thread-loading');
+    const refresh = refreshThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    const mark = markLoadedThreadsStale as unknown as ReturnType<typeof vi.fn>;
+    refresh.mockClear();
+    mark.mockClear();
+
+    await handleResume();
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+
+    // The focused thread is the one whose staleness the user can see, so it is
+    // the one worth a request now. Asserted as the SET of ids rather than a
+    // count, because these fixture threads hold no events and so also trip
+    // `checkConnection`'s separate empty-focused-thread recovery, which
+    // refreshes the same id once more.
+    expect(new Set(refresh.mock.calls.map(c => c[0]))).toEqual(new Set(['focused']));
+    expect(mark).toHaveBeenCalled();
+  });
+
+  it('issues no request at all when the user is on the compose view', async () => {
+    loadedThreads(Array.from({ length: 20 }, (_, i) => `t${i}`));
+    const { refreshThreadEvents, markLoadedThreadsStale } = await import('./thread-loading');
+    const refresh = refreshThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    const mark = markLoadedThreadsStale as unknown as ReturnType<typeof vi.fn>;
+    refresh.mockClear();
+    mark.mockClear();
+
+    await handleResume();
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+
+    // A wake used to dump one request per loaded thread onto a link it was
+    // still re-establishing, each carrying its own 10s client deadline. Bounding
+    // that to four at a time queued the burst; marking removes it.
+    expect(refresh).not.toHaveBeenCalled();
+    expect(mark).toHaveBeenCalled();
+  });
+
+  it('still bounds the failed-load retry, which stays eager', async () => {
+    threadMap.value = new Map(
+      Array.from({ length: 20 }, (_, i) => [`t${i}`, makeThreadState(`t${i}`, { eventsLoadFailed: true })]),
+    );
+    const { loadThreadEvents } = await import('./thread-loading');
+    const load = loadThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    load.mockClear();
+
+    let inFlight = 0;
+    let peak = 0;
+    load.mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await Promise.resolve();
+      inFlight--;
+    });
+
+    await handleResume();
+    for (let i = 0; i < 40; i++) await Promise.resolve();
+
+    // These are FULL snapshots, up to three attempts each, and the set is
+    // largest at exactly the wrong moment. They stay eager because the retry
+    // landing is what retracts the load-failure card.
+    expect(load).toHaveBeenCalledTimes(20);
+    expect(peak).toBeLessThanOrEqual(THREAD_EVENTS_FETCH_CONCURRENCY);
+    load.mockReset();
+    load.mockResolvedValue(undefined);
   });
 });

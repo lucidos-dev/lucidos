@@ -95,7 +95,19 @@ describe('ContentPane iOS resume repaint', () => {
     const repaintCalls = contentPaneCode.match(/forceIOSRepaint\w*\(/g) ?? [];
     expect(repaintCalls).toHaveLength(1);
     expect(contentPaneCode).toMatch(/onPageResume\([\s\S]*?\)\s*,\s*\[\s*\]\s*\)/);
-    expect(contentPaneCode).not.toMatch(/\[\s*viewKey\s*\]/);
+    // A `[viewKey]` dep array is not banned outright: the navigation reveal
+    // (content-pane-nav-reveal.test.ts) legitimately keys a cover on it, and
+    // that effect touches neither the scroll container nor a repaint. What is
+    // banned is a per-view effect that pokes the element the resume path owns,
+    // which is the shape the reverted regression had whatever it was called.
+    // Sliced at each effect call so one effect's body can never be read as
+    // another's: a plain lazy match would swallow the resume effect whole on
+    // its way to a `[viewKey]` further down and fail on ITS repaint call.
+    for (const block of contentPaneCode.split(/(?=use(?:Layout)?Effect\()/)) {
+      const perViewEffect = block.match(/^use(?:Layout)?Effect\([\s\S]*?,\s*\[\s*viewKey\s*\]\s*\)/)?.[0];
+      if (!perViewEffect) continue;
+      expect(perViewEffect).not.toMatch(/Repaint|bodyRef|scrollTop/);
+    }
   });
 
   it('skips the app-ui overlay on the repaint path', () => {

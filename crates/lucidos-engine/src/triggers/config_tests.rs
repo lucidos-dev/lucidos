@@ -801,23 +801,8 @@ fn trigger_config_derives_slug_from_name_when_missing() {
     assert_eq!(config.slug, "nightly-ci-build");
 }
 
-#[test]
-fn slug_kebab_strips_unicode_arrows_and_lowercases() {
-    assert_eq!(
-        slugify_trigger_name("Nightly Build → Harden → E2E"),
-        "nightly-build-harden-e2e"
-    );
-    assert_eq!(
-        slugify_trigger_name("Send Daily Summary"),
-        "send-daily-summary"
-    );
-    assert_eq!(
-        slugify_trigger_name("Café Morning Briefing"),
-        "cafe-morning-briefing"
-    );
-    assert_eq!(slugify_trigger_name("My  Trigger!  v2"), "my-trigger-v2");
-}
-
+// Kebab-case slugification itself is covered by `core::slug`, which owns the
+// shared function; only the trigger-specific fallback is tested here.
 #[test]
 fn slug_kebab_falls_back_to_uuid_short_when_empty() {
     let s = slugify_trigger_name_with_fallback("!!!", "abcdef-1234-5678");

@@ -70,10 +70,20 @@
     font-size: var(--font-size-xs);
 }
 
+/* The composer column. Width + centering match the transcript's turns
+   (`.thread-content > *`, also capped at --content-max-width and centered), and
+   the --turn-body-inset padding reproduces the inset a turn puts between that
+   box and its visible content (.initiator-panel / .initiator-body / .response-
+   content). So the composer box's left and right edges land exactly on the
+   message text, question cards and user bubbles above it, on every pane width:
+   below the cap both are gutter-to-gutter, above it both are the same centered
+   50rem box. Whatever the transcript's scroll gutter takes on the right is
+   already subtracted by .prompt-area's padding. */
 .prompt-input-container {
     width: 100%;
     max-width: var(--content-max-width);
     margin: 0 auto;
+    padding-inline: var(--turn-body-inset);
     position: relative;
 }
 
@@ -196,6 +206,32 @@
 .prompt-row .prompt-textarea {
     flex: 1;
     font-size: var(--font-size-lg);
+}
+
+/* Put the typed text on the same content edge as a question / change card's
+   text, the surface the composer docks under: --turn-surface-inset measured from
+   .prompt-box's outer edge, so the box's own border is subtracted here
+   (base.css). The shared shell's `padding: 0.5rem 1rem` (panels/previews.css)
+   carried a wider inset than a card's, which left the composer's text a few px
+   right of the card text directly above it even with the two boxes edge-aligned
+   to the pixel. Only the horizontal half is overridden; the vertical 0.5rem
+   stays with the shell, and the trigger form's Intent field (no `.prompt-row`)
+   keeps the shell's padding untouched.
+
+   Two things about this selector are deliberate:
+   - The leading `.prompt-box` is redundant for MATCHING (`.prompt-row` only ever
+     renders inside one) and is there purely for specificity: the shell's rule is
+     a `padding` SHORTHAND at the same 0,2,0 as `.prompt-row .prompt-textarea`,
+     so without the extra class this override only wins because chat.css is
+     imported after panels.css in main.tsx. Reordering those imports would
+     silently put the composer's text back off the card edge.
+   - It is a SEPARATE rule rather than a third declaration on the block above,
+     because raising that block to 0,3,0 would also shadow mobile.css's
+     `.prompt-row .prompt-textarea { font-size: 0.9rem }` (0,2,0), which is
+     pinned ≥16px so focusing the composer doesn't trigger iOS Safari's input
+     zoom. Keep the font-size at 0,2,0 and only the padding here. */
+.prompt-box .prompt-row .prompt-textarea {
+    padding-inline: calc(var(--turn-surface-inset) - var(--prompt-box-border-width));
 }
 
 .prompt-clear {
@@ -581,7 +617,22 @@
     position: absolute;
     inset: 0;
     overflow-x: hidden;
-    overflow-y: auto;
+    /* `scroll` rather than `auto`, PAIRED with the stable gutter: the transcript
+       must reserve the same width whether or not it currently overflows, so its
+       centered turns don't shift sideways the moment a thread grows past one
+       screen (and so the composer below can compensate by a constant). The two
+       declarations cover each other across engines: Chromium honours the stable
+       gutter on a non-overflowing container but WebKit does not, while `scroll`
+       makes WebKit draw the scrollbar unconditionally. Both are no-ops where
+       scrollbars are overlay (iOS, default macOS), and the track is painted in
+       --bg-primary, so an always-present empty track is invisible.
+
+       utils/scrollbarGutter.ts probes a container declaring EXACTLY this pair
+       and publishes the result as --scrollbar-gutter-width, which every
+       non-scrolling sibling that must line up with the transcript adds to its
+       own right inset. Change these two lines and you must change the probe. */
+    overflow-y: scroll;
+    scrollbar-gutter: stable;
     overflow-anchor: none; /* manual scroll anchoring — prevent browser interference */
     overscroll-behavior: contain;
     /* Top/bottom padding reserves room for a first/last turn's navigation focus
@@ -594,7 +645,7 @@
        ::before header spacer) and re-sets padding-bottom in mobile.css. */
     padding:
         calc(var(--thread-top-fade) + var(--nav-focus-reach))
-        0.75rem
+        var(--thread-pane-gutter)
         calc(var(--prompt-fade) + var(--nav-focus-reach));
 }
 
@@ -606,7 +657,8 @@
    keys scroll it. It never shows a focus outline: a whole-pane ring around the
    entire conversation while arrow-scrolling reads as chrome, not affordance. The
    per-turn navigation marker (.nav-focus-stuck) already shows which turn is
-   focused, so the pane itself stays borderless in both keyboard and pointer focus. */
+   focused (by washing it, not by ringing it), so the pane itself stays borderless
+   in both keyboard and pointer focus. */
 .thread-content:focus,
 .thread-content:focus-visible {
     outline: none;
@@ -897,6 +949,14 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     background: var(--border-color);
     animation: progress-pulse 2s ease-in-out infinite;
     opacity: 0.5;
+}
+
+/* Paused: an engine restart interrupted the turn. Deliberately NOT the failed
+   red, because nothing failed and the thread usually resumes on its own within
+   seconds. --accent-notable is the same neutral in-between tone the Info
+   popover's Waiting dot uses. */
+.progress-dot-paused {
+    background: var(--accent-notable);
 }
 
 .progress-dot-failed {

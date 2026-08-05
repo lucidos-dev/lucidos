@@ -9,13 +9,24 @@
 # same scripts/lib/stage_runtime.sh code; the triple selects the theseus relocatable
 # Postgres asset.
 #
-# WHAT THIS WORKFLOW DOES NOT DO — it never creates or tags a Release:
+# WHAT THIS WORKFLOW DOES NOT DO, it never creates or tags a Release:
 #   • It NEVER creates a GitHub Release and NEVER cuts a tag.
-#   • On a plain tag push it ONLY uploads workflow artifacts.
-#   • The attach step only ADDS assets to a Release that ALREADY exists. It runs
-#     automatically for a PUBLISHED, non-prerelease Release (so a real release
-#     gets its Linux/macOS tarballs without a human dispatch), and on demand via
-#     workflow_dispatch with attach_to_release=true. rc-* prereleases are skipped.
+#   • The attach step only ADDS assets to a Release that ALREADY exists, and
+#     that Release is normally still a DRAFT when this runs.
+#
+# THE TAG PUSH IS WHAT ATTACHES (2026-08-04). release-to-lucidos.sh pushes the
+# v<version> tag, creates the Release as a DRAFT, and then WAITS for the assets
+# this run produces before flipping it public, so a release is COMPLETE at the
+# moment it becomes visible. Two ways into the attach step: the v* tag push (the
+# real one), and workflow_dispatch with attach_to_release=true (the backfill).
+#
+# There used to be a THIRD way in, `release: types: [published]`, and removing
+# it is half of the fix. It built the same four tarballs a second time from a
+# run that started two seconds after the tag-push one (v0.21.0: runs
+# 30926097107 and 30926100020), and it can no longer serve any purpose here:
+# a DRAFT release fires no webhook at all, so it would not start the build, and
+# publishing the draft at the END would start a whole second 35-minute build
+# that re-attached over files already there.
 #
 # Supported pair (parent plan): macOS arm64 + Linux x86_64. macOS x86_64 and Linux
 # aarch64 are best-effort. x86_64-unknown-linux-gnu is the MUST-WORK entry;
@@ -47,35 +58,56 @@ on:
   workflow_dispatch:
     inputs:
       attach_to_release:
-        description: 'Also attach the tarballs to an EXISTING GitHub Release. Default off — never creates a Release.'
+        description: 'Also attach the tarballs to an EXISTING GitHub Release (the backfill path). Default off, and it never creates a Release.'
         type: boolean
         default: false
       attach_tag:
-        description: 'Release tag to attach to (e.g. v0.15.0). Empty = use the dispatched ref, which must then BE a tag. Set it to backfill a past release from a branch carrying a CI fix the tag tree predates.'
+        description: 'Release tag to attach to (e.g. v0.15.0). Empty = use the dispatched ref, which must then BE a tag. Set it to backfill a release whose own run failed or attached nothing.'
         type: string
         default: ''
-  # Build artifacts on a version tag. This does NOT publish — it only uploads
-  # workflow artifacts (the attach step needs a Release to already exist).
+  # THE REAL TRIGGER. A v* tag push builds all four tarballs and attaches them to
+  # the Release carrying that tag, which at that point is still a DRAFT: this is
+  # what lets release-to-lucidos.sh publish a release that is already complete.
+  #
+  # Workflows run from the version of the file at the PUSHED REF, so the tag's
+  # own tree decides what this does. That is why the attaching behaviour takes
+  # effect on the very release that ships it, rather than one release later.
+  #
+  # `rc-<version>` never reaches this arm: the RC flow pushes a BRANCH
+  # (rc/<version>) and creates the rc-<version> draft prerelease, and pushes no
+  # v* tag at all. The attach step re-checks anyway (see its two refusals).
   push:
     tags: ['v*']
-  # A PUBLISHED, non-prerelease GitHub Release attaches its platform tarballs
-  # automatically. This is what makes install.sh's default download path work at
-  # all: `release.sh --publish-verified` cuts the Release with the macOS DMG, and
-  # this run adds the Linux + macOS headless tarballs to it ~30 min later. The
-  # step still only ADDS assets to an existing Release — it never creates or tags
-  # one. The `rc-<version>` PRERELEASE that Phase A arms is excluded by the
-  # `prerelease == false` guard below, so the RC gate is untouched.
-  release:
-    types: [published]
 
 permissions:
   # `contents: write` is needed ONLY by the gated attach-to-release step below;
   # nothing writes to the repo/releases unless that opt-in step runs.
+  #
+  # It is load-bearing for READING too, which is easy to miss: GitHub lists
+  # DRAFT releases only to a token with push access, and the release this step
+  # attaches to is a draft. A `contents: read` token would see an empty listing
+  # and the step would report "no release carries this tag". That is the same
+  # trap ADR 0036 documents for dmg-verify and the rc draft.
   contents: write
 
 jobs:
   tarball:
     name: ${{ matrix.triple }}
+    # Public mirror ONLY: the same guard install-smoke.yml puts on every job.
+    #
+    # This workflow lives in BOTH repos (the private development repo and the
+    # public lucidos-dev/lucidos mirror), and a release pushes the v* tag to both.
+    # Without this guard the full 4-way matrix ran TWICE per release: once free in
+    # the public mirror, and once BILLED against the private repo's 2000-minute
+    # free tier, where two of the four entries are macOS at the 10x multiplier
+    # (~590 multiplied minutes per release, i.e. the allowance covers ~3.4
+    # releases/month). That second copy is pure waste. It uploads workflow
+    # artifacts nobody consumes, and its attach step can never fire because the
+    # private repo has no Releases at all. It exhausted the account's minutes on
+    # 2026-08-04. Public repos get unlimited free minutes on every runner, so the
+    # mirror's copy (the one that actually attaches assets to the Release) is the
+    # only one that needs to exist.
+    if: github.repository == 'lucidos-dev/lucidos'
     strategy:
       fail-fast: false
       matrix:
@@ -209,51 +241,149 @@ jobs:
             dist/headless/*.tar.gz.sha256
           if-no-files-found: error
 
-      # ── ATTACH TO AN EXISTING RELEASE — automatic on a real release ────────────
-      # Attach the built tarballs to an EXISTING GitHub Release. Two ways in: a
-      # PUBLISHED non-prerelease Release (the normal release flow — this is what
-      # makes install.sh's default download path work), or a manual
-      # workflow_dispatch with attach_to_release=true against a tag. It only ADDS
-      # assets to a Release someone already cut — it never publishes or tags one,
-      # and rc-<version> prereleases are excluded so the RC gate never sees these.
+      # ── ATTACH TO THE RELEASE FOR THIS TAG, DRAFT OR PUBLISHED ────────────────
+      # This is the step the whole ordering turns on. The Release exists (
+      # release-to-lucidos.sh created it seconds after pushing the tag) and is
+      # still a DRAFT, waiting for exactly these assets before it goes public.
+      #
+      # Two ways in: the v* tag push (the real one), and workflow_dispatch with
+      # attach_to_release=true (the backfill, used when a run failed or attached
+      # nothing). It only ADDS assets to a Release someone already cut, and it
+      # never publishes or tags one: the publish is release-to-lucidos.sh's, once
+      # it has seen every asset land.
       #
       # Upload is done via the raw GitHub REST API (curl), NOT `gh release upload`,
       # because the Linux matrix entries run inside the ubuntu:22.04 container which
       # has no `gh` CLI (only the macOS runner images ship it). curl works on BOTH
       # the container and the macOS runners.
-      - name: Attach tarballs to the existing Release
-        # Two ways in:
-        #   1. release:published, non-prerelease -> automatic (the release flow).
-        #      rc-<ver> prereleases are excluded so the RC gate never sees these.
-        #   2. workflow_dispatch with attach_to_release=true -> manual/backfill.
-        #      Target tag comes from inputs.attach_tag, else the dispatched ref
-        #      (which must then be a tag). attach_tag lets a branch carrying a CI
-        #      fix attach to an older tag whose own tree predates that fix.
+      - name: Attach tarballs to the release for this tag
+        # 1. push of a v* tag -> the release flow. GITHUB_REF_NAME is the tag.
+        # 2. workflow_dispatch with attach_to_release=true -> the backfill. The
+        #    target tag comes from inputs.attach_tag, else the dispatched ref
+        #    (which must then be a tag). attach_tag lets a branch carrying a CI
+        #    fix attach to a tag whose own tree predates that fix.
         if: >-
-          (github.event_name == 'release' && github.event.release.prerelease == false)
+          (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v'))
           || (github.event_name == 'workflow_dispatch'
               && inputs.attach_to_release == true
               && (inputs.attach_tag != '' || startsWith(github.ref, 'refs/tags/')))
         env:
           GH_TOKEN: ${{ github.token }}
-          RELEASE_TAG: ${{ github.event.release.tag_name }}
           INPUT_TAG: ${{ inputs.attach_tag }}
         run: |
           set -euo pipefail
-          # Resolve which Release to attach to: the published Release's own tag,
-          # else the explicit dispatch input, else the dispatched tag ref.
-          attach_tag="${RELEASE_TAG:-}"
-          [ -n "$attach_tag" ] || attach_tag="${INPUT_TAG:-}"
+          # Resolve which Release to attach to: the explicit dispatch input, else
+          # the pushed or dispatched tag ref.
+          attach_tag="${INPUT_TAG:-}"
           [ -n "$attach_tag" ] || attach_tag="${GITHUB_REF_NAME}"
-          [ -n "$attach_tag" ] || { echo "no target tag resolved" >&2; exit 1; }
-          echo "Attaching $(ls dist/headless/*.tar.gz) to existing Release ${attach_tag}"
+          [ -n "$attach_tag" ] || { echo "::error::no target tag resolved"; exit 1; }
+
+          # REFUSAL 1: never a release candidate. The RC flow pushes a branch and
+          # creates an rc-<version> draft PRERELEASE carrying only the DMG + the
+          # updater .sig; the headless tarballs belong to GA releases. The tag-push
+          # arm cannot reach an rc (no v* tag is ever pushed for one), so this
+          # guards the dispatch path, where a hand-typed attach_tag could.
+          case "$attach_tag" in
+            rc-*)
+              echo "::error::refusing to attach GA platform tarballs to '${attach_tag}': rc-* is a release-candidate draft, gated by dmg-verify, and it must not carry install.sh's download artifacts."
+              exit 1
+              ;;
+          esac
+
+          echo "Attaching $(ls dist/headless/*.tar.gz) to the release for ${attach_tag}"
           api="https://api.github.com"; up="https://uploads.github.com"
-          # Look up the release id by tag.
-          rel_id=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
-            -H "Accept: application/vnd.github+json" \
-            "$api/repos/${GITHUB_REPOSITORY}/releases/tags/${attach_tag}" | \
-            python3 -c "import sys,json;print(json.load(sys.stdin)['id'])")
-          echo "release id = $rel_id"
+
+          # ── find the release, INCLUDING A DRAFT ─────────────────────────────
+          # GET /releases/tags/<tag> cannot see a draft: a draft has no tag ref,
+          # so that endpoint 404s for exactly the release this step now targets.
+          # The only listing that includes drafts is GET /releases (and only for
+          # a token with push access, which is what `permissions: contents: write`
+          # at the top of this file buys). Paged, because the mirror already
+          # carries 30+ releases and the newest is not guaranteed to be page one
+          # forever.
+          #
+          # Exit codes: 0 found (prints "<id> <draft> <prerelease>"), 1 no such
+          # tag, 3 the API answered something unusable. 1 is retried, 3 is fatal.
+          find_release() {
+            FIND_REPO="${GITHUB_REPOSITORY}" FIND_TAG="$1" python3 -c '
+          import json, os, sys, urllib.error, urllib.request
+
+          repo = os.environ["FIND_REPO"]
+          tag = os.environ["FIND_TAG"]
+          token = os.environ["GH_TOKEN"]
+
+          def get(url):
+              req = urllib.request.Request(url, headers={
+                  "Authorization": "Bearer %s" % token,
+                  "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              with urllib.request.urlopen(req, timeout=30) as resp:
+                  return json.load(resp)
+
+          for page in range(1, 11):
+              url = "https://api.github.com/repos/%s/releases?per_page=100&page=%d" % (repo, page)
+              try:
+                  releases = get(url)
+              except urllib.error.URLError as exc:
+                  sys.stderr.write("could not list releases: %s\n" % exc)
+                  sys.exit(3)
+              if not isinstance(releases, list):
+                  sys.stderr.write("the releases listing is not an array\n")
+                  sys.exit(3)
+              if not releases:
+                  break
+              for rel in releases:
+                  if not isinstance(rel, dict) or rel.get("tag_name") != tag:
+                      continue
+                  if not isinstance(rel.get("id"), int):
+                      sys.stderr.write("the release for %s has no numeric id\n" % tag)
+                      sys.exit(3)
+                  print("%d %s %s" % (rel["id"],
+                                      str(bool(rel.get("draft"))).lower(),
+                                      str(bool(rel.get("prerelease"))).lower()))
+                  sys.exit(0)
+          sys.exit(1)
+          '
+          }
+
+          # The draft is created moments AFTER the tag push that started this run,
+          # and this step runs at the END of a 10 to 35 minute build, so it is
+          # always there by now. The bounded retry is for the pathological case
+          # (a slow or retried `gh release create`), and it FAILS rather than
+          # skipping: a green run that attached nothing is exactly what makes a
+          # release look finished when it is not.
+          rel=""
+          rel_deadline=$(( $(date +%s) + 300 ))
+          while : ; do
+            set +e
+            rel="$(find_release "$attach_tag")"
+            rc=$?
+            set -e
+            [ "$rc" -eq 0 ] && break
+            if [ "$rc" -ne 1 ]; then
+              echo "::error::could not read the release listing for ${attach_tag} (see above). Refusing to guess which release to attach to."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$rel_deadline" ]; then
+              echo "::error::no GitHub Release carries the tag ${attach_tag}, draft or published, after 300s of looking. The tarballs are built and uploaded as workflow artifacts, but nothing was attached. If the release exists now, backfill with: gh workflow run release-tarballs.yml --ref ${attach_tag} -f attach_to_release=true -f attach_tag=${attach_tag}"
+              exit 1
+            fi
+            echo "no release for ${attach_tag} yet; retrying in 15s"
+            sleep 15
+          done
+          rel_id="${rel%% *}"
+          rel_rest="${rel#* }"
+          rel_draft="${rel_rest%% *}"
+          rel_prerelease="${rel_rest##* }"
+
+          # REFUSAL 2: the same rule as refusal 1, asked of the RELEASE rather
+          # than of its name, so a prerelease under any tag is still refused.
+          if [ "$rel_prerelease" = "true" ]; then
+            echo "::error::${attach_tag} is a PRERELEASE. The per-platform tarballs are install.sh's download artifacts and belong to GA releases only."
+            exit 1
+          fi
+          echo "release id = $rel_id (draft=$rel_draft, prerelease=$rel_prerelease)"
           for f in dist/headless/*.tar.gz dist/headless/*.tar.gz.sha256; do
             base=$(basename "$f")
             # delete any existing asset with the same name (clobber)

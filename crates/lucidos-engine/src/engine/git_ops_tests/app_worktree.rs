@@ -1,13 +1,15 @@
 use super::common::make_test_repo;
 use super::*;
 
-#[test]
-fn generate_app_branch_name_embeds_app_id() {
-    let b = generate_app_branch_name("habit-tracker");
-    assert!(b.starts_with("claude-code/app/habit-tracker/"));
-    // Branch has the shape `claude-code/app/<id>/<ts>-<uuid>` — three slashes
-    // before the timestamp + random suffix.
-    assert_eq!(b.matches('/').count(), 3);
+/// The sparse app worktree is created on whatever branch the caller allocated;
+/// the app-branch SHAPE is `branch_name`'s business and is tested there. This
+/// helper just keeps the fixtures below reading like real allocations.
+fn app_branch(app_id: &str) -> String {
+    coding_agent_branch_base(
+        crate::runtime::CodingAgent::ClaudeCode,
+        &BranchScope::App(app_id.to_string()),
+        "add-streaks",
+    )
 }
 
 #[test]
@@ -75,7 +77,7 @@ async fn create_sparse_app_worktree_materialises_only_app_folder() {
 
     let wt_tmp = tempfile::tempdir().unwrap();
     let wt = wt_tmp.path().join("thread-test");
-    let branch = generate_app_branch_name("habit-tracker");
+    let branch = app_branch("habit-tracker");
 
     create_sparse_app_worktree(&ws, "habit-tracker", &branch, &wt)
         .await
@@ -125,7 +127,7 @@ async fn create_sparse_app_worktree_reuses_surviving_branch_on_resume() {
 
     let wt_tmp = tempfile::tempdir().unwrap();
     let wt = wt_tmp.path().join("thread-resume");
-    let branch = generate_app_branch_name("habit-tracker");
+    let branch = app_branch("habit-tracker");
 
     let created = create_sparse_app_worktree(&ws, "habit-tracker", &branch, &wt)
         .await
@@ -190,7 +192,7 @@ async fn create_sparse_app_worktree_reuses_branch_after_dirty_teardown() {
 
     let wt_tmp = tempfile::tempdir().unwrap();
     let wt = wt_tmp.path().join("thread-dirty");
-    let branch = generate_app_branch_name("habit-tracker");
+    let branch = app_branch("habit-tracker");
 
     create_sparse_app_worktree(&ws, "habit-tracker", &branch, &wt)
         .await
@@ -240,21 +242,16 @@ async fn create_sparse_app_worktree_recovers_from_missing_but_registered_path() 
     let wt = wt_tmp.path().join("thread-stale");
 
     // First spawn creates the worktree.
-    create_sparse_app_worktree(
-        &ws,
-        "habit-tracker",
-        &generate_app_branch_name("habit-tracker"),
-        &wt,
-    )
-    .await
-    .expect("first sparse worktree should succeed");
+    create_sparse_app_worktree(&ws, "habit-tracker", &app_branch("habit-tracker"), &wt)
+        .await
+        .expect("first sparse worktree should succeed");
 
     // Residue: dir wiped, git registration kept.
     tokio::fs::remove_dir_all(&wt).await.unwrap();
     assert!(!wt.exists(), "precondition: worktree dir should be gone");
 
     // Second spawn reuses the same path with a fresh branch — must recover.
-    let branch = generate_app_branch_name("habit-tracker");
+    let branch = app_branch("habit-tracker");
     create_sparse_app_worktree(&ws, "habit-tracker", &branch, &wt)
         .await
         .expect("re-spawn over stale registration should recover");

@@ -153,20 +153,26 @@ authoritative answer.
 
 The handler resolves an actor from the request headers via
 `api::actor::user_actor_resolved` and stamps it onto the emitted
-`ChangeApplied` event. Two headers drive the agent-vs-human distinction:
+`ChangeApplied` event. One header drives the agent-vs-human distinction:
 
-- **`x-lucidos-agent-origin-token`** — must match the per-engine-startup
-  token. Set by the `lucidos` CLI from the `LUCIDOS_AGENT_ORIGIN_TOKEN`
-  env var that the engine injects into every spawned subprocess.
-- **`x-lucidos-source-thread-id`** — the spawning thread id (UUID). Set
-  by the CLI from `LUCIDOS_THREAD_ID`. Only trusted when paired with a
-  valid token.
+- **`x-lucidos-agent-origin-token`**: the *thread-bound origin token*,
+  shaped `<thread-id>.<mac>`, minted per spawn under a per-engine-startup
+  HMAC secret. Set by the `lucidos` CLI from the
+  `LUCIDOS_AGENT_ORIGIN_TOKEN` env var that the engine injects into every
+  spawned subprocess.
 
-When both are present, the actor stamps as `Api { mode: Agent,
-source_thread_id }`. The UI renders that chip as **"Lucidos Agent"** and
-the popover links back to the spawning thread. Drop either header and the
-actor falls through to `Api { mode: Human, user_agent: <UA> }`, which the
-UI renders as **"You"** — wrong attribution for an agent-driven apply.
+The token is self-describing: when its MAC verifies, the spawning thread
+is the token's own prefix, so nothing else on the request names it. The
+actor stamps as `Api { mode: Agent, source_thread_id }`, which the UI
+renders as **"Lucidos Agent"** with a popover linking back to the
+spawning thread. Drop the header, or present a token that does not
+verify, and the actor falls through to `Api { mode: Human, user_agent:
+<UA> }`, which the UI renders as **"You"** (wrong attribution for an
+agent-driven apply).
+
+A second `x-lucidos-source-thread-id` header used to carry the thread id
+separately. It was unverifiable, so any subprocess could claim any
+thread; it is gone, and the engine reads no such header.
 
 This is why the CLI exists: a `run_python` block calling
 `urllib.request.urlopen(...)` ships with `User-Agent: Python-urllib/X.Y`

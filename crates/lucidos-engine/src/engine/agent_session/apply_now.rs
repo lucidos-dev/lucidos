@@ -755,14 +755,16 @@ impl LucidosEngine {
             );
         }
 
-        // Verify CC completed the merge
-        let main_merged = git_cmd(
+        // Verify CC completed the merge. `or_unknown(false)`: a probe that
+        // could not run must not authorize the fast-forward below. A `false`
+        // costs the user one retry, while an unverified `true` would ff main
+        // onto a branch that never took the merge (`.claude/rules/rust.md`).
+        let main_merged = crate::engine::git_ops::git_answer(
             &["merge-base", "--is-ancestor", "main", branch_name],
             repo_root,
         )
         .await
-        .map(|o| o.status.success())
-        .unwrap_or(false);
+        .or_unknown(false);
         if !main_merged {
             return Err(
                 "Coding agent session ended without completing the merge. Try applying again."

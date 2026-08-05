@@ -168,6 +168,59 @@ function installPromptListener() {
   });
 }
 
+/** What `lucidos.ui.previewFile` shows.
+ *
+ *  Deliberately the `file` navigate target's own field names, `snake_case`
+ *  included, so one object literal drives both calls and an app promotes a
+ *  glance into a navigation by swapping the verb:
+ *
+ *  ```js
+ *  const at = { file_path: `repo:${repoId}:file:src/main.rs`, line: 510, line_end: 520 };
+ *  await lucidos.ui.previewFile(at);        // glance, your app stays put
+ *  await lucidos.ui.navigate('file', at);   // leave for the Files panel
+ *  ```
+ */
+export interface FilePreviewParams {
+  /** The same forms `navigate('file', …)` accepts: a workspace data path
+   *  (`artifacts/…`, `knowhow/…`, `apps/…`, `triggers/…`, `system-knowhow/…`, or
+   *  a bare name, which is treated as an artifact), or a repo-encoded path for a
+   *  file in a registered repository clone, either at its current `HEAD`
+   *  (`repo:<repoId>:file:<repo-relative path>`) or at a branch, tag or sha you
+   *  name (`repo:<repoId>:file#<ref>:<repo-relative path>`).
+   *
+   *  Naming the revision matters here: the modal may be showing a repository the
+   *  Files panel is not bound to, so it cannot fall back to whatever branch that
+   *  panel is on. A file a coding agent has edited is on that agent's branch,
+   *  not at `HEAD`. */
+  file_path: string;
+  /** 1-based first line to highlight and scroll to. */
+  line?: number;
+  /** Inclusive last line of the range; omit to highlight a single line. */
+  line_end?: number;
+}
+
+let previewCounter = 0;
+const pendingPreviews = new Map<string, (result: { ok: boolean; error?: string }) => void>();
+let previewListenerInstalled = false;
+
+function installPreviewListener() {
+  if (previewListenerInstalled) return;
+  previewListenerInstalled = true;
+  window.addEventListener('message', (event: MessageEvent) => {
+    const data = event.data as { type?: unknown; id?: unknown; ok?: unknown; error?: unknown } | null;
+    if (!data || typeof data !== 'object') return;
+    if (data.type !== 'lucidos:ui:preview-file:result') return;
+    if (typeof data.id !== 'string') return;
+    const resolver = pendingPreviews.get(data.id);
+    if (!resolver) return;
+    pendingPreviews.delete(data.id);
+    resolver({
+      ok: data.ok === true,
+      error: typeof data.error === 'string' ? data.error : undefined,
+    });
+  });
+}
+
 /** Where an external http(s) link goes when tapped in an installed iOS PWA.
  *  Mirrors `ExternalLinkTarget` in
  *  `crates/lucidos-app/src/store/actions/preferences.ts`. */
@@ -226,9 +279,7 @@ export function primeExternalLinkTarget(): Promise<void> {
  *  the host's display mode, so the same check the host makes works here. */
 function inIOSStandalone(): boolean {
   if (typeof navigator === 'undefined' || typeof window === 'undefined') return false;
-  const iOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
-    || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-  if (!iOS) return false;
+  if (!isIOSAgent()) return false;
   return window.matchMedia?.('(display-mode: standalone)').matches === true
     || (navigator as Navigator & { standalone?: boolean }).standalone === true;
 }
@@ -512,6 +563,83 @@ export const ui = {
         resolve(value);
       });
       window.parent.postMessage({ type: 'lucidos:ui:prompt', id, payload }, '*');
+    });
+  },
+
+  /**
+   * Show a file in a read-only modal rendered by the host, over your app,
+   * WITHOUT navigating away. Use it for a citation in a report or a dashboard:
+   * the reader glances at the code and carries on, instead of losing their place
+   * in the Files panel and having to navigate back. The modal carries a link
+   * that escalates into the full Files preview when they do want to leave.
+   *
+   * Takes the same locators as `navigate('file', …)` (a workspace data path, a
+   * `repo:<repoId>:file:<path>` one, or `repo:<repoId>:file#<ref>:<path>` to
+   * name a branch, tag or sha) and the same `line` / `line_end`, with the same
+   * degradation: a line the file cannot honour (`0`, negative, fractional, past
+   * the end, a format with no source view) opens the file at the top rather
+   * than refusing it.
+   *
+   * Resolves once the preview is on screen, NOT when the reader dismisses it: a
+   * glance can stay open for minutes, and your app is not blocked while it is.
+   * Rejects when the host cannot show it, which makes the escalation a natural
+   * fallback:
+   *
+   * ```js
+   * try { await lucidos.ui.previewFile(at); }
+   * catch { await lucidos.ui.navigate('file', at); }
+   * ```
+   *
+   * Two things make it reject: your app is running with no host shell around it
+   * (opened in its own tab, or the SDK loaded in a top-level page), and a
+   * fullscreen element the host cannot render over. Both mean the same thing,
+   * that nothing would appear, and the fallback above is what turns that into
+   * something the reader can act on.
+   *
+   * A second call replaces a showing preview. Read-only: there is no editing in
+   * the modal.
+   */
+  previewFile(params: FilePreviewParams): Promise<void> {
+    assertPlainObject('params', params);
+    if (typeof params.file_path !== 'string' || params.file_path.length === 0) {
+      return Promise.reject(new TypeError('params.file_path must be a non-empty string'));
+    }
+    const payload = {
+      file_path: params.file_path,
+      line: typeof params.line === 'number' ? params.line : undefined,
+      line_end: typeof params.line_end === 'number' ? params.line_end : undefined,
+    };
+    // No host shell around this window (an app opened in its own tab, or the SDK
+    // loaded in a top-level page), so there is no modal to show and no reply to
+    // wait for. Reject rather than quietly calling `navigate` here: that request
+    // goes through the engine and lands in whichever OTHER window is running the
+    // shell, so the reader clicking a citation would see nothing happen while a
+    // different window navigated its Files panel behind their back, and the
+    // promise would resolve as if it had worked. The escalation is the app
+    // author's to make, from its own catch, where it is a deliberate "take me to
+    // the workspace" rather than a silent side effect somewhere else.
+    if (window.parent === window) {
+      return Promise.reject(new Error(
+        'lucidos.ui.previewFile: no host to show the preview (this app is not running inside Lucidos)',
+      ));
+    }
+    installPreviewListener();
+    const id = `v${++previewCounter}-${Date.now()}`;
+    return new Promise<void>((resolve, reject) => {
+      // Bounds a LOST reply, not the reader's time: the host answers as soon as
+      // it has decided, so this only fires when nothing answered at all. Without
+      // it a host crash would leak the Map entry forever.
+      const timeout = setTimeout(() => {
+        if (pendingPreviews.delete(id)) {
+          reject(new Error('lucidos.ui.previewFile: the host did not respond'));
+        }
+      }, 60_000);
+      pendingPreviews.set(id, (result) => {
+        clearTimeout(timeout);
+        if (result.ok) resolve();
+        else reject(new Error(result.error || 'lucidos.ui.previewFile: the host refused the preview'));
+      });
+      window.parent.postMessage({ type: 'lucidos:ui:preview-file', id, payload }, '*');
     });
   },
 

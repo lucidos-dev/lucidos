@@ -5,7 +5,7 @@ import { navigateToApp, sendMessage, waitForResponse, assertHealthy, isMobileVie
  *  OVER the centered transcript (it was pulled in from the right gutter in fix
  *  956b47519). A deep-link / turn-nav landing scrolls a `.chat-exchange` to its
  *  own `scroll-margin-top` below the container top — so that clearance MUST drop
- *  the landed element (and its .nav-focus-stuck outline, which reaches
+ *  the landed element (and its .nav-focus-stuck highlight, whose glow reaches
  *  --nav-focus-reach beyond the box) below the chevron's footprint, or the
  *  element tucks right under the chevron with no room.
  *
@@ -60,10 +60,10 @@ test.describe('Deep-link landing clears the scroll-to-top chevron (desktop)', ()
       scrollMarginTop,
       `landed element (scroll-margin-top=${scrollMarginTop}px) tucks under the chevron (bottom=${chevronBottom}px)`,
     ).toBeGreaterThanOrEqual(chevronBottom);
-    // ...and its focus-marker outline (reaches navFocusReach above the box) must clear it too.
+    // ...and its focus-marker glow (reaches navFocusReach above the box) must clear it too.
     expect(
       scrollMarginTop,
-      `focus-marker outline lands behind the chevron (footprint=${chevronBottom + navFocusReach}px)`,
+      `focus-marker highlight lands behind the chevron (footprint=${chevronBottom + navFocusReach}px)`,
     ).toBeGreaterThanOrEqual(chevronBottom + navFocusReach);
   });
 });

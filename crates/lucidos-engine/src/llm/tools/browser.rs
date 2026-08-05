@@ -4,8 +4,8 @@
 //! state lives in `runtime::browser`. This module owns only the JSON-shape
 //! contract that gets advertised to the LLM.
 //!
-//! First family extracted as part of the `llm/tools.rs` split — see the
-//! top-of-`mod.rs` plan for the remaining families.
+//! One of the per-domain families `get_default_tools()` splices together; the
+//! full list lives in this module's parent (`llm::tools`).
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;

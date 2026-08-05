@@ -103,6 +103,13 @@ for IDE integrations.
   documented as such in both glossaries. A wholesale rename to
   `coding_agent`-rooted names would touch every persisted row, every
   client, and recovery — separate migration-sized change if ever worth it.
+
+  *Superseded in part 2026-08-04, for the branch prefix only (ADR 0041).*
+  New coding-agent branches are `lucidos-<agent>-<app|repo>-<name>-<slug>`.
+  It was the one member of this bullet with no persisted schema behind it:
+  a branch name is a per-branch string, so old and new coexist with no
+  migration, and the recovery scan this bullet named is a single predicate
+  that now accepts both prefixes. The other three names stand.
 - **`spawn_agent_thread` (the chat LLM tool) stays CC-only.** It passes no
   backend; giving the LLM a `coding_agent` arg is deferred until there's a
   reason for the model to pick Codex.

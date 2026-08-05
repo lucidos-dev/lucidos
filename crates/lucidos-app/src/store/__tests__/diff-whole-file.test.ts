@@ -1,10 +1,13 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { diffWholeFile, diffWholeFileEffective, panelOverlay, repoDiff, encodeRepoPath } from '../store';
-import type { RepoDiff } from '../store';
+import type { RepoDiff, RepoLocator } from '../store';
 import type { Loadable } from '../types';
 
 function setPreview(path: string, mode: 'file' | 'diff', changeId?: string): void {
-  panelOverlay.value = { type: 'file-preview', path: encodeRepoPath('repo-1', mode, path, changeId) };
+  const locator: RepoLocator = mode === 'diff'
+    ? { repoId: 'repo-1', mode, changeId, path }
+    : { repoId: 'repo-1', mode, path };
+  panelOverlay.value = { type: 'file-preview', path: encodeRepoPath(locator) };
 }
 
 function loadedDiff(files: RepoDiff['files']): Loadable<RepoDiff> {

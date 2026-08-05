@@ -415,6 +415,50 @@ describe('loadAllThreads', () => {
     expect(archiveThreadCount.value).toBe(247);
   });
 
+  it('resolves only after its eager per-thread loads settle, and bounds them', async () => {
+    // The eager loads run through a pool now (they used to be one unbounded
+    // `Promise.all`). Two things must survive that: callers ordering work after
+    // `loadAllThreads` still see every load finished, and a boot no longer fires
+    // one request per active thread at once.
+    const ids = Array.from({ length: 12 }, (_, i) => `a${i}`);
+    (fetchThreads as any).mockResolvedValue({
+      saved: [], composing: [], family_threads: [], archive: [],
+      active: ids,
+      active_threads: ids.map(id => ({
+        thread_id: id, title: id, channel: 'chat', initiator: 'user',
+        last_activity: '2026-08-04T10:00:00Z', created_at: '2026-08-04T10:00:00Z',
+        message_count: 1, section: 'inbox', status: 'idle',
+        active_children_count: 0, total_children_count: 0,
+        blocking_descendant_count: 0, attention_descendant_count: 0,
+        coding_agent_proposed: false, coding_agent_requires_restart: false,
+        coding_agent_is_external_repo: false, coding_agent_applying: false,
+        coding_agent_has_diff: false, last_revived_at: null, state: 'active',
+      })),
+    });
+
+    const { fetchThreadEvents } = await import('../../api/threads');
+    const mock = fetchThreadEvents as unknown as ReturnType<typeof vi.fn>;
+    mock.mockReset();
+    let inFlight = 0;
+    let peak = 0;
+    let settled = 0;
+    mock.mockImplementation(async () => {
+      inFlight++;
+      peak = Math.max(peak, inFlight);
+      await Promise.resolve();
+      inFlight--;
+      settled++;
+      return { events: [], currentAggregate: null };
+    });
+
+    await loadAllThreads();
+
+    expect(settled).toBe(12);
+    expect(peak).toBeLessThanOrEqual(4);
+    mock.mockReset();
+    mock.mockResolvedValue({ events: [], currentAggregate: null });
+  });
+
   it('falls back to 0 when archive_count is omitted (older engine / mock)', async () => {
     archiveThreadCount.value = 99;
     (fetchThreads as any).mockResolvedValue({

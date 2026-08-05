@@ -7,11 +7,16 @@ import {
 import { renderMarkdown } from '../../utils/renderMarkdown';
 
 export function PluginInstallPanel() {
+  // Every hook runs before the early return: a hook called after it is a
+  // rules-of-hooks violation that only survives because this component has
+  // exactly one, so the index realigns by luck. Adding a second would corrupt
+  // state silently. `EmailConfirmModal` splits into two components for the same
+  // reason; here hoisting is enough.
+  const [busy, setBusy] = useState(false);
   const form = activeInlineForm.value;
   if (form?.type !== 'plugin-install') return null;
 
   const req = form.request;
-  const [busy, setBusy] = useState(false);
 
   const description = typeof req.manifest['description'] === 'string'
     ? (req.manifest['description'] as string)

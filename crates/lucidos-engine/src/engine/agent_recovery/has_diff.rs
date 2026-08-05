@@ -316,7 +316,7 @@ pub(crate) async fn refresh_coding_agent_has_diff_for_active_cc_threads(
         // holds the `data/apps/<id>/` edits) and carry a NULL `cc_repo_id`. Route
         // them to `workspace_path` BEFORE the `cc_repo_id` branch — a NULL
         // `cc_repo_id` otherwise falls through to `lucidos_repo_root`, where the
-        // `claude-code/app/...` branch does not exist, so `proposal_files_for_branch`
+        // `lucidos-<agent>-app-...` branch does not exist, so `proposal_files_for_branch`
         // comes back empty and the sweep wipes `coding_agent_has_diff` to FALSE on
         // every restart (hiding the WaitingBanner Diff button and the standalone
         // WIP diff button). Mirrors the kind routing in

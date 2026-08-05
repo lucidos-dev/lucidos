@@ -61,11 +61,15 @@ impl RoutingProvider {
             ProviderKind::Local => self.local.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
                 "Local model requested but the local OpenAI-compatible provider is not configured (Settings → Models → Providers)".into()
             }),
+            // The project id is an ALREADY-RESOLVED value (`VERTEX_PROJECT_ID`
+            // › ADC `quota_project_id` / gcloud config file › `gcloud config`
+            // subprocess), so naming only the env var sends a user who
+            // authenticated with ADC to fix the wrong thing.
             ProviderKind::Vertex => self
                 .vertex
                 .as_deref()
                 .map(|p| p as &dyn LlmProvider)
-                .ok_or_else(|| "Vertex AI model requested but VERTEX_PROJECT_ID is not configured".into()),
+                .ok_or_else(|| "Vertex AI model requested but no Google Cloud project is configured (set VERTEX_PROJECT_ID or run `gcloud auth application-default login`)".into()),
         }
     }
 }

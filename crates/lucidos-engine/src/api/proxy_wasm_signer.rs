@@ -1,8 +1,8 @@
 //! `WasmSigner` — per-request `AuthLayer` impl backed by a sandboxed
 //! wasmtime module loaded from `data/auth-modules/<name>.wasm`.
 
+use crate::api::hex::hex_lower;
 use crate::api::proxy_auth_layer::{AuthLayer, AuthMutation, BodyView, LayerInput};
-use crate::api::proxy_hex::hex_lower;
 use crate::api::proxy_wasm_host::{register_host_imports, HostState};
 use async_trait::async_trait;
 use axum::http::{HeaderName, StatusCode};

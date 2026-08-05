@@ -48,6 +48,12 @@ pub(crate) use agentic_loop::{
     emit_user_prompt_injected_event, filter_removed_queued_prompts, strip_app_capture_marker,
 };
 pub(crate) use change_ops::now_epoch_millis;
+// The child-follow-up vocabulary, re-exported for the HTTP route in
+// `api::threads::follow_up`, which is outside `engine`. Only the ack and the
+// refusal taxonomy: the delivery half stays reachable solely as
+// `LucidosEngine::follow_up_child_thread`, so there is no way to assemble a
+// second delivery path out of its parts.
+pub(crate) use chat::child_follow_up::{ChildFollowUpError, FollowUpAck, FollowUpDelivery};
 pub(crate) use chat::generate_thread_title;
 pub(crate) use chat::PreEmittedOrigin;
 #[cfg(test)]

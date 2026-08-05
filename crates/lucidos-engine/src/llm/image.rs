@@ -396,13 +396,26 @@ pub async fn build_image_provider(
                 build_openai(key, model)
             }
             None => {
-                crate::log!("[Image] {} selected but OPENAI_API_KEY not set", model);
+                // `openai_api_key` is the ALREADY-RESOLVED key from
+                // `resolve_openai_api_key` (stored credential › OPENAI_API_KEY
+                // › Codex CLI), so naming only the env var sends the user to
+                // fix the wrong thing when they configured it in Settings.
+                crate::log!(
+                    "[Image] {} selected but no OpenAI key is configured (Settings → Models → Providers or OPENAI_API_KEY)",
+                    model
+                );
                 None
             }
         },
         "imagen-4" => {
             if vertex_project_id.is_empty() {
-                crate::log!("[Image] imagen-4 selected but VERTEX_PROJECT_ID not set");
+                // Same already-resolved-chain caveat as the OpenAI key above:
+                // `vertex_project_id` comes from `VERTEX_PROJECT_ID` › the ADC
+                // file › gcloud config, so pointing only at the env var
+                // misdirects a user who authenticated with ADC.
+                crate::log!(
+                    "[Image] imagen-4 selected but no Google Cloud project is configured (set VERTEX_PROJECT_ID or run `gcloud auth application-default login`)"
+                );
                 return None;
             }
             crate::log!("[Image] Using Vertex AI Imagen 4");

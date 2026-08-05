@@ -7,10 +7,18 @@ vi.mock('../utils/dom', async (importOriginal) => {
   return { ...actual, isTextInput: vi.fn(() => false), isThreadTranscript: vi.fn(() => false) };
 });
 
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
 import { dispatchEscape, classifyForwardedChord, dispatchForwardedChord, dispatchPreviewIframeShortcut, shouldTypeToFocusPrompt } from './useKeyboardShortcuts';
 import { isTextInput, isThreadTranscript } from '../utils/dom';
 import { pushOverlay, _resetOverlayStackForTesting } from '../store/overlayStack';
 import { focusedPane, splitRatio } from '../store/store';
+
+const here: string = dirname(fileURLToPath(import.meta.url));
 
 beforeEach(() => {
   _resetOverlayStackForTesting();
@@ -48,6 +56,73 @@ describe('dispatchEscape (non-destructive Escape policy)', () => {
 
   it('no-ops when nothing is open and focus is not a text input (never touches the thread)', () => {
     expect(dispatchEscape(null)).toBe('noop');
+  });
+
+  // A pseudo-fullscreen app registers on the same stack (ContentHeaderActions
+  // pushes it while active), and a modal an app raises over it is pushed after.
+  // LIFO is what keeps one Escape to one effect: the modal closes and the app
+  // stays fullscreen. Reversing the pop order would drop the reader out of
+  // fullscreen on the keystroke they aimed at the modal.
+  it('pops only the modal when an app is pseudo-fullscreen behind it', () => {
+    const exitFullscreen = vi.fn();
+    const closeModal = vi.fn();
+    pushOverlay({ id: 'pseudo-fullscreen', dismiss: exitFullscreen });
+    pushOverlay({ id: 'overlay-1', dismiss: closeModal });
+
+    expect(dispatchEscape(null)).toBe('dismissed');
+    expect(closeModal).toHaveBeenCalledTimes(1);
+    expect(exitFullscreen).not.toHaveBeenCalled();
+  });
+
+  // Native fullscreen is the browser's: it takes Escape to exit, and nothing in
+  // a keydown handler can stop it (Escape grants no user activation to
+  // re-request with, and the only way to consume the close request first is the
+  // top layer, which the overlay layer deliberately does not use). Acting anyway
+  // would make one Escape close the overlay AND drop fullscreen. Standing down
+  // leaves it doing one thing; the overlay is then visible in the normal layout
+  // and the next Escape closes it.
+  it('stands down while an element is natively fullscreen', () => {
+    const dismiss = vi.fn();
+    pushOverlay({ id: 'm', dismiss });
+    expect(dispatchEscape(null, true)).toBe('fullscreen');
+    expect(dismiss).not.toHaveBeenCalled();
+  });
+
+  // The stand-down is NOT 'noop'. <Overlay> installs its own bubble-phase
+  // Escape listener (useDismissOnOutside), which dismisses unconditionally and
+  // is normally shadowed by the stopPropagation the 'dismissed' branch does.
+  // A silent fall-through let that listener close the overlay anyway, so one
+  // Escape did both things after all. The distinct value is what tells the
+  // capture-phase dispatcher to stop the event (without preventDefault, which
+  // would be the UA's fullscreen exit).
+  it('is distinguishable from a no-op, so the caller can stop the event', () => {
+    expect(dispatchEscape(null, true)).not.toBe(dispatchEscape(null, false));
+  });
+
+  it('dismisses normally once native fullscreen is gone', () => {
+    const dismiss = vi.fn();
+    pushOverlay({ id: 'm', dismiss });
+    expect(dispatchEscape(null, false)).toBe('dismissed');
+    expect(dismiss).toHaveBeenCalledTimes(1);
+  });
+
+  // The stand-down must not swallow the blur either: whatever the browser is
+  // about to do with this Escape, the host does nothing.
+  it('does not blur a focused text input while natively fullscreen', () => {
+    vi.mocked(isTextInput).mockReturnValue(true);
+    const blur = vi.fn();
+    expect(dispatchEscape({ blur } as unknown as Element, true)).toBe('fullscreen');
+    expect(blur).not.toHaveBeenCalled();
+  });
+
+  // The capture-phase dispatcher must stop the event on the stand-down (or the
+  // overlay's own Escape closes it anyway) and must NOT preventDefault (or it
+  // would try to suppress the one thing that should happen).
+  it('is stopped but not defaulted by the capture dispatcher', () => {
+    const src = readFileSync(resolve(here, './useKeyboardShortcuts.ts'), 'utf-8');
+    const branch = src.match(/} else if \(result === 'fullscreen'\) \{[\s\S]*?\n {6}\}/)?.[0] ?? '';
+    expect(branch).toContain('e.stopPropagation()');
+    expect(branch).not.toContain('e.preventDefault()');
   });
 });
 

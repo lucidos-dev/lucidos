@@ -69,11 +69,15 @@ Archiving a parent *thread* also archives every *sub-thread* under it, in one at
 ### Chat thread
 A *thread* whose `source = 'chat'` — the user typed the opening message in the Lucidos chat UI. Answered by the *Lucidos Agent*. Contrast with *trigger thread* and *coding-agent thread*.
 
+### Child follow-up
+A message from a *parent thread* to one of its own *child threads*, sent with the `follow_up_child_thread` tool. The one privileged cross-thread write: it redirects a child that is going the wrong way, hands a child something a sibling learned, or tells a stalled child to continue. Deliberately not an any-to-any address space, a thread can address its **direct** children and nothing else: no sibling can address a sibling, no grandparent can reach a grandchild (it goes through the child), and no cross-workspace caller has children to address. The caller never states the relationship; the engine looks it up from the child's `parent_thread_id`. A follow-up returns as soon as the message is on the child's timeline and does **not** wait for the child, which reports back the usual way when its turn ends. It never creates a thread, never changes how many children the parent has, and consumes no child slot, so reviving an existing child is cheaper than spawning another one.
+See also: *child thread*, *parent thread*.
+
 ### Child thread
-A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread` / `run_coding_agent` / `lucidos spawn-thread --relation child`). The engine wires a callback so the *parent thread* resumes with the child's result when it terminates. Identifiers: DB column `parent_thread_id` on the child row points up to the parent; Rust struct field and event payload field `child_thread_id` (on the `Callback` struct and the `ChildThreadCompleted` event) name the child. A child is a *sub-thread*; the reverse isn't true.
+A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread` / `run_coding_agent` / `lucidos spawn-thread --relation child`). The engine wires a callback so the *parent thread* resumes with the child's result when it terminates. The reverse direction also exists: the parent can address a child it already spawned with a *child follow-up*, and a child that is followed up on reports again when its next turn ends. Identifiers: DB column `parent_thread_id` on the child row points up to the parent; Rust struct field and event payload field `child_thread_id` (on the `Callback` struct and the `ChildThreadCompleted` event) name the child. A child is a *sub-thread*; the reverse isn't true.
 
 ### Command guard
-An opt-in safety gate over the *Lucidos Agent*'s shell/Python tools. Toggled under **Settings → Permissions → Command Safety** (off by default). When enabled, a command that's clearly catastrophic (`rm -rf /`, a fork bomb, formatting a disk) is refused without running; a command that looks like an irreversible real-world side-effect (sending mail, a mutating HTTP request, a cloud-CLI change, spending money) or destruction outside the workspace pauses and shows the user a *command permission card* to approve; an in-workspace deletion/overwrite (recoverable) runs after a *command checkpoint* is taken, leaving a one-click Undo. A fast static check settles the obvious cases and a cheap LLM **judge** decides the ambiguous middle, erring toward asking. Under the master toggle, two sub-settings (only active while the guard is on): an **LLM judge** on/off switch (off falls back to a static classifier: the dangerous-command list plus a destruction scan — out-of-workspace deletes/overwrites still ask, in-workspace ones still checkpoint) and the **judge model** (defaults to Haiku). Commands the user has chosen to always allow are kept in an editable list under **Settings → Permissions → Lucidos Agent permissions** (`~/.lucidos/agent-allowed-commands`). A *trigger* fires unattended, so it can't be asked — it instead runs irreversible commands only within its declared *side-effect grant*; an ungranted one is blocked and fails the run. The safe majority of commands — including reads anywhere and writes inside the workspace — run untouched. See `system-knowhow/running-python.md` § The command guard.
+An opt-in safety gate over the *Lucidos Agent*'s shell/Python tools. Toggled under **Settings → Permissions → Command safety** (off by default). When enabled, a command that's clearly catastrophic (`rm -rf /`, a fork bomb, formatting a disk) is refused without running; a command that looks like an irreversible real-world side-effect (sending mail, a mutating HTTP request, a cloud-CLI change, spending money) or destruction outside the workspace pauses and shows the user a *command permission card* to approve; an in-workspace deletion/overwrite (recoverable) runs after a *command checkpoint* is taken, leaving a one-click Undo. A fast static check settles the obvious cases and a cheap LLM **judge** decides the ambiguous middle, erring toward asking. Under the master toggle, two sub-settings (only active while the guard is on): an **LLM judge** on/off switch (off falls back to a static classifier: the dangerous-command list plus a destruction scan, so out-of-workspace deletes/overwrites still ask and in-workspace ones still checkpoint) and the **judge model** (defaults to Haiku). Commands the user has chosen to always allow are kept in an editable list under **Settings → Permissions → Lucidos Agent permissions** (`~/.lucidos/agent-allowed-commands`). A *trigger* fires unattended, so it can't be asked, so it instead runs irreversible commands only within its declared *side-effect grant*; an ungranted one is blocked and fails the run. The safe majority of commands, including reads anywhere and writes inside the workspace, run untouched. See `system-knowhow/running-python.md` § The command guard.
 
 ### Command checkpoint
 A snapshot of the workspace's tracked content the *command guard* takes right before running an in-workspace destructive command (a delete or overwrite under the workspace) — the recoverable, "reversible" lane. Instead of asking, the guard saves the current state, runs the command, and shows a one-click **Undo** on the command's card; Undo restores the workspace to the snapshot (re-creating deleted files, reverting overwritten ones). Undo does not remove files the command newly *created* — it targets destruction. Out-of-workspace destruction can't be checkpointed, so it goes to the *command permission card* (ask) lane instead. Only taken when the *command guard* is on.
@@ -87,6 +91,28 @@ The compose view's single "who/where" pick for a new *thread*, shown as a single
 ### Config
 Workspace configuration files under `data/config/`, principally `apis.json` (proxy entries, signer wiring, OAuth flows). Users edit these directly or via the engine's auth-handshake flow.
 See also: `system-knowhow/building-an-auth-handshake.md`.
+
+### Connected account
+A service the user has signed in to, so Lucidos can act on their behalf: the
+stored result of an OAuth authorization (access token, refresh token, granted
+scopes, and the account's email where the provider reports one). Listed under
+**Settings → Accounts → Connected accounts**, one row per provider. Created by
+the *Lucidos Agent*'s `connect_oauth_account` tool or by the Connect button on
+that page; both hand the provider's authorization page to the user's own browser
+(the in-app browser panel, their system browser, or a new tab, whichever they
+have configured) and store the tokens when it comes back.
+
+Distinct from the *credential* that backs it. A connected account is a **sign-in**;
+the OAuth Client credential beside it is the **app registration**
+(`client_id`, optional `client_secret`, and the provider's endpoint URLs) that
+made the sign-in possible. One provider therefore shows one row in each list,
+which is expected and not a duplicate. A provider name may be *derived*
+(`ghealth`) to hold a narrowly-scoped connection separately from the base
+provider's, which is a distinct connected account on the base provider's
+endpoints. Backup uploads read the connected account for their
+`backup_provider`; the Backup page has no account UI of its own and links here.
+See also: *credential*, *OAuth client type*, *OAuth redirect URI*,
+`system-knowhow/oauth-providers.md`.
 
 ### Connected-but-hidden
 A device whose Lucidos page is alive (SSE EventSource still streaming) but not currently *active*: a different browser tab is selected, the window is behind another app, or the iOS PWA is in the app switcher. Receives the `NotificationCreated` SSE message and updates its bell badge silently, but does NOT show a toast (the user can't see it). Eligible for an *OS surface* push (subject to global suppression in §2 of `system-knowhow/notifications.md`). Distinct from *Offline*, where there's no SSE at all.
@@ -117,6 +143,29 @@ early, while one set too high makes the engine build a prompt the provider
 rejects. Builtins ship with theirs declared where it could be verified.
 See also: *Model registry*, *Provider*.
 
+### Credential
+A secret Lucidos stores on the user's behalf: an API key, bearer token, username
+and password, mailbox password, or an OAuth client registration. Listed under
+**Settings → Accounts → Credentials**, keyed by a **service name**, and injected
+into every subprocess Lucidos spawns as `CRED_<NAME>` (plus an optional custom
+env var name as an extra alias). Also what the proxy auth pipeline
+(`data/config/apis.json`) resolves when it signs an outbound request. Deliberately
+distinct from an *environment variable*, which is non-secret by design and
+appears in tool-call payloads, logs, and the *event* store.
+
+A credential is identified by its service name **together with its auth type**,
+not by the name alone. That matters for exactly one pair: an OAuth Client
+registration may share a name with an ordinary credential for the same provider,
+so `google` can be both an API key and the Google app registration, listed as two
+rows telling themselves apart by their type badge. Every other type keeps a name
+unique to itself, because that name is what `CRED_<NAME>` and `apis.json` resolve.
+(Until 2026-08-05 the two engine-owned types wrapped their names in an `oauth:` /
+`email:` prefix instead; the type carries that now, so the name is just the
+provider or the mailbox account.) An OAuth Client is the one type NOT injected as
+`CRED_<NAME>`: only the OAuth flow reads it, and it reads it from the database.
+A secret is never a *preference*.
+See also: *connected account*, *environment variable*, *config*.
+
 ### Domain event
 An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos events emit` CLI — anything observable about the user's world (`MorningRoutineCompleted`, `JobListingFound`, `PanasonicHeatpumpAdjusted`). Persisted with the inner event type (not the literal string `"DomainEvent"`). Flows through the trigger matcher unconditionally, so a *trigger*'s `on_event:` can subscribe to any domain event name. Persisted `ThreadEvent` variants are also subscribable except per-token streaming ones — see *scheduler blocklist* (dev).
 See also: `system-knowhow/thread-events.md` § "Today the scheduler uses a blocklist", `.claude/rules/rust.md` § "Apps — Event APIs".
@@ -128,6 +177,10 @@ A user-managed, **non-secret** `NAME=value` pair (Settings → System → Enviro
 ### Event
 A past-tense fact about something that happened in the workspace. Always past-tense, including transient ones. Two persistence flavors live side by side: persisted events (written to the `events` table, replayable, drive projections, match triggers) and transient events (broadcast over SSE only, never persisted, never reach projections or the trigger matcher). Concrete subtypes: thread lifecycle events (`MessageReceived`, `ResponseGenerated`, …), system events (notifications, preferences, …), and *domain events*. There is no *command* concept — anything that would look imperative is reframed as a request event (e.g. `AppUiRefreshRequested`, not `RefreshAppUI`); a subscriber chooses whether to act.
 <!--gloss-event-end-->
+
+### File preview modal
+A read-only view of one file, rendered by Lucidos over whatever the *content pane* is showing, without navigating there. Opened by an *app* through `lucidos.ui.previewFile` so a reader following a citation in a report glances at the file and carries on, instead of losing their place. It takes the same locators and the same `line` / `line_end` as the `file` navigation target (a workspace data path or a `repo:<repoId>:file:<path>` one), shows the same highlight and line numbers the *content pane*'s preview shows, and carries a link that escalates the glance into that full preview. Dismissed by Esc, a click outside it, or its close control. Distinct from the *content pane*'s file preview, which IS a navigation: that one replaces what the pane was showing and lands in the Back history.
+See also: `system-knowhow/js-sdk.md` § lucidos.ui.
 
 ### Imported
 The `data/imported/` directory where imported external repositories land (via `RepositoryImported` events). Treated as *artifacts* — content is flattened into the workspace's git tree, not kept as nested git repositories. Distinct from the *external-repo coding-agent thread* surface, which runs against a *repository* (a separately registered external git repo path).
@@ -159,7 +212,7 @@ The engine itself acting without LLM mediation — recovery sweeps, *hardening*,
 A registered git repository (or GitHub tree URL) that the *Plugins panel* scans for installable *plugins* (its catalog, shown when the **Installed only** filter is unchecked). Stored in `data/config/plugin-marketplaces.json`; added/removed under Settings → Marketplaces (or the `register_plugin_marketplace` tool). A marketplace can contain a single plugin at its root or multiple plugin directories; GitHub marketplace subdirectories are converted into GitHub tree install URLs. The engine scans registered marketplaces at startup, after registration changes, and every five minutes; when an installed plugin has a newer version it notifies the user (a single deduplicated "updates available" notification) rather than applying the update automatically — the user reviews and applies it from the *Plugins panel* (with **Installed only** unchecked).
 
 ### Max tool calls
-How many tool calls the *Lucidos Agent* may make in a single turn before the engine ends the turn, set under **Settings → Models → Chat & Triggers** (default 500). It counts individual calls, not replies, so three calls in one reply spend three of them, and it applies to *trigger* runs exactly as to chat. There is deliberately **no maximum**: a high cap costs time and tokens, which is the user's call to make, and roughly speaking the cap is how long a single turn can run (around 15 seconds per call, so 500 is a couple of hours). The minimum is 1. Reaching it is not an error: the turn ends with a message prefixed `[ENGINE-LIMIT]` that names the limit, links to the setting, and can be continued by sending any message. That prefix is the only trustworthy signal the limit was hit, since the agent cannot observe its own tool-call count and will otherwise invent one. Only the user can change it; the agent is refused, because the cap is the backstop over the agent's own work. Distinct from the *command guard*, which judges whether one command is safe rather than how many run.
+How many tool calls the *Lucidos Agent* may make in a single turn before the engine ends the turn, set under **Settings → Models → Chat & triggers** (default 500). It counts individual calls, not replies, so three calls in one reply spend three of them, and it applies to *trigger* runs exactly as to chat. There is deliberately **no maximum**: a high cap costs time and tokens, which is the user's call to make, and roughly speaking the cap is how long a single turn can run (around 15 seconds per call, so 500 is a couple of hours). The minimum is 1. Reaching it is not an error: the turn ends with a message prefixed `[ENGINE-LIMIT]` that names the limit, links to the setting, and can be continued by sending any message. That prefix is the only trustworthy signal the limit was hit, since the agent cannot observe its own tool-call count and will otherwise invent one. Only the user can change it; the agent is refused, because the cap is the backstop over the agent's own work. Distinct from the *command guard*, which judges whether one command is safe rather than how many run.
 
 ### MCP permission card
 The approval card the *Lucidos Agent* shows when it wants to call a tool on an *MCP* server that isn't already trusted. Same UI as the *command permission card*: Deny, Allow once, Allow for this thread, Always allow this tool, or Always allow this server. "Always allow" choices are remembered in an editable list (`~/.lucidos/mcp-allowed-tools`) — per-tool (`Mcp(<server>:<tool>)`) or whole-server (`Mcp(<server>:*)`). Until answered, the thread waits on the user. A *trigger* fires unattended, so it never shows this card — MCP tool calls in a trigger thread are auto-approved silently (as is any call to a server with auto-approve set).
@@ -188,7 +241,10 @@ Both ride the engine's single push-allowed decision (see PresenceCheck protocol)
 See also: `system-knowhow/notifications.md` §§1, 3, 4.
 
 ### Parent thread
-The direct ancestor of a *child thread*. Resolved via the child's `parent_thread_id` column. A thread can have at most one parent; a parent can have many children.
+The direct ancestor of a *child thread*. Resolved via the child's `parent_thread_id` column. A thread can have at most one parent; a parent can have many children. The edge carries traffic both ways: each child reports its outcome upward when it terminates, and the parent can send a *child follow-up* downward to any child it spawned itself.
+
+### Paused (thread status)
+A *thread* whose turn an engine restart interrupted and which has not resumed. Its own status dot (a neutral one, deliberately not the red *failed* dot) and the word "Paused" in the row's Info card. Two ways in, and they differ only in what happens next. After a user-initiated *Switch to new version* the engine auto-resumes the turn by itself, usually within seconds, so no **Continue** button is offered: the thread simply goes back to running. After a crash, a bare stop, or a switch whose resume the next boot could not deliver, the Continue button IS offered, and clicking it resumes the turn. Paused is a *verdict* about the interrupted turn, not a resting state, so the events that merely close the turn out cannot walk it back to idle; sending a follow-up message clears it like any other new work. Distinct from *failed* (the turn errored), from `waiting` (a *change* is sitting in review) and from `waiting_for_user_answer` (the agent is parked on a question the user must answer). A paused thread does not count toward *attention*: it either resumes on its own or shows the button.
 
 ### Plugin
 A bundle of installable workspace content shipped as a single unit. Contains any of `apps/`, `knowhow/`, `triggers/`, `scripts/`, `auth-modules/` — mirroring the top-level `data/` directories. Defined by a *plugin manifest* at the root. At install time the contents merge into the target workspace's `data/`. Use a plugin when the pieces only make sense together (e.g. an app + its knowhow + its trigger); ship single files individually otherwise.
@@ -234,11 +290,11 @@ The set of irreversible side-effect categories a *trigger* is pre-authorized to 
 The `<name>.manifest.json` sidecar next to a `<name>.wasm` signer artifact in `data/auth-modules/`. Carries WASM-host metadata (`secret_handles`, `body_mode`, `capabilities`). The engine never auto-loads provider config from it — `data/config/apis.json` is the single source of truth for proxy entries.
 
 ### Source event
-The specific *event* a notification points to, stored as `notifications.event_id`. Used by the *in-app surface* to decide whether the user is currently looking at the very thing the notification is about: if the page is on the source event's thread AND the source event is in viewport, the notification is auto-marked-read with no toast and no badge increment. A notification with `tap = { kind: 'navigate', to: { target: 'thread', id: '...', event_id: '...' } }` also lands on the source event (scroll + pulse).
+The specific *event* a notification points to, stored as `notifications.event_id`. Used by the *in-app surface* to decide whether the user is currently looking at the very thing the notification is about: if the page is on the source event's thread AND the source event is in viewport, the notification is auto-marked-read with no toast and no badge increment. A notification with `tap = { kind: 'navigate', to: { target: 'thread', id: '...', event_id: '...' } }` also lands on the source event (scroll + pulse). Both uses resolve the event the same way, and they resolve it whether it starts a turn or is folded into one as a step: an event rendered as a step is addressed by its own card (a failed response by its failure card), not by the turn around it. A source event that never renders is reported rather than silently ignored, and the page falls back to the thread's most recent turn.
 See also: `system-knowhow/notifications.md` §§2, 4.
 
 ### Spawning thread
-The *thread* that issued the `run_thread` / `run_coding_agent` / `lucidos spawn-thread` call. For `relation: "child"`, the spawning thread IS the parent. For `relation: "top"`, there's a spawning thread but no parent and no callback wiring.
+The *thread* that issued the `run_thread` / `run_coding_agent` / `lucidos spawn-thread` call. For `relation: "child"`, the spawning thread IS the parent. For `relation: "top"`, there's a spawning thread but no parent and no callback wiring. Either way the spawn is *attributed*: the spawned thread's first message records which thread launched it, so its route popover names and links back here. Attribution is not linkage, so it never makes a top-thread report back, count as a child, or inherit the spawning thread's permissions.
 
 ### Sub-thread
 Any descendant in the *thread* tree (transitive). A *child thread* is a sub-thread; a grandchild is a sub-thread. Use *child thread* when you mean the direct relationship; use *sub-thread* when depth is irrelevant or the relationship is transitive.
@@ -271,7 +327,7 @@ A per-*thread*, *Lucidos Agent*-maintained list of *todo items* the agent is wor
 **Abandonment.** When a response terminates (`ResponseGenerated` / `ResponseCanceled` / `ResponseAborted`), the engine looks at the thread's latest `TodoListWritten`. If every item is `completed`, the list is left alone — finished lists persist for the thread's lifetime. If any item is still `pending` or `in_progress`, the engine emits a new `TodoListWritten` with those items flipped to `abandoned` (completed items keep their status). The panel keeps showing the list — abandoned rows render with a dashed strike-through and an `abandoned` tag so it's obvious the agent did not see them through. To avoid the auto-flip the agent must either finish the list (every item `completed`) or call `todo_write` with `[]` to drop it explicitly.
 
 ### Top-thread
-A spawn with `relation: "top"` (the CLI default for `lucidos spawn-thread`). Has no parent and no callback wiring — appears in the main thread list as an independent top-level thread. The *spawning thread* is **not** resumed when it finishes.
+A spawn with `relation: "top"` (the CLI default for `lucidos spawn-thread`). Has no parent and no callback wiring, so it appears in the main thread list as an independent top-level thread. The *spawning thread* is **not** resumed when it finishes. It still records WHO launched it: the route popover on its first message names the spawning thread and links to it. "No parent" is about the callback, not about provenance.
 
 <!--gloss-trigger-start-->
 ### Trigger
@@ -344,6 +400,9 @@ OpenAI's coding-agent CLI; the second *coding agent* product Lucidos integrates.
 ### Coding agent
 Role: a subprocess driving a *thread* to make code changes inside an isolated git *worktree* (dev). Lucidos integrates two coding agents: *Claude Code* (default) and *Codex*. Modeled in code as `CodingAgent` (enum). The thread it drives is a *coding-agent thread*; which agent drives it is chosen at the thread's first message and locked thereafter.
 
+### Coding-agent branch
+The git branch a *coding-agent thread* does its work on, named after the thread so `git branch -a` reads as a list of work: `lucidos-<coding-agent>-<app|repo>-<name>-<slug>`, e.g. `lucidos-claude-code-repo-lucidos-fix-auth-timeout`, `lucidos-claude-code-app-habit-tracker-add-streaks`, `lucidos-codex-repo-example-repo-fix-auth`. The `lucidos-` prefix marks it as one Lucidos created, which matters most in an *external repo* where it sits among your own branches. Two threads with the same name get `-2`, `-3`. The name is fixed when the thread's branch is created, so renaming the thread afterwards does not move it, and a thread you continue keeps the branch its work is on. *Apply* merges this branch into `main`. Branches from before this naming (`claude-code/…`) keep their old names and keep working.
+
 ### Coding-agent permission card
 The approval card a *coding-agent thread* shows when its agent wants to do something the engine won't wave through: Deny, Allow once, Allow for this thread, or Always allow. Until answered, the thread waits on the user. Most of the agent's work never reaches a card — anything it writes **inside its own worktree** is allowed automatically, because that worktree is disposable and you review every change in the diff before you Apply it. A card appears for a shell command the agent's own gate escalates, a write **outside** the worktree (somewhere else on your machine), or a write into the worktree's hidden `.git` folder — the one in-worktree place whose contents don't show up in the diff you review. **"Allow for this thread" is remembered for the life of that thread**, including across an Apply that restarts Lucidos; "Always allow" is remembered for every future thread, in an editable list under **Settings → Permissions**. A *trigger* fires unattended, so it never shows this card — see *side-effect grant*.
 
@@ -360,7 +419,7 @@ See also: `system-knowhow/coding-agent-events.md`.
 A *coding-agent thread* (see) running against a user-registered external git *repository* rather than the Lucidos workspace itself. No Apply / Discard surface — the user reviews diffs via the external-repo diff viewer. Worktree creation and system prompt differ from the Lucidos-internal variant; documented in `docs/plans/2026-03-17-external-repos-plan.md`.
 
 ### App coding-agent thread
-A *coding-agent thread* whose isolated *worktree* sparse-checks out the workspace git on a single `data/apps/<id>/` folder. Same machinery as a Lucidos-internal coding-agent thread (worktree, branch, *change*, *Apply* ff-merge) but on the user's workspace git rather than the Lucidos source repo. No engine restart on *Apply*; Lucidos's `/harden` does not run (apps own their hardening). On *Apply*, the engine emits a transient `AppUiRefreshRequested { app_id }` if any iframe-bundled file changed so open iframes reload with the merged content. The *WIP app preview* surface lets the user see the in-flight app from the worktree while the thread is still open. Branch name shape: `claude-code/app/<app_id>/<ts>-<uuid>`.
+A *coding-agent thread* whose isolated *worktree* sparse-checks out the workspace git on a single `data/apps/<id>/` folder. Same machinery as a Lucidos-internal coding-agent thread (worktree, branch, *change*, *Apply* ff-merge) but on the user's workspace git rather than the Lucidos source repo. No engine restart on *Apply*; Lucidos's `/harden` does not run (apps own their hardening). On *Apply*, the engine emits a transient `AppUiRefreshRequested { app_id }` if any iframe-bundled file changed so open iframes reload with the merged content. The *WIP app preview* surface lets the user see the in-flight app from the worktree while the thread is still open. Branch name shape: `lucidos-<coding-agent>-app-<app_id>-<slug>`, e.g. `lucidos-claude-code-app-habit-tracker-add-streaks` (ADR 0041).
 See also: `docs/plans/2026-05-27-app-coding-agent-threads-design.md`.
 
 ### WIP app preview

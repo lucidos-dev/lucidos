@@ -32,7 +32,7 @@ import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation'
 import { revealThreadPane } from './pane';
 import { scrollToBottom } from '../../components/chat/scrollState';
 import { setCanceledQuestion, setCanceledWhileAwaiting } from '../../components/chat/prompt-input-helpers';
-import { refreshThreadEvents } from './thread-loading';
+import { refreshThreadEvents, forgetThreadEventsFailures } from './thread-loading';
 import { markThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { isTauri } from '../../utils/platform';
@@ -220,8 +220,24 @@ export async function removeQueuedMessage(threadId: string, messageId: string): 
   if (outcome === 'removed') return;
   // Non-success (transport error OR a 409 race where the loop injected it just
   // now): re-sync so the row reflects truth and tell the user it didn't take.
-  void refreshThreadEvents(threadId).catch(() => {});
+  void refreshThreadEvents(threadId);
   showToast(`Failed to remove queued message: ${errorDetail(error)}`, 'error');
+}
+
+/** Mark one pending row as never-confirmed: the safety refetch gave up on it.
+ *  The row stays so the user's text remains visible, but it stops counting as a
+ *  turn in flight (`effectiveThreadStatus`). Still swapped for the real event by
+ *  `handleEvent` if one ever arrives, since the match is on `eventId`. */
+function markPendingUnconfirmed(threadId: string, eventId: string): void {
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return;
+  const pending = thread.pendingUserMessages.find(p => p.eventId === eventId);
+  if (!pending || pending.unconfirmed) return;
+  pending.unconfirmed = true;
+  threadMap.value = new Map(threadMap.value);
+  // Same per-thread bump pairing as removePendingMessage: the focused
+  // ThreadView reads the row through the events bell, not the map write.
+  bumpThreadEvents(threadId);
 }
 
 /** Remove pending messages older than PENDING_MESSAGE_SAFETY_MS.
@@ -252,6 +268,14 @@ export function clearStalePendingMessages(threadId: string): void {
  *  transitions from "Requesting..." to "Aborted". */
 export const STALE_EXCHANGE_FOLLOWUP_MS = 60_000;
 
+/** How many safety refetches may fail to land before the retry gives up (it
+ *  keeps the pending row either way). Three, i.e. ~90s: long enough that a
+ *  transient outage or a lagging SSE resolves first, which is the case the retry
+ *  exists for, and bounded because a refetch can also decline permanently (the
+ *  thread's events never loaded), which no amount of retrying changes and which
+ *  would otherwise poll for the life of the page. */
+const PENDING_CLEANUP_MAX_ATTEMPTS = 3;
+
 /** Schedule a safety check that fires after PENDING_MESSAGE_SAFETY_MS.
  *  If the pending message is still present (SSE missed the MessageReceived),
  *  force-refresh thread events and clear any stale pending messages.
@@ -269,21 +293,41 @@ export const STALE_EXCHANGE_FOLLOWUP_MS = 60_000;
  *  `coding-agent-follow-ups` "follow-up lost entirely under rapid send-while-
  *  working" flake: under load the MessageReceived SSE lags past 30s AND the
  *  safety refetch times out, so the unconditional clear destroyed a persisted
- *  follow-up. On a failed refetch we reschedule another attempt instead (the
- *  guard at the top exits once the pending is gone, so the retry is bounded by
- *  the pending's lifetime and self-clears when SSE catches up or any later
- *  refetch succeeds). */
-export function schedulePendingCleanup(threadId: string, eventId: string): void {
+ *  follow-up. On a refetch that never landed we reschedule instead, up to
+ *  `PENDING_CLEANUP_MAX_ATTEMPTS`, and then stop retrying while KEEPING the row:
+ *  exhausting the retries proves no more than one failure did. The guard at the
+ *  top also exits early once the pending is gone, so the retry usually ends the
+ *  moment SSE catches up. */
+export function schedulePendingCleanup(threadId: string, eventId: string, attempt = 1): void {
   setTimeout(async () => {
     const thread = threadMap.value.get(threadId);
     if (!thread || !thread.pendingUserMessages.some(p => p.eventId === eventId)) return;
-    let refetchOk = true;
-    await refreshThreadEvents(threadId).catch(() => { refetchOk = false; });
+    // `refreshThreadEvents` never rejects, so the `.catch` this used to gate on
+    // could never fire and the force-drop below ran on every outcome, including
+    // a refetch that got no answer. It reports whether a snapshot actually
+    // LANDED instead, which is the only thing that can prove the event absent.
+    const refetchOk = await refreshThreadEvents(threadId);
     if (refetchOk) {
       clearStalePendingMessages(threadId);
+    } else if (attempt < PENDING_CLEANUP_MAX_ATTEMPTS) {
+      // No answer, so nothing is proven. Don't drop a persisted message.
+      schedulePendingCleanup(threadId, eventId, attempt + 1);
     } else {
-      // Transient failure — don't drop a persisted message; try again later.
-      schedulePendingCleanup(threadId, eventId);
+      // Out of attempts. Stop POLLING, but keep the row: running out of tries
+      // proves nothing either, and the two failure modes are not comparable. A
+      // kept row is a visible, honest "this send was never confirmed" that
+      // `handleEvent` swaps for the real event the moment one arrives, and that
+      // a reload clears (it is in-memory only). Dropping it would silently
+      // delete a message the user sent and the engine persisted, which is the
+      // bug this whole gate exists for.
+      //
+      // Marked rather than merely kept, because a bare pending row makes
+      // `effectiveThreadStatus` report 'running'. Left counted, the thread would
+      // sit mid-turn for the life of the page: out of Review even once it
+      // proposes a change, inside `runningThreadCount`, and showing a Stop with
+      // nothing to stop.
+      markPendingUnconfirmed(threadId, eventId);
+      console.warn(`[Chat] pending message ${eventId} unconfirmed after ${attempt} refetches that never landed; keeping the row`);
     }
   }, PENDING_MESSAGE_SAFETY_MS);
 
@@ -294,7 +338,7 @@ export function schedulePendingCleanup(threadId: string, eventId: string): void 
     setTimeout(async () => {
       const thread = threadMap.value.get(threadId);
       if (!thread || thread.meta.status !== 'running') return;
-      await refreshThreadEvents(threadId).catch(() => {});
+      await refreshThreadEvents(threadId);
     }, STALE_EXCHANGE_FOLLOWUP_MS);
   }
 }
@@ -568,6 +612,11 @@ export async function sendMessage(
       const next = new Map(threadMap.value);
       next.delete(threadId);
       threadMap.value = next;
+      // One of the two paths that remove a row outright (the other is
+      // `rollbackOptimistic` in compose.ts), so it owes the thread-events
+      // failure maps the same cleanup: nothing will ever fetch this thread
+      // again to clear an entry keyed on it.
+      forgetThreadEventsFailures(threadId);
       removeThreadNavEntries(threadId);
       if (focusedThreadId.value === threadId) setFocusedThread(null);
     } else {
@@ -705,6 +754,6 @@ export async function handleCancelExchange(threadId: string): Promise<void> {
   if (outcome === 'noop') {
     // Stale view: re-read events + currentAggregate so the missed terminal
     // event lands and the thread stops looking mid-turn.
-    void refreshThreadEvents(threadId).catch(() => {});
+    void refreshThreadEvents(threadId);
   }
 }

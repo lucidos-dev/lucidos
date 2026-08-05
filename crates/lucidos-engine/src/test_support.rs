@@ -39,7 +39,7 @@ pub async fn setup_test_db() -> (PgPool, String) {
         .await
         .expect("create db");
     admin_pool.close().await;
-    let test_url = base_url.replace("/postgres", &format!("/{}", db_name));
+    let test_url = test_db_url(&db_name);
     let pool = PgPoolOptions::new()
         .max_connections(5)
         .connect(&test_url)
@@ -171,9 +171,21 @@ pub async fn seed_credential(
 /// `crate::engine::event_bus` to build a bus for the store's
 /// `CredentialDeleted` emit: `llm/*.rs` is forbidden from depending on
 /// `crate::engine` (see `llm::validate::tests::llm_does_not_depend_on_engine`).
+/// Still takes a NAME rather than the store's id, because that is what a
+/// fixture has in hand. It resolves the id first, so a caller does not have to
+/// thread one through just to clean up after itself.
 pub async fn delete_credential(pool: &PgPool, service_name: &str) {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
-    crate::core::CredentialStore::delete(pool, &bus, service_name, None)
+    let Some(id) = sqlx::query_scalar::<_, uuid::Uuid>(
+        "SELECT id FROM credentials WHERE service_name = $1 LIMIT 1",
+    )
+    .bind(service_name)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| panic!("look up credential {service_name}: {e}")) else {
+        return;
+    };
+    crate::core::CredentialStore::delete(pool, &bus, id, None)
         .await
         .unwrap_or_else(|e| panic!("delete credential {service_name}: {e}"));
 }

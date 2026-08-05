@@ -1,6 +1,7 @@
-import { useEffect, useCallback, useMemo } from 'preact/hooks';
-import type { DiffFile, RepoDiff } from '../../store/store';
-import { selectedLines, repoDiff, repoPending, filePreviewSource, diffWholeFileEffective, openImagePopup, repoSelectedChangeId } from '../../store/store';
+import { useEffect, useMemo } from 'preact/hooks';
+import type { DiffFile, RepoDiff, RepoLocator } from '../../store/store';
+import { repoDiff, repoPending, filePreviewSource, diffSideBySide, openImagePopup, repoSelectedChangeId } from '../../store/store';
+import { diffBodyKind } from '../../store/diffBody';
 import type { Loadable } from '../../store/types';
 import { getRepoFileContent, getChangeFileContent, repoFileUrl, changeFileUrl } from '../../api/client';
 import { loadChangeContextById } from '../../store/actions/repositories';
@@ -16,49 +17,42 @@ import { DiffView } from './DiffView';
 import { RenderedDiff } from './RenderedDiff';
 import { ChangesFileList } from './RepoFilesView';
 import { LoadableError } from '../shared/LoadableError';
+import { LineNumberedCode, fileRows } from './LineNumberedCode';
 import { bridgePreviewIframeShortcuts } from './previewIframeShortcuts';
 
 interface Props {
-  repoId: string;
-  mode: 'file' | 'diff';
-  path: string;
-  /** When the overlay was restored from nav history after a reload, repoDiff
-   *  is empty — this is the change to fetch to repopulate it. */
-  changeId?: string;
+  /** The parsed `repo:` locator the panel overlay holds. Its per-mode qualifier
+   *  is what the preview needs beyond the path: for a diff, the change to fetch
+   *  when the overlay was restored from nav history after a reload (repoDiff is
+   *  runtime-only, so it is empty then); for a file, the git revision to read it
+   *  at. */
+  locator: RepoLocator;
   /** Skip mounting in the inactive dual-rendered layout — otherwise both
    *  SplitLayout and MobileSwipeContainer copies fetch and decode the file. */
   layout: 'desktop' | 'mobile';
 }
 
-/** Decide whether to render a markdown diff via RenderedDiff (vs raw DiffView).
- *  RenderedDiff needs to fetch the post-change file body, which requires either
- *  a pending `Change` row (changeId → /api/v1/changes/:id/file — covers
- *  Lucidos-internal AND app coding-agent threads, both of which produce a
- *  Change) or a CC worktree branch on a registered repo (branchRef →
- *  /api/v1/repositories/:id/file?ref=). External-repo Claude Code sessions
- *  skip the Apply flow and only ever have the branchRef path. */
-export function shouldRenderMarkdownDiff(opts: {
-  ext: string;
-  fileStatus: DiffFile['status'];
-  activeChangeId: string | null;
-  branchRef: string | null;
-  filePreviewSourceOn: boolean;
-}): boolean {
-  if (opts.filePreviewSourceOn) return false;
-  if (opts.ext !== 'md') return false;
-  if (opts.fileStatus === 'deleted') return false;
-  return !!opts.activeChangeId || !!opts.branchRef;
-}
-
-/** Whether the diff preview should show the whole merged end-state file instead
- *  of the unified hunks. A deletion has no end state, so the whole-file view is
- *  suppressed for deleted files even when the toggle is on. */
-export function shouldShowWholeFile(opts: {
-  wholeFileOn: boolean;
-  fileStatus: DiffFile['status'];
-}): boolean {
-  if (!opts.wholeFileOn) return false;
-  return opts.fileStatus !== 'deleted';
+/** Which git revision a locator's file is read at.
+ *
+ *  The locator's own ref always wins: `repo:<id>:file#<ref>:<path>` is a caller
+ *  saying which revision it cited, and that caller (an app, an LLM
+ *  `navigate_ui`, an `<a href>` in a report) knows something the UI does not.
+ *
+ *  `surfaceDefault` is what to read when the locator names no ref, and it is
+ *  deliberately the SURFACE's business rather than this function's, because the
+ *  two surfaces have genuinely different answers:
+ *
+ *    - The Files panel is bound to one repository, so its default is that
+ *      repository's pending coding-agent branch: the revision the user is
+ *      already looking at.
+ *    - The preview modal may be showing a repository the panel is NOT bound to,
+ *      so the panel's branch would be the wrong repository's. Its default is
+ *      `null`, the clone's `HEAD`, which is what a bare `repo:` locator means.
+ *
+ *  A `diff` locator carries a change id rather than a ref, so it always takes
+ *  the surface default. */
+export function previewGitRef(locator: RepoLocator, surfaceDefault: string | null): string | null {
+  return (locator.mode === 'file' ? locator.ref : undefined) ?? surfaceDefault;
 }
 
 /** `hidden` covers both not-loaded and loaded-with-zero-files — the inner
@@ -108,7 +102,7 @@ export function RepoFilePreviewWithSidebar(props: Props) {
           </div>
         )}
         {sidebar.kind === 'files' && (
-          <ChangesFileList files={sidebar.files} activePath={props.path} />
+          <ChangesFileList files={sidebar.files} activePath={props.locator.path} />
         )}
       </aside>
       <div class="repo-preview-split-main">
@@ -118,9 +112,15 @@ export function RepoFilePreviewWithSidebar(props: Props) {
   );
 }
 
-function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
+function RepoFilePreview({ locator, layout }: Props) {
+  const { repoId, mode, path } = locator;
+  const changeId = locator.mode === 'diff' ? locator.changeId : undefined;
   const isActiveLayout = layout === (viewportIsMobile.value ? 'mobile' : 'desktop');
   const showDiffLoading = useDelayedLoading(repoDiff.value);
+  // Resolved once here and passed down rather than read inside the leaves: the
+  // same leaves render in the app-facing preview modal, whose surface default is
+  // not this one (see `previewGitRef`).
+  const gitRef = previewGitRef(locator, repoPending.value?.branch_name ?? null);
 
   // After a reload, the panel overlay re-hydrates from nav history but the
   // repoDiff/repoSelectedChangeId backing state does not. If the URL carries
@@ -143,34 +143,42 @@ function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
     const file = diff.data.files.find(f => f.path === path);
     if (!file) return <div class="empty-state">File not found in diff</div>;
 
-    const ext = path.split('.').pop()?.toLowerCase() || '';
     const activeChangeId = changeId ?? repoSelectedChangeId.value;
-    const branchRef = repoPending.value?.branch_name ?? null;
 
-    // Whole-file mode: show the file as it would be once merged (end state),
-    // rendered like the All Files view. A deletion has no end state. Added files
-    // default to this view (their diff is all additions); see diffWholeFileEffective.
-    const wholeFileOn = diffWholeFileEffective.value;
-    if (wholeFileOn) {
-      if (shouldShowWholeFile({ wholeFileOn, fileStatus: file.status })) {
-        return <RepoFileContent repoId={repoId} path={path} changeId={activeChangeId ?? undefined} />;
-      }
-      return <div class="empty-state">File is deleted in this change — no end state to show</div>;
+    // Which of the four bodies shows is derived in the store, because the
+    // header derives the same thing to decide which toggles to offer (see
+    // `diffBodyKind`). A `null` here means the diff is not loaded, which the
+    // guards above have already handled.
+    switch (diffBodyKind.value) {
+      // The file as it would be once merged (end state), rendered like the All
+      // Files view. Added files default to this (their diff is all additions);
+      // see diffWholeFileEffective.
+      case 'whole-file':
+        return <RepoFileContent repoId={repoId} path={path} changeId={activeChangeId ?? undefined} gitRef={gitRef} />;
+      case 'no-end-state':
+        return <div class="empty-state">File is deleted in this change, so there is no end state to show</div>;
+      case 'rendered-markdown':
+        return <RenderedDiff file={file} changeId={activeChangeId} repoId={repoId} gitRef={gitRef} />;
+      default:
+        // The one instance that measures: this is the diff the content-pane
+        // header's Side by side toggle acts on (see `measureFit`).
+        return <DiffView file={file} sideBySide={diffSideBySide.value} measureFit />;
     }
-
-    if (shouldRenderMarkdownDiff({
-      ext,
-      fileStatus: file.status,
-      activeChangeId,
-      branchRef,
-      filePreviewSourceOn: filePreviewSource.value,
-    })) {
-      return <RenderedDiff file={file} changeId={activeChangeId} repoId={repoId} gitRef={branchRef} />;
-    }
-    return <DiffView file={file} />;
   }
 
-  return <RepoFileContent repoId={repoId} path={path} />;
+  return <RepoFileContent repoId={repoId} path={path} gitRef={gitRef} />;
+}
+
+interface RepoFileContentProps {
+  repoId: string;
+  path: string;
+  changeId?: string;
+  /** Which revision of the file to read: a branch name, or `null` for the
+   *  clone's current `HEAD`. Always explicit, never read from the bound
+   *  repository's state, because this component also renders for a repository
+   *  the Files panel is not bound to (the app-facing file preview modal), where
+   *  the bound repository's branch would fetch the wrong revision or 404. */
+  gitRef: string | null;
 }
 
 /** Dispatches a repo file to the right preview. Binary-media files (images,
@@ -178,19 +186,23 @@ function RepoFilePreview({ repoId, mode, path, changeId, layout }: Props) {
  *  engine serves them with a content-type from the extension. Everything else
  *  (source, markdown, csv, svg, and any extensionless/unknown-but-textual file)
  *  goes through the text path, which fetches the body as a string. Fetching a
- *  PNG as text was the bug: it rendered the raw bytes line-numbered. */
-function RepoFileContent({ repoId, path, changeId }: { repoId: string; path: string; changeId?: string }) {
+ *  PNG as text was the bug: it rendered the raw bytes line-numbered.
+ *
+ *  Exported because the file preview modal renders the same content over an app
+ *  without navigating to the Files panel (see `FilePreviewModal`). It is the
+ *  content alone: the panel's chrome (the changed-files sidebar, the diff modes)
+ *  stays with `RepoFilePreviewWithSidebar`. */
+export function RepoFileContent({ repoId, path, changeId, gitRef }: RepoFileContentProps) {
   const ext = path.split('.').pop()?.toLowerCase() || '';
   if (previewMediaKind(ext) !== 'text') {
-    return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} ext={ext} />;
+    return <RepoFileMedia repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} ext={ext} />;
   }
-  return <RepoFileText repoId={repoId} path={path} changeId={changeId} />;
+  return <RepoFileText repoId={repoId} path={path} changeId={changeId} gitRef={gitRef} />;
 }
 
 /** Binary-media preview. Builds the file URL (same change-vs-branch ref logic as
  *  RepoFileText) and renders it without fetching the bytes as text. */
-function RepoFileMedia({ repoId, path, changeId, ext }: { repoId: string; path: string; changeId?: string; ext: string }) {
-  const gitRef = repoPending.value?.branch_name;
+function RepoFileMedia({ repoId, path, changeId, gitRef, ext }: RepoFileContentProps & { ext: string }) {
   const url = changeId ? changeFileUrl(changeId, path) : repoFileUrl(repoId, path, gitRef ?? undefined);
   const kind = previewMediaKind(ext);
 
@@ -202,8 +214,7 @@ function RepoFileMedia({ repoId, path, changeId, ext }: { repoId: string; path: 
   return <audio src={url} controls style="width:100%;" />;
 }
 
-function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string; changeId?: string }) {
-  const gitRef = repoPending.value?.branch_name;
+function RepoFileText({ repoId, path, changeId, gitRef }: RepoFileContentProps) {
   // With a Lucidos/app change row, fetch the end state via /changes/:id/file —
   // the correct ref for both pending (branch) and applied (post_merge_sha). Without
   // one (external-repo CC), fall back to the branch ref. Mirrors RenderedDiff.
@@ -213,17 +224,6 @@ function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string
       : getRepoFileContent(repoId, path, gitRef ?? undefined),
     [repoId, path, changeId, gitRef],
   );
-
-  const handleLineClick = useCallback((lineNum: number, shiftKey: boolean) => {
-    if (shiftKey && selectedLines.value) {
-      selectedLines.value = {
-        start: Math.min(selectedLines.value.start, lineNum),
-        end: Math.max(selectedLines.value.end, lineNum),
-      };
-    } else {
-      selectedLines.value = { start: lineNum, end: lineNum };
-    }
-  }, []);
 
   const ext = path.split('.').pop()?.toLowerCase() || '';
   const content = loadable.status === 'loaded' ? loadable.data : null;
@@ -245,8 +245,8 @@ function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string
     if (renderedHtml && ext === 'svg') return () => URL.revokeObjectURL(renderedHtml);
   }, [renderedHtml, ext]);
 
-  const highlightedLines = useMemo(
-    () => content ? (isCode ? highlightFileLines(content, ext) : content.split('\n').map(escapeHtml)) : [],
+  const rows = useMemo(
+    () => fileRows(content ? (isCode ? highlightFileLines(content, ext) : content.split('\n').map(escapeHtml)) : []),
     [content, ext, isCode],
   );
 
@@ -265,28 +265,9 @@ function RepoFileText({ repoId, path, changeId }: { repoId: string; path: string
     if (ext === 'svg') return <div class="repo-file-rendered repo-file-rendered-media"><img src={renderedHtml!} alt={path} style="max-width:100%;max-height:100%;object-fit:contain;" onClick={() => { if (isMobile()) openImagePopup(renderedHtml!); }} /></div>;
   }
 
-  const sel = selectedLines.value;
-
   return (
     <div class="repo-file-content">
-      <pre class="file-preview-code line-numbered">
-        {highlightedLines.map((html, i) => {
-          const num = i + 1;
-          const isSelected = sel !== null && num >= sel.start && num <= sel.end;
-
-          return (
-            <div key={num} class={`code-line ${isSelected ? 'line-selected' : ''}`}>
-              <span
-                class="line-number"
-                onClick={(e: MouseEvent) => handleLineClick(num, e.shiftKey)}
-              >
-                {num}
-              </span>
-              <span class="line-content" dangerouslySetInnerHTML={{ __html: html || ' ' }} />
-            </div>
-          );
-        })}
-      </pre>
+      <LineNumberedCode rows={rows} />
     </div>
   );
 }

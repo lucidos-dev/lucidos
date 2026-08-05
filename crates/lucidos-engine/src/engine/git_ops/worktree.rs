@@ -128,15 +128,6 @@ pub(crate) async fn resolve_main_worktree(path: &Path) -> PathBuf {
     }
 }
 
-/// Generate the app coding-agent thread branch name:
-/// `claude-code/app/<app_id>/<ts>-<uuid>`. Embeds the app id in the path so a
-/// `git branch -a` on the workspace git is greppable by app.
-pub(crate) fn generate_app_branch_name(app_id: &str) -> String {
-    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let suffix = &uuid::Uuid::new_v4().as_simple().to_string()[..6];
-    format!("claude-code/app/{}/{}-{}", app_id, ts, suffix)
-}
-
 /// Create a sparse-checkout worktree narrowed to `data/apps/<app_id>/`. The
 /// worktree is anchored at `workspace_root` (the workspace git, not Lucidos
 /// source). After this returns successfully, the worktree has only the app
@@ -146,8 +137,9 @@ pub(crate) fn generate_app_branch_name(app_id: &str) -> String {
 /// If `branch_name` already exists it is reused (checked out into the new
 /// worktree, preserving its commits); otherwise it is created off the
 /// default branch. Reuse is keyed purely on ref existence, not resume
-/// intent: callers pass either a freshly generated unique name
-/// (`generate_app_branch_name` — timestamp + random suffix) or a validated
+/// intent: callers pass either a freshly allocated name
+/// (`branch_name::allocate_coding_agent_branch`, unique against the repo's
+/// refs at allocation time) or a validated
 /// resume branch, so the fresh-branch-at-default-tip guarantee is
 /// caller-supplied naming discipline, and the second probe (the caller's
 /// `resolve_branch_for_resume` already checked once) makes the recreate
@@ -285,7 +277,7 @@ pub(crate) async fn worktree_add(
         .ok_or_else(|| format!("non-utf8 worktree path: {}", wt_path.display()))?;
     let mut args: Vec<&str> = vec!["worktree", "add", "--no-checkout"];
     // Engine-created isolation branches (`-b <name>`) must NOT set up upstream
-    // tracking. They're throwaway `claude-code/*` / app branches merged into
+    // tracking. They're throwaway `lucidos-*` coding-agent branches merged into
     // main locally and never pushed on their own, so tracking config is dead
     // weight — AND it is the ONLY thing `git worktree add` writes to the shared
     // `.git/config`. With `branch.autoSetupMerge` in play that write races on

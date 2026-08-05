@@ -381,6 +381,7 @@ impl EventStore {
                     OR ($1 = TRUE AND t.status = ANY($2)) \
                     OR ($1 = FALSE AND NOT (t.status = ANY($2)))) \
                AND ($3::text[] IS NULL OR t.source = ANY($3)) \
+               AND ($5::uuid IS NULL OR t.parent_thread_id = $5) \
              ORDER BY t.last_activity DESC LIMIT $4",
             THREAD_COLS.as_str(),
         );
@@ -389,6 +390,7 @@ impl EventStore {
             .bind(&active_statuses[..])
             .bind(filters.sources)
             .bind(filters.limit)
+            .bind(filters.parent)
             .fetch_all(&self.pool)
             .await?;
         Self::rows_to_thread_summaries(rows)
@@ -409,11 +411,13 @@ impl EventStore {
              WHERE ($1::bool IS NULL \
                     OR ($1 = TRUE AND t.status = ANY($2)) \
                     OR ($1 = FALSE AND NOT (t.status = ANY($2)))) \
-               AND ($3::text[] IS NULL OR t.source = ANY($3))",
+               AND ($3::text[] IS NULL OR t.source = ANY($3)) \
+               AND ($4::uuid IS NULL OR t.parent_thread_id = $4)",
         )
         .bind(filters.active)
         .bind(&active_statuses[..])
         .bind(filters.sources)
+        .bind(filters.parent)
         .fetch_one(&self.pool)
         .await?;
         Ok(count)

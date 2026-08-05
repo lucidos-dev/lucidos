@@ -98,6 +98,27 @@ export const filePreviewSource = signal(localStorage.getItem('lucidos-file-previ
  *  filePreviewEditing, NOT persisted across diffs or reloads. */
 export const diffWholeFile = signal<boolean | null>(null);
 
+/** When true, a diff's unified hunks render as two columns instead: the original
+ *  on the left, the changed file on the right, aligned row for row.
+ *
+ *  Persisted, unlike `diffWholeFile`: this is a way of READING diffs rather than
+ *  a per-file override, so it must not reset every time the previewed file
+ *  changes. Honoured only where there is room for two columns and only for the
+ *  raw hunks (see `fitsSideBySide` and `diffBodyKind`). */
+export const diffSideBySide = signal(localStorage.getItem('lucidos-diff-side-by-side') === 'true');
+
+/** Whether the diff on screen is wide enough for two columns, measured by
+ *  `DiffView` (see `fitsSideBySide`) and published here because the CONTENT
+ *  pane's header needs the same answer: it offers the Side by side toggle only
+ *  where the toggle would do something, and a control that is present but inert
+ *  on a phone or a collapsed pane is a lie about what the surface can do.
+ *
+ *  Written from the measuring component rather than derived, because only the
+ *  DOM knows: the content pane is resizable, so this is not a function of the
+ *  viewport. Defaults to true so the first paint does not flash the unified
+ *  view before the ResizeObserver has run. */
+export const diffFitsSideBySide = signal(true);
+
 /** When true, the data-file preview shows an editable textarea instead of the
  *  rendered/source view. Reset to false whenever the previewed file changes
  *  (see store/effects.ts) so a stale draft toggle never carries to a new file.
@@ -141,11 +162,18 @@ export function closeInlineForm(): void {
 }
 
 // --- Settings subview ---
-export type SettingsSubview = 'main' | 'links' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'repositories' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'mobile-access' | 'environment-variables' | 'network-access' | 'thread-queue' | 'debugging' | 'experimental';
+export type SettingsSubview = 'main' | 'system' | 'models' | 'appearance' | 'memory' | 'devices' | 'accounts' | 'backup' | 'coding-agents' | 'locale' | 'marketplaces' | 'disk-usage' | 'permissions' | 'keyboard-shortcuts' | 'access' | 'environment-variables' | 'thread-queue' | 'debugging';
 export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
   label: string;
+}
+/** Home-list grouping for the top-level Settings rows. Presentational only: a
+ *  group is a heading above its rows, NOT a navigation level, so every category
+ *  is still one tap from the Settings home. */
+export type SettingsNavGroup = 'Assistant' | 'Workspace' | 'This device';
+export interface SettingsHomeNavItem extends SettingsNavItem {
+  group: SettingsNavGroup;
 }
 export const settingsSubview = signal<SettingsSubview>('main');
 /** Anchor to scroll/highlight after navigating from Search Everywhere. SettingsView clears it after applying. */
@@ -157,40 +185,109 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
   { key: 'memory', label: 'Memory' },
   { key: 'disk-usage', label: 'Disk Usage' },
   { key: 'environment-variables', label: 'Environment Variables' },
-  { key: 'network-access', label: 'Network access' },
   { key: 'debugging', label: 'Debugging' },
 ];
 
-export const SETTINGS_NAV_ITEMS: SettingsNavItem[] = [
-  { key: 'models', label: 'Models' },
-  { key: 'appearance', label: 'Appearance' },
-  // How Lucidos handles links: where an external one opens, and (in future)
-  // anything else about link routing. A NAMED category rather than a generic
-  // General/Advanced bucket, which the settings-IA guidance warns becomes a
-  // junk drawer. Its rows are platform-conditional today, so the entry itself
-  // is gated on having one to show. See the filter in SettingsView.
-  { key: 'links', label: 'Links' },
-  { key: 'devices', label: 'Devices' },
-  { key: 'accounts', label: 'Accounts' },
-  { key: 'repositories', label: 'Repositories' },
-  { key: 'marketplaces', label: 'Marketplaces' },
-  // Listed on EVERY platform, deliberately: this page exists to get Lucidos
-  // onto another device, so the device it is written for must be able to reach
-  // it. Only the native-only controls inside it are gated (isTauri() &&
-  // enginePackaged, in the page itself); everything the page REPORTS works over
-  // plain HTTP. This comment claimed the opposite until 2026-08-04, and the page
-  // was written as though the claim were true.
-  { key: 'mobile-access', label: 'Mobile Access' },
-  { key: 'permissions', label: 'Permissions' },
-  { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts' },
-  // Desktop only — gated to isTauri() in SettingsView (the experimental toggles
-  // here, e.g. the in-app browser, are only meaningful under Tauri).
-  { key: 'experimental', label: 'Experimental' },
-  { key: 'system', label: 'System' },
+// The top-level Settings categories, in home-list order. Two rules hold this
+// list together, both learned the hard way (see
+// docs/plans/2026-08-05-settings-information-architecture.md):
+//
+//  1. NO ENTRY IS PLATFORM-GATED. Every row here renders on every platform, so
+//     the nav has one shape everywhere and "go to Settings → X" is true for
+//     everyone. Platform gating belongs to a ROW or SECTION inside a category
+//     (the iOS external-link target and the Tauri in-app browser toggle both
+//     live inside Appearance & Behavior → Links that way). Gating a whole
+//     CATEGORY is what
+//     once hid the external-link setting from installed iOS PWAs, the only
+//     platform it applies to: the row's own predicate was right and the
+//     Experimental nav entry it sat behind was isTauri()-only. Pinned by
+//     components/settings/__tests__/settings-nav-structure.test.ts.
+//  2. A ROW IS A CATEGORY, NOT A SETTING. `Links` and `Experimental` were once
+//     top-level rows holding one control each, peers of System's twelve
+//     sections. A single control belongs in a section of a bigger category.
+//
+// Groups are contiguous and rendered as headings; they add no tap depth.
+export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
+  { key: 'models', label: 'Models', group: 'Assistant' },
+  { key: 'permissions', label: 'Permissions', group: 'Assistant' },
+  // Binary paths + registered repositories: everything a coding-agent thread
+  // needs configured, in one place. Both halves used to live apart (paths under
+  // System → Overview, repositories as their own top-level row).
+  { key: 'coding-agents', label: 'Coding Agents', group: 'Assistant' },
+  { key: 'accounts', label: 'Accounts', group: 'Workspace' },
+  // Language + timezone: workspace-wide user preferences, and among the most
+  // looked-for settings there are. Previously buried under System → Overview.
+  { key: 'locale', label: 'Locale', group: 'Workspace' },
+  { key: 'marketplaces', label: 'Marketplaces', group: 'Workspace' },
+  // Reaching this engine from elsewhere: the mobile-access guide plus the
+  // engine's network bind, which used to be a System subpanel that the guide
+  // had to deep-link into.
+  { key: 'access', label: 'Access', group: 'Workspace' },
+  { key: 'devices', label: 'Devices', group: 'Workspace' },
+  { key: 'system', label: 'System', group: 'Workspace' },
+  // Widened, not renamed. Link routing moved in, and where a link opens is
+  // behaviour rather than display, so the label says both (the shape JetBrains
+  // uses for the same widened scope). The KEY stays the head noun, matching the
+  // repo's own ampersand precedent: "Chat & triggers" is anchored `models:chat`.
+  // Keeping `appearance` also keeps every persisted search recent, the LLM's
+  // `settings_view` value and the SDK type stable across this restructure.
+  { key: 'appearance', label: 'Appearance & Behavior', group: 'This device' },
+  { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', group: 'This device' },
 ];
 
 export function settingsSubviewLabel(key: Exclude<SettingsSubview, 'main'>): string | undefined {
   return [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].find(item => item.key === key)?.label;
+}
+
+/** Where a subview key retired by the 2026-08-05 restructure now lives. The
+ *  content did not disappear, it moved, so each maps to the category that
+ *  absorbed it rather than to `main`.
+ *
+ *  A `Map`, not an object literal, because the lookup key is UNTRUSTED (it comes
+ *  from persisted JSON). An object literal inherits `Object.prototype`, so
+ *  `obj['constructor']` returns a truthy function and the migration would hand
+ *  that back as a subview, landing on the blank panel it exists to prevent. */
+const RETIRED_SETTINGS_SUBVIEWS = new Map<string, SettingsSubview>([
+  // Both were one-control categories folded into Appearance & Behavior's Links
+  // section. (`appearance` itself is NOT retired: it kept its key.)
+  ['links', 'appearance'],
+  ['experimental', 'appearance'],
+  ['repositories', 'coding-agents'],
+  ['mobile-access', 'access'],
+  ['network-access', 'access'],
+]);
+
+/** Resolve a subview name that came from OUTSIDE this build into a renderable
+ *  one: the persisted nav stack (`lucidos-nav-state`, restored across upgrades),
+ *  or any other untrusted source.
+ *
+ *  The nav stack survives the upgrade that renames a subview, and
+ *  `SettingsView.renderSubview` falls through to `null` for a key it no longer
+ *  knows, so restoring the raw string lands the user on a BLANK Settings panel
+ *  with no error. Retired keys map to the category that absorbed them;
+ *  everything unrecognised falls back to the Settings home list, which is always
+ *  renderable. */
+export function migrateSettingsSubview(raw: unknown): SettingsSubview {
+  if (typeof raw !== 'string') return 'main';
+  if (raw === 'main') return 'main';
+  const moved = aliasRetiredSettingsSubview(raw);
+  const live = [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].some(i => i.key === moved);
+  return live ? (moved as SettingsSubview) : 'main';
+}
+
+/** Map a retired subview key onto the category that absorbed it, leaving
+ *  anything else untouched.
+ *
+ *  Split out from `migrateSettingsSubview` because the two callers want
+ *  different treatment of an UNKNOWN key. Restoring the nav stack wants it
+ *  collapsed onto `main` (there is no user to tell, and a blank panel is the
+ *  alternative). A `NavigationRequested` from outside this build (a stored
+ *  notification's deep link, an app built against an older SDK
+ *  `SettingsViewTarget`, an LLM `navigate_ui` call) wants the alias applied but
+ *  a genuinely unknown value REPORTED, since the caller can be told and a typo
+ *  should not silently land on the Settings home. */
+export function aliasRetiredSettingsSubview(raw: string): string {
+  return RETIRED_SETTINGS_SUBVIEWS.get(raw) ?? raw;
 }
 
 // --- Active menu item ---
@@ -265,7 +362,7 @@ export const appUpdateCommitted = computed(() => {
 export const databaseReachable = signal(true);
 /** True when the connected engine is a packaged desktop build. Routes the
  *  "Restart" control (LaunchAgent kickstart vs. dev rebuild script) and gates
- *  the Tauri-only Mobile Access settings page. Set from /health. */
+ *  the Tauri-only half of the Settings Access page. Set from /health. */
 export const enginePackaged = signal<boolean>(false);
 
 /** False when the connected engine booted with no LLM provider configured (the
@@ -402,7 +499,15 @@ function restoreThreadChannelFilter(): Set<ThreadChannel> {
     if (Array.isArray(parsed)) {
       return new Set(parsed.filter(s => ALL_CHANNELS.includes(s)));
     }
-  } catch { /* ignore */ }
+  } catch (err) {
+    // Startup probe the user did not initiate, at module-load time where no
+    // toast or Loadable surface exists yet. Self-recovery: falling back to "all
+    // channels" shows MORE threads, never fewer, and the next filter click
+    // overwrites the bad payload via `toggleChannel`. Logged rather than
+    // swallowed so a corrupt filter is diagnosable instead of reading as the
+    // user having reset it. Mirrors `restoreInputMode` below.
+    console.warn('[store] dropping malformed thread channel filter payload', err);
+  }
   return new Set(ALL_CHANNELS);
 }
 
@@ -550,8 +655,12 @@ export function effectiveThreadStatus(thread: ThreadState): ThreadStatus {
   // stays Idle/Waiting) or wakes CC for harden / merge-conflict resolution
   // (CC's own activity events will transition status to Running). The
   // disabled "Apply..." button in WaitingBanner is the visual feedback.
-  // Pending user messages = request sent, thread is running before SSE event arrives
-  if (thread.pendingUserMessages.length > 0) return 'running';
+  // Pending user messages = request sent, thread is running before SSE event
+  // arrives. An `unconfirmed` row is excluded: the safety refetch has given up
+  // on it, so it is kept only to keep the text visible and there is no turn in
+  // flight behind it. Counting it would pin the thread on 'running' for the
+  // life of the page, keeping it out of Review and showing a Stop it cannot use.
+  if (thread.pendingUserMessages.some(p => !p.unconfirmed)) return 'running';
   return thread.meta.status;
 }
 
@@ -641,6 +750,12 @@ export function threadNeedsAttention(thread: ThreadState): boolean {
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
   const status = effectiveThreadStatus(thread);
+  // `paused` is deliberately absent. An engine restart interrupted that turn,
+  // and the engine either resumes it by itself (a Switch to new version, within
+  // seconds) or hands the Continue button back via the boot floor sweep. Neither
+  // is "nothing progresses until you act", and counting it here would flash the
+  // badge on every version switch. It still floats to the top of Current with
+  // its own dot via `reviewTier`.
   return status === 'waiting_for_user_answer' || status === 'failed';
 }
 
@@ -978,6 +1093,49 @@ export const repoDiff = signal<Loadable<RepoDiff>>({ status: 'not-loaded' });
 export const repoPending = signal<RepoPendingInfo | null>(null);
 export const repoViewMode = signal<'all' | 'changes'>('all');
 export const selectedLines = signal<{ start: number; end: number } | null>(null);
+
+/** A one-shot "scroll this line into view" request, consumed and cleared by
+ *  whichever file preview renders next (see `consumeLineScrollTarget`). Written
+ *  only by the navigate-to-a-line path; a manual line click never sets it.
+ *
+ *  Deliberately NOT derived from `selectedLines`. An effect keyed on the
+ *  selection would re-scroll on every unrelated re-render that keeps the
+ *  selection alive (an `artifactRevision` bump, a `repoPending` refetch),
+ *  yanking a user who had scrolled away, and it would fight a shift-click that
+ *  extends a selection upward. Mirrors `pluginScrollTarget`. */
+export const lineScrollTarget = signal<number | null>(null);
+
+/** Take the pending scroll target, clearing it so the same navigate can't
+ *  scroll twice. Returns null when nothing is pending. */
+export function consumeLineScrollTarget(): number | null {
+  const target = lineScrollTarget.value;
+  if (target !== null) lineScrollTarget.value = null;
+  return target;
+}
+
+/** Turn a navigate's `line` / `line_end` pair into a selectable range, or null
+ *  when there is nothing usable to select.
+ *
+ *  These arrive from outside the app (an app iframe's `lucidos.ui.navigate`, an
+ *  LLM `navigate_ui`, an `<a href>` inside a previewed artifact), so anything
+ *  that isn't a positive whole number is rejected rather than trusted: a
+ *  fractional or negative line would index a row that doesn't exist and a
+ *  non-number would render as `NaN` in the highlight comparison. An inverted
+ *  range is swapped rather than dropped, since the author's intent is
+ *  unambiguous. Whether the range fits INSIDE the file is not checked here: the
+ *  line count isn't known until the content loads, and a range past the end
+ *  simply highlights nothing (the file still opens, which is the point). */
+export function normalizeLineRange(
+  line: unknown,
+  lineEnd?: unknown,
+): { start: number; end: number } | null {
+  const isLine = (v: unknown): v is number =>
+    typeof v === 'number' && Number.isInteger(v) && v >= 1;
+  if (!isLine(line)) return null;
+  if (!isLine(lineEnd)) return { start: line, end: line };
+  return lineEnd < line ? { start: lineEnd, end: line } : { start: line, end: lineEnd };
+}
+
 export const SELECTED_CHANGE_KEY = 'lucidos-repo-selected-change-id';
 // Hydrated from localStorage so the persistence effect's first synchronous
 // fire doesn't wipe a saved ID before useStartup can call restore on it.
@@ -993,44 +1151,80 @@ export const selectedChange = computed(() => {
     ?? changes.data.applied.find(c => c.id === id);
 });
 
-/** Encode a repo file path for the panel overlay. The changeId is embedded
- *  in the mode segment for diff mode (`diff#<changeId>`) so it survives nav
- *  history persistence — without it, reloading on a diff view hits a spinner
- *  forever because repoDiff is runtime-only state. */
-export function encodeRepoPath(repoId: string, mode: 'file' | 'diff', path: string, changeId?: string): string {
-  const modeSeg = mode === 'diff' && changeId ? `diff#${changeId}` : mode;
-  return `repo:${repoId}:${modeSeg}:${path}`;
+/** A file in a registered repository clone, named by an encoded `repo:` string.
+ *
+ *  The mode segment carries the qualifier both modes need, and they are
+ *  different qualifiers, which is why this is a union rather than one shape with
+ *  two optional fields: a `file` names a git revision, a `diff` names the Change
+ *  whose hunks to show. Neither is meaningful in the other's mode. */
+export type RepoLocator =
+  | {
+      repoId: string;
+      mode: 'file';
+      /** The git revision to read the file at (a branch, tag or sha), or
+       *  undefined for the clone's current `HEAD`. */
+      ref?: string;
+      path: string;
+    }
+  | { repoId: string; mode: 'diff'; changeId?: string; path: string };
+
+/** Encode a repo file locator for the panel overlay.
+ *
+ *  The qualifier is embedded in the mode segment (`file#<ref>`,
+ *  `diff#<changeId>`) rather than added as a fourth colon-separated field, so it
+ *  survives nav history persistence AND stays unambiguous: a git ref cannot
+ *  contain a colon (`git check-ref-format`), and a path can, so the existing
+ *  "everything after the third colon is the path" rule still holds. Without the
+ *  embedded changeId, reloading on a diff view hits a spinner forever because
+ *  repoDiff is runtime-only state.
+ *
+ *  Takes the parsed shape so this is the exact inverse of `parseRepoPath`:
+ *  `encodeRepoPath(parseRepoPath(s)) === s` for every locator `s` that parses. */
+export function encodeRepoPath(locator: RepoLocator): string {
+  const qualifier = locator.mode === 'file' ? locator.ref : locator.changeId;
+  const modeSeg = qualifier ? `${locator.mode}#${qualifier}` : locator.mode;
+  return `repo:${locator.repoId}:${modeSeg}:${locator.path}`;
 }
 
 /** Decode a repo file path from the panel overlay. Returns null if not a repo path.
- *  Accepts both new (`diff#<changeId>`) and legacy (`diff`) encodings — legacy
- *  entries from older nav histories degrade to changeId-less but still parse.
+ *
+ *  Four forms, all of them live:
+ *
+ *    repo:<repoId>:file:<path>              the clone's current HEAD
+ *    repo:<repoId>:file#<ref>:<path>        that branch, tag or sha
+ *    repo:<repoId>:diff#<changeId>:<path>   a Change's diff
+ *    repo:<repoId>:diff:<path>              legacy, from nav histories persisted
+ *                                           before the changeId was embedded;
+ *                                           degrades to changeId-less but parses
  *
  *  Every segment must be non-empty: this is the single predicate that decides
  *  "is this a repo path" for `normalizeDataPath`, `ContentPane`'s routing, and
  *  `openEncodedRepoFilePreview`, and `file_path` reaches it from outside the app
- *  (an app iframe's `lucidos.ui.navigate`, an LLM `navigate_ui`). A structurally
- *  incomplete encoding like `repo::file:x` or `repo:r1:file:` would otherwise
- *  parse into an empty repoId (an "is a repo selected?" state that is neither
- *  null nor a real id) or an empty path, and open a preview that can only 404 —
- *  instead of falling back to the data-path preview. */
-export function parseRepoPath(encoded: string): { repoId: string; mode: 'file' | 'diff'; changeId?: string; path: string } | null {
+ *  (an app iframe's `lucidos.ui.navigate` / `previewFile`, an LLM `navigate_ui`,
+ *  an `<a href="repo:…">` inside a previewed artifact). A structurally
+ *  incomplete encoding like `repo::file:x`, `repo:r1:file:` or `repo:r1:file#:x`
+ *  would otherwise parse into an empty repoId (an "is a repo selected?" state
+ *  that is neither null nor a real id), an empty path, or an empty ref, and open
+ *  a preview that can only 404, instead of falling back to the data-path preview.
+ *
+ *  The qualifier is sliced at the FIRST `#`, so a ref that itself contains one
+ *  (`#` is legal in a ref name, unlike `:`) survives intact. This is also what
+ *  keeps a GitHub-style `#L510` line suffix on an href working: that suffix is
+ *  stripped by `parseRepoFileHref` before the locator ever reaches here. */
+export function parseRepoPath(encoded: string): RepoLocator | null {
   if (!encoded.startsWith('repo:')) return null;
   const [, repoId, modeSeg, ...rest] = encoded.split(':');
   const path = rest.join(':');
-  if (!repoId || !path) return null;
-  if (modeSeg === 'file') {
-    return { repoId, mode: 'file', path };
-  }
-  if (modeSeg === 'diff') {
-    return { repoId, mode: 'diff', path };
-  }
-  const DIFF_PREFIX = 'diff#';
-  if (modeSeg?.startsWith(DIFF_PREFIX)) {
-    const changeId = modeSeg.slice(DIFF_PREFIX.length);
-    if (!changeId) return null;
-    return { repoId, mode: 'diff', changeId, path };
-  }
+  if (!repoId || !path || !modeSeg) return null;
+
+  const hash = modeSeg.indexOf('#');
+  const mode = hash === -1 ? modeSeg : modeSeg.slice(0, hash);
+  const qualifier = hash === -1 ? undefined : modeSeg.slice(hash + 1);
+  // Present but empty (`file#:x`, `diff#:x`) is malformed, not "unqualified".
+  if (qualifier === '') return null;
+
+  if (mode === 'file') return { repoId, mode, ref: qualifier, path };
+  if (mode === 'diff') return { repoId, mode, changeId: qualifier, path };
   return null;
 }
 
@@ -1405,6 +1599,28 @@ export const promptState = signal<PromptState>({
   message: '',
 });
 
+// --- File preview modal ---
+/** A file an app asked the host to show over it, without navigating the shell
+ *  away (`lucidos.ui.previewFile`). Read-only, and deliberately NOT a
+ *  `panelOverlay` variant: `panelOverlay` is the content pane's nav-history
+ *  unit, and a glance at a cited file is not a destination the Back button
+ *  should walk onto. Opened and closed through `store/actions/filePreviewModal`,
+ *  which owns the view-state borrowing that makes the shared preview components
+ *  render it. */
+export interface FilePreviewModalState {
+  /** Bumped per open, so a second `previewFile` that replaces a showing modal
+   *  re-runs the component's per-open effects instead of looking unchanged. */
+  id: number;
+  /** The resolved locator: a workspace data path, or a `repo:` encoded path.
+   *  Parsed by the renderer with `parseRepoPath`, exactly as `ContentPane` parses
+   *  the panel's own file-preview path. */
+  path: string;
+  /** The line range the modal opened at, or null when the citation named none.
+   *  Kept so the escalation into the Files panel carries the same lines. */
+  range: { start: number; end: number } | null;
+}
+export const filePreviewModal = signal<FilePreviewModalState | null>(null);
+
 // --- Toasts ---
 let toastIdCounter = 0;
 export const toasts = signal<ToastItem[]>([]);
@@ -1689,6 +1905,46 @@ export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
 // sustained outage replaces one toast instead of stacking a new one on every
 // 3s SSE reconnect.
 export const THREAD_LIST_REFRESH_TOAST_KEY = 'thread-list-refresh-failed';
+
+// Toast keys for the two per-thread event fetches (thread-loading.ts). The LOAD
+// one is still fanned out, one full snapshot per eagerly-loaded thread on boot
+// and per failed thread on the recovery path, so an unkeyed card meant one
+// permanent, undismissable toast PER THREAD for a single outage: dozens at once
+// on an iOS PWA. Keyed, the whole fan-out collapses into one card whose copy
+// counts the affected threads, and a landed fetch retracts it. The REFRESH one
+// no longer fans out at all (a sync point marks instead, see "stale thread
+// events"), but it keeps its key for the same reason: several threads can still
+// be failing at once as the user moves between them. Two keys, not one: a LOAD
+// failure means this device never got the thread's history, a REFRESH failure
+// means it did not get the newest events, and neither card may retract the other
+// while its own claim is still true.
+export const THREAD_EVENTS_LOAD_TOAST_KEY = 'thread-events-load-failed';
+export const THREAD_EVENTS_REFRESH_TOAST_KEY = 'thread-events-refresh-failed';
+
+/** How many per-thread event fetches one fan-out may have in flight at once.
+ *  Named for the FETCH rather than the load because both remaining fan-outs are
+ *  full snapshot loads: the eager boot loads in `loadAllThreads`, and the
+ *  failed-load retry in `runResumeSync`. The wake refresh and the SSE-reconnect
+ *  resync used to be here too; they now refresh only the focused thread and mark
+ *  the rest (see `markLoadedThreadsStale` in `store/actions/thread-loading.ts`).
+ *
+ *  Over HTTP/2 the browser applies no per-host connection cap, so an unbounded
+ *  fan-out over a large workspace put ~85 requests a minute onto one connection,
+ *  all racing the same 10s client deadline down a tunnel a wake had only just
+ *  started re-establishing. The engine answers each in single-digit
+ *  milliseconds, so the burst itself was what spent those deadlines. Four keeps
+ *  the link saturated without the herd.
+ *
+ *  Deliberately PER FAN-OUT, not a global semaphore. A recovery wake can run both
+ *  of the remaining ones concurrently (the failed-load retry, and `loadAllThreads`'
+ *  own eager loads), so the real ceiling there is eight. A global cap would buy
+ *  little and cost the property that matters most on a wake: the focused thread's
+ *  fetch would have to queue behind unrelated background work.
+ *
+ *  Lives here rather than in `thread-loading.ts` for the same reason the toast
+ *  keys above do: its other consumer is an action module that would otherwise
+ *  import it across a mocked boundary. */
+export const THREAD_EVENTS_FETCH_CONCURRENCY = 4;
 
 // Toast key for the "frontend change applied — takes effect on Switch" hint,
 // shown when the engine emits FrontendUpdateDeferred (a frontend-only Apply

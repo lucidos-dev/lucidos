@@ -21,9 +21,10 @@ use std::path::PathBuf;
 /// `sitecustomize`. (Verified against Homebrew Python 3.14.)
 ///
 /// What it does: monkey-patches `http.client.HTTPConnection.request` to
-/// attach the engine's agent-origin token (`x-lucidos-agent-origin-token`)
-/// plus the spawning thread id (`x-lucidos-source-thread-id`) on outbound
-/// HTTPS/HTTP requests that target `localhost:LUCIDOS_API_PORT`. Since
+/// attach the engine's thread-bound origin token
+/// (`x-lucidos-agent-origin-token`) on outbound HTTPS/HTTP requests that
+/// target `localhost:LUCIDOS_API_PORT`. That one header carries both facts
+/// the engine needs, because the token names the spawning thread. Since
 /// `urllib`, `requests`, and `urllib3` all route through `http.client`
 /// underneath, a single patch covers every common HTTP client library.
 ///
@@ -42,8 +43,10 @@ const AGENT_ORIGIN_SHIM_PY: &str = r#"# Lucidos venv bootstrap — auto-attribut
 # Python shadows with its own. Patches http.client so that any
 # urllib / requests / urllib3 / http.client call from a Lucidos-spawned
 # subprocess (run_python, run_python_background, scheduled script, ...) to
-# the engine's API port automatically carries the agent-origin token and
-# spawning thread id. Without this, raw urllib.request.urlopen("https://
+# the engine's API port automatically carries the thread-bound agent-origin
+# token. That one token is the whole contract: the engine reads the spawning
+# thread off the token itself, so nothing here has to name it. Without the
+# shim, raw urllib.request.urlopen("https://
 # localhost:PORT/api/v1/changes/<id>/apply") lands as Api{Human} in the
 # events table and the timeline renders the action as "You" instead of
 # "Lucidos Agent".
@@ -55,14 +58,12 @@ const AGENT_ORIGIN_SHIM_PY: &str = r#"# Lucidos venv bootstrap — auto-attribut
 import os as _os
 
 _TOKEN = _os.environ.get("LUCIDOS_AGENT_ORIGIN_TOKEN")
-_THREAD = _os.environ.get("LUCIDOS_THREAD_ID")
 _PORT = _os.environ.get("LUCIDOS_API_PORT")
 
 if _TOKEN and _PORT:
     import http.client as _http_client
 
     _HEADER_TOKEN = "x-lucidos-agent-origin-token"
-    _HEADER_THREAD = "x-lucidos-source-thread-id"
     _LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1", "[::1]"}
     _orig_request = _http_client.HTTPConnection.request
 
@@ -94,8 +95,6 @@ if _TOKEN and _PORT:
             present = {k.lower() for k in headers}
             if _HEADER_TOKEN not in present:
                 headers[_HEADER_TOKEN] = _TOKEN
-            if _THREAD and _HEADER_THREAD not in present:
-                headers[_HEADER_THREAD] = _THREAD
         return _orig_request(self, method, url, body, headers, *args, **kwargs)
 
     _http_client.HTTPConnection.request = _request_with_token
@@ -404,6 +403,13 @@ impl PythonRuntime {
     /// outside `data/` go straight to the host. The staging redirect is what gives
     /// `run_python` its atomic-commit semantics — apps see old `data/` files until the
     /// script finishes and the engine commits the staged tree.
+    ///
+    /// The `_data_dir` prefix carries a trailing separator on purpose. Without it a
+    /// bare `startswith` also matched every SIBLING whose name merely starts with
+    /// `data` (`database.json`, `datasets/`, `data_backup/`): those writes were
+    /// diverted into staging, and since the committer only copies `<staging>/data`
+    /// before deleting the whole staging tree, they were silently discarded while the
+    /// tool still reported success.
     fn staging_preamble(&self, staging_dir: &std::path::Path) -> String {
         let workspace = self.workspace_str_escaped();
         let staging = staging_dir
@@ -416,7 +422,7 @@ impl PythonRuntime {
             "import builtins as _builtins, os as _os\n\
              _workspace = _os.path.realpath('{workspace}')\n\
              _staging = _os.path.realpath('{staging}')\n\
-             _data_dir = _os.path.join(_workspace, 'data')\n\
+             _data_dir = _os.path.join(_workspace, 'data') + _os.sep\n\
              def _staged_open(file, mode='r', *args, _orig=_builtins.open, **kwargs):\n\
              \x20   if not isinstance(file, (str, bytes, _os.PathLike)):\n\
              \x20       return _orig(file, mode, *args, **kwargs)\n\

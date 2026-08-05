@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use crate::engine::git_ops::{git_cmd, worktree_current_branch};
+use crate::engine::git_ops::{git_answer, git_cmd, worktree_current_branch};
 
 /// Result of [`verify_branch`] when the worktree's checked-out branch
 /// doesn't match the engine's expected branch.
@@ -251,13 +251,19 @@ pub(crate) async fn is_ancestor(
     ancestor_sha: &str,
     descendant_ref: &str,
 ) -> bool {
-    git_cmd(
+    // `or_unknown(false)`: a probe that could not run must never claim
+    // ancestry. The only caller (`try_adopt_renegade_branch`) reads a `false`
+    // as "unsafe to adopt" and lets the spawn refuse loudly on the branch
+    // mismatch, whereas an unverified `true` would silently retarget the
+    // thread onto a branch that may not contain its work. The rule is in
+    // `.claude/rules/rust.md`: an unanswered probe is UNKNOWN, never a "no",
+    // and never the answer that authorizes losing work.
+    git_answer(
         &["merge-base", "--is-ancestor", ancestor_sha, descendant_ref],
         worktree_path,
     )
     .await
-    .map(|o| o.status.success())
-    .unwrap_or(false)
+    .or_unknown(false)
 }
 
 /// Decide whether the worktree's current branch can be safely adopted as

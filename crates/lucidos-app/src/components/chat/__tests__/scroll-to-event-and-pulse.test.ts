@@ -1,6 +1,6 @@
-import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, scrolledUp, isHeaderPinnedForScroll, setActiveScrollElement } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, scrolledUp, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement } from '../scrollState';
 import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS } from '../../shared/focusMarker';
 
 /** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
@@ -344,12 +344,8 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
     expect(hasPendingEventScroll()).toBe(false);
   });
 
-  it('clears the pending flag when the deadline passes without the event, and does NOT yank the scroll', () => {
+  it('clears the pending flag when the deadline passes without the event', () => {
     restore = installFakeDom({}); // target never appears
-    // Simulate the user (or onResize during load) having parked off-bottom
-    // while the deep-link waited. The deadline must release the claim WITHOUT
-    // forcing a scroll-to-bottom that would yank the user away.
-    scrolledUp.value = true;
 
     scrollToEventAndPulse('e-7');
     expect(hasPendingEventScroll()).toBe(true);
@@ -357,7 +353,169 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
     vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
 
     expect(hasPendingEventScroll()).toBe(false);
-    expect(scrolledUp.value).toBe(true); // untouched — no scroll-to-bottom yank
+  });
+});
+
+describe('deep-link deadline: recovery when the target never renders', () => {
+  // The deadline used to expire in silence: claim released, nothing scrolled,
+  // nothing said. A notification tap that hit an event this thread doesn't show
+  // therefore looked simply broken. Now the deadline lands the user on the
+  // thread's most recent turn and reports the dead link through the caller's
+  // `onUnresolved` (the words live in `store/actions/threads.ts`, which owns the
+  // toast; scrollState stays free of the `store` import).
+  //
+  // The guarantee the silent give-up was protecting survives, sharpened: the
+  // recovery SCROLL stands down for a user who took over during the wait, so
+  // nobody reading history gets yanked 4s later. The report fires either way,
+  // being the only remaining signal that the link failed.
+  let restore: (() => void) | null = null;
+  let container: any;
+  let onUnresolved: Mock<() => void>;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    container = makeContainer();
+    setActiveScrollElement(container);
+    onUnresolved = vi.fn<() => void>();
+  });
+  afterEach(() => {
+    clearNavFocus();
+    vi.clearAllTimers();
+    vi.useRealTimers();
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  /** The bottom of the fake container: `scrollToBottom` writes scrollHeight, so
+   *  this value is the assertion for "landed on the most recent turn". */
+  const BOTTOM = 10000;
+
+  function makeVisibleEl(absTop = 3000) {
+    return {
+      parentElement: null,
+      getBoundingClientRect: () => ({ width: 200, height: 200, top: absTop - container.scrollTop, bottom: absTop - container.scrollTop + 200, left: 0, right: 200 }),
+      classList: { add: () => {}, remove: () => {} },
+      querySelector: () => null,
+    } as any;
+  }
+
+  function fireMutation() {
+    const node = { nodeType: 1, matches: () => true, querySelector: () => null } as any;
+    lastMoCallback?.([{ addedNodes: [node], type: 'childList' } as unknown as MutationRecord], {} as MutationObserver);
+  }
+
+  it('lands on the most recent turn and reports the failure when the user stayed put', () => {
+    restore = installFakeDom({}); // target never appears
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    expect(container.scrollTop).toBe(0);
+
+    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
+
+    expect(container.scrollTop).toBe(BOTTOM);
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+    // No pulse: there is no specific element to highlight, and marking the last
+    // turn would claim the deep-link landed on it.
+    expect(hasNavFocus()).toBe(false);
+    expect(hasPendingEventScroll()).toBe(false);
+  });
+
+  it('reports the failure but leaves the scroll alone once the user has scrolled away', () => {
+    restore = installFakeDom({}); // target never appears
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    // The user scrolls back to read history during the 4s window. A real scroll
+    // gesture is what distinguishes them from the app's own scrollTop writes.
+    document.dispatchEvent(new Event('wheel'));
+    container.scrollTop = 1234;
+
+    vi.advanceTimersByTime(5000);
+
+    expect(container.scrollTop).toBe(1234); // untouched: no late yank
+    expect(onUnresolved).toHaveBeenCalledTimes(1); // still told, since nothing else says so
+  });
+
+  it('a synchronous resolve neither reports nor runs the fallback', () => {
+    restore = installFakeDom({ dataEventMatches: [makeVisibleEl()] });
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    vi.advanceTimersByTime(6000); // well past the deadline the async path would have set
+
+    expect(container.scrollTop).toBe(3000); // the event, not the bottom
+    expect(onUnresolved).not.toHaveBeenCalled();
+  });
+
+  it('an observer resolve neither reports nor runs the fallback, though its deadline still fires', () => {
+    restore = installFakeDom({}); // not in the DOM yet: the async path
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    expect(moObservations).toHaveLength(1);
+
+    const visibleEl = makeVisibleEl();
+    (globalThis.document as any).querySelectorAll = (sel: string) =>
+      sel.startsWith('[data-event-id') ? [visibleEl] : [];
+    fireMutation();
+
+    // The deadline timer is still armed after an observer resolve (it doubles as
+    // the claim's release), so it MUST distinguish "resolved" from "gave up".
+    vi.advanceTimersByTime(6000);
+
+    expect(container.scrollTop).toBe(3000); // the event, not the bottom
+    expect(onUnresolved).not.toHaveBeenCalled();
+  });
+
+  it('runs the recovery exactly once, with the observer still attached at expiry', () => {
+    restore = installFakeDom({}); // target never appears, so the observer is live at expiry
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    expect(moObservations).toHaveLength(1);
+
+    vi.advanceTimersByTime(5000);
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+
+    // Nothing re-arms it: later timer work must not produce a second recovery.
+    vi.advanceTimersByTime(20000);
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+    expect(container.scrollTop).toBe(BOTTOM);
+  });
+
+  it('re-tapping the SAME notification mid-wait does not let the older deadline recover over it', () => {
+    // The claim is identified per CALL, not by what it points at. Two taps on
+    // one notification inside the 4s window produce an identical target, so a
+    // target-keyed claim let the first deadline mistake the second call's claim
+    // for its own: it released the live claim, snapped to the bottom and
+    // reported a dead link while the second attempt was still waiting, and the
+    // second deadline then went silent because the claim no longer looked like
+    // its own.
+    restore = installFakeDom({}); // target never appears for either call
+
+    scrollToEventAndPulse('e-7', { onUnresolved });
+    vi.advanceTimersByTime(3000);
+    scrollToEventAndPulse('e-7', { onUnresolved }); // same notification, tapped again
+
+    // The FIRST call's deadline (t=4000) must stand down: the claim is the
+    // second call's now, and that navigation is still live.
+    vi.advanceTimersByTime(1500); // t=4500
+    expect(onUnresolved).not.toHaveBeenCalled();
+    expect(container.scrollTop).toBe(0);
+    expect(hasPendingEventScroll()).toBe(true);
+
+    // The SECOND call's own deadline (t=3000+4000) is what recovers, once.
+    vi.advanceTimersByTime(3000); // t=7500
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
+    expect(container.scrollTop).toBe(BOTTOM);
+    expect(hasPendingEventScroll()).toBe(false);
+  });
+
+  it('the change deep-link gets the same recovery, off the same deadline', () => {
+    restore = installFakeDom({}); // no matching turn in this thread
+
+    scrollToChangeAndPulse('c-1', { onUnresolved });
+    vi.advanceTimersByTime(5000);
+
+    expect(container.scrollTop).toBe(BOTTOM);
+    expect(onUnresolved).toHaveBeenCalledTimes(1);
   });
 });
 
@@ -468,6 +626,11 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
       parentElement: null,
       getBoundingClientRect: () => ({ width: 200, height: 200, top: 10, bottom: 210, left: 0, right: 200 }),
       classList: makeClassList(),
+      // The event picker narrows to `.initiator-panel` only for a match that IS
+      // the turn wrapper, so the fake has to answer the same question the real
+      // element does. A step-level card (makeStepCardEl below) answers `false`
+      // and is pulsed whole.
+      matches: (sel: string) => sel === '.chat-exchange',
       querySelector: (sel: string) => {
         // The change picker probes for the resolution-card accent class first.
         if (sel.includes('initiator-panel-change-')) return resolutionCard ? initiator : null;
@@ -538,6 +701,128 @@ describe('deep-link pulse — scoped to the subject panel, not the whole exchang
 
     expect(exchangeEl.classList._classes.has('nav-focus-stuck')).toBe(true);
   });
+
+  /** A step-level card: the rendered surface for an event that is folded into an
+   *  exchange as a STEP rather than starting one (the `ResponseFailed` failure
+   *  card, `.exchange-error`). It carries its own `data-event-id`, so it is what
+   *  the deep-link matches, and it is NOT a `.chat-exchange`. The `querySelector`
+   *  deliberately answers a panel for every probe: a card that gets narrowed
+   *  anyway must fail loudly here rather than pass on "there was nothing inside
+   *  to narrow to". */
+  function makeStepCardEl(inner: any) {
+    return {
+      parentElement: null,
+      getBoundingClientRect: () => ({ width: 200, height: 60, top: 10, bottom: 70, left: 0, right: 200 }),
+      classList: makeClassList(),
+      matches: (sel: string) => sel === '.exchange-error',
+      querySelector: () => inner,
+    } as any;
+  }
+
+  it('a ResponseFailed folded in as a step pulses its OWN card, with no narrowing into it', () => {
+    // `ResponseFailed` is a terminal routed into the owning exchange by
+    // request_event_id, not an EXCHANGE_START_TYPE, so the turn's root carries a
+    // different event's id and the failure was unreachable. `ChatExchange` now
+    // stamps the failure card itself, and the pulse must land on THAT card: not
+    // the whole turn (a failure buried in a long turn is not "the turn"), and
+    // not a descendant.
+    const innerPanel = { classList: makeClassList() };
+    const failureCard = makeStepCardEl(innerPanel);
+    restore = installFakeDom({ dataEventMatches: [failureCard] });
+
+    scrollToEventAndPulse('failed-evt');
+
+    expect(failureCard.classList._classes.has('nav-focus-stuck')).toBe(true);
+    expect(innerPanel.classList._classes.has('nav-focus-stuck')).toBe(false);
+  });
+
+  it('the exchange-start events that already navigated still resolve to the exchange root', () => {
+    // Regression guard for the four event types whose deep-links worked before
+    // step-level addressing existed. They are EXCHANGE_START_TYPES, so each
+    // stamps `.chat-exchange` and must keep narrowing to its `.initiator-panel`.
+    for (const eventId of [
+      'user-question-asked',
+      'coding-agent-permission-request',
+      'credential-requested',
+      'mcp-consent-requested',
+    ]) {
+      clearPendingEventScroll();
+      const initiatorPanel = { classList: makeClassList() };
+      const exchangeEl = makeExchangeEl({ initiator: initiatorPanel });
+      restore?.();
+      restore = installFakeDom({ dataEventMatches: [exchangeEl] });
+
+      scrollToEventAndPulse(eventId);
+
+      expect(initiatorPanel.classList._classes.has('nav-focus-stuck'), eventId).toBe(true);
+      expect(exchangeEl.classList._classes.has('nav-focus-stuck'), eventId).toBe(false);
+    }
+  });
+
+  it('dual-mount: the hidden layout copy of a failure card is skipped, the visible one is pulsed', () => {
+    // Desktop and mobile each render the transcript, so BOTH copies carry the
+    // new attribute exactly as they carry the exchange root's. The hidden one
+    // reports a 0×0 rect and must lose the match, or the pulse runs invisibly.
+    const hiddenCard = makeStepCardEl(null);
+    hiddenCard.getBoundingClientRect = () => ({ width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 });
+    const visibleCard = makeStepCardEl(null);
+    // Document order puts the hidden (desktop) copy first, which is what made
+    // this worth pinning: a first-match resolve would take it.
+    restore = installFakeDom({ dataEventMatches: [hiddenCard, visibleCard] });
+
+    scrollToEventAndPulse('failed-evt');
+
+    expect(visibleCard.classList._classes.has('nav-focus-stuck')).toBe(true);
+    expect(hiddenCard.classList._classes.has('nav-focus-stuck')).toBe(false);
+  });
+});
+
+describe('isEventInViewport for a step-level card', () => {
+  // The notification §4 in-app matrix asks "is the user already looking at the
+  // thing this notification points at?" and silently marks it read when so. It
+  // resolves the source event through the same `data-event-id`, so stamping the
+  // failure card is what makes the question answerable for a `ResponseFailed`;
+  // before, the query found nothing and the answer was always false.
+  let restore: (() => void) | null = null;
+  let container: any;
+
+  beforeEach(() => {
+    container = makeContainer();
+    setActiveScrollElement(container);
+  });
+  afterEach(() => {
+    setActiveScrollElement(null);
+    restore?.();
+    restore = null;
+  });
+
+  /** A failure card whose rect sits `top` px down the 0..800 scroll container. */
+  function makeCardAt(top: number) {
+    return {
+      parentElement: null,
+      getBoundingClientRect: () => ({ width: 200, height: 60, top, bottom: top + 60, left: 0, right: 200 }),
+      classList: { add: () => {}, remove: () => {} },
+    } as any;
+  }
+
+  it('true when the failure card is on screen', () => {
+    restore = installFakeDom({ dataEventMatches: [makeCardAt(300)] });
+    expect(isEventInViewport('failed-evt')).toBe(true);
+  });
+
+  it('false when the failure card is scrolled out of the transcript band', () => {
+    // Inside window.innerHeight is not enough: the band is the transcript
+    // container's (0..800 here), so a card below it is not on screen.
+    restore = installFakeDom({ dataEventMatches: [makeCardAt(2400)] });
+    expect(isEventInViewport('failed-evt')).toBe(false);
+  });
+
+  it('false when the only copy is the hidden layout mount', () => {
+    const hidden = makeCardAt(300);
+    hidden.getBoundingClientRect = () => ({ width: 0, height: 0, top: 0, bottom: 0, left: 0, right: 0 });
+    restore = installFakeDom({ dataEventMatches: [hidden] });
+    expect(isEventInViewport('failed-evt')).toBe(false);
+  });
 });
 
 describe('scrollToChangeAndPulse — resolves to the LAST visible match', () => {
@@ -605,9 +890,10 @@ describe('scrollToChangeAndPulse — resolves to the LAST visible match', () => 
 
 describe('chat deep-link applies the shared navigation focus marker', () => {
   // The chat deep-link routes its highlight through the shared focus marker
-  // (components/shared/focusMarker.ts): a fill flash that fades, leaving a sticky
-  // border. The marker's own behaviors (supersede, gesture-clear semantics) are
-  // covered in focusMarker.test.ts; these tests pin the CHAT integration — the
+  // (components/shared/focusMarker.ts): a sticky background wash with a spotlight
+  // glow. The marker's own behaviors (supersede, gesture-clear semantics) are
+  // covered in focusMarker.test.ts, and its paint by nav-focus-marker-paint.test.ts.
+  // These tests pin the CHAT integration: the
   // marker is applied on resolve, survives the flash, clears on
   // clearPendingEventScroll, and (the chat-specific bit) its gesture-clear is
   // gated on the deep-link claim (settleGuard = hasPendingEventScroll) so the
@@ -639,7 +925,7 @@ describe('chat deep-link applies the shared navigation focus marker', () => {
     return el;
   }
 
-  it('applies the sticky border on resolve (no entrance animation)', () => {
+  it('applies the sticky highlight on resolve', () => {
     const el = makeMarkerEl();
     restore = installFakeDom({ dataEventMatches: [el] });
 

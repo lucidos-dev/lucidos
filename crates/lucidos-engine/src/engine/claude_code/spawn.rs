@@ -302,6 +302,7 @@ impl LucidosEngine {
             caller_title,
             app_id,
             coding_agent,
+            origin,
         } = params;
 
         // Stash the app id for run_direct_agent to pick up. Cleared by the
@@ -411,11 +412,12 @@ impl LucidosEngine {
 
             // Route the actual CC work through the unified router. Mirrors
             // `spawn_thread` (the chat parallel for sub-thread fan-out): the
-            // slow path emits MessageReceived (with channel=ClaudeCode and a
-            // `ThreadLink { mode: Agent }` origin synthesized from
-            // mode=Agent + parent_thread_id), registers the thread, runs
-            // `run_cc_chat_branch` with `skip_coalesce=true` (computed from
-            // mode=Agent + parent linkage), and dispatches to `run_direct_agent`.
+            // slow path emits MessageReceived (with channel=ClaudeCode and the
+            // `ThreadLink { mode: Agent }` origin the spawn site stamped, which
+            // names the launching thread whatever the relation), registers the
+            // thread, runs `run_cc_chat_branch` with `skip_coalesce=true`
+            // (computed from mode=Agent + parent linkage, so a top spawn keeps
+            // coalescing), and dispatches to `run_direct_agent`.
             let result = engine
                 .process_message_with_steps(
                     &prompt_owned,
@@ -438,7 +440,7 @@ impl LucidosEngine {
                     Some(coding_agent),
                     None, // pre_emitted_origin — router emits MR itself
                     None, // title — already emitted placeholder above
-                    None,
+                    origin,
                 )
                 .await;
 

@@ -35,6 +35,60 @@ fn human_size(bytes: Option<u64>) -> String {
     }
 }
 
+/// What `get_backup_status` knows about the selected provider's account.
+///
+/// Distinguishing all six states is the point: the `backup_provider` preference
+/// only names a destination, it connects nothing, so a provider that is set is
+/// not a provider that works. Collapsing "no account" into the same silence as
+/// "connected" is what let an agent tell a user their Dropbox backups were
+/// configured when every upload would have failed (2026-08-05).
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ProviderAccount {
+    /// No `backup_provider` preference set.
+    Unset,
+    /// The preference names a provider this engine doesn't have.
+    UnknownProvider,
+    /// The lookup itself failed. Genuinely unknown, never reported as a "no".
+    LookupFailed(String),
+    /// No OAuth account exists for this provider.
+    NotConnected,
+    /// Connected, but the account lacks the scope the provider needs.
+    MissingScope,
+    /// Connected with everything the provider needs.
+    Ready,
+}
+
+/// The `Provider:` line of `get_backup_status`. Pure so every branch is
+/// unit-testable without a pool. Always names Settings → Accounts (never the
+/// Backup page) as where an account is connected.
+fn backup_provider_line(provider: &str, account: &ProviderAccount) -> String {
+    match account {
+        ProviderAccount::Unset => "Provider: (none set. Scheduled backups cannot upload \
+             until one is set and its account is connected.)\n"
+            .to_string(),
+        ProviderAccount::UnknownProvider => format!(
+            "Provider: {provider} (NOT a known provider id. Valid ids: {}.)\n",
+            crate::core::backup::PROVIDER_IDS.join(", ")
+        ),
+        ProviderAccount::LookupFailed(e) => format!(
+            "Provider: {provider} (could not check whether the account is connected: {e}. \
+             Do not tell the user backups are working or broken; say the check failed.)\n"
+        ),
+        ProviderAccount::NotConnected => format!(
+            "Provider: {provider} (NOT CONNECTED. Backups will run and the upload will FAIL. \
+             Connect the account with connect_oauth_account, or send the user to \
+             Settings → Accounts. It cannot be connected on the Backup page. Do not report \
+             backup setup as complete until this says connected.)\n"
+        ),
+        ProviderAccount::MissingScope => format!(
+            "Provider: {provider} (account connected but MISSING the access backups need. \
+             Re-run connect_oauth_account with the backup scopes, or use 'Grant access' in \
+             Settings → System → Backup. Uploads will fail until then.)\n"
+        ),
+        ProviderAccount::Ready => format!("Provider: {provider} (account connected)\n"),
+    }
+}
+
 impl LucidosEngine {
     /// Handler for the read-only `get_backup_status` tool. Reports the backup
     /// schedule (in the user's timezone) + computed next run, provider, retention,
@@ -76,6 +130,24 @@ impl LucidosEngine {
         let retention = backup::get_retention_count(pool).await;
         let tz: chrono_tz::Tz = self.user_timezone().await.parse().unwrap_or(chrono_tz::UTC);
 
+        // Resolve the provider's account state before rendering. Reported
+        // whatever the schedule says: a manual "Back up now" needs a connected
+        // account too, so hiding this behind an active schedule would answer
+        // "is my backup set up?" with only half the truth.
+        let provider_name = provider.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        let account = match provider_name {
+            None => ProviderAccount::Unset,
+            Some(p) => match backup::provider_meta(p) {
+                None => ProviderAccount::UnknownProvider,
+                Some(meta) => match backup::provider_readiness(pool, &meta).await {
+                    Err(e) => ProviderAccount::LookupFailed(e.to_string()),
+                    Ok(r) if r.ready => ProviderAccount::Ready,
+                    Ok(r) if r.connected => ProviderAccount::MissingScope,
+                    Ok(_) => ProviderAccount::NotConnected,
+                },
+            },
+        };
+
         let mut out = String::new();
 
         match cron.as_deref() {
@@ -87,15 +159,13 @@ impl LucidosEngine {
                         out.push_str(&format!("Next run: {}\n", next.format("%Y-%m-%d %H:%M %Z")));
                     }
                 }
-                match provider.as_deref() {
-                    Some(p) if !p.is_empty() => out.push_str(&format!("Provider: {}\n", p)),
-                    _ => out.push_str(
-                        "Provider: (none set — scheduled backups cannot upload until one is set and connected)\n",
-                    ),
-                }
             }
             _ => out.push_str("Schedule: off (automatic backups disabled)\n"),
         }
+        out.push_str(&backup_provider_line(
+            provider_name.unwrap_or_default(),
+            &account,
+        ));
         out.push_str(&format!("Retention: keep {} most recent\n", retention));
 
         match backup::load_last_run(pool).await {
@@ -146,8 +216,10 @@ impl LucidosEngine {
 
         out.push_str(
             "\nChange the schedule/provider/retention with set_preference \
-             (keys: backup_schedule, backup_provider, backup_retention). Restore is done \
-             from the workspace picker, not from here.",
+             (keys: backup_schedule, backup_provider, backup_retention). Setting \
+             backup_provider only picks a destination, it does NOT connect the account: \
+             that is connect_oauth_account, or the user in Settings → Accounts. Restore is \
+             done from the workspace picker, not from here.",
         );
         Ok(out)
     }
@@ -326,5 +398,88 @@ impl LucidosEngine {
         }
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod backup_status_tests {
+    use super::{backup_provider_line, ProviderAccount};
+
+    /// The regression this whole line exists for: a provider preference that is
+    /// SET is not a provider that WORKS. `backup_provider` only names a
+    /// destination, so the agent must be told, in the same breath, that nothing
+    /// is connected behind it. The 2026-08-05 session read `Provider: dropbox`
+    /// and told the user backups were configured.
+    #[test]
+    fn not_connected_is_stated_loudly_and_names_accounts() {
+        let line = backup_provider_line("dropbox", &ProviderAccount::NotConnected);
+        assert!(line.contains("dropbox"));
+        assert!(line.contains("NOT CONNECTED"), "{line}");
+        assert!(line.contains("FAIL"), "must say uploads fail: {line}");
+        assert!(
+            line.contains("Settings → Accounts"),
+            "must name the page that connects an account: {line}"
+        );
+        assert!(
+            !line.contains("Settings → System → Backup"),
+            "must never send the user to the Backup page to connect: {line}"
+        );
+    }
+
+    #[test]
+    fn ready_reports_the_account_as_connected() {
+        let line = backup_provider_line("google_drive", &ProviderAccount::Ready);
+        assert!(line.contains("google_drive"));
+        assert!(line.contains("connected"), "{line}");
+        assert!(
+            !line.contains("NOT CONNECTED"),
+            "a ready provider must not read as broken: {line}"
+        );
+    }
+
+    /// Connected-but-underscoped is its own state: telling the user to connect
+    /// an account they already have would send them in a circle.
+    #[test]
+    fn missing_scope_is_distinct_from_not_connected() {
+        let line = backup_provider_line("google_drive", &ProviderAccount::MissingScope);
+        assert!(line.contains("MISSING"), "{line}");
+        assert!(
+            !line.contains("NOT CONNECTED"),
+            "the account exists; only its scopes are short: {line}"
+        );
+    }
+
+    #[test]
+    fn unset_provider_says_so_without_naming_an_empty_provider() {
+        let line = backup_provider_line("", &ProviderAccount::Unset);
+        assert!(line.contains("none set"), "{line}");
+        assert!(!line.contains("Provider:  "), "no empty name hole: {line}");
+    }
+
+    /// A failed lookup is UNKNOWN, never a "no" (CLAUDE.md's no-silent-defaults
+    /// rule, same reasoning as the schedule/provider preference reads above).
+    #[test]
+    fn lookup_failure_refuses_to_report_either_verdict() {
+        let line = backup_provider_line(
+            "dropbox",
+            &ProviderAccount::LookupFailed("connection reset".to_string()),
+        );
+        assert!(line.contains("connection reset"), "{line}");
+        assert!(line.contains("the check failed"), "{line}");
+        assert!(
+            !line.contains("NOT CONNECTED"),
+            "an unreachable DB must not read as a missing account: {line}"
+        );
+    }
+
+    /// A typo'd provider id must name the valid ids rather than looking like a
+    /// connection problem.
+    #[test]
+    fn unknown_provider_lists_the_valid_ids() {
+        let line = backup_provider_line("dropbx", &ProviderAccount::UnknownProvider);
+        assert!(line.contains("dropbx"), "{line}");
+        for id in crate::core::backup::PROVIDER_IDS {
+            assert!(line.contains(id), "must list {id}: {line}");
+        }
     }
 }

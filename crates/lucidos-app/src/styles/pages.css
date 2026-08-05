@@ -535,14 +535,25 @@
 }
 
 /* Uniform gap for the navigation focus marker on a plugin row (a plugins
-   deep-link / Search-Everywhere jump). The marker (.nav-focus-stuck outline,
-   host-components.css) hugs the row's padding box, and a .list-row is padded
+   deep-link / Search-Everywhere jump). The marker (.nav-focus-stuck wash + glow,
+   host-components.css) fills the row's padding box, and a .list-row is padded
    0.5rem top/bottom but 1rem left/right — so here the marker's SIDE gaps dwarf its
    top/bottom (the mirror of the settings-row case). Shrink the sides to the same
    0.5rem with a padding / positive margin pair that cancels for layout: the row is
    a stretch flex item in .list-rows, so it keeps its content-box width and the
-   content stays put while the box (and its outline) pull inward to an even gap.
-   The box only shrinks inward, so the outline can't clip. */
+   content stays put while the box (and the wash filling it) pull inward to an even
+   gap. The box only shrinks inward, so the WASH (the hard-edged part, and the whole
+   of what the eye reads as the highlight) is comfortably inside the row's clip
+   ancestor, .content-pane-body { overflow-x: hidden }. The soft halo around it is a
+   different matter and IS cut there: a plugin row is full-bleed against that clip,
+   the shrink buys only 0.5rem, and the wide glow layer's 1.5rem blur reaches
+   further. That is accepted. What gets terminated at the pane edge is the tail of a
+   12%-alpha gaussian, already near-invisible where it meets a boundary the eye
+   reads as a boundary anyway. It is NOT the failure 4f901b586 fixed, which was a
+   crisp 0.1875rem accent outline having its side edges and rounded corners sliced
+   flat. Do not "fix" it by shrinking the box further: that would pull the wash off
+   the row's content for a halo nobody can see. The wash is an inset box-shadow, so
+   the row's own hover background still shows through beneath it. */
 .app-store-plugin-row.nav-focus-stuck {
     padding-left: 0.5rem;
     padding-right: 0.5rem;
@@ -685,7 +696,8 @@
 /* A plugin row deep-link (navigate_ui target `plugins`) scrolls to the row and
    applies the shared NAVIGATION FOCUS MARKER (.nav-focus-stuck,
    styles/global/host-components.css, via components/shared/focusMarker.ts) — same
-   sticky border that fades on dismiss as chat and settings. See StoreTab.tsx. */
+   sticky background wash that fades on dismiss as chat and settings. See
+   StoreTab.tsx. */
 
 /* Error rows read from the red error text — no left accent stripe (see
    .claude/rules/frontend.md — left-accent stripes on notices are forbidden). */

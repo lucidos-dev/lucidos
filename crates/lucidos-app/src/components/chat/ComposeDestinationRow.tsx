@@ -1,6 +1,6 @@
 import { useRef } from 'preact/hooks';
 import type { CodingAgent } from '../../api/types';
-import { repositories, appsList, enginePackaged } from '../../store/store';
+import { repositories, appsList, enginePackaged, settingsScrollTarget } from '../../store/store';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { loadApps } from '../../store/actions/apps';
 import { loadRepositories } from '../../store/actions/chat';
@@ -24,6 +24,9 @@ type DestinationSelectionDeps = {
   focusPrompt: () => void;
   switchMenuItem: typeof switchMenuItem;
   openSettingsSubview: typeof openSettingsSubview;
+  /** Anchor to scroll to once the subview has rendered. Injected rather than
+   *  writing `settingsScrollTarget` inline so the jump stays assertable. */
+  scrollToSetting: (anchor: string) => void;
 };
 
 type CodingAgentSelectionDeps = {
@@ -39,15 +42,19 @@ export function handleComposeDestinationSelection(
     focusPrompt: focusPromptNow,
     switchMenuItem,
     openSettingsSubview,
+    scrollToSetting: (anchor) => { settingsScrollTarget.value = anchor; },
   },
 ): void {
   if (value === REGISTER_REPO_OPTION_VALUE) {
-    // Action row, not a destination: land on Settings → Repositories.
+    // Action row, not a destination: land on Settings → Coding Agents, scrolled
+    // to its Repositories section (repositories share that page with the
+    // coding-agent binaries they run under).
     // openSettingsSubview only sets the subview — ContentPane renders
     // SettingsView only when the settings menu item is active, so switch first
     // (same pairing as SearchEverywhere).
     deps.switchMenuItem('settings');
-    deps.openSettingsSubview('repositories');
+    deps.openSettingsSubview('coding-agents');
+    deps.scrollToSetting('coding-agents:repositories');
     return;
   }
   const destination = parseOptionValue(value);

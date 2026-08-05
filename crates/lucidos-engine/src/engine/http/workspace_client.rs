@@ -26,14 +26,18 @@ const CROSS_WORKSPACE_TIMEOUT: Duration = Duration::from_secs(30);
 /// timeout / TLS knobs live in one place and tests can verify the timeout
 /// fires against a hung peer without paying the production 30-second cost.
 ///
-/// - `danger_accept_invalid_certs(true)` matches the other localhost engine
-///   clients (`api/proxy.rs`, `api/backup.rs`) since each workspace engine
-///   ships a self-signed cert.
+/// - `no_proxy()` + `danger_accept_invalid_certs(true)` is the loopback pair
+///   every other engine/gateway client uses (`api/proxy.rs`, `api/history.rs`,
+///   `boot_report.rs`, `boot_failure.rs`, the gateway's `proxy.rs` / `stack.rs`)
+///   and the one `.claude/rules/rust.md` prescribes: each workspace engine
+///   ships a self-signed cert, and every target here is `localhost`, so an
+///   `HTTP_PROXY` / `HTTPS_PROXY` in the environment must never be consulted.
 /// - `timeout(timeout)` bounds each request so a hung peer can't pin the
 ///   calling thread (see `harden-engine-workspace-client-no-timeout` in the
 ///   work tracker).
 pub(crate) fn build_cross_workspace_client(timeout: Duration) -> reqwest::Result<Client> {
     Client::builder()
+        .no_proxy()
         .danger_accept_invalid_certs(true)
         .timeout(timeout)
         .build()
@@ -171,8 +175,12 @@ pub(crate) fn build_cross_workspace_coding_agent_body(
 /// Returns the pre-generated `thread_id` on success so the caller can build
 /// the user-facing link.
 ///
-/// `scheme` is "https" in production; tests pass "http" to avoid TLS setup
-/// against a plain axum listener.
+/// `scheme` is never hardcoded: production passes the TARGET's own
+/// `CrossWorkspaceTarget::proto`, which `workspace_resolver` reads from that
+/// workspace's `.lucidos/ports` (`PROTO=`, defaulting to `https`), so a peer
+/// that serves plain HTTP (the packaged gateway strips the TLS env pair) is
+/// still reachable. Tests pass "http" to avoid TLS setup against a plain axum
+/// listener.
 pub async fn spawn_coding_agent_in_workspace(
     client: &Client,
     target: &CrossWorkspaceTarget,

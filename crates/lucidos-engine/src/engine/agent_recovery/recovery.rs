@@ -295,6 +295,15 @@ impl LucidosEngine {
         Ok(())
     }
 
+    /// Boot floor: withdraw every *Switch to new version* resume promise this
+    /// boot did not keep. Thin wrapper over
+    /// [`settle_unresumed_switch_threads`], which documents the whole contract;
+    /// `main.rs` calls this after both resume drains with the union of the ids
+    /// they actuated.
+    pub async fn settle_unresumed_switch_threads(&self, resumed: &std::collections::HashSet<Uuid>) {
+        settle_unresumed_switch_threads(self.pool(), &self.event_bus, resumed).await;
+    }
+
     /// Detect orphaned coding-agent worktrees from a previous engine run and
     /// start new coding-agent sessions on them instead of proposing pending changes.
     pub async fn recover_orphaned_worktrees(self: &Arc<Self>) -> Vec<uuid::Uuid> {
@@ -384,7 +393,7 @@ impl LucidosEngine {
                     branch = Some(b.to_string());
                 } else if line.is_empty() {
                     if let (Some(ref wt), Some(ref br)) = (&worktree_path, &branch) {
-                        if br.starts_with("claude-code/") {
+                        if crate::engine::git_ops::is_coding_agent_branch(br) {
                             // Fast path: worktrees outside this workspace's worktrees
                             // dir cannot belong to us — skip without reading the marker.
                             // Saves a stat+read per cross-workspace worktree, which
@@ -473,50 +482,7 @@ impl LucidosEngine {
                        AND e2.event_type IN ('CodingAgentIdled', 'ResponseGenerated', 'SessionEnded') \
                  )"
             ).fetch_all(pool),
-            sqlx::query_as::<_, BranchStatus>(
-                "WITH last_lifecycle AS ( \
-                    SELECT DISTINCT ON (thread_id) thread_id, event_type, sequence \
-                    FROM events \
-                    WHERE event_type IN ('SessionStarted', 'CodingAgentIdled', 'SessionEnded', 'ResponseGenerated') \
-                      AND thread_id IS NOT NULL \
-                    ORDER BY thread_id, sequence DESC \
-                 ), \
-                 session_branches AS ( \
-                    SELECT DISTINCT ON (thread_id) thread_id, payload->>'branch' AS branch \
-                    FROM events \
-                    WHERE event_type = 'SessionStarted' AND thread_id IS NOT NULL \
-                      AND payload->>'branch' IS NOT NULL AND payload->>'branch' != '' \
-                    ORDER BY thread_id, sequence DESC \
-                 ) \
-                 SELECT sb.branch, 'idle' AS status \
-                 FROM last_lifecycle ll \
-                 JOIN session_branches sb ON sb.thread_id = ll.thread_id \
-                 WHERE ll.event_type IN ('CodingAgentIdled', 'ResponseGenerated') \
-                   AND NOT EXISTS ( \
-                       SELECT 1 FROM events e3 \
-                       WHERE e3.thread_id = ll.thread_id \
-                         AND e3.sequence > ll.sequence \
-                         AND e3.event_type IN ('SessionStarted', 'CodingAgentUserMessageSent', 'MessageReceived', \
-                             'CodingAgentPromptSent', 'CodingAgentToolCalled', 'CodingAgentTextStreamed', 'ContinuationStarted') \
-                   ) \
-                 UNION ALL \
-                 SELECT sb.branch, 'running' AS status \
-                 FROM last_lifecycle ll \
-                 JOIN session_branches sb ON sb.thread_id = ll.thread_id \
-                 WHERE ll.event_type = 'SessionStarted' \
-                 UNION ALL \
-                 SELECT sb.branch, 'running' AS status \
-                 FROM last_lifecycle ll \
-                 JOIN session_branches sb ON sb.thread_id = ll.thread_id \
-                 WHERE ll.event_type IN ('CodingAgentIdled', 'ResponseGenerated') \
-                   AND EXISTS ( \
-                       SELECT 1 FROM events e3 \
-                       WHERE e3.thread_id = ll.thread_id \
-                         AND e3.sequence > ll.sequence \
-                         AND e3.event_type IN ('CodingAgentUserMessageSent', 'MessageReceived', 'CodingAgentPromptSent', \
-                             'CodingAgentToolCalled', 'CodingAgentTextStreamed', 'ContinuationStarted') \
-                   )"
-            ).fetch_all(pool),
+            sqlx::query_as::<_, BranchStatus>(&BRANCH_CLASSIFICATION_SQL).fetch_all(pool),
             sqlx::query_as::<_, BranchThread>(
                 "SELECT DISTINCT ON (payload->>'branch') thread_id, payload->>'branch' AS branch FROM events \
                  WHERE event_type = 'SessionStarted' AND payload->>'branch' IS NOT NULL \
@@ -670,13 +636,26 @@ impl LucidosEngine {
 
             let mut found_repo: Option<(PathBuf, Option<String>)> = None;
             for (repo_root, repo_id) in &repos_to_scan {
-                let branch_exists = git_cmd(
+                // `or_unknown(false)`: an unanswered probe must not claim the
+                // branch lives in THIS repo, or the scan below would create a
+                // worktree against the wrong root, which is both wrong and
+                // unrecoverable. A `false` just moves on to the next repo.
+                //
+                // Note this is NOT a free direction: if every repo answers
+                // Unknown, the `None` arm below runs, and while its FIRST step
+                // (`recover_branch_ref_from_worktree`) is non-destructive, its
+                // last resort is `end_stuck_session`, which drops the session
+                // id and forces a fresh branch from main, discarding the
+                // conversation. `false` wins anyway because that chain puts a
+                // real recovery attempt in front of the destructive step,
+                // whereas a `true` goes straight to the wrong repo with none
+                // (`.claude/rules/rust.md`).
+                let branch_exists = crate::engine::git_ops::git_answer(
                     &["rev-parse", "--verify", &format!("refs/heads/{}", branch)],
                     repo_root,
                 )
                 .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+                .or_unknown(false);
 
                 if branch_exists {
                     found_repo = Some((repo_root.clone(), repo_id.clone()));
@@ -1263,9 +1242,8 @@ pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uu
         "SELECT EXISTS ( \
             SELECT 1 FROM events WHERE aggregate_id = $1 \
               AND {SWITCH_TEARDOWN_ABORT_SQL} \
-              AND sequence > COALESCE( \
-                  (SELECT MAX(sequence) FROM events WHERE aggregate_id = $1 \
-                     AND event_type IN ({THREAD_START_EVENTS_SQL})), 0))"
+              AND {unsuperseded})",
+        unsuperseded = switch_abort_unsuperseded_sql("$1", "sequence"),
     ))
     .bind(thread_id.to_string())
     .fetch_one(pool)
@@ -1285,9 +1263,294 @@ pub(crate) const SWITCH_TEARDOWN_ABORT_SQL: &str = "event_type = 'ResponseAborte
 
 /// SQL list of the events that begin (or restart) a thread's turn. A switch abort
 /// only counts while no newer start supersedes it — the resume loop-breaker.
-pub(crate) const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
+/// Reach for [`switch_abort_unsuperseded_sql`] rather than this constant: the
+/// list is only ever useful inside that one predicate.
+const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
     'CodingAgentUserMessageSent','TriggerStarted','ContinuationStarted',\
     'OrphanRecoveryStarted'";
+
+/// The **resume loop-breaker** as a SQL boolean: the switch abort at `seq_expr`
+/// is still the newest thing that happened on the thread at `id_expr`, i.e. no
+/// [`THREAD_START_EVENTS_SQL`] event superseded it.
+///
+/// One definition for all three consumers, so a switch abort cannot be "consumed"
+/// by one of them and still live for another: the coding-agent resume gate
+/// ([`switch_was_user_initiated`]), the chat one
+/// (`chat::recovery::switch_resume_candidates`), and the boot floor
+/// ([`unresumed_switch_threads_sql`]). `ContinuationStarted` is in the list, so
+/// once a resume has actually begun the abort stops counting anywhere. This is
+/// what stops an auto-resume that dies before emitting anything else from being
+/// resumed again on the next boot, forever.
+///
+/// `id_expr` yields the thread's `aggregate_id` (text): `"$1"` for a bound
+/// single-thread check, or a column reference such as `"e.aggregate_id"` for a
+/// set-based scan. `seq_expr` yields the abort's sequence in the same scope. The
+/// subquery aliases its own `events` as `s`, so an unqualified `seq_expr` in an
+/// un-aliased outer query is never captured by it.
+pub(crate) fn switch_abort_unsuperseded_sql(id_expr: &str, seq_expr: &str) -> String {
+    format!(
+        "{seq} > COALESCE(( \
+             SELECT MAX(s.sequence) FROM events s \
+             WHERE s.aggregate_id = {id} \
+               AND s.event_type IN ({starts}) \
+         ), 0)",
+        seq = seq_expr,
+        id = id_expr,
+        starts = THREAD_START_EVENTS_SQL,
+    )
+}
+
+/// Coding-agent lifecycle events that mean **the turn is over**: the engine was
+/// not mid-response when it died, so a restart must NOT re-open that turn with a
+/// "Response interrupted" boundary and a Continue button.
+///
+/// This is the whole list of terminals a CC turn can end on, minus two deliberate
+/// absences. Both would break something if included:
+///
+/// * **`ResponseAborted`** IS the interrupted boundary: it is what recovery
+///   itself emits, and an `EngineShutdown` one carrying a device actor is the
+///   *Switch to new version* fingerprint that [`switch_was_user_initiated`] keys
+///   on. Counting it as turn-ended would classify every switched-away session as
+///   idle and silently kill auto-resume.
+/// * **`SessionEnded`** is listed, but only for the reasons that really end a
+///   turn. The mid-turn ones are subtracted separately by
+///   [`SESSION_ENDED_MID_TURN_REASONS_SQL`].
+///
+/// The set was `CodingAgentIdled` + `ResponseGenerated` only until 2026-08-05,
+/// which meant a turn the user *canceled* (or one that ended `ResponseFailed`)
+/// left `SessionStarted` as the newest recognised lifecycle event forever. Every
+/// later engine restart then re-surfaced that dead turn as "System / Response
+/// interrupted" with a Continue button, hours after the timeline already showed
+/// "Canceled" and "Response canceled" for it.
+const TURN_ENDED_EVENT_TYPES_SQL: &str = "'CodingAgentIdled','ResponseGenerated',\
+    'ResponseCanceled','ResponseFailed','SessionEnded'";
+
+/// [`crate::engine::thread_events::SessionEndReason`] values that do NOT end the
+/// turn. A `SessionEnded` carrying one is dropped from the lifecycle scan
+/// entirely, so the preceding `SessionStarted` becomes the newest lifecycle event
+/// again and the branch classifies `running`.
+///
+/// * `stale_resume` is transient by `SessionEndReason::is_transient`: CC answered
+///   a stale `--resume` with an empty Result, and the chat handler retries
+///   against a fresh session, so a new `SessionStarted` is imminent.
+/// * `shutdown` is the engine going away mid-turn: the `SessionEnded`-shaped twin
+///   of the `ResponseAborted { EngineShutdown }` boundary excluded above, and the
+///   turn it ends is precisely the one recovery must resume or offer Continue for.
+///   No production site emits it today (teardown goes through `stop_terminal_kind`,
+///   which yields `Aborted(EngineShutdown)`, and no workspace DB has ever held a
+///   `reason='shutdown'` row), but the variant is live in the enum and its meaning
+///   is unambiguous. The classifier states the rule rather than depending on a
+///   census of current emit sites: re-adding that emit must not silently cost
+///   *Switch to new version* its auto-resume.
+///
+/// Matched through `COALESCE(payload->>'reason','')`, and the `COALESCE` is
+/// load-bearing. `reason` is absent on the oldest rows (464 of them in one
+/// workspace DB), where `payload->>'reason'` is NULL, `NULL IN (...)` is NULL,
+/// and `NOT (TRUE AND NULL)` is NULL rather than TRUE, so a bare `IN` drops those
+/// rows from the scan instead of keeping them. They would then fall back to an
+/// older `SessionStarted` and classify `running`: the very bogus interrupt panel
+/// this whole change removes, just for the legacy cohort. A reason-less row
+/// deserializes as `LegacyNonTerminal`, which is terminal, so keeping it is also
+/// the semantically right answer.
+const SESSION_ENDED_MID_TURN_REASONS_SQL: &str = "'stale_resume','shutdown'";
+
+/// Events proving a new turn began after the last turn-ended event, so the
+/// session was live again when the engine died.
+const TURN_PROGRESSION_EVENT_TYPES_SQL: &str = "'SessionStarted','CodingAgentUserMessageSent',\
+    'MessageReceived','CodingAgentPromptSent','CodingAgentToolCalled',\
+    'CodingAgentTextStreamed','ContinuationStarted'";
+
+/// Classify every coding-agent branch as `running` (a turn was in flight when the
+/// engine died, so resume it or offer Continue) or `idle` (the turn ended; leave
+/// the worktree to the cleanup worker), one row per thread that ever emitted a
+/// `SessionStarted` with a branch.
+///
+/// A branch is `running` iff its newest lifecycle event is a `SessionStarted`, or
+/// a turn-progression event landed after its newest turn-ended event. Everything
+/// else is `idle`, including (since 2026-08-05) the previously unclassified
+/// `SessionEnded` case. "Unclassified" was not a third state anywhere: the caller
+/// computes `in_flight = !idle_branches.contains(branch)`, so any branch missing
+/// from both sets was treated as in-flight and got the same bogus interrupt panel.
+pub(crate) static BRANCH_CLASSIFICATION_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| {
+        format!(
+            "WITH last_lifecycle AS ( \
+            SELECT DISTINCT ON (thread_id) thread_id, event_type, sequence \
+            FROM events \
+            WHERE event_type IN ('SessionStarted',{turn_ended}) \
+              AND NOT (event_type = 'SessionEnded' \
+                       AND COALESCE(payload->>'reason','') IN ({mid_turn_ends})) \
+              AND thread_id IS NOT NULL \
+            ORDER BY thread_id, sequence DESC \
+         ), \
+         session_branches AS ( \
+            SELECT DISTINCT ON (thread_id) thread_id, payload->>'branch' AS branch \
+            FROM events \
+            WHERE event_type = 'SessionStarted' AND thread_id IS NOT NULL \
+              AND payload->>'branch' IS NOT NULL AND payload->>'branch' != '' \
+            ORDER BY thread_id, sequence DESC \
+         ) \
+         SELECT sb.branch, \
+                CASE WHEN ll.event_type = 'SessionStarted' \
+                       OR EXISTS ( \
+                           SELECT 1 FROM events e3 \
+                           WHERE e3.thread_id = ll.thread_id \
+                             AND e3.sequence > ll.sequence \
+                             AND e3.event_type IN ({progression}) \
+                       ) \
+                     THEN 'running' ELSE 'idle' END AS status \
+         FROM last_lifecycle ll \
+         JOIN session_branches sb ON sb.thread_id = ll.thread_id",
+            turn_ended = TURN_ENDED_EVENT_TYPES_SQL,
+            mid_turn_ends = SESSION_ENDED_MID_TURN_REASONS_SQL,
+            progression = TURN_PROGRESSION_EVENT_TYPES_SQL,
+        )
+    });
+
+/// Threads still holding an UNKEPT resume promise: a switch-teardown abort that
+/// is the thread's newest `ResponseAborted`, with no start event after it, on a
+/// thread the projection still shows `paused`.
+///
+/// A *Switch to new version* promises a resume. Both halves of the boot honour
+/// it (`resume_pending_switches` for coding agents, `resume_pending_chat_switches`
+/// for chat / trigger), and the UI reads the same promise off the abort itself to
+/// withhold the Continue button (`abortPromisesAutoResume`, the TS mirror of
+/// [`SWITCH_TEARDOWN_ABORT_SQL`]). So a promise the boot cannot keep must be
+/// WITHDRAWN, or the thread sits paused with no way forward but a follow-up
+/// message. The paths that leave one unkept are all real: the chat per-boot
+/// resume cap, a `continue_chat` that errored, a `ContinuationRequested` that
+/// failed to persist, a candidate scan that failed, a coding-agent branch
+/// `recover_orphaned_worktrees` skipped, and an archived thread neither drain
+/// selects at all.
+///
+/// Three clauses, each load-bearing:
+///
+/// * `t.status = 'paused'` scopes the sweep to threads still sitting on the
+///   interruption. A switch abort followed by an Apply / anything that settled
+///   the row is not waiting on anything. Note this is also what keeps the sweep
+///   quiet on the first boot after `paused` was introduced: no historical row
+///   carries the value, so it only ever fires for interruptions from here on.
+/// * The abort is the thread's newest `ResponseAborted`. This is the idempotency
+///   guard: the withdrawal below emits a `RecoveryAfterRestart` abort, which is
+///   not a switch abort, so the thread stops matching on the next boot. Without
+///   it the floor would re-fire forever, since nothing supersedes the original
+///   switch abort in the START-event sense.
+/// * No newer [`THREAD_START_EVENTS_SQL`] event, the same loop-breaker both
+///   resume gates use.
+///
+/// **Archived threads are deliberately INCLUDED**, unlike the resume drains and
+/// the orphan sweeps, which all exclude them. Those emit work or revive a turn,
+/// and the user dismissed the row. This does neither: it corrects a promise the
+/// engine made and could not keep, and the correction cannot resurrect anything
+/// (`display_section` keeps a `paused`, change-less thread in Archive, since
+/// `demands_surface` covers only running / active children / pending changes /
+/// attention descendants). Excluding them was a real dead end: no drain selects
+/// an archived thread, so its switch abort would stay the newest boundary
+/// forever, and unarchiving it would surface a paused thread whose Continue
+/// button no later boot could ever restore. `state = 'active'` still applies:
+/// that is the compose lifecycle, and a composing or discarded row is not a
+/// dismissed thread but a draft or a tombstone.
+///
+/// Selecting `payload->>'request_event_id'` too: the withdrawal reuses the switch
+/// abort's own originating id, so both boundaries land in the same exchange
+/// rather than the withdrawal opening a stray one.
+fn unresumed_switch_threads_sql() -> String {
+    format!(
+        "SELECT e.aggregate_id::uuid AS thread_id, \
+                e.payload->>'request_event_id' AS request_event_id \
+         FROM events e \
+         JOIN thread_summaries t ON t.thread_id = e.aggregate_id::uuid \
+         WHERE e.aggregate = 'thread' \
+           AND t.state = 'active' \
+           AND t.status = 'paused' \
+           AND {abort} \
+           AND e.sequence = ( \
+               SELECT MAX(a.sequence) FROM events a \
+               WHERE a.aggregate_id = e.aggregate_id \
+                 AND a.event_type = 'ResponseAborted' \
+           ) \
+           AND {unsuperseded} \
+         ORDER BY e.sequence ASC",
+        abort = SWITCH_TEARDOWN_ABORT_SQL,
+        unsuperseded = switch_abort_unsuperseded_sql("e.aggregate_id", "e.sequence"),
+    )
+}
+
+/// Withdraw every resume promise this boot did not keep, by emitting the
+/// crash-shaped `ResponseAborted { RecoveryAfterRestart }` boundary that
+/// `chat::recovery::recover_orphaned_threads` already uses for an interrupted
+/// turn nobody is resuming. The frontend's newest-abort scan then re-arms the
+/// Continue button on its own, because that boundary is not a switch abort.
+///
+/// `resumed` is the union of what the two resume drains actuated, passed BY ID
+/// rather than re-derived from the events table. A coding-agent resume has only
+/// emitted `ContinuationRequested` by the time this runs, and that type is
+/// deliberately absent from [`THREAD_START_EVENTS_SQL`], so a query-only
+/// exclusion would re-abort a thread that is resuming perfectly well and hand
+/// the user a Continue button for a turn already back in flight.
+///
+/// Best-effort, like every other boot sweep: a DB error degrades to "nothing to
+/// withdraw" rather than blocking boot. Every withdrawal is logged by id, so the
+/// sweep can never read as "resumed everything" when it did not.
+///
+/// Runs LAST in the boot sequence (`main.rs`, after both drains) for the obvious
+/// reason: it can only tell a broken promise from a kept one once every resume
+/// path has had its turn.
+pub(crate) async fn settle_unresumed_switch_threads(
+    pool: &sqlx::PgPool,
+    bus: &crate::engine::event_bus::EventBus,
+    resumed: &std::collections::HashSet<Uuid>,
+) {
+    let rows: Vec<(Uuid, Option<String>)> = match sqlx::query_as(&unresumed_switch_threads_sql())
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log!(
+                "[Recovery] unresumed-switch sweep query failed: {}. \
+                 Affected threads keep their paused status with no Continue",
+                e
+            );
+            return;
+        }
+    };
+
+    for (thread_id, request_event_id) in rows {
+        if resumed.contains(&thread_id) {
+            continue;
+        }
+        log!(
+            "[Recovery] Switch-interrupted thread {} was not resumed by this boot. \
+             Withdrawing the resume promise so its Continue affordance returns",
+            thread_id
+        );
+        let meta = crate::engine::thread_events::EventMeta {
+            // Reuse the switch abort's originating id so the withdrawal lands in
+            // the same exchange as the interruption it is about. `.ok()` is safe
+            // here: an unparseable value means the withdrawal opens its own
+            // exchange instead of joining, which costs grouping and nothing else,
+            // and the field is one the engine wrote itself.
+            request_event_id: request_event_id.as_deref().and_then(|s| s.parse().ok()),
+            // The host system ended this turn and no resume followed. Not
+            // engine-deliberate work, so `system` rather than `Engine{reason}`.
+            actor: Some(MessageOrigin::system()),
+            ..crate::engine::thread_events::EventMeta::NONE
+        };
+        crate::engine::thread_events::emit_response_aborted(
+            bus,
+            thread_id,
+            crate::engine::thread_events::AbortCause::RecoveryAfterRestart,
+            "This response was interrupted by an engine restart and did not resume.".to_string(),
+            vec![],
+            None,
+            None,
+            meta,
+            "[Recovery] ResponseAborted (switch resume not kept)",
+        )
+        .await;
+    }
+}
 
 /// Settle any coding-agent thread still `running` in the projection that boot
 /// recovery neither resumed (in `recovering`) nor settled. After a restart

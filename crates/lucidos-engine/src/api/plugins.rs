@@ -32,9 +32,10 @@ use crate::engine::tools::plugins::{
 };
 
 /// Plugin archives are mostly text bundles; cap well below the router-wide
-/// `DefaultBodyLimit`. The route in `api/mod.rs` applies a per-route
-/// `DefaultBodyLimit::max(MAX_ARCHIVE_BYTES)` so axum rejects oversized
-/// requests before the body is buffered.
+/// `DefaultBodyLimit` that `api/mod.rs` layers over the merged API router. The
+/// `/plugins/upload-archive` route in this module's `router()` applies a
+/// per-route `DefaultBodyLimit::max(MAX_ARCHIVE_BYTES)` so axum rejects
+/// oversized requests before the body is buffered.
 pub(crate) const MAX_ARCHIVE_BYTES: usize = 50 * 1024 * 1024;
 
 #[derive(Debug, Serialize)]

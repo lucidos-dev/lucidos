@@ -12,4 +12,4 @@ export type { App } from '../apps';
 export type { ThreadSummary, ThreadsListOptions } from '../threads';
 export type { SseEvent, SseThreadEvent, SseSystemEvent } from '../sse';
 export type { SelectOption, SelectCreateOptions, SelectInstance } from '../select';
-export type { NavigateParams, ConfirmOptions, ToastType, ToastOptions, PromptOptions } from '../ui';
+export type { NavigateParams, ConfirmOptions, ToastType, ToastOptions, PromptOptions, FilePreviewParams } from '../ui';

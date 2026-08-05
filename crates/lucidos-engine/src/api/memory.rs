@@ -50,8 +50,15 @@ pub(super) async fn get_memory_entries(
         StatusCode::NOT_FOUND,
         "Memory index not available".to_string(),
     ))?;
-    let limit = query.limit.unwrap_or(50).min(200);
-    let offset = query.offset.unwrap_or(0);
+    // `clamp`, not `min`: both values are bound straight into `LIMIT $1 OFFSET
+    // $2`, and Postgres rejects a negative one, so `?limit=-1` came back as a
+    // 500 rather than an empty page. The upper bound alone covered only half of
+    // the same hostile-query-string case the `has_more` comment below names.
+    // Every sibling list endpoint clamps (`changes.rs`, `notifications.rs`,
+    // `history.rs`); limit floors at 1 rather than 0 because this route has no
+    // count-only caller.
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0).max(0);
     let source_type = query.source_type.as_deref();
     let sort = query.sort.as_deref();
     let importance_levels: Option<Vec<&str>> = query
@@ -75,7 +82,12 @@ pub(super) async fn get_memory_entries(
             )
         })?;
 
-    let has_more = (offset + limit) < total;
+    // `offset` comes straight off the query string, so a caller-supplied
+    // `?offset=9223372036854775807` overflows a plain `offset + limit`: a panic
+    // in a debug build, a wrap to a negative (and a wrong `has_more: true`) in a
+    // release one. Saturating keeps the comparison honest at the top of the range
+    // and is identical to `+` for every reachable page.
+    let has_more = offset.saturating_add(limit) < total;
     Ok(Json(serde_json::json!({
         "entries": entries,
         "total": total,

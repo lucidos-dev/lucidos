@@ -1,4 +1,4 @@
-use crate::engine::git_ops::{git_answer, GitAnswer};
+use crate::engine::git_ops::{allocate_coding_agent_branch, git_answer, BranchScope, GitAnswer};
 use crate::engine::LucidosEngine;
 use crate::runtime::{CodingAgent, RunningAgent, SpawnArgs};
 use std::path::Path;
@@ -34,10 +34,34 @@ pub(super) async fn spawn_or_resume(
     runtime.spawn(args, cancel).await
 }
 
-pub(crate) fn generate_cc_branch_name() -> String {
-    let ts = chrono::Utc::now().format("%Y%m%d-%H%M%S");
-    let suffix = &uuid::Uuid::new_v4().as_simple().to_string()[..6];
-    format!("claude-code/{}-{}", ts, suffix)
+/// Everything needed to mint a branch name for a thread that doesn't have one
+/// yet: `lucidos-<agent>-<app|repo>-<name>-<slug>`. See
+/// `git_ops::branch_name` for the shape and the duplicate numbering.
+pub(super) struct FreshBranch<'a> {
+    pub(super) repo_root: &'a Path,
+    pub(super) agent: CodingAgent,
+    pub(super) scope: BranchScope,
+    /// The thread's display name (title, else first message), slugified into
+    /// the branch. Empty is fine: the allocator falls back to the thread id.
+    pub(super) thread_name: &'a str,
+    pub(super) thread_id: uuid::Uuid,
+}
+
+impl FreshBranch<'_> {
+    async fn resolution(&self) -> BranchResolution {
+        BranchResolution {
+            branch_name: allocate_coding_agent_branch(
+                self.repo_root,
+                self.agent,
+                &self.scope,
+                self.thread_name,
+                self.thread_id,
+            )
+            .await,
+            reusing_branch: false,
+            resume_session_id: None,
+        }
+    }
 }
 
 /// Result of resolving which branch a CC turn should run on.
@@ -46,6 +70,18 @@ pub(super) struct BranchResolution {
     pub reusing_branch: bool,
     /// May be `None` even if the caller passed `Some` — see `resolve_branch_for_resume`.
     pub resume_session_id: Option<String>,
+}
+
+/// The pure half's verdict, before any name is minted. Separate from
+/// [`BranchResolution`] so allocating a fresh name (which costs a git call)
+/// happens only on the path that actually needs one.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BranchDecision {
+    Reuse {
+        branch_name: String,
+        resume_session_id: Option<String>,
+    },
+    Fresh,
 }
 
 /// Decide the git branch for this CC turn and validate the resume context against it.
@@ -57,19 +93,25 @@ pub(super) struct BranchResolution {
 /// `No conversation found with session ID: ...`, which the safety net then turns into
 /// a user-visible "Aborted" badge.
 pub(super) async fn resolve_branch_for_resume(
-    repo_root: &Path,
+    fresh: &FreshBranch<'_>,
     resume_session_id: Option<String>,
     resume_branch: Option<&str>,
 ) -> BranchResolution {
     let Some(rb) = resume_branch else {
-        return BranchResolution {
-            branch_name: generate_cc_branch_name(),
-            reusing_branch: false,
-            resume_session_id: None,
-        };
+        return fresh.resolution().await;
     };
-    let answer = git_answer(&["rev-parse", "--verify", rb], repo_root).await;
-    decide_branch_resolution(answer, rb, resume_session_id)
+    let answer = git_answer(&["rev-parse", "--verify", rb], fresh.repo_root).await;
+    match decide_branch_resolution(answer, rb, resume_session_id) {
+        BranchDecision::Reuse {
+            branch_name,
+            resume_session_id,
+        } => BranchResolution {
+            branch_name,
+            reusing_branch: true,
+            resume_session_id,
+        },
+        BranchDecision::Fresh => fresh.resolution().await,
+    }
 }
 
 /// Pure half of [`resolve_branch_for_resume`]: given git's answer about the
@@ -89,7 +131,7 @@ pub(super) fn decide_branch_resolution(
     branch_exists: GitAnswer,
     resume_branch: &str,
     resume_session_id: Option<String>,
-) -> BranchResolution {
+) -> BranchDecision {
     if branch_exists.is_unknown() {
         log!(
             "[AgentSession] Could not verify resume branch {} (git gave no answer). Reusing it rather than starting fresh, since dropping a branch that exists loses the session",
@@ -103,9 +145,8 @@ pub(super) fn decide_branch_resolution(
                 resume_branch
             );
         }
-        BranchResolution {
+        BranchDecision::Reuse {
             branch_name: resume_branch.to_string(),
-            reusing_branch: true,
             resume_session_id,
         }
     } else {
@@ -113,18 +154,14 @@ pub(super) fn decide_branch_resolution(
             "[AgentSession] Resume branch {} no longer exists, creating fresh branch (dropping stale session id)",
             resume_branch
         );
-        BranchResolution {
-            branch_name: generate_cc_branch_name(),
-            reusing_branch: false,
-            resume_session_id: None,
-        }
+        BranchDecision::Fresh
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::engine::git_ops::git_cmd;
+    use crate::engine::git_ops::{git_cmd, LUCIDOS_BRANCH_PREFIX};
 
     async fn make_test_repo() -> (tempfile::TempDir, std::path::PathBuf) {
         let tmp = tempfile::tempdir().unwrap();
@@ -139,11 +176,21 @@ mod tests {
         (tmp, repo)
     }
 
+    fn fresh_branch(repo: &std::path::Path) -> FreshBranch<'_> {
+        FreshBranch {
+            repo_root: repo,
+            agent: CodingAgent::ClaudeCode,
+            scope: BranchScope::Repo(BranchScope::LUCIDOS_REPO.to_string()),
+            thread_name: "fix the auth timeout",
+            thread_id: uuid::Uuid::new_v4(),
+        }
+    }
+
     #[tokio::test]
     async fn missing_resume_branch_drops_stale_session_id() {
         let (_tmp, repo) = make_test_repo().await;
         let resolution = resolve_branch_for_resume(
-            &repo,
+            &fresh_branch(&repo),
             Some("e4a3d60a-ea4d-4592-b252-0558f8798cf3".into()),
             Some("claude-code/already-merged-and-pruned"),
         )
@@ -152,27 +199,24 @@ mod tests {
             !resolution.reusing_branch,
             "must not reuse a branch that doesn't exist"
         );
-        assert!(
-            resolution.branch_name.starts_with("claude-code/"),
-            "must generate a fresh CC branch name, got {}",
-            resolution.branch_name
-        );
-        assert_ne!(
-            resolution.branch_name, "claude-code/already-merged-and-pruned",
-            "fresh branch must differ from the missing one"
+        assert_eq!(
+            resolution.branch_name, "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout",
+            "must mint a fresh thread-named branch"
         );
         assert_eq!(
             resolution.resume_session_id, None,
-            "stale session_id must be dropped — otherwise CC dies with 'No conversation found'"
+            "stale session_id must be dropped, otherwise CC dies with 'No conversation found'"
         );
     }
 
+    /// A legacy `claude-code/*` branch is never renamed: a resumed thread that
+    /// predates the thread-named scheme keeps the branch holding its commits.
     #[tokio::test]
-    async fn existing_resume_branch_keeps_session_id() {
+    async fn existing_legacy_resume_branch_keeps_its_name_and_session_id() {
         let (_tmp, repo) = make_test_repo().await;
         let _ = git_cmd(&["branch", "claude-code/active-session"], &repo).await;
         let resolution = resolve_branch_for_resume(
-            &repo,
+            &fresh_branch(&repo),
             Some("good-sid".into()),
             Some("claude-code/active-session"),
         )
@@ -189,88 +233,106 @@ mod tests {
     /// must leave both the branch and the session id alone.
     #[test]
     fn unverifiable_resume_branch_is_reused_not_replaced() {
-        let resolution = decide_branch_resolution(
+        let decision = decide_branch_resolution(
             GitAnswer::Unknown,
-            "claude-code/live-session",
+            "lucidos-claude-code-repo-lucidos-live-session",
             Some("good-sid".into()),
         );
-        assert!(
-            resolution.reusing_branch,
-            "an unanswered rev-parse must not be read as a deleted branch"
-        );
-        assert_eq!(resolution.branch_name, "claude-code/live-session");
         assert_eq!(
-            resolution.resume_session_id,
-            Some("good-sid".into()),
-            "keeping the branch is pointless if the session id is dropped with it"
+            decision,
+            BranchDecision::Reuse {
+                branch_name: "lucidos-claude-code-repo-lucidos-live-session".into(),
+                resume_session_id: Some("good-sid".into()),
+            },
+            "an unanswered rev-parse must not be read as a deleted branch, and keeping \
+             the branch is pointless if the session id is dropped with it"
         );
     }
 
     /// A real answer still decides, in both directions.
     #[test]
     fn answered_probes_still_decide_branch_reuse() {
-        let reused =
-            decide_branch_resolution(GitAnswer::Yes, "claude-code/there", Some("sid".into()));
-        assert!(reused.reusing_branch);
-        assert_eq!(reused.resume_session_id, Some("sid".into()));
-
-        let fresh =
-            decide_branch_resolution(GitAnswer::No, "claude-code/pruned", Some("sid".into()));
-        assert!(!fresh.reusing_branch);
-        assert_ne!(fresh.branch_name, "claude-code/pruned");
-        assert_eq!(fresh.resume_session_id, None);
+        assert_eq!(
+            decide_branch_resolution(
+                GitAnswer::Yes,
+                "lucidos-codex-repo-lucidos-there",
+                Some("sid".into())
+            ),
+            BranchDecision::Reuse {
+                branch_name: "lucidos-codex-repo-lucidos-there".into(),
+                resume_session_id: Some("sid".into()),
+            }
+        );
+        assert_eq!(
+            decide_branch_resolution(GitAnswer::No, "claude-code/pruned", Some("sid".into())),
+            BranchDecision::Fresh,
+            "a pruned branch starts over, and Fresh carries no session id by construction"
+        );
     }
 
     #[tokio::test]
     async fn no_resume_branch_generates_fresh_with_no_session_id() {
         let (_tmp, repo) = make_test_repo().await;
-        let resolution = resolve_branch_for_resume(&repo, Some("ignored-sid".into()), None).await;
+        let resolution =
+            resolve_branch_for_resume(&fresh_branch(&repo), Some("ignored-sid".into()), None).await;
         assert!(!resolution.reusing_branch);
-        assert!(resolution.branch_name.starts_with("claude-code/"));
+        assert!(resolution.branch_name.starts_with(LUCIDOS_BRANCH_PREFIX));
         assert_eq!(
             resolution.resume_session_id, None,
             "without a resume branch, the session_id has no anchor and must be dropped"
         );
     }
 
-    #[test]
-    fn cc_branch_names_are_unique_when_generated_simultaneously() {
-        let names: Vec<String> = (0..10).map(|_| generate_cc_branch_name()).collect();
-        let unique: std::collections::HashSet<&String> = names.iter().collect();
+    /// Two threads with the same title in the same repo must not collide: the
+    /// second takes `-2`. Exercised end to end (through the ref listing) rather
+    /// than only against the pure allocator.
+    #[tokio::test]
+    async fn a_second_thread_with_the_same_name_is_numbered() {
+        let (_tmp, repo) = make_test_repo().await;
+        let first = resolve_branch_for_resume(&fresh_branch(&repo), None, None).await;
         assert_eq!(
-            names.len(),
-            unique.len(),
-            "branch names must be unique: {:?}",
-            names
+            first.branch_name,
+            "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout"
+        );
+        let _ = git_cmd(&["branch", &first.branch_name], &repo).await;
+
+        let second = resolve_branch_for_resume(&fresh_branch(&repo), None, None).await;
+        assert_eq!(
+            second.branch_name,
+            "lucidos-claude-code-repo-lucidos-fix-the-auth-timeout-2"
         );
     }
 
-    #[test]
-    fn cc_branch_name_has_expected_format() {
-        let name = generate_cc_branch_name();
-        assert!(
-            name.starts_with("claude-code/"),
-            "must start with claude-code/: {}",
-            name
-        );
-        let parts: Vec<&str> = name
-            .strip_prefix("claude-code/")
-            .unwrap()
-            .splitn(3, '-')
-            .collect();
-        assert_eq!(parts.len(), 3, "expected 3 parts after prefix: {:?}", parts);
-        assert_eq!(
-            parts[0].len(),
-            8,
-            "date part should be 8 chars: {}",
-            parts[0]
-        );
-        assert_eq!(
-            parts[1].len(),
-            6,
-            "time part should be 6 chars: {}",
-            parts[1]
-        );
-        assert_eq!(parts[2].len(), 6, "suffix should be 6 chars: {}", parts[2]);
+    /// Every minted name has to survive git's own ref validation, whatever the
+    /// thread was called.
+    #[tokio::test]
+    async fn minted_names_are_valid_git_refs() {
+        let (_tmp, repo) = make_test_repo().await;
+        let names = [
+            "fix the auth timeout",
+            "🎉🎉🎉",
+            "!!!",
+            "日本語のスレッド",
+            "Refs/../../etc/passwd",
+            "a name ending in .lock",
+            &"very long thread name that keeps going ".repeat(12),
+        ];
+        for name in names {
+            let mut fresh = fresh_branch(&repo);
+            fresh.thread_name = name;
+            let resolution = resolve_branch_for_resume(&fresh, None, None).await;
+            let out = git_cmd(
+                &["check-ref-format", "--branch", &resolution.branch_name],
+                &repo,
+            )
+            .await
+            .unwrap();
+            assert!(
+                out.status.success(),
+                "git rejected {:?} minted from {:?}",
+                resolution.branch_name,
+                name
+            );
+        }
     }
 }

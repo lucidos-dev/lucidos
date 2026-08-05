@@ -158,6 +158,56 @@ async fn test_staging_non_data_writes_go_to_workspace() {
     assert!(ws.join("scratch.txt").exists());
 }
 
+/// Regression: the staging preamble matched the `data` prefix without a
+/// trailing separator, so a SIBLING whose name merely starts with it was
+/// treated as a `data/` write and diverted into the staging tree. The
+/// committer copies only `<staging>/data` back before deleting that tree, so
+/// those writes were silently discarded while `run_python` reported success.
+///
+/// The sibling names below are the three real shapes: a file (`database.json`),
+/// a directory (`datasets/`), and an underscore variant (`data_backup/`).
+#[tokio::test]
+async fn test_staging_data_prefixed_siblings_are_not_diverted() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data")).unwrap();
+    std::fs::create_dir_all(ws.join("datasets")).unwrap();
+    std::fs::create_dir_all(ws.join("data_backup")).unwrap();
+    let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+
+    let staging = ws.join(".lucidos/staging/test-run-data-prefix");
+
+    let result = runtime
+        .execute_staged(
+            "open('database.json', 'w').write('{}')\n\
+             open('datasets/rows.csv', 'w').write('a,b')\n\
+             open('data_backup/old.txt', 'w').write('x')\n\
+             open('data/real.txt', 'w').write('staged')\n\
+             print('ok')",
+            vec![],
+            &staging,
+        )
+        .await;
+
+    assert!(result.is_ok(), "script failed: {:?}", result);
+
+    // The three siblings land on the host, where the script asked for them.
+    for sibling in ["database.json", "datasets/rows.csv", "data_backup/old.txt"] {
+        assert!(
+            ws.join(sibling).exists(),
+            "{sibling} was diverted into staging and discarded"
+        );
+    }
+
+    // A genuine `data/` write still stages rather than hitting the host
+    // directly, which is what gives run_python its atomic-commit semantics.
+    assert!(
+        !ws.join("data/real.txt").exists(),
+        "a real data/ write must stage, not land on the host before commit"
+    );
+    assert!(staging.join("data/real.txt").exists());
+}
+
 // ── scripts execute in place ───────────────────────────────────────────
 //
 // Regression coverage for the 2026-07-29 `notary-verdict-watch` incident:
@@ -820,8 +870,9 @@ print('done')
         "expected x-lucidos-agent-origin-token in captured headers, got: {headers:?}"
     );
     assert!(
-        headers.contains("x-lucidos-source-thread-id"),
-        "expected x-lucidos-source-thread-id in captured headers, got: {headers:?}"
+        !headers.contains("x-lucidos-source-thread-id"),
+        "the shim must send ONE origin header: the thread id rides inside the \
+         token, and a separate claim of it is what the binding removed. Got: {headers:?}"
     );
 }
 

@@ -18,7 +18,8 @@ fn subprocess_chat_rejects_human_mode_targeting_any_thread() {
         ActorMode::Human,
         source,
         target_other,
-        None
+        None,
+        true,
     ));
     // Same-thread human mode — also reject. A subprocess never *is*
     // the user, even when targeting its own thread.
@@ -26,7 +27,8 @@ fn subprocess_chat_rejects_human_mode_targeting_any_thread() {
         ActorMode::Human,
         source,
         source,
-        None
+        None,
+        true,
     ));
     // No target / no parent — reject (nothing to legitimise).
     assert!(!subprocess_chat_legitimate(
@@ -34,6 +36,7 @@ fn subprocess_chat_rejects_human_mode_targeting_any_thread() {
         source,
         None,
         None,
+        false,
     ));
 }
 
@@ -48,12 +51,14 @@ fn subprocess_chat_rejects_cross_thread_agent_post() {
         source,
         target_other,
         None,
+        true,
     ));
     assert!(!subprocess_chat_legitimate(
         ActorMode::Engine,
         source,
         target_other,
         None,
+        true,
     ));
 }
 
@@ -68,12 +73,14 @@ fn subprocess_chat_allows_same_thread_agent_followup() {
         source,
         source,
         None,
+        true,
     ));
     assert!(subprocess_chat_legitimate(
         ActorMode::Engine,
         source,
         source,
         None,
+        true,
     ));
 }
 
@@ -88,6 +95,7 @@ fn subprocess_chat_allows_spawn_with_matching_parent_thread() {
         source,
         None,
         source,
+        false,
     ));
 }
 
@@ -103,21 +111,93 @@ fn subprocess_chat_rejects_spawn_with_mismatched_parent_thread() {
         source,
         None,
         lied_parent,
+        false,
+    ));
+}
+
+/// Hazard 10(b) of the child-follow-up plan. `parent_matches_source` says
+/// "I am spawning a child"; nothing in that claim constrains the TARGET.
+/// Without the `!target_exists` conjunct, a subprocess of thread S could
+/// write into any existing thread by naming it as the target and naming
+/// itself as the parent, reaching the same cross-thread injection the
+/// `target_matches_source` arm refuses through the other arm.
+///
+/// After the origin token became thread-bound this was the last route by
+/// which an authenticated subprocess could write into a thread it does not
+/// own, and it would have made `POST /threads/:thread_id/follow-up`'s
+/// refusal ladder bypassable.
+#[test]
+fn parent_matches_source_requires_a_new_target() {
+    let source = Some(Uuid::new_v4());
+    let someone_elses_thread = Some(Uuid::new_v4());
+
+    for mode in [ActorMode::Agent, ActorMode::Engine] {
+        assert!(
+            !subprocess_chat_legitimate(mode, source, someone_elses_thread, source, true),
+            "{mode:?}: claiming parenthood must not open an EXISTING thread"
+        );
+        // Same call, target does not exist yet: that is a spawn, and allowed.
+        assert!(
+            subprocess_chat_legitimate(mode, source, someone_elses_thread, source, false),
+            "{mode:?}: a spawn naming its own new thread id stays allowed"
+        );
+    }
+}
+
+/// The regression the deferral asked for. `lucidos spawn-thread --relation
+/// child` pre-generates a client-side uuid and sends it together with
+/// `parent_thread_id`, so it hits the spawn arm with a target that provably
+/// does not exist. See `crates/lucidos-cli/src/spawn_thread.rs`.
+#[test]
+fn spawn_thread_with_a_pregenerated_id_is_still_allowed() {
+    let source = Some(Uuid::new_v4());
+    let pregenerated = Some(Uuid::new_v4());
+    assert!(subprocess_chat_legitimate(
+        ActorMode::Agent,
+        source,
+        pregenerated,
+        source,
+        false,
+    ));
+}
+
+/// The tightening did not overreach: a subprocess following up on its OWN
+/// thread is allowed precisely because that thread exists, and it reaches
+/// the `target_matches_source` arm, which the new conjunct does not touch.
+#[test]
+fn target_matches_source_is_unaffected_by_the_new_conjunct() {
+    let source = Some(Uuid::new_v4());
+    assert!(subprocess_chat_legitimate(
+        ActorMode::Agent,
+        source,
+        source,
+        None,
+        true,
+    ));
+    // And still allowed with the parent claim alongside it, which is what a
+    // subprocess re-sending into its own thread with spawn context looks like.
+    assert!(subprocess_chat_legitimate(
+        ActorMode::Agent,
+        source,
+        source,
+        source,
+        true,
     ));
 }
 
 #[test]
 fn subprocess_chat_no_source_thread_still_rejects_cross_thread() {
-    // Subprocess presented the token but no source-thread-id header
-    // (older subprocess, raw curl that forgot the second header).
-    // We can't link to a source, so any agent-mode post that isn't a
-    // follow-up to *some* thread we can name is rejected.
+    // A thread-less subprocess: a scheduled script, whose origin token is
+    // minted against the no-thread sentinel. There is no source thread to
+    // compare against, so neither arm can match and any agent-mode post is
+    // rejected.
     let target_other = Some(Uuid::new_v4());
     assert!(!subprocess_chat_legitimate(
         ActorMode::Agent,
         None,
         target_other,
         None,
+        true,
     ));
 }
 
@@ -726,4 +806,252 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
     );
 
     crate::test_support::teardown_test_db(&db_name).await;
+}
+
+// ── announce_orphan_batch ──
+
+/// Persist a `MessageReceived` under a caller-chosen event id, so the test can
+/// build an orphan that names it via `injected_message_id`.
+async fn persist_message(
+    bus: &crate::engine::event_bus::EventBus,
+    thread_id: Uuid,
+    text: &str,
+    event_id: Uuid,
+) {
+    bus.emit(crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::MessageReceived {
+            text: text.into(),
+            user_image_hashes: vec![],
+            device_id: None,
+            device: None,
+            image_description: None,
+            parent_thread_id: None,
+            spawning_event_id: None,
+            mode: ActorMode::Human,
+            model: None,
+            reasoning_effort: None,
+            origin: None,
+        },
+        meta: EventMeta {
+            event_id: Some(event_id),
+            ..EventMeta::NONE
+        },
+    })
+    .await
+    .expect("MessageReceived must persist");
+}
+
+fn orphan_naming(event_id: Uuid, text: &str) -> InjectedPrompt {
+    InjectedPrompt {
+        event_id: Some(event_id),
+        ..make_orphan(text)
+    }
+}
+
+/// The shape the user hit: message A starts a turn, message B lands while it is
+/// running (so it is injected, not queued behind a fresh turn), then the user's
+/// Stop terminates A. B is recovered as an orphan and re-submitted as a turn of
+/// its own, anchored on the `MessageReceived` that already exists for it.
+///
+/// Nothing else in that re-processed turn sets the thread back to `running`, so
+/// the batch announcement is what keeps the projection honest while the agent
+/// works. Before the fix the first orphan was skipped and the thread read
+/// `idle` for the whole turn.
+#[tokio::test]
+async fn announce_orphan_batch_revives_a_thread_the_cancel_left_idle() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _cb_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let msg_a = Uuid::new_v4();
+    let msg_b = Uuid::new_v4();
+
+    persist_message(&bus, thread_id, "summarize the report", msg_a).await;
+    persist_message(&bus, thread_id, "actually, just the totals", msg_b).await;
+    crate::engine::thread_events::emit_response_canceled(
+        &bus,
+        &pool,
+        thread_id,
+        crate::engine::thread_events::CancelCause::UserStop,
+        String::new(),
+        vec![],
+        None,
+        None,
+        EventMeta {
+            request_event_id: Some(msg_a),
+            ..EventMeta::NONE
+        },
+        "[Test] user stop",
+    )
+    .await;
+
+    let idled: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query");
+    assert_eq!(
+        idled, "idle",
+        "premise of the bug: the Stop settles the thread even though a follow-up is queued behind it"
+    );
+
+    announce_orphan_batch(
+        &bus,
+        thread_id,
+        &[orphan_naming(msg_b, "actually, just the totals")],
+    )
+    .await;
+
+    let revived: String =
+        sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("query");
+    assert_eq!(
+        revived, "running",
+        "the re-submitted follow-up must read as running; an idle projection makes a working \
+         thread look finished until its answer lands"
+    );
+
+    let named: Vec<String> = sqlx::query_scalar(
+        "SELECT payload->>'injected_message_id' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected' ORDER BY sequence",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("query");
+    assert_eq!(
+        named,
+        vec![msg_b.to_string()],
+        "the announcement must name the follow-up's own MessageReceived, which is what the \
+         client absorbs it into instead of rendering a duplicate panel"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// Every orphan in the batch is announced, not just the ones after the first.
+/// The batch is coalesced into ONE re-processed turn, so all of them anchor on
+/// the first message's request id while naming their own.
+#[tokio::test]
+async fn announce_orphan_batch_announces_every_orphan_in_the_batch() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _cb_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    let ids: Vec<Uuid> = (0..3).map(|_| Uuid::new_v4()).collect();
+
+    let mut batch = Vec::new();
+    for (i, id) in ids.iter().enumerate() {
+        persist_message(&bus, thread_id, &format!("follow-up {i}"), *id).await;
+        batch.push(orphan_naming(*id, &format!("follow-up {i}")));
+    }
+
+    announce_orphan_batch(&bus, thread_id, &batch).await;
+
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT payload->>'injected_message_id', payload->>'request_event_id' FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected' ORDER BY sequence",
+    )
+    .bind(thread_id.to_string())
+    .fetch_all(&pool)
+    .await
+    .expect("query");
+
+    let named: Vec<String> = rows.iter().map(|(named, _)| named.clone()).collect();
+    assert_eq!(
+        named,
+        ids.iter().map(Uuid::to_string).collect::<Vec<_>>(),
+        "one announcement per orphan, in batch order"
+    );
+    assert!(
+        rows.iter().all(|(_, anchor)| *anchor == ids[0].to_string()),
+        "the whole batch runs as one turn, anchored on the first orphan's message"
+    );
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+/// An empty batch cannot happen through `process_orphan_chain` (the caller has
+/// already read `first`), but the helper must not panic if one ever reaches it.
+#[tokio::test]
+async fn announce_orphan_batch_is_a_noop_for_an_empty_batch() {
+    let (pool, db_name) = crate::test_support::setup_test_db().await;
+    let (bus, _cb_rx) = crate::engine::event_bus::EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+
+    announce_orphan_batch(&bus, thread_id, &[]).await;
+
+    let count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events WHERE aggregate_id = $1 AND event_type = 'UserPromptInjected'",
+    )
+    .bind(thread_id.to_string())
+    .fetch_one(&pool)
+    .await
+    .expect("query");
+    assert_eq!(count, 0);
+
+    crate::test_support::teardown_test_db(&db_name).await;
+}
+
+// ── resolve_file_ctx ────────────────────────────────────────────────
+//
+// Both file previews render the same line-numbered source view, so a workspace
+// data file carries a selected line range exactly as a repository file does.
+
+#[test]
+fn file_ctx_carries_a_data_file_line_range() {
+    let ctx = FileContext {
+        path: "artifacts/notes.md".to_string(),
+        lines: Some((10, 20)),
+    };
+    assert_eq!(
+        resolve_file_ctx(Some(&ctx), None).as_deref(),
+        Some("artifacts/notes.md:10-20")
+    );
+}
+
+#[test]
+fn file_ctx_is_the_bare_path_when_nothing_is_selected() {
+    let ctx = FileContext {
+        path: "artifacts/notes.md".to_string(),
+        lines: None,
+    };
+    assert_eq!(
+        resolve_file_ctx(Some(&ctx), None).as_deref(),
+        Some("artifacts/notes.md")
+    );
+}
+
+#[test]
+fn repo_file_ctx_keeps_its_repo_prefix_and_range() {
+    let ctx = RepoFileContext {
+        repo_id: "repo-1".to_string(),
+        path: "src/main.rs".to_string(),
+        lines: Some((510, 520)),
+    };
+    assert_eq!(
+        resolve_file_ctx(None, Some(&ctx)).as_deref(),
+        Some("[repo:repo-1] src/main.rs:510-520")
+    );
+}
+
+#[test]
+fn file_ctx_wins_over_repo_file_ctx_and_neither_is_none() {
+    let file = FileContext {
+        path: "artifacts/notes.md".to_string(),
+        lines: None,
+    };
+    let repo = RepoFileContext {
+        repo_id: "repo-1".to_string(),
+        path: "src/main.rs".to_string(),
+        lines: None,
+    };
+    assert_eq!(
+        resolve_file_ctx(Some(&file), Some(&repo)).as_deref(),
+        Some("artifacts/notes.md")
+    );
+    assert_eq!(resolve_file_ctx(None, None), None);
 }

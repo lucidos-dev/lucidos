@@ -213,3 +213,147 @@ test.describe('Repo File Explorer — changes view', () => {
     }, undefined, { timeout: 10_000 });
   });
 });
+
+/** The side-by-side rendering of a diff: the original on the left, the changed
+ *  file on the right, aligned row for row. A mode of the existing diff surface,
+ *  so these drive it through the same header the whole-file toggle lives in. */
+test.describe('Repo File Explorer, side-by-side diff', () => {
+  let repoId: string;
+  let branch: string;
+  let file: string;
+  let changeId: string;
+  const suffix = Date.now().toString(36);
+  const repoName = `e2e-side-by-side-${suffix}`;
+  const changeDescription = 'E2E side-by-side diff test';
+  const ADDED_LINES = ['first added line', 'second added line', 'third added line'];
+
+  test.beforeAll(async () => {
+    branch = `e2e-test/side-by-side-${suffix}`;
+    file = `e2e-side-by-side-${suffix}.txt`;
+    changeId = randomUUID();
+
+    git(['checkout', '-b', branch, 'main']);
+    writeFileSync(resolve(WORKSPACE, file), `${ADDED_LINES.join('\n')}\n`);
+    git(['add', '.']);
+    git(['commit', '-m', `e2e side-by-side fixture ${suffix}`]);
+    git(['checkout', 'main']);
+
+    psql([
+      `INSERT INTO changes (id, request_id, branch_name, repo_root, description, file_count, files, requires_restart, hardened)`,
+      `VALUES ('${changeId}', '${randomUUID()}', '${branch}', '${WORKSPACE}', '${changeDescription}', 1, ARRAY['${file}'], false, true)`,
+    ].join(' '));
+  });
+
+  test.afterAll(async () => {
+    psql(`DELETE FROM changes WHERE id = '${changeId}'`);
+    try { git(['branch', '-D', branch]); } catch { /* */ }
+  });
+
+  test.beforeEach(async ({ page }) => {
+    await assertHealthy(page);
+    repoId = await registerRepo(page, repoName);
+    // Two columns are offered only where they fit, so the diff pane has to
+    // clear the threshold. Narrowing the Conversation side gives the content
+    // pane the width without depending on the project's viewport. The side-by-side
+    // preference is pinned off so each test starts from the unified view.
+    await page.addInitScript(() => {
+      localStorage.setItem('lucidos-split-ratio', '0.15');
+      localStorage.setItem('lucidos-thread-drawer-open', 'false');
+      localStorage.setItem('lucidos-diff-side-by-side', 'false');
+    });
+  });
+
+  test.afterEach(async ({ page }) => {
+    if (repoId) await removeRepo(page, repoId);
+  });
+
+  /** Open the seeded change's one file, on its unified hunks.
+   *
+   *  An added file defaults to the whole merged file (its diff is all
+   *  additions), so the whole-file toggle is flipped to reach the hunks. */
+  async function openHunks(page: Page): Promise<void> {
+    await navigateToApp(page);
+    await openFilesPanel(page);
+
+    await clickVisibleElement(page, '.files-source-switcher .dropdown-trigger');
+    await page.waitForSelector('.dropdown-option:visible', { timeout: 5_000 });
+    await clickVisibleElement(page, '.dropdown-option', repoName);
+
+    await page.waitForSelector('.change-selector .dropdown-trigger:visible', { timeout: 10_000 });
+    await clickVisibleElement(page, '.change-selector .dropdown-trigger');
+    await page.waitForSelector('.change-selector-menu .dropdown-option:visible', { timeout: 5_000 });
+    await clickVisibleElement(page, '.change-selector-menu .dropdown-option', changeDescription);
+
+    await page.waitForSelector('.file-item:visible', { timeout: 15_000 });
+    await clickVisibleElement(page, '.file-item', file);
+
+    await page.waitForSelector('.diff-whole-file-toggle:visible', { timeout: 10_000 });
+    await clickVisibleElement(page, '.diff-whole-file-toggle');
+    await expect(page.locator('.diff-view:visible')).toBeVisible({ timeout: 10_000 });
+  }
+
+  test('toggles between the unified hunks and two aligned columns', async ({ page }, testInfo) => {
+    test.skip(
+      testInfo.project.name !== 'chromium',
+      'a phone has no room for two columns, so the toggle is deliberately absent there',
+    );
+    await openHunks(page);
+
+    // Unified to begin with: one column carrying both files' line numbers.
+    await expect(page.locator('.diff-line:visible').first()).toBeVisible();
+    await expect(page.locator('[data-role="side-by-side-diff"]')).toHaveCount(0);
+
+    await clickVisibleElement(page, '.diff-side-by-side-toggle');
+
+    const sideBySide = page.locator('[data-role="side-by-side-diff"]:visible');
+    await expect(sideBySide).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.diff-line')).toHaveCount(0);
+
+    // Every line of this change is an addition, so the changed side carries all
+    // of them and the original side is filler across from each one.
+    const original = page.locator('[data-role="side-by-side-diff-original"]');
+    const changed = page.locator('[data-role="side-by-side-diff-changed"]');
+    for (const line of ADDED_LINES) {
+      await expect(changed).toContainText(line);
+      await expect(original).not.toContainText(line);
+    }
+
+    // Aligned row for row: the columns always hold the same number of rows,
+    // fillers included, or the two sides drift apart down the file.
+    const leftRows = await original.locator('.code-line').count();
+    const rightRows = await changed.locator('.code-line').count();
+    expect(leftRows).toBe(rightRows);
+    expect(leftRows).toBeGreaterThan(ADDED_LINES.length);
+
+    // A column is not the file's own line numbering (the left is the old
+    // file's, the right the new one's), so clicking a number selects nothing.
+    await changed.locator('.code-line .line-number').first().click();
+    await expect(page.locator('.line-selected')).toHaveCount(0);
+
+    // And back.
+    await clickVisibleElement(page, '.diff-side-by-side-toggle');
+    await expect(page.locator('[data-role="side-by-side-diff"]')).toHaveCount(0);
+    await expect(page.locator('.diff-line:visible').first()).toBeVisible();
+  });
+
+  // A control that is present but does nothing is a lie about what the surface
+  // can do: side by side is a rendering of the HUNKS.
+  test('does not offer the toggle over the whole merged file', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name !== 'chromium', 'the narrow case is covered separately');
+    await openHunks(page);
+    await expect(page.locator('.diff-side-by-side-toggle:visible')).toBeVisible();
+
+    // Back to the whole merged file.
+    await clickVisibleElement(page, '.diff-whole-file-toggle');
+    await expect(page.locator('.repo-file-content:visible')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.diff-side-by-side-toggle')).toHaveCount(0);
+  });
+
+  test('does not offer the toggle on a phone, where two columns do not fit', async ({ page }, testInfo) => {
+    test.skip(testInfo.project.name === 'chromium', 'desktop has the room; this is the narrow case');
+    await openHunks(page);
+
+    await expect(page.locator('.diff-line:visible').first()).toBeVisible();
+    await expect(page.locator('.diff-side-by-side-toggle')).toHaveCount(0);
+  });
+});

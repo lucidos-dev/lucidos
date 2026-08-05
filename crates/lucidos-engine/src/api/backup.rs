@@ -1,6 +1,5 @@
 use super::*;
 use crate::core::backup::{self, crypto};
-use crate::core::oauth::OAuthStore;
 use crate::core::PreferenceStore;
 
 #[derive(Serialize)]
@@ -11,8 +10,6 @@ pub struct ProviderInfo {
     pub connected: bool,
     /// Whether connected AND the account's scopes contain the required scope.
     pub ready: bool,
-    /// The scope substring required for this provider (e.g. "drive"), empty if none needed.
-    pub required_scope: &'static str,
     /// Web URL to this provider's backups folder ("View backups folder" link), or
     /// null when the provider can't form one.
     pub folder_url: Option<String>,
@@ -83,20 +80,12 @@ pub async fn list_providers(
     for meta in metas {
         // Surface DB errors instead of silently treating them as "not connected" —
         // a transient DB failure must not be reported as "no OAuth account".
-        let account = OAuthStore::get_by_provider(&state.pool, meta.oauth_provider)
-            .await
-            .map_err(|e| {
-                ApiError::internal(format!(
-                    "Failed to query OAuth account for {}: {e}",
-                    meta.oauth_provider
-                ))
-            })?;
-        let connected = account.is_some();
-        let ready = connected
-            && (meta.required_scope.is_empty()
-                || account
-                    .as_ref()
-                    .is_some_and(|a| a.scopes.contains(meta.required_scope)));
+        // `provider_readiness` is shared with the agent's `get_backup_status`, so
+        // the page and the agent cannot disagree about whether a provider works.
+        let backup::ProviderReadiness { connected, ready } =
+            backup::provider_readiness(&state.pool, &meta)
+                .await
+                .map_err(|e| ApiError::internal(e.to_string()))?;
         // Best-effort folder link, computed only for a ready provider (it's the
         // only state the link is shown in). For Drive this resolves the folder id
         // live with one Drive lookup, so bound it — a slow or unreachable provider
@@ -119,7 +108,6 @@ pub async fn list_providers(
             name: meta.name,
             connected,
             ready,
-            required_scope: meta.required_scope,
             folder_url,
         });
     }

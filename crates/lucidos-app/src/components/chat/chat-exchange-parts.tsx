@@ -13,6 +13,7 @@ import type { CodingAgent } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
+import { viewportIsMobile } from '../../utils/viewport';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
 import { highlightEllipsis } from './highlightEllipsis';
 import { getSessionBlobUrlForHash } from './pastedImages';
@@ -123,9 +124,10 @@ export function ChangeBody({ changeId, error, seedDescription, seedFileCount }: 
   );
 }
 
-/** "Continue" button rendered on the most recent unresumed ResponseAborted
- *  exchange. Disables itself between click and response so a double-click
- *  can't double-emit. Surfaces network failures via toast and re-enables. */
+/** "Continue" button rendered on the abort exchange the user may resume from
+ *  (`continuableAbortIndex`). Disables itself between click and response so a
+ *  double-click can't double-emit. Surfaces network failures via toast and
+ *  re-enables. */
 export function ContinueButton({ threadId }: { threadId: string }) {
   const inFlight = useSignal(false);
   const onClick = async (e: MouseEvent) => {
@@ -140,7 +142,7 @@ export function ContinueButton({ threadId }: { threadId: string }) {
       return;
     }
     // ContinuationStarted will arrive via SSE and remove the button by hiding
-    // this exchange's `isUnresumedAbort` — re-enable as a safety net in case
+    // this exchange's `isContinuableAbort`. Re-enable as a safety net in case
     // the SSE event is delayed.
     setTimeout(() => { inFlight.value = false; }, 5000);
   };
@@ -425,6 +427,28 @@ function lastLinePreview(text: string, max = 120): string {
   return clip(line, max);
 }
 
+/** The context-usage suffix on a step row.
+ *
+ *  `compact` (mobile) keeps only the percentage. The full
+ *  "178k / 1000k (18%)" is wider than a phone's remaining row space, and since
+ *  the row is `nowrap` the excess would push the description out rather than
+ *  wrap. The percentage is the part that is read at a glance anyway. */
+export function contextLabel(
+  used: number,
+  window: number | null | undefined,
+  messages: number | null | undefined,
+  compact: boolean,
+): string {
+  if (window) {
+    const pct = `${contextPercent(used, window)}%`;
+    return compact ? pct : `${formatTokens(used)} / ${formatTokens(window)} (${pct})`;
+  }
+  // No window to divide by, so there is no percentage: the token count alone is
+  // the compact form.
+  if (compact) return formatTokens(used);
+  return `${formatTokens(used)} tokens${messages != null ? `, ${messages} msgs` : ''}`;
+}
+
 export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
   const { label, icon, className } = stepStatus(event.outcome);
   const snap = event.contextCapture;
@@ -459,9 +483,7 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
       {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
       {hasContext && (
         <span class={`step-context${trimmed ? ' trimmed' : ''}`}>
-          {window
-            ? `${formatTokens(used!)} / ${formatTokens(window)} (${contextPercent(used!, window)}%)`
-            : `${formatTokens(used!)} tokens${event.context_messages != null ? `, ${event.context_messages} msgs` : ''}`}
+          {contextLabel(used!, window, event.context_messages, viewportIsMobile.value)}
           {trimmed && ' · trimmed'}
         </span>
       )}

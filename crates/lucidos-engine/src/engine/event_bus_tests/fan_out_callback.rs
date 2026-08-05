@@ -972,29 +972,36 @@ async fn refire_skips_parent_that_already_resumed() {
 }
 
 /// Regression for the parent-callback duplicate window: the
-/// `parent_callback_sent` marker must be written by the projection of the
-/// `ChildThreadCompleted` emit itself — in the same transaction as the event
-/// INSERT — not by a separate post-emit UPDATE. The old shape (emit, then a
-/// standalone `mark_parent_callback_sent`) left a crash window where the
+/// `parent_callback_pending` marker must be written by the projection of the
+/// `ChildThreadCompleted` emit itself, in the same transaction as the event
+/// INSERT, not by a separate post-emit UPDATE. The old shape (emit, then a
+/// standalone marker UPDATE) left a crash window where the
 /// typed event committed but the marker didn't; the next terminal event then
 /// re-fired the whole fan-in and handed the parent a duplicate completion
 /// card. Emitting the typed event (exactly as `notify_parent_if_child` does)
 /// must therefore be sufficient on its own to flip the marker.
+///
+/// The baseline assertion is also the first thing that fails if the spawn
+/// branch of the `MessageReceived` arm forgets its explicit TRUE write:
+/// `spawn_parent_child` goes through exactly that branch.
 #[tokio::test]
-async fn test_child_thread_completed_projection_marks_callback_sent_in_tx() {
+async fn test_child_thread_completed_projection_clears_pending_in_tx() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
 
     let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
 
-    let sent: bool = sqlx::query_scalar(
-        "SELECT parent_callback_sent FROM thread_summaries WHERE thread_id = $1",
+    let pending: bool = sqlx::query_scalar(
+        "SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(child_id)
     .fetch_one(&pool)
     .await
     .unwrap();
-    assert!(!sent, "baseline: parent_callback_sent starts FALSE");
+    assert!(
+        pending,
+        "baseline: a freshly spawned child owes its parent a card"
+    );
 
     // Emit the typed fan-in event onto the parent thread, exactly as
     // notify_parent_if_child does after a child terminal event.
@@ -1012,19 +1019,413 @@ async fn test_child_thread_completed_projection_marks_callback_sent_in_tx() {
     .await
     .unwrap();
 
-    let sent: bool = sqlx::query_scalar(
-        "SELECT parent_callback_sent FROM thread_summaries WHERE thread_id = $1",
+    let pending: bool = sqlx::query_scalar(
+        "SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1",
     )
     .bind(child_id)
     .fetch_one(&pool)
     .await
     .unwrap();
     assert!(
-        sent,
-        "ChildThreadCompleted projection must set parent_callback_sent=TRUE \
-         in the same tx as the event insert — a post-emit UPDATE leaves a \
+        !pending,
+        "ChildThreadCompleted projection must clear parent_callback_pending \
+         in the same tx as the event insert: a post-emit UPDATE leaves a \
          crash window that duplicates the parent's completion card"
     );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Count the persisted `ChildThreadCompleted` cards sitting on `parent_id`.
+async fn count_completion_cards(pool: &PgPool, parent_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COUNT(*) FROM events \
+         WHERE aggregate_id = $1 AND event_type = 'ChildThreadCompleted'",
+    )
+    .bind(parent_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+/// Emit a `ResponseCanceled` with an explicit cause on `thread_id`.
+async fn emit_response_canceled_with_cause(
+    bus: &EventBus,
+    thread_id: Uuid,
+    cause: crate::engine::thread_events::CancelCause,
+) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseCanceled {
+            text: "partial work".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// The flip's one dangerous failure mode, and it is silent. Under
+/// `parent_callback_pending` a freshly spawned child owes its parent a card,
+/// which is TRUE, and the storage default is FALSE (a top-level thread owes
+/// nothing). If the spawn branch of the `MessageReceived` arm does not write
+/// the TRUE explicitly, a fresh coding-agent child sits at FALSE, the dedup
+/// early-return in `notify_parent_if_child` matches its very first
+/// `CodingAgentIdled`, and its first card is never sent. Nothing else fails:
+/// every other fixture passes through the same default.
+#[tokio::test]
+async fn fresh_coding_agent_child_reports_its_first_completion() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "baseline: one child in flight").await;
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "a coding-agent child's FIRST idle must produce exactly one \
+         ChildThreadCompleted on the parent"
+    );
+    let mut callbacks = 0;
+    while callback_rx.try_recv().is_ok() {
+        callbacks += 1;
+    }
+    assert_eq!(callbacks, 1, "and exactly one parent wake");
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "and the parent's count must come back down",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Read the child's `parent_callback_pending` marker.
+async fn read_callback_pending(pool: &PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar("SELECT parent_callback_pending FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// The non-child default, asserted rather than assumed. A `DEFAULT TRUE` would
+/// claim every top-level thread in the workspace owes some parent a card, so
+/// the storage default stays FALSE and the TRUE is written explicitly, only
+/// for a thread that has a parent.
+#[tokio::test]
+async fn top_level_thread_never_marks_a_pending_callback() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    emit_thread_message(&bus, thread_id, None, "top-level work").await;
+    assert!(
+        !read_callback_pending(&pool, thread_id).await,
+        "a thread with no parent has no parent callback pending after its \
+         first MessageReceived"
+    );
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ResponseGenerated {
+            text: "done".into(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    assert!(
+        !read_callback_pending(&pool, thread_id).await,
+        "nor after a terminal"
+    );
+
+    emit_thread_message(&bus, thread_id, None, "more work").await;
+    assert!(
+        !read_callback_pending(&pool, thread_id).await,
+        "nor after a second MessageReceived, which routes through the revive \
+         helper: its `parent_thread_id IS NOT NULL` conjunct keeps the write \
+         off a parentless row"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The terminal-abort write, which no test read before. A coding-agent child
+/// whose terminal is a crash (a terminal-cause `ResponseAborted`) decrements
+/// the parent and deliberately sends no card: the user is already looking at
+/// the child's error state. So nothing further is owed and the marker settles
+/// to FALSE. That is correct, not a leak.
+///
+/// `clear_pending_parent_callback` logs and continues on a query error, so a
+/// typo'd column name inside its SQL string produces a `[FanOut] Failed to …`
+/// line and no other test failure.
+#[tokio::test]
+async fn terminal_abort_clears_the_pending_callback() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert!(
+        read_callback_pending(&pool, child_id).await,
+        "baseline: the spawned child owes its parent a card"
+    );
+
+    bus.emit(BusEvent::Thread {
+        thread_id: child_id,
+        event: ThreadEvent::ResponseAborted {
+            text: String::new(),
+            images: vec![],
+            model: None,
+            reasoning_effort: None,
+            cause: crate::engine::thread_events::AbortCause::SafetyNet,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    assert_active_children(&pool, parent_id, 0, "a terminal abort decrements").await;
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        0,
+        "a terminal abort sends no card by design"
+    );
+    assert!(callback_rx.try_recv().is_err(), "and no wake either");
+    assert!(
+        !read_callback_pending(&pool, child_id).await,
+        "an abort owes the parent nothing further, so the marker settles to \
+         FALSE until the next start event"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The missing-parent retry write, which no test reached before. When the
+/// parent row is gone from `thread_summaries` the card has already committed
+/// and its projection has already cleared the child's marker, but the wake
+/// never reached `parent_callback_tx`. The parent callback therefore genuinely
+/// IS still pending, so the marker goes back to TRUE and the next terminal
+/// event retries the kick.
+///
+/// This write also log-and-continues, so a typo'd column name in its SQL
+/// string is silent at runtime.
+#[tokio::test]
+async fn missing_parent_row_leaves_the_callback_pending() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    // Drop the parent's summary row, leaving the child's `parent_thread_id`
+    // dangling: the self-join's `p.is_coding_agent` comes back NULL, which is
+    // the corruption branch under test.
+    sqlx::query("DELETE FROM thread_summaries WHERE thread_id = $1")
+        .bind(parent_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    emit_cc_idle(&bus, child_id, false, None).await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "the typed card is persisted before the parent row is inspected"
+    );
+    assert!(
+        callback_rx.try_recv().is_err(),
+        "but no wake is sent for a parent whose row is missing"
+    );
+    assert!(
+        read_callback_pending(&pool, child_id).await,
+        "the card exists and the wake does not, so the parent callback is \
+         still pending and the next terminal must retry"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A mid-turn redirect is not a completion. `arm_codex_redirect` interrupts a
+/// live Codex turn and emits `ResponseCanceled { cause: SupersededByFollowup }`,
+/// which means the caller steered rather than abandoned
+/// (`thread_events/cause.rs`). Reporting it to the parent wakes the parent with
+/// "your child was canceled" while the child is in fact running the redirected
+/// turn, and the parent may spawn a replacement.
+#[tokio::test]
+async fn codex_redirect_does_not_report_a_cancellation_to_the_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    emit_response_canceled_with_cause(
+        &bus,
+        child_id,
+        crate::engine::thread_events::CancelCause::SupersededByFollowup,
+    )
+    .await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        0,
+        "a SupersededByFollowup cancel is a redirect, not a completion: it \
+         must persist no ChildThreadCompleted on the parent"
+    );
+    assert!(
+        callback_rx.try_recv().is_err(),
+        "a SupersededByFollowup cancel must not wake the parent"
+    );
+    // The in-tx reconcile is cause-agnostic and still runs, so no counter
+    // drifts while the child is between turns; the follow-up's own
+    // `MessageReceived` re-increments when the redirected turn starts.
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "the in-tx reconcile still runs for a redirect cancel",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Companion to the redirect test: the discrimination must not swallow a real
+/// user Stop, which is still a completion the parent has to hear about.
+#[tokio::test]
+async fn user_stop_still_reports_a_cancellation_to_the_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+
+    emit_response_canceled_with_cause(
+        &bus,
+        child_id,
+        crate::engine::thread_events::CancelCause::UserStop,
+    )
+    .await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "a user Stop is a real completion and must reach the parent"
+    );
+    assert!(
+        callback_rx.try_recv().is_ok(),
+        "a user Stop must wake the parent"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The redirect's transient counter window, pinned so it is understood rather
+/// than rediscovered.
+///
+/// A `SupersededByFollowup` cancel sends no card (the test above), but its
+/// projection arm is cause-agnostic: it settles the child to idle and
+/// reconciles the parent from ground truth, so the parent's
+/// `active_children_count` really does read 0 between the interrupt landing and
+/// the redirected turn's `MessageReceived`. On the Codex lane that window can
+/// be up to `REDIRECT_INTERRUPT_MAX_WAIT`, because the lane waits for the
+/// interrupted turn to reach a boundary before emitting.
+///
+/// What the window costs and does not cost: the parent can end its own turn
+/// inside it and show idle rather than "waiting for children" until the
+/// redirected turn starts. Nothing is lost. The message is not dropped, the
+/// card is not skipped, and the counter is not permanently wrong: the
+/// redirected turn's start re-increments, its terminal reports, and every
+/// terminal reconciles from ground truth rather than by delta. The parent is
+/// still woken by the redirected turn's own completion.
+///
+/// Recorded as an accepted transient in ADR 0043 rather than closed here.
+/// Closing it would mean not settling the child to idle on this cause, which
+/// is a change to a contract-tested lifecycle transition and is deliberately
+/// outside the phase that introduced the discrimination.
+#[tokio::test]
+async fn a_codex_redirect_dips_the_parent_count_then_restores_it() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::ClaudeCode).await;
+    emit_cc_session_started(&bus, child_id).await;
+    assert_active_children(&pool, parent_id, 1, "the child is working").await;
+
+    // The interrupt lands. The child settles to idle and the parent's count
+    // reconciles from ground truth, which is the dip.
+    emit_response_canceled_with_cause(
+        &bus,
+        child_id,
+        crate::engine::thread_events::CancelCause::SupersededByFollowup,
+    )
+    .await;
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "the dip: the interrupted turn settled the child before the redirected \
+         one started",
+    )
+    .await;
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        0,
+        "and no card, so the parent is not told its child was canceled"
+    );
+
+    // The lane reaches the boundary and emits the follow-up. The child is back
+    // in flight and the parent's count is restored.
+    emit_cc_message_received(&bus, child_id, None, "go the other way").await;
+    assert_active_children(
+        &pool,
+        parent_id,
+        1,
+        "restored the moment the redirect starts",
+    )
+    .await;
+    assert!(
+        read_callback_pending(&pool, child_id).await,
+        "and the redirected turn owes the parent a card"
+    );
+
+    // The redirected turn completes, and THAT is the report.
+    emit_cc_idle(&bus, child_id, false, None).await;
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        1,
+        "exactly one card for the whole redirect, describing the work the \
+         parent actually asked for"
+    );
+    assert_active_children(&pool, parent_id, 0, "and the count lands at ground truth").await;
+    let mut wakes = 0;
+    while callback_rx.try_recv().is_ok() {
+        wakes += 1;
+    }
+    assert_eq!(wakes, 1, "and exactly one wake");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

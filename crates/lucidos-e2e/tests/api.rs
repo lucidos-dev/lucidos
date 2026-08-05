@@ -121,3 +121,6 @@ mod network_config_test;
 
 #[path = "api_support/embedding_model_status_test.rs"]
 mod embedding_model_status_test;
+
+#[path = "api_support/follow_up_test.rs"]
+mod follow_up_test;

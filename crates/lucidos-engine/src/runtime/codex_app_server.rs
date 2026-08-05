@@ -327,8 +327,8 @@ pub(super) async fn app_server_driver_task(
             images: Vec::new(),
         });
     }
-    // Established thread id (from the thread response) — turns can start
-    // only once this is Some.
+    // True once the thread response has established the session (the id itself
+    // lives on `tracker.session_id`). Turns can start only once this is true.
     let mut thread_ready = false;
     // One-shot guard for the thread/resume → thread/start fallback below.
     let mut tried_fresh_thread_fallback = false;

@@ -130,6 +130,15 @@ the `--font-size-*` type-scale tokens over a raw `rem` — body text is
 `sdk-iframe.css` already ships). (`1px` borders are the one acceptable `px`
 exception, same as the host shell.)
 
+**The body step is already the default.** `sdk-iframe.css` sets
+`body { font-size: var(--font-size-md) }`, so a paragraph you never size
+explicitly still lands on Lucidos's body text size instead of the raw root
+(`1rem`), which is a size nothing in the host shell renders at. So you don't
+need to declare it, and if you do (a text-heavy report might want
+`--font-size-lg`), it takes another type-scale step. Never reset it to `1rem` or
+a `px` value: that is exactly what makes an app read a whole scale step larger
+than the rest of Lucidos, with looser line spacing to match.
+
 ### Component classes
 
 `sdk-iframe.css` also ships Lucidos's shared component layer — literally the
@@ -290,7 +299,15 @@ One other special case: a `system-knowhow/...` path is routed through the engine
 
 ## lucidos.events — Event Store
 
-Emit and query domain events.
+Emit domain events, and query the workspace's event store.
+
+**`query` reads the whole store, not just what your app emitted.** Workspace
+domain events (`HabitCompleted`) and the engine's own thread / system events
+(`ChildThreadCompleted`, `ResponseGenerated`, `ChangeApplied`, `TriggerCompleted`)
+are rows in one `events` table and come back from one call, filtered only by
+`event_type` / time. There is no second stream to reach for. See
+`system-knowhow/thread-events.md` § "One table, two enums" for what the
+`ThreadEvent` / `SystemEvent` distinction actually is.
 
 ```ts
 lucidos.events.emit(type: string, payload: Record<string, unknown>, options?: EmitOptions): Promise<void>
@@ -312,8 +329,10 @@ interface LucidosEvent {
   event_type: string;
   payload: Record<string, unknown>;
   created: string;
-  aggregate?: string;
-  aggregate_id?: string;
+  /** Engine thread events only (absent, not null, on domain events). */
+  thread_id?: string;
+  /** Monotonic insertion order across the workspace. Always present. */
+  sequence: number;
 }
 
 interface EmitOptions {
@@ -346,6 +365,23 @@ const events = await lucidos.events.query({
   since: '2026-04-01T00:00:00Z',
   limit: 50
 });
+
+// Read the outcome of child threads the workspace has spawned. This is an
+// ENGINE event, not one your app emitted, and it comes back from the same
+// call: `thread_id` is the PARENT thread, and the payload carries the child.
+const completions = await lucidos.events.query({
+  event_type: 'ChildThreadCompleted',
+  limit: 20
+});
+for (const e of completions) {
+  console.log(
+    e.thread_id,                      // parent thread
+    e.payload.child_thread_id,
+    e.payload.child_thread_title,
+    e.payload.status,                 // success | failure | no_changes | canceled
+    e.payload.summary
+  );
+}
 ```
 
 ## lucidos.proxy — Call External APIs
@@ -438,7 +474,7 @@ const res = await lucidos.proxy('vertex').fetch(
 | Want to … | Use |
 |---|---|
 | Read/write workspace files | `lucidos.data.*` |
-| Emit/query domain events | `lucidos.events.*` |
+| Emit a domain event, or query the event store (domain AND engine events) | `lucidos.events.*` |
 | Call a model provider the engine already has (LLM / image) | `lucidos.proxy('openai' \| 'vertex' \| 'openrouter' \| 'anthropic' \| 'local').fetch(...)` — no `apis.json` needed |
 | Call any other external HTTP API | `lucidos.proxy(name).fetch(path, init)` + an `apis.json` entry |
 | Hit the engine's own `/api/v1/*` | Plain `fetch` (same origin, no proxy needed) |
@@ -720,18 +756,23 @@ type NavigateTarget =
   | 'settings' | 'app' | 'file' | 'trigger' | 'thread'
   | 'new-app' | 'new-trigger' | 'new-chat' | 'url';
 
-// Settings sub-section for `target: 'settings'` (platform-gated 'mobile-access' /
-// 'experimental' are intentionally excluded).
+// Settings sub-section for `target: 'settings'`. Every top-level Settings
+// category plus the System subpanels: no category is platform-gated, so none
+// has to be withheld from a caller with no platform signal.
 type SettingsViewTarget =
-  | 'models' | 'appearance' | 'devices' | 'accounts' | 'repositories' | 'marketplaces'
-  | 'permissions' | 'keyboard-shortcuts' | 'system'
-  | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables';
+  | 'models' | 'permissions' | 'coding-agents' | 'accounts' | 'locale' | 'marketplaces'
+  | 'access' | 'devices' | 'system' | 'appearance' | 'keyboard-shortcuts'
+  | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
 
 interface NavigateUi {
   target: NavigateTarget;
   settings_view?: SettingsViewTarget;
   app_id?: string;
   file_path?: string;
+  /** 1-based line to open `file_path` at, and the inclusive last line of the
+   *  range. See § Navigation targets for the degradation rules. */
+  line?: number;
+  line_end?: number;
   id?: string;
   url?: string;
   event_id?: string;
@@ -857,6 +898,12 @@ interface ThreadsListOptions {
   source?: string;
   /** Server clamps to 1..=1000 (default 100). */
   limit?: number;
+  /** Thread id. Restrict to that thread's DIRECT children only, never its
+   *  grandchildren. Same filter as the `--parent` CLI flag and the
+   *  `list_threads` tool's `my_children` (which resolves it from the calling
+   *  thread; an app has no calling thread, so it names one). A malformed
+   *  uuid is a 400, never a silently unfiltered list. */
+  parent?: string;
 }
 
 /** Projected snapshot of a thread's metadata, derived from the event
@@ -891,7 +938,9 @@ interface ThreadSummary {
    *  descendants needing *user attention* (WaitingForUserAnswer, or pending
    *  changes). Drives REVIEW bubbling up the ancestor chain. */
   attention_descendant_count: number;
-  /** 'idle' | 'running' | 'waiting' | 'failed' | 'waiting_for_user_answer'. */
+  /** 'idle' | 'running' | 'waiting' | 'paused' | 'failed' | 'waiting_for_user_answer'.
+   *  `paused` = an engine restart interrupted the turn; it resumes on its own or
+   *  offers a Continue button. */
   status: string;
   coding_agent_has_diff: boolean;
   coding_agent_proposed: boolean;
@@ -931,6 +980,7 @@ interface ThreadSummary {
 |---|---|
 | Render a list of threads in an app UI | `lucidos.threads.list()` |
 | Show "N active threads" badge | `lucidos.threads.count({ active: true })` |
+| Render one thread's children (a fan-out board) | `lucidos.threads.list({ parent: id })` |
 | React to thread state changes in real time | Subscribe to `lucidos.sse` instead |
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })` |
 | Open a link outside Lucidos from JS | `lucidos.ui.openExternal(url)` (never `window.open`) |
@@ -943,6 +993,7 @@ lucidos.ui.watchPreferences(): void
 lucidos.ui.navigate(target: NavigateTarget, params?: NavigateParams): Promise<void>
 lucidos.ui.openExternal(url: string): Promise<void>
 lucidos.ui.startThread(opts?: { prompt?: string }): Promise<void>
+lucidos.ui.previewFile(params: FilePreviewParams): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
 lucidos.ui.toast(message: string, type?: ToastType, opts?: ToastOptions): void
 lucidos.ui.prompt(options: PromptOptions): Promise<string | null>
@@ -965,11 +1016,11 @@ discoverable and type-checked (§ Types, under lucidos.notifications).
 |--------|--------|-------------|
 | `thread` | `id` | Focus a specific thread |
 | `app` | `id` (or `app_id`) | Open an app UI |
-| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section — `models`, `appearance`, `permissions`, `keyboard-shortcuts`, `devices`, `accounts`, `repositories`, `marketplaces`, or a System subpanel (`system`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`). Omit `settings_view` for the Settings home list. |
+| `settings` | `settings_view` (optional) | Open Settings, optionally a sub-section: `models`, `permissions`, `coding-agents`, `accounts`, `locale`, `marketplaces`, `access`, `devices`, `appearance`, `keyboard-shortcuts`, or a System subpanel (`system`, `backup`, `memory`, `disk-usage`, `environment-variables`, `thread-queue`, `debugging`). Omit `settings_view` for the Settings home list. |
 | `new-chat` | `prompt` (optional) | Open a fresh chat thread, optionally prefilling the compose textarea. Prefer `lucidos.ui.startThread()` — it's the typed wrapper around this target. |
 | `plugins` | `id` (optional) | Open the Plugins panel's Installed tab. With `id` (a plugin id), scroll to and pulse-highlight that plugin's row — used by the plugin-update notification so a tap lands on the plugin that has the pending update. |
 | `app-store` | — | Open the Plugins panel's Store (marketplace) tab. |
-| `file` | `file_path` | Open a file in the preview pane — see the two accepted path forms below. |
+| `file` | `file_path`, `line` (optional), `line_end` (optional) | Open a file in the preview pane, optionally at a line. See the two accepted path forms and the line params below. |
 | _other panels_ | — | `files`, `apps`, `triggers`, `thread-queue`, `changes`, `notifications`; plus `trigger` (`id`), `url` (`url`), `new-app`, `new-trigger`. |
 
 #### `file_path` — workspace data vs a registered repository
@@ -977,7 +1028,7 @@ discoverable and type-checked (§ Types, under lucidos.notifications).
 `file_path` takes one of two forms:
 
 - **A workspace data path** — `artifacts/…`, `knowhow/…`, `apps/…`, `triggers/…`, or `system-knowhow/…`. A path with none of those prefixes is treated as an artifact, so `notes.md` opens `artifacts/notes.md`.
-- **A repo-encoded path** — `repo:<repoId>:file:<repo-relative path>`, which opens a file from a **registered repository** (a local clone added under Settings → Repositories) instead of the workspace data tree. `<repoId>` is that Repository's id, as returned by `GET /api/v1/repositories`; the file is read at the clone's current `HEAD`.
+- **A repo-encoded path**: `repo:<repoId>:file:<repo-relative path>`, which opens a file from a **registered repository** (a local clone added under Settings → Coding Agents) instead of the workspace data tree. `<repoId>` is that Repository's id, as returned by `GET /api/v1/repositories`; the file is read at the clone's current `HEAD`.
 
 ```js
 // Open src/main/resources/transforms/order.jslt from a registered repo clone.
@@ -987,6 +1038,124 @@ await lucidos.ui.navigate('file', {
 ```
 
 The preview pane binds itself to that repository, so the Files panel behind it and the preview's changed-files sidebar stay on the same repo. A malformed `repo:…` string is not a repo path — it falls back to the artifact rule above.
+
+##### Naming a revision: `repo:<repoId>:file#<ref>:<path>`
+
+The bare form reads the clone's `HEAD`, which is often not where the interesting content is: a file a coding agent has edited lives on that agent's worktree branch, and a citation into a released version means a tag or a sha. Add `#<ref>` to the `file` segment to say which revision you mean.
+
+```js
+// The file as it stands on a coding agent's branch, not as it stands on HEAD.
+await lucidos.ui.previewFile({
+  file_path: `repo:${repoId}:file#${branchName}:src/main.rs`,
+  line: 510,
+});
+```
+
+- `<ref>` is anything `git show` accepts as a revision: a branch, a tag, a full or short sha.
+- It works on both calls and in the href form below, since it is part of the path string rather than a separate parameter.
+- Omit it and you get `HEAD`, exactly as before.
+- A ref that does not exist (or a file that does not exist at it) shows the preview's normal "failed to load" state, not a thrown error.
+- **Every segment must be non-empty.** `repo:<repoId>:file#:<path>` names no revision and is not a repo path at all, so it falls back to the artifact rule like any other malformed `repo:…` string. Leave the `#` off instead.
+
+A ref cannot contain `:` (git forbids it), which is what keeps the `:`-separated form unambiguous; a `/` in a branch name is fine.
+
+`diff` locators do not take a `#<ref>`: `repo:<repoId>:diff#<changeId>:<path>` already names its revisions through the change.
+
+#### `line` / `line_end`: opening at a cited line
+
+**Whenever you cite a specific line, pass it.** The preview then scrolls that line into view and highlights it, exactly as if the reader had clicked its line number. Without it the file opens at the top and a `file.rs:510` citation leaves the reader to find line 510 by hand, which is the whole value of the citation lost at the last step.
+
+- `line` is **1-based**. `line_end` is the last line of the range and is **inclusive**; omit it to highlight a single line.
+- Both work for either `file_path` form, a workspace data path or a repo-encoded one.
+- A file that renders (markdown, CSV, SVG) switches to its **source view**, since a rendered document has no lines to highlight.
+- The highlight is the same one a manual line selection produces, so the reader can send it straight into a chat message as context.
+
+```js
+// "src/main.rs:510-520" in a report, made clickable.
+await lucidos.ui.navigate('file', {
+  file_path: `repo:${repoId}:file:src/main.rs`,
+  line: 510,
+  line_end: 520,
+});
+```
+
+A line the file can't honour never costs the reader the file: `0`, a negative or fractional number, a line past the end of the file, and a format with no source view at all (PDF, an image) are all ignored, and the file opens at the top as it would with no `line` at all. A citation's line number is the part that goes stale, so this is deliberate rather than an error.
+
+#### Linking to a repo file from an HTML artifact
+
+An `<a href>` inside a **previewed HTML or markdown artifact** can use the repo-encoded path directly, with a GitHub-style line suffix:
+
+```html
+<a href="repo:REPO_ID:file:src/main.rs#L510-L520">src/main.rs:510-520</a>
+```
+
+The host routes that click through the same navigation this section describes, so a report full of citations works as a plain artifact and does not have to be published as an app to reach `lucidos.ui.navigate`. `#L510` is a single line; `#L510-L520` (or `#L510-520`) is a range. The suffix exists only for hrefs, since an anchor has no other way to carry a param: from JavaScript, use `line` / `line_end` above.
+
+The revision form composes with it. The two `#` never compete: the line suffix is the trailing one, and the ref is the one inside the `file` segment.
+
+```html
+<a href="repo:REPO_ID:file#release/2.4:src/main.rs#L510-L520">src/main.rs:510-520 on release/2.4</a>
+```
+
+### Showing a cited file without leaving your app
+
+`navigate('file', …)` takes the whole shell into the Files panel. For a report or a dashboard full of citations that is the wrong motion: the reader loses their place and has to navigate back. `lucidos.ui.previewFile(params)` shows the file in a **file preview modal** over your app instead, so they glance at the code and carry on.
+
+```js
+// "src/main.rs:510-520" in a report, glanceable.
+await lucidos.ui.previewFile({
+  file_path: `repo:${repoId}:file:src/main.rs`,
+  line: 510,
+  line_end: 520,
+});
+```
+
+```ts
+interface FilePreviewParams {
+  /** The same forms `navigate('file', …)` accepts: a workspace data path, or
+   *  `repo:<repoId>:file:<repo-relative path>` for a registered repository
+   *  clone (its current HEAD), or `repo:<repoId>:file#<ref>:<path>` for a
+   *  named branch, tag or sha. */
+  file_path: string;
+  /** 1-based first line to highlight and scroll to. */
+  line?: number;
+  /** Inclusive last line of the range; omit for a single line. */
+  line_end?: number;
+}
+```
+
+`params` is the `file` target's own params, with the same field names, so one object drives either call:
+
+```js
+const at = { file_path: 'artifacts/report.md', line: 42 };
+await lucidos.ui.previewFile(at);        // glance, your app stays put
+await lucidos.ui.navigate('file', at);   // leave for the Files panel
+```
+
+Everything the two sections above specify applies unchanged: every `file_path` form (the named-revision one included), `line` / `line_end` 1-based and inclusive, and the same degradation for a line the file cannot honour. The modal shows the same rendering the Files panel shows, with the same highlight and line numbers, and it carries an **Open in Files** link that escalates the glance into exactly the `navigate('file', …)` you would otherwise have called, at the same lines.
+
+Naming the revision matters more here than anywhere else: the modal may be showing a repository the Files panel is not bound to, so it cannot fall back to whatever branch that panel happens to be on. Without a `#<ref>` it reads `HEAD`.
+
+| Want to … | Use |
+|---|---|
+| Let the reader check a citation and keep reading | `lucidos.ui.previewFile({ file_path, line })` |
+| Send the reader to the file to work with it (edit, pick a range for chat, browse the tree) | `lucidos.ui.navigate('file', { file_path, line })` |
+
+Three things to know:
+
+- **It resolves when the preview is on screen, not when the reader dismisses it.** A glance can stay open for minutes and your app is not blocked while it is. It rejects when the host cannot put it on screen, which makes the escalation a natural fallback:
+
+  ```js
+  try { await lucidos.ui.previewFile(at); }
+  catch { await lucidos.ui.navigate('file', at); }
+  ```
+
+  Two things make it reject, and both mean "nothing would have appeared". Your app is running with **no host shell around it**: opened in its own tab, or the SDK loaded in a plain page. Or **something is fullscreen that the host cannot render over**, which in practice means your app called `requestFullscreen` on its own content. Fullscreen taken from the Lucidos content header is fine, and so is everything else: the preview appears over your app there like anywhere else. Write the `catch` and you are covered in all of them.
+
+- **Read-only.** There is no editing in the modal; `navigate('file', …)` is the way to the editable preview. A second `previewFile` replaces a showing one.
+- **A `repo:…:diff#…:…` locator previews the file, not the diff.** The diff view belongs to the Files panel; use `navigate` for it. The change is not thrown away though: the file is shown at that change's end state, so a citation into a coding agent's work shows the work. Because it is a file view, its lines ARE honoured, unlike the same locator through `navigate`.
+
+Since one of those two reject causes is about fullscreen, the ordinary case is worth stating plainly: `previewFile`, `confirm`, `prompt` and `toast` are all rendered by the host, and all of them appear over your app when the reader has put it in fullscreen from the content header. Escape closes what is in front: with the app pseudo-fullscreen (iOS, and anywhere the Fullscreen API is unavailable) one Escape closes the modal and the app stays fullscreen; with real fullscreen the browser claims that first Escape to leave fullscreen, so the modal stays up in the normal layout and the next Escape closes it.
 
 ### Opening a link outside Lucidos
 

@@ -12,6 +12,7 @@ import {
   TerminatedQuestionBody,
 } from '../QuestionCard';
 import { PLACEHOLDER_ANSWERING } from '../prompt-input-helpers';
+import { ANSWER_CANCEL_TOOLTIP } from '../PromptInput';
 import { vnodeToText } from './vnodeToText';
 
 describe('OptionIndicator', () => {
@@ -40,7 +41,9 @@ describe('OptionIndicator', () => {
 // a card with options said the two real escapes existed. Naming them is what
 // fixed that, but the card is the wrong surface for it: a guide line under the
 // options sat a few pixels above the textarea it pointed at, and said the same
-// thing that textarea's own placeholder says. The prompt owns the sentence now.
+// thing that textarea's own placeholder says. The prompt row owns both halves
+// now, one on each control: the textarea's placeholder names typing, the Cancel
+// button's tooltip names Cancel.
 describe('the card carries no hint of its own', () => {
   const SOURCE = readFileSync(
     resolve(dirname(fileURLToPath(import.meta.url)), '../QuestionCard.tsx'),
@@ -52,10 +55,41 @@ describe('the card carries no hint of its own', () => {
     expect(Object.keys(QuestionCardModule).filter(k => /hint/i.test(k))).toEqual([]);
   });
 
-  it('leaves both escapes to the prompt placeholder, in one sentence', () => {
-    expect(PLACEHOLDER_ANSWERING).toContain('Type your answer');
-    expect(PLACEHOLDER_ANSWERING).toContain('Cancel');
-    expect(PLACEHOLDER_ANSWERING.split('.').filter(s => s.trim()).length).toBe(1);
+  // "custom answer", not "your answer": the placeholder has to read as a peer of
+  // the card's options rather than as composer chrome. Short and unpunctuated
+  // for the same reason, since a placeholder that wraps to two lines of grey
+  // text at 125% scale in monospace is the first thing the eye skips.
+  it('leaves the typing escape to the prompt placeholder, in one short line', () => {
+    expect(PLACEHOLDER_ANSWERING).toContain('Type');
+    expect(PLACEHOLDER_ANSWERING).toContain('custom answer');
+    expect(PLACEHOLDER_ANSWERING.length).toBeLessThan(32);
+    expect(PLACEHOLDER_ANSWERING).not.toContain('.');
+  });
+
+  // The other half of the pair: what the red button does to a pending question
+  // is spelled out nowhere else, so the tooltip carries it.
+  it('leaves the Cancel escape to the prompt row Cancel tooltip', () => {
+    expect(ANSWER_CANCEL_TOOLTIP).toContain('Cancel');
+    expect(ANSWER_CANCEL_TOOLTIP).toContain('ask something else');
+  });
+
+  // Pin the WIRING, not just the wording. While both halves lived in one string
+  // the placeholder assertion covered them together; split across two controls,
+  // a refactor that drops the tooltip leaves the constant (and the assertion
+  // above) intact while the escape goes unnamed on screen. Source-scan for the
+  // same reason as prompt-answer-no-images.test.ts: mounting PromptInput drags
+  // in every chat signal and store.
+  it('wires that tooltip onto both Cancel controls in PromptInput', () => {
+    const promptSource = readFileSync(
+      resolve(dirname(fileURLToPath(import.meta.url)), '../PromptInput.tsx'),
+      'utf8',
+    );
+    // Lone Cancel: question card gets the wording, a permission card keeps Stop.
+    expect(promptSource).toMatch(
+      /data-tooltip=\{answeringQuestionCard\s*\?\s*ANSWER_CANCEL_TOOLTIP\s*:\s*'Stop'\}/,
+    );
+    // Multi-select split button: that path only exists with a question pending.
+    expect(promptSource).toMatch(/tooltip:\s*ANSWER_CANCEL_TOOLTIP/);
   });
 });
 

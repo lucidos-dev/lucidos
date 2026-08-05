@@ -29,12 +29,9 @@ import { isNewerVersion } from '../../utils/version';
 import { formatShortTime } from '../../utils/formatTime';
 import { CLIENT_BUILD_ID } from 'virtual:build-id';
 import { BackupSection } from './BackupSection';
-import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
-import { LocaleSection } from './LocaleSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
 import { EnvironmentVariablesPage } from './EnvironmentVariablesPage';
-import { NetworkAccessPage } from './NetworkAccessPage';
 import { DebuggingSection } from './DebuggingSection';
 import { restartControlHome } from './restartControl';
 import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
@@ -51,7 +48,7 @@ function formatBuildId(id: string): string {
   return isUnstampedBuildId(id) ? 'dev' : id;
 }
 
-export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'network-access' | 'debugging';
+export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
 
 const SYSTEM_PANELS: Array<{ key: SystemPanel; label: string; subview: SettingsNavKey }> = [
   { key: 'overview', label: 'Overview', subview: 'system' },
@@ -176,7 +173,6 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
       case 'memory': return <MemoryInspector />;
       case 'disk-usage': return <DiskUsagePage />;
       case 'environment-variables': return <EnvironmentVariablesPage />;
-      case 'network-access': return <NetworkAccessPage />;
       case 'debugging': return <DebuggingSection />;
       default: return renderOverview();
     }
@@ -211,10 +207,12 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
           </div>
         </div>
 
-        <LocaleSection />
-
-        <CodingAgentBinariesSection />
-
+        {/* Locale (language + timezone) and the coding-agent binary paths used
+            to render here. Neither is a system concern: Locale is a plain user
+            preference and now has its own top-level category, and the binary
+            paths moved to Coding Agents beside the repositories they run in.
+            What is left is what System actually is: this workspace's
+            connection, what version is running, and how to move it forward. */}
         <div class="settings-section">
           <div class="settings-section-title" data-search-anchor="system:versions">Versions</div>
           <div class="system-info-list">

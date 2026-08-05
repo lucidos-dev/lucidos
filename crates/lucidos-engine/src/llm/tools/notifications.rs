@@ -1,5 +1,10 @@
-//! LLM-facing schemas for notification tools (send/read notifications,
-//! enable push). Handlers live in `engine::tools` + the scheduler push path.
+//! LLM-facing schema for the `send_notification` tool. Its handler lives in
+//! `engine::tools` + the scheduler push path.
+//!
+//! This module owns the SEND schema only. Reading / clearing the inbox is the
+//! grouped `notifications` manifest tool, and enabling push is
+//! `set_preference(key="push_notifications", …)`. See the trailing comments
+//! below for both.
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;

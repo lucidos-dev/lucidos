@@ -30,6 +30,7 @@ fn generate_cross_validation_fixture() -> String {
             "waiting_for_user_answer",
             ThreadStatus::WaitingForUserAnswer,
         ),
+        ("paused", ThreadStatus::Paused),
         ("failed", ThreadStatus::Failed),
     ];
     let sections = [
@@ -126,7 +127,7 @@ fn generate_typescript() -> String {
     out.push_str("export type ThreadType = 'chat' | 'claude_code';\n");
     out.push_str("export type ArchiveState = 'archived' | 'inbox';\n");
     out.push_str("export type DisplaySection = 'saved' | 'current' | 'archive';\n");
-    out.push_str("export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'failed';\n");
+    out.push_str("export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'paused' | 'failed';\n");
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
     out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'archive' | 'save' | 'unsave';\n");
     out.push_str("export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';\n\n");

@@ -28,8 +28,8 @@ use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::Mutex;
 use uuid::Uuid;
 
-use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::engine::thread_events::{AbortCause, EventMeta, ThreadEvent};
+use crate::engine::event_bus::EventBus;
+use crate::engine::thread_events::{AbortCause, EventMeta};
 use crate::engine::types::{AgentSession, AgentUserInput};
 
 /// Drop-guard over `agent_sessions[thread_id]` for one `run_session` call.
@@ -170,26 +170,22 @@ async fn settle_dropped_session(pool: &sqlx::PgPool, event_bus: &EventBus, threa
             return;
         }
     }
-    event_bus
-        .emit_or_log(
-            BusEvent::Thread {
-                thread_id,
-                event: ThreadEvent::ResponseAborted {
-                    text: String::new(),
-                    images: vec![],
-                    model: None,
-                    reasoning_effort: None,
-                    cause: AbortCause::SessionDropped,
-                },
-                // No actor: nobody chose this. The caller's future was
-                // cancelled out from under the session — a transport event,
-                // not a decision. `stamp_system_actor_if_aborted` supplies
-                // `MessageOrigin::System` downstream.
-                meta: EventMeta::NONE,
-            },
-            "[AgentSession] ResponseAborted (session future dropped)",
-        )
-        .await;
+    crate::engine::thread_events::emit_response_aborted(
+        event_bus,
+        thread_id,
+        AbortCause::SessionDropped,
+        String::new(),
+        vec![],
+        None,
+        None,
+        // No actor: nobody chose this. The caller's future was cancelled out
+        // from under the session, a transport event rather than a decision.
+        // `stamp_system_actor_if_aborted` supplies `MessageOrigin::System`
+        // downstream.
+        EventMeta::NONE,
+        "[AgentSession] ResponseAborted (session future dropped)",
+    )
+    .await;
 }
 
 #[cfg(test)]

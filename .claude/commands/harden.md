@@ -208,7 +208,7 @@ Commit any fixes from this phase before proceeding to Phase 4.5.
 ./scripts/check-em-dashes.sh
 ```
 
-Runs for **every** diff, with no fast path: the docs-only and CSS-only skips below do NOT apply to it, because prose is exactly where em dashes come from. It is diff-scoped and added-lines-only, so the ~29,000 pre-existing ones in the tree never fire it (see `.claude/rules/no-em-dashes.md`). A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
+Runs for **every** diff, with no fast path: the docs-only skip below does NOT apply to it, because prose is exactly where em dashes come from. It is diff-scoped and added-lines-only, so the ~29,000 pre-existing ones in the tree never fire it (see `.claude/rules/no-em-dashes.md`). A non-zero exit is a hardening failure like any other: fix the flagged lines, commit, and return to Phase 1.
 
 This is also the layer that covers **Codex**, which has no `PreToolUse` hooks and therefore never met the write-time gate.
 
@@ -247,8 +247,30 @@ Pick suites by `git diff main...HEAD --name-only`, applying the CLAUDE.md test-s
 - `.rs`, `Cargo.toml`, `Cargo.lock`, `.sql` → `make lint && make test`
 - `.sh`, `.shellcheckrc`, `Makefile` → `make lint`
 - `.ts`, `.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`
-- CSS-only / docs-only → skip
+- `.css` under `crates/lucidos-app/src/` → `cd crates/lucidos-app && npx vite build`
+- `crates/lucidos-engine/src/api/sdk_iframe.css` → `cd crates/lucidos-app && npm test`
+- Docs-only → skip
 - Mixed → run both **in parallel**
+
+**CSS is not a skip.** Until 2026-08-05 this table said "CSS-only → skip", and
+nothing else in the gate parses CSS: `tsc` ignores it, Vitest never built it.
+So a syntax error passed every phase and landed on `main`, where it kills the
+checkout-shared build-watch's `vite build`. The watch keeps serving the previous
+`dist/` and republishes nothing, so the next frontend-only Apply times out in
+`engine::frontend_refresh` and the user gets "Frontend change applied but not
+served yet", naming the build-watch instead of the CSS file that broke it, for a
+change that may not touch CSS at all. `npx vite build` is sub-second and is the
+exact command the build-watch runs, so it fails on precisely what the watch will
+fail on. Add it to the parallel launch when the diff also touches Rust or TS.
+
+The two CSS surfaces need **different** gates, which is why they are separate
+rows. `sdk_iframe.css` is `include_str!`d by `api/sdk.rs` and served to every
+app iframe, so it is outside the Vite graph and `vite build` never reads it; a
+syntax error there ships silently as app chrome that stops being styled. It is
+covered instead by `styles/__tests__/engine-served-css-parses.test.ts`, a
+postcss parse under the ordinary Vitest run. Neither gate subsumes the other:
+`vite build` resolves `@import` (which a per-file parse cannot), and the guard
+reaches a file `vite build` cannot see.
 
 **`make lint`, not `cargo check` — this is THE per-change lint gate.** Lucidos is
 not PR-based: Apply merges the branch into `main` directly, so there is no CI

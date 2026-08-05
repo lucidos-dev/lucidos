@@ -19,7 +19,7 @@ import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
 import type { Exchange } from '../../store/thread-events';
-import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, unresumedAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
+import { exchangeStatus as getExchangeStatus, exchangeResponseModel, exchangeReasoningEffort, exchangeKey, continuableAbortIndex, queuedFollowupRun, isChangeLifecycleEvent } from '../../store/thread-events';
 import { isActive as isStatusActive } from '../../store/exchange-status';
 import { forceIOSRepaint } from '../../utils/iosRepaint';
 
@@ -56,16 +56,18 @@ export function renderExchanges(
   streamingBuffer: string,
   /** Windowing: emit DOM only for exchanges at this index or later. The loop
    *  still iterates the FULL array so every index-based decision (activeIdx,
-   *  queued run, unresumedAbort) and the prior model/effort accumulator
+   *  queued run, continuable abort) and the prior model/effort accumulator
    *  stays correct — only `nodes.push` is gated. A large thread thus renders (and
    *  markdown-parses) just its visible tail; older exchanges materialize as the
    *  user scrolls up (see ThreadView's renderCount). Default 0 = render all (the
    *  pre-windowing behavior, used by tests and the deep-link "render all" path). */
   renderFromIndex = 0,
 ): VNode[] {
-  // Compute once which abort exchange (if any) gets the Continue button —
-  // the most recent ResponseAborted that has no later ContinuationStarted.
-  const unresumedIdx = unresumedAbortIndex(exchanges);
+  // Compute once which abort exchange (if any) gets the Continue button: the
+  // most recent ResponseAborted the user may actually resume from. See
+  // `continuableAbortIndex` for the three ways that comes back empty, the
+  // sharpest being a switch teardown the engine is already auto-resuming.
+  const continuableIdx = continuableAbortIndex(exchanges);
   // Lifted once for the whole list and passed as props to every ChatExchange:
   // these reads subscribe the PARENT (this function, called from ThreadView)
   // to threadMap + cancelingThreadIds instead of the 29+ child ChatExchanges.
@@ -148,7 +150,7 @@ export function renderExchanges(
         hasPriorActive={priorActive}
         priorModel={lastModel}
         priorEffort={lastEffort}
-        isUnresumedAbort={i === unresumedIdx}
+        isContinuableAbort={i === continuableIdx}
         threadIsCC={threadIsCC}
         threadCodingAgent={threadCodingAgent}
         threadIdle={threadIdle}

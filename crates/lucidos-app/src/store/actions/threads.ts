@@ -6,7 +6,7 @@ import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attenti
 import type { FamilyGraph } from '../../components/drawer/family-graph';
 import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
-import { loadThreadEvents, ensureThreadByIdInMap, sectionMutatedAt } from './thread-loading';
+import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt } from './thread-loading';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { scrollToBottom, scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
@@ -67,6 +67,11 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
 
   // Lazy-load events for this thread if not already loaded
   loadThreadEvents(threadId);
+  // And catch it up if it IS loaded but a sync point (an iOS PWA wake, an SSE
+  // reopen, a `Lagged`) marked it as possibly behind. Those no longer fetch every
+  // loaded thread; they mark, and this is where the mark is paid, on the one
+  // thread the user is actually opening. No-op for a thread with no mark.
+  refreshStaleThreadEvents(threadId);
 
   pushThreadNavState({ type: 'thread', id: threadId });
 
@@ -78,10 +83,29 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // `revealPane: false` opts out for a bookkeeping focus change (see the option).
   if (options?.revealPane !== false) revealThreadPane();
 
+  // A deep-link whose target never renders (the event isn't in this thread, it
+  // renders nothing, or the thread was still loading when the resolve deadline
+  // closed) used to end in silence, so the notification tap just looked broken.
+  // scrollState handles the recovery scroll and calls back here for the words:
+  // it stays free of the `store` import that `showToast` would drag in.
+  //
+  // The message deliberately does NOT claim where the user was taken, because
+  // the recovery scroll is conditional (it stands down for a user who scrolled
+  // away during the wait) while the message is not.
   if (targetEventId) {
-    scrollToEventAndPulse(targetEventId);
+    scrollToEventAndPulse(targetEventId, {
+      onUnresolved: () => showToast(
+        'The event this notification points at is not shown in this thread.',
+        'warning',
+      ),
+    });
   } else if (targetChangeId) {
-    scrollToChangeAndPulse(targetChangeId);
+    scrollToChangeAndPulse(targetChangeId, {
+      onUnresolved: () => showToast(
+        'That change is not shown in this thread.',
+        'warning',
+      ),
+    });
   }
 
   // No auto-read — user must explicitly click Archive, Apply, or Discard.

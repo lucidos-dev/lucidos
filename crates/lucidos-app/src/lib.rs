@@ -987,6 +987,25 @@ fn heartbeat(app: tauri::AppHandle) {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Bring the main window to the front.
+///
+/// The same reshow the tray's "Open Lucidos" and a notification tap perform
+/// ([`show_main_window`]: leave menu-bar-only, unminimize, show, focus, activate
+/// frontmost), exposed to the page for the one flow that finishes somewhere
+/// else: an OAuth authorization the user completes in a browser. Without it they
+/// approve the provider's consent screen and are left staring at the callback
+/// tab with Lucidos behind it.
+///
+/// Deliberately NOT a general "focus me" the page may call whenever it likes.
+/// Its one caller (`handleOAuthAccountConnected`) fires only for a flow THIS
+/// device started, seconds after the user's own click, and only once. A window
+/// that fronts itself on a background event is a nuisance, so keep new callers
+/// to that shape.
+#[tauri::command]
+fn focus_main_window(app: tauri::AppHandle) {
+    show_main_window(&app);
+}
+
 #[tauri::command]
 fn __panel_content_report(
     app: tauri::AppHandle,
@@ -1361,6 +1380,7 @@ pub fn run() {
             open_url_external,
             show_native_notification,
             dismiss_native_notification,
+            focus_main_window,
             nudge_dock_badge,
             get_native_window_active,
             take_pending_native_taps,

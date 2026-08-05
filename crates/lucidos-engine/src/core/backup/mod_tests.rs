@@ -9,6 +9,49 @@ fn provider_ids_match_registry() {
     assert_eq!(PROVIDER_IDS, registry.as_slice());
 }
 
+/// Every provider must name at least one scope. An empty list means the
+/// readiness verdict degenerates to "an account row exists", which is exactly
+/// what let a Dropbox account with no file permissions read as ready and fail
+/// at `files/create_folder_v2` with a 400 (2026-08-05).
+#[test]
+fn every_provider_requires_at_least_one_scope() {
+    for meta in list_providers() {
+        assert!(
+            !meta.required_scopes.is_empty(),
+            "{} declares no required scopes",
+            meta.id
+        );
+    }
+}
+
+/// The registry list IS the preflight list. `provider_readiness` and each
+/// provider's own scope check read the same `required_scopes`, so a partially
+/// scoped account cannot read as ready on the page and then be rejected by the
+/// backup it enabled.
+#[test]
+fn readiness_requires_every_declared_scope() {
+    for meta in list_providers() {
+        let full = meta.required_scopes.join(" ");
+        assert!(missing_scopes(&full, meta.required_scopes).is_empty());
+        // Drop one scope at a time: each must be enough to fail the verdict.
+        for dropped in meta.required_scopes {
+            let partial = meta
+                .required_scopes
+                .iter()
+                .filter(|s| *s != dropped)
+                .copied()
+                .collect::<Vec<_>>()
+                .join(" ");
+            assert_eq!(
+                missing_scopes(&partial, meta.required_scopes),
+                vec![*dropped],
+                "{} tolerated a grant missing {dropped}",
+                meta.id
+            );
+        }
+    }
+}
+
 /// `backup_run_from_event` parses a persisted `BackupCompleted` event in the
 /// real `{ "type": .., "data": { .. } }` shape (the `#[serde(tag, content)]`
 /// wire format), recovering start/finish/size for the run history.

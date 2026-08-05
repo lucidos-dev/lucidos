@@ -28,18 +28,21 @@ export type NavigateTarget = (typeof NAVIGATE_TARGETS)[number];
 
 export const SETTINGS_VIEW_TARGETS = [
   'models',
-  'appearance',
-  'devices',
-  'accounts',
-  'repositories',
-  'marketplaces',
   'permissions',
-  'keyboard-shortcuts',
+  'coding-agents',
+  'accounts',
+  'locale',
+  'marketplaces',
+  'access',
+  'devices',
   'system',
+  'appearance',
+  'keyboard-shortcuts',
   'thread-queue',
   'backup',
   'memory',
   'disk-usage',
   'environment-variables',
+  'debugging',
 ] as const;
 export type SettingsViewTarget = (typeof SETTINGS_VIEW_TARGETS)[number];

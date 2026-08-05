@@ -35,9 +35,9 @@ export type ThreadDirection = 'parent' | 'child';
 /** Mirrors the Rust `MessageOrigin` enum (serde tag = "kind", snake_case).
  *  `api.source_thread_id` populated when the request came from a
  *  Lucidos-spawned subprocess (CC, `run_bash`, `run_python`, scheduled
- *  script, `lucidos` CLI) — engine sets it from the
- *  `x-lucidos-source-thread-id` header after validating the
- *  `x-lucidos-agent-origin-token` against the per-engine-startup token.
+ *  script, `lucidos` CLI). The engine reads it out of the thread-bound
+ *  origin token in `x-lucidos-agent-origin-token`, whose own prefix names
+ *  the spawning thread, so the value is authenticated rather than claimed.
  *  When set, `mode === 'agent'` (subprocesses are never human) and the
  *  popover renders a deep-link back to the spawning thread. */
 export type MessageOrigin =
@@ -181,18 +181,32 @@ export const CONTINUATION_USER_CLICKED_REASON = 'user_clicked_continue';
  *  not here, so the resume itself carries no actor. */
 export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = 'auto_resume_after_switch';
 
+/** ContinuationStarted.reason emitted when the engine resumes a coding-agent
+ *  turn the backend ended on a TRANSIENT upstream failure it reported itself
+ *  (its own `API Error: …`, e.g. a connection closed mid-response). Mirrors
+ *  Rust's `AUTO_RESUME_AFTER_API_ERROR_REASON`. Nothing restarted here either:
+ *  the previous turn's `ResponseFailed` is in the timeline right above, and this
+ *  is the engine picking the same work back up. */
+export const CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON = 'auto_resume_after_api_error';
+
 /** Header label / preview text for a `ContinuationStarted` turn. The reason
- *  takes precedence: an `auto_recovery_after_hang` resume is a LOCAL
- *  interruption (hang or stray signal-kill), never an engine restart, so it
- *  must not claim "Resumed after engine restart" (which once made a user think
- *  restarting an unrelated workspace had restarted theirs). A human actor means
- *  the user clicked Continue; anything else on a restart-recovery continuation
- *  is the engine resuming after a real restart. */
+ *  takes precedence: an `auto_recovery_after_hang` or
+ *  `auto_resume_after_api_error` resume is a LOCAL interruption (a hang, a stray
+ *  signal-kill, an upstream drop), never an engine restart, so it must not claim
+ *  "Resumed after engine restart" (which once made a user think restarting an
+ *  unrelated workspace had restarted theirs). A human actor means the user
+ *  clicked Continue; anything else on a restart-recovery continuation is the
+ *  engine resuming after a real restart. */
 export function continuationStartedSummary(
   reason: string | undefined,
   actor: MessageOrigin | undefined,
 ): string {
-  if (reason === CONTINUATION_AUTO_RECOVERY_REASON) return 'Resumed after an interruption';
+  if (
+    reason === CONTINUATION_AUTO_RECOVERY_REASON ||
+    reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON
+  ) {
+    return 'Resumed after an interruption';
+  }
   return originMode(actor) === 'human' ? 'Continued the response' : 'Resumed after engine restart';
 }
 

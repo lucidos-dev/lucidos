@@ -32,6 +32,7 @@ Use these — never hardcode the raw values:
 | `--z-sticky` | `200` | Sticky headers, drawer overlays |
 | `--z-drawer` | `300` | Side drawers |
 | `--z-control-panel` | `2200` | Floating header items (brand, route panel, collapsed thread actions) |
+| `--z-app-fullscreen` | `2250` | A pseudo-fullscreen app panel: covers the header chrome, and is covered by every host overlay |
 | `--z-modal` | `2300` | Modal overlays — sits above the header so the dim backdrop blocks it |
 | `--z-toast` | `2400` | Toast notifications (must sit above `.ui-blocking-overlay` at `--z-control-panel + 100`) |
 | `--z-tooltip` | `10000` | Tooltips |

@@ -479,6 +479,12 @@ export function useTooltip() {
       document.removeEventListener('touchstart', onTouchStart, passiveCapture);
       document.removeEventListener('touchmove', onTouchMove, passiveCapture);
       document.removeEventListener('touchend', onTouchEnd, passiveCapture);
+      // Cancel any pending reveal before the nodes go: the hover timer calls
+      // show() → ensureEl(), which would re-create #tooltip and re-append it to
+      // <body> AFTER this teardown removed it, leaking an orphan node that no
+      // later cleanup owns. clearLongPress() covers the touch counterpart.
+      if (showTimer) { clearTimeout(showTimer); showTimer = null; }
+      clearLongPress();
       if (tipEl?.parentNode) tipEl.parentNode.removeChild(tipEl);
       if (safeAreaProbe?.parentNode) safeAreaProbe.parentNode.removeChild(safeAreaProbe);
     };

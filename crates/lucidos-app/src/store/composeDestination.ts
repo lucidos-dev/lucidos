@@ -41,7 +41,7 @@ export const LUCIDOS_SOURCE_REPO_NAME = 'Lucidos';
 /** Sentinel option value for the "＋ Register a repository…" action row.
  *  NOT part of the destination encoding — callers must check for it BEFORE
  *  `parseOptionValue` (which would fall it through to the Lucidos Agent
- *  default) and route it to Settings → Repositories instead. */
+ *  default) and route it to Settings → Coding Agents instead. */
 export const REGISTER_REPO_OPTION_VALUE = '__register-repo';
 
 /** The Lucidos Agent's consequence blurb — single source for the picker

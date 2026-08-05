@@ -9,12 +9,12 @@ use chrono::Utc;
 use uuid::Uuid;
 
 use super::{BusEvent, EmittedEvent, EventBus, ParentCallback};
-use crate::engine::thread_events::{ChildCompletionStatus, EventMeta, ThreadEvent};
+use crate::engine::thread_events::{CancelCause, ChildCompletionStatus, EventMeta, ThreadEvent};
 use crate::engine::thread_lifecycle::ArchiveState;
 
 /// DB row from thread_summaries for child-to-parent fan-out:
 /// `(parent_thread_id, is_coding_agent, title, first_message,
-/// parent_callback_sent, parent_is_coding_agent)`. The last column is
+/// parent_callback_pending, parent_is_coding_agent)`. The last column is
 /// `Option<bool>` because it comes from a `LEFT JOIN` against the parent's
 /// own `thread_summaries` row — `None` either when the child has no parent
 /// (immediately filtered out below) or when that parent row is missing
@@ -82,11 +82,25 @@ impl EventBus {
         // parent doesn't display as Active forever, but no card — the user
         // already sees the child's error state). Same `is_transient` shape as
         // `SessionEnded { reason }` below.
+        //
+        // Cancel splits on `CancelCause` for the same reason. A
+        // `SupersededByFollowup` is the mid-turn redirect `arm_codex_redirect`
+        // arms when a follow-up lands on a live Codex turn: the caller steered,
+        // they did not abandon (`thread_events/cause.rs`), and the child runs
+        // the redirected turn immediately after. Reporting it would wake the
+        // parent with a false "child canceled" card for work that is still
+        // running, and the parent may spawn a replacement. The redirected
+        // turn's own terminal is the real report. Dropping out of the terminal
+        // set here leaves the in-tx `reconcile_parent_active_children_count`
+        // (which runs in the `ResponseCanceled` projection arm, cause-agnostic)
+        // as the only thing that fires, so no counter drifts.
         let is_terminal = match event {
             ThreadEvent::CodingAgentIdled { .. }
             | ThreadEvent::ResponseGenerated { .. }
-            | ThreadEvent::ResponseFailed { .. }
-            | ThreadEvent::ResponseCanceled { .. } => true,
+            | ThreadEvent::ResponseFailed { .. } => true,
+            ThreadEvent::ResponseCanceled { cause, .. } => {
+                !matches!(cause, CancelCause::SupersededByFollowup)
+            }
             ThreadEvent::ResponseAborted { cause, .. } => !cause.is_transient(),
             ThreadEvent::SessionEnded { reason } => !reason.is_transient(),
             _ => false,
@@ -95,14 +109,14 @@ impl EventBus {
             return;
         }
 
-        // Look up parent, child info, CC status, and whether callback was
-        // already sent. Self-join `thread_summaries` to pick up the parent's
+        // Look up parent, child info, CC status, and whether the parent
+        // callback for this run is still pending. Self-join to pick up the parent's
         // own `is_coding_agent` in the same roundtrip — the FanOut consumer
         // needs it to pick the CC vs chat routing fork, and skipping the
         // join would force a second query per child completion.
         let row: Option<ChildSummaryRow> = match sqlx::query_as::<_, ChildSummaryRow>(
             "SELECT c.parent_thread_id, c.is_coding_agent, c.title, c.first_message, \
-                    c.parent_callback_sent, p.is_coding_agent \
+                    c.parent_callback_pending, p.is_coding_agent \
              FROM thread_summaries c \
              LEFT JOIN thread_summaries p ON p.thread_id = c.parent_thread_id \
              WHERE c.thread_id = $1",
@@ -128,7 +142,7 @@ impl EventBus {
             is_coding_agent,
             title,
             first_msg,
-            callback_already_sent,
+            parent_callback_pending,
             parent_is_coding_agent,
         )) = row
         else {
@@ -138,9 +152,11 @@ impl EventBus {
         // CC threads can emit CodingAgentIdled multiple times (initial work,
         // auto-harden, background agents). Only process the first one —
         // subsequent idles should not decrement the counter again or send
-        // duplicate callbacks to the parent.
+        // duplicate callbacks to the parent. Reads as "this child owes its
+        // parent nothing, so swallow the extra idle": the marker is set again
+        // by the next start event, so a REAL new turn is never swallowed.
         if is_coding_agent
-            && callback_already_sent
+            && !parent_callback_pending
             && matches!(event, ThreadEvent::CodingAgentIdled { .. })
         {
             return;
@@ -150,11 +166,11 @@ impl EventBus {
         // SessionEnded — e.g. the user cancels and the session sits archived,
         // leaving only ResponseCanceled (or a terminal-cause ResponseAborted
         // from a SafetyNet / ProcessKilled crash) as the signal. The
-        // `!callback_already_sent` guard collapses multiple terminal events
+        // `parent_callback_pending` guard collapses multiple terminal events
         // for the same child to a single decrement. ResponseFailed sits in
         // the gated set too: a failing coding-agent turn typically emits ResponseFailed
         // immediately followed by CodingAgentIdled, and ResponseFailed's
-        // `should_callback` branch marks callback_sent — so the follow-up
+        // `should_callback` branch clears the pending marker, so the follow-up
         // Idled early-returns via the dedup guard and never decrements. Add
         // ResponseFailed here so the decrement happens on the ResponseFailed
         // itself; otherwise the parent's count leaks by 1 per failed turn
@@ -163,7 +179,7 @@ impl EventBus {
         // `is_terminal`.
         let should_decrement = if is_coding_agent {
             matches!(event, ThreadEvent::CodingAgentIdled { .. })
-                || (!callback_already_sent
+                || (parent_callback_pending
                     && matches!(
                         event,
                         ThreadEvent::SessionEnded { .. }
@@ -184,12 +200,14 @@ impl EventBus {
         // Completion events trigger a callback to the parent (typed
         // ChildThreadCompleted on the parent thread) and surface the parent
         // to inbox. ResponseCanceled is included so the parent sees a
-        // "Canceled" card and the LLM learns the child was stopped.
+        // "Canceled" card and the LLM learns the child was stopped, except for
+        // a `SupersededByFollowup` redirect, which never reaches here (the
+        // `is_terminal` split above already returned).
         // ResponseAborted is NOT — the user already sees the child's error
         // state (SafetyNet/ProcessKilled), and engine-shutdown aborts are
         // transient (and were filtered out above). For coding-agent children,
-        // SessionEnded also counts when no prior callback was sent — handles
-        // coding-agent sessions that end without ever idling.
+        // SessionEnded also counts when the run's callback is still pending:
+        // handles coding-agent sessions that end without ever idling.
         let should_callback = matches!(
             (is_coding_agent, event),
             (true, ThreadEvent::CodingAgentIdled { .. })
@@ -197,18 +215,18 @@ impl EventBus {
                 | (_, ThreadEvent::ResponseFailed { .. })
                 | (_, ThreadEvent::ResponseCanceled { .. })
         ) || (is_coding_agent
-            && !callback_already_sent
+            && parent_callback_pending
             && matches!(event, ThreadEvent::SessionEnded { .. }));
 
-        // Decrement-only paths must still mark the child or a follow-up event
+        // Decrement-only paths must still clear the marker or a follow-up event
         // (CodingAgentIdled, SessionEnded) re-decrements via the
-        // `!callback_already_sent` gate above. The should_callback path marks
+        // `parent_callback_pending` gate above. The should_callback path clears
         // in-tx via the ChildThreadCompleted projection arm; abort never
-        // emits a typed event, so mark here directly.
+        // emits a typed event, so clear here directly.
         // Non-CC chat children emit exactly one terminator per request (the
-        // agentic loop's `has_terminator` guard), so they need no marker; CC
+        // agentic loop's `has_terminator_for` guard), so they need no marker; CC
         // children can have multiple terminal events for the same turn.
-        let mark_callback_for_terminal_abort = should_decrement
+        let clear_callback_for_terminal_abort = should_decrement
             && is_coding_agent
             && matches!(event, ThreadEvent::ResponseAborted { .. });
 
@@ -226,8 +244,8 @@ impl EventBus {
             self.update_parent_after_child_terminal(parent_id).await;
         }
 
-        if mark_callback_for_terminal_abort {
-            self.mark_parent_callback_sent(child_thread_id).await;
+        if clear_callback_for_terminal_abort {
+            self.clear_pending_parent_callback(child_thread_id).await;
         }
 
         if !should_callback {
@@ -350,7 +368,7 @@ impl EventBus {
         };
 
         // Emit the typed source-of-truth event onto the parent thread. The
-        // `parent_callback_sent` marker is written by THIS emit's projection
+        // `parent_callback_pending` marker is cleared by THIS emit's projection
         // arm (see ChildThreadCompleted in `update_thread_projection`), in
         // the same transaction as the event INSERT — so the event and the
         // marker cannot disagree. The previous shape (emit, then a separate
@@ -412,12 +430,13 @@ impl EventBus {
         // Defensive: `parent_is_coding_agent` should always be `Some` here
         // (the parent thread row must exist for its child to have spawned),
         // so a `None` is a serious state corruption — skip the kick rather
-        // than guess. The projection arm already marked the child atomically
-        // with the emit, which would consume the callback and block every
-        // later terminal's retry through the `callback_already_sent` gate —
-        // so un-mark here to keep the pre-atomicity retry semantics for this
-        // corruption case: the next terminal event re-fires the fan-in and
-        // gets another shot at the kick. Cost while the corruption persists:
+        // than guess. The projection arm already cleared the child's marker
+        // atomically with the emit, which would consume the callback and block
+        // every later terminal's retry through the `parent_callback_pending`
+        // gate. The card is persisted but the wake never reached
+        // `parent_callback_tx`, so the parent callback genuinely IS still
+        // pending: write it back so the next terminal event re-fires the fan-in
+        // and gets another shot at the kick. Cost while the corruption persists:
         // one duplicate persisted ChildThreadCompleted per terminal event
         // (unbounded across a long session, N duplicate cards if the parent
         // row is later repaired) — accepted as the lesser evil vs. a
@@ -425,20 +444,20 @@ impl EventBus {
         let Some(parent_is_cc) = parent_is_coding_agent else {
             crate::log!(
                 "[FanOut] Parent {} for child {} missing from thread_summaries — \
-                 skipping wake-up kick; typed event already persisted. Clearing \
-                 the callback marker so the next terminal event retries.",
+                 skipping wake-up kick; typed event already persisted. Leaving \
+                 the parent callback pending so the next terminal event retries.",
                 parent_id,
                 child_thread_id
             );
             if let Err(e) = sqlx::query(
-                "UPDATE thread_summaries SET parent_callback_sent = FALSE WHERE thread_id = $1",
+                "UPDATE thread_summaries SET parent_callback_pending = TRUE WHERE thread_id = $1",
             )
             .bind(child_thread_id)
             .execute(&self.pool)
             .await
             {
                 crate::log!(
-                    "[FanOut] Failed to clear callback marker for child {}: {}",
+                    "[FanOut] Failed to re-mark the pending callback for child {}: {}",
                     child_thread_id,
                     e
                 );
@@ -501,16 +520,22 @@ impl EventBus {
         self.send_children_count_event(parent_id, active, total, aggregate);
     }
 
-    async fn mark_parent_callback_sent(&self, child_thread_id: Uuid) {
+    /// Settle the child's `parent_callback_pending` marker on a decrement-only
+    /// terminal (a coding-agent child whose terminal is a crash-class
+    /// `ResponseAborted`). Nothing further is owed to the parent: the counter
+    /// already came down through the in-tx reconcile, no card is sent by
+    /// design, and the user is looking at the child's error state. The child
+    /// keeps FALSE until a start event sets it again.
+    async fn clear_pending_parent_callback(&self, child_thread_id: Uuid) {
         if let Err(e) = sqlx::query(
-            "UPDATE thread_summaries SET parent_callback_sent = TRUE WHERE thread_id = $1",
+            "UPDATE thread_summaries SET parent_callback_pending = FALSE WHERE thread_id = $1",
         )
         .bind(child_thread_id)
         .execute(&self.pool)
         .await
         {
             crate::log!(
-                "[FanOut] Failed to mark callback sent for child {}: {}",
+                "[FanOut] Failed to clear the pending callback for child {}: {}",
                 child_thread_id,
                 e
             );

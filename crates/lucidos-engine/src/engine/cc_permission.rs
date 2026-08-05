@@ -458,9 +458,19 @@ const MAX_ANCESTRY_HOPS: usize = 16;
 /// sub-thread) both stamp a `MessageOrigin` into `payload->'origin'`. Returns
 /// `None` when no such event carries an origin (legacy rows / odd threads),
 /// which the caller treats as interactive (preserve the pre-existing behavior).
-async fn fetch_thread_origin(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<MessageOrigin> {
-    let row: Result<Option<(serde_json::Value,)>, sqlx::Error> = sqlx::query_as(
-        "SELECT payload->'origin' FROM events \
+///
+/// Also returns that row's `parent_thread_id`, the *callback linkage*, which is
+/// a strictly narrower thing than the origin: a `relation: "top"` spawn and a
+/// parent's child follow-up both stamp a `ThreadLink` origin with NO linkage.
+/// `resolve_attend_mode` walks up only where the linkage exists, so attribution
+/// alone never carries a trigger's grant across a boundary the user asked to be
+/// independent.
+async fn fetch_thread_origin_and_linkage(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+) -> Option<(MessageOrigin, Option<Uuid>)> {
+    let row: Result<Option<(serde_json::Value, Option<Uuid>)>, sqlx::Error> = sqlx::query_as(
+        "SELECT payload->'origin', (payload->>'parent_thread_id')::uuid FROM events \
          WHERE thread_id = $1 \
            AND event_type IN ('TriggerStarted', 'MessageReceived') \
            AND payload ? 'origin' \
@@ -471,11 +481,13 @@ async fn fetch_thread_origin(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Mes
     .fetch_optional(pool)
     .await;
     match row {
-        Ok(Some((v,))) => serde_json::from_value::<MessageOrigin>(v).ok(),
+        Ok(Some((v, parent_thread_id))) => serde_json::from_value::<MessageOrigin>(v)
+            .ok()
+            .map(|origin| (origin, parent_thread_id)),
         Ok(None) => None,
         Err(e) => {
             crate::log!(
-                "[CCPermission] fetch_thread_origin failed for {}: {}",
+                "[CCPermission] fetch_thread_origin_and_linkage failed for {}: {}",
                 thread_id,
                 e
             );
@@ -495,7 +507,13 @@ async fn fetch_thread_origin(pool: &sqlx::PgPool, thread_id: Uuid) -> Option<Mes
 ///     events at boot — so this is restart-safe).
 ///   * any other engine / system / non-human origin ⇒ `Unattended` with an
 ///     empty grant.
-///   * `ThreadLink { direction: Parent }` ⇒ hop to the parent and continue.
+///   * `ThreadLink { direction: Parent }` **whose event also carries the
+///     `parent_thread_id` callback linkage** ⇒ hop to the parent and continue.
+///     A `ThreadLink` without linkage is attribution only (a `relation: "top"`
+///     spawn, or a parent's child follow-up): it names who launched the thread
+///     for the route popover, and deliberately does NOT lend that spawning thread's
+///     attend mode or side-effect grant. Unclassifiable ⇒ `Interactive`, so an
+///     independent spawn asks a human rather than auto-resolving.
 ///
 /// Everything is derived from already-persisted events plus the trigger
 /// registry — no new persistence, no spawn-time plumbing. A user-rooted tree
@@ -513,7 +531,8 @@ pub async fn resolve_attend_mode(
         if !seen.insert(current) {
             break; // cycle guard — should never happen for a tree
         }
-        let Some(origin) = fetch_thread_origin(pool, current).await else {
+        let Some((origin, callback_linkage)) = fetch_thread_origin_and_linkage(pool, current).await
+        else {
             // No recorded origin — preserve the pre-existing interactive behavior
             // rather than auto-resolving a thread we can't classify.
             return AttendMode::Interactive;
@@ -537,18 +556,23 @@ pub async fn resolve_attend_mode(
                     _ => AttendMode::Unattended { grant: Vec::new() },
                 };
             }
-            MessageOrigin::ThreadLink {
-                thread_id: parent,
-                direction,
-                ..
-            } => {
+            MessageOrigin::ThreadLink { direction, .. } => {
                 // Only a Parent link means "the linked thread spawned me"; a
                 // Child callback shouldn't be a thread's originating origin, but
                 // be safe and treat it as non-human.
-                if direction == ThreadDirection::Parent {
-                    current = parent;
-                } else {
+                if direction != ThreadDirection::Parent {
                     return AttendMode::Unattended { grant: Vec::new() };
+                }
+                // Hop via the LINKAGE, not the origin's `thread_id`. The two
+                // name the same thread on every row the engine writes, but this
+                // walk decides privilege, and `parent_thread_id` is the field
+                // that owns parent-ness; the origin only owns display. Absent
+                // linkage is a `relation: "top"` spawn: it names its spawning thread
+                // for the popover but is NOT in that spawning thread's tree, so the
+                // walk stops rather than inheriting a trigger's grant.
+                match callback_linkage {
+                    Some(parent) => current = parent,
+                    None => return AttendMode::Interactive,
                 }
             }
             MessageOrigin::Engine { reason } => {
@@ -1396,6 +1420,10 @@ mod tests {
     /// Insert a raw event row carrying `{"origin": <origin>}` so the resolver's
     /// `payload->'origin'` query has something to read — cheaper than driving a
     /// full MessageReceived through the bus + lifecycle guard.
+    ///
+    /// Origin only, no `parent_thread_id`: that is the shape of a thread with no
+    /// callback linkage (a `relation: "top"` spawn, a trigger, a device chat).
+    /// A child spawn carries both, so it uses [`insert_child_spawn_event`].
     async fn insert_origin_event(
         pool: &sqlx::PgPool,
         thread_id: Uuid,
@@ -1414,6 +1442,28 @@ mod tests {
         .execute(pool)
         .await
         .expect("insert origin event");
+    }
+
+    /// A `relation: "child"` spawn's `MessageReceived`: the `ThreadLink` origin
+    /// AND the `parent_thread_id` callback linkage, exactly as
+    /// `make_message_received` writes it. The linkage is what licenses the
+    /// resolver's hop, so a fixture that omitted it would silently stop testing
+    /// the walk.
+    async fn insert_child_spawn_event(pool: &sqlx::PgPool, thread_id: Uuid, parent: Uuid) {
+        let payload = serde_json::json!({
+            "origin": parent_link(parent),
+            "parent_thread_id": parent,
+        });
+        sqlx::query(
+            "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+             VALUES ($1, 'thread', $2, 'MessageReceived', $3, NOW(), $2::uuid)",
+        )
+        .bind(Uuid::new_v4())
+        .bind(thread_id.to_string())
+        .bind(payload)
+        .execute(pool)
+        .await
+        .expect("insert child spawn event");
     }
 
     fn parent_link(parent: Uuid) -> MessageOrigin {
@@ -1920,7 +1970,7 @@ mod tests {
         let root = Uuid::new_v4();
         let child = Uuid::new_v4();
         insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
-        insert_origin_event(&pool, child, "MessageReceived", &parent_link(root)).await;
+        insert_child_spawn_event(&pool, child, root).await;
         let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
         let mode = resolve_attend_mode(&pool, &cfgs, child).await;
         assert_eq!(
@@ -1928,6 +1978,33 @@ mod tests {
             AttendMode::Unattended {
                 grant: vec![SideEffectCategory::Email]
             }
+        );
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// A `relation: "top"` spawn stamps a `ThreadLink` origin naming its
+    /// spawning thread (so the route popover can link back) but carries NO
+    /// `parent_thread_id`. Attribution must not lend it the spawning thread's trigger
+    /// grant: the thread was asked to run independently, so an unresolvable
+    /// permission request waits for a human instead of auto-approving a
+    /// real-world side effect.
+    #[tokio::test]
+    async fn resolve_attend_mode_top_spawn_does_not_inherit_trigger_grant() {
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        let (pool, db_name) = setup_test_db().await;
+        let trigger_id = "trig-top";
+        let root = Uuid::new_v4();
+        let spawned = Uuid::new_v4();
+        insert_origin_event(&pool, root, "TriggerStarted", &scheduler_origin(trigger_id)).await;
+        // Origin without linkage: the top-spawn shape.
+        insert_origin_event(&pool, spawned, "MessageReceived", &parent_link(root)).await;
+        let cfgs = trigger_configs_with(trigger_id, vec![SideEffectCategory::Email]);
+        let mode = resolve_attend_mode(&pool, &cfgs, spawned).await;
+        assert_eq!(
+            mode,
+            AttendMode::Interactive,
+            "a top spawn names its spawning thread for display, but is not in its privilege tree"
         );
         pool.close().await;
         teardown_test_db(&db_name).await;
@@ -1949,7 +2026,7 @@ mod tests {
             },
         )
         .await;
-        insert_origin_event(&pool, child, "MessageReceived", &parent_link(root)).await;
+        insert_child_spawn_event(&pool, child, root).await;
         let mode = resolve_attend_mode(&pool, &empty_trigger_configs(), child).await;
         assert_eq!(mode, AttendMode::Interactive);
         pool.close().await;

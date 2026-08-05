@@ -28,9 +28,10 @@ vi.mock('./thread-sync', () => ({
 }));
 vi.mock('./thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
-  refreshThreadEvents: vi.fn().mockResolvedValue(undefined),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
   loadThreadEvents: vi.fn().mockResolvedValue(undefined),
-  clearForcedRetries: vi.fn(),
+  clearThreadFetchGuards: vi.fn(),
+  markLoadedThreadsStale: vi.fn(),
 }));
 vi.mock('./chat-changes', () => ({
   refreshChangesState: vi.fn(),

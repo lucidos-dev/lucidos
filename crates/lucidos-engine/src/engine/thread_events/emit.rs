@@ -140,26 +140,45 @@ pub(crate) async fn emit_response_aborted(
 /// `Err` to an HTTP 500. `reason` must be one of the `*_REASON`
 /// constants in `agent_recovery`; new reasons must opt in to
 /// `continue_should_open_resume_exchange` deliberately.
+///
+/// Returns whether the request actually PERSISTED, so a caller that has to know
+/// can tell "the dispatcher will see this" from "it was logged and dropped".
+/// Fire-and-forget callers ignore it, as the `_or_log` name implies. The one
+/// caller that must not is `resume_pending_switches`: it hands its actuated ids
+/// to `settle_unresumed_switch_threads`, which SKIPS them, so treating a dropped
+/// request as actuated would suppress the thread's Continue button forever.
+/// `Ok(None)` counts as not-persisted for the same reason an `Err` does: the
+/// lifecycle rejected the event, so no dispatcher will ever act on it.
 pub(crate) async fn emit_continuation_requested_or_log(
     bus: &crate::engine::event_bus::EventBus,
     thread_id: uuid::Uuid,
     reason: &str,
     actor: Option<MessageOrigin>,
     log_tag: &str,
-) {
-    bus.emit_or_log(
-        crate::engine::event_bus::BusEvent::Thread {
-            thread_id,
-            event: ThreadEvent::ContinuationRequested {
-                reason: reason.to_string(),
-            },
-            meta: EventMeta {
-                channel: Some(EventChannel::ClaudeCode),
-                actor,
-                ..EventMeta::NONE
-            },
+) -> bool {
+    let event = crate::engine::event_bus::BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ContinuationRequested {
+            reason: reason.to_string(),
         },
-        log_tag,
-    )
-    .await;
+        meta: EventMeta {
+            channel: Some(EventChannel::ClaudeCode),
+            actor,
+            ..EventMeta::NONE
+        },
+    };
+    match bus.emit(event).await {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            crate::log!(
+                "[EventBus] {} not persisted (rejected by lifecycle)",
+                log_tag
+            );
+            false
+        }
+        Err(e) => {
+            crate::log!("[EventBus] {} emit failed: {}", log_tag, e);
+            false
+        }
+    }
 }

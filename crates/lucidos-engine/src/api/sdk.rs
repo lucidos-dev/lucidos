@@ -206,3 +206,30 @@ pub(super) fn router() -> Router<AppState> {
         .route("/sdk-iframe-audio.js", get(serve_sdk_iframe_audio_js))
         .route("/ui/navigate", post(ui_navigate))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An app's `<body>` must carry the type scale's body step. Two ways to get
+    /// this wrong, and the assert below covers both: leave the declaration off
+    /// and unstyled app text falls to the raw root font-size (`1rem`, 18px at a
+    /// 112.5% UI scale), which nothing in the host shell renders at, so every
+    /// app reads a scale step larger than Lucidos with proportionally looser
+    /// line spacing on top (2026-08-05); write a raw `rem` and it ships an
+    /// off-scale size to every app, against the closed-set rule the host shell
+    /// follows (`.claude/rules/frontend.md`).
+    #[test]
+    fn iframe_body_is_sized_from_the_type_scale() {
+        let rule = SDK_IFRAME_BASE_CSS
+            .split("\nbody {")
+            .nth(1)
+            .and_then(|rest| rest.split('}').next())
+            .expect("sdk_iframe.css must carry a top-level `body {` rule");
+        assert!(
+            rule.contains("font-size: var(--font-size-md);"),
+            "app <body> must default to the type scale's body step, not the raw \
+             root font-size and not an off-scale rem. Found:\n{rule}"
+        );
+    }
+}

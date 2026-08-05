@@ -115,7 +115,7 @@
     flex: 1 1 10rem;
 }
 
-/* Settings → System → Coding agents: the per-agent binary-path override row.
+/* Settings → Coding Agents: the per-agent binary-path override row.
    The input and its Save/Clear actions share one horizontal row so the buttons
    sit level with the input rather than the title. Both action slots are always
    rendered (disabled — greyed via .action-btn:disabled — when their action

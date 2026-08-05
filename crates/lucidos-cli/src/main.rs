@@ -85,10 +85,12 @@ enum Command {
     },
     /// Record/query the durable Planned marker that enforces the
     /// `implementation-plan` skill. `mark --plan <docs/plans/file>` records a
-    /// real plan (the skill calls this); `mark --simple "<reason>"`
-    /// acknowledges a local fix that needs no plan; `state` prints
-    /// `PRESENT`/`MISSING`. Both marked states satisfy the pre-edit gate and
-    /// the Apply floor.
+    /// real plan awaiting the user's approval (the skill calls this);
+    /// `approve` flips that to the gate-satisfying state once the user has
+    /// approved; `mark --simple "<reason>"` acknowledges a local fix that needs
+    /// no plan; `state` prints `SATISFIED`, `PROPOSED`, or `MISSING`. Only an
+    /// approved plan and a `--simple` ack satisfy the pre-edit gate and the
+    /// Apply floor; a `proposed` plan still blocks.
     Planned {
         #[command(subcommand)]
         action: PlannedCmd,
@@ -159,10 +161,12 @@ enum Command {
     /// `send_notification` LLM tool. Use from scripts that need to nudge the
     /// user without going through an LLM thread.
     Notify(NotifyArgs),
-    /// Query thread summaries on the parent workspace. The same shape returned
-    /// by `GET /api/v1/threads/list` and the `list_threads` LLM tool — a flat
+    /// Query thread summaries on the parent workspace, and message your own
+    /// child threads. `list` / `count` return the same shape as
+    /// `GET /api/v1/threads/list` and the `list_threads` LLM tool: a flat
     /// newest-first list of every thread (with optional filters), distinct
-    /// from the UI-shaped `/api/v1/threads`.
+    /// from the UI-shaped `/api/v1/threads`. `follow-up` sends a message to one
+    /// of THIS thread's own direct children.
     Threads {
         #[command(subcommand)]
         action: ThreadsCmd,
@@ -333,6 +337,14 @@ enum ThreadsCmd {
         /// Max rows to return. Server clamps to 1..=1000 (default 100).
         #[arg(long)]
         limit: Option<u32>,
+        /// Restrict to the direct children of this thread (not grandchildren).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Restrict to the direct children of THIS thread. Shorthand for
+        /// `--parent` with the calling thread's own id, so it only works from
+        /// inside a Lucidos thread.
+        #[arg(long)]
+        my_children: bool,
     },
     /// Count thread summaries matching the same filters as `list`.
     /// Outputs `{ "count": N }`.
@@ -343,6 +355,39 @@ enum ThreadsCmd {
         /// Comma-separated source filter (`chat`, `trigger`, `coding-agent`; legacy `claude_code` also accepted).
         #[arg(long)]
         source: Option<String>,
+        /// Restrict to the direct children of this thread (not grandchildren).
+        #[arg(long)]
+        parent: Option<String>,
+        /// Restrict to the direct children of THIS thread. Shorthand for
+        /// `--parent` with the calling thread's own id.
+        #[arg(long)]
+        my_children: bool,
+    },
+    /// Send a message to one of THIS thread's own child threads: redirect one
+    /// going the wrong way, hand it something a sibling learned, or tell a
+    /// stalled one to continue.
+    ///
+    /// Returns as soon as the message lands; it does not wait for the child.
+    /// The child reports back the usual way, as a completion card on its
+    /// parent.
+    ///
+    /// You can only address your own DIRECT children. There is no flag for
+    /// saying who you are: the engine reads the calling thread from the
+    /// origin token this subprocess was spawned with, and looks the
+    /// relationship up itself.
+    FollowUp {
+        /// The child's uuid. Find it with `threads list --my-children`, or in
+        /// the result of `spawn-thread`.
+        #[arg(long)]
+        thread: String,
+        /// What to say. Lands in the child's conversation as a message from
+        /// this thread.
+        #[arg(long)]
+        message: String,
+        /// The originating event, for the child's message-route panel.
+        /// Defaults to `$LUCIDOS_EVENT_ID`.
+        #[arg(long)]
+        event_id: Option<String>,
     },
 }
 
@@ -850,18 +895,48 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     active,
                     source,
                     limit,
+                    parent,
+                    my_children,
                 } => threads::cmd_list(
                     &ws,
                     threads::ListFilters {
                         active: if active { Some(true) } else { None },
                         source: source.as_deref(),
                         limit,
+                        parent: threads::resolve_parent_filter(
+                            parent,
+                            my_children,
+                            threads::source_thread_id_from_env(),
+                        )?,
                     },
                 )?,
-                ThreadsCmd::Count { active, source } => threads::cmd_count(
+                ThreadsCmd::Count {
+                    active,
+                    source,
+                    parent,
+                    my_children,
+                } => {
+                    let parent = threads::resolve_parent_filter(
+                        parent,
+                        my_children,
+                        threads::source_thread_id_from_env(),
+                    )?;
+                    threads::cmd_count(
+                        &ws,
+                        if active { Some(true) } else { None },
+                        source.as_deref(),
+                        parent.as_deref(),
+                    )?
+                }
+                ThreadsCmd::FollowUp {
+                    thread,
+                    message,
+                    event_id,
+                } => threads::cmd_follow_up(
                     &ws,
-                    if active { Some(true) } else { None },
-                    source.as_deref(),
+                    &thread,
+                    &message,
+                    event_id.or_else(threads::event_id_from_env).as_deref(),
                 )?,
             }
             Ok(0)
@@ -926,6 +1001,72 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             let ws = resolve_from_env()?;
             generated::dispatch_models(&ws, action)?;
             Ok(0)
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    /// The clap tree is built at startup and panics on a malformed
+    /// definition, so asserting it builds is the cheapest coverage there is
+    /// for a newly added subcommand.
+    #[test]
+    fn the_command_tree_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    fn subcommand_flags(path: &[&str]) -> Vec<String> {
+        let mut cmd = Cli::command();
+        for name in path {
+            cmd = cmd
+                .find_subcommand(name)
+                .unwrap_or_else(|| panic!("subcommand '{name}' exists"))
+                .clone();
+        }
+        cmd.get_arguments()
+            .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
+            .collect()
+    }
+
+    /// `threads follow-up` must offer no way to state who the caller is. The
+    /// engine reads the calling thread off the thread-bound origin token, and
+    /// a `--from` / `--caller-thread` flag would hand back exactly the
+    /// capability that binding removes, one layer up.
+    #[test]
+    fn follow_up_exposes_no_caller_identity_flag() {
+        let flags = subcommand_flags(&["threads", "follow-up"]);
+        assert!(flags.contains(&"--thread".to_string()), "{flags:?}");
+        assert!(flags.contains(&"--message".to_string()), "{flags:?}");
+        for forbidden in ["--from", "--caller", "--caller-thread", "--parent"] {
+            assert!(
+                !flags.iter().any(|f| f == forbidden),
+                "{forbidden} must not exist on follow-up: the caller is authenticated, not stated"
+            );
+        }
+    }
+
+    /// The child-listing filter is spelled the same at every layer: `parent`
+    /// is the HTTP query param, `my-children` mirrors the LLM tool's
+    /// `my_children`. Neither is a third synonym.
+    #[test]
+    fn threads_list_and_count_share_the_child_filter_spelling() {
+        for path in [["threads", "list"], ["threads", "count"]] {
+            let flags = subcommand_flags(&path);
+            assert!(
+                flags.contains(&"--parent".to_string()),
+                "{path:?} {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--my-children".to_string()),
+                "{path:?} {flags:?}"
+            );
+            assert!(
+                !flags.iter().any(|f| f == "--mine"),
+                "{path:?}: --mine is a third name for a filter that already has one"
+            );
         }
     }
 }

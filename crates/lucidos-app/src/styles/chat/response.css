@@ -170,17 +170,30 @@
        as margin) stays CONTAINED — otherwise a first-child margin-top / last-child
        margin-bottom collapses through this padding-less exchange and the panel's
        content shifts by the reduced padding. flow-root establishes the BFC without
-       clipping (unlike overflow: hidden, which would clip the marker's outline). */
+       clipping (unlike overflow: hidden, which would clip the marker's glow). */
     display: flow-root;
-    /* Room above a deep-linked landing for its focus border. The navigation focus
-       marker's border (.nav-focus-stuck) is an `outline` offset just BEYOND the
-       element box, and .chat-exchange has no top padding, so without this the top
-       edge of the border lands above the scroll-container top / behind the header
-       stack and is clipped — "the top of the border isn't visible". This base
-       value is the bare focus-border gap; the desktop and mobile rules below add
-       it on top of their respective top-of-transcript occlusion (the desktop fade
-       mask / the mobile header stack). */
+    /* Room above a deep-linked landing for its focus highlight. The navigation
+       focus marker (.nav-focus-stuck) washes the element's own box and blooms a
+       glow just BEYOND it, and .chat-exchange has no top padding, so without this
+       the top edge of the highlight lands above the scroll-container top / behind
+       the header stack and is clipped ("the top of the border isn't visible").
+       This base value is the bare focus-highlight gap; the desktop and mobile
+       rules below add it on top of their respective top-of-transcript occlusion
+       (the desktop fade mask / the mobile header stack). */
     --deep-link-focus-gap: 0.5rem;
+}
+
+/* The deep-link landing clearance, shared by the turn AND by any addressable
+   card INSIDE it. A step-level event carries its OWN `data-event-id` (today the
+   `ResponseFailed` failure card, see ChatExchange.tsx), so the deep-link lands on
+   that card rather than on the whole turn; without the same clearance it would
+   land flush under the top-of-transcript chrome with its focus highlight clipped,
+   which is exactly what the `.chat-exchange` values below exist to prevent.
+   `--deep-link-focus-gap` inherits from the enclosing exchange, so the descendant
+   arm needs no second declaration. The desktop and mobile rules below carry the
+   same selector pair, so all three stay in lockstep. */
+.chat-exchange,
+.chat-exchange [data-event-id] {
     scroll-margin-top: var(--deep-link-focus-gap);
 }
 
@@ -188,13 +201,13 @@
    of the transcript, whichever is taller (hence max()):
      1. the top --thread-top-fade band, mask-faded so messages dissolve under the
         thread title header (see .thread-content in chat/input-messages.css) — land
-        below it plus the focus-border gap so the element's top edge AND its
-        .nav-focus-stuck outline are fully opaque instead of hidden in the fade;
+        below it plus the focus-highlight gap so the element's top edge AND its
+        .nav-focus-stuck wash are fully opaque instead of hidden in the fade;
      2. the floating up-chevron (.scroll-to-top), which since fix 956b47519 sits
         OVER the centered transcript rather than out in the gutter — land below its
         footprint (safe-area inset + top inset + diameter) plus --nav-focus-reach so
-        the focus-marker outline clears it too. Without this the element (and its
-        outline) tucked right under the chevron with no room — the reported
+        the focus-marker glow clears it too. Without this the element (and its
+        highlight) tucked right under the chevron with no room, the reported
         regression. The env(safe-area-inset-top) term MIRRORS the chevron's own top
         (max(--scroll-chevron-top, env(safe-area-inset-top) + --scroll-chevron-top)
         == env + inset on desktop, since env >= 0): on a viewport-fit / notched
@@ -205,7 +218,8 @@
    variables (base.css) so moving/resizing it keeps this clearance in lockstep.
    Matches the mask's min-width breakpoint. */
 @media (min-width: 769px) {
-    .chat-exchange {
+    .chat-exchange,
+    .chat-exchange [data-event-id] {
         scroll-margin-top: max(
             calc(var(--thread-top-fade) + var(--deep-link-focus-gap) + 0.5rem),
             calc(env(safe-area-inset-top, 0px) + var(--scroll-chevron-top) + var(--scroll-chevron-size) + var(--nav-focus-reach) + 0.5rem)
@@ -229,12 +243,13 @@
         the bar's live height so a wrapped title still clears;
      3. the --mobile-title-fade overlay below the title row (.mobile-thread-title-row
         .scrolled::after), opaque at its top edge while the transcript is scrolled.
-   Plus --deep-link-focus-gap so the focus border (an outline offset just beyond
-   the box) clears the header stack too (same reason as the desktop base above).
-   The event lands below all four, exactly under the thread title header with its
-   whole border visible. */
+   Plus --deep-link-focus-gap so the focus highlight (a wash on the box, with a
+   glow blooming just beyond it) clears the header stack too (same reason as the
+   desktop base above). The event lands below all four, exactly under the thread
+   title header with its whole highlight visible. */
 @media (max-width: 768px) {
-    .chat-exchange {
+    .chat-exchange,
+    .chat-exchange [data-event-id] {
         scroll-margin-top: calc(
             var(--mobile-header-height, 3rem)
             + var(--mobile-thread-title-height, 2.75rem)
@@ -244,7 +259,7 @@
     }
 }
 
-/* The deep-link highlight (a sticky border that fades out on dismiss) is the
+/* The deep-link highlight (a sticky background wash that fades out on dismiss) is the
    shared NAVIGATION FOCUS MARKER — `.nav-focus-stuck` in
    styles/global/host-components.css, driven by components/shared/focusMarker.ts.
    scrollState.ts scopes it to the panel that HOLDS the deep-link's subject — NOT
@@ -257,8 +272,8 @@
    settings, and plugin navigations share one look. */
 
 /* Uniform gap on ALL FOUR sides between the navigation focus marker and a turn's
-   content. The marker (the .nav-focus-stuck outline, defined in
-   host-components.css) hugs the panel's padding box with a fixed outline-offset,
+   content. The marker (the .nav-focus-stuck wash + glow, defined in
+   host-components.css) fills the panel's padding box edge to edge,
    so the gap it shows on each side equals the panel's padding there. The sides
    are already symmetric in the BASE layout — content is inset
    var(--turn-body-inset) on the LEFT (.initiator-header / .response-header /
@@ -266,14 +281,14 @@
    padding (input-messages.css) — so the marker fits inside .thread-content's
    side gutter with EQUAL breathing room on both pane edges. (It used to grow
    the box rightward with a padding-right / negative-margin pair to compensate
-   for a flush-right feed; that pushed the border against the pane's right edge
+   for a flush-right feed; that pushed the highlight against the pane's right edge
    while the left kept its gutter — "border is all the way to the right".)
    Only the VERTICAL sides need normalizing: the feed-rhythm padding
    var(--turn-feed-pad-y) top and bottom is far larger than the inset, so the
    marker's top/bottom gap dwarfed its sides ("padding isn't the same top/bottom
    as left/right"). Shrink the feed padding to the same inset and hand the
    removed space back as margin, so the turn's content and its neighbours don't
-   move (net-zero) while the outline hugs tight. .chat-exchange establishes a
+   move (net-zero) while the wash hugs tight. .chat-exchange establishes a
    block formatting context (display: flow-root, below) so a first/last focused
    panel's margin can't collapse through the exchange and shift its content.
    The padding shorthand restates the horizontal sides (right inset matching the
@@ -292,10 +307,10 @@
 
 /* Uniform gap on ALL FOUR sides when the marker lands on a WHOLE TURN. Keyboard
    ⌘↑/⌘↓ turn-nav marks the `.chat-exchange` (TURN_SELECTOR in scrollState.ts), not
-   an inner panel — so the panel rule above never applies and the outline hugged the
+   an inner panel, so the panel rule above never applies and the wash filled the
    exchange box while the panel's feed padding (var(--turn-feed-pad-y) top/bottom) and
    left content inset leaked through, sitting flush right: top/bottom ~2× the left
-   gap and the right gap collapsed to just the outline offset. This is the exchange's
+   gap and the right gap collapsed to nothing. This is the exchange's
    counterpart to the panel rule; it normalizes every side to var(--turn-body-inset).
 
    The exchange has NO padding of its own — its content is the panel(s), which
@@ -308,8 +323,8 @@
    lives on the PANEL children, not the exchange — so drop the first panel's
    feed padding-top and the last panel's feed padding-bottom (they'd stack on
    the exchange padding and inflate the gap), and hand the removed feed rhythm
-   back as margin on the exchange (OUTSIDE its outline, so the gap stays tight)
-   — content and neighbouring turns don't move, exactly like the panel rule's
+   back as margin on the exchange (OUTSIDE the washed box, so the gap stays tight).
+   Content and neighbouring turns don't move, exactly like the panel rule's
    vertical handling. */
 .chat-exchange.nav-focus-stuck {
     padding: var(--turn-body-inset) 0;
@@ -460,7 +475,15 @@
     position: absolute;
     inset: 0;
     overflow: hidden;
-    padding: 0.5rem 0.75rem 0.75rem;
+    /* Same horizontal box as the transcript it covers: the shared gutter, plus
+       the scroll gutter the transcript loses on the right (this overlay is a
+       sibling of the scroll container, not inside it), so the skeleton's
+       centered column lands where the real turns will. */
+    padding:
+        0.5rem
+        calc(var(--thread-pane-gutter) + var(--scrollbar-gutter-width))
+        0.75rem
+        var(--thread-pane-gutter);
     background: var(--bg-primary);
     pointer-events: none;
     opacity: 1;
@@ -580,10 +603,14 @@
        are capped at `--content-max-width` and centered (`.thread-content > *`,
        `.prompt-input-container`), so the welcome lines up with the prompt
        textarea on both sides. (Inherited from `.thread-content > *` — kept
-       explicit here so the intent reads at a glance.) */
+       explicit here so the intent reads at a glance.) The --turn-body-inset
+       padding is the same one the composer column carries, and the same one a
+       transcript turn puts between its box and its visible content, so all three
+       share one content edge. */
     max-width: var(--content-max-width);
     margin-left: auto;
     margin-right: auto;
+    padding-inline: var(--turn-body-inset);
     text-align: left;
     /* Anchor the dismiss pill (below) to this centered content box instead of the
        full-width pane, so it sits at the content's top-right edge. */
@@ -914,7 +941,11 @@
     row-gap: 0.25rem;
     align-items: start;
     width: 100%;
-    padding: 0.75rem 0.875rem;
+    /* Horizontal padding is NOT free: this card and the composer box below the
+       transcript are the two nested thread-pane surfaces, and the composer docks
+       directly under a stack of these, so both put their content on the shared
+       --turn-surface-inset edge (base.css) by subtracting their own border. */
+    padding: 0.75rem calc(var(--turn-surface-inset) - 1px);
     background: var(--bg-tertiary);
     border: 1px solid var(--border-color);
     border-radius: 0.5rem;

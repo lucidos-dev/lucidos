@@ -52,6 +52,16 @@ const attachMenuOpen = signal(false);
 const cameraOpen = signal(false);
 const ANSWER_NO_IMAGES_TOAST = 'Answers to user questions are text only.';
 const ANSWER_NO_IMAGES_TOOLTIP = 'Answers are text only';
+/** Tooltip on the prompt row's Cancel while a question card is pending. It
+ *  carries the half of the old answering placeholder that the short one dropped:
+ *  nothing else on screen spells out what the red button does to a pending
+ *  question (it stamps it `Canceled`, so the user can steer the agent somewhere
+ *  else). The placeholder keeps the typing half (`PLACEHOLDER_ANSWERING`), and
+ *  between the two nothing on the card needs an "Other, I'll type it" option.
+ *  Only while a question card is actually pending: the same button also serves
+ *  coding-agent permission cards, which are not `UserQuestionAsked` and absorb
+ *  no typed text, so there it stays the plain "Stop". */
+export const ANSWER_CANCEL_TOOLTIP = 'Cancel this question and ask something else';
 
 function addImageFile(file: File) {
   attachImageToActiveDraft(file).catch((err) => {
@@ -91,14 +101,27 @@ function CameraCapture() {
     const canvas = document.createElement('canvas');
     canvas.width = geom.canvasWidth;
     canvas.height = geom.canvasHeight;
-    const ctx = canvas.getContext('2d')!;
+    // Both failure paths below are real on iOS Safari, which refuses a new 2D
+    // context (and can hand back a null blob) once its per-tab canvas memory
+    // budget is spent. Neither may stay silent: the user pressed the shutter,
+    // so an unhandled null left the button dead with the camera still open.
+    // Both failure paths end in close(), same as the success path: the shutter
+    // is a one-shot, so whether we got a photo or not the camera is done. An
+    // early return that only toasts would strand the live MediaStream and leave
+    // the overlay up, which is the very thing this handling exists to prevent.
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      showToast('Could not capture photo: the browser refused a drawing surface', 'error');
+      close();
+      return;
+    }
     ctx.translate(geom.translateX, geom.translateY);
     ctx.rotate(geom.rotateRadians);
     ctx.drawImage(video, 0, 0);
     canvas.toBlob((blob) => {
       if (blob) addImageFile(new File([blob], 'camera.jpg', { type: 'image/jpeg' }));
-      streamRef.current?.getTracks().forEach((t) => t.stop());
-      cameraOpen.value = false;
+      else showToast('Could not capture photo: the browser produced no image', 'error');
+      close();
     }, 'image/jpeg', 0.9);
   }
 
@@ -549,9 +572,9 @@ export function PromptInput() {
   // A placeholder swap changes what the empty box has to fit without touching
   // its value, which is the only thing resizeTextarea reacts to, so force a
   // fresh measurement on each one. The answering placeholder is the reason: it
-  // is a whole sentence and wraps at phone widths, in a narrowed thread pane,
-  // and at large UI scales, so the box has to grow to it on arrival and back
-  // down on the answer.
+  // is the longest of the three, so in a narrowed thread pane or at a large UI
+  // scale it wraps where the follow-up one does not, and the box has to grow to
+  // it on arrival and back down on the answer.
   //
   // Except while the compose FLIP is easing the height: that animation inverts
   // (parks the box at the height it came from, then transitions to the target it
@@ -813,7 +836,9 @@ export function PromptInput() {
         key: 'cancel',
         label: 'Cancel',
         className: 'action-btn action-btn-danger',
-        tooltip: 'Stop',
+        // This path exists only while a multi-select question is pending, so the
+        // question-specific wording always applies here.
+        tooltip: ANSWER_CANCEL_TOOLTIP,
         onClick: cancelExchangeForTarget,
       }]}
     />
@@ -852,7 +877,9 @@ export function PromptInput() {
       onPointerCancel={() => morphGate.cancel()}
       onClick={() => { if (!morphGate.isTap()) return; cancelExchangeForTarget(); }}
       aria-label="Cancel"
-      data-tooltip="Stop"
+      // A pending question card gets the wording that says what Cancel does to
+      // it; a permission card (same button, no typed-text escape) keeps "Stop".
+      data-tooltip={answeringQuestionCard ? ANSWER_CANCEL_TOOLTIP : 'Stop'}
       data-row-item
     >
       Cancel

@@ -897,6 +897,36 @@ fn engine_restart_interrupt_reason_constant_is_stable() {
     );
 }
 
+/// The *Switch to new version* fingerprint has a THIRD consumer now, in another
+/// language: `abortPromisesAutoResume` in
+/// `crates/lucidos-app/src/store/thread-events/exchange-render.ts` reads the same
+/// `engine_shutdown` + device-actor pair off the event to withhold the Continue
+/// button while the engine auto-resumes the turn.
+///
+/// TypeScript cannot import this constant, so this is the canary: change either
+/// half of the pair and the frontend keeps reading the old shape, which is wrong
+/// in whichever direction the change went (a button offered on a turn already
+/// resuming, or withheld on one nothing will resume). Both halves are asserted
+/// separately because both are load-bearing: a device actor alone is not the
+/// fingerprint, since `StaleSettle` deliberately carries the actor of whichever
+/// button exposed the stuck row.
+#[test]
+fn switch_teardown_fingerprint_is_stable_for_the_frontend_mirror() {
+    let sql = crate::engine::agent_recovery::SWITCH_TEARDOWN_ABORT_SQL;
+    assert!(
+        sql.contains("event_type = 'ResponseAborted'"),
+        "the fingerprint must still be about ResponseAborted: {sql}"
+    );
+    assert!(
+        sql.contains("'engine_shutdown'"),
+        "the cause half of the fingerprint changed; update abortPromisesAutoResume: {sql}"
+    );
+    assert!(
+        sql.contains("'device'"),
+        "the actor half of the fingerprint changed; update abortPromisesAutoResume: {sql}"
+    );
+}
+
 /// Phase 5.3 contract: a synthetic `CodingAgentIdled` carrying
 /// `reason = engine_restart_interrupt` must round-trip through serde so
 /// the projection + SSE consumers see the reason field intact. Without

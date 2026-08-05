@@ -115,6 +115,24 @@ impl EmailStore {
         Ok(result)
     }
 
+    /// The `email_accounts.name` an `email_password` credential belongs to.
+    ///
+    /// Normally the identity function: the credential's `service_name` IS the
+    /// account name, since `auth_type` carries what the old `email:` prefix used
+    /// to say.
+    ///
+    /// **Temporary measure (`credential-email-prefix-fallback` in
+    /// `docs/temporary-measures.md`).** The strip is for the rows
+    /// `20260805134838_drop_credential_name_prefixes_use_auth_type.sql` had to
+    /// leave prefixed, because their bare name was already held by another
+    /// non-oauth credential. Without it, editing such a credential resolves no
+    /// `email_accounts` row: the settings load 404s, and worse, the password
+    /// write silently affects zero rows and reports success while IMAP keeps the
+    /// old secret. Remove alongside the `get_email_password` fallback.
+    pub fn account_name_for_credential(service_name: &str) -> &str {
+        service_name.strip_prefix("email:").unwrap_or(service_name)
+    }
+
     /// Update just the password for an existing email account
     pub async fn update_password(
         pool: &PgPool,

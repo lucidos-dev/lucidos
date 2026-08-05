@@ -3,14 +3,38 @@ use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use uuid::Uuid;
 
+/// One row of the `events` table, and the **wire shape** of every event the
+/// workspace-facing read surface returns: `GET /api/v1/events/query`,
+/// `GET /api/v1/events/:event_id/{context,tool-result}`, the `events` LLM
+/// tool's `query` action, and `lucidos events query`.
+///
+/// `ThreadEvent` rows and `SystemEvent` rows (including workspace-emitted
+/// `DomainEvent`s) share this one table and this one shape. The `aggregate` /
+/// `aggregate_id` columns exist on the table but are deliberately NOT selected
+/// by `EventStore::fetch_events`, so they never reach the wire. See
+/// `system-knowhow/thread-events.md` § "One table, two enums".
+///
+/// The JS SDK mirrors this as `LucidosEvent` in
+/// `packages/lucidos-sdk/src/events.ts` (documented in
+/// `system-knowhow/js-sdk.md` § `lucidos.events`). Adding, removing or
+/// renaming a field here means updating both, and
+/// `serialized_key_set_is_the_documented_sdk_wire_shape` fails until you do.
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EventRow {
     pub id: Uuid,
     pub event_type: String,
     pub payload: serde_json::Value,
     pub created: DateTime<Utc>,
+    /// The thread this row belongs to. `EventBus::persist` sets it exactly for
+    /// `aggregate = 'thread'` rows, which is every `ThreadEvent` and no
+    /// `SystemEvent` the engine persists today (domain events carry
+    /// `aggregate = 'domain'`). NULL there means the key is ABSENT from the
+    /// JSON rather than null.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_id: Option<Uuid>,
+    /// Monotonic insertion order (`events.sequence`, a NOT NULL bigserial).
+    /// Always present on a row read back from the database; `None` only on an
+    /// in-memory [`EventRow::new`] that was never persisted.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sequence: Option<i64>,
 }
@@ -191,5 +215,70 @@ mod tests {
         let parsed: EventRow = serde_json::from_str(&json).unwrap();
 
         assert_eq!(event.id, parsed.id);
+    }
+
+    /// Drift guard for the workspace-facing event read surface.
+    ///
+    /// `EventRow` IS the JSON `/api/v1/events/query` returns, and the JS SDK
+    /// hand-declares that shape as `LucidosEvent` in
+    /// `packages/lucidos-sdk/src/events.ts` (mirrored in
+    /// `system-knowhow/js-sdk.md` § `lucidos.events`). Nothing else held the
+    /// two together, and they drifted: the SDK declared `aggregate?` /
+    /// `aggregate_id?`, which this endpoint never returns (the columns exist
+    /// on the table but `EventStore::fetch_events` does not select them), and
+    /// omitted `thread_id` / `sequence`, which it always does. An app reading
+    /// `e.thread_id` worked at runtime and failed `tsc`, which is what made
+    /// "an app cannot see a child thread's outcome" look true.
+    ///
+    /// Both shapes are asserted because both reach real clients: a
+    /// `ThreadEvent` row carries `thread_id`, a `SystemEvent` / domain-event
+    /// row has a NULL `thread_id` column and so drops the key entirely.
+    #[test]
+    fn serialized_key_set_is_the_documented_sdk_wire_shape() {
+        fn keys(row: &EventRow) -> Vec<String> {
+            let mut k: Vec<String> = serde_json::to_value(row)
+                .expect("EventRow serializes")
+                .as_object()
+                .expect("EventRow serializes to a JSON object")
+                .keys()
+                .cloned()
+                .collect();
+            k.sort();
+            k
+        }
+
+        // A thread-scoped row, as returned for e.g. ChildThreadCompleted.
+        let thread_row = EventRow {
+            thread_id: Some(Uuid::new_v4()),
+            sequence: Some(42),
+            ..EventRow::new("ChildThreadCompleted", serde_json::json!({}))
+        };
+        assert_eq!(
+            keys(&thread_row),
+            [
+                "created",
+                "event_type",
+                "id",
+                "payload",
+                "sequence",
+                "thread_id"
+            ],
+            "wire shape of a thread-scoped event row changed. Update \
+             `LucidosEvent` in packages/lucidos-sdk/src/events.ts and the Types \
+             block in system-knowhow/js-sdk.md § lucidos.events in the same change.",
+        );
+
+        // A workspace-emitted domain event: aggregate = 'domain', so the
+        // thread_id column is NULL and `skip_serializing_if` drops the key.
+        let domain_row = EventRow {
+            sequence: Some(7),
+            ..EventRow::new("HabitCompleted", serde_json::json!({"summary": "x"}))
+        };
+        assert_eq!(
+            keys(&domain_row),
+            ["created", "event_type", "id", "payload", "sequence"],
+            "a domain-event row must omit `thread_id` (absent, not null) so \
+             `thread_id?` stays the honest declaration on the SDK side.",
+        );
     }
 }

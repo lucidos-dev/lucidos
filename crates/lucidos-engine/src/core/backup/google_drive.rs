@@ -50,6 +50,12 @@ const DRIVE_AUTH_403_MSG: &str = "Google Drive access denied (403). Go to Settin
 const DRIVE_QUOTA_MSG: &str =
     "Google Drive is full — delete old backups or free space; this is NOT an access problem.";
 
+/// The scope substring a Drive backup needs, matched against the granted-scope
+/// string (the fragment matches the full `.../auth/drive.file` URL). This IS the
+/// provider registry's `required_scopes` entry, so the readiness verdict the
+/// Settings page renders and the preflight below check one list.
+pub const BACKUP_SCOPES: &[&str] = &["drive"];
+
 /// Shown by preflight when the granted token is missing the required Drive
 /// scope — the ONLY preflight case that should tell the user to re-grant access.
 const DRIVE_SCOPE_MISSING_MSG: &str = "Google Drive backup is missing the required Drive permission. Go to Settings > Backup and click 'Grant access' to re-authorize.";
@@ -62,9 +68,9 @@ pub struct GoogleDriveBackupProvider {
     pool: PgPool,
     client: reqwest::Client,
     folder_id_cache: Arc<Mutex<Option<String>>>,
-    /// Scope substring the token must carry, threaded from the provider
-    /// registry's `required_scope` so there's a single source of truth for it.
-    required_scope: &'static str,
+    /// Scopes the token must carry, threaded from the provider registry's
+    /// `required_scopes` so there's a single source of truth for them.
+    required_scopes: &'static [&'static str],
 }
 
 #[derive(Deserialize)]
@@ -182,13 +188,6 @@ fn quota_check(limit: Option<u64>, usage: u64, estimated_upload_bytes: u64) -> R
     }
 }
 
-/// True when the granted-scopes string includes the required scope substring.
-/// Mirrors the readiness check in `api::backup` (substring match against the
-/// space-separated granted scopes); an empty requirement always passes.
-fn scopes_include(granted: &str, required: &str) -> bool {
-    required.is_empty() || granted.contains(required)
-}
-
 /// Parse Drive's `Range:` response header (`bytes=0-262143`) and return the
 /// next byte to upload (one past the last received byte). Returns `None` if
 /// the header is missing or malformed — callers should treat that as
@@ -218,12 +217,12 @@ fn chunk_end(start: u64, total: u64, chunk_size: u64) -> u64 {
 }
 
 impl GoogleDriveBackupProvider {
-    pub fn new(pool: PgPool, required_scope: &'static str) -> Self {
+    pub fn new(pool: PgPool, required_scopes: &'static [&'static str]) -> Self {
         Self {
             pool,
             client: reqwest::Client::new(),
             folder_id_cache: Arc::new(Mutex::new(None)),
-            required_scope,
+            required_scopes,
         }
     }
 
@@ -256,7 +255,7 @@ impl GoogleDriveBackupProvider {
         }
         let info: TokenInfo = resp.json().await?;
         let granted = info.scope.unwrap_or_default();
-        if scopes_include(&granted, self.required_scope) {
+        if super::missing_scopes(&granted, self.required_scopes).is_empty() {
             Ok(())
         } else {
             Err(DRIVE_SCOPE_MISSING_MSG.into())
@@ -943,18 +942,18 @@ mod tests {
         assert!(quota_check(None, u64::MAX, u64::MAX / 2).is_ok());
     }
 
-    /// Scope verification is a substring match against the space-separated
-    /// granted scopes (mirrors `api::backup`'s readiness check). A token without
-    /// the Drive scope fails — the case preflight maps to the re-grant message.
+    /// The registry entry Drive's preflight verifies against. A backup writes
+    /// with `drive.file`, which the fragment matches.
     #[test]
-    fn scopes_include_substring_and_empty() {
+    fn backup_scopes_match_the_drive_file_grant() {
         let granted = "https://www.googleapis.com/auth/drive.file https://www.googleapis.com/auth/userinfo.email";
-        assert!(scopes_include(granted, "drive"));
-        assert!(!scopes_include(
-            "https://www.googleapis.com/auth/userinfo.email",
-            "drive"
-        ));
-        // An empty requirement always passes (the Dropbox no-scope case).
-        assert!(scopes_include("", ""));
+        assert!(super::super::missing_scopes(granted, BACKUP_SCOPES).is_empty());
+        assert_eq!(
+            super::super::missing_scopes(
+                "https://www.googleapis.com/auth/userinfo.email",
+                BACKUP_SCOPES
+            ),
+            vec!["drive"]
+        );
     }
 }

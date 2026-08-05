@@ -104,6 +104,12 @@ pub const CAPTURE_APP: &str = "capture_app";
 pub const RUN_CODING_AGENT: &str = "run_coding_agent";
 pub const RUN_CLAUDE_LEGACY: &str = "run_claude";
 pub const RUN_THREAD: &str = "run_thread";
+/// Redirect a child thread this thread already spawned. Standalone rather than
+/// a `threads` action per the hot-single-purpose guardrail: it is the third
+/// member of the run_thread / run_coding_agent family, and the `threads` domain
+/// is an introspection tool whose summary opens "Introspect threads", where a
+/// model that just called `run_thread` would not look for a write verb.
+pub const FOLLOW_UP_CHILD_THREAD: &str = "follow_up_child_thread";
 
 // Memory — grouped `memory` tool (correct/correct_by_id) from the capability
 // parity manifest; the flat names below stay as back-compat aliases. (The CLI's

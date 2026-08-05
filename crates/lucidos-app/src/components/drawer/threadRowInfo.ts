@@ -48,7 +48,7 @@ function threadContextRow(f: ThreadContextFields): TooltipRow {
 /** A tone keyword that maps to a small colored status dot in the tooltip's value
  *  cell — the only place a row carries one. Mirrors the row's status dot so the
  *  word and the color can't disagree. */
-export type StatusTone = 'running' | 'changes' | 'waiting' | 'failed' | 'idle';
+export type StatusTone = 'running' | 'changes' | 'waiting' | 'paused' | 'failed' | 'idle';
 
 /** One row of the structured thread tooltip: a dim label and its value, with an
  *  optional status `tone` that paints a leading dot in the value cell. */
@@ -72,6 +72,7 @@ const CARD_STATUS: Record<VisualStatus, { word: string; tone: StatusTone }> = {
   waiting: { word: 'Waiting', tone: 'waiting' },
   question: { word: 'Waiting for you', tone: 'waiting' },
   changes: { word: 'Changes ready', tone: 'changes' },
+  paused: { word: 'Paused by a restart', tone: 'paused' },
   failed: { word: 'Failed', tone: 'failed' },
   idle: { word: 'Idle', tone: 'idle' },
   // `resolveVisualStatus` collapses the raw `waiting_for_user_answer` ThreadStatus

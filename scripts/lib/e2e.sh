@@ -349,8 +349,11 @@ cleanup_e2e_worktrees() {
         git worktree remove --force "$wt_path" 2>/dev/null && removed=$((removed + 1))
     done < <(git worktree list 2>/dev/null)
 
-    # Clean up leftover e2e-test branches
-    git branch --list 'e2e-test/*' 'claude-code/*' 'merge-tmp/*' 2>/dev/null | xargs -r git branch -D 2>/dev/null
+    # Clean up leftover e2e-test branches. Safe to match by NAME here and only
+    # here: this is the disposable e2e workspace's own git, which no real
+    # session ever branches in. `lucidos-*` is the current coding-agent branch
+    # prefix, `claude-code/*` the legacy one.
+    git branch --list 'e2e-test/*' 'lucidos-*' 'claude-code/*' 'merge-tmp/*' 2>/dev/null | xargs -r git branch -D 2>/dev/null
 
     # CC test worktrees are physically inside this workspace but registered in
     # the canonical lucidos repo (where `git worktree add` ran). Without this the
@@ -359,11 +362,11 @@ cleanup_e2e_worktrees() {
     # readiness budget.
     #
     # SAFETY — this repo is SHARED with every real CC session: dev/personal
-    # worktrees and their `claude-code/*` branches all live here, and
+    # worktrees and their `lucidos-*` branches all live here, and
     # `$_E2E_PROJECT_DIR` is whichever checkout invoked the script — frequently a
     # CC worktree of this same repo. So the ONLY safe discriminator for "created
     # by an e2e run" is the worktree path living under $E2E_WORKSPACE. NEVER
-    # delete branches by name (`claude-code/*`) or by ancestry: a just-started
+    # delete branches by name (`lucidos-*`, `claude-code/*`) or by ancestry: a just-started
     # real session has no commits ahead of main yet, so an ancestry sweep deletes
     # live user work — this force-deleted an active session's branch and wiped its
     # worktree on 2026-06-13. Delete ONLY the branch each removed e2e worktree was

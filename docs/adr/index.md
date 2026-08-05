@@ -48,3 +48,8 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0038: A chat link never leaves the workspace: the click handler's extractor chain is closed at the bottom, so an unclaimed href is a toast rather than an SPA-fallback reload](0038-a-chat-link-never-leaves-the-workspace.md)
 - [0039: The public mirror's `main` is a linear release history, and a parent is safe because the mirror already publishes it (the orphan rule was sufficient, never necessary)](0039-the-public-mirror-is-a-linear-release-history.md)
 - [0040: Concurrent ADRs stop conflicting: the index is a union-merged file of its own, and a number is allocated across every unmerged branch rather than read off main](0040-adr-index-is-union-merged-and-numbers-are-allocated.md)
+- [0041: Coding-agent branches are named for their thread, not a timestamp](0041-coding-agent-branches-named-for-their-thread.md)
+- [0042: A GA release is a draft until every platform tarball is attached](0042-release-is-complete-when-it-goes-public.md)
+- [0043: The parent-to-child edge is the only privileged cross-thread write, and it asserts nothing](0043-parent-to-child-privileged-write.md)
+- [0044: SDK-rendered surfaces render themselves in a hostless app window; the popout stays a bare app tab](0044-sdk-surfaces-render-without-a-host.md)
+- [0045: The engine, not a client timer, decides when a switch-interrupted thread gets its Continue button back](0045-switch-resume-promise-discharged-by-engine.md)

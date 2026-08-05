@@ -97,15 +97,36 @@ impl AbortCause {
     }
 
     /// SQL fragment for the `status` column on the `thread_summaries` row when
-    /// this abort lands. Most aborts surface a red `failed` indicator (with
-    /// pending changes overriding to `waiting`); `StaleSettle` is engine
-    /// cleanup of a stuck row whose process was already gone — fired by a user
-    /// button (Stop / Apply / Discard / Archive / Interrupt). No real abort
-    /// happened, so it uses the cancel-style mapping (idle, or waiting if
-    /// pending changes) rather than the red failed indicator.
+    /// this abort lands. Three outcomes, and the split keys on
+    /// [`is_transient`](Self::is_transient) rather than on a second hand-written
+    /// cause list, so "the turn is expected to come back" is decided in exactly
+    /// one place:
+    ///
+    /// * **`StaleSettle`** is engine cleanup of a stuck row whose process was
+    ///   already gone, fired by a user button (Stop / Apply / Discard / Archive /
+    ///   Interrupt). No real abort happened, so it uses the cancel-style mapping
+    ///   (idle, or waiting if pending changes) rather than any verdict.
+    /// * **Transient** (`EngineShutdown`, `RecoveryAfterRestart`) surfaces
+    ///   `paused`: the engine went away mid-turn and either resumes the work
+    ///   itself (the *Switch to new version* teardown) or offers the manual
+    ///   Continue button. Reporting that as `failed` was the bug this split
+    ///   fixes: a switch painted every in-flight thread with the red error dot,
+    ///   while `is_transient()` three methods up already said a fresh
+    ///   `SessionStarted` was expected.
+    /// * **Everything else** (`SafetyNet`, `ProcessKilled`, `SessionDropped`,
+    ///   `Unknown`) is a real failure and keeps the red `failed` indicator.
+    ///
+    /// Pending changes override both verdicts to `waiting`: a change ready to
+    /// review is more actionable than either the interruption or the failure.
+    ///
+    /// Both verdicts must also survive the dying turn's trailing events. See
+    /// `event_bus::preserving_verdict`, whose list this function feeds.
     pub fn status_sql(&self) -> &'static str {
         match self {
             Self::StaleSettle => crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE,
+            _ if self.is_transient() => {
+                "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'paused' END"
+            }
             _ => "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END",
         }
     }

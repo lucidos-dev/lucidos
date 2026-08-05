@@ -123,14 +123,18 @@ test_cleanup_spares_real_cc_sessions() {
     git -C "$canon" commit -q --allow-empty -m init
 
     # e2e CC test worktree: lives under $E2E_WORKSPACE, registered in canonical.
-    git -C "$canon" worktree add -q -b claude-code/e2e-fake \
+    git -C "$canon" worktree add -q -b lucidos-claude-code-repo-lucidos-e2e-fake \
         "$E2E_WORKSPACE/.lucidos/worktrees/e2e-cc" main >/dev/null 2>&1
     # Real CC session worktree: lives in a different workspace, on an
-    # ancestor-of-main branch (just started, nothing committed yet).
-    git -C "$canon" worktree add -q -b claude-code/real-live \
+    # ancestor-of-main branch (just started, nothing committed yet). Named with
+    # the current `lucidos-*` prefix, which the disposable-workspace sweep DOES
+    # match by name, so this pins that the shared-repo half still discriminates
+    # by path.
+    git -C "$canon" worktree add -q -b lucidos-codex-repo-lucidos-real-live \
         "$dev/.lucidos/worktrees/real-cc" main >/dev/null 2>&1
     # Real CC session branch with NO worktree, also ancestor-of-main — exactly
     # what the old `for-each-ref … merge-base --is-ancestor … branch -D` deleted.
+    # Legacy prefix, so the sweep is pinned against both branch shapes.
     git -C "$canon" branch claude-code/real-untracked main
 
     local saved_proj="$_E2E_PROJECT_DIR"
@@ -145,7 +149,7 @@ test_cleanup_spares_real_cc_sessions() {
         *"$E2E_WORKSPACE/.lucidos/worktrees/e2e-cc"*) fail "e2e worktree not removed" ;;
         *) pass "e2e worktree removed" ;;
     esac
-    if git -C "$canon" show-ref --verify --quiet refs/heads/claude-code/e2e-fake; then
+    if git -C "$canon" show-ref --verify --quiet refs/heads/lucidos-claude-code-repo-lucidos-e2e-fake; then
         fail "e2e branch not deleted"
     else
         pass "e2e branch deleted"
@@ -155,7 +159,7 @@ test_cleanup_spares_real_cc_sessions() {
         *"$dev/.lucidos/worktrees/real-cc"*) pass "real session worktree preserved" ;;
         *) fail "real session worktree was removed" ;;
     esac
-    if git -C "$canon" show-ref --verify --quiet refs/heads/claude-code/real-live; then
+    if git -C "$canon" show-ref --verify --quiet refs/heads/lucidos-codex-repo-lucidos-real-live; then
         pass "real session branch (live worktree) preserved"
     else
         fail "real session branch (live worktree) was deleted"

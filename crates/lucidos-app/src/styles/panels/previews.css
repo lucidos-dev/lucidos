@@ -43,16 +43,47 @@
 
 /* --- Pseudo-fullscreen (CSS fallback when native Fullscreen API is unavailable, e.g. iOS Safari) --- */
 
+/* --z-app-fullscreen (base.css) is above the header chrome and BELOW the modal
+   layer, so the host's own modals and toasts still paint over a fullscreen app.
+   Not --z-tooltip: that put the panel over every overlay, which is what made an
+   app's previewFile / confirm / prompt / toast invisible. */
 .app-ui-inline.app-ui-fullscreen {
     position: fixed;
     top: 0;
     left: 0;
     right: 0;
     bottom: 0;
-    z-index: var(--z-tooltip);
+    z-index: var(--z-app-fullscreen);
     background: var(--bg-primary);
     height: auto;
     padding: env(safe-area-inset-top, 0px) env(safe-area-inset-right, 0px) env(safe-area-inset-bottom, 0px) env(safe-area-inset-left, 0px);
+}
+
+/* Native fullscreen (the Fullscreen API path). It is requested on this panel
+   rather than on the iframe, so the host can render its overlay layer INSIDE
+   the fullscreen element (see OverlayLayer): a natively fullscreen element
+   paints only its own subtree, and nothing outside it can be seen at any
+   z-index. The base rules size this panel to the content pane, which is not
+   what a fullscreen element needs, and its own background is transparent over
+   the UA's black backdrop.
+
+   Two rules, not one selector list: an unrecognized pseudo-class invalidates
+   the whole list, so pairing :fullscreen with :-webkit-full-screen would drop
+   both on any engine that knows only one of them. */
+.app-ui-inline:fullscreen {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg-primary);
+}
+
+.app-ui-inline:-webkit-full-screen {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    background: var(--bg-primary);
 }
 
 .pseudo-fullscreen-exit {
@@ -585,7 +616,11 @@
 
 .prompt-box {
     background: var(--bg-secondary);
-    border: 0.125rem solid color-mix(in srgb, var(--border-color) 50%, transparent);
+    /* Tokenized because the chat composer derives its inner horizontal padding
+       from --turn-surface-inset minus this width, so that its typed text lands
+       on the same content edge as the question / change cards above it
+       (chat/input-messages.css `.prompt-row .prompt-textarea`). */
+    border: var(--prompt-box-border-width) solid color-mix(in srgb, var(--border-color) 50%, transparent);
     border-radius: 1rem;
     transition: border-color 0.5s ease;
 }

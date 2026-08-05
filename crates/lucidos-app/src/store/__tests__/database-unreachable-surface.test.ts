@@ -19,8 +19,9 @@ vi.mock('../actions/thread-sync', () => ({
 vi.mock('../actions/thread-loading', () => ({
   loadAllThreads: vi.fn().mockResolvedValue(undefined),
   loadThreadEvents: vi.fn().mockResolvedValue(undefined),
-  refreshThreadEvents: vi.fn().mockResolvedValue(undefined),
-  clearForcedRetries: vi.fn(),
+  refreshThreadEvents: vi.fn().mockResolvedValue(true),
+  clearThreadFetchGuards: vi.fn(),
+  markLoadedThreadsStale: vi.fn(),
 }));
 vi.mock('../actions/notifications', () => ({
   loadUnreadNotifications: vi.fn(),

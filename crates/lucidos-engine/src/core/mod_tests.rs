@@ -289,7 +289,7 @@ fn test_describe_tool_background_exec() {
     );
 }
 
-/// Every `describe_tool` arm ends in a trailing "..." as an in-progress
+/// Nearly every `describe_tool` arm ends in a trailing "..." as an in-progress
 /// aesthetic. `truncate` appends its OWN "..." when it cuts, so an arm that
 /// elides a value AND wraps it in a `"{}..."` format string emitted six dots
 /// for any value long enough to truncate. The frontend accents only the
@@ -301,13 +301,14 @@ fn test_describe_tool_background_exec() {
 fn describe_tool_never_doubles_the_trailing_ellipsis_on_an_elided_value() {
     let long = "cd /Users/me/workspaces/example && for f in *.json; do jq . \"$f\"; done";
     assert!(long.len() > 60, "fixture must exceed every elision budget");
-    let args = serde_json::json!({ "command": long, "prompt": long });
+    let args = serde_json::json!({ "command": long, "prompt": long, "message": long });
 
     for (tool, prefix) in [
         ("run_bash", "Running: "),
         ("run_bash_background", "Running in background: "),
         ("generate_image", "Generating image: "),
         ("run_thread", "Running thread: "),
+        ("follow_up_child_thread", "Following up with child thread: "),
     ] {
         let desc = describe_tool(tool, &args);
         assert!(desc.starts_with(prefix), "{tool} lost its label: {desc}");
@@ -493,6 +494,187 @@ fn test_describe_tool_unknown_falls_back_to_generic() {
     assert_eq!(
         describe_tool("some_future_tool", &serde_json::json!({})),
         "Executing some_future_tool..."
+    );
+    // The fallback is reachable only for a name we do not ship: `tool_label`
+    // says so, which is what the exhaustiveness guard below relies on.
+    assert!(tool_label("some_future_tool", &serde_json::json!({})).is_none());
+}
+
+/// Every `pub const … : &str = "…";` value in `llm/tool_names.rs`, read out of
+/// the file's own text (embedded by `include_str!`, parsed here at test time).
+/// Reading the source beats naming the constants here: a new constant is
+/// covered the moment it lands, with no second list to keep in sync.
+fn tool_name_constants() -> Vec<String> {
+    const SRC: &str = include_str!("../llm/tool_names.rs");
+    let mut names = Vec::new();
+    for line in SRC.lines() {
+        let Some(decl) = line.trim().strip_prefix("pub const ") else {
+            continue;
+        };
+        if !decl.contains(": &str = ") {
+            continue;
+        }
+        let Some(open) = decl.find('"') else { continue };
+        let value = &decl[open + 1..];
+        let Some(close) = value.find('"') else {
+            continue;
+        };
+        names.push(value[..close].to_string());
+    }
+    // A parser that silently stops matching (someone moves the constants behind
+    // a macro, or reformats the declarations) would disarm the guard while the
+    // test still passed. Hold a floor well under today's count so ordinary
+    // additions and removals do not trip it.
+    assert!(
+        names.len() >= 100,
+        "only {} tool-name constants parsed out of llm/tool_names.rs: the parser \
+         in tool_name_constants no longer matches how they are declared",
+        names.len()
+    );
+    names
+}
+
+/// Every tool name the engine knows must render a human-readable step label.
+/// `describe_tool`'s fallback prints the raw identifier into the chat steps UI
+/// ("Executing follow_up_child_thread..."), which leaks an internal name at the
+/// one place the user is watching the agent work. `tool_label` answers `None`
+/// for an unlabelled name, so this test can hold that line for every name we
+/// register.
+///
+/// The four sources are unioned because a tool can enter the engine through any
+/// of them: the flat default set, the manifest's grouped tools, a manifest
+/// back-compat alias, or `tool_names.rs` on its own. That last source is the
+/// belt-and-braces one: it fails as soon as the constant is declared, before the
+/// tool is wired into any registry.
+#[test]
+fn every_known_tool_name_has_a_step_label() {
+    let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for tool in crate::llm::tools::get_default_tools() {
+        names.insert(tool.name);
+    }
+    for tool in crate::capability_manifest::llm_tools() {
+        names.insert(tool.name);
+    }
+    for domain in crate::capability_manifest::domains() {
+        names.extend(domain.alias_names().into_iter().map(String::from));
+    }
+    names.extend(tool_name_constants());
+
+    // Empty args on purpose: a label must survive a call whose optional
+    // arguments are all absent, which is the shape the fallback used to swallow.
+    let args = serde_json::json!({});
+    let unlabelled: Vec<&str> = names
+        .iter()
+        .filter(|name| tool_label(name, &args).is_none())
+        .map(String::as_str)
+        .collect();
+    assert!(
+        unlabelled.is_empty(),
+        "these tool names render the raw fallback \"Executing <name>...\" in the \
+         steps UI: {}. Add a match arm in core::mod::tool_label for each.",
+        unlabelled.join(", ")
+    );
+}
+
+/// The cheap way to "fix" a missing label is to alias it back to the fallback
+/// string, which changes nothing the user sees. Pin the eight names that were
+/// hitting the fallback: each must render a real label that does not contain
+/// its own snake_case identifier.
+#[test]
+fn the_previously_unlabelled_tools_render_a_real_label() {
+    for name in [
+        "run_trigger",
+        "get_backup_status",
+        "follow_up_child_thread",
+        "correct_memory_by_id",
+        "list_thread_queue",
+        "update_thread_queue_policy",
+        "view_image",
+        "register_plugin_marketplace",
+    ] {
+        let label = describe_tool(name, &serde_json::json!({}));
+        assert!(!label.is_empty(), "{name} rendered an empty label");
+        assert!(
+            !label.contains(name),
+            "{name} still renders its raw tool name: {label}"
+        );
+    }
+}
+
+/// The grouped `triggers` tool dispatches on `action`, and an unrecognised
+/// action falls to the list label. An off-schedule run is the opposite of a
+/// list, so "Listing triggers..." for `action: "run"` was actively wrong, not
+/// merely vague.
+#[test]
+fn describe_tool_labels_an_off_schedule_trigger_run() {
+    assert_eq!(
+        describe_tool("triggers", &serde_json::json!({ "action": "run" })),
+        "Running trigger now..."
+    );
+    assert_eq!(
+        describe_tool("run_trigger", &serde_json::json!({ "trigger_id": "t" })),
+        "Running trigger now..."
+    );
+}
+
+#[test]
+fn describe_tool_follow_up_child_thread_shows_the_message_not_the_uuid() {
+    let args = serde_json::json!({
+        "thread_id": "11111111-2222-3333-4444-555555555555",
+        "message": "Fix the failing test first"
+    });
+    let label = describe_tool("follow_up_child_thread", &args);
+    assert_eq!(
+        label,
+        "Following up with child thread: Fix the failing test first..."
+    );
+    assert!(
+        !label.contains("11111111"),
+        "the child's uuid must never reach the label: {label}"
+    );
+    // No message (a malformed call, or a replayed older payload) still reads as
+    // a sentence rather than as a raw tool name.
+    assert_eq!(
+        describe_tool(
+            "follow_up_child_thread",
+            &serde_json::json!({ "thread_id": "x" })
+        ),
+        "Following up with child thread..."
+    );
+}
+
+#[test]
+fn describe_tool_labels_the_remaining_previously_missing_tools() {
+    assert_eq!(
+        describe_tool("get_backup_status", &serde_json::json!({})),
+        "Checking backup status..."
+    );
+    assert_eq!(
+        describe_tool("correct_memory_by_id", &serde_json::json!({ "id": "m" })),
+        "Updating memory..."
+    );
+    assert_eq!(
+        describe_tool("list_thread_queue", &serde_json::json!({})),
+        "Listing Thread Queue..."
+    );
+    assert_eq!(
+        describe_tool("update_thread_queue_policy", &serde_json::json!({})),
+        "Updating Thread Queue policy..."
+    );
+    assert_eq!(
+        describe_tool("view_image", &serde_json::json!({ "image": "thread:2" })),
+        "Viewing thread:2..."
+    );
+    assert_eq!(
+        describe_tool("view_image", &serde_json::json!({})),
+        "Viewing image..."
+    );
+    assert_eq!(
+        describe_tool(
+            "register_plugin_marketplace",
+            &serde_json::json!({ "source": "example-org/plugins" })
+        ),
+        "Registering marketplace example-org/plugins..."
     );
 }
 
@@ -825,6 +1007,40 @@ fn test_describe_cc_tool_unknown() {
     assert_eq!(
         describe_cc_tool("CustomTool", &serde_json::json!({})),
         "CustomTool"
+    );
+}
+
+/// Both coding-agent backends name an MCP tool `mcp__<server>__<tool>`: Claude
+/// Code natively, and Codex because `runtime/codex_parse.rs` rebuilds its
+/// `mcp_tool_call` item into that exact shape. Neither had an arm, so the raw
+/// identifier (server prefix and all) WAS the step label.
+#[test]
+fn describe_cc_tool_names_an_mcp_tool_without_its_server_prefix() {
+    let args = serde_json::json!({});
+    assert_eq!(
+        describe_cc_tool("mcp__example_server__create_issue", &args),
+        "MCP: create_issue"
+    );
+    // A malformed name (no `__` after the server) keeps the whole identifier
+    // rather than losing it, same as the engine-side arm.
+    assert_eq!(describe_cc_tool("mcp__weird", &args), "MCP: mcp__weird");
+    assert_eq!(
+        describe_tool("mcp__example_server__create_issue", &args),
+        "MCP: create_issue..."
+    );
+    assert_eq!(describe_tool("mcp__weird", &args), "MCP: mcp__weird...");
+}
+
+/// The two backends' plan tools are the same thing to the user, so they get the
+/// same label. `TodoWrite` had no arm and rendered as the bare tool name.
+#[test]
+fn describe_cc_tool_labels_both_backends_plan_tools_alike() {
+    let args = serde_json::json!({});
+    assert_eq!(describe_cc_tool("TodoWrite", &args), "Update plan");
+    assert_eq!(describe_cc_tool("todo_list", &args), "Update plan");
+    assert_eq!(
+        describe_cc_tool("ExitPlanMode", &args),
+        "Present plan for approval"
     );
 }
 

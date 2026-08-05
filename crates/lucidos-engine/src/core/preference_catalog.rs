@@ -311,16 +311,17 @@ pub const CATALOG: &[PrefSpec] = &[
         side_effect: PrefSideEffect::Push,
     },
     // ---- Backup (global) — re-registers the backup cron via the scheduler's
-    // PreferencesChanged subscriber (no engine restart). The provider must be
-    // connected in Settings → System → Backup for a scheduled backup to upload;
-    // an enabled schedule auto-generates an encryption key on its first run.
+    // PreferencesChanged subscriber (no engine restart). The provider's ACCOUNT
+    // must be connected in Settings → Accounts (NOT on the Backup page, which
+    // has no account UI) before a scheduled backup can upload; an enabled
+    // schedule auto-generates an encryption key on its first run.
     PrefSpec {
         key: "backup_schedule",
         label: "Backup schedule",
         scope: PrefScope::Global,
         value: PrefValue::Text,
         default: "off",
-        description: "Automatic backup schedule as a 6-field cron expression in the user's timezone (second minute hour day-of-month month day-of-week), or 'off' to disable. Examples: '0 0 3 * * *' = daily 03:00, '0 0 3 * * 0' = weekly Sunday 03:00, '0 0 */12 * * *' = every 12h. Requires backup_provider set and connected.",
+        description: "Automatic backup schedule as a 6-field cron expression in the user's timezone (second minute hour day-of-month month day-of-week), or 'off' to disable. Examples: '0 0 3 * * *' = daily 03:00, '0 0 3 * * 0' = weekly Sunday 03:00, '0 0 */12 * * *' = every 12h. Requires backup_provider set AND its account connected (see that key).",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -329,7 +330,7 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Enum(crate::core::backup::PROVIDER_IDS),
         default: "(unset — ask the user)",
-        description: "Cloud destination for backups. The account must be connected in Settings → System → Backup (OAuth) before a scheduled backup can upload.",
+        description: "Cloud destination for backups. Setting this connects NOTHING: the account is connected separately with connect_oauth_account, or by the user in Settings → Accounts (never on the Backup page, which has no account UI). Until then backups run and the upload fails. Check get_backup_status, which reports whether the account is connected.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {
@@ -357,13 +358,13 @@ pub const CATALOG: &[PrefSpec] = &[
 /// gets actionable guidance instead of "unknown key".
 pub const INTERNAL_KEYS: &[(&str, &str)] = &[
     ("command_guard", "the command guard is the safety gate over the agent's own bash/python — toggle it in Settings → Permissions, not via set_preference"),
-    ("command_guard_judge", "managed in Settings → Permissions (Command Safety)"),
-    ("model_command_judge", "managed in Settings → Permissions (Command Safety)"),
-    ("max_tool_calls", "the per-turn tool-call cap is the backstop over your own agentic loop, so you must not raise your own limit; the user changes it in Settings → Models → Chat & Triggers"),
+    ("command_guard_judge", "managed in Settings → Permissions (Command safety)"),
+    ("model_command_judge", "managed in Settings → Permissions (Command safety)"),
+    ("max_tool_calls", "the per-turn tool-call cap is the backstop over your own agentic loop, so you must not raise your own limit; the user changes it in Settings → Models → Chat & triggers"),
     ("capture_context", "a debug-only context-capture toggle; change it in Settings if you really need to"),
     ("backup_last_run", "internal backup state, not a setting"),
     ("keybindings", "keyboard shortcuts are managed in Settings → Keyboard Shortcuts"),
-    ("network_bind", "the per-workspace engine network bind (loopback / all interfaces / a specific tailnet IP) — a security setting changed in Settings → System → Network access, not via set_preference"),
+    ("network_bind", "the per-workspace engine network bind (loopback / all interfaces / a specific tailnet IP): a security setting changed in Settings → Access → Network access, not via set_preference"),
     ("engine_switch_dismissed_build", "internal UI state — the on-disk engine build id the user deferred the 'Switch to new version' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
     ("client_refresh_dismissed_build", "internal UI state — the served client build id the user deferred the 'refresh to sync' toast for (workspace-global so a dismiss defers on every device); managed by the version-update toast, not a setting"),
 ];

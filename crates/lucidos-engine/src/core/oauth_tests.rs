@@ -1,5 +1,13 @@
 use super::*;
 
+/// What a credential that says nothing about authorization parameters sends,
+/// i.e. what every connection made before the field existed sends. Spelled as
+/// `parse(None)` rather than a literal so a test can never assert against a
+/// default the parser does not actually produce.
+fn default_authorize_params() -> AuthorizeParams {
+    AuthorizeParams::parse(None).expect("the default parses")
+}
+
 #[test]
 fn merge_scopes_adds_new_without_duplicates() {
     let existing = "openid email https://www.googleapis.com/auth/gmail.readonly";
@@ -175,6 +183,17 @@ fn account_env_vars_normalizes_provider_name() {
     assert_eq!(map.get("OAUTH_MY_PROVIDER_ACCESS_TOKEN").unwrap(), "tok");
 }
 
+/// The provider name reaches here from `connect_oauth_account`'s free-text
+/// argument, so it can carry anything. Shares `env_var_segment` with `CRED_*`
+/// so a provider that isn't already identifier-shaped can't inject a variable
+/// bash refuses to expand.
+#[test]
+fn account_env_vars_replaces_every_non_identifier_character() {
+    let accounts = vec![make_env_account("acme:cloud+eu", None, "tok")];
+    let map: std::collections::HashMap<_, _> = account_env_vars(accounts).into_iter().collect();
+    assert_eq!(map.get("OAUTH_ACME_CLOUD_EU_ACCESS_TOKEN").unwrap(), "tok");
+}
+
 #[test]
 fn provider_not_connected_msg_names_provider_and_recovery() {
     let msg = provider_not_connected_msg("google");
@@ -193,11 +212,13 @@ fn oauth_client_request_attaches_supplied_endpoints_as_defaults() {
         auth_url: Some("https://accounts.google.com/o/oauth2/v2/auth".to_string()),
         token_url: Some("https://oauth2.googleapis.com/token".to_string()),
         userinfo_url: Some("https://openidconnect.googleapis.com/v1/userinfo".to_string()),
+        userinfo_method: None,
+        authorize_params: None,
         scopes: Some("https://www.googleapis.com/auth/cloud-healthcare".to_string()),
         redirect_uri: Some("http://localhost:14981/oauth/callback".to_string()),
     };
     let req = oauth_client_request("ghealth", &overrides);
-    assert_eq!(req["service"], "oauth:ghealth");
+    assert_eq!(req["service"], "ghealth");
     assert_eq!(req["auth_type"], "oauth_client");
     assert_eq!(req["base_url"], "https://healthcare.googleapis.com");
     assert_eq!(
@@ -228,7 +249,7 @@ fn oauth_client_request_without_overrides_has_no_defaults_and_falls_back_base_ur
     // custom provider and expands the endpoint section for manual entry. The
     // base_url falls back to a best-effort guess.
     let req = oauth_client_request("acme", &OAuthClientOverrides::default());
-    assert_eq!(req["service"], "oauth:acme");
+    assert_eq!(req["service"], "acme");
     assert_eq!(req["base_url"], "https://acme.com");
     assert!(
         req.get("defaults").is_none(),
@@ -717,6 +738,7 @@ fn authorize_url_and_token_exchange_send_an_identical_redirect_uri() {
                 &redirect_uri,
                 "openid email",
                 &auth,
+                &default_authorize_params(),
             );
             let form = exchange_form("the-code", "cid-123", &redirect_uri, &auth);
 
@@ -755,6 +777,7 @@ fn a_credential_with_a_secret_is_a_confidential_client() {
         "http://127.0.0.1:14981/oauth/callback",
         "openid email",
         &auth,
+        &default_authorize_params(),
     );
     assert_eq!(
         url,
@@ -810,6 +833,7 @@ fn a_credential_without_a_secret_is_a_public_client_using_pkce() {
             "http://127.0.0.1:14981/oauth/callback",
             "offline_access User.Read",
             &auth,
+            &default_authorize_params(),
         );
         assert_eq!(
             authorize_param(&url, "code_challenge").as_deref(),
@@ -1043,7 +1067,7 @@ async fn callback_recovers_a_long_code_split_across_reads() {
 
     send_callback_request(addr, head, Some(tail)).await;
 
-    let got = wait_for_oauth_callback(listener).await.unwrap();
+    let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
     assert_eq!(
         got, code,
         "the full authorization code must survive a split read"
@@ -1064,7 +1088,7 @@ async fn callback_surfaces_a_provider_denial() {
     )
     .await;
 
-    let err = wait_for_oauth_callback(listener)
+    let err = wait_for_oauth_callback(listener, "testprov")
         .await
         .expect_err("a denial callback must be an error");
     let msg = err.to_string();
@@ -1110,7 +1134,7 @@ async fn callback_is_received_on_every_bound_loopback_family() {
             None,
         )
         .await;
-        let got = wait_for_oauth_callback(listener).await.unwrap();
+        let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
         assert_eq!(got, "family-code", "callback over {addr} must be received");
     }
 }
@@ -1136,7 +1160,7 @@ async fn callback_ignores_browser_noise_before_the_real_redirect() {
     )
     .await;
 
-    let got = wait_for_oauth_callback(listener).await.unwrap();
+    let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
     assert_eq!(got, "the-real-code");
 }
 
@@ -1151,6 +1175,7 @@ fn authorize_url_appends_to_an_endpoint_that_already_has_a_query() {
         "http://127.0.0.1:14981/oauth/callback",
         "openid",
         &auth,
+        &default_authorize_params(),
     );
     assert_eq!(
         url.matches('?').count(),
@@ -1185,6 +1210,359 @@ async fn callback_survives_a_connection_that_closes_without_sending() {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     });
 
-    let got = wait_for_oauth_callback(listener).await.unwrap();
+    let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
     assert_eq!(got, "survived");
+}
+
+// ---------------------------------------------------------------------------
+// client_provider_name: what survived of the deleted `oauth:` canonicalization
+// ---------------------------------------------------------------------------
+
+/// The name is just the provider now. `auth_type = oauth_client` is what marks
+/// the row, so nothing manufactures a namespace to distinguish it from a
+/// same-named API key.
+#[test]
+fn client_provider_name_leaves_a_bare_provider_alone() {
+    assert_eq!(client_provider_name("dropbox"), "dropbox");
+    assert_eq!(client_provider_name("google"), "google");
+}
+
+/// The 2026-08-05 duplicate-credential bug, pinned from the other direction.
+/// The chat system prompt said `service: "oauth:<provider>"` for as long as the
+/// tool existed, so both spellings are still in circulation among agents and
+/// workspace knowhow. They must land on ONE row: an agent saying `oauth:google`
+/// and a user typing `google` into the Add Credential form cannot end up with a
+/// pair the user has to tell apart by hand.
+#[test]
+fn client_provider_name_strips_a_legacy_prefix() {
+    assert_eq!(client_provider_name("oauth:google"), "google");
+    assert_eq!(client_provider_name("OAuth:Google"), "google");
+    assert_eq!(
+        client_provider_name(&client_provider_name("oauth:dropbox")),
+        "dropbox"
+    );
+}
+
+/// `connect_oauth_account` lowercases its `provider` arg before looking the
+/// credential up, so a differently-cased write would store a row that lookup
+/// never finds. Whitespace is trimmed for the same reason.
+#[test]
+fn client_provider_name_normalizes_case_and_whitespace() {
+    assert_eq!(client_provider_name("Dropbox"), "dropbox");
+    assert_eq!(client_provider_name("  Dropbox  "), "dropbox");
+}
+
+/// A derived connection name (the alias rule in the oauth-providers knowhow)
+/// stays its own provider, not a variant of the one it borrows endpoints from.
+#[test]
+fn client_provider_name_keeps_derived_provider_names_distinct() {
+    assert_eq!(client_provider_name("ghealth"), "ghealth");
+    assert_ne!(
+        client_provider_name("ghealth"),
+        client_provider_name("google")
+    );
+}
+
+// ---------------------------------------------------------------------------
+// callback_page: the last screen of the flow
+// ---------------------------------------------------------------------------
+
+/// The success page must name the provider and state the honest tense. It is
+/// written at callback RECEIPT, before the code is exchanged, so it cannot claim
+/// the account is connected.
+#[test]
+fn callback_success_page_names_the_provider_and_what_happens_next() {
+    let page = callback_page("dropbox", true);
+    assert!(page.contains("dropbox"), "{page}");
+    assert!(page.contains("Authorization complete"), "{page}");
+    assert!(page.contains("close this tab"), "{page}");
+    assert!(
+        !page.contains("Authorization successful!"),
+        "the bare debug-looking heading is gone: {page}"
+    );
+}
+
+/// The failure page says nothing was connected and sends the user back for the
+/// reason, which lives in the engine.
+#[test]
+fn callback_failure_page_points_back_at_lucidos() {
+    let page = callback_page("dropbox", false);
+    assert!(page.contains("Authorization failed"), "{page}");
+    assert!(page.contains("Nothing was connected"), "{page}");
+    assert!(page.contains("Return to Lucidos"), "{page}");
+}
+
+/// The injection guard, pinned. NOTHING the provider sends in the redirect may
+/// be rendered: `error_description` is attacker-controllable, and echoing it
+/// into HTML we serve on the user's own loopback port would be an injection sink
+/// for no benefit. The only interpolated value is the engine-side provider name.
+#[test]
+fn callback_page_renders_no_provider_supplied_text() {
+    let hostile = "err=<script>alert(1)</script>&error_description=<img onerror=x>";
+    for ok in [true, false] {
+        let page = callback_page("dropbox", ok);
+        assert!(!page.contains("<script>"), "{page}");
+        assert!(!page.contains(&hostile[..10]), "{page}");
+    }
+    // And the one value that IS interpolated is escaped, so a richer provider
+    // name can never open a tag either.
+    let page = callback_page("<script>alert(1)</script>", true);
+    assert!(!page.contains("<script>"), "{page}");
+    assert!(page.contains("&lt;script&gt;"), "{page}");
+}
+
+/// A blank provider (a flow whose name never made it this far) must not render
+/// an empty `<title>` or a stray label.
+#[test]
+fn callback_page_tolerates_a_blank_provider() {
+    let page = callback_page("", true);
+    assert!(page.contains("<title>Lucidos</title>"), "{page}");
+    assert!(page.contains("Authorization complete"), "{page}");
+}
+
+// ---------------------------------------------------------------------------
+// userinfo: method selection and the two display-name shapes
+// ---------------------------------------------------------------------------
+
+/// Absent means GET. Every credential written before `userinfo_method` existed
+/// omits the key, so this branch is what keeps them working untouched.
+#[test]
+fn userinfo_method_defaults_to_get() {
+    assert_eq!(UserinfoMethod::parse(None), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("")), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("   ")), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("GET")), UserinfoMethod::Get);
+}
+
+/// Dropbox's `users/get_current_account` is POST-only, which is why the key
+/// exists at all. Case-insensitive because the value is typed by a human in the
+/// credential modal as often as it is passed by the agent.
+#[test]
+fn userinfo_method_reads_post_in_any_case() {
+    assert_eq!(UserinfoMethod::parse(Some("POST")), UserinfoMethod::Post);
+    assert_eq!(UserinfoMethod::parse(Some("post")), UserinfoMethod::Post);
+    assert_eq!(UserinfoMethod::parse(Some(" Post ")), UserinfoMethod::Post);
+}
+
+/// An unrecognized value degrades to GET rather than failing. Userinfo is
+/// fetched best-effort AFTER the token exchange has already succeeded, so a
+/// typo here must cost the account's email, never the connection.
+#[test]
+fn userinfo_method_degrades_an_unknown_value_to_get() {
+    assert_eq!(UserinfoMethod::parse(Some("PATCH")), UserinfoMethod::Get);
+    assert_eq!(UserinfoMethod::parse(Some("nonsense")), UserinfoMethod::Get);
+}
+
+/// OIDC's flat shape.
+#[test]
+fn display_name_reads_the_flat_oidc_shape() {
+    let body = serde_json::json!({ "email": "me@example.com", "name": "Jane Doe" });
+    assert_eq!(userinfo_display_name(&body).as_deref(), Some("Jane Doe"));
+}
+
+/// Dropbox's nested shape. Reading only the flat form left this as no name at
+/// all, which is half of why a connected Dropbox account read as "unknown".
+#[test]
+fn display_name_reads_the_nested_dropbox_shape() {
+    let body = serde_json::json!({
+        "email": "me@example.com",
+        "name": { "given_name": "Jane", "display_name": "Jane Doe" },
+    });
+    assert_eq!(userinfo_display_name(&body).as_deref(), Some("Jane Doe"));
+}
+
+/// Neither shape present is None, not a panic and not an empty string.
+#[test]
+fn display_name_is_none_when_absent_or_unrecognized() {
+    assert_eq!(userinfo_display_name(&serde_json::json!({})), None);
+    assert_eq!(
+        userinfo_display_name(&serde_json::json!({ "name": { "given_name": "Jane" } })),
+        None
+    );
+    assert_eq!(
+        userinfo_display_name(&serde_json::json!({ "name": 42 })),
+        None
+    );
+}
+
+/// The method rides into the modal's `defaults` block, so a user editing the
+/// credential sees (and can correct) what the agent chose.
+#[test]
+fn oauth_client_request_carries_the_userinfo_method() {
+    let overrides = OAuthClientOverrides {
+        userinfo_url: Some("https://api.dropboxapi.com/2/users/get_current_account".to_string()),
+        userinfo_method: Some("POST".to_string()),
+        ..Default::default()
+    };
+    let req = oauth_client_request("dropbox", &overrides);
+    assert_eq!(req["defaults"]["userinfo_method"], "POST");
+}
+
+// ---------------------------------------------------------------------------
+// Authorization parameters: per-credential, because "give me a refresh token"
+// has no standard spelling
+// ---------------------------------------------------------------------------
+
+/// The whole point of the field. Dropbox returns a short-lived token and NO
+/// refresh token unless the authorize URL carries its own spelling, so every
+/// Dropbox connection made before this was unrefreshable.
+#[test]
+fn a_provider_can_ask_for_offline_access_in_its_own_spelling() {
+    let url = build_authorize_url(
+        "https://www.dropbox.com/oauth2/authorize",
+        "cid-123",
+        "http://127.0.0.1:14981/oauth/callback",
+        "files.content.write",
+        &ClientAuth::from_secret(Some("s")),
+        &AuthorizeParams::parse(Some("token_access_type=offline")).unwrap(),
+    );
+    assert_eq!(
+        authorize_param(&url, "token_access_type").as_deref(),
+        Some("offline")
+    );
+    // Google's spelling must NOT ride along: an explicit value replaces the
+    // default outright, so what the knowhow documents is what gets sent.
+    assert_eq!(authorize_param(&url, "access_type"), None);
+    assert_eq!(authorize_param(&url, "prompt"), None);
+}
+
+/// Absent means unchanged. Every stored credential predates the key, and
+/// Google needs both halves to re-issue a refresh token on a repeat consent.
+#[test]
+fn an_absent_value_sends_exactly_what_it_always_sent() {
+    assert_eq!(
+        AuthorizeParams::parse(None).unwrap(),
+        AuthorizeParams::parse(Some(DEFAULT_AUTHORIZE_PARAMS)).unwrap()
+    );
+    // Blank is the same as absent: the credential modal omits an empty field
+    // from the blob, so a user who never touched it must not lose the default.
+    assert_eq!(
+        AuthorizeParams::parse(Some("   ")).unwrap(),
+        AuthorizeParams::parse(None).unwrap()
+    );
+}
+
+/// The opt-out, for a provider strict enough to reject a parameter it doesn't
+/// know. Without it the default would be unavoidable.
+#[test]
+fn none_sends_nothing_extra() {
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid-123",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        &ClientAuth::from_secret(Some("s")),
+        &AuthorizeParams::parse(Some("NONE")).unwrap(),
+    );
+    assert_eq!(
+        url,
+        "https://accounts.example.com/authorize\
+         ?client_id=cid-123\
+         &redirect_uri=http%3A%2F%2F127.0.0.1%3A14981%2Foauth%2Fcallback\
+         &response_type=code\
+         &scope=openid"
+    );
+}
+
+/// A credential is agent- and user-writable, so it must not be able to rewrite
+/// the loopback URI the callback listener is bound to, or narrow the scopes the
+/// caller asked for, from a field that reads like provider trivia.
+#[test]
+fn the_flows_own_parameters_are_refused() {
+    for key in [
+        "client_id",
+        "redirect_uri",
+        "response_type",
+        "scope",
+        "code_challenge",
+        "code_challenge_method",
+    ] {
+        let err = AuthorizeParams::parse(Some(&format!("{key}=evil")))
+            .expect_err("{key} must be refused");
+        assert!(err.contains(key), "the error names the key: {err}");
+    }
+    // Case is not a way around it.
+    assert!(AuthorizeParams::parse(Some("Redirect_URI=evil")).is_err());
+    // A reserved key anywhere in the list fails the whole value, rather than
+    // being dropped: a silently ignored parameter is a swallowed error.
+    assert!(AuthorizeParams::parse(Some("token_access_type=offline&scope=evil")).is_err());
+}
+
+/// A value carrying `&` or `=` must survive as one value. Percent-decoded on
+/// the way in, re-encoded on the way out, so it cannot split into further
+/// parameters.
+#[test]
+fn a_value_with_separators_in_it_round_trips_as_one_value() {
+    let params = AuthorizeParams::parse(Some("claims=a%26b%3Dc%20d")).unwrap();
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        &ClientAuth::from_secret(Some("s")),
+        &params,
+    );
+    assert_eq!(authorize_param(&url, "claims").as_deref(), Some("a&b=c d"));
+    // One extra pair, not three.
+    assert_eq!(url.matches('&').count(), 4, "{url}");
+}
+
+#[test]
+fn a_malformed_entry_is_an_error_not_a_silent_drop() {
+    assert!(AuthorizeParams::parse(Some("just_a_key")).is_err());
+    assert!(AuthorizeParams::parse(Some("=novalue")).is_err());
+    // A trailing separator is ordinary sloppiness, not a malformed pair.
+    assert_eq!(
+        AuthorizeParams::parse(Some("token_access_type=offline&")).unwrap(),
+        AuthorizeParams::parse(Some("token_access_type=offline")).unwrap()
+    );
+    // An empty value is legitimate: some providers read presence alone.
+    assert!(AuthorizeParams::parse(Some("consent=")).is_ok());
+}
+
+/// PKCE is appended after the extra parameters, so a public client's challenge
+/// keeps its place at the end of the URL.
+#[test]
+fn pkce_still_lands_last_for_a_public_client() {
+    let auth = ClientAuth::from_secret(None);
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        &auth,
+        &AuthorizeParams::parse(Some("token_access_type=offline")).unwrap(),
+    );
+    assert!(
+        url.contains("&token_access_type=offline&code_challenge="),
+        "{url}"
+    );
+    assert_eq!(
+        authorize_param(&url, "code_challenge_method").as_deref(),
+        Some("S256")
+    );
+}
+
+/// The value rides into the modal's `defaults` block, so a user editing the
+/// credential sees (and can correct) what the agent chose.
+#[test]
+fn oauth_client_request_carries_the_authorize_params() {
+    let overrides = OAuthClientOverrides {
+        authorize_params: Some("token_access_type=offline".to_string()),
+        ..Default::default()
+    };
+    let req = oauth_client_request("dropbox", &overrides);
+    assert_eq!(
+        req["defaults"]["authorize_params"],
+        "token_access_type=offline"
+    );
+}
+
+/// A bare `oauth:` has nothing after the colon. Stripping it would yield an
+/// empty service name, which is not a credential anyone can address, so the
+/// input is kept and the caller's own validation rejects it visibly.
+#[test]
+fn client_provider_name_does_not_strip_a_prefix_with_nothing_after_it() {
+    assert_eq!(client_provider_name("oauth:"), "oauth:");
+    assert_eq!(client_provider_name("  OAuth:  "), "oauth:");
 }

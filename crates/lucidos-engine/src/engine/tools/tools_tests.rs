@@ -7,8 +7,8 @@
 //! exercises bus paths.
 
 use super::{
-    dismiss_from_context_impl, merge_thread_queue_policy_patch, parse_apply_change_id,
-    parse_source_arg,
+    dismiss_from_context_impl, merge_thread_queue_policy_patch, parent_filter_arg,
+    parse_apply_change_id, parse_source_arg, BACKUP_SETTINGS_NAVIGATED,
 };
 use crate::engine::event_bus::EventBus;
 use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
@@ -405,6 +405,59 @@ mod build_query_events_response_tests {
         assert!(parsed["hint"].is_string());
     }
 
+    /// The truncation hint must only name arguments `query_events` accepts.
+    ///
+    /// It used to say "Narrow by aggregate_id". `aggregate_id` is a real
+    /// column on the `events` table but NOT an argument of this tool, so a
+    /// model following the advice re-issued the same query with an ignored
+    /// parameter and got the identical truncated result. The events table's
+    /// other non-argument columns are checked too, because that is the reach
+    /// that produced the bug: someone read the schema of the storage and
+    /// mistook it for the schema of the tool.
+    #[test]
+    fn truncation_hint_names_only_real_query_arguments() {
+        let events_domain = crate::capability_manifest::domain_for_tool("events")
+            .expect("events domain is in the capability manifest");
+        let query_op = events_domain
+            .operations
+            .iter()
+            .find(|op| op.action == "query")
+            .expect("events domain has a `query` operation");
+        let schema: serde_json::Value = serde_json::from_str(
+            query_op
+                .llm_schema
+                .expect("the query operation declares an explicit LLM schema"),
+        )
+        .expect("the LLM schema is a JSON object");
+        let properties = schema.as_object().expect("schema is a JSON object");
+
+        for filter in crate::engine::tools::QUERY_EVENTS_HINT_FILTERS {
+            assert!(
+                properties.contains_key(*filter),
+                "the truncation hint tells the model to narrow with `{filter}`, \
+                 which is not a property of the events `query` LLM schema \
+                 (it accepts: {:?}). Naming a filter the tool ignores makes the \
+                 model retry into the identical truncated result.",
+                properties.keys().collect::<Vec<_>>(),
+            );
+            assert!(
+                crate::engine::tools::QUERY_EVENTS_TRUNCATION_HINT.contains(*filter),
+                "`{filter}` is listed in QUERY_EVENTS_HINT_FILTERS but the hint \
+                 text never mentions it, so the check above guards nothing.",
+            );
+        }
+
+        // Columns of the `events` table that are NOT query arguments. Reaching
+        // for one of these in the hint is the exact mistake being guarded.
+        for column in ["aggregate", "aggregate_id", "thread_id", "sequence"] {
+            assert!(
+                !crate::engine::tools::QUERY_EVENTS_TRUNCATION_HINT.contains(column),
+                "the truncation hint mentions `{column}`, an events-table column \
+                 that `query_events` cannot filter on.",
+            );
+        }
+    }
+
     /// Empty store input round-trips to an empty array with no hint.
     #[test]
     fn empty_input_yields_empty_array_no_hint() {
@@ -560,5 +613,74 @@ fn thread_queue_policy_patch_rejects_unknown_fields() {
     assert!(
         matches!(&out, Err(msg) if msg.contains("unknown Thread Queue policy field")),
         "unknown field should error, got: {out:?}"
+    );
+}
+
+/// The blurb the agent gets after landing on Settings → System → Backup must
+/// name Settings → Accounts as where an account is connected, and must not
+/// re-acquire the two claims that rotted: an in-app backup LIST and an in-app
+/// RESTORE. Both moved to the workspace picker, and the stale text sent a user
+/// hunting for accounts on the Backup page (2026-08-05).
+#[test]
+fn backup_navigation_names_the_accounts_page_and_not_a_restore_ui() {
+    let s = BACKUP_SETTINGS_NAVIGATED;
+    assert!(
+        s.contains("Settings → Accounts"),
+        "must point at the page that actually connects an account: {s}"
+    );
+    assert!(
+        s.contains("workspace picker"),
+        "restore lives in the workspace picker and the agent must say so: {s}"
+    );
+    let lower = s.to_lowercase();
+    assert!(
+        !lower.contains("restore from an existing"),
+        "there is no in-app restore button to advertise: {s}"
+    );
+    assert!(
+        !lower.contains("list of available cloud backups"),
+        "the page shows no backup list: {s}"
+    );
+}
+
+/// `my_children` resolves to the CALLER's ambient thread id, never to anything
+/// the model supplies. There is no `parent` argument on the LLM surface to
+/// supply, which is the point: a model asking for "my children" cannot name a
+/// thread that is not its own.
+#[test]
+fn my_children_resolves_to_the_ambient_caller_thread() {
+    let caller = Uuid::new_v4();
+
+    assert_eq!(
+        parent_filter_arg(&json!({"my_children": true}), caller),
+        Some(caller),
+        "my_children: true scopes the listing to the caller's own children"
+    );
+    assert_eq!(
+        parent_filter_arg(&json!({"my_children": false}), caller),
+        None,
+        "my_children: false is no filter, not an empty one"
+    );
+    assert_eq!(
+        parent_filter_arg(&json!({}), caller),
+        None,
+        "omitted is no filter"
+    );
+
+    // A model that invents a `parent` argument gets no filter at all rather
+    // than a listing of someone else's children.
+    let someone_else = Uuid::new_v4();
+    assert_eq!(
+        parent_filter_arg(&json!({"parent": someone_else.to_string()}), caller),
+        None,
+        "the LLM surface exposes no parent argument, so an invented one is inert"
+    );
+    assert_eq!(
+        parent_filter_arg(
+            &json!({"my_children": true, "parent": someone_else.to_string()}),
+            caller
+        ),
+        Some(caller),
+        "and an invented one alongside my_children still resolves to the caller"
     );
 }

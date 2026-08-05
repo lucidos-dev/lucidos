@@ -180,8 +180,8 @@ impl AppManager {
         self.get_app(app_id).ok().map(|a| a.name)
     }
 
-    /// Create a new app directory with manifest.json + index.html and commit to git.
-    /// Create an app on disk, commit it, and announce it.
+    /// Create an app on disk (manifest.json + index.html), commit it to git, and
+    /// announce it.
     ///
     /// `AppCreated` is what puts the app in every client's list; the emit lives
     /// here rather than at the call site so a second creation path cannot ship

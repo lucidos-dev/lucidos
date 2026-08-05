@@ -9,7 +9,12 @@ import type { Tap } from '@lucidos/sdk';
 import type { ToastAction } from '../types';
 import { markReadOptimistic, viewNotification } from './notifications';
 import { switchMenuItem } from './menu';
-import { handleNavigationRequest } from './thread-sync';
+// Imported from the module that DEFINES it, not from `thread-sync` (which only
+// re-exports it). `thread-sync` imports this file for the toast handler, so
+// going back through it would close a needless module cycle between the two:
+// the exact shape `.claude/rules/frontend.md` warns about, where whichever side
+// initializes first sees the other's binding still undefined.
+import { handleNavigationRequest } from './navigation-request';
 import {
   resolveDeepLink,
   type DeepLinkTarget,

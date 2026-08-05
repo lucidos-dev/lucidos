@@ -6,7 +6,7 @@
 //! side-effects can never diverge by who made the write:
 //! - `language` / `timezone` refresh the engine's in-memory `user_language` /
 //!   `user_timezone` and emit `LanguageSet` / `TimezoneSet` (the frontend
-//!   live-applies on those), so the Settings → System "Locale" controls take
+//!   live-applies on those), so the Settings → Locale controls take
 //!   effect without an engine restart.
 //! - `push_notifications` syncs `devices.push_enabled`.
 //!

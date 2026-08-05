@@ -544,7 +544,7 @@ async fn test_cc_child_idle_after_cancel_does_not_double_decrement() {
 /// handler is mid-retry against a fresh session — the real CodingAgentIdled
 /// (with results) lands seconds later, and decrementing now would orphan it
 /// (the second decrement clamps at 0; the second callback is suppressed by
-/// `parent_callback_sent`).
+/// `parent_callback_pending`).
 #[tokio::test]
 async fn test_cc_child_stale_resume_does_not_decrement_parent() {
     let (pool, db_name) = setup_test_db().await;

@@ -583,7 +583,7 @@ impl LucidosEngine {
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         // Install the subprocess-origin token before anything spawns a
         // subprocess. See `api::actor` module docs.
-        crate::api::actor::init_agent_origin_token(Uuid::new_v4().to_string());
+        crate::api::actor::init_agent_origin_secret(Uuid::new_v4().to_string());
 
         // Snapshot BEFORE `ArtifactManager::new` runs, because that call
         // git-inits the workspace itself if `.git/` is missing. We use this
@@ -1061,10 +1061,24 @@ impl LucidosEngine {
             }
         };
         for change in stale {
-            let branch_ok = git_cmd(&["rev-parse", "--verify", &change.branch_name], &repo_root)
-                .await
-                .map(|o| o.status.success())
-                .unwrap_or(false);
+            // Ask the change's OWN repo, not the Lucidos source worktree. An app
+            // coding-agent change carries `repo_root = <workspace>` and an
+            // external-repo one carries that repo, so probing `repo_root` here
+            // asked the wrong git for a branch it was never going to have, and
+            // logged the missing-branch alarm for every such change on every
+            // boot. The stale_merges loop above already does this correctly.
+            let change_repo = std::path::PathBuf::from(&change.repo_root);
+            // `or_unknown(true)`: a probe that could not run is UNKNOWN, never a
+            // "no". `git_cmd` returns `Err` for a spawn failure AND for its 30s
+            // timeout, and boot competes with every other startup sweep for the
+            // machine, so reading a timeout as "the branch is gone" would print a
+            // false missing-branch alarm on exactly the boots that are busiest.
+            let branch_ok = crate::engine::git_ops::git_answer(
+                &["rev-parse", "--verify", &change.branch_name],
+                &change_repo,
+            )
+            .await
+            .or_unknown(true);
             if !branch_ok {
                 log!(
                     "[Engine] Pending change {} references missing branch {} — left in Review for user to resolve",

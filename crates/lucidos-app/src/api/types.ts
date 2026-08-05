@@ -27,6 +27,7 @@ export interface ChatRequestBody {
   };
   file_context?: {
     path: string;
+    lines?: [number, number];
   };
   url_context?: {
     url: string;
@@ -115,7 +116,7 @@ export interface EnvVarsListResponse {
 }
 
 /** GET /api/v1/network-config — the per-workspace engine bind plus the inherited
- *  machine-global gateway bind, for Settings → System → Network access. Mirrors
+ *  machine-global gateway bind, for Settings → Access → Network access. Mirrors
  *  the engine `NetworkConfigResponse`. `engine_bind` is `loopback` | `all` | an
  *  IP; when `inherit` is true the engine binds `gateway_bind` and the pane
  *  disables the engine field (showing the inherited value). */
@@ -140,7 +141,7 @@ export interface AgentBinaryStatus {
 }
 
 /** GET /api/v1/coding-agents/binaries — per-agent binary resolution for
- *  Settings → System → Coding agents. Mirrors the engine
+ *  Settings → Coding Agents. Mirrors the engine
  *  `AgentBinariesResponse`. */
 export interface AgentBinariesResponse {
   claude_code: AgentBinaryStatus;

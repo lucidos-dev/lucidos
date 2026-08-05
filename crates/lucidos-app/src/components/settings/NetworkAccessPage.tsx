@@ -1,3 +1,4 @@
+import type { ComponentChildren } from 'preact';
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { showToast } from '../../store/store';
 import { getNetworkConfig, setNetworkConfig } from '../../api/client/settings';
@@ -31,7 +32,7 @@ function describeBind(value: string): string {
 }
 
 /**
- * Per-workspace engine Network access (Settings → System → Network access).
+ * Per-workspace engine Network access (Settings → Access → Network access).
  *
  * Controls THIS workspace's engine bind — the address its API server listens on.
  * The machine-global gateway bind + the "engines inherit gateway bind" toggle
@@ -85,22 +86,30 @@ export function NetworkAccessPage() {
     }
   }, [mode, address, reload]);
 
-  if (info.status === 'failed') {
-    return (
-      <div class="settings-section">
-        <div class="settings-section-title">Network access</div>
-        <LoadableError noun="network configuration" error={info.error} />
+  // The section shell and its TITLE render in every state, because the title
+  // carries `data-search-anchor="access:network"` and that anchor is a
+  // navigation target: Search Everywhere jumps here, and `SettingsView`'s scroll
+  // effect does ONE `querySelector` on the commit where the subview mounts, then
+  // clears the target whether it found the element or not. An anchor that only
+  // appears once an async fetch lands is therefore missed on a cold open, and
+  // the user is dropped at the top of the page with no scroll and no marker.
+  // Every other settings anchor renders unconditionally; this one must too.
+  const shell = (body: ComponentChildren) => (
+    <div class="settings-section">
+      <div class="settings-section-title" data-search-anchor="access:network">
+        Network access
       </div>
-    );
+      {body}
+    </div>
+  );
+
+  if (info.status === 'failed') {
+    return shell(<LoadableError noun="network configuration" error={info.error} />);
   }
   if (info.status !== 'loaded') {
-    if (!showLoading) return null;
-    return (
-      <div class="settings-section">
-        <div class="settings-section-title">Network access</div>
-        <div class="empty-state">Loading…</div>
-      </div>
-    );
+    // Still gated on the delay so a fast load never flashes a loader, but the
+    // shell itself is unconditional (see above).
+    return shell(showLoading ? <div class="empty-state">Loading…</div> : null);
   }
 
   const data = info.data;
@@ -111,11 +120,8 @@ export function NetworkAccessPage() {
     !inherited && (mode !== stored.mode || (mode === 'address' && address.trim() !== stored.address));
   const placeholder = data.detected_tailscale_ip ?? '100.x.y.z';
 
-  return (
-    <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor="network-access:engine">
-        Network access
-      </div>
+  return shell(
+    <>
       <p class="settings-section-desc">
         Controls the address this workspace's engine listens on. Loopback keeps it
         reachable only from this Mac; binding your Tailscale address exposes it to
@@ -193,6 +199,6 @@ export function NetworkAccessPage() {
           </div>
         </>
       )}
-    </div>
+    </>
   );
 }

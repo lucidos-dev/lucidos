@@ -199,6 +199,17 @@ export function DiffIcon() {
   );
 }
 
+/** Two columns side by side: the side-by-side diff glyph. Toggle counterpart to
+ *  DiffIcon, whose single column is the unified rendering. */
+export function SideBySideColumnsIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <rect x="3" y="4" width="7.5" height="16" rx="1" />
+      <rect x="13.5" y="4" width="7.5" height="16" rx="1" />
+    </svg>
+  );
+}
+
 export function BackIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="10 3 5 8 10 13" /></svg>

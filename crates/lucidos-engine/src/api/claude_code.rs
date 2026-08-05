@@ -287,7 +287,7 @@ pub(super) async fn claude_code_interrupt(
 }
 
 /// Response of `GET /api/v1/coding-agents/binaries` — effective CLI binary
-/// resolution per coding agent, for the Settings → System → Coding agents surface.
+/// resolution per coding agent, for the Settings → Coding Agents surface.
 /// Live detection (see `runtime::detect_agent_binary`); the override itself is
 /// the `coding_agent_*_path` preference written via `PUT /api/v1/preferences`.
 #[derive(Serialize)]

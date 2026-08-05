@@ -14,6 +14,7 @@ mod data_api;
 mod disk_usage;
 pub(crate) mod error;
 pub(crate) mod frontend_snapshot;
+pub(crate) mod hex;
 mod history;
 mod images;
 pub(crate) mod internal;
@@ -28,7 +29,6 @@ pub mod presence_pong;
 pub(crate) mod proxy;
 pub(crate) mod proxy_auth_layer;
 pub(crate) mod proxy_builtin;
-pub(crate) mod proxy_hex;
 pub(crate) mod proxy_hmac_layer;
 pub mod proxy_migration;
 pub(crate) mod proxy_pipeline;
@@ -204,6 +204,10 @@ pub struct AppContext {
 #[derive(Debug, Clone, Deserialize)]
 pub struct FileContext {
     pub path: String,
+    /// Inclusive 1-based line range the user has selected in the preview, when
+    /// they picked one. Same shape and meaning as `RepoFileContext::lines`.
+    #[serde(default)]
+    pub lines: Option<(u32, u32)>,
 }
 
 /// Repo file context sent when the user is viewing a file from a registered repo
@@ -742,9 +746,20 @@ pub struct PushUnsubscribeRequest {
 }
 
 // Query param structs for routes migrated from path params
+
+/// Addresses one credential row by its primary key.
+///
+/// The credential verbs that act on an EXISTING row (copy-value, update,
+/// delete) take this rather than a service name, because a name stopped being a
+/// unique handle when `auth_type` became the discriminator
+/// (`20260805134838_drop_credential_name_prefixes_use_auth_type.sql`): an
+/// `oauth_client` registration may share a name with an API key. Update needs
+/// the id for a sharper reason still, since the edit form can change
+/// `auth_type`, so even `(name, type)` cannot name the row being edited. Create
+/// stays name-keyed: it is an upsert, and the row has no id yet.
 #[derive(Deserialize)]
-struct ServiceQuery {
-    service: String,
+struct CredentialIdQuery {
+    id: uuid::Uuid,
 }
 
 #[derive(Deserialize)]

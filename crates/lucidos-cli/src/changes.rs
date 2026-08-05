@@ -2,8 +2,9 @@ use crate::http::{client as http_client, send_and_print};
 use crate::workspace::{BoxError, Workspace};
 
 /// `POST /api/v1/changes/<id>/apply`. The CLI's HTTP client auto-forwards
-/// `x-lucidos-agent-origin-token` + `x-lucidos-source-thread-id` when the
-/// engine-injected env vars are present, so the resulting `ChangeApplied`
+/// `x-lucidos-agent-origin-token` when the engine-injected env var is
+/// present, and that thread-bound token names the spawning thread itself, so
+/// the resulting `ChangeApplied`
 /// stamps `Api { mode: Agent, source_thread_id }` instead of bleeding through
 /// as `Api { mode: Human }` (which the UI renders as "You"). That is the
 /// reason this subcommand exists at all — hand-rolled urllib / curl from a

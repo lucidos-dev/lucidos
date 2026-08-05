@@ -742,7 +742,11 @@ async fn driver_task(
                                 session_id = Some(sid.clone());
                             }
                             if events_tx.send(ev).is_err() {
-                                // Consumer dropped — abandon the process.
+                                // Consumer dropped: stop forwarding this line's
+                                // remaining events. This `break` leaves the
+                                // `for` only; teardown is the `cancel` /
+                                // `child.wait()` arms' job, and dropping the
+                                // receiver goes hand in hand with cancelling.
                                 line_buf.clear();
                                 break;
                             }

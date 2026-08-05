@@ -467,7 +467,7 @@ pub async fn send_push_to_all_with_app(
     let deliveries: Vec<(PushSubscription, String)> = subscriptions
         .into_iter()
         .map(|sub| {
-            let payload_bytes = build_push_payload(
+            let payload_bytes = build_push_payload_fitted(
                 title,
                 body,
                 notification_id,
@@ -874,6 +874,175 @@ const DEFAULT_NOTIFICATION_TAG: &str = "lucidos-notification";
 /// `system-knowhow/notifications.md` §4.5.
 const DECLARATIVE_WEB_PUSH_MAGIC: i64 = 8030;
 
+/// Hard ceiling the web-push transport enforces, in BYTES of the plaintext we
+/// hand `set_payload`.
+///
+/// Measured against the crate, not assumed: `web-push` 0.11's
+/// `HttpEce::encrypt` returns `WebPushError::PayloadTooLarge` when
+/// `content.len() > 3052`, and `content` is exactly the serialized JSON
+/// envelope we pass in (the check runs BEFORE encryption, so the encrypted size
+/// never enters into it). The crate renders that error as "maximum payload size
+/// of 3070 characters exceeded", which is both the wrong number and the wrong
+/// unit: budgeting against 3070 characters still overflows.
+/// `s4_5_crate_ceiling_constant_matches_what_build_actually_enforces` pins this
+/// constant against the real builder from both sides, so a crate bump that
+/// moves the threshold fails a test instead of silently dropping pushes.
+const MAX_PUSH_PAYLOAD_BYTES: usize = 3052;
+
+/// Reserve a payload we had to truncate leaves below [`MAX_PUSH_PAYLOAD_BYTES`].
+///
+/// Correctness does not rest on it: [`fit_payload_body`] searches on the REAL
+/// serialized length, so the fit is exact rather than estimated. This is
+/// deliberate slack, so a body we already had to cut is not also sitting one
+/// byte under the transport's limit. A payload that fits without truncation is
+/// measured against the full ceiling and passed through untouched.
+const PUSH_PAYLOAD_SAFETY_MARGIN_BYTES: usize = 64;
+
+/// What a TRUNCATED payload aims for: the hard ceiling less the reserve above.
+/// [`fit_payload_body`] falls back to the hard ceiling when the envelope alone
+/// already eats into the reserve, so the slack can never cost deliverable text.
+const TRUNCATED_PAYLOAD_TARGET_BYTES: usize =
+    MAX_PUSH_PAYLOAD_BYTES - PUSH_PAYLOAD_SAFETY_MARGIN_BYTES;
+
+/// Appended to a body the size guard had to cut, so the banner reads as
+/// truncated instead of as a sentence that stops mid-word. The full text is
+/// always intact in the notification row: the push is a banner, not the content
+/// of record.
+const TRUNCATION_MARKER: &str = "…";
+
+/// How far back from the cut point [`truncate_body_to_bytes`] will look for a
+/// whitespace boundary. Snapping to one keeps the banner from ending mid-word;
+/// beyond this distance the lost text costs more than the ragged edge.
+const TRUNCATION_WHITESPACE_LOOKBACK: usize = 96;
+
+/// Cut `body` down to at most `budget` BYTES, [`TRUNCATION_MARKER`] included.
+///
+/// UTF-8 safe by construction: the cut lands on a char boundary via
+/// `floor_char_boundary`, so the multi-byte characters real bodies carry (the
+/// "✅" in the 2026-08-05 case) are never split into invalid UTF-8. When a
+/// whitespace boundary sits within [`TRUNCATION_WHITESPACE_LOOKBACK`] bytes of
+/// the cut, we snap back to it so the banner ends on a word.
+fn truncate_body_to_bytes(body: &str, budget: usize) -> String {
+    if body.len() <= budget {
+        return body.to_string();
+    }
+    if budget < TRUNCATION_MARKER.len() {
+        // No room even for the marker. Drop the body; the rest of the envelope
+        // (title, navigate, tag, badge) still carries a usable banner.
+        return String::new();
+    }
+    let mut cut = body.floor_char_boundary(budget - TRUNCATION_MARKER.len());
+    let lookback_floor = cut.saturating_sub(TRUNCATION_WHITESPACE_LOOKBACK);
+    if let Some(ws) = body[..cut].rfind(char::is_whitespace) {
+        if ws >= lookback_floor && ws > 0 {
+            cut = ws;
+        }
+    }
+    let mut out = body[..cut].trim_end().to_string();
+    out.push_str(TRUNCATION_MARKER);
+    out
+}
+
+/// Build a push payload whose serialized form is guaranteed to fit
+/// [`MAX_PUSH_PAYLOAD_BYTES`], shrinking the BODY (and only the body) by as
+/// much as it takes.
+///
+/// `build` renders the whole envelope around a candidate body, so the budget is
+/// measured against the exact bytes the transport will see rather than against
+/// a hardcoded body length. That matters because the envelope's overhead is
+/// both substantial and VARIABLE: the absolute iOS `navigate` URL is built from
+/// the subscription's own `scope_url`, `data` carries a second (hash-form)
+/// navigate URL, and the Layer-3 wake variant adds a `wake: true` sibling on
+/// top. Every one of those fields survives the cut intact.
+///
+/// The budget is found by BINARY SEARCH on the rendered length rather than by
+/// arithmetic, because JSON escaping is not a fixed cost: a `"` or a newline
+/// serializes to two bytes and a control char to six, so "keep `ceiling minus
+/// envelope` bytes of body" is only an upper bound. Correcting a single
+/// estimate by the observed overflow is what breaks down at the extreme: on a
+/// control-char-dense body the overflow exceeds the body length itself, the
+/// correction saturates to zero and the banner ships EMPTY while hundreds of
+/// characters would have fitted. Both `truncate_body_to_bytes` and the rendered
+/// length are monotone in the budget, so the search is well defined and lands
+/// on the largest body that actually fits, whatever the escape density.
+fn fit_payload_body(
+    body: &str,
+    kind: &str,
+    build: impl Fn(&str) -> serde_json::Value,
+) -> serde_json::Value {
+    let rendered_len = |candidate_body: &str| build(candidate_body).to_string().len();
+
+    // The overwhelmingly common case, so it renders the envelope ONCE and hands
+    // that same value back: byte-identical to what the pre-guard engine sent,
+    // and no second build on the hot path.
+    let full = build(body);
+    if full.to_string().len() <= MAX_PUSH_PAYLOAD_BYTES {
+        return full;
+    }
+
+    // The envelope with an empty body: everything the body has to share the
+    // ceiling with, measured for THIS subscription. Used to pick the target and
+    // to report the overhead; the search below does not trust it as an
+    // arithmetic budget.
+    let envelope_len = rendered_len("");
+
+    // Aim for the reserve when there is room for one. When the envelope alone
+    // already eats into it, aim at the hard ceiling instead: the reserve is
+    // deliberate slack, and slack must never cost the user deliverable text.
+    // Without this, an envelope between the target and the ceiling makes every
+    // candidate miss the target, so the body would be dropped entirely while
+    // the last few dozen bytes of it would have shipped fine.
+    let target = if envelope_len <= TRUNCATED_PAYLOAD_TARGET_BYTES {
+        TRUNCATED_PAYLOAD_TARGET_BYTES
+    } else {
+        MAX_PUSH_PAYLOAD_BYTES
+    };
+
+    // Largest byte budget whose rendered payload still fits the target. `lo`
+    // holds the best budget known to fit, `hi` the smallest known not to; the
+    // whole body is known not to fit from the check above. When even an empty
+    // body overshoots the hard ceiling, `lo` simply stays 0 and the
+    // classification below reports it.
+    let (mut lo, mut hi) = (0usize, body.len());
+    while hi - lo > 1 {
+        let mid = lo + (hi - lo) / 2;
+        if rendered_len(&truncate_body_to_bytes(body, mid)) <= target {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+
+    let truncated = truncate_body_to_bytes(body, lo);
+    let payload = build(&truncated);
+    let payload_len = payload.to_string().len();
+    if payload_len <= MAX_PUSH_PAYLOAD_BYTES {
+        log!(
+            "[Push] Truncated {} body to fit the {} B payload ceiling: {} B of body kept {} B \
+             ({} B payload, {} B envelope overhead). The notification row keeps the full text.",
+            kind,
+            MAX_PUSH_PAYLOAD_BYTES,
+            body.len(),
+            truncated.len(),
+            payload_len,
+            envelope_len
+        );
+    } else {
+        // Nothing left to give: the envelope alone overshoots. Return it anyway
+        // so the send loop's last-resort arm reports the real failure per
+        // subscription.
+        log!(
+            "[Push] Cannot fit the {} payload for this subscription: {} B with the body dropped \
+             entirely, over the {} B ceiling. The envelope alone (title plus deep-link URLs) is \
+             too large, so NO push will be delivered here.",
+            kind,
+            payload_len,
+            MAX_PUSH_PAYLOAD_BYTES
+        );
+    }
+    payload
+}
+
 /// Build the `key=value&…` deep-link param string shared by both navigate URL
 /// forms (see [`navigate_url_ios`] / [`navigate_url_sw`]). Empty when there's
 /// nothing to deep-link, so the callers can fall back to a bare `/`.
@@ -1014,24 +1183,65 @@ async fn read_unread_count(pool: &sqlx::PgPool) -> Option<i64> {
 /// ignores it while the SW reads it to gate `renotify` / `silent`. Safari
 /// never sees wake pushes (filtered by `is_mac_chromium`); the flag is
 /// purely for Chrome's SW.
+///
+/// The body is fitted to the transport ceiling exactly as on the original send
+/// (see [`fit_payload_body`]), and the fitting measures THIS envelope, `wake`
+/// flag included. That flag makes the wake strictly larger than the push it
+/// mirrors, so a body that just squeezes into the original send would otherwise
+/// blow the wake up: on 2026-08-05 both failed, three seconds apart.
 fn build_wake_payload(
     notification: &crate::scheduler::notifications::Notification,
     ios_scope_url: Option<&str>,
     unread_count: Option<i64>,
 ) -> serde_json::Value {
-    let mut payload = build_push_payload(
-        &notification.title,
-        &notification.message,
-        Some(notification.id),
-        notification.app_id.as_deref(),
-        notification.thread_id,
-        notification.event_id,
-        &notification.tap,
-        ios_scope_url,
-        unread_count,
-    );
-    payload["wake"] = serde_json::Value::Bool(true);
-    payload
+    fit_payload_body(&notification.message, "wake", |candidate_body| {
+        let mut payload = build_push_payload(
+            &notification.title,
+            candidate_body,
+            Some(notification.id),
+            notification.app_id.as_deref(),
+            notification.thread_id,
+            notification.event_id,
+            &notification.tap,
+            ios_scope_url,
+            unread_count,
+        );
+        payload["wake"] = serde_json::Value::Bool(true);
+        payload
+    })
+}
+
+/// [`build_push_payload`] with the body fitted to the transport ceiling.
+///
+/// Every send path builds through this; `build_push_payload` stays the pure
+/// envelope builder underneath so the wire shape is testable without the size
+/// guard in the way, and so [`fit_payload_body`] has something to re-render
+/// while it searches for a body that fits.
+#[allow(clippy::too_many_arguments)]
+fn build_push_payload_fitted(
+    title: &str,
+    body: &str,
+    notification_id: Option<uuid::Uuid>,
+    app_id: Option<&str>,
+    link_thread_id: Option<uuid::Uuid>,
+    link_event_id: Option<uuid::Uuid>,
+    tap: &crate::scheduler::notifications::Tap,
+    ios_scope_url: Option<&str>,
+    unread_count: Option<i64>,
+) -> serde_json::Value {
+    fit_payload_body(body, "notification", |candidate_body| {
+        build_push_payload(
+            title,
+            candidate_body,
+            notification_id,
+            app_id,
+            link_thread_id,
+            link_event_id,
+            tap,
+            ios_scope_url,
+            unread_count,
+        )
+    })
 }
 
 /// Build the JSON payload delivered to the push transport.
@@ -1257,7 +1467,23 @@ async fn fan_out_to_web_push(
         let message = match msg_builder.build() {
             Ok(m) => m,
             Err(e) => {
-                log!("[Push] Failed to build {} message: {}", kind, e);
+                // Genuine last resort. `build_push_payload_fitted` /
+                // `build_wake_payload` already truncate the body so the payload
+                // fits `MAX_PUSH_PAYLOAD_BYTES`, so reaching here means
+                // something the guard cannot shrink (an oversized title, bad
+                // subscription keys, an unparseable endpoint). Say plainly that
+                // this device gets NOTHING: the old wording read like a
+                // per-message hiccup while every subscription was silently
+                // dying.
+                log!(
+                    "[Push] NO {} push delivered to {} ({} B payload): the encrypted message \
+                     could not be built: {}. The notification row and bell badge are \
+                     unaffected, so nothing else surfaces this failure.",
+                    kind,
+                    endpoint_label,
+                    payload_bytes.len(),
+                    e
+                );
                 continue;
             }
         };

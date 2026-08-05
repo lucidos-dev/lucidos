@@ -40,8 +40,6 @@ pub(crate) use resume::{
 // Test-only re-exports — non-test callers reach these via super::* inside agent_session.
 #[cfg(test)]
 pub(crate) use resume::CC_TURN_CLOSER_EVENTS;
-#[cfg(test)]
-pub(crate) use spawn::generate_cc_branch_name;
 
 // Phase 7 regression: cancel = turn boundary, not terminal event.
 #[cfg(test)]

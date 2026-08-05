@@ -31,10 +31,13 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
         true
     );
 
+    // Every verb below addresses the row by id, so resolve it once from the list.
+    let id = credential_id(&client, &api, &service).await;
+
     // Update base_url + auth_type + auth_header + secret.
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
-        .query(&[("service", &service)])
+        .query(&[("id", &id)])
         .json(&json!({
             "base_url": "https://api.new.example.com",
             "auth_type": "bearer",
@@ -57,12 +60,12 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
     assert_eq!(listed["auth_header"], "X-Api-Key");
 
     // credential-value reflects the new secret.
-    assert_eq!(credential_value(&client, &api, &service).await, "k2");
+    assert_eq!(credential_value(&client, &api, &id).await, "k2");
 
     // Update without auth_value keeps the secret but still edits other fields.
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
-        .query(&[("service", &service)])
+        .query(&[("id", &id)])
         .json(&json!({
             "base_url": "https://api.newer.example.com",
             "auth_type": "bearer",
@@ -76,13 +79,13 @@ async fn update_credential_edits_all_fields_and_keeps_secret_when_omitted() {
     let listed = find_credential(&client, &api, &service).await;
     assert_eq!(listed["base_url"], "https://api.newer.example.com");
     assert_eq!(
-        credential_value(&client, &api, &service).await,
+        credential_value(&client, &api, &id).await,
         "k2",
         "omitting auth_value must keep the stored secret"
     );
 
     // Cleanup.
-    delete_credential(&client, &api, &service).await;
+    delete_credential(&client, &api, &id).await;
 }
 
 /// Editing an `email_password` credential must propagate the password AND the
@@ -95,7 +98,9 @@ async fn update_email_credential_syncs_email_accounts_row() {
     let pool = PgPool::connect(&db_url()).await.expect("db connect");
 
     let name = unique_marker("e2e-email");
-    let service = format!("email:{}", name);
+    // No `email:` prefix: `auth_type` marks it, and the name IS the
+    // `email_accounts.name` the sync resolves.
+    let service = name.clone();
 
     // Seed an email account (the row IMAP reads), as `configure_email` would.
     sqlx::query(
@@ -122,11 +127,13 @@ async fn update_email_credential_syncs_email_accounts_row() {
         .expect("create failed");
     assert_eq!(resp.status(), 200);
 
+    let id = credential_id(&client, &api, &service).await;
+
     // Edit: new password + new server settings.
     let new_email = format!("{}@new.example.com", name);
     let resp = client
         .put(format!("{}/api/v1/credentials", api))
-        .query(&[("service", &service)])
+        .query(&[("id", &id)])
         .json(&json!({
             "base_url": "ignored — derived from smtp_host",
             "auth_type": "email_password",
@@ -173,10 +180,10 @@ async fn update_email_credential_syncs_email_accounts_row() {
     // The credential's base_url is derived from the SMTP host, and its secret synced.
     let listed = find_credential(&client, &api, &service).await;
     assert_eq!(listed["base_url"], "smtp://smtp.new.example.com");
-    assert_eq!(credential_value(&client, &api, &service).await, "newpass");
+    assert_eq!(credential_value(&client, &api, &id).await, "newpass");
 
     // Cleanup.
-    delete_credential(&client, &api, &service).await;
+    delete_credential(&client, &api, &id).await;
     sqlx::query("DELETE FROM email_accounts WHERE name = $1")
         .bind(&name)
         .execute(&pool)
@@ -202,10 +209,22 @@ async fn find_credential(client: &reqwest::Client, api: &str, service: &str) -> 
         .clone()
 }
 
-async fn credential_value(client: &reqwest::Client, api: &str, service: &str) -> String {
+/// The id of the credential with this service name, for the verbs that address
+/// an existing row.
+async fn credential_id(client: &reqwest::Client, api: &str, service: &str) -> String {
+    find_credential(client, api, service).await["id"]
+        .as_str()
+        .expect("credential id")
+        .to_string()
+}
+
+/// Keyed on `id`, like the endpoint. A service name no longer identifies one
+/// row: `auth_type` is the discriminator, and an `oauth_client` registration is
+/// allowed to share a name with an API key for the same provider.
+async fn credential_value(client: &reqwest::Client, api: &str, id: &str) -> String {
     let body: serde_json::Value = client
         .get(format!("{}/api/v1/credential-value", api))
-        .query(&[("service", service)])
+        .query(&[("id", id)])
         .send()
         .await
         .expect("value failed")
@@ -215,10 +234,10 @@ async fn credential_value(client: &reqwest::Client, api: &str, service: &str) ->
     body["auth_value"].as_str().expect("auth_value").to_string()
 }
 
-async fn delete_credential(client: &reqwest::Client, api: &str, service: &str) {
+async fn delete_credential(client: &reqwest::Client, api: &str, id: &str) {
     let resp = client
         .delete(format!("{}/api/v1/credentials", api))
-        .query(&[("service", service)])
+        .query(&[("id", id)])
         .send()
         .await
         .expect("delete failed");

@@ -829,13 +829,15 @@ jobs:
     # The ceiling must always exceed the budgets it contains, and
     # front_door_gate_test.sh does that arithmetic from the literals in this
     # file, over all THREE waits: FD_EXPECT_VERSION_WAIT_SECS (600, and it can
-    # stack on the next one) + FD_ASSET_WAIT_SECS (1800) +
-    # GW_HEALTH_TIMEOUT_SECS (900) leaves 900 s of 75 minutes for the install
-    # itself, the four uninstall rungs and the runner setup. It was 30 minutes
-    # before the asset preflight existed, which the preflight budget alone would
-    # have exhausted. A job timeout is a hard
-    # kill with no diagnosis, which is exactly the burying this file's guards
-    # exist to prevent.
+    # stack on the next one) + FD_ASSET_WAIT_SECS (300) +
+    # GW_HEALTH_TIMEOUT_SECS (900) leaves 2700 s of 75 minutes for the install
+    # itself, the four uninstall rungs and the runner setup. It went 30 -> 75
+    # when the asset preflight arrived, 75 -> 105 when that preflight's budget
+    # was raised to an hour to cover the attach window, and back to 75 now that
+    # the attach window is gone: the release is a DRAFT until it is complete, so
+    # nothing here waits for a build. A job timeout is a hard kill with no
+    # diagnosis, which is exactly the burying this file's guards exist to
+    # prevent.
     timeout-minutes: 75
     # This job pipes remote code into a shell by design, so give it a token with
     # no scopes at all — it reads nothing from the repo and writes nothing back.
@@ -866,19 +868,30 @@ jobs:
       RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
       GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
       GW_HEALTH_TIMEOUT_SECS: '900'    # download + extract + embedded-PG first boot
-      # ── the release-asset preflight budget (full mode) ───────────────────────
-      # A full install downloads lucidos-<version>-<triple>.tar.gz from the
-      # v<version> Release, and release-tarballs.yml attaches those assets ~23
-      # minutes AFTER the Release is cut. The post-publish dispatch therefore
-      # arrives BEFORE the thing it installs exists (v0.18.0: dispatched 05:58,
-      # assets landed 06:21), so the preflight waits rather than failing, then
-      # fails FAST and by name if the wait expires.
+      # ── the release-asset backstop (full mode) ───────────────────────────────
+      # THIS NO LONGER WAITS FOR A BUILD, and that is the whole change of
+      # 2026-08-04. A GitHub Release is now created as a DRAFT and published
+      # only once release-tarballs.yml has attached all four per-platform
+      # tarballs, so by the time any release is visible, its assets are on it.
+      # This preflight therefore stopped being the thing that decides anything:
+      # it is a backstop against a hung origin or an asset that vanished, not a
+      # wait for a build that is still running.
       #
-      # BOUNDED, never a spin: 30 minutes covers the observed attach window with
-      # room, and an asset still missing after it is a broken release rather than
-      # a slow one. The poll is deliberately coarse, because these are one-byte
-      # range requests against GitHub and not something to hammer.
-      FD_ASSET_WAIT_SECS: '1800'       # 30 min; release-tarballs takes ~23
+      # THE BUDGET WAS SIZED FOR THE OLD ORDERING and is deliberately not kept.
+      # It had to cover cut-to-attached for the slowest triple (v0.19.0 25m48s,
+      # v0.20.0 30m07s, v0.21.0 34m43s, v0.20.1 44m52s), which is why it was
+      # raised 1800 -> 3600 s on 2026-08-04 after v0.21.0's Intel tarball landed
+      # 3m33s past the old ceiling. That raise was a band-aid on the ordering,
+      # and the ordering is what got fixed. 300 s now covers the only thing left
+      # to absorb: GitHub's own asset propagation, seconds, plus slack.
+      #
+      # A LONGER BUDGET WOULD BE ACTIVELY WORSE. Under the new ordering a
+      # missing asset means something is genuinely wrong (a release published
+      # with --allow-missing-tarballs, or an asset deleted afterwards), and no
+      # amount of waiting fixes either. Waiting an hour to say so just buries
+      # the verdict. scripts/lib/front_door_gate_test.sh caps this at 900 s so
+      # re-inflating it reds a test rather than a release.
+      FD_ASSET_WAIT_SECS: '300'        # 5 min: CDN propagation, not a build
       FD_ASSET_POLL_SECS: '30'
       # ── the RC version-convergence budget (payload mode, rung 1) ─────────────
       # How long rung 1 will keep re-reading the served installer's baked version
@@ -1647,7 +1660,7 @@ jobs:
             fi
             now="$(date +%s)"
             if [ "$now" -ge "$deadline" ]; then
-              echo "::error::the release assets this install needs are still not published after ${FD_ASSET_WAIT_SECS}s of waiting: $tarball_url answered $tar_code and $checksum_url answered $sha_code. This is an ASSET AVAILABILITY failure. It is not a broken front door and not a gateway health failure, and the install is deliberately NOT being started: it would 404 at the download step and then burn the ${GW_HEALTH_TIMEOUT_SECS}s gateway poll before reporting the wrong cause. release-tarballs.yml attaches the per-triple headless tarballs roughly 23 minutes AFTER the Release is cut, so a dispatch fired at publish time legitimately arrives early. Check that the release-tarballs run for v$version finished and attached $stem.tar.gz + .sha256."
+              echo "::error::the release assets this install needs are MISSING after ${FD_ASSET_WAIT_SECS}s: $tarball_url answered $tar_code and $checksum_url answered $sha_code. This is an ASSET AVAILABILITY failure. It is not a broken front door and not a gateway health failure, and the install is deliberately NOT being started: it would 404 at the download step and then burn the ${GW_HEALTH_TIMEOUT_SECS}s gateway poll before reporting the wrong cause. DO NOT read this as 'the tarballs are still attaching, wait longer'. Since 2026-08-04 a release is created as a DRAFT and published only once release-tarballs.yml has attached all four per-platform tarballs, so a PUBLISHED v$version missing one is a real fault rather than a race: either it was published deliberately incomplete (release.sh --allow-missing-tarballs), or the asset was removed afterwards, or this POP is serving an install.sh for a release that was never published. Look at the v$version release page for $stem.tar.gz + .sha256, then at the release-tarballs run that was supposed to attach them."
               exit 1
             fi
             echo "    attempt $attempt: tarball $tar_code, sidecar $sha_code; $(( deadline - now ))s of the ${FD_ASSET_WAIT_SECS}s budget left, retrying in ${FD_ASSET_POLL_SECS}s"
@@ -2155,7 +2168,8 @@ jobs:
     runs-on: ${{ matrix.runner }}
     # Same arithmetic as `front-door`, asserted by front_door_gate_test.sh:
     # FD_EXPECT_VERSION_WAIT_SECS + FD_ASSET_WAIT_SECS + GW_HEALTH_TIMEOUT_SECS
-    # + 900 s of slack must fit.
+    # + 900 s of slack must fit. Back to 75 now that the asset backstop is 300 s
+    # rather than the hour the old attach window needed.
     timeout-minutes: 75
     # Same reasoning as `front-door`: this job pipes remote code into a shell by
     # design, so it gets a token with no scopes at all.
@@ -2172,11 +2186,17 @@ jobs:
       RC_ACCESS_CLIENT_SECRET: ${{ secrets.RC_ACCESS_CLIENT_SECRET }}
       GW_DEFAULT_PORT: '5252'          # install.sh's default; it auto-picks upward if taken
       GW_HEALTH_TIMEOUT_SECS: '900'    # download + extract + embedded-PG first boot
-      # The asset-preflight budget, identical to `front-door` (see that job for
-      # why 30 minutes and why it is bounded). It matters MORE here: this job has
-      # no installer-exited fast-fail, so a missing asset costs the full health
-      # budget instead of seconds.
-      FD_ASSET_WAIT_SECS: '1800'       # 30 min; release-tarballs takes ~23
+      # The asset backstop, identical to `front-door` (see that job for why it
+      # stopped being a wait for a build at all, and for the budget's history).
+      # This job is where the old wait actually bit: the Intel leg downloads
+      # x86_64-apple-darwin, consistently the last of the four tarballs to be
+      # attached, so every expiry so far has been here while macos-latest went
+      # green in seconds off the same origin. Under the new ordering neither leg
+      # waits for that build, because the release is not public until it is
+      # finished. A missing asset still costs more here than on Linux (this job
+      # has no installer-exited fast-fail), which is a reason to fail FAST, not
+      # a reason to wait longer.
+      FD_ASSET_WAIT_SECS: '300'        # 5 min: CDN propagation, not a build
       FD_ASSET_POLL_SECS: '30'
       # The RC version-convergence budget, identical to `front-door` (see that
       # job, and the check itself, for why a single fetch is a sample rather than
@@ -2796,7 +2816,7 @@ jobs:
             fi
             now="$(date +%s)"
             if [ "$now" -ge "$deadline" ]; then
-              echo "::error::the release assets this install needs are still not published after ${FD_ASSET_WAIT_SECS}s of waiting: $tarball_url answered $tar_code and $checksum_url answered $sha_code. This is an ASSET AVAILABILITY failure. It is not a broken front door and not a gateway health failure, and the install is deliberately NOT being started: it would 404 at the download step and then burn the ${GW_HEALTH_TIMEOUT_SECS}s gateway poll before reporting the wrong cause. release-tarballs.yml attaches the per-triple headless tarballs roughly 23 minutes AFTER the Release is cut, so a dispatch fired at publish time legitimately arrives early. Check that the release-tarballs run for v$version finished and attached $stem.tar.gz + .sha256."
+              echo "::error::the release assets this install needs are MISSING after ${FD_ASSET_WAIT_SECS}s: $tarball_url answered $tar_code and $checksum_url answered $sha_code. This is an ASSET AVAILABILITY failure. It is not a broken front door and not a gateway health failure, and the install is deliberately NOT being started: it would 404 at the download step and then burn the ${GW_HEALTH_TIMEOUT_SECS}s gateway poll before reporting the wrong cause. DO NOT read this as 'the tarballs are still attaching, wait longer'. Since 2026-08-04 a release is created as a DRAFT and published only once release-tarballs.yml has attached all four per-platform tarballs, so a PUBLISHED v$version missing one is a real fault rather than a race: either it was published deliberately incomplete (release.sh --allow-missing-tarballs), or the asset was removed afterwards, or this POP is serving an install.sh for a release that was never published. Look at the v$version release page for $stem.tar.gz + .sha256, then at the release-tarballs run that was supposed to attach them."
               exit 1
             fi
             echo "    attempt $attempt: tarball $tar_code, sidecar $sha_code; $(( deadline - now ))s of the ${FD_ASSET_WAIT_SECS}s budget left, retrying in ${FD_ASSET_POLL_SECS}s"

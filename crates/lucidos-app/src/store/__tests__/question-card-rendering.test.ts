@@ -233,13 +233,16 @@ describe('promptPlaceholder', () => {
     expect(promptPlaceholder(true, true)).toBe(PLACEHOLDER_ANSWERING);
   });
 
-  // The card renders the question and its options, nothing else, so this
-  // placeholder is the ONLY place the two escapes that need no option slot are
-  // named. Typing routes to the pending question as a `FreeText` answer; Cancel
-  // stamps it `Canceled`. Drop either half and an agent starts inventing an
-  // "Other, I'll type it" option, which just hands its label back as the answer.
-  it('names both escapes, since nothing on the card does', () => {
-    expect(PLACEHOLDER_ANSWERING).toBe('Type your answer, or Cancel to ask something else.');
+  // The card renders the question and its options, nothing else, so the two
+  // escapes that need no option slot are named by the prompt row. This
+  // placeholder is the typing half: text typed here routes to the pending
+  // question as a `FreeText` answer. Cancel (which stamps it `Canceled`) is
+  // named by the Cancel button's tooltip instead, `ANSWER_CANCEL_TOOLTIP`,
+  // pinned in `components/chat/__tests__/question-card.test.tsx`. Drop either
+  // half and an agent starts inventing an "Other, I'll type it" option, which
+  // just hands its label back as the answer.
+  it('names the typing escape, since nothing on the card does', () => {
+    expect(PLACEHOLDER_ANSWERING).toBe('Type custom answer here…');
   });
 
   // A permission card leaves the thread `waiting_for_user_answer` with no

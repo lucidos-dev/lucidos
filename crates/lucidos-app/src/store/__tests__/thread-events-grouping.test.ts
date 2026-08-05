@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TS, makeThreadState } from './thread-events-helpers';
-import { computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, resumeEngineNote, unresumedAbortIndex, type Exchange, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
+import { abortPromisesAutoResume, computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, resumeEngineNote, continuableAbortIndex, type Exchange, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
 
 describe('aggregate-takes-precedence over event-type lookups', () => {
   function makeAggregate(overrides: Partial<ThreadAggregate> = {}): ThreadAggregate {
@@ -549,7 +549,7 @@ describe('groupIntoExchanges', () => {
   });
 });
 
-describe('unresumedAbortIndex', () => {
+describe('continuableAbortIndex', () => {
   it('returns the latest aborted exchange when no ContinuationStarted follows', () => {
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'one' }],
@@ -559,7 +559,7 @@ describe('unresumedAbortIndex', () => {
     ]);
     const exchanges = groupIntoExchanges(events);
     // 4 exchanges: msg, abort, msg, abort
-    expect(unresumedAbortIndex(exchanges)).toBe(3);
+    expect(continuableAbortIndex(exchanges)).toBe(3);
   });
 
   it('returns null when the last abort has been resumed', () => {
@@ -570,7 +570,7 @@ describe('unresumedAbortIndex', () => {
       [4, { type: 'ResponseGenerated' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    expect(unresumedAbortIndex(exchanges)).toBeNull();
+    expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
   it('returns null when there are no aborts', () => {
@@ -579,7 +579,7 @@ describe('unresumedAbortIndex', () => {
       [2, { type: 'ResponseGenerated' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    expect(unresumedAbortIndex(exchanges)).toBeNull();
+    expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
   // Stale-settle aborts are engine cleanup of stuck threads — clicking
@@ -591,7 +591,7 @@ describe('unresumedAbortIndex', () => {
       [2, { type: 'ResponseAborted', cause: 'stale_settle' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    expect(unresumedAbortIndex(exchanges)).toBeNull();
+    expect(continuableAbortIndex(exchanges)).toBeNull();
   });
 
   it('returns null when a stale-settle abort sits above an older real abort', () => {
@@ -604,7 +604,78 @@ describe('unresumedAbortIndex', () => {
       [4, { type: 'ResponseAborted', cause: 'stale_settle' }],
     ]);
     const exchanges = groupIntoExchanges(events);
-    expect(unresumedAbortIndex(exchanges)).toBeNull();
+    expect(continuableAbortIndex(exchanges)).toBeNull();
+  });
+
+  // The switch fingerprint, mirroring the backend's SWITCH_TEARDOWN_ABORT_SQL:
+  // engine_shutdown AND a device actor. The engine auto-resumes that turn, so
+  // offering Continue races its own recovery (the 2026-08-05 report: the button
+  // sat there through the whole restart and the user's click landed first).
+  it('returns null on a switch-teardown abort: the engine is auto-resuming it', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, {
+        type: 'ResponseAborted',
+        cause: 'engine_shutdown',
+        actor: { kind: 'device', device_id: 'd1', label: 'My iPhone' },
+      }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(continuableAbortIndex(exchanges)).toBeNull();
+  });
+
+  // Both halves of the fingerprint are load-bearing on the backend, so both are
+  // here. A bare engine_shutdown (stop.sh / an external SIGUSR1) is NOT a switch:
+  // nothing auto-resumes it, so it keeps the manual Continue.
+  it('offers Continue on an engine_shutdown abort with no device actor', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'engine_shutdown', actor: { kind: 'system' } }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(continuableAbortIndex(exchanges)).toBe(1);
+  });
+
+  // The other half: a device actor on a NON-shutdown cause is not a switch
+  // either. `stale_settle` deliberately carries the actor of the button that
+  // exposed the stuck row, which is why an actor-only check would be wrong.
+  it('offers Continue on the boot floor abort that withdraws a resume promise', () => {
+    // The engine declined to resume this switch-interrupted thread, so the boot
+    // floor emitted a fresh recovery_after_restart abort on top. That newer
+    // abort is not a switch abort, so the button comes back.
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, {
+        type: 'ResponseAborted',
+        cause: 'engine_shutdown',
+        actor: { kind: 'device', device_id: 'd1', label: 'My iPhone' },
+      }],
+      [3, { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: { kind: 'system' } }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(continuableAbortIndex(exchanges)).toBe(2);
+  });
+});
+
+describe('abortPromisesAutoResume', () => {
+  const device = { kind: 'device', device_id: 'd1', label: 'My iPhone' } as const;
+
+  it('matches only engine_shutdown AND a device actor', () => {
+    expect(abortPromisesAutoResume(
+      { type: 'ResponseAborted', cause: 'engine_shutdown', actor: device },
+    )).toBe(true);
+    expect(abortPromisesAutoResume(
+      { type: 'ResponseAborted', cause: 'engine_shutdown', actor: { kind: 'system' } },
+    )).toBe(false);
+    expect(abortPromisesAutoResume(
+      { type: 'ResponseAborted', cause: 'stale_settle', actor: device },
+    )).toBe(false);
+    expect(abortPromisesAutoResume(
+      { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: device },
+    )).toBe(false);
+    // Legacy rows carry neither field.
+    expect(abortPromisesAutoResume({ type: 'ResponseAborted' })).toBe(false);
+    expect(abortPromisesAutoResume({ type: 'ResponseGenerated' })).toBe(false);
   });
 });
 

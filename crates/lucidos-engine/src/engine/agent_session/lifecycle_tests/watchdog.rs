@@ -422,3 +422,196 @@ fn safety_net_action_aborted_when_no_watchdog_no_external_terminal() {
         "non-watchdog non-signal safety net MUST emit ResponseAborted",
     );
 }
+
+/// A turn the backend closed itself on a transient upstream failure never
+/// reaches the safety net (it emitted a real terminal), so the auto-resume is a
+/// SEPARATE decision made from that terminal. These are the exact strings
+/// Claude Code produced on 2026-08-04: both threads died on the first one.
+#[test]
+fn transient_api_failures_are_recognized_by_the_api_error_prefix() {
+    for error in [
+        "API Error: Connection closed mid-response. The response above may be incomplete.",
+        "API Error: Stream idle timeout - no chunks received",
+        "API Error: 529 overloaded",
+    ] {
+        assert!(
+            is_transient_api_failure(&TerminalKind::Failed {
+                error: error.to_string()
+            }),
+            "{error} is a transient upstream drop and MUST be resumable",
+        );
+    }
+}
+
+/// Everything else stays a dead end, because resuming it would reproduce it.
+/// The prose case is the reason this matches a PREFIX: a turn that merely
+/// mentions an api error while explaining one is a successful turn.
+#[test]
+fn deterministic_failures_are_not_transient() {
+    for error in [
+        "error_max_turns",
+        "No conversation found with session ID: 7c61f11b",
+        EMPTY_RESPONSE_ERROR,
+        "the log shows an API Error further down, which I fixed",
+    ] {
+        assert!(
+            !is_transient_api_failure(&TerminalKind::Failed {
+                error: error.to_string()
+            }),
+            "{error} reproduces on resume and MUST NOT auto-resume",
+        );
+    }
+}
+
+/// No terminal other than a `Failed` is a candidate: `Generated` finished,
+/// `Canceled` was the user's Stop, and `Aborted` already belongs to shutdown or
+/// safety-net recovery.
+#[test]
+fn only_a_failed_terminal_can_auto_resume() {
+    use crate::engine::thread_events::{AbortCause, CancelCause};
+    for terminal in [
+        TerminalKind::Generated,
+        TerminalKind::Canceled(CancelCause::UserStop),
+        TerminalKind::Aborted(AbortCause::EngineShutdown),
+    ] {
+        assert!(!is_transient_api_failure(&terminal));
+        assert!(!auto_resume_after_api_error(
+            &Some(terminal.clone()),
+            0,
+            false,
+            false
+        ));
+    }
+    assert!(
+        !auto_resume_after_api_error(&None, 0, false, false),
+        "no terminal at all is the safety net's business, not ours",
+    );
+}
+
+/// The bound. Attempts below the cap resume; the one that would exceed it stops
+/// and leaves the red dot standing, so a broken upstream surfaces instead of
+/// looping. A query that could not answer reports the budget as spent, which
+/// this same gate then refuses.
+#[test]
+fn api_error_auto_resume_is_bounded() {
+    let dropped = Some(TerminalKind::Failed {
+        error: "API Error: Connection closed mid-response.".to_string(),
+    });
+    for spent in 0..MAX_API_ERROR_AUTO_RESUMES {
+        assert!(
+            auto_resume_after_api_error(&dropped, spent, false, false),
+            "{spent} of {MAX_API_ERROR_AUTO_RESUMES} spent must still resume",
+        );
+    }
+    assert!(
+        !auto_resume_after_api_error(&dropped, MAX_API_ERROR_AUTO_RESUMES, false, false),
+        "the budget is a hard cap",
+    );
+}
+
+/// Two paths own the thread instead, and both must win over the auto-resume.
+/// Shutdown: post-restart recovery re-adopts in-flight threads, and a
+/// continuation emitted into a dying engine races it. Conflict resolution: the
+/// session carries an apply's merge duty whose cleanup decides hand-off vs abort
+/// from the watchdog's own flags, so an API drop mid-merge keeps today's
+/// behavior (abort the merge, leave the change pending).
+#[test]
+fn shutdown_and_conflict_resolution_refuse_the_auto_resume() {
+    let dropped = Some(TerminalKind::Failed {
+        error: "API Error: Connection closed mid-response.".to_string(),
+    });
+    assert!(!auto_resume_after_api_error(&dropped, 0, true, false));
+    assert!(!auto_resume_after_api_error(&dropped, 0, false, true));
+    assert!(
+        auto_resume_after_api_error(&dropped, 0, false, false),
+        "with neither gate set the same input MUST resume (else this test proves nothing)",
+    );
+}
+
+/// The new reason opens its own resume boundary, like every other automatic
+/// resume. `answered_after_idle` stays out: that continuation continues an
+/// existing exchange rather than starting a recovery.
+#[test]
+fn api_error_resume_opens_a_resume_exchange() {
+    use crate::engine::agent_recovery::{
+        continue_should_open_resume_exchange, ANSWERED_AFTER_IDLE_REASON,
+        AUTO_RESUME_AFTER_API_ERROR_REASON,
+    };
+    assert!(continue_should_open_resume_exchange(Some(
+        AUTO_RESUME_AFTER_API_ERROR_REASON
+    )));
+    assert!(!continue_should_open_resume_exchange(Some(
+        ANSWERED_AFTER_IDLE_REASON
+    )));
+}
+
+/// **The regression test for the incident.** Every test above passes on a
+/// version of this feature that can never run, and one shipped: the emit lived
+/// only in the post-loop `finalize_direct_agent`, which a turn that ends with a
+/// Result never reaches. It idles, and the idle-exit arm of the event loop
+/// returns straight out of `run_direct_agent`. A reported `API Error` drop is
+/// always that shape, so the recovery was dead through four consecutive
+/// incidents while its whole unit table stayed green. See
+/// `docs/plans/2026-08-05-api-drop-auto-resume-emit-site-unreachable.md`.
+///
+/// Asserted against the source text, like
+/// `the_completion_path_removes_only_the_two_worktrees_it_is_allowed_to`,
+/// because that is where the property lives. This is not a placeholder for a
+/// behavioural test, and building the `run_direct_agent` harness the tree
+/// currently lacks would not retire it: a behavioural test can only show that
+/// the exits reachable *today* emit the continuation, and the defect here is a
+/// path that reaches neither call site. The property is "every way out of the
+/// run loop passes through the helper", which is a statement about the shape of
+/// the function, so it is checked against the function's text.
+#[test]
+fn both_session_exits_reach_the_api_drop_auto_resume() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+    const COMPLETION_SRC: &str = include_str!("../run_session/completion.rs");
+    const CALL: &str = "self.maybe_auto_resume_after_api_error(";
+
+    assert!(
+        COMPLETION_SRC.contains("async fn maybe_auto_resume_after_api_error("),
+        "the shared auto-resume helper must stay in completion.rs under that name",
+    );
+    assert_eq!(
+        COMPLETION_SRC.matches(CALL).count(),
+        1,
+        "finalize_direct_agent must call the helper exactly once: it is the exit for every \
+         session end that does NOT idle first (safety net, user Stop, shutdown, conflict \
+         resolution).",
+    );
+
+    // The idle exit: `AgentEvent::Exited` while `is_waiting`, which is how every
+    // turn that produced a Result ends. Bounded by the arm's own release log and
+    // its `return`, so the call has to sit inside the arm and not merely
+    // somewhere in the file.
+    let release_log = RUN_SRC
+        .find("CC process exited while idle")
+        .expect("run.rs must still carry the idle-exit arm");
+    let arm = &RUN_SRC[release_log..];
+    let call = arm.find(CALL).expect(
+        "the idle-exit arm must call the auto-resume helper before returning. Without it a \
+         transient upstream API drop leaves the thread dead behind a red dot until a human \
+         notices, which is the bug this whole feature exists to fix.",
+    );
+    let teardown = arm
+        .find("self.clear_cc_debounce(thread_id);")
+        .expect("the idle-exit arm must still tear the session down before returning");
+    let drain = arm
+        .find("let orphans = lost_followups_to_orphans(")
+        .expect("the idle-exit arm must still drain follow-ups before returning");
+    let ret = arm
+        .find("return Ok(ProcessResult {")
+        .expect("the idle-exit arm must still return a ProcessResult");
+    assert!(
+        teardown < call && call < ret,
+        "the auto-resume call must sit after the session teardown and before the return: \
+         emitting while the subprocess is still in agent_sessions races the spawn dispatcher \
+         into a session the loop is about to cancel.",
+    );
+    assert!(
+        drain < call,
+        "the auto-resume call must sit after the follow-up drain: it stands down when a \
+         follow-up is already queued, and it can only know that once `orphans` exists.",
+    );
+}

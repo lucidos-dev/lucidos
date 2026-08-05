@@ -294,15 +294,14 @@ fn switch_resume_candidates_sql() -> String {
            AND t.state = 'active' \
            AND t.archive_state != 'archived' \
            AND {abort} \
-           AND e.sequence > COALESCE(( \
-               SELECT MAX(s.sequence) FROM events s \
-               WHERE s.aggregate_id = e.aggregate_id \
-                 AND s.event_type IN ({starts}) \
-           ), 0) \
+           AND {unsuperseded} \
          GROUP BY e.aggregate_id \
          ORDER BY abort_sequence ASC",
         abort = crate::engine::agent_recovery::SWITCH_TEARDOWN_ABORT_SQL,
-        starts = crate::engine::agent_recovery::THREAD_START_EVENTS_SQL,
+        unsuperseded = crate::engine::agent_recovery::switch_abort_unsuperseded_sql(
+            "e.aggregate_id",
+            "e.sequence"
+        ),
     )
 }
 
@@ -346,10 +345,17 @@ impl LucidosEngine {
     /// must be live for that status change to reconcile a queue slot. It also must
     /// follow `recover_orphan_tool_calls`, or the re-entered turn reconstructs an
     /// unpaired `tool_use` block and the provider rejects the call.
-    pub async fn resume_pending_chat_switches(self: &Arc<Self>) {
+    ///
+    /// Returns the thread ids it actually drove into `continue_chat`, which
+    /// `settle_unresumed_switch_threads` needs to EXCLUDE: a resume that has only
+    /// reached `ContinuationStarted` is indistinguishable, by query alone, from
+    /// one that never happened. Threads dropped by the per-boot cap are
+    /// deliberately absent from the return, so the floor withdraws their resume
+    /// promise and hands their Continue button back.
+    pub async fn resume_pending_chat_switches(self: &Arc<Self>) -> Vec<uuid::Uuid> {
         let mut candidates = switch_resume_candidates(self.pool()).await;
         if candidates.is_empty() {
-            return;
+            return Vec::new();
         }
 
         if candidates.len() > MAX_CHAT_SWITCH_RESUMES {
@@ -368,13 +374,19 @@ impl LucidosEngine {
             candidates.len()
         );
 
+        let mut resumed = Vec::with_capacity(candidates.len());
         for thread_id in candidates {
             match self.continue_chat(thread_id, None).await {
-                Ok(outcome) => log!(
-                    "[Recovery] chat switch-resume for thread {}: {:?}",
-                    thread_id,
-                    outcome
-                ),
+                Ok(outcome) => {
+                    log!(
+                        "[Recovery] chat switch-resume for thread {}: {:?}",
+                        thread_id,
+                        outcome
+                    );
+                    resumed.push(thread_id);
+                }
+                // NOT added to `resumed`: the promise was not kept, so the floor
+                // must withdraw it and restore the manual Continue button.
                 Err(e) => log!(
                     "[Recovery] chat switch-resume for thread {} failed: {} — \
                      the manual Continue affordance remains",
@@ -383,6 +395,7 @@ impl LucidosEngine {
                 ),
             }
         }
+        resumed
     }
 }
 

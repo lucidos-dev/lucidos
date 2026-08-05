@@ -12,8 +12,9 @@ const PANE_SELECTOR: Record<FocusedPane, string> = {
   content: '.pane-content',
 };
 
-/** Tabbable elements within a pane. Mirrors the set `ConfirmDialog` traps over,
- *  plus `iframe` (an app content pane). Visibility-filtered so a `display:none`
+/** Tabbable elements within a pane. Mirrors the set the dialog trap uses
+ *  (`shared/dialogFocusTrap.ts`, which both centered dialogs share), plus
+ *  `iframe` (an app content pane). Visibility-filtered so a `display:none`
  *  control (collapsed section, hidden layout copy) never becomes a tab stop.
  *  Every native-focusable term ALSO excludes `[tabindex="-1"]` so an element
  *  explicitly removed from the tab order (e.g. the thread drawer's mouse-only

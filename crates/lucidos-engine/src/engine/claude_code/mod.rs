@@ -503,6 +503,12 @@ pub(crate) struct SpawnAgentThreadParams {
     pub app_id: Option<String>,
     /// Backend to launch for this coding-agent thread.
     pub coding_agent: crate::runtime::CodingAgent,
+    /// Who launched this thread, stamped on its first `MessageReceived` for the
+    /// message route popover. Independent of `parent_thread_id` above: a
+    /// `relation: "top"` spawn records its spawning thread here while carrying no
+    /// callback linkage. `None` falls back to the linkage-derived origin in
+    /// `synthesize_legacy_origin`.
+    pub origin: Option<crate::engine::thread_events::MessageOrigin>,
 }
 
 /// Returns true iff `thread_summaries.status` is currently `'running'`.

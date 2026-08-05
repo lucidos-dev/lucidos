@@ -26,6 +26,7 @@ pub mod preference_catalog;
 pub mod preferences;
 pub mod repositories;
 pub mod shell;
+pub mod slug;
 pub mod store;
 pub mod system_knowhow;
 pub mod user_dir;
@@ -103,6 +104,40 @@ pub(crate) fn pg_env_vars(database_url: &str) -> Vec<(String, String)> {
     vars.push(("PGPORT".to_string(), port));
     vars.push(("PGDATABASE".to_string(), dbname));
     vars
+}
+
+/// Convert a credential `service_name` or an OAuth provider name into the
+/// `{NAME}` segment of an injected env var (`CRED_{NAME}`, `OAUTH_{NAME}_…`):
+/// uppercased, with every character outside `[A-Z0-9_]` replaced by `_`.
+///
+/// Sanitizes by character CLASS rather than a fixed list. The list this
+/// replaced was `-` / `.` / space, which is every separator a hand-typed
+/// service name uses and none of the ones the engine generates itself: a
+/// namespaced name (`oauth:google`, `email:work`) kept its colon, and an
+/// address-shaped one kept its `@`. `CRED_OAUTH:GOOGLE` is a legal entry in
+/// `environ` and an illegal shell identifier, so it was set but unreadable from
+/// bash (`$CRED_OAUTH:GOOGLE` parses as `$CRED_OAUTH` then a literal
+/// `:GOOGLE`), while Python could still reach it through `os.environ` with the
+/// literal key. A silent asymmetry between two of the three script runtimes is
+/// worse than either outcome alone, which is why this is a class and not three
+/// more characters.
+///
+/// No leading-digit guard: every caller prefixes `CRED_` / `OAUTH_`, so the
+/// full variable name always starts with a letter.
+///
+/// Non-ASCII collapses to `_` per `char`, so the result is always ASCII and
+/// the function never slices a multi-byte boundary.
+pub fn env_var_segment(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            let upper = c.to_ascii_uppercase();
+            if upper.is_ascii_alphanumeric() || upper == '_' {
+                upper
+            } else {
+                '_'
+            }
+        })
+        .collect()
 }
 
 /// Mask the password segment of any `postgres(ql)://user:password@host…` URL
@@ -722,6 +757,17 @@ fn first_command_line(cmd: &str) -> &str {
         .unwrap_or(cmd)
 }
 
+/// The bare tool name inside an `mcp__<server>__<tool>` identifier, or `None`
+/// when `name` is not shaped like one. Every surface uses that naming: the
+/// engine's own MCP client, Claude Code natively, and Codex, whose
+/// `mcp_tool_call` item is deliberately rebuilt into the same shape
+/// (`runtime/codex_parse.rs`). Both description paths split it here so the two
+/// can't drift.
+fn mcp_tool_suffix(name: &str) -> Option<&str> {
+    let rest = name.strip_prefix("mcp__")?;
+    rest.find("__").map(|sep| &rest[sep + 2..])
+}
+
 /// Summarize a `glob_files` / `grep_files` JSON result as "N items[, truncated]".
 /// Falls back to a char count if the JSON can't be parsed (e.g. the handler
 /// returned an "Error: ..." string).
@@ -767,8 +813,23 @@ pub fn describe_tool_result(tool_name: &str, result: &str, success: bool) -> Opt
 
 /// Human-friendly description of a tool call, used for progress steps in both
 /// live streaming (engine.rs) and session replay (store.rs).
+///
+/// The `Executing <name>...` fallback exists only for names we genuinely cannot
+/// know: a third-party MCP tool arriving without the `mcp__` prefix, or a
+/// historical event replaying a tool name we have since retired. Everything the
+/// engine ships is labelled in [`tool_label`], and
+/// `every_known_tool_name_has_a_step_label` fails the build if one is not, so
+/// the fallback can never render a raw snake_case name for a registered tool.
 pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
-    match name {
+    tool_label(name, args).unwrap_or_else(|| format!("Executing {}...", name))
+}
+
+/// The known-tool half of [`describe_tool`]: `Some(label)` for a name we ship,
+/// `None` for anything else. Split out from the fallback so the exhaustiveness
+/// guard test can ask "is this name labelled?" and get an honest answer, which
+/// it cannot do through `describe_tool` (the fallback labels everything).
+pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String> {
+    Some(match name {
         "list_files" => "Listing files in workspace...".to_string(),
         "glob_files" => format!(
             "Globbing {}...",
@@ -791,13 +852,11 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             args["destination"].as_str().unwrap_or("file")
         ),
         "delete_file" => format!("Deleting {}...", args["path"].as_str().unwrap_or("file")),
-        "run_python" => {
-            if let Some(path) = args["output_path"].as_str() {
-                format!("Running Python → {}...", path)
-            } else {
-                "Running Python code...".to_string()
-            }
-        }
+        // No `output_path` branch: that key belongs to `http_request`'s schema
+        // (see the arm below), never `run_python`'s, which declares only `code`,
+        // `packages` and `commit_message` (`llm/tools/exec.rs`). The lookup could
+        // not match, so the arrow form was unreachable.
+        "run_python" => "Running Python code...".to_string(),
         "run_bash" => {
             let cmd = args["command"].as_str().unwrap_or("command");
             format!(
@@ -847,6 +906,10 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
         ),
         "pause_trigger" => "Pausing trigger...".to_string(),
         "resume_trigger" => "Resuming trigger...".to_string(),
+        // No name in the label: the `run` action declares only `trigger_id`
+        // (`capability_manifest`, TRIGGERS_OPS), which is a uuid the user has
+        // never seen. There is no `name` key on the payload to prefer over it.
+        "run_trigger" => "Running trigger now...".to_string(),
         "list_trigger_groups" => "Listing trigger groups...".to_string(),
         "create_trigger_group" => format!(
             "Creating trigger group '{}'...",
@@ -878,6 +941,7 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             args["key"].as_str().unwrap_or("preference")
         ),
         "get_preferences" => "Reading preferences...".to_string(),
+        "get_backup_status" => "Checking backup status...".to_string(),
         "fetch_news" => format!(
             "Fetching news about '{}'...",
             args["topic"].as_str().unwrap_or("topic")
@@ -1007,7 +1071,15 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
                         .and_then(|v| v.as_str())
                         .unwrap_or("app")
                 ),
-                "file" => format!("Opening {}...", args["path"].as_str().unwrap_or("file")),
+                // `file_path`, not `path`: that is what `get_navigate_ui_tool`
+                // declares (`llm/tools/misc.rs`) and what the frontend reads off
+                // the `NavigationRequested` payload. Reading `path` matched no
+                // key, so every file navigation rendered the bare "Opening
+                // file..." instead of naming the file.
+                "file" => format!(
+                    "Opening {}...",
+                    args["file_path"].as_str().unwrap_or("file")
+                ),
                 "url" => format!("Opening {}...", args["url"].as_str().unwrap_or("URL")),
                 _ => format!("Opening {}...", target),
             }
@@ -1051,6 +1123,10 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Saving image to {}...",
             args["path"].as_str().unwrap_or("artifacts")
         ),
+        // `image` is a thread reference like "thread:2" (`llm/tools/images.rs`),
+        // which is exactly how the conversation history labels the image, so it
+        // reads as an identifier the user can find rather than an internal id.
+        "view_image" => format!("Viewing {}...", args["image"].as_str().unwrap_or("image")),
         "generate_image" => format!(
             "Generating image: {}...",
             middle_truncate(args["prompt"].as_str().unwrap_or("image"), 50)
@@ -1067,11 +1143,21 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Running thread: {}...",
             middle_truncate(args["prompt"].as_str().unwrap_or("task"), 50)
         ),
+        // The message, never the `thread_id`: the id is a raw uuid the user has
+        // no way to resolve to a child they recognise, and the message is the
+        // one part of the call that says what is happening.
+        "follow_up_child_thread" => match args["message"].as_str() {
+            Some(message) => format!(
+                "Following up with child thread: {}...",
+                middle_truncate(message, 50)
+            ),
+            None => "Following up with child thread...".to_string(),
+        },
         "list_threads" => "Listing threads...".to_string(),
         "count_threads" => "Counting threads...".to_string(),
         "list_changes" => "Listing changes...".to_string(),
         "apply_change" => "Applying change...".to_string(),
-        "correct_memory" => "Updating memory...".to_string(),
+        "correct_memory" | "correct_memory_by_id" => "Updating memory...".to_string(),
         "dismiss_from_context" => "Dismissing from context...".to_string(),
         "query_events" => format!(
             "Querying {} events...",
@@ -1098,6 +1184,7 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             Some("delete") => "Deleting trigger...".to_string(),
             Some("pause") => "Pausing trigger...".to_string(),
             Some("resume") => "Resuming trigger...".to_string(),
+            Some("run") => "Running trigger now...".to_string(),
             _ => "Listing triggers...".to_string(),
         },
         "trigger_groups" => match args["action"].as_str() {
@@ -1184,6 +1271,10 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             Some("apply") => "Applying change...".to_string(),
             _ => "Listing changes...".to_string(),
         },
+        // Flat back-compat aliases for the two LLM-exposed `thread_queue`
+        // actions; same wording as the grouped arm below.
+        "list_thread_queue" => "Listing Thread Queue...".to_string(),
+        "update_thread_queue_policy" => "Updating Thread Queue policy...".to_string(),
         "thread_queue" => match args["action"].as_str() {
             Some("update_policy") => "Updating Thread Queue policy...".to_string(),
             Some("run_now") => "Running queued entry now...".to_string(),
@@ -1244,6 +1335,10 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
             "Installing plugin from {}...",
             args["source"].as_str().unwrap_or("source")
         ),
+        "register_plugin_marketplace" => format!(
+            "Registering marketplace {}...",
+            args["source"].as_str().unwrap_or("source")
+        ),
         "check_plugin_updates" => match args.get("id").and_then(|v| v.as_str()) {
             Some(id) => format!("Checking plugin '{}' for updates...", id),
             None => "Checking installed plugins for updates...".to_string(),
@@ -1258,16 +1353,10 @@ pub fn describe_tool(name: &str, args: &serde_json::Value) -> String {
         ),
         "enable_push_notifications" => "Enabling push notifications...".to_string(),
         _ if name.starts_with("mcp__") => {
-            let rest = &name[5..];
-            if let Some(sep) = rest.find("__") {
-                let tool_name = &rest[sep + 2..];
-                format!("MCP: {}...", tool_name)
-            } else {
-                format!("MCP: {}...", name)
-            }
+            format!("MCP: {}...", mcp_tool_suffix(name).unwrap_or(name))
         }
-        _ => format!("Executing {}...", name),
-    }
+        _ => return None,
+    })
 }
 
 /// Human-friendly description of a Claude Code tool call.
@@ -1367,6 +1456,11 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
                 format!("Edit {}", basename(p))
             }
         }
+        // Same label as Codex's `todo_list` below: the two backends' plan steps
+        // are the same thing to the user and should read alike (the frontend's
+        // `fullCommandForCCTool` already renders both with one marker list).
+        "TodoWrite" => "Update plan".into(),
+        "ExitPlanMode" => "Present plan for approval".into(),
         // Codex item types (see runtime/codex_parse.rs) — Codex reports
         // coarse-grained items, not named tools like CC.
         "command_execution" => {
@@ -1398,6 +1492,16 @@ pub fn describe_cc_tool(name: &str, args: &serde_json::Value) -> String {
             }
         }
         "todo_list" => "Update plan".into(),
+        // An MCP tool reaches both backends under the same `mcp__<server>__<tool>`
+        // name (Codex rebuilds it that way on purpose), and the server prefix is
+        // noise in a step row. Without this the raw identifier WAS the label.
+        _ if name.starts_with("mcp__") => {
+            format!("MCP: {}", mcp_tool_suffix(name).unwrap_or(name))
+        }
+        // Unlike `tool_label`, this fallback stays reachable: coding-agent tool
+        // names come from Anthropic and OpenAI, not from a registry we own, so
+        // a tool added upstream tomorrow has no arm here and never can have one
+        // before it ships. Showing its name beats showing nothing.
         _ => name.to_string(),
     }
 }

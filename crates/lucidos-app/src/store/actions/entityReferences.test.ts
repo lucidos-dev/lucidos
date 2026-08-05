@@ -8,7 +8,7 @@ vi.mock('./triggers', () => ({ loadTriggers: vi.fn() }));
 vi.mock('./artifacts', () => ({ loadArtifacts: vi.fn() }));
 vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
 vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }));
-vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn() }));
+vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn(), handleOAuthAccountConnected: vi.fn() }));
 vi.mock('./repositoriesLoader', () => ({ loadRepositories: vi.fn() }));
 // Partial-mock the HTTP client so the credential-event /health re-probe is
 // observable without a real network call (keeps every other export real for the
@@ -39,7 +39,7 @@ import { loadTriggers } from './triggers';
 import { loadArtifacts } from './artifacts';
 import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
-import { loadOAuthAccounts } from './oauth';
+import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
 import { loadDevices, devices } from './devices';
 import { loadPinnedApps } from './pinnedApps';
@@ -462,7 +462,6 @@ describe('processSSEForReferences', () => {
   describe('OAuthAccount* events', () => {
     it('does not reload when oauthAccounts cache is not-loaded', () => {
       oauthAccounts.value = { status: 'not-loaded' };
-      processSSEForReferences('OAuthAccountConnected', { account_id: 'acc-1', provider: 'google' });
       processSSEForReferences('OAuthAccountDeleted', { account_id: 'acc-1' });
       expect(loadOAuthAccounts).not.toHaveBeenCalled();
     });
@@ -476,10 +475,24 @@ describe('processSSEForReferences', () => {
     // The connect half is the one that was missing: the engine wrote the
     // account row straight from the OAuth callback and emitted nothing, so
     // every device except the one running the flow sat on a stale list.
-    it('reloads on connect, not only on disconnect', () => {
+    //
+    // It now routes to `handleOAuthAccountConnected` rather than reloading
+    // inline, because connecting does more than refresh a list: on the device
+    // that STARTED the flow it also closes the callback page, toasts, and
+    // fronts the window. That handler owns the reload (and its own device
+    // scoping) and is tested in oauth-connected.test.ts; what belongs here is
+    // that the event reaches it, payload intact.
+    it('routes a connect to the OAuth-connected handler with the payload', () => {
       oauthAccounts.value = { status: 'loaded', data: [] };
-      processSSEForReferences('OAuthAccountConnected', { account_id: 'acc-1', provider: 'google' });
-      expect(loadOAuthAccounts).toHaveBeenCalled();
+      const payload = {
+        account_id: 'acc-1',
+        provider: 'google',
+        actor: { kind: 'device', device_id: 'device-aaa' },
+      };
+      processSSEForReferences('OAuthAccountConnected', payload);
+      expect(handleOAuthAccountConnected).toHaveBeenCalledWith(payload);
+      // And NOT a second, unscoped reload from this arm.
+      expect(loadOAuthAccounts).not.toHaveBeenCalled();
     });
   });
 

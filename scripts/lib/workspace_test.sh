@@ -1101,6 +1101,66 @@ test_publish_failure_preserves_the_previous_binary() {
     fi
 }
 
+test_publish_prunes_only_dead_publish_temps() {
+    echo "test: a SIGKILLed publish's temp is collected, a live one's is not"
+
+    # A coalescing Apply SIGKILLs the whole build process group
+    # (engine_version::BuildProcessGroupGuard), which no trap catches, so a kill
+    # inside the copy/sign window strands a ~250 MB temp that nothing collects.
+    # The next publish sweeps it, but ONLY when its pid is dead: a human
+    # `web-dev.sh -b` is not coordinated by the engine's build lock, and eating
+    # its in-flight temp would break that build's rename.
+    local src_dir="$SANDBOX/prune-src"
+    local dst_dir="$SANDBOX/prune-dst/launch/plain"
+    mkdir -p "$src_dir" "$dst_dir"
+    printf 'ENGINE' > "$src_dir/lucidos-engine"
+    printf 'GW' > "$src_dir/lucidos-gateway"
+    printf 'CLI' > "$src_dir/lucidos"
+
+    # A pid that is certainly gone: spawn one and reap it.
+    sh -c 'exit 0' &
+    local dead_pid=$!
+    wait "$dead_pid" 2>/dev/null || true
+    # A pid that is certainly alive for the duration. Deliberately NOT `$$`:
+    # `publish_launch_binary` names its own temp `$dst.tmp.$$`, so this shell's
+    # pid would collide with the publish under test and be consumed by its
+    # rename, proving nothing about the sweep.
+    ( exec sleep 30 ) & local live_pid=$!
+
+    local dead_temp="$dst_dir/lucidos-engine.tmp.$dead_pid"
+    local live_temp="$dst_dir/lucidos-engine.tmp.$live_pid"
+    local junk_temp="$dst_dir/lucidos-engine.tmp.notapid"
+    printf 'ORPHAN' > "$dead_temp"
+    printf 'IN-FLIGHT' > "$live_temp"
+    printf 'JUNK' > "$junk_temp"
+
+    sign_engine_binary() { :; }
+    publish_launch_binaries "$src_dir" "$dst_dir"
+    unset -f sign_engine_binary
+
+    if [ ! -e "$dead_temp" ]; then
+        pass "a temp whose publisher is gone is collected"
+    else
+        fail "the orphaned publish temp was left to accumulate"
+    fi
+    if [ -e "$live_temp" ]; then
+        pass "a temp belonging to a live publisher is left alone"
+    else
+        fail "swept an in-flight publish's temp, whose rename would now fail"
+    fi
+    if [ -e "$junk_temp" ]; then
+        pass "an unparseable suffix is left alone rather than guessed at"
+    else
+        fail "deleted a temp whose suffix is not a pid"
+    fi
+    if [ "$(cat "$dst_dir/lucidos-engine")" = "ENGINE" ]; then
+        pass "the publish itself still lands"
+    else
+        fail "pruning interfered with the publish"
+    fi
+    kill "$live_pid" 2>/dev/null || true
+}
+
 test_publish_signs_the_temp_before_the_rename() {
     echo "test: signing happens on the temp copy, never on the published path"
 
@@ -1410,6 +1470,7 @@ test_kills_shared_build_watch_when_no_workspace_serves
 test_launch_bin_dir_is_per_profile_and_variant
 test_publish_launch_binary_is_atomic_and_executable
 test_publish_failure_preserves_the_previous_binary
+test_publish_prunes_only_dead_publish_temps
 test_publish_signs_the_temp_before_the_rename
 test_published_build_state_classifies_against_head
 test_locate_prefers_published_and_falls_back

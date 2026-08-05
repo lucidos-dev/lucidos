@@ -2,6 +2,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 use std::time::Duration;
 
+mod branch_name;
 mod checkpoint;
 mod commits;
 mod harden_marker;
@@ -10,6 +11,7 @@ mod plan_marker;
 mod restart_detection;
 mod worktree;
 
+pub(crate) use branch_name::*;
 pub(crate) use checkpoint::*;
 pub(crate) use commits::*;
 pub(crate) use harden_marker::*;

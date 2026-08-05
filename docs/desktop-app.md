@@ -208,18 +208,30 @@ users download, and the *commit* CI gated on is the very object that lands on
 #     rc means CI's verdict belongs to a different commit), manifest.source_commit
 #     must equal the worktree HEAD, and every staged sha256 must still match;
 #   → force-pushes THAT SAME COMMIT OBJECT to the mirror's main → tags it there
-#     BY SHA → Release → uploads the staged artifacts (via build-dmg.sh
-#     --release-attach, which generates latest.json from the staged .sig) →
+#     BY SHA → creates the GA Release as a DRAFT → uploads the staged artifacts
+#     (via build-dmg.sh --release-attach, which generates latest.json from the
+#     staged .sig) → WAITS 25 to 45 min for release-tarballs.yml to attach the
+#     four per-platform tarballs, which the tag push started → PUBLISHES the
+#     draft → emits LucidosReleased →
 #     LANDS the bump on local main (fast-forward, else cherry-pick, else a hard
 #     failure — never a skipped bump) → tags THAT commit locally → pushes main +
 #     the tag to `origin`, unforced → deletes the rc branch + the rc-<version>
 #     draft release → cleans up the worktree + staging.
+#     THE RELEASE IS INVISIBLE UNTIL IT IS COMPLETE (ADR 0042). Nothing is
+#     public during that wait, so an interrupted one costs no rebuild:
+#         ./scripts/release.sh --publish-draft <version>
+#     Refuse-by-default if a tarball never arrives; --allow-missing-tarballs
+#     publishes anyway, knowing `curl … | sh` will 404 for that platform.
 #     The same tag name means a different object per remote, deliberately: the
 #     mirror's names the orphan (the Release + download URLs resolve through
 #     it), the local/origin one names the release commit on main. See ADR 0029.
 
 # Re-arm the gate without a rebuild (rc push failed, or the rc was replaced):
 ./scripts/release.sh --push-rc <version>
+
+# Finish a release whose draft exists but never went public (the wait above was
+# interrupted). No push, no rebuild, no re-upload: wait, publish, emit, settle.
+./scripts/release.sh --publish-draft <version>
 ```
 
 Two guards make this safe, and both fail closed:
@@ -614,7 +626,7 @@ target to the engine build).
 
 > **Implemented** in `crates/lucidos-app/src/desktop.rs` (the service +
 > LaunchAgent + stable-port lifecycle) and `crates/lucidos-app/src/mobile.rs`
-> (connect URLs + Tailscale setup, surfaced in **Settings → Mobile Access**).
+> (connect URLs + Tailscale setup, surfaced in **Settings → Access**).
 > This **supersedes** the window-coupled lifecycle the initial foundation
 > shipped (`desktop.rs` used to boot the stack on launch and tear it down on
 > `RunEvent::Exit` / `restart_app`). The runtime can only be fully verified by
@@ -683,7 +695,7 @@ class of difference caused:
   probes `~/.local/bin/claude`, `~/.claude/local/claude`, and the Homebrew
   prefixes (parity with codex) before the bare PATH lookup. The
   `coding_agent_claude_path` / `coding_agent_codex_path` preferences
-  (Settings → System → Coding agents) win outright when set, and an invalid
+  (Settings → Coding Agents) win outright when set, and an invalid
   configured path FAILS the spawn naming the setting.
   `GET /api/v1/coding-agents/binaries` reports the live per-agent resolution
   (override / detected / path / not-found) for that Settings section — only
@@ -694,9 +706,9 @@ class of difference caused:
   subprocess PATH, matching what `workspace_script_env_vars` already did for
   chat/scheduled scripts — the advertised `psql -c '…'` contract holds in
   packaged CC/Codex threads.
-- **Mobile Access shows only reachable URLs.** The "Local network" row derives
+- **Access shows only reachable URLs.** The "Local network" row derives
   from the configured gateway bind (`GET /api/v1/network-config`): loopback
-  (the packaged default) shows guidance linking Settings → Network access
+  (the packaged default) shows guidance linking the Network access section
   instead of a dead `http://<lan-ip>` URL; `all` shows the detected LAN URL;
   a specific-IP bind shows that IP. Plain-HTTP rows carry the "no PWA/push"
   caveat — Tailscale (`serve`, https) remains the push-capable remote path.

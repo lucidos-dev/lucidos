@@ -340,9 +340,9 @@ pub(super) async fn push_unsubscribe(
 // ===== Test-only push log =====
 //
 // Backs the `expectPushSent` / `expectNoPushSent` helpers used by Playwright
-// e2e tests. The handler, the query/row types, and the route registration
-// in api/mod.rs are all gated on the `e2e-test-hooks` cargo feature; the
-// production binary never compiles them in. See
+// e2e tests. The handler, the query/row types, and the route registration in
+// this module's `router()` are all gated on the `e2e-test-hooks` cargo
+// feature; the production binary never compiles them in. See
 // system-knowhow/notifications.md §5.4.
 
 #[cfg(feature = "e2e-test-hooks")]

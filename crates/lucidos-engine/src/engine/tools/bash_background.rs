@@ -122,6 +122,14 @@ impl Stream {
         (text, std::mem::take(&mut self.dropped_unread))
     }
 
+    /// Bytes not yet handed to a reader, leaving the cursor where it is.
+    /// Test-only: lets `wait_for_stdout` poll for a flush without consuming
+    /// the output the test is about to drain.
+    #[cfg(test)]
+    fn peek_unread(&self) -> std::borrow::Cow<'_, str> {
+        String::from_utf8_lossy(&self.bytes[self.cursor.min(self.bytes.len())..])
+    }
+
     /// The whole retained buffer and everything the cap ever cut from it.
     /// Used for the final `BackgroundBashCompleted` record. Read-only: it
     /// leaves the cursor alone, so building the completion event cannot
@@ -576,6 +584,36 @@ impl BackgroundBashRegistry {
         })
     }
 
+    /// Test helper: poll-wait until the task's not-yet-read stdout contains
+    /// `needle` (or timeout). Peeks past the cursor instead of draining, so a
+    /// test that then drains still sees the bytes.
+    ///
+    /// Use this instead of sleeping before asserting on a subprocess's first
+    /// flush. A sleep long enough on an idle machine is not long enough under
+    /// the full suite, where thousands of tests contend for the CPU: three
+    /// tests here failed on exactly that race on 2026-08-05 and passed in
+    /// isolation seconds later. Polling also fixes the other direction, since
+    /// a fixed sleep can overshoot a later write the test asserts is absent.
+    #[cfg(test)]
+    pub async fn wait_for_stdout(&self, task_id: &str, needle: &str, timeout: Duration) -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            {
+                let tasks = self.tasks.lock().await;
+                if tasks
+                    .get(task_id)
+                    .is_some_and(|t| t.stdout.peek_unread().contains(needle))
+                {
+                    return true;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     /// Test helper: poll-wait until the task is marked finished (or
     /// timeout). Production callers don't need this: the dispatch site uses
     /// an event-emitting watcher driven by the spawn-time finish receiver.
@@ -770,8 +808,14 @@ mod tests {
             .await
             .expect("spawn");
 
-        // Wait for "a" to flush.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Wait for "a" to flush. Polled, not slept: a fixed wait is both too
+        // short under suite load (no "a" yet) and too long on a slow scheduler
+        // (the 0.3s "b" arrives too, which the next assert forbids).
+        assert!(
+            reg.wait_for_stdout(&task_id, "a", Duration::from_secs(5))
+                .await,
+            "the first echo never flushed",
+        );
         let first = reg
             .read_output_in_memory_wait(&task_id, Duration::ZERO)
             .await
@@ -1199,8 +1243,14 @@ mod tests {
             .await
             .expect("spawn");
 
-        // Wait for the echo to flush, then kill mid-sleep.
-        tokio::time::sleep(Duration::from_millis(200)).await;
+        // Wait for the echo to flush, then kill mid-sleep. Polled, not slept:
+        // under suite load a fixed wait kills before the first line lands, and
+        // the test then blames the kill for losing output that never arrived.
+        assert!(
+            reg.wait_for_stdout(&task_id, "hello-before-kill", Duration::from_secs(5))
+                .await,
+            "the echo never flushed, so this test cannot say what the kill did",
+        );
         assert!(reg.kill(&task_id).await);
 
         let finished = reg.wait_for_finish(&task_id, Duration::from_secs(8)).await;
@@ -1648,8 +1698,14 @@ mod tests {
             .await
             .expect("spawn");
 
-        // Wait for "a" to flush into the buffer.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // Wait for "a" to flush into the buffer. Polled, not slept: this test
+        // then measures that a ZERO wait does not block, which is only a
+        // meaningful measurement once there is something to return.
+        assert!(
+            reg.wait_for_stdout(&task_id, "a", Duration::from_secs(5))
+                .await,
+            "the echo never flushed",
+        );
 
         let start = std::time::Instant::now();
         let snap = reg

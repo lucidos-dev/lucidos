@@ -17,9 +17,14 @@
 #   1. the asset preflight exists, is full-mode-only, and is ordered BEFORE the
 #      launch step, so the install never starts against a release whose tarball
 #      has not been attached yet;
-#   2. its wait is BOUNDED and its poll interval is in the 30 to 60 s band;
-#   3. expiry fails immediately, naming the asset URL and the release-tarballs
-#      window, instead of falling through into the 900 s gateway poll;
+#   2. its wait is BOUNDED, its poll interval is in the 30 to 60 s band, and its
+#      ceiling stays SMALL: since 2026-08-04 the release is a draft until its
+#      tarballs are attached, so this waits out CDN propagation rather than a
+#      build, and re-inflating it to the old hour reds here;
+#   3. expiry fails immediately, naming the asset URL and release-tarballs, and
+#      saying that a published release is complete by construction (so the
+#      reader is not sent away to wait), instead of falling through into the
+#      900 s gateway poll;
 #   4. every parse in the preflight fails CLOSED, and the URL it probes is the
 #      one install.sh will really fetch (cross-checked against the tree's own
 #      install_common.sh + headless_tarball.sh);
@@ -200,11 +205,20 @@ for job in "${JOBS[@]}"; do
   ev_wait="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*FD_EXPECT_VERSION_WAIT_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
   ev_poll="$(printf '%s\n' "$code" | sed -n "s/^[0-9]*:[[:space:]]*FD_EXPECT_VERSION_POLL_SECS:[[:space:]]*'\([0-9]*\)'.*/\1/p" | head -n 1)"
 
+  # The UPPER bound is the interesting half since 2026-08-04. A release is now
+  # created as a DRAFT and published only once release-tarballs.yml has attached
+  # all four tarballs, so this preflight no longer waits for a build: it absorbs
+  # GitHub's asset propagation and nothing else. The budget was 1800 s, then
+  # 3600 s, both sized for the attach window that no longer exists, and the
+  # temptation on the next red run will be to raise it again. 900 s is the
+  # ceiling because past that the wait is hiding a real fault (a release
+  # published with --allow-missing-tarballs, or a deleted asset) instead of
+  # reporting it.
   if [ -n "$wait_secs" ] && [ -n "$poll_secs" ]; then
-    if [ "$poll_secs" -gt 0 ] && [ "$poll_secs" -le 60 ] && [ "$wait_secs" -ge 60 ] && [ "$wait_secs" -le 3600 ]; then
+    if [ "$poll_secs" -gt 0 ] && [ "$poll_secs" -le 60 ] && [ "$wait_secs" -ge 60 ] && [ "$wait_secs" -le 900 ]; then
       pass "the preflight budget is bounded and literal: wait ${wait_secs}s, poll ${poll_secs}s"
     else
-      fail "the preflight budget is out of band: wait ${wait_secs}s, poll ${poll_secs}s (want 0 < poll <= 60 <= wait <= 3600)"
+      fail "the preflight budget is out of band: wait ${wait_secs}s, poll ${poll_secs}s (want 0 < poll <= 60 <= wait <= 900). Raising it back to an hour is treating a broken release as a slow one: the release is a draft until its tarballs are attached, so nothing here waits for a build any more."
     fi
   else
     fail "FD_ASSET_WAIT_SECS / FD_ASSET_POLL_SECS are not both literal integers in this job's env (an unbounded or interpolated wait is exactly what this asserts against)"
@@ -218,7 +232,14 @@ for job in "${JOBS[@]}"; do
     exp_line="${expiry%%:*}"
     ok=1
     case "$expiry" in *'$tarball_url'*) ;; *) ok=0; fail "the expiry error does not name the tarball URL" ;; esac
-    case "$expiry" in *'release-tarballs'*) ;; *) ok=0; fail "the expiry error does not name release-tarballs, which is the window that explains it" ;; esac
+    case "$expiry" in *'release-tarballs'*) ;; *) ok=0; fail "the expiry error does not name release-tarballs, which is what produces the assets it is looking for" ;; esac
+    # And it must NOT read as "they are still attaching, wait longer", which was
+    # the honest advice under the old ordering and is misdirection under this
+    # one: a published release missing an asset is a fault, not a race.
+    case "$expiry" in
+      *'DRAFT'*) ;;
+      *) ok=0; fail "the expiry error does not say that a published release is complete by construction, so it still reads as 'the tarballs are on their way'" ;;
+    esac
     next="$(sed -n "$((exp_line + 1))p" "$WORKFLOW")"
     case "$next" in
       *'exit 1'*) ;;

@@ -58,3 +58,18 @@
     margin-bottom: 0.75rem;
     font-size: var(--font-size-xs);
 }
+
+/* "No <provider> account connected" + the button that fixes it. Same red as the
+   other blocked states on this page, but it is a row rather than a sentence,
+   because the fix lives on another Settings page and the user needs a way to
+   get there rather than a path to walk. Wraps so the button drops below the
+   text on a narrow pane instead of squeezing it. */
+.backup-not-connected-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex-wrap: wrap;
+    margin-bottom: var(--space-sm);
+    font-size: var(--font-size-xs);
+    color: var(--accent-red);
+}

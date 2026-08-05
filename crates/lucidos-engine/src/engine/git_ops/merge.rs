@@ -310,18 +310,65 @@ pub(crate) fn push_main_in_background(repo_root: &Path) {
     });
 }
 
+/// Characters that can continue a git ref name. Used to tell a mention of
+/// `feature` from one of `feature-2`, which merely contains it.
+fn is_ref_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/')
+}
+
+/// Does `line` mention `needle` as a whole ref token, i.e. not flanked by
+/// characters that would make it part of a longer branch name?
+///
+/// A plain `line.contains(branch)` is wrong here and the consequence is severe.
+/// Coding-agent branches are named `lucidos-<agent>-<scope>-<slug>` with `-2` /
+/// `-3` appended on a duplicate slug, so `…-fix-auth` is a literal prefix of
+/// `…-fix-auth-2`. Under a substring match, merging the `-2` branch would make
+/// [`find_branch_merge_in_main`] report the FIRST branch as already merged, and
+/// its caller (`apply_change`) would resolve that Apply as an idempotent no-op:
+/// the user clicks Apply, is told it already landed, and their commits never
+/// reach main. (The same hazard was already latent for `claude-code/foo` versus
+/// `claude-code/foobar`.)
+fn mentions_ref(line: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(needle) {
+        let start = from + rel;
+        let end = start + needle.len();
+        let bounded_left = line[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|c| !is_ref_char(c));
+        let bounded_right = line[end..].chars().next().is_none_or(|c| !is_ref_char(c));
+        if bounded_left && bounded_right {
+            return true;
+        }
+        // Overlapping occurrences are possible, so step past this match's FIRST
+        // CHARACTER rather than to `end`. By character, not by byte: git allows
+        // non-ASCII branch names (an adopted renegade branch in an external repo
+        // can carry one), and `start + 1` would land mid-codepoint and panic the
+        // next `line[from..]`.
+        from = start + line[start..].chars().next().map_or(1, char::len_utf8);
+    }
+    false
+}
+
 /// Check if a git log --oneline merge entry represents merging `branch_name` INTO main,
 /// not the reverse (merging main into the branch). Git merge commit messages follow these patterns:
 /// - "abc1234 Merge branch 'feature-branch'" -- branch merged into current (main)
 /// - "abc1234 Merge feature-branch: description" -- branch merged with custom message
 /// - "abc1234 Merge branch 'main' into feature-branch" -- WRONG direction (main into branch)
+///
+/// Both halves match on whole ref tokens (see [`mentions_ref`]), so a sibling
+/// branch that merely contains this one's name neither counts as a merge of it
+/// nor suppresses one.
 pub(crate) fn is_merge_of_branch_into_main(line: &str, branch_name: &str) -> bool {
-    if !line.contains(branch_name) {
+    if !mentions_ref(line, branch_name) {
         return false;
     }
     // Reject "into <branch>" pattern -- that's merging something INTO the branch, not FROM it
-    let into_pattern = format!("into {}", branch_name);
-    if line.contains(&into_pattern) {
+    if mentions_ref(line, &format!("into {}", branch_name)) {
         return false;
     }
     true
@@ -484,7 +531,7 @@ pub(crate) async fn detect_origin_default_branch(repo_root: &Path) -> Option<Str
 ///
 /// The new worktree's branch must NEVER inherit whatever the shared repo
 /// checkout happens to have at `HEAD`. A primary checkout parked on an unrelated
-/// in-flight `claude-code/*` branch would otherwise leak that branch's commits
+/// in-flight `lucidos-*` branch would otherwise leak that branch's commits
 /// into the new thread as phantom "pending changes" — a thread that did nothing
 /// surfaces a multi-file diff it never authored. Always resolve an explicit base:
 ///

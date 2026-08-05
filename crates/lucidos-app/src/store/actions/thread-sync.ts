@@ -43,7 +43,7 @@ import { focusThread } from './threads';
 import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
-import { loadAllThreads, refreshThreadEvents, loadThreadEvents } from './thread-loading';
+import { loadAllThreads, refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
 import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft } from './compose';
 import type { ComposeSelectionOverride } from '../composeSelections';
 import { clearDraft, setDraft } from '../composeDrafts';
@@ -201,7 +201,16 @@ export function connectThreadEvents(): void {
     let parsed: Record<string, unknown>;
     try {
       parsed = JSON.parse(msg.data);
-    } catch {
+    } catch (err) {
+      // Telemetry carve-out (.claude/rules/frontend.md): an unparseable SSE
+      // frame arrives without user intent and names no user-facing operation,
+      // so there is nothing honest to toast about. Self-recovery: the stream
+      // stays open and the next frame is handled normally, and any state the
+      // dropped frame carried is re-read by the resync on the next reconnect /
+      // wake (`resyncLoadedThreads`). Logged rather than swallowed so a
+      // malformed envelope is diagnosable instead of looking like an event the
+      // backend never sent.
+      console.warn('[SSE] dropping unparseable frame', err);
       return;
     }
 
@@ -263,15 +272,26 @@ export function connectThreadEvents(): void {
   };
 }
 
-/** Refetch thread metadata + missed events for every loaded thread.
- *  Called when SSE drops + reconnects, or when the backend signals `Lagged`
+/** Refetch thread metadata for every thread, and missed events for the focused
+ *  one. Called when SSE drops + reconnects, or when the backend signals `Lagged`
  *  (its broadcast subscriber fell behind the buffer and dropped events).
  *  Without this, a tab that misses `ResponseGenerated` shows the "Thinking"
- *  spinner indefinitely while the backend has long since gone idle. */
+ *  spinner indefinitely while the backend has long since gone idle.
+ *
+ *  That spinner is repaired by the METADATA half: the drawer's status dot, its
+ *  sections and its badges all read `meta.status`, which the one `loadAllThreads`
+ *  request below refreshes for every thread it returns. The per-thread event
+ *  fetch matters only for the transcript on screen, so every other loaded thread
+ *  is marked stale here and refreshed when the user opens it. */
 export function resyncLoadedThreads(): Promise<void> {
   if (resyncInFlight) return resyncInFlight;
   resyncInFlight = (async () => {
     try {
+      // Before the metadata read, because only a fetch that STARTS after a mark
+      // may clear it (see `staleMarkedAtToken`): a thread `loadAllThreads`
+      // eagerly LOADS below (a newly-active one) has to be on the far side of
+      // this line to clear its own mark on landing.
+      markLoadedThreadsStale();
       // Refresh thread-level metadata (status, section, message_count) first
       // so any per-thread refresh sees the authoritative state. `loadAllThreads`
       // REJECTS on a failed GET and has no Loadable or toast of its own, so
@@ -291,10 +311,19 @@ export function resyncLoadedThreads(): Promise<void> {
           });
         }
       }
-      const ids = [...threadMap.value.values()]
-        .filter((t) => t.eventsLoaded)
-        .map((t) => t.meta.id);
-      await Promise.all(ids.map((id) => refreshThreadEvents(id)));
+      // One request, for the thread on screen. This used to be one per loaded
+      // thread, four at a time, which on a large workspace an SSE drop re-ran in
+      // full on every 3s reconnect, down a link that had just come back. The
+      // metadata read above is what actually repairs the drawer; the rest of the
+      // marks are consumed by `refreshStaleThreadEvents` on focus.
+      //
+      // After the metadata read, deliberately, so the refresh sees the
+      // authoritative state. Coalesced against a concurrent wake resync, and
+      // `refreshThreadEvents` surfaces its own failures.
+      const focused = focusedThreadId.value;
+      if (focused && threadMap.value.get(focused)?.eventsLoaded) {
+        await refreshThreadEvents(focused, { coalesce: true });
+      }
     } finally {
       resyncInFlight = null;
     }
@@ -444,6 +473,13 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
   if (thread.eventsLoadFailed && seq != null) {
     thread.eventsLoadFailed = false;
     metaChanged = true;
+    // The flag is also the ONLY thing that puts a thread into `runResumeSync`'s
+    // failed-load retry set, so clearing it here is the thread's last exit from
+    // that queue: with `eventsLoaded` still false it now belongs to neither
+    // collection, and nothing will fetch it again to retract its card. This
+    // block's own premise (SSE is delivering persisted events for this thread)
+    // is exactly the evidence that the failure is over, so retract it here.
+    forgetThreadEventsFailures(threadId);
   }
 
   // seq from SSE: present (number > 0) for persisted events, absent for transient

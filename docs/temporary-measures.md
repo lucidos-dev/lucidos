@@ -500,6 +500,34 @@ condition; fix the condition rather than acting on it.
   this measure and stay classified as `Failed`.
 - **Status:** active
 
+### CC `API Error` prefix as the transient-vs-permanent failure signal (auto-resume)
+
+- **Added:** 2026-08-05
+- **Lives in:** `crates/lucidos-engine/src/engine/agent_session/lifecycle.rs`
+  (`is_transient_api_failure`, read by `auto_resume_after_api_error`), covered by
+  `transient_api_failures_are_recognized_by_the_api_error_prefix` and
+  `deterministic_failures_are_not_transient` in
+  `crates/lucidos-engine/src/engine/agent_session/lifecycle_tests/watchdog.rs`.
+- **Impermanent because (tolerates):** Claude Code's `result` event exposes no
+  structured code for "the upstream connection died mid-response" as distinct
+  from "this turn is over and would fail the same way again". The only signal is
+  the human-readable text CC streams as the turn's final message, whose one
+  stable feature is a leading `API Error` (`API Error: Connection closed
+  mid-response.`, `API Error: Stream idle timeout - no chunks received`, `API
+  Error: 529 overloaded`). The engine keys the bounded auto-resume on that
+  prefix, so a wording change upstream would silently stop recovering the exact
+  failure this exists for. Same string contract as the `is_error: true` +
+  `subtype: "success"` row above, which is why both match the PREFIX rather than
+  a loose substring: they must agree on what the string means.
+- **Removal / resolution condition:** When Claude Code's `result` event carries a
+  structured transient/retryable signal (an error code, a `retryable` flag, a
+  stable `subtype` for a stream drop), switch `is_transient_api_failure` to read
+  it and keep the prefix only as a fallback for old CC versions, then drop the
+  fallback once the minimum supported CC version emits the structured field.
+  Verify by sampling recent CC `result` events with `is_error: true` and checking
+  every one carries the structured signal.
+- **Status:** active
+
 ### CSS font-variable aliases (`--font-family`, `--font` → `--font-ui`)
 
 - **Added:** 2026-06-25
@@ -823,6 +851,74 @@ event that retires it.
   workspace recipes for `--parent`), then remove the `parent` arg, the
   relation-resolution arm + warning in `spawn_thread.rs`, and the
   `parent_flag_still_works_with_deprecation_warning` test.
+- **Status:** active
+
+### `email:`-prefixed credential fallback in `get_email_password`
+
+- **Added:** 2026-08-05
+- **Lives in:** `crates/lucidos-engine/src/core/credentials.rs`
+  (`CredentialStore::get_email_password`: the
+  `service_name = $1 OR service_name = 'email:' || $1` disjunction and its
+  `ORDER BY (service_name = $1) DESC` preference for the unprefixed row), pinned by
+  `migration_strands_an_email_row_whose_bare_name_is_taken`.
+- **Impermanent because:** `20260805134838_drop_credential_name_prefixes_use_auth_type.sql`
+  strips the `email:` prefix so `auth_type = 'email_password'` is the only thing
+  marking a mailbox password. It cannot strip EVERY row: `email_password` lives
+  under the globally-unique arm of the new constraints, so a workspace holding both
+  an `email:work` mailbox password and a separate `work` API key would have the two
+  collide on one name. The migration leaves that row prefixed rather than aborting
+  and blocking engine startup, and this fallback is what keeps the stranded row's
+  mailbox working until the user resolves the duplicate. It is NOT permanent
+  back-compat: the migration names every skipped row in a `RAISE NOTICE`, so the
+  set is finite, known, and shrinking.
+- **Removal / resolution condition:** Once no workspace has an `email_password` row
+  whose `service_name` still starts with `email:`. Verify with
+  `SELECT service_name FROM credentials WHERE auth_type = 'email_password' AND service_name LIKE 'email:%'`
+  against each live workspace database, expecting zero rows, then drop the `OR` and
+  the `ORDER BY` from the query, and drop the stranded-row half of
+  `migration_strands_an_email_row_whose_bare_name_is_taken` (keep the half asserting
+  the migration does not clobber the same-named API key).
+- **Status:** active
+
+### `oauth:` prefix stripped from a caller-supplied credential name
+
+- **Added:** 2026-08-05
+- **Lives in:** `crates/lucidos-engine/src/core/oauth.rs`
+  (`client_provider_name`, the `strip_prefix("oauth:")`), reached from three
+  sites: the `request_credential` LLM tool
+  (`engine/tools/credentials.rs::requested_service_name`),
+  `POST /api/v1/credentials` (`api/settings.rs::create_credential`), and the
+  proxy's `api/proxy.rs::fetch_required_credential`, whose fallback covers a
+  `data/config/apis.json` entry that still names a credential
+  `oauth:<provider>`. That third site is the load-bearing one: `data/config/` is
+  user data no DB migration can rewrite, so a live config would otherwise 502 on
+  every request the moment the prefix migration runs (the `personal` workspace
+  had two such entries when this shipped). Pinned by
+  `client_provider_name_strips_a_legacy_prefix`,
+  `fetch_required_credential_tolerates_a_legacy_oauth_prefixed_name`, and
+  `fetch_required_credential_still_reports_a_genuinely_missing_one`.
+- **Impermanent because:** an `oauth_client` credential is named for the provider
+  alone now. The strip exists only because `oauth:<provider>` is still in
+  circulation as the spelling agents and workspace knowhow learned: the chat system
+  prompt advertised it for as long as the tool existed. A caller passing either
+  spelling has to land on ONE row, because the failure mode is the 2026-08-05
+  incident, where a mismatch left the user holding two credentials for one provider
+  and instructions to delete one by hand. This is a model-and-recipe tolerance
+  measure, not a naming rule: we would not want it if every caller read the current
+  docs.
+- **Removal / resolution condition:** Two independent halves, removable
+  separately. For the proxy fallback: once no live workspace's
+  `data/config/apis.json` names a credential `oauth:<provider>` (grep each
+  workspace's `data/config/`), drop the second attempt in
+  `fetch_required_credential` and its two tests, keeping the first attempt's
+  `get_oauth_client` leg, which is a real capability rather than a tolerance.
+  For the write-path strip: once no shipped prompt, `system-knowhow/**` file, or
+  workspace recipe still says `oauth:<provider>` (grep the tree and the live
+  workspaces' `data/knowhow/`), AND a sampling of the weakest models in the
+  *model registry* passes a bare provider name to `request_credential` unprompted
+  (see § 2's sampling rule), drop the `strip_prefix` and the
+  `client_provider_name_strips_a_legacy_prefix` test, keeping the lowercase/trim
+  normalization, which is a real rule rather than a tolerance.
 - **Status:** active
 
 ### `script_handshake` workspace-root script fallback
