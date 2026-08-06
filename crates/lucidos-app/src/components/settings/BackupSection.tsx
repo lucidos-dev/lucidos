@@ -2,7 +2,7 @@ import { type VNode } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { backupProgress, backupStatusVersion, showToast } from '../../store/store';
 import { grantOAuthScope } from '../../store/actions/oauth';
-import { PROVIDER_SCOPES, oauthProviderFor } from './backupProviderScopes';
+import { PROVIDER_SCOPES, oauthProviderFor, pickInitialProvider } from './backupProviderScopes';
 import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -233,23 +233,51 @@ export function BackupSection() {
   const [retentionLoaded, setRetentionLoaded] = useState(false);
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [granting, setGranting] = useState(false);
+  const [providerSaving, setProviderSaving] = useState(false);
 
   useEffect(() => {
     setProvidersLoadable({ status: 'loading' });
-    getBackupProviders().then((p) => {
-      setProvidersLoadable({ status: 'loaded', data: p });
-      if (p.length > 0) setSelectedProvider(p[0].id);
-    }).catch((err: unknown) => {
-      setProvidersLoadable(toFailed(err));
-    });
 
-    getBackupSchedule().then((s) => {
-      setSchedule(s.schedule || 'off');
-      setScheduleLoaded(true);
-    }).catch((err) => {
-      setScheduleLoaded(true);
-      showToast(`Failed to load backup schedule: ${errorDetail(err)}`, 'error');
-    });
+    // The registry and the configured destination are fetched concurrently but
+    // applied TOGETHER. Seeding from whichever settled first is what let the
+    // registry's first entry (always Google Drive) override a real
+    // `backup_provider`; settling both first also means the dropdown never
+    // renders one provider and then flips to another.
+    void (async () => {
+      const [providers, schedule] = await Promise.allSettled([
+        getBackupProviders(),
+        getBackupSchedule(),
+      ]);
+
+      setProvidersLoadable(
+        providers.status === 'fulfilled'
+          ? { status: 'loaded', data: providers.value }
+          : toFailed(providers.reason),
+      );
+
+      // `scheduleLoaded` means the value is KNOWN, not that the request
+      // settled. A failed read leaves `schedule` at its 'off' default, and one
+      // endpoint writes the schedule and the provider together, so treating
+      // that default as known would let a provider pick silently disable a real
+      // nightly backup. Unknown therefore hides the schedule control and blocks
+      // the provider write instead of guessing.
+      if (schedule.status === 'fulfilled') {
+        setSchedule(schedule.value.schedule || 'off');
+        setScheduleLoaded(true);
+      } else {
+        showToast(`Failed to load backup schedule: ${errorDetail(schedule.reason)}`, 'error');
+      }
+
+      // Either request failing degrades the seed rather than skipping it: the
+      // page still has to select something, and both failures are already
+      // surfaced above.
+      setSelectedProvider(
+        pickInitialProvider(
+          schedule.status === 'fulfilled' ? schedule.value.provider : null,
+          providers.status === 'fulfilled' ? providers.value : [],
+        ),
+      );
+    })();
 
     getBackupRetention().then((r) => {
       setRetention(String(r.keep));
@@ -421,6 +449,51 @@ export function BackupSection() {
     }
   }
 
+  /** Picking a destination is configuration, so it is persisted immediately.
+   *
+   *  It used to be view-only state, written to `backup_provider` only as a side
+   *  effect of changing the schedule. That is how the page and the preference
+   *  came to disagree in the first place.
+   *
+   *  The current schedule travels with it because one endpoint writes both
+   *  keys; sending anything else here would turn a destination change into a
+   *  silent schedule change. */
+  async function handleProviderChange(newProvider: string) {
+    const previous = selectedProvider;
+    if (!newProvider || newProvider === previous) return;
+    // The write carries the schedule too, so it cannot proceed on a guess. The
+    // dropdown is disabled in this state; the guard is here because the state
+    // is what makes the write unsafe, not the control.
+    if (!scheduleLoaded) return;
+    setSelectedProvider(newProvider);
+    setProviderSaving(true);
+    try {
+      try {
+        await setBackupSchedule(newProvider, schedule);
+      } catch (err) {
+        // ONLY a failed write rolls back. Leaving the dropdown on a destination
+        // the engine refused would make every control below it wrong again.
+        setSelectedProvider(previous);
+        showToast(`Failed to set backup provider: ${errorDetail(err)}`, 'error');
+        return;
+      }
+      // Written and persisted. Connected / ready is per provider, so the
+      // verdict has to be re-read or the page keeps answering Grant access and
+      // Back up now for the provider the user just navigated away from. A
+      // failure HERE is a stale verdict, not a failed write: rolling back would
+      // show a destination the engine is no longer configured for, and report a
+      // write that in fact succeeded as failed.
+      try {
+        const p = await getBackupProviders();
+        setProvidersLoadable({ status: 'loaded', data: p });
+      } catch (err) {
+        showToast(`Backup provider saved, but its status could not be refreshed: ${errorDetail(err)}`, 'error');
+      }
+    } finally {
+      setProviderSaving(false);
+    }
+  }
+
   async function handleScheduleChange(newSchedule: string) {
     if (!selectedProvider) return;
     setScheduleSaving(true);
@@ -456,6 +529,12 @@ export function BackupSection() {
 
   const providerInfo = selectedProviderInfo();
   const backingUp = progress !== null;
+  // `PUT /backup/schedule` writes backup_provider AND backup_schedule together,
+  // and each handler sends the other half from captured state. So an in-flight
+  // write of either one has to disable BOTH controls: change the provider, then
+  // the schedule before the first lands, and the later response overwrites one
+  // choice with its stale counterpart.
+  const backupPairSaving = providerSaving || scheduleSaving;
 
   return (
     <div class="settings-section">
@@ -484,8 +563,8 @@ export function BackupSection() {
         <Dropdown
           options={providerOptions}
           value={selectedProvider}
-          disabled={!loadedProviders}
-          onChange={(v) => setSelectedProvider(v)}
+          disabled={!loadedProviders || !scheduleLoaded || backupPairSaving}
+          onChange={(v) => void handleProviderChange(v)}
         />
         {providersLoadable.status === 'failed' && (
           <span class="error-text">Failed to load providers: {providersLoadable.error}</span>
@@ -546,7 +625,7 @@ export function BackupSection() {
           <Dropdown
             options={SCHEDULE_OPTIONS}
             value={schedule}
-            disabled={scheduleSaving || !selectedProvider}
+            disabled={backupPairSaving || !selectedProvider}
             onChange={handleScheduleChange}
           />
         )}

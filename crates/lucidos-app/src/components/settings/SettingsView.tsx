@@ -501,9 +501,9 @@ export function SettingsView() {
       // margin trick); a section-title anchor (no enclosing row) keeps the marker
       // on itself, where it's already padded uniformly.
       const markEl = (el.closest('.settings-row') as HTMLElement | null) ?? el;
-      // Shared navigation focus marker: a sticky background highlight that fades out
-      // on the user's next action (components/shared/focusMarker.ts). Same look as
-      // chat + plugins.
+      // Shared navigation focus marker: a sticky background highlight that dissolves
+      // on the user's next action, never before its hold has elapsed
+      // (components/shared/focusMarker.ts). Same look as chat + plugins.
       applyNavFocus(markEl);
       // Land keyboard focus on the targeted row's control (e.g. the Language
       // dropdown) so a Search Everywhere jump lands focus on the setting itself,

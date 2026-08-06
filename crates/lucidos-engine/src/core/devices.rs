@@ -88,6 +88,27 @@ impl DeviceStore {
         Ok((row.device, row.inserted))
     }
 
+    /// Does a row exist for this device id?
+    ///
+    /// The *attribution* probe, distinct from [`Self::display_name`] on purpose.
+    /// `display_name` collapses "no such device" and "the database is down"
+    /// into the same `None`, which is fine when the answer only picks a label
+    /// but wrong when it decides whether to accept a request: a transient
+    /// outage would then refuse the user's own chat sends. This returns the
+    /// error so the caller can name its fallback, per the UNKNOWN-is-not-a-no
+    /// rule in `.claude/rules/rust.md`.
+    ///
+    /// The one caller today is the human-attribution gate in
+    /// `api::chat::require_human_mode_is_attributed`, which treats `Err` as
+    /// attributed: a missed refusal costs a mis-labelled event, a false refusal
+    /// costs the user their message.
+    pub async fn is_registered(pool: &PgPool, id: &str) -> Result<bool, sqlx::Error> {
+        sqlx::query_scalar::<_, bool>("SELECT EXISTS (SELECT 1 FROM devices WHERE id = $1)")
+            .bind(id)
+            .fetch_one(pool)
+            .await
+    }
+
     /// Get the display name for a device (falls back to truncated ID if no name set).
     /// DB errors are logged and treated as "device not found" — caller falls back to None.
     pub async fn display_name(pool: &PgPool, id: &str) -> Option<String> {

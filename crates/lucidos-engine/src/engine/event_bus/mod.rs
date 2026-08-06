@@ -28,8 +28,9 @@ pub(super) const STATUS_FROM_PROPOSED_CHANGE: &str = "'idle'";
 /// The `status` values that are a **verdict about how the turn ended**, rather
 /// than a resting state the next event may freely overwrite. Both are written by
 /// exactly one place each: `'failed'` by `ResponseFailed` and by
-/// `AbortCause::status_sql()`'s non-transient arm, `'paused'` by that same
-/// function's transient arm (an engine restart interrupted the turn).
+/// `AbortCause::status_sql()`'s fall-through arm, `'paused'` by that same
+/// function's `promises_auto_resume` arm (the user's own *Switch to new version*
+/// interrupted the turn, and the engine is bringing it back).
 ///
 /// They share this list because they share the hazard: each is emitted at the
 /// moment a coding-agent turn dies, and each is followed by that turn's trailing

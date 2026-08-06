@@ -50,6 +50,39 @@ describe('computeAnchorPosition', () => {
     expect(pos.left).toBe(65);
   });
 
+  /** The prompt-bar popover regression, in its own shape. Both prompt-bar
+   *  indicators (subscription clock, todo list) sit near the LEFT of the
+   *  actions row, so the anchor is nowhere near the right edge and the panel
+   *  still cannot start at the anchor: it is nearly as wide as the phone. The
+   *  shell used to place these with `position: absolute; left: 0`, which has no
+   *  viewport to clamp against, and the panel's own countdown fell off the
+   *  right edge. Pins that a left-ish anchor with a wide panel is pulled BACK
+   *  toward the left margin, not left where it sits. */
+  it('pulls a wide panel back from a left-of-centre anchor on a phone', () => {
+    setViewport(393, 852); // iPhone 14 Pro
+    const clockButton = fakeAnchor({ top: 760, bottom: 796, left: 78, right: 114 });
+    const pos = computeAnchorPosition(clockButton, 300, 375);
+    // Unclamped this is left: 78, so the 375px panel would end at 453 on a
+    // 393px screen. Clamped: 393 - 375 - 8 = 10.
+    expect(pos.left).toBe(10);
+    // No room below a bottom-docked prompt bar, so it opens upward.
+    expect(pos.placement).toBe('top-start');
+  });
+
+  /** The flip has the same off-screen failure the horizontal clamp exists for,
+   *  one axis over. A tall panel above a bottom-docked anchor on a SHORT
+   *  viewport (landscape, or the keyboard shrinking the visual viewport) gets a
+   *  negative `top`, and unlike a horizontal overflow the user cannot scroll it
+   *  back: the panel's own scroll container has already moved off-screen. */
+  it('keeps a flipped panel on screen when there is not enough room above', () => {
+    setViewport(393, 400); // landscape-ish, keyboard open
+    const clockButton = fakeAnchor({ top: 300, bottom: 336, left: 78, right: 114 });
+    const pos = computeAnchorPosition(clockButton, 324, 320);
+    // Unclamped this is 300 - 324 - 4 = -28, with the panel's head off the top.
+    expect(pos.top).toBe(8);
+    expect(pos.placement).toBe('top-start');
+  });
+
   it('clamps to the left margin when the panel is wider than the viewport allows', () => {
     setViewport(360, 800);
     const pos = computeAnchorPosition(fakeAnchor({ top: 100, bottom: 120, left: 300, right: 340 }), 200, 380);
@@ -83,6 +116,82 @@ describe('computeAnchorPosition', () => {
       container,
     );
     expect(pos.left).toBe(80);
+  });
+
+  /** Clamping only helps a panel that FITS: a wider one pins to the leading
+   *  edge and overflows the far one. `maxWidth` is what a surface caps itself
+   *  with so that never happens, and it must describe the CONTAINER, not the
+   *  viewport, or a thread-pane popover on desktop is capped against a box
+   *  twice its size and half of it lands in the content pane. */
+  it('reports the container width, margins deducted, as the panel fit', () => {
+    setViewport(1280, 800);
+    const container = fakeAnchor({ top: 0, bottom: 800, left: 0, right: 500 }) as HTMLElement;
+    const pos = computeAnchorPosition(
+      fakeAnchor({ top: 100, bottom: 120, left: 80, right: 130 }),
+      200,
+      300,
+      container,
+    );
+    expect(pos.maxWidth).toBe(484); // 500 - 2 * 8
+  });
+
+  it('falls back to the viewport width for the fit when no container is given', () => {
+    setViewport(393, 852);
+    const pos = computeAnchorPosition(fakeAnchor({ top: 100, bottom: 120, left: 78, right: 114 }), 200, 300);
+    expect(pos.maxWidth).toBe(377); // 393 - 2 * 8
+  });
+
+  /** A collapsed pane (the maximize shortcut, fired while a popover is open)
+   *  is a zero-width container. Capping to it would render a zero-width panel:
+   *  invisible, while the overlay is still open and the UI behind it inert. */
+  it('falls back to the viewport when the container has collapsed to nothing', () => {
+    setViewport(1280, 800);
+    const collapsed = fakeAnchor({ top: 0, bottom: 800, left: 0, right: 0 }) as HTMLElement;
+    const pos = computeAnchorPosition(
+      fakeAnchor({ top: 100, bottom: 120, left: 0, right: 0 }),
+      200,
+      300,
+      collapsed,
+    );
+    expect(pos.maxWidth).toBe(1264); // 1280 - 2 * 8, not 0
+  });
+
+  /** The first measurement necessarily runs on the UNCAPPED panel, since the
+   *  cap is what this call produces. It still lands right: an over-wide panel
+   *  pins to the container's leading edge, which is exactly where it belongs
+   *  once it narrows to the reported fit. */
+  it('pins an over-wide panel where the capped panel will sit', () => {
+    setViewport(1280, 800);
+    const container = fakeAnchor({ top: 0, bottom: 800, left: 200, right: 700 }) as HTMLElement;
+    const pos = computeAnchorPosition(
+      fakeAnchor({ top: 100, bottom: 120, left: 240, right: 276 }),
+      200,
+      900, // wider than the 500px pane it opened in
+      container,
+    );
+    expect(pos.left).toBe(208); // container left + margin
+    expect(pos.maxWidth).toBe(484);
+    expect(pos.left + pos.maxWidth).toBe(692); // container right - margin
+  });
+
+  /** Why `useAnchoredPosition` watches the panel's own size (a ResizeObserver
+   *  feeding the same rAF-coalesced recompute), not just the viewport's.
+   *  Applying the fit above NARROWS the panel, which reflows its text onto more
+   *  lines and makes it TALLER, and for an upward-opening panel the height is
+   *  what `top` is derived from. Measured once at the uncapped height, the
+   *  panel would hang down over the prompt-bar button that opened it. */
+  it('re-derives top from the panel height, so a reflowed panel clears its anchor', () => {
+    setViewport(1280, 900);
+    const clockButton = fakeAnchor({ top: 800, bottom: 836, left: 300, right: 336 });
+    const container = fakeAnchor({ top: 0, bottom: 900, left: 200, right: 700 }) as HTMLElement;
+    const uncapped = computeAnchorPosition(clockButton, 120, 900, container);
+    const reflowed = computeAnchorPosition(clockButton, 220, 484, container);
+    expect(uncapped.placement).toBe('top-start');
+    expect(reflowed.placement).toBe('top-start');
+    // Held at the stale `top`, the taller panel would end 100px past the
+    // anchor's top edge; re-measured, its bottom sits just above the anchor.
+    expect(uncapped.top + 220).toBeGreaterThan(clockButton.getBoundingClientRect().top);
+    expect(reflowed.top + 220).toBeLessThanOrEqual(clockButton.getBoundingClientRect().top);
   });
 
   it("align 'end' aligns the panel's right edge with the anchor's right edge", () => {

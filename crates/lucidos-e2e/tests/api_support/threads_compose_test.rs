@@ -618,3 +618,188 @@ async fn post_threads_rejects_unknown_mode() {
         .expect("POST failed");
     assert_eq!(resp.status(), 400, "unknown mode must be 400 Bad Request");
 }
+
+// --- The compose write fence (`compose_epoch`) ---
+//
+// A compose write composed BEFORE a submission must never be applied AFTER it.
+// Without the fence, a draft PUT stalled by a bad connection lands after the
+// message it preceded and rewrites the draft the send just consumed, so the
+// message reads as sent while the composer still holds a stale revision of it
+// (reported 2026-08-06 from the iOS PWA).
+//
+// These tests move `compose_epoch` directly rather than sending a real message:
+// the endpoint contract is what is under test here, and which projection arms
+// advance the epoch is covered by the engine's own projection tests
+// (`event_bus_tests::thread_state_and_eviction`). Doing it in SQL also keeps
+// the case deterministic and free of an LLM round trip.
+
+/// Stand in for a submission consuming the thread's compose slot.
+async fn consume_compose_slot(pool: &sqlx::PgPool, thread_id: Uuid) {
+    sqlx::query(
+        "UPDATE thread_summaries \
+         SET compose_epoch = compose_epoch + 1, compose_text = '' \
+         WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(pool)
+    .await
+    .expect("consume compose slot");
+}
+
+async fn fetch_compose_epoch(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT compose_epoch FROM thread_summaries WHERE thread_id = $1")
+        .bind(thread_id)
+        .fetch_one(pool)
+        .await
+        .expect("compose_epoch query")
+}
+
+#[tokio::test]
+async fn put_compose_at_a_consumed_epoch_is_refused_and_changes_nothing() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /api/v1/threads failed");
+
+    // The client's draft PUT, composed at epoch 0.
+    let stale_body = json!({ "text": "You can have both", "compose_epoch": 0 });
+    let resp = client
+        .put(compose_url(&id))
+        .json(&stale_body)
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(resp.status(), 204, "the first write is at the live epoch");
+
+    consume_compose_slot(&pool, id).await;
+
+    // The same write, arriving late. This is the replay the stalled link
+    // produces, and it must not resurrect the draft.
+    let resp = client
+        .put(compose_url(&id))
+        .json(&stale_body)
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(
+        resp.status(),
+        412,
+        "a write composed before the submission must be refused, got {}",
+        resp.status()
+    );
+    let body: serde_json::Value = resp.json().await.expect("412 body");
+    assert_eq!(
+        body["compose_epoch"].as_i64(),
+        Some(1),
+        "the refusal must hand back the current epoch so the client can re-issue"
+    );
+
+    let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
+    assert_eq!(text, "", "the refused write must not have been applied");
+}
+
+#[tokio::test]
+async fn put_compose_at_the_current_epoch_is_applied() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /api/v1/threads failed");
+    consume_compose_slot(&pool, id).await;
+
+    // The client heard about the submission and re-composed against epoch 1,
+    // which is what the 412 above tells it to do.
+    let resp = client
+        .put(compose_url(&id))
+        .json(&json!({ "text": "a genuinely new follow-up", "compose_epoch": 1 }))
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(resp.status(), 204);
+
+    let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
+    assert_eq!(text, "a genuinely new follow-up");
+}
+
+#[tokio::test]
+async fn consecutive_compose_puts_at_one_epoch_are_all_accepted() {
+    // The keystroke path. The epoch counts SUBMISSIONS, not writes, so every
+    // PUT between two submissions carries the same value and none of them may
+    // fence out the next. A per-write counter would break typing outright.
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /api/v1/threads failed");
+
+    for text in ["a", "ab", "abc"] {
+        let resp = client
+            .put(compose_url(&id))
+            .json(&json!({ "text": text, "compose_epoch": 0 }))
+            .send()
+            .await
+            .expect("PUT compose failed");
+        assert_eq!(
+            resp.status(),
+            204,
+            "keystroke write `{text}` was fenced out"
+        );
+    }
+
+    let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
+    assert_eq!(text, "abc");
+    assert_eq!(
+        fetch_compose_epoch(&pool, id).await,
+        0,
+        "a compose write must not move the epoch"
+    );
+}
+
+#[tokio::test]
+async fn put_compose_without_an_epoch_is_unfenced() {
+    // Permanent back-compat: a cached PWA bundle running against a newer engine
+    // cannot know to send an epoch, and refusing its writes would break draft
+    // sync outright for it.
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to e2e db");
+    let id = Uuid::new_v4();
+    client
+        .post(threads_url())
+        .json(&json!({ "id": id, "mode": "lucidos" }))
+        .send()
+        .await
+        .expect("POST /api/v1/threads failed");
+    consume_compose_slot(&pool, id).await;
+
+    let resp = client
+        .put(compose_url(&id))
+        .json(&json!({ "text": "from a client that predates the fence" }))
+        .send()
+        .await
+        .expect("PUT compose failed");
+    assert_eq!(resp.status(), 204);
+
+    let (_state, text, _images, _mode) = fetch_compose_row(&pool, id).await;
+    assert_eq!(text, "from a client that predates the fence");
+}

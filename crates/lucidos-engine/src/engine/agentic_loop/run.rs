@@ -76,11 +76,19 @@ impl LucidosEngine {
         // force-evict can't decrement a newer turn's unread count. Travels
         // with `injection_rx` — the two describe the same registration.
         injection_generation: u64,
-        // Set to true at every terminator emission so the post-loop guard
-        // in `chat::process` can skip its `payload->>'request_event_id'`
-        // existence check on the success path. The check has no functional
-        // index and would walk every event in long-lived threads otherwise.
-        terminator_emitted: &mut bool,
+        // Set to true once this turn's ENDING is accounted for, so the
+        // post-loop guard in `chat::process` can skip its
+        // `payload->>'request_event_id'` existence check. The check has no
+        // functional index and would walk every event in long-lived threads
+        // otherwise.
+        //
+        // "Settled" rather than "emitted" because there are two ways to
+        // account for an ending: emit a terminator (every branch below but
+        // one), or park on an `await_event` wait, which deliberately emits
+        // NONE. A parked thread has not finished, so a synthesized
+        // `ResponseAborted` would report it as interrupted and drag it out of
+        // `waiting_for_event`.
+        terminator_settled: &mut bool,
         capture_seed: ContextCaptureSeed<'_>,
         // The firing trigger's declared side-effect grant (ADR 0002, Phase 5).
         // Empty for chat turns. Consulted by the command guard only on the
@@ -190,7 +198,7 @@ impl LucidosEngine {
                     &self.event_bus,
                     &self.pool,
                     thread_id,
-                    crate::engine::thread_events::CancelCause::UserStop,
+                    cancel_cause_for_turn(self, thread_id),
                     String::new(),
                     images.clone(),
                     effective_model.clone(),
@@ -199,7 +207,7 @@ impl LucidosEngine {
                     "[AgenticLoop] ResponseCanceled (cancel pre-iter)",
                 )
                 .await;
-                *terminator_emitted = true;
+                *terminator_settled = true;
                 return Ok(terminal_result(
                     String::new(),
                     images,
@@ -239,7 +247,7 @@ impl LucidosEngine {
                     cap_message,
                 )
                 .await;
-                *terminator_emitted = true;
+                *terminator_settled = true;
                 return Ok(terminal_result(
                     msg,
                     images,
@@ -432,7 +440,7 @@ impl LucidosEngine {
                                 },
                                 "[AgenticLoop] ResponseFailed",
                             ).await;
-                            *terminator_emitted = true;
+                            *terminator_settled = true;
                             return Err(e);
                         }
                     }
@@ -461,7 +469,7 @@ impl LucidosEngine {
                         &self.event_bus,
                         &self.pool,
                         thread_id,
-                        crate::engine::thread_events::CancelCause::UserStop,
+                        cancel_cause_for_turn(self, thread_id),
                         partial.clone(),
                         images.clone(),
                         effective_model.clone(),
@@ -470,7 +478,7 @@ impl LucidosEngine {
                         "[AgenticLoop] ResponseCanceled",
                     )
                     .await;
-                    *terminator_emitted = true;
+                    *terminator_settled = true;
                     return Ok(terminal_result(
                         partial,
                         images,
@@ -922,7 +930,7 @@ impl LucidosEngine {
                         )
                         .await;
 
-                    *terminator_emitted = true;
+                    *terminator_settled = true;
                     return Ok(terminal_result(
                         clean_response,
                         images,
@@ -1016,7 +1024,7 @@ impl LucidosEngine {
                         .await;
                 }
 
-                *terminator_emitted = true;
+                *terminator_settled = true;
                 return Ok(terminal_result(
                     String::new(),
                     images,
@@ -1131,7 +1139,7 @@ impl LucidosEngine {
                                 },
                                 "[AgenticLoop] ResponseGenerated (force-break)",
                             ).await;
-                            *terminator_emitted = true;
+                            *terminator_settled = true;
                             return Ok(terminal_result(
                                 msg.to_string(),
                                 images,
@@ -1187,7 +1195,7 @@ impl LucidosEngine {
                                 "[AgenticLoop] ResponseGenerated (read_file force-break)",
                             )
                             .await;
-                        *terminator_emitted = true;
+                        *terminator_settled = true;
                         return Ok(terminal_result(
                             msg,
                             images,
@@ -1251,7 +1259,7 @@ impl LucidosEngine {
                                 "[AgenticLoop] ResponseGenerated (generic force-break)",
                             )
                             .await;
-                        *terminator_emitted = true;
+                        *terminator_settled = true;
                         return Ok(terminal_result(
                             msg,
                             images,
@@ -1286,7 +1294,7 @@ impl LucidosEngine {
                 last_call_was_error = false;
             }
 
-            for tool_call in &response.tool_calls {
+            for tool_call in response.tool_calls.iter() {
                 // Count the CALL, not the round. One response can carry several
                 // tool calls (the system prompt asks for exactly that when
                 // writing N files), so counting iterations would let a cap of
@@ -1343,6 +1351,62 @@ impl LucidosEngine {
                     judge_cache: &mut command_guard_judge_cache,
                     trigger_grant: trigger_side_effect_grant,
                 };
+                // `await_event`: registers a subscription and returns, like any
+                // other tool (ADR 0047). It is handled here rather than in
+                // `handle_special_tool` only because it needs the thread id and
+                // the raw `tool_use` id to record the wait against.
+                //
+                // It used to END the turn, leaving this `ToolCalled` unpaired so
+                // a delivered event could fill it in later. That shape is gone:
+                // an unpaired `tool_use` is a provider 400 the moment anything
+                // else runs on the thread, and every mechanism that existed to
+                // keep one alive (detach-on-interruption, the attachment probe,
+                // two wake-anchor kinds, a restart guard) existed only to pay
+                // for it. A wake is now an ordinary new turn, so a subscribed
+                // thread is simply idle.
+                if tool_call.name == tn::AWAIT_EVENT {
+                    let (result, success) = match self
+                        .register_event_wait(thread_id, &tool_call.id, &tool_call.arguments)
+                        .await
+                    {
+                        crate::engine::event_wait::AwaitEventOutcome::Registered(msg) => {
+                            (msg, true)
+                        }
+                        // The model reads the refusal and can act on it in this
+                        // same turn, which is the entire advantage `await_event`
+                        // has over a trigger's silent footgun.
+                        crate::engine::event_wait::AwaitEventOutcome::Refused(msg) => {
+                            last_call_was_error = true;
+                            had_errors = true;
+                            (msg, false)
+                        }
+                    };
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                                    name: tool_call.name.clone(),
+                                    result: result.clone(),
+                                    images: vec![],
+                                    success,
+                                    tool_called_event_id,
+                                },
+                                meta: meta.clone(),
+                            },
+                            "[AgenticLoop] ToolResult (await_event)",
+                        )
+                        .await;
+                    tool_outputs.push((tool_call.id.clone(), result));
+                    continue;
+                }
+
+                // Set when the guard took a checkpoint before this call (ADR
+                // 0002, Phase 4). The bracket is closed right after the outcome
+                // lands, below: only then is it known what the command changed.
+                let mut pending_checkpoint: Option<
+                    crate::engine::command_guard::PendingCheckpoint,
+                > = None;
                 let outcome: crate::engine::tools::ToolOutcome = match self
                     .command_guard_decision(
                         &mut command_guard_ctx,
@@ -1363,7 +1427,14 @@ impl LucidosEngine {
                         trigger_fail_reason = Some(reason.clone());
                         Err(reason)
                     }
-                    crate::engine::command_guard::GuardDecision::Proceed => {
+                    decision @ (crate::engine::command_guard::GuardDecision::Proceed
+                    | crate::engine::command_guard::GuardDecision::ProceedCheckpointed(_)) => {
+                        if let crate::engine::command_guard::GuardDecision::ProceedCheckpointed(
+                            pending,
+                        ) = decision
+                        {
+                            pending_checkpoint = Some(pending);
+                        }
                         if let Some(r) = self
                             .handle_special_tool(
                                 &tool_call.name,
@@ -1415,6 +1486,15 @@ impl LucidosEngine {
                     Ok(text) => (text, false),
                     Err(text) => (text, true),
                 };
+
+                // Close the checkpoint bracket. Deliberately outside the
+                // success test: a command that failed or was cancelled midway
+                // is exactly the one whose partial destruction the user wants
+                // back, and the post image is what says how far it got.
+                if let Some(pending) = pending_checkpoint.take() {
+                    self.finalize_command_checkpoint(pending, thread_id, &meta)
+                        .await;
+                }
 
                 // Carry this single call's outcome to the next iteration so the
                 // generic breaker's failure streak only grows on repeated
@@ -1610,7 +1690,7 @@ impl LucidosEngine {
                         "[AgenticLoop] ResponseFailed (trigger side-effect not granted)",
                     )
                     .await;
-                *terminator_emitted = true;
+                *terminator_settled = true;
                 return Err(reason.into());
             }
 

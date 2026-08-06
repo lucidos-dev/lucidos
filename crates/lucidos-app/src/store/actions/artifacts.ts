@@ -174,12 +174,17 @@ export function normalizeUrl(url: string): string {
   try { return new URL(url).href; } catch { return url; }
 }
 
-export function openUrl(url: string): void {
+/** `source` says where a navigate that the user did NOT click originated (a
+ *  thread label, or "an app"), so a "couldn't open it" toast names what asked
+ *  instead of appearing out of nowhere. Same shape as `openAppById`'s. */
+export function openUrl(url: string, source?: string): void {
   const normalized = normalizeUrl(url);
+  const from = source ? ` (requested by ${source})` : '';
   if (!isTauri()) {
     // Browser + PWA: a new tab, except on an installed iOS PWA where that would
-    // be the inescapable in-app web view. See utils/openExternalUrl.ts.
-    openExternalUrl(normalized);
+    // be the inescapable in-app web view. See utils/openExternalUrl.ts, which
+    // owns the toast for a tab the browser refused to open.
+    openExternalUrl(normalized, source);
     return;
   }
   // Experimental in-app browser (the Tauri native webview) is opt-in. Off by
@@ -188,7 +193,7 @@ export function openUrl(url: string): void {
   // in-app url-preview panel below.
   if (!currentInAppBrowser()) {
     void openExternal(normalized).catch((err) =>
-      showToast(`Couldn't open ${normalized}: ${errorDetail(err)}`, 'error'),
+      showToast(`Couldn't open ${normalized}${from}: ${errorDetail(err)}`, 'error'),
     );
     return;
   }

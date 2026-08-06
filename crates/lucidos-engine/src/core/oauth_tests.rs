@@ -1311,6 +1311,60 @@ fn callback_page_renders_no_provider_supplied_text() {
     assert!(page.contains("&lt;script&gt;"), "{page}");
 }
 
+/// The page reaches for nothing over the network.
+///
+/// It is served by a one-shot loopback listener that holds no engine URL, so a
+/// linked stylesheet would trade a certain render for a conditional one on the
+/// last screen of the flow; and a redirect landing page that phones anywhere is
+/// a privacy surface. Both are avoided the same way: inline CSS, and the mark
+/// as inline SVG rather than an `<img>`.
+///
+/// The mark's `xmlns` is the one allowed exception, and only in the exact form
+/// the SVG spec fixes. It is a namespace IDENTIFIER, never resolved by any user
+/// agent, and it comes along with `include_str!`ing the real `favicon.svg`
+/// instead of keeping a hand-stripped copy. Everything else URL-shaped is a
+/// fetch and is refused.
+#[test]
+fn callback_page_fetches_nothing() {
+    const SVG_NS: &str = "xmlns=\"http://www.w3.org/2000/svg\"";
+    for ok in [true, false] {
+        let page = callback_page("dropbox", ok);
+        for needle in ["<link", "<script", "src=", "@import", "url(http"] {
+            assert!(
+                !page.contains(needle),
+                "the callback page must be self-contained, found {needle}: {page}"
+            );
+        }
+        // Strip the one permitted identifier, then no URL may remain anywhere.
+        let rest = page.replace(SVG_NS, "");
+        for needle in ["http://", "https://"] {
+            assert!(
+                !rest.contains(needle),
+                "the only URL-shaped text allowed is the SVG namespace, found {needle}: {page}"
+            );
+        }
+    }
+}
+
+/// The page wears the Lucidos brand surface, so a user landing on it can tell
+/// at a glance that it is ours rather than the provider's. It could not before:
+/// the palette was a flat `#16181d` grey belonging to no product, and someone
+/// completing a real authorization asked whether the tab was Dropbox's.
+///
+/// Pinned against `styles/picker.css` `.ws-picker`, the repo's existing
+/// standalone-screen treatment, whose values this page copies.
+#[test]
+fn callback_page_wears_the_brand_surface() {
+    let page = callback_page("dropbox", true);
+    // The picker's gradient stops, and the mark itself.
+    assert!(page.contains("#4a97ee"), "{page}");
+    assert!(page.contains("#0c52ad"), "{page}");
+    assert!(page.contains("<svg"), "the mark is rendered: {page}");
+    assert!(page.contains("lucidosBrand"), "{page}");
+    // The palette it replaced, which matched neither the app nor the brand.
+    assert!(!page.contains("#16181d"), "{page}");
+}
+
 /// A blank provider (a flow whose name never made it this far) must not render
 /// an empty `<title>` or a stray label.
 #[test]

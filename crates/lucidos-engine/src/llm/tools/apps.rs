@@ -1,5 +1,5 @@
 //! LLM-facing schemas for app-management tools (create/list/refresh/capture,
-//! load_knowhow, refresh_file).
+//! load_knowhow).
 
 use crate::llm::provider::ToolDefinition;
 use crate::llm::tool_names as tn;
@@ -54,20 +54,6 @@ pub(super) fn app_tools() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["id"]
-            }),
-        },
-        ToolDefinition {
-            name: tn::REFRESH_FILE.to_string(),
-            description: "Refresh the user's file preview window to show updated content. Call this after writing/editing a file that the user has open.".to_string(),
-            parameters: json!({
-                "type": "object",
-                "properties": {
-                    "path": {
-                        "type": "string",
-                        "description": "File path to refresh (e.g., artifacts/notes.md)"
-                    }
-                },
-                "required": ["path"]
             }),
         },
         ToolDefinition {

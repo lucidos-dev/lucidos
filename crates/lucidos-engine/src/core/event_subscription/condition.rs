@@ -1,8 +1,16 @@
-//! Condition evaluator for event triggers.
+//! Condition evaluator for event subscriptions.
 //!
 //! Evaluates a JSON condition against an event payload.
 //! Supports operators: $eq, $ne, $lt, $lte, $gt, $gte, $in.
 //! A bare value (no operator) is treated as $eq.
+//!
+//! **One predicate language, two consumers.** This lived under `triggers/` when
+//! a trigger was the only thing that could subscribe to an event. A thread's
+//! *event wait* subscribes with the same shape, so the evaluator moved here
+//! rather than being duplicated: a `condition` that matches for a trigger must
+//! match for a wait, and the only way to guarantee that is one function. See
+//! [`super::EventSubscription::matches`], which is the sole caller both
+//! dispatch paths go through.
 
 use serde_json::Value;
 

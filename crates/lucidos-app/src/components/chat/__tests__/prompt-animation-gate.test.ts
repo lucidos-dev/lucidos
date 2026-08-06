@@ -13,7 +13,7 @@ function makeThreadState(id: string): ThreadState {
   events.set(1, { type: 'MessageReceived', text: 'hello', channel: 'chat', created: '2026-01-01T00:00:00Z' });
   events.set(2, { type: 'ResponseGenerated', text: 'hi back', created: '2026-01-01T00:00:01Z' });
   return {
-    meta: { id, title: 'Test', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, state: 'active', latestTodoList: null },
+    meta: { id, title: 'Test', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
     events,
     streamingBuffer: '',
     eventsLoaded: true,
@@ -122,7 +122,7 @@ describe('promptAnimating gate', () => {
     events.set(1, { type: 'MessageReceived', text: 'hello', channel: 'chat', created: '2026-01-01T00:00:00Z' });
 
     const state: ThreadState = {
-      meta: { id, title: '', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, state: 'active', latestTodoList: null },
+      meta: { id, title: '', channel: 'chat', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 1, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events,
       streamingBuffer: '',
       eventsLoaded: true,

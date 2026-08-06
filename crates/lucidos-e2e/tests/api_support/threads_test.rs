@@ -1,11 +1,11 @@
 use crate::support::{
-    base_url, db_url, http_client, poll_thread_summary_by_marker, poll_threads_until_archive,
-    unique_marker,
+    base_url, db_url, poll_thread_summary_by_marker, poll_threads_until_archive, unique_marker,
+    user_client,
 };
 
 #[tokio::test]
 async fn threads_list_returns_expected_shape() {
-    let client = http_client();
+    let client = user_client().await;
     let url = format!("{}/api/v1/threads", base_url());
 
     let resp = client
@@ -35,7 +35,7 @@ async fn threads_list_returns_expected_shape() {
 
 #[tokio::test]
 async fn thread_appears_after_sending_message() {
-    let client = http_client();
+    let client = user_client().await;
     let marker = unique_marker("api-threads-list");
 
     // Send a message to create a thread
@@ -71,7 +71,7 @@ async fn thread_appears_after_sending_message() {
 
 #[tokio::test]
 async fn thread_messages_endpoint_returns_events() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -127,7 +127,7 @@ async fn thread_messages_endpoint_returns_events() {
 
 #[tokio::test]
 async fn disk_usage_worktrees_returns_inventory_shape() {
-    let client = http_client();
+    let client = user_client().await;
     let url = format!("{}/api/v1/disk-usage/worktrees", base_url());
 
     let resp = client
@@ -155,7 +155,7 @@ async fn disk_usage_worktrees_returns_inventory_shape() {
 
 #[tokio::test]
 async fn thread_save_and_unsave() {
-    let client = http_client();
+    let client = user_client().await;
     let marker = unique_marker("api-save");
 
     // Create a thread

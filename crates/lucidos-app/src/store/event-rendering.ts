@@ -4,9 +4,21 @@
  */
 import type { ResponseEvent } from './types';
 
+/** True when a streamed text chunk puts something on screen.
+ *
+ *  Blank chunks are not a curiosity, they are the norm on a coding-agent
+ *  thread: every `CodingAgentToolCalled` is preceded by a whitespace-only
+ *  `CodingAgentTextStreamed`. The renderer already drops them (`ChatExchange`
+ *  skips a text event with no `md.trim()`), so anything that treats a text
+ *  chunk as "the model produced output" has to ask this first, or it acts on
+ *  output the user never sees. */
+export function hasVisibleText(text: string | undefined): boolean {
+  return !!text && text.trim().length > 0;
+}
+
 /** True when `e` is a text event whose markdown is non-empty after trimming. */
 export function isMeaningfulText(e: ResponseEvent): boolean {
-  return e.type === 'text' && e.md.trim().length > 0;
+  return e.type === 'text' && hasVisibleText(e.md);
 }
 
 /** True when an in-progress step is actually rendered on screen — steps are
@@ -26,12 +38,18 @@ export function hasVisibleLiveStep(showSteps: boolean, collapsed: boolean, visib
   return showSteps && !collapsed && visibleEvents.some(e => e.type === 'step' && e.outcome === 'pending');
 }
 
-/** Determine which toggles (More/Less, Show/Hide steps) to show for an exchange. */
+/** Determine which toggles (More/Less, Show/Hide steps) to show for an exchange.
+ *
+ *  The event-wait row counts as a step here because it renders as one and is
+ *  gated on the same `showSteps` flag. A turn whose only action was parking on
+ *  an event has no `'step'` of its own (the row replaced it), so without this
+ *  the row was hidden by the default-collapsed steps with no toggle to reveal
+ *  it: the turn read as empty. */
 export function getEventToggleState(events: ResponseEvent[]): {
   showMoreToggle: boolean;
   showStepsToggle: boolean;
 } {
-  const hasSteps = events.some(e => e.type === 'step');
+  const hasSteps = events.some(e => e.type === 'step' || e.type === 'event_wait');
   const meaningfulTextCount = events.filter(isMeaningfulText).length;
   const showMoreToggle = hasSteps && meaningfulTextCount >= 2;
   const showStepsToggle = hasSteps;

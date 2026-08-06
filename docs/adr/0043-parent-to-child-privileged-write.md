@@ -146,7 +146,8 @@ second reclaimer.
   on this cause, which is a change to a contract-tested lifecycle transition and
   a wider blast radius than the transient earns. Pinned by
   `a_codex_redirect_dips_the_parent_count_then_restores_it`. Note this window is
-  not new: it is the shape `arm_codex_redirect` has always had for a human
+  not new: it is the shape `arm_followup_redirect` (`arm_codex_redirect` when
+  this was written) has always had for a human
   follow-up into a live Codex child. What is new is how often a parent reaches
   it.
 - A follow-up to an archived coding-agent child re-surfaces it to the user's

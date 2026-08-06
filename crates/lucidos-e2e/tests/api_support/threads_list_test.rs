@@ -103,6 +103,9 @@ async fn list_returns_seeded_threads_with_full_shape() {
         "state",
         "compose_text",
         "compose_images",
+        // The client echoes this back on every compose PUT, so a summary that
+        // omits it leaves every write unfenced.
+        "compose_epoch",
     ] {
         assert!(
             row.get(field).is_some(),

@@ -241,11 +241,24 @@ impl LucidosEngine {
                 engine_cancelled,
             );
         }
-        let external_already = Self::external_terminal_already_emitted(
-            &external_terminal_emitted,
-            thread_id,
-            "safety net",
-        );
+        // Asked here for the safety net, and asked AGAIN at the cleanup branch
+        // below rather than reused. That is deliberate: the flags are monotonic
+        // (see `thread_session_is_shutting_down`), several awaits separate the
+        // two decisions, and the later one is the destructive one. Caching this
+        // answer for it would mean a restart that begins mid-finalize takes the
+        // normal-cleanup path and can reclaim a still-resumable branch, which is
+        // the thread-9e37697e data-loss shape.
+        let is_shutdown = self.thread_session_is_shutting_down(thread_id).await;
+        let external_already =
+            crate::engine::agent_session::runtime_helpers::external_terminal_already_emitted(
+                &self.pool,
+                &external_terminal_emitted,
+                thread_id,
+                meta.request_event_id,
+                is_shutdown,
+                "safety net",
+            )
+            .await;
         let net_action = crate::engine::agent_session::lifecycle::safety_net_action(
             safety_net_fired,
             watchdog_fired,
@@ -305,61 +318,48 @@ impl LucidosEngine {
             Some(StopReason::Discard),
         );
 
+        // Re-asked, not reused: a restart that began during the awaits above
+        // must be seen HERE, because this is the branch that decides whether the
+        // worktree and branch are preserved for post-restart recovery or handed
+        // to normal cleanup. The flags only go false to true, so this can only
+        // be more true than the safety net's answer.
+        let is_shutdown = self.thread_session_is_shutting_down(thread_id).await;
+
         // Auto-commit any uncommitted changes so they survive on disk.
-        {
-            // Engine-global shutdown OR the per-session flag. `shutdown_agent_sessions`
-            // sets the per-session flag only on sessions present in `agent_sessions`
-            // when shutdown began — a session whose `spawn_or_resume` finished and
-            // inserted itself AFTER that pass (a slow ~30s `--resume` racing an Apply
-            // restart) keeps the flag `false`. Reading only the per-session flag then
-            // let finalize run full normal cleanup and `git branch -D` a still-resumable
-            // branch (the thread-9e37697e data-loss incident: a child's follow-up
-            // resumed during shutdown, its session was inserted after the flag pass, and
-            // its no-commit branch was reclaimed). `is_shutting_down()` is set first
-            // thing in every shutdown path, so OR-ing it closes the insert-after-the-pass
-            // race and preserves the worktree + branch for post-restart recovery.
-            let is_shutdown = self.is_shutting_down() || {
-                let guard = self.agent_sessions.lock().await;
-                guard
-                    .get(&thread_id)
-                    .map(|s| s.shutting_down.load(std::sync::atomic::Ordering::Relaxed))
-                    .unwrap_or(false)
-            };
-            if is_shutdown {
-                // Same gate as the other cleanup paths — only commit (and so
-                // fire the per-commit hook → ChangeProposed) when the last
-                // turn ended Generated. Mid-turn shutdown is half-assed; the
-                // worktree's uncommitted state survives for recovery either
-                // way, so skipping the auto-commit costs us nothing.
-                if let Some(ref wt) = worktree_path {
-                    if should_auto_commit_on_cleanup(false, &last_terminal_kind) {
-                        auto_commit_preserving_marker(
-                            &self.pool,
-                            wt,
-                            &repo_root,
-                            &branch_name,
-                            "Coding agent changes (auto-committed on shutdown)",
-                        )
-                        .await;
-                    }
+        if is_shutdown {
+            // Same gate as the other cleanup paths: only commit (and so fire
+            // the per-commit hook → ChangeProposed) when the last turn ended
+            // Generated. Mid-turn shutdown is half-assed; the worktree's
+            // uncommitted state survives for recovery either way, so skipping
+            // the auto-commit costs us nothing.
+            if let Some(ref wt) = worktree_path {
+                if should_auto_commit_on_cleanup(false, &last_terminal_kind) {
+                    auto_commit_preserving_marker(
+                        &self.pool,
+                        wt,
+                        &repo_root,
+                        &branch_name,
+                        "Coding agent changes (auto-committed on shutdown)",
+                    )
+                    .await;
                 }
-                let mut guard = self.agent_sessions.lock().await;
-                guard.remove(&thread_id);
-                log!(
-                    "[Shutdown] Skipping cleanup for thread {} — session will resume after restart",
-                    thread_id
-                );
-                return Ok(ProcessResult {
-                    response: String::new(),
-                    steps: vec![],
-                    images,
-                    request_id,
-                    thread_id,
-                    proposed_change: false,
-                    auto_apply: false,
-                    orphaned_injections: vec![],
-                });
             }
+            let mut guard = self.agent_sessions.lock().await;
+            guard.remove(&thread_id);
+            log!(
+                "[Shutdown] Skipping cleanup for thread {}: session will resume after restart",
+                thread_id
+            );
+            return Ok(ProcessResult {
+                response: String::new(),
+                steps: vec![],
+                images,
+                request_id,
+                thread_id,
+                proposed_change: false,
+                auto_apply: false,
+                orphaned_injections: vec![],
+            });
         }
 
         if let Some(change) = conflict_change {

@@ -1,12 +1,12 @@
+use super::idle_change_state::{resolve_idle_change_state, IdleChangeStateInput};
 use super::idle_snapshot::CodingAgentIdleSnapshot;
 use super::spawn_context::SpawnWorktreeContext;
 use crate::engine::agentic_loop::should_flush;
 use crate::engine::change_ops::now_epoch_millis;
 use crate::engine::claude_code::STALE_RESUME_ERROR;
 use crate::engine::git_ops::{
-    auto_commit_preserving_marker, branch_changed_files, default_local_branch,
-    describe_branch_changes, files_require_restart, is_external_repo_path,
-    is_harden_marker_present, main_worktree,
+    auto_commit_preserving_marker, default_local_branch, describe_branch_changes,
+    files_require_restart, is_external_repo_path, is_harden_marker_present, main_worktree,
 };
 use crate::engine::thread_events::{EventChannel, SessionEndReason};
 use crate::engine::{AgentSession, AgentUserInput, LucidosEngine, ProcessResult, StopReason};
@@ -26,7 +26,6 @@ use crate::engine::agent_session::lifecycle::{
 };
 use crate::engine::agent_session::resume::{
     change_description_fallback, default_claude_config_dir, resolve_resume_context,
-    CC_TURN_CLOSER_EVENTS,
 };
 use crate::engine::agent_session::spawn::spawn_or_resume;
 
@@ -479,7 +478,7 @@ impl LucidosEngine {
         let SpawnWorktreeContext {
             cwd,
             system_prompt,
-            branch_name,
+            mut branch_name,
             worktree_path,
             interactive_session,
             adoption_note,
@@ -508,6 +507,21 @@ impl LucidosEngine {
                 coding_agent,
             )
             .await?;
+
+        // Anchor for idle-time branch adoption: where this session's worktree
+        // sat BEFORE the agent ran. `last_idle_sha` (the previous idle's HEAD)
+        // is the stronger anchor because it already contains the thread's
+        // commits, but it is `None` on a first turn, which is exactly the
+        // single-turn session that renames its own branch and can never
+        // recover. Reading HEAD here costs one `rev-parse` per session and
+        // gives that case an anchor; `try_adopt_branch_at_idle` carries the
+        // second gate that makes the weaker anchor safe.
+        let adoption_anchor_sha = match worktree_path.as_deref() {
+            Some(wt) => crate::engine::agent_session::external_edits::git_head_sha(wt)
+                .await
+                .or_else(|| last_idle_sha.clone()),
+            None => last_idle_sha.clone(),
+        };
 
         let system_prompt = if user_device_preferences_context.is_empty() {
             system_prompt
@@ -1054,7 +1068,7 @@ impl LucidosEngine {
         let mut user_hit_stop = false;
         // interrupt_is_redirect: set alongside user_hit_stop when the interrupt
         // came from a Codex mid-turn follow-up redirect (drained from the session
-        // by `arm_codex_redirect`), so the Result classifies as
+        // by `arm_followup_redirect`), so the Result classifies as
         // CancelCause::SupersededByFollowup (neutral render) instead of UserStop.
         // Cleared at the turn boundary in lockstep with user_hit_stop.
         let mut interrupt_is_redirect = false;
@@ -1846,8 +1860,14 @@ impl LucidosEngine {
                                         result_texts.push(text.clone());
                                         // Single read of shutting_down — both the terminal-event
                                         // and the skip-idle decisions must agree on its value.
-                                        let is_shutdown = shutting_down
-                                            .load(std::sync::atomic::Ordering::Relaxed);
+                                        // Widened through `session_is_shutting_down`: the
+                                        // per-session flag alone misses a session that
+                                        // registered after the teardown's snapshot, which
+                                        // would classify an engine restart as a user Stop.
+                                        let is_shutdown = self.session_is_shutting_down(
+                                            shutting_down
+                                                .load(std::sync::atomic::Ordering::Relaxed),
+                                        );
                                         let (terminal_kind, emit_idle) = classify_result(
                                             is_silent_resume(user_message.is_empty(), has_user_images),
                                             user_hit_stop,
@@ -1874,7 +1894,7 @@ impl LucidosEngine {
                                                 user_hit_stop = false;
                                                 interrupt_is_redirect = false;
                                             }
-                                            if !Self::external_terminal_already_emitted(&external_terminal_emitted, thread_id, "Result classify") {
+                                            if !crate::engine::agent_session::runtime_helpers::external_terminal_already_emitted(&self.pool, &external_terminal_emitted, thread_id, meta.request_event_id, is_shutdown, "Result classify").await {
                                                 let terminal_event = Self::make_terminal_event(
                                                     kind,
                                                     text.clone(),
@@ -1908,64 +1928,33 @@ impl LucidosEngine {
                                         if let Some(ref wt) = worktree_path {
                                             auto_commit_preserving_marker(&self.pool, wt, &repo_root, &branch_name, "Coding agent changes (auto-committed)").await;
                                         }
-                                        // Check for worktree changes before entering waiting.
-                                        // `branch_changed_files` is a three-dot merge-base diff against
-                                        // `default_diff_base` (the SAME base the Diff button uses) so we
-                                        // only see changes introduced ON this branch, not changes the
-                                        // base received after the branch was created. Without this, a
-                                        // branch whose changes were already merged — or whose local
-                                        // default diverged — appears to have changes because the base
-                                        // moved ahead, lighting the Diff button on an empty diff.
-                                        let (wt_has_changes, wt_requires_restart) = if conflict_change.is_some() {
-                                            (true, false) // Conflict resolution always has work
+                                        // Resolve the branch and probe the diff ONCE, together, in
+                                        // `idle_change_state`. Both halves used to be inline and wrong:
+                                        // the branch came from the spawn-time `branch_name` (stale the
+                                        // moment a repo skill runs `git branch -m`), and the diff was
+                                        // probed three separate times through the swallowing
+                                        // `branch_changed_files` wrapper, so one git failure reached
+                                        // three consumers as "there is no diff". This site WRITES its
+                                        // answer somewhere durable, so it gets git truth or an explicit
+                                        // unknown, never a silent no.
+                                        let (wt_has_changes, wt_requires_restart, changed_files) = if conflict_change.is_some() {
+                                            (true, false, None) // Conflict resolution always has work
                                         } else {
-                                            // Reuse branch_changed_files so the runtime-path filter
-                                            // applies here too — without it `coding_agent_proposed` would
-                                            // flip to true whenever `.lucidos/` files were committed.
-                                            let changed_files = branch_changed_files(&repo_root, &branch_name).await;
-                                            (!changed_files.is_empty(), files_require_restart(&changed_files))
-                                        };
-
-                                        // Defensive: if this worktree has no changes but a previous
-                                        // CodingAgentIdled on the same thread had has_changes:true
-                                        // (without an intervening apply/discard/end), carry forward.
-                                        // This prevents a text-only follow-up from erasing the change
-                                        // state when the changes still exist on the original branch.
-                                        let (wt_has_changes, wt_requires_restart) = if !wt_has_changes {
-                                            let q = format!(
-                                                "SELECT payload FROM events \
-                                                 WHERE aggregate_id = $1 AND event_type IN ({}) \
-                                                 ORDER BY created DESC LIMIT 1",
-                                                CC_TURN_CLOSER_EVENTS,
-                                            );
-                                            match sqlx::query_scalar::<_, serde_json::Value>(&q)
-                                            .bind(thread_id.to_string())
-                                            .fetch_optional(self.pool())
-                                            .await {
-                                                Ok(Some(payload)) => {
-                                                    let prev_has = payload.get("has_changes").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                    let prev_restart = payload.get("requires_restart").and_then(|v| v.as_bool()).unwrap_or(false);
-                                                    if prev_has {
-                                                        // Verify the branch still has actual changes.
-                                                        // A commit+revert leaves the previous idle's
-                                                        // has_changes=true stale, causing a phantom
-                                                        // "Apply" button with zero changed files.
-                                                        let files = branch_changed_files(&repo_root, &branch_name).await;
-                                                        if files.is_empty() {
-                                                            log!("[AgentSession] Carry-forward skipped — branch has no actual diff (likely commit+revert)");
-                                                            (false, false)
-                                                        } else {
-                                                            log!("[AgentSession] Carrying forward has_changes=true from previous idle (worktree diff was empty)");
-                                                            (prev_has, prev_restart)
-                                                        }
-                                                    } else {
-                                                        (false, false)
-                                                    }
-                                                }
-                                                _ => (false, false),
-                                            }
-                                        } else {
-                                            (wt_has_changes, wt_requires_restart)
+                                            let state = resolve_idle_change_state(IdleChangeStateInput {
+                                                pool: self.pool(),
+                                                thread_id,
+                                                repo_root: &repo_root,
+                                                worktree_path: worktree_path.as_deref(),
+                                                tracked_branch: &branch_name,
+                                                is_external_repo,
+                                                anchor_sha: adoption_anchor_sha.as_deref(),
+                                            })
+                                            .await;
+                                            // One name per session from here on: the propose, the
+                                            // session-state write-back below, and the post-loop cleanup
+                                            // all follow the adoption.
+                                            branch_name = state.branch_name;
+                                            (state.has_changes, state.requires_restart, state.changed_files)
                                         };
 
                                         is_waiting = true;
@@ -1975,6 +1964,12 @@ impl LucidosEngine {
                                                 s.is_waiting = true;
                                                 s.has_changes = wt_has_changes;
                                                 s.requires_restart = wt_requires_restart;
+                                                // Keep ONE branch name per session. An adoption above
+                                                // moved the run loop onto the worktree's real branch;
+                                                // without this write-back `apply_now` and the stop /
+                                                // discard paths would keep acting on the stale name,
+                                                // which is the same drift that produced this bug.
+                                                s.branch_name = Some(branch_name.clone());
                                                 // Notify anyone waiting for idle (e.g. send_and_wait,
                                                 // apply_now conflict resolution). Without this,
                                                 // idle_notify only fires on EOF/process exit,
@@ -2036,60 +2031,74 @@ impl LucidosEngine {
                                             conflict_change.is_some(),
                                             &last_terminal_kind,
                                         ) {
-                                            let changed_files = branch_changed_files(&repo_root, &branch_name).await;
-                                            if changed_files.is_empty() {
-                                                // No committed diff against the base (nothing was
-                                                // done, or a commit + revert cancelled out). Never
-                                                // auto-discard an existing pending row — the user
-                                                // resolves it from Review — but DO re-sync it to
-                                                // zero files so the card stops advertising work the
-                                                // branch no longer carries. No pending row → nothing
-                                                // to reconcile and nothing to propose.
-                                                self.reconcile_emptied_pending_change(thread_id, &repo_root, &branch_name).await;
-                                            } else {
-                                                // Only the propose path needs the marker — the
-                                                // reconcile above re-reads it itself, and only if
-                                                // it actually has a row to correct.
-                                                let hardened = is_harden_marker_present(&self.pool, &repo_root, &branch_name).await;
-                                                let requires_restart = files_require_restart(&changed_files);
-                                                let fallback = change_description_fallback(self.pool(), thread_id, &branch_name).await;
-                                                let base = default_local_branch(&repo_root).await;
-                                                let log_range = format!("{}..{}", base, branch_name);
-                                                let description = describe_branch_changes(&repo_root, &log_range, &fallback, None).await;
-                                                let repo_root_str = repo_root.to_string_lossy().to_string();
-                                                match self.propose_change(crate::engine::change_ops::ProposeChangeInput {
-                                                    thread_id,
-                                                    branch_name: &branch_name,
-                                                    repo_root: &repo_root_str,
-                                                    description: &description,
-                                                    files: &changed_files,
-                                                    requires_restart,
-                                                    channel: EventChannel::ClaudeCode,
-                                                    hardened,
-                                                    // Live agent proposal — origin is
-                                                    // carried by the surrounding
-                                                    // MessageReceived. Engine-internal
-                                                    // recovery paths stamp Engine origin
-                                                    // via propose_branch_changes.
-                                                    origin: None,
-                                                    // Always false now: `may_touch_change_state_at_idle`
-                                                    // refuses every non-Generated terminal, so partial
-                                                    // work never reaches this point. The field stays in
-                                                    // the event for backward compat with persisted rows.
-                                                    incomplete: false,
-                                                }).await {
-                                                    Ok(_) => {
-                                                        // Track for the ProcessResult returned via the
-                                                        // Exited arm. Every idle exits the subprocess,
-                                                        // so the post-loop cleanup that used to set
-                                                        // this is skipped now.
-                                                        proposed_change = true;
-                                                    }
-                                                    Err(e) => {
-                                                        log!("[AgentSession] Failed to propose change at idle: {}", e);
-                                                    }
+                                            // Reuses the single probe above rather than re-asking git.
+                                            // `None` means the probe could not be answered, and an
+                                            // unanswered probe must never touch durable change state:
+                                            // proposing would need a file list we don't have, and
+                                            // reconciling would zero a pending row's files on a git
+                                            // hiccup. Both wait for the next idle.
+                                            match changed_files.as_deref() {
+                                                None => {
+                                                    log!(
+                                                        "[AgentSession] Skipping propose/reconcile at idle for thread {}: the diff probe could not be answered",
+                                                        thread_id
+                                                    );
                                                 }
-                                                self.broadcast_changes_updated().await;
+                                                Some([]) => {
+                                                    // No committed diff against the base (nothing was
+                                                    // done, or a commit + revert cancelled out). Never
+                                                    // auto-discard an existing pending row (the user
+                                                    // resolves it from Review), but DO re-sync it to
+                                                    // zero files so the card stops advertising work the
+                                                    // branch no longer carries. No pending row → nothing
+                                                    // to reconcile and nothing to propose.
+                                                    self.reconcile_emptied_pending_change(thread_id, &repo_root, &branch_name).await;
+                                                }
+                                                Some(changed_files) => {
+                                                    // Only the propose path needs the marker: the
+                                                    // reconcile above re-reads it itself, and only if
+                                                    // it actually has a row to correct.
+                                                    let hardened = is_harden_marker_present(&self.pool, &repo_root, &branch_name).await;
+                                                    let requires_restart = files_require_restart(changed_files);
+                                                    let fallback = change_description_fallback(self.pool(), thread_id, &branch_name).await;
+                                                    let base = default_local_branch(&repo_root).await;
+                                                    let log_range = format!("{}..{}", base, branch_name);
+                                                    let description = describe_branch_changes(&repo_root, &log_range, &fallback, None).await;
+                                                    let repo_root_str = repo_root.to_string_lossy().to_string();
+                                                    match self.propose_change(crate::engine::change_ops::ProposeChangeInput {
+                                                        thread_id,
+                                                        branch_name: &branch_name,
+                                                        repo_root: &repo_root_str,
+                                                        description: &description,
+                                                        files: changed_files,
+                                                        requires_restart,
+                                                        channel: EventChannel::ClaudeCode,
+                                                        hardened,
+                                                        // Live agent proposal: origin is
+                                                        // carried by the surrounding
+                                                        // MessageReceived. Engine-internal
+                                                        // recovery paths stamp Engine origin
+                                                        // via propose_branch_changes.
+                                                        origin: None,
+                                                        // Always false now: `may_touch_change_state_at_idle`
+                                                        // refuses every non-Generated terminal, so partial
+                                                        // work never reaches this point. The field stays in
+                                                        // the event for backward compat with persisted rows.
+                                                        incomplete: false,
+                                                    }).await {
+                                                        Ok(_) => {
+                                                            // Track for the ProcessResult returned via the
+                                                            // Exited arm. Every idle exits the subprocess,
+                                                            // so the post-loop cleanup that used to set
+                                                            // this is skipped now.
+                                                            proposed_change = true;
+                                                        }
+                                                        Err(e) => {
+                                                            log!("[AgentSession] Failed to propose change at idle: {}", e);
+                                                        }
+                                                    }
+                                                    self.broadcast_changes_updated().await;
+                                                }
                                             }
                                         }
 
@@ -2325,7 +2334,7 @@ impl LucidosEngine {
                     if !is_waiting {
                         user_hit_stop = true;
                         // Distinguish a follow-up redirect (set by
-                        // `arm_codex_redirect`) from a real Stop click: the
+                        // `arm_followup_redirect`) from a real Stop click: the
                         // former classifies as SupersededByFollowup (neutral),
                         // the latter as UserStop ("Canceled ✕"). Drained on read;
                         // cleared at the Result turn boundary below alongside
@@ -2359,7 +2368,8 @@ impl LucidosEngine {
                     // (`ChangeApplied` / `ChangeDiscarded` / `ThreadArchived`); only
                     // a real `UserStop` (or no reason set — engine shutdown direct
                     // notify) lets `ResponseCanceled` through.
-                    let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
+                    let is_shutdown = self
+                        .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     let suppress_user_terminal = matches!(
                         self.pending_stop_reason(thread_id).await,
                         Some(StopReason::Apply | StopReason::Discard | StopReason::Archive),
@@ -2409,7 +2419,8 @@ impl LucidosEngine {
                             crate::engine::thread_events::CancelCause::UserStop
                         },
                     ));
-                    let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
+                    let is_shutdown = self
+                        .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     self.emit_stop_terminal(
                         "interrupt_escalate",
                         thread_id,
@@ -2433,7 +2444,8 @@ impl LucidosEngine {
                 _ = chat_cancel.cancelled() => {
                     // Upstream chat handler cancelled (engine shutdown / request abort).
                     // No user-action context here — suppress flag is always false.
-                    let is_shutdown = shutting_down.load(std::sync::atomic::Ordering::Relaxed);
+                    let is_shutdown = self
+                        .session_is_shutting_down(shutting_down.load(std::sync::atomic::Ordering::Relaxed));
                     self.emit_stop_terminal(
                         "chat_cancel",
                         thread_id,

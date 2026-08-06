@@ -92,6 +92,29 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   nothing but print their own "runs from the internal checkout" refusal.
 - **Status:** open
 
+### Legacy attached-event-wait boot sweep
+
+- **Added:** 2026-08-06
+- **Lives in:** `engine/event_wait/mod.rs::settle_legacy_attached_event_waits`
+  (the query) and `engine/event_wait/dispatcher.rs` (the emit), called once from
+  `main.rs` before `refire_unresolved_event_wakes` / `rebuild_event_waits`.
+  Paired with the `waiting_for_event` arm in `ThreadStatus::parse` and the
+  migration `20260806090527_event_wait_status_retired.sql`.
+- **Impermanent because:** It exists for threads caught mid-wait by ADR 0049,
+  which removed the attached shape. Such a thread has an `await_event`
+  `ToolCalled` with no `ToolResult`, which is a provider 400 on its very next
+  turn, and no code left would close that pair for it. Every wait registered
+  after the upgrade pairs its own call at registration, so the query can only
+  ever match rows written by an older engine.
+- **Removal / resolution condition:** No unpaired `await_event` call remains on
+  any non-discarded thread. Verify with the sweep's own query returning zero on
+  a real workspace (it logs `Closed N legacy unpaired await_event call(s)`, so a
+  boot that logs nothing for a while is the signal). Then delete the sweep, its
+  `main.rs` call, `legacy_attached_settle_tool_result`, the `waiting_for_event`
+  arm in `ThreadStatus::parse`, and the note about it on `AWAIT_EVENT` in
+  `llm/tool_names.rs`. The migration stays: it is applied history.
+- **Status:** open
+
 ### Batch `data/` writes announce once for the caller, not per file
 
 - **Added:** 2026-08-01
@@ -618,6 +641,42 @@ condition; fix the condition rather than acting on it.
   confirmation is backed by a matching `ToolCalled` in the SAME turn over a
   representative window, drop `REPEATED_ACTION_RULE` + its placeholder + the test,
   and narrow CRITICAL RULE #1 / VERIFICATION back to file writes.
+- **Status:** active
+
+### "Narrating it does not do it" on an event-wait re-arm
+
+- **Added:** 2026-08-06
+- **Lives in:** `crates/lucidos-engine/src/engine/event_wait/mod.rs` (the final
+  sentence of the `WAIT_SPENT_NOTICE` const, "Narrating it does not do it: a turn
+  that ends with no new call leaves nothing watching for this, whatever the
+  sentence said") and `crates/lucidos-engine/src/llm/tools/misc.rs` (the
+  `await_event` description's "Saying you will re-arm is not re-arming; a turn
+  that ends with no new call leaves nothing watching for it"). Pinned by
+  `the_delivery_result_says_the_subscription_is_spent_and_re_arming_is_a_call`
+  in `engine/event_wait/mod_tests.rs` and
+  `await_event_description_splits_the_two_wakes_before_saying_do_not_register`
+  in `llm/tools/tests.rs`.
+- **Impermanent because (tolerates):** The same "wrote the confirmation instead
+  of calling the tool" mistake as the entry above, in the one place it is most
+  invited: `await_event` is a TERMINAL tool (`AwaitEventOutcome::Parked`, "the
+  turn must end here"), so the habit of writing the closing paragraph after the
+  last tool call puts prose exactly where the call had to go. Observed
+  2026-08-06 in the *Notification of Agent Code Edits* thread: the thread woke
+  on a delivery, reported the edit, closed with "Re-arming the watch now, so
+  I'll keep reporting each edit as it happens" and ended the turn with no second
+  `await_event` call, leaving an idle thread that had just promised to keep
+  watching. Pure model-tolerance: a perfect model told the subscription is spent
+  and to call again before the turn ends does not additionally need to be told
+  that saying so is not doing so.
+- **Removal / resolution condition:** When a delivery wake reliably produces
+  either a re-arm call or an honest "I have stopped watching" in the same turn.
+  Sample threads that took an `EventWaitDelivered` and whose reply claims to
+  keep watching; if every such claim is backed by an `EventWaitStarted` in the
+  SAME turn over a representative window, drop the two sentences and the
+  assertions that pin them. The rest of `WAIT_SPENT_NOTICE` stays either way:
+  "this subscription is now spent, call `await_event` again before this turn
+  ends" is a system fact a perfect model still needs, not a crutch.
+- **Investigation:** none (the mistake is understood, not under investigation).
 - **Status:** active
 
 ### Empty-echo stale-resume: output-shape inference for an unconfirmed attach

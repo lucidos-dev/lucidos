@@ -686,7 +686,33 @@ async fn check_one(
     }
 }
 
+/// Fetch a plugin source and read its `manifest.toml`.
+///
+/// Runs on the blocking pool, like the install path's
+/// [`super::stage_install_request`]: the body contains no `.await` at all, and
+/// `fetch_source` performs a SYNCHRONOUS `git2` clone over the network with no
+/// fetch timeout. Called directly on a tokio worker it pins that worker for as
+/// long as the remote takes to answer, which for an unreachable host is
+/// unbounded, and the blocking syscall cannot be freed by dropping the future,
+/// so a user cancel does not release it either. `check_plugin_updates` with no
+/// `id` clones EVERY installed plugin in sequence, so one bad remote parks a
+/// worker for the rest of the sweep.
 pub(crate) async fn fetch_remote_manifest(
+    workspace_path: &Path,
+    source_str: &str,
+) -> Result<PluginManifest, String> {
+    let workspace_path = workspace_path.to_path_buf();
+    let source_str = source_str.to_string();
+    tokio::task::spawn_blocking(move || {
+        fetch_remote_manifest_blocking(&workspace_path, &source_str)
+    })
+    .await
+    .map_err(|e| format!("manifest fetch task panicked: {}", e))?
+}
+
+/// The synchronous body of [`fetch_remote_manifest`]. Never call this from an
+/// async context directly.
+fn fetch_remote_manifest_blocking(
     workspace_path: &Path,
     source_str: &str,
 ) -> Result<PluginManifest, String> {

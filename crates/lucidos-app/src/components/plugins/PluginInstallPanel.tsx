@@ -1,21 +1,28 @@
 import { useState } from 'preact/hooks';
-import { activeInlineForm } from '../../store/store';
+import { activeInlineForm, closeInlineForm } from '../../store/store';
+import type { PluginInstallForm } from '../../store/store';
 import {
   cancelPluginInstallAction,
   confirmPluginInstallAction,
 } from '../../store/actions/plugin-install';
 import { renderMarkdown } from '../../utils/renderMarkdown';
+import { formatMessageTimestamp } from '../../utils/formatTime';
+import { PluginFileList } from './PluginFileList';
 
 export function PluginInstallPanel() {
-  // Every hook runs before the early return: a hook called after it is a
-  // rules-of-hooks violation that only survives because this component has
-  // exactly one, so the index realigns by luck. Adding a second would corrupt
-  // state silently. `EmailConfirmModal` splits into two components for the same
-  // reason; here hoisting is enough.
-  const [busy, setBusy] = useState(false);
   const form = activeInlineForm.value;
   if (form?.type !== 'plugin-install') return null;
+  // Two components rather than one branching on `installed`, so the confirm
+  // panel's hooks are never conditionally skipped: resolving the install
+  // unmounts the confirm panel and mounts the receipt. Same split as
+  // `EmailConfirmModal`.
+  return form.installed
+    ? <PluginInstallReceiptPanel form={form} />
+    : <PluginInstallConfirm form={form} />;
+}
 
+function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
+  const [busy, setBusy] = useState(false);
   const req = form.request;
 
   const description = typeof req.manifest['description'] === 'string'
@@ -52,14 +59,14 @@ export function PluginInstallPanel() {
     </div>
   );
 
-  // The action fns always closeInlineForm() in their own finally (unmounting
-  // this panel), so busy normally never resets visibly — but reset in a finally
-  // anyway so the buttons re-enable if a future action path returns without
-  // closing the form. setBusy after unmount is a harmless no-op in Preact.
+  // The action fns resolve the panel themselves (into a receipt on success,
+  // closed on failure), so busy normally never resets visibly. Reset in a
+  // finally anyway so the buttons re-enable if a future path returns with the
+  // panel still up. setBusy after unmount is a harmless no-op in Preact.
   async function handleConfirm() {
     setBusy(true);
     try {
-      await confirmPluginInstallAction(req.install_id, req.plugin_name, req.plugin_version);
+      await confirmPluginInstallAction(form);
     } finally {
       setBusy(false);
     }
@@ -68,7 +75,7 @@ export function PluginInstallPanel() {
   async function handleCancel() {
     setBusy(true);
     try {
-      await cancelPluginInstallAction(req.install_id);
+      await cancelPluginInstallAction(form);
     } finally {
       setBusy(false);
     }
@@ -104,37 +111,23 @@ export function PluginInstallPanel() {
         </section>
 
         {req.overwrites.length > 0 && (
-          <section class="plugin-install-section plugin-install-overwrites">
-            <div class="plugin-install-label">
-              Overwrites ({req.overwrites.length})
-            </div>
-            <ul class="plugin-install-files">
-              {req.overwrites.map((f) => (
-                <li class="plugin-install-file plugin-install-file-overwrite" key={f}>
-                  {f}
-                </li>
-              ))}
-            </ul>
-            <p class="plugin-install-warning-text">
-              These files already exist in your workspace and will be replaced.
-            </p>
-          </section>
+          <PluginFileList
+            label={`Overwrites (${req.overwrites.length})`}
+            files={req.overwrites}
+            sectionClass="plugin-install-overwrites"
+            fileClass="plugin-install-file-overwrite"
+            note="These files already exist in your workspace and will be replaced."
+          />
         )}
 
-        <section class="plugin-install-section">
-          <div class="plugin-install-label">
-            New files ({newFiles.length})
-          </div>
-          {newFiles.length === 0 ? (
+        {newFiles.length === 0 ? (
+          <section class="plugin-install-section">
+            <div class="plugin-install-label">New files (0)</div>
             <p class="plugin-install-empty">No new files — every path overwrites an existing one.</p>
-          ) : (
-            <ul class="plugin-install-files">
-              {newFiles.map((f) => (
-                <li class="plugin-install-file" key={f}>{f}</li>
-              ))}
-            </ul>
-          )}
-        </section>
+          </section>
+        ) : (
+          <PluginFileList label={`New files (${newFiles.length})`} files={newFiles} />
+        )}
 
         {req.setup && (
           <section class="plugin-install-section plugin-install-setup">
@@ -147,6 +140,65 @@ export function PluginInstallPanel() {
         )}
 
         {renderActions()}
+      </div>
+    </div>
+  );
+}
+
+/** The panel after a confirmed install: a read-only record of what the engine
+ *  actually wrote, holding the nav-history slot the pending confirm had (see
+ *  `markPluginInstalled`). The list comes off the receipt marker, not off
+ *  `request.files`, which was only what the install *would* write.
+ *
+ *  Deliberately offers no Install and no Cancel: the files have landed, the
+ *  staged `install_id` is popped, and the only action left is to close the
+ *  panel. The plugin's setup instructions stay on it, since they are the one
+ *  thing the user may still need after the install and the setup thread is a
+ *  pane away rather than in front of them.
+ *
+ *  Exported for its unit test, which renders it directly: the suite's VNode walk
+ *  stops at function components (the confirm branch's hooks would throw), so it
+ *  cannot reach this one through the dispatcher. */
+export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm }) {
+  const req = form.request;
+  const installed = form.installed!;
+  return (
+    <div class="inline-form">
+      <div class="plugin-install-panel">
+        <header class="plugin-install-header">
+          <div class="panel-receipt-status">
+            <span class="panel-receipt-badge">Installed</span>
+            <span class="panel-receipt-time">{formatMessageTimestamp(installed.at)}</span>
+          </div>
+          <div class="plugin-install-title-row">
+            <span class="plugin-install-name">{req.plugin_name}</span>
+            <span class="plugin-install-version">v{req.plugin_version}</span>
+          </div>
+          <p class="plugin-install-description">{installed.summary}</p>
+        </header>
+
+        {installed.installed_files.length > 0 && (
+          <PluginFileList
+            label={`Files written (${installed.installed_files.length})`}
+            files={installed.installed_files}
+          />
+        )}
+
+        {req.setup && (
+          <section class="plugin-install-section plugin-install-setup">
+            <div class="plugin-install-label">Setup instructions</div>
+            <div
+              class="plugin-install-setup-body markdown-content"
+              dangerouslySetInnerHTML={{ __html: renderMarkdown(req.setup) }}
+            />
+          </section>
+        )}
+
+        <div class="plugin-install-actions">
+          <button type="button" class="action-btn" onClick={() => closeInlineForm()}>
+            Close
+          </button>
+        </div>
       </div>
     </div>
   );

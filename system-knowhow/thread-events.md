@@ -64,6 +64,24 @@ If you add a new per-token streaming variant to `ThreadEvent`, add it to `Thread
 
 The `Triggerable` column on every table below is the binary "would a trigger fire on this today?" answer. **Triggerable does not mean "good idea to subscribe without a condition"** — for any per-action variant, lean on `condition:` filters to scope the matches.
 
+### Triggerable is not the same question as awaitable
+
+There are now **two** kinds of event subscription, and they share a predicate language, a matcher (`EventSubscription::matches`) and a blocklist, but not their answer for every event:
+
+- A **trigger** is a persistent reactive rule. It fires every time its `on:` matches, and each firing spawns a NEW thread. "React to every X."
+- A thread's **event wait** (`await_event`) is a one-shot subscription. The calling thread finishes its turn and idles, the first match re-opens THAT thread with the event as a new message, and the wait is consumed. "Continue when the next X happens."
+
+Two questions pick between them, and the first one is the one that gets forgotten:
+
+1. **Where does the answer go?** A trigger reaches the user as a notification from its own thread; it cannot continue the conversation they are typing in. `await_event` parks the current turn and resumes it, so the report lands in the thread they are reading. "Tell me **here** when X happens" is `await_event`, even though the phrasing sounds like a standing rule.
+2. **How long must it last?** `await_event` is one-shot and you re-arm per event, with consecutive parks capped. A reaction that must outlive the conversation and fire indefinitely is a trigger.
+
+Being blocked is not a precondition. `await_event` is a delivery mechanism as much as a waiting one: a turn that could have ended perfectly well still uses it when the user wants the next X reported into this conversation. And `await_event` is not a stream: if you need every X forever, that is a trigger.
+
+The two columns differ for exactly one family, the `EventWait*` events below. They are **triggerable but not awaitable**: a trigger that notifies "a thread's wait timed out" is a reasonable thing to want, while a wait on `EventWaitStarted` would satisfy itself the instant any thread in the workspace registers one. The per-token streaming blocklist applies to both.
+
+One more difference, and it is in `await_event`'s favour: a **blocked subscription is refused at the tool boundary**. Subscribing a trigger to `TextStreamed` validates, persists, and then silently never fires. `await_event` returns an error naming the blocked variant, so the model picks another event in the same turn.
+
 ## Persisted vs transient
 
 The enum splits into two halves, mirrored by `ThreadEvent::is_persisted()`:
@@ -101,7 +119,7 @@ These fire on chat threads (`channel = chat`) and on trigger-driven runs (`chann
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
-| `MessageReceived` | A user (or upstream workspace, or parent thread, or engine) submitted text into the thread. Stamped at the HTTP boundary in `api/chat.rs::chat_submit`. Its projection also **clears the thread's stored compose draft** — the send is what ends that draft's life — and, when there was one, broadcasts a `ThreadComposeChanged` reporting the emptied state so peers mirroring the draft drop it live instead of at their next reload. | one-per-turn | yes | yes |
+| `MessageReceived` | A user (or upstream workspace, or parent thread, or engine) submitted text into the thread. Stamped at the HTTP boundary in `api/chat.rs::chat_submit`. Its projection also **clears the thread's stored compose draft** (the send is what ends that draft's life), advances the thread's *compose epoch* so a draft write composed before the send can no longer be applied after it, and broadcasts a `ThreadComposeChanged` reporting the emptied state and the new epoch, so peers mirroring the draft drop it live instead of at their next reload. Broadcast on every send to a thread that already existed, including one where no draft was stored: the epoch moved either way, and the draft-less case is exactly the one where a client's write is still in flight. A message that CREATES the thread announces nothing, since there was no compose slot to consume and no device has heard of the thread yet. | one-per-turn | yes | yes |
 | `QueuedMessageRemoved` | A user removed a queued chat follow-up before the agentic loop ingested it. Pure append-only marker over the original `MessageReceived`: renderers hide the matching message only while it remains stepless, and the agentic loop skips the matching injected prompt when it drains the queue. Carries `removed_message_id: Uuid` (the event id of the queued `MessageReceived`), plus `actor` / `channel` from `EventMeta`. | per-action | yes | yes |
 | `TextStreamed` | A complete chunk of assistant text was committed to the thread (post-stream finalize for chat; one event per appended chunk). | high-volume-streaming | yes | **no (blocked)** |
 | `ThoughtStreamed` | The model emitted a `thinking` / reasoning block (extended-thinking models). One event per chunk. Legacy alias: `Thinking`. | high-volume-streaming | yes | **no (blocked)** |
@@ -115,18 +133,22 @@ These fire on chat threads (`channel = chat`) and on trigger-driven runs (`chann
 | `ResponseCanceled` | User clicked Cancel, clicked Apply / Discard / Archive on a still-running session, or posted a follow-up that interrupted a mid-turn Codex turn. Carries `cause: CancelCause` (`UserStop` / `UserAction` / `SupersededByFollowup` / `Unknown`). Always emit via `thread_events::emit_response_canceled` — it's idempotent against pre-emitted terminators (the `/api/v1/restart` race). | one-per-turn | yes | yes |
 | `ResponseAborted` | System-driven termination — engine shutdown, safety net (non-watchdog), recovery sweep, OS signal, stale-projection settle. Carries `cause: AbortCause` (`EngineShutdown` / `SafetyNet` / `RecoveryAfterRestart` / `ProcessKilled` / `StaleSettle` / `SessionDropped` / `Unknown`). Always emit via `thread_events::emit_response_aborted`. Note: when a hung-subprocess watchdog interrupts a coding agent (vs a crash or driver death), the engine emits `ContinuationRequested{auto_recovery_after_hang}` instead of `ResponseAborted{SafetyNet}` so the thread auto-resumes without user intervention. Two watchdogs can fire that path — see the `ContinuationRequested` row below. | one-per-turn | yes | yes |
 | `ResponseFailed` | Hard failure mid-turn: upstream API error, panic, OOM-killed bash, empty assistant text on a non-cancel turn (`agent_session::lifecycle::classify_result` triggers this for coding-agent threads too). Carries `error: String`. For an empty chat completion, `ResponseFailed` is reserved for the *genuine* failure shapes — output **truncated** (`max_tokens` / `MAX_TOKENS` / `length`), **blocked** by a safety/policy classifier (`refusal` / `SAFETY` / `content_filter`), **dropped output** (provider billed tokens but nothing parsed; Anthropic-only signal), or an **unrecognised** stop reason (fail-safe). A clean model-decided empty stop is benign and emits an empty `ResponseGenerated` instead (see that row). Classification is uniform across providers and thread types — see `classify_empty_completion` / `normalize_finish_reason` (`agentic_loop/helpers.rs`). | one-per-turn | yes | yes |
-| `UserPromptInjected` | A user interjection (a message sent while the turn was already running) OR an engine-injected mid-flight message (resume note, child-thread callback in legacy paths) was relayed into the live agentic loop. Carries `text`, `mode: ActorMode`, optional `origin`, optional `injected_message_id`. The loop wraps the text before the model sees it (`framed_injected_prompt`, `agentic_loop/helpers.rs`), keyed on `mode` **and** on whether the message lands mid-turn or starts a turn of its own. Mid-turn: a `Human` message is framed as an interjection to answer *and then resume the work in progress* (a redirect still overrides, but answering alone is not a reason to end the turn), while `Agent`/`Engine` messages are framed as a system update to fold into the response in progress. An injection the previous turn ended before draining is re-processed as its own turn (`api::chat::process_orphan_chain`) and gets no resume directive at all: that turn is over, so there is no work left to carry on with. **Every** orphan in such a batch is announced, the first included (`announce_orphan_batch`). The re-processed turn reuses the already-persisted `MessageReceived` as its starter event, so this is the only event in it whose lifecycle rule sets the thread back to `running`, and the client uses `injected_message_id` to absorb it into that message's own panel rather than rendering a second one. The event itself always stores the user's raw `text`, never the framing. | per-action | yes | yes (use condition) |
+| `UserPromptInjected` | A user interjection (a message sent while the turn was already running) OR an engine-injected mid-flight message (resume note, child-thread callback in legacy paths) was relayed into the live agentic loop. Carries `text`, `mode: ActorMode`, optional `origin`, optional `injected_message_id`, optional `delivered_event_id`. The loop wraps the text before the model sees it (`framed_injected_prompt`, `agentic_loop/helpers.rs`), keyed on `mode` **and** on whether the message lands mid-turn or starts a turn of its own. Mid-turn: a `Human` message is framed as an interjection to answer *and then resume the work in progress* (a redirect still overrides, but answering alone is not a reason to end the turn), while `Agent`/`Engine` messages are framed as a system update to fold into the response in progress. An injection the previous turn ended before draining is re-processed as its own turn (`api::chat::process_orphan_chain`) and gets no resume directive at all: that turn is over, so there is no work left to carry on with. **Every** orphan in such a batch is announced, the first included (`announce_orphan_batch`). The re-processed turn reuses the already-persisted `MessageReceived` as its starter event, so this is the only event in it whose lifecycle rule sets the thread back to `running`, and the client uses `injected_message_id` to absorb it into that message's own panel rather than rendering a second one. The event itself always stores the user's raw `text`, never the framing. | per-action | yes | yes (use condition) |
 | `ImageDescribed` | A background Flash call produced a text description for one of the images attached to a `MessageReceived`. One event per attached `user_image_hashes` entry, all carrying the same description text. Emitted from the agentic loop after iteration 1 of a chat turn; a message that arrives while the thread is already working is injected mid-turn instead of starting one, so that path emits from the chat injection fast-path as a detached task (before, such an image got no `ImageDescribed` at all and left no record once its bytes aged out of context). Replaced an in-place `jsonb_set` mutation that used to write `image_description` back into the source row. Carries `source_event_id: Uuid` (the originating `MessageReceived`), `hash: String` (the described blob's sha256), `description: String` (post `is_bad_image_description` filter), `model: String` (literal `"backfill"` on rows produced by the startup backfill, otherwise the actual Flash model). The `description` is indexed into memory (it carries real shared content — screenshots, tickets, photos), so an image-only turn isn't a memory black hole. | per-action | yes | yes (use condition) |
 | `TodoListWritten` | The *Lucidos Agent* called the `todo_write` LLM tool, OR the engine's `todo_consumer` flipped abandoned items at response termination. Replace-whole-list semantics — `items: Vec<TodoItem>` is the new complete *todo list*, fully superseding any prior `TodoListWritten` in the thread. Each `TodoItem` has `content: String` (imperative form, "Run tests"), `active_form: String` (present continuous, "Running tests"), `status: TodoStatus` (`pending` / `in_progress` / `completed` / `abandoned`, snake_case on the wire). LLM tool handler enforces ≤ 50 items, at most one `in_progress`, and rejects `abandoned` (engine-only); empty list is valid and means "cleared". The engine-side `todo_consumer` subscribes to `ResponseGenerated` / `ResponseCanceled` / `ResponseAborted` and re-emits the latest list with any `pending` / `in_progress` items flipped to `abandoned`, so the panel always shows an honest final state once a response ends. Chat-agent tool only — *coding-agent threads* render backend-native todo/tool output instead. UI: frontend walks the thread's events backwards, finds the most recent `TodoListWritten`, and renders the items in the prompt-bar collapsible panel; abandoned rows render with a dashed strike-through and an `abandoned` tag. | per-action | yes | yes (use condition) |
 
 Terminator set for chat-mode (`TERMINATOR_EVENT_TYPES` constant): `ResponseGenerated`, `ResponseCanceled`, `ResponseAborted`, `ResponseFailed`. Used by `has_terminator_for` for idempotent terminator emission.
+
+**One turn, one terminator, even during a restart.** An interruption produces two would-be terminators: the engine pre-emits `ResponseAborted` for the turn it is tearing down, and the agentic loop's cancel arm fires moments later when its token is cancelled. They collapse into one because both name the same turn through `request_event_id`, so `has_terminator_for` sees the abort and `emit_response_canceled` skips. That only holds because the pre-emit resolves the anchor from the running turn itself (`engine::in_flight_request_event_id`) rather than guessing it from the newest `MessageReceived`. Guessing is what produced the stacked "Paused by restart" plus "Response canceled" pair on a thread nobody cancelled: a follow-up queued mid-turn, or a turn started by `ContinuationStarted`, made the two ids disagree and both boundaries rendered. Applies to all three out-of-loop emitters: the `/api/v1/restart` teardown, the 60 s stuck-turn eviction, and the shutdown sweep.
+
+**A coding-agent session gets there a different way, because the request id cannot do that job for it.** A chat turn takes a fresh anchor per turn, but a live coding-agent session keeps ONE `request_event_id` for its whole life, across every follow-up turn, so "a terminator already exists for this request id" would read the first turn's `ResponseGenerated` as covering the second and swallow a real terminator. Its suppression is therefore scoped to the *turn*: a `ResponseAborted` that out-sequences the thread's newest start event (`MessageReceived`, `CodingAgentUserMessageSent`, `TriggerStarted`, `ContinuationStarted`, `OrphanRecoveryStarted`) already covers the turn, so the session emits nothing. The in-memory `AgentSession::external_terminal_emitted` flag is the fast path for a boundary emitted while the session was already registered; the events-table check covers the opposite ordering, a boundary emitted **before the session existed at all**. Both restart emitters iterate a snapshot of `agent_sessions`, so a session still spawning is invisible to them and has no flag to be handed. Without that second arm, a *Switch to new version* landing inside a multi-second session spawn stacked a `ResponseCanceled{user_stop}` next to "Paused by restart" on a turn nobody stopped, and because a cancel means "turn ended" to the resume gate, the next boot then declined the auto-resume and withdrew the promise the transcript had already made.
 
 ## Resume / continuation
 
 | Event | When it fires | Volume | Persisted | Triggerable |
 |---|---|---|---|---|
 | `ContinuationStarted` | Resume-after-abort boundary. Opens a new exchange in the timeline whose body is the rerun (chat: re-LLM call after abort; coding agent: resume into the same `cc_session_id` when the backend has one). **Channel-agnostic** — emitted on the chat, trigger, and coding-agent paths alike, so it says nothing about a thread's type (see below). Carries optional `branch`, engine-stamped `origin`, and `reason` (mirrors the `ContinuationRequested.reason` so a hang/stray-signal auto-recovery isn't labeled an engine restart). Aliases for old DB rows: `SessionRecovered`, `SessionResumed`. | lifecycle | yes | yes |
-| `SessionStarted` | A coding-agent process spawned. Carries `session_id` (backend session id), optional `branch`, optional `repo_id`, plus *coding-agent-thread* discriminators: `coding_agent_kind` (`"lucidos" \| "app" \| "external"`, default `"lucidos"`), `coding_agent_folder` (canonical folder the spawn targets — `<ws>/data/apps/<id>/` for App, repo root otherwise), `app_id` (set only for App), and `coding_agent` (`"claude-code" \| "codex"`, default `"claude-code"` — which backend drives the thread; locked in by the first SessionStarted via the `thread_summaries.coding_agent` projection). Legacy rows without these decode as Lucidos / Claude Code via the serde defaults. | lifecycle | yes | yes |
+| `SessionStarted` | A coding-agent process spawned. Carries `session_id` (backend session id), optional `branch`, optional `repo_id`, plus *coding-agent-thread* discriminators: `coding_agent_kind` (`"lucidos" \| "app" \| "external"`, default `"lucidos"`), `coding_agent_folder` (canonical folder the spawn targets: `<ws>/data/apps/<id>/` for App, repo root otherwise), `app_id` (set only for App), and `coding_agent` (`"claude-code" \| "codex"`, default `"claude-code"`, which backend drives the thread; locked in by the first SessionStarted via the `thread_summaries.coding_agent` projection). Legacy rows without these decode as Lucidos / Claude Code via the serde defaults. Its projection also **clears the thread's stored compose draft** and advances the *compose epoch*, because a coding-agent session start consumes the thread's prompt, and **broadcasts a `ThreadComposeChanged`** carrying the emptied state and the new epoch. Both are gated on the event being a coding-agent one: a chat or trigger `ContinuationStarted` shares this arm, consumes nothing, and must leave the user's draft and the epoch alone. | lifecycle | yes | yes |
 | `SessionEnded` | A coding-agent thread is truly done (terminal-only). Carries `reason: SessionEndReason` (`Shutdown` / `Panic` / `Closed` / `StaleResume` / `LegacyNonTerminal`). `StaleResume` is the one transient case: it does NOT settle the thread — the projection stays `running` while the caller re-spawns once with a fresh session (chat and the continuation/spawn consumer both do), and the frontend skips the AbortPanel. A caller that does not retry leaves the thread `running` with no subprocess, so the retry is part of the contract, not an optimization. | lifecycle | yes | yes |
 
 ## Coding agent (Claude Code / Codex)
@@ -162,14 +184,14 @@ Not prefixed `CodingAgent*` because the same machinery serves any agent that nee
 | `CommandPermissionResolved` | The above was answered (Allow once / Deny / Allow for this thread / Always allow), or auto-resolved by the engine (`reason: "Superseded by a new message"` when the user types instead of clicking; an orphan/cancel reason on restart or Stop). Carries `request_id`, `allowed`, optional `reason`, optional `persist_scope` (`narrow` / `broad` / `session`). Flips the thread back to `running` **only from `waiting_for_user_answer`** (a stale resolution on an idle/terminal thread leaves the status unchanged). | per-action | yes | yes |
 | `McpPermissionRequested` | The Lucidos Agent (chat) paused an **MCP server tool** call to ask the user — the chat mirror of `CommandPermissionRequested` for MCP tools. Renders the same `PermissionCard`; the agent loop blocks in-process. Carries `request_id`, `tool_use_id`, `server_id` (MCP registry key), `server_name` (human label), `tool_name` (bare MCP tool), `arguments_summary`. Chat-channel only; flips the thread to `waiting_for_user_answer`. **Skipped (no event, auto-approved) in two cases**: a non-interactive **trigger** thread (no human to prompt) and a server with the `auto_approve` flag set. | per-action (only when the call isn't pre-authorized) | yes | yes |
 | `McpPermissionResolved` | The above was answered (Allow once / Deny / Allow for this thread / Always allow this tool / Always allow this server), or auto-resolved by the engine (superseded / orphan / cancel). Carries `request_id`, `allowed`, optional `reason`, optional `persist_scope` (`narrow` → `Mcp(server:tool)`, `broad` → `Mcp(server:*)` — both persisted to `~/.lucidos/mcp-allowed-tools`; `session` → in-memory per-thread). Flips the thread back to `running` **only from `waiting_for_user_answer`** (a stale resolution on an idle/terminal thread leaves the status unchanged). | per-action | yes | yes |
-| `CommandCheckpointed` | The **command guard** (ADR 0002, Phase 4) snapshotted the workspace's git-tracked `data/` on a safety ref before running a `ReversibleDanger` command (in-workspace deletion/overwrite) — so the user can one-click Undo. Emitted only after the snapshot succeeds; a failed snapshot runs the command unguarded with no event. Carries `checkpoint_id` (the ref key), `command` (the inspected text), `summary` (the card line). Does not change thread status (it's taken mid-turn, right before the command). | per-action (only when the guard is on AND a command hits the reversible lane) | yes | yes |
-| `CommandCheckpointReverted` | The user clicked Undo on a `CommandCheckpointed` card (or the engine resolved it): the workspace was restored from the checkpoint ref and the ref deleted. Carries `checkpoint_id`; stamped with the original turn's `request_event_id` so it groups into the same exchange as its checkpoint (the card renders reverted). | per-action | yes | yes |
+| `CommandCheckpointed` | The **command guard** (ADR 0002, Phase 4) bracketed a `ReversibleDanger` command (in-workspace deletion/overwrite) with two snapshots of the workspace's git-visible content: a **pre** image on a safety ref before it ran, and a **post** image after. Diffing the pair is what tells the engine which files the command created, overwrote and deleted, so the card can offer both an Undo and a view of what changed. Emitted **after** the command returns, and only when the two images differ: a command that changed nothing git-visible (typically because its target was gitignored) emits nothing, since its Undo could neither restore nor remove anything. A failed snapshot likewise emits nothing and lets the command run unguarded. Carries `checkpoint_id` (the ref key), `command` (the inspected text), `summary` (the card line), and the counts `restores` / `removes` (what Undo would put back, and what it would delete because the command created it; both 0 on events written before the counts existed). Does not change thread status. | per-action (only when the guard is on AND a command hits the reversible lane AND it changed something git-visible) | yes | yes |
+| `CommandCheckpointReverted` | The user clicked Undo on a `CommandCheckpointed` card (or the engine resolved it): the workspace was restored from the pre image and the files the command created were removed, each only if it still matched what the command wrote. The two refs are kept, so the card's diff stays viewable afterwards. Carries `checkpoint_id`; stamped with the original turn's `request_event_id` so it groups into the same exchange as its checkpoint (the card renders reverted). | per-action | yes | yes |
 | `CredentialRequested` | Persisted audit-log entry: a credential prompt was opened for `provider`. Pairs with the transient `CredentialPromptRequested` SSE request that carries the JSON payload for the modal. | lifecycle | yes | yes |
 | `McpConsentRequested` | Legacy persisted audit-log entry (`tool`, `args`) from the pre-card MCP consent flow. No longer emitted — chat MCP consent now uses the in-thread `McpPermissionRequested` / `McpPermissionResolved` permission card above. Kept as a defined variant for replay of any historical rows. | lifecycle | yes | yes |
 
 `QUESTION_OVERTAKEN_EVENT_TYPES` constant — the unified set of event names that mean a `UserQuestionAsked` is no longer the latest interactive point on the thread. Once any of these lands after a question, the next typed user text starts a fresh follow-up rather than a `FreeText` answer. Two categories: **terminal** (`ResponseAborted`, `ResponseCanceled`, `ResponseFailed`, `CodingAgentIdled`); **agent progression** — coding agent (`CodingAgentTextStreamed`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `CodingAgentPromptSent`) and chat (`TextStreamed`, `ThoughtStreamed`, `ToolCalled`, `ToolResult`). The coding-agent progression category defends against the parallel-tool-call race: a coding agent can emit a question alongside sibling tool calls in one assistant message, the question path blocks while the siblings dispatch and emit events. Without filtering on those events, the user's next typed comment is silently absorbed as a `FreeText` answer to the dead question.
 
-Because the fast-path reroutes typed text, an answer that carries composer text (`FreeText`, or `MultiSelected` with `text`) **clears the thread's stored compose draft** — but only when the draft is exactly what was submitted (trimmed text compare, and no attached images, since an answer carries none) — and **broadcasts a `ThreadComposeChanged`** carrying the now-empty state so every device learns of it live. Nothing else on this path would do either: no `MessageReceived` is emitted, so the send-side clear never runs, and the draft would otherwise re-sync to every device (or linger on peers until their next thread-summary reload). A click-only answer submits no text, so it clears nothing and broadcasts nothing, and a different draft still in progress on another device survives.
+Because the fast-path reroutes typed text, an answer that carries composer text (`FreeText`, or `MultiSelected` with `text`) **clears the thread's stored compose draft** (but only when the draft is exactly what was submitted: trimmed text compare, and no attached images, since an answer carries none) and **broadcasts a `ThreadComposeChanged`** carrying the now-empty state and the thread's new *compose epoch*, so every device learns of it live and a draft write composed before the answer can no longer be applied after it. Nothing else on this path would do either: no `MessageReceived` is emitted, so the send-side clear never runs, and the draft would otherwise re-sync to every device (or linger on peers until their next thread-summary reload). A click-only answer submits no text, so it clears nothing and broadcasts nothing, and a different draft still in progress on another device survives.
 
 The FreeText fast-path is additionally gated to **human-authored** follow-ups (`ActorMode::Human`). Only a real person typing answers an open question; agent- and engine-driven re-entries on the same thread are not the user's answer and must fall through. The case that motivated this: a **child-thread completion** wakes the parent via `notify_parent_of_child_completion` with `ActorMode::Agent`, feeding a `[CHILD THREAD COMPLETED] …` block through the same chat-turn entry point. Before the guard, that block was consumed as a bogus `UserQuestionAnswered { FreeText }` (actor = `thread_link`/`child`), silently killing the user's open question. Now the wake falls through to the injection fast-path (queued as `WakeFromChild`), so the question stays live for the user and the child's result is processed right after they answer it.
 
@@ -218,6 +240,119 @@ Legacy: historical events with empty `change_id` + `commit_sha` set are from the
 | `ContextDismissed` | The agent (LLM) explicitly asked to drop a prior `ToolCalled` / `ToolResult` / `ChildThreadCompleted` from future resume context, via the `dismiss_from_context` tool. Carries `dismissed_event_id`. The resume helper honours it on every subsequent assembly. | per-action | yes | yes |
 | `WorktreeCleaned` | Background worktree cleanup ran on this thread (Phase 10.2/10.3). Carries `tier: u8` (0 = applied/clean worktree removed after the short grace; 1 = build artifacts stripped, worktree still on disk; 2 = entire worktree removed — the full-removal tier, also used for *stranded* worktrees whose git admin dir is gone), `freed_bytes: u64` (best-effort), `branch_deleted: bool` (a full removal that also dropped a fully-merged branch; always false for stranded removal). | lifecycle (rare per thread) | yes | yes |
 
+## Event wait (a thread holding a subscription)
+
+The lifecycle of one `await_event` call. All four are persisted, all four are
+**triggerable but never awaitable** (see § "Triggerable is not the same question
+as awaitable"). There is no `thread_event_waits` table: `EventWaitStarted` *is*
+the wait, and the dispatcher's live set is rebuilt from these rows at boot.
+
+| Event | When it fires | Volume | Persisted | Triggerable | Awaitable |
+|---|---|---|---|---|---|
+| `EventWaitStarted` | A thread registered a subscription. Emitted between the `ToolCalled` and that call's `ToolResult`, so the pair closes normally and the turn carries on. Carries `wait_id`, `tool_use_id`, `on: EventSubscription[]` (same shape as a trigger's `on:`), `reason` (the model's own words, shown to the user), `expires_at`, and `watermark` (the event `sequence` at registration, which the catch-up scan reads forward from). Writes NO status. | per-action (rare) | yes | yes | **no** |
+| `EventWaitDelivered` | A matching event resolved the wait. Carries `wait_id`, the matched `event_id` / `event_type` / `payload` (self-contained, so replay never dangles), and `matched_index` (which `on:` entry fired). | per-action (rare) | yes | yes | **no** |
+| `EventWaitExpired` | The wait passed `expires_at`. **Wakes the thread** with an explanatory message rather than dropping it: a silently dropped wait is a permanently stalled thread, which is worse than the polling this replaces. Carries `wait_id`. | per-action (rare) | yes | yes | **no** |
+| `EventWaitCanceled` | The user ended the wait deliberately. `cause` is one of `user_stop` (the Stop waiting button), `thread_canceled`, `thread_archived`, `thread_discarded`. Note what is absent: an ordinary user message does NOT cancel, and does not disturb the subscription in any way. | per-action (rare) | yes | yes | **no** |
+
+### A subscription does not hold the turn
+
+`await_event` returns immediately, like any other tool. The turn carries on and
+ends with an ordinary terminator, and the thread is then plain **`idle`** while
+it watches: no queue slot, no blocking state, nothing for the user to resolve.
+Archive stays offered, and archiving cancels the subscription rather than
+stranding it. What surfaces a live subscription is the per-thread **subscription
+indicator**, not the thread status.
+
+#### Which wakes leave you still watching, and which do not
+
+| Wake | Subscription after it | What to do |
+|---|---|---|
+| **Delivery** (`EventWaitDelivered`) | **Spent.** The first match resolves the wait and consumes it. Any *other* live wait on the thread is untouched. | This one has stopped watching. To catch the next one, call `await_event` again *before the turn ends*. Saying you will re-subscribe is not re-subscribing: a turn that ends with no new call leaves nothing watching for it. |
+| **Expiry** (`EventWaitExpired`) | Gone. | Report what you were waiting for, rather than subscribing again to the same thing. |
+| **Cancel** (`EventWaitCanceled`) | Gone, by the user's choice. There is no wake at all: the thread is left exactly as it was. | Report back. Do not re-register unless they ask. |
+
+Delivery is the one that bites. It is the only resolution that consumes the
+subscription *and* hands you a payload to act on, so it reads like the wait is
+still running when it is not. A standing in-thread watch is therefore one
+subscription per event, and it is bounded by the consecutive-subscription cap in
+§ "Limits" below: past it the next `await_event` call is refused and you have to
+report back. Do not promise the user "forever" in a thread; that is a trigger's
+job.
+
+A **user message** is deliberately absent from that table, and its absence is
+the point: it resolves nothing, so every subscription survives it with its
+deadline intact and none of them needs re-registering. It used to *detach* a
+wait, which was the closest thing to a fourth row.
+
+
+**No `EventWait*` event writes a status**, and that absence is the rule rather
+than an omission. Registration happens mid-turn, so the turn's own terminator
+decides. A resolution lands on a thread that is either idle (its wake's own
+`UserPromptInjected` sets `running`) or running something unrelated, which a
+write here would misreport as revived.
+
+**A user message changes nothing.** Typing into a subscribed thread runs an
+ordinary turn and every subscription survives untouched, deadline included,
+because none of them was holding anything.
+
+This was not always so. Until 2026-08-06 a wait was **attached**: `await_event`
+ended the turn with its `tool_use` deliberately unpaired, so the delivered event
+could arrive as that call's result and the model could resume mid-thought inside
+one exchange. It bought continuity, and it cost an unpaired `tool_use` in the
+message array, which is a provider 400 the moment anything else runs on the
+thread. Paying for that needed detach-on-interruption with a filler result, an
+attachment probe at every resolution site, a `was_attached` field on all three
+resolutions, two wake-anchor shapes, a `waiting_for_event` status, a restart
+preserve guard, and a bar on the injection fast path. All of it is gone. See
+`docs/plans/2026-08-06-every-event-wait-is-detached.md`.
+
+### The wake anchor
+
+Every delivery and every expiry is immediately followed by exactly one more
+event, which is where the payload goes: a **`UserPromptInjected`** carrying it as
+prose. It starts a new exchange, which is the honest shape for a wake that may
+arrive hours later, and it is the same shape a child-thread completion uses to
+wake its parent.
+
+On a *delivery* it also carries `delivered_event_id`, the id of the
+`EventWaitDelivered` above it. The prose is the prompt the model reads and
+cannot be trimmed, but a client rendering it verbatim shows a screen of
+pretty-printed JSON, so the id points at the row already holding the same facts
+as fields (`event_type`, `payload`) and the transcript names the event with its
+payload folded away. An *expiry* leaves the field unset: it has no payload to
+point at.
+
+Worth knowing when reading a transcript, and load-bearing on restart: a
+resolution followed *only* by its anchor is one whose turn never ran, which is
+how the engine re-drives a wake lost to a crash.
+
+### Both agents, one registration
+
+The chat agent registers through the `await_event` LLM tool. A **coding agent**
+registers through `lucidos await-event` (see `lucidos-cli`), which POSTs
+`/api/v1/threads/<id>/event-waits` into the same code, so the caps, the
+subscribability gate and the refusal wording are one implementation rather than
+two. The delivery routes down the coding-agent lane (into a live session, or a
+fresh resume when there is none), exactly as a child completion does.
+
+Coding agents were excluded from waits in v1 for one reason: the engine does not
+own a Claude Code or Codex session's message array, so it could not leave a
+dangling `tool_use` in one. Removing the attached shape removed the obstacle.
+
+### Limits
+
+Three, all refused at the registration boundary with an error the agent reads in
+the same turn rather than discovering later:
+
+- `timeout_secs` is **required** and capped at **24 hours**. There is no
+  unbounded wait. For anything longer, the right shape is a trigger.
+- A thread may hold **5 live waits** at once, and may not register the same
+  `on:` list twice (one event would then wake it twice).
+- A thread may subscribe **10 times in a row** with no message from the user in
+  between. That bounds a thread that wakes itself, two threads ping-ponging,
+  and a model simply stuck. An agent- or engine-authored message does not reset
+  the count, since those are exactly what such a loop is made of.
+
 ## Transient — never persisted, broadcast over SSE only
 
 All transient names are past tense (events-only model). They cannot trigger (the matcher only sees persisted events). They drive live UI state (streaming preview, modal opens, in-app refreshes) and parent-thread fan-out signals. The "request events" carry the JSON payload that drives a frontend modal; the persisted sibling `CredentialRequested` is the audit-log entry that the same request opened a prompt. (The old `McpConsentPromptRequested` transient request was removed — chat MCP consent is now the persisted in-thread `McpPermissionRequested` card, not a modal.)
@@ -232,7 +367,6 @@ All transient names are past tense (events-only model). They cannot trigger (the
 | `PluginUninstallRequested` | Request event — opens the plugin uninstall panel. Carries the JSON preview from `uninstall_plugin` (plugin name + version, file list partitioned into still-on-disk vs already-missing). Resolved by `POST /api/v1/plugins/uninstall/{uninstall_id}/{confirm\|cancel}`. Legacy alias: `PluginUninstallRequest`. | per-action |
 | `EmailConfirmRequested` | Request event — opens the email confirmation modal. Carries `payload: String`. Legacy alias: `EmailConfirmRequest`. | per-action |
 | `PushNotificationRequested` | Request event — prompts the device to register for web push. Empty payload. Legacy alias: `PushNotificationRequest`. | lifecycle |
-| `FileRefreshRequested` | Tells the frontend / open editors to re-read a file at `path`. Emitted by `agentic_loop_special_tool`. Legacy alias: `RefreshFile`. | per-action |
 | `AppUiRefreshRequested` | Tells any open app iframe with `app_id` to reload itself. Legacy alias: `RefreshAppUI`. | per-action |
 | `AppUiCaptureRequested` | Asks an open app iframe to capture state for `request_id`. The reply lands via the SDK capture path. Legacy alias: `CaptureAppUI`. | per-action |
 | `NavigationRequested` | Tells the frontend to navigate (URL, intra-app route, etc.). Carries `payload: String`. An agent navigate (`navigate_ui`) also carries an optional `actor` (the originating device — the device that sent the prompt that triggered the turn); the frontend scopes the navigate to that device so it doesn't land on the user's other devices. Absent for trigger/background turns and the SDK app-iframe (nil-thread) path. | per-action |
@@ -285,7 +419,46 @@ The `Api` variant carries an optional `source_thread_id`:
 }
 ```
 
-Set when the engine recognised the request as coming from a Lucidos-spawned subprocess (coding-agent session, `run_bash`, `run_python`, scheduled script, `lucidos` CLI). Detection is via the **thread-bound origin token**: every spawned subprocess gets its own `LUCIDOS_AGENT_ORIGIN_TOKEN` injected into its env, shaped `<thread-id>.<mac>` (or `-.<mac>` when the subprocess has no thread context) under a per-engine-startup HMAC secret, and the `lucidos` CLI auto-forwards it as the `x-lucidos-agent-origin-token` header on every engine call. When the MAC verifies, `source_thread_id` is **the token's own prefix**, so it is authenticated rather than claimed: a subprocess can present only the token it was handed, and that token names exactly one thread. Mutating HTTP handlers (`apply_change`, `revert_change`, `discard_change`, `chat_submit`, settings writes, …) then stamp `Api { mode: "agent", source_thread_id: <spawning thread> }` regardless of what the request body claims, so agent actions never appear as "You" cards. A token that does not verify (including a valid one re-pointed at another thread) is treated as not-a-subprocess at all and falls through to the regular `Api { mode: "human" }` resolution, the same path external API clients take. There used to be a second `x-lucidos-source-thread-id` header carrying the thread id; it was unverifiable, so any subprocess could claim any thread. It is gone, and nothing reads one. Cross-thread chat injection from a subprocess is refused with 403 at `chat_submit`: the target must be the caller's own thread, or a thread that does not exist yet and whose declared parent is the caller. See `api::chat::subprocess_chat_legitimate` for the full allow/deny matrix.
+Set when the engine recognised the request as coming from a Lucidos-spawned subprocess (coding-agent session, `run_bash`, `run_python`, scheduled script, `lucidos` CLI). Detection is via the **thread-bound origin token**: every spawned subprocess gets its own `LUCIDOS_AGENT_ORIGIN_TOKEN` injected into its env, shaped `<thread-id>.<mac>` (or `-.<mac>` when the subprocess has no thread context) under a per-engine-startup HMAC secret, and the `lucidos` CLI auto-forwards it as the `x-lucidos-agent-origin-token` header on every engine call. When the MAC verifies, `source_thread_id` is **the token's own prefix**, so it is authenticated rather than claimed: a subprocess can present only the token it was handed, and that token names exactly one thread. Mutating HTTP handlers (`apply_change`, `revert_change`, `discard_change`, `chat_submit`, settings writes, …) then stamp `Api { mode: "agent", source_thread_id: <spawning thread> }` regardless of what the request body claims, so agent actions never appear as "You" cards. A token that does not verify (including a valid one re-pointed at another thread) is treated as not-a-subprocess at all and falls through to the regular unattributed-API-client resolution, the same path external API clients take. There used to be a second `x-lucidos-source-thread-id` header carrying the thread id; it was unverifiable, so any subprocess could claim any thread. It is gone, and nothing reads one. Cross-thread chat injection from a subprocess is refused with 403 at `chat_submit`: the target must be the caller's own thread, or a thread that does not exist yet and whose declared parent is the caller. See `api::chat::subprocess_chat_legitimate` for the full allow/deny matrix.
+
+#### `mode` and `origin` are attribution, and an agent may not fabricate them
+
+The two fields together are the answer to "who authored this turn", and the
+projection acts on `mode`, not just the UI: `human` sets the thread's
+`initiator` to the user and bumps `last_user_action`, the drawer's recency sort.
+So a `mode: "human"` turn an agent wrote is not a cosmetic mislabel, it is a
+record the user cannot distinguish from their own.
+
+**An agent must never post a message the engine would record as human.** The
+engine enforces this on both chat entry points: `mode: "human"` is accepted only
+from a caller carrying a `device_id` that resolves in the `devices` table (the
+user's own client, which sends `x-lucidos-device-id` on every mutating request)
+or a `caller_workspace` (the cross-workspace contract, where the calling
+workspace vouches for its own human). Everything else is an *unattributed
+caller* and gets 403. See `api::chat::human_mode_is_attributed`.
+
+Note the asymmetry this removes. Before it, a subprocess that PRESENTED its
+origin token was held to `subprocess_chat_legitimate` (which refuses
+`mode: Human` outright), while the same subprocess shelling out to `curl`
+dropped the token, read as an ordinary external API client, and was allowed.
+Dropping your credential bought more privilege than presenting it. It no longer
+does.
+
+Two related refusals on the same path, both of which write nothing:
+
+- **404** when `thread_id` names no existing thread and the request carries no
+  create signal (`new_thread: true`, a `parent_thread_id`, or a
+  `caller_workspace`). A thread has no creation event, so an unknown id used to
+  be materialized by this event's own upsert projection, which meant a caller
+  that reached the wrong engine got its threads created there and its read-back
+  confirmed the mistake.
+- **409** when the request asserted a different workspace than the answering
+  engine serves (`x-lucidos-target-workspace`). The body names the actual
+  workspace.
+
+If no tool covers what you were asked to do, say so. Do not hand-roll HTTP to
+the engine to get around it: see `system-knowhow/lucidos-cli.md` § "Never post
+to the engine API as the user".
 
 The `ThreadLink` variant answers "who launched this thread", and it is **independent of `parent_thread_id`**:
 

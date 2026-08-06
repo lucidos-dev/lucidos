@@ -1,9 +1,9 @@
-use crate::support::{base_url, http_client, unique_marker};
+use crate::support::{base_url, http_client, unique_marker, user_client};
 use std::time::Duration;
 
 #[tokio::test]
 async fn sse_stream_connects_and_receives_events() {
-    let client = http_client();
+    let client = user_client().await;
     let sse_url = format!("{}/api/v1/events", base_url());
 
     // Connect to SSE stream
@@ -35,7 +35,7 @@ async fn sse_stream_connects_and_receives_events() {
 /// when the client doesn't ask for it.
 #[tokio::test]
 async fn sse_sets_content_encoding_gzip_when_client_offers_it() {
-    let client = http_client();
+    let client = user_client().await;
     let resp = client
         .get(format!("{}/api/v1/events", base_url()))
         .header("Accept", "text/event-stream")
@@ -155,7 +155,8 @@ async fn sse_compressed_events_decompress_to_sse_wire_format() {
         "message": format!("Say exactly: \"sse gzip {marker}\""),
         "mode": "human",
     });
-    http_client()
+    user_client()
+        .await
         .post(&chat_url)
         .json(&chat_body)
         .send()
@@ -181,7 +182,7 @@ async fn sse_compressed_events_decompress_to_sse_wire_format() {
 
 #[tokio::test]
 async fn sse_receives_events_after_chat() {
-    let client = http_client();
+    let client = user_client().await;
     let marker = unique_marker("api-sse");
 
     // Start SSE stream in background

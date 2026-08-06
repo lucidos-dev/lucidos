@@ -5,7 +5,7 @@ use super::super::agent_session::change_description_fallback;
 use super::super::change_ops::branch_is_hardened;
 use super::super::claude_code::{WORKTREE_EXCLUDE_PATHS, WORKTREE_WORKSPACE_MARKER};
 use super::super::git_ops::{
-    add_paths_to_worktree_exclude, auto_commit_worktree, default_local_branch,
+    add_paths_to_worktree_exclude, commit_worktree_or_err, default_local_branch,
     describe_branch_changes, files_require_restart, find_worktree_for_branch, git_cmd,
     is_external_repo_path, main_worktree, proposal_files_for_branch, worktree_add, worktrees_dir,
 };
@@ -146,18 +146,59 @@ impl LucidosEngine {
 
         let wt_path = find_worktree_for_branch(&repo_root, &branch_name).await;
 
-        // If worktree exists, commit uncommitted changes (unless discarding) and remove it
+        // If worktree exists, commit uncommitted changes (unless discarding) and remove it.
+        //
+        // The removal is `--force`, so it discards whatever is still uncommitted.
+        // That is only safe once the rescue commit has actually LANDED, which is
+        // why this uses `commit_worktree_or_err` rather than the silent
+        // `auto_commit_worktree`: `git add` / `git commit` fail for perfectly
+        // ordinary reasons in a real repo (a non-zero pre-commit hook, a
+        // git-crypt filter on a locked repo, a `git status` that could not run),
+        // and swallowing that failure meant the very next line deleted the work
+        // the commit was supposed to save. On a failed rescue we keep the
+        // worktree: the branch is still proposed below, and the background
+        // WorktreeCleanup worker owns reclamation (ADR 0035), which weighs
+        // dirtiness before removing anything.
         if let Some(ref wt) = wt_path {
+            let mut rescued = true;
             if !discard {
-                auto_commit_worktree(wt, "Coding agent changes (auto-committed)").await;
+                match commit_worktree_or_err(wt, "Coding agent changes (auto-committed)").await {
+                    Ok(_) => {}
+                    Err(e) => {
+                        rescued = false;
+                        log!(
+                            "[Recovery] Could not auto-commit {} before ending the stale session: {}. Keeping the worktree so its uncommitted work is not force-removed",
+                            wt.display(),
+                            e
+                        );
+                    }
+                }
             }
-            if let Some(wt_str) = wt.to_str() {
-                let _ = git_cmd(&["worktree", "remove", "--force", wt_str], &repo_root).await;
-            } else {
-                log!(
-                    "[Recovery] skipped worktree remove (non-UTF8 path): {}",
-                    wt.display()
-                );
+            // `rescued == false` leaves the tree in place; the cleanup worker
+            // reclaims it later, once its work is safe or genuinely absent.
+            if rescued {
+                match wt.to_str() {
+                    Some(wt_str) => {
+                        match git_cmd(&["worktree", "remove", "--force", wt_str], &repo_root).await
+                        {
+                            Ok(o) if o.status.success() => {}
+                            Ok(o) => log!(
+                                "[Recovery] git worktree remove failed for {}: {}",
+                                wt.display(),
+                                String::from_utf8_lossy(&o.stderr).trim()
+                            ),
+                            Err(e) => log!(
+                                "[Recovery] git worktree remove errored for {}: {}",
+                                wt.display(),
+                                e
+                            ),
+                        }
+                    }
+                    None => log!(
+                        "[Recovery] skipped worktree remove (non-UTF8 path): {}",
+                        wt.display()
+                    ),
+                }
             }
         }
 
@@ -266,12 +307,15 @@ impl LucidosEngine {
                         cc_session_id: None,
                         coding_agent,
                         reason: None,
-                        // Worktree was removed above (`worktree remove --force`)
-                        // before this idle fires. Recording the now-deleted path
-                        // would mislead the resolver into trying to reuse it.
-                        // Leave None — the next spawn falls through to
-                        // `git worktree list` lookup or fresh deterministic
-                        // path generation.
+                        // The removal above is CONDITIONAL now (a rescue commit
+                        // that did not land keeps the worktree), so this path may
+                        // or may not still exist by the time the idle fires.
+                        // Recording it either way is wrong: a deleted path would
+                        // mislead the resolver into reusing it, and a retained
+                        // one belongs to a failed attempt nobody should resume
+                        // blind. Leave None and let the next spawn fall through
+                        // to the `git worktree list` lookup, which answers for
+                        // both cases, or to fresh deterministic path generation.
                         worktree_path: None,
                         // No worktree → no SHA to record. The next spawn will
                         // skip external-edit detection until a real CC turn
@@ -946,28 +990,9 @@ impl LucidosEngine {
             // Emit the boundary `ResponseAborted` FIRST so the UI shows the
             // "Response interrupted" panel above the synthetic Idled. The
             // dispatcher classifies on `CodingAgentIdled.reason`, so order
-            // doesn't affect spawn decisions.
-            //
-            // Idempotency: `/api/v1/restart` pre-emits a `ResponseAborted{actor:
-            // device}` for in-flight CC threads BEFORE shutdown so the
-            // post-restart timeline reads "You restarted". If that event
-            // exists newer than the latest start, skip our emit — emitting
-            // again would double-render the AbortPanel and overwrite the
-            // device attribution with `engine`.
-            let abort_already_exists: bool = sqlx::query_scalar(
-                "SELECT EXISTS ( \
-                    SELECT 1 FROM events WHERE aggregate_id = $1 \
-                      AND event_type = 'ResponseAborted' \
-                      AND sequence > COALESCE( \
-                          (SELECT MAX(sequence) FROM events WHERE aggregate_id = $1 \
-                             AND event_type IN ('MessageReceived','CodingAgentUserMessageSent','TriggerStarted')), 0))",
-            )
-            .bind(thread_id.to_string())
-            .fetch_one(self.pool())
-            .await
-            .unwrap_or(false);
-
-            if !abort_already_exists {
+            // doesn't affect spawn decisions. Skipped when this turn already
+            // carries a boundary (see `boundary_abort_already_emitted`).
+            if !boundary_abort_already_emitted(self.pool(), thread_id).await {
                 let originating_event_id =
                     crate::engine::agent_session::latest_originating_event_id(
                         self.pool(),
@@ -1120,8 +1145,8 @@ pub(crate) async fn thread_has_unanswered_question(pool: &sqlx::PgPool, thread_i
 /// Apply / Discard / Archive with a question on screen is untouched, because
 /// those are deliberate user actions that DO end the turn and they cancel-stamp
 /// the card themselves. The gate is a *window*, not an actor test, and the
-/// `emit_stop_terminal` call site widens it to `is_shutdown ||
-/// engine.is_shutting_down()` to cover a session inserted after
+/// `emit_stop_terminal` call site widens it through
+/// `LucidosEngine::session_is_shutting_down` to cover a session inserted after
 /// `shutdown_agent_sessions` took its flag pass. So a raw Stop that lands inside
 /// the teardown window IS swallowed too. That is deliberate: the engine is on
 /// its way out either way, and preserving the card costs the user nothing that
@@ -1251,6 +1276,87 @@ pub(crate) async fn switch_was_user_initiated(pool: &sqlx::PgPool, thread_id: Uu
     .unwrap_or(false)
 }
 
+/// True when a `ResponseAborted` already covers the thread's **current** turn, so
+/// the recovery pass must not emit a second boundary over the top of it.
+///
+/// `/api/v1/restart` pre-emits a `ResponseAborted{actor: device}` for in-flight
+/// coding-agent threads BEFORE shutdown, so the post-restart timeline reads
+/// "Paused by restart". Emitting again here would double-render the AbortPanel and
+/// bury that device attribution under the system actor.
+///
+/// "Current turn" is the load-bearing half, and it is why this shares
+/// [`after_latest_thread_start_sql`] with the switch fingerprint instead of
+/// spelling out a start set of its own. An abort older than the thread's newest
+/// start belongs to a turn that a later resume already superseded, so it says
+/// nothing about whether THIS turn was interrupted.
+///
+/// It did spell out its own list until 2026-08-06, and that list was missing both
+/// resume starts (`ContinuationStarted`, `OrphanRecoveryStarted`), which are
+/// precisely the ones that open a turn after an abort. The cost, on a nightly
+/// e2e coding-agent thread that had already been resumed once: the engine
+/// died, was switched back up (device abort), auto-resumed, then died again
+/// involuntarily. The retired switch abort still out-sequenced the message the
+/// stale list mistook for the turn's start, so of the four coding-agent threads
+/// that restart interrupted, the auto-resumed one was the only one to get no
+/// "Response interrupted" panel. Its timeline read as if it had never stopped.
+pub(crate) async fn boundary_abort_already_emitted(pool: &sqlx::PgPool, thread_id: Uuid) -> bool {
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM events WHERE aggregate_id = $1 \
+              AND event_type = 'ResponseAborted' \
+              AND {current_turn})",
+        current_turn = after_latest_thread_start_sql("$1", "sequence"),
+    ))
+    .bind(thread_id.to_string())
+    .fetch_one(pool)
+    .await
+    // A probe that could not run is UNKNOWN. Fall back to emitting: a duplicate
+    // boundary is cosmetic noise, a missing one hides a real interruption.
+    .unwrap_or(false)
+}
+
+/// [`boundary_abort_already_emitted`], narrowed to a boundary that **names this
+/// turn**: same current-turn window, plus the abort's `request_event_id` must
+/// equal the turn's own anchor.
+///
+/// The extra clause is what makes the answer safe for a caller that will SKIP
+/// its own terminal on a `true`. The recovery pass can rely on the window
+/// alone, because a spurious `true` there costs it only a duplicate panel. An
+/// in-loop terminal is the turn's ONLY terminator, so a spurious `true` costs
+/// the turn its terminator entirely.
+///
+/// The window alone is not enough for that, because it is turn-exact only for
+/// turns that carry one of [`THREAD_START_EVENTS_SQL`], and two ordinary shapes
+/// carry none: a parent woken by `ChildThreadCompleted` (the anchor is the CTC,
+/// which is in `CC_ORIGINATING_EVENT_TYPES` but not in the start set), and an
+/// `answered_after_idle` continuation (`continue_should_open_resume_exchange`
+/// deliberately withholds its `ContinuationStarted`). For those, a previous
+/// turn's abort is still inside the window forever, so the window alone would
+/// read a stale boundary as covering a live turn.
+///
+/// A `None` anchor cannot prove anything, so the caller treats it as "not
+/// covered" and emits. Same fail-open direction as the sibling: a duplicate
+/// boundary is cosmetic, a missing terminator is not.
+pub(crate) async fn boundary_abort_covers_turn(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    request_event_id: Uuid,
+) -> bool {
+    sqlx::query_scalar::<_, bool>(&format!(
+        "SELECT EXISTS ( \
+            SELECT 1 FROM events WHERE aggregate_id = $1 \
+              AND event_type = 'ResponseAborted' \
+              AND payload->>'request_event_id' = $2 \
+              AND {current_turn})",
+        current_turn = after_latest_thread_start_sql("$1", "sequence"),
+    ))
+    .bind(thread_id.to_string())
+    .bind(request_event_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap_or(false)
+}
+
 /// SQL predicate matching the teardown boundary abort of a user-initiated *Switch to
 /// new version*: an `EngineShutdown` `ResponseAborted` stamped with the device that
 /// clicked switch. Assumes the row is already scoped to one thread's events.
@@ -1261,33 +1367,37 @@ pub(crate) const SWITCH_TEARDOWN_ABORT_SQL: &str = "event_type = 'ResponseAborte
      AND payload->'actor'->>'kind' = 'device' \
      AND payload->>'cause' = 'engine_shutdown'";
 
-/// SQL list of the events that begin (or restart) a thread's turn. A switch abort
-/// only counts while no newer start supersedes it — the resume loop-breaker.
-/// Reach for [`switch_abort_unsuperseded_sql`] rather than this constant: the
-/// list is only ever useful inside that one predicate.
+/// SQL list of the events that begin (or restart) a thread's turn. Reach for
+/// [`after_latest_thread_start_sql`] rather than this constant: the list is only
+/// ever useful inside that one predicate.
 const THREAD_START_EVENTS_SQL: &str = "'MessageReceived',\
     'CodingAgentUserMessageSent','TriggerStarted','ContinuationStarted',\
     'OrphanRecoveryStarted'";
 
-/// The **resume loop-breaker** as a SQL boolean: the switch abort at `seq_expr`
-/// is still the newest thing that happened on the thread at `id_expr`, i.e. no
-/// [`THREAD_START_EVENTS_SQL`] event superseded it.
+/// SQL boolean: the event at `seq_expr` is newer than every
+/// [`THREAD_START_EVENTS_SQL`] event on the thread at `id_expr`, so it belongs to
+/// that thread's **current** turn rather than to one a later start superseded.
 ///
-/// One definition for all three consumers, so a switch abort cannot be "consumed"
-/// by one of them and still live for another: the coding-agent resume gate
-/// ([`switch_was_user_initiated`]), the chat one
-/// (`chat::recovery::switch_resume_candidates`), and the boot floor
-/// ([`unresumed_switch_threads_sql`]). `ContinuationStarted` is in the list, so
-/// once a resume has actually begun the abort stops counting anywhere. This is
-/// what stops an auto-resume that dies before emitting anything else from being
-/// resumed again on the next boot, forever.
+/// Every recovery read that asks "which turn does this `ResponseAborted` belong
+/// to?" goes through here, because the interesting failures are two of them
+/// answering differently. The two questions:
+///
+/// * Is the *Switch to new version* fingerprint still live, or did a resume
+///   already consume it? ([`switch_abort_unsuperseded_sql`], the loop-breaker.)
+/// * Does this turn still need an interruption boundary, or did the teardown
+///   pre-emit already land one? ([`boundary_abort_already_emitted`].)
+///
+/// The second carried its own hand-rolled copy of the list until 2026-08-06, one
+/// that had neither resume start in it, so a switch abort the first read had
+/// retired still counted for the second. See that function's doc for what a crash
+/// after an auto-resume then looked like.
 ///
 /// `id_expr` yields the thread's `aggregate_id` (text): `"$1"` for a bound
 /// single-thread check, or a column reference such as `"e.aggregate_id"` for a
-/// set-based scan. `seq_expr` yields the abort's sequence in the same scope. The
+/// set-based scan. `seq_expr` yields the event's sequence in the same scope. The
 /// subquery aliases its own `events` as `s`, so an unqualified `seq_expr` in an
 /// un-aliased outer query is never captured by it.
-pub(crate) fn switch_abort_unsuperseded_sql(id_expr: &str, seq_expr: &str) -> String {
+fn after_latest_thread_start_sql(id_expr: &str, seq_expr: &str) -> String {
     format!(
         "{seq} > COALESCE(( \
              SELECT MAX(s.sequence) FROM events s \
@@ -1298,6 +1408,21 @@ pub(crate) fn switch_abort_unsuperseded_sql(id_expr: &str, seq_expr: &str) -> St
         id = id_expr,
         starts = THREAD_START_EVENTS_SQL,
     )
+}
+
+/// The **resume loop-breaker**: the switch abort at `seq_expr` is still the newest
+/// thing that happened on the thread at `id_expr`, so no resume has consumed it.
+///
+/// One definition for all three consumers, so a switch abort cannot be "consumed"
+/// by one of them and still live for another: the coding-agent resume gate
+/// ([`switch_was_user_initiated`]), the chat one
+/// (`chat::recovery::switch_resume_candidates`), and the boot floor
+/// ([`unresumed_switch_threads_sql`]). `ContinuationStarted` is in the start set,
+/// so once a resume has actually begun the abort stops counting anywhere. This is
+/// what stops an auto-resume that dies before emitting anything else from being
+/// resumed again on the next boot, forever.
+pub(crate) fn switch_abort_unsuperseded_sql(id_expr: &str, seq_expr: &str) -> String {
+    after_latest_thread_start_sql(id_expr, seq_expr)
 }
 
 /// Coding-agent lifecycle events that mean **the turn is over**: the engine was

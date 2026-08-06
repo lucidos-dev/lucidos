@@ -255,13 +255,66 @@ pub struct PermissionPromptOutcome {
     pub reason: Option<String>,
 }
 
+/// How many changed paths a `file_change` summary names before collapsing into
+/// a `+N more` tail. Three keeps the line readable while still naming enough of
+/// a patch to recognize it.
+const SUMMARY_MAX_PATHS: usize = 3;
+
+/// What the engine could learn about a file-write request's targets.
+///
+/// Three states rather than a `Vec`, because both decisions below are made over
+/// the WHOLE set and a plain list cannot tell "no targets, this is not a file
+/// write" from "a target we could not read". Dropping an unreadable entry is
+/// the dangerous shape: its siblings would then vouch for it, and one
+/// in-worktree path would auto-approve a patch whose other half writes
+/// somewhere nobody looked.
+enum FileTargets {
+    /// Not one of the file-write tools.
+    NotAFileWrite,
+    /// Every target the request names, all of them resolved. Never empty, so
+    /// the `all()` below can never vacuously approve nothing.
+    Known(Vec<String>),
+    /// A file write at least one of whose targets could not be read.
+    Unresolved,
+}
+
 /// Render the PermissionCard's one-line summary from the tool call shape.
 /// Picks the first recognizable argument; falls back to the bare tool name.
-/// `reason` / `grant_root` are last-resort keys for the Codex `file_change`
-/// approval, whose input carries no path — without them the card would read
-/// as a bare "file_change" with nothing telling the user WHAT is being
-/// approved.
+///
+/// A Codex `file_change` is the awkward one: its approval request carries no
+/// path of its own, so the paths come from the `changes` list the driver attached,
+/// and they win over `reason` / `grant_root`. Those two stay as last-resort
+/// keys for the case where the `changes` list is unknown, but both arrive `null` in
+/// practice (verified live against codex-cli 0.146.1), which is why the card
+/// used to read as a bare "file_change" with nothing telling the user WHAT was
+/// being approved.
 pub fn build_permission_summary(tool_name: &str, input: &serde_json::Value) -> String {
+    let display_name = match tool_name {
+        "Skill" => "skill",
+        _ => tool_name,
+    };
+    // Only a FULLY resolved `changes` list is named, and only from `changes`
+    // itself. Listing the entries that happened to parse would be worse than
+    // naming none, since the user would read a complete-looking card and
+    // approve a patch whose unnamed half writes somewhere else; and a
+    // `grant_root` is a directory the agent wants opened up, not a file it is
+    // editing, so it stays a last-resort `arg` below rather than posing as one.
+    if tool_name == "file_change" && input.get("changes").is_some() {
+        if let FileTargets::Known(paths) = coding_agent_file_targets(tool_name, input) {
+            let shown = paths
+                .iter()
+                .take(SUMMARY_MAX_PATHS)
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let rest = paths.len().saturating_sub(SUMMARY_MAX_PATHS);
+            return if rest > 0 {
+                format!("{} {} +{} more", display_name, shown, rest)
+            } else {
+                format!("{} {}", display_name, shown)
+            };
+        }
+    }
     let arg = [
         "file_path",
         "path",
@@ -276,10 +329,6 @@ pub fn build_permission_summary(tool_name: &str, input: &serde_json::Value) -> S
     .iter()
     .find_map(|k| input.get(k).and_then(|v| v.as_str()))
     .unwrap_or("");
-    let display_name = match tool_name {
-        "Skill" => "skill",
-        _ => tool_name,
-    };
     if arg.is_empty() {
         display_name.to_string()
     } else {
@@ -619,24 +668,75 @@ fn coding_agent_command<'a>(tool_name: &str, input: &'a serde_json::Value) -> Op
     input.get("command").and_then(|v| v.as_str())
 }
 
-/// Extract the target path from a coding-agent *file-write* request. Codex
-/// raises these as `file_change` (carrying `grant_root`); Claude Code as
-/// `Edit`/`Write`/`MultiEdit`/`NotebookEdit` (carrying `file_path`/`path`).
-fn coding_agent_file_target(tool_name: &str, input: &serde_json::Value) -> Option<String> {
+/// Extract the target paths of a coding-agent *file-write* request. Claude Code
+/// raises these as `Edit`/`Write`/`MultiEdit`/`NotebookEdit`, each naming a
+/// single `file_path`/`path`; Codex raises `file_change`, whose
+/// `changes: [{path, kind}]` list (attached by the app-server driver from the
+/// item's `item/started`, since the approval carries no paths of its own) can
+/// name several files at once.
+///
+/// **One unreadable entry makes the whole set [`FileTargets::Unresolved`]**,
+/// rather than being filtered out of the list. The driver writes a change's
+/// path through `str_field`, which yields `""` when codex omits it, so a
+/// partially-understood patch is a shape that really reaches here; excusing it
+/// by the entries that DID parse is exactly the fail-open the callers must not
+/// make.
+fn coding_agent_file_targets(tool_name: &str, input: &serde_json::Value) -> FileTargets {
     if !matches!(
         tool_name,
         "file_change" | "Edit" | "Write" | "MultiEdit" | "NotebookEdit"
     ) {
-        return None;
+        return FileTargets::NotAFileWrite;
+    }
+    // `changes` is Codex vocabulary, so only a `file_change` may be read from
+    // it. Without the tool gate a stray `changes` key on a Claude Code `Write`
+    // would REPLACE its real `file_path` (this branch returns before the key
+    // scan below), and one in-worktree entry would skip the card for a write
+    // landing anywhere. CC's input is model-authored JSON that the MCP
+    // permission server forwards verbatim, so that is not a hypothetical shape.
+    if tool_name == "file_change" {
+        if let Some(changes) = input.get("changes") {
+            // Present but not a list means the `changes` list is a shape we do not
+            // understand, which is `Unresolved` and NOT a licence to fall
+            // through to `grant_root` below.
+            let Some(changes) = changes.as_array() else {
+                return FileTargets::Unresolved;
+            };
+            let mut paths = Vec::with_capacity(changes.len());
+            for change in changes {
+                match change.get("path").and_then(|p| p.as_str()) {
+                    // Absolute only. A relative path cannot be placed without
+                    // the agent's cwd, and `path_outside_workspace` reads an
+                    // unplaceable path as in-workspace (correct for CC, whose
+                    // file tools require an absolute path and whose relative
+                    // paths resolve against the worktree). For a `file_change`
+                    // that reasoning is inverted by the request's own
+                    // existence: codex raises it BECAUSE the patch escaped its
+                    // sandbox, so "assume it lands in the worktree" is the one
+                    // conclusion the evidence rules out.
+                    Some(path) if !path.is_empty() && Path::new(path).is_absolute() => {
+                        paths.push(path.to_string())
+                    }
+                    _ => return FileTargets::Unresolved,
+                }
+            }
+            return if paths.is_empty() {
+                // An announced patch that changes nothing is not something
+                // codex raises an approval for, so read it as not understood.
+                FileTargets::Unresolved
+            } else {
+                FileTargets::Known(paths)
+            };
+        }
     }
     for key in ["file_path", "path", "notebook_path", "grant_root"] {
         if let Some(s) = input.get(key).and_then(|v| v.as_str()) {
             if !s.is_empty() {
-                return Some(s.to_string());
+                return FileTargets::Known(vec![s.to_string()]);
             }
         }
     }
-    None
+    FileTargets::Unresolved
 }
 
 /// True when `path` provably targets somewhere OUTSIDE the workspace root. A
@@ -750,11 +850,16 @@ fn path_inside_worktree(path: &str, worktree_root: &Path) -> bool {
 /// [`path_inside_worktree`] precisely because it is the one in-worktree
 /// location that ISN'T in that diff.
 ///
-/// Scope is the file-write vocabulary of [`coding_agent_file_target`] —
-/// commands (`Bash` / `command_execution`) are deliberately NOT covered: a
+/// Scope is the file-write vocabulary of [`coding_agent_file_targets`].
+/// Commands (`Bash` / `command_execution`) are deliberately NOT covered: a
 /// command can do anything, so it stays on the card path even when it merely
 /// mentions a `.claude/` file. `None` for `worktree_root` (no live session
 /// entry, or the session never recorded one) fails closed.
+///
+/// **Every** target must be contained, and an empty target list is never
+/// auto-allowed. A Codex `changes` list can name several files, and skipping the
+/// card is only justified when the whole patch lands in the reviewed diff, so
+/// one path we cannot place is enough to ask.
 pub fn worktree_write_auto_allowed(
     tool_name: &str,
     input: &serde_json::Value,
@@ -763,8 +868,17 @@ pub fn worktree_write_auto_allowed(
     let Some(root) = worktree_root else {
         return false;
     };
-    coding_agent_file_target(tool_name, input)
-        .is_some_and(|target| path_inside_worktree(&target, root))
+    match coding_agent_file_targets(tool_name, input) {
+        // `Known` is never empty by construction; the guard keeps a future edit
+        // that relaxes that from turning `all()` on nothing into an auto-allow.
+        FileTargets::Known(targets) => {
+            !targets.is_empty()
+                && targets
+                    .iter()
+                    .all(|target| path_inside_worktree(target, root))
+        }
+        FileTargets::NotAFileWrite | FileTargets::Unresolved => false,
+    }
 }
 
 /// Classify one coding-agent permission request for the unattended decision.
@@ -776,9 +890,13 @@ pub fn worktree_write_auto_allowed(
 ///   in-workspace destruction (`ReversibleDanger`) counts as benign here (it's
 ///   recoverable and in-workspace); an irreversible side-effect carries its
 ///   category for the grant check.
-/// * File requests (`file_change` / `Edit` / `Write` / …): an in-workspace
-///   target is benign; a target outside the workspace root is out-of-workspace
-///   destruction (grant-gated).
+/// * File requests (`file_change` / `Edit` / `Write` / …): benign only when
+///   EVERY target is in-workspace; **any** target outside the workspace root
+///   makes the whole request out-of-workspace destruction (grant-gated). A
+///   Codex `file_change` whose targets are unknown is grant-gated too: codex
+///   raises that approval precisely because the patch escaped its sandbox, so
+///   an unattended session must not read "I could not see the paths" as
+///   permission to write them.
 /// * Anything else (reads, etc.) is benign.
 pub fn classify_coding_agent_request(
     tool_name: &str,
@@ -806,11 +924,26 @@ pub fn classify_coding_agent_request(
             }
         };
     }
-    if let Some(path) = coding_agent_file_target(tool_name, input) {
-        if path_outside_workspace(&path, workspace_path) {
+    match coding_agent_file_targets(tool_name, input) {
+        FileTargets::Known(targets) => {
+            if targets
+                .iter()
+                .any(|path| path_outside_workspace(path, workspace_path))
+            {
+                return RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction);
+            }
+            return RequestVerdict::Benign;
+        }
+        // A file write we cannot place is the opposite of benign, so it is
+        // grant-gated rather than waved through. Codex only asks about a patch
+        // that escaped its sandbox in the first place, and falling through to
+        // the benign default below is how an unattended trigger session used to
+        // auto-allow every out-of-workspace Codex write: `grant_root` was the
+        // only path key the approval ever carried, and it arrives `null`.
+        FileTargets::Unresolved => {
             return RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction);
         }
-        return RequestVerdict::Benign;
+        FileTargets::NotAFileWrite => {}
     }
     RequestVerdict::Benign
 }
@@ -969,7 +1102,19 @@ pub async fn prompt_coding_agent_permission(
 
     let canonical_input = serde_json::to_string(&input).unwrap_or_else(|_| "{}".to_string());
     let dedup_key: DedupKey = (thread_id, tool_name.clone(), canonical_input);
-    let summary = build_permission_summary(&tool_name, &input);
+    // The event below is persisted in `events` AND fanned out over SSE, and it
+    // carries the tool input verbatim, so a hardcoded
+    // `postgres://user:pass@host/db` in the command text would be written to the
+    // event store in the clear. Redact a COPY for the event; the dedup key and
+    // the pending entry keep the verbatim input, which is what the agent
+    // actually asked to run and what the approval must match. The summary is
+    // built from the redacted copy because it interpolates the command. Same
+    // scrub the sibling surfaces already apply: `CodingAgentToolCalled`,
+    // `ToolCalled.args`, `CommandPermissionRequested.command`, and
+    // `CommandCheckpointed.command`.
+    let mut event_input = input.clone();
+    crate::core::redact_postgres_secrets_in_json(&mut event_input);
+    let summary = build_permission_summary(&tool_name, &event_input);
 
     let (request_id, mut rx, is_canonical) = {
         let mut pending = pending.lock().unwrap();
@@ -993,7 +1138,7 @@ pub async fn prompt_coding_agent_permission(
                         request_id: request_id.clone(),
                         tool_use_id,
                         tool_name,
-                        input,
+                        input: event_input,
                         summary,
                     },
                     meta,
@@ -1212,6 +1357,64 @@ mod tests {
     fn build_permission_summary_uses_skill_for_skill_tool() {
         let s = build_permission_summary("Skill", &serde_json::json!({ "skill": "update-config" }));
         assert_eq!(s, "skill update-config");
+    }
+
+    #[test]
+    fn build_permission_summary_names_the_codex_changed_files() {
+        // The whole complaint: this card used to read as a bare "file_change".
+        let one = build_permission_summary(
+            "file_change",
+            &serde_json::json!({
+                "item_id": "exec-1",
+                "changes": [{"path": "/Users/me/notes.txt", "kind": {"type": "add"}}],
+            }),
+        );
+        assert_eq!(one, "file_change /Users/me/notes.txt");
+
+        let three = build_permission_summary(
+            "file_change",
+            &serde_json::json!({"changes": [
+                {"path": "/a.rs"}, {"path": "/b.rs"}, {"path": "/c.rs"},
+            ]}),
+        );
+        assert_eq!(three, "file_change /a.rs, /b.rs, /c.rs");
+
+        let many = build_permission_summary(
+            "file_change",
+            &serde_json::json!({"changes": [
+                {"path": "/a.rs"}, {"path": "/b.rs"}, {"path": "/c.rs"},
+                {"path": "/d.rs"}, {"path": "/e.rs"},
+            ]}),
+        );
+        assert_eq!(many, "file_change /a.rs, /b.rs, /c.rs +2 more");
+    }
+
+    #[test]
+    fn build_permission_summary_prefers_paths_over_the_codex_reason() {
+        // `reason` was only ever a last resort for the pathless card; now that
+        // the driver attaches the `changes` list, the files win.
+        let s = build_permission_summary(
+            "file_change",
+            &serde_json::json!({
+                "reason": "writes outside worktree",
+                "grant_root": "/etc",
+                "changes": [{"path": "/etc/hosts", "kind": {"type": "update"}}],
+            }),
+        );
+        assert_eq!(s, "file_change /etc/hosts");
+    }
+
+    #[test]
+    fn build_permission_summary_falls_back_when_the_change_set_is_unknown() {
+        // Degrade path: a reordered or dropped `item/started` costs the card
+        // its detail, nothing more.
+        let s = build_permission_summary(
+            "file_change",
+            &serde_json::json!({"item_id": "exec-1", "reason": "needs write access"}),
+        );
+        assert_eq!(s, "file_change needs write access");
+        let bare = build_permission_summary("file_change", &serde_json::json!({"changes": []}));
+        assert_eq!(bare, "file_change");
     }
 
     #[test]
@@ -1869,6 +2072,207 @@ mod tests {
             &serde_json::json!({ "file_path": under(&f.root, ".git/hooks/pre-commit") }),
             Some(&f.root)
         ));
+    }
+
+    /// A Codex `file_change` input as it reaches the engine: the approval's own
+    /// `item_id`, plus the `changes` list the app-server driver attached from the
+    /// item's `item/started`.
+    fn file_change_input(paths: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "item_id": "exec-1",
+            "changes": paths.iter()
+                .map(|p| serde_json::json!({ "path": p, "kind": {"type": "add"} }))
+                .collect::<Vec<_>>(),
+        })
+    }
+
+    #[test]
+    fn worktree_write_auto_allowed_requires_every_codex_target_inside() {
+        // A `changes` list is one approval over several files, so the card can only
+        // be skipped when the whole patch lands in the reviewed diff.
+        let f = worktree_fixture();
+        let inside_a = under(&f.root, "src/a.rs");
+        let inside_b = under(&f.root, ".claude/rules/db.md");
+        let outside = under(&f.outside, "notes.txt");
+        assert!(worktree_write_auto_allowed(
+            "file_change",
+            &file_change_input(&[&inside_a, &inside_b]),
+            Some(&f.root)
+        ));
+        assert!(
+            !worktree_write_auto_allowed(
+                "file_change",
+                &file_change_input(&[&inside_a, &outside]),
+                Some(&f.root)
+            ),
+            "one unplaceable path in the set is enough to ask"
+        );
+    }
+
+    /// A `changes` list codex only partly described: one path we can read, one we
+    /// cannot. The driver writes an omitted path through `str_field`, which
+    /// yields `""`, so this is the shape that actually arrives.
+    fn partly_readable_change_set(readable: &str) -> serde_json::Value {
+        serde_json::json!({
+            "item_id": "exec-1",
+            "changes": [
+                { "path": readable, "kind": {"type": "add"} },
+                { "path": "", "kind": {"type": "add"} },
+            ],
+        })
+    }
+
+    #[test]
+    fn one_unreadable_change_entry_makes_the_whole_set_unresolved() {
+        // The dangerous shape: filtering the unreadable entry out would let the
+        // readable sibling vouch for it, so an in-worktree path would skip the
+        // card and an in-workspace path would classify benign, for a patch
+        // whose other half writes nobody knows where.
+        let f = worktree_fixture();
+        let inside = under(&f.root, "src/a.rs");
+        assert!(
+            !worktree_write_auto_allowed(
+                "file_change",
+                &partly_readable_change_set(&inside),
+                Some(&f.root)
+            ),
+            "a half-understood patch must still render a card"
+        );
+        assert_eq!(
+            classify_coding_agent_request(
+                "file_change",
+                &partly_readable_change_set("/ws/src/a.rs"),
+                Path::new("/ws")
+            ),
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
+        );
+        assert_eq!(
+            build_permission_summary("file_change", &partly_readable_change_set("/ws/src/a.rs")),
+            "file_change",
+            "naming only the half that parsed would read as a complete card"
+        );
+    }
+
+    #[test]
+    fn a_stray_changes_key_never_speaks_for_a_claude_code_file_write() {
+        // `changes` is Codex vocabulary. CC's input is model-authored JSON the
+        // MCP permission server forwards verbatim, so an extra key can arrive;
+        // reading it would REPLACE the real `file_path` and let one in-worktree
+        // entry skip the card for a write landing anywhere.
+        let f = worktree_fixture();
+        let input = serde_json::json!({
+            "file_path": under(&f.outside, "hosts"),
+            "changes": [{ "path": under(&f.root, "ok.txt") }],
+        });
+        assert!(
+            !worktree_write_auto_allowed("Write", &input, Some(&f.root)),
+            "the card must be decided by file_path, not by a stray changes key"
+        );
+        assert_eq!(
+            classify_coding_agent_request("Write", &input, Path::new("/ws")),
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
+        );
+    }
+
+    #[test]
+    fn a_relative_change_path_is_unresolved_rather_than_assumed_in_workspace() {
+        // `path_outside_workspace` reads an unplaceable path as in-workspace,
+        // which is right for CC (its file tools require an absolute path) and
+        // inverted for a `file_change`: codex raises that approval BECAUSE the
+        // patch escaped its sandbox, so "assume it lands in the worktree" is
+        // the one conclusion its existence rules out.
+        let input = serde_json::json!({ "changes": [{ "path": "src/x.rs" }] });
+        assert_eq!(
+            classify_coding_agent_request("file_change", &input, Path::new("/ws")),
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
+        );
+        // CC's own relative-path handling is untouched.
+        assert_eq!(
+            classify_coding_agent_request(
+                "Write",
+                &serde_json::json!({ "file_path": "src/x.rs" }),
+                Path::new("/ws")
+            ),
+            RequestVerdict::Benign,
+        );
+    }
+
+    #[test]
+    fn a_change_set_of_an_unknown_shape_is_not_classified_from_grant_root() {
+        // `changes` present but not a list is a shape we did not understand, so
+        // the security decision must not quietly fall through to `grant_root` and
+        // treat that directory as the request's one known target.
+        let input = serde_json::json!({ "changes": "surprise", "grant_root": "/ws/sub" });
+        assert_eq!(
+            classify_coding_agent_request("file_change", &input, Path::new("/ws")),
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
+            "an in-workspace grant_root must not make an unreadable `changes` list benign"
+        );
+        // The SUMMARY may still surface it: `grant_root` is a documented
+        // last-resort `arg` (the root the agent wants opened up), and reaching
+        // it through the key scan makes no claim that it is a file being
+        // edited. What must never happen is it arriving via the change-set
+        // branch, which is what the `Known` path above prints as the files.
+        assert_eq!(
+            build_permission_summary("file_change", &input),
+            "file_change /ws/sub"
+        );
+    }
+
+    #[test]
+    fn worktree_write_auto_allowed_rejects_an_empty_target_set() {
+        // The shape codex actually sends when the item was never announced:
+        // nothing to place, so nothing to auto-allow.
+        let f = worktree_fixture();
+        for input in [
+            serde_json::json!({ "item_id": "exec-1" }),
+            serde_json::json!({ "item_id": "exec-1", "changes": [] }),
+        ] {
+            assert!(!worktree_write_auto_allowed(
+                "file_change",
+                &input,
+                Some(&f.root)
+            ));
+        }
+    }
+
+    #[test]
+    fn classify_flags_a_codex_change_set_touching_anything_outside() {
+        let ws = Path::new("/ws");
+        assert_eq!(
+            classify_coding_agent_request(
+                "file_change",
+                &file_change_input(&["/ws/src/a.rs", "/ws/data/b.md"]),
+                ws
+            ),
+            RequestVerdict::Benign
+        );
+        assert_eq!(
+            classify_coding_agent_request(
+                "file_change",
+                &file_change_input(&["/ws/src/a.rs", "/etc/cron.d/evil"]),
+                ws
+            ),
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction),
+            "one out-of-workspace path grant-gates the whole patch"
+        );
+    }
+
+    #[test]
+    fn classify_grant_gates_a_codex_change_whose_paths_are_unknown() {
+        // Codex raises a file-change approval precisely because the patch
+        // escaped its sandbox. Before the driver attached the `changes` list, the
+        // only path key was `grant_root`, which arrives null, so this request
+        // classified as Benign and an unattended trigger session auto-allowed
+        // every out-of-workspace Codex write.
+        assert_eq!(
+            classify_coding_agent_request(
+                "file_change",
+                &serde_json::json!({ "item_id": "exec-1" }),
+                Path::new("/ws")
+            ),
+            RequestVerdict::SideEffect(SideEffectCategory::OutOfWorkspaceDestruction)
+        );
     }
 
     #[test]

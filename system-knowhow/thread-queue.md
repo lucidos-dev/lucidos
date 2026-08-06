@@ -28,8 +28,25 @@ priority can't starve triggers/cron.
 | Agent/Engine-mode `POST /api/v1/chat/submit` that starts a NEW thread (cross-workspace task POSTs, `lucidos spawn-thread`) | `sub-thread` or `coding-agent`, by `use_coding_agent`; `coding_agent` preserves Claude Code vs Codex for coding-agent rows | background — `submit` |
 | User-initiated chat / user-typed coding-agent threads (a person typing, any workspace; follow-ups on existing threads; child→parent callbacks) | `user-chat` | user — `acquire_user_slot` |
 
+| Waking a thread parked on an *event wait* (a matching event arrived, or the wait timed out) | `user-chat` | user, `acquire_user_slot` |
+
 NOT gated at all: mid-flight injections into an already-running thread (they feed
 an existing response, they don't start a new one) and engine recovery resumes.
+
+**A parked thread occupies ZERO slots.** A thread that called `await_event` has
+ended its turn: no tokio task, no response in flight, and `reconcile_user_slot`
+reads its `waiting_for_event` status and releases the slot. This is not an
+optimization, it is what makes the primitive safe. If a parked thread held its
+slot, N threads waiting on events would fill the pool while the very work that
+would emit those events queued behind them, which is a deadlock rather than
+mere waste.
+
+The wake is admitted as `user-chat`, the same kind as a child-thread callback
+and for the same reason: it resumes work that was already admitted once, rather
+than starting new work, and a woken thread the user is watching must not sit
+behind a saturated per-trigger cap. Prioritized but still counted (ADR 0008). A
+parked *trigger* thread's wake therefore bypasses that trigger's concurrency
+cap, which is correct: the fire was admitted when it started.
 
 **Two mechanics, one pool:**
 

@@ -4,6 +4,7 @@
 use axum::{
     extract::{Path, State},
     http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::Deserialize;
@@ -67,6 +68,18 @@ pub(super) struct PutComposeBody {
     /// must not wipe the draft's picks; a dropdown change sends the full object.
     #[serde(default)]
     pub selection: Option<JsonValue>,
+    /// The *compose epoch* (`docs/glossary.md`) this write was composed
+    /// against: the newest value the client had heard for the thread when it
+    /// read the draft. The UPDATE matches on it, so a write composed BEFORE a
+    /// submission is refused when it arrives AFTER one, however long it was
+    /// stalled and whatever the client concluded about it.
+    ///
+    /// `None` (absent) skips the precondition. That is permanent back-compat
+    /// for a cached PWA bundle running against a newer engine: refusing an
+    /// epoch-less write would break draft sync outright for a client that
+    /// cannot know to send one.
+    #[serde(default)]
+    pub compose_epoch: Option<i64>,
 }
 
 fn validate_mode(mode: &str) -> Result<(), ApiError> {
@@ -173,6 +186,26 @@ pub(super) async fn post_thread(
     Ok(StatusCode::CREATED)
 }
 
+/// The write was composed against a *compose epoch* a submission has since
+/// consumed, so it was not applied. `412 Precondition Failed` is the exact HTTP
+/// semantic for a failed optimistic-concurrency check, and this endpoint's 409
+/// already means the unrelated mode lock, so the status alone tells the two
+/// apart without a bespoke error code. The body carries the current epoch so
+/// the client can adopt it and re-issue in one round trip.
+///
+/// Hand-built rather than returned through `ApiError`, which is a bare
+/// `{"error": msg}` and has nowhere to put the epoch.
+fn stale_compose_epoch_response(current_epoch: i64) -> Response {
+    (
+        StatusCode::PRECONDITION_FAILED,
+        Json(serde_json::json!({
+            "error": "compose write is stale: the draft was consumed by a submission",
+            "compose_epoch": current_epoch,
+        })),
+    )
+        .into_response()
+}
+
 /// PUT /api/v1/threads/:id/compose — update compose fields.
 ///
 /// One round-trip: `UPDATE ... RETURNING compose_mode, …` folds the
@@ -189,7 +222,7 @@ pub(super) async fn put_compose(
     Path(id): Path<Uuid>,
     headers: HeaderMap,
     Json(body): Json<PutComposeBody>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<Response, ApiError> {
     if body.text.len() > MAX_COMPOSE_TEXT_BYTES {
         return Err(ApiError::new(
             StatusCode::PAYLOAD_TOO_LARGE,
@@ -275,7 +308,12 @@ pub(super) async fn put_compose(
     // COALESCE($5, compose_selection) the same way: a text-only/keystroke PUT
     // (NULL bind) must preserve the draft's stored dropdown picks, while a
     // dropdown change sends the full object.
-    let row: Option<(Option<String>, JsonValue, Option<JsonValue>)> = sqlx::query_as(
+    //
+    // `compose_epoch = $6` is the write fence. It costs nothing on the
+    // keystroke path because the epoch counts SUBMISSIONS, not writes: every
+    // PUT between two submissions carries the same value, so only a write that
+    // straddles a submission can fail it.
+    let row: Option<(Option<String>, JsonValue, Option<JsonValue>, i64)> = sqlx::query_as(
         "UPDATE thread_summaries
             SET compose_text = $2,
                 compose_images = COALESCE($3, compose_images),
@@ -289,31 +327,35 @@ pub(super) async fn put_compose(
           WHERE thread_id = $1
             AND state IN ('composing', 'active')
             AND ($4::text IS NULL OR state = 'composing')
-         RETURNING compose_mode, compose_images, compose_selection",
+            AND ($6::bigint IS NULL OR compose_epoch = $6)
+         RETURNING compose_mode, compose_images, compose_selection, compose_epoch",
     )
     .bind(id)
     .bind(&body.text)
     .bind(images_bind.as_ref())
     .bind(body.mode.as_deref())
     .bind(body.selection.as_ref())
+    .bind(body.compose_epoch)
     .fetch_optional(state.engine.pool())
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    let (resolved_mode, post_compose_images, post_compose_selection) = match row {
+    let (resolved_mode, post_compose_images, post_compose_selection, compose_epoch) = match row {
         Some(r) => r,
         None => {
             // Cold path: UPDATE matched zero rows. Distinguish "no row" from
-            // "wrong state" / "mode-locked" with a follow-up read so the e2e
-            // contract (404/410/409) stays specific.
-            let lookup: Option<(String,)> =
-                sqlx::query_as("SELECT state FROM thread_summaries WHERE thread_id = $1")
-                    .bind(id)
-                    .fetch_optional(state.engine.pool())
-                    .await
-                    .map_err(|e| ApiError::internal(e.to_string()))?;
+            // "wrong state" / "mode-locked" / "stale epoch" with a follow-up
+            // read so the e2e contract (404/410/409/412) stays specific.
+            let lookup: Option<(String, i64)> = sqlx::query_as(
+                "SELECT state, compose_epoch FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(id)
+            .fetch_optional(state.engine.pool())
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+            let current_epoch = lookup.as_ref().map(|(_, e)| *e);
             let st = lookup
-                .map(|(s,)| ThreadState::from_db_str(&s))
+                .map(|(s, _)| ThreadState::from_db_str(&s))
                 .transpose()
                 .map_err(|e| ApiError::internal(e.to_string()))?;
             // Mode locks at first send — once the thread leaves Composing,
@@ -328,13 +370,24 @@ pub(super) async fn put_compose(
                     "mode is locked once the thread has been sent",
                 ));
             }
+            // The state was fine and only the fence rejected: a submission
+            // consumed the compose slot after this write was composed. Answer
+            // 412 with the current epoch rather than a silent 204, because the
+            // client would otherwise record the text as stored and stop owing a
+            // re-send while the engine had dropped it. The client adopts the
+            // epoch and re-issues, so a draft typed while behind still lands.
+            if let (Some(sent), Some(current)) = (body.compose_epoch, current_epoch) {
+                if sent != current && compose_error(st).is_none() {
+                    return Ok(stale_compose_epoch_response(current));
+                }
+            }
             // TOCTOU: a concurrent send between the UPDATE and the lookup
             // may have flipped state to active and the row now matches
             // `compose_can_compose`. Treat as a benign no-op — the
             // concurrent path already wrote a more authoritative value.
             return match compose_error(st) {
                 Some(e) => Err(e),
-                None => Ok(StatusCode::NO_CONTENT),
+                None => Ok(StatusCode::NO_CONTENT.into_response()),
             };
         }
     };
@@ -364,6 +417,11 @@ pub(super) async fn put_compose(
         // change, the existing stored object on a preserve (keystroke) write —
         // so every SSE receiver hydrates the authoritative per-draft selection.
         selection: post_compose_selection,
+        // Unchanged by a compose write (only a submission moves it), but
+        // carried anyway so every broadcast is a complete report of the
+        // thread's compose state and a receiver never has to merge two frames
+        // to know which epoch the text belongs to.
+        compose_epoch,
         origin_device_id: device_id,
     });
     state
@@ -373,7 +431,7 @@ pub(super) async fn put_compose(
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
 
-    Ok(StatusCode::NO_CONTENT)
+    Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// DELETE /api/v1/threads/:id — discard a composing thread.

@@ -1,6 +1,6 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code, Codex) — writes files under `data/`, emits and queries domain events, lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including Codex via `--codex` / `--coding-agent codex` and app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), reads system-knowhow on demand (`lucidos knowhow list` / `lucidos knowhow read <id>` — how an app coding-agent thread fetches app-building guides), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
+description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code, Codex). It writes files under `data/`, emits and queries domain events, subscribes the calling thread to an event instead of polling (`lucidos await-event`), lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including Codex via `--codex` / `--coding-agent codex` and app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), reads system-knowhow on demand (`lucidos knowhow list` / `lucidos knowhow read <id>`, which is how an app coding-agent thread fetches app-building guides), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
 ---
 
 # `lucidos` CLI
@@ -11,12 +11,68 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 - emit a domain event, or query the workspace's event store (which holds engine thread/system events alongside domain events, and `events query` returns both)
 - list or count *thread summaries* in the workspace — useful for "is anything still running?" gates in triggers
 - spawn a new *thread* — a chat thread, or a *coding-agent thread* on a repo or an app folder (`--cc` for Claude Code, `--codex` / `--coding-agent codex` for Codex, `--folder data/apps/<id>` for app worktrees) — `lucidos spawn-thread`
+- subscribe the calling thread to an event instead of polling for it, and finish, letting the engine re-open the thread when the event lands: `lucidos await-event`
 - list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
 - read engine-shipped system-knowhow (and user knowhow) — `lucidos knowhow list` / `lucidos knowhow read <id>` — the way an *app coding-agent thread* (whose worktree can't see `system-knowhow/`) pulls app-building guides on demand
 - call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
 - send a push notification to the user without going through an LLM thread
 
 The CLI is a thin Rust wrapper around the engine's HTTP API and filesystem conventions — for app UI usage see the JS [`lucidos.data.*`](./js-sdk.md) reference. Scripts should always prefer the CLI over hand-rolling HTTP calls back to the engine.
+
+## Never post to the engine API as the user, and never route around a tool
+
+Read this before anything below it. Three rules, and the third is the one that
+matters most.
+
+1. **Never fabricate a human turn.** A message you author is an *agent* message.
+   You may not POST `mode: "human"` to `/api/v1/chat/stream` (or anywhere else),
+   because a turn recorded as the user is indistinguishable, in the timeline and
+   in the event log, from something they actually typed. It also lands in the
+   projection as a user action: it sets the thread's initiator to the user and
+   bumps the drawer's recency sort. The engine refuses a human claim it has no
+   evidence for, but the rule binds you whether or not the engine catches you.
+
+2. **Never hand-roll HTTP to the engine to get past a restriction.** If a tool
+   or a CLI subcommand will not let you do something, that is the answer, not an
+   obstacle. Reaching for `curl`, `urllib` or `fetch` against the engine's own
+   `/api/v1` surface to do the same thing another way is the failure mode this
+   section exists for. Use the CLI (it forwards the attribution headers the
+   engine reads, and it resolves the right engine) and stop where it stops.
+
+3. **When a tool refuses you, TELL THE USER IT IS NOT POSSIBLE.** This is the
+   part that was missing on 2026-08-06, when an agent asked to message every
+   running coding-agent thread found that `follow_up_child_thread` and
+   `lucidos threads follow-up` reach only its own children, and instead of
+   saying so it curled the engine directly. Six agent messages were recorded as
+   the user's. They also went to the wrong engine (another workspace's, on a
+   guessed port), which created six phantom threads there, and reading them back
+   off that same wrong engine made the mistake look like a success.
+
+   The honest turn is short: say what you cannot do, say why, and offer what you
+   can. Name the threads and let the user send the message themselves. A refusal
+   reported plainly is a good turn. A refusal worked around is a broken one,
+   however well it appears to have succeeded.
+
+Three engine-side consequences worth knowing, because they change what a failed
+request looks like:
+
+- **403** on a `mode: "human"` POST means the request carried no registered
+  device, so the engine will not record it as the user. Do not try to acquire
+  one.
+- **404** on a `thread_id` means no such thread exists *on the engine you
+  reached*. It is no longer created for you. Check `GET /api/v1/health`, which
+  names the workspace the answering engine serves.
+- **409** naming a different workspace means you reached the wrong engine. The
+  body names the right one. Several engines run on one machine, one per
+  workspace, each on its own port, so never guess a port: the CLI resolves the
+  target for you, and `$LUCIDOS_API_BASE_URL` is the base for this workspace's
+  engine.
+
+The CLI asserts the workspace it is talking to on every request
+(`x-lucidos-target-workspace`, from `$LUCIDOS_WORKSPACE`), which is what makes
+the 409 possible; `lucidos spawn-thread --to <ws>` asserts the target it was
+given instead. Hand-rolled HTTP asserts nothing and is served by whichever
+engine answers the port.
 
 Some subcommands are hidden and engine-internal. They are documented here only
 so the workspace-facing CLI surface stays complete; scripts and users should not
@@ -205,7 +261,7 @@ $ lucidos threads list --active --limit 5 | jq '.[].title'
 "Refactor settings dialog"
 ```
 
-- `--active` restricts to threads where the agentic loop is mid-flow: status `running` or `waiting_for_user_answer`. Status `waiting` is **not** active: it means the coding-agent thread has stopped and proposed changes the user must act on (the loop has paused). Status `failed` is also excluded (the response is over), and so is `paused`: an engine restart interrupted that turn, and it either resumes on its own or waits for the user to click Continue.
+- `--active` restricts to threads where the agentic loop is mid-flow: status `running` or `waiting_for_user_answer`. Status `waiting` is **not** active: it means the coding-agent thread has stopped and proposed changes the user must act on (the loop has paused). Status `failed` is also excluded (the response is over, whether it errored or was interrupted with nobody resuming it), and so is `paused`: the user's own version switch interrupted that turn, and the engine resumes it by itself without the loop being mid-flow right now.
 - `--source` is a comma-separated list of `chat`, `trigger`, `coding-agent`. Legacy `claude_code` is also accepted. Omit for all sources.
 - `--limit` clamps to `1..=1000` server-side, default 100.
 - `--parent <uuid>` restricts to that thread's **direct** children only, never its grandchildren. A malformed uuid is a 400, never a silently unfiltered list.
@@ -235,7 +291,7 @@ $ if [ "$(lucidos threads count --active | jq .count)" -eq 0 ]; then
 
 Cheaper than materialising the full list just to read `.length` on big workspaces.
 
-### `lucidos threads follow-up --thread <child-uuid> --message <M> [--event-id <E>]`
+### `lucidos threads follow-up --thread <child-uuid> --message <M> [--event-id <E>] [--urgent]`
 
 Send a message to one of **this thread's own child threads**: redirect one going the wrong way, hand it something a sibling learned, or tell a stalled one to continue. This is the *child follow-up* edge, the one privileged cross-thread write. Wraps `POST /api/v1/threads/<child>/follow-up`.
 
@@ -251,14 +307,17 @@ $ lucidos threads follow-up \
 
 The ack prints as raw JSON on stdout, like every other `lucidos threads` subcommand. `child_title` is how you should refer to the child afterwards: a uuid names nothing the user can see.
 
-Four things worth knowing:
+Five things worth knowing:
 
-- **You can only address your own DIRECT children.** No siblings, no grandchildren, no arbitrary thread. There is no flag for saying who you are: the engine reads the calling thread off the *thread-bound origin token* this subprocess was spawned with, then looks the relationship up from the child's own row. A thread that is not yours is a 403 whatever you claim.
-- **It returns as soon as the message lands, and does not wait for the child.** The child reports back the usual way, as a completion card on its parent. The ack's `delivered_to` says which of three things happened: `running` (the child was mid-turn, so the message queues behind its work or steers it), `waiting-for-user-answer` (parked on a question or permission card, so **a human must answer before it reads this**), or `revived` (it was not working, so a fresh turn starts now). `detail` is the same thing in a sentence.
+- **You can only address your own DIRECT children.** No siblings, no grandchildren, no arbitrary thread. There is no flag for saying who you are: the engine reads the calling thread off the *thread-bound origin token* this subprocess was spawned with, then looks the relationship up from the child's own row. A thread that is not yours is a 403 whatever you claim. **This is a boundary, not an obstacle**: if you were asked to message a thread you did not spawn, there is no way to do it and no other route to try. Say so, name the threads, and let the user send it. See the prohibition at the top of this file.
+- **It returns as soon as the message lands, and does not wait for the child.** The child reports back the usual way, as a completion card on its parent. The ack's `delivered_to` says which of four things happened: `running` (the child was mid-turn, so the message queues behind its work or steers it), `interrupted` (you passed `--urgent` and the child's turn is being stopped so it reads you next), `waiting-for-user-answer` (parked on a question or permission card, so **a human must answer before it reads this**), or `revived` (it was not working, so a fresh turn starts now). `detail` is the same thing in a sentence.
+- **`--urgent` is for cancellations, not for hurry.** By default a mid-turn child reads you when its current work reaches a natural break, and if it is inside a long tool call that can be many minutes: a coding-agent child parked in a ten-minute blocking wait reads you when that wait returns, not before. `--urgent` stops the child's current turn instead, so it reads you at once, and whatever that turn was mid-way through is lost. Use it when the child must act on your message *instead* of what it is doing. Use the default for anything you would be happy for it to read later.
 - **Address the child by uuid, never by title.** Titles are not unique, and a fuzzy match would silently deliver to the wrong child. Find the id with `lucidos threads list --my-children`. The ack carries `child_title`, so refer to the child by that afterwards rather than by the uuid you typed.
 - **A follow-up consumes no child slot.** The fan-out limit counts threads spawned, not messages sent, so reviving a child you already have is cheaper than spawning another one.
 
 `--event-id` defaults from `$LUCIDOS_EVENT_ID` and stamps the child's message-route panel so the follow-up links back to the originating event.
+
+**A cancellation is not done when the ack returns.** The ack says the message is on the child's timeline, nothing more: even with `--urgent` the child still has to wake, read it, and do the work of stopping. If you told a child to kill a running job, verify the job is actually gone (no processes, no lock file) before you report the cancellation as complete. Reporting off the ack is how a nightly pipeline once announced a clean host while its e2e suite ran on for another seven minutes.
 
 ### `lucidos spawn-thread --to <WS> --message <M> [--cc | --codex | --coding-agent <backend>] [--folder <path> | --repo <name>] [--relation child|top] [--title <T>] [--model <M>] [--cc-model <M>]`
 
@@ -292,6 +351,63 @@ $ lucidos spawn-thread --to dev --codex --relation top \
     --title "Codex review" \
     --message "Review the current app folder and fix the failing test."
 [Codex review](thread:dev/7a42…)
+```
+
+### `lucidos await-event --on <EventType> [--on <EventType> ...] [--condition <JSON>] --timeout-secs <N> --reason <R>`
+
+Subscribe the **calling thread** to a Lucidos event, then finish. The engine
+re-opens the thread with a follow-up message when a matching event lands, or
+tells it the deadline passed. The coding-agent counterpart of the chat agent's
+`await_event` tool, on the same registration underneath, so both agents get the
+same caps and the same refusals.
+
+**It returns immediately and blocks nothing.** The thread is plain **idle** while
+it holds a subscription: no queue slot, no running turn, nothing for the user to
+resolve. So the correct shape is *subscribe, say what you are waiting for, end
+the session*. Sitting in a sleep-and-recheck loop afterwards is the thing this
+replaces, and polling for the event as well is strictly worse than either.
+
+Reach for it whenever the thing you are waiting on is something the engine
+emits: another thread finishing (`ChildThreadCompleted`), a change appearing
+(`ChangeProposed`), a trigger firing (`TriggerExecuted`), a workspace domain
+event your own scripts emit. It is **not** for external state with no Lucidos
+event (a third-party API you can only re-query, a file another process may
+write): nothing would ever wake you, so poll for those.
+
+A **rendezvous, not a stream**. The first match resolves the subscription and
+consumes it. "Continue when the next X happens" is this; "react to every X,
+forever" is a *trigger*.
+
+- `--on` names the event type, PascalCase past tense. Repeat it to watch
+  several: any one of them wakes the thread.
+- `--condition` is a JSON object filtering the event's OWN payload fields (the
+  ones `lucidos events query` prints), applied to every `--on` name. Equality by
+  default, or an operator object: `{"$eq":v}`, `{"$ne":v}`, `{"$lt":n}`,
+  `{"$lte":n}`, `{"$gt":n}`, `{"$gte":n}`, `{"$in":[…]}`. The thread an event
+  belongs to is not a payload field, so it cannot be filtered on.
+- `--timeout-secs` is required and capped at 86400 (24 h). There is no unbounded
+  subscription. Waking early with a timeout costs one turn; waking too late
+  costs the user the whole wait.
+- `--reason` is one short line in the user's language. They read it in the
+  subscription indicator, and it is how they tell a sleeping thread from a
+  stalled one.
+
+Refusals arrive as a `400` carrying the reason, and are worth reading rather
+than retrying: a per-token streaming event (`TextStreamed` and friends) or an
+`EventWait*` type is refused outright, a thread may hold at most 5 live
+subscriptions, the same `--on` list twice on one thread is refused (it would
+wake you twice for one event), and 10 subscriptions in a row with no message
+from the user is the loop cap.
+
+```bash
+# Wait for a coding-agent sidequest to finish, then stop. The engine re-opens
+# this thread with the completion when it lands.
+$ lucidos await-event --on ChildThreadCompleted --timeout-secs 3600 \
+    --reason "waiting for the e2e sidequest to finish"
+
+# Narrow it: only a change that actually touched files.
+$ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}}' \
+    --timeout-secs 1800 --reason "waiting for the refactor to propose its change"
 ```
 
 ### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>]`
@@ -606,17 +722,37 @@ The CLI prints the JSON verbatim on stdout. Exit non-zero on transport / 4xx wit
 
 Two 409s are refusals rather than errors, and both name the resolution: the change's thread is still working (wait for it to idle), or the change has **no file changes left** (`file_count` is 0 — its branch's commits cancelled out, so there is nothing to merge; discard it with the Discard button instead). A script driving a build → apply pipeline should treat a zero-`file_count` entry in `lucidos changes list` as "nothing to apply", not as a change to retry.
 
-#### Why use the CLI instead of hand-rolled urllib / curl
+#### Why the CLI and not hand-rolled urllib / curl
 
-The CLI auto-forwards the subprocess-origin header (`x-lucidos-agent-origin-token`) that the engine reads to stamp the resulting `ChangeApplied` event as `Api { mode: Agent, source_thread_id }`. The token is *thread-bound*: the engine mints one per spawn and reads the spawning thread off the token itself, so one header carries both facts. Without it, the engine falls through to `Api { mode: Human }` and the UI renders the apply card as **"You"**, wrongly attributing an agent action to the user. A `run_python` block that calls `urllib.request.urlopen("https://localhost:.../api/v1/changes/<id>/apply")` will hit this bug because urllib doesn't read the env var on its own.
+Because a hand-rolled request gets two things wrong that you cannot see from
+inside the script, and because of the rule at the top of this file: do not reach
+for raw HTTP to the engine at all.
+
+**It loses your identity.** The CLI auto-forwards the subprocess-origin header
+(`x-lucidos-agent-origin-token`) that the engine reads to stamp the resulting
+`ChangeApplied` event as `Api { mode: Agent, source_thread_id }`. The token is
+*thread-bound*: the engine mints one per spawn and reads the spawning thread off
+the token itself, so one header carries both facts, and the popover links back
+to the thread that acted. Without it the engine sees an unattributed API client:
+your agent action is recorded as an anonymous one, and on the chat path it is
+refused outright. A `run_python` block calling
+`urllib.request.urlopen(".../api/v1/changes/<id>/apply")` hits this, because
+urllib does not read the env var on its own.
+
+**It can reach the wrong engine.** The CLI resolves this workspace's engine and
+asserts which workspace it is talking to, so a mis-resolved port comes back as a
+409 naming the right one. A hand-built `https://localhost:<port>/...` asserts
+nothing and is served in full by whichever engine happens to hold that port,
+which is how six threads were created in an unrelated workspace on 2026-08-06.
 
 ```python
-# ❌ Wrong — the User-Agent on the request is "Python-urllib/X.Y" and the UI says "You"
+# WRONG: unattributed, and aimed at a port you guessed
 import ssl, urllib.request as r
 ctx = ssl._create_unverified_context()  # self-signed cert
 r.urlopen(r.Request(f"https://localhost:{port}/api/v1/changes/{cid}/apply", method="POST"), context=ctx)
 
-# ✅ Right — CLI forwards the headers; UI says "Lucidos Agent" with the source thread linked
+# RIGHT: the CLI forwards the headers and resolves the engine, so the UI says
+# "Lucidos Agent" with the source thread linked
 import subprocess
 subprocess.run(["lucidos", "changes", "apply", cid], check=True)
 ```
@@ -624,27 +760,30 @@ subprocess.run(["lucidos", "changes", "apply", cid], check=True)
 The same rule applies to bash:
 
 ```bash
-# ❌ Wrong — bare curl from inside a run_bash tool
+# WRONG: bare curl from inside a run_bash tool
 curl -k -X POST "https://localhost:$LUCIDOS_API_PORT/api/v1/changes/$CID/apply"
 
-# ✅ Right — CLI handles the headers
+# RIGHT: the CLI handles the headers and the target
 lucidos changes apply "$CID"
 ```
 
-If a script genuinely needs to call the HTTP endpoint directly (test harness, external tool that can't shell out to the CLI), forward the token header and build the base URL from `$LUCIDOS_API_BASE_URL`:
+**If there is no CLI subcommand for what you want, that is the answer.** Do not
+substitute raw HTTP: read the top of this file. The only callers that
+legitimately speak to `/api/v1` directly are test harnesses and external tools
+that cannot shell out, and neither of those is an agent working around a
+refusal.
 
-```bash
-curl -k -X POST \
-  -H "x-lucidos-agent-origin-token: $LUCIDOS_AGENT_ORIGIN_TOKEN" \
-  "${LUCIDOS_API_BASE_URL:-https://localhost:$LUCIDOS_API_PORT}/api/v1/changes/$CID/apply"
-```
-
-Forward `$LUCIDOS_AGENT_ORIGIN_TOKEN` **verbatim**. It is an opaque
-credential bound to this thread, and rewriting any part of it (in
-particular the thread id in its prefix) makes it fail verification, which
-downgrades the attribution back to "You".
-
-Use `$LUCIDOS_API_BASE_URL` (set by the engine on every spawned subprocess) rather than building the URL from `$LUCIDOS_API_PORT` yourself: under the workspace gateway (ADR 0014) the engine binds a **loopback HTTP** port and the user-facing port belongs to the gateway, which routes the workspace under `/<slug>/`, so a bare `https://localhost:$LUCIDOS_API_PORT/api/v1/...` request there never reaches the engine (the gateway resolves the first path segment as a workspace slug). `$LUCIDOS_API_BASE_URL` is the exact base the engine answers on (loopback `http://` under the gateway; `https://` self-signed in the legacy single-engine model, which `-k` / `_create_unverified_context()` accepts). The fallback to `$LUCIDOS_API_PORT` covers older engines that predate the var. The token env var is process-local secret state set by the engine on every spawned subprocess, minted for that subprocess's own thread. See `docs/apply-change-api.md` for the response shape and the full apply workflow.
+Where the CLI does cover the operation and you need the underlying URL for some
+other reason, use `$LUCIDOS_API_BASE_URL` (set by the engine on every spawned
+subprocess) rather than building one from `$LUCIDOS_API_PORT`: under the
+workspace gateway (ADR 0014) the engine binds a **loopback HTTP** port while the
+user-facing port belongs to the gateway, which routes the workspace under
+`/<slug>/`, so a bare `https://localhost:$LUCIDOS_API_PORT/api/v1/...` request
+there never reaches the engine (the gateway resolves the first path segment as a
+workspace slug). `$LUCIDOS_API_BASE_URL` is the exact base this engine answers
+on: loopback `http://` under the gateway, `https://` self-signed in the legacy
+single-engine model. See `docs/apply-change-api.md` for the apply response shape
+and the full workflow.
 
 ### `lucidos planned mark (--plan <path> | --simple "<reason>")` / `lucidos planned approve` / `lucidos planned state`
 

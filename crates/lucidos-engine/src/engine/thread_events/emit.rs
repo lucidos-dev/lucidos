@@ -8,22 +8,35 @@ use super::{AbortCause, CancelCause, EventChannel, EventMeta, MessageOrigin, Thr
 /// meta (see `meta_with_cancel_actor` in `agentic_loop.rs`). Engine-
 /// internal cancels (shutdown, restart) leave the slot empty on purpose
 /// because they pre-emit their own boundary events with explicit actor
-/// upstream. The idempotency gate below only suppresses the loop's
-/// follow-up emit when the pre-emitted terminator shares the same
-/// `request_event_id` (e.g. `/api/v1/restart` via `abort_in_flight_for_restart`);
-/// for shutdown the pre-emit carries no `request_event_id`, so the loop's
-/// actor-less `ResponseCanceled` still lands and the UI relies on
-/// `ResponseAborted` taking precedence in status derivation (see
-/// `shutdown_active_threads`' own docstring).
+/// upstream. The idempotency gate below suppresses the loop's follow-up emit
+/// when the pre-emitted terminator shares the same `request_event_id`. All
+/// three engine-internal pre-emits resolve that anchor through
+/// `engine::in_flight_request_event_id` (`/api/v1/restart` via
+/// `abort_in_flight_for_restart`, the 60 s safety net via
+/// `emit_stuck_thread_eviction_abort`, and the teardown sweep via
+/// `shutdown_active_threads`), so they match whenever the turn is one that
+/// registered a `ThreadHandle`, which is every chat turn. A turn with no handle
+/// (the spawn dispatcher's `run_direct_agent` resume) still falls back to the
+/// originating-type guess and can still miss, exactly as before.
 ///
 /// Idempotent against pre-emitted terminators: if `meta.request_event_id` is
 /// set and a `ResponseGenerated`/`ResponseCanceled`/`ResponseAborted`/
 /// `ResponseFailed` already exists for it, this is a no-op. Covers the
-/// `/api/v1/restart` race — `abort_in_flight_for_restart` pre-emits
+/// `/api/v1/restart` race: `abort_in_flight_for_restart` pre-emits
 /// `ResponseAborted{actor: device}` for the in-flight chat thread, then
 /// cancels its token; the agentic loop's cancel branch fires moments later
 /// and would otherwise stack a phantom `ResponseCanceled{UserStop}` boundary
-/// on top of the "You — Restarted" panel.
+/// on top of the "Paused by restart" panel.
+///
+/// The gate matches on the request id and nothing else, deliberately. It is
+/// therefore only as good as the anchor the pre-emit carries: while the restart
+/// path guessed that anchor from the newest originating-type event, a queued
+/// follow-up or a `ContinuationStarted` turn made the ids disagree, the gate
+/// found nothing, and both boundaries rendered on two different exchanges
+/// (`docs/plans/2026-08-06-restart-abort-anchors-on-the-in-flight-turn.md`).
+/// Widening it to "any recent terminator" would paper over that class and would
+/// also swallow the legitimate cancel a user's Stop produces moments after an
+/// unrelated abort. Fix the anchor, not the gate.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn emit_response_canceled(
     bus: &crate::engine::event_bus::EventBus,

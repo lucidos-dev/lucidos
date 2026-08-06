@@ -298,8 +298,9 @@ pub struct AgentSession {
     /// actor upstream). Drained on read so a stale device can't carry into the
     /// next turn on a resumed session.
     pub cancel_actor: Option<crate::engine::thread_events::MessageOrigin>,
-    /// Set by `arm_codex_redirect` when a follow-up interrupts a mid-turn Codex
-    /// turn (the redirect path) — the redirect analog of `cancel_actor`. The
+    /// Set by `arm_followup_redirect` when a follow-up interrupts a mid-turn
+    /// coding-agent turn (the redirect path). The redirect analog of
+    /// `cancel_actor`. The
     /// run_session interrupt arm drains it (`take_session_redirect_followup`)
     /// alongside `cancel_actor` and feeds it to `classify_result` so the
     /// interrupted turn's `ResponseCanceled` carries
@@ -341,6 +342,19 @@ pub struct AgentSession {
     /// Set during engine shutdown so CC cleanup emits SessionEnded with
     /// reason SessionEndReason::Shutdown — the frontend uses this to show "Aborted"
     /// instead of "Done" for engine-interrupted exchanges.
+    ///
+    /// **Do not read this alone to classify a turn's terminal.** It is a
+    /// SNAPSHOT signal: `shutdown_agent_sessions` sets it on the sessions
+    /// present in `agent_sessions` when its pass ran, so a session inserted
+    /// after that pass carries `false` through a teardown it is very much part
+    /// of. Ask [`crate::engine::LucidosEngine::session_is_shutting_down`], which
+    /// ORs the durable engine-global flag; its doc records the two incidents a
+    /// bare read caused.
+    ///
+    /// `run_session/entry_guard.rs` is the one deliberate bare reader, and it is
+    /// asking a different question: not "how should this turn be classified" but
+    /// "does the shutdown sweep own this thread's terminal, so my drop-guard
+    /// must not invent one". It holds only this `Arc`, never the engine.
     pub shutting_down: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by `abort_in_flight_for_restart` when it pre-emits a `ResponseAborted`
     /// on `/api/v1/restart` for this thread. The run_session loop's Result-classify
@@ -349,6 +363,13 @@ pub struct AgentSession {
     /// actor) instead of two (one device, one system). Without this flag, CC's
     /// graceful interrupt → Result event → classify_result(is_shutdown=true)
     /// path emits a duplicate `ResponseAborted` 3s after the pre-emit.
+    ///
+    /// Covers one ordering only: a boundary emitted while this session was
+    /// already in the map. The pre-emit iterates a snapshot, so a session still
+    /// spawning gets no flag set at all, and the opposite ordering (boundary
+    /// first, session second) is covered by the DB arm of
+    /// `agent_session::runtime_helpers::external_terminal_already_emitted`.
+    /// Read through that function rather than loading this directly.
     pub external_terminal_emitted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by the external watchdog (alongside `external_terminal_emitted`,
     /// before it cancels the session) when the "terminal" it emitted is a

@@ -11,10 +11,30 @@ use base64::Engine as _;
 const IMAGE_MAX_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Why a write to `data_path` should be rejected, or `None` if it's allowed.
-/// Centralized so all write tools share the same policy and message.
+/// Centralized so all write tools share the same policy and message: every
+/// mutating file tool (`write_file`, `edit_file`, `copy_file`'s destination,
+/// `delete_file`) consults this before touching disk.
+///
+/// `data_path` is already normalized, so the `.lucidos/` arm only ever sees the
+/// one readable subtree ([`crate::core::TMP_DIR`]); the rest was refused
+/// outright during normalization. Scratch is readable but not writable because
+/// these tools git-commit everything they write, and that tree is gitignored:
+/// letting a write through would either commit nothing (a silent lie to the
+/// caller) or need a second, commitless result shape. `run_python` already
+/// covers the case.
 fn read_only_reason(data_path: &str) -> Option<&'static str> {
-    crate::core::is_system_knowhow_path(data_path)
-        .then_some("system knowhow is read-only (shipped with the engine)")
+    if crate::core::is_system_knowhow_path(data_path) {
+        return Some("system knowhow is read-only (shipped with the engine)");
+    }
+    if crate::core::is_tmp_path(data_path) {
+        return Some(
+            "the file tools commit everything they write, and .lucidos/tmp/ is gitignored \
+             ephemeral scratch. Read it here, but create and edit it with run_python, whose \
+             cwd is the workspace root: open('.lucidos/tmp/notes.json', 'w'). For a file \
+             that should persist, target a typed data/ subdirectory such as artifacts/",
+        );
+    }
+    None
 }
 
 /// Convert a flexible "dot-bracket" path expression to an RFC 6901 JSON Pointer.

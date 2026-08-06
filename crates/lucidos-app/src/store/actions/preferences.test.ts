@@ -396,12 +396,17 @@ describe('welcomeSuggestionsDismissed — new-workspace welcome gate', () => {
  * The app-shell backup reminder's visibility rule.
  *
  * The property worth pinning is that it needs no endpoint of its own: the
- * engine's GET /backup/schedule reports a schedule only for
- * `(Some(cron), Some(provider)) if is_schedule_active(cron)`, and both are
+ * engine's GET /backup/schedule reports a `schedule` only when the cron is
+ * active AND a provider is set (`api::backup::schedule_response`), and both are
  * ordinary preference rows that GET /preferences already returns. So these
  * predicates are a mirror of an engine rule, and drift between them is the bug
  * to catch. The component-side tests live in
  * `components/layout/__tests__/backup-reminder-banner.test.tsx`.
+ *
+ * Only the `schedule` field is mirrored. That response's `provider` field is
+ * reported whether or not the schedule is active, because a destination does
+ * not stop existing when the cron is off, so it is NOT a signal for "is backup
+ * on" and this predicate deliberately does not follow it.
  */
 describe('backup reminder: is backup actually on?', () => {
   const T0 = Date.parse('2026-08-04T09:00:00Z');

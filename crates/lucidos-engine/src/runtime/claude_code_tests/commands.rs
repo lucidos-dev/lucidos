@@ -182,6 +182,29 @@ fn fable_5_round_trips_through_cc_model_helpers() {
 }
 
 #[test]
+fn sonnet_5_round_trips_through_cc_model_helpers() {
+    // Sonnet 5 is pinned as a full model id in cc_menu_options.json, so CC
+    // echoing `claude-sonnet-5` must normalize to itself rather than being
+    // rewritten to the `sonnet` alias by the `claude-sonnet-4` rule below it.
+    assert_eq!(normalize_cc_model_id("claude-sonnet-5"), "claude-sonnet-5");
+    assert_eq!(
+        reconcile_cc_model(Some("claude-sonnet-5"), "claude-sonnet-5"),
+        "claude-sonnet-5"
+    );
+    // Picking the `sonnet` alias also lands on Sonnet 5: CC resolves the alias
+    // and reports the concrete id, which is a picker value.
+    assert_eq!(
+        reconcile_cc_model(Some("sonnet"), "claude-sonnet-5"),
+        "claude-sonnet-5"
+    );
+    // Sonnet 4.6 still folds back to the alias (unchanged behaviour).
+    assert_eq!(normalize_cc_model_id("claude-sonnet-4-6"), "sonnet");
+    // The /model picker offers Sonnet 5 alongside the alias.
+    let defs = cc_command_definitions();
+    assert_command_options(&defs, "set_model", "model", &["claude-sonnet-5", "sonnet"]);
+}
+
+#[test]
 fn reconcile_cc_model_preserves_1m_suffix_when_cc_strips_it() {
     // CC strips the [1m] suffix when echoing the model in stream-json
     // (both Init and per-message Usage frames). The engine pinned the

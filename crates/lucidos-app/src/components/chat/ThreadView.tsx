@@ -28,6 +28,7 @@ import { takeThreadOpenStart, takeThreadRerenderStart } from '../../utils/thread
 import { readRenderPhaseTotals } from '../../utils/renderPhaseTimers';
 import { reportThreadRenderProbe } from '../../utils/threadRenderProbe';
 import { postClientLog } from '../../utils/liveness';
+import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 
 /** Only sample a grouping fold this slow (ms) — keeps cheap incremental folds
  *  (streaming tokens) out of the perf log; we only want the expensive full
@@ -407,6 +408,17 @@ export function ThreadView() {
     const areaRef = useRef<HTMLDivElement>(null);
     const isUp = awayFromBottom.value;
     const isNotAtTop = notAtTop.value;
+
+    // Re-publish --scrollbar-gutter-width now that a real transcript exists to
+    // measure. The boot publish (main.tsx) ran before any of this was mounted and
+    // could only estimate from a detached probe, which on iOS over-reports by the
+    // ::-webkit-scrollbar width the transcript does not actually reserve, leaving
+    // the composer's right edge inside the question cards it docks under
+    // (utils/scrollbarGutter.ts). Mount-only: what a scroll container reserves is
+    // content-independent (`overflow-y: scroll` + `scrollbar-gutter: stable`), so
+    // one forced layout read per entry into thread mode is enough, and it runs
+    // before paint so the corrected inset is never a visible jump.
+    useLayoutEffect(() => { publishScrollbarGutter(); }, []);
 
     // Force-restart CSS animation imperatively — works even when the
     // .revealing class is already on the element from a prior thread switch.

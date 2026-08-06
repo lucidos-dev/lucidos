@@ -238,6 +238,78 @@ historical narration needs judgment. New ADRs come from `./scripts/adr-new.sh`,
 which allocates across `main`, every unmerged branch, and the working tree, and
 therefore cannot collide.
 
+### Also always: the context-budget gate
+
+```bash
+./scripts/check-context-budget.sh
+```
+
+Also runs for **every** diff, and docs-only diffs least of all are exempt: a
+docs-only diff is exactly the change that grows this set, so skipping it there
+would exempt the only change that can break it.
+
+Two arms, both hard. **Size**: the always-loaded instruction set (`CLAUDE.md`
+plus every unscoped `.claude/rules/*.md`) must stay at or under
+`CONTEXT_BUDGET_CEILING`. Every byte is paid on every request of every session,
+before the agent has read a line of code, and the set grew 98% in the seven
+weeks to 2026-08-06 because everyone appends and nobody deletes.
+**Membership**: the resident set must be exactly the declared list. That arm is
+the regression detector for a rule meant to be path-scoped that silently is
+not, which is not a hypothetical: every rule file used the `globs:` key (a
+Cursor convention Claude Code ignores) until 2026-07-25, so the whole set was
+resident in every session and nothing said so.
+
+Whole-tree, not diff-scoped, unlike the em-dash gate above. What a session
+loads today does not depend on which branch grew it, so a merge that pushes the
+total over is caught by the next branch to run the gate, the same reasoning as
+`check-adrs.sh`.
+
+`./scripts/check-context-budget.sh --report` prints the set without failing.
+Fixing a size failure means moving content, not raising the number: reference
+material to a skill (loads on invocation), a convention to a path-scoped rule
+(loads on a matching Read), maintainer prose to `docs/agent-config.md` (never
+loads). Raising `CONTEXT_BUDGET_CEILING` is allowed and is a deliberate act:
+say in the commit message what became worth paying for on every request.
+
+### Also always: the mirrored-rule gate
+
+```bash
+./scripts/check-prompt-mirror.sh
+```
+
+Also whole-tree and also unconditional, and a docs-only diff is again the one
+that can break it.
+
+Two instruction surfaces reach every coding-agent session, and
+`docs/agent-config.md` § Which surface owns a rule splits them so a rule lands
+on exactly one. Exactly one rule cannot: the process-safety prohibition
+(ADR 0025) binds both a session with no Lucidos checkout, which only the engine
+system prompt reaches, and a hand-run `claude`, which only `CLAUDE.md` reaches.
+So it is stated on both surfaces on purpose, and this gate fails if either half
+loses the prohibition.
+
+Shell rather than a Rust test because the failure mode is a `CLAUDE.md`-only
+edit, which never triggers `cargo test`. It also reaches Codex, which has no
+hooks. Fix a failure by restoring the missing half, never by deleting the other
+one. Adding a *second* mirror needs the proof spelled out in
+`scripts/lib/prompt_mirror_scan.sh`.
+
+### Also always: registered hooks can actually run
+
+```bash
+./scripts/lib/hooks_registered_test.sh
+```
+
+Asserts `.claude/settings.json` is valid JSON and that every hook it registers
+resolves to a file that exists and is executable. Milliseconds, and
+unconditional for the same reason as the two gates above.
+
+It exists because a hook committed at mode 100644 is invisible when it fails:
+several events ignore the hook's exit code by design, and hook stdout never
+reaches the transcript, so a permission error goes nowhere. That shipped on
+2026-08-06 with `log-instructions-loaded.sh`. A hook that silently never runs
+looks exactly like a hook that was never added.
+
 ### Then the test suites
 
 Run the test suites for the layers touched on this branch.
@@ -306,8 +378,11 @@ After all phases complete (and any bug fixes are applied), record this branch's
 HEAD as hardened in the parent workspace's DB:
 
 ```bash
-.claude/hooks/mark-harden.sh
+lucidos hardened mark
 ```
+
+All the git inspection and the HTTP call live in that subcommand, so this stays
+a stable one-liner even when the storage scheme changes.
 
 State lives in the `hardened_branches` DB table (keyed by repo root + branch),
 not on disk — do not look for or manage any marker files.

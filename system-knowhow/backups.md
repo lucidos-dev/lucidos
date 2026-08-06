@@ -1,6 +1,6 @@
 ---
 name: Backups
-description: How Lucidos backs up a workspace, what's included (workspace files + .git + a database dump, NOT ~/.lucidos), the encrypted-archive pipeline, the schedule (a cron expression in the USER'S timezone), and how the agent reads status with get_backup_status and changes the schedule/provider/retention with set_preference. Covers which Settings page owns which half (the backup itself is Settings → System → Backup; the provider ACCOUNT is connected only in Settings → Accounts, never on the Backup page), that setting backup_provider connects nothing on its own, which scopes each provider needs (Dropbox needs four, permitted in its App Console first, and a reconnect after any change there), the encryption key (auto-generated, must be stored to restore), retention/pruning, run history + duration, staleness, and that restore happens from the workspace picker (not the engine). Load when the user asks about backups: "when's my next/last backup", "how big/long are backups", "back up to Dropbox", "change the backup time", "is my backup stale".
+description: How Lucidos backs up a workspace, what's included (workspace files + .git + a database dump, NOT ~/.lucidos), the encrypted-archive pipeline, the schedule (a cron expression in the USER'S timezone), and how the agent reads status with get_backup_status and changes the schedule/provider/retention with set_preference. Covers which Settings page owns which half (the backup itself is Settings → System → Backup; the provider ACCOUNT is connected only in Settings → Accounts, never on the Backup page), that setting backup_provider connects nothing on its own, that backup_provider is independent of backup_schedule (it stays set with the schedule off, and the Backup page's dropdown both opens on it and writes it), which scopes each provider needs (Dropbox needs four, permitted in its App Console first, and a reconnect after any change there), the encryption key (auto-generated, must be stored to restore), retention/pruning, run history + duration, staleness, and that restore happens from the workspace picker (not the engine). Load when the user asks about backups: "when's my next/last backup", "how big/long are backups", "back up to Dropbox", "change the backup time", "is my backup stale".
 ---
 
 # Backups
@@ -47,7 +47,7 @@ The schedule, provider, and retention are ordinary agent-settable preferences:
 | Key | Value | Meaning |
 |---|---|---|
 | `backup_schedule` | a 6-field cron, or `off` | When automatic backups run (user's timezone). `off` disables them. |
-| `backup_provider` | `google_drive` \| `dropbox` | Where to upload. The account itself is connected in **Settings → Accounts**, not here. |
+| `backup_provider` | `google_drive` \| `dropbox` | Where to upload. Independent of `backup_schedule`: a destination stays configured with the schedule `off`, and the Backup page opens on it. The account itself is connected in **Settings → Accounts**, not here. |
 | `backup_retention` | `1`–`50` | How many recent backups to keep; older ones are pruned after each success. |
 
 Set them with `set_preference` — e.g. `set_preference(key="backup_schedule",
@@ -63,7 +63,7 @@ wrong one is the single most common way this flow goes wrong:
 
 | What | Where | What lives there |
 |---|---|---|
-| **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the encryption key, and a health card (last run, last cloud backup, staleness). |
+| **The backup itself** | Settings → System → Backup | Provider dropdown, *Back up now*, the schedule, retention, the encryption key, and a health card (last run, last cloud backup, staleness). The dropdown opens on the configured `backup_provider` and **writes** it: picking one there is the same act as `set_preference(key="backup_provider", …)`. |
 | **The provider account** | **Settings → Accounts** | The *Connected accounts* list. This is the ONLY place a Google / Dropbox account is connected, and the only place its OAuth app registration is stored. |
 
 The Backup page has no account UI at all. It shows a red line linking to

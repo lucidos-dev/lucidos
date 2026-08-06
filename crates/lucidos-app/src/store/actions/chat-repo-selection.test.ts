@@ -35,7 +35,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   submitChat: vi.fn().mockResolvedValue({ event_id: 'srv-evt' }),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
-  putComposeOnThread: vi.fn().mockResolvedValue(undefined),
+  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
@@ -54,6 +54,7 @@ vi.mock('./thread-loading', () => ({
 
 vi.mock('./devices', () => ({
   getDeviceId: () => 'device-test',
+  pendingDeviceRegistration: vi.fn(),
 }));
 
 vi.mock('../../utils/platform', () => ({
@@ -116,6 +117,7 @@ function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
     lastRevivedAt: '',
     state: 'active',
     latestTodoList: null,
+    liveEventWaits: [],
     ...overrides,
   };
 }
@@ -303,5 +305,41 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     expect(body.use_coding_agent).toBe(true);
     expect(body.repo_id).toBeUndefined();
     expect(body.folder).toBeUndefined();
+  });
+});
+
+/** A raw new send mints its own thread id client-side, so the engine has never
+ *  seen it. The body must SAY that: an unknown `thread_id` with no create
+ *  signal is a 404, not a thread conjured out of whatever the caller sent.
+ *  That refusal is what stops a wrong-target write from looking exactly like a
+ *  correct one (a message posted at the wrong engine used to materialize the
+ *  thread there, so reading it back confirmed the mistake). See ADR 0050. */
+describe('new_thread declares a client-minted thread id', () => {
+  it('raw new send sets new_thread', async () => {
+    await sendMessage('start something new');
+
+    const body = lastBody();
+    expect(body.new_thread).toBe(true);
+    expect(body.thread_id).toBeTruthy();
+  });
+
+  it('follow-up on an existing thread does NOT set new_thread', async () => {
+    const tid = 'existing-thread';
+    focusedThreadId.value = tid;
+    putThread(tid, { state: 'active', channel: 'chat', messageCount: 1 });
+
+    await sendMessage('follow up');
+
+    const body = lastBody();
+    expect(body.new_thread).toBeUndefined();
+    expect(body.thread_id).toBe(tid);
+  });
+
+  it('a coding-agent raw new send declares it too', async () => {
+    selectedScope.value = { kind: 'lucidos' };
+
+    await sendMessage('build the thing', undefined, { useCodingAgent: true });
+
+    expect(lastBody().new_thread).toBe(true);
   });
 });

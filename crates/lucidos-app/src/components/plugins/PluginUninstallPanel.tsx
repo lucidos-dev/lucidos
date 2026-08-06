@@ -1,28 +1,37 @@
 import { useState } from 'preact/hooks';
-import { activeInlineForm } from '../../store/store';
+import { activeInlineForm, closeInlineForm } from '../../store/store';
+import type { PluginUninstallForm } from '../../store/store';
 import {
   cancelPluginUninstallAction,
   confirmPluginUninstallAction,
 } from '../../store/actions/plugin-uninstall';
+import { formatMessageTimestamp } from '../../utils/formatTime';
+import { PluginFileList } from './PluginFileList';
 
 export function PluginUninstallPanel() {
-  // Hook before the early return, same as `PluginInstallPanel`: a hook called
-  // after it is a rules-of-hooks violation that only survives because this
-  // component has exactly one, so the index realigns by luck.
-  const [busy, setBusy] = useState(false);
   const form = activeInlineForm.value;
   if (form?.type !== 'plugin-uninstall') return null;
+  // Two components rather than one branching on `removed`, so the confirm
+  // panel's hooks are never conditionally skipped: resolving the uninstall
+  // unmounts the confirm panel and mounts the receipt. Same split as
+  // `EmailConfirmModal`.
+  return form.removed
+    ? <PluginUninstallReceiptPanel form={form} />
+    : <PluginUninstallConfirm form={form} />;
+}
 
+function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
+  const [busy, setBusy] = useState(false);
   const req = form.request;
 
-  // The action fns always closeInlineForm() in their own finally (unmounting
-  // this panel), so busy normally never resets visibly — but reset in a finally
-  // anyway so the buttons re-enable if a future action path returns without
-  // closing the form. setBusy after unmount is a harmless no-op in Preact.
+  // The action fns resolve the panel themselves (into a receipt on success,
+  // closed on failure), so busy normally never resets visibly. Reset in a
+  // finally anyway so the buttons re-enable if a future path returns with the
+  // panel still up. setBusy after unmount is a harmless no-op in Preact.
   async function handleConfirm() {
     setBusy(true);
     try {
-      await confirmPluginUninstallAction(req.uninstall_id, req.plugin_name);
+      await confirmPluginUninstallAction(form);
     } finally {
       setBusy(false);
     }
@@ -31,7 +40,7 @@ export function PluginUninstallPanel() {
   async function handleCancel() {
     setBusy(true);
     try {
-      await cancelPluginUninstallAction(req.uninstall_id);
+      await cancelPluginUninstallAction(form);
     } finally {
       setBusy(false);
     }
@@ -83,37 +92,76 @@ export function PluginUninstallPanel() {
         </header>
 
         {req.files_present.length > 0 && (
-          <section class="plugin-install-section plugin-install-overwrites">
-            <div class="plugin-install-label">
-              Will be deleted ({req.files_present.length})
-            </div>
-            <ul class="plugin-install-files">
-              {req.files_present.map((f) => (
-                <li class="plugin-install-file plugin-install-file-overwrite" key={f}>
-                  {f}
-                </li>
-              ))}
-            </ul>
-            <p class="plugin-install-warning-text">
-              Local edits to these files since install will be lost. Empty parent directories under <code>data/</code> are pruned.
-            </p>
-          </section>
+          <PluginFileList
+            label={`Will be deleted (${req.files_present.length})`}
+            files={req.files_present}
+            sectionClass="plugin-install-overwrites"
+            fileClass="plugin-install-file-overwrite"
+            note={<>Local edits to these files since install will be lost. Empty parent directories under <code>data/</code> are pruned.</>}
+          />
         )}
 
         {req.files_missing.length > 0 && (
-          <section class="plugin-install-section">
-            <div class="plugin-install-label">
-              Already gone ({req.files_missing.length})
-            </div>
-            <ul class="plugin-install-files">
-              {req.files_missing.map((f) => (
-                <li class="plugin-install-file" key={f}>{f}</li>
-              ))}
-            </ul>
-          </section>
+          <PluginFileList
+            label={`Already gone (${req.files_missing.length})`}
+            files={req.files_missing}
+          />
         )}
 
         {renderActions()}
+      </div>
+    </div>
+  );
+}
+
+/** The panel after a confirmed uninstall: a read-only record of what the engine
+ *  actually removed, holding the nav-history slot the pending confirm had (see
+ *  `markPluginUninstalled`). The lists come off the receipt marker, not off
+ *  `request.files_present`, which was only what existed at prepare time.
+ *
+ *  Deliberately offers no Confirm and no Cancel: the files are gone, the staged
+ *  `uninstall_id` is popped, and the only action left is to close the panel.
+ *
+ *  Exported for its unit test, which renders it directly: the suite's VNode walk
+ *  stops at function components (the confirm branch's hooks would throw), so it
+ *  cannot reach this one through the dispatcher. */
+export function PluginUninstallReceiptPanel({ form }: { form: PluginUninstallForm }) {
+  const req = form.request;
+  const removed = form.removed!;
+  return (
+    <div class="inline-form">
+      <div class="plugin-install-panel">
+        <header class="plugin-install-header">
+          <div class="panel-receipt-status">
+            <span class="panel-receipt-badge">Uninstalled</span>
+            <span class="panel-receipt-time">{formatMessageTimestamp(removed.at)}</span>
+          </div>
+          <div class="plugin-install-title-row">
+            <span class="plugin-install-name">{req.plugin_name}</span>
+            <span class="plugin-install-version">v{req.plugin_version}</span>
+          </div>
+          <p class="plugin-install-description">{removed.summary}</p>
+        </header>
+
+        {removed.files_deleted.length > 0 && (
+          <PluginFileList
+            label={`Deleted (${removed.files_deleted.length})`}
+            files={removed.files_deleted}
+          />
+        )}
+
+        {removed.files_missing.length > 0 && (
+          <PluginFileList
+            label={`Already gone (${removed.files_missing.length})`}
+            files={removed.files_missing}
+          />
+        )}
+
+        <div class="plugin-install-actions">
+          <button type="button" class="action-btn" onClick={() => closeInlineForm()}>
+            Close
+          </button>
+        </div>
       </div>
     </div>
   );

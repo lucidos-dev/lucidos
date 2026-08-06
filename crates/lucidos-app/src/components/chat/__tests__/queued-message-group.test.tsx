@@ -35,6 +35,7 @@ function makeThread(
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

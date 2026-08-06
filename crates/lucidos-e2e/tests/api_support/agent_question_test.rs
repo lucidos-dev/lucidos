@@ -13,7 +13,7 @@
 //! the resume path (no fresh CC spawn) and just emits `UserQuestionAnswered`.
 
 use crate::support::{
-    base_url, db_url, http_client, seed_cc_thread_summary, seed_chat_thread_summary,
+    base_url, db_url, seed_cc_thread_summary, seed_chat_thread_summary, user_client,
 };
 use uuid::Uuid;
 
@@ -112,7 +112,7 @@ async fn count_resume_marker(pool: &sqlx::PgPool, thread_id: Uuid) -> i64 {
 
 #[tokio::test]
 async fn answer_question_canceled_emits_answered_event_without_resume_marker() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -153,7 +153,7 @@ async fn answer_question_canceled_emits_answered_event_without_resume_marker() {
 
 #[tokio::test]
 async fn answer_question_missing_returns_409() {
-    let client = http_client();
+    let client = user_client().await;
     let body = serde_json::json!({
         "tool_use_id": "does-not-exist",
         "answer": { "kind": "Canceled" }
@@ -175,7 +175,7 @@ async fn answer_question_missing_returns_409() {
 /// these channels (`should_emit_cc_resume_side_effects` in agent_question.rs).
 #[tokio::test]
 async fn answer_question_chat_channel_skips_cc_resume_marker() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -248,7 +248,7 @@ async fn archive_with_pending_question_emits_canceled_answer() {
     // and archiving didn't resolve the question card. Dismiss must auto-cancel
     // any pending question so the card resolves cleanly to "Canceled" and the
     // thread can leave REVIEW.
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -306,7 +306,7 @@ async fn archive_with_pending_question_emits_canceled_answer() {
 
 #[tokio::test]
 async fn answer_question_idempotent_409_on_duplicate() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -355,7 +355,7 @@ async fn answer_question_idempotent_409_on_duplicate() {
 /// pins the chat-channel path.
 #[tokio::test]
 async fn chat_freeform_followup_on_chat_thread_routes_to_pending_question() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -453,7 +453,7 @@ async fn chat_freeform_followup_on_chat_thread_routes_to_pending_question() {
 /// `resolve_pending_question_as_canceled` first.
 #[tokio::test]
 async fn cancel_chat_with_pending_question_resolves_card_as_canceled() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");
@@ -524,7 +524,7 @@ async fn cancel_chat_with_pending_question_resolves_card_as_canceled() {
 /// It must NOT fabricate a terminal event on an already-idle thread.
 #[tokio::test]
 async fn cancel_chat_idle_thread_reports_not_canceled() {
-    let client = http_client();
+    let client = user_client().await;
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("Failed to connect to E2E workspace database");

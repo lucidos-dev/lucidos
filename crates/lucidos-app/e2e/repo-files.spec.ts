@@ -1,5 +1,5 @@
 import { test, expect, Page } from './fixtures';
-import { navigateToApp, assertHealthy, openFilesPanel, clickVisibleElement } from './helpers';
+import { navigateToApp, assertHealthy, openFilesPanel, clickVisibleElement, clickHeaderAction } from './helpers';
 import { WORKSPACE, psql, git, getDbPort } from './db-helpers';
 import { randomUUID } from 'crypto';
 import { writeFileSync } from 'fs';
@@ -287,8 +287,7 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
     await page.waitForSelector('.file-item:visible', { timeout: 15_000 });
     await clickVisibleElement(page, '.file-item', file);
 
-    await page.waitForSelector('.diff-whole-file-toggle:visible', { timeout: 10_000 });
-    await clickVisibleElement(page, '.diff-whole-file-toggle');
+    await clickHeaderAction(page, '.diff-whole-file-toggle');
     await expect(page.locator('.diff-view:visible')).toBeVisible({ timeout: 10_000 });
   }
 
@@ -303,7 +302,7 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
     await expect(page.locator('.diff-line:visible').first()).toBeVisible();
     await expect(page.locator('[data-role="side-by-side-diff"]')).toHaveCount(0);
 
-    await clickVisibleElement(page, '.diff-side-by-side-toggle');
+    await clickHeaderAction(page, '.diff-side-by-side-toggle');
 
     const sideBySide = page.locator('[data-role="side-by-side-diff"]:visible');
     await expect(sideBySide).toBeVisible({ timeout: 10_000 });
@@ -331,7 +330,7 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
     await expect(page.locator('.line-selected')).toHaveCount(0);
 
     // And back.
-    await clickVisibleElement(page, '.diff-side-by-side-toggle');
+    await clickHeaderAction(page, '.diff-side-by-side-toggle');
     await expect(page.locator('[data-role="side-by-side-diff"]')).toHaveCount(0);
     await expect(page.locator('.diff-line:visible').first()).toBeVisible();
   });
@@ -344,7 +343,7 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
     await expect(page.locator('.diff-side-by-side-toggle:visible')).toBeVisible();
 
     // Back to the whole merged file.
-    await clickVisibleElement(page, '.diff-whole-file-toggle');
+    await clickHeaderAction(page, '.diff-whole-file-toggle');
     await expect(page.locator('.repo-file-content:visible')).toBeVisible({ timeout: 10_000 });
     await expect(page.locator('.diff-side-by-side-toggle')).toHaveCount(0);
   });

@@ -48,6 +48,10 @@ export function inlineFormKey(form: InlineForm): string {
     // re-cover it (and reset its scroll) at the moment the mail went out.
     case 'email-confirm':
       return `email-confirm:${digest([form.request.account, form.request.to.join(','), form.request.subject].join('|'))}`;
+    // Deliberately not the receipt marker, for the same reason `email-confirm`
+    // above ignores `sentAt`: a panel flipping to its receipt is the same panel
+    // mutating in place, and keying on the marker would re-cover it (and reset
+    // its scroll) at the exact moment the files landed or went.
     case 'plugin-install': return `plugin-install:${form.request.install_id}`;
     case 'plugin-uninstall': return `plugin-uninstall:${form.request.uninstall_id}`;
   }

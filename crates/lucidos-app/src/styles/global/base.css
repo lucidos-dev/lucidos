@@ -295,6 +295,40 @@ html, html[data-theme="dark"] {
        never reference it from shared-components.css (that file is served to
        app iframes, where the variable would not resolve). */
     --accent-notable: #9db4d0;
+    /* The navigation focus marker's spotlight (.nav-focus-stuck in
+       host-components.css): plain white here, and NEUTRAL by request. The marker
+       is a light shone on the thing the user landed on, not a colour that means
+       something, so it now carries no hue at all. That also settles the collision
+       question rather than navigating it: a wash with no hue cannot be mistaken
+       for another hue's surface, so there is no neighbouring token to keep clear
+       of, and no judgement to redo when a new coloured surface ships.
+
+       The one thing it must still NOT be is the accent, and that is a correction
+       rather than a preference. The marker used to wash the landed element in
+       --accent at 16%, which is the same hue at nearly the same alpha as
+       --picked-surface (--accent at 12%, worn by the user bubble, the selected
+       question option and the collapsed-turn stub), so a spotlit turn read as a
+       PICKED surface rather than as a marker. Blue could not have carried the
+       signal anyway: the header, the links and the badges are all already blue,
+       so nothing about an accent wash says "look here".
+
+       The light theme carries a mid GREY rather than white, which looks like an
+       oversight and is not: the two themes have opposite problems, so one value
+       cannot serve both. Over a near-black navy a wash can only lift toward its
+       own colour, so dark needs the brightest neutral there is; over white nothing
+       can be added, so light needs a DARK neutral to sink the surface instead.
+       Same absence of hue, driven from opposite ends of the scale.
+
+       Do not reuse a SEMANTIC token for either value. A marker must not assert a
+       STATE, so reaching for the caution or success token would say something is
+       wrong with, or has succeeded about, the thing the user just navigated to.
+       Neutral makes that easy to hold: there is nothing here for a reader to
+       interpret as a status in the first place.
+
+       Host-only by design, like --accent-notable above: the marker is host chrome
+       and never renders in an app iframe, so this is absent from the engine's
+       sdk_iframe.css and must never be referenced from shared-components.css. */
+    --nav-focus-glow: #ffffff;
     /* Sole survivor of the --initiator-* family: the coding-agent brand orange,
        worn by the chat executor chip and the Claude mark. The you / agent /
        engine members were never referenced and have been removed. */
@@ -393,6 +427,12 @@ html[data-theme="light"] {
     --accent-orange: #c26a4a;
     /* Neutral notable state — see the dark-theme note. Host-only. */
     --accent-notable: #5a7492;
+    /* Marker spotlight, a mid grey. See the dark-theme note for why it carries no
+       hue, why it is not the accent, and why the two themes sit at opposite ends
+       of the neutral scale rather than sharing one value: the marker's alphas are
+       low and nothing can be added to white, so on this theme the wash has to
+       darken the surface where the dark one brightens it. Host-only. */
+    --nav-focus-glow: #454545;
     /* Light-theme variants — darkened so each hue passes contrast on the white surface. */
     --initiator-coding-agent: #ea7c2a;
     --reason-trigger: #b45309;

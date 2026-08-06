@@ -48,6 +48,7 @@ function buildThreadState(events: ThreadEvent[]): ThreadState {
     blockingDescendantCount: 0, attentionDescendantCount: 0,
     state: 'active',
     latestTodoList: null,
+    liveEventWaits: [],
   };
   return { meta, events: map, streamingBuffer: '', eventsLoaded: true, eventsLoadFailed: false, lastDbSeq: events.length, pendingUserMessages: [] };
 }

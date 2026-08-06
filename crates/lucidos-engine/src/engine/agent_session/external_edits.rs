@@ -24,7 +24,9 @@
 
 use std::path::Path;
 
-use crate::engine::git_ops::{git_answer, git_cmd, worktree_current_branch};
+use crate::engine::git_ops::{
+    git_answer, git_answer_with, git_cmd, worktree_current_branch, GitAnswer,
+};
 
 /// Result of [`verify_branch`] when the worktree's checked-out branch
 /// doesn't match the engine's expected branch.
@@ -284,6 +286,145 @@ pub(crate) async fn try_adopt_renegade_branch(
         return None;
     }
     Some((new_branch.clone(), build_adoption_note(&new_branch)))
+}
+
+/// [`try_adopt_renegade_branch`] for the **idle** boundary rather than the
+/// spawn one.
+///
+/// The tracked branch name is a spawn-time snapshot of a fact that lives in
+/// git, inside a worktree the coding agent owns: `git branch -m` from a repo's
+/// own skill is ordinary, and we already decided (at spawn) to follow the agent
+/// onto its new branch. Until this existed, adoption ran ONLY on respawn, so a
+/// single-turn session that renamed its own branch computed its end-of-turn
+/// diff against a ref that no longer existed, git exited 128, and the Diff
+/// button stayed dark forever. Idle is the boundary whose answer is durable
+/// (`CodingAgentIdled.has_changes` feeds `thread_summaries.coding_agent_has_diff`),
+/// which is why it, of all the branch-reading sites, must not trust the cache.
+///
+/// Adoption needs BOTH gates to pass:
+///
+/// 1. The same ancestry check [`try_adopt_renegade_branch`] makes: the worktree
+///    HEAD must descend from `anchor_sha`, where this session last knew itself
+///    to be. No anchor means no check to make, so no adoption.
+/// 2. [`tracked_branch_continues_into_head`]: the current branch must be
+///    provably a continuation of the tracked one, either because git's own
+///    reflog records the rename, or because the tracked ref is still an
+///    ancestor of HEAD.
+///
+/// Gate 2 is what the spawn path doesn't need and this one does. At spawn,
+/// `anchor_sha` is the previous idle's HEAD, which already contains the
+/// thread's commits. On a session's FIRST idle there is no previous idle, so
+/// the anchor is the worktree's HEAD at spawn, which for a fresh branch is just
+/// the base tip: on its own, gate 1 would then accept ANY branch forked from
+/// the same base. Gate 2 is what makes that anchor safe, and it is why "the
+/// tracked ref is gone" is not accepted as evidence of a rename: an agent that
+/// checks out a sibling branch and then deletes the tracked one produces the
+/// same absence, and adopting there would point the thread's Diff (and a later
+/// Discard, which deletes the branch) at work that was never ours.
+///
+/// Every probe involved refuses adoption on `GitAnswer::Unknown`: the question
+/// was not answered, and an unanswered probe must never authorize retargeting a
+/// thread (`.claude/rules/rust.md`).
+///
+/// Returns `Some((new_branch, note_for_the_agent))` when the worktree's branch
+/// should be adopted, `None` to keep the tracked one.
+pub(crate) async fn try_adopt_branch_at_idle(
+    repo_root: &Path,
+    worktree_path: &Path,
+    tracked_branch: &str,
+    anchor_sha: Option<&str>,
+) -> Option<(String, String)> {
+    // Read the branch ONCE and gate that value. Delegating the adoption back to
+    // `try_adopt_renegade_branch` would re-read it, so the name checked and the
+    // name adopted could differ; the gates below are worth nothing if they
+    // approve one branch and the caller is handed another.
+    let anchor = anchor_sha?;
+    let current = worktree_current_branch(worktree_path).await?;
+    if current == tracked_branch {
+        return None;
+    }
+    if !tracked_branch_continues_into_head(repo_root, worktree_path, &current, tracked_branch).await
+    {
+        return None;
+    }
+    if !is_ancestor(worktree_path, anchor, "HEAD").await {
+        return None;
+    }
+    let note = build_adoption_note(&current);
+    Some((current, note))
+}
+
+/// Gate 2 of [`try_adopt_branch_at_idle`]: is `current_branch` provably a
+/// continuation of `tracked_branch`?
+///
+/// Two ways to prove it, and both are positive evidence:
+///
+/// - The tracked ref is still there and is reachable from HEAD, so whatever the
+///   agent created was built on top of our work (`git checkout -b`).
+/// - git's own reflog for the current branch records the rename. `git branch -m`
+///   moves the old ref's reflog onto the new name and appends a
+///   `Branch: renamed refs/heads/<old> to refs/heads/<new>` entry, so the new
+///   branch carries proof of where it came from.
+///
+/// The absence of the tracked ref is deliberately NOT evidence. An agent that
+/// checks out a sibling branch and then deletes the tracked one leaves exactly
+/// the same absence, and a first idle's anchor can be no stronger than the
+/// shared base, so accepting absence would let an unrelated branch pass both
+/// gates. That branch would then own the thread's Diff and, on an explicit
+/// Discard, be the branch deleted.
+///
+/// A repo with reflogs disabled (`core.logAllRefUpdates=false`) yields no
+/// evidence and therefore no adoption. That is the safe direction: the thread
+/// keeps its tracked branch and the next spawn re-derives.
+async fn tracked_branch_continues_into_head(
+    repo_root: &Path,
+    worktree_path: &Path,
+    current_branch: &str,
+    tracked_branch: &str,
+) -> bool {
+    let tracked_ref = format!("refs/heads/{}", tracked_branch);
+    match git_answer(
+        &["rev-parse", "--verify", "--quiet", &tracked_ref],
+        repo_root,
+    )
+    .await
+    {
+        GitAnswer::Yes => is_ancestor(worktree_path, &tracked_ref, "HEAD").await,
+        GitAnswer::No => {
+            branch_reflog_records_rename_from(repo_root, current_branch, tracked_branch).await
+        }
+        // Could not ask. Never retarget on an unanswered probe.
+        GitAnswer::Unknown => {
+            log!(
+                "[AgentSession] Could not verify whether ref {} still exists, refusing idle branch adoption",
+                tracked_ref
+            );
+            false
+        }
+    }
+}
+
+/// Does `current_branch`'s reflog record that it was renamed from
+/// `tracked_branch`? The message is written by git itself (`builtin/branch.c`),
+/// so this is git's own account of the rename rather than an inference from
+/// what is missing.
+async fn branch_reflog_records_rename_from(
+    repo_root: &Path,
+    current_branch: &str,
+    tracked_branch: &str,
+) -> bool {
+    let renamed_from = format!("Branch: renamed refs/heads/{} to ", tracked_branch);
+    git_answer_with(
+        &["reflog", "show", "--format=%gs", current_branch],
+        repo_root,
+        |out| {
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .any(|line| line.starts_with(&renamed_from))
+        },
+    )
+    .await
+    .or_unknown(false)
 }
 
 fn build_adoption_note(new_branch: &str) -> String {

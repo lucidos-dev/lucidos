@@ -96,6 +96,7 @@ function makeActiveThread(id: string, updatedAt: string): ThreadState {
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

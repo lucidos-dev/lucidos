@@ -304,3 +304,55 @@ pub(in crate::api) async fn get_tool_result(
         .unwrap_or(serde_json::Value::Null);
     Ok(Json(ToolResultPayload { result }))
 }
+
+/// Where one event lives, returned by `GET /events/:event_id/location`.
+///
+/// `thread_id` is `None` for an event that belongs to no conversation, i.e.
+/// anything whose `aggregate` is not `thread` (a workspace *domain event*, an
+/// app event, a trigger event). That is a real answer, not a missing one: the
+/// events insert derives the column as
+/// `CASE WHEN aggregate = 'thread' THEN aggregate_id ELSE NULL END`
+/// (`engine/event_bus`), so a null here means "nowhere in any transcript"
+/// rather than "not recorded". An event id with no row at all is a 404, so the
+/// caller can tell the two apart.
+#[derive(serde::Serialize)]
+pub struct EventLocation {
+    pub thread_id: Option<Uuid>,
+}
+
+/// GET /api/v1/events/:event_id/location: the thread one event belongs to.
+///
+/// Exists for the *event wait* step's "show it". An `EventWaitDelivered`
+/// carries the matched event's id, type and payload, but not its thread, and
+/// the whole point of a wait is that the match usually happened somewhere else.
+/// Without this the card could only search the open thread's DOM, which is the
+/// one place the event reliably is not.
+///
+/// Keyed on `event_id` only, the same routing contract as
+/// `get_context_capture` and `get_tool_result`.
+pub(in crate::api) async fn get_event_location(
+    State(state): State<AppState>,
+    Path(event_id): Path<String>,
+) -> Result<Json<EventLocation>, (StatusCode, String)> {
+    let event_uuid = Uuid::parse_str(&event_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid event_id: {}", e)))?;
+
+    let row = state
+        .event_store
+        .get_event_by_id(event_uuid)
+        .await
+        .map_err(|e| {
+            log!("[API] get_event_location: db error: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        })?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("Event {} not found", event_uuid),
+            )
+        })?;
+
+    Ok(Json(EventLocation {
+        thread_id: row.thread_id,
+    }))
+}

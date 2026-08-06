@@ -1,9 +1,10 @@
 import { useSignal } from '@preact/signals';
-import { useState } from 'preact/hooks';
+import { useRef, useState } from 'preact/hooks';
 import type { Ref } from 'preact';
+import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusedThreadId, threadMap } from '../../store/store';
 import type { TodoItem } from '../../store/thread-events';
-import { TodoCheckIcon, TodoInProgressIcon } from '../shared/icons';
+import { CloseIcon, TodoCheckIcon, TodoInProgressIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 
 export function todoListIndicatorBody({
@@ -54,7 +55,10 @@ export function todoListIndicatorBody({
   );
 }
 
-/** `data-status` is stamped on each row so CSS can branch on it. */
+/** `data-status` is stamped on each row so CSS can branch on it.
+ *
+ *  Returns the panel's CONTENTS, not its box: the box is the `<Overlay>` panel
+ *  itself, which is what `useAnchoredPosition` measures and positions. */
 export function todoListPanelBody({
   items,
   onClose,
@@ -63,48 +67,48 @@ export function todoListPanelBody({
   onClose: () => void;
 }) {
   return (
-    <div
-      class="todo-panel"
-      data-role="todo-panel"
-      role="dialog"
-      aria-label="Current todo list"
-    >
-      <ul class="todo-panel-list">
-        {items.map((item, idx) => (
-          <li
-            key={idx}
-            class="todo-panel-row"
-            data-status={item.status}
-          >
-            <span class="todo-panel-marker" aria-hidden="true">
-              {item.status === 'completed'
-                ? '✓'
-                : item.status === 'in_progress'
-                  ? '◐'
-                  : item.status === 'abandoned'
-                    ? '⊘'
-                    : '○'}
-            </span>
-            <span class="todo-panel-text">
-              {item.status === 'in_progress' ? item.active_form : item.content}
-            </span>
-            {item.status === 'abandoned' ? (
-              <span class="todo-panel-abandoned-tag" aria-label="abandoned">
-                abandoned
+    <>
+      <div class="prompt-bar-popover-head">
+        <span class="prompt-bar-popover-title">Todo list</span>
+        <button
+          type="button"
+          class="icon-btn prompt-bar-popover-close"
+          aria-label="Close todo list"
+          onClick={onClose}
+        >
+          <CloseIcon />
+        </button>
+      </div>
+      <div class="prompt-bar-popover-body">
+        <ul class="todo-panel-list">
+          {items.map((item, idx) => (
+            <li
+              key={idx}
+              class="todo-panel-row"
+              data-status={item.status}
+            >
+              <span class="todo-panel-marker" aria-hidden="true">
+                {item.status === 'completed'
+                  ? '✓'
+                  : item.status === 'in_progress'
+                    ? '◐'
+                    : item.status === 'abandoned'
+                      ? '⊘'
+                      : '○'}
               </span>
-            ) : null}
-          </li>
-        ))}
-      </ul>
-      <button
-        type="button"
-        class="todo-panel-close"
-        aria-label="Close todo list"
-        onClick={onClose}
-      >
-        ✕
-      </button>
-    </div>
+              <span class="todo-panel-text">
+                {item.status === 'in_progress' ? item.active_form : item.content}
+              </span>
+              {item.status === 'abandoned' ? (
+                <span class="todo-panel-abandoned-tag" aria-label="abandoned">
+                  abandoned
+                </span>
+              ) : null}
+            </li>
+          ))}
+        </ul>
+      </div>
+    </>
   );
 }
 
@@ -117,9 +121,12 @@ export function TodoListIndicator() {
   // useState (not useRef) so the dismiss hook re-runs once the button mounts
   // and we have a real anchor to exclude from the outside-click test.
   const [anchorEl, setAnchorEl] = useState<HTMLButtonElement | null>(null);
+  const panelRef = useRef<HTMLDivElement>(null);
 
   const id = focusedThreadId.value;
   const items = id ? threadMap.value.get(id)?.meta.latestTodoList ?? null : null;
+  const isOpen = open.value && !!items && items.length > 0;
+  const pos = useAnchoredPosition(isOpen ? anchorEl : null, panelRef, '.thread-pane');
 
   return (
     <>
@@ -128,15 +135,31 @@ export function TodoListIndicator() {
         onClick: () => (open.value = !open.value),
         buttonRef: setAnchorEl,
       })}
-      {/* Overlay panel is the `.todo-panel-anchor` positioning wrapper; the
-          inner `.todo-panel` (role/aria-label) is its child — same DOM as
-          before. Anchor is the indicator button. Contract lives in <Overlay>. */}
+      {/* The Overlay panel IS the `.todo-panel` box now, placed by
+          `useAnchoredPosition` rather than by CSS, and portaled because the
+          composer's ancestors animate `transform`. Anchor is the indicator
+          button. Same wiring as the subscription popover beside it; the
+          contract lives in <Overlay>. */}
       <Overlay
-        open={open.value && !!items && items.length > 0}
+        open={isOpen}
         onClose={() => (open.value = false)}
         anchor={anchorEl}
         backdrop={false}
-        panelClass="todo-panel-anchor"
+        portal
+        panelClass="prompt-bar-popover todo-panel"
+        // `--prompt-bar-popover-fit` is the thread pane's usable width, the box
+        // the hook clamped this panel's position into (see EventWaitPanel).
+        panelStyle={pos
+          ? {
+              top: `${pos.top}px`,
+              left: `${pos.left}px`,
+              '--prompt-bar-popover-fit': `${pos.maxWidth}px`,
+            }
+          : { visibility: 'hidden' }}
+        panelRole="dialog"
+        panelProps={{ 'aria-label': 'Current todo list' }}
+        dataRole="todo-panel"
+        panelRef={panelRef}
       >
         {items && items.length > 0 && todoListPanelBody({ items, onClose: () => (open.value = false) })}
       </Overlay>

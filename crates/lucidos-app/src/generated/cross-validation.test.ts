@@ -8,7 +8,7 @@
 // from the Rust implementation.
 
 import { describe, it, expect } from 'vitest';
-import { availableThreadActions, displaySection } from './thread-lifecycle';
+import { availableThreadActions, displaySection, THREAD_STATUSES } from './thread-lifecycle';
 import type { ThreadType, ThreadStatus, ArchiveState, Action, DisplaySection } from './thread-lifecycle';
 import fixture from './cross-validation-fixture.json';
 
@@ -38,8 +38,11 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const availableThreadActionsCases = cases.filter((c): c is AvailableThreadActionsCase => c.fn === 'availableThreadActions');
 
     it(`has exhaustive coverage (${availableThreadActionsCases.length} cases)`, () => {
-      // 2 thread types × 6 statuses × 2 sections × 2 pending × 2 descendantsBlockArchive × 2 hasUnsentDraft × 2 isSaved = 384
-      expect(availableThreadActionsCases.length).toBe(384);
+      // 2 threadTypes × N statuses × 2 sections × 2 pending ×
+      // 2 descendantsBlockArchive × 2 hasUnsentDraft × 2 isSaved.
+      // Derived from THREAD_STATUSES rather than hardcoded, because the literal
+      // product went stale on every new ThreadStatus variant.
+      expect(availableThreadActionsCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 5);
     });
 
     for (const tc of availableThreadActionsCases) {
@@ -65,8 +68,9 @@ describe('Cross-validation: generated TS matches Rust', () => {
     const displaySectionCases = cases.filter((c): c is DisplaySectionCase => c.fn === 'displaySection');
 
     it(`has exhaustive coverage (${displaySectionCases.length} cases)`, () => {
-      // 2 sections × 6 statuses × 2 saved × 2 activeChildren × 2 pending × 2 attentionDescendants = 192
-      expect(displaySectionCases.length).toBe(192);
+      // 2 sections × N statuses × 2 saved × 2 activeChildren × 2 pending ×
+      // 2 attentionDescendants. Derived, same reason as above.
+      expect(displaySectionCases.length).toBe(2 * THREAD_STATUSES.length * 2 ** 4);
     });
 
     for (const tc of displaySectionCases) {

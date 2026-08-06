@@ -1,0 +1,109 @@
+/* ───────────────────────────────────────────────────────────────────────
+   The prompt-bar popover shell, shared by the todo indicator
+   (`styles/chat/todo-list.css`) and the subscription indicator
+   (`styles/chat/event-waits.css`). Both open off an `.icon-btn` in the prompt
+   bar's actions row through the same `<Overlay anchor backdrop={false} portal>`
+   wiring, and were written identically before this was extracted. A surface
+   keeps only its own width.
+
+   It lives in its OWN file, imported by `chat.css` BEFORE both surfaces, and
+   that ordering is load-bearing rather than tidy. The shell and a surface class
+   land on the SAME element (`panelClass="prompt-bar-popover event-wait-panel"`)
+   at the same specificity, so the cascade is decided by source order alone.
+   While the shell sat inside `todo-list.css` it therefore beat every rule in
+   `event-waits.css`, which loads first: `.event-wait-panel`'s
+   `max-width: min(26rem, …)` lost to the shell's bare fit cap and the panel grew
+   to the full viewport width, running out of the thread pane and leaving its
+   description on one unbroken line. `.todo-panel` never showed it, because it is
+   declared after the shell within one file. Keep the shell first and a surface's
+   own width wins by construction.
+
+   Placement is `useAnchoredPosition`'s, not CSS's: the panel is `position:
+   fixed` and the hook writes viewport `top`/`left` it has already clamped into
+   the thread pane, flipping above the anchor when there is no room below. The
+   shell used to be `position: absolute; left: 0` inside a relative wrapper,
+   which cannot see the viewport at all, and both indicators sit near the LEFT
+   of the actions row, so on a phone an 18rem panel opened off one ran straight
+   past the right edge and clipped its own countdown. The clamp only helps a
+   panel that FITS, hence the fit cap below.
+   ─────────────────────────────────────────────────────────────────────── */
+
+.prompt-bar-popover {
+    /* Widest a panel may get before its container is the binding constraint.
+       Each surface caps its own width against this rather than a bare rem, so
+       a panel too wide for the space is narrowed instead of overflowing.
+
+       The container is the box the hook clamped the position into, i.e. the
+       THREAD PANE, and the live value is published per-open as an inline
+       `--prompt-bar-popover-fit` by the two indicators (from `pos.maxWidth`).
+       The viewport-based value here is only the pre-measurement fallback: on a
+       phone the pane IS the viewport so the two agree, but on desktop the pane
+       is a fraction of it, and a popover capped against the viewport sits half
+       in the content pane. */
+    --prompt-bar-popover-fit: calc(100vw - 1rem);
+
+    position: fixed;
+    max-width: var(--prompt-bar-popover-fit);
+    /* Height caps against the VIEWPORT for the same reason the width does.
+       These open upward off a bottom-docked bar, so a fixed 18rem is taller
+       than the space above the anchor on a short viewport (landscape, or the
+       virtual keyboard open) and the panel's head lands off-screen. The hook
+       clamps `top` as the guarantee; this is what keeps the clamp from having
+       to overlap the anchor in the first place. `--app-height` is the
+       visualViewport measurement MobileSwipeContainer writes to <html>, which
+       is the only thing that shrinks with the iOS keyboard. */
+    max-height: min(18rem, calc(var(--app-height, 100dvh) - 8rem));
+    overflow-y: auto;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    box-shadow: var(--shadow-sm);
+    /* No padding on the shell: the head and the body carry their own, so the
+       head's rule can span the full width. */
+    z-index: var(--z-control-panel);
+}
+
+/* The close affordance's own place: a header strip naming the surface, with the
+   button pinned to its end. It was `position: absolute; top/right`, floating
+   over the panel's first row, which put it on top of the description the moment
+   that description wrapped. Being absolute inside a scrolling box, it also
+   scrolled away with the content of a long list. `sticky` keeps it on the panel
+   at any scroll offset; the shell's `overflow` clips it to the rounded corners,
+   so it needs no radius of its own. */
+.prompt-bar-popover-head {
+    position: sticky;
+    top: 0;
+    z-index: 1;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.5rem;
+    padding: 0 0.25rem 0 0.625rem;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border-color);
+}
+
+.prompt-bar-popover-title {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    font-size: var(--font-size-3xs);
+    font-weight: 500;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+    color: var(--text-muted);
+}
+
+/* Glyph size, hover and focus ring all come from `.icon-btn`, which also pins
+   `flex-shrink: 0` so a long title ellipsizes instead of squeezing the button.
+   Only the padding is this surface's own: `.icon-btn`'s 0.25rem around a
+   0.875rem glyph is a ~22px target, and this is a close control on a touch
+   surface. */
+.prompt-bar-popover-close {
+    padding: 0.5rem;
+}
+
+.prompt-bar-popover-body {
+    padding: 0.5rem;
+}

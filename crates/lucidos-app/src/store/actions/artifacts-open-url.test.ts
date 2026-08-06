@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { panelOverlay, preferences, webviewInitialUrl } from '../store';
+import { panelOverlay, preferences, webviewInitialUrl, toasts } from '../store';
 
 // Spy on the panel side effects — real implementations dirty localStorage,
 // a module-level nav stack, and touch viewport/DOM state. artifacts.ts imports
@@ -26,12 +26,22 @@ vi.mock('../../utils/tauri', () => ({
   setTitlebarColor: () => Promise.resolve(),
 }));
 
+// The engine-log breadcrumb channel would fire a real fetch from the blocked
+// case below; stub it so this suite stays offline.
+const postClientLog = vi.hoisted(() => vi.fn());
+vi.mock('../../utils/clientLog', () => ({ postClientLog }));
+
 // Imports must come after vi.mock so the mocked deps are wired in.
 const { openUrl } = await import('./artifacts');
 
 // jsdom doesn't implement window.open, so stub it as a global rather than
-// spying on a non-existent property.
+// spying on a non-existent property. It returns a window handle by default:
+// openExternalUrl reads the return value to tell a real tab from one the
+// popup blocker refused, so a bare vi.fn() would read as "blocked".
 const windowOpen = vi.hoisted(() => vi.fn());
+function fakeWindow(): { closed: boolean; opener: unknown } {
+  return { closed: false, opener: {} };
+}
 
 const TARGET_URL = 'https://example.com/';
 const APP_URL = 'https://app.example.com/ws/dev/';
@@ -47,7 +57,10 @@ describe('openUrl — system browser vs in-app webview routing', () => {
     pushNavState.mockClear();
     revealContentPane.mockClear();
     openExternal.mockClear();
-    windowOpen.mockClear();
+    windowOpen.mockReset();
+    windowOpen.mockReturnValue(fakeWindow());
+    postClientLog.mockClear();
+    toasts.value = [];
     fakeLocation = { href: APP_URL };
     vi.stubGlobal('open', windowOpen);
     vi.stubGlobal('location', fakeLocation);
@@ -61,10 +74,40 @@ describe('openUrl — system browser vs in-app webview routing', () => {
     platformMocks.isTauri = false;
     openUrl(TARGET_URL);
 
-    expect(window.open).toHaveBeenCalledWith(TARGET_URL, '_blank', 'noopener');
+    expect(window.open).toHaveBeenCalledWith(TARGET_URL, '_blank');
     expect(openExternal).not.toHaveBeenCalled();
     expect(panelOverlay.value).toBeNull();
     expect(window.location.href).toBe(APP_URL);
+    expect(toasts.value).toEqual([]);
+  });
+
+  it('non-Tauri, popup blocked: the whole chain surfaces it instead of going silent', () => {
+    // The reported bug end to end. A `navigate_ui` with target `url` arrives
+    // over SSE, so handleNavigationRequest → openUrl → openExternalUrl runs in a
+    // network event handler with no transient user activation and Chrome refuses
+    // the popup. Every layer used to drop that on the floor while the engine had
+    // already told the agent the device was asked to open the page.
+    platformMocks.isTauri = false;
+    windowOpen.mockReturnValue(null);
+
+    openUrl(TARGET_URL);
+
+    expect(toasts.value).toHaveLength(1);
+    expect(toasts.value[0].message).toContain(TARGET_URL);
+    expect(toasts.value[0].action?.label).toBe('Open');
+    expect(postClientLog).toHaveBeenCalledWith('nav', 'external-url-blocked', {
+      url: TARGET_URL,
+      source: null,
+    });
+  });
+
+  it('non-Tauri, popup blocked: the toast names the thread that asked', () => {
+    platformMocks.isTauri = false;
+    windowOpen.mockReturnValue(null);
+
+    openUrl(TARGET_URL, 'thread "Weekly report"');
+
+    expect(toasts.value[0].message).toContain('(requested by thread "Weekly report")');
   });
 
   it('installed iOS PWA: hands the URL to Safari, never the inescapable in-app web view', () => {

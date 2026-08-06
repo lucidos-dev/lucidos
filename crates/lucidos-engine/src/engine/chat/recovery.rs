@@ -84,25 +84,36 @@ LEFT JOIN LATERAL (
 /// interrupted", and the equivalent chat case (this sweep is the ONLY restart
 /// abort path a question-parked chat thread hits). Same `unanswered_question_exists_sql`
 /// fragment every other abort path uses, so the guard cannot drift.
+///
+/// A thread holding an **event wait** needs no guard of its own. Its turn ended
+/// with an ordinary terminator, so the sweep does not select it in the first
+/// place; a subscription is not a park. That was not always true, and the guard
+/// that used to be the second clause here went with the attached-wait shape
+/// (`docs/plans/2026-08-06-every-event-wait-is-detached.md`).
 fn orphan_threads_sql() -> String {
     format!(
         "{ORPHAN_THREADS_SQL}\nWHERE NOT {}",
-        crate::engine::agent_recovery::unanswered_question_exists_sql("o.thread_id::text")
+        crate::engine::agent_recovery::unanswered_question_exists_sql("o.thread_id::text"),
     )
 }
 
-/// [`ORPHAN_TOOL_CALLS_SQL`] plus the shared preserve guard, injected before the
-/// `ORDER BY`. A question-parked chat thread has a dangling
+/// [`ORPHAN_TOOL_CALLS_SQL`] plus the shared preserve guards, injected before
+/// the `ORDER BY`. A question-parked chat thread has a dangling
 /// `ToolCalled{ask_user_question}` (the loop emits it before blocking in
 /// `walk_question_batch`); without this guard the sweep would synthesize a
 /// "[Tool execution interrupted…]" `ToolResult` for it, poisoning the pending
 /// question's tool-use pair so the resumed turn reads the answer as an error.
+///
+/// `await_event` needs no such guard: it pairs its own call at registration, so
+/// it never leaves an orphan for this sweep to find. It used to leave one on
+/// purpose (that dangling pair WAS the park, and the guard here kept the sweep
+/// from spending it), which is exactly the fragility that shape carried.
 fn orphan_tool_calls_sql() -> String {
     ORPHAN_TOOL_CALLS_SQL.replace(
         "ORDER BY e.thread_id",
         &format!(
             "AND NOT {} ORDER BY e.thread_id",
-            crate::engine::agent_recovery::unanswered_question_exists_sql("e.thread_id::text")
+            crate::engine::agent_recovery::unanswered_question_exists_sql("e.thread_id::text"),
         ),
     )
 }

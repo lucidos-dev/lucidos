@@ -76,15 +76,6 @@
 }
 
 @media (max-width: 600px) {
-    .response-content table {
-        font-size: var(--font-size-xs);
-    }
-
-    .response-content th,
-    .response-content td {
-        padding: 0.25rem 0.375rem;
-    }
-
     /* A big, solid dot IS the tap target on mobile (2.5em ≈ 40px). The old
        trick — a 2.75em hit box with a 0.75em transparent border + padding-box
        background-clip — kept the visible dot a tiny 1.25em, which read as "a

@@ -1,7 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
 import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, scrolledUp, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement } from '../scrollState';
-import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS } from '../../shared/focusMarker';
+import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
  *  writing scrollTop on the active container), NOT native scrollIntoView. Tests
@@ -894,7 +894,7 @@ describe('chat deep-link applies the shared navigation focus marker', () => {
   // glow. The marker's own behaviors (supersede, gesture-clear semantics) are
   // covered in focusMarker.test.ts, and its paint by nav-focus-marker-paint.test.ts.
   // These tests pin the CHAT integration: the
-  // marker is applied on resolve, survives the flash, clears on
+  // marker is applied on resolve, survives the landing scroll, clears on
   // clearPendingEventScroll, and (the chat-specific bit) its gesture-clear is
   // gated on the deep-link claim (settleGuard = hasPendingEventScroll) so the
   // landing scroll can't self-clear it.
@@ -961,7 +961,19 @@ describe('chat deep-link applies the shared navigation focus marker', () => {
     vi.advanceTimersByTime(1100); // past SCROLL_SETTLE_FALLBACK_MS (1000) → claim released
     expect(hasPendingEventScroll()).toBe(false);
 
-    // Now an action is the user engaging → marker fades out, then is removed.
+    // Past the marker's hold too, so what this test observes is the
+    // CLAIM gating the dismissal and not the hold standing in for it. The two defer
+    // for different reasons and only the claim is under test here.
+    vi.advanceTimersByTime(NAV_FOCUS_RAMP_MS + NAV_FOCUS_HOLD_MS);
+
+    // THE assertion that makes this test about the claim. The guarded wheel above has
+    // to have been DISCARDED, not banked: the hold banks a real dismissal and runs it
+    // when it expires, which the advance just crossed, so without this line deleting
+    // the settleGuard wiring entirely leaves the whole spec green (verified). What the
+    // guard uniquely buys is that a landing scroll never enters the bank at all.
+    expect(el.classList._classes.has('nav-focus-fading')).toBe(false);
+
+    // Now an action is the user engaging → marker dissolves, then is removed.
     document.dispatchEvent(new Event('wheel'));
     expect(el.classList._classes.has('nav-focus-fading')).toBe(true);
     vi.advanceTimersByTime(NAV_FOCUS_FADE_MS);

@@ -50,6 +50,7 @@ function makeThread(
         codingAgentFolder: opts.codingAgentFolder,
         state: 'active',
         latestTodoList: null,
+    liveEventWaits: [],
     };
     return {
         meta,

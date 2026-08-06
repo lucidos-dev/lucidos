@@ -36,7 +36,7 @@ function startNewThread() {
  *  turn has one, else the initiator panel (a response-less divider / change turn).
  *  Preserves scroll position across the height change (`preserveOnToggle`, matching
  *  the header-click path) and RE-ASSERTS the marker so it survives the Enter
- *  keydown's clear (the marker fades on any keydown) and repeated Enter presses stay
+ *  keydown's clear (any keydown retires the marker's ref) and repeated Enter presses stay
  *  visible and reversible. Lives here (not in `scrollState`) so `scrollState` stays
  *  free of the heavy `store` import — see `parseNavigatedTurn`'s doc. Returns false
  *  (leaving the keystroke unconsumed) when no turn is marked, the marker is on a
@@ -54,9 +54,11 @@ function toggleNavigatedTurnCollapsed(): boolean {
   if (parsed.kind === 'response') toggleExchangeCollapsed(parsed.threadId, parsed.userSeq);
   else toggleInitiatorCollapsed(parsed.threadId, parsed.userSeq);
   // Re-stick the marker: this runs from the Enter keydown's bubble phase, after
-  // focusMarker's capture-phase keydown listener has already armed the fade-out, so
-  // re-applying cancels that fade and keeps the highlight on the turn for the next
-  // toggle. A later scroll / click / other keypress still fades it normally.
+  // focusMarker's capture-phase keydown listener has already handled that keydown.
+  // Inside the marker's hold that means it banked the dismissal and retired the ref;
+  // after the hold it means the dissolve has started. Re-applying supersedes either,
+  // keeping the highlight on the turn for the next toggle. A later scroll / click /
+  // other keypress dismisses it normally.
   applyNavFocus(el);
   return true;
 }

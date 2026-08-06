@@ -24,6 +24,7 @@
           "dismiss_native_notification",
           "nudge_dock_badge",
           "get_native_window_active",
+          "focus_main_window",
           "take_pending_native_taps",
           "check_app_update",
           "install_app_update_and_restart",

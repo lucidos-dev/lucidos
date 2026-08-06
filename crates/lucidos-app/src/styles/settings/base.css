@@ -29,21 +29,19 @@
     margin-bottom: 0;
 }
 
+/* --text-muted, the lightest grey, washes out in both themes and reads as
+   disabled, so the eyebrow rests one step up: still quiet against the (primary)
+   setting labels it sits over, but legible. Declared plainly here rather than
+   behind a :not(.settings-nav-row) carve-out, which is what this was until the
+   carve-out went dead: the one other role wearing this class, the
+   .settings-nav-row destination below, states its own colour on its own rule. */
 .settings-section-title {
     font-size: var(--font-size-sm);
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-muted);
-    margin-bottom: 0.5rem;
-}
-
-/* The uppercase eyebrow at --text-muted (the lightest grey) washes out in both
-   themes, reading as disabled. Step it up to secondary — still muted relative to
-   the (primary) setting labels below, but legible. Scoped off the left-nav rows
-   (which reuse this class but keep their own muted→hover treatment). */
-.settings-section-title:not(.settings-nav-row) {
     color: var(--text-secondary);
+    margin-bottom: 0.5rem;
 }
 
 .settings-section-desc {
@@ -57,11 +55,24 @@
    above them (.settings-nav-group-title, which owns the uppercase-eyebrow role)
    an uppercase muted row would compete with its own heading and read as the
    quieter of the two. Normal case, body size, primary colour: heading first,
-   then the rows under it. */
+   then the rows under it.
+
+   The WEIGHT and the COLOUR answer to different things here, and two attempts
+   that moved them together bracketed this one. At 500 the rows shouted in both
+   themes: a page that is nothing BUT these rows has no quieter text to be
+   emphatic against, and the default font is a monospace whose 500 already reads
+   as a semibold. Taking them to --text-secondary as well then flattened the
+   page the other way, because the group heading buys back in weight what it
+   gives up in tone (uppercase at 600) and the two landed as one grey however
+   the tokens compare. So: the weight drop is what takes the shout out, and the
+   colour gap against --text-muted is what keeps a destination distinguishable
+   from the heading of the group it sits in. Don't grey these rows without
+   giving .settings-nav-group-title somewhere quieter to go, and there is
+   nowhere: muted is already the dimmest token. */
 .settings-section-title.settings-nav-row {
     margin-bottom: 0;
     font-size: var(--font-size-md);
-    font-weight: 500;
+    font-weight: 400;
     text-transform: none;
     letter-spacing: normal;
     color: var(--text-primary);
@@ -102,11 +113,12 @@
     -webkit-tap-highlight-color: transparent;
 }
 
-/* Hover LIFTS the row. The old rule stepped muted → secondary, which read as a
-   lift while the row sat at --text-muted; now that the row rests at
-   --text-primary the same rule would DIM it, so it goes to the accent instead
-   (the same direction .settings-option takes). Equal specificity with the
-   colour rule above, so this must stay after it. */
+/* Hover LIFTS the row, to the accent (the same direction .settings-option
+   takes) rather than by stepping the grey. Stepping is what the row used to do
+   (muted → secondary) and it is no longer available: the row rests at
+   --text-primary, so a step up the greys has nowhere to go and a step down
+   would DIM it. Equal specificity with the row's colour rule above (0,2,0 both
+   ways), so this must stay after it. */
 @media (hover: hover) {
     .settings-nav-row:hover {
         color: var(--accent);

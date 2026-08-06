@@ -15,7 +15,13 @@
  *   3. The transcript is a scroll container and the composer is not, so on a
  *      classic-scrollbar platform the scrollbar takes its width out of the
  *      transcript's content box only. That is what --scrollbar-gutter-width
- *      (utils/scrollbarGutter.ts) hands back to the composer.
+ *      (utils/scrollbarGutter.ts) hands back to the composer. It is measured off
+ *      the LIVE transcript, because a detached clone of it answered 9px on real
+ *      iOS where the transcript itself reserves nothing, and the composer then
+ *      subtracted a gutter that was not there. No engine reproduces that split
+ *      under emulation, so the guard here is the gutterVar-vs-reserved assertion
+ *      below (it fails if the publish stops tracking the real element at all)
+ *      plus the unit tests in utils/scrollbarGutter.test.ts.
  *   4. Matching the outer edges was not enough on its own. The composer's shell
  *      put a wider border+padding between its edge and its text than a question
  *      card puts between its edge and its text, so the typed text still sat a
@@ -151,9 +157,10 @@ test.describe('Composer aligns with the transcript content', () => {
     const e = edges!;
 
     // The published gutter must equal what the transcript's scroll container
-    // actually reserved, or the composer compensates by the wrong amount. This
-    // is the one assertion that would catch the measurement going stale (e.g. a
-    // browser that reserves a gutter the probe can't see).
+    // actually reserved, or the composer compensates by the wrong amount. The
+    // publish reads that element directly, so this catches the reverse: the
+    // re-publish never running (ThreadView's mount effect), leaving the boot
+    // probe's estimate live on a platform where it does not match.
     expect(
       parseFloat(e.gutterVar),
       `--scrollbar-gutter-width=${e.gutterVar} but .thread-content reserved ${e.reservedByScrollbar}px`,

@@ -53,6 +53,25 @@ impl ApiError {
     }
 }
 
+/// A bare status with no message of its own, carrying the status' canonical
+/// reason phrase as the body text.
+///
+/// This exists so a handler that already returns `StatusCode` errors can adopt
+/// `ApiError` for the ONE branch that has something to say, without rewriting
+/// the other dozen. It is not a licence to keep returning bare statuses: the
+/// canonical phrase ("Conflict", "Bad Request") names the class of failure, not
+/// the failure, so any branch a user can reach owes a real message.
+///
+/// The phrase matters even so. A bare `StatusCode` sends an EMPTY body, and the
+/// frontend's `throwIfNotOk` then falls back to `res.statusText`, which is
+/// always `""` over HTTP/2, so the toast reads `Failed to send message: 409` and
+/// tells the user nothing at all. `Conflict` is at least a word.
+impl From<StatusCode> for ApiError {
+    fn from(status: StatusCode) -> Self {
+        Self::new(status, status.canonical_reason().unwrap_or("Error"))
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (
@@ -60,5 +79,26 @@ impl IntoResponse for ApiError {
             Json(serde_json::json!({ "error": self.message })),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bare_status_carries_its_canonical_reason() {
+        let err: ApiError = StatusCode::CONFLICT.into();
+        assert_eq!(err.status, StatusCode::CONFLICT);
+        assert_eq!(err.message, "Conflict");
+    }
+
+    #[test]
+    fn an_explicit_message_is_never_replaced_by_the_canonical_one() {
+        let err = ApiError::new(
+            StatusCode::CONFLICT,
+            "Thread is locked to coding-agent mode",
+        );
+        assert_eq!(err.message, "Thread is locked to coding-agent mode");
     }
 }

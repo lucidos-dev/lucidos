@@ -88,7 +88,7 @@ Every site that assumes the repo+worktree model, with file:line refs.
 | Surface | Location | Notes |
 |---|---|---|
 | Skill file | `.claude/commands/harden.md` | Phases 0–5. Phase 4.5 has a **hardcoded** table: `.rs/Cargo.toml/Cargo.lock/.sql` → `cargo check && cargo test -p lucidos-engine`; `.ts/.tsx` → `cd crates/lucidos-app && npx tsc --noEmit && npm test`. CSS-only / docs-only → skip. No support for "this folder isn't Lucidos". |
-| `ALREADY_HARDENED` marker | `.claude/hooks/mark-harden.sh` → `lucidos hardened mark` → `POST /api/v1/internal/mark-hardened` → `record_hardened()` at `crates/lucidos-engine/src/api/internal.rs:266` | Stored in `hardened_branches` table, keyed by canonical `(repo_root, branch_name, head_sha)`. The branch-name key assumes a per-session feature branch. |
+| `ALREADY_HARDENED` marker | `/harden` Phase 5 → `lucidos hardened mark` → `POST /api/v1/internal/mark-hardened` → `record_hardened()` at `crates/lucidos-engine/src/api/internal.rs:266` | Stored in `hardened_branches` table, keyed by canonical `(repo_root, branch_name, head_sha)`. The branch-name key assumes a per-session feature branch. |
 | Query | `crates/lucidos-engine/src/api/internal.rs:306` (`query_hardened`) | Reports `FRESH` / `STALE` / `MISSING`. STALE = HEAD has advanced since the mark; the harden skill re-runs. |
 
 ### 1.8 Thread UI
@@ -180,7 +180,7 @@ Three subtleties:
 ### 2.5 Harden semantics per mode
 
 - **worktree + Lucidos:** unchanged from today — full Lucidos `/harden` skill (Phases 0–5), marker enforced; Apply gates on `FRESH` marker (else runs harden synchronously).
-- **worktree + data:** Lucidos's `/harden` **does not run**. Apps own their test/lint stories; the engine does not impose its hardening pipeline on them and does not gate Apply on a `hardened_branches` marker. The harden hook (`mark-harden.sh`) is not invoked; `query_hardened` is not called from the data Apply path. Apps that DO want a review pass can provide their own `.claude/commands/harden.md` (or any other command) inside the app folder — CC will pick it up via cwd discovery and run it on demand. The Apply path treats data-tree changes as `hardened = N/A` (a dedicated flag, not "false" — see Q13).
+- **worktree + data:** Lucidos's `/harden` **does not run**. Apps own their test/lint stories; the engine does not impose its hardening pipeline on them and does not gate Apply on a `hardened_branches` marker. `lucidos hardened mark` is not invoked; `query_hardened` is not called from the data Apply path. Apps that DO want a review pass can provide their own `.claude/commands/harden.md` (or any other command) inside the app folder: CC will pick it up via cwd discovery and run it on demand. The Apply path treats data-tree changes as `hardened = N/A` (a dedicated flag, not "false"; see Q13).
 - **worktree + external:** Lucidos's `/harden` does not run. External's own CI is responsible.
 - **in_place:** none.
 - **no_git:** none.

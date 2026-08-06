@@ -3,7 +3,8 @@ use super::{
     trigger_toml_data_relpath, write_trigger_definition, TriggerDefinition,
 };
 use crate::engine::command_guard::SideEffectCategory;
-use crate::triggers::config::{EventSubscription, TriggerConfig, TriggerRun};
+use crate::triggers::config::{TriggerConfig, TriggerRun};
+use crate::triggers::EventSubscription;
 
 fn tmpdir(name: &str) -> std::path::PathBuf {
     let p = std::env::temp_dir().join(format!(

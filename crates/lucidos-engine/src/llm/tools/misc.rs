@@ -1,7 +1,7 @@
 //! LLM-facing schemas for cross-cutting tools that do not belong to a
 //! single domain family: navigate_ui, git_clone, get_backup_status,
 //! request_credential, connect_oauth_account, execute_intent,
-//! ask_user_question, todo_write.
+//! ask_user_question, await_event, todo_write.
 //!
 //! (manage_repositories / manage_models moved to the capability parity manifest —
 //! domains `repositories` / `models` — and are built by `capability_manifest`.)
@@ -325,7 +325,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::ASK_USER_QUESTION.to_string(),
-            description: "Ask the user a multiple-choice question and wait for their pick. The Lucidos UI renders each question as a card with the options as clickable buttons, so the user can answer with a tap instead of typing. Use whenever the answer is a yes/no decision, a pick from 2–4 named choices, or a confirmation step before doing something significant, anywhere a button would beat a typed reply. Single-question is the common case; pass up to 4 questions in one call only when they are a tight batch the user should answer in sequence (each question renders one card at a time). Every question object MUST carry a non-empty `question` (the full question text the user reads on the card); the short `header` chip-label is NEVER a substitute, and the engine rejects (and forces you to re-ask) any call that leaves `question` empty, so fill it the first time. NEVER add an \"Other\" / \"Something else\" / \"Let me type it\" option: Lucidos has no text-entry option, so tapping one just sends you that label back as the user's answer, which is a dead end. Both escapes are on every card without you: the user can type any reply in the prompt textarea (it arrives as their answer to this question), and Cancel dismisses the question so they can steer you elsewhere. An option carrying a decision you can act on is different and still welcome (\"None of these\", \"Neither, ask me later\", \"Cancel the deploy\"); what is banned is an option whose only meaning is \"I will type it instead\". Returns a JSON object mapping each question text to the chosen option label (or the user's typed text when they answer freeform).".to_string(),
+            description: "Ask the user a multiple-choice question and wait for their pick. The Lucidos UI renders each question as a card with the options as clickable buttons, so the user can answer with a tap instead of typing. Use whenever the answer is a yes/no decision, a pick from 2–4 named choices, or a confirmation step before doing something significant, anywhere a button would beat a typed reply. Single-question is the common case; pass up to 4 questions in one call only when they are a tight batch the user should answer in sequence (each question renders one card at a time). Every question object MUST carry a non-empty `question` (the full question text the user reads on the card); the short `header` chip-label is NEVER a substitute, and the engine rejects (and forces you to re-ask) any call that leaves `question` empty, so fill it the first time. NEVER add an \"Other\" / \"Something else\" / \"Let me type it\" option: Lucidos has no text-entry option, so tapping one just sends you that label back as the user's answer, which is a dead end. Both escapes are on every card without you: the user can type any reply in the prompt textarea (it arrives as their answer to this question), and Cancel dismisses the question so they can steer you elsewhere. An option carrying a decision you can act on is different and still welcome (\"None of these\", \"Neither, ask me later\", \"Cancel the deploy\"); what is banned is an option whose only meaning is \"I will type it instead\". Returns a JSON object mapping each question text to the chosen option label (or the user's typed text when they answer freeform). NEVER ask a question purely to get resumed. A one-option card whose only job is to wake you back up makes the human your scheduler: it lights the needs-attention badge, pushes a notification, and blocks Apply, all for something the engine already knows. If you are waiting for something that happens in Lucidos, `await_event` is the tool; if you are waiting on the output of a process you started, `bash_output(task_id, wait_secs=N)` is. Ask only when you genuinely need the person to decide.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -375,6 +375,57 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                     }
                 },
                 "required": ["questions"]
+            }),
+        },
+    ]
+}
+
+/// One clause here is a **temporary measure**: "Saying you will re-arm is not
+/// re-arming; a turn that ends with no new call leaves nothing watching for it"
+/// carries no system fact and exists only to pre-empt a recurring model mistake
+/// on this terminal tool. Registered in `docs/temporary-measures.md` § "\"Narrating it
+/// does not do it\" on an event-wait re-arm", alongside its twin in
+/// `engine::event_wait::WAIT_SPENT_NOTICE`. Everything else in the description
+/// states real properties of the tool.
+pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: tn::AWAIT_EVENT.to_string(),
+            description: format!("Subscribe to something happening in Lucidos, instead of checking over and over. This call returns IMMEDIATELY and blocks nothing: finish your turn and end your response normally, and the engine re-opens this thread with a NEW turn the moment a matching event arrives. If nothing matches before `timeout_secs`, you are woken with a timeout instead. A subscription always resolves; it never strands you.\n\nYou are not blocked while subscribed. The thread is simply idle and watching, so say what you are waiting for and stop, exactly as you would at the end of any turn. Do NOT keep the turn alive waiting, and do NOT poll to see whether it fired.\n\nUse this INSTEAD of a polling loop whenever you are waiting on Lucidos state: a thread finishing, a change being proposed, a trigger firing, an app or workspace emitting a domain event. A `run_bash_background` / `run_python` sleep-and-recheck loop for any of those is strictly worse: it burns a full LLM call per poll, samples on an interval so it can miss or tear a transition, and dies on restart. This does not. The subscription is persisted, so it survives an engine restart and still wakes you.\n\nTWO QUESTIONS PICK BETWEEN THIS AND A TRIGGER, AND YOU NEED BOTH. First, WHERE DOES THE ANSWER GO? A trigger runs in its own thread and reaches the user as a notification; it cannot continue THIS conversation. This tool re-opens the very thread they are reading. So \"tell me HERE when X happens\", \"let me know in this chat\", or a request typed into a thread they are clearly waiting in, is this tool, even though the words sound like a standing rule. Second, HOW LONG? A RENDEZVOUS, NOT A STREAM: the first matching event resolves the subscription and consumes it. \"Continue when the next X happens\" is this tool; \"react to every X, forever\", outliving the conversation, is a trigger (`triggers` tool). Both answers can be right at once, so lead with the one that matches where they asked to be told, and offer the other: report here now with this tool, and a trigger if they want it to keep running after this thread is done.\n\nNOT for external state with no Lucidos event (a third-party API you can only re-query, a file another process might write). There is no event to wake you, so poll for those.\n\nWhen you are woken, the event arrives as a new message on this same thread and you carry on with the whole conversation behind you. THE SUBSCRIPTION IS SPENT once it wakes you, however it woke you, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing; a turn that ends with no new call leaves nothing watching. A message from the user meanwhile changes nothing: it runs an ordinary turn and every subscription you hold survives it untouched, so do not register those again.\n\nA re-armed watch is bounded, so do not promise the user \"forever\". After {} subscriptions in a row with no message from them, the next call is refused and you have to report back. Offer to keep watching and check in; a rule that must outlive the conversation is a trigger.", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "on": {
+                        "type": "array",
+                        "minItems": 1,
+                        "description": "What to wake on. Any entry matching wakes you (OR), and the result names which one fired. Same event names and same `condition` language as a trigger's `on_event`.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "event_type": {
+                                    "type": "string",
+                                    "description": "Event name, PascalCase past tense. A Lucidos thread event (`ChangeProposed`, `ResponseGenerated`, `CodingAgentIdled`, `ChildThreadCompleted`, `TriggerExecuted`, and so on) or a domain event this workspace emits with `emit_event` (`ReleasePublished`, ...). Per-token streaming events (`TextStreamed`, `ThoughtStreamed`, and the coding-agent twins) and the `EventWait*` family are refused: the first never reaches a subscriber, the second would satisfy itself."
+                                },
+                                "condition": {
+                                    "type": "object",
+                                    "description": "Optional payload filter, scoped to THIS entry. Field-to-value for equality, or an operator object: `{\"$eq\":v}`, `{\"$ne\":v}`, `{\"$lt\":n}`, `{\"$lte\":n}`, `{\"$gt\":n}`, `{\"$gte\":n}`, `{\"$in\":[…]}`. Filter on the event's OWN payload fields, which are the ones you see in `query_events` output: e.g. `{\"child_thread_id\": \"<uuid>\"}` on `ChildThreadCompleted`, or `{\"file_count\": {\"$gt\": 0}}` on `ChangeProposed`. The thread an event belongs to is NOT a payload field, so you cannot filter on it."
+                                }
+                            },
+                            "required": ["event_type"]
+                        }
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 86400,
+                        "description": "REQUIRED. How long to wait before giving up, in seconds (max 86400 = 24h). There is no unbounded wait. Pick a real upper bound for the thing you are waiting on and add margin: waking early with a timeout costs one turn, waking too late costs the user the whole wait."
+                    },
+                    "reason": {
+                        "type": "string",
+                        "description": "REQUIRED. One short line, in the user's language, saying what you are waiting for and why (\"waiting for the release build to finish\"). The user reads this in the subscription indicator, and it is how they tell a sleeping thread from a stalled one."
+                    }
+                },
+                "required": ["on", "timeout_secs", "reason"]
             }),
         },
     ]

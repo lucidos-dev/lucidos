@@ -298,3 +298,56 @@ fn no_terminal_kind_does_not_propose_at_idle() {
         "None terminal (silent resume / safety-net abort) must NOT auto-propose"
     );
 }
+
+// -------------------- idle_change_flags --------------------
+
+#[test]
+fn answered_non_empty_probe_reports_changes() {
+    let files = vec!["crates/lucidos-engine/src/engine/mod.rs".to_string()];
+    assert_eq!(
+        idle_change_flags(Some(&files), (false, false)),
+        (true, true),
+        "a real diff sets has_changes, and a .rs file requires a restart"
+    );
+}
+
+#[test]
+fn answered_non_empty_probe_without_restart_files() {
+    let files = vec!["docs/notes.md".to_string()];
+    assert_eq!(
+        idle_change_flags(Some(&files), (false, false)),
+        (true, false)
+    );
+}
+
+#[test]
+fn answered_empty_probe_clears_a_previously_true_state() {
+    // Commit then revert: git ANSWERED, and the answer is that the branch
+    // carries no diff. Carrying `true` forward here is the phantom-Apply
+    // regression `may_touch_change_state_at_idle` documents.
+    assert_eq!(
+        idle_change_flags(Some(&[]), (true, true)),
+        (false, false),
+        "an answered-empty diff must clear the state, not carry it forward"
+    );
+}
+
+#[test]
+fn unanswerable_probe_preserves_a_true_state() {
+    // The renamed-branch bug: `git diff <base>...<gone-ref>` exits 128. That
+    // is UNKNOWN, and must never downgrade the Diff button to dark.
+    assert_eq!(
+        idle_change_flags(None, (true, true)),
+        (true, true),
+        "git could not answer, so the thread keeps the state it already had"
+    );
+}
+
+#[test]
+fn unanswerable_probe_preserves_a_false_state() {
+    assert_eq!(
+        idle_change_flags(None, (false, false)),
+        (false, false),
+        "unknown preserves, it does not invent changes either"
+    );
+}

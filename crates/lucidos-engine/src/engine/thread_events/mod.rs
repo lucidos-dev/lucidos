@@ -17,7 +17,7 @@ mod session;
 mod todo;
 
 pub use actor::{ActorMode, EngineReason, MessageOrigin, ThreadDirection};
-pub use cause::{AbortCause, CancelCause};
+pub use cause::{AbortCause, CancelCause, EventWaitCancelCause};
 pub use channel::{EventChannel, TriggerInvocation};
 pub use event::ThreadEvent;
 pub use meta::EventMeta;

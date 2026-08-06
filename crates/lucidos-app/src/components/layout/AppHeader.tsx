@@ -7,6 +7,7 @@ import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { ComposeIcon, SearchIcon } from '../shared/icons';
 import { ThreadNav } from '../shared/ThreadNav';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
+import { SetupInterviewButton } from '../shared/SetupInterviewButton';
 import { unfocusThread } from '../../store/actions/threads';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane, focusPane } from '../../store/actions/pane';
@@ -305,6 +306,7 @@ export function AppHeader() {
                   mobile thread header. */}
               <span class="pane-header-brand-actions">
                 <ControlPanel layout="desktop" />
+                <SetupInterviewButton showTooltip />
                 <button
                   class="icon-btn header-icon brand-compose-btn"
                   onClick={() => unfocusThread()}

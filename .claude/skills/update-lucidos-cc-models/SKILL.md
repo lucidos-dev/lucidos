@@ -46,4 +46,20 @@ CC accepts these short aliases for `set_model` control requests:
 - `opus` — latest Opus
 - `haiku` — latest Haiku
 
-For 1M context variants, use the full model ID with extended context flag.
+**An alias resolves per provider, and it moves.** On the Anthropic API (what
+Lucidos spawns against) `sonnet` resolves to **Sonnet 5** and `opus` to **Opus 5**
+as of CC v2.1.219; on Bedrock / Google Cloud those same aliases land on older
+versions. So an alias row's *label* goes stale silently whenever Anthropic
+repoints it. Two consequences for this file:
+
+- Re-check what each alias resolves to on every resync (the model-config docs
+  page has the per-provider table), and fix the label if it moved. The `opus` /
+  `opus[1m]` rows were left claiming "Opus 4.6" past that point and are the
+  known outstanding case.
+- Prefer a **pinned full id** (`claude-sonnet-5`, `claude-opus-5@default`) for the
+  models the picker recommends, and keep an alias row only where "always latest"
+  is the point. A pinned id cannot drift.
+
+For 1M context variants, use the full model ID with extended context flag. Note
+that a `<model>[1m]` alias is a no-op once the alias already resolves to a model
+with a native 1M window, which is why the picker carries no `sonnet[1m]` row.

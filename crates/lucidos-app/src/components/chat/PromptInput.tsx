@@ -26,6 +26,7 @@ import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, Glo
 import { BlobImage } from '../shared/BlobImage';
 import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
 import { LucidosControlMenu } from './LucidosControlMenu';
+import { EventWaitIndicator } from './EventWaitPanel';
 import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
 import { composeHasContent, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
@@ -1050,7 +1051,7 @@ export function PromptInput() {
         <div class={rowClass} ref={promptActionsAreaRef}>
           {showCodingAgentControls
             ? <CodingAgentControlMenu threadId={codingAgentControlThreadId} composeThreadId={composeControlThreadId} codingAgent={promptCodingAgent} />
-            : <><LucidosControlMenu threadId={focusedThreadId.value ?? undefined} composeContext={inComposeContext} /><TodoListIndicator /></>}
+            : <><LucidosControlMenu threadId={focusedThreadId.value ?? undefined} composeContext={inComposeContext} /><TodoListIndicator /><EventWaitIndicator /></>}
           {(() => {
             // WIP app preview toggle: visible whenever the focused thread is an
             // app coding-agent thread that has an in-flight diff

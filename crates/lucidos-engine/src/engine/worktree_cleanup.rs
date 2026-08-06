@@ -387,7 +387,14 @@ impl WorktreeCleanup {
             }
 
             match lookup_thread_by_short(&self.pool, &short).await {
-                Some(thread_id) => {
+                // The lookup could not be answered (a DB error, or an ambiguous
+                // 8-hex prefix). Skip the entry outright: the `NotFound` arm
+                // below routes to `try_orphan_path`, which is the one arm that
+                // never consults `active_threads::is_active`, so treating an
+                // unanswered probe as "orphan" would let a database blip delete
+                // a live session's worktree.
+                ShortThreadLookup::Unknown => continue,
+                ShortThreadLookup::Found(thread_id) => {
                     // Footprint accounting MUST stay above the active-session
                     // skip below — `inventory_worktrees` counts active worktrees
                     // too, and the disk-low alert's "Lucidos uses X GB" framing
@@ -463,7 +470,7 @@ impl WorktreeCleanup {
                         }
                     }
                 }
-                None => {
+                ShortThreadLookup::NotFound => {
                     // Orphan worktrees are excluded from the footprint to
                     // match `inventory_worktrees` (Settings → Disk Usage).
                     if let Some(freed) = self

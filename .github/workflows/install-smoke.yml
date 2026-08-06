@@ -2226,6 +2226,16 @@ jobs:
       # service_launchd_label(default) == com.lucidos.gateway.default. Teardown
       # needs it to prove nothing was left bootstrapped on the runner.
       GW_LAUNCHD_LABEL: 'com.lucidos.gateway.default'
+      # The bounded wait rungs 5-8 open with, in this file's usual
+      # <thing>_WAIT_SECS / <thing>_POLL_SECS shape. macOS-ONLY, and that is the
+      # point: only the launchd path can be answering health while the instance
+      # is not yet discoverable (the long note on the wait itself explains why,
+      # and why the Linux job needs no twin). 60s is headroom over a window
+      # measured in seconds, and it stacks with nothing, since it runs after the
+      # health poll has already returned, so it disappears into the 900s of
+      # slack the timeout arithmetic on this job already carries.
+      FD_MARKER_WAIT_SECS: '60'
+      FD_MARKER_POLL_SECS: '2'
     steps:
       # ── validate the origin BEFORE anything touches it ────────────────────────
       # Verbatim from `front-door`, deliberately NOT weakened for this job: the
@@ -3105,20 +3115,109 @@ jobs:
           plist="$HOME/Library/LaunchAgents/$GW_LAUNCHD_LABEL.plist"
           target="gui/$(id -u)/$GW_LAUNCHD_LABEL"
 
+          # ── rung 5's precondition: WAIT FOR THE INSTANCE TO BE DISCOVERABLE ───
+          # HEALTH IS NOT THE INSTALLER'S FINISH LINE ON THE LAUNCHD PATH, and
+          # every rung below depends on the part that comes after it. The
+          # previous step returns the moment the gateway answers /health, which
+          # is a statement about the gateway, not about install.sh.
+          #
+          # install.sh's register_service bootstraps the LaunchAgent FIRST and
+          # calls record_instance_port SECOND, deliberately, so that a
+          # registration which dies leaves no marker claiming the instance was
+          # installed. launchd starts the gateway as soon as it accepts the
+          # bootstrap, while register_launchd keeps going: it does not return
+          # until launchctl has CONFIRMED the job is loaded, and that path runs
+          # a `kickstart -k` over a gateway which ignores SIGTERM (so launchd
+          # has to wait out its ExitTimeOut) before a `launchctl print` state
+          # check. The gateway is racing that confirmation to the health
+          # endpoint, and it can win.
+          #
+          # service_list_instance_names keys on <prefix>/<slug>/port and NOTHING
+          # else, so inside that window the instance is invisible: --list reports
+          # none, resolve_targets resolves no targets, and rungs 5, 6, 7 and 8
+          # all fail off the one missing file. That is exactly what separated two
+          # runs of this leg 22 minutes apart on 2026-08-04: identical rungs 1-4
+          # (all six routes shell, preflight 206, gateway healthy, frontend 200)
+          # and one differing log line, "the installer process had already
+          # exited" on the green one against "was still running" on the red,
+          # which then lost all four uninstall rungs. Do not "simplify" this wait
+          # away: the health step passing is not evidence the marker is on disk.
+          #
+          # THIS IS NOT THE LINUX JOB'S FAST-FAIL, and the health poll's warning
+          # against copying that one back here still stands in full. That check
+          # ABORTS because the installer exited; this one only stops WAITING,
+          # because a marker still absent once install.sh is gone is never going
+          # to appear. An exited installer remains the successful launchd shape,
+          # and the verdict below is about the marker, never about the process.
+          # The gate test's "no installer-exited fast-fail" assertion is scoped
+          # to the health step, which is the step that must not have one.
+          #
+          # THE LINUX JOB HAS NO TWIN OF THIS WAIT, and does not need one: the
+          # ordering there is INVERTED, not merely faster. That container has no
+          # service manager, so install.sh degrades to launch_runtime, which
+          # calls record_instance_port BEFORE an `exec` that never returns. The
+          # marker is therefore on disk before the process that answers health
+          # has even started, which is a happens-before and not a race won on
+          # timing. Copy this wait over there only if that job ever gains a
+          # service manager.
+          echo "Waiting for the port marker $marker (timeout ${FD_MARKER_WAIT_SECS}s)…"
+          marker_deadline=$(( $(date +%s) + FD_MARKER_WAIT_SECS ))
+          while [ ! -f "$marker" ]; do
+            # Unquoted-default deliberately absent, same reasoning as the health
+            # poll: `kill -0 0` targets the whole process group and always
+            # succeeds, so a `${INSTALL_PID:-0}` fallback would silently disable
+            # this. `set -u` is the right failure; the launch step shares this
+            # step's `FD_MODE == 'full'` guard, so it always ran first.
+            if ! kill -0 "$INSTALL_PID" 2>/dev/null; then
+              # One more look: the marker can land between the loop test above
+              # and this check.
+              [ -f "$marker" ] && break
+              echo "::error::the port marker $marker was NEVER written and the installer (pid $INSTALL_PID) has exited, so it never will be. service_list_instance_names keys on that file and nothing else, so this instance is invisible to --list, resolve_targets resolves no targets, and run_uninstall would return before purging. This is an INSTALLER defect in record_instance_port (register_service must write the marker after register_launchd, and launch_runtime before its exec), NOT a harness race and NOT an origin regression."
+              exit 1
+            fi
+            if [ "$(date +%s)" -ge "$marker_deadline" ]; then
+              echo "::error::HARNESS BUDGET, not a product failure: $marker had still not appeared after ${FD_MARKER_WAIT_SECS}s and the installer (pid $INSTALL_PID) is STILL RUNNING. install.sh writes that marker right after a launchd registration it has evidently not finished, so rungs 5-8 would now fail on an instance that is merely not discoverable YET. Raise FD_MARKER_WAIT_SECS on this job; it fits inside the slack timeout-minutes already carries. Do NOT read this as a record_instance_port defect, which is the OTHER error this wait can print."
+              exit 1
+            fi
+            sleep "$FD_MARKER_POLL_SECS"
+          done
+          echo "    OK  the instance is discoverable: $marker records port $(tr -d ' \t\r\n' < "$marker" 2>/dev/null)"
+
           fail=0
           HTML_PAYLOAD_RE='DOCTYPE|syntax error near|syntax error:'
 
-          # marker_diagnosis: the root cause that would make an instance invisible
-          # to --list and unremovable by --all --purge. service_list_instance_names
-          # keys on <prefix>/<slug>/port, which install.sh records via
-          # record_instance_port from BOTH launch shapes. If it is missing here,
-          # that is an INSTALLER defect, not an origin regression.
+          # marker_diagnosis: called by a rung that could not see the instance, to
+          # say whether DISCOVERY is what failed. It reports; it deliberately does
+          # not attribute, and that restraint is the point.
+          #
+          # THIS ANNOTATION CAUSED A REAL MISDIAGNOSIS ON 2026-08-04. It used to
+          # offer exactly two explanations, an INSTALLER defect in
+          # record_instance_port or an origin regression, and the actual cause was
+          # a third one it did not name: this step reached rung 5 while install.sh
+          # was still mid-registration, so the marker was not written YET.
+          # install.sh does record it on the launchd shape. It does so after
+          # register_launchd returns, deliberately, so that a registration which
+          # dies leaves no marker. A reader following the old text went hunting
+          # for a bug in record_instance_port that was never there.
+          #
+          # That case cannot reach this function at all any more. The wait at the
+          # top of this step blocks rung 5 until the marker exists, and it is now
+          # where the never-written verdict gets made, in its OWN two errors: the
+          # installer exited without writing it (a real record_instance_port
+          # regression) against the deadline expiring with the installer still
+          # running (a harness budget). Those two are the ones that can genuinely
+          # fire for a marker that was never there, so send the reader to them
+          # rather than repeating a verdict this line is no longer entitled to.
+          #
+          # What is left for the error branch below is genuinely stranger: the
+          # marker was OBSERVED and then vanished mid-step. Name that, and name
+          # what fits it, instead of blaming a write that demonstrably happened.
           marker_diagnosis() {
             if [ -f "$marker" ]; then
-              echo "    (the port marker $marker exists, so this is NOT the known marker gap)"
+              echo "    (the port marker $marker is still here, so discovery is not what failed: the cause is in the rung's own output below)"
               return 0
             fi
-            echo "::error::ROOT CAUSE: the port marker $marker does not exist. service_list_instance_names keys on it, so this instance is invisible to --list, resolve_targets resolves no targets, and run_uninstall returns before purging. install.sh must record it on BOTH launch shapes (record_instance_port). That is an INSTALLER defect, not an origin regression."
+            echo "::error::the port marker $marker is GONE, and it EXISTED when this step began: the wait above blocks rung 5 until it does. service_list_instance_names keys on that file and nothing else, so from this point the instance is invisible to --list, resolve_targets resolves no targets, and run_uninstall returns before purging. Something removed it DURING these rungs, so suspect the rungs themselves first: a data-safe rung 7 (no --purge) promises to keep the instance data dir AND this marker, which is exactly what leaves rung 8 a target to purge. Do NOT read this as install.sh failing to write the marker. That case cannot reach this line, and its verdict, installer defect against harness budget, is made by the wait's own two errors at the top of this step."
           }
 
           # assert_uninstaller_ran <label> <log> <status>: the floor every rung
@@ -3181,10 +3280,27 @@ jobs:
             assert_listed "rung 5 (install.sh --list)" "$log5" || fail=1
             # Only reachable on this leg: the instance is registered, so --list
             # must say so rather than reporting it stopped.
+            #
+            # This USED to convict instance_status outright, which is the same
+            # closed-set mistake marker_diagnosis above was rewritten out of: the
+            # agent's state is read here, not at rung 3, and the agent carries
+            # KeepAlive, so a job that crashed out of the domain in between reads
+            # identically from --list and is not a misreading of anything.
+            #
+            # So ask launchctl DIRECTLY, at the moment the rung disagrees, and
+            # let the two answers name their own cause. A second opinion from a
+            # different source taken microseconds later is what separates them;
+            # the teardown's report cannot, because rung 7 boots the agent out
+            # itself, so by then "nothing left behind" is the expected outcome on
+            # every run and says nothing about what rung 5 saw.
             if grep -q 'launchd loaded' "$log5"; then
               echo "    OK  rung 5 reports the launchd agent as loaded"
             else
-              echo "::error::rung 5: --list did not report instance '$slug' as '(launchd loaded)', but install.sh bootstrapped $GW_LAUNCHD_LABEL and the gateway answered health. instance_status is misreading launchd state."
+              if launchctl print "$target" >/dev/null 2>&1; then
+                echo "::error::rung 5: --list did not report instance '$slug' as '(launchd loaded)', but launchctl says $GW_LAUNCHD_LABEL IS bootstrapped at $target right now. The agent is fine and the report is wrong, so instance_status is misreading launchd state."
+              else
+                echo "::error::rung 5: --list did not report instance '$slug' as '(launchd loaded)', and launchctl agrees: $GW_LAUNCHD_LABEL is NOT bootstrapped at $target. instance_status reported the truth, so the fault is upstream of it. install.sh bootstrapped this agent and the gateway answered health at rung 3, so it left the domain in between: look at the gateway logs under $data/logs and at whether KeepAlive was still restarting it."
+              fi
               fail=1
             fi
           else

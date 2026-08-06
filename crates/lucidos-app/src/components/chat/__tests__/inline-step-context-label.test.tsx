@@ -3,6 +3,7 @@ import type { VNode } from 'preact';
 import { InlineStep, contextLabel } from '../chat-exchange-parts';
 import { vnodeToText } from './vnodeToText';
 import { viewportIsMobile } from '../../../utils/viewport';
+import { contextViewer } from '../../../store/store';
 import type { ContextCapture, ResponseEvent } from '../../../store/types';
 
 /** The context counter on a step row. On a phone the full
@@ -61,5 +62,58 @@ describe('InlineStep context suffix', () => {
     const rendered = text(true);
     expect(rendered).toContain('18%');
     expect(rendered).not.toContain('1000k');
+  });
+});
+
+/** The counter is the context viewer's only door, now that a thinking pass no
+ *  longer gets a row of its own to click. So it has to BE a button wherever
+ *  there is a snapshot behind it, and must not pretend to be one where there
+ *  isn't. */
+describe('InlineStep context counter as a click target', () => {
+  const capture: ContextCapture = {
+    producer: 'main_llm',
+    model: 'claude-opus-5',
+    context_window: 1_000_000,
+    sections: [],
+    tools: [],
+    estimated_total_tokens: 178_000,
+    trimmed: false,
+  };
+
+  function counterOf(event: Extract<ResponseEvent, { type: 'step' }>) {
+    const vnode = InlineStep({ event }) as VNode<{ children?: unknown }>;
+    const children = vnode.props.children as VNode<Record<string, unknown>>[];
+    return children[1];
+  }
+
+  afterEach(() => { contextViewer.value = null; });
+
+  it('opens the context viewer when the step carries a snapshot', () => {
+    const event: Extract<ResponseEvent, { type: 'step' }> = {
+      type: 'step',
+      description: 'Run ls',
+      tool_name: 'Bash',
+      outcome: 'success',
+      contextCapture: capture,
+    };
+    const counter = counterOf(event);
+    expect(counter.type).toBe('button');
+    (counter.props.onClick as () => void)();
+    expect(contextViewer.value?.snapshot).toBe(capture);
+    // The viewer opens from a row and would otherwise be a wall of sections
+    // with no statement of which call it belongs to.
+    expect(contextViewer.value?.description).toBe('Run ls');
+  });
+
+  it('stays inert text for a legacy row whose tokens have no snapshot behind them', () => {
+    const event: Extract<ResponseEvent, { type: 'step' }> = {
+      type: 'step',
+      description: 'Thinking',
+      outcome: 'success',
+      context_tokens: 23_500,
+    };
+    const counter = counterOf(event);
+    expect(counter.type).toBe('span');
+    expect(counter.props.onClick).toBeUndefined();
   });
 });

@@ -1,8 +1,10 @@
 import { useEffect, useRef } from 'preact/hooks';
 import { promptState } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
+import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
 import { trapDialogTab } from './dialogFocusTrap';
+import { dialogOwnsKey } from './dialogKeyScope';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 /** What the reader has typed into the prompt that is currently open, kept
@@ -59,6 +61,10 @@ export function PromptDialog() {
 
     function handleKey(e: KeyboardEvent) {
       const target = e.target as HTMLElement | null;
+      // A keystroke aimed at another open overlay is not ours to submit: a
+      // confirm can sit on top of this prompt, and this listener would
+      // otherwise close it with the input's text. See dialogOwnsKey.
+      if (!dialogOwnsKey(target, dialogRef.current)) return;
       if (e.key === 'Enter') {
         // Buttons handle Enter natively (triggers click). A multiline textarea
         // needs newlines, so it does NOT submit on a bare Enter; a single-line
@@ -107,7 +113,7 @@ export function PromptDialog() {
       panelRef={dialogRef}
     >
         {state.title && <h2 class="confirm-title">{state.title}</h2>}
-        <p class="confirm-message">{state.message}</p>
+        <DialogMessage message={state.message} />
         {/* The answer is free-form natural language (the dialog is driven by the
             LLM's ask-the-user payload), so both branches are prose fields. */}
         {/* `onInput` records the draft (see openPromptDraft) and nothing else:

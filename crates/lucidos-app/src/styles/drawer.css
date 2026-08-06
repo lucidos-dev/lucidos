@@ -367,6 +367,29 @@
     opacity: 0.6;
 }
 
+/* Archived sub-thread cue: this thread's own natural section is Archive, but
+ * its family routed to Current / Pinned, so it renders under a parent that
+ * still has live work. Render it disabled at the drawer's own disabled opacity
+ * (0.45, the value the filter panel's disabled controls already use) so a
+ * sub-thread the user has already archived can't be mistaken for pending work.
+ * Dimmer than the lifted-parent cue above, which says "I'm here because of a
+ * child", not "I'm already put away" (and which owns the root row, so the two
+ * never land on the same row). Visual only: the row still opens on click,
+ * keeps its hover background, and keeps its actions usable.
+ *
+ * The class rides the WRAPPER because the status dot (`.thread-status`) is the
+ * wrapper's child, outside `.thread-row`, and has to dim with the rest. An
+ * archived thread is never running (`displaySection` keeps a running thread in
+ * Current), but it can carry a failed / paused dot, which is exactly the loud
+ * cue that must dim here. */
+.thread-row-wrap.is-archived .thread-status,
+.thread-row-wrap.is-archived .thread-row-title,
+.thread-row-wrap.is-archived .thread-row-created,
+.thread-row-wrap.is-archived .thread-row-context,
+.thread-row-wrap.is-archived .message-channel-tag {
+    opacity: 0.45;
+}
+
 /* Sub-thread disclosure, horizontally centered on the parent row and aligned
  * to the same line as the row's copy-icon action so it reads as the parent's
  * (not the next thread's). The control swaps contents by state: while EXPANDED
@@ -719,11 +742,6 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
     width: 0.5rem;
     height: 0.5rem;
     box-sizing: border-box;
-}
-
-.thread-status svg {
-    width: var(--icon-size-sm);
-    height: var(--icon-size-sm);
 }
 
 @media (min-width: 769px) {

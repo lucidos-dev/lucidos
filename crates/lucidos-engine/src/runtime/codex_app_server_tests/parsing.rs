@@ -552,3 +552,120 @@ fn file_change_strips_diffs_from_the_persisted_input() {
         other => panic!("expected ToolUse, got {other:?}"),
     }
 }
+
+/// Build the approval an out-of-sandbox patch actually raises: no paths, and
+/// both optional fields null (verified live against codex-cli 0.146.1).
+fn file_change_approval(item_id: &str) -> ApprovalRequest {
+    parse_approval_request(
+        "item/fileChange/requestApproval",
+        &serde_json::json!({
+            "threadId": "t", "turnId": "u", "itemId": item_id,
+            "startedAtMs": 1, "reason": null, "grantRoot": null
+        }),
+    )
+    .expect("file-change approval parses")
+}
+
+fn started_file_change(t: &mut AppServerTracker, id: &str, path: &str) {
+    note(
+        t,
+        "item/started",
+        serde_json::json!({"item": {
+            "id": id, "type": "fileChange", "status": "inProgress",
+            "changes": [{"path": path, "kind": {"type": "add"}, "diff": "---huge---"}]
+        }}),
+    );
+}
+
+#[test]
+fn file_change_approval_is_given_the_paths_from_its_item() {
+    // The whole point: the approval params carry no paths, so without this the
+    // permission card reads as a bare "file_change" and the user is asked to
+    // authorize a write they cannot see.
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    started_file_change(&mut t, "i6", "/Users/me/notes.txt");
+
+    let mut approval = file_change_approval("i6");
+    assert!(
+        approval.input.get("changes").is_none(),
+        "the raw approval params carry no paths"
+    );
+    t.attach_known_file_changes(&mut approval);
+    assert_eq!(approval.input["changes"][0]["path"], "/Users/me/notes.txt");
+    assert_eq!(approval.input["changes"][0]["kind"]["type"], "add");
+    assert!(
+        approval.input["changes"][0].get("diff").is_none(),
+        "the approval is persisted verbatim, so inline diffs must stay out of it"
+    );
+}
+
+#[test]
+fn file_change_approvals_never_borrow_another_items_paths() {
+    // Two concurrent patches each get their own card (the item id is in the
+    // input for exactly that reason); enriching one must not leak the other.
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    started_file_change(&mut t, "i1", "/one.txt");
+    started_file_change(&mut t, "i2", "/two.txt");
+
+    let mut first = file_change_approval("i1");
+    t.attach_known_file_changes(&mut first);
+    let mut second = file_change_approval("i2");
+    t.attach_known_file_changes(&mut second);
+
+    assert_eq!(first.input["changes"][0]["path"], "/one.txt");
+    assert_eq!(first.input["changes"].as_array().unwrap().len(), 1);
+    assert_eq!(second.input["changes"][0]["path"], "/two.txt");
+}
+
+#[test]
+fn an_unknown_item_leaves_the_approval_exactly_as_it_arrived() {
+    // Degrade, never block: a reordered or dropped notification on some future
+    // codex must cost the card its detail, not the approval its round-trip.
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    let mut approval = file_change_approval("never-announced");
+    let before = approval.input.clone();
+    t.attach_known_file_changes(&mut approval);
+    assert_eq!(approval.input, before);
+
+    // Same for a command approval, which carries its own detail already.
+    let mut cmd = parse_approval_request(
+        "item/commandExecution/requestApproval",
+        &serde_json::json!({"itemId": "i1", "command": "sudo ls", "cwd": "/wt"}),
+    )
+    .expect("command approval parses");
+    let before = cmd.input.clone();
+    t.attach_known_file_changes(&mut cmd);
+    assert_eq!(cmd.input, before);
+}
+
+#[test]
+fn remembered_file_changes_do_not_outlive_their_item_or_their_turn() {
+    let mut t = AppServerTracker::new(Some("t-1".into()));
+    t.begin_turn();
+    started_file_change(&mut t, "i6", "/Users/me/notes.txt");
+    note(
+        &mut t,
+        "item/completed",
+        serde_json::json!({"item": {
+            "id": "i6", "type": "fileChange", "status": "completed", "changes": []
+        }}),
+    );
+    let mut approval = file_change_approval("i6");
+    t.attach_known_file_changes(&mut approval);
+    assert!(
+        approval.input.get("changes").is_none(),
+        "a completed item's paths are dropped: its approval already resolved"
+    );
+
+    started_file_change(&mut t, "i7", "/Users/me/other.txt");
+    t.begin_turn();
+    let mut approval = file_change_approval("i7");
+    t.attach_known_file_changes(&mut approval);
+    assert!(
+        approval.input.get("changes").is_none(),
+        "a new turn starts with no remembered items"
+    );
+}

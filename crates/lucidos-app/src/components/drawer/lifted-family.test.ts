@@ -15,6 +15,14 @@
  *
  * When every family member naturally belongs to the routed section, neither
  * cue fires.
+ *
+ * It also drives a third, independent cue that does NOT require a lift:
+ *
+ * - **Archived sub-thread**: a non-root family member whose own natural
+ *   section is Archive while the family renders in a live section (Current /
+ *   Pinned). The drawer renders it disabled so a child the user already
+ *   archived can't read as pending work under a live parent. The family root
+ *   is excluded because the demoted-parent cue already owns that row.
  */
 
 import { describe, it, expect } from 'vitest';
@@ -55,6 +63,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         parentThreadId: opts.parentId,
         state: 'active',
         latestTodoList: null,
+    liveEventWaits: [],
     };
     return {
         meta,
@@ -156,6 +165,74 @@ describe('computeFamilyDecorations', () => {
         expect(decorations.routedByThread.has('discarded-child')).toBe(false);
         expect(decorations.liftedRoots.size).toBe(0);
         expect(decorations.routedByThread.get('parent')).toBe('current');
+    });
+
+    it('marks an archived child of a running parent as an archived sub-thread', () => {
+        // The reported case: the parent is genuinely in Current, the child was
+        // archived, and the child still renders under the parent because the
+        // family routes as one unit. Nothing is lifted here, so the disabled
+        // cue has to be independent of the lift.
+        const parent = running('parent');
+        const child = inArchive('child', { parentId: 'parent' });
+        const graph = computeFamilyGraph([parent, child]);
+        const decorations = computeFamilyDecorations([parent, child], graph);
+
+        expect(decorations.liftedRoots.size).toBe(0);
+        expect(decorations.routedByThread.get('child')).toBe('current');
+        expect([...decorations.archivedSubThreads]).toEqual(['child']);
+    });
+
+    it('marks an archived grandchild under a pinned family', () => {
+        // A saved root pins the family to Saved; Pinned is a live section too,
+        // so an archived descendant at any depth still reads as put away.
+        const root = inSaved('root');
+        const mid = running('mid', { parentId: 'root' });
+        const leaf = inArchive('leaf', { parentId: 'mid' });
+        const threads = [root, mid, leaf];
+        const graph = computeFamilyGraph(threads);
+        const decorations = computeFamilyDecorations(threads, graph);
+
+        expect(decorations.routedByThread.get('leaf')).toBe('saved');
+        expect([...decorations.archivedSubThreads]).toEqual(['leaf']);
+    });
+
+    it('leaves the lifted root out of the archived set, so its demoted-parent cue owns the row', () => {
+        // Archived root + running child. The root IS archived-in-a-live-section,
+        // but it's already marked lifted; double-cueing the same row would just
+        // make the two styles fight.
+        const parent = inArchive('parent');
+        const child = running('child', { parentId: 'parent' });
+        const graph = computeFamilyGraph([parent, child]);
+        const decorations = computeFamilyDecorations([parent, child], graph);
+
+        expect(decorations.liftedRoots.has('parent')).toBe(true);
+        expect(decorations.archivedSubThreads.size).toBe(0);
+    });
+
+    it('does not mark a stored-archived child that still has live work', () => {
+        // `section: 'archived'` is the STORED state; a running (or
+        // change-carrying) thread resolves to Current anyway, and dimming it
+        // would hide live work.
+        const parent = running('parent');
+        const runningChild = makeThread('running-child', { parentId: 'parent', section: 'archived', status: 'running' });
+        const ctaChild = makeThread('cta-child', { parentId: 'parent', section: 'archived', codingAgentProposed: true });
+        const threads = [parent, runningChild, ctaChild];
+        const graph = computeFamilyGraph(threads);
+        const decorations = computeFamilyDecorations(threads, graph);
+
+        expect(decorations.archivedSubThreads.size).toBe(0);
+    });
+
+    it('leaves an archived child alone when the whole family is in Archive', () => {
+        // Everyone is archived, so the family renders in Archive and no row is
+        // out of place. Dimming there would dim the entire section.
+        const parent = inArchive('parent');
+        const child = inArchive('child', { parentId: 'parent' });
+        const graph = computeFamilyGraph([parent, child]);
+        const decorations = computeFamilyDecorations([parent, child], graph);
+
+        expect(decorations.routedByThread.get('child')).toBe('archive');
+        expect(decorations.archivedSubThreads.size).toBe(0);
     });
 
     it('routes a saved-parent + review-child family to Saved without a lift', () => {

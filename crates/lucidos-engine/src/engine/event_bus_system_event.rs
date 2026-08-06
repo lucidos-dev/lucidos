@@ -737,6 +737,14 @@ pub enum SystemEvent {
         /// per-draft store from it under the same origin/focus guards as text.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         selection: Option<serde_json::Value>,
+        /// The thread's *compose epoch* after this change (`docs/glossary.md`):
+        /// how many times a submission has consumed the thread's compose slot.
+        /// Carried on every broadcast so a device always holds a value its next
+        /// compose PUT can be fenced against, including the device whose own
+        /// write is in flight. `#[serde(default)]` reads a pre-epoch payload as
+        /// 0, which is also what a never-submitted thread stores.
+        #[serde(default)]
+        compose_epoch: i64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         origin_device_id: Option<String>,
     },

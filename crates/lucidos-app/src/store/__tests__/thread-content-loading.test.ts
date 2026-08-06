@@ -29,6 +29,7 @@ function makeThread(id: string, overrides: Partial<Omit<ThreadState, 'meta'>> & 
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...(overrides.meta || {}),
     },
     events: overrides.events || new Map(),

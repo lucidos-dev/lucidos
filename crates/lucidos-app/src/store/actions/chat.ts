@@ -20,7 +20,7 @@ import type { ChatContext } from './chatContext';
 import type { ChatRequestBody } from '../../api/types';
 import { submitChat, cancelChat, stopClaudeCode, isTransportError, removeQueuedMessage as removeQueuedMessageRequest, ApiError, type CodingAgentModelValue, type CodingAgentReasoningEffort } from '../../api/client';
 import { getUnreachableEngineMsg } from './connection';
-import { getDeviceId } from './devices';
+import { getDeviceId, pendingDeviceRegistration } from './devices';
 import { generateUuid } from '../../utils/uuid';
 import { handleEvent, makeOptimisticThreadState, computeExchanges, queuedMessagesFromExchanges, type StoredEvent, type QueuedMessage } from '../thread-events';
 import { getDraft } from '../composeDrafts';
@@ -473,6 +473,15 @@ export async function sendMessage(
     ...(options?.context ?? {}),
   };
   if (imageHashes?.length) body.image_hashes = imageHashes;
+  // A raw new send mints its own thread id above (`threadId = ... || eventId`),
+  // so the engine has never seen it. Say so: an unknown id with no create
+  // signal is a 404 rather than a thread conjured out of whatever the caller
+  // typed. `threadBeforeSend` is the PRE-insert snapshot, so it is undefined
+  // exactly on the raw-new path; compose first-sends and follow-ups both pass
+  // an explicit `threadId` for a thread that is already in the map, and a
+  // compose thread's row exists server-side because `sendCompose` awaits
+  // `POST /threads` first.
+  if (!threadBeforeSend) body.new_thread = true;
 
   // `sendCompose` (compose.ts) flips composing→active before delegating here,
   // so by this point `threadBeforeSend.meta.state` is always 'active' when the
@@ -570,6 +579,13 @@ export async function sendMessage(
     // waiting for the thread's previous POST costs the user nothing visible and
     // is what keeps the engine's record in the order they pressed send.
     if (sendSlot.waitForTurn) await sendSlot.waitForTurn;
+    // This body claims `mode: 'human'`, which the engine accepts only from a
+    // device it can resolve, so the send must not overtake its own startup
+    // registration. `null` on every send but the very first, and skipping the
+    // await is what keeps a lone send synchronous (same reason as the chain
+    // above). See `pendingDeviceRegistration`.
+    const pendingRegistration = pendingDeviceRegistration();
+    if (pendingRegistration) await pendingRegistration;
     await submitChat(body);
     schedulePendingCleanup(threadId, eventId);
     // The pick (if any) is now stamped on the sent message and becomes the

@@ -54,6 +54,7 @@ function makeCCThread(id: string, overrides: Partial<ThreadState['meta']> = {}):
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...overrides,
     },
     events: new Map(),

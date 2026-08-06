@@ -352,8 +352,9 @@ describe('revealContentPane', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 // revealThreadPane — the mirror of revealContentPane for thread navigation
 // (focusThread / unfocusThread / sendMessage's raw-new-thread path). Desktop:
-// re-activate the Threads pane group ONLY from the cross-group case so drawer/
-// thread focus is left alone. Mobile: swipe to the thread pane.
+// re-expand a collapsed Threads pane group, then re-activate it. The focus half
+// is skipped outside the cross-group case so drawer/thread focus is left alone.
+// Mobile: swipe to the thread pane.
 // ─────────────────────────────────────────────────────────────────────────────
 describe('revealThreadPane', () => {
   beforeEach(() => {
@@ -383,12 +384,39 @@ describe('revealThreadPane', () => {
     expect(focusedPane.value).toBe('thread');
   });
 
-  it('desktop: does not move the split ratio (focus-only)', () => {
+  it('desktop: leaves an open split untouched (only focus moves)', () => {
     (globalThis as any).innerWidth = 1024;
     focusedPane.value = 'content';
     splitRatio.value = 0.5;
     revealThreadPane();
     expect(splitRatio.value).toBe(0.5);
+  });
+
+  // The bug this pins: a thread link clicked from the content pane (a change
+  // toast, a Search Everywhere hit, the New-thread button) moved the focused
+  // thread behind a zero-width Threads pane group, so the click read as a
+  // no-op. Mobile never hit it: panes there are navigated, not collapsed.
+  it('desktop: re-expands a collapsed split (Content group maximized)', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusedPane.value = 'content';
+    splitRatio.value = 0; // thread pane collapsed
+    revealThreadPane();
+    expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
+    expect(focusedPane.value).toBe('thread');
+  });
+
+  // A collapsed pane hides the thread drawer with it, so a 'drawer' marker
+  // surviving the collapse points at nothing on screen. Re-expanding for a
+  // navigation must land the focus on the pane it just revealed rather than
+  // honour that stale marker, which is why the cross-group guard above does
+  // not apply to the collapsed case.
+  it('desktop: a re-expand overrides a stale drawer focus', () => {
+    (globalThis as any).innerWidth = 1024;
+    focusedPane.value = 'drawer';
+    splitRatio.value = 0;
+    revealThreadPane();
+    expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
+    expect(focusedPane.value).toBe('thread');
   });
 
   it('mobile: navigates to the thread pane and never touches focusedPane', () => {

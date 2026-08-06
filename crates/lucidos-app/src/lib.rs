@@ -710,7 +710,9 @@ async fn webview_get_content(app: tauri::AppHandle) -> Result<serde_json::Value,
 #[tauri::command]
 fn restart_app(app: tauri::AppHandle) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("Failed to get current exe: {e}"))?;
-    let args: Vec<_> = std::env::args_os().skip(1).collect();
+    // Minus `--login`: a restart must come back the way any restart does, with
+    // its window, even for a client that originally started at login.
+    let args = desktop::relaunch_args();
 
     eprintln!("[Tauri] Restarting app: {:?} {:?}", exe, args);
 
@@ -1115,8 +1117,9 @@ fn emit_window_active(app: &tauri::AppHandle, label: &str, active: bool) {
 /// visible app window, so it uses the `Accessory` activation policy and is absent
 /// from the Dock and the Cmd+Tab app switcher, living only in the menu-bar tray.
 /// Flipped by [`set_menu_bar_only`]; read by [`apply_unread_indicator`] to pick
-/// which surface shows the unread count. Starts `false` — the config declares a
-/// visible `main` window, so the app launches as a normal `Regular` Dock app.
+/// which surface shows the unread count. Starts `false`, so an ordinary launch
+/// is a normal `Regular` Dock app; a login start flips it in `setup` (see
+/// [`should_show_window_at_startup`]) instead of ever showing a window.
 static MENU_BAR_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// The most recent aggregate unread total, so a `Regular`↔`Accessory` transition
@@ -1129,6 +1132,25 @@ static LAST_UNREAD: AtomicU64 = AtomicU64::new(0);
 /// Split out so the rule is unit-testable without a running app.
 fn should_be_menu_bar_only(visible_app_windows: usize) -> bool {
     visible_app_windows == 0
+}
+
+/// Pure: should this launch put its window on screen?
+///
+/// The `main` window is declared `"visible": false` in `tauri.conf.json` and is
+/// shown here instead, so the ONE launch that wants no window never has to flash
+/// one first. That launch is the login agent's: it passes
+/// [`desktop::LOGIN_FLAG`], and the client comes up menu-bar-only (tray item, no
+/// window, no Dock icon), which is the same resident state closing the window
+/// leaves it in.
+///
+/// In dev the answer is always yes. `install_tray` is skipped there, so a hidden
+/// dev window would have nothing to reopen it (see [`close_all_to_tray`] for the
+/// same reasoning), and nothing in dev passes the flag anyway.
+fn should_show_window_at_startup(args: &[std::ffi::OsString], is_dev: bool) -> bool {
+    is_dev
+        || !args
+            .iter()
+            .any(|a| a == std::ffi::OsStr::new(desktop::LOGIN_FLAG))
 }
 
 /// Pure: which surface shows the unread `count` for the current activation state,
@@ -1527,6 +1549,29 @@ pub fn run() {
                 }
             }
 
+            // Now that the tray exists to represent us, decide whether this
+            // launch gets a window. The config declares `main` hidden, so a
+            // login start (the login agent, which passes `--login`) simply never
+            // shows it and drops straight to menu-bar-only instead of flashing a
+            // window on screen at every boot. Every other launch shows it here.
+            // Ordered AFTER the tray on purpose: going `Accessory` with neither a
+            // window nor a tray item would leave the client with no surface at
+            // all.
+            let launch_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+            if should_show_window_at_startup(&launch_args, tauri::is_dev()) {
+                match app.get_webview_window("main") {
+                    Some(win) => {
+                        if let Err(e) = win.show() {
+                            eprintln!("[Tauri] Failed to show the main window: {e}");
+                        }
+                    }
+                    None => eprintln!("[Tauri] No main window to show at startup"),
+                }
+            } else {
+                eprintln!("[Tauri] Started at login: coming up menu-bar-only, no window");
+                set_menu_bar_only(app.handle(), true);
+            }
+
             // WKWebView crash recovery watchdog: if the JS heartbeat stops
             // arriving, the content process likely crashed (white screen), so
             // reload the webview to recover. A reload that brings back no
@@ -1746,6 +1791,47 @@ mod tests {
         // main-hidden-but-a-secondary-still-open case.
         assert!(!should_be_menu_bar_only(1));
         assert!(!should_be_menu_bar_only(3));
+    }
+
+    #[test]
+    fn the_declared_main_window_starts_hidden() {
+        // The other half of `should_show_window_at_startup`: `setup` is what puts
+        // the window on screen, which is only a choice while the config keeps it
+        // hidden. Make this window `"visible": true` again and every login start
+        // flashes a window before hiding it.
+        let conf: serde_json::Value =
+            serde_json::from_str(include_str!("../tauri.conf.json")).unwrap();
+        assert_eq!(
+            conf["app"]["windows"][0]["visible"],
+            serde_json::json!(false)
+        );
+    }
+
+    #[test]
+    fn only_a_packaged_login_start_comes_up_without_a_window() {
+        let os = |s: &str| std::ffi::OsString::from(s);
+        let login = [os(desktop::LOGIN_FLAG)];
+
+        // The login agent's launch: menu bar only, no window, ever. The config
+        // declares `main` hidden, so this is the one launch that leaves it that
+        // way instead of flashing a window at every boot.
+        assert!(!should_show_window_at_startup(&login, false));
+        // Alongside other arguments it still counts.
+        assert!(!should_show_window_at_startup(
+            &[os("--other"), os(desktop::LOGIN_FLAG)],
+            false
+        ));
+
+        // Every human launch shows the window: a double-click, and the updater's
+        // relaunch, which forwards whatever argv it was started with.
+        assert!(should_show_window_at_startup(&[], false));
+        assert!(should_show_window_at_startup(&[os("--other")], false));
+        // Not a prefix match: `--login-something` is not the flag.
+        assert!(should_show_window_at_startup(&[os("--login-shell")], false));
+
+        // In dev the flag is inert. There is no tray there (`install_tray` is
+        // skipped), so a hidden dev window would have nothing to reopen it.
+        assert!(should_show_window_at_startup(&login, true));
     }
 
     #[test]

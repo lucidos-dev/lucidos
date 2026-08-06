@@ -52,7 +52,9 @@ describe('renderQuestion', () => {
     // The same card is raised by CC's MCP permission prompt AND the Codex
     // app-server approval bridge — naming Claude Code would misattribute a
     // Codex escalation at the moment of a security decision.
-    const text = vnodeToText(renderQuestion('command_execution', 'command_execution sudo ls'));
+    const text = vnodeToText(
+      renderQuestion('command_execution', 'command_execution sudo ls', { command: 'sudo ls' }),
+    );
     expect(text).toContain('The coding agent wants');
     expect(text).not.toContain('Claude Code');
   });
@@ -68,6 +70,132 @@ describe('renderQuestion', () => {
     const text = vnodeToText(renderQuestion('Skill', 'skill meta:trace'));
     expect(text).toContain('the <strong>Skill</strong> tool');
     expect(text).toContain('on <code>meta:trace</code>');
+  });
+});
+
+describe('renderQuestion, the Codex backend tools', () => {
+  const change = (path: string, type?: string) => ({
+    path,
+    ...(type ? { kind: { type } } : {}),
+  });
+
+  it('never puts a wire tool identifier in the sentence', () => {
+    // The reported bug: a card reading "wants to use the file_change tool.
+    // Allow?" and nothing else. `file_change` / `command_execution` are
+    // app-server protocol names that surface nowhere else in the product, so
+    // they must never be the words a user makes a security decision on.
+    const cards = [
+      renderQuestion('file_change', 'file_change /a.txt', { changes: [change('/a.txt', 'add')] }),
+      renderQuestion('file_change', 'file_change', { item_id: 'exec-1' }),
+      renderQuestion('command_execution', 'command_execution sudo ls', { command: 'sudo ls' }),
+      renderQuestion('command_execution', 'command_execution', {}),
+    ];
+    for (const card of cards) {
+      const text = vnodeToText(card);
+      expect(text).not.toContain('file_change');
+      expect(text).not.toContain('command_execution');
+      expect(text).toContain('The coding agent wants to');
+      expect(text).toContain('Allow?');
+    }
+  });
+
+  it('names the single changed file, with a verb matching the change kind', () => {
+    const verbs: [string | undefined, string][] = [
+      ['add', 'create'],
+      ['update', 'change'],
+      ['delete', 'delete'],
+      // An unrecognized or absent kind reads "change": true of every kind, and
+      // it claims nothing the frame did not say.
+      ['rename', 'change'],
+      [undefined, 'change'],
+    ];
+    for (const [kind, verb] of verbs) {
+      const text = vnodeToText(
+        renderQuestion('file_change', 'file_change /Users/me/notes.txt', {
+          changes: [change('/Users/me/notes.txt', kind)],
+        }),
+      );
+      expect(text).toContain(`wants to ${verb} <code>/Users/me/notes.txt</code>`);
+    }
+  });
+
+  it('counts a multi-file patch and lists every file under it', () => {
+    const text = vnodeToText(
+      renderQuestion('file_change', 'file_change /a.rs, /b.rs', {
+        changes: [change('/a.rs', 'add'), change('/b.rs', 'add')],
+      }),
+    );
+    expect(text).toContain('wants to create 2 files');
+    expect(text).toContain('<code>/a.rs</code>');
+    expect(text).toContain('<code>/b.rs</code>');
+  });
+
+  it('falls back to "change" for the whole set when the kinds disagree', () => {
+    const text = vnodeToText(
+      renderQuestion('file_change', 'file_change /a.rs, /b.rs', {
+        changes: [change('/a.rs', 'add'), change('/b.rs', 'delete')],
+      }),
+    );
+    expect(text).toContain('wants to change 2 files');
+    // Each file still carries its own verb in the list.
+    expect(text).toContain('create');
+    expect(text).toContain('delete');
+  });
+
+  it('degrades to the least it can still claim when no paths were announced', () => {
+    // Codex reordering or dropping the `item/started` that carries the paths
+    // must cost the card its detail, never its correctness.
+    const bare = vnodeToText(renderQuestion('file_change', 'file_change', { item_id: 'exec-1' }));
+    expect(bare).toContain('The coding agent wants to change files. Allow?');
+    expect(bare).not.toContain('<code>');
+
+    const withReason = vnodeToText(
+      renderQuestion('file_change', 'file_change needs write access', {
+        reason: 'needs write access',
+      }),
+    );
+    expect(withReason).toContain('wants to change files: needs write access. Allow?');
+  });
+
+  it('discards the whole set when one change entry has no readable path', () => {
+    // Mirrors the engine's `FileTargets::Unresolved`. The driver writes an
+    // omitted path as "", so a half-understood patch really arrives this way;
+    // naming only the half that parsed would show a complete-looking card for
+    // a patch whose other half writes somewhere nobody looked.
+    const text = vnodeToText(
+      renderQuestion('file_change', 'file_change', {
+        changes: [change('/a.rs', 'add'), { path: '', kind: { type: 'add' } }],
+      }),
+    );
+    expect(text).toContain('The coding agent wants to change files. Allow?');
+    expect(text).not.toContain('/a.rs');
+  });
+
+  it('does not resolve a change kind off Object.prototype', () => {
+    // The kind is a string codex chose, so it indexes the verb lookup with
+    // whatever it sends. On a plain object literal `CHANGE_VERBS[k] ?? default`
+    // answers `constructor` / `toString` / `valueOf` / `__proto__` off the
+    // prototype and returns a FUNCTION, which would be rendered into the card.
+    for (const kind of ['constructor', 'toString', 'valueOf', '__proto__', 'hasOwnProperty']) {
+      const text = vnodeToText(
+        renderQuestion('file_change', 'file_change /a.rs', {
+          changes: [change('/a.rs', kind)],
+        }),
+      );
+      expect(text).toContain('wants to change <code>/a.rs</code>');
+      expect(text).not.toContain('native code');
+      expect(text).not.toContain('function');
+    }
+  });
+
+  it('asks about a command the same way the command-guard card does', () => {
+    const text = vnodeToText(
+      renderQuestion('command_execution', 'command_execution sudo rm -rf /x', {
+        command: 'sudo rm -rf /x',
+        cwd: '/wt',
+      }),
+    );
+    expect(text).toContain('wants to run <code>sudo rm -rf /x</code>. Allow?');
   });
 });
 

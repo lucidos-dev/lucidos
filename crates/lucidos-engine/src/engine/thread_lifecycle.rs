@@ -82,19 +82,20 @@ pub enum ThreadStatus {
     /// answer (or cancel), at which point the engine respawns CC with
     /// `--resume` and feeds the answer back as a `tool_result`.
     WaitingForUserAnswer,
-    /// The turn was interrupted by an engine restart and has not resumed. Set by
-    /// `AbortCause::status_sql()` for the two causes `AbortCause::is_transient()`
-    /// calls transient: the teardown boundary of a *Switch to new version*
-    /// (`EngineShutdown`) and the boot sweep's crash boundary
-    /// (`RecoveryAfterRestart`).
-    ///
+    /// The user's own *Switch to new version* interrupted this turn, and the
+    /// engine has promised to resume it. Set by `AbortCause::status_sql()` for
+    /// exactly one shape, `AbortCause::promises_auto_resume()`: an
+    /// `EngineShutdown` abort stamped with the device that clicked Switch.    ///
     /// Nothing failed here, which is the whole point of the variant: before it
-    /// existed both causes landed on `Failed`, so switching versions painted every
-    /// in-flight thread with the red error dot for work the engine was about to
-    /// resume by itself. Distinct from `WaitingForUserAnswer` (the loop is parked
-    /// on a question the user must answer) and from `Waiting` (a change is sitting
-    /// in review): a paused turn resumes on its own after a switch, or offers the
-    /// manual Continue button when the boot declines to resume it.
+    /// existed the switch teardown landed on `Failed`, so switching versions
+    /// painted every in-flight thread with the red error dot for work the engine
+    /// was about to resume by itself. The converse matters just as much, and is
+    /// why the condition is this narrow: an interruption NOBODY is coming back
+    /// for (a crash, a bare shutdown, or a boot that could not keep the resume
+    /// promise) is `Failed`, so it keeps the red dot, its needs-attention slot,
+    /// and its Continue button. Distinct from `WaitingForUserAnswer` (the loop is
+    /// parked on a question the user must answer) and from `Waiting` (a change is
+    /// sitting in review): a paused turn is simply on its way back.
     ///
     /// A verdict, not a resting state: like `Failed`, it must survive the trailing
     /// events of the dying turn (see `preserving_verdict`), or recovery's own
@@ -124,6 +125,15 @@ impl ThreadStatus {
     /// Mirrors `as_str` exactly; unknown values fall back to Idle
     /// (defensive — the column is only written by the projection itself, so a
     /// surprise value would indicate manual DB tampering, not a bug to crash on).
+    ///
+    /// `waiting_for_event` is the one value that reaches this from real data
+    /// without being tampering: it was a status until 2026-08-06, when a
+    /// subscription stopped holding the turn (see
+    /// `docs/plans/2026-08-06-every-event-wait-is-detached.md`). The migration
+    /// rewrites the stored rows; the arm is here so a row written by an older
+    /// engine against a shared database still reads as what it now means, which
+    /// is `Idle`. It is listed explicitly rather than left to the catch-all so
+    /// the intent survives the next person reading this match.
     pub fn parse(s: &str) -> Self {
         match s {
             "running" => Self::Running,
@@ -131,6 +141,7 @@ impl ThreadStatus {
             "waiting_for_user_answer" => Self::WaitingForUserAnswer,
             "paused" => Self::Paused,
             "failed" => Self::Failed,
+            "waiting_for_event" => Self::Idle,
             _ => Self::Idle,
         }
     }
@@ -275,6 +286,15 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // iterations later as a derived past-tense fact and must NOT
         // disturb the section/status machinery.
         "ImageDescribed" => EventClass::Metadata,
+        // Event-wait lifecycle. Registration is Activity, not ActionRequired:
+        // the thread subscribed to something the SYSTEM will deliver, so it must
+        // never read as needing the user. The three resolutions are Activity for
+        // the same reason `UserQuestionAnswered` is: they are steps, not the
+        // start of a new exchange. The delivery's own `UserPromptInjected` is
+        // the Start event that opens the woken turn.
+        "EventWaitStarted" | "EventWaitDelivered" | "EventWaitExpired" | "EventWaitCanceled" => {
+            EventClass::Activity
+        }
         _ => return None,
     })
 }
@@ -349,6 +369,12 @@ pub fn all_persisted_event_types() -> Vec<&'static str> {
         // Command-guard checkpoint lifecycle (ADR 0002, Phase 4).
         "CommandCheckpointed",
         "CommandCheckpointReverted",
+        // Event-wait lifecycle. Persisted because the wait IS the event: there
+        // is no table, and the dispatcher's live set is rebuilt from these.
+        "EventWaitStarted",
+        "EventWaitDelivered",
+        "EventWaitExpired",
+        "EventWaitCanceled",
     ]
 }
 
@@ -585,7 +611,20 @@ pub fn resolve_transition(
         // never rendered, and every guarded command leaked its git checkpoint
         // ref because only the undo path deletes it.
         | "CommandCheckpointed"
-        | "CommandCheckpointReverted" => no_change,
+        | "CommandCheckpointReverted"
+        // Event-wait lifecycle. No section transition in either direction: the
+        // park keeps the thread exactly where it was (it is mid-turn, and the
+        // status carries the parked signal in place), and the resolutions
+        // resume that same turn. Surfacing to Inbox on the park would read as
+        // "your turn", which is the one thing a system-side wait is not.
+        //
+        // Legal on both thread types for forward-compat, though only the chat
+        // agent has `await_event` today (a coding-agent thread parks through
+        // its own mechanisms).
+        | "EventWaitStarted"
+        | "EventWaitDelivered"
+        | "EventWaitExpired"
+        | "EventWaitCanceled" => no_change,
         _ => violation("Unknown event type"),
     }?;
 
@@ -664,9 +703,13 @@ pub fn display_section(
 /// A thread is "blocking" iff archiving its ancestor would silently strand
 /// active work in it. Three clauses, in order:
 ///
-/// 1. Running or WaitingForUserAnswer always blocks, regardless of
-///    `archive_state` — active work cannot be "already terminal", and the
-///    Archived short-circuit must not mask it.
+/// 1. Running or WaitingForUserAnswer always blocks, whatever the
+///    `archive_state`: active work cannot be "already terminal", and the
+///    Archived short-circuit must not mask it. A thread merely holding an
+///    *event wait* is deliberately NOT here: a subscription does not hold its
+///    thread's turn, so such a thread is idle and archiving it is a legitimate
+///    thing to do (the archive cancels the subscription through
+///    `EventWaitCancelCause::ThreadArchived`).
 /// 2. Otherwise, `archive_state == Archived` does NOT block — the user
 ///    dismissed the thread and the row isn't stranding anything.
 /// 3. An idle in-workspace CodingAgent thread with pending changes blocks
@@ -722,6 +765,12 @@ pub fn is_blocking(
 /// once archived. Running and attention-needing threads share that one
 /// section; what separates them in the UI is the per-row status icon versus
 /// the attention badge and its drawer filter, both fed by this count.
+///
+/// A thread merely holding an *event wait* is absent from this and from
+/// `is_blocking` alike: a subscription does not hold its thread's turn, and it
+/// asks nothing of the user, so such a thread is plain idle. Its subscriptions
+/// surface in the per-thread subscription indicator instead.
+///
 /// Relationship: `is_blocking = is_attention_needing OR status == Running`.
 /// `Archive`-button gating still uses `is_blocking` so a Running descendant
 /// keeps the button hidden.
@@ -787,6 +836,10 @@ pub fn available_thread_actions(
     is_saved: bool,
 ) -> Vec<Action> {
     let mut actions = Vec::new();
+    // A thread holding an *event wait* is NOT live: the subscription does not
+    // hold its turn, so Archive stays offered. Archiving is not a way to strand
+    // one either, since the archive cancels every live wait on the thread
+    // (`EventWaitCancelCause::ThreadArchived`).
     let live = status == ThreadStatus::Running || status == ThreadStatus::WaitingForUserAnswer;
     let coding_agent_pending = has_pending_changes && thread_type == ThreadType::CodingAgent;
 
@@ -980,15 +1033,16 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
             },
         ),
         // System interruption. Approximate on purpose: this table has no cause
-        // axis, and `AbortCause::status_sql()` splits three ways. `StaleSettle`
-        // maps to 'idle' (engine cleanup of a row whose process was already
-        // gone), and a TRANSIENT cause (`EngineShutdown`, `RecoveryAfterRestart`)
-        // maps to 'paused' rather than 'failed', because an engine restart
-        // interrupted the turn and did not fail it. The row below states the
-        // remaining, genuinely-failed case; the cause split lives in the
-        // projection next to `is_transient()`. Pending changes override every
-        // arm to 'waiting': reviewing the changes is more actionable than
-        // acknowledging the interrupt.
+        // or actor axis, and `AbortCause::status_sql()` splits three ways.
+        // `StaleSettle` maps to 'idle' (engine cleanup of a row whose process was
+        // already gone), and the user's own *Switch to new version* (an
+        // `EngineShutdown` abort carrying a device actor) maps to 'paused' rather
+        // than 'failed', because the engine resumes that turn itself. The row
+        // below states the remaining case, which is every interruption nobody
+        // promised to undo and IS genuinely failed; the split lives next to the
+        // cause enum, on `AbortCause::promises_auto_resume()`. Pending changes
+        // override every arm to 'waiting': reviewing the changes is more
+        // actionable than acknowledging the interrupt.
         (
             "ResponseAborted",
             StatusTransition {
@@ -1138,6 +1192,19 @@ pub fn status_transitions() -> Vec<(&'static str, StatusTransition)> {
                 cc_flags: CcFlagRule::None,
             },
         ),
+        // **No event-wait row sets a status, and that absence is the rule, not
+        // an omission.** A subscription does not hold its thread's turn:
+        // registration happens mid-turn and the turn's own terminator decides
+        // the status, while a resolution lands on a thread that is either idle
+        // or running something unrelated. The delivery's wake sets Running
+        // through its own `UserPromptInjected`, which is where that transition
+        // belongs, and a cancel leaves the thread exactly as it found it.
+        //
+        // Writing one here is the specific bug to avoid: it would report a
+        // running thread as revived, or an idle one as running with no turn
+        // behind it. All four `EventWait*` types are deliberately absent from
+        // this table. See
+        // `docs/plans/2026-08-06-every-event-wait-is-detached.md`.
         // Archive → idle, clear CC flags
         (
             "ThreadArchived",

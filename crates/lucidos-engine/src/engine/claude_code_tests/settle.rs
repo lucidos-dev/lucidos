@@ -52,7 +52,7 @@ fn user_device_actor() -> crate::engine::thread_events::MessageOrigin {
 ///   - `Aborted` (not `Canceled`) because no live response existed to cancel
 ///     — this is system-driven cleanup of stuck projection state.
 ///   - `cause=StaleSettle` so the frontend renders "Settled stuck response"
-///     instead of "Restarted" (device actor's default abort summary) or
+///     instead of "Paused by restart" (device actor's default abort summary) or
 ///     "Response interrupted" (system actor's default abort summary).
 ///   - User actor so the chip reads "You" (the user *did* push the button)
 ///     rather than "⚙ System".

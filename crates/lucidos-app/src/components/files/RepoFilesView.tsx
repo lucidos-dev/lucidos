@@ -181,7 +181,7 @@ export function ChangesFileList({ files, activePath }: { files: DiffFile[]; acti
  *  file-preview panel). Stacks each file's hunks inline so the user gets the
  *  full diff in one scroll, without depending on openRepoFilePreview (which
  *  no-ops when repoSource is null). */
-function InlineDiffList({ files }: { files: DiffFile[] }) {
+export function InlineDiffList({ files }: { files: DiffFile[] }) {
   if (files.length === 0) {
     return <div class="empty-state">No changes</div>;
   }

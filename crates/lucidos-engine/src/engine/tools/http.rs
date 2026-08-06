@@ -273,7 +273,7 @@ impl LucidosEngine {
                         "Error: temp_path must be relative with no '..' components".to_string()
                     );
                 }
-                let tmp_dir = self.workspace_path.join(".lucidos").join("tmp");
+                let tmp_dir = self.workspace_path.join(crate::core::TMP_DIR);
                 if let Err(e) = std::fs::create_dir_all(&tmp_dir) {
                     return Ok(format!(
                         "Error: failed to create tmp dir {}: {}",
@@ -298,7 +298,9 @@ impl LucidosEngine {
                         e
                     ));
                 }
-                Some(format!(".lucidos/tmp/{}", path))
+                // The exact string `read_file` resolves, so the path this
+                // announces back to the LLM is one it can act on.
+                Some(format!("{}/{}", crate::core::TMP_DIR, path))
             } else {
                 None
             }

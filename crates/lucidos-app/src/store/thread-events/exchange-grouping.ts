@@ -1,4 +1,5 @@
 import { EVENT_CLASSIFICATION } from '../../generated/thread-lifecycle';
+import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, modeToInitiator } from './exchange';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange } from './exchange';
@@ -1202,6 +1203,14 @@ export function handleEvent(
     // flows through this branch; live SSE updates it incrementally.
     if (event.type === 'TodoListWritten') {
       thread.meta.latestTodoList = event.items;
+      metaChanged = true;
+    }
+    // Project the thread's live *event waits* into meta, the same way and for
+    // the same reason as the Todo list above: the subscription indicator is
+    // always mounted, so re-deriving this per render would walk the events Map
+    // on every flush. Replay rebuilds the identical set because every
+    // EventWait* flows through here in order.
+    if (eventWaitProjection(thread.meta, event)) {
       metaChanged = true;
     }
     if (event.type === 'QueuedMessageRemoved' && thread.pendingUserMessages.length > 0) {

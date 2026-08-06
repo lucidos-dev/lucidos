@@ -55,6 +55,7 @@ function makeThread(id: string, status: ThreadStatus): ThreadState {
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

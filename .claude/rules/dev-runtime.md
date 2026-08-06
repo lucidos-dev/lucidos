@@ -18,8 +18,13 @@ paths:
   - "scripts/lint-shell.sh"
   - "scripts/check-em-dashes.sh"
   - "scripts/check-adrs.sh"
+  - "scripts/check-context-budget.sh"
+  - "scripts/check-prompt-mirror.sh"
   - "scripts/adr-new.sh"
   - "scripts/lib/adr_scan*.sh"
+  - "scripts/lib/context_budget*.sh"
+  - "scripts/lib/prompt_mirror*.sh"
+  - "scripts/lib/hooks_registered_test.sh"
   - "scripts/e2e*.sh"
   - "scripts/lib/workspace*.sh"
   - "scripts/lib/ports*.sh"
@@ -84,6 +89,8 @@ opt-in itself, and never starts a gateway.
 ./scripts/e2e-packaged.sh [--rebuild]     # macOS-only: boot the packaged .app (service + embedded PG) and smoke-test the chain (heavy: builds the .app)
 ./scripts/lint-shell.sh                   # ShellCheck over every tracked *.sh (= make lint-shell; part of make lint / make check)
 ./scripts/check-em-dashes.sh [--base <ref>]  # Fail if the branch ADDS a U+2014 / U+2015 (diff-scoped; /harden Phase 4.5 runs it for every diff). Rule + rationale: .claude/rules/no-em-dashes.md
+./scripts/check-context-budget.sh [--report] # Fail if the always-loaded instruction set grew past its ceiling, or if a rule meant to be path-scoped went resident (whole-tree; /harden Phase 4.5, every diff). Rationale: docs/agent-config.md
+./scripts/check-prompt-mirror.sh [--report]  # Fail if the one deliberately mirrored rule (process safety, ADR 0025) lost either half (whole-tree; /harden Phase 4.5, every diff). Rationale: docs/agent-config.md
 ```
 
 ### One Docker-daemon probe, shared by preflight and provisioning

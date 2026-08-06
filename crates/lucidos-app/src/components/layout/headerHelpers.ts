@@ -33,8 +33,12 @@ function getFormTitle(form: InlineForm): string {
     // Also the nav-history row's label (via navEntryTitle), so a sent email
     // reads as the receipt it is rather than a confirmation still pending.
     case 'email-confirm': return form.sentAt ? 'Email Sent' : 'Confirm Email';
-    case 'plugin-install': return `Install ${form.request.plugin_name}`;
-    case 'plugin-uninstall': return `Uninstall ${form.request.plugin_name}`;
+    // Past tense once the panel is a receipt, so the nav-history row says what
+    // happened rather than offering an action that is already resolved.
+    case 'plugin-install':
+      return `${form.installed ? 'Installed' : 'Install'} ${form.request.plugin_name}`;
+    case 'plugin-uninstall':
+      return `${form.removed ? 'Uninstalled' : 'Uninstall'} ${form.request.plugin_name}`;
   }
 }
 
@@ -127,9 +131,12 @@ export function navEntryCategory(entry: NavEntry): string {
       case 'app-edit':
       case 'new-app': return 'apps';
       case 'credential':
-      case 'email-confirm':
+      case 'email-confirm': return 'settings';
+      // A plugin panel is about a plugin, and `plugins` is both a menu item and
+      // a CategoryIcon key, so the row carries the plugin glyph rather than the
+      // settings cog it used to borrow.
       case 'plugin-install':
-      case 'plugin-uninstall': return 'settings';
+      case 'plugin-uninstall': return 'plugins';
     }
   }
   if (overlay?.type === 'app-ui') return 'apps';

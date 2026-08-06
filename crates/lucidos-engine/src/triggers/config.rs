@@ -1,3 +1,4 @@
+use crate::core::event_subscription::EventSubscription;
 use crate::engine::command_guard::SideEffectCategory;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -82,57 +83,6 @@ pub enum TriggerRun {
     },
     #[serde(rename = "script")]
     Script { path: String },
-}
-
-/// One event the trigger listens for, with an optional payload filter scoped
-/// to that event. A trigger may carry several entries — it fires when an
-/// incoming event matches *any* entry's `event_type` AND the entry's
-/// condition (if set) evaluates true against the payload. Conditions are
-/// per-entry so a single trigger can subscribe to events with different
-/// payload shapes without one filter constraining the other.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct EventSubscription {
-    pub event_type: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub condition: Option<Value>,
-}
-
-impl EventSubscription {
-    /// Trim `event_type` on every entry and drop ones that become empty.
-    /// Used by both create and update endpoints (HTTP + LLM tool) so the
-    /// blank-event-type drop rule lives in one place.
-    pub fn normalize_list(
-        subs: impl IntoIterator<Item = EventSubscription>,
-    ) -> Vec<EventSubscription> {
-        subs.into_iter()
-            .filter_map(|sub| {
-                let trimmed = sub.event_type.trim();
-                if trimmed.is_empty() {
-                    None
-                } else {
-                    Some(EventSubscription {
-                        event_type: trimmed.to_string(),
-                        condition: sub.condition,
-                    })
-                }
-            })
-            .collect()
-    }
-
-    /// Build a subscription from a JSON object entry (`{event_type, condition?}`).
-    /// Returns `None` when `event_type` is missing or blank — the caller decides
-    /// whether to treat that as silent-skip (stored events) or an error (LLM tool).
-    pub(crate) fn from_object_entry(obj: &serde_json::Map<String, Value>) -> Option<Self> {
-        let event_type = obj.get("event_type")?.as_str()?.trim();
-        if event_type.is_empty() {
-            return None;
-        }
-        let condition = obj.get("condition").filter(|v| !v.is_null()).cloned();
-        Some(EventSubscription {
-            event_type: event_type.to_string(),
-            condition,
-        })
-    }
 }
 
 /// In-memory representation of a trigger, rebuilt from events on startup.

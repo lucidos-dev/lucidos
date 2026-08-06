@@ -565,6 +565,29 @@ impl AuthLayer for WasmSignerLayer {
         let out_len = (packed & 0xFFFF_FFFF) as usize;
 
         // 7. Read output and parse SignOutput.
+        //
+        // Bounds-check the module-supplied (ptr, len) against its OWN linear
+        // memory BEFORE allocating. `out_len` is 32 bits of whatever the module
+        // returned, so a signer that signals an error the C way (`return -1`)
+        // packs `0xFFFF_FFFF` into it and the host would try to zero a 4 GiB
+        // buffer: an OOM abort of the whole engine, driven from inside the
+        // sandbox. Any slice a real module returns lies inside its memory (the
+        // `memory.read` below would fail otherwise), so this rejects nothing
+        // that used to work; it only turns the OOM into a 502.
+        let mem_size = memory.data_size(&store);
+        if out_ptr
+            .checked_add(out_len)
+            .is_none_or(|end| end > mem_size)
+        {
+            return Err((
+                StatusCode::BAD_GATEWAY,
+                format!(
+                    "signer {} returned an out-of-bounds SignOutput slice at {out_ptr}/{out_len} \
+                     (module memory is {mem_size} bytes)",
+                    self.module.name
+                ),
+            ));
+        }
         let mut out_buf = vec![0u8; out_len];
         memory.read(&store, out_ptr, &mut out_buf).map_err(|e| {
             (

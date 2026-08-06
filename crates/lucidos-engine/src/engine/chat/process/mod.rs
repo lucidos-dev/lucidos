@@ -64,19 +64,45 @@ pub(crate) enum PreEmittedOrigin {
     /// (`chat::rerun`), or the re-processing of an orphaned injection. Not
     /// something the person just typed, so it must not surface as one.
     EngineReentry(Uuid),
+    /// An **event-wait wake** (`engine::event_wait`). A re-entry like the one
+    /// above, split out because a live thread has to inject it under its own
+    /// name: the two wakes are projected identically but come from different
+    /// places, and folding an event wake into `WakeFromChild` would put a
+    /// child that does not exist into the log.
+    ///
+    /// Anchored to the `UserPromptInjected` `emit_resolution` wrote beside the
+    /// resolution, which carries the payload as prose. One shape, always: a
+    /// subscription does not hold its thread's turn, so there is never a
+    /// dangling tool call for the delivery to land in instead.
+    EventWake(Uuid),
 }
 
 impl PreEmittedOrigin {
     /// The `events.id` of the already-persisted event.
     pub(crate) fn event_id(self) -> Uuid {
         match self {
-            PreEmittedOrigin::Message(id) | PreEmittedOrigin::EngineReentry(id) => id,
+            PreEmittedOrigin::Message(id)
+            | PreEmittedOrigin::EngineReentry(id)
+            | PreEmittedOrigin::EventWake(id) => id,
         }
     }
 
     /// True for an engine-internal re-entry, false for a real message.
     pub(crate) fn is_engine_reentry(self) -> bool {
-        matches!(self, PreEmittedOrigin::EngineReentry(_))
+        matches!(
+            self,
+            PreEmittedOrigin::EngineReentry(_) | PreEmittedOrigin::EventWake(_)
+        )
+    }
+
+    /// How a LIVE thread injects this re-entry. `Message` is not an engine
+    /// re-entry at all, so it routes as ordinary user text.
+    pub(crate) fn inject_kind(self) -> crate::engine::InjectedPromptKind {
+        match self {
+            PreEmittedOrigin::Message(_) => crate::engine::InjectedPromptKind::UserText,
+            PreEmittedOrigin::EngineReentry(_) => crate::engine::InjectedPromptKind::WakeFromChild,
+            PreEmittedOrigin::EventWake(_) => crate::engine::InjectedPromptKind::WakeFromEvent,
+        }
     }
 }
 
@@ -131,6 +157,7 @@ impl LucidosEngine {
             None,
             None,
             external_cancel,
+            crate::engine::FollowUpUrgency::Normal,
         )
         .await
     }
@@ -162,6 +189,11 @@ impl LucidosEngine {
         pre_emitted_origin: Option<PreEmittedOrigin>,
         title: Option<&str>,
         origin: Option<MessageOrigin>,
+        // `Normal` for every caller but a child follow-up the parent marked
+        // urgent, which preempts the child's in-flight turn instead of queueing
+        // behind it. Named rather than a bare `bool` so the call sites stay
+        // readable in a column of `None`s.
+        urgency: crate::engine::FollowUpUrgency,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
         self.process_message_with_steps_internal(
             user_message,
@@ -187,6 +219,7 @@ impl LucidosEngine {
             title,
             origin,
             None,
+            urgency,
         )
         .await
     }

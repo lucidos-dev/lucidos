@@ -9,24 +9,17 @@
    1.25rem SVG via --icon-size-lg) — see global.css. Pixel-identical to the
    adjacent ImageIcon button since both use the same SVG sizing rule. */
 
-.todo-panel-anchor {
-    position: relative;
-}
+/* Shell geometry, placement, the header strip and the close button all come
+   from `.prompt-bar-popover*` in `styles/chat/prompt-bar-popover.css`, which
+   the subscription indicator beside it uses too, and which `chat.css` imports
+   FIRST so a surface's own width beats the shell's fit cap.
 
+   Both bounds go through that fit cap. A bare `min-width` outranks `max-width`
+   in CSS, so leaving it unwrapped would quietly reinstate the overflow the
+   shell was converted to prevent. */
 .todo-panel {
-    position: absolute;
-    bottom: calc(100% + 0.375rem);
-    left: 0;
-    min-width: 14rem;
-    max-width: 22rem;
-    max-height: 18rem;
-    overflow-y: auto;
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    box-shadow: var(--shadow-sm);
-    padding: 0.5rem;
-    z-index: 100;
+    min-width: min(14rem, var(--prompt-bar-popover-fit));
+    max-width: min(22rem, var(--prompt-bar-popover-fit));
 }
 
 .todo-panel-list {
@@ -113,21 +106,4 @@
 .todo-panel-text {
     flex: 1 1 auto;
     word-break: break-word;
-}
-
-.todo-panel-close {
-    position: absolute;
-    top: 0.25rem;
-    right: 0.25rem;
-    background: transparent;
-    border: none;
-    color: var(--text-secondary);
-    cursor: pointer;
-    font-size: var(--font-size-sm);
-    padding: 0.125rem 0.375rem;
-    line-height: 1;
-}
-
-.todo-panel-close:hover {
-    color: var(--text-primary);
 }

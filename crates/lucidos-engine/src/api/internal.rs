@@ -269,8 +269,8 @@ pub(super) async fn coding_agent_diff_refresh(
     }
 }
 
-/// POST /api/v1/internal/mark-hardened — invoked by `lucidos hardened mark` from
-/// the `mark-harden.sh` hook after Claude Code finishes `/harden`. Replaces
+/// POST /api/v1/internal/mark-hardened, invoked by `lucidos hardened mark`,
+/// which `/harden` Phase 5 runs once every phase completes. Replaces
 /// the prior worktree-keyed file marker, which was lost when stale-session
 /// recovery removed the worktree before the apply check ran.
 pub(super) async fn mark_hardened(

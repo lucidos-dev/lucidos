@@ -653,6 +653,38 @@ fn load_trigger_summaries_returns_empty_when_no_dir() {
     assert!(summaries.is_empty());
 }
 
+/// The setup interview's id, resolved end to end against the REAL shipped
+/// directory rather than a temp fixture. The other system-knowhow cases here
+/// prove the prefix machinery works; this one proves the specific id the chat
+/// system prompt hands to `load_knowhow` comes back with a body.
+///
+/// Worth its own case because the entry point is a button: a user who clicks it
+/// has no way to recover from a miss, and the two ways to break this (renaming
+/// the file, or breaking its frontmatter so `load_summaries` drops it) both
+/// leave the route looking fine at the callsite.
+#[test]
+fn shipped_setup_interview_knowhow_resolves_by_its_routed_id() {
+    let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+    let system = repo.join("system-knowhow");
+    let tmp = tempfile::tempdir().unwrap();
+    let local = tmp.path().join("local");
+    std::fs::create_dir_all(&local).unwrap();
+
+    let section = load_one_knowhow_section(
+        &dirs(None, &local),
+        Some(&system),
+        "system-knowhow/setup-interview",
+    )
+    .expect(
+        "system-knowhow/setup-interview must resolve: the chat system prompt routes the \
+         first-run entry point at this exact id",
+    );
+    assert!(
+        section.contains("[SYSTEM-KNOWHOW: Setup Interview]"),
+        "resolved doc should carry the system-knowhow tag and its frontmatter name, got: {section}"
+    );
+}
+
 #[test]
 fn app_scoped_path_builds_well_formed_path_for_safe_id() {
     let apps = std::path::PathBuf::from("/ws/data/apps");

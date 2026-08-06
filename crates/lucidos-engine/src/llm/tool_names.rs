@@ -95,8 +95,7 @@ pub const LIST_APPS: &str = "list_apps";
 pub const EXECUTE_INTENT: &str = "execute_intent";
 pub const LOAD_KNOWHOW: &str = "load_knowhow";
 
-// App UI & file refresh (handled by handle_special_tool)
-pub const REFRESH_FILE: &str = "refresh_file";
+// App UI (handled by handle_special_tool)
 pub const REFRESH_APP: &str = "refresh_app";
 pub const CAPTURE_APP: &str = "capture_app";
 
@@ -161,6 +160,14 @@ pub const NOTIFICATIONS: &str = "notifications";
 pub const READ_NOTIFICATIONS: &str = "read_notifications";
 pub const NAVIGATE_UI: &str = "navigate_ui";
 pub const ASK_USER_QUESTION: &str = "ask_user_question";
+/// Subscribe to an event and be woken as a new turn when it arrives. Returns
+/// immediately and does not end the turn. See `engine::event_wait` and ADR 0047.
+///
+/// One thing outside the tool layer keys on this name and cannot import it from
+/// a tool module without a cycle: the boot sweep
+/// `event_wait::settle_legacy_attached_event_waits`, which closes the unpaired
+/// `await_event` calls left by the pre-2026-08-06 shape.
+pub const AWAIT_EVENT: &str = "await_event";
 
 // Image generation
 pub const GENERATE_IMAGE: &str = "generate_image";

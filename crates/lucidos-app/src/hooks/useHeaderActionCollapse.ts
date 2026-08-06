@@ -118,23 +118,39 @@ export interface MobileHeaderCollapseResult {
    *  0 or 2..N, never exactly 1 (⋮ replaces one 1:1 — no gain), same as the
    *  desktop rule. */
   collapsed: number;
-  /** Symmetric max-width (px) for the absolutely row-centered title at the
-   *  chosen collapse count. It clears both clusters: the title renders at its
-   *  natural width (centred) when shorter, and ellipsizes at this width when
-   *  even fully collapsed can't host it. */
+  /** Max-width (px) for the absolutely row-centered title box at the chosen
+   *  collapse count. Together with `titleShift` it clears both clusters: the
+   *  title renders at its natural width when shorter, and ellipsizes at this
+   *  width when even the fully-collapsed row can't host it. */
   titleMaxWidth: number;
-  /** True only once the icons are minimal (or collapsing no longer buys room —
-   *  the leading cluster binds) and the full title STILL doesn't fit. */
+  /** Horizontal offset (px, positive = right) applied to the row-centered title
+   *  box. 0 while the title fits the SYMMETRIC reserve, which is the preferred
+   *  layout; otherwise the LEAST slide that pulls the box clear of both
+   *  clusters, so it can spend the roomier side's slack instead of truncating
+   *  into it. */
+  titleShift: number;
+  /** True only once the icons are minimal and the full title STILL doesn't fit
+   *  the whole gap between the two clusters. */
   titleEllipsized: boolean;
 }
 
 /** Pure mobile collapse math, exported for unit testing without the DOM.
- *  Collapses the FEWEST nearest-title trailing actions into the ⋮ menu so the
- *  symmetric centred box grows enough to host the full title; only ellipsizes
- *  (symmetrically, still centred) if even the fully-collapsed row can't. When
- *  the LEADING cluster is the binding side, collapsing the trailing cluster
- *  stops helping — so a title that still won't fit collapses only to the LEAST
- *  count that already reaches the maximum room, never hiding icons for no gain.
+ *  Three tiers, in preference order:
+ *
+ *  1. **Centred on the row middle**, the layout the mobile header is built
+ *     around, so collapses are spent keeping it: the FEWEST nearest-title
+ *     actions folded into ⋮ whose symmetric reserve hosts the full title.
+ *  2. **Slid off centre.** The symmetric reserve is bounded by whichever cluster
+ *     is NEARER the centre, so it leaves the roomier side's slack unused. A
+ *     settings subview carries no context actions at all, which makes the
+ *     leading cluster (hamburger + back/forward) the binding one and strands
+ *     the whole trailing half: the title truncated next to blank space. Rather
+ *     than ellipsize into that room, slide the box by the least amount that
+ *     clears both clusters and let it use the full span between them.
+ *  3. **Ellipsized** at the widest span there is, which is always the
+ *     fully-collapsed one (folding an action into ⋮ moves the trailing cluster
+ *     right, so unlike the symmetric reserve the span never plateaus).
+ *
  *  Candidate counts are 0, then 2..N (never exactly 1). */
 export function computeMobileHeaderCollapse(input: MobileHeaderCollapseInput): MobileHeaderCollapseResult {
   const n = input.actionWidths.length;
@@ -144,28 +160,45 @@ export function computeMobileHeaderCollapse(input: MobileHeaderCollapseInput): M
   const center = input.rowWidth / 2;
   const leadingHalf = center - input.leadingRight; // room on the LEFT of centre
 
-  // Symmetric centred box that clears the leading cluster AND the trailing
-  // cluster at collapse count `c`. `iconsRowWidth` gives the trailing width
-  // (⋮ + remaining actions + bell + gaps) — the same helper the desktop path uses.
-  const boxAt = (c: number): number => {
-    const trailingLeft = input.rowWidth - input.trailingRightGap - iconsRowWidth(input, c);
-    const trailingHalf = trailingLeft - center; // room on the RIGHT of centre
-    return Math.max(0, 2 * Math.min(leadingHalf, trailingHalf));
+  /** Inner edge of the trailing cluster at collapse count `c`. `iconsRowWidth`
+   *  gives its width (⋮ + remaining actions + bell + gaps), the same helper the
+   *  desktop path uses. */
+  const trailingLeftAt = (c: number): number =>
+    input.rowWidth - input.trailingRightGap - iconsRowWidth(input, c);
+  /** Symmetric centred box that clears BOTH clusters at collapse count `c`. */
+  const symmetricAt = (c: number): number =>
+    Math.max(0, 2 * Math.min(leadingHalf, trailingLeftAt(c) - center));
+  /** The whole gap between the clusters: what an off-centre box can use. */
+  const spanAt = (c: number): number => Math.max(0, trailingLeftAt(c) - input.leadingRight);
+  /** Least slide (px, right-positive) that pulls a row-centred box of `painted`
+   *  width inside both clusters; 0 whenever the centred box already clears
+   *  them. Only called with `painted <= spanAt(c)`, so the clamp range is real. */
+  const shiftAt = (c: number, painted: number): number => {
+    const centredLeft = center - painted / 2;
+    const left = Math.min(Math.max(centredLeft, input.leadingRight), trailingLeftAt(c) - painted);
+    return left - centredLeft;
   };
 
-  const maxBox = boxAt(candidates[candidates.length - 1]);
-  let plateau = candidates[candidates.length - 1]; // least collapse that reaches maxBox
-  let plateauSet = false;
   for (const c of candidates) {
-    const box = boxAt(c);
+    const box = symmetricAt(c);
     if (box + 0.5 >= input.titleWidth) {
-      return { collapsed: c, titleMaxWidth: box, titleEllipsized: false };
+      return { collapsed: c, titleMaxWidth: box, titleShift: 0, titleEllipsized: false };
     }
-    if (!plateauSet && box + 0.5 >= maxBox) { plateau = c; plateauSet = true; }
   }
-  // Even fully collapsed the centred title can't fit — clamp to the max room and
-  // ellipsize, collapsing only as far as actually widens the box.
-  return { collapsed: plateau, titleMaxWidth: maxBox, titleEllipsized: true };
+  for (const c of candidates) {
+    const span = spanAt(c);
+    if (span + 0.5 >= input.titleWidth) {
+      return {
+        collapsed: c,
+        titleMaxWidth: span,
+        titleShift: shiftAt(c, Math.min(input.titleWidth, span)),
+        titleEllipsized: false,
+      };
+    }
+  }
+  const last = candidates[candidates.length - 1];
+  const span = spanAt(last);
+  return { collapsed: last, titleMaxWidth: span, titleShift: shiftAt(last, span), titleEllipsized: true };
 }
 
 /**
@@ -178,10 +211,13 @@ export function computeMobileHeaderCollapse(input: MobileHeaderCollapseInput): M
  * - **Mobile** — `MobileAppHeader` hosts the actions directly in
  *   `.mobile-header-row`, where the title is an ABSOLUTELY row-centered box.
  *   `computeMobileHeaderCollapse` decides the collapse count AND publishes the
- *   title's symmetric max-width as `--mobile-content-title-max` on the row (the
- *   title span, a sibling, reads it) so it truncates before the icons instead of
- *   painting under them. The hidden layout copy (the other layout's header is
- *   `display:none`) measures a 0-width row and no-ops to collapsed 0.
+ *   title box's geometry on the row (the title span, a sibling, reads both
+ *   through inheritance): `--mobile-content-title-max` so it truncates before
+ *   the icons instead of painting under them, and `--mobile-content-title-shift`
+ *   so a title the symmetric reserve can't host slides into the roomier side's
+ *   slack rather than truncating next to it. The hidden layout copy (the other
+ *   layout's header is `display:none`) measures a 0-width row and no-ops to
+ *   collapsed 0, dropping both overrides.
  *
  * Measurement model (all inputs independent of the current collapse state, so
  * the computation can never oscillate):
@@ -226,6 +262,7 @@ export function useHeaderActionCollapse(
         if (rowWidth <= 0 || !bell) {
           setCollapsed(0);
           mobileRow.style.removeProperty('--mobile-content-title-max');
+          mobileRow.style.removeProperty('--mobile-content-title-shift');
           return;
         }
         // Icons are uniform `.icon-btn.header-icon` squares, so the always-present
@@ -236,7 +273,7 @@ export function useHeaderActionCollapse(
         const iconWidth = bellRect.width;
         const navSlot = mobileRow.querySelector<HTMLElement>('.mobile-nav-slot');
         const titleEl = mobileRow.querySelector<HTMLElement>('.mobile-content-title');
-        const { collapsed: next, titleMaxWidth } = computeMobileHeaderCollapse({
+        const { collapsed: next, titleMaxWidth, titleShift } = computeMobileHeaderCollapse({
           rowWidth,
           leadingRight: navSlot ? navSlot.getBoundingClientRect().right - rowRect.left : 0,
           trailingRightGap: rowWidth - (bellRect.right - rowRect.left),
@@ -248,6 +285,7 @@ export function useHeaderActionCollapse(
         });
         setCollapsed(next);
         mobileRow.style.setProperty('--mobile-content-title-max', `${titleMaxWidth}px`);
+        mobileRow.style.setProperty('--mobile-content-title-shift', `${titleShift}px`);
       };
       measure();
       const ro = new ResizeObserver(measure);

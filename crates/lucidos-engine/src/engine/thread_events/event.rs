@@ -1,11 +1,12 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::core::event_subscription::EventSubscription;
 use crate::runtime::CodingAgent;
 
 use super::{
-    AbortCause, ActorMode, AnswerKind, CancelCause, ChildCompletionStatus, MessageOrigin,
-    QuestionOption, SessionEndReason, TodoItem, TriggerInvocation,
+    AbortCause, ActorMode, AnswerKind, CancelCause, ChildCompletionStatus, EventWaitCancelCause,
+    MessageOrigin, QuestionOption, SessionEndReason, TodoItem, TriggerInvocation,
 };
 
 /// Replay default for events persisted before the `agent` field existed —
@@ -784,6 +785,17 @@ pub enum ThreadEvent {
         // and for legacy DB rows that pre-date this field.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         injected_message_id: Option<uuid::Uuid>,
+        // Set ONLY on a detached event-wake anchor (ADR 0047): the id of the
+        // `EventWaitDelivered` this injection is the wake for. `text` has to
+        // carry the matched event as prose because it IS the prompt the model
+        // reads, and a transcript that renders that verbatim is a screen of
+        // pretty-printed JSON. The id points at the row that already holds the
+        // same facts structurally (`event_type`, `payload`), so the client can
+        // render a named event with the payload folded away instead of parsing
+        // the prose back apart. None for every other injection, and for legacy
+        // rows, where the prose IS the content.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delivered_event_id: Option<uuid::Uuid>,
     },
 
     // Interactive (persisted)
@@ -930,18 +942,33 @@ pub enum ThreadEvent {
         persist_scope: Option<crate::engine::claude_code::AllowScope>,
     },
 
-    /// The command guard snapshotted the workspace's git-tracked `data/` before
-    /// running a `ReversibleDanger` command (in-workspace destruction) — ADR
-    /// 0002, Phase 4. The snapshot lives on the safety ref
-    /// `refs/lucidos/command-checkpoints/<checkpoint_id>`; `command` is the
-    /// command about to run and `summary` is the one-line card text. Persisted
-    /// so the one-click Undo affordance survives reload. Emitted only after the
-    /// snapshot succeeds (a failed snapshot lets the command run unguarded, no
-    /// event — same as the pre-Phase-4 behavior).
+    /// The command guard bracketed a `ReversibleDanger` command (in-workspace
+    /// destruction) with a snapshot of the workspace's git-visible content: ADR
+    /// 0002, Phase 4 and its 2026-08-06 addendum. The pre image lives on
+    /// `refs/lucidos/command-checkpoints/<checkpoint_id>` and the post image on
+    /// `refs/lucidos/command-post-images/<checkpoint_id>`; `command` is the
+    /// command that ran and `summary` is the one-line card text. Persisted so
+    /// the one-click Undo affordance and the card's diff viewer survive reload.
+    ///
+    /// Emitted **after** the command returns, and only when the two images
+    /// actually differ. A command that changed nothing git-visible (the usual
+    /// cause is destruction inside a gitignored path) emits no event, because
+    /// its Undo could neither restore nor remove anything. A failed snapshot
+    /// likewise emits nothing and lets the command run unguarded, the
+    /// pre-Phase-4 behavior.
+    ///
+    /// `restores` counts the files Undo would put back (deleted or overwritten)
+    /// and `removes` the files it would delete (created by the command); both
+    /// default to 0 so events written before the addendum still deserialize,
+    /// where they mean "counts unknown, restore only".
     CommandCheckpointed {
         checkpoint_id: String,
         command: String,
         summary: String,
+        #[serde(default)]
+        restores: u32,
+        #[serde(default)]
+        removes: u32,
     },
     /// The user clicked Undo on a `CommandCheckpointed` card (or the engine
     /// resolved it). The workspace working tree was restored from the checkpoint
@@ -1026,6 +1053,65 @@ pub enum ThreadEvent {
         model: String,
     },
 
+    /// The thread registered an **event wait**. Emitted by the `await_event`
+    /// tool between its `ToolCalled` and that call's `ToolResult`, and it is the
+    /// SOURCE OF TRUTH for the wait: there is no `thread_event_waits` table,
+    /// and the dispatcher's live set is a cache rebuilt from these events at
+    /// boot (ADR 0011's shape applied to a new wake).
+    ///
+    /// It does NOT end the turn and it does NOT set a status. Registering a
+    /// subscription is an ordinary tool call, the turn carries on and
+    /// terminates normally, and the thread is then plain `idle` while it
+    /// watches. The delivery arrives later as its own turn.
+    EventWaitStarted {
+        wait_id: uuid::Uuid,
+        /// The `await_event` call this wait is the other half of.
+        tool_use_id: String,
+        /// What the thread is watching for. Same shape and same matcher as a
+        /// trigger's `on:` list (`core::event_subscription`), per-entry OR.
+        on: Vec<EventSubscription>,
+        /// The model's own words for why it is waiting. Shown in the
+        /// subscription indicator and the thread card, so the user can tell an
+        /// asleep thread from a stalled one.
+        reason: String,
+        expires_at: chrono::DateTime<chrono::Utc>,
+        /// The event `sequence` at registration. Both the registration path and
+        /// the boot rebuild scan forward from here, which closes the restart
+        /// gap and the live race between this emit and the cache insert with
+        /// one mechanism.
+        watermark: i64,
+    },
+
+    /// A matching event resolved the wait. Carries the event so the delivery is
+    /// self-contained on replay rather than a reference that can dangle.
+    EventWaitDelivered {
+        wait_id: uuid::Uuid,
+        /// The `events` row that matched, for the card's deep-link.
+        event_id: uuid::Uuid,
+        event_type: String,
+        payload: Value,
+        /// Which `on:` entry matched. A wait is a rendezvous, not a stream, so
+        /// naming the entry is how the model learns which of several
+        /// subscriptions fired.
+        matched_index: usize,
+    },
+
+    /// The wait passed its deadline. **Wakes the thread** with an explanatory
+    /// message rather than dropping it: a silently dropped wait is a
+    /// permanently stalled thread, which is strictly worse than the polling it
+    /// replaces.
+    EventWaitExpired {
+        wait_id: uuid::Uuid,
+    },
+
+    /// The user ended the wait deliberately. Note what is NOT here: an ordinary
+    /// message into a subscribed thread leaves every subscription untouched, so
+    /// a passing "how's it going?" cannot silently discard a long wait.
+    EventWaitCanceled {
+        wait_id: uuid::Uuid,
+        cause: EventWaitCancelCause,
+    },
+
     // ---- Transient — never persisted ----
     // Every transient variant is past-tense (events-only model — no command
     // concept). Aliases preserve replay of any legacy persisted rows that
@@ -1074,10 +1160,6 @@ pub enum ThreadEvent {
     },
     #[serde(alias = "PushNotificationRequest")]
     PushNotificationRequested,
-    #[serde(alias = "RefreshFile")]
-    FileRefreshRequested {
-        path: String,
-    },
     #[serde(alias = "RefreshAppUI")]
     AppUiRefreshRequested {
         app_id: String,

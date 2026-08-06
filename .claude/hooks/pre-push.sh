@@ -42,8 +42,8 @@ $COMMIT_COUNT unpushed commit(s):
 $UNPUSHED
 
 You MUST invoke the /harden skill to review these changes.
-/harden writes the marker automatically when it completes (via mark-harden.sh).
-Then retry the push.
+/harden writes the marker automatically when it completes: its Phase 5 runs
+the "lucidos hardened mark" subcommand. Then retry the push.
 EOF
     exit 2
     ;;

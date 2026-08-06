@@ -97,6 +97,11 @@ export interface ThreadSummary {
    *  store, so a reload rehydrates the draft's picks. A partial override; absent
    *  fields resolve to the account default. Null/absent = no per-draft picks. */
   compose_selection?: ComposeSelectionOverride | null;
+  /** The thread's *compose epoch*: how many times a submission has consumed its
+   *  compose slot. Echoed back on every compose PUT so the engine can refuse a
+   *  write composed before a submission that has since landed. Absent on a
+   *  pre-epoch engine, which leaves those writes unfenced. */
+  compose_epoch?: number;
 }
 
 export interface ThreadsResponse {
@@ -349,4 +354,19 @@ export async function fetchToolResult(
   eventId: string,
 ): Promise<ToolResultPayload> {
   return json(`${API}/events/${eventId}/tool-result`);
+}
+
+/** Where one event lives. `thread_id` is `null` for an event that belongs to no
+ *  conversation (a workspace domain event, an app event, a trigger event): a
+ *  real answer, distinct from the 404 an unknown event id returns. Mirrors Rust
+ *  `EventLocation` in `api/threads/events_snapshot.rs`. */
+export interface EventLocation {
+  thread_id: string | null;
+}
+
+/** Resolve the thread one event belongs to. Same event-id-only routing as
+ *  `fetchContextCapture`. Used by the event-wait step's "show it", whose
+ *  matched event is normally in some OTHER thread. */
+export async function fetchEventLocation(eventId: string): Promise<EventLocation> {
+  return json(`${API}/events/${eventId}/location`);
 }

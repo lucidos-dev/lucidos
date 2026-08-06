@@ -30,15 +30,25 @@ use crate::engine::thread_lifecycle::{resolve_transition, ArchiveState};
 /// only — a textarea's trailing newline would otherwise defeat the match.
 const COMPOSE_TRIM_CHARS: &str = " \t\n\r\u{000b}\u{000c}";
 
-/// Announce that the thread's stored draft is gone. Every projection arm that
-/// empties the compose fields owes one of these: the clear is otherwise silent,
-/// and a device holding the same draft keeps showing it until its next
-/// thread-summary reload. A thread event won't do — delivery can lag
-/// arbitrarily behind the transaction, so the frontend only treats a compose
-/// REPORT as evidence of the server's current state (`serverDraft` in
-/// `store/actions/compose.ts`). `origin_device_id: None` because this is the
-/// server's own report, not any device's echo, so nobody suppresses it.
-fn compose_cleared_broadcast(thread_id: Uuid) -> BusEvent {
+/// Announce that the thread's stored draft is gone, and at which *compose
+/// epoch* (`docs/glossary.md`). Every projection arm that empties the compose
+/// fields owes one of these: the clear is otherwise silent, and a device
+/// holding the same draft keeps showing it until its next thread-summary
+/// reload. A thread event won't do, because delivery can lag arbitrarily behind
+/// the transaction, so the frontend only treats a compose REPORT as evidence of
+/// the server's current state (`serverDraft` in `store/actions/compose.ts`).
+/// `origin_device_id: None` because this is the server's own report, not any
+/// device's echo, so nobody suppresses it.
+///
+/// It is also how a device learns the new epoch, which is what lets its next
+/// compose PUT carry a value the fence accepts. A device that misses this frame
+/// is not stuck: its next write is refused with `412` carrying the current
+/// epoch, and it retries. Broadcast UNCONDITIONALLY, even when the thread held
+/// no draft to clear: the epoch moved, and the draft-less case is exactly the
+/// reported bug (the client's write was still in flight, so the engine had
+/// nothing yet), so staying quiet there would be quiet precisely when it
+/// matters most.
+fn compose_cleared_broadcast(thread_id: Uuid, compose_epoch: i64) -> BusEvent {
     BusEvent::System(
         crate::engine::event_bus::SystemEvent::ThreadComposeChanged {
             id: thread_id,
@@ -46,28 +56,10 @@ fn compose_cleared_broadcast(thread_id: Uuid) -> BusEvent {
             image_hashes: Vec::new(),
             mode: None,
             selection: None,
+            compose_epoch,
             origin_device_id: None,
         },
     )
-}
-
-/// Whether the thread currently holds a draft that a compose-clearing arm is
-/// about to wipe — so the arm knows whether it has anything to announce. One
-/// cheap in-tx read per submitted message; the alternative (broadcasting
-/// unconditionally) would claim a change on every message for threads that
-/// never had a draft.
-async fn thread_holds_a_draft(
-    tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    thread_id: Uuid,
-) -> Result<bool, sqlx::Error> {
-    let held: Option<bool> = sqlx::query_scalar(
-        "SELECT compose_text <> '' OR COALESCE(compose_images, '[]'::jsonb) <> '[]'::jsonb \
-         FROM thread_summaries WHERE thread_id = $1",
-    )
-    .bind(thread_id)
-    .fetch_optional(&mut **tx)
-    .await?;
-    Ok(held.unwrap_or(false))
 }
 
 impl EventBus {
@@ -142,12 +134,6 @@ impl EventBus {
                 // one is agent activity. Drives which attributed-recency column
                 // the follow-up UPDATE bumps below.
                 let human = matches!(mode, ActorMode::Human);
-                // Read BEFORE the upsert below wipes the compose fields: the
-                // send is what ends the draft's life, and peers must be told
-                // (see `compose_cleared_broadcast`). `sendCompose` cancels its
-                // own compose PUT and relies on exactly this clear, so nothing
-                // else on that path would report it.
-                let had_draft = thread_holds_a_draft(tx, thread_id).await?;
                 // Compute child depth and inherit initiator from parent —
                 // a non-Human parent forces "system" on its descendants.
                 let (child_depth, initiator) = if let Some(pid) = parent_thread_id {
@@ -173,7 +159,15 @@ impl EventBus {
                 // `CodingAgentIdled`, and its first card would never be sent.
                 // The CASE in the conflict arm covers a spawn landing on a
                 // pre-existing row, and leaves a parentless row alone.
-                sqlx::query(
+                //
+                // `compose_epoch` comes back so the post-commit broadcast can
+                // carry it. A fresh INSERT returns the storage default 0 and the
+                // conflict arm always returns at least 1, which is what
+                // distinguishes "a submission consumed an existing thread's
+                // compose slot" (announce it) from "this row was just created"
+                // (nothing to announce, and no device has heard of the thread
+                // yet). `None` means the discarded-thread guard below matched.
+                let compose_epoch: Option<i64> = sqlx::query_as(
                     r#"INSERT INTO thread_summaries (thread_id, first_message, source, initiator, created_at, last_activity, message_count, parent_thread_id, spawning_event_id, depth, status, last_revived_at, state, parent_callback_pending)
                        VALUES ($1, $2, $3, $6, NOW(), NOW(), 1, $4, $7, $5, 'running', NOW(), 'active', $4 IS NOT NULL)
                        ON CONFLICT (thread_id) DO UPDATE
@@ -202,10 +196,20 @@ impl EventBus {
                            compose_text = '',
                            compose_images = '[]'::jsonb,
                            compose_mode = NULL,
-                           compose_selection = NULL
+                           compose_selection = NULL,
+                           -- The send consumed this thread's compose slot, so
+                           -- every write composed against the old epoch is now
+                           -- stale and `put_compose` must refuse it. Bumped
+                           -- whether or not a draft was actually stored: the
+                           -- reported bug is precisely the case where the
+                           -- client's draft PUT was still in flight, so the
+                           -- engine held nothing to clear and the write landed
+                           -- afterwards. See `docs/glossary.md` § compose epoch.
+                           compose_epoch = thread_summaries.compose_epoch + 1
                        -- Defense in depth: refuse to resurrect a discarded thread if a
                        -- stale MessageReceived slips past the API-layer guard.
-                       WHERE thread_summaries.state != 'discarded'"#,
+                       WHERE thread_summaries.state != 'discarded'
+                       RETURNING compose_epoch"#,
                 )
                 .bind(thread_id)
                 .bind(text)
@@ -215,8 +219,9 @@ impl EventBus {
                 .bind(initiator)
                 .bind(spawning_event_id)
                 .bind(human)
-                .execute(&mut **tx)
-                .await?;
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|(epoch,): (i64,)| epoch);
 
                 // If this message has a parent, increment the parent's active_children_count.
                 // Parents are always Chat threads — CC threads are always children.
@@ -251,10 +256,9 @@ impl EventBus {
                     }
                 }
 
-                if had_draft {
-                    vec![compose_cleared_broadcast(thread_id)]
-                } else {
-                    Vec::new()
+                match compose_epoch {
+                    Some(epoch) if epoch > 0 => vec![compose_cleared_broadcast(thread_id, epoch)],
+                    _ => Vec::new(),
                 }
             }
             // Session lifecycle — session start/continuation don't update
@@ -315,7 +319,11 @@ impl EventBus {
                     ),
                     _ => (None, None, None, None),
                 };
-                sqlx::query(
+                // `compose_epoch` comes back for the same reason as in the
+                // `MessageReceived` arm: only a row that already existed can
+                // have held (or be about to receive) a draft, and only the
+                // coding-agent branch consumes one.
+                let compose_epoch: Option<i64> = sqlx::query_as(
                     r#"INSERT INTO thread_summaries (thread_id, source, is_coding_agent, created_at, last_activity, message_count, status, last_revived_at, cc_repo_id, coding_agent_kind, coding_agent_folder, coding_agent, state)
                        VALUES ($1, $2, $7, NOW(), NOW(), 0, 'running', NOW(), $3, $4, $5, $6, 'active')
                        ON CONFLICT (thread_id) DO UPDATE
@@ -343,17 +351,20 @@ impl EventBus {
                            state = 'active',
                            -- Gated too: a coding-agent session start consumes
                            -- the thread's prompt, but a chat/trigger Continue
-                           -- consumes nothing — the user clicked Continue, they
-                           -- did not send — so their draft must survive. It also
-                           -- has to: this arm emits no `compose_cleared_broadcast`
-                           -- (see the fn's doc), so a clear here is invisible to
-                           -- peer devices, which would keep showing the ghost draft.
+                           -- consumes nothing (the user clicked Continue, they
+                           -- did not send), so their draft must survive. The
+                           -- epoch is gated with it: an epoch bump means "a
+                           -- submission consumed the slot", and a Continue is
+                           -- not one, so bumping there would refuse a perfectly
+                           -- good draft write for nothing.
                            compose_text = CASE WHEN $7 THEN '' ELSE thread_summaries.compose_text END,
                            compose_images = CASE WHEN $7 THEN '[]'::jsonb ELSE thread_summaries.compose_images END,
                            compose_mode = CASE WHEN $7 THEN NULL ELSE thread_summaries.compose_mode END,
-                           compose_selection = CASE WHEN $7 THEN NULL ELSE thread_summaries.compose_selection END
+                           compose_selection = CASE WHEN $7 THEN NULL ELSE thread_summaries.compose_selection END,
+                           compose_epoch = thread_summaries.compose_epoch + CASE WHEN $7 THEN 1 ELSE 0 END
                        -- Defense in depth (see MessageReceived above for rationale).
-                       WHERE thread_summaries.state != 'discarded'"#,
+                       WHERE thread_summaries.state != 'discarded'
+                       RETURNING compose_epoch"#,
                 )
                 .bind(thread_id)
                 .bind(source)
@@ -362,9 +373,19 @@ impl EventBus {
                 .bind(session_folder)
                 .bind(session_agent)
                 .bind(is_coding_agent_event)
-                .execute(&mut **tx)
-                .await?;
-                Vec::new()
+                .fetch_optional(&mut **tx)
+                .await?
+                .map(|(epoch,): (i64,)| epoch);
+                // Only the coding-agent branch cleared anything, and until this
+                // change it did so silently, so a peer device kept rendering the
+                // consumed draft until its next reload. Announcing it also hands
+                // every device the new epoch.
+                match compose_epoch {
+                    Some(epoch) if is_coding_agent_event && epoch > 0 => {
+                        vec![compose_cleared_broadcast(thread_id, epoch)]
+                    }
+                    _ => Vec::new(),
+                }
             }
             ThreadEvent::TriggerStarted { trigger_id, trigger_name, go_to_review, .. } => {
                 let source = meta.channel.as_ref().map(|c| c.as_str()).unwrap_or("trigger");
@@ -424,15 +445,18 @@ impl EventBus {
             }
             ThreadEvent::ResponseAborted { cause, .. } => {
                 // Status mapping lives on `AbortCause::status_sql()` so the
-                // cause-classification stays next to `is_transient()` on the
-                // enum. Most aborts surface a red `failed` indicator;
-                // stale-settle is engine cleanup of an already-gone process
-                // and uses the cancel-style `idle`/`waiting` mapping.
+                // classification stays next to the cause enum. It needs the
+                // ACTOR as well as the cause: `paused` means the engine promised
+                // to resume this turn, which is the user's own *Switch to new
+                // version* (a device-actor `EngineShutdown`) and nothing else.
+                // Most aborts surface a red `failed` indicator; stale-settle is
+                // engine cleanup of an already-gone process and uses the
+                // cancel-style `idle`/`waiting` mapping.
                 sqlx::query(&format!(
                     "UPDATE thread_summaries SET last_activity = NOW(), last_agent_action = NOW(), \
                      has_response = TRUE, \
                      status = {} WHERE thread_id = $1",
-                    cause.status_sql()
+                    cause.status_sql(meta.actor.as_ref())
                 ))
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1086,6 +1110,51 @@ impl EventBus {
                 .await?;
                 Vec::new()
             }
+            // The thread registered a subscription. Agent activity, and nothing
+            // more: registering does not hold the turn, so the status is
+            // whatever the turn itself is doing and this arm must not touch it.
+            // `last_user_action` is untouched too, since nothing is being asked
+            // of anyone.
+            ThreadEvent::EventWaitStarted { .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                     last_agent_action = NOW() WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            // **No resolution moves the status.** A subscription never held the
+            // turn, so its resolution says nothing about one: the thread is
+            // either idle (and its wake's own `UserPromptInjected` sets
+            // 'running') or already running an unrelated turn, which a write
+            // here would misreport as revived.
+            //
+            // None of the three is a user action for `last_agent_action`
+            // either: the wake's first event bumps it, and stamping it here
+            // would credit the agent for an event the engine delivered. A
+            // cancel IS a user action, because every cancel cause is a person
+            // pressing something.
+            ThreadEvent::EventWaitDelivered { .. } | ThreadEvent::EventWaitExpired { .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET last_activity = NOW() WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
+            ThreadEvent::EventWaitCanceled { .. } => {
+                sqlx::query(
+                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                     last_user_action = NOW() WHERE thread_id = $1",
+                )
+                .bind(thread_id)
+                .execute(&mut **tx)
+                .await?;
+                Vec::new()
+            }
             // A question answer can RESUME a session that already idled: answering
             // an AskUserQuestion after the thread parked spawns a `--resume`
             // (see `agent_question.rs`, `ANSWERED_AFTER_IDLE_REASON`). So it must
@@ -1130,9 +1199,9 @@ impl EventBus {
                 // compose_text is already empty — clearing that row's stored
                 // `compose_selection` for nothing.
                 .filter(|t| !t.trim().is_empty());
-                let mut cleared_draft = false;
+                let mut cleared_epoch: Option<i64> = None;
                 if let Some(text) = submitted_text {
-                    cleared_draft = sqlx::query(
+                    let cleared = sqlx::query(
                         "UPDATE thread_summaries \
                          SET compose_text = '', compose_images = '[]'::jsonb, \
                              compose_mode = NULL, compose_selection = NULL \
@@ -1147,9 +1216,35 @@ impl EventBus {
                     .await?
                     .rows_affected()
                         > 0;
+                    // The epoch advances for ANY answer that carried composer
+                    // text, matched or not, and that asymmetry with the clear
+                    // above is the point. The clear must stay conditional
+                    // because an answer says nothing about different text a peer
+                    // is still writing. The fence must not, because the case it
+                    // exists for is exactly the one the content match cannot
+                    // see: the answering device's own compose PUT was still in
+                    // flight, so storage held the older text (or nothing), the
+                    // match failed, and without a bump that stalled write lands
+                    // afterwards and resurrects the answer as a draft. A peer
+                    // whose unrelated draft is now behind the epoch is not
+                    // harmed: its draft survives (the clear didn't touch it) and
+                    // its next write is refused once with the current epoch,
+                    // adopted, and re-issued.
+                    let bumped: Option<(i64,)> = sqlx::query_as(
+                        "UPDATE thread_summaries SET compose_epoch = compose_epoch + 1 \
+                         WHERE thread_id = $1 RETURNING compose_epoch",
+                    )
+                    .bind(thread_id)
+                    .fetch_optional(&mut **tx)
+                    .await?;
+                    // Announced only when a draft was actually cleared: the
+                    // broadcast reports an EMPTY compose, which would be a lie
+                    // about a peer's surviving draft. A device that therefore
+                    // misses this epoch pays one refusal and retry.
+                    cleared_epoch = bumped.map(|(epoch,)| epoch).filter(|_| cleared);
                 }
-                if cleared_draft {
-                    vec![compose_cleared_broadcast(thread_id)]
+                if let Some(epoch) = cleared_epoch {
+                    vec![compose_cleared_broadcast(thread_id, epoch)]
                 } else {
                     Vec::new()
                 }
@@ -1248,7 +1343,6 @@ impl EventBus {
             | ThreadEvent::PluginUninstallRequested { .. }
             | ThreadEvent::EmailConfirmRequested { .. }
             | ThreadEvent::PushNotificationRequested
-            | ThreadEvent::FileRefreshRequested { .. }
             | ThreadEvent::AppUiRefreshRequested { .. }
             | ThreadEvent::AppUiCaptureRequested { .. }
             | ThreadEvent::NavigationRequested { .. }

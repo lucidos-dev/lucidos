@@ -221,15 +221,43 @@ export type ResponseEvent =
       resolved?: { allowed: boolean; reason?: string };
     }
   | {
-      /** The command guard checkpointed the workspace before a ReversibleDanger
-       *  command (ADR 0002, Phase 4). Renders inline with a one-click Undo;
-       *  `reverted` flips true once the paired CommandCheckpointReverted event
-       *  lands in this exchange. */
+      /** The command guard bracketed a ReversibleDanger command with a
+       *  snapshot pair (ADR 0002, Phase 4). Renders inline with a one-click
+       *  Undo and a View changes button; `reverted` flips true once the paired
+       *  CommandCheckpointReverted event lands in this exchange.
+       *
+       *  `restores` (files Undo puts back) and `removes` (files it deletes,
+       *  because the command created them) drive the card's scope line. Both
+       *  are 0 on checkpoints written before the counts existed, which the
+       *  card reads as "unknown" and says nothing rather than "0 files". */
       type: 'checkpoint';
       checkpoint_id: string;
       command: string;
       summary: string;
       reverted: boolean;
+      restores: number;
+      removes: number;
+    }
+  | {
+      /** The thread subscribed to an *event wait* (`await_event`, ADR 0047). A
+       *  step-level card, deliberately NOT an exchange divider: an attached
+       *  delivery resumes the SAME exchange, which is the whole point of the
+       *  design, so `EventWaitStarted` stays out of `EXCHANGE_START_TYPES` and
+       *  the wake's steps continue below this card.
+       *
+       *  `state` is flipped in place by whichever resolution lands later in the
+       *  exchange, matched by `wait_id`. Same shape as the checkpoint card. */
+      type: 'event_wait';
+      wait_id: string;
+      /** Rendered subscription line, already collapsed to prose. */
+      subscription: string;
+      reason: string;
+      expires_at: string;
+      state: 'waiting' | 'woke' | 'timed_out' | 'canceled';
+      /** Set on `woke`: the event that matched, for the card's summary line and
+       *  its deep link into the source event. */
+      matched_event_type?: string;
+      matched_event_id?: string;
     }
   | {
       /** The model ended its turn cleanly but produced no text (a benign empty
@@ -689,6 +717,28 @@ export interface PluginInstallRequest {
   plugin_id: string;
   plugin_version: string;
   plugin_name: string;
+}
+
+/** What a confirmed install actually did, stamped onto the form so the panel
+ *  becomes a read-only receipt in place. Carries the ENGINE's answer, not the
+ *  staged request's: `PluginInstallRequest.files` is what the install *would*
+ *  write, `installed_files` is what it wrote. Self-contained on purpose, since a
+ *  history round-trip or a reload re-seeds the panel from the form alone. */
+export interface PluginInstallReceipt {
+  /** ISO timestamp of the confirm. */
+  at: string;
+  summary: string;
+  installed_files: string[];
+}
+
+/** What a confirmed uninstall actually did. Mirrors `PluginInstallReceipt`;
+ *  `files_deleted` is the engine's outcome, where the request's `files_present`
+ *  was only what existed at prepare time. */
+export interface PluginUninstallReceipt {
+  at: string;
+  summary: string;
+  files_deleted: string[];
+  files_missing: string[];
 }
 
 /** Plugin uninstall awaiting user confirmation in the uninstall panel.

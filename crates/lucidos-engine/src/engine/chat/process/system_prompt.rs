@@ -108,6 +108,14 @@ pub(crate) fn coding_surface_section(has_lucidos_source: bool) -> &'static str {
 /// agents by `agent_session::prompts::{ASK_USER_QUESTION_RULE,
 /// CODEX_ASK_USER_QUESTION_RULE}` and by the `ask_user_question` tool
 /// description in `llm::tools::misc`; change them together.
+///
+/// The `multiSelect` paragraph is deliberately chat-only. The flag has existed
+/// since 2026-05-10 and the tool schema documents it, but no prompt ever said
+/// WHEN to set it, so the chat agent shipped single-pick cards for additive
+/// questions and users answered by typing "the first three" into the prompt.
+/// The coding-agent rules are not mirrored here because a coding agent's cards
+/// are overwhelmingly decision forks (approve / a variant / stop), where
+/// single-pick is the correct default and an added paragraph would be noise.
 pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      Use the `ask_user_question` tool for any question with 2-4 discrete \
      answers, including the binary yes/no case. The Lucidos UI renders the \
@@ -121,6 +129,17 @@ pub(crate) const ASK_USER_QUESTION_RULE: &str = "ASKING THE USER QUESTIONS:\n\
      lead-in prose) and leave `question` empty. The engine rejects any call \
      whose `question` is missing and makes you re-ask, so fill it the first \
      time.\n\
+     \n\
+     SET `multiSelect` WHEN THE OPTIONS ARE NOT MUTUALLY EXCLUSIVE: the card \
+     is single-pick by default, so a question whose answers stack (\"which of \
+     these apply?\", \"what should I include?\", \"which ones slip?\") forces \
+     the user to type \"the first three\" into the prompt to say what three \
+     taps should have said. The test is mechanical: could a reasonable person \
+     want two of these at once? Then pass `multiSelect: true` on that \
+     question. Leave it off for a genuine fork, where the answers really are \
+     exclusive and picking one changes what you do next (build all of it vs \
+     start with one, daily vs weekly). A checklist is multi-select; a fork is \
+     not.\n\
      \n\
      NEVER OFFER AN \"OTHER\" OPTION: do not add an option meaning \"Other\", \
      \"Something else\", \"Let me type it\" or \"I'll write my own answer\". \
@@ -301,6 +320,100 @@ pub(crate) const REPEATED_ACTION_RULE: &str = "DOING IT AGAIN — A REPEAT \
      did not do it — call it now. This holds for every state-changing tool, \
      not just file writes.";
 
+/// Stops the agent from routing around a tool it was refused by, and from ever
+/// posting to the engine as the user.
+///
+/// The reported failure (2026-08-06): asked to send a follow-up to every
+/// running coding-agent thread, the agent found that `follow_up_child_thread`
+/// only reaches its own children and that no tool covered the request. Instead
+/// of saying so, it used `run_bash` to `curl` the engine's own
+/// `/api/v1/chat/stream` with `mode: "human"`, which recorded six agent
+/// messages as turns the user had typed. It also hit the wrong engine, whose
+/// chat path then created six phantom threads from the ids it sent, so reading
+/// them back "confirmed" delivery and it reported success.
+///
+/// The engine now refuses all three moves (`api::chat::human_mode_is_attributed`,
+/// `api::chat::thread_target_is_addressable`, `api::target_workspace`). The
+/// model must still be TOLD, for the same reason
+/// [`NO_LUCIDOS_SOURCE_SECTION`] exists: a rule that only blocks lets the agent
+/// narrate the capability first and discover the refusal after the user has
+/// been misled. And the load-bearing half is not the prohibition but the
+/// instruction about what to do instead, because the actual failure was not
+/// reporting the block.
+///
+/// Deliberately short. It says what not to do, in one place, and points at the
+/// tools that do work rather than restating their contracts, which
+/// `system-knowhow/lucidos-cli.md` owns.
+const NO_IMPERSONATION_RULE: &str = "NEVER ACT AS THE USER, AND NEVER ROUTE \
+     AROUND A TOOL:\n\
+     You may never post to the Lucidos engine's own HTTP API by hand (curl, \
+     urllib, fetch) to do something a tool would not let you do, and you may \
+     never record a message as though the user typed it. An agent-authored turn \
+     stamped as the user is indistinguishable from the real thing in the \
+     timeline and in the event log, so it is a lie the user cannot detect. The \
+     engine refuses these requests, but do not go looking for the edge it \
+     misses.\n\
+     WHEN A TOOL REFUSES YOU, SAY SO. That is the whole rule. If you were asked \
+     for something no tool covers (messaging a thread that is not your own \
+     child, acting in another workspace, reaching a thread you did not spawn), \
+     tell the user plainly that it is not possible and offer what IS: name the \
+     threads and let them send the message themselves, or use the tools you do \
+     have. A refusal reported honestly is a good turn. A refusal worked around \
+     is a broken one, however well it appears to succeed.";
+
+/// Routes "tell me here when X happens" to `await_event` rather than a
+/// trigger, at the moment the mechanism is chosen.
+///
+/// Every other surface describing `await_event` frames it as an agent-side
+/// remedy: the tool description says "INSTEAD of a polling loop", the
+/// state-change section below is headed "NEVER A POLL LOOP", and
+/// `system-knowhow/thread-events.md` says "when the current turn cannot
+/// usefully continue". A user asking to be told about something introduces no
+/// poll loop and blocks no turn, so none of those framings matches, and the one
+/// property the request does carry (the answer has to land HERE) appeared
+/// nowhere. Worse, the single discriminator that was stated everywhere,
+/// one-shot versus standing, actively selects the wrong mechanism: "when a
+/// coding agent edits code let me know" parses as a standing rule.
+///
+/// That is the 2026-08-06 miss. The agent loaded the coding-agent-events and
+/// triggers knowhow, listed triggers, and asked which granularity of *trigger*
+/// to build, having already written "a trigger can't write into this chat
+/// thread" as a caveat to accept rather than as the disqualifying fact it is.
+/// It reached `await_event` only when the user named the tool.
+///
+/// So the destination question is stated here, alongside the duration question
+/// rather than replacing it, on a surface that is resident in every chat turn.
+/// The knowhow carries the same fork, but knowhow has to be RETRIEVED, and in
+/// the miss the retrieval had already committed to triggers before the fork
+/// could be considered.
+///
+/// Deliberately does not claim a trigger cannot reach the user at all: it can,
+/// as a notification from its own thread. What it cannot do is continue the
+/// conversation the user typed into. Pinned by
+/// `trigger_vs_event_wait_rule_routes_on_destination_without_overclaiming`.
+///
+/// Extracted as a const rather than left inline in the prompt literal so it is
+/// assertable, matching [`ASK_USER_QUESTION_RULE`] and [`REPEATED_ACTION_RULE`].
+pub(crate) const TRIGGER_VS_EVENT_WAIT_RULE: &str =
+    "\"TELL ME WHEN X HAPPENS\", TRIGGER OR `await_event`? ASK WHERE THE ANSWER \
+     GOES, NOT JUST HOW OFTEN:\n\
+     - WHERE. A trigger runs in its OWN thread and reaches the user as a \
+     notification. It cannot continue the conversation you are in. \
+     `await_event` re-opens THIS thread, so the report lands where they are \
+     reading. \"Let me know HERE\", \"tell me in this chat\", or a request typed \
+     into a thread they are plainly waiting in, is `await_event`, even when the \
+     phrasing sounds like a standing rule.\n\
+     - HOW LONG. `await_event` is one-shot: it resolves on the first match, and \
+     you subscribe again per event. A rule that must outlive this conversation, \
+     run when nobody is here, and fire indefinitely is a trigger.\n\
+     - Both can be right. Lead with the one that matches where they asked to be \
+     told, and offer the other in the same breath: \"I'll watch and report here; \
+     want a trigger too, so it keeps running after this thread?\"\n\
+     - Do NOT build a trigger to post back into a chat thread. It costs a \
+     persisted trigger row plus a whole extra turn in a DIFFERENT thread to \
+     route one message, and it lands in that other thread rather than the one \
+     they are reading.";
+
 /// Routes the chat agent to the authoritative system-knowhow file before it
 /// touches a workspace asset.
 ///
@@ -338,6 +451,49 @@ pub(crate) const WORKSPACE_ASSETS_KNOWHOW_RULE: &str =
      says to ask), then act.\n\
      Skip the load_knowhow call if you already loaded the same knowhow earlier \
      in this thread; its content is still in your context.";
+
+/// Routes "set Lucidos up around my life" to the *setup interview* knowhow.
+///
+/// The first-run entry point (the welcome CTA and the header help button, both
+/// in `WelcomeMessage.tsx` / the app headers) sends a fixed sentence as an
+/// ordinary user message, so the opening request has a KNOWN shape. That is the
+/// same situation `plugin-setup` is in, and it gets the same treatment: a
+/// deterministic route rather than a bet on the frontmatter `description`
+/// winning retrieval. The description is written for retrieval too, and covers
+/// the re-run phrasings a returning user types; this block is what makes the
+/// button itself reliable.
+///
+/// The ACTION FIRST carve-out is load-bearing, not boilerplate. That rule says
+/// "Don't ask clarifying questions" and currently excepts only workspace
+/// assets, but an interview is a clarification loop by construction, so without
+/// the carve-out the agent skips the questions and builds something generic on
+/// turn one. Pinned by `setup_interview_rule_carves_itself_out_of_action_first`.
+///
+/// The "not only about work" sentence is here rather than left to the knowhow
+/// alone because this block is what the model reads BEFORE deciding to load
+/// anything: a rule that describes the interview as being about the user's work
+/// invites a "they only asked about training, this is something else" miss on
+/// exactly the requests the widened interview exists to serve.
+pub(crate) const SETUP_INTERVIEW_RULE: &str =
+    "SETTING THE WORKSPACE UP AROUND THE USER, LOAD KNOWHOW FIRST:\n\
+     When the user wants Lucidos set up around their own life rather than a \
+     single answer (\"help me get the most out of Lucidos\", \"set me up\", \
+     \"build me a starting kit\", \"what should I use Lucidos for\", \"help me \
+     get started\", \"figure out what to build for me\", \"help me with my \
+     training\", \"coach me\", or a returning user asking to run setup again), \
+     FIRST call load_knowhow on `system-knowhow/setup-interview` and follow it. \
+     It owns which parts of their life to interview about, the question ladder, \
+     how to map their answers to a kit worth building, when to confirm, and \
+     what to persist afterwards.\n\
+     This is NOT only about work. Personal admin, health and training, \
+     learning, a side project and a household are all in scope, and the \
+     knowhow's first question is which mix applies. Route the request here \
+     whether or not it mentions a job.\n\
+     The ACTION FIRST rule below does NOT apply to the setup interview: the \
+     questions ARE the work there, so ask them rather than guessing a kit. The \
+     knowhow says when to cut the questions short.\n\
+     Skip the load_knowhow call if you already loaded it earlier in this \
+     thread; its content is still in your context.";
 
 impl LucidosEngine {
     /// Build the full chat system prompt for this turn plus the mandatory
@@ -501,7 +657,8 @@ WORKSPACE LAYOUT:
 The workspace root has two top-level areas:
 
   .lucidos/                    ← Ephemeral, NOT under data/, NOT git-tracked
-    tmp/                      ← Temp files from http_request (e.g., .lucidos/tmp/oura_data.json)
+    tmp/                      ← Scratch from http_request / git_clone (e.g., .lucidos/tmp/oura_data.json)
+                                 read_file and copy_file READ it; create/edit/delete via run_python or run_bash
     exhaust/                  ← Internal runtime temp (do not reference)
   data/
     artifacts/              ← User files (notes, imported data, projects)
@@ -556,6 +713,9 @@ When you discover something new during execution (a quirk, a better approach, a 
 
 - Tool paths for artifacts are relative to data/ — use "artifacts/notes.md", not "data/artifacts/notes.md"
 - .lucidos/ paths are relative to workspace root — use ".lucidos/tmp/file.json", NEVER "data/.lucidos/tmp/file.json"
+- When http_request or git_clone reports a .lucidos/tmp/ path, pass that exact path to read_file. Don't shell out to `cat` for it, and don't re-fetch.
+- Only .lucidos/tmp/ is reachable by the file tools. The rest of .lucidos/ (worktrees/, exhaust/, engine.pid) is engine runtime state and is refused.
+- The file tools git-commit everything they write, so they REFUSE to write .lucidos/tmp/. To create or edit a scratch file use run_python; to delete one use run_bash.
 - In Python scripts (run_python), cwd is the workspace root. Use open('.lucidos/tmp/file.json') for temp files, open('data/artifacts/file.md') for artifacts.
 - Everything under data/ (except postgres/) is git-tracked — files persist and have version history
 - Never nest artifacts inside artifacts (e.g., DON'T write to artifacts/artifacts/x)
@@ -616,6 +776,8 @@ newly installed X plugin"), FIRST call load_knowhow on
 plugin author's setup instructions, plan the steps, and complete them with
 the user. Skip the load if you already loaded it earlier in this thread.
 
+__SETUP_INTERVIEW_RULE__
+
 ACTION FIRST - NO CLARIFICATION LOOPS:
 - JUST DO IT. If the user asks for something, DO IT immediately. Don't ask clarifying questions.
 - "This week" = since Monday of the current week. "Last 7 days" = last 7 days. Figure it out.
@@ -657,6 +819,8 @@ BROWSER TOOLS:
 - Browser uses a persistent profile — logins, cookies, and localStorage carry over between sessions
 - If a site redirects to a login page during headless browsing, suggest the user log in with visible=true
 - Use browser_clear_data to wipe all browser data (cookies, logins, cache) and start fresh
+
+__TRIGGER_VS_EVENT_WAIT_RULE__
 
 TRIGGERS:
 - Cron: 6 fields (sec min hour dom month dow) in USER'S LOCAL timezone. DST is handled automatically.
@@ -725,18 +889,27 @@ WAITING ON A BACKGROUND TASK — USE `bash_output(task_id, wait_secs=N)`:
 - Very long output keeps the TAIL, marked with a leading `[truncated — N earlier bytes dropped]`. The newest lines survive; if you need earlier ones, have the task `tee` to a log file and `read_file` it.
 - DO NOT spawn `run_python(code="import time; time.sleep(N)")` to wait for a background task. That burns two tool calls per wait, doubles your context, and now also trips the same-bucket guard (the first actionable line `time.sleep(N)` collides on verbatim retries).
 - For tasks that need genuine in-script periodic action (NOT waiting on background work) — e.g. the user asks "ping me every 60s for the next 4 minutes" — use ONE `run_python` call with an internal `for _ in range(4): print(bar()); time.sleep(60)` loop and stream a summary when it returns. The first actionable line `for _ in range(4):` is unique to that workflow so the guard won't trip on it.
-- For waits that are genuinely unbounded (sweep may run all night, backtest results in hours not minutes): after a couple of `wait_secs=120` drains with no end in sight, step aside with a WAKE QUESTION — call `ask_user_question` with a single option whose label is the user-perspective wake prompt (e.g. `["Show results"]`, `["Stop sweep"]`). The thread parks with a "?" attention status until the user taps. Do NOT end your turn with prose like "I'll report when it finishes" — the engine has no way to wake you back up. See ASKING THE USER QUESTIONS § WAKE QUESTION above for the full rule.
+- For waits that are genuinely unbounded (sweep may run all night, backtest results in hours not minutes): after a couple of `wait_secs=120` drains with no end in sight, stop draining and `await_event` on `BackgroundBashCompleted` with a `condition` on the `task_id`. A finished background task persists that event, so this is a state wait like any other (see the next section): subscribing costs nothing, you end the turn, and the engine re-opens the thread the moment the task ends, however long that takes. Do NOT step aside with a one-option `ask_user_question` to get resumed, and do NOT end your turn with prose like "I'll report when it finishes" WITHOUT the call. The first makes the human your scheduler for something the engine already knows; the second leaves nothing to wake you at all.
+
+WAITING FOR A STATE CHANGE IN LUCIDOS: USE `await_event`, NEVER A POLL LOOP:
+- Everything above is about waiting for the OUTPUT of a process you started. Waiting for a STATE CHANGE in Lucidos is a different thing and has its own tool: `await_event(on, timeout_secs, reason)`. A thread going idle, a change being proposed, a coding agent finishing, a trigger firing, an app or workspace emitting a domain event with `events` action='emit': every one of those is an event the engine already publishes, and `await_event` subscribes you to it, then re-opens this thread as a new turn when it arrives.
+- Reach for it INSTEAD of a `bash_output` drain loop, a `sleep`-and-recheck script, or a `lucidos threads list` / `lucidos changes list` poll. A poll loop for a state change is strictly worse on every axis: it burns a full model turn per check, it samples on an interval so it can miss or tear a transition that opens and closes in between, and it dies on restart. `await_event` costs zero turns while watching, is exact, and is persisted, so it survives a restart and still wakes you.
+- It is a RENDEZVOUS, not a stream: the first match resolves it. "Continue when the next X happens" is `await_event`; "react to every X, forever" is a trigger. That is only the duration half of the choice. The destination half is the "TELL ME WHEN X HAPPENS" block above, and it is the half that decides "let me know HERE when X happens".
+- It is ALSO how you deliver, not only how you wait. Nothing has to be blocking you: if the user wants to be told about something in THIS conversation, `await_event` is the mechanism even though your turn could have ended fine without it.
+- It is NOT for external state with no Lucidos event (a third-party API you can only re-query, a file another process might write). Poll for those, with the background tools above.
+- IT RETURNS IMMEDIATELY AND BLOCKS NOTHING. Say what you are waiting for and END YOUR TURN: the thread is then plain idle while it watches. Do not keep the turn alive, and do not poll to see whether it fired.
+- After it wakes you, carry on with the whole conversation behind you. The subscription is SPENT once it wakes you, so call `await_event` again in that turn if you want the next one too; narrating a re-subscribe is not one.
 
 USER ASKS FOR LIVE PROGRESS IN THIS CHAT ("ping me every 60s", "show me a bar, sleep, show again"):
+- This is the case where a loop IS right: the user wants to watch something tick, so the point is the intermediate output, not the end state. If what they actually want is to be told WHEN something lands, that is not live progress: `await_event` it and report once.
 - Don't chain `run_bash` calls of `sleep 60 && check` — the third call's result gets replaced with a STOP, and if you keep going the fifth ends the turn.
 - DO use ONE run_python call with an internal loop, e.g. `for _ in range(4): print(bar()); time.sleep(60)` — the first actionable line is unique to that workflow so it won't bucket with anything else, and you can do ~4 iterations of 60s sleep under the 300s ceiling. Stream a summary to the user when the call returns, then end the turn — their next message naturally re-engages a fresh poll round.
 - For checks longer than ~4 minutes, spawn ONE run_bash_background (or run_python_background) that appends a progress line to a file every N seconds; in subsequent turns drain with `bash_output(task_id, wait_secs=60)` and read the file with read_file when needed.
 
 REFRESHING OPEN WINDOWS:
-When you modify a file that the user has open (shown in FOCUSED WINDOW context):
-- After writing/editing: call refresh_file(path)
-- App UIs are refreshed automatically when their files are modified — do NOT tell the user to refresh
-- If the user doesn't have the file open, just mention the path — it will appear as a clickable link
+- A file the user has open (shown in FOCUSED WINDOW context) refreshes ITSELF the moment you write it. There is no file-refresh tool and you must not spend a step on one: after write_file / edit_file / run_python, the preview already shows the new content. (refresh_app is a different thing and still exists, see below.)
+- App UIs are refreshed automatically when their files are modified. Do NOT tell the user to refresh.
+- If the user doesn't have the file open, just mention the path. It will appear as a clickable link.
 
 FILE REFERENCES:
 - Always use the full path when mentioning files (e.g., "artifacts/notes.md", not just "notes.md")
@@ -769,12 +942,14 @@ You have two tools for spawning Lucidos threads:
 - run_coding_agent: Start a coding-agent session for code tasks (creates worktree, proposes changes). Default is Claude Code; set `coding_agent="codex"` when the user asks for Codex or OpenAI Codex.
 - run_thread: Start a Lucidos thread for non-code tasks (research, analysis, drafting)
 And one for steering a child you already spawned:
-- follow_up_child_thread: Send a message to one of YOUR OWN child threads. Redirect one going the wrong way, hand it something a sibling learned, or tell a stalled one to continue. It returns as soon as the message lands and does NOT wait for the child, so issue it and end your turn; the child reports back the usual way. A follow-up does NOT consume a child slot (the limit below counts threads spawned, not messages sent), so reviving a child you already have is cheaper than spawning another one, and a revived child gets a fresh turn with the full tool set and can spawn its own children within its own depth and fan-out limits. You can only address your own DIRECT children; use the `threads` tool's 'list' action with `my_children: true` to see them, their status, and which one is parked rather than working.
+- follow_up_child_thread: Send a message to one of YOUR OWN child threads. Redirect one going the wrong way, hand it something a sibling learned, or tell a stalled one to continue. It returns as soon as the message lands and does NOT wait for the child, so issue it and end your turn; the child reports back the usual way. A follow-up does NOT consume a child slot (the limit below counts threads spawned, not messages sent), so reviving a child you already have is cheaper than spawning another one, and a revived child gets a fresh turn with the full tool set and can spawn its own children within its own depth and fan-out limits. You can only address your own DIRECT children; use the `threads` tool's 'list' action with `my_children: true` to see them, their status, and which one is waiting on you rather than working.
 Both spawn tools accept an optional `relation` argument (default `"child"`):
 - `relation: "child"` — child thread. Runs independently; when it completes a callback resumes this thread with its result. Use for delegated subtasks whose outcome you need yourself. (`"sub"` is accepted as a back-compat alias.)
 - `relation: "top"` — top-thread. Independent top-level thread; this thread does NOT resume when it finishes. Use ONLY when the user asked for the work to happen in a separate thread they will follow themselves (e.g. "do this in a separate thread", "spawn a session for this and I'll check in later").
 The callback only works for SAME-workspace child threads spawned via these tools. POSTs to another workspace's /api/v1/chat/stream are always fire-and-forget — see the cross-workspace knowhow.
 For pipelines where step N depends on step N-1's outcome, spawn one child thread per response and wait for the callback before spawning the next — do not batch sequential spawns in one response.
+
+__NO_IMPERSONATION_RULE__
 
 __ENGINE_RESTART_RULE__
 
@@ -820,7 +995,10 @@ __REPEATED_ACTION_RULE__"#;
                 "__WORKSPACE_ASSETS_KNOWHOW_RULE__",
                 WORKSPACE_ASSETS_KNOWHOW_RULE,
             )
+            .replace("__SETUP_INTERVIEW_RULE__", SETUP_INTERVIEW_RULE)
+            .replace("__TRIGGER_VS_EVENT_WAIT_RULE__", TRIGGER_VS_EVENT_WAIT_RULE)
             .replace("__NAMES_NOT_IDS_RULE__", NAMES_NOT_IDS_RULE)
+            .replace("__NO_IMPERSONATION_RULE__", NO_IMPERSONATION_RULE)
             .replace("__REPEATED_ACTION_RULE__", REPEATED_ACTION_RULE)
             .replace("__MAX_TOOL_CALLS__", &max_tool_calls.to_string())
             .replace(
@@ -1033,7 +1211,8 @@ mod tests {
     use super::super::super::process_helpers::{APPLY_VERIFY_DEV_ADDENDUM, APPLY_VERIFY_RULE};
     use super::{
         coding_surface_section, workspace_identity_section, ASK_USER_QUESTION_RULE,
-        NAMES_NOT_IDS_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
+        NAMES_NOT_IDS_RULE, NO_IMPERSONATION_RULE, SETUP_INTERVIEW_RULE,
+        TRIGGER_VS_EVENT_WAIT_RULE, WORKSPACE_ASSETS_KNOWHOW_RULE,
     };
     use std::path::{Path, PathBuf};
 
@@ -1149,6 +1328,93 @@ mod tests {
                 "renamed knowhow id {stale} still routed:\n{rule}"
             );
         }
+    }
+
+    /// The setup interview's discovery route must name a knowhow id that
+    /// actually resolves. Same failure mode as
+    /// `workspace_assets_rule_names_only_live_knowhow_ids`: the id is
+    /// filename-derived, so renaming the file leaves the route pointing at
+    /// nothing and `load_knowhow` answers with the not-found sentinel, at which
+    /// point the button fires and the agent improvises an interview.
+    #[test]
+    fn setup_interview_rule_routes_to_a_live_knowhow_id() {
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        assert!(
+            SETUP_INTERVIEW_RULE.contains("`system-knowhow/setup-interview`"),
+            "the route must name the knowhow id:\n{SETUP_INTERVIEW_RULE}"
+        );
+        assert!(
+            repo.join("system-knowhow/setup-interview.md").exists(),
+            "routed id system-knowhow/setup-interview has no backing file, so \
+             load_knowhow would return the not-found sentinel"
+        );
+    }
+
+    /// The route has to survive the ACTION FIRST rule that follows it in the
+    /// prompt. That rule says "Don't ask clarifying questions" and excepts only
+    /// workspace assets, so without an explicit carve-out the agent reads the
+    /// interview request as a normal request, skips the ladder, and builds
+    /// something generic on turn one. The carve-out IS the feature here: the
+    /// questions are the work.
+    #[test]
+    fn setup_interview_rule_carves_itself_out_of_action_first() {
+        assert!(
+            SETUP_INTERVIEW_RULE.contains("ACTION FIRST rule below does NOT apply"),
+            "the interview must except itself from ACTION FIRST, or the agent \
+             skips the questions:\n{SETUP_INTERVIEW_RULE}"
+        );
+    }
+
+    /// Cross-layer pin for the entry point's discovery. The welcome CTA and the
+    /// header help button send a FIXED sentence as an ordinary user message
+    /// (`SETUP_INTERVIEW_PROMPT` in `store/actions/compose.ts`), and the route
+    /// only fires if the prompt says something the route recognises. All three
+    /// sides carry this phrase verbatim; the frontend half is pinned from its
+    /// own direction by `welcome-onboarding.test.tsx`. Reading the sources here
+    /// is what makes this a real check on the set rather than three independent
+    /// assertions that the same string equals itself.
+    ///
+    /// The knowhow's frontmatter `description` is the third arm because it is
+    /// the SECOND discovery path: retrieval, for a user who types the request
+    /// themselves rather than pressing the button. A description that no longer
+    /// mentions the sentence leaves the feature alive on the hardcoded route
+    /// alone, which is exactly the kind of silent single-point-of-failure this
+    /// pair of paths exists to avoid.
+    #[test]
+    fn setup_interview_route_matches_the_frontend_seeded_prompt() {
+        const ANCHOR: &str = "help me get the most out of lucidos";
+
+        assert!(
+            SETUP_INTERVIEW_RULE.to_lowercase().contains(ANCHOR),
+            "the route must recognise the phrase the button actually sends:\n{SETUP_INTERVIEW_RULE}"
+        );
+
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let read = |rel: &str| {
+            let path = repo.join(rel);
+            std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+                .to_lowercase()
+        };
+
+        assert!(
+            read("crates/lucidos-app/src/store/actions/compose.ts").contains(ANCHOR),
+            "the frontend's seeded prompt no longer carries the phrase the \
+             system-prompt route keys on, so clicking the button would start an \
+             ordinary chat instead of the setup interview"
+        );
+
+        let knowhow = read("system-knowhow/setup-interview.md");
+        let description = knowhow
+            .split("\n---")
+            .next()
+            .expect("split always yields at least one element");
+        assert!(
+            description.contains(ANCHOR),
+            "the setup-interview knowhow's frontmatter description no longer \
+             carries the seeded phrase, so a user who TYPES the request has to \
+             rely on the hardcoded route matching instead of retrieval"
+        );
     }
 
     /// The reported failure, pinned. On an install with no source checkout the
@@ -1348,6 +1614,43 @@ mod tests {
         );
     }
 
+    /// Regression guard for the 2026-08-06 incident. The rule has to carry two
+    /// things, and the second is the one that was actually missing on the day:
+    /// the prohibition, and what to do instead. An agent that only knows it may
+    /// not work around a tool still has to be told that reporting the block IS
+    /// the correct turn, because the failure was silence plus a workaround, not
+    /// a misunderstanding of the tool's scope.
+    #[test]
+    fn no_impersonation_rule_bans_the_workaround_and_names_the_honest_move() {
+        let rule = NO_IMPERSONATION_RULE;
+        for needle in [
+            "NEVER ACT AS THE USER, AND NEVER ROUTE AROUND A TOOL",
+            "curl",
+            "as though the user typed it",
+        ] {
+            assert!(
+                rule.contains(needle),
+                "rule must ban the workaround (`{needle}`):\n{rule}"
+            );
+        }
+        assert!(
+            rule.contains("WHEN A TOOL REFUSES YOU, SAY SO"),
+            "rule must name the honest move, not just the ban:\n{rule}"
+        );
+        assert!(
+            rule.contains("not possible") && rule.contains("offer what IS"),
+            "rule must tell the agent to report the block AND offer an alternative, \
+             or a refusal just becomes a dead end:\n{rule}"
+        );
+        // The engine refuses these requests too, but a rule that leans on the
+        // block invites hunting for the gap. Say the block exists and then say
+        // not to probe it.
+        assert!(
+            rule.contains("do not go looking for the edge it misses"),
+            "rule must not read as an invitation to find the engine's gap:\n{rule}"
+        );
+    }
+
     /// Regression guard for the reported card: a timezone question whose
     /// fourth option was "Other, I'll type it". Lucidos has no text-entry
     /// option, so tapping it returns that label as the user's answer. The rule
@@ -1396,5 +1699,68 @@ mod tests {
 
         let section = workspace_identity_section("shared", outside, "", "");
         assert!(section.contains("WORKSPACE: shared (/srv/lucidos/ws)"));
+    }
+
+    /// The 2026-08-06 miss, pinned. Asked to be told "here" when a coding agent
+    /// edits code, the agent went looking for a trigger, wrote "a trigger can't
+    /// write into this chat thread" as a caveat, and asked which granularity of
+    /// trigger to build. Every surface framed `await_event` as an anti-polling
+    /// remedy, and the only stated test (one-shot vs standing) picks a trigger
+    /// for that sentence.
+    ///
+    /// Three things have to hold together. The destination question must be
+    /// present, the duration question must SURVIVE beside it (a rule that only
+    /// says "in this thread means await_event" pushes a genuine standing rule
+    /// into a one-shot wait), and neither may overclaim: a trigger reaches the
+    /// user perfectly well, just not inside the conversation they typed into.
+    #[test]
+    fn trigger_vs_event_wait_rule_routes_on_destination_without_overclaiming() {
+        let rule = TRIGGER_VS_EVENT_WAIT_RULE;
+
+        // Destination: the axis that was missing everywhere.
+        assert!(
+            rule.contains("WHERE"),
+            "the destination question has to be asked explicitly:\n{rule}"
+        );
+        assert!(
+            rule.contains("cannot continue the conversation you are in"),
+            "the fact the agent derived and then ignored must be stated as the \
+             disqualifier, not left to be re-derived:\n{rule}"
+        );
+        assert!(
+            rule.contains("even when the phrasing sounds like a standing rule"),
+            "the miss was phrasing that reads as standing, so the rule has to \
+             pre-empt exactly that reading:\n{rule}"
+        );
+
+        // Duration: the axis that already existed, which must not be lost.
+        assert!(
+            rule.contains("one-shot") && rule.contains("outlive this conversation"),
+            "dropping the duration half routes standing rules into a wait that \
+             stops after one match:\n{rule}"
+        );
+
+        // Both mechanisms named, so neither half is a dead end.
+        assert!(
+            rule.contains("await_event") && rule.contains("trigger"),
+            "a fork has to name both branches:\n{rule}"
+        );
+
+        // No overclaim. A trigger notifying the user is its normal, correct
+        // behaviour; only in-conversation delivery is out of reach.
+        assert!(
+            rule.contains("reaches the user as a notification"),
+            "must say what a trigger DOES do, or it reads as 'triggers cannot \
+             tell me anything':\n{rule}"
+        );
+
+        // The heading is a cross-reference anchor: the "WAITING FOR A STATE
+        // CHANGE IN LUCIDOS" section points the model back here by name, and
+        // that pointer is the only route from the duration half to this one.
+        assert!(
+            rule.starts_with("\"TELL ME WHEN X HAPPENS\""),
+            "the state-change section names this block by its opening heading; \
+             renaming it here silently dangles that pointer:\n{rule}"
+        );
     }
 }

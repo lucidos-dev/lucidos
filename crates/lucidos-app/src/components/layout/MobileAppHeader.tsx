@@ -9,6 +9,7 @@ import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { ThreadNav } from '../shared/ThreadNav';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
 import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
+import { SetupInterviewButton } from '../shared/SetupInterviewButton';
 import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
 import { ControlPanel, BrandBadge, toggleControlPanelAtClick } from './ControlPanel';
@@ -94,6 +95,7 @@ function MobileThreadsHeader() {
             .mobile-header-title); the spacer pins the trailing icons right. */}
         <span class="pane-header-title mobile-header-title">Threads</span>
         <div class="pane-header-spacer" />
+        <SetupInterviewButton />
         <button
           class="icon-btn header-icon brand-compose-btn"
           {...composeHandlers(() => unfocusThread())}
@@ -147,6 +149,13 @@ function MobileThreadHeader() {
           <ControlPanel layout="mobile" />
         </span>
         <div class="pane-header-spacer" />
+        {/* No SetupInterviewButton here, deliberately. This row is the one that
+            is out of space: the brand is absolutely centered and shrink-to-
+            content, and a fourth trailing icon beside compose + search + menu
+            pushes the brand into the cluster at 375px (measured, not guessed:
+            e2e/mobile-threads-title-alignment.spec.ts fails on the overlap).
+            Mobile reaches the setup interview from the Threads header above,
+            which has room and is where "start something new" already lives. */}
         <button
           class="icon-btn header-icon brand-compose-btn"
           {...composeHandlers(() => unfocusThread())}

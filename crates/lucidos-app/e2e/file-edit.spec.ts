@@ -6,6 +6,7 @@ import {
   openFilesPanel,
   waitForVisibleElement,
   clickVisibleElement,
+  clickHeaderAction,
   gotoWithRetry,
 } from './helpers';
 
@@ -63,9 +64,8 @@ test.describe('File preview inline editing', () => {
     await waitForVisibleElement(page, '.file-preview-content', 10_000);
     await expect(page.locator('.file-preview-content:visible').first()).toContainText('original body');
 
-    // Enter edit mode via the header Edit button.
-    await waitForVisibleElement(page, '.file-edit-btn', 5_000);
-    expect(await clickVisibleElement(page, '.file-edit-btn')).toBe(true);
+    // Enter edit mode via the header Edit action (in the ⋯ menu on a narrow row).
+    await clickHeaderAction(page, '.file-edit-btn');
 
     // The editable textarea appears, seeded with the current raw content.
     const textarea = page.locator('.file-editor-textarea:visible').first();
@@ -91,8 +91,7 @@ test.describe('File preview inline editing', () => {
     await waitForVisibleElement(page, '.file-item', 15_000);
     expect(await clickVisibleElement(page, '.file-item', fileName)).toBe(true);
 
-    await waitForVisibleElement(page, '.file-edit-btn', 10_000);
-    expect(await clickVisibleElement(page, '.file-edit-btn')).toBe(true);
+    await clickHeaderAction(page, '.file-edit-btn');
 
     const textarea = page.locator('.file-editor-textarea:visible').first();
     await expect(textarea).toBeVisible({ timeout: 5_000 });

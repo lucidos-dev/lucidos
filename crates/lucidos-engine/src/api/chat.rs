@@ -57,6 +57,201 @@ pub(crate) fn subprocess_chat_legitimate(
     }
 }
 
+/// What the engine tells a caller that tried to record a turn as the user
+/// without any evidence of being the user. Written for the agent that will read
+/// it: what was refused, why, and what to do instead. A bare status code would
+/// reach the caller as nothing at all, since `statusText` is always empty over
+/// HTTP/2 (the same defect already fixed for the continuity lock below).
+pub(crate) const HUMAN_MODE_UNATTRIBUTED: &str = "\
+`mode: \"human\"` requires a registered device, and this request has none, so \
+the engine cannot record it as something the user typed. If you are an agent: \
+do not post to the engine API as the user. Use `follow_up_child_thread` (or \
+`lucidos threads follow-up`) to reach one of your own child threads, and if no \
+tool covers what you were asked to do, tell the user it is not possible rather \
+than working around the tool.";
+
+/// May this request be recorded as a turn the *user* authored?
+///
+/// The engine holds exactly three kinds of identity evidence, and only two of
+/// them can vouch for a human:
+///
+/// - **Device attribution**: a `device_id` (body field, else the
+///   `x-lucidos-device-id` header) that resolves to a row in `devices`. This is
+///   the user's own client, which sends it on every mutating fetch.
+/// - **A `caller_workspace`**: another workspace vouching for its own human.
+///   Still only a display hint (`api::actor`), but it is the existing
+///   cross-workspace contract and this gate does not renegotiate it.
+/// - The **thread-bound origin token**, which vouches for a *subprocess* and
+///   therefore proves the opposite: `subprocess_chat_legitimate` refuses
+///   `mode: Human` outright.
+///
+/// Anything else is an *unattributed caller* and may not claim to be the user.
+///
+/// ## Why this exists on top of `subprocess_chat_legitimate`
+///
+/// That gate is the stricter one, but it only runs for a caller that
+/// *presents* a token, so **dropping the token bought strictly more privilege
+/// than presenting it**: a Lucidos-spawned subprocess that shelled out to
+/// `curl` instead of the CLI (which forwards the token automatically) read as
+/// an ordinary external API client and could post `mode: human` into any
+/// thread. That inversion is the 2026-08-06 incident, and this predicate is
+/// what removes it: the constraint no longer depends on the constrained party
+/// opting in.
+///
+/// Pure function, so the matrix is unit-testable without a router or a
+/// database. The device lookup happens in
+/// [`require_human_mode_is_attributed`].
+pub(crate) fn human_mode_is_attributed(
+    mode: ActorMode,
+    device_attributed: bool,
+    caller_workspace_present: bool,
+) -> bool {
+    match mode {
+        ActorMode::Human => device_attributed || caller_workspace_present,
+        // Agent / Engine make no claim about a human, so there is nothing to
+        // substantiate. `validate_mode_and_spawn` requires their provenance and
+        // `subprocess_chat_legitimate` constrains their reach.
+        ActorMode::Agent | ActorMode::Engine => true,
+    }
+}
+
+/// Resolve the device evidence for `request` and refuse a `mode: human` claim
+/// that has none. Called by BOTH chat entry points before any other work, so a
+/// refusal writes nothing.
+///
+/// The device id precedence mirrors `actor::user_actor_resolved`: the body
+/// field wins, then the `x-lucidos-device-id` header. The two must agree or the
+/// gate would accept a shape the origin builder then stamps differently.
+///
+/// A database error counts as attributed. The probe is on the user's own send
+/// path, so an outage that made it fail closed would refuse real messages;
+/// `DeviceStore::is_registered` returns the error precisely so this fallback is
+/// chosen here, in the open, rather than swallowed at the query.
+async fn require_human_mode_is_attributed(
+    pool: &sqlx::PgPool,
+    headers: &axum::http::HeaderMap,
+    request: &ChatRequest,
+) -> Result<(), ApiError> {
+    if request.mode != ActorMode::Human {
+        return Ok(());
+    }
+    // Blank-filter EACH source BEFORE falling back, not the winner afterwards.
+    // `Some("")` is a present-but-empty body field, and `Option::or` keeps it,
+    // so filtering after the fallback lets an empty `device_id` shadow a
+    // perfectly good `x-lucidos-device-id` header and refuse a request that is
+    // in fact device-attributed.
+    // A nested `fn` rather than a closure so it can borrow from its argument:
+    // that keeps both sources as `&str` and the whole resolution allocation-free.
+    fn blank_filtered(s: &str) -> Option<&str> {
+        let t = s.trim();
+        (!t.is_empty()).then_some(t)
+    }
+    let device_id = request
+        .device_id
+        .as_deref()
+        .and_then(blank_filtered)
+        .or_else(|| {
+            headers
+                .get(super::actor::HEADER_DEVICE_ID)
+                .and_then(|v| v.to_str().ok())
+                .and_then(blank_filtered)
+        });
+    let device_attributed = match device_id {
+        Some(id) => match crate::core::DeviceStore::is_registered(pool, id).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                log!(
+                    "[Chat] device lookup for '{}' failed ({}); treating the request as \
+                     device-attributed so a database blip cannot refuse a real send",
+                    id,
+                    e
+                );
+                true
+            }
+        },
+        None => false,
+    };
+    if human_mode_is_attributed(
+        request.mode,
+        device_attributed,
+        request.caller_workspace.is_some(),
+    ) {
+        return Ok(());
+    }
+    log!(
+        "[Chat] Refusing unattributed mode=human POST: device_id={:?}, user_agent={:?}, thread={:?}",
+        device_id,
+        headers.get("user-agent").and_then(|v| v.to_str().ok()),
+        request.thread_id
+    );
+    Err(ApiError::new(
+        StatusCode::FORBIDDEN,
+        HUMAN_MODE_UNATTRIBUTED,
+    ))
+}
+
+/// What the engine tells a caller that addressed a `thread_id` naming nothing.
+pub(crate) fn unknown_thread_message(thread_id: Uuid) -> String {
+    format!(
+        "No thread {thread_id} exists in this workspace, and this request does not say it is \
+         creating one, so nothing was written. If you meant to start a new thread, send \
+         `new_thread: true`. If you meant to reach an existing thread, you are addressing the \
+         wrong engine or the wrong id: several Lucidos engines run on one machine, each serving \
+         a different workspace, so check GET /api/v1/health before retrying."
+    )
+}
+
+/// May this request address `thread_id`?
+///
+/// A thread has no creation event. It exists because an event exists on its
+/// aggregate id, and the `MessageReceived` projection
+/// (`engine::event_bus_projection_thread`) is an `INSERT … ON CONFLICT DO
+/// UPDATE`, so an id naming nothing took the insert arm and the thread came
+/// into being. That made a client-supplied id self-fulfilling: a caller that
+/// reached the WRONG engine got its threads created there, and its own
+/// read-back-to-verify step then found the message and confirmed the mistake.
+/// A wrong-target write was indistinguishable from a correct one.
+///
+/// So a create must be explicit. Three things count as saying so, and the
+/// second and third are why no existing caller had to change:
+///
+/// - `new_thread: true`, the frontend's raw-new and compose-first sends;
+/// - `parent_thread_id`, a same-workspace spawn with callback
+///   (`lucidos spawn-thread --relation child`);
+/// - `caller_workspace`, a cross-workspace spawn
+///   (`engine::http::workspace_client`, `lucidos spawn-thread --to`).
+///
+/// A request with no `thread_id` at all is not this function's business: the
+/// engine mints the id itself and there is nothing for a caller to have got
+/// wrong.
+///
+/// Pure function, unit-testable without a router.
+pub(crate) fn thread_target_is_addressable(
+    thread_exists: bool,
+    new_thread: Option<bool>,
+    parent_thread_id: Option<Uuid>,
+    caller_workspace_present: bool,
+) -> bool {
+    thread_exists
+        || new_thread == Some(true)
+        || parent_thread_id.is_some()
+        || caller_workspace_present
+}
+
+/// Does a `thread_summaries` row exist for `thread_id`?
+///
+/// `chat_submit` gets the same answer for free from the row it already reads
+/// for the continuity lock; this is for the legacy `/chat` route, which reads
+/// nothing else and would otherwise have to skip the check.
+async fn thread_summary_exists(pool: &sqlx::PgPool, thread_id: Uuid) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar::<_, bool>(
+        "SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)",
+    )
+    .bind(thread_id)
+    .fetch_one(pool)
+    .await
+}
+
 /// Announce every orphan in `batch` as `UserPromptInjected`, anchored on the
 /// batch's first message (the turn the re-process runs under).
 ///
@@ -172,6 +367,7 @@ pub(crate) async fn process_orphan_chain(
                     origin_event_id.map(PreEmittedOrigin::EngineReentry),
                     None,
                     None,
+                    crate::engine::FollowUpUrgency::Normal,
                 )
                 .await
             {
@@ -400,11 +596,18 @@ pub(super) fn validate_thread_continuity(
 
 pub(super) async fn chat(
     State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
     Json(request): Json<ChatRequest>,
-) -> Result<Json<ChatResponse>, StatusCode> {
+) -> Result<Json<ChatResponse>, ApiError> {
     if let Some(ref model) = request.model {
         log!("[Chat] Using model: {}", model);
     }
+
+    // Same gate as `chat_submit`, first thing, for the same reason: this
+    // handler also persists a `MessageReceived` carrying the body's `mode`. It
+    // is in fact the wider hole of the two, because it never builds a
+    // `MessageOrigin` and never runs the subprocess gate.
+    require_human_mode_is_attributed(&state.pool, &headers, &request).await?;
 
     let validated = validate_mode_and_spawn(&request)?;
     let ValidatedSpawn {
@@ -424,6 +627,27 @@ pub(super) async fn chat(
     // Reject malformed thread_id with 400 instead of silently starting a new
     // thread (CLAUDE.md "no silent defaults").
     let thread_id = parse_optional_uuid(request.thread_id.as_deref())?;
+    // And reject a WELL-FORMED id that names nothing, on the same terms as
+    // `chat_submit`. Two entry points that disagree about which requests are
+    // legitimate is the shape that leaves a hole, so this route pays for its own
+    // existence query rather than skipping the check.
+    if let Some(tid) = thread_id {
+        let exists = thread_summary_exists(state.engine.pool(), tid)
+            .await
+            .map_err(|e| {
+                log!("[Chat] thread_summaries lookup failed for {}: {}", tid, e);
+                ApiError::db(e)
+            })?;
+        if !thread_target_is_addressable(
+            exists,
+            request.new_thread,
+            parent_thread_id,
+            request.caller_workspace.is_some(),
+        ) {
+            log!("[Chat] Refusing to address unknown thread {} on /chat", tid);
+            return Err(ApiError::not_found(unknown_thread_message(tid)));
+        }
+    }
     Ok(
         match state
             .engine
@@ -449,6 +673,7 @@ pub(super) async fn chat(
                 None,
                 request.title.as_deref(),
                 None,
+                crate::engine::FollowUpUrgency::Normal,
             )
             .await
         {
@@ -583,7 +808,7 @@ pub(super) async fn chat_submit(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
     Json(mut request): Json<ChatRequest>,
-) -> Result<Json<ChatSubmitResponse>, StatusCode> {
+) -> Result<Json<ChatSubmitResponse>, ApiError> {
     // Capture frontend origin from the browser Origin header so the LLM
     // system prompt can show the user-facing Lucidos URL. Skip cross-workspace
     // calls (a cross-workspace caller — `caller_workspace` set in body) so a
@@ -596,6 +821,11 @@ pub(super) async fn chat_submit(
             }
         }
     }
+    // The human-attribution gate runs before every other check, so a refusal
+    // writes nothing at all. See `human_mode_is_attributed` for why it sits in
+    // front of the (stricter, but opt-in) subprocess gate further down.
+    require_human_mode_is_attributed(&state.pool, &headers, &request).await?;
+
     let ValidatedSpawn {
         parent_thread_id,
         spawning_event_id,
@@ -636,6 +866,28 @@ pub(super) async fn chat_submit(
         };
     let thread_exists = existing_thread_row.is_some();
 
+    // An id-carrying create must say so. Runs before the subprocess gate
+    // deliberately: a caller that named a thread which does not exist here has
+    // most likely reached the wrong engine, and the 404 says so, where the
+    // subprocess gate's 403 would blame the caller's relationship to a thread
+    // that was never the one it meant. See `thread_target_is_addressable`.
+    if let Some(tid) = target_thread_id {
+        if !thread_target_is_addressable(
+            thread_exists,
+            request.new_thread,
+            parent_thread_id,
+            request.caller_workspace.is_some(),
+        ) {
+            log!(
+                "[Chat] Refusing to address unknown thread {} (no create signal): mode={:?}, user_agent={:?}",
+                tid,
+                mode,
+                headers.get("user-agent").and_then(|v| v.to_str().ok())
+            );
+            return Err(ApiError::not_found(unknown_thread_message(tid)));
+        }
+    }
+
     // Subprocess gate — see `subprocess_chat_legitimate` for the matrix.
     // Skipped on the cross-workspace path: those requests have their own
     // origin contract (Workspace variant) and don't route through the
@@ -659,7 +911,7 @@ pub(super) async fn chat_submit(
                     parent_thread_id,
                     thread_exists
                 );
-                return Err(StatusCode::FORBIDDEN);
+                return Err(StatusCode::FORBIDDEN.into());
             }
         }
     }
@@ -772,7 +1024,7 @@ pub(super) async fn chat_submit(
     // would silently vanish (the chat-agent path never reads it). Reject early.
     if coding_agent.is_some() && use_coding_agent != Some(true) {
         log!("[Chat] chat_submit received `coding_agent` without `use_coding_agent=true` — rejecting");
-        return Err(StatusCode::BAD_REQUEST);
+        return Err(StatusCode::BAD_REQUEST.into());
     }
     let event_id = request.event_id;
     // Re-bind under the existing name so the rest of the handler reads
@@ -795,11 +1047,11 @@ pub(super) async fn chat_submit(
                 Ok(Some(repo)) => Some(repo.id.to_string()),
                 Ok(None) => {
                     log!("[Chat] Unknown repo name '{}' in chat_submit", s);
-                    return Err(StatusCode::BAD_REQUEST);
+                    return Err(StatusCode::BAD_REQUEST.into());
                 }
                 Err(e) => {
                     log!("[Chat] Failed to look up repo '{}': {}", s, e);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
                 }
             }
         }
@@ -823,7 +1075,7 @@ pub(super) async fn chat_submit(
     let (repo_id, thread_id, app_id_to_stash) = if let Some(folder_str) = folder_in {
         if repo_id.as_deref().is_some_and(|s| !s.is_empty()) {
             log!("[Chat] chat_submit received both `folder` and `repo_id` — rejecting");
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(StatusCode::BAD_REQUEST.into());
         }
         // `folder` is a CC-spawn payload — when CC isn't requested, the
         // resolved app_id_to_stash would sit forever in `pending_app_spawn`
@@ -832,7 +1084,7 @@ pub(super) async fn chat_submit(
             log!(
                 "[Chat] chat_submit received `folder` without `use_coding_agent=true` — rejecting"
             );
-            return Err(StatusCode::BAD_REQUEST);
+            return Err(StatusCode::BAD_REQUEST.into());
         }
         // Canonicalize workspace_root too — classify_resolved_folder's
         // `.starts_with(workspace_root.join("data"))` check uses this prefix
@@ -859,7 +1111,7 @@ pub(super) async fn chat_submit(
                 Ok(v) => v,
                 Err(e) => {
                     log!("[Chat] failed to list repos for folder resolution: {}", e);
-                    return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                    return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
                 }
             };
         // Canonicalize each registered path once. Both `resolve_folder_input`
@@ -918,7 +1170,7 @@ pub(super) async fn chat_submit(
             Ok(p) => p,
             Err(e) => {
                 log!("[Chat] folder `{}` failed to resolve: {}", folder_str, e);
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(StatusCode::BAD_REQUEST.into());
             }
         };
         let external_repo_match = |path: &std::path::Path| -> Option<PathBuf> {
@@ -946,7 +1198,7 @@ pub(super) async fn chat_submit(
                     folder_str,
                     e
                 );
-                return Err(StatusCode::BAD_REQUEST);
+                return Err(StatusCode::BAD_REQUEST.into());
             }
         };
         match classification {
@@ -967,7 +1219,7 @@ pub(super) async fn chat_submit(
                              external_repo_match invariant violated",
                             repo_root
                         );
-                        return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                        return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
                     }
                 };
                 (Some(repo_uuid), thread_id, None)
@@ -1016,8 +1268,13 @@ pub(super) async fn chat_submit(
                 repo_id.as_deref(),
                 coding_agent,
             ) {
+                // The message goes to the CLIENT, not just the log. Returning a
+                // bare `sc` sent an empty body, and `statusText` is always ""
+                // over HTTP/2, so the user's toast read "Failed to send
+                // message: 409" with no hint that the thread was locked to a
+                // different mode.
                 log!("[Chat] Reject follow-up on thread {}: {}", tid, msg);
-                return Err(sc);
+                return Err(ApiError::new(sc, msg));
             }
         }
     }
@@ -1094,7 +1351,7 @@ pub(super) async fn chat_submit(
             }
             Err(e) => {
                 log!("[Chat] pending_app_spawn poisoned, cannot stash: {}", e);
-                return Err(StatusCode::INTERNAL_SERVER_ERROR);
+                return Err(StatusCode::INTERNAL_SERVER_ERROR.into());
             }
         }
     }
@@ -1171,6 +1428,7 @@ pub(super) async fn chat_submit(
                 pre_emitted_origin,
                 title.as_deref(),
                 origin,
+                crate::engine::FollowUpUrgency::Normal,
             )
             .await;
 
@@ -1366,6 +1624,26 @@ pub(super) async fn cancel_chat(
     } else {
         false
     };
+    // Stop ends this thread's event waits too (S6b lists a thread-level Stop
+    // as one of the four cancel causes). Done here rather than off the bus,
+    // unlike archive and discard: a PARKED thread has no running turn, so Stop
+    // emits nothing for a bus subscriber to observe, and the wait would outlive
+    // the Stop that was meant to end it. Counts toward `canceled` because it IS
+    // a status-changing event the client will receive.
+    let waits_canceled = match thread_id {
+        Some(uuid) => {
+            state
+                .engine
+                .cancel_event_waits_for_thread(
+                    uuid,
+                    crate::engine::thread_events::EventWaitCancelCause::ThreadCanceled,
+                    actor.clone(),
+                )
+                .await
+                > 0
+        }
+        None => false,
+    };
     // `canceled = false` means the server had nothing live to cancel — the
     // client's optimistic "canceling" state is stale and it must re-sync.
     let canceled = match thread_id {
@@ -1397,7 +1675,7 @@ pub(super) async fn cancel_chat(
         None => state.engine.cancel_all_threads(actor),
     };
     Ok(Json(super::CancelResponse {
-        canceled: question_resolved || canceled,
+        canceled: question_resolved || waits_canceled || canceled,
     }))
 }
 

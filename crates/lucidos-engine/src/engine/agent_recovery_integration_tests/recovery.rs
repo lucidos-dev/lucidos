@@ -954,17 +954,26 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         .await
         .expect("archive the thread");
 
-    // The teardown abort is transient, so every thread reads `paused`, never
-    // `failed`: nothing has gone wrong yet, the engine just went away.
+    let status_of = |thread_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("summary row exists")
+        }
+    };
+
+    // Every thread carries the switch fingerprint (device actor + engine
+    // shutdown), so every one reads `paused`: nothing has gone wrong yet, the
+    // engine just went away and promised to come back.
     for thread_id in [resumed, declined, archived] {
-        let status: String =
-            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
-                .bind(thread_id)
-                .fetch_one(&pool)
-                .await
-                .expect("summary row exists");
         assert_eq!(
-            status, "paused",
+            status_of(thread_id).await,
+            "paused",
             "a switch teardown must settle the thread at paused, not failed"
         );
     }
@@ -1005,6 +1014,26 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
          its only chance: excluding it here is a permanent dead end"
     );
 
+    // The withdrawal has to be VISIBLE, not just recorded. Its abort carries a
+    // system actor and `recovery_after_restart`, neither of which is the switch
+    // fingerprint, so the status follows the promise off `paused` and onto
+    // `failed`: the red dot, a slot in the needs-attention count, and the
+    // Continue button the withdrawal exists to hand back. Leaving these two on
+    // the reassuring pause glyph is exactly the state the user reported.
+    for thread_id in [declined, archived] {
+        assert_eq!(
+            status_of(thread_id).await,
+            "failed",
+            "a withdrawn resume promise must stop reading as paused"
+        );
+    }
+    assert_eq!(
+        status_of(resumed).await,
+        "paused",
+        "the thread whose promise is being KEPT must stay paused: it is on its \
+         way back, and nothing is being asked of the user"
+    );
+
     // The resumed thread's spawn lands its `ContinuationStarted`, which IS in
     // `THREAD_START_EVENTS_SQL`, so from here on the query alone excludes it.
     bus.emit(BusEvent::Thread {
@@ -1036,6 +1065,218 @@ async fn boot_floor_withdraws_only_the_switch_promises_it_did_not_keep() {
         0,
         "a thread resumed on an earlier boot is superseded by its own \
          ContinuationStarted and must never be swept"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// What one stray `ResponseCanceled` costs a switch, and why the fix belongs
+/// upstream of every read in this file.
+///
+/// The reported shape
+/// (`docs/plans/2026-08-06-a-session-that-registers-mid-teardown-is-shutting-down.md`):
+/// a *Switch to new version* landed 2 s into a coding-agent session's spawn. The
+/// teardown snapshot could not see a session that did not exist yet, so nothing
+/// set its `external_terminal_emitted` flag and its per-session `shutting_down`
+/// stayed `false`. When the session registered a second later and its
+/// `chat_cancel` arm fired on the already-cancelled handle token, it read that
+/// bare flag, classified an engine restart as a user Stop, and wrote
+/// `ResponseCanceled{user_stop}` on a turn nobody stopped.
+///
+/// Every recovery read below is correct and unchanged. They simply reached the
+/// right conclusion from a wrong input, which is why the plan's non-goals refuse
+/// to take `ResponseCanceled` out of `TURN_ENDED_EVENT_TYPES_SQL`: that list is
+/// right, and editing it would be a downstream filter over an upstream defect.
+///
+/// Both halves are asserted against the SAME seed minus that one event, so the
+/// test states the cost of the bug rather than merely the shape of the fix.
+#[tokio::test]
+async fn a_stray_cancel_during_teardown_costs_the_switch_its_auto_resume() {
+    use crate::engine::agent_recovery::{
+        settle_unresumed_switch_threads, switch_was_user_initiated, BRANCH_CLASSIFICATION_SQL,
+    };
+    use crate::engine::thread_events::{AbortCause, CancelCause, MessageOrigin};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let device = MessageOrigin::Device {
+        device_id: "d1".into(),
+        label: "My MacBook".into(),
+    };
+    // `fixed` is what the engine now writes; `buggy` is what it wrote before.
+    let fixed = Uuid::new_v4();
+    let buggy = Uuid::new_v4();
+    let branch_of = |thread_id: Uuid| format!("claude-code/{thread_id}");
+
+    let cc_meta = EventMeta {
+        channel: Some(EventChannel::ClaudeCode),
+        ..EventMeta::NONE
+    };
+
+    for thread_id in [fixed, buggy] {
+        // The user's message, which anchors the turn and is the newest start
+        // event, so the teardown abort below out-sequences it.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                text: "so go?".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: crate::engine::thread_events::ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: cc_meta.clone(),
+        })
+        .await
+        .expect("emit succeeds")
+        .expect("event persisted");
+
+        // The switch teardown boundary: device actor + engine shutdown, the
+        // fingerprint the whole auto-resume contract keys on.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ResponseAborted {
+                text: "This response was interrupted by an engine restart.".into(),
+                images: Vec::new(),
+                model: None,
+                reasoning_effort: None,
+                cause: AbortCause::EngineShutdown,
+            },
+            meta: EventMeta {
+                actor: Some(device.clone()),
+                ..cc_meta.clone()
+            },
+        })
+        .await
+        .expect("emit succeeds")
+        .expect("event persisted");
+
+        // The session finally registers, AFTER the boundary. This is the whole
+        // race: `SessionStarted` is what leaves the branch classified `running`.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::SessionStarted {
+                session_id: String::new(),
+                branch: branch_of(thread_id),
+                repo_id: None,
+                coding_agent_kind: crate::engine::agent_session::CodingAgentKind::Lucidos,
+                coding_agent_folder: String::new(),
+                app_id: None,
+                coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+            },
+            meta: cc_meta.clone(),
+        })
+        .await
+        .expect("emit succeeds")
+        .expect("event persisted");
+    }
+
+    // The one event that differs: the phantom cancel the pre-fix engine wrote.
+    // Constructed directly rather than through `emit_response_canceled` on
+    // purpose: that helper's idempotency gate would recognise the abort above by
+    // request id and skip, which is exactly the suppression the pre-fix engine
+    // did NOT have on this path. Going through it would seed a shape the bug
+    // never produced.
+    bus.emit(BusEvent::Thread {
+        thread_id: buggy,
+        event: ThreadEvent::ResponseCanceled {
+            text: String::new(),
+            images: Vec::new(),
+            model: None,
+            reasoning_effort: None,
+            cause: CancelCause::UserStop,
+        },
+        meta: cc_meta.clone(),
+    })
+    .await
+    .expect("emit succeeds")
+    .expect("event persisted");
+
+    // Read 1: the branch classifier decides whether there is a turn to resume.
+    let branch_status = |branch: String| {
+        let pool = pool.clone();
+        async move {
+            let rows: Vec<(String, String)> = sqlx::query_as(&BRANCH_CLASSIFICATION_SQL)
+                .fetch_all(&pool)
+                .await
+                .expect("branch classification query");
+            rows.into_iter()
+                .find(|(b, _)| *b == branch)
+                .map(|(_, status)| status)
+                .expect("the seeded branch is classified")
+        }
+    };
+    assert_eq!(
+        branch_status(branch_of(fixed)).await,
+        "running",
+        "with no phantom cancel the newest lifecycle event is SessionStarted, so \
+         the turn is in flight and the resume gate can pick it up"
+    );
+    assert_eq!(
+        branch_status(branch_of(buggy)).await,
+        "idle",
+        "the phantom cancel is a turn-ended event, so the classifier reads the \
+         turn as finished and no resume is even attempted"
+    );
+
+    // Read 2: the switch fingerprint itself is unharmed either way. The cancel
+    // does not retire the abort (it is not a start event), which is precisely
+    // why the damage is invisible at this layer and only shows up above.
+    for thread_id in [fixed, buggy] {
+        assert!(
+            switch_was_user_initiated(&pool, thread_id).await,
+            "the device-attributed teardown abort is still the newest thing on \
+             the thread in the START-event sense"
+        );
+    }
+
+    // Read 3: the promise as the user sees it. Neither thread was resumed by
+    // this boot, so the floor withdraws both; the point is that only `buggy`
+    // ever reaches this state in production, because `fixed` classifies
+    // `running` above and the resume drain claims it first.
+    let status_of = |thread_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM thread_summaries WHERE thread_id = $1",
+            )
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .expect("summary row exists")
+        }
+    };
+    for thread_id in [fixed, buggy] {
+        assert_eq!(
+            status_of(thread_id).await,
+            "paused",
+            "a switch teardown settles at paused, and the phantom cancel does \
+             not disturb that: `ResponseCanceled` is a verdict-preserving arm"
+        );
+    }
+
+    settle_unresumed_switch_threads(&pool, &bus, &std::collections::HashSet::from([fixed])).await;
+
+    assert_eq!(
+        status_of(fixed).await,
+        "paused",
+        "the resumed thread keeps its promise and stays behind the pause glyph \
+         with no Continue button"
+    );
+    assert_eq!(
+        status_of(buggy).await,
+        "failed",
+        "the reported end state: a transcript that opens 'Paused by restart' and \
+         a thread that ends red, in the attention count, asking the user to \
+         Continue work the engine had promised to resume itself"
     );
 
     pool.close().await;

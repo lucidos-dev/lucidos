@@ -67,6 +67,23 @@ fn read_ports() -> (u16, String) {
     (port, proto.unwrap_or_else(|| "https".to_string()))
 }
 
+/// Serializes every test that touches the workspace's `backup.key`.
+///
+/// Two files contend for it and the contention is not obvious from either:
+/// `backup_key_test` deletes the key and asserts a read-only reveal does not
+/// mint one, while `backup_schedule_test` enables a schedule, and
+/// `PUT /backup/schedule` calls `crypto::ensure_key` whenever the new schedule
+/// is active. Run in parallel, the second silently re-mints the key the first
+/// just removed, and the failure surfaces in the innocent test.
+///
+/// Lives here rather than in either test file because a lock only one side
+/// takes is not a lock.
+pub fn backup_key_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    &LOCK
+}
+
 pub fn workspace_path() -> PathBuf {
     if let Ok(ws) = std::env::var("E2E_WORKSPACE") {
         PathBuf::from(ws)
@@ -132,6 +149,58 @@ pub fn http_client() -> reqwest::Client {
         .danger_accept_invalid_certs(true)
         .build()
         .expect("Failed to build HTTP client")
+}
+
+/// Device id this suite registers to stand in for the user's own client.
+/// Stable across tests: registration is an upsert, and the `DeviceRegistered`
+/// event only fires on the genuine first insert.
+pub const E2E_DEVICE_ID: &str = "e2e-api-client";
+
+/// An HTTP client that speaks for the user, the way the browser does: every
+/// request carries `x-lucidos-device-id` for a device that is registered in
+/// this workspace.
+///
+/// Use this for anything posting `mode: "human"`. The engine refuses a human
+/// claim it has no evidence for (`api::chat::human_mode_is_attributed`), and
+/// this suite IS a legitimate external client, so the honest way to keep it
+/// working is to be a registered one rather than to weaken the gate. Tests that
+/// deliberately exercise the refusal keep using the bare [`http_client`].
+///
+/// **A fresh client per call, deliberately.** Caching one in a `static` looks
+/// like the obvious saving (registration is an upsert, so every call after the
+/// first is a no-op write) and it is a trap: a `reqwest::Client` owns a
+/// connection pool bound to the runtime that built it, each `#[tokio::test]`
+/// gets its OWN runtime, and the first test to finish takes the pool's dispatch
+/// task down with it. A later test reusing the cached client then fails with
+/// `hyper::Error(User(DispatchGone), "runtime dropped the dispatch task")`, on a
+/// different test each run depending on scheduling. The registration POST is a
+/// single indexed upsert against a local engine, which is not the cost worth
+/// optimising here.
+pub async fn user_client() -> reqwest::Client {
+    let resp = http_client()
+        .post(format!("{}/api/v1/devices/register", base_url()))
+        .json(&serde_json::json!({
+            "device_id": E2E_DEVICE_ID,
+            "user_agent": "lucidos-e2e/1",
+        }))
+        .send()
+        .await
+        .expect("device registration request failed");
+    assert!(
+        resp.status().is_success(),
+        "device registration returned {}",
+        resp.status()
+    );
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        "x-lucidos-device-id",
+        reqwest::header::HeaderValue::from_static(E2E_DEVICE_ID),
+    );
+    reqwest::Client::builder()
+        .danger_accept_invalid_certs(true)
+        .default_headers(headers)
+        .build()
+        .expect("Failed to build device-attributed HTTP client")
 }
 
 /// Run a git command in the e2e workspace, asserting success.

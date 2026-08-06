@@ -185,7 +185,11 @@ pub(crate) fn unwrap_shell_command(command: &str) -> &str {
     let Some(first) = trimmed.split_whitespace().next() else {
         return command;
     };
-    let base = first.rsplit('/').next().unwrap_or(first);
+    // Normalized, not a raw basename: `\bash -c '…'` and `"bash" -c '…'` run the
+    // same shell, and leaving them unwrapped hid the payload from every scan
+    // that follows (the head read `\bash`, matched no rule, and the script never
+    // got classified on its own merits). Unwrapping can only ever expose more.
+    let base = normalized_head(first);
     if !SHELLS.contains(&base) {
         return command;
     }
@@ -206,7 +210,19 @@ pub(crate) fn unwrap_shell_command(command: &str) -> &str {
             break;
         }
         if is_shell_c_flag(&trimmed[start..i]) {
-            return shell_script_operand(trimmed[i..].trim());
+            let (script, tail) = split_shell_script_operand(trimmed[i..].trim());
+            // `sh -c <script> [$0 args]` makes the tail positional parameters,
+            // which is why cutting at the close quote is right. But the tail is
+            // only OURS to discard when it really is plain words: a control
+            // operator there belongs to the OUTER shell and runs, so returning
+            // the script alone hid it from every scan
+            // (`bash -c 'echo hi'; rm -rf /` classified as just `echo hi`).
+            // Fall back to the whole command, which the segment split then
+            // covers end to end. Strictly more scanning, never less.
+            if tail_runs_more_commands(tail) {
+                return command;
+            }
+            return script;
         }
     }
     command
@@ -217,8 +233,16 @@ pub(crate) fn unwrap_shell_command(command: &str) -> &str {
 /// `-l`).
 fn is_shell_c_flag(tok: &str) -> bool {
     match tok.strip_prefix('-') {
+        // Any single-dash cluster of ASCII letters containing `c`. An enumerated
+        // letter set was tried and is the wrong shape: it has to list every
+        // option a shell accepts, and the ones it missed (`-uc`, `-vc`, `-Tc`,
+        // `-pc`, `-Bc`, `-Cc`, `-hc`, `-bc`) are all real invocations that run
+        // the script, so the wrapper went unrecognised and its payload
+        // unclassified. Rejecting long options and non-letter clusters is all
+        // that is actually needed, and reading MORE things as a wrapper only
+        // ever exposes the script to the scans.
         Some(letters) if tok.len() >= 2 && !tok.starts_with("--") => {
-            letters.contains('c') && letters.chars().all(|ch| "clixeasfm".contains(ch))
+            letters.contains('c') && letters.chars().all(|ch| ch.is_ascii_alphabetic())
         }
         _ => false,
     }
@@ -236,17 +260,43 @@ fn is_shell_c_flag(tok: &str) -> bool {
 /// An unquoted or unterminated operand is returned as-is: there is no full shell
 /// parser here, and the classifiers downstream are the ones that must stay
 /// conservative.
-fn shell_script_operand(s: &str) -> &str {
+///
+/// Returns the script and the TAIL after it, because the caller has to decide
+/// whether that tail is discardable (see [`tail_runs_more_commands`]).
+fn split_shell_script_operand(s: &str) -> (&str, &str) {
     let b = s.as_bytes();
     if b.len() >= 2 && (b[0] == b'\'' || b[0] == b'"') {
         let quote = b[0] as char;
         // `find` returns a byte offset relative to `s[1..]`, and both it and the
         // opening quote are ASCII, so these are real char boundaries.
         if let Some(end) = s[1..].find(quote) {
-            return &s[1..1 + end];
+            return (&s[1..1 + end], &s[1 + end + 1..]);
         }
     }
-    s
+    (s, "")
+}
+
+/// True when the tail after a `-c` script operand can run something rather than
+/// just supplying `$0` and positional parameters.
+///
+/// The separator set mirrors [`command_segments`] exactly, plus the
+/// substitution forms from [`has_command_substitution`]: those are precisely the
+/// constructs that would have become their own segment had the command not been
+/// truncated.
+///
+/// **Redirection counts too**, even though it starts no new segment. It is the
+/// OUTER shell's, so `bash -c 'echo x' > /etc/crontab` truncates that file while
+/// the unwrapped script says only `echo x`, and because the unwrap result
+/// replaces the raw command for every later check, the redirect was invisible
+/// even to `command_escapes_workspace`.
+fn tail_runs_more_commands(tail: &str) -> bool {
+    tail.contains(';')
+        || tail.contains('|')
+        || tail.contains('&')
+        || tail.contains('\n')
+        || tail.contains('>')
+        || tail.contains('<')
+        || has_command_substitution(tail)
 }
 
 /// The static, deterministic, zero-cost classification pass.
@@ -395,14 +445,13 @@ fn segment_destruction_scope(segment: &str) -> Option<DestructionScope> {
         return Some(DestructionScope::OutOfWorkspace);
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
-    let i = command_head_index(&toks);
-    let head = toks.get(i)?;
-    let base = head.rsplit('/').next().unwrap_or(head);
+    let (base, head_args) = danger_head_and_args(&toks)?;
+    let base = base.as_str();
     if base == "dd" {
         // dd overwrites its `of=` target (a block-device target is already
         // caught by the catastrophic scan upstream). No `of=` → stdout → not
         // destruction.
-        let of_target = toks[i + 1..].iter().find_map(|a| a.strip_prefix("of="));
+        let of_target = head_args.iter().find_map(|a| a.strip_prefix("of="));
         return of_target.map(|t| {
             if !path_in_workspace(t) && !is_harmless_redirect(t) {
                 DestructionScope::OutOfWorkspace
@@ -411,7 +460,7 @@ fn segment_destruction_scope(segment: &str) -> Option<DestructionScope> {
             }
         });
     }
-    let args: Vec<&str> = toks[i + 1..]
+    let args: Vec<&str> = head_args
         .iter()
         .copied()
         .filter(|a| !a.starts_with('-'))
@@ -509,6 +558,19 @@ pub fn catastrophic_refusal(tool_name: &str, input: &Value) -> String {
     )
 }
 
+/// A checkpoint whose **pre** image is on disk and whose command has not run
+/// yet. Handed back to the agentic loop by the guard so the loop can close the
+/// bracket once the command returns (`finalize_command_checkpoint`): only then
+/// is it known what the command changed, and therefore whether a
+/// `CommandCheckpointed` card is worth showing at all.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingCheckpoint {
+    pub checkpoint_id: String,
+    /// Already scrubbed by `core::redact_postgres_secrets`.
+    pub command: String,
+    pub summary: String,
+}
+
 /// The command guard's pre-dispatch decision for one bash/python tool call.
 /// Produced by `LucidosEngine::command_guard_decision` (see
 /// `engine::command_permission`).
@@ -516,6 +578,10 @@ pub fn catastrophic_refusal(tool_name: &str, input: &Value) -> String {
 pub enum GuardDecision {
     /// Run the command normally.
     Proceed,
+    /// Run the command, then close the checkpoint bracket (ADR 0002, Phase 4).
+    /// Identical to `Proceed` on the dispatch side; the payload is what the
+    /// loop hands back to `finalize_command_checkpoint` afterwards.
+    ProceedCheckpointed(PendingCheckpoint),
     /// Block this command and hand `message` back to the LLM as a failed tool
     /// result (catastrophic hard-block or a chat Deny) — the turn continues so
     /// the model can route around it.
@@ -710,6 +776,20 @@ fn segment_is_safe(segment: &str) -> bool {
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
     let i = command_head_index(&toks);
+    // A `VAR=value` preamble is skipped when resolving the head (so `sudo rm` and
+    // `FOO=1 rm` are both seen as `rm`), but a handful of variable NAMES make the
+    // process load and run attacker-chosen code before the head's own `main`.
+    // `LD_PRELOAD=/tmp/evil.so ls` would otherwise settle as the read-only `ls`
+    // and execute arbitrary code with no card and no checkpoint. Route them to
+    // the judge instead; the head walk is deliberately left alone so the
+    // catastrophic scan still sees `LD_PRELOAD=x rm -rf /` as an `rm`.
+    //
+    // Scanned over the PREAMBLE only, not the whole segment: past the head the
+    // same text is an argument, not an assignment the shell acts on, so
+    // `grep NODE_OPTIONS= .env` is an ordinary read.
+    if preamble_has_code_injecting_env(&toks, i) {
+        return false;
+    }
     let Some(head) = toks.get(i) else {
         // Only benign prefixes / redirects — no command runs.
         return true;
@@ -915,7 +995,17 @@ fn catastrophic_reason(command: &str) -> Option<&'static str> {
         );
     }
     for segment in command_segments(command) {
-        if let Some(reason) = catastrophic_rm_or_chmod(&segment) {
+        // Unwrap a shell wrapper PER SEGMENT, not just at the head of the whole
+        // line. `static_classify` unwraps the outermost wrapper, which covers
+        // `bash -c 'rm -rf /'`; it does nothing for a wrapper that appears in a
+        // LATER segment, where the segment's head token reads as `bash` and the
+        // payload is never inspected. Prefixing any read-only command was
+        // therefore enough to walk the hard-block: `true && bash -c 'rm -rf /'`
+        // scanned as head `true` then head `bash`, matched nothing, and fell
+        // through to Safe (auto-allowed outright on the unattended
+        // coding-agent lane). Unwrapping here can only ever ADD a catastrophic
+        // verdict, never remove one.
+        if let Some(reason) = catastrophic_rm_or_chmod(unwrap_shell_command(&segment)) {
             return Some(reason);
         }
     }
@@ -1012,18 +1102,156 @@ fn is_disk_device(raw: &str) -> bool {
 /// `rm -rf data/tmp` or `chmod -R 755 data/` are untouched.
 fn catastrophic_rm_or_chmod(segment: &str) -> Option<&'static str> {
     let toks: Vec<&str> = segment.split_whitespace().collect();
-    let i = command_head_index(&toks);
-    let head = toks.get(i)?;
-    let base = head.rsplit('/').next().unwrap_or(head);
-    let reason = match base {
+    let (base, args) = danger_head_and_args(&toks)?;
+    let reason = match base.as_str() {
         "rm" => "recursive deletion of the filesystem root or home directory",
         "chmod" => "a recursive permission change on the filesystem root or home directory",
         _ => return None,
     };
-    let args = &toks[i + 1..];
     let recursive = args.iter().any(|a| is_recursive_flag(a));
     let targets_root = args.iter().any(|a| is_catastrophic_target(a));
     (recursive && targets_root).then_some(reason)
+}
+
+/// The command word a head token really names, after stripping the shell
+/// decorations that do NOT change which binary runs: a leading `\` (the
+/// alias-bypass form `\rm`, which runs `/bin/rm` exactly like a bare `rm`),
+/// surrounding quotes (`"rm"`, `'rm'`), a glued grouping token (`(rm`), and any
+/// directory prefix (`/bin/rm`).
+///
+/// A raw `head.rsplit('/')` comparison saw `\rm` and `"rm"` as unknown commands,
+/// so `\rm -rf /` matched neither the catastrophic deny-list nor the
+/// destruction-scope scan and classified all the way through to Safe.
+fn normalized_head(head: &str) -> &str {
+    let stripped = head.trim_start_matches(['(', '{', '\\']);
+    let unquoted = stripped.trim_matches(|c| c == '"' || c == '\'');
+    unquoted.rsplit('/').next().unwrap_or(unquoted)
+}
+
+/// Resolve a segment's command word and argument tokens for the two scans that
+/// CLASSIFY DANGER ([`catastrophic_rm_or_chmod`] and
+/// [`segment_destruction_scope`]). Extends [`command_head_index`] by also
+/// walking past a bare shell grouping token (`{ rm -rf /; }`, `( rm -rf / )`),
+/// and normalizes the head via [`normalized_head`].
+///
+/// Deliberately NOT used by [`segment_is_safe`]: there an unrecognised head
+/// already falls through to the judge, which is the conservative direction, so
+/// resolving these forms would newly SETTLE decorated commands as Safe. Here it
+/// can only ever add a danger verdict.
+fn danger_head_and_args<'a>(toks: &'a [&'a str]) -> Option<(String, &'a [&'a str])> {
+    let mut from = 0;
+    let head_at = loop {
+        let next = from + command_head_index(&toks[from..]);
+        match toks.get(next) {
+            Some(&"{") | Some(&"(") => from = next + 1,
+            _ => break next,
+        }
+    };
+    let head = toks.get(head_at)?;
+    Some((normalized_head(head).to_string(), &toks[head_at + 1..]))
+}
+
+/// Environment-variable names whose value is loaded and EXECUTED by the process
+/// the command starts, so a `VAR=value` preamble carrying one runs code the
+/// command head says nothing about. Matched case-sensitively (the dynamic loader
+/// and these interpreters all read exact upper-case names).
+///
+/// **An entry ending in `=` is an EXACT name; every other entry is a prefix.**
+/// `ENV`, `PATH` and `IFS` are short enough to begin a great many ordinary
+/// application variables (`ENVIRONMENT`, `PATHEXT`, `IFS_MODE`), and matching
+/// those as prefixes drops routine commands out of the Safe fast path for
+/// nothing.
+///
+/// Not a completeness claim: it covers the loader hooks (`LD_*`, `DYLD_*`) and
+/// the startup-file hooks of the interpreters we ship or that any dev box has.
+/// A miss costs a judge call that did not happen, so add rather than debate.
+const CODE_INJECTING_ENV_NAMES: &[&str] = &[
+    "LD_",
+    "DYLD_",
+    "BASH_ENV",
+    "ENV=",
+    // The most direct one: the agent can write `data/bin/ls` with an ordinary
+    // in-workspace write (itself Safe) and then `PATH=data/bin ls` runs it with
+    // no card, no checkpoint and no judge call. Exact, so `PATHEXT=` and the
+    // various `*_PATH=` build variables keep the fast path.
+    "PATH=",
+    "SHELLOPTS",
+    "BASHOPTS",
+    "PS4",
+    "IFS=",
+    "PYTHONSTARTUP",
+    "PYTHONPATH",
+    "PERL5OPT",
+    "PERL5LIB",
+    "RUBYOPT",
+    "NODE_OPTIONS",
+    "GIT_SSH",
+    "GIT_EXTERNAL_DIFF",
+    "GIT_PAGER",
+    "GIT_EDITOR",
+    // Covers GIT_CONFIG_GLOBAL / _SYSTEM / _COUNT / _KEY_n / _VALUE_n. These are
+    // the environment equivalents of `git -c` and `--config-env`, which
+    // `git_subcommand_read_only` already refuses by name as "an executable
+    // config", and they reach the same place: a config file naming
+    // `diff.external` makes a plain `git diff` run it. The same write-then-run
+    // path as `PATH=` applies, since writing `data/g` is itself Safe.
+    "GIT_CONFIG",
+];
+
+/// True when `tok` is a `VAR=value` assignment whose variable name is one of
+/// [`CODE_INJECTING_ENV_NAMES`].
+///
+/// A trailing `=` in the list marks an **exact** variable name; every other
+/// entry is a name prefix. The distinction is load-bearing: `ENV` and `IFS` are
+/// three-letter names that begin an enormous number of ordinary application
+/// variables (`ENVIRONMENT`, `ENV_FILE`, `IFS_MODE`), so matching them as
+/// prefixes would drop routine commands out of the Safe fast path and send them
+/// to the judge for nothing.
+fn is_code_injecting_assignment(tok: &str) -> bool {
+    let Some((name, _)) = tok.split_once('=') else {
+        return false;
+    };
+    // bash's append form `VAR+=value` assigns the same variable, so the `+` has
+    // to come off before an exact-name comparison. Without this `PATH+=:data/bin`
+    // sailed past the fast path while `PATH=` was refused.
+    let name = name.strip_suffix('+').unwrap_or(name);
+    if name.is_empty() || name.starts_with('-') {
+        return false;
+    }
+    CODE_INJECTING_ENV_NAMES
+        .iter()
+        .any(|p| match p.strip_suffix('=') {
+            Some(exact) => name == exact,
+            None => name.starts_with(p),
+        })
+}
+
+/// True when the `VAR=value` preamble before the head at `head_at` carries a
+/// code-injecting variable name.
+fn preamble_has_code_injecting_env(toks: &[&str], head_at: usize) -> bool {
+    toks.iter()
+        .take(head_at)
+        .copied()
+        .any(is_code_injecting_assignment)
+}
+
+/// True when any segment of `command` carries such a preamble.
+///
+/// Shared by the two PERMISSIVE paths so they cannot disagree: the Safe fast
+/// path in [`segment_is_safe`], and the stored-grant path in
+/// `command_permission::command_is_allowed`, where a `Bash(ls:*)` grant would
+/// otherwise auto-allow `LD_PRELOAD=/tmp/evil.so ls` with no card, which is the
+/// same bypass the fast path already refuses.
+///
+/// The danger scans' head walk is deliberately NOT gated on this: there the
+/// assignment must stay invisible so `LD_PRELOAD=x rm -rf /` still reads as an
+/// `rm` and still hard-blocks.
+pub fn command_has_code_injecting_env(command: &str) -> bool {
+    command_segments(command).any(|segment| {
+        let toks: Vec<&str> = segment.split_whitespace().collect();
+        let i = command_head_index(&toks);
+        preamble_has_code_injecting_env(&toks, i)
+    })
 }
 
 /// Command-line tokens that prefix the real command and should be skipped when
@@ -1101,10 +1329,28 @@ fn is_recursive_flag(arg: &str) -> bool {
 /// targets the catastrophic lane recognises), tolerating surrounding quotes and
 /// the common `$HOME` / `~` spellings.
 fn is_catastrophic_target(tok: &str) -> bool {
-    let t = tok.trim_matches(|c| c == '"' || c == '\'');
+    // Trailing shell punctuation comes off with the quotes. `normalized_head`
+    // already strips the OPENING grouping token off the head, so `(rm -rf /)`
+    // resolves its head to `rm`; without the matching close the target read as
+    // `/)` and the pair escaped the hard block into the merely-dangerous lane.
+    //
+    // A trailing `}` is only a group closer when the token opened no brace of
+    // its own: `${HOME}` carries its own, and trimming it unconditionally
+    // stopped `rm -rf ${HOME}` from matching at all.
+    let unquoted = tok.trim_matches(|c| c == '"' || c == '\'');
+    let t = if unquoted.contains('{') {
+        unquoted.trim_end_matches([';', ')'])
+    } else {
+        unquoted.trim_end_matches([';', ')', '}'])
+    };
     matches!(
         t,
         "/" | "/*"
+            // Other spellings of the same root directory. `ls -di // /` reports
+            // the same inode for both.
+            | "//"
+            | "/."
+            | "/./"
             | "~"
             | "~/"
             | "~/*"
@@ -1157,10 +1403,14 @@ pub fn static_side_effect_category(command: &str) -> Option<SideEffectCategory> 
 /// benign prefixes the catastrophic scan does so `sudo curl -X POST …` is seen.
 fn segment_side_effect_category(segment: &str) -> Option<SideEffectCategory> {
     let toks: Vec<&str> = segment.split_whitespace().collect();
-    let i = command_head_index(&toks);
-    let head = toks.get(i)?;
-    let base = head.rsplit('/').next().unwrap_or(head);
-    let args = &toks[i + 1..];
+    // Resolved exactly like the danger scans, decorations and bare grouping
+    // tokens included: this category is what an unattended trigger's grant is
+    // checked against, so a head that resolved to nothing here skipped the grant
+    // check entirely and auto-allowed. Using the shared resolver can only ever
+    // derive a category where there was none, and keeps the three head-resolving
+    // scans from drifting apart again.
+    let (base, args) = danger_head_and_args(&toks)?;
+    let base = base.as_str();
     match base {
         "curl" | "wget" => is_mutating_http(args).then_some(SideEffectCategory::ExternalApi),
         "mail" | "mailx" | "sendmail" | "osascript" => Some(SideEffectCategory::Email),
@@ -1371,6 +1621,283 @@ mod tests {
             "/bin/zsh -lc 'rm -rf ~' zsh",
         ] {
             assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// The wrapper only had to move out of the FIRST segment to hide again:
+    /// `static_classify` unwraps the outermost wrapper, so prefixing any
+    /// read-only command left the payload behind a head token of `bash`, and
+    /// the whole line fell through to Safe (auto-allowed outright on the
+    /// unattended coding-agent lane). The unwrap is per segment now.
+    #[test]
+    fn catastrophic_survives_a_shell_c_wrapper_in_a_later_segment() {
+        for cmd in [
+            "true && bash -c 'rm -rf /'",
+            "echo hi; bash -c 'rm -rf /'",
+            "ls | /bin/zsh -lc 'rm -rf ~'",
+            "pwd && sh -c 'chmod -R 777 /'",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// A decorated head names the same binary: `\rm` bypasses aliases, quotes
+    /// are stripped by the shell, and `{`/`(` are grouping tokens. Comparing the
+    /// raw token meant every one of these read as an unknown command and
+    /// classified Safe.
+    #[test]
+    fn catastrophic_sees_through_a_decorated_head() {
+        for cmd in [
+            r"\rm -rf /",
+            "\"rm\" -rf /",
+            "'rm' -rf /",
+            r"\chmod -R 777 /",
+            "{ rm -rf /",
+            "( rm -rf /",
+            r"true && \rm -rf ~",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// A `VAR=value` preamble is skipped when resolving the head, which is right
+    /// for `FOO=1 ls` but wrong for the variables the dynamic loader and the
+    /// interpreters EXECUTE: `LD_PRELOAD=/tmp/evil.so ls` used to settle Safe on
+    /// the read-only `ls` and run arbitrary code with no card and no checkpoint.
+    #[test]
+    fn a_code_injecting_env_assignment_is_never_settled_safe() {
+        for cmd in [
+            "LD_PRELOAD=/tmp/evil.so ls",
+            "DYLD_INSERT_LIBRARIES=/tmp/evil.dylib ls -la",
+            "BASH_ENV=/tmp/x cat data/f.txt",
+            "PYTHONSTARTUP=/tmp/x echo hi",
+            "NODE_OPTIONS=--require=/tmp/x echo hi",
+        ] {
+            assert!(
+                !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
+                "{cmd} must not settle Safe"
+            );
+        }
+        // An ordinary assignment still rides the read-only fast path.
+        assert_settled(bash("FOO=1 ls"), RiskLane::Safe, "FOO=1 ls");
+        // The exact-name entries (`ENV=`, `IFS=`) still catch their own name.
+        for cmd in ["ENV=/tmp/rc bash -c 'echo hi'", "IFS=, cat data/f.txt"] {
+            assert!(
+                !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
+                "{cmd} must not settle Safe"
+            );
+        }
+    }
+
+    /// `PATH=` is the most direct code-injecting assignment: the agent can write
+    /// the target with an ordinary in-workspace write and then run it under a
+    /// read-only head.
+    #[test]
+    fn a_path_preamble_is_never_settled_safe() {
+        for cmd in ["PATH=data/bin ls", "PATH=/tmp:$PATH cat data/f.txt"] {
+            assert!(
+                !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
+                "{cmd} must not settle Safe"
+            );
+        }
+        // The `*_PATH=` build variables and PATHEXT keep the fast path.
+        for cmd in ["PATHEXT=.EXE ls", "MY_PATH=/tmp ls"] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    /// The shared predicate behind both permissive paths (the Safe fast path
+    /// here, and `command_permission::command_is_allowed`'s grant lane).
+    #[test]
+    fn code_injecting_env_is_detected_across_every_segment() {
+        assert!(command_has_code_injecting_env("LD_PRELOAD=/tmp/evil.so ls"));
+        assert!(command_has_code_injecting_env("PATH=data/bin ls"));
+        // Not only the first segment.
+        assert!(command_has_code_injecting_env(
+            "ls && LD_PRELOAD=/tmp/evil.so cat data/f.txt"
+        ));
+        assert!(!command_has_code_injecting_env("FOO=1 ls && git status"));
+        assert!(!command_has_code_injecting_env(
+            "grep NODE_OPTIONS= data/f.txt"
+        ));
+    }
+
+    /// A decorated shell head hid the whole `-c` payload from every scan.
+    ///
+    /// Covers the DECORATION forms only. A wrapper reached past a benign prefix
+    /// (`sudo bash -c '…'`, `env bash -c '…'`) is still not unwrapped, because
+    /// `unwrap_shell_command` resolves the first token rather than the head. See
+    /// `docs/known-gaps.md` § "The command guard does not see through every
+    /// shell-wrapper or substitution form".
+    #[test]
+    fn a_decorated_shell_wrapper_still_unwraps_its_payload() {
+        for cmd in [r"\bash -c 'rm -rf /'", "\"bash\" -c 'rm -rf /'"] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Catastrophic)),
+                "{cmd} must hard-block"
+            );
+        }
+    }
+
+    /// `normalized_head` strips the opening grouping token off the head, so the
+    /// matching closer has to come off the target or the pair escapes the block.
+    #[test]
+    fn catastrophic_sees_a_glued_subshell_on_both_ends() {
+        for cmd in ["(rm -rf /)", "{ rm -rf /;}", "(rm -rf ~)"] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Catastrophic)),
+                "{cmd} must hard-block"
+            );
+        }
+    }
+
+    /// The side-effect category gates an unattended trigger's grant check, so a
+    /// decorated head that derived no category skipped the check entirely.
+    #[test]
+    fn side_effect_category_sees_through_a_decorated_head() {
+        use SideEffectCategory::*;
+        assert_eq!(
+            static_side_effect_category(r"\curl -X POST https://example.com -d @data/f.txt"),
+            Some(ExternalApi)
+        );
+        assert_eq!(
+            static_side_effect_category("\"gh\" pr create"),
+            Some(CloudCli)
+        );
+        assert_eq!(
+            static_side_effect_category(r"\mail -s x user@example.com"),
+            Some(Email)
+        );
+        // Bare grouping tokens too, which is what sharing `danger_head_and_args`
+        // buys: `normalized_head("{")` alone resolves to the empty string.
+        assert_eq!(
+            static_side_effect_category("{ gh pr create ; }"),
+            Some(CloudCli)
+        );
+        assert_eq!(
+            static_side_effect_category("( aws s3 rm x )"),
+            Some(CloudCli)
+        );
+    }
+
+    /// A `-c` script operand is cut at its close quote because `sh -c <script>
+    /// [$0 args]` makes the rest positional parameters. A control operator in
+    /// that tail is NOT a positional parameter: the outer shell runs it, so
+    /// discarding it hid whole commands from every scan.
+    #[test]
+    fn a_tail_after_the_script_operand_is_never_discarded() {
+        for cmd in [
+            "bash -c 'echo hi'; rm -rf /",
+            "bash -c 'echo hi' && rm -rf ~",
+            "/bin/zsh -lc 'ls' ; rm -rf /",
+            r"\bash -c 'echo hi'; rm -rf /",
+        ] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Catastrophic)),
+                "{cmd} must hard-block on its tail"
+            );
+        }
+        // The documented `$0 args` form is still unwrapped to the script alone.
+        assert_eq!(
+            unwrap_shell_command("bash -c 'rm -rf /' ignored"),
+            "rm -rf /"
+        );
+        assert_eq!(unwrap_shell_command("/bin/zsh -lc 'ls -la'"), "ls -la");
+    }
+
+    /// The `-c` cluster accepts any shell option letter, not an enumerated set:
+    /// the ones an enumerated set missed all run the script.
+    #[test]
+    fn every_shell_option_cluster_carrying_c_is_a_wrapper() {
+        for flag in [
+            "-c", "-lc", "-uc", "-vc", "-Tc", "-pc", "-Bc", "-Cc", "-hc", "-bc",
+        ] {
+            let cmd = format!("bash {flag} 'rm -rf /'");
+            assert!(
+                matches!(bash(&cmd), StaticVerdict::Settled(RiskLane::Catastrophic)),
+                "{cmd} must hard-block"
+            );
+        }
+        // Long options and non-letter clusters are still not `-c`.
+        assert!(!is_shell_c_flag("--config"));
+        assert!(!is_shell_c_flag("-l"));
+        assert!(!is_shell_c_flag("-c1"));
+    }
+
+    /// Redirection in the discarded tail belongs to the OUTER shell.
+    #[test]
+    fn a_redirect_after_the_script_operand_is_never_discarded() {
+        for cmd in [
+            "bash -c 'echo x' > /etc/crontab",
+            "/bin/zsh -lc 'echo x' > ~/.zshrc",
+            "bash -c 'echo x' >> /etc/hosts",
+        ] {
+            assert!(
+                !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
+                "{cmd} must not settle Safe"
+            );
+        }
+    }
+
+    /// The environment equivalents of `git -c`, which `git_subcommand_read_only`
+    /// already refuses by name.
+    #[test]
+    fn a_git_config_env_preamble_is_never_settled_safe() {
+        for cmd in [
+            "GIT_CONFIG_GLOBAL=data/g git diff",
+            "GIT_CONFIG_SYSTEM=data/g git log",
+            "GIT_CONFIG_COUNT=1 git diff",
+        ] {
+            assert!(
+                !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
+                "{cmd} must not settle Safe"
+            );
+            assert!(command_has_code_injecting_env(cmd));
+        }
+        assert_settled(bash("git diff"), RiskLane::Safe, "git diff");
+    }
+
+    /// Other spellings of the filesystem root reach the same inode.
+    #[test]
+    fn catastrophic_covers_every_spelling_of_root() {
+        for cmd in ["rm -rf //", "rm -rf /.", "rm -rf /./"] {
+            assert!(
+                matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Catastrophic)),
+                "{cmd} must hard-block"
+            );
+        }
+    }
+
+    /// bash's append form assigns the same variable.
+    #[test]
+    fn the_append_form_of_a_code_injecting_assignment_is_caught() {
+        for cmd in ["PATH+=:data/bin ls", "IFS+=, cat data/f.txt"] {
+            assert!(
+                !matches!(bash(cmd), StaticVerdict::Settled(RiskLane::Safe)),
+                "{cmd} must not settle Safe"
+            );
+        }
+        assert!(command_has_code_injecting_env("PATH+=:data/bin ls"));
+        // An ordinary append is unaffected.
+        assert_settled(bash("FOO+=1 ls"), RiskLane::Safe, "FOO+=1 ls");
+    }
+
+    /// The guard above is a fast-path REFUSAL, so an over-broad match costs
+    /// every routine command a judge round-trip. Two ways it over-matched:
+    /// treating the exact-name entries as prefixes, and scanning the whole
+    /// segment instead of the assignment preamble.
+    #[test]
+    fn ordinary_env_names_and_arguments_keep_the_read_only_fast_path() {
+        for cmd in [
+            // `ENV=` / `IFS=` are exact names, not prefixes.
+            "ENVIRONMENT=staging cat data/config.yaml",
+            "ENV_FILE=.env ls",
+            "IFS_MODE=x echo hi",
+            // Past the head the same text is an argument, not an assignment.
+            "grep NODE_OPTIONS= data/f.txt",
+            "echo LD_PRELOAD=x",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
         }
     }
 

@@ -37,6 +37,7 @@ function makeThread(id: string, overrides: Partial<ThreadState> = {}): ThreadSta
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

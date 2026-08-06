@@ -824,7 +824,7 @@ fn handle_server_request(
     approval_tasks: &mut tokio::task::JoinSet<()>,
     tracker: &mut AppServerTracker,
 ) {
-    let Some(approval) = parse_approval_request(method, params) else {
+    let Some(mut approval) = parse_approval_request(method, params) else {
         log!("[CodexAppServer] unsupported server request: {}", method);
         let _ = driver_action_tx.send(DriverAction::SendLine(error_response_line(
             &id,
@@ -833,6 +833,10 @@ fn handle_server_request(
         )));
         return;
     };
+    // A file-change approval arrives with no paths on it; the tracker saw them
+    // on the item's `item/started` and hands them over here, so the permission
+    // card can name what is being written.
+    tracker.attach_known_file_changes(&mut approval);
     tracker.note_approval_request(&approval);
 
     let (respond_tx, respond_rx) = tokio::sync::oneshot::channel::<bool>();

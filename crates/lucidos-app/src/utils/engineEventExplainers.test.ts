@@ -15,6 +15,32 @@ import {
   type CancelCause,
 } from '../store/thread-events';
 
+/** Every `AbortCause` / `CancelCause` variant, kept honest by tsc rather than
+ *  by hand. The `satisfies Record<Union, true>` trick is the same drift guard
+ *  `THREAD_EVENT_TYPE_FLAGS` uses for the `ThreadEvent` union
+ *  (`.claude/rules/testing.md`): adding a variant without listing it here is a
+ *  type error, so the "every variant" tests below cannot silently cover a
+ *  subset. They had both drifted, missing `session_dropped` and
+ *  `superseded_by_followup` respectively. */
+const ABORT_CAUSE_FLAGS = {
+  safety_net: true,
+  engine_shutdown: true,
+  recovery_after_restart: true,
+  process_killed: true,
+  stale_settle: true,
+  session_dropped: true,
+  unknown: true,
+} satisfies Record<AbortCause, true>;
+const ABORT_CAUSES = Object.keys(ABORT_CAUSE_FLAGS) as AbortCause[];
+
+const CANCEL_CAUSE_FLAGS = {
+  user_stop: true,
+  user_action: true,
+  superseded_by_followup: true,
+  unknown: true,
+} satisfies Record<CancelCause, true>;
+const CANCEL_CAUSES = Object.keys(CANCEL_CAUSE_FLAGS) as CancelCause[];
+
 describe('describeEngineReason', () => {
   it('returns explainer for session_recovered', () => {
     expect(describeEngineReason({ kind: 'session_recovered' }))
@@ -68,8 +94,17 @@ describe('describeAbortCause', () => {
   it('mentions shutdown for engine_shutdown', () => {
     expect(describeAbortCause('engine_shutdown')).toMatch(/shut down|restarted/i);
   });
-  it('mentions recovery for recovery_after_restart', () => {
-    expect(describeAbortCause('recovery_after_restart')).toMatch(/recover/i);
+  it('explains recovery_after_restart as a deliberate hold, not an impossibility', () => {
+    // The turn CAN be resumed, and Continue is armed for it. The engine
+    // declines to do it on its own rather than re-run work that may be what
+    // brought it down. Saying it "could not be resumed" blames the engine for
+    // a caution it chose. The text must also stay true of BOTH emit sites (the
+    // boot orphan sweep's unknown cause and the boot floor's withdrawn switch
+    // promise), so it must not claim the cause is always unknown.
+    const text = describeAbortCause('recovery_after_restart');
+    expect(text).toMatch(/restart/i);
+    expect(text).toMatch(/Continue/);
+    expect(text).not.toMatch(/could not be resumed/i);
   });
   it('mentions the session for process_killed', () => {
     expect(describeAbortCause('process_killed')).toMatch(/session/i);
@@ -82,15 +117,7 @@ describe('describeAbortCause', () => {
     expect(describeAbortCause(undefined)).toMatch(/cause not recorded/i);
   });
   it('returns a non-empty string for every AbortCause variant', () => {
-    const causes: AbortCause[] = [
-      'safety_net',
-      'engine_shutdown',
-      'recovery_after_restart',
-      'process_killed',
-      'stale_settle',
-      'unknown',
-    ];
-    for (const cause of causes) {
+    for (const cause of ABORT_CAUSES) {
       const text = describeAbortCause(cause);
       expect(text.length).toBeGreaterThan(0);
     }
@@ -152,8 +179,7 @@ describe('describeCancelCause', () => {
     expect(describeCancelCause(undefined)).toMatch(/cause not recorded/i);
   });
   it('attributes every cause to the user ("You")', () => {
-    const causes: CancelCause[] = ['user_stop', 'user_action', 'unknown'];
-    for (const cause of causes) {
+    for (const cause of CANCEL_CAUSES) {
       expect(describeCancelCause(cause)).toMatch(/^You\b/);
     }
   });

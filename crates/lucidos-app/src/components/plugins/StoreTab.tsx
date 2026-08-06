@@ -12,7 +12,8 @@ import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
-import { installMarketplacePlugin, refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
+import { refreshPluginCatalog } from '../../store/actions/plugin-marketplaces';
+import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { loadInstalledPlugins } from '../../store/actions/plugins';
 import { openAppById } from '../../store/actions/apps';
 import { focusThread } from '../../store/actions/threads';
@@ -260,9 +261,9 @@ export function StoreTab() {
     const el = document.querySelector<HTMLElement>(`[data-plugin-id="${CSS.escape(target)}"]`);
     if (el) {
       el.scrollIntoView({ block: 'center', behavior: 'smooth' });
-      // Shared navigation focus marker: a sticky background highlight that fades out
-      // on the user's next action (components/shared/focusMarker.ts). Same look as
-      // chat + settings.
+      // Shared navigation focus marker: a sticky background highlight that dissolves
+      // on the user's next action, never before its hold has elapsed
+      // (components/shared/focusMarker.ts). Same look as chat + settings.
       applyNavFocus(el);
       pluginScrollTarget.value = null;
     } else if (!appSearchQuery.value.trim()) {

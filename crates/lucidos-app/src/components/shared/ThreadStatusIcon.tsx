@@ -1,5 +1,6 @@
 import type { ThreadStatus, ThreadState } from '../../store/thread-events';
 import { effectiveThreadStatus } from '../../store/store';
+import { PauseIcon } from './icons';
 
 /** 'changes' = static dot (CC has pending changes); 'question' = "?" badge
  *  (CC paused on AskUserQuestion). 'waiting' = pulsing dot, used only when
@@ -15,11 +16,12 @@ export function resolveVisualStatus(
   if (status === 'failed') return 'failed';
   if (status === 'running') return 'running';
   if (status === 'waiting_for_user_answer') return 'question';
-  // An engine restart interrupted this turn. It outranks `changes` for the same
-  // reason `failed` does: it describes what happened to the turn, and the
-  // backend has already resolved the two against each other (a paused thread
-  // that HAS a proposed change is written `waiting`, not `paused`, by
-  // `AbortCause::status_sql`), so reaching here means there is nothing to review.
+  // The user's own version switch interrupted this turn, and the engine is
+  // bringing it back. It outranks `changes` for the same reason `failed` does:
+  // it describes what happened to the turn, and the backend has already resolved
+  // the two against each other (a paused thread that HAS a proposed change is
+  // written `waiting`, not `paused`, by `AbortCause::status_sql`), so reaching
+  // here means there is nothing to review.
   if (status === 'paused') return 'paused';
   if (codingAgentProposed) return 'changes';
   if (hasActiveChildren) return 'waiting';
@@ -49,7 +51,7 @@ const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
   { status: 'waiting', label: 'Waiting', desc: 'Waiting for its child threads to finish.' },
   { status: 'question', label: 'Waiting for your answer', desc: 'Paused until you answer its question.' },
   { status: 'changes', label: 'Changes to review', desc: 'A coding agent proposed changes to open and Apply.' },
-  { status: 'paused', label: 'Paused', desc: 'An engine restart interrupted this turn. It resumes on its own, or offers a Continue button.' },
+  { status: 'paused', label: 'Paused', desc: 'Your switch to a new version interrupted this turn. It resumes on its own, so there is nothing to do.' },
   { status: 'failed', label: 'Failed', desc: 'The last response failed.' },
 ];
 
@@ -93,7 +95,9 @@ export function ThreadStatusIcon({ status }: Props) {
         <span class="thread-status-question-badge" aria-label="Waiting for your answer" />
       )}
       {status === 'paused' && (
-        <span class="progress-dot progress-dot-paused" aria-label="Paused by an engine restart" />
+        <span class="thread-status-paused-icon" aria-label="Paused by your version switch, resuming on its own">
+          <PauseIcon />
+        </span>
       )}
       {status === 'failed' && (
         <span class="progress-dot progress-dot-failed" aria-label="Last response failed" />

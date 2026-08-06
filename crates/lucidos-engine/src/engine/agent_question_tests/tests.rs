@@ -596,7 +596,7 @@ fn should_emit_cc_resume_side_effects_only_for_claude_code_channel() {
     )));
 }
 
-/// Engine-restart-style abort: the user's "Restarted" exchange in the UI
+/// Engine-restart-style abort: the user's "Paused by restart" exchange in the UI
 /// is paired with this `ResponseAborted` row in the DB.
 #[tokio::test]
 async fn response_aborted_orphans_only_active_lookup() {

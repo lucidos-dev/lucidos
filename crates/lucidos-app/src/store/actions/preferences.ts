@@ -772,12 +772,18 @@ export function dismissWelcomeSuggestions(): Promise<void> {
 // --- Backup reminder banner ---
 //
 // The banner asks "have you switched backup on?", and the answer is already in
-// this map: `GET /backup/schedule` decides it as `is_schedule_active(cron) &&
-// provider.is_some()`, and both are ordinary preference rows that
+// this map: `GET /backup/schedule` decides its `schedule` field as
+// `is_schedule_active(cron) && provider.is_some()` (the engine's
+// `api::backup::schedule_response`), and both are ordinary preference rows that
 // `GET /preferences` returns. So the banner needs no endpoint of its own and no
 // poll, and because `set_backup_schedule` writes through `PreferenceStore::set`
 // (which announces `PreferencesChanged` → `loadPreferences`), enabling backup
 // retracts it live on every connected device.
+//
+// Note the asymmetry on the engine side: that response's `provider` field is
+// reported whether or not the schedule is active, because a destination does
+// not stop existing when the cron is off. Only `schedule` needs both halves,
+// which is the half these predicates mirror.
 //
 // Deliberately NOT backup *health*: a schedule that exists but whose runs are
 // failing is the Settings health card's job. Keeping this to "is it on?" is what

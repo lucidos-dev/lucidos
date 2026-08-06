@@ -55,13 +55,22 @@ function inlineFormsEqual(a: InlineForm | null, b: InlineForm | null): boolean {
         ar.to.every((addr, i) => addr === br.to[i])
       );
     }
-    case 'plugin-install':
+    case 'plugin-install': {
       // Two staged installs always have distinct install_ids (UUID per call),
-      // so install_id is the cheapest correct equality.
-      return a.request.install_id === (b as typeof a).request.install_id;
-    case 'plugin-uninstall':
-      // Same as install — fresh UUID per prepare call.
-      return a.request.uninstall_id === (b as typeof a).request.uninstall_id;
+      // so install_id is the cheapest correct equality. The receipt marker
+      // joins it for the same reason `sentAt` does above: the pending confirm
+      // and the receipt for one install are different destinations (one still
+      // has an Install button), so they must never dedupe against each other.
+      const bb = b as typeof a;
+      return a.request.install_id === bb.request.install_id
+        && a.installed?.at === bb.installed?.at;
+    }
+    case 'plugin-uninstall': {
+      // Same as install, with a fresh UUID per prepare call.
+      const bb = b as typeof a;
+      return a.request.uninstall_id === bb.request.uninstall_id
+        && a.removed?.at === bb.removed?.at;
+    }
   }
 }
 
@@ -168,19 +177,25 @@ function migrateEntry(raw: Record<string, unknown>): NavEntry {
  *  resurrected from the persisted nav stack on reload. These overlays are backed
  *  by an engine-staged request whose id (a fresh-per-prepare-call UUID) is dead
  *  the moment the page reloads — restoring the panel would show a stale form
- *  whose Confirm/Cancel resolves a request that no longer exists. Covers plugin
- *  install/uninstall, a *pending* email-confirm, and an *engine-prompted*
- *  credential request (a `credential` form WITH a `request`). A `credential`
- *  form WITHOUT a request is a Settings-driven edit of a stored credential and
- *  restores normally, as do the persistent forms (app-edit, new-app, trigger).
- *  Mirrors the url-preview suppression guard in `restoreState`. */
+ *  whose Confirm/Cancel resolves a request that no longer exists. Covers a
+ *  *pending* plugin install/uninstall, a *pending* email-confirm, and an
+ *  *engine-prompted* credential request (a `credential` form WITH a `request`).
+ *  A `credential` form WITHOUT a request is a Settings-driven edit of a stored
+ *  credential and restores normally, as do the persistent forms (app-edit,
+ *  new-app, trigger). Mirrors the url-preview suppression guard in
+ *  `restoreState`. */
 function isTransientForm(overlay: PanelOverlay): boolean {
   if (overlay?.type !== 'form') return false;
   const form = overlay.form;
   switch (form.type) {
+    // A completed install/uninstall is a receipt, not a staged request: the
+    // files already landed or went, so there is nothing left to resolve and the
+    // entry is a real destination. Only the pending form dies with the page.
+    // Same carve-out as email's `sentAt`, below.
     case 'plugin-install':
+      return form.installed == null;
     case 'plugin-uninstall':
-      return true;
+      return form.removed == null;
     case 'email-confirm':
       // A SENT email is a receipt, not a staged request — nothing is left to
       // resolve, so it restores like any other destination. That's what makes it

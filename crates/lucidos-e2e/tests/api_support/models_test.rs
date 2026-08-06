@@ -205,6 +205,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
         "claude-opus-4-8@default[1m]",
         "claude-opus-4-7[1m]",
         "claude-opus-4-6[1m]",
+        "claude-sonnet-5[1m]",
         "claude-sonnet-4-6[1m]",
     ] {
         let m = find_model(&client, &api, id)
@@ -234,6 +235,7 @@ async fn seeded_builtins_declare_the_window_the_prefix_map_gets_wrong() {
         "claude-opus-4-8@default",
         "claude-opus-4-7",
         "claude-opus-4-6",
+        "claude-sonnet-5",
         "claude-sonnet-4-6",
         "gpt-5.4",
         "gpt-5.3-codex",

@@ -22,6 +22,16 @@ pub(crate) use recovery::{
     preserve_question_park_at_shutdown, thread_has_unanswered_question,
     unanswered_question_exists_sql,
 };
+// "Does a boundary already cover this turn?", in its two strengths. The
+// recovery pass asks the window-only form before emitting its own boundary; a
+// coding-agent session that registered mid-teardown asks the anchored form
+// before SKIPPING its own terminal (`agent_session::runtime_helpers`), because
+// the cost of a wrong `true` differs: a duplicate panel versus a turn with no
+// terminator at all. One place, so the two cannot drift on which turn an abort
+// belongs to.
+#[cfg(test)]
+pub(crate) use recovery::boundary_abort_already_emitted;
+pub(crate) use recovery::boundary_abort_covers_turn;
 // The switch-vs-crash fingerprint, shared with the chat resume gate
 // (`chat::recovery::switch_resume_candidates`) so the coding-agent and chat
 // halves of the auto-resume contract cannot drift apart.

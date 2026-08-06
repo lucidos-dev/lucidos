@@ -660,6 +660,12 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Reset any threads stuck in 'running' from the previous engine process.
     // These are orphaned — no live task is processing them. The recovery below
     // will set the correct status (waiting for CC threads with changes, idle otherwise).
+    //
+    // Scoped to 'running' ON PURPOSE. `waiting_for_user_answer` stays out of it
+    // because the user's answer is what resumes such a thread. A thread holding
+    // an *event wait* needs no exemption at all any more: a subscription does
+    // not hold a turn, so it is already `idle` here and the dispatcher's boot
+    // rebuild re-arms it from the event store either way.
     if let Err(e) =
         sqlx::query("UPDATE thread_summaries SET status = 'idle' WHERE status = 'running'")
             .execute(shared_engine.pool())
@@ -815,6 +821,36 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .event_bus
         .refire_unprocessed_child_completions()
         .await;
+
+    // The event-wait dispatcher (ADR 0047). Order inside this block is
+    // load-bearing and each step is documented on its own method:
+    //
+    // 0. The wake consumer first of all: every path below hands its turn to
+    //    this task rather than awaiting it, so nothing resumes until it runs.
+    // 1. The subscriber next, so an event landing during the rebuild is either
+    //    matched live or caught by a watermark scan. Started after, it could be
+    //    missed by both.
+    // 2. The lost-wake sweep BEFORE the rebuild, and this order is load-bearing
+    //    rather than tidy. The sweep looks for a resolution whose only
+    //    successor is its own wake anchor, which is exactly the shape the
+    //    rebuild's catch-up scan *creates*: it persists the pair and hands the
+    //    turn to a task that will not write anything for hundreds of
+    //    milliseconds. Run after, the sweep re-drives every wake the rebuild
+    //    just queued and each recovered thread wakes twice. Run first, it sees
+    //    only the genuinely stranded resolutions from the previous process.
+    // 3. The rebuild last: re-derive every live wait from the event store
+    //    (there is no table) and run each one's catch-up scan, so a match that
+    //    landed while the engine was down still wakes its thread and a deadline
+    //    that passed while it was down expires loudly on the next sweep tick.
+    shared_engine.start_event_wake_consumer();
+    shared_engine.start_event_wait_dispatcher();
+    // Before either: close any `await_event` call left unpaired by the
+    // pre-2026-08-06 attached-wait shape, or the thread 400s on its next turn.
+    // Ordered first so a wait that is ALSO re-armed below wakes into a thread
+    // whose message array is already valid.
+    shared_engine.settle_legacy_attached_event_waits().await;
+    shared_engine.refire_unresolved_event_wakes().await;
+    shared_engine.rebuild_event_waits().await;
 
     // Rebuild the Apply-All batch registry from the durable `apply_all_batches`
     // table and resolve any batch the previous process abandoned mid-flight

@@ -5,7 +5,7 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
@@ -22,7 +22,7 @@ import { formatMessageTimestamp } from '../../utils/formatTime';
 import { renderMarkdown } from '../../utils/renderMarkdown';
 import { linkifyPaths, extractAppIdFromHref, extractNavTargetFromHref, extractLocalFileTarget, extractBareAppRef, extractDataPathTarget, hasUrlScheme } from '../../utils/linkifyPaths';
 import { handleNavigationRequest } from '../../store/actions/thread-sync';
-import { ChangeBody, CheckpointCard, ContinueButton, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
+import { ChangeBody, CheckpointCard, ContinueButton, EventDeliveryBody, EventWaitStep, FileList, GeneratedImage, InitiatorPanel, InlineStep, MarkdownBlock, ResponsePanel, ResumeNoteBody, UserMessageBody, changeAccent, changeActions, describeExecutor } from './chat-exchange-parts';
 import { TrashIcon } from '../shared/icons';
 
 // Stable refs so loadedOr fallback doesn't yield a fresh [] each render —
@@ -101,9 +101,18 @@ interface Props {
    *  ChangeProposed rode the thread). Primitives, so the memo stays cheap. */
   proposedChangeDesc?: string;
   proposedChangeFileCount?: number;
+  /** The event a detached wake delivered, resolved once per thread in
+   *  `renderExchanges` by following this exchange's
+   *  `UserPromptInjected.delivered_event_id`. Resolved THERE rather than here
+   *  because the target `EventWaitDelivered` sits in a different exchange, and
+   *  reading `threadMap` from this component would undo the memo that keeps a
+   *  29-exchange thread from re-parsing every markdown body per SSE event.
+   *  Both undefined unless this exchange is such a wake. */
+  wakeEventType?: string;
+  wakePayloadJson?: string;
 }
 
-function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount }: Props) {
+function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadId, hasPriorActive, priorModel, priorEffort, isContinuableAbort, threadIsCC, threadCodingAgent, threadIdle, threadAwaitingAnswer, threadCanceling, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakePayloadJson }: Props) {
   const rootRef = useRef<HTMLDivElement>(null);
   const showDetails = detailsExpanded.value;
   const showSteps = stepsExpanded.value;
@@ -408,8 +417,8 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   const responseTerminated = isTerminated(status) || exchange.questionOvertaken === true;
 
   const initiator = useMemo(
-    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount),
-    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount],
+    () => describeInitiator(exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakePayloadJson),
+    [exchange, userMessageHtml, userImageHashes, threadId, responseTerminated, threadIsCC, threadCodingAgent, proposedChangeDesc, proposedChangeFileCount, wakeEventType, wakePayloadJson],
   );
   const canCollapseInitiator = !!initiator.summary || !!initiator.details;
   const isInitiatorCollapsed = canCollapseInitiator
@@ -466,7 +475,26 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // must render its body, or that work + its follow-up proposal are invisible
   // between two "Change applied" rows (real thread 76b4ee76).
   const isChangeContinuation = isChangePanel && changePanelHasContinuation(exchange);
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && !isAbortPanel && !isCancelPanel && !isCanceledDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
+  // Same exception, other boundary: an abort or cancel boundary that ACQUIRED
+  // work must render it. The boundary is a statement about the turn that ended,
+  // not a promise that nothing follows, and something can legitimately land
+  // under it. The sharpest case is an event-wait wake, whose anchor is not an
+  // exchange-start type, so its whole turn folds in here as steps.
+  //
+  // Suppressing that is how a turn on 2026-08-06 applied a change, spawned a
+  // sub-thread and wrote a full summary while the UI showed only "Response
+  // interrupted" (real thread ebc787a4). A stepless boundary still renders bare,
+  // which is the common case and the one the panel was written for.
+  //
+  // The test is RENDERABLE content, not `hasEvents`. A boundary picks up the
+  // drain of whatever the teardown just killed, and a coding-agent subprocess
+  // signs off with a bare `"\n\n"`, which becomes a `text` event that counts
+  // toward `hasEvents` and then draws nothing. That gave the switch-teardown
+  // boundary a response panel whose only visible content was its status badge,
+  // reading "Working" over a stopped engine.
+  const isTerminatedContinuation = (isAbortPanel || isCancelPanel)
+    && (hasResponse || hasRenderableResponseContent(events));
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isCanceledDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -492,11 +520,19 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
       // `dangerouslySetInnerHTML`) on each streamed event.
       const k = baseIndex + i;
       if (evt.type === 'text' && evt.md?.trim()) {
-        return <div key={`t${k}`} dangerouslySetInnerHTML={{ __html: visibleTextHtmls.get(evt)! }} />;
+        // Classed so the chunk can own the space around itself. Interleaved with
+        // step rows, its markdown paragraph's bottom-only margin was the only
+        // thing separating prose from a log row, which put all the air on one
+        // side (see `.response-chunk` in chat/response.css).
+        return <div key={`t${k}`} class="response-chunk" dangerouslySetInnerHTML={{ __html: visibleTextHtmls.get(evt)! }} />;
       }
       if (evt.type === 'step' && showSteps) return <InlineStep key={`s${k}`} event={evt} />;
       if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
       if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
+      // Gated on `showSteps` like any other step, because it now IS one. Hiding
+      // the mechanics loses nothing the user can't reach: the live wait is on
+      // the prompt bar's clock indicator, which is always mounted.
+      if (evt.type === 'event_wait' && showSteps) return <EventWaitStep key={`ew${k}`} event={evt} />;
       if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
     });
@@ -535,7 +571,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           executor={executor}
           onExecutorClick={(e) => openInfoPanel('executor', e)}
           hasBody={hasResponse || hasEvents}
-          status={showStatus && shouldShowResponseStatusBadge(exchange.userEvent.type, statusClass) ? (
+          status={showStatus && shouldShowResponseStatusBadge(exchange.userEvent, statusClass) ? (
             <span class={`exchange-status-label exchange-status-${statusClass}`}>
               {/* The active status label — Working / Requesting / Canceling —
                   shimmers as the AI running-text affordance, which replaces the
@@ -656,6 +692,8 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
   if (prev.threadCanceling !== next.threadCanceling) return false;
   if (prev.proposedChangeDesc !== next.proposedChangeDesc) return false;
   if (prev.proposedChangeFileCount !== next.proposedChangeFileCount) return false;
+  if (prev.wakeEventType !== next.wakeEventType) return false;
+  if (prev.wakePayloadJson !== next.wakePayloadJson) return false;
   const a = prev.exchange;
   const b = next.exchange;
   if (a.userSeq !== b.userSeq) return false;
@@ -672,13 +710,27 @@ function chatExchangePropsEqual(prev: Props, next: Props): boolean {
  *  on every per-SSE-event ThreadView re-render of the heavy thread. */
 export const ChatExchange = memo(ChatExchangeImpl, chatExchangePropsEqual);
 
-/** Hide the response panel's "Canceled ✕" badge when the question card's
- *  own Cancel-as-picked button already carries the same signal. */
+/** Whether the response panel gets a status badge at all. Two turns already
+ *  state their own outcome in the panel ABOVE the response, and a second
+ *  rendering of it is at best noise and at worst a contradiction:
+ *
+ *  - A question card whose own Cancel-as-picked button carries the "Canceled ✕"
+ *    signal.
+ *  - A **switch-teardown boundary**. Its initiator panel reads "Paused by
+ *    restart", which is the engine promising to bring the turn back, and the
+ *    badge under it would be the "Aborted ⚠" the drain earns from the stale
+ *    detector. Painting the failure affordance on a switch is precisely what
+ *    `docs/plans/2026-08-06-paused-only-for-a-user-initiated-switch.md` removed
+ *    from the status dot; the response badge is the same claim in another place.
+ *    Narrowed to the switch fingerprint on purpose: an ordinary abort boundary
+ *    CAN acquire a live turn (a `safety_net` abort over a loop that kept going,
+ *    real thread ebc787a4), and that turn needs its "Working" badge. */
 export function shouldShowResponseStatusBadge(
-  userEventType: ThreadEvent['type'],
+  userEvent: ThreadEvent,
   statusClass: string,
 ): boolean {
-  return !(userEventType === 'UserQuestionAsked' && statusClass === 'canceled');
+  if (userEvent.type === 'UserQuestionAsked' && statusClass === 'canceled') return false;
+  return !abortPromisesAutoResume(userEvent);
 }
 
 // ---------------------------------------------------------------------------
@@ -857,6 +909,13 @@ export function describeInitiator(
    *  at full height on first open (before the per-id Change fetch lands). */
   proposedChangeDesc?: string,
   proposedChangeFileCount?: number,
+  /** The event a detached wake delivered, already resolved through this
+   *  exchange's `UserPromptInjected.delivered_event_id` (see
+   *  `buildDeliveredEventInfo`). Two primitives rather than the payload object,
+   *  so `chatExchangePropsEqual` can compare them without a deep walk. Both
+   *  undefined for every exchange that is not such a wake. */
+  wakeEventType?: string,
+  wakePayloadJson?: string,
 ): InitiatorDescriptor {
   const ev = exchange.userEvent;
   const summary = initiatorSummary(ev);
@@ -944,8 +1003,16 @@ export function describeInitiator(
       return {
         variant: actorVariant(ev.origin),
         ...actorInitiator(ev.origin),
-        summary,
-        details: <MarkdownBlock html={userMessageHtml} />,
+        // A detached event wake, resolved through `delivered_event_id`, is the
+        // one injection whose text is NOT its content: the prose is the model's
+        // prompt and carries the payload as raw JSON. Name the event instead
+        // and fold the payload away. Falls back to the prose whenever the link
+        // is absent (every other injection, legacy rows) or unresolved (the
+        // delivery scrolled out of the loaded window).
+        summary: wakeEventType ? `Woke on ${wakeEventType}` : summary,
+        details: wakeEventType
+          ? <EventDeliveryBody eventType={wakeEventType} payloadJson={wakePayloadJson} />
+          : <MarkdownBlock html={userMessageHtml} />,
       };
     case 'MessageReceived': {
       const details = userMessageHtml || userImageHashes.length > 0

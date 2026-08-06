@@ -55,7 +55,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   submitChat: vi.fn(),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
-  putComposeOnThread: vi.fn().mockResolvedValue(undefined),
+  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
@@ -73,8 +73,12 @@ vi.mock('./thread-loading', () => ({
   refreshThreadEvents: vi.fn().mockResolvedValue(true),
 }));
 
+const devicesMocks = vi.hoisted(() => ({
+  pendingDeviceRegistration: vi.fn<() => Promise<void> | null>(() => null),
+}));
 vi.mock('./devices', () => ({
   getDeviceId: () => 'device-test',
+  pendingDeviceRegistration: devicesMocks.pendingDeviceRegistration,
 }));
 
 vi.mock('../../utils/platform', () => ({
@@ -292,6 +296,40 @@ describe('per-thread send serialization', () => {
     const p = sendMessage('second', undefined, { threadId: THREAD_A, focus: false });
     await flush();
     expect(sentMessages()).toEqual(['first', 'second']);
+    await p;
+  });
+});
+
+/** A human-mode send must not overtake its own device registration: the engine
+ *  refuses `mode: 'human'` from a device it cannot resolve (ADR 0050), so a
+ *  send racing startup would come back 403 for a real person typing. But the
+ *  wait is only owed while registration is genuinely in flight, or it would
+ *  cost the lone-send synchronous dispatch pinned above. */
+describe('a send waits for device registration, but only while it is pending', () => {
+  it('holds the POST until a pending registration settles', async () => {
+    seedActiveThread(THREAD_A);
+    mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
+    const registration = deferred<void>();
+    devicesMocks.pendingDeviceRegistration.mockReturnValueOnce(registration.promise);
+
+    const p = sendMessage('hello', undefined, { threadId: THREAD_A, focus: false });
+    await flush();
+    expect(sentMessages()).toEqual([]);
+
+    registration.resolve();
+    await p;
+    expect(sentMessages()).toEqual(['hello']);
+  });
+
+  it('does not defer a microtask once registration has settled', async () => {
+    // `null` is the settled state, and skipping the await is what keeps the
+    // lone-send dispatch synchronous.
+    seedActiveThread(THREAD_A);
+    mockedSubmitChat.mockResolvedValue({ event_id: 'e' });
+    devicesMocks.pendingDeviceRegistration.mockReturnValue(null);
+
+    const p = sendMessage('lone', undefined, { threadId: THREAD_A, focus: false });
+    expect(sentMessages()).toEqual(['lone']);
     await p;
   });
 });

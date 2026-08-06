@@ -17,6 +17,7 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 mod ask_user_question_hook;
+mod await_event;
 mod cc_bash_guard;
 mod cc_plan_gate;
 mod cc_read_coerce;
@@ -78,7 +79,22 @@ enum Command {
         #[command(subcommand)]
         action: EventsCmd,
     },
-    /// Record/query hardening state. Invoked by the `mark-harden.sh` hook.
+    /// Subscribe this thread to an event instead of polling for it, then FINISH
+    /// your session. Returns immediately: the engine wakes this thread with a
+    /// follow-up message when a matching event lands, or tells you the deadline
+    /// passed. Nothing is blocked while you are subscribed, and you must not
+    /// sit in a sleep-and-recheck loop waiting for it.
+    ///
+    /// Use it for anything the engine emits: another thread finishing
+    /// (`ChildThreadCompleted`), a change appearing (`ChangeProposed`), a
+    /// trigger firing, a workspace domain event. NOT for external state with no
+    /// Lucidos event, which has nothing to wake you.
+    ///
+    /// A rendezvous, not a stream: the first match consumes it. For a standing
+    /// rule that fires every time, create a trigger instead.
+    #[command(name = "await-event")]
+    AwaitEvent(AwaitEventArgs),
+    /// Record/query hardening state. Invoked by `/harden` Phase 5.
     Hardened {
         #[command(subcommand)]
         action: HardenedCmd,
@@ -388,7 +404,39 @@ enum ThreadsCmd {
         /// Defaults to `$LUCIDOS_EVENT_ID`.
         #[arg(long)]
         event_id: Option<String>,
+        /// Stop the child's current turn so it reads this immediately,
+        /// instead of queueing behind its current work. Whatever that turn
+        /// was mid-way through is lost, so use it for a cancellation, not
+        /// for an ordinary steer. Without it a child inside a long tool call
+        /// reads you only when that call returns.
+        #[arg(long)]
+        urgent: bool,
     },
+}
+
+#[derive(Args)]
+pub(crate) struct AwaitEventArgs {
+    /// Event name to wake on, PascalCase past tense. Repeat the flag to watch
+    /// several: any one of them wakes the thread.
+    #[arg(long = "on", required = true)]
+    pub(crate) on: Vec<String>,
+    /// Optional payload filter as a JSON object, applied to every `--on` name.
+    /// Field-to-value for equality, or an operator object (`{"$gt": 0}`,
+    /// `{"$in": [...]}`). Filter on the event's OWN payload fields, the ones
+    /// `lucidos events query` prints; the thread an event belongs to is not one
+    /// of them.
+    #[arg(long)]
+    pub(crate) condition: Option<String>,
+    /// How long to wait before giving up, in seconds (1 to 86400). Required:
+    /// there is no unbounded subscription. You are woken with a timeout if
+    /// nothing matches, so pick a real upper bound and add margin.
+    #[arg(long = "timeout-secs")]
+    pub(crate) timeout_secs: i64,
+    /// One short line, in the user's language, saying what you are waiting for
+    /// and why. The user reads it in the subscription indicator, and it is how
+    /// they tell a sleeping thread from a stalled one.
+    #[arg(long)]
+    pub(crate) reason: String,
 }
 
 #[derive(Args)]
@@ -873,6 +921,19 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 },
             )
         }
+        Command::AwaitEvent(args) => {
+            let ws = resolve_from_env()?;
+            await_event::cmd_await_event(
+                &ws,
+                await_event::AwaitEventArgs {
+                    on: &args.on,
+                    condition: args.condition.as_deref(),
+                    timeout_secs: args.timeout_secs,
+                    reason: &args.reason,
+                },
+            )?;
+            Ok(0)
+        }
         Command::Notify(args) => {
             let ws = resolve_from_env()?;
             notify::cmd_notify(
@@ -932,11 +993,13 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     thread,
                     message,
                     event_id,
+                    urgent,
                 } => threads::cmd_follow_up(
                     &ws,
                     &thread,
                     &message,
                     event_id.or_else(threads::event_id_from_env).as_deref(),
+                    urgent,
                 )?,
             }
             Ok(0)
@@ -1040,6 +1103,7 @@ mod tests {
         let flags = subcommand_flags(&["threads", "follow-up"]);
         assert!(flags.contains(&"--thread".to_string()), "{flags:?}");
         assert!(flags.contains(&"--message".to_string()), "{flags:?}");
+        assert!(flags.contains(&"--urgent".to_string()), "{flags:?}");
         for forbidden in ["--from", "--caller", "--caller-thread", "--parent"] {
             assert!(
                 !flags.iter().any(|f| f == forbidden),

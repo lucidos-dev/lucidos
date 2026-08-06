@@ -47,6 +47,7 @@ function makeThread(id = 'thread-1', status: ThreadStatus = 'idle'): ThreadState
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

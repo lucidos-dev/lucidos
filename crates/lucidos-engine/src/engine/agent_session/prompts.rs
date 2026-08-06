@@ -74,13 +74,27 @@ const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your c
 /// Hardening reminder shared across all Lucidos-repo CC system prompts. The
 /// /harden skill itself runs the test suites and iterates on failure — keep
 /// this text in sync with `.claude/commands/harden.md` Phase 4.5.
+///
+/// This is the SOLE statement of the rule to a session. `CLAUDE.md` carried a
+/// second copy until 2026-08-06; running `/harden` is session truth, so under
+/// the split in `docs/agent-config.md` § Which surface owns a rule the engine
+/// owns it outright. The last three sentences came from that copy and exist
+/// nowhere else, so do not trim them back as redundant. What stays in
+/// `CLAUDE.md` is the repo-side fact that `.claude/hooks/pre-push.sh` enforces
+/// the marker, which also binds a hand-run `claude` that never sees this text.
 const HARDENING_RULE: &str = "HARDENING: Once your implementation is complete and committed, \
     you MUST run `/harden`. No exceptions — even for docs-only, CSS-only, comment-only, or \
     seemingly trivial changes. Do not rationalize skipping it (\"too small to harden\", \
     \"nothing to test\", \"just a wording tweak\"). The skill itself decides what to check: \
     it reviews the diff and runs the test suites for the layers you touched, auto-skipping \
-    phases when no relevant layers were touched. The harden marker only exists if you actually \
-    invoke `/harden` — without the marker, the user pays the wait when they click Apply.";
+    phases when no relevant layers were touched, and iterates from Phase 1 if anything fails. \
+    The harden marker only exists if you actually invoke `/harden`, and without it the user \
+    pays the wait when they click Apply. Run it ONCE, over the whole finished batch of \
+    commits: hardening mid-work re-runs the same suites for nothing and says nothing about \
+    the commits that follow it. If Phase 0 reports ALREADY_HARDENED, say so and stop. Never \
+    tell the user you are postponing, deferring, or skipping it. There is no such option in \
+    the system, and Apply runs hardening synchronously when the marker is missing, so a \
+    postponement you announce is a confusing lie.";
 
 /// Implementation-planning rule shared by the two Lucidos-source prompts
 /// (`worktree_system_prompt`, `recovery_system_prompt`). Lives in the shared
@@ -449,7 +463,14 @@ const CODEX_CLI_RULE: &str = "\n\n\
     so the action is attributed to the agent, not the user.\n\
     - `lucidos spawn-thread --to <workspace> [--cc|--codex|--coding-agent <backend>] --message ... \
     --title ...` — spawn a new Lucidos thread. Use `--codex` when the user asks for Codex \
-    (always ask the user before spawning).";
+    (always ask the user before spawning).\n\
+    - `lucidos await-event --on <EventType> --timeout-secs <n> --reason \"...\"`: subscribe \
+    this thread to a Lucidos event, then FINISH your session. It returns immediately and \
+    blocks nothing. The engine re-opens this thread with a follow-up message when the event \
+    lands, or tells you the deadline passed. Use it instead of a sleep-and-recheck loop \
+    whenever you are waiting on something the engine emits (a spawned thread finishing, a \
+    change appearing, a trigger firing). Do NOT poll for it afterwards, and do NOT keep the \
+    session alive waiting.";
 
 /// Codex-only slash-command mapping appended by [`append_backend_rules`]
 /// alongside [`CODEX_CLI_RULE`]. Lucidos prompts name Claude Code slash
@@ -587,6 +608,20 @@ const NAMES_NOT_IDS_RULE: &str = "\n\n\
     started. The only other exception is a raw value the user asked for, or one they have to \
     paste somewhere.";
 
+/// One-line mirror of the chat agent's
+/// `chat::process::system_prompt::NO_IMPERSONATION_RULE`, which carries the
+/// full reasoning and the 2026-08-06 incident it comes from. A coding agent
+/// holds the same Bash capability and the same `lucidos` CLI, so it can reach
+/// the engine's API by hand exactly as the chat agent did; it is short here
+/// because a coding-agent session's own scope makes the temptation rarer.
+/// Change both together.
+const NO_IMPERSONATION_RULE: &str = "\n\n\
+    NEVER POST TO THE LUCIDOS ENGINE API AS THE USER: Do not curl (or otherwise hand-roll HTTP \
+    to) the engine's own `/api/v1` surface to do something a tool or the `lucidos` CLI refuses \
+    you, and never record a message as though the user typed it. When you are blocked, say so \
+    and offer what you CAN do. A refusal reported honestly is a good turn; a refusal worked \
+    around is a broken one, however well it appears to succeed.";
+
 /// Append backend-specific rules — plus the backend-independent
 /// [`REASONING_NOT_VISIBLE_RULE`], which rides every prompt here — to a finished
 /// system prompt — the single
@@ -608,7 +643,8 @@ pub(super) fn append_backend_rules(
     // and both talk to the user about work they track by sha, so every prompt
     // flavor gets these two rules here (the shared chokepoint) before the
     // backend-specific teaching below.
-    let prompt = format!("{prompt}{REASONING_NOT_VISIBLE_RULE}{NAMES_NOT_IDS_RULE}");
+    let prompt =
+        format!("{prompt}{REASONING_NOT_VISIBLE_RULE}{NAMES_NOT_IDS_RULE}{NO_IMPERSONATION_RULE}");
     match coding_agent {
         crate::runtime::CodingAgent::ClaudeCode => format!("{prompt}{PERMISSION_CONFIG_RULE}"),
         crate::runtime::CodingAgent::Codex => {
@@ -1384,6 +1420,117 @@ mod tests {
             !conflict_resolution_system_prompt()
                 .contains("BACKGROUND PROCESSES DON'T SURVIVE A TURN"),
             "merge-conflict prompt should omit the background-process rule",
+        );
+    }
+
+    /// Byte ceiling for each assembled system prompt, measured AFTER
+    /// `append_backend_rules` because that is what a session actually receives.
+    ///
+    /// The engine-side counterpart of `scripts/check-context-budget.sh`, which
+    /// gates the OTHER unconditional surface (`CLAUDE.md` plus the unscoped
+    /// `.claude/rules/*.md`) and deliberately does not look at this one. Two
+    /// surfaces reach every session before it has read a line of code; until
+    /// 2026-08-06 only one of them was gated, so this file could grow forever
+    /// without anything objecting. `docs/agent-config.md` § Which surface owns
+    /// a rule says which content belongs here at all.
+    ///
+    /// A RATCHET, the same convention as `CONTEXT_BUDGET_CEILING`: lowering a
+    /// number is the point and needs no ceremony, raising one needs a reason in
+    /// the commit message saying what became worth paying for on every request
+    /// of every session of that flavor.
+    ///
+    /// Per BACKEND as well as per flavor, because the two tails differ enough
+    /// to hide each other. Codex swaps the 5,767-char `ASK_USER_QUESTION_RULE`
+    /// for a 3,245-char one and then appends `CODEX_CLI_RULE` +
+    /// `CODEX_SLASH_COMMANDS_RULE`, while Claude Code appends
+    /// `PERMISSION_CONFIG_RULE`. One shared number per flavor would let either
+    /// backend grow into the other's slack unnoticed.
+    ///
+    /// Backend labels are `CodingAgent::as_str()` values, kebab-case, so the
+    /// table reads the same as every other public surface naming a backend.
+    const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
+        ("worktree", "claude-code", 21420),
+        ("worktree", "codex", 19826),
+        ("external_repo", "claude-code", 14345),
+        ("external_repo", "codex", 12751),
+        ("recovery", "claude-code", 20015),
+        ("recovery", "codex", 18421),
+        ("external_repo_recovery", "claude-code", 14221),
+        ("external_repo_recovery", "codex", 12627),
+        ("app_worktree", "claude-code", 17555),
+        ("app_worktree", "codex", 15961),
+        ("app_worktree_recovery", "claude-code", 16119),
+        ("app_worktree_recovery", "codex", 14525),
+        ("conflict_resolution", "claude-code", 5343),
+        ("conflict_resolution", "codex", 6275),
+    ];
+
+    /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
+    fn all_backends() -> [(crate::runtime::CodingAgent, &'static str); 2] {
+        [
+            (crate::runtime::CodingAgent::ClaudeCode, "claude-code"),
+            (crate::runtime::CodingAgent::Codex, "codex"),
+        ]
+    }
+
+    /// The engine system prompt is one of the two surfaces every session pays
+    /// for before reading any code. This is its regrowth gate.
+    ///
+    /// Two arms, mirroring `check-context-budget.sh`. SIZE: no assembled prompt
+    /// exceeds its ceiling. MEMBERSHIP: every flavor/backend pair has a
+    /// declared ceiling and every declared ceiling names a real pair, so a
+    /// renamed or deleted flavor cannot leave a dead row that silently gates
+    /// nothing.
+    #[test]
+    fn every_prompt_flavor_stays_under_its_size_ceiling() {
+        let mut table = Vec::new();
+        let mut over = Vec::new();
+        let mut seen = Vec::new();
+
+        for (flavor, base) in all_prompt_flavors() {
+            for (agent, label) in all_backends() {
+                let size = append_backend_rules(base.clone(), agent).len();
+                seen.push((flavor, label));
+                let ceiling = PROMPT_FLAVOR_CEILINGS
+                    .iter()
+                    .find(|(f, b, _)| *f == flavor && *b == label)
+                    .map(|(_, _, c)| *c);
+                match ceiling {
+                    Some(ceiling) => {
+                        table.push(format!("{size:>7} / {ceiling:<7} {flavor}/{label}"));
+                        if size > ceiling {
+                            over.push(format!(
+                                "{flavor}/{label}: {size} bytes, over its {ceiling} ceiling by {}",
+                                size - ceiling
+                            ));
+                        }
+                    }
+                    None => over.push(format!(
+                        "{flavor}/{label}: {size} bytes, no ceiling declared in PROMPT_FLAVOR_CEILINGS"
+                    )),
+                }
+            }
+        }
+
+        for (flavor, label, _) in PROMPT_FLAVOR_CEILINGS {
+            assert!(
+                seen.iter().any(|(f, b)| f == flavor && b == label),
+                "PROMPT_FLAVOR_CEILINGS declares {flavor}/{label}, which no longer exists. \
+                 A dead row gates nothing, so drop it or fix the name."
+            );
+        }
+
+        assert!(
+            over.is_empty(),
+            "the engine system prompt grew past its ceiling:\n  {}\n\nall flavors (bytes / ceiling):\n  {}\n\n\
+             Every byte is paid on every request of every session of that flavor, with \
+             system-prompt authority, before the agent has read a line of code. Prefer moving \
+             the content: repo conventions belong in CLAUDE.md (see docs/agent-config.md \
+             section \"Which surface owns a rule\"), and maintainer explanation belongs in \
+             docs/agent-config.md, which never loads. Raising a ceiling is allowed and is a \
+             deliberate act: say in the commit message what became worth paying for.",
+            over.join("\n  "),
+            table.join("\n  "),
         );
     }
 

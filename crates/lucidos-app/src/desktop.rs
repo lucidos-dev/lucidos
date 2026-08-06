@@ -25,6 +25,13 @@
 //!    the sigil namespace `/~/`). Closing the window and Cmd+Q only dismiss the
 //!    window — the client stays resident in the menu bar and the service keeps
 //!    running; only the menu-bar "Quit and Stop Background Service" tears it down.
+//!    It also installs a SECOND agent, the **login agent**
+//!    (`~/Library/LaunchAgents/com.lucidos.client.plist`, `RunAtLoad`, one shot),
+//!    which `open`s the bundle with [`LOGIN_FLAG`] at login so the client is back
+//!    in the menu bar after a restart, menu-bar-only and without a window. Without
+//!    it a rebooted Mac runs the service with no client at all, which means no
+//!    menu-bar item, no Dock badge and no native notifications (the client is what
+//!    shows those).
 //!
 //! None of this runs in development — `scripts/tauri-dev.sh` keeps using Docker
 //! Postgres + a natively-built engine, and [`launch`] short-circuits on
@@ -57,9 +64,28 @@ use tauri::{AppHandle, Manager};
 /// resolve the OS app-data dir from the service role, which has no `AppHandle`.
 const BUNDLE_IDENTIFIER: &str = "com.lucidos.app";
 
-/// Historical launchd label for the always-on gateway service. The plist
-/// installs at `~/Library/LaunchAgents/<LAUNCH_AGENT_LABEL>.plist`.
-pub const LAUNCH_AGENT_LABEL: &str = "com.lucidos.engine";
+/// Historical launchd label for the **service agent**: the always-on gateway
+/// service. The plist installs at
+/// `~/Library/LaunchAgents/<SERVICE_AGENT_LABEL>.plist`. The value is historical
+/// (`engine`, from before the gateway owned the stack) and must not change: it
+/// keys every already-installed plist.
+pub const SERVICE_AGENT_LABEL: &str = "com.lucidos.engine";
+
+/// launchd label for the **login agent**: the one-shot job that brings the
+/// CLIENT back at login, so the menu-bar item (and with it native
+/// notifications, which only the client can show) survives a restart. Distinct
+/// from [`SERVICE_AGENT_LABEL`], which is the headless always-on service and
+/// hosts no UI at all.
+pub const LOGIN_AGENT_LABEL: &str = "com.lucidos.client";
+
+/// The argument the login agent passes the client, marking a launch as
+/// "started at login, not by a person". Such a launch comes up menu-bar-only:
+/// tray icon, no window, no Dock icon. Read in `lib.rs` by
+/// `should_show_window_at_startup`.
+///
+/// It is launch CONTEXT, not a persistent mode, which is why every relaunch
+/// drops it: see [`relaunch_args`].
+pub const LOGIN_FLAG: &str = "--login";
 
 /// Fixed default gateway port so the mobile connect URL is stable across
 /// restarts. The historical `engine_port` name is kept for callers, but in ADR
@@ -727,7 +753,8 @@ fn install_stop_handlers() {}
 // ── LaunchAgent management (client role) ────────────────────────────────────
 
 /// Install/update the plist (if missing or stale) and ensure the service is
-/// loaded and running.
+/// loaded and running. Installs the login agent alongside it, so the client
+/// itself also comes back at the next login.
 ///
 /// Note: the plist captures `current_exe()`. A SIGNED + NOTARIZED app in
 /// `/Applications` has a stable path. An UNSIGNED local test build run from
@@ -736,7 +763,15 @@ fn install_stop_handlers() {}
 /// `/Applications` (or sign it) before relying on the service across reboots.
 fn ensure_service_installed_and_running(app_data: &Path) -> io::Result<()> {
     let exe = std::env::current_exe()?;
-    let changed = install_or_update_plist(&exe, app_data)?;
+
+    // Best-effort and deliberately first-and-forgotten: the service is what this
+    // function must not fail to deliver, and a login agent that did not install
+    // costs only what every build before it already cost, a client the user
+    // opens by hand.
+    #[cfg(target_os = "macos")]
+    ensure_login_agent_installed(&exe, app_data);
+
+    let changed = install_or_update_service_plist(&exe, app_data)?;
 
     if changed && is_service_loaded() {
         // A rewritten definition only takes effect after a reload. Remove the
@@ -757,25 +792,40 @@ fn ensure_service_installed_and_running(app_data: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// `~/Library/LaunchAgents/<label>.plist`.
-fn plist_path() -> io::Result<PathBuf> {
+/// `~/Library/LaunchAgents/<label>.plist` for any of our agents.
+fn agent_plist_path(label: &str) -> io::Result<PathBuf> {
     let home = std::env::var_os("HOME").ok_or_else(|| io::Error::other("HOME not set"))?;
     Ok(PathBuf::from(home)
         .join("Library/LaunchAgents")
-        .join(format!("{LAUNCH_AGENT_LABEL}.plist")))
+        .join(format!("{label}.plist")))
 }
 
-/// Minimal XML text escaping for paths embedded in the plist.
-fn xml_escape(p: &Path) -> String {
-    p.to_string_lossy()
-        .replace('&', "&amp;")
+/// The service agent's plist, `~/Library/LaunchAgents/com.lucidos.engine.plist`.
+fn service_plist_path() -> io::Result<PathBuf> {
+    agent_plist_path(SERVICE_AGENT_LABEL)
+}
+
+/// The login agent's plist, `~/Library/LaunchAgents/com.lucidos.client.plist`.
+#[cfg(target_os = "macos")]
+fn login_plist_path() -> io::Result<PathBuf> {
+    agent_plist_path(LOGIN_AGENT_LABEL)
+}
+
+/// Minimal XML text escaping for text embedded in a plist `<string>`.
+fn xml_escape_str(s: &str) -> String {
+    s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
 }
 
+/// Minimal XML text escaping for paths embedded in the plist.
+fn xml_escape(p: &Path) -> String {
+    xml_escape_str(&p.to_string_lossy())
+}
+
 /// The plist that runs `Lucidos --service` at login, restarts it on crash, and
 /// logs to the app-data `logs/` dir.
-fn desired_plist(exe: &Path, app_data: &Path) -> String {
+fn desired_service_plist(exe: &Path, app_data: &Path) -> String {
     let logs = app_data.join("logs");
     let out = logs.join("engine-service.out.log");
     let err = logs.join("engine-service.err.log");
@@ -806,27 +856,181 @@ fn desired_plist(exe: &Path, app_data: &Path) -> String {
 </dict>
 </plist>
 "#,
-        label = LAUNCH_AGENT_LABEL,
+        label = SERVICE_AGENT_LABEL,
         exe = xml_escape(exe),
         out = xml_escape(&out),
         err = xml_escape(&err),
     )
 }
 
-/// Write the plist if missing or different from desired. Returns true if it was
-/// (re)written.
-fn install_or_update_plist(exe: &Path, app_data: &Path) -> io::Result<bool> {
-    let desired = desired_plist(exe, app_data);
-    let path = plist_path()?;
+/// Write `desired` to `path` if it is missing or different, creating the
+/// `LaunchAgents` dir and the app-data `logs/` dir the plist points into.
+/// Returns true if it was (re)written, which is the caller's cue that launchd is
+/// holding a stale definition.
+fn write_plist_if_changed(path: &Path, app_data: &Path, desired: &str) -> io::Result<bool> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     std::fs::create_dir_all(app_data.join("logs"))?;
-    if std::fs::read_to_string(&path).ok().as_deref() == Some(desired.as_str()) {
+    if std::fs::read_to_string(path).ok().as_deref() == Some(desired) {
         return Ok(false);
     }
-    std::fs::write(&path, desired)?;
+    std::fs::write(path, desired)?;
     Ok(true)
+}
+
+/// Write the service agent's plist if missing or different from desired.
+/// Returns true if it was (re)written.
+fn install_or_update_service_plist(exe: &Path, app_data: &Path) -> io::Result<bool> {
+    let desired = desired_service_plist(exe, app_data);
+    write_plist_if_changed(&service_plist_path()?, app_data, &desired)
+}
+
+// ── Login agent: the client comes back in the menu bar at login ─────────────
+
+/// How many times the login agent retries `open` before giving up. At login
+/// LaunchServices can still be coming up, and the whole point of this agent is
+/// that the client is there afterwards, so one refused `open` must not be the
+/// end of it.
+#[cfg(target_os = "macos")]
+const LOGIN_OPEN_ATTEMPTS: u32 = 10;
+
+/// Seconds between those attempts. Bounded rather than `KeepAlive`, so a bundle
+/// the user dragged to the Trash cannot leave launchd re-`open`ing it forever.
+#[cfg(target_os = "macos")]
+const LOGIN_OPEN_RETRY_SECONDS: u32 = 3;
+
+/// The login agent's command: hand the bundle to LaunchServices, in the
+/// background, with [`LOGIN_FLAG`], retrying a bounded number of times.
+///
+/// `open` rather than the bundle's inner binary, for two reasons. It launches
+/// the app exactly as a double-click does (the same reason
+/// [`relaunch_watcher_script`] uses it), and on an ALREADY-RUNNING client it
+/// merely activates that instance, so this job can never produce a second
+/// client no matter what kickstarts it. `-g` keeps that activation out of the
+/// foreground: a login start belongs in the menu bar, not in front of whatever
+/// the user is doing.
+///
+/// Pure, so the bound, the ordering and the quoting are unit-tested rather than
+/// eyeballed. Errors on a bundle path that isn't valid UTF-8: it cannot be
+/// quoted into a shell word without corrupting it.
+#[cfg(target_os = "macos")]
+fn login_launch_script(bundle: &Path) -> Result<String, String> {
+    let bundle = bundle
+        .to_str()
+        .ok_or_else(|| format!("bundle path is not valid UTF-8: {}", bundle.display()))?;
+    Ok(format!(
+        "i=0; while [ $i -lt {LOGIN_OPEN_ATTEMPTS} ]; do \
+         /usr/bin/open -g -a {bundle} --args {LOGIN_FLAG} && exit 0; \
+         sleep {LOGIN_OPEN_RETRY_SECONDS}; i=$((i+1)); done; \
+         echo \"lucidos: gave up opening {bundle} after {LOGIN_OPEN_ATTEMPTS} attempts; \
+         Lucidos will not be in the menu bar until it is opened by hand\" >&2; exit 1",
+        bundle = sh_quote(bundle)
+    ))
+}
+
+/// The plist that brings the CLIENT back at login: one shot, no `KeepAlive`
+/// (quitting the client must not respawn it), logging beside the service's own
+/// logs.
+#[cfg(target_os = "macos")]
+fn desired_login_plist(bundle: &Path, app_data: &Path) -> Result<String, String> {
+    let script = login_launch_script(bundle)?;
+    let logs = app_data.join("logs");
+    let out = logs.join("client-login.out.log");
+    let err = logs.join("client-login.err.log");
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/sh</string>
+        <string>-c</string>
+        <string>{script}</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>{out}</string>
+    <key>StandardErrorPath</key>
+    <string>{err}</string>
+</dict>
+</plist>
+"#,
+        label = LOGIN_AGENT_LABEL,
+        script = xml_escape_str(&script),
+        out = xml_escape(&out),
+        err = xml_escape(&err),
+    ))
+}
+
+/// Pure: what the login agent's plist should contain for this executable, or
+/// `None` when there is nothing to install because the binary is not inside a
+/// `.app` (dev, `cargo run`, an unbundled build) and LaunchServices would have
+/// nothing to open. `Err` only for a bundle path that cannot be shell-quoted.
+///
+/// Split from [`ensure_login_agent_installed`] so the skip-when-unbundled
+/// decision is unit-testable without writing to `~/Library/LaunchAgents`.
+#[cfg(target_os = "macos")]
+fn desired_login_plist_for_exe(exe: &Path, app_data: &Path) -> Result<Option<String>, String> {
+    match app_bundle_root_from_exe(exe) {
+        Some(bundle) => desired_login_plist(&bundle, app_data).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Install the login agent, and bootstrap it only when its definition actually
+/// changed.
+///
+/// Two deliberate restraints:
+///
+///  * **Nothing happens without a `.app`.** A dev or unbundled binary has no
+///    bundle for LaunchServices to open, so no plist is written at all.
+///  * **An unchanged plist never touches launchd.** Switching the item off in
+///    System Settings records a launchd override keyed by the label, which our
+///    idempotent write does not clear, and we never `launchctl enable`. So the
+///    user's "off" survives every later client launch. A bootstrap is attempted
+///    only on a first install or a moved bundle, where launchd genuinely holds
+///    nothing or holds a stale path; on a disabled job that attempt fails
+///    harmlessly, and the item stays off.
+///
+/// Every failure is logged and swallowed: the client is already running, so the
+/// worst case is the behaviour every build before this one had.
+#[cfg(target_os = "macos")]
+fn ensure_login_agent_installed(exe: &Path, app_data: &Path) {
+    let desired = match desired_login_plist_for_exe(exe, app_data) {
+        Ok(Some(desired)) => desired,
+        // Dev / unbundled: there is no `.app` for LaunchServices to open.
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("[desktop] cannot build the login agent plist: {e}");
+            return;
+        }
+    };
+    let path = match login_plist_path() {
+        Ok(path) => path,
+        Err(e) => {
+            eprintln!("[desktop] cannot resolve the login agent plist path: {e}");
+            return;
+        }
+    };
+    match write_plist_if_changed(&path, app_data, &desired) {
+        Ok(false) => {} // Already installed: leave launchd's view of it alone.
+        Ok(true) => {
+            let target = login_target();
+            if is_job_loaded(&target) {
+                // A rewritten definition only takes effect after a reload.
+                let _ = bootout_job(&target);
+            }
+            if let Err(e) = bootstrap_job(&path, &target) {
+                eprintln!("[desktop] could not bootstrap the login agent: {e}");
+            }
+        }
+        Err(e) => eprintln!("[desktop] could not install the login agent plist: {e}"),
+    }
 }
 
 #[cfg(unix)]
@@ -839,36 +1043,51 @@ fn current_uid() -> u32 {
     0
 }
 
-/// `gui/<uid>` — the per-user launchd domain.
-fn service_domain() -> String {
+/// The per-user launchd domain, `gui/<uid>`, which both our agents live in.
+fn launchd_domain() -> String {
     format!("gui/{}", current_uid())
 }
 
-/// `gui/<uid>/<label>` — the service's launchd target.
+/// A job's launchd target, `gui/<uid>/<label>`.
+fn launchd_target(label: &str) -> String {
+    format!("gui/{}/{}", current_uid(), label)
+}
+
+/// The service agent's launchd target, `gui/<uid>/com.lucidos.engine`.
 fn service_target() -> String {
-    format!("gui/{}/{}", current_uid(), LAUNCH_AGENT_LABEL)
+    launchd_target(SERVICE_AGENT_LABEL)
+}
+
+/// The login agent's launchd target, `gui/<uid>/com.lucidos.client`.
+#[cfg(target_os = "macos")]
+fn login_target() -> String {
+    launchd_target(LOGIN_AGENT_LABEL)
 }
 
 fn launchctl(args: &[&str]) -> io::Result<std::process::Output> {
     Command::new("launchctl").args(args).output()
 }
 
-/// True if the service is bootstrapped into the user's launchd domain.
-fn is_service_loaded() -> bool {
-    launchctl(&["print", &service_target()])
+/// True if `target` is bootstrapped into the user's launchd domain.
+fn is_job_loaded(target: &str) -> bool {
+    launchctl(&["print", target])
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
 
-fn bootstrap_service() -> io::Result<()> {
-    let plist = plist_path()?;
+/// True if the service agent is bootstrapped into the user's launchd domain.
+fn is_service_loaded() -> bool {
+    is_job_loaded(&service_target())
+}
+
+fn bootstrap_job(plist: &Path, target: &str) -> io::Result<()> {
     let plist_s = plist.to_string_lossy().to_string();
-    let out = launchctl(&["bootstrap", &service_domain(), &plist_s])?;
+    let out = launchctl(&["bootstrap", &launchd_domain(), &plist_s])?;
     if !out.status.success() {
-        // Idempotent re-bootstrap of an already-loaded service is fine; only
+        // Idempotent re-bootstrap of an already-loaded job is fine; only
         // surface a genuine failure to load.
         let stderr = String::from_utf8_lossy(&out.stderr);
-        if !is_service_loaded() {
+        if !is_job_loaded(target) {
             return Err(io::Error::other(format!(
                 "launchctl bootstrap failed: {}",
                 stderr.trim()
@@ -878,8 +1097,12 @@ fn bootstrap_service() -> io::Result<()> {
     Ok(())
 }
 
-fn bootout_service() -> io::Result<()> {
-    let out = launchctl(&["bootout", &service_target()])?;
+fn bootstrap_service() -> io::Result<()> {
+    bootstrap_job(&service_plist_path()?, &service_target())
+}
+
+fn bootout_job(target: &str) -> io::Result<()> {
+    let out = launchctl(&["bootout", target])?;
     if !out.status.success() {
         return Err(io::Error::other(format!(
             "launchctl bootout failed: {}",
@@ -887,6 +1110,10 @@ fn bootout_service() -> io::Result<()> {
         )));
     }
     Ok(())
+}
+
+fn bootout_service() -> io::Result<()> {
+    bootout_job(&service_target())
 }
 
 fn kickstart_service(kill: bool) -> io::Result<()> {
@@ -976,6 +1203,28 @@ const RELAUNCH_POLL_SECONDS: &str = "0.1";
 #[cfg(target_os = "macos")]
 const RELAUNCH_WAIT_PROBES: u32 = 3000;
 
+/// This client's argv, minus [`LOGIN_FLAG`], for handing to a relaunch of
+/// itself.
+///
+/// The flag is one-shot launch CONTEXT ("launchd started you at login"), never a
+/// mode the process keeps. Both relaunch paths forward argv verbatim, so without
+/// this filter a client that came up at login and was later restarted (the
+/// updater's relaunch, or the Restart App action) would come back hidden and
+/// menu-bar-only even though the user had a window open, which reads as the app
+/// vanishing mid-update. It would also quietly undo the frontmost relaunch
+/// [`schedule_relaunch_after_exit`] exists to guarantee, since there would be no
+/// window to bring forward.
+pub fn relaunch_args() -> Vec<std::ffi::OsString> {
+    strip_login_flag(std::env::args_os().skip(1))
+}
+
+/// Pure half of [`relaunch_args`], so the filter is unit-testable without argv.
+fn strip_login_flag(args: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    args.into_iter()
+        .filter(|a| a != std::ffi::OsStr::new(LOGIN_FLAG))
+        .collect()
+}
+
 /// Arrange for LaunchServices to relaunch this app once THIS process has
 /// exited. `Ok` means it is arranged and the caller MUST exit; `Err` means it
 /// isn't, and the caller must fall back to respawning the executable itself.
@@ -1005,7 +1254,7 @@ pub fn schedule_relaunch_after_exit() -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("resolve this executable: {e}"))?;
     let bundle = app_bundle_root_from_exe(&exe)
         .ok_or_else(|| format!("{} is not inside a .app bundle", exe.display()))?;
-    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    let args = relaunch_args();
     let script = relaunch_watcher_script(std::process::id(), &bundle, &args)?;
     Command::new("/bin/sh")
         .arg("-c")
@@ -1130,21 +1379,39 @@ pub fn uninstall(app_data: &Path, delete_data: bool) -> Result<(), String> {
         true
     };
 
-    // (d) Delete the LaunchAgent plist (best-effort) so it can't reload at login.
-    match plist_path() {
-        Ok(plist) => match delete_path(&plist) {
-            Ok(()) => eprintln!("[service] uninstall: removed {}", plist.display()),
+    // (c2) Boot out the login agent too (best-effort). It is a one-shot job that
+    //      has normally already run and exited, but while it stays loaded a
+    //      `kickstart` could still fire it at the bundle we are about to trash.
+    let login = login_target();
+    if is_job_loaded(&login) {
+        match bootout_job(&login) {
+            Ok(()) => eprintln!("[service] uninstall: login agent booted out"),
             Err(e) => {
-                eprintln!(
-                    "[service] uninstall: failed to remove {}: {e}",
-                    plist.display()
-                );
-                failures.push(format!("delete {}: {e}", plist.display()));
+                eprintln!("[service] uninstall: login agent bootout failed: {e}");
+                failures.push(format!("stop the login agent: {e}"));
             }
-        },
-        Err(e) => {
-            eprintln!("[service] uninstall: cannot resolve plist path: {e}");
-            failures.push(format!("resolve plist path: {e}"));
+        }
+    }
+
+    // (d) Delete BOTH LaunchAgent plists (best-effort) so neither can reload at
+    //     login: the service agent, and the login agent that would otherwise
+    //     spend a boot trying to `open` a bundle sitting in the Trash.
+    for resolved in [service_plist_path(), login_plist_path()] {
+        match resolved {
+            Ok(plist) => match delete_path(&plist) {
+                Ok(()) => eprintln!("[service] uninstall: removed {}", plist.display()),
+                Err(e) => {
+                    eprintln!(
+                        "[service] uninstall: failed to remove {}: {e}",
+                        plist.display()
+                    );
+                    failures.push(format!("delete {}: {e}", plist.display()));
+                }
+            },
+            Err(e) => {
+                eprintln!("[service] uninstall: cannot resolve plist path: {e}");
+                failures.push(format!("resolve plist path: {e}"));
+            }
         }
     }
 
@@ -1471,15 +1738,213 @@ mod tests {
     fn desired_plist_runs_service_role_with_keepalive() {
         let exe = Path::new("/Applications/Lucidos.app/Contents/MacOS/Lucidos");
         let app_data = Path::new("/Users/me/Library/Application Support/com.lucidos.app");
-        let plist = desired_plist(exe, app_data);
+        let plist = desired_service_plist(exe, app_data);
 
-        assert!(plist.contains(&format!("<string>{LAUNCH_AGENT_LABEL}</string>")));
+        assert!(plist.contains(&format!("<string>{SERVICE_AGENT_LABEL}</string>")));
         assert!(plist.contains("<string>/Applications/Lucidos.app/Contents/MacOS/Lucidos</string>"));
         assert!(plist.contains("<string>--service</string>"));
         assert!(plist.contains("<key>RunAtLoad</key>"));
         assert!(plist.contains("<key>KeepAlive</key>"));
         // Logs land under the app-data dir, not next to the bundle.
         assert!(plist.contains("Application Support/com.lucidos.app/logs/engine-service.out.log"));
+    }
+
+    // ── The login agent ──────────────────────────────────────────────────────
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_launch_script_opens_the_bundle_through_launch_services() {
+        let script = login_launch_script(Path::new("/Applications/Lucidos.app")).unwrap();
+
+        // LaunchServices, not the inner binary: that is what makes a second
+        // client impossible, because `open` activates a running one instead.
+        assert!(script.contains("/usr/bin/open -g -a '/Applications/Lucidos.app'"));
+        assert!(!script.contains("Contents/MacOS"));
+        // And the flag that keeps the login start out of the way.
+        assert!(script.contains(&format!("--args {LOGIN_FLAG}")));
+        // Backgrounded: a login start belongs in the menu bar, not in front of
+        // whatever the user is doing.
+        assert!(script.contains(" -g "));
+        // Bounded retry, then give up: LaunchServices may not be ready the
+        // instant launchd fires, but a trashed bundle must not loop forever.
+        assert!(script.contains(&format!("[ $i -lt {LOGIN_OPEN_ATTEMPTS} ]")));
+        assert!(script.contains(&format!("sleep {LOGIN_OPEN_RETRY_SECONDS}")));
+        assert!(script.trim_end().ends_with("exit 1"));
+        // The retry only happens when `open` FAILED; a success leaves at once.
+        assert!(script.contains("&& exit 0"));
+        // Giving up says so in the agent's own log. "Lucidos is not in my menu
+        // bar" is the whole symptom this feature exists to fix, so the one place
+        // that can explain it must not exit silently.
+        assert!(script.contains("gave up opening"));
+        assert!(script.contains(">&2"));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn login_launch_script_quotes_a_bundle_path_with_a_quote_in_it() {
+        let script =
+            login_launch_script(Path::new("/Users/me/don't-quote-me/Lucidos.app")).unwrap();
+        assert!(script.contains(r"-a '/Users/me/don'\''t-quote-me/Lucidos.app'"));
+        // And the result is still a script `/bin/sh -c` can parse. A quoting slip
+        // here is a syntax error at login, which reads as "Lucidos did not start".
+        assert_eq!(sh_parses(&script), Ok(()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_login_script_parses_as_a_shell_script() {
+        let script = login_launch_script(Path::new("/Applications/Lucidos.app")).unwrap();
+        assert_eq!(sh_parses(&script), Ok(()));
+        // Guard the guard: `sh -n` really does reject a broken script, so a
+        // passing assertion above means something.
+        assert!(sh_parses("while [ 1 ]; do echo").is_err());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn desired_login_plist_is_a_one_shot_that_runs_at_login() {
+        let bundle = Path::new("/Applications/Lucidos.app");
+        let app_data = Path::new("/Users/me/Library/Application Support/com.lucidos.app");
+        let plist = desired_login_plist(bundle, app_data).unwrap();
+
+        assert!(plist.contains(&format!("<string>{LOGIN_AGENT_LABEL}</string>")));
+        assert!(plist.contains("<string>/bin/sh</string>"));
+        assert!(plist.contains("<string>-c</string>"));
+        assert!(plist.contains("<key>RunAtLoad</key>"));
+        // NO KeepAlive: quitting the client must not respawn it, and the job is
+        // one shot that exits as soon as `open` has been handed the bundle.
+        assert!(!plist.contains("<key>KeepAlive</key>"));
+        // The shell `&&` has to survive as XML, or launchd reads a truncated
+        // command and the client never starts.
+        assert!(plist.contains("&amp;&amp; exit 0"));
+        assert!(!plist.contains("&& exit 0"));
+        // Its own logs, beside the service's.
+        assert!(plist.contains("Application Support/com.lucidos.app/logs/client-login.out.log"));
+        assert!(plist.contains("Application Support/com.lucidos.app/logs/client-login.err.log"));
+    }
+
+    /// Pipe `input` to `program args…` and report what it said if it refused.
+    #[cfg(target_os = "macos")]
+    fn check_with(program: &str, args: &[&str], input: &str) -> Result<(), String> {
+        use std::io::Write as _;
+        use std::process::Stdio;
+        let mut child = Command::new(program)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn {program}: {e}"))?;
+        child
+            .stdin
+            .take()
+            .expect("piped stdin")
+            .write_all(input.as_bytes())
+            .map_err(|e| format!("write to {program}: {e}"))?;
+        let out = child.wait_with_output().map_err(|e| format!("{e}"))?;
+        if out.status.success() {
+            return Ok(());
+        }
+        let said = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        Err(said.trim().to_string())
+    }
+
+    /// Feed a plist to the system parser the way launchd will read it.
+    #[cfg(target_os = "macos")]
+    fn plutil_lint(plist: &str) -> Result<(), String> {
+        check_with("plutil", &["-lint", "-"], plist)
+    }
+
+    /// Parse a script the way `/bin/sh -c` will, without running it.
+    #[cfg(target_os = "macos")]
+    fn sh_parses(script: &str) -> Result<(), String> {
+        check_with("/bin/sh", &["-n"], script)
+    }
+
+    /// Both plists have to survive the system parser, not just look right. A
+    /// malformed one is refused by launchd wholesale, and for the login agent
+    /// that failure mode IS the bug it exists to fix: a Mac that comes back from
+    /// a restart with no client. The `&&` in the login script is the live
+    /// hazard, since raw it is an unknown ampersand-escape.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn both_agent_plists_parse_as_plists() {
+        let app_data = Path::new("/Users/me/Library/Application Support/com.lucidos.app");
+        let service = desired_service_plist(
+            Path::new("/Applications/Lucidos.app/Contents/MacOS/lucidos-app"),
+            app_data,
+        );
+        assert_eq!(plutil_lint(&service), Ok(()));
+
+        let login = desired_login_plist(Path::new("/Applications/Lucidos.app"), app_data).unwrap();
+        assert_eq!(plutil_lint(&login), Ok(()));
+
+        // A path carrying markup characters must not break out of the `<string>`.
+        let awkward =
+            desired_login_plist(Path::new("/Users/me/App & <Co>/Lucidos.app"), app_data).unwrap();
+        assert_eq!(plutil_lint(&awkward), Ok(()));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn no_login_agent_is_installed_for_an_unbundled_binary() {
+        let app_data = Path::new("/Users/me/Library/Application Support/com.lucidos.app");
+        // Dev / `cargo run`: nothing for LaunchServices to open, so nothing is
+        // written, and a dev machine never grows a com.lucidos.client.plist.
+        assert_eq!(
+            desired_login_plist_for_exe(Path::new("/usr/local/bin/lucidos-app"), app_data),
+            Ok(None)
+        );
+        // A real bundle: the plist names the BUNDLE, never the inner binary.
+        let exe = Path::new("/Applications/Lucidos.app/Contents/MacOS/lucidos-app");
+        let plist = desired_login_plist_for_exe(exe, app_data)
+            .unwrap()
+            .expect("a bundled exe installs a login agent");
+        assert!(plist.contains("-a '/Applications/Lucidos.app'"));
+    }
+
+    #[test]
+    fn a_relaunch_never_carries_the_login_flag_forward() {
+        let os = |s: &str| std::ffi::OsString::from(s);
+
+        // The bug this prevents: a client the login agent started keeps `--login`
+        // in its argv forever, and both relaunch paths forward argv verbatim. So
+        // an update or a Restart App would bring the client back HIDDEN, even
+        // with a window open at the time, which reads as the app vanishing.
+        assert_eq!(
+            strip_login_flag([os(LOGIN_FLAG)]),
+            Vec::<std::ffi::OsString>::new()
+        );
+        assert_eq!(
+            strip_login_flag([os("--first"), os(LOGIN_FLAG), os("--last")]),
+            vec![os("--first"), os("--last")]
+        );
+        // Everything else is passed through untouched, including near-misses.
+        assert_eq!(
+            strip_login_flag([os("--login-shell"), os("login")]),
+            vec![os("--login-shell"), os("login")]
+        );
+        assert_eq!(strip_login_flag([]), Vec::<std::ffi::OsString>::new());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_two_agents_are_separate_jobs() {
+        // Same domain, distinct labels, distinct plists: installing or booting
+        // out one must never reach the other.
+        assert_ne!(SERVICE_AGENT_LABEL, LOGIN_AGENT_LABEL);
+        assert_ne!(service_target(), login_target());
+        assert!(service_target().starts_with(&launchd_domain()));
+        assert!(login_target().starts_with(&launchd_domain()));
+        assert_eq!(
+            agent_plist_path(LOGIN_AGENT_LABEL).ok(),
+            login_plist_path().ok()
+        );
+        assert_ne!(service_plist_path().ok(), login_plist_path().ok());
     }
 
     #[cfg(target_os = "macos")]

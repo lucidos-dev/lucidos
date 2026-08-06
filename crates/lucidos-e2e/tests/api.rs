@@ -47,6 +47,9 @@ mod repo_files_test;
 #[path = "api_support/file_edit_test.rs"]
 mod file_edit_test;
 
+#[path = "api_support/event_wait_test.rs"]
+mod event_wait_test;
+
 #[path = "api_support/agent_question_test.rs"]
 mod agent_question_test;
 
@@ -86,6 +89,9 @@ mod context_capture_lazy_test;
 #[path = "api_support/tool_result_lazy_test.rs"]
 mod tool_result_lazy_test;
 
+#[path = "api_support/event_location_test.rs"]
+mod event_location_test;
+
 #[path = "api_support/snapshot_compression_test.rs"]
 mod snapshot_compression_test;
 
@@ -115,6 +121,9 @@ mod models_test;
 
 #[path = "api_support/backup_key_test.rs"]
 mod backup_key_test;
+
+#[path = "api_support/backup_schedule_test.rs"]
+mod backup_schedule_test;
 
 #[path = "api_support/network_config_test.rs"]
 mod network_config_test;

@@ -49,9 +49,14 @@ pub(crate) fn parse_context_suffix(model: &str) -> (&str, bool) {
 
 /// Models that support extended thinking (reasoning goes to dedicated blocks
 /// instead of polluting the text response).
+///
+/// The Sonnet arms are two rules, not one: `claude-sonnet-4` covers the 4.x
+/// line but does NOT match `claude-sonnet-5`, so a new Sonnet generation needs
+/// its own arm or it silently falls to the no-thinking 8192-token path.
 pub(crate) fn supports_extended_thinking(model: &str) -> bool {
     model.contains("claude-3-7-sonnet")
         || model.contains("claude-sonnet-4")
+        || model.contains("claude-sonnet-5")
         || model.contains("claude-opus-4")
         || model.contains("claude-opus-5")
         || model.contains("claude-fable-5")
@@ -59,11 +64,13 @@ pub(crate) fn supports_extended_thinking(model: &str) -> bool {
 
 /// Models that only support adaptive thinking (no `budget_tokens`, no
 /// `temperature`/`top_p`/`top_k`). Effort is controlled via
-/// `output_config.effort`. Covers Opus 4.7+ (incl. Opus 5) and Fable 5.
+/// `output_config.effort`. Covers Opus 4.7+ (incl. Opus 5), Sonnet 5, and
+/// Fable 5. Sonnet 4.6 and older stay on the `budget_tokens` path.
 pub(crate) fn requires_adaptive_thinking(model: &str) -> bool {
     model.contains("claude-opus-4-7")
         || model.contains("claude-opus-4-8")
         || model.contains("claude-opus-5")
+        || model.contains("claude-sonnet-5")
         || model.contains("claude-fable-5")
 }
 
@@ -700,6 +707,12 @@ mod tests {
             parse_context_suffix("claude-sonnet-4-6[1m]"),
             ("claude-sonnet-4-6", true)
         );
+        // The 1M variant must resolve to the SAME model plus the beta, never to
+        // a literal `...[1m]` id in the Vertex URL (which 404s).
+        assert_eq!(
+            parse_context_suffix("claude-sonnet-5[1m]"),
+            ("claude-sonnet-5", true)
+        );
     }
 
     #[test]
@@ -734,6 +747,33 @@ mod tests {
             assert!(supports_extended_thinking(id), "extended: {id}");
             assert!(requires_adaptive_thinking(id), "adaptive: {id}");
         }
+    }
+
+    #[test]
+    fn sonnet_5_is_adaptive_thinking_and_sonnet_4_6_is_not() {
+        // Sonnet 5 removed `budget_tokens` and the sampling params, so it needs
+        // BOTH gates. Neither fires by accident: `supports_extended_thinking`
+        // matches Sonnet 4.x on `claude-sonnet-4`, which does not cover
+        // `claude-sonnet-5`, and the adaptive list was Opus-only before.
+        for id in ["claude-sonnet-5", "claude-sonnet-5[1m]"] {
+            assert!(supports_extended_thinking(id), "extended: {id}");
+            assert!(requires_adaptive_thinking(id), "adaptive: {id}");
+        }
+        // Sonnet 4.6 still takes the `budget_tokens` path, so the new arm must
+        // not drag the older generation onto adaptive with it.
+        assert!(supports_extended_thinking("claude-sonnet-4-6"));
+        assert!(!requires_adaptive_thinking("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn sonnet_5_thinking_config_uses_adaptive_not_budget_tokens() {
+        let (thinking, output_config, max_tokens) =
+            thinking_config("claude-sonnet-5", Some("xhigh"));
+        let thinking = thinking.expect("adaptive thinking present");
+        assert_eq!(thinking.thinking_type, "adaptive");
+        assert!(thinking.budget_tokens.is_none());
+        assert_eq!(output_config.expect("effort present").effort, "xhigh");
+        assert_eq!(max_tokens, 32768);
     }
 
     #[test]

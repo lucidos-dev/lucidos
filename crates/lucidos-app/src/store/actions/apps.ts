@@ -41,6 +41,21 @@ import { errorDetail } from '../../utils/errorDetail';
 // Loadable and falsely report failure — hence sharing the promise, not skipping.
 let appsLoadInFlight: Promise<void> | null = null;
 
+// The app-window restore below is a page-reload re-hydration step: it belongs to
+// the FIRST successful loadApps() after a fresh load, never to the SSE-driven
+// refreshes that fire all session long (AppCreated / AppUpdated / AppDeleted /
+// PluginInstalled all call loadApps). Without this one-shot gate, any such
+// refresh re-opens the last-opened app and yanks the content pane there,
+// clobbering whatever the user is actually looking at. `app-window-open` is
+// cleared only by `setActiveMenu` / `closeAppWindow` / nav `restoreState`, so
+// opening a file preview, a URL preview or a change diff over an app leaves the
+// key set while `currentApp` reads null, which is exactly the condition the
+// restore fires on. Mirrors `filePreviewRestoreAttempted` in ./artifacts.ts,
+// which fixed the same bug from the other side. Set only on the success path so
+// a failed load doesn't burn the one-shot; resets on page reload (module
+// re-init).
+let appWindowRestoreAttempted = false;
+
 export function loadApps(): Promise<void> {
   if (appsLoadInFlight) return appsLoadInFlight;
   appsLoadInFlight = loadAppsInner().finally(() => { appsLoadInFlight = null; });
@@ -56,18 +71,22 @@ async function loadAppsInner(): Promise<void> {
     const apps = await retryTransientRead(() => listAppsApi());
     appsList.value = { status: 'loaded', data: apps };
 
-    // Restore previously open app window on reload.
+    // Restore previously open app window on reload, once per page load (see
+    // `appWindowRestoreAttempted` above).
     // Set state directly instead of calling openApp() to avoid side effects
     // (switchMenuItem switches mobileView to 'content').
-    const savedAppId = localStorage.getItem('app-window-open');
-    if (savedAppId && !currentApp.value) {
-      const saved = apps.find((s) => s.id === savedAppId);
-      if (saved) {
-        panelOverlay.value = { type: 'app-ui', app: saved };
-      } else {
-        // App was deleted while not open here — drop the stale pointer so the
-        // next reload doesn't keep probing for a missing id.
-        localStorage.removeItem('app-window-open');
+    if (!appWindowRestoreAttempted) {
+      appWindowRestoreAttempted = true;
+      const savedAppId = localStorage.getItem('app-window-open');
+      if (savedAppId && !currentApp.value) {
+        const saved = apps.find((s) => s.id === savedAppId);
+        if (saved) {
+          panelOverlay.value = { type: 'app-ui', app: saved };
+        } else {
+          // App was deleted while not open here, so drop the stale pointer and
+          // the next reload won't keep probing for a missing id.
+          localStorage.removeItem('app-window-open');
+        }
       }
     }
   } catch (error) {

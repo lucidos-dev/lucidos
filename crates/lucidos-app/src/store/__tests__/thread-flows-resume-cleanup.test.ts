@@ -1,10 +1,10 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import { getExchanges, insertEvents, makeThread, resetSeqCounter } from './thread-flows-helpers';
-import { exchangeResponseEvents, exchangeStatus, exchangeSteps, type ThreadEvent } from '../thread-events';
+import { exchangeResponseEvents, exchangeStatus, exchangeSteps, hasRenderableResponseContent, type ThreadEvent } from '../thread-events';
 import { isActive } from '../exchange-status';
 import { displaySection } from '../../generated/thread-lifecycle';
 import type { StepOutcome } from '../types';
-import { isThreadQuiescent } from '../store';
+import { isRenderedThreadIdle, isThreadQuiescent } from '../store';
 
 beforeEach(resetSeqCounter);
 
@@ -783,5 +783,126 @@ describe('coding-agent turn with no terminator must not read Working forever', (
     const exchanges = getExchanges(map, id);
     const status = exchangeStatus(exchanges[0], '', true, false, true, true);
     expect(status).toBe('done');
+  });
+});
+
+// Regression (2026-08-06): the same "Working forever" class, reached through the
+// ABORT BOUNDARY instead of through a raced question, and reported as "Says its
+// working before it has restarted".
+//
+// A `ResponseAborted` is dual-purpose in the fold: it terminates the originating
+// exchange AND opens a boundary exchange of its own. The subprocess the teardown
+// just Esc'd keeps draining for a few more milliseconds, and because CC events
+// fold chronologically rather than by request id, that drain lands in the
+// boundary as steps. Reproduced from a real event log: the abort
+// at .145, the Esc rejection at .186, a `"\n\n"` flush at .197, and the resume 25
+// seconds later.
+//
+// The stale detector above should have caught it, but it is gated on
+// `threadIdle`, and a switch teardown does not leave the thread in a quiescent
+// status: it settles at 'paused', or at 'waiting' when a change was already
+// proposed, which the drain then revives to 'running'. So the boundary fell
+// through to `isCC && !isStale` and shimmered "Working" while the engine was
+// down. The fix does not widen quiescence (see the live-turn case at the bottom
+// for why that would misfire); it lets the switch fingerprint supply the
+// quiescence itself, since an engine that is going down cannot be working.
+// See docs/plans/2026-08-06-no-working-label-while-nothing-is-running.md
+describe('an abort boundary must not read Working while the engine is down', () => {
+  const now = Date.now();
+  const t = (offset: number) => new Date(now + offset).toISOString();
+  const device = { kind: 'device', device_id: 'd1', label: 'My MacBook' } as const;
+
+  /** The reproduced teardown: a turn in flight, the boundary abort, then the
+   *  dying subprocess's last two events landing under it.
+   *
+   *  `proposed` seeds a change, which is what makes the same abort settle at
+   *  'waiting' instead of 'paused' and then get revived to 'running' by the
+   *  drain. The rendering must not depend on which of those it lands on. */
+  const seedTeardownBoundary = (name: string, proposed = false) => {
+    const { map, id } = makeThread(name, 'running');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'run the browser suite', channel: 'claude_code', created: t(-300000) },
+      { type: 'SessionStarted', session_id: 's1', created: t(-299000) },
+      { type: 'CodingAgentToolCalled', name: 'Bash', args: { command: 'git status' }, created: t(-290000) },
+      { type: 'CodingAgentToolResult', name: 'Bash', result: 'clean', created: t(-289000) },
+      ...(proposed
+        ? [{ type: 'ChangeProposed' as const, change_id: 'c1', description: 'x', files: [], created: t(-285000) }]
+        : []),
+      { type: 'ResponseAborted', cause: 'engine_shutdown', actor: device, created: t(-200000) },
+      // The drain, 41ms and 52ms after the abort in the real log.
+      { type: 'CodingAgentToolResult', name: '', result: "The user doesn't want to proceed with this tool use.", created: t(-199959) },
+      { type: 'CodingAgentTextStreamed', text: '\n\n', created: t(-199948) },
+    ] as any);
+    return { map, id, exchanges: getExchanges(map, id) };
+  };
+
+  for (const [label, proposed] of [['no pending change', false], ['a proposed change', true]] as const) {
+    it(`reads as settled, not Working, with ${label}`, () => {
+      resetSeqCounter();
+      const { map, id, exchanges } = seedTeardownBoundary(`cc-teardown-${proposed}`, proposed);
+
+      const boundary = exchanges[exchanges.length - 1];
+      expect(boundary.userEvent.type).toBe('ResponseAborted');
+      expect(boundary.steps.length).toBeGreaterThan(0);
+
+      // The thread's own status is NOT quiescent in either shape, which is
+      // exactly why the fix cannot lean on it.
+      const threadIdle = isRenderedThreadIdle(map.get(id));
+      expect(threadIdle).toBe(false);
+      expect(isThreadQuiescent(map.get(id)!.meta.status)).toBe(false);
+
+      const status = exchangeStatus(boundary, '', true, false, /* threadIsCC */ true, threadIdle);
+      expect(isActive(status)).toBe(false);
+      expect(status).toBe('aborted');
+    });
+  }
+
+  /** The drain is not renderable content, so the boundary shows no response
+   *  panel at all: the transcript is the "Paused by restart" panel alone. */
+  it('has nothing renderable to show under the boundary', () => {
+    resetSeqCounter();
+    const { exchanges } = seedTeardownBoundary('cc-teardown-empty');
+    const boundary = exchanges[exchanges.length - 1];
+
+    const events = exchangeResponseEvents(boundary, true, false);
+    expect(events.length).toBeGreaterThan(0);
+    expect(hasRenderableResponseContent(events)).toBe(false);
+  });
+
+  /** The complement, and the case commit 3da5620eb exists for: a REAL turn runs
+   *  under an abort boundary. A `safety_net` abort fires on a turn the watchdog
+   *  thought was stuck, the loop keeps going, and two minutes of work lands here
+   *  (real thread ebc787a4). That boundary is not a switch teardown, and its
+   *  turn carries no start event at all, so nothing but the live events says it
+   *  is alive. It must still read "Working", and then "Done" at its terminal.
+   *
+   *  This is also why quiescence was not widened to cover `failed`: the
+   *  `safety_net` abort settles this very thread at `failed` and
+   *  `preserving_verdict` pins it there for the whole live turn. */
+  it('still reads Working for a live turn under a non-switch boundary', () => {
+    resetSeqCounter();
+    const { map, id } = makeThread('safety-net-live', 'running');
+    insertEvents(map, id, [
+      { type: 'MessageReceived', text: 'close out the pipeline', created: t(-300000) },
+      { type: 'ToolCalled', name: 'run_bash', args: { command: 'ls' }, created: t(-299000) },
+      { type: 'ResponseAborted', cause: 'safety_net', actor: { kind: 'system' }, created: t(-290000) },
+      // The loop never noticed: a full turn lands under the boundary, with no
+      // start event of its own.
+      { type: 'ThoughtStreamed', text: 'Context: 63064 tokens', created: t(-280000) },
+      { type: 'ToolCalled', name: 'edit_file', args: { path: 'a.md' }, created: t(-279000) },
+      { type: 'ToolResult', name: 'edit_file', result: 'ok', created: t(-278000) },
+      { type: 'TextStreamed', text: 'Cut and carried over.', created: t(-277000) },
+    ] as any);
+
+    expect(map.get(id)!.meta.status).toBe('failed');
+    const live = getExchanges(map, id).slice(-1)[0];
+    expect(live.userEvent.type).toBe('ResponseAborted');
+    // Quiescent by status would call this crashed; the switch fingerprint does not.
+    expect(exchangeStatus(live, '', true, false, /* threadIsCC */ false, false)).toBe('streaming');
+    expect(hasRenderableResponseContent(exchangeResponseEvents(live, true, false))).toBe(true);
+
+    insertEvents(map, id, [{ type: 'ResponseGenerated', text: 'done', created: t(-276000) }] as any);
+    const finished = getExchanges(map, id).slice(-1)[0];
+    expect(exchangeStatus(finished, '', true, false, false, false)).toBe('done');
   });
 });

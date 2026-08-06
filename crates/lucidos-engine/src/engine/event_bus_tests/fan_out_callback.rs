@@ -1266,14 +1266,18 @@ async fn missing_parent_row_leaves_the_callback_pending() {
     teardown_test_db(&db_name).await;
 }
 
-/// A mid-turn redirect is not a completion. `arm_codex_redirect` interrupts a
-/// live Codex turn and emits `ResponseCanceled { cause: SupersededByFollowup }`,
+/// A mid-turn redirect is not a completion. Interrupt-and-redirect ends the
+/// child's live turn with `ResponseCanceled { cause: SupersededByFollowup }`,
 /// which means the caller steered rather than abandoned
 /// (`thread_events/cause.rs`). Reporting it to the parent wakes the parent with
 /// "your child was canceled" while the child is in fact running the redirected
 /// turn, and the parent may spawn a replacement.
+///
+/// Coding-agent lane: a Codex follow-up (always) or an urgent Claude Code one,
+/// both through `arm_followup_redirect`. The chat lane is the companion test
+/// below; the discrimination itself is cause-only, so the two must agree.
 #[tokio::test]
-async fn codex_redirect_does_not_report_a_cancellation_to_the_parent() {
+async fn a_coding_agent_redirect_does_not_report_a_cancellation_to_the_parent() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, mut callback_rx) = EventBus::new(pool.clone());
 
@@ -1305,6 +1309,53 @@ async fn codex_redirect_does_not_report_a_cancellation_to_the_parent() {
         parent_id,
         0,
         "the in-tx reconcile still runs for a redirect cancel",
+    )
+    .await;
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The Lucidos Agent lane reaches the same cause by a different road: no
+/// coding-agent session at all, just `cancel_thread_for_followup` cancelling the
+/// per-thread token and `cancel_cause_for_turn` labelling the terminal. The
+/// exclusion in `notify_parent_if_child` matches on cause alone, so this must
+/// behave identically to the coding-agent case above. Asserted rather than
+/// assumed: a chat child has no `SessionStarted`, so it takes a different arm of
+/// `should_callback`, and "it is cause-only" is exactly the kind of claim that
+/// silently stops being true.
+#[tokio::test]
+async fn a_chat_child_redirect_does_not_report_a_cancellation_to_the_parent() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, mut callback_rx) = EventBus::new(pool.clone());
+
+    // Chat channel and NO emit_cc_session_started: this is a Lucidos Agent
+    // child, the lane whose redirect is new.
+    let (parent_id, child_id) = spawn_parent_child(&bus, EventChannel::Chat).await;
+
+    emit_response_canceled_with_cause(
+        &bus,
+        child_id,
+        crate::engine::thread_events::CancelCause::SupersededByFollowup,
+    )
+    .await;
+
+    assert_eq!(
+        count_completion_cards(&pool, parent_id).await,
+        0,
+        "an urgent follow-up preempting a Lucidos Agent child is a redirect, not a \
+         completion: it must persist no ChildThreadCompleted on the parent"
+    );
+    assert!(
+        callback_rx.try_recv().is_err(),
+        "and it must not wake the parent, which would have it act on a child that \
+         is about to run the redirected turn"
+    );
+    assert_active_children(
+        &pool,
+        parent_id,
+        0,
+        "the in-tx reconcile is cause-agnostic and still runs on the chat lane too",
     )
     .await;
 

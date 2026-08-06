@@ -214,17 +214,26 @@ async fn returns_true_immediately_when_session_already_alive() {
     );
 }
 
-// --- should_redirect_codex_followup ---------------------------------------
+// --- should_redirect_followup ---------------------------------------------
 
-use super::should_redirect_codex_followup;
+use super::should_redirect_followup;
 use crate::runtime::CodingAgent;
 
 #[test]
 fn redirect_fires_for_codex_user_followup_mid_turn() {
-    // The reported bug: a Codex turn in flight + a genuine user follow-up must
-    // interrupt-and-redirect rather than queue invisibly behind the long turn.
-    assert!(should_redirect_codex_followup(
+    // A Codex turn in flight + a genuine user follow-up must interrupt-and-
+    // redirect rather than queue invisibly behind the long turn. Codex does
+    // this whether or not the caller marked the follow-up urgent, because a
+    // Codex turn cannot see a queued message at all until it ends.
+    assert!(should_redirect_followup(
         CodingAgent::Codex,
+        true,
+        true,
+        false
+    ));
+    assert!(should_redirect_followup(
+        CodingAgent::Codex,
+        true,
         true,
         true
     ));
@@ -233,10 +242,17 @@ fn redirect_fires_for_codex_user_followup_mid_turn() {
 #[test]
 fn redirect_skips_codex_when_idle() {
     // Idle-but-alive Codex (not in flight): a follow-up routes via turn/start
-    // immediately, no interrupt.
-    assert!(!should_redirect_codex_followup(
+    // immediately, no interrupt. Urgency does not manufacture a turn to stop.
+    assert!(!should_redirect_followup(
         CodingAgent::Codex,
         false,
+        true,
+        false
+    ));
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        false,
+        true,
         true
     ));
 }
@@ -244,28 +260,77 @@ fn redirect_skips_codex_when_idle() {
 #[test]
 fn redirect_skips_codex_child_wake() {
     // A child-wake (not a user message) resumes a waiting thread and must never
-    // interrupt a turn, even mid-flight.
-    assert!(!should_redirect_codex_followup(
+    // interrupt a turn, even mid-flight and even marked urgent. The flag rides
+    // on the follow-up, and a wake is not one.
+    assert!(!should_redirect_followup(
         CodingAgent::Codex,
+        true,
+        false,
+        false
+    ));
+    assert!(!should_redirect_followup(
+        CodingAgent::Codex,
+        true,
+        false,
+        true
+    ));
+}
+
+#[test]
+fn redirect_skips_claude_code_unless_urgent() {
+    // The opt-in half. A plain CC follow-up is forwarded as-is and queues, so a
+    // benign steer never throws away an in-flight build. This is the invariant
+    // `chat.spec.ts` ("mid-turn user message reaches CC during active tool
+    // calls") exercises end to end.
+    assert!(!should_redirect_followup(
+        CodingAgent::ClaudeCode,
+        true,
         true,
         false
     ));
 }
 
 #[test]
-fn redirect_never_fires_for_claude_code() {
-    // CC steers via stdin — a mid-turn follow-up is forwarded as-is, never
-    // interrupted. Guards the "CC behavior unchanged" invariant.
-    assert!(!should_redirect_codex_followup(
+fn redirect_fires_for_urgent_claude_code_followup_mid_turn() {
+    // The 2026-08-06 incident: a CC child parked in
+    // `TaskOutput(block: true, timeout: 600000)` did not read a STOP for nine
+    // and a half minutes, because CC surfaces a queued stdin message only at
+    // the next assistant turn boundary and there was not one. An urgent
+    // follow-up interrupts instead of waiting for the tool's own timeout.
+    assert!(should_redirect_followup(
         CodingAgent::ClaudeCode,
+        true,
         true,
         true
     ));
 }
 
-// --- arm_codex_redirect ----------------------------------------------------
+#[test]
+fn redirect_skips_idle_claude_code_even_when_urgent() {
+    // Nothing to interrupt: an idle CC session picks the message up from stdin
+    // at once. Interrupting would cancel a turn that does not exist.
+    assert!(!should_redirect_followup(
+        CodingAgent::ClaudeCode,
+        false,
+        true,
+        true
+    ));
+}
 
-use super::arm_codex_redirect;
+#[test]
+fn redirect_skips_urgent_claude_code_child_wake() {
+    // Urgency cannot promote an engine-internal child-wake into an interrupt.
+    assert!(!should_redirect_followup(
+        CodingAgent::ClaudeCode,
+        true,
+        false,
+        true
+    ));
+}
+
+// --- arm_followup_redirect -------------------------------------------------
+
+use super::arm_followup_redirect;
 
 /// A live Codex session mid-turn: alive (`process_exited=false`), not at a turn
 /// boundary (`is_waiting=false`), with `pending_followups=1` as a normal turn
@@ -288,7 +353,7 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
     let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
-    let idle = arm_codex_redirect(&mut sessions, thread_id, true, &None);
+    let idle = arm_followup_redirect(&mut sessions, thread_id, true, false, &None);
 
     assert!(
         idle.is_some(),
@@ -318,7 +383,7 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
 fn arm_redirect_keeps_warmup_turn_alive() {
     // A silent-resume / warm-up turn starts at pending_followups=0. A lone +1
     // would land at 1 → terminate_decision → Terminate, killing the queued
-    // follow-up. arm_codex_redirect must bump it to >= 2 so the interrupted
+    // follow-up. arm_followup_redirect must bump it to >= 2 so the interrupted
     // warm-up turn's idle keeps the subprocess alive.
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
@@ -329,7 +394,7 @@ fn arm_redirect_keeps_warmup_turn_alive() {
     let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
-    assert!(arm_codex_redirect(&mut sessions, thread_id, true, &None).is_some());
+    assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &None).is_some());
     assert_eq!(
         pending.load(std::sync::atomic::Ordering::Acquire),
         2,
@@ -337,34 +402,95 @@ fn arm_redirect_keeps_warmup_turn_alive() {
     );
 }
 
+/// A live Claude Code session mid-turn, the shape the 2026-08-06 incident had:
+/// alive, not at a turn boundary, with `pending_followups=1` from its own turn.
+fn claude_code_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
+    let (mut s, msg_rx) = make_test_session(false);
+    s.is_waiting = false; // turn in flight
+    debug_assert_eq!(s.coding_agent, CodingAgent::ClaudeCode);
+    s.pending_followups
+        .store(1, std::sync::atomic::Ordering::Release);
+    (s, msg_rx)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn arm_redirect_skips_claude_code_mid_turn() {
+async fn arm_redirect_skips_plain_claude_code_mid_turn() {
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
-    let (mut session, _msg_rx) = make_test_session(false);
-    session.is_waiting = false; // CC turn in flight
-    debug_assert_eq!(session.coding_agent, CodingAgent::ClaudeCode);
+    let (session, _msg_rx) = claude_code_in_flight_session();
     let interrupt = session.interrupt.clone();
     let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
-    let idle = arm_codex_redirect(&mut sessions, thread_id, true, &None);
+    let idle = arm_followup_redirect(&mut sessions, thread_id, true, false, &None);
 
     assert!(
         idle.is_none(),
-        "CC must never be interrupted on a follow-up"
+        "a plain (non-urgent) CC follow-up must not be interrupted: it steers via stdin"
     );
     assert!(
         !sessions.get(&thread_id).unwrap().redirect_followup,
-        "CC must not be flagged for redirect — it steers via stdin, never cancels"
+        "a plain CC follow-up must not be flagged for redirect"
     );
-    assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        1,
+        "no interrupt means no pre-count: the caller's own msg_tx send does the counting"
+    );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), interrupt.notified())
             .await
             .is_err(),
-        "no interrupt should have been fired for CC"
+        "no interrupt should have been fired for a plain CC follow-up"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn arm_redirect_fires_for_urgent_claude_code_mid_turn() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    let (session, _msg_rx) = claude_code_in_flight_session();
+    let interrupt = session.interrupt.clone();
+    let pending = session.pending_followups.clone();
+    sessions.insert(thread_id, session);
+
+    let idle = arm_followup_redirect(&mut sessions, thread_id, true, true, &None);
+
+    assert!(
+        idle.is_some(),
+        "an urgent CC mid-turn follow-up must arm the redirect and return idle_notify"
+    );
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_followup,
+        "the interrupted turn must classify as SupersededByFollowup (neutral), not UserStop"
+    );
+    assert_eq!(
+        pending.load(std::sync::atomic::Ordering::Acquire),
+        2,
+        "the interrupted turn's idle must keep the subprocess alive (terminate_decision needs > 1)"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), interrupt.notified())
+            .await
+            .is_ok(),
+        "the live CC turn's interrupt must have been fired"
+    );
+}
+
+#[test]
+fn arm_redirect_skips_idle_claude_code_even_when_urgent() {
+    let thread_id = Uuid::new_v4();
+    let mut sessions = HashMap::new();
+    // make_test_session(false) leaves is_waiting=true, i.e. idle but alive.
+    let (session, _msg_rx) = make_test_session(false);
+    let pending = session.pending_followups.clone();
+    sessions.insert(thread_id, session);
+
+    assert!(
+        arm_followup_redirect(&mut sessions, thread_id, true, true, &None).is_none(),
+        "an idle CC session reads stdin at once: there is no turn to interrupt"
+    );
+    assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
 }
 
 #[test]
@@ -377,7 +503,7 @@ fn arm_redirect_skips_idle_codex() {
     sessions.insert(thread_id, session);
 
     // Idle Codex: route via turn/start immediately, no interrupt.
-    assert!(arm_codex_redirect(&mut sessions, thread_id, true, &None).is_none());
+    assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &None).is_none());
     assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
 }
 
@@ -389,11 +515,11 @@ fn arm_redirect_skips_child_wake() {
     sessions.insert(thread_id, session);
 
     // is_user_message=false (child-wake) must never interrupt a live turn.
-    assert!(arm_codex_redirect(&mut sessions, thread_id, false, &None).is_none());
+    assert!(arm_followup_redirect(&mut sessions, thread_id, false, false, &None).is_none());
 }
 
 #[test]
 fn arm_redirect_none_when_no_session() {
     let mut sessions = HashMap::new();
-    assert!(arm_codex_redirect(&mut sessions, Uuid::new_v4(), true, &None).is_none());
+    assert!(arm_followup_redirect(&mut sessions, Uuid::new_v4(), true, false, &None).is_none());
 }

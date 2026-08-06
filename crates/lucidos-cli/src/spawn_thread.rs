@@ -190,6 +190,12 @@ pub(crate) fn run(args: SpawnThreadArgs) -> Result<(), BoxError> {
     let start = std::time::Instant::now();
     let resp = client
         .post(&url)
+        // This is the ONE subcommand that deliberately talks to a workspace
+        // other than its own, so it asserts the TARGET rather than letting the
+        // `$LUCIDOS_WORKSPACE` default through (which would name the caller and
+        // earn a 409 from the receiving engine). A per-request header wins over
+        // a default of the same name.
+        .header(crate::http::HEADER_TARGET_WORKSPACE, &target_basename)
         .json(&body)
         .send()
         .map_err(|e| crate::http::format_request_error("POST", &url, &e, start.elapsed()))?;

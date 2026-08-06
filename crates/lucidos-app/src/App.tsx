@@ -27,6 +27,8 @@ import {
   popupImage,
   messageRoutePanel,
   stepDetailModal,
+  checkpointDiffModal,
+  contextViewer,
   searchEverywhereOpen,
   filePreviewModal,
 } from './store/store';
@@ -37,6 +39,8 @@ const FileSearchModal = lazyComponent(() => import('./components/files/FileSearc
 const ImagePopup = lazyComponent(() => import('./components/shared/ImagePopup').then(m => m.ImagePopup));
 const MessageRoutePanel = lazyComponent(() => import('./components/chat/MessageRoutePanel').then(m => m.MessageRoutePanel));
 const StepDetailModal = lazyComponent(() => import('./components/chat/StepDetailModal').then(m => m.StepDetailModal));
+const CheckpointDiffModal = lazyComponent(() => import('./components/chat/CheckpointDiffModal').then(m => m.CheckpointDiffModal));
+const ContextViewerModal = lazyComponent(() => import('./components/chat/ContextViewerModal').then(m => m.ContextViewerModal));
 const ScaleModal = lazyComponent(() => import('./components/shared/ScaleModal').then(m => m.ScaleModal));
 const SearchEverywhere = lazyComponent(() => import('./components/search/SearchEverywhere').then(m => m.SearchEverywhere));
 const FilePreviewModal = lazyComponent(() => import('./components/files/FilePreviewModal').then(m => m.FilePreviewModal));
@@ -46,6 +50,8 @@ const FilePreviewModal = lazyComponent(() => import('./components/files/FilePrev
 function ImagePopupSlot()        { return popupImage.value           ? <ImagePopup />        : null; }
 function MessageRoutePanelSlot() { return messageRoutePanel.value    ? <MessageRoutePanel /> : null; }
 function StepDetailModalSlot()   { return stepDetailModal.value      ? <StepDetailModal />   : null; }
+function CheckpointDiffSlot()    { return checkpointDiffModal.value  ? <CheckpointDiffModal /> : null; }
+function ContextViewerSlot()     { return contextViewer.value        ? <ContextViewerModal /> : null; }
 function ScaleModalSlot()        { return scaleModalOpen.value       ? <ScaleModal />        : null; }
 // Slot-gated for a second reason beyond the leaf-scoped subscription: it keeps
 // the file preview renderers (which the content pane already lazy-loads) out of
@@ -127,6 +133,8 @@ export function App() {
         <ConfirmDialog />
         <PromptDialog />
         <StepDetailModalSlot />
+        <CheckpointDiffSlot />
+        <ContextViewerSlot />
         <FilePreviewModalSlot />
         <ScaleModalSlot />
         <SearchEverywhereSlot />

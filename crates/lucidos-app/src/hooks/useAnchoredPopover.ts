@@ -1,11 +1,33 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'preact/hooks';
-import { clampLeftWithin } from '../utils/dom';
+import { clampWithin } from '../utils/dom';
 
 export interface AnchorPosition {
   top: number;
   left: number;
   placement: 'bottom-start' | 'top-start';
+  /** Widest the panel may be and still fit inside the box its `left` was
+   *  clamped into (the `container`, or the viewport when none was given),
+   *  margins already deducted.
+   *
+   *  Clamping alone only helps a panel that FITS: a panel wider than its
+   *  container pins to the container's leading edge and overflows the far one,
+   *  which on desktop means a thread-pane popover spilling into the content
+   *  pane. A surface that must stay inside its container publishes this as a
+   *  CSS var and caps its own width against it.
+   *
+   *  The first measurement necessarily runs on the UNCAPPED panel, since the
+   *  cap is what this value produces. `left` survives that: a too-wide panel
+   *  makes `clampWithin` pin it to the container's leading edge, which is
+   *  exactly where the panel belongs once it narrows to fill the container.
+   *  `top` does NOT, because narrowing reflows the content taller, so the
+   *  hook watches the panel's size and re-measures once the cap lands. */
+  maxWidth: number;
 }
+
+/** Breathing room left at either end of the clamp range. Passed to
+ *  `clampWithin` explicitly (rather than leaning on its default) so the margin
+ *  the position is clamped by and the margin `maxWidth` deducts cannot drift. */
+const CLAMP_MARGIN = 8;
 
 /** Horizontal alignment of the panel relative to its anchor.
  *  - `'start'` (default): the panel's LEFT edge aligns with the anchor's left
@@ -26,7 +48,17 @@ export type AnchorAlign = 'start' | 'end';
  *  narrow viewports where an anchor near the right edge would otherwise push the
  *  panel off-screen, and to keep the popover visually contained within its
  *  originating pane. Returns viewport-coordinate offsets ready for `style.top` /
- *  `style.left`. */
+ *  `style.left`.
+ *
+ *  `top` is clamped to the viewport for the same reason `left` is, and the case
+ *  it covers is the flip: placing a tall panel ABOVE an anchor near the bottom
+ *  of a SHORT viewport (a phone in landscape, or one with the virtual keyboard
+ *  open shrinking the visual viewport) produces a negative `top`, which pushes
+ *  the panel's head off the screen where its content cannot be scrolled back
+ *  into view. The clamp never re-flips: a panel too tall for the space pins to
+ *  the top margin and overlaps its anchor, which is strictly better than being
+ *  unreachable. Surfaces should still cap their own `max-height` against the
+ *  viewport so that overlap stays rare (see `.prompt-bar-popover`). */
 export function computeAnchorPosition(
   anchor: HTMLElement,
   panelHeight: number,
@@ -35,18 +67,24 @@ export function computeAnchorPosition(
   align: AnchorAlign = 'start',
 ): AnchorPosition {
   const rect = anchor.getBoundingClientRect();
-  const wantBelow = rect.bottom + panelHeight + 8 <= window.innerHeight;
-  const top = wantBelow ? rect.bottom + 4 : rect.top - panelHeight - 4;
+  const wantBelow = rect.bottom + panelHeight + CLAMP_MARGIN <= window.innerHeight;
+  const desiredTop = wantBelow ? rect.bottom + 4 : rect.top - panelHeight - 4;
+  const top = clampWithin(desiredTop, panelHeight, 0, window.innerHeight, CLAMP_MARGIN);
   const placement: AnchorPosition['placement'] = wantBelow ? 'bottom-start' : 'top-start';
   const bounds = container?.getBoundingClientRect();
+  const boundsLeft = bounds?.left ?? 0;
+  const boundsRight = bounds?.right ?? window.innerWidth;
   const desiredLeft = align === 'end' ? rect.right - panelWidth : rect.left;
-  const left = clampLeftWithin(
-    desiredLeft,
-    panelWidth,
-    bounds?.left ?? 0,
-    bounds?.right ?? window.innerWidth,
-  );
-  return { top, left, placement };
+  const left = clampWithin(desiredLeft, panelWidth, boundsLeft, boundsRight, CLAMP_MARGIN);
+  // A container with no room left to give is not a cap, it is a disappearing
+  // act: capping to 0 renders a zero-width panel that is invisible while the
+  // overlay is still open and holding the UI behind it inert. The thread pane
+  // reaches exactly that when a keyboard shortcut collapses it with a popover
+  // already open, so a degenerate container falls back to the viewport, the
+  // same box used when no container was given at all.
+  const containerFit = boundsRight - boundsLeft - 2 * CLAMP_MARGIN;
+  const maxWidth = containerFit > 0 ? containerFit : Math.max(0, window.innerWidth - 2 * CLAMP_MARGIN);
+  return { top, left, placement, maxWidth };
 }
 
 /** Decide whether a pointerdown should dismiss the popover. Clicks on the panel
@@ -67,6 +105,8 @@ export function isOutsidePointerTarget(
  *  page scrolls or resizes. Returns the current viewport offsets, or `null`
  *  when the popover is closed (`anchor === null`).
  *
+ *  Recomputes on scroll, on resize (window and visual viewport) and when the
+ *  PANEL itself changes size, since its height is an input to the position.
  *  rAF-coalesced + equality-guarded so a fast scroll burst produces at most one
  *  recompute per frame and no re-render when the anchor's screen position
  *  hasn't actually changed (common during inertia scroll where anchor and
@@ -92,7 +132,11 @@ export function useAnchoredPosition(
       if (!panel) return;
       const next = computeAnchorPosition(anchor, panel.offsetHeight, panel.offsetWidth, container, align);
       setPos(prev =>
-        prev && prev.top === next.top && prev.left === next.left && prev.placement === next.placement
+        prev &&
+        prev.top === next.top &&
+        prev.left === next.left &&
+        prev.placement === next.placement &&
+        prev.maxWidth === next.maxWidth
           ? prev
           : next,
       );
@@ -121,8 +165,23 @@ export function useAnchoredPosition(
       vv.addEventListener('resize', schedule);
       vv.addEventListener('scroll', schedule);
     }
+    // The panel's own size is an INPUT to the position (`top` is derived from
+    // its height whenever it opens upward off the bottom-docked prompt bar), so
+    // it has to be watched like the viewport is. Two ways it moves under us:
+    // the caller applies `maxWidth` as a cap, which narrows the panel and
+    // reflows its text onto more lines, and the content itself changes while
+    // open (a wait resolves, a todo row lands). Without this the first
+    // measurement is the only one until an unrelated scroll or resize, and an
+    // upward-opening panel that grew after being measured hangs down over the
+    // anchor that opened it. The observer's initial callback is free: an
+    // unchanged position hits the equality guard above and re-renders nothing,
+    // and a position change cannot itself change the panel's size, so this
+    // cannot cycle.
+    const ro = typeof ResizeObserver === 'undefined' ? null : new ResizeObserver(schedule);
+    if (ro && panelRef.current) ro.observe(panelRef.current);
     return () => {
       if (rafId !== null) cancelAnimationFrame(rafId);
+      ro?.disconnect();
       window.removeEventListener('scroll', schedule, true);
       window.removeEventListener('resize', schedule);
       if (vv) {

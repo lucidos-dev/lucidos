@@ -17,22 +17,30 @@ const CC_ONLY_EVENTS: &[&str] = &[
     "UserQuestionAnswered",
 ];
 
+/// Every `ThreadStatus` variant with its wire string, in one place.
+///
+/// Source for BOTH halves of the contract: the fixture's status dimension and
+/// the generated TS union + `THREAD_STATUSES` list. Keeping them as two
+/// separate literals is how the hardcoded fixture-size assertions went stale.
+/// `all_statuses_covers_the_enum` pins it against `ThreadStatus::parse`.
+const ALL_STATUSES: &[(&str, ThreadStatus)] = &[
+    ("idle", ThreadStatus::Idle),
+    ("running", ThreadStatus::Running),
+    ("waiting", ThreadStatus::Waiting),
+    (
+        "waiting_for_user_answer",
+        ThreadStatus::WaitingForUserAnswer,
+    ),
+    ("paused", ThreadStatus::Paused),
+    ("failed", ThreadStatus::Failed),
+];
+
 fn generate_cross_validation_fixture() -> String {
     let thread_types = [
         ("chat", ThreadType::Chat),
         ("claude_code", ThreadType::CodingAgent),
     ];
-    let statuses = [
-        ("idle", ThreadStatus::Idle),
-        ("running", ThreadStatus::Running),
-        ("waiting", ThreadStatus::Waiting),
-        (
-            "waiting_for_user_answer",
-            ThreadStatus::WaitingForUserAnswer,
-        ),
-        ("paused", ThreadStatus::Paused),
-        ("failed", ThreadStatus::Failed),
-    ];
+    let statuses = ALL_STATUSES;
     let sections = [
         ("archived", ArchiveState::Archived),
         ("inbox", ArchiveState::Inbox),
@@ -41,10 +49,12 @@ fn generate_cross_validation_fixture() -> String {
 
     let mut cases = Vec::new();
 
-    // availableThreadActions: 2 types × 5 statuses × 2 sections × 2 pending ×
-    // 2 descendants_block_archive × 2 has_unsent_draft × 2 is_saved = 320 cases
+    // availableThreadActions: the full cross product of thread_types ×
+    // statuses × sections × pending × descendants_block_archive ×
+    // has_unsent_draft × is_saved. Adding a `ThreadStatus` variant widens the
+    // fixture automatically; do not hardcode the case count here, it drifts.
     for (tt_str, tt) in &thread_types {
-        for (st_str, st) in &statuses {
+        for (st_str, st) in statuses {
             for (sec_str, sec) in &sections {
                 for &pending in &bools {
                     for &dba in &bools {
@@ -76,9 +86,10 @@ fn generate_cross_validation_fixture() -> String {
         }
     }
 
-    // displaySection: 2 sections × 5 statuses × 2 saved × 2 activeChildren × 2 pending × 2 attentionDescendants = 160 cases
+    // displaySection: the full cross product of sections × statuses × saved ×
+    // activeChildren × pending × attentionDescendants.
     for (sec_str, sec) in &sections {
-        for (st_str, st) in &statuses {
+        for (st_str, st) in statuses {
             for &saved in &bools {
                 for &active_children in &bools {
                     for &pending in &bools {
@@ -127,7 +138,23 @@ fn generate_typescript() -> String {
     out.push_str("export type ThreadType = 'chat' | 'claude_code';\n");
     out.push_str("export type ArchiveState = 'archived' | 'inbox';\n");
     out.push_str("export type DisplaySection = 'saved' | 'current' | 'archive';\n");
-    out.push_str("export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'paused' | 'failed';\n");
+    // Both spellings come off ALL_STATUSES, so the union, the runtime list and
+    // the fixture's status dimension cannot disagree.
+    let status_literals: Vec<String> = ALL_STATUSES
+        .iter()
+        .map(|(s, _)| format!("'{}'", s))
+        .collect();
+    out.push_str(&format!(
+        "export type ThreadStatus = {};\n",
+        status_literals.join(" | ")
+    ));
+    // The runtime list, so the cross-validation suite can DERIVE the expected
+    // fixture size from the number of statuses instead of hardcoding a product
+    // that goes stale the next time a variant lands (it did, twice).
+    out.push_str(&format!(
+        "export const THREAD_STATUSES: readonly ThreadStatus[] = [{}] as const;\n",
+        status_literals.join(", ")
+    ));
     out.push_str("export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';\n");
     out.push_str("export type Action = 'discard_draft' | 'discard' | 'apply' | 'archive' | 'save' | 'unsave';\n");
     out.push_str("export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';\n\n");
@@ -238,6 +265,38 @@ fn generate_typescript() -> String {
 }
 
 // 22c. cross_validation_fixture_is_up_to_date
+/// `ALL_STATUSES` drives the fixture's status dimension AND the generated TS
+/// union, so a `ThreadStatus` variant missing from it silently shrinks the
+/// contract surface rather than failing. Nothing enumerates the enum, so pin it
+/// from the other side: every entry must round-trip through `as_str` / `parse`,
+/// and the count must match the enum's own arm count.
+#[test]
+fn all_statuses_covers_the_enum() {
+    for (wire, status) in ALL_STATUSES {
+        assert_eq!(
+            status.as_str(),
+            *wire,
+            "ALL_STATUSES wire string disagrees with ThreadStatus::as_str",
+        );
+        assert_eq!(
+            ThreadStatus::parse(wire),
+            *status,
+            "ThreadStatus::parse does not round-trip '{wire}'; a status missing \
+             from `parse` falls back to Idle and the projection would silently \
+             read the wrong state off the column",
+        );
+    }
+    // Bumped deliberately when a variant is added, which is the prompt to add
+    // it above. `parse`'s catch-all means a missing entry cannot be detected by
+    // round-tripping alone.
+    assert_eq!(
+        ALL_STATUSES.len(),
+        6,
+        "a ThreadStatus variant was added or removed: update ALL_STATUSES (and \
+         this count) so the fixture and the generated TS union cover it",
+    );
+}
+
 #[test]
 fn cross_validation_fixture_is_up_to_date() {
     let generated = generate_cross_validation_fixture();

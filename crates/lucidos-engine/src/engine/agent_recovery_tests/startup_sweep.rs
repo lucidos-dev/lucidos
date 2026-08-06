@@ -725,15 +725,26 @@ mod settle_orphaned_running_sweep {
     }
 }
 
-// -- Phase D: user-switch vs crash classification -----------------------------
+// -- Phase D: what recovery reads off the last restart ------------------------
 //
-// `switch_was_user_initiated` is the predicate `recover_orphaned_worktrees` uses
-// to decide auto-resume (a device-attributed teardown `ResponseAborted` proves a
-// real *Switch to new version*) vs the manual Continue affordance (a crash left
-// no such boundary). The startup lease guarantees the predecessor's teardown emit
-// has landed before recovery reads it; these tests pin the classification itself.
-mod switch_classification {
-    use crate::engine::agent_recovery::recovery::switch_was_user_initiated;
+// `recover_orphaned_worktrees` asks two questions of an interrupted thread's abort
+// history, and both reduce to "is this `ResponseAborted` newer than the thread's
+// latest start?":
+//
+//   * `switch_was_user_initiated`: auto-resume (a device-attributed teardown abort
+//     proves a real *Switch to new version*) vs the manual Continue affordance (a
+//     crash left no such boundary).
+//   * `boundary_abort_already_emitted`: does this turn still need a "Response
+//     interrupted" boundary, or did the teardown pre-emit already land one?
+//
+// They are tested together because the failure mode is them DISAGREEING about the
+// start set: the same abort then counts as consumed for one and live for the
+// other. The startup lease guarantees the predecessor's teardown emit has landed
+// before recovery reads either.
+mod restart_boundary_reads {
+    use crate::engine::agent_recovery::recovery::{
+        boundary_abort_already_emitted, switch_was_user_initiated,
+    };
     use crate::engine::event_bus::{BusEvent, EventBus};
     use crate::engine::thread_events::{
         AbortCause, ActorMode, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
@@ -766,6 +777,26 @@ mod switch_classification {
                 model: None,
                 reasoning_effort: None,
                 origin: None,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+    }
+
+    /// The auto-resume actually beginning. Also a start event, and the one both
+    /// reads used to disagree about: it opens a NEW turn, which retires every
+    /// abort before it.
+    async fn seed_continuation_started(bus: &EventBus, thread_id: Uuid) {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ContinuationStarted {
+                branch: "feature-branch".into(),
+                origin: None,
+                reason: Some("engine_restart_interrupt".into()),
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
@@ -921,6 +952,78 @@ mod switch_classification {
                  even when a user button supplied the device actor"
             );
         }
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// The second read: `boundary_abort_already_emitted` decides whether recovery
+    /// owes this turn a "Response interrupted" boundary, and it asks the SAME
+    /// "newer than the latest start" question of the SAME start set. A pre-emitted
+    /// teardown abort belonging to the current turn must suppress the duplicate.
+    #[tokio::test]
+    async fn a_teardown_abort_in_the_current_turn_suppresses_a_second_boundary() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        // Nothing aborted yet: the turn is owed its boundary.
+        let clean_thread = Uuid::new_v4();
+        seed_cc_start(&bus, clean_thread).await;
+        assert!(
+            !boundary_abort_already_emitted(&pool, clean_thread).await,
+            "a turn with no abort at all is owed its interruption boundary"
+        );
+
+        // The `/api/v1/restart` pre-emit landed for this turn: do not emit again,
+        // or the AbortPanel double-renders and the device attribution is buried.
+        let preempted_thread = Uuid::new_v4();
+        seed_cc_start(&bus, preempted_thread).await;
+        tick().await;
+        abort_with(&bus, preempted_thread, Some(device_actor())).await;
+        assert!(
+            boundary_abort_already_emitted(&pool, preempted_thread).await,
+            "the teardown pre-emit already covers this turn"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// Regression, observed 2026-08-06 on the nightly e2e thread. The two reads
+    /// above must agree on what counts as a start, and for a while they did not:
+    /// this one carried a hand-rolled list that omitted `ContinuationStarted`.
+    ///
+    /// Sequence: user message, engine switched away (device abort), auto-resume
+    /// (`ContinuationStarted`), then the engine dies again involuntarily. The
+    /// switch abort now belongs to the PREVIOUS turn, and
+    /// `switch_was_user_initiated` already treats it as consumed (that is the
+    /// loop-breaker, asserted above). A boundary guard that still counts it reads
+    /// "already aborted" and emits nothing, so the crash leaves no trace: of four
+    /// coding-agent threads interrupted by that restart, the one that had been
+    /// auto-resumed earlier was the only one with no interruption panel, which is
+    /// exactly what made the crash look like a silent auto-resume.
+    #[tokio::test]
+    async fn a_consumed_switch_abort_does_not_suppress_the_next_crash_boundary() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+
+        seed_cc_start(&bus, thread_id).await;
+        tick().await;
+        abort_with(&bus, thread_id, Some(device_actor())).await;
+        tick().await;
+        seed_continuation_started(&bus, thread_id).await;
+
+        assert!(
+            !switch_was_user_initiated(&pool, thread_id).await,
+            "precondition: the resume consumed the switch abort, so this crash \
+             falls back to manual Continue"
+        );
+        assert!(
+            !boundary_abort_already_emitted(&pool, thread_id).await,
+            "the consumed switch abort belongs to the previous turn, so the turn \
+             the resume opened is still owed its own interruption boundary"
+        );
 
         pool.close().await;
         teardown_test_db(&db_name).await;

@@ -344,10 +344,17 @@ impl LucidosEngine {
                 .ok()
                 .flatten()
                 .unwrap_or_default();
+        // Cloned, and hoisted out of the retry loop, so no `RwLock` guard is held
+        // across the `extract_facts` await below. `user_language` is a
+        // write-preferring `tokio::sync::RwLock`, so a read guard parked on a
+        // multi-minute LLM round trip makes a `preferences(set, language)` write
+        // queue behind it, and every later reader (including the setup path of
+        // every chat turn, `chat/process/run.rs`) then queues behind that pending
+        // writer. Every other read site already clones.
+        let language = self.user_language.read().await.clone();
         let facts: Vec<ExtractedFact> = if let Some(ref extractor) = self.extractor {
             let mut facts = None;
             for attempt in 1..=3u32 {
-                let language = self.user_language.read().await;
                 let lang_ref = if language.is_empty() {
                     None
                 } else {

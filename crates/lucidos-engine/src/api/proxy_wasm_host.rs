@@ -124,12 +124,32 @@ fn lookup_memory(caller: &mut Caller<'_, HostState>) -> Result<Memory, wasmtime:
         .ok_or_else(|| wasmtime::Error::msg("module did not export `memory`"))
 }
 
+/// True when `[ptr, ptr+len)` lies inside the module's own linear memory.
+///
+/// Every host import below takes a length straight off the WASM stack, so it is
+/// whatever the module put there (up to 2 GiB). Allocating first and letting the
+/// subsequent `Memory::read` / `Memory::write` reject afterwards means a buggy or
+/// hostile signer can OOM-abort the whole engine from inside the sandbox, which
+/// is precisely what the sandbox exists to prevent. Checking first rejects
+/// nothing a working module does: its buffers are in its own memory by
+/// construction.
+fn range_in_memory(mem: &Memory, caller: &Caller<'_, HostState>, ptr: u32, len: u32) -> bool {
+    (ptr as usize)
+        .checked_add(len as usize)
+        .is_some_and(|end| end <= mem.data_size(caller))
+}
+
 fn read_bytes(
     mem: &Memory,
     caller: &mut Caller<'_, HostState>,
     ptr: u32,
     len: u32,
 ) -> Result<Vec<u8>, wasmtime::Error> {
+    if !range_in_memory(mem, caller, ptr, len) {
+        return Err(wasmtime::Error::msg(format!(
+            "memory read at {ptr}/{len} is out of bounds"
+        )));
+    }
     let mut buf = vec![0u8; len as usize];
     mem.read(caller, ptr as usize, &mut buf)
         .map_err(|e| wasmtime::Error::msg(format!("memory read at {ptr}/{len}: {e}")))?;
@@ -178,12 +198,18 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
             if out_len <= 0 {
                 return -1;
             }
-            let mut buf = vec![0u8; out_len as usize];
-            rand::thread_rng().fill_bytes(&mut buf);
             let mem = match lookup_memory(&mut caller) {
                 Ok(m) => m,
                 Err(_) => return -1,
             };
+            // Bound the fill BEFORE allocating (see `range_in_memory`): the
+            // destination has to fit in the module's own memory, so a 2 GiB
+            // `out_len` is a bad call, not a buffer to zero and randomize.
+            if !range_in_memory(&mem, &caller, out_ptr as u32, out_len as u32) {
+                return -1;
+            }
+            let mut buf = vec![0u8; out_len as usize];
+            rand::thread_rng().fill_bytes(&mut buf);
             match write_bytes(&mem, &mut caller, out_ptr as u32, &buf) {
                 Ok(()) => out_len,
                 Err(_) => -1,
@@ -300,6 +326,12 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
                 Ok(b) => b,
                 Err(_) => return -1,
             };
+            // `out_cap` is module-supplied: a capacity larger than the module's
+            // whole linear memory cannot name a real destination buffer, and
+            // allocating it would OOM the host (see `range_in_memory`).
+            if !range_in_memory(&mem, &caller, out_ptr as u32, out_cap as u32) {
+                return -1;
+            }
             let mut buf = vec![0u8; out_cap as usize];
             let written = match hex_encode_into(&input, &mut buf) {
                 Some(n) => n,
@@ -333,6 +365,11 @@ pub fn register_host_imports(linker: &mut Linker<HostState>) -> Result<(), wasmt
                 Ok(b) => b,
                 Err(_) => return -1,
             };
+            // Same bound as `hex_encode`: reject a destination capacity that
+            // cannot fit in the module's own memory before allocating it.
+            if !range_in_memory(&mem, &caller, out_ptr as u32, out_cap as u32) {
+                return -1;
+            }
             let mut buf = vec![0u8; out_cap as usize];
             let written = match base64_encode_into(&input, &mut buf) {
                 Some(n) => n,

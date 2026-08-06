@@ -9,6 +9,7 @@ export type ThreadType = 'chat' | 'claude_code';
 export type ArchiveState = 'archived' | 'inbox';
 export type DisplaySection = 'saved' | 'current' | 'archive';
 export type ThreadStatus = 'idle' | 'running' | 'waiting' | 'waiting_for_user_answer' | 'paused' | 'failed';
+export const THREAD_STATUSES: readonly ThreadStatus[] = ['idle', 'running', 'waiting', 'waiting_for_user_answer', 'paused', 'failed'] as const;
 export type EventClass = 'metadata' | 'start' | 'activity' | 'terminal' | 'action_required';
 export type Action = 'discard_draft' | 'discard' | 'apply' | 'archive' | 'save' | 'unsave';
 export type MessageLabel = 'Requesting' | 'Working' | 'Waiting' | 'Canceled' | 'Aborted';
@@ -83,6 +84,10 @@ export const EVENT_CLASSIFICATION: Readonly<Record<string, EventClass>> = {
   ImageDescribed: 'metadata',
   CommandCheckpointed: 'metadata',
   CommandCheckpointReverted: 'metadata',
+  EventWaitStarted: 'activity',
+  EventWaitDelivered: 'activity',
+  EventWaitExpired: 'activity',
+  EventWaitCanceled: 'activity',
 } as const;
 
 export const CC_ONLY_EVENTS: ReadonlySet<string> = new Set([

@@ -132,6 +132,7 @@ impl LucidosEngine {
                     pre_emitted_origin.map(PreEmittedOrigin::Message),
                     None,
                     origin,
+                    crate::engine::FollowUpUrgency::Normal,
                 )
                 .await
             {

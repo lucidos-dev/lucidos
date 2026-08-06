@@ -213,6 +213,61 @@ export async function waitAndClick(page: Page, selector: string, text?: string, 
   await clickVisibleElement(page, selector, text);
 }
 
+/** Click a content-header action by its ACTION class (`.file-edit-btn`,
+ *  `.diff-whole-file-toggle`, …) wherever progressive collapse put it.
+ *
+ *  The content header collapses its leading context actions into a `⋯` overflow
+ *  menu when the row runs out of room for the title (`useHeaderActionCollapse`),
+ *  so on a phone an ordinary long title can fold EVERY action behind `⋯`. A test
+ *  that waits on the bare header button therefore times out on a layout that is
+ *  behaving exactly as designed, which is what happened to file-edit.spec.ts and
+ *  repo-files.spec.ts once a title could collapse the row completely. Placement
+ *  is the layout's business; the test's business is that the action works.
+ *
+ *  Both renderings carry the action class (`ContentHeaderActions.renderHeaderAction`
+ *  / `renderMenuAction`), so one selector finds it either way. This still fails
+ *  loudly when the action is genuinely absent: neither placement appears and the
+ *  wait times out. */
+export async function clickHeaderAction(page: Page, actionSelector: string, timeout = 10_000): Promise<void> {
+  const menuRow = `.thread-overflow-item${actionSelector}`;
+  // Settled = the action has a placement: its own header button, or the `⋯`
+  // trigger that would hold it. Waiting on either avoids racing the collapse
+  // hook's layout-effect measurement.
+  await page.waitForFunction(({ sel }) => {
+    const anyVisible = (s: string) =>
+      Array.from(document.querySelectorAll(s)).some(el => el.getBoundingClientRect().width > 0);
+    return anyVisible(sel) || anyVisible('.content-header-more');
+  }, { sel: actionSelector }, { timeout });
+
+  if (await clickVisibleElement(page, actionSelector)) return;
+
+  if (!await clickVisibleElement(page, '.content-header-more')) {
+    throw new Error(`clickHeaderAction: "${actionSelector}" is not in the header and the overflow trigger is not clickable`);
+  }
+  await waitForVisibleElement(page, menuRow, timeout);
+  if (!await clickVisibleElement(page, menuRow)) {
+    throw new Error(`clickHeaderAction: "${actionSelector}" is not in the header nor in the overflow menu`);
+  }
+}
+
+/** The id of the thread the app currently has focused, read from the same
+ *  `localStorage` key the app persists it under.
+ *
+ *  This is the identity-safe way to answer "which thread did I just create?"
+ *  after a `sendMessage` + `waitForResponse`. Reading it off the drawer instead
+ *  (`REAL_THREAD_NAV` + a positional `.first()`) is unsafe for the reason
+ *  `threadRowFor` documents below: a coding-agent session left running by an
+ *  EARLIER spec re-inserts its projection row with `last_activity = NOW()` and
+ *  sorts above the thread this test just made, so `.first()` silently captures a
+ *  foreign thread id and every later assertion measures the wrong thread.
+ *  Throws when nothing is focused, since a caller asking for the id always
+ *  believes a thread is. */
+export async function focusedThreadId(page: Page): Promise<string> {
+  const id = await page.evaluate(() => localStorage.getItem('lucidos-focused-thread'));
+  if (!id) throw new Error('focusedThreadId: no thread is focused (lucidos-focused-thread is unset)');
+  return id;
+}
+
 /** Selector for ONE specific thread's drawer row.
  *
  *  Use this — never `REAL_THREAD_ROW` plus a positional `.first()` — whenever a

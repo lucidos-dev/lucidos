@@ -66,6 +66,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         triggerId: opts.triggerId,
         state: opts.state ?? 'active',
         latestTodoList: null,
+    liveEventWaits: [],
     };
     return {
         meta,
@@ -112,6 +113,7 @@ function snapshot(r: DrawerCategorization) {
         rootByThread: [...r.familyGraph.rootByThread.entries()].sort(),
         routedByThread: [...r.decorations.routedByThread.entries()].sort(),
         liftedRoots: [...r.decorations.liftedRoots].sort(),
+        archivedSubThreads: [...r.decorations.archivedSubThreads].sort(),
     };
 }
 

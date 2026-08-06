@@ -41,6 +41,7 @@ function makeThread(id: string, createdAt: string, lastUserAction: string): Thre
         lastRevivedAt: '',
         state: 'active',
         latestTodoList: null,
+    liveEventWaits: [],
     };
     return {
         meta,

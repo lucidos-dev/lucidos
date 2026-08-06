@@ -793,3 +793,65 @@ fn send_notification_schema_exposes_optional_app_id() {
         required_names
     );
 }
+
+/// A wake spends the subscription, and the description used to say only the
+/// opposite case: "the subscription STAYS LIVE, so do not register it again",
+/// which is true of a user message and the exact reverse of what a delivery
+/// needs. That was the nearest matching instruction a model read at delivery
+/// time, and on 2026-08-06 a live thread duly narrated a re-arm it never
+/// performed.
+///
+/// The two-wake fork this used to pin is gone with the attached shape (a user
+/// message no longer wakes anything, it just runs a turn), but the hazard is
+/// not: a bare "do not register it again" anywhere near the delivery case
+/// re-creates it. So the assertion is that the spent-and-resubscribe statement
+/// is present AND that the do-not-register clause carries its own scope.
+#[test]
+fn await_event_description_says_a_wake_spends_the_subscription() {
+    let tools = get_default_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::AWAIT_EVENT)
+        .expect("await_event must be registered in get_default_tools()");
+    let d = &tool.description;
+
+    assert!(
+        d.contains("THE SUBSCRIPTION IS SPENT once it wakes you"),
+        "a wake consumes the wait, and that has to be stated:\n{d}"
+    );
+    assert!(
+        d.contains("call this again before that turn ends"),
+        "the re-subscribe has to name the call AND the deadline:\n{d}"
+    );
+    assert!(
+        d.contains("Saying you will re-subscribe is not re-subscribing"),
+        "prose in place of the call is the failure worth naming:\n{d}"
+    );
+    assert!(
+        d.contains("survives it untouched, so do not register those again"),
+        "the do-not-register clause must stay scoped to the user-message case, \
+         or it reads as advice for the delivery case:\n{d}"
+    );
+}
+
+/// The description promises a bound because there is one. A model that offers
+/// to watch "forever" in a chat thread is wrong twice: the cap refuses the next
+/// call, and an unbounded standing rule is a trigger's job.
+#[test]
+fn await_event_description_names_the_real_subscription_cap() {
+    let tools = get_default_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::AWAIT_EVENT)
+        .expect("await_event must be registered in get_default_tools()");
+    let cap = crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS;
+
+    assert!(
+        tool.description
+            .contains(&format!("After {cap} subscriptions in a row")),
+        "the cap must be interpolated from MAX_CONSECUTIVE_SUBSCRIPTIONS, not \
+         restated as a literal that drifts from the refusal the model actually \
+         hits:\n{}",
+        tool.description
+    );
+}

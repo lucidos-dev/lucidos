@@ -66,7 +66,7 @@ vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
 // `../store`), so the mock fn must be vi.hoisted — a plain const isn't
 // initialized yet when the hoisted factory runs.
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
-vi.mock('./devices', () => ({ getDeviceId, toggleDevicePush: vi.fn() }));
+vi.mock('./devices', () => ({ getDeviceId, toggleDevicePush: vi.fn(), pendingDeviceRegistration: vi.fn() }));
 vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
 // Mirrors the real predicate: a repo-encoded path is handled here, anything
 // else declines so the 'file' branch falls back to openFilePreview.
@@ -128,7 +128,12 @@ describe('handleNavigationRequest', () => {
 
   it('opens URL', () => {
     handleNavigationRequest({ target: 'url', url: 'https://example.com' });
-    expect(openUrl).toHaveBeenCalledWith('https://example.com');
+    expect(openUrl).toHaveBeenCalledWith('https://example.com', undefined);
+  });
+
+  it('forwards the source with a URL, so a blocked tab can say who asked', () => {
+    handleNavigationRequest({ target: 'url', url: 'https://example.com' }, { source: 'thread "X"' });
+    expect(openUrl).toHaveBeenCalledWith('https://example.com', 'thread "X"');
   });
 
   it('opens settings with subview', () => {

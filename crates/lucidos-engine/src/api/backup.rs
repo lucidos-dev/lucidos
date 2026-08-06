@@ -310,15 +310,36 @@ pub async fn get_schedule(
         .await
         .map_err(|e| ApiError::internal(format!("Failed to get schedule: {e}")))?;
 
-    match (cron, provider) {
-        (Some(c), Some(p)) if backup::is_schedule_active(&c) => Ok(Json(ScheduleResponse {
-            schedule: Some(c),
-            provider: Some(p),
-        })),
-        _ => Ok(Json(ScheduleResponse {
-            schedule: None,
-            provider: None,
-        })),
+    Ok(Json(schedule_response(cron, provider)))
+}
+
+/// Shape a `(backup_schedule, backup_provider)` preference pair for the wire.
+///
+/// The two fields answer different questions, and the dependency between them
+/// runs ONE WAY:
+///
+/// * `provider` is the CONFIGURED DESTINATION, reported whatever the schedule
+///   says, because a destination does not stop existing when the cron is off.
+/// * `schedule` is the cron that WILL ACTUALLY RUN, which needs an active
+///   expression AND a destination. `reload_backup_schedule` removes the job
+///   outright when the provider is unset, so a cron reported without one would
+///   promise a backup the engine has not registered.
+///
+/// The pair used to collapse in both directions: any inactive schedule returned
+/// `{schedule: null, provider: null}`, which meant the Backup page could not
+/// learn which provider it was configured for and fell back to the first entry
+/// in the registry. An install configured for Dropbox rendered every control on
+/// the page against Google Drive. Only the provider half of that collapse was
+/// wrong; keeping the other half is what holds this in step with
+/// `reload_backup_schedule` and with the frontend's `backupIsActive`, which
+/// also requires both.
+fn schedule_response(cron: Option<String>, provider: Option<String>) -> ScheduleResponse {
+    let provider = provider.filter(|p| !p.is_empty());
+    ScheduleResponse {
+        schedule: cron
+            .filter(|c| backup::is_schedule_active(c))
+            .filter(|_| provider.is_some()),
+        provider,
     }
 }
 
@@ -356,17 +377,14 @@ pub async fn set_schedule(
             .map_err(|e| ApiError::bad_request(format!("Failed to set schedule: {e}")))?;
     }
 
-    if active {
-        Ok(Json(ScheduleResponse {
-            schedule: Some(req.schedule),
-            provider: Some(req.provider),
-        }))
-    } else {
-        Ok(Json(ScheduleResponse {
-            schedule: None,
-            provider: None,
-        }))
-    }
+    // Shaped by the same rule the GET uses, so a PUT reports back what was
+    // actually written. The old version nulled BOTH fields for an inactive
+    // schedule, which told a caller disabling the cron that the destination it
+    // had just set did not exist.
+    Ok(Json(schedule_response(
+        Some(req.schedule),
+        Some(req.provider),
+    )))
 }
 
 #[derive(Serialize)]
@@ -482,6 +500,68 @@ mod tests {
         assert_eq!(second, "BackupCompleted");
 
         crate::test_support::teardown_test_db(&db_name).await;
+    }
+
+    /// The reported regression: with the schedule off, the configured
+    /// destination still has to reach the caller. Nulling it is what left the
+    /// Backup page with nothing to seed its provider dropdown from, so it fell
+    /// back to the first registry entry and rendered Google Drive on an install
+    /// configured for Dropbox.
+    #[test]
+    fn an_inactive_schedule_still_reports_the_configured_provider() {
+        for cron in [Some("off".to_string()), Some(String::new()), None] {
+            let r = schedule_response(cron.clone(), Some("dropbox".to_string()));
+            assert_eq!(r.schedule, None, "cron {cron:?} is not an active schedule");
+            assert_eq!(
+                r.provider.as_deref(),
+                Some("dropbox"),
+                "cron {cron:?} must not erase the destination"
+            );
+        }
+    }
+
+    /// The active case is unchanged: both halves reported.
+    #[test]
+    fn an_active_schedule_reports_both_halves() {
+        let r = schedule_response(Some("0 0 3 * * *".to_string()), Some("dropbox".to_string()));
+        assert_eq!(r.schedule.as_deref(), Some("0 0 3 * * *"));
+        assert_eq!(r.provider.as_deref(), Some("dropbox"));
+    }
+
+    /// Nothing configured stays null on both halves, so a fresh workspace does
+    /// not read as having a destination it never picked.
+    #[test]
+    fn an_unconfigured_workspace_reports_neither() {
+        let r = schedule_response(None, None);
+        assert_eq!(r.schedule, None);
+        assert_eq!(r.provider, None);
+    }
+
+    /// A blank stored provider is "not configured", not a provider named "".
+    /// It would otherwise seed the page with an id matching nothing in the
+    /// registry, leaving every provider-scoped control disabled with no hint
+    /// why.
+    #[test]
+    fn a_blank_provider_reads_as_unconfigured() {
+        let r = schedule_response(Some("0 0 3 * * *".to_string()), Some(String::new()));
+        assert_eq!(r.provider, None);
+    }
+
+    /// The decoupling runs ONE WAY. A cron with no destination is not a
+    /// schedule that runs: `reload_backup_schedule` removes the job when the
+    /// provider is unset, so reporting the cron would show the Backup page
+    /// "Daily (03:00)" for a workspace where nothing is registered, and would
+    /// contradict the reminder banner's `backupIsActive`, which requires both.
+    #[test]
+    fn a_cron_with_no_destination_is_not_an_active_schedule() {
+        for provider in [None, Some(String::new())] {
+            let r = schedule_response(Some("0 0 3 * * *".to_string()), provider.clone());
+            assert_eq!(
+                r.schedule, None,
+                "provider {provider:?} registers no job, so no schedule is reported"
+            );
+            assert_eq!(r.provider, None);
+        }
     }
 
     /// `running` must pass straight through to the response in both states —
@@ -626,16 +706,32 @@ mod tests {
         crate::test_support::teardown_test_db(&db_name).await;
     }
 
-    /// Disabling writes only `PREF_BACKUP_SCHEDULE = "off"` and leaves the
-    /// provider preference untouched, so exactly one row appears: a provider
-    /// row here would falsely suggest the user changed their backup
-    /// destination.
+    /// Disabling announces BOTH keys, because it writes both: the schedule goes
+    /// to `"off"` and the destination is written unchanged rather than skipped.
+    ///
+    /// It used to write only the schedule, and this test used to assert exactly
+    /// that, on the reasoning that a provider row "would falsely suggest the
+    /// user changed their backup destination". The opposite turned out to be
+    /// true: skipping the write meant the destination could not be set at all
+    /// while the schedule was off, since `PUT /backup/schedule` is the only
+    /// route to `backup_provider` and it took the disable branch.
+    ///
+    /// Like its sibling above, this drives `PreferenceStore::set` directly to
+    /// mirror what `set_backup_schedule`'s disable branch writes, because
+    /// calling that method needs a live `SchedulerManager` (a `JobScheduler`
+    /// plus a `SharedEngine`). It therefore pins the ANNOUNCEMENT contract, not
+    /// the branch; the branch itself is covered end to end by
+    /// `backup_schedule_test` in the API e2e suite, which asserts a disable
+    /// leaves the destination readable.
     #[tokio::test]
-    async fn disabling_a_schedule_announces_only_the_schedule_key() {
+    async fn disabling_a_schedule_announces_both_keys_too() {
         let (pool, db_name) = crate::test_support::setup_test_db().await;
         let (bus, _parent_rx) = EventBus::new(pool.clone());
 
         PreferenceStore::set(&pool, &bus, backup::PREF_BACKUP_SCHEDULE, "off", None)
+            .await
+            .unwrap();
+        PreferenceStore::set(&pool, &bus, backup::PREF_BACKUP_PROVIDER, "dropbox", None)
             .await
             .unwrap();
 
@@ -647,12 +743,22 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(rows.len(), 1, "expected only the schedule key to emit");
+        assert_eq!(rows.len(), 2, "expected one row per written preference");
+        let by_key: std::collections::HashMap<&str, &str> = rows
+            .iter()
+            .map(|(_, p)| {
+                (
+                    p["data"]["key"].as_str().unwrap(),
+                    p["data"]["value"].as_str().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(by_key.get(backup::PREF_BACKUP_SCHEDULE), Some(&"off"));
         assert_eq!(
-            rows[0].1["data"]["key"].as_str().unwrap(),
-            backup::PREF_BACKUP_SCHEDULE
+            by_key.get(backup::PREF_BACKUP_PROVIDER),
+            Some(&"dropbox"),
+            "the destination survives a disable"
         );
-        assert_eq!(rows[0].1["data"]["value"].as_str().unwrap(), "off");
 
         crate::test_support::teardown_test_db(&db_name).await;
     }

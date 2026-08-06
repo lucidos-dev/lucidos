@@ -42,29 +42,92 @@ async function subscribePush(subscription: PushSubscription): Promise<void> {
   await throwIfNotOk(res);
 }
 
-/** Ask the browser for a push subscription using the engine's current VAPID key. */
-async function createPushSubscription(
+/**
+ * Does `sub` speak this engine's VAPID key? `null` means "can't tell", i.e. a
+ * browser that doesn't expose `options.applicationServerKey`, which is
+ * deliberately NOT treated as a mismatch: `subscribe()` itself is then the
+ * authority (see `ensurePushSubscription`).
+ */
+function subscriptionUsesVapidKey(sub: PushSubscription, vapidKey: Uint8Array): boolean | null {
+  const raw = sub.options?.applicationServerKey;
+  if (!raw) return null;
+  const bytes = new Uint8Array(raw);
+  return bytes.length === vapidKey.length && bytes.every((b, i) => b === vapidKey[i]);
+}
+
+/** The Push API's spec-mandated rejection for "this registration already has a
+ *  subscription under a DIFFERENT applicationServerKey". */
+const STALE_KEY_ERROR = 'InvalidStateError';
+
+/**
+ * The browser-side subscription for this registration, reconciled against the
+ * engine's CURRENT VAPID public key.
+ *
+ * The reconciliation is load-bearing, not defensive. VAPID keys are per
+ * workspace (`vapid_keys` in that workspace's `preferences`), while behind the
+ * gateway every workspace shares one origin and takes a `/<slug>/` service-worker
+ * scope. So a workspace *recreated at the same slug* gets a fresh keypair while
+ * the browser keeps the previous incarnation's subscription at that unchanged
+ * scope. Without this, the two paths fail in opposite directions: enabling push
+ * dies on the browser's "A subscription with a different applicationServerKey
+ * already exists" (permanently: nothing in the UI could clear it), and the
+ * background refresh silently re-POSTs a subscription this engine can never sign
+ * a push for, so the user just gets no notifications.
+ *
+ * A subscription already on the current key is returned as-is; `subscribe()`
+ * would only hand back that same object.
+ */
+async function ensurePushSubscription(
   registration: ServiceWorkerRegistration,
 ): Promise<PushSubscription> {
-  const vapidKey = await getVapidKey();
-  const applicationServerKey = urlBase64ToUint8Array(vapidKey);
-  return registration.pushManager.subscribe({
-    userVisibleOnly: true,
-    applicationServerKey: applicationServerKey.buffer as ArrayBuffer,
-  });
+  const vapidKey = urlBase64ToUint8Array(await getVapidKey());
+  const subscribe = () =>
+    registration.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: vapidKey.buffer as ArrayBuffer,
+    });
+
+  const existing = await registration.pushManager.getSubscription();
+  if (existing) {
+    const usesCurrentKey = subscriptionUsesVapidKey(existing, vapidKey);
+    if (usesCurrentKey) return existing;
+    if (usesCurrentKey === false) {
+      await existing.unsubscribe();
+      return subscribe();
+    }
+  }
+
+  try {
+    return await subscribe();
+  } catch (err) {
+    // Reaching here with a non-null `existing` means exactly one thing: it
+    // held a subscription whose key we could not read, so the browser is the
+    // first to know it is stale. Drop it and take the browser's own advice
+    // ("unsubscribe then resubscribe"). Bounded to one retry, and gated on
+    // `existing` (rather than a fresh read) so the retry fires only under
+    // that precondition. The other documented source of InvalidStateError,
+    // subscribing before the worker is active, cannot reach it: a caller
+    // holding an inactive registration is holding a brand-new one, which has
+    // no subscription to drop.
+    if (!existing || (err as { name?: string })?.name !== STALE_KEY_ERROR) throw err;
+    await existing.unsubscribe();
+    return subscribe();
+  }
 }
 
 /**
  * Silently re-subscribe push if already permitted.
  * Called on every page load to keep the endpoint fresh in the backend.
  *
- * Self-heals two divergent states that leave `devices.push_enabled = true`
- * with no `push_subscriptions` row, so the engine pushes to nothing and the
- * user sees silence: (1) the LLM `enable_push_notifications` tool flips the
- * device flag before the browser handshake completes; (2) the browser loses
- * the subscription (cleared site data, SW unregistered). In either case
- * `Notification.permission` stays 'granted', so we can `subscribe()` silently
- * without a permission prompt.
+ * Self-heals three divergent states that leave the engine pushing into the
+ * void while the user sees silence. Two of them leave `devices.push_enabled =
+ * true` with no `push_subscriptions` row: (1) the LLM
+ * `enable_push_notifications` tool flips the device flag before the browser
+ * handshake completes; (2) the browser loses the subscription (cleared site
+ * data, SW unregistered). The third leaves a row that looks healthy but is
+ * addressed with another workspace incarnation's VAPID key, and is repaired by
+ * `ensurePushSubscription`. In all three `Notification.permission` stays
+ * 'granted', so we can `subscribe()` silently without a permission prompt.
  */
 export async function refreshPushSubscription(registration: ServiceWorkerRegistration): Promise<void> {
   try {
@@ -72,15 +135,9 @@ export async function refreshPushSubscription(registration: ServiceWorkerRegistr
     if (!('PushManager' in window)) return;
     if (Notification.permission !== 'granted') return;
 
-    const existing = await registration.pushManager.getSubscription();
-    if (existing) {
-      // Re-send the current subscription to the backend (updates device_id, replaces stale rows)
-      await subscribePush(existing);
-      return;
-    }
-
-    // pushManager.subscribe() doesn't prompt when permission is already 'granted'.
-    await subscribePush(await createPushSubscription(registration));
+    // Re-send to the backend either way: an unchanged subscription still
+    // refreshes device_id and replaces stale rows.
+    await subscribePush(await ensurePushSubscription(registration));
   } catch (err) {
     // Telemetry carve-out (.claude/rules/frontend.md): background refresh
     // runs on every page load without user intent. Failures are non-blocking;
@@ -202,7 +259,7 @@ export async function initPushSubscription(): Promise<boolean> {
   }
 
   try {
-    const registration = await navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH });
+    await navigator.serviceWorker.register(withBase('/sw.js'), { scope: SCOPE_PATH });
 
     const permission = await Notification.requestPermission();
     if (permission !== 'granted') {
@@ -210,7 +267,13 @@ export async function initPushSubscription(): Promise<boolean> {
       return false;
     }
 
-    await subscribePush(await createPushSubscription(registration));
+    // Wait for the ACTIVE worker rather than using the registration
+    // `register()` hands back, for the same reason `recoverServiceWorker`
+    // does: `subscribe()` requires an active worker and rejects with
+    // InvalidStateError against one still in 'installing', which is what a
+    // first-ever registration for this scope returns.
+    const registration = await navigator.serviceWorker.ready;
+    await subscribePush(await ensurePushSubscription(registration));
     showToast('Push notifications enabled', 'success');
     return true;
   } catch (err) {

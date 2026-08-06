@@ -615,6 +615,61 @@ describe('restoreState suppresses transient request-backed form overlays on relo
     expect(store.panelOverlay.value).toBeNull();
   });
 
+  it('restores a plugin-uninstall RECEIPT, which has nothing left to resolve', async () => {
+    const store = await restoreWithOverlay({
+      type: 'form',
+      form: {
+        type: 'plugin-uninstall',
+        request: {
+          uninstall_id: 'u-dead-uuid',
+          plugin_id: 'habit-tracker',
+          plugin_version: '1.0.0',
+          plugin_name: 'Habit Tracker',
+          files_present: ['data/apps/habit-tracker/manifest.json'],
+          files_missing: [],
+        },
+        // The files are already gone, so the dead `uninstall_id` costs nothing:
+        // the panel is a record, not a request, and the row is a real
+        // destination the user can walk back to.
+        removed: {
+          at: '2026-08-06T10:00:00.000Z',
+          summary: 'Removed Habit Tracker',
+          files_deleted: ['data/apps/habit-tracker/manifest.json'],
+          files_missing: [],
+        },
+      },
+    });
+    expect(store.panelOverlay.value).not.toBeNull();
+    expect(store.activeInlineForm.value?.type).toBe('plugin-uninstall');
+  });
+
+  it('restores a plugin-install RECEIPT', async () => {
+    const store = await restoreWithOverlay({
+      type: 'form',
+      form: {
+        type: 'plugin-install',
+        request: {
+          install_id: 'i-dead-uuid',
+          source: 'git://example.com/habit-tracker',
+          source_type: 'git',
+          manifest: {},
+          files: [],
+          overwrites: [],
+          plugin_id: 'habit-tracker',
+          plugin_version: '1.0.0',
+          plugin_name: 'Habit Tracker',
+        },
+        installed: {
+          at: '2026-08-06T10:00:00.000Z',
+          summary: 'Installed Habit Tracker',
+          installed_files: ['data/apps/habit-tracker/manifest.json'],
+        },
+      },
+    });
+    expect(store.panelOverlay.value).not.toBeNull();
+    expect(store.activeInlineForm.value?.type).toBe('plugin-install');
+  });
+
   it('drops a stale PENDING email-confirm overlay', async () => {
     const store = await restoreWithOverlay({
       type: 'form',

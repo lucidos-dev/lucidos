@@ -68,6 +68,14 @@ impl LucidosEngine {
             return Ok((normalized.clone(), dir.join(rel)));
         }
 
+        // Ephemeral scratch sits beside `data/` at the workspace root, so it
+        // joins onto the root rather than onto `data/`. [`normalize_data_path`]
+        // has already narrowed `.lucidos/` to the readable tmp subtree.
+        if crate::core::is_tmp_path(&normalized) {
+            let full_path = resolve_tmp_path(&self.workspace_path, &normalized)?;
+            return Ok((normalized, full_path));
+        }
+
         let full_path = self.workspace_path.join("data").join(&normalized);
 
         // For knowhow paths: if file doesn't exist locally, fall back to shared.
@@ -259,8 +267,8 @@ impl LucidosEngine {
     }
 
     /// Record that `(repo_root, branch_name)` has been hardened at `head_sha`.
-    /// Called by the `/api/v1/internal/mark-hardened` endpoint that the
-    /// `mark-harden.sh` hook hits via `lucidos hardened mark`.
+    /// Called by the `/api/v1/internal/mark-hardened` endpoint that
+    /// `lucidos hardened mark` hits from `/harden` Phase 5.
     pub async fn record_hardened(
         &self,
         repo_root: &std::path::Path,
@@ -410,6 +418,8 @@ const KNOWN_DATA_PREFIXES: [&str; 8] = [
 ///
 /// - `..` / absolute paths are rejected (path traversal).
 /// - A leading `data/` is stripped — LLMs often pass the full workspace-relative path.
+/// - `.lucidos/…` is handled by [`normalize_lucidos_path`] BEFORE the untyped
+///   default, because it names the ephemeral scratch tree outside `data/`.
 /// - A known typed prefix ([`KNOWN_DATA_PREFIXES`]) is kept as-is.
 /// - An *untyped* bare path (no `data/` prefix) defaults under `artifacts/`, the
 ///   catch-all content store — so `write_file('report.md')` lands sensibly at
@@ -432,6 +442,16 @@ fn normalize_data_path(relative_path: &str) -> Result<String, String> {
     let had_data_prefix = relative_path.starts_with("data/");
     let stripped = relative_path.strip_prefix("data/").unwrap_or(relative_path);
 
+    // Must come before the untyped default below, which would otherwise route
+    // `.lucidos/tmp/x` to `artifacts/.lucidos/tmp/x`. That is the same hazard as
+    // the `data/<untyped>` refusal further down, one prefix over, except that
+    // this one was live rather than hypothetical: it git-committed 94 scratch
+    // files into tracked artifacts repos while the matching reads failed
+    // against a path nobody had asked for.
+    if stripped == ".lucidos" || stripped.starts_with(".lucidos/") {
+        return normalize_lucidos_path(had_data_prefix, stripped);
+    }
+
     if KNOWN_DATA_PREFIXES.iter().any(|p| stripped.starts_with(p)) {
         return Ok(stripped.to_string());
     }
@@ -444,6 +464,140 @@ fn normalize_data_path(relative_path: &str) -> Result<String, String> {
         ));
     }
     Ok(format!("artifacts/{stripped}"))
+}
+
+/// Decide what a `.lucidos/…` path means to the file tools. `stripped` is the
+/// path with any leading `data/` already removed, and `had_data_prefix` records
+/// whether it carried one.
+///
+/// Exactly one subtree is addressable: [`crate::core::TMP_DIR`], the ephemeral
+/// scratch the engine's own tools write into and then name back to the LLM
+/// (`http_request(temp_path)` answers `[SAVED] .lucidos/tmp/<f>`, `git_clone`'s
+/// tmp route answers `CLONED TO TMP: …` and tells the agent to extract from it
+/// with `copy_file`). Reads land there; writes are refused one layer up in
+/// `engine::tools::files::read_only_reason`, because the file tools commit
+/// everything they write and this tree is gitignored.
+///
+/// Everything else under `.lucidos/` stays unaddressable in both directions:
+/// `worktrees/` holds entire source checkouts, `exhaust/` is engine runtime
+/// scratch, and `engine.pid` / `ports` / `cc-commands.json` are process state.
+/// None of it is "a file in the workspace" in the sense the tool advertises.
+fn normalize_lucidos_path(had_data_prefix: bool, stripped: &str) -> Result<String, String> {
+    let tmp = crate::core::TMP_DIR;
+    if had_data_prefix {
+        return Err(format!(
+            "'data/{stripped}' does not exist: .lucidos/ sits beside data/ at the workspace \
+             root, not inside it. Drop the prefix and use '{stripped}'."
+        ));
+    }
+    // `is_tmp_path` anchors on the separator; the extra emptiness check rejects
+    // a bare `.lucidos/tmp/`, which names the directory rather than a file.
+    if crate::core::is_tmp_path(stripped) && !stripped.ends_with('/') {
+        return Ok(stripped.to_string());
+    }
+    Err(format!(
+        "'{stripped}' is not addressable by the file tools. Under .lucidos/ only \
+         '{tmp}/<file>' is (the ephemeral scratch http_request and git_clone write to); the \
+         rest is engine runtime state. To CREATE a scratch file use run_python, whose cwd is \
+         the workspace root: open('{tmp}/notes.json', 'w')."
+    ))
+}
+
+/// Join an already-normalized [`crate::core::TMP_DIR`] path onto the workspace
+/// root, refusing a target that escapes the scratch tree through a symlink.
+///
+/// `git_clone`'s tmp route drops whatever symlinks a cloned repository carries
+/// into this directory, and `is_path_traversal` is a string check that cannot
+/// see them, so string validation alone does not bound where a read lands.
+/// Canonicalizing both sides does.
+///
+/// Only a PROVEN escape refuses. When the target does not exist,
+/// `canonicalize` fails and the path is returned unchanged, so the caller
+/// reports its ordinary "file not found" rather than a misleading security
+/// error. Both sides are canonicalized because the workspace root itself may
+/// sit behind a symlink, in which case comparing a canonical target against a
+/// non-canonical root would reject every legitimate read.
+fn resolve_tmp_path(
+    workspace_path: &std::path::Path,
+    normalized: &str,
+) -> Result<std::path::PathBuf, String> {
+    let full_path = workspace_path.join(normalized);
+    let tmp_root = workspace_path.join(crate::core::TMP_DIR);
+    if let (Ok(root), Ok(target)) = (tmp_root.canonicalize(), full_path.canonicalize()) {
+        if !target.starts_with(&root) {
+            return Err(format!(
+                "'{}' resolves outside {}/ through a symlink",
+                normalized,
+                crate::core::TMP_DIR
+            ));
+        }
+    }
+    Ok(full_path)
+}
+
+#[cfg(test)]
+mod resolve_tmp_path_tests {
+    use super::resolve_tmp_path;
+
+    #[test]
+    fn resolves_a_real_scratch_file() {
+        let ws = tempfile::tempdir().unwrap();
+        let tmp = ws.path().join(crate::core::TMP_DIR);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::write(tmp.join("readme.md"), "hi").unwrap();
+
+        let got = resolve_tmp_path(ws.path(), ".lucidos/tmp/readme.md").unwrap();
+        assert_eq!(std::fs::read_to_string(got).unwrap(), "hi");
+    }
+
+    #[test]
+    fn refuses_a_symlink_that_escapes_the_scratch_tree() {
+        // The `git_clone` hazard: a cloned repo carries a symlink pointing out
+        // of the workspace entirely.
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret.txt");
+        std::fs::write(&secret, "private").unwrap();
+
+        let ws = tempfile::tempdir().unwrap();
+        let tmp = ws.path().join(crate::core::TMP_DIR);
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::os::unix::fs::symlink(&secret, tmp.join("escape.txt")).unwrap();
+
+        let err = resolve_tmp_path(ws.path(), ".lucidos/tmp/escape.txt").unwrap_err();
+        assert!(err.contains("symlink"), "got: {err}");
+    }
+
+    #[test]
+    fn allows_a_symlink_that_stays_inside_the_scratch_tree() {
+        let ws = tempfile::tempdir().unwrap();
+        let tmp = ws.path().join(crate::core::TMP_DIR);
+        std::fs::create_dir_all(tmp.join("repo")).unwrap();
+        std::fs::write(tmp.join("repo/real.md"), "inside").unwrap();
+        std::os::unix::fs::symlink(tmp.join("repo/real.md"), tmp.join("link.md")).unwrap();
+
+        let got = resolve_tmp_path(ws.path(), ".lucidos/tmp/link.md").unwrap();
+        assert_eq!(std::fs::read_to_string(got).unwrap(), "inside");
+    }
+
+    #[test]
+    fn a_missing_file_is_not_reported_as_a_symlink_escape() {
+        // Canonicalization fails for a path that isn't there; the caller must
+        // still get its plain "file not found", not a security error.
+        let ws = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(ws.path().join(crate::core::TMP_DIR)).unwrap();
+
+        let got = resolve_tmp_path(ws.path(), ".lucidos/tmp/nope.md").unwrap();
+        assert!(!got.exists());
+    }
+
+    #[test]
+    fn an_absent_scratch_dir_is_not_reported_as_a_symlink_escape() {
+        // A workspace that has never used scratch has no .lucidos/tmp at all,
+        // so the ROOT is what fails to canonicalize. Still not an escape.
+        let ws = tempfile::tempdir().unwrap();
+        let got = resolve_tmp_path(ws.path(), ".lucidos/tmp/nope.md").unwrap();
+        assert!(!got.exists());
+    }
 }
 
 #[cfg(test)]
@@ -514,5 +668,97 @@ mod normalize_data_path_tests {
         assert!(normalize_data_path("../secret").is_err());
         assert!(normalize_data_path("/etc/passwd").is_err());
         assert!(normalize_data_path("artifacts/../../escape").is_err());
+    }
+
+    // ── .lucidos/ (ephemeral scratch, outside data/) ─────────────────────────
+
+    #[test]
+    fn tmp_scratch_paths_survive_normalization() {
+        // The regression: these used to come back as `artifacts/.lucidos/…`,
+        // so a read of a path `http_request` had just printed missed, and a
+        // write git-committed scratch into the tracked artifacts repo.
+        for p in [
+            ".lucidos/tmp/t3code_readme.md",
+            ".lucidos/tmp/oura_data.json",
+            ".lucidos/tmp/some-repo/README.md",
+            ".lucidos/tmp/plugins/uploads/abc/x.lucidos-plugin",
+        ] {
+            assert_eq!(normalize_data_path(p).unwrap(), p, "path {p}");
+        }
+    }
+
+    #[test]
+    fn no_lucidos_path_can_reach_artifacts() {
+        // Whether it resolves or is refused, no `.lucidos/` input may ever
+        // produce a data/-relative path. That rewrite is the whole bug.
+        for p in [
+            ".lucidos",
+            ".lucidos/",
+            ".lucidos/tmp",
+            ".lucidos/tmp/",
+            ".lucidos/tmp/x.md",
+            ".lucidos/exhaust/y",
+            ".lucidos/worktrees/thread-x/src/main.rs",
+            ".lucidos/engine.pid",
+            "data/.lucidos/tmp/x.md",
+        ] {
+            match normalize_data_path(p) {
+                Ok(n) => assert!(!n.starts_with("artifacts/"), "{p} normalized to {n}"),
+                Err(e) => assert!(!e.contains("artifacts/.lucidos"), "{p} suggested {e}"),
+            }
+        }
+    }
+
+    #[test]
+    fn only_the_tmp_subtree_is_addressable() {
+        // Everything else under .lucidos/ is engine runtime state: worktrees
+        // hold entire source checkouts, exhaust/ is internal scratch.
+        for p in [
+            ".lucidos/worktrees/thread-x/src/main.rs",
+            ".lucidos/exhaust/run.log",
+            ".lucidos/engine.pid",
+            ".lucidos/ports",
+            ".lucidos/cc-commands.json",
+        ] {
+            let err = normalize_data_path(p).unwrap_err();
+            assert!(err.contains("not addressable"), "{p} got: {err}");
+            assert!(err.contains(".lucidos/tmp/<file>"), "{p} got: {err}");
+        }
+    }
+
+    #[test]
+    fn tmp_directory_itself_is_not_a_file() {
+        // `.lucidos/tmp` and `.lucidos/tmp/` name the directory, not a file in
+        // it, so they are refused rather than resolved to a path a read would
+        // fail on with a confusing "is a directory".
+        for p in [".lucidos", ".lucidos/", ".lucidos/tmp", ".lucidos/tmp/"] {
+            assert!(normalize_data_path(p).is_err(), "{p} should be refused");
+        }
+    }
+
+    #[test]
+    fn data_prefixed_lucidos_path_is_corrected_not_rerouted() {
+        // The chat system prompt warns against this exact form. Say where
+        // .lucidos/ actually lives instead of routing it under data/.
+        let err = normalize_data_path("data/.lucidos/tmp/x.json").unwrap_err();
+        assert!(err.contains("beside data/"), "got: {err}");
+        assert!(err.contains("'.lucidos/tmp/x.json'"), "got: {err}");
+    }
+
+    #[test]
+    fn refusals_name_the_route_that_works() {
+        // A refusal the model can act on: run_python is how scratch is created.
+        let err = normalize_data_path(".lucidos/exhaust/y").unwrap_err();
+        assert!(err.contains("run_python"), "got: {err}");
+    }
+
+    #[test]
+    fn a_dotfile_that_merely_starts_with_lucidos_is_not_scratch() {
+        // Prefix matching is on the whole `.lucidos` segment, so an artifact
+        // named `.lucidosrc` keeps defaulting under artifacts/.
+        assert_eq!(
+            normalize_data_path(".lucidosrc").unwrap(),
+            "artifacts/.lucidosrc"
+        );
     }
 }

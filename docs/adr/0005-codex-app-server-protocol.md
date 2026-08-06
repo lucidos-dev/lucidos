@@ -128,8 +128,14 @@ normally. The app-server driver is unchanged — it still queues the input and
 runs it the instant the interrupted turn ends. Gated on
 `AgentSession::coding_agent == Codex` and `is_in_flight()`; never fires for an
 engine-internal child-wake. Decision + arming are pure functions
-(`should_redirect_codex_followup` / `arm_codex_redirect` in
-`engine/chat/process_helpers.rs`) with unit tests.
+(`should_redirect_followup` / `arm_followup_redirect` in
+`engine/chat/process_helpers.rs`) with unit tests. (Named
+`should_redirect_codex_followup` / `arm_codex_redirect` until 2026-08-06, when
+Claude Code gained the same interrupt behind an opt-in `urgent` flag and the
+mechanism stopped being Codex-only. Codex still redirects unconditionally, and
+that is what `urgent` being a no-op on Codex means: its protocols cannot surface
+a queued message mid-turn at all, so there is no gentler mode to opt out of. See
+`docs/plans/2026-08-06-urgent-child-follow-up-preempts-in-flight-work.md`.)
 
 **Labeling (2026-06-21 follow-up).** The interrupted turn now carries a dedicated
 `CancelCause::SupersededByFollowup` instead of `UserStop`. The user steered, they
@@ -137,11 +143,13 @@ didn't Stop, so the frontend renders it **neutrally** — the interrupted turn r
 a plain "Done", with no "Canceled ✕" badge and no standalone "Response canceled"
 panel, exactly like a chat/CC follow-up. The cancel is still emitted (it's what
 suppresses a spurious `ResponseGenerated` / change proposal); only the cause and
-its rendering changed. `arm_codex_redirect` flags the session; the run_session
+its rendering changed. `arm_followup_redirect` flags the session; the run_session
 interrupt arm drains the flag into `classify_result` (and the escalation
 fallback). `CancelCause` is not part of the generated TS contract, so this needed
 only the hand-maintained frontend `CancelCause` union — no `ThreadEvent` variant
-change. See `docs/plans/2026-06-21-codex-followup-redirect-label.md`.
+change. Both other lanes now reach the same cause the same way: Claude Code
+through the shared `arm_followup_redirect`, and the Lucidos Agent through
+`cancel_thread_for_followup` + `cancel_cause_for_turn`. See `docs/plans/2026-06-21-codex-followup-redirect-label.md`.
 
 ## Addendum (2026-06-25): unattended trigger sessions auto-resolve approvals
 

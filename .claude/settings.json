@@ -20,6 +20,11 @@
       "Edit(.claude/hooks/**)",
       "Write(.claude/hooks/**)",
       "Read(.claude/hooks/**)"
+    ],
+    "deny": [
+      "Read(./target/**)",
+      "Read(./**/dist/**)",
+      "Read(./crates/lucidos-app/src/generated/cross-validation-fixture.json)"
     ]
   },
   "hooks": {
@@ -56,6 +61,16 @@
           {
             "type": "command",
             "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/no-em-dashes.sh"
+          }
+        ]
+      }
+    ],
+    "InstructionsLoaded": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/log-instructions-loaded.sh"
           }
         ]
       }

@@ -29,8 +29,8 @@ impl LucidosEngine {
     /// "Switched/Aborted" while the old engine is still alive through a dev
     /// rebuild. Walks the in-flight chat AND CC threads and emits the boundary
     /// events with the `actor` the switch handler stashed (via
-    /// `take_restart_actor`): a device actor → "You restarted"; `None` (bare
-    /// stop.sh / external SIGUSR1) → "⚙ System restarted".
+    /// `take_restart_actor`): a device actor → "Paused by restart"; `None`
+    /// (bare stop.sh / external SIGUSR1) → "⚙ System / Response interrupted".
     ///
     /// For chat threads: emits `ResponseAborted { actor: <actor> }` with
     /// `request_event_id` pointing to the originating MessageReceived/
@@ -78,17 +78,23 @@ impl LucidosEngine {
             partition_chat_thread_ids(&self.processing_thread_ids(), &all_cc_thread_ids);
 
         // ---- Chat threads ---------------------------------------------------
-        // Look up originating event ids in parallel — sequential awaits would
-        // serialize N round-trips on a busy restart. The CTC entry in
-        // `CHAT_ORIGINATING_EVENT_TYPES` is what makes a chat agent woken by a
-        // child finishing get its abort stamped with the CTC's id rather than
-        // a stale older `MessageReceived` from a previous turn — without it
+        // Resolve each thread's anchor in parallel, because sequential awaits
+        // would serialize N round-trips on a busy restart. The running turn
+        // recorded its own `request_event_id` on the handle, so the abort
+        // terminates the turn that is actually in flight and the loop's
+        // follow-up cancel is suppressed by the gate in
+        // `emit_response_canceled`. The `CHAT_ORIGINATING_EVENT_TYPES` query
+        // behind it is the fallback for a thread whose turn never got that far;
+        // the CTC entry in that list is what makes a chat agent woken by a child
+        // finishing resolve to the CTC rather than a stale older
+        // `MessageReceived` from a previous turn. Without an anchor
         // `groupIntoExchanges` routes the abort into the wrong (already-
         // completed) exchange and the live `UserQuestionAsked` exchange never
         // gets the abort step.
         let chat_originating_ids: Vec<Option<uuid::Uuid>> =
             futures::future::join_all(chat_thread_ids.iter().map(|tid| {
-                crate::engine::agent_session::latest_originating_event_id(
+                crate::engine::in_flight_request_event_id(
+                    &self.active_threads,
                     &self.pool,
                     *tid,
                     crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
@@ -101,8 +107,8 @@ impl LucidosEngine {
             // its card stays answerable and answering resumes. The chat agent's
             // `ask_user_question` blocks the loop on the same wait registry as CC,
             // so a question-parked chat thread is still in `processing_thread_ids()`
-            // and would otherwise get the device "Restarted" abort here (the
-            // reproduced chat screenshot). `None` channel = chat bucket.
+            // and would otherwise get the device "Paused by restart" abort here
+            // (the reproduced chat screenshot). `None` channel = chat bucket.
             emit_teardown_abort_unless_question_parked(
                 &self.pool,
                 &self.event_bus,
@@ -116,7 +122,7 @@ impl LucidosEngine {
             // Drop the thread from `active_threads` so the subsequent
             // `shutdown_active_threads` sweep doesn't see it in
             // `processing_thread_ids()` and emit a second System abort on top
-            // of the device "Restarted" panel we just persisted. CC's side of
+            // of the device "Paused by restart" panel we persisted. CC's side of
             // this is the `external_terminal_emitted` flag on `AgentSession`
             // because `run_session` keeps running and re-reads it; the chat
             // loop has no equivalent re-read — it just exits when its token
@@ -126,7 +132,7 @@ impl LucidosEngine {
 
         // ---- CC threads -----------------------------------------------------
         // Pre-emit ONLY the boundary `ResponseAborted{actor: device}` so the
-        // post-restart timeline reads "You restarted" on the AbortPanel.
+        // post-restart timeline reads "Paused by restart" on the AbortPanel.
         // The synthetic `CodingAgentIdled{engine_restart_interrupt}` that
         // drives the spawn-dispatcher classifier is left to the post-restart
         // recovery sweep — it owns the decision of whether to preserve the
@@ -134,15 +140,21 @@ impl LucidosEngine {
         // or clean it up. Pre-emitting that idle event from here would push
         // the branch into `idle_branches` on restart and trigger a worktree
         // cleanup, breaking the Continue flow.
-        // CC parents woken from a finished child also have CTC as their
-        // turn's `request_event_id` — `notify_parent_of_child_completion`
+        // The anchor comes off the handle, same as the chat bucket, for a
+        // session the chat path spawned: it holds its `ThreadGuard` across the
+        // whole session (`process_cc.rs`) and `run_session` stamps that same
+        // `EventMeta::request_event_id = Some(origin_id)` on every CC event,
+        // which the `msg_rx` follow-up arm does NOT rewrite, so handle and
+        // session agree for the session's whole life. CC parents woken from a
+        // finished child need no special case: `notify_parent_of_child_completion`
         // passes the CTC id as `pre_emitted_origin` regardless of whether
-        // `parent_is_coding_agent`, and `run_session` stamps
-        // `EventMeta::request_event_id = Some(origin_id)` on every CC event.
-        // `CC_ORIGINATING_EVENT_TYPES` is the chat list + CCUMS, so it covers
-        // both regular CC follow-ups and wake-from-child.
+        // `parent_is_coding_agent`, and that id is what the handle records.
+        // A session the spawn dispatcher resumed calls `run_direct_agent`
+        // directly and registers no handle at all, so it takes the
+        // `CC_ORIGINATING_EVENT_TYPES` fallback (the chat list plus CCUMS),
+        // exactly as every coding-agent thread did before.
         //
-        // Per-thread work runs concurrently — same rationale as the chat
+        // Per-thread work runs concurrently, same rationale as the chat
         // lookups above (sequential awaits would serialize N round-trips on a
         // busy restart), and each thread's chain needs two queries now: the
         // originating-id lookup plus the question-parked check inside
@@ -158,13 +170,13 @@ impl LucidosEngine {
             |(thread_id, flag)| {
                 let actor = actor.clone();
                 async move {
-                    let originating_event_id =
-                        crate::engine::agent_session::latest_originating_event_id(
-                            &self.pool,
-                            *thread_id,
-                            crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES,
-                        )
-                        .await;
+                    let originating_event_id = crate::engine::in_flight_request_event_id(
+                        &self.active_threads,
+                        &self.pool,
+                        *thread_id,
+                        crate::engine::agent_session::CC_ORIGINATING_EVENT_TYPES,
+                    )
+                    .await;
                     emit_teardown_abort_unless_question_parked(
                         &self.pool,
                         &self.event_bus,
@@ -186,22 +198,29 @@ impl LucidosEngine {
     /// CC threads are handled separately by `shutdown_agent_sessions`.
     ///
     /// After emitting, cancels all threads so their tasks can clean up. The
-    /// agentic loop may also emit ResponseCanceled on cancellation, and the
-    /// idempotency gate in `emit_response_canceled` can't suppress it here (the
-    /// abort above carries no `request_event_id` to match on). Having both is
-    /// harmless: the exchange label prefers Aborted over Canceled regardless of
-    /// order, and the `thread_summaries.status` column
-    /// (and IS last-write-wins) keeps the abort's verdict: `'paused'`, since
-    /// `EngineShutdown` is a transient cause, preserved because the
-    /// `ResponseCanceled` projection arm is `preserving_verdict`. Both halves
-    /// are load-bearing; the status half used to be missing, which erased the
-    /// interrupted thread's status dot.
+    /// agentic loop's cancel arm fires moments later, and the abort is anchored
+    /// on the in-flight turn (`in_flight_request_event_id`) precisely so the
+    /// idempotency gate in `emit_response_canceled` recognises it and skips that
+    /// second emit. Until 2026-08-06 this path stamped no `request_event_id` at
+    /// all, nothing could match, and the transcript grew a "Response canceled"
+    /// boundary next to the interruption on a shutdown the user never cancelled.
+    /// The verdict is unaffected either way: `thread_summaries.status` keeps the
+    /// abort's, because the `ResponseCanceled` projection arm is
+    /// `preserving_verdict`.
     ///
     /// Stamps `actor: System` so the AbortPanel renders ⚙ System — the host
     /// system killed these in-flight responses (engine shutdown). The
     /// user-driven `/api/v1/restart` path pre-emits with `actor: Device {..}`
     /// BEFORE shutdown for in-flight threads it knows about; this fallback
     /// covers anything that started after that pre-emit.
+    ///
+    /// The actor decides the verdict, so this fallback settles at `'failed'`
+    /// while the pre-emit settles at `'paused'`
+    /// (`AbortCause::promises_auto_resume`). That is not a discrepancy: the two
+    /// resume gates key on the same device-actor fingerprint, so a thread reached
+    /// only by this fallback is one NO resume gate will pick up. It keeps the
+    /// Continue button, and `'failed'` is what puts it in the needs-attention
+    /// count where the user will find it.
     pub async fn shutdown_active_threads(&self) {
         let active_ids = self.processing_thread_ids();
         if active_ids.is_empty() {
@@ -229,6 +248,13 @@ impl LucidosEngine {
                 "[Shutdown] Emitting ResponseAborted for active thread {}",
                 thread_id
             );
+            let request_event_id = crate::engine::in_flight_request_event_id(
+                &self.active_threads,
+                &self.pool,
+                thread_id,
+                crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES,
+            )
+            .await;
             // Direct .emit (not emit_response_aborted): wants the Err for the per-thread log below.
             if let Err(e) = self
                 .event_bus
@@ -241,9 +267,11 @@ impl LucidosEngine {
                         reasoning_effort: None,
                         cause: crate::engine::thread_events::AbortCause::EngineShutdown,
                     },
-                    meta: crate::engine::thread_events::EventMeta::with_actor(Some(
-                        crate::engine::thread_events::MessageOrigin::system(),
-                    )),
+                    meta: crate::engine::thread_events::EventMeta {
+                        request_event_id,
+                        actor: Some(crate::engine::thread_events::MessageOrigin::system()),
+                        ..crate::engine::thread_events::EventMeta::NONE
+                    },
                 })
                 .await
             {

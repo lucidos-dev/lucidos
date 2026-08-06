@@ -109,6 +109,10 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     "message": {
                         "type": "string",
                         "description": "What to tell the child. Write it as an instruction to the child, not as a description of the child: it lands in the child's conversation as a message from you."
+                    },
+                    "urgent": {
+                        "type": "boolean",
+                        "description": "Set true ONLY when the child must act on this instead of what it is doing now, typically a cancellation. It stops the child's current turn so it reads you immediately; whatever that turn was mid-way through is lost. Leave it out for an ordinary steer or an extra fact: the child then reads you when its current work reaches a natural break, which can take as long as the tool call it is inside. Default false."
                     }
                 },
                 "required": ["thread_id", "message"]
@@ -130,14 +134,24 @@ const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
     "You can only address your OWN direct children (not a sibling, not a grandchild, not a ",
     "thread someone else spawned). Refer to the child by TITLE in anything you write for the ",
     "user; the uuid is an addressing detail and never belongs in your prose.\n\n",
-    "Three things to know before you call it:\n",
+    "By default the message QUEUES: a child that is mid-turn reads it when its current work ",
+    "reaches a natural break, and if it is inside a long tool call that can be many minutes. ",
+    "That is the right default for a steer, because nothing in flight is thrown away. When the ",
+    "child must act on your message INSTEAD of what it is doing (a cancellation, a stop, a ",
+    "\"you are working from a wrong assumption\"), pass urgent: true and its current turn is ",
+    "stopped so it reads you at once.\n\n",
+    "Four things to know before you call it:\n",
     "- It RESOLVES ANY PENDING PERMISSION CARD on the child as superseded. If a human was ",
     "about to approve a tool call there, your redirect cancels that request.\n",
     "- If the child is parked on a question, your message is NOT an answer to it. The child ",
-    "will not read the message until a human answers, and the result says so.\n",
+    "will not read the message until a human answers, and the result says so. urgent does not ",
+    "change that: the child is blocked on a human, not on work.\n",
     "- A follow-up racing the child's own finish can produce a completion card for the turn ",
     "you interrupted. That does not mean the redirect failed; the redirected turn reports ",
-    "separately when it ends."
+    "separately when it ends.\n",
+    "- On a CODEX child urgent changes nothing, because a Codex turn cannot read a queued ",
+    "message at all until it ends, so every follow-up already stops the current turn. Pass ",
+    "urgent by what you MEAN, not by which backend the child runs."
 );
 
 #[cfg(test)]
@@ -184,13 +198,45 @@ mod tests {
         names.sort_unstable();
         assert_eq!(
             names,
-            ["message", "thread_id"],
-            "the tool takes the child and the message and nothing else: any \
-             caller-thread argument would let the model claim to be someone else"
+            ["message", "thread_id", "urgent"],
+            "the tool takes the child, the message and how hard to push, and nothing \
+             else: any caller-thread argument would let the model claim to be someone else"
         );
         assert_eq!(
             follow_up.parameters["required"],
-            serde_json::json!(["thread_id", "message"])
+            serde_json::json!(["thread_id", "message"]),
+            "urgent stays optional so omitting it yields the non-destructive default"
+        );
+    }
+
+    /// `urgent` ends the child's current turn, so the model has to be told both
+    /// what it costs and that the cost is real on only two of the three
+    /// backends. A model that reads it as a free "please hurry" would spend it
+    /// on every steer.
+    #[test]
+    fn follow_up_tool_states_what_urgent_costs_and_where_it_is_a_no_op() {
+        let tools = spawn_tools();
+        let follow_up = tools
+            .iter()
+            .find(|tool| tool.name == tn::FOLLOW_UP_CHILD_THREAD)
+            .expect("follow_up_child_thread tool must be registered");
+
+        let urgent = follow_up.parameters["properties"]["urgent"]["description"]
+            .as_str()
+            .expect("urgent description");
+        assert!(
+            urgent.contains("is lost"),
+            "the model must know an urgent follow-up throws away in-flight work:\n{urgent}"
+        );
+
+        let d = &follow_up.description;
+        assert!(
+            d.contains("QUEUES"),
+            "the default must be stated, or the model cannot tell what urgent changes:\n{d}"
+        );
+        assert!(
+            d.contains("CODEX child urgent changes nothing"),
+            "the Codex no-op is an honest asymmetry and must be stated, not hidden:\n{d}"
         );
     }
 

@@ -57,3 +57,31 @@ describe('InlineStep rendering per step outcome', () => {
     expect(text).not.toContain('⊘');
   });
 });
+
+/** Thinking and the call it produced share one row, so the reasoning ticker has
+ *  to know when to stop: it is the only thing an unnamed row can say, and it is
+ *  noise once the row can name the tool it called. The full text is in the step
+ *  detail either way. */
+describe('InlineStep reasoning ticker', () => {
+  const reasoning = 'Weighing the options\nChecking the projection first';
+
+  function tickerOf(description: string): string {
+    const event: Extract<ResponseEvent, { type: 'step' }> = {
+      type: 'step',
+      description,
+      outcome: 'pending',
+      thinkingText: reasoning,
+    };
+    return vnodeToText(InlineStep({ event }) as VNode);
+  }
+
+  it('shows the latest reasoning line while the row is still unnamed', () => {
+    expect(tickerOf('Thinking')).toContain('Checking the projection first');
+  });
+
+  it('drops it once the row names the call it produced', () => {
+    const rendered = tickerOf('Running: cd ~/projects && ls');
+    expect(rendered).toContain('Running: cd ~/projects && ls');
+    expect(rendered).not.toContain('Checking the projection first');
+  });
+});

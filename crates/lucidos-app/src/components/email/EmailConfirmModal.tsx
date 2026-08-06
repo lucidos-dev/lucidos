@@ -179,9 +179,9 @@ function EmailConfirmDraft({ form }: { form: EmailConfirmForm }) {
 function EmailSentReceipt({ sent, sentAt }: { sent: EmailConfirmForm['request']; sentAt: string }) {
   return (
     <div class="inline-form email-confirm">
-      <div class="email-confirm-sent-status">
-        <span class="email-confirm-sent-badge">Sent</span>
-        <span class="email-confirm-sent-time">{formatMessageTimestamp(sentAt)}</span>
+      <div class="panel-receipt-status">
+        <span class="panel-receipt-badge">Sent</span>
+        <span class="panel-receipt-time">{formatMessageTimestamp(sentAt)}</span>
       </div>
       <EmailMeta request={sent} subject={sent.subject} />
       <div class="form-group">

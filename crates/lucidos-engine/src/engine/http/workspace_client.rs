@@ -99,16 +99,29 @@ pub(crate) fn merge_caller_fields(mut body: Value, ctx: &WorkspaceCallCtx) -> Va
 }
 
 /// POST `body` as JSON to `url`, merging the caller_* fields from `ctx` into
-/// the body so the receiver can capture a `MessageOrigin::Workspace`.
+/// the body so the receiver can capture a `MessageOrigin::Workspace`, and
+/// asserting `target_workspace` so a stale or mis-resolved port cannot land
+/// this write on somebody else's engine (`api::target_workspace`).
+///
+/// The assertion is a required parameter rather than something the one caller
+/// remembers to add, because forgetting it fails silently in exactly the way
+/// the header exists to prevent: the request succeeds against the wrong
+/// workspace and looks like a delivery.
 pub async fn workspace_post<B: serde::Serialize>(
     client: &Client,
     url: &str,
     body: &B,
     ctx: &WorkspaceCallCtx,
+    target_workspace: &str,
 ) -> Result<reqwest::Response, Box<dyn std::error::Error + Send + Sync>> {
     let body_json = serde_json::to_value(body)?;
     let merged = merge_caller_fields(body_json, ctx);
-    Ok(client.post(url).json(&merged).send().await?)
+    Ok(client
+        .post(url)
+        .header(crate::api::actor::HEADER_TARGET_WORKSPACE, target_workspace)
+        .json(&merged)
+        .send()
+        .await?)
 }
 
 /// The user-facing parameters for spawning a coding-agent thread in another
@@ -201,7 +214,15 @@ pub async fn spawn_coding_agent_in_workspace(
         "{}://localhost:{}/api/v1/chat/stream",
         scheme, target.api_port
     );
-    let resp = workspace_post(client, &url, &body, ctx)
+    // Assert the workspace this spawn is FOR, taken from the resolved target's
+    // own path rather than from anything the caller typed, so the assertion and
+    // the port it was resolved alongside always name the same workspace.
+    let target_workspace = target
+        .workspace_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let resp = workspace_post(client, &url, &body, ctx, &target_workspace)
         .await
         .map_err(|e| format!("cross-workspace POST to {} failed: {}", url, e))?;
     let status = resp.status();
@@ -316,9 +337,15 @@ mod tests {
 
         let url = format!("http://{}/", addr);
         let client = cross_workspace_http_client();
-        let resp = workspace_post(client, &url, &serde_json::json!({"message": "hi"}), &ctx())
-            .await
-            .expect("post should succeed");
+        let resp = workspace_post(
+            client,
+            &url,
+            &serde_json::json!({"message": "hi"}),
+            &ctx(),
+            "target-ws",
+        )
+        .await
+        .expect("post should succeed");
         assert!(resp.status().is_success());
 
         let recv = captured.lock().unwrap().clone().expect("body received");
@@ -493,6 +520,74 @@ mod tests {
         assert_eq!(body["mode"], "agent");
     }
 
+    /// The spawn must assert WHICH workspace it is for, taken from the resolved
+    /// target's own path. Without it, a stale or mis-resolved port lands the
+    /// spawn on a different workspace's engine and looks like a success:
+    /// `api::target_workspace` can only refuse an assertion that was made.
+    #[tokio::test]
+    async fn spawn_coding_agent_in_workspace_asserts_the_target_workspace() {
+        use std::sync::{Arc, Mutex};
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured_for_handler = captured.clone();
+
+        let app = axum::Router::new().route(
+            "/api/v1/chat/stream",
+            axum::routing::post(move |headers: axum::http::HeaderMap| {
+                let captured = captured_for_handler.clone();
+                async move {
+                    *captured.lock().unwrap() = headers
+                        .get(crate::api::actor::HEADER_TARGET_WORKSPACE)
+                        .and_then(|v| v.to_str().ok())
+                        .map(str::to_string);
+                    axum::http::StatusCode::OK
+                }
+            }),
+        );
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let port = addr.port();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let target = CrossWorkspaceTarget {
+            // The assertion comes off this path's basename, never off anything
+            // the caller typed, so it always names the workspace whose ports
+            // file supplied the port beside it.
+            workspace_path: std::path::PathBuf::from("/tmp/workspaces/myws"),
+            api_port: port,
+            proto: "http".to_string(),
+        };
+        let ctx = WorkspaceCallCtx {
+            self_workspace: "dev".into(),
+            source_thread_id: None,
+            source_event_id: None,
+            mode: ActorMode::Agent,
+        };
+        spawn_coding_agent_in_workspace(
+            cross_workspace_http_client(),
+            &target,
+            &CrossWorkspaceSpawn {
+                prompt: "build the feature",
+                title: None,
+                repo: None,
+                folder: None,
+                coding_agent: None,
+            },
+            &ctx,
+            "http",
+        )
+        .await
+        .expect("cross-workspace spawn must succeed");
+
+        assert_eq!(
+            captured.lock().unwrap().clone().as_deref(),
+            Some("myws"),
+            "the target workspace assertion must name the TARGET, not the caller"
+        );
+    }
+
     #[tokio::test]
     async fn spawn_coding_agent_in_workspace_propagates_http_error_with_status_and_body() {
         // 4xx/5xx from the receiver must surface as Err so the LLM sees the
@@ -571,7 +666,7 @@ mod tests {
         let url = format!("http://{}/api/v1/chat/stream", addr);
         let body = serde_json::json!({"message": "hi"});
         let start = std::time::Instant::now();
-        let result = workspace_post(&client, &url, &body, &ctx()).await;
+        let result = workspace_post(&client, &url, &body, &ctx(), "target-ws").await;
         let elapsed = start.elapsed();
 
         let err = result.expect_err("hung peer must surface as Err");

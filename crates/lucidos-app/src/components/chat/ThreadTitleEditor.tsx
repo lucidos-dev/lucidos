@@ -5,6 +5,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { viewportIsMobile } from '../../utils/viewport';
 import { autoResizeTextarea } from '../../utils/dom';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
+import { useDelayedFlag } from '../../hooks/useDelayedLoading';
 
 interface Props {
   threadId: string;
@@ -31,6 +32,12 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
   const [editValue, setEditValue] = useState(title);
   const [suggestion, setSuggestion] = useState<string | null>(null);
   const [suggesting, setSuggesting] = useState(false);
+  // The shimmer is a loading indicator, so it is delay-gated like every other
+  // one (.claude/rules/frontend.md). A `suggestTitle` that settles inside
+  // SPINNER_DELAY_MS (the offline / no-provider reject, which comes back almost
+  // immediately) would otherwise paint a shimmer bar for a frame or two and
+  // yank it away.
+  const showSuggesting = useDelayedFlag(suggesting);
   // Mobile renders a <textarea> (multi-line wrap), desktop an <input> (single-line
   // hug) — both share this ref via the setInputEl callback below.
   const inputRef = useRef<HTMLInputElement | HTMLTextAreaElement | null>(null);
@@ -217,7 +224,7 @@ export function ThreadTitleEditor({ threadId, title }: Props) {
       {editing && (
         <div class="thread-title-suggestion">
           {suggesting ? (
-            <div class="thread-title-shimmer" />
+            showSuggesting ? <div class="thread-title-shimmer" /> : null
           ) : suggestion && suggestion !== title ? (
             <button
               class="thread-title-suggestion-btn"

@@ -24,6 +24,7 @@ vi.mock('./devices', async () => {
     loadDevices: vi.fn(),
     devices: signal({ status: 'not-loaded' }),
     getDeviceId: vi.fn(() => 'this-device'),
+    pendingDeviceRegistration: vi.fn(),
   };
 });
 // Keep removePinnedAppLocal real (the AppDeleted test asserts on its effect),

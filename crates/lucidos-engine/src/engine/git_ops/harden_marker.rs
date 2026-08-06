@@ -82,7 +82,7 @@ pub(crate) async fn is_harden_marker_present(
 /// Record that `(repo_root, branch_name)` has been hardened at `head_sha`.
 /// Idempotent — a second `/harden` upserts the new HEAD SHA. Called by the
 /// HTTP endpoint that the `lucidos hardened mark` CLI POSTs to from the
-/// `mark-harden.sh` hook.
+/// `lucidos hardened mark` call in `/harden` Phase 5.
 pub(crate) async fn record_hardened(
     pool: &sqlx::PgPool,
     repo_root: &Path,

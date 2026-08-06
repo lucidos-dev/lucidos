@@ -38,7 +38,7 @@ vi.hoisted(() => {
 vi.mock('../api/client', async (importOriginal) => ({
   ...(await importOriginal<typeof import('../api/client')>()),
   API_BASE: '',
-  putComposeOnThread: vi.fn().mockResolvedValue(undefined),
+  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));

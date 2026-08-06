@@ -129,18 +129,41 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.variant).toBe('system');
   });
 
-  it('ResponseAborted (device actor = restart pre-emit): iconless action label "Restarted" (ResponseCanceled style)', () => {
-    // /api/v1/restart → abort_in_flight_for_restart pre-emits with the device
-    // actor that hit Restart. Rendered like the cancel boundary: no icon, the
-    // action ("Restarted") IS the label, no separate summary.
+  it('ResponseAborted (switch teardown): iconless action label "Paused by restart" (ResponseCanceled style)', () => {
+    // /api/v1/restart → abort_in_flight_for_restart pre-emits `engine_shutdown`
+    // with the device actor that hit Restart. BOTH halves are the fingerprint
+    // (`isSwitchTeardownAbort`), so the fixture carries both. Rendered like the
+    // cancel boundary: no icon, the action ("Paused by restart") IS the label, no
+    // separate summary. The wording matches the `paused` thread status the same
+    // abort leaves.
+    const ex = exchangeWith({
+      type: 'ResponseAborted',
+      cause: 'engine_shutdown',
+      actor: { kind: 'device', device_id: 'd-1', label: 'iOS Safari PWA' },
+    });
+    const desc = describeInitiator(ex, '', [], 'tid');
+    expect(desc.icon).toBeNull();
+    expect(desc.label).toBe('Paused by restart');
+    expect(desc.summary).toBeUndefined();
+  });
+
+  it('ResponseAborted (device actor, no cause): reads as an interruption, not a pause', () => {
+    // A device actor ALONE is not the switch fingerprint, so this legacy row
+    // (persisted before `cause` existed) reads "Response interrupted". The
+    // wording on those old transcript rows is a deliberate cost of keeping the
+    // frontend fingerprint identical to the backend's: `SWITCH_TEARDOWN_ABORT_SQL`
+    // requires `cause = 'engine_shutdown'` too, so a legacy row is not a switch on
+    // either side. Making only the frontend lenient is what would drift.
+    //
+    // Still the iconless action style: the branch keys on the device actor, and
+    // whatever the cause, a device-attributed abort IS something the user did.
     const ex = exchangeWith({
       type: 'ResponseAborted',
       actor: { kind: 'device', device_id: 'd-1', label: 'iOS Safari PWA' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
     expect(desc.icon).toBeNull();
-    expect(desc.label).toBe('Restarted');
-    expect(desc.summary).toBeUndefined();
+    expect(desc.label).toBe('Response interrupted');
   });
 
   it('ResponseCanceled: no chip — "Response canceled" IS the header label, no summary, no icon', () => {
@@ -188,6 +211,38 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.label).toBe(ENGINE_LABEL);
     expect(desc.summary).toBe('Auto-prompt sent');
     expect(desc.variant).toBe('system');
+  });
+
+  /** A detached event wake is the ONE injection whose text is not its content:
+   *  the prose is the model's prompt and carries the matched payload as
+   *  pretty-printed JSON, which is a screen of raw JSON in a transcript. When
+   *  the resolved delivery is in hand, the panel names the event instead. */
+  it('UserPromptInjected (detached event wake): summary names the delivered event', () => {
+    const ex = exchangeWith({
+      type: 'UserPromptInjected',
+      text: 'An event you subscribed to has arrived …\n\nCodingAgentIdled:\n{ … }',
+      delivered_event_id: 'evt-1',
+    });
+    const desc = describeInitiator(
+      ex, '<p>raw json</p>', [], 'tid', false, false, 'claude-code', undefined, undefined,
+      'CodingAgentIdled', '{\n  "has_changes": true\n}',
+    );
+    expect(desc.summary).toBe('Woke on CodingAgentIdled');
+    expect(desc.details).toBeDefined();
+  });
+
+  /** The link can dangle: the delivery sits in an earlier exchange, so a long
+   *  thread can load the wake without it. Falling back to the prose is the
+   *  honest thing to show when the structured half is not in hand. */
+  it('UserPromptInjected (wake whose delivery is not loaded): falls back to the prose body', () => {
+    const ex = exchangeWith({
+      type: 'UserPromptInjected',
+      text: 'An event you subscribed to has arrived …',
+      delivered_event_id: 'evt-gone',
+    });
+    const desc = describeInitiator(ex, '<p>raw json</p>', [], 'tid');
+    expect(desc.summary).toBe('Auto-prompt sent');
+    expect(desc.details).toBeDefined();
   });
 
   // Regression: a child→parent callback emits UserPromptInjected with

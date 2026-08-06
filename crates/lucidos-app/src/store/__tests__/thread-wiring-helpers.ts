@@ -28,6 +28,7 @@ export function makeThread(overrides: Partial<ThreadState> = {}): ThreadState {
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

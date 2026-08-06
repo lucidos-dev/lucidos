@@ -138,18 +138,43 @@ export type AbortCause =
   | 'session_dropped'
   | 'unknown';
 
+/** True for the teardown boundary of a user-initiated *Switch to new version*:
+ *  an `engine_shutdown` abort stamped with the device that clicked Switch.
+ *
+ *  The single frontend definition of the fingerprint, mirroring the backend's
+ *  `SWITCH_TEARDOWN_ABORT_SQL` (`agent_recovery/recovery.rs`) and its in-Rust
+ *  twin `AbortCause::promises_auto_resume` (`thread_events/cause.rs`). Matching
+ *  means the engine PROMISED to resume this turn, and all three consequences
+ *  key on this one predicate so they cannot disagree: the thread reads `paused`
+ *  (backend), the transcript says "Paused by restart", and the Continue button
+ *  is withheld (see `abortPromisesAutoResume`).
+ *
+ *  **Both halves are load-bearing.** A device actor alone is not the
+ *  fingerprint: `stale_settle` deliberately carries the actor of whichever
+ *  button exposed a stuck row (Stop / Apply / Discard / Archive / Interrupt).
+ *  Nor is `engine_shutdown` alone: the shutdown fallback for a thread that
+ *  started after the restart pre-emit carries a system actor, and no resume gate
+ *  picks that up. */
+export function isSwitchTeardownAbort(
+  actor: MessageOrigin | undefined,
+  cause: AbortCause | undefined,
+): boolean {
+  return cause === 'engine_shutdown' && actor?.kind === 'device';
+}
+
 /** Summary text for a `ResponseAborted` event. `stale_settle` (engine cleanup
  *  of a stuck projection on a user button click) reads "Settled stuck
  *  response" — distinct from a real abort because no live response existed.
- *  Otherwise: device actor = `/api/v1/restart` pre-emit ("You — Restarted");
- *  anything else is the host system killing the process ("System — Response
- *  interrupted"). */
+ *  The user's own switch reads "Paused by restart", matching the `paused` thread
+ *  status the same abort leaves behind (the turn is parked, not lost, and
+ *  resumes on its own). Anything else is an interruption nobody promised to
+ *  undo, which reads "Response interrupted" over a `failed` thread. */
 export function responseAbortedSummary(
   actor: MessageOrigin | undefined,
   cause: AbortCause | undefined,
 ): string {
   if (cause === 'stale_settle') return 'Settled stuck response';
-  return actor?.kind === 'device' ? 'Restarted' : 'Response interrupted';
+  return isSwitchTeardownAbort(actor, cause) ? 'Paused by restart' : 'Response interrupted';
 }
 
 /** Header label / preview text for a `ResponseCanceled` turn — always a
@@ -222,6 +247,27 @@ export type ChildCompletionStatus = 'success' | 'failure' | 'no_changes' | 'canc
  *  strike-through on the rest. `undefined` covers Allow-once, Deny, and
  *  recovery-emitted orphan resolutions (no scope was picked). */
 export type PersistScope = 'narrow' | 'broad' | 'session';
+
+/** Mirrors the Rust `EventSubscription` (`core::event_subscription`). One entry
+ *  in a subscriber's `on:` list: an event name plus an optional payload filter
+ *  using the `$eq/$ne/$lt/$lte/$gt/$gte/$in` operators. A trigger's `on:` and a
+ *  thread's event wait are the same shape and run the same matcher, so this one
+ *  type serves both. */
+export interface EventSubscription {
+  event_type: string;
+  condition?: unknown;
+}
+
+/** Mirrors the Rust `EventWaitCancelCause` (serde rename_all = "snake_case").
+ *  Every arm is the user ending the wait deliberately. Note what is absent: an
+ *  ordinary message into a parked thread DETACHES the wait and leaves it live,
+ *  so a passing question cannot silently discard a long wait. */
+export type EventWaitCancelCause =
+  | 'user_stop'
+  | 'thread_canceled'
+  | 'thread_archived'
+  | 'thread_discarded'
+  | 'unknown';
 
 export type ThreadEvent =
   | { type: 'MessageReceived'; text: string; channel?: EventChannel; user_image_hashes?: string[]; device_id?: string; device?: string; image_description?: string; mode?: ActorMode; model?: string; reasoning_effort?: string; parent_thread_id?: string; spawning_event_id?: string; origin?: MessageOrigin }
@@ -326,7 +372,15 @@ export type ThreadEvent =
   // Both survive restart so startup cleanup can find dangling worktrees.
   | { type: 'MergeResolutionStarted'; change_id?: string; worktree_path?: string; temp_branch?: string }
   | { type: 'MergeResolutionCleared'; change_id?: string }
-  | { type: 'UserPromptInjected'; text: string; mode?: ActorMode; origin?: MessageOrigin; injected_message_id?: string }
+  /** `delivered_event_id` is set ONLY on a detached event-wake anchor: the id
+   *  of the `EventWaitDelivered` this injection is the wake for. `text` spells
+   *  the matched event out as pretty-printed JSON because it is the prompt the
+   *  model reads, so rendering it verbatim gives the user a screen of raw JSON.
+   *  Follow the id to that event instead and render its `event_type` /
+   *  `payload` as a named event with the payload folded away. Absent on every
+   *  other injection, on an expiry wake, and on rows that pre-date the field,
+   *  where the prose IS the content. */
+  | { type: 'UserPromptInjected'; text: string; mode?: ActorMode; origin?: MessageOrigin; injected_message_id?: string; delivered_event_id?: string }
   | { type: 'CredentialRequested'; provider: string }
   | { type: 'McpConsentRequested'; tool: string; args: unknown }
   | { type: 'CodingAgentSettingsChanged'; model?: string; reasoning_effort?: string; permission_mode?: string; cc_session_id?: string; coding_agent?: CodingAgent }
@@ -344,7 +398,10 @@ export type ThreadEvent =
   | { type: 'McpPermissionResolved'; request_id: string; allowed: boolean; reason?: string; persist_scope?: PersistScope; actor?: MessageOrigin }
   // Command guard checkpoint/undo (ADR 0002, Phase 4) — a ReversibleDanger
   // command was snapshotted before running; the user can one-click Undo.
-  | { type: 'CommandCheckpointed'; checkpoint_id: string; command: string; summary: string }
+  // `restores` / `removes` are absent on events written before 2026-08-06,
+  // when Undo could only restore. Treated as 0 at render, which reads as
+  // "unknown", and the card then says nothing about what Undo will do.
+  | { type: 'CommandCheckpointed'; checkpoint_id: string; command: string; summary: string; restores?: number; removes?: number }
   | { type: 'CommandCheckpointReverted'; checkpoint_id: string; actor?: MessageOrigin }
   | { type: 'ChildThreadCompleted'; child_thread_id: string; child_thread_title?: string; status: ChildCompletionStatus; summary: string; pending_change_ids?: string[] }
   // ── Passive / bookkeeping events ──────────────────────────────────────
@@ -377,7 +434,23 @@ export type ThreadEvent =
   // consumer today — the description only matters to the backend's history /
   // title-generation paths — but the type belongs on the union so projections
   // can pattern-match without `as` casts when the SSE stream delivers one.
-  | { type: 'ImageDescribed'; source_event_id: string; hash: string; description: string; model: string };
+  | { type: 'ImageDescribed'; source_event_id: string; hash: string; description: string; model: string }
+  // ── Event-wait lifecycle ──────────────────────────────────────────────
+  // The thread subscribed to an event and parked; the engine wakes it on a
+  // match, the deadline, or a user cancel. These DO render: `EventWaitStarted`
+  // becomes a step-level card in the transcript (the CheckpointCard shape,
+  // never an exchange divider, because the wake resumes the SAME exchange),
+  // and the three resolutions flip that card's state by `wait_id`. They also
+  // feed `meta.liveEventWaits`, which backs the always-visible subscription
+  // indicator.
+  //
+  // `was_attached` records whether the delivery filled in the model's own
+  // dangling `await_event` tool call (a seamless mid-thought resume) or arrived
+  // as a new exchange because a user message had already forced that call shut.
+  | { type: 'EventWaitStarted'; wait_id: string; tool_use_id: string; on: EventSubscription[]; reason: string; expires_at: string; watermark: number }
+  | { type: 'EventWaitDelivered'; wait_id: string; event_id: string; event_type: string; payload: unknown; matched_index: number; was_attached: boolean }
+  | { type: 'EventWaitExpired'; wait_id: string; was_attached: boolean }
+  | { type: 'EventWaitCanceled'; wait_id: string; cause: EventWaitCancelCause; was_attached?: boolean };
 
 /** Every `ThreadEvent['type']` discriminant, as a compile-time-checked object.
  *  The `satisfies Record<ThreadEvent['type'], true>` annotation forces this map
@@ -450,6 +523,10 @@ const THREAD_EVENT_TYPE_FLAGS = {
   CommandCheckpointed: true,
   CommandCheckpointReverted: true,
   ChildThreadCompleted: true,
+  EventWaitStarted: true,
+  EventWaitDelivered: true,
+  EventWaitExpired: true,
+  EventWaitCanceled: true,
   WorktreeCleaned: true,
   ContextDismissed: true,
   BackgroundBashStarted: true,
@@ -477,6 +554,28 @@ export interface TodoItem {
   content: string;
   active_form: string;
   status: TodoStatus;
+}
+
+/** One live *event wait* on a thread, projected into `meta.liveEventWaits` from
+ *  the `EventWait*` events (see `handleEvent`).
+ *
+ *  Held in meta rather than re-derived per render for the same reason as
+ *  `latestTodoList`: the subscription indicator is always mounted, so walking
+ *  the events Map on every `threadMap` flush would cost a scan per keystroke.
+ *
+ *  `attached` says whether this wait is the one holding the turn parked. It
+ *  starts true (`await_event` is terminal, so registration always parks) and is
+ *  flipped by the filler `ToolResult` the engine writes when something forces a
+ *  turn to run. That is the same derived fact the engine reads off the pairing,
+ *  seen from the client. */
+export interface EventWaitSummary {
+  wait_id: string;
+  on: EventSubscription[];
+  reason: string;
+  /** ISO-8601 deadline. The indicator counts down to it in component-local
+   *  state, never in a signal: a per-second store write would re-flush
+   *  `threadMap` every second for every subscribed thread. */
+  expires_at: string;
 }
 
 /** Mirrors the Rust `QuestionOption` in thread_events.rs. */
@@ -520,7 +619,6 @@ export type TransientEvent =
   | { type: 'PluginUninstallRequested'; payload: string }
   | { type: 'EmailConfirmRequested'; payload: string }
   | { type: 'PushNotificationRequested' }
-  | { type: 'FileRefreshRequested'; path: string }
   | { type: 'AppUiRefreshRequested'; app_id: string }
   | { type: 'AppUiCaptureRequested'; app_id: string; request_id: string }
   // `actor` carries the originating device for an agent (navigate_ui) navigate —

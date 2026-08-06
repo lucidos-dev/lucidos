@@ -267,7 +267,9 @@ fn is_packaged() -> bool {
 }
 
 /// launchd label of the always-on engine service (matches
-/// `crates/lucidos-app/src/desktop.rs` `LAUNCH_AGENT_LABEL`).
+/// `crates/lucidos-app/src/desktop.rs` `SERVICE_AGENT_LABEL`). The client's own
+/// login agent is a separate job and is deliberately NOT restarted from here:
+/// restarting the service must not disturb the window the user is looking at.
 const LAUNCH_AGENT_LABEL: &str = "com.lucidos.engine";
 
 /// Read a VERSION file from disk, returning "unknown" if missing.
@@ -957,7 +959,7 @@ pub(super) async fn emit_event(
 /// Routes for the engine-level surfaces this module's handlers own:
 /// `/health`, `/restart`, `/workspaces`, `/history`, `/messages`,
 /// `/session/messages`, and the `/events*` surface (global SSE stream +
-/// event-store queries). The two `/events/:event_id/*` routes are part of
+/// event-store queries). The three `/events/:event_id/*` routes are part of
 /// the events URL surface, so they register here even though their handlers
 /// live in `api::threads`.
 pub(super) fn router() -> Router<AppState> {
@@ -982,6 +984,10 @@ pub(super) fn router() -> Router<AppState> {
         .route(
             "/events/:event_id/tool-result",
             get(super::threads::get_tool_result),
+        )
+        .route(
+            "/events/:event_id/location",
+            get(super::threads::get_event_location),
         )
 }
 

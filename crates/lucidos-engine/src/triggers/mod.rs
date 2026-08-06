@@ -1,4 +1,3 @@
-pub mod condition;
 pub mod config;
 pub mod definition;
 pub mod groups;
@@ -7,9 +6,14 @@ pub mod replay;
 pub mod run_history;
 pub mod summary;
 
+/// The subscription primitive a trigger's `on:` list is made of. It lives in
+/// [`crate::core::event_subscription`] rather than here because a thread's
+/// *event wait* subscribes with the same shape and the same matcher; the
+/// re-export keeps trigger code reading in trigger terms.
+pub use crate::core::event_subscription::EventSubscription;
 pub use config::{
     is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
-    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
+    TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
@@ -30,6 +34,16 @@ use std::collections::HashMap;
 /// Conditions are scoped to each subscription, so a single trigger can listen
 /// for multiple events with different payload shapes without one filter
 /// constraining the other.
+///
+/// The predicate itself is [`EventSubscription::any_matches`], shared verbatim
+/// with the event-wait dispatcher. Do not inline the name comparison or reach
+/// into `condition::evaluate` here: the two dispatch paths agreeing on every
+/// (subscription, event) pair is the whole reason the primitive is shared, and
+/// `matcher_parity_with_the_shared_predicate` below pins it.
+///
+/// The caller is responsible for the subscribability gate
+/// ([`crate::core::event_subscription::is_subscribable`]); see
+/// `start_trigger_event_subscriber` in `crates/lucidos-engine/src/scheduler/mod.rs`.
 pub fn find_matching_event_triggers(
     configs: &HashMap<String, TriggerConfig>,
     event_type: &str,
@@ -37,13 +51,7 @@ pub fn find_matching_event_triggers(
 ) -> Vec<TriggerConfig> {
     configs
         .values()
-        .filter(|t| {
-            !t.paused
-                && t.on.iter().any(|sub| {
-                    sub.event_type == event_type
-                        && condition::evaluate(sub.condition.as_ref(), payload)
-                })
-        })
+        .filter(|t| !t.paused && EventSubscription::any_matches(&t.on, event_type, payload))
         .cloned()
         .collect()
 }
@@ -79,6 +87,38 @@ mod tests {
         EventSubscription {
             event_type: event_type.to_string(),
             condition,
+        }
+    }
+
+    /// I8: the trigger dispatch path must return the same verdict as the shared
+    /// predicate for every (subscription, event) pair, so the event-wait
+    /// dispatcher and this one cannot disagree. The table is owned by
+    /// `core::event_subscription`, which asserts the same cases against
+    /// `EventSubscription::matches` directly; running it through
+    /// `find_matching_event_triggers` is what proves the trigger side did not
+    /// quietly re-implement the comparison.
+    #[test]
+    fn matcher_parity_with_the_shared_predicate() {
+        use crate::core::event_subscription::tests::PARITY_CASES;
+        for (sub_type, cond, event_type, payload, expected) in PARITY_CASES {
+            let mut configs = HashMap::new();
+            configs.insert(
+                "t1".into(),
+                make_event_trigger(
+                    "t1",
+                    vec![sub(
+                        sub_type,
+                        cond.map(|c| serde_json::from_str(c).unwrap()),
+                    )],
+                ),
+            );
+            let payload: serde_json::Value = serde_json::from_str(payload).unwrap();
+            let hit = !find_matching_event_triggers(&configs, event_type, &payload).is_empty();
+            assert_eq!(
+                hit, *expected,
+                "trigger dispatch disagrees with EventSubscription::matches for \
+                 subscription {sub_type} cond={cond:?} vs event {event_type} {payload}",
+            );
         }
     }
 

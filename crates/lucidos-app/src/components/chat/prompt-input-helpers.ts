@@ -247,6 +247,14 @@ export function computeAnswerActionMode(args: {
 // PromptInput.tsx (`ANSWER_CANCEL_TOOLTIP`). Between the two, nothing on the
 // card needs an "Other, I'll type it" option row, which would just hand its own
 // label back as the answer.
+//
+// A thread parked on an *event wait* deliberately gets NO placeholder of its
+// own. It is asleep on the SYSTEM, not on the user, the composer stays fully
+// enabled, and a message runs an ordinary turn while the subscription keeps
+// waiting: that is exactly the ordinary follow-up promise, so the ordinary
+// follow-up line says it. The event-wait indicator and the wait card already
+// carry the state; a second copy in the composer only added a line of grey
+// text under every parked thread.
 export const PLACEHOLDER_NEW_THREAD = 'What can I help with?';
 export const PLACEHOLDER_FOLLOW_UP = 'Post a follow up…';
 export const PLACEHOLDER_ANSWERING = 'Type custom answer here…';

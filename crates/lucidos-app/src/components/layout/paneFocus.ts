@@ -135,7 +135,9 @@ function focusPaneSurface(pane: FocusedPane, force: boolean): void {
   // marker, DOM focus, and scroll target all agree — and the retry's stale-marker
   // bail below doesn't abort a legitimate destination focus whose navigation left
   // `focusedPane` unchanged (e.g. Search Everywhere selecting a thread while the
-  // drawer is the focused pane: `revealThreadPane` only switches from 'content').
+  // drawer is the focused pane: with the split open, `revealThreadPane` switches
+  // only from 'content'; it takes the marker unconditionally only when it just
+  // re-expanded a collapsed thread pane).
   // (`focusPaneAndControl` already set it; this is a redundant no-op there.)
   if (force) focusedPane.value = pane;
   let frames = 0;

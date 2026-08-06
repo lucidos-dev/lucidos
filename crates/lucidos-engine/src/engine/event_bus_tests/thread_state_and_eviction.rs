@@ -365,7 +365,19 @@ async fn stuck_thread_eviction_emits_aborted_with_system_actor() {
     // Empty agent_sessions — chat thread, no Claude Code session involved.
     let agent_sessions = tokio::sync::Mutex::new(std::collections::HashMap::new());
 
-    crate::engine::emit_stuck_thread_eviction_abort(&bus, &pool, &agent_sessions, thread_id).await;
+    // Empty active_threads: no live handle, so the anchor comes from the
+    // `latest_originating_event_id` fallback this thread's events seed.
+    let active_threads =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    crate::engine::emit_stuck_thread_eviction_abort(
+        &bus,
+        &pool,
+        &agent_sessions,
+        &active_threads,
+        thread_id,
+    )
+    .await;
 
     let (event_type, actor_kind, req_id, status): (String, Option<String>, Option<String>, String) =
         sqlx::query_as(
@@ -481,7 +493,19 @@ async fn stuck_thread_eviction_uses_child_thread_completed_as_req_id_for_chat() 
     // Empty agent_sessions — chat thread, not CC.
     let agent_sessions = tokio::sync::Mutex::new(std::collections::HashMap::new());
 
-    crate::engine::emit_stuck_thread_eviction_abort(&bus, &pool, &agent_sessions, thread_id).await;
+    // Empty active_threads: no live handle, so the anchor comes from the
+    // `latest_originating_event_id` fallback this thread's events seed.
+    let active_threads =
+        std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+
+    crate::engine::emit_stuck_thread_eviction_abort(
+        &bus,
+        &pool,
+        &agent_sessions,
+        &active_threads,
+        thread_id,
+    )
+    .await;
 
     let req_id: Option<String> = sqlx::query_scalar(
         "SELECT payload->>'request_event_id' FROM events \
@@ -712,9 +736,10 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
     .await
     .unwrap();
 
-    // 3. Engine restarts — chat orphan-thread sweep emits ResponseAborted
-    //    (EngineShutdown). For a chat thread (coding_agent_proposed=false) that
-    //    maps to status='failed'.
+    // 3. Engine restarts: the chat orphan-thread sweep emits ResponseAborted
+    //    (EngineShutdown) with a SYSTEM actor. Nobody promised to resume this
+    //    one, so for a chat thread (coding_agent_proposed=false) it maps to
+    //    status='failed'.
     bus.emit(BusEvent::Thread {
         thread_id,
         event: ThreadEvent::ResponseAborted {
@@ -736,9 +761,9 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
             .await
             .unwrap();
     assert_eq!(
-        after_abort, "paused",
-        "an EngineShutdown abort is transient, so a thread with \
-         coding_agent_proposed=false settles at paused"
+        after_abort, "failed",
+        "a system-actor EngineShutdown abort is not the switch fingerprint, so a \
+         thread with coding_agent_proposed=false settles at failed"
     );
 
     // 4. Tool-orphan sweep emits the synthetic ToolResult (system actor) to
@@ -768,7 +793,7 @@ async fn system_actor_activity_event_does_not_resurrect_terminated_thread() {
             .await
             .unwrap();
     assert_eq!(
-        after_synthetic, "paused",
+        after_synthetic, "failed",
         "system-actor synthetic ToolResult must not resurrect status to 'running'. \
          The recovery backfill is not live activity."
     );
@@ -914,7 +939,11 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
         .unwrap();
 
         // 2. User hits *Switch to new version*: the teardown emits the boundary
-        //    abort while the subprocess is still draining.
+        //    abort while the subprocess is still draining. The DEVICE actor is
+        //    half the switch fingerprint (`AbortCause::promises_auto_resume`),
+        //    and it is what makes this a paused turn rather than a failed one:
+        //    the same pair is what the resume gates key on, so a system-actor
+        //    abort here would be a turn nothing is coming back for.
         bus.emit(BusEvent::Thread {
             thread_id,
             event: ThreadEvent::ResponseAborted {
@@ -926,7 +955,10 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
             },
             meta: EventMeta {
                 channel: Some(EventChannel::ClaudeCode),
-                actor: Some(MessageOrigin::system()),
+                actor: Some(MessageOrigin::Device {
+                    device_id: "dev-1".into(),
+                    label: "My MacBook".into(),
+                }),
                 ..EventMeta::NONE
             },
         })
@@ -935,8 +967,9 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
         assert_eq!(
             status_of(thread_id).await,
             "paused",
-            "[{agent}] an EngineShutdown abort is TRANSIENT, so it must settle the \
-             interrupted thread at paused, never at the red failed"
+            "[{agent}] a device-attributed EngineShutdown abort is the user's own \
+             switch, so it must settle the interrupted thread at paused, never at \
+             the red failed"
         );
 
         // 3. The dying subprocess's trailing output. Live activity (no actor),
@@ -1033,6 +1066,105 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
     teardown_test_db(&db_name).await;
 }
 
+/// `paused` is the promise "the engine is bringing this turn back", so only the
+/// abort that carries such a promise may write it. Three shapes go through the
+/// real projection here, differing ONLY in the pair the verdict reads:
+///
+/// 1. `EngineShutdown` + device actor: the user's own *Switch to new version*,
+///    which both resume gates auto-resume. Paused.
+/// 2. `EngineShutdown` + system actor: the `shutdown_active_threads` fallback for
+///    a thread that started after the restart pre-emit. No gate picks it up.
+/// 3. `RecoveryAfterRestart` + system actor: the crash boundary, and the shape
+///    `settle_unresumed_switch_threads` emits to WITHDRAW a promise this boot
+///    could not keep. Withdrawing it behind a reassuring pause glyph, and out of
+///    the needs-attention count, is the bug this test pins shut.
+///
+/// The last two must read `failed`: each keeps its Continue button, and `failed`
+/// is what puts the thread where the user will look.
+#[tokio::test]
+async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+
+    let device = MessageOrigin::Device {
+        device_id: "dev-1".into(),
+        label: "My MacBook".into(),
+    };
+
+    for (case, cause, actor, expected) in [
+        (
+            "user switch teardown",
+            crate::engine::thread_events::AbortCause::EngineShutdown,
+            device.clone(),
+            "paused",
+        ),
+        (
+            "system-actor shutdown fallback",
+            crate::engine::thread_events::AbortCause::EngineShutdown,
+            MessageOrigin::system(),
+            "failed",
+        ),
+        (
+            "boot recovery / withdrawn resume promise",
+            crate::engine::thread_events::AbortCause::RecoveryAfterRestart,
+            MessageOrigin::system(),
+            "failed",
+        ),
+    ] {
+        let thread_id = Uuid::new_v4();
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::MessageReceived {
+                text: "do the thing".into(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            },
+            meta: EventMeta {
+                channel: Some(EventChannel::Chat),
+                ..EventMeta::NONE
+            },
+        })
+        .await
+        .unwrap();
+
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ResponseAborted {
+                text: "interrupted".into(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+                cause,
+            },
+            meta: EventMeta::with_actor(Some(actor)),
+        })
+        .await
+        .unwrap();
+
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, expected,
+            "{case}: {cause:?} must settle the thread at {expected}"
+        );
+    }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Regression: the shutdown sweep's phantom `ResponseCanceled` must not walk an
 /// interrupted **Lucidos Agent** thread's error status back to 'idle'.
 ///
@@ -1100,7 +1232,10 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     })
     .await
     .unwrap();
-    assert_eq!(status_of(thread_id).await, "paused");
+    // System actor, so this is NOT the switch fingerprint: no resume gate will
+    // pick this thread up, and 'failed' is what keeps it in the attention count
+    // with its Continue button.
+    assert_eq!(status_of(thread_id).await, "failed");
 
     // `cancel_all_threads` wakes the agentic loop's cancel arm moments later.
     bus.emit(BusEvent::Thread {
@@ -1118,7 +1253,7 @@ async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     .unwrap();
     assert_eq!(
         status_of(thread_id).await,
-        "paused",
+        "failed",
         "the loop's phantom ResponseCanceled must not clear the interrupted \
          thread's status. The abort is the turn's verdict."
     );
@@ -1490,10 +1625,11 @@ async fn sending_a_draft_broadcasts_the_cleared_compose_state() {
     teardown_test_db(&db_name).await;
 }
 
-/// No draft, nothing to announce — an ordinary message on a thread that never
-/// held one must not spend an SSE frame claiming a compose change.
+/// A message that CREATES the thread announces nothing. There is no compose
+/// slot to consume, the epoch stays at its storage default, and no device has
+/// heard of the thread yet, so an SSE frame would reach nobody.
 #[tokio::test]
-async fn sending_without_a_draft_broadcasts_no_compose_change() {
+async fn a_message_that_creates_the_thread_broadcasts_no_compose_change() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     let thread_id = Uuid::new_v4();
@@ -1503,9 +1639,166 @@ async fn sending_without_a_draft_broadcasts_no_compose_change() {
 
     while let Ok(emitted) = rx.try_recv() {
         if let BusEvent::System(SystemEvent::ThreadComposeChanged { id, .. }) = &emitted.typed {
-            assert_ne!(*id, thread_id, "no draft existed, so nothing changed");
+            assert_ne!(*id, thread_id, "the thread was created by this message");
         }
     }
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A send on an existing thread announces even when the engine held NO draft,
+/// because the *compose epoch* moved. This is the reported bug's exact shape:
+/// the client's draft PUT was still in flight, so the engine had nothing to
+/// clear, and the write landed after the message and rewrote the draft the send
+/// had just consumed. The device needs the new epoch to fence its next write,
+/// and the announcement is how it gets it without a round trip.
+#[tokio::test]
+async fn sending_without_a_stored_draft_still_announces_the_new_epoch() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    let mut rx = bus.subscribe();
+
+    emit_thread_message(&bus, thread_id, None, "typed and sent inside the debounce").await;
+
+    let mut announced_epoch = None;
+    while let Ok(emitted) = rx.try_recv() {
+        if let BusEvent::System(SystemEvent::ThreadComposeChanged {
+            id, compose_epoch, ..
+        }) = &emitted.typed
+        {
+            if *id == thread_id {
+                announced_epoch = Some(*compose_epoch);
+            }
+        }
+    }
+    assert_eq!(
+        announced_epoch,
+        Some(1),
+        "the submission consumed the compose slot, so the epoch advanced and peers must hear it"
+    );
+
+    let stored: (i64,) =
+        sqlx::query_as("SELECT compose_epoch FROM thread_summaries WHERE thread_id = $1")
+            .bind(thread_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        stored.0, 1,
+        "the stored epoch is what later writes fence on"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// An answer whose text has NOT reached storage yet still advances the epoch.
+///
+/// This is the answer-path form of the reported bug. The answering device's
+/// compose PUT is still in flight, so `compose_text` holds the older value and
+/// the content match finds nothing to clear. Without a bump, that stalled write
+/// lands after the answer and resurrects the submitted text as a live draft. The
+/// unrelated text a peer may be writing must survive either way, so the CLEAR
+/// stays conditional while the fence does not.
+#[tokio::test]
+async fn an_answer_advances_the_epoch_even_when_it_cleared_no_stored_draft() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id =
+        seed_thread_awaiting_answer(&bus, &pool, "a different half-typed thought").await;
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::UserQuestionAnswered {
+            tool_use_id: "tu-1".into(),
+            answer: AnswerKind::FreeText {
+                text: "the answer, typed and sent inside the debounce".into(),
+            },
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let row: (String, i64) = sqlx::query_as(
+        "SELECT compose_text, compose_epoch FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        row.0, "a different half-typed thought",
+        "an answer that was not the stored draft must leave that draft alone"
+    );
+    assert_eq!(
+        row.1, 1,
+        "but it must still fence the write that carried the answer text"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A `ContinuationStarted` is not a submission. The user clicked Continue, they
+/// did not send, so their draft survives AND the epoch must stay put: bumping
+/// it would refuse the next perfectly good write for nothing.
+#[tokio::test]
+async fn a_chat_continue_leaves_the_compose_epoch_alone() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _callback_rx) = EventBus::new(pool.clone());
+    let thread_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ThreadStarted {
+            mode: "lucidos".into(),
+            actor: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    sqlx::query(
+        "UPDATE thread_summaries SET compose_text = 'half a follow-up' WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ContinuationStarted {
+            branch: String::new(),
+            origin: None,
+            reason: Some("user_clicked_continue".into()),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let row: (String, i64) = sqlx::query_as(
+        "SELECT compose_text, compose_epoch FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(row.0, "half a follow-up", "a Continue consumes no draft");
+    assert_eq!(row.1, 0, "and therefore moves no epoch");
 
     pool.close().await;
     teardown_test_db(&db_name).await;

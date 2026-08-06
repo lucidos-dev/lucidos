@@ -7,6 +7,28 @@ fn read_only_reason_blocks_system_knowhow() {
 }
 
 #[test]
+fn read_only_reason_blocks_ephemeral_scratch() {
+    // The silent half of the .lucidos/tmp bug: these used to normalize to
+    // `artifacts/.lucidos/tmp/…` and get git-committed into the tracked
+    // artifacts repo while reporting "[ACTION COMPLETED] CREATED".
+    for p in [
+        ".lucidos/tmp/scratch.py",
+        ".lucidos/tmp/changelog-v0.15.0.md",
+        ".lucidos/tmp/some-repo/build.sh",
+    ] {
+        assert!(read_only_reason(p).is_some(), "{p} should be refused");
+    }
+}
+
+#[test]
+fn scratch_refusal_names_run_python() {
+    // A refusal is only useful if it says what to do instead.
+    let reason = read_only_reason(".lucidos/tmp/scratch.py").unwrap();
+    assert!(reason.contains("run_python"), "got: {reason}");
+    assert!(reason.contains("workspace root"), "got: {reason}");
+}
+
+#[test]
 fn data_path_app_id_extracts_id_under_apps() {
     assert_eq!(
         data_path_app_id("apps/demo-director/index.html"),
@@ -69,6 +91,9 @@ fn read_only_reason_allows_user_paths() {
     assert!(read_only_reason("knowhow/lucidos/best-practices.md").is_none());
     assert!(read_only_reason("apps/foo/index.html").is_none());
     assert!(read_only_reason("triggers/daily/check.md").is_none());
+    // The scratch guard matches a path prefix, not a name prefix: an artifact
+    // that merely starts with the same letters stays writable.
+    assert!(read_only_reason("artifacts/.lucidosrc").is_none());
 }
 
 #[test]

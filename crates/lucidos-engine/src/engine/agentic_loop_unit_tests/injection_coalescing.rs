@@ -39,7 +39,7 @@ mod injection_coalescing_tests {
             }
             _ => panic!("first group must be user text"),
         }
-        assert!(matches!(groups[1], InjectedPromptGroup::WakeFromChild(_)));
+        assert!(matches!(groups[1], InjectedPromptGroup::Standalone(_)));
         match &groups[2] {
             InjectedPromptGroup::UserText(batch) => {
                 assert_eq!(

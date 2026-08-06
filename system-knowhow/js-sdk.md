@@ -163,6 +163,9 @@ file). The class names are the contract:
 | `.list-rows`, `.list-row`, `.list-row-info`, `.list-row-name`, `.list-row-actions`, `.list-section-title`, … | List/row layouts |
 | `.list-row-details` (+ `.list-row-details-prose`) | The small muted line under a row title. The base class is a flex row of metadata fields whose 0.75rem gap IS the separator between them, so a **sentence** takes the additive prose variant (`class="list-row-details list-row-details-prose"`): under the bare flex class every inline `<strong>`/`<code>` becomes its own flex item, which opens gaps mid-sentence and strands the punctuation after the element at the start of the next line. |
 | `.markdown-content` | A container for rendered markdown (headings, tables, code, blockquotes) |
+| `.table-scroll-wrapper` | Wrap a `<table>` inside `.markdown-content` in this. A table always fits its container and wraps its cells, at every viewport width, so this is a safety net rather than the normal path: it catches the one overflow that cannot be designed away, a single token wider than the container, and scrolls it inside the wrapper instead of widening your iframe body. Cells are also capped at a readable line length (`60ch`), so one prose column cannot swallow the table and starve the key column beside it. |
+| `.image-scroll-wrapper` | Wrap an `<img>` inside `.markdown-content` in this. Unlike a table an image cannot reflow, so this one is the normal path rather than a safety net: the wrapper stays within your container width and pans an oversized image sideways inside itself, at every viewport width, instead of widening the body. The image keeps its natural width (no `max-width` cap, which would shrink a wide screenshot to a thumbnail) and is capped at `24rem` tall with the aspect ratio preserved. An image smaller than the container renders unchanged, with no scrollbar. A bare `<img>` with no wrapper around it is untouched by these rules. |
+| `data-stack` + `data-label` (attributes, not classes) | Opt a wide table into the stacked mobile layout: put `data-stack` on the `<table>` and `data-label="<column header>"` on every `<td>`. At 768px and under each row becomes a card, the header row is hidden, and each cell shows its `data-label` above its value. Worth it from about 4 columns up; below that the scroll wrapper reads better. |
 | `.progress-bar` + `.progress-bar-fill`, `.progress-label` | A progress indicator |
 | `.empty-state`, `.error-text` | Empty/error placeholders |
 
@@ -939,8 +942,10 @@ interface ThreadSummary {
    *  changes). Drives REVIEW bubbling up the ancestor chain. */
   attention_descendant_count: number;
   /** 'idle' | 'running' | 'waiting' | 'paused' | 'failed' | 'waiting_for_user_answer'.
-   *  `paused` = an engine restart interrupted the turn; it resumes on its own or
-   *  offers a Continue button. */
+   *  `paused` = the user's own version switch interrupted the turn and the engine
+   *  is resuming it, so nothing is being asked of anyone. Any OTHER interruption
+   *  (a crash, or a switch whose resume the boot could not deliver) is `failed`
+   *  and offers a Continue button. */
   status: string;
   coding_agent_has_diff: boolean;
   coding_agent_proposed: boolean;
@@ -1212,7 +1217,8 @@ Call with no arguments (`lucidos.ui.startThread()`) to just open a blank fresh c
 interface ConfirmOptions {
   /** Optional heading. Renders above the message. */
   title?: string;
-  /** Required. Plain text. Use \n for line breaks. */
+  /** Required. Plain text. A BLANK line (\n\n) starts a new paragraph; a
+   *  single \n collapses to a space, the way HTML collapses source wrapping. */
   message: string;
   /** Default: "Confirm". */
   okLabel?: string;
@@ -1288,7 +1294,9 @@ it instead of `window.prompt()`.
 
 ```ts
 interface PromptOptions {
-  /** Required. The question/instruction shown above the input. Plain text. */
+  /** Required. The question/instruction shown above the input. Plain text,
+   *  with the same paragraph rule as `confirm`: a blank line (\n\n) starts a
+   *  new paragraph, a single \n collapses to a space. */
   message: string;
   /** Optional heading rendered above the message. */
   title?: string;

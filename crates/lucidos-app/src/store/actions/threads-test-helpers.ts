@@ -43,6 +43,7 @@ export function makeThreadState(id: string, overrides: MakeThreadOverrides = {})
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...metaOverrides,
     },
     events: overrides.events || new Map(),

@@ -855,15 +855,18 @@ impl SchedulerManager {
                 .await?;
             }
             None => {
-                // Disable schedule
-                PreferenceStore::set(
-                    &self.pool,
-                    &self.engine.event_bus,
-                    PREF_BACKUP_SCHEDULE,
-                    "off",
-                    actor,
-                )
-                .await?;
+                // Disable schedule. The PROVIDER is still written: it is the
+                // configured destination, not a property of the cron, and the
+                // Backup page reads it back to know which provider it is
+                // talking about. Skipping it here made the destination
+                // unwritable with the schedule off, so a user who picked
+                // Dropbox while backups were manual-only kept whatever the
+                // preference happened to hold.
+                let bus = &self.engine.event_bus;
+                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_SCHEDULE, "off", actor.clone())
+                    .await?;
+                PreferenceStore::set(&self.pool, bus, PREF_BACKUP_PROVIDER, provider, actor)
+                    .await?;
                 remove_backup_job(&self.scheduler, &self.backup_job_id).await?;
                 log!("[Scheduler] Backup schedule disabled");
             }

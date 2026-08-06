@@ -41,6 +41,32 @@ pub(crate) fn meta_with_cancel_actor(
     out
 }
 
+/// Why this turn's `ResponseCanceled` ended it: a Stop click, or an urgent
+/// child follow-up superseding it.
+///
+/// The two are not interchangeable and the difference reaches the user twice
+/// over. `UserStop` renders "Canceled x" and reports to a parent as a terminal
+/// child outcome; `SupersededByFollowup` renders neutrally and is excluded
+/// from the parent-callback terminal set, because the work is not abandoned,
+/// it continues in the very next turn (`event_bus/parent_callback.rs`). Mislabel
+/// it and the parent wakes with a false "child canceled" card and may spawn a
+/// replacement for a child that is still working.
+///
+/// Drains the flag on read, like `meta_with_cancel_actor` drains the actor and
+/// for the same reason: a stale flag must not relabel the next turn on this
+/// thread. Call it exactly once per terminated turn. The Lucidos Agent analog
+/// of `take_session_redirect_followup`.
+pub(crate) fn cancel_cause_for_turn(
+    engine: &LucidosEngine,
+    thread_id: Uuid,
+) -> crate::engine::thread_events::CancelCause {
+    if engine.take_redirect_followup(thread_id) {
+        crate::engine::thread_events::CancelCause::SupersededByFollowup
+    } else {
+        crate::engine::thread_events::CancelCause::UserStop
+    }
+}
+
 /// Race a tool execution future against the per-thread cancel token. On
 /// cancel, returns `Err("Error: canceled by user")` so the agent loop's
 /// `tool_use → tool_result` pairing invariant survives — every emitted
@@ -104,10 +130,15 @@ where
 #[derive(Debug)]
 pub(crate) enum InjectedPromptGroup {
     UserText(Vec<InjectedPrompt>),
-    WakeFromChild(InjectedPrompt),
+    /// One engine wake, kept out of any batch. Named for the LAYOUT rather than
+    /// the source, because every engine wake gets the same one: its
+    /// exchange-starter is already on the wire, so the text is projected inline
+    /// and no `UserPromptInjected` is emitted. Which wake it is stays on
+    /// [`InjectedPromptKind`], which is what the log line reads.
+    Standalone(InjectedPrompt),
 }
 
-/// Keep `WakeFromChild` prompts as standalone user-channel blocks, but batch
+/// Keep each engine wake as a standalone user-channel block, but batch
 /// contiguous user/agent/engine text prompts so one injection window becomes
 /// one LLM user message. Each original prompt still emits its own
 /// UserPromptInjected audit event at append time.
@@ -116,16 +147,15 @@ pub(crate) fn group_injected_prompts(prompts: Vec<InjectedPrompt>) -> Vec<Inject
     let mut user_batch = Vec::new();
 
     for prompt in prompts {
-        match &prompt.kind {
-            InjectedPromptKind::WakeFromChild => {
-                if !user_batch.is_empty() {
-                    groups.push(InjectedPromptGroup::UserText(std::mem::take(
-                        &mut user_batch,
-                    )));
-                }
-                groups.push(InjectedPromptGroup::WakeFromChild(prompt));
+        if prompt.kind.is_engine_wake() {
+            if !user_batch.is_empty() {
+                groups.push(InjectedPromptGroup::UserText(std::mem::take(
+                    &mut user_batch,
+                )));
             }
-            InjectedPromptKind::UserText => user_batch.push(prompt),
+            groups.push(InjectedPromptGroup::Standalone(prompt));
+        } else {
+            user_batch.push(prompt);
         }
     }
 
@@ -356,13 +386,28 @@ pub(crate) async fn append_injected_prompts_to_messages(
     let mut result = AppendedInjections::default();
     for group in group_injected_prompts(prompts) {
         match group {
-            InjectedPromptGroup::WakeFromChild(prompt) => {
+            InjectedPromptGroup::Standalone(prompt) => {
+                // An empty block is a provider 400 ("all messages must have
+                // non-empty content"), and it would carry nothing anyway. The
+                // callers are supposed to keep an empty wake off this path
+                // entirely (see `is_attached_event_wake` in `chat/process`);
+                // this is the backstop that turns a future slip into a dropped
+                // no-op rather than a failed turn.
+                if prompt.text.trim().is_empty() {
+                    crate::log!(
+                        "[Inject] Dropped an empty engine wake {:?} on thread {}",
+                        prompt.kind,
+                        thread_id
+                    );
+                    continue;
+                }
                 crate::log!(
-                    "[Inject] Wake-from-child (spawning_event {:?}) into active parent {}",
+                    "[Inject] Engine wake {:?} (spawning_event {:?}) into active thread {}",
+                    prompt.kind,
                     prompt.spawning_event_id,
                     thread_id
                 );
-                // Child-completion wakes are text-only, so there is nothing to pin.
+                // Engine wakes are text-only, so there is nothing to pin.
                 messages.push(Message {
                     role: "user".to_string(),
                     content: MessageContent::Text(prompt.text),
@@ -549,9 +594,17 @@ pub(crate) fn effective_flush_text<'a>(
 /// Build the tool list for intent sub-loops.
 /// Notification tools must be included explicitly — they're not in get_default_tools().
 pub(crate) fn build_intent_tools() -> Vec<ToolDefinition> {
+    // `await_event` is dropped alongside `execute_intent`, and for a sharper
+    // reason than recursion: an intent sub-loop runs INSIDE the caller's turn
+    // and returns a string, so a subscription registered here outlives the only
+    // thing that wanted it. It would be recorded against the OUTER thread and
+    // wake it, hours later, with an event nobody on that thread ever asked to
+    // wait for. (Before subscriptions became non-blocking this was refused for
+    // a different reason, a park with no turn to end; that one is gone, this
+    // one is not.)
     let mut tools: Vec<_> = get_default_tools()
         .into_iter()
-        .filter(|t| t.name != tn::EXECUTE_INTENT)
+        .filter(|t| t.name != tn::EXECUTE_INTENT && t.name != tn::AWAIT_EVENT)
         .collect();
     tools.push(get_notification_tool());
     // Grouped notification-inbox tool (list / mark_read / mark_all_read) +
@@ -1131,8 +1184,8 @@ pub(crate) fn generic_breaker_action(failure_streak: usize) -> BreakerAction {
 /// those constant fields from drifting across the return sites.
 ///
 /// This is a pure value constructor with no side effects: each caller still
-/// sets `*terminator_emitted = true` and emits its own distinct event before
-/// returning, so the circuit-breaker branches keep their individual
+/// sets `*terminator_settled = true` and settles the turn's ending its own way
+/// before returning, so the circuit-breaker branches keep their individual
 /// thresholds and messages — nothing is unified beyond the result literal.
 pub(crate) fn terminal_result(
     response: String,
@@ -1257,6 +1310,7 @@ pub(crate) async fn emit_user_prompt_injected_event(
                 mode: prompt.mode,
                 origin: prompt.origin.clone(),
                 injected_message_id: prompt.event_id,
+                delivered_event_id: None,
             },
             meta: inject_meta,
         },
@@ -1409,12 +1463,13 @@ pub(crate) async fn emit_image_descriptions(
 /// the SQL check is the safety net. Scoped to `request_event_id` so a
 /// previous exchange's terminator doesn't mask a current zombie one.
 ///
-/// Skip the SQL when callers can prove a terminator was emitted (success
-/// path) — `chat::process` does this via the `terminator_emitted` flag
-/// threaded through `run_agentic_loop`. Without that fast path this
+/// Skip the SQL when callers can prove the turn's ending is already settled
+/// (the success path): `chat::process` does this via the `terminator_settled`
+/// flag threaded through `run_agentic_loop`. Without that fast path this
 /// query runs on every chat turn against a `payload->>'request_event_id'`
 /// expression that has no functional index, walking every event in the
 /// thread on long-lived conversations.
+///
 pub(crate) async fn ensure_terminator_emitted(
     bus: &crate::engine::event_bus::EventBus,
     pool: &sqlx::PgPool,

@@ -59,6 +59,14 @@ export interface ChatRequestBody {
   coding_agent?: CodingAgent;
   event_id?: string;
   thread_id?: string;
+  /** Set on a send whose `thread_id` names a thread the server has not seen
+   *  yet, because THIS request is the one creating it (a raw new send, where
+   *  the client mints the uuid). Without it the engine 404s an unknown id
+   *  rather than materializing the thread from it, so a caller that reached the
+   *  wrong engine finds out instead of getting a phantom thread there.
+   *  Follow-ups and compose first-sends omit it: a compose thread already has
+   *  its row (`sendCompose` awaits `POST /threads` before the chat POST). */
+  new_thread?: boolean;
   /** Required when `mode !== 'human'`: the thread that spawned this one. */
   parent_thread_id?: string;
   /** Required when `mode !== 'human'`: the parent event that triggered the spawn. */

@@ -9,13 +9,13 @@ pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::READ_FILE.to_string(),
-            description: "Read the contents of a file in the workspace. Supports text files and images (.png, .jpg, .jpeg, .gif, .webp — displayed visually). SVGs are returned as text. Large images (e.g. iPhone photos) are automatically downsampled to fit the model; only files over 25 MB are rejected. Text files >50KB are returned in chunks: the response ends with the exact `offset=` to pass on the next call to continue reading. Don't re-read content you've already seen.\n\nReads inside .zip and .lucidos-plugin archives transparently — point `path` past the archive segment, e.g. `artifacts/plugins/foo.lucidos-plugin/apps/x/index.html`. To inspect a small section of a long file use `start_line` + `line_count` instead of pulling the whole thing or shelling out to run_python.".to_string(),
+            description: "Read the contents of a file in the workspace, under data/ or under the ephemeral .lucidos/tmp/ scratch tree. Supports text files and images (.png, .jpg, .jpeg, .gif, .webp: displayed visually). SVGs are returned as text. Large images (e.g. iPhone photos) are automatically downsampled to fit the model; only files over 25 MB are rejected. Text files >50KB are returned in chunks: the response ends with the exact `offset=` to pass on the next call to continue reading. Don't re-read content you've already seen.\n\nReads inside .zip and .lucidos-plugin archives transparently: point `path` past the archive segment, e.g. `artifacts/plugins/foo.lucidos-plugin/apps/x/index.html`. To inspect a small section of a long file use `start_line` + `line_count` instead of pulling the whole thing or shelling out to run_python.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/index.html). May traverse a .zip or .lucidos-plugin segment to read an entry inside the archive (e.g. artifacts/plugins/foo.lucidos-plugin/apps/x/index.html)."
+                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/index.html), or a scratch path under .lucidos/tmp/ (e.g. .lucidos/tmp/oura_data.json, exactly what http_request's temp_path and git_clone's tmp destination report back). May traverse a .zip or .lucidos-plugin segment to read an entry inside the archive (e.g. artifacts/plugins/foo.lucidos-plugin/apps/x/index.html)."
                     },
                     "offset": {
                         "type": "integer",
@@ -37,7 +37,7 @@ pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::WRITE_FILE.to_string(),
-            description: "Create or update a file in the workspace. For NEW files or FULL rewrites only. NEVER use when edit_file can do the job — rewriting introduces subtle regressions.".to_string(),
+            description: "Create or update a file in the workspace. For NEW files or FULL rewrites only. NEVER use when edit_file can do the job, because rewriting introduces subtle regressions. Writes under data/ only: this tool git-commits everything it writes, so it refuses the gitignored .lucidos/tmp/ scratch tree. Create scratch with run_python instead (its cwd is the workspace root).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -62,7 +62,8 @@ pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
             description: "Make a targeted edit to an existing file. Two modes:\n\
                 1. Text mode: old_string + new_string — search-and-replace for text files\n\
                 2. JSON mode: json_path + new_value — surgical edit at a specific path for JSON files (.json, .slides, etc.)\n\
-                JSON mode handles parsing, navigation, and re-serialization automatically. Use it for .slides and other JSON files to avoid escape and matching issues.".to_string(),
+                JSON mode handles parsing, navigation, and re-serialization automatically. Use it for .slides and other JSON files to avoid escape and matching issues.\n\
+                Edits files under data/ only; the gitignored .lucidos/tmp/ scratch tree is readable but not editable here (use run_python).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -161,17 +162,17 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::COPY_FILE.to_string(),
-            description: "Copy a file within the workspace. Use this instead of read_file + write_file when you need to duplicate or move content — it handles the copy server-side without passing content through the conversation.".to_string(),
+            description: "Copy a file within the workspace. Use this instead of read_file + write_file when you need to duplicate or move content: it handles the copy server-side without passing content through the conversation. This is how you promote a file out of ephemeral scratch, e.g. after git_clone lands a repo under .lucidos/tmp/<name>/, copy the few files you actually need into artifacts/imported/<name>/.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Source path under data/ (e.g., artifacts/imported/report.txt)"
+                        "description": "Source path under data/ (e.g., artifacts/imported/report.txt) or under .lucidos/tmp/ (e.g., .lucidos/tmp/some-repo/README.md)"
                     },
                     "destination": {
                         "type": "string",
-                        "description": "Destination path under data/ (e.g., artifacts/projects/report.txt)"
+                        "description": "Destination path under data/ (e.g., artifacts/projects/report.txt). Must be under data/: the copy is git-committed, so .lucidos/tmp/ is not a valid destination."
                     },
                     "message": {
                         "type": "string",
@@ -189,7 +190,7 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/old.js)"
+                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/old.js). Deletes tracked files only; remove .lucidos/tmp/ scratch with run_bash."
                     },
                     "message": {
                         "type": "string",

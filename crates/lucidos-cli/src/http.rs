@@ -18,9 +18,27 @@ use crate::workspace::BoxError;
 pub(crate) const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
 const ENV_AGENT_ORIGIN_TOKEN: &str = "LUCIDOS_AGENT_ORIGIN_TOKEN";
 
-/// Forward the thread-bound origin token when the matching env var is in
-/// scope (i.e. we're inside a Lucidos-spawned subprocess). Engine verifies
-/// the token and stamps mutating events as Agent-origin instead of "You".
+/// The *target workspace assertion*: which workspace this request is meant for.
+/// Mirrors `api::actor::HEADER_TARGET_WORKSPACE` under the same lockstep rule as
+/// the origin token above. The engine refuses with 409 when it names a
+/// workspace other than the one it serves, which is what stops a wrong port
+/// from being silently served by whichever engine is listening there.
+pub(crate) const HEADER_TARGET_WORKSPACE: &str = "x-lucidos-target-workspace";
+const ENV_WORKSPACE: &str = "LUCIDOS_WORKSPACE";
+
+/// Default headers for a request to THIS workspace's engine:
+///
+/// - the thread-bound origin token, when the matching env var is in scope (that
+///   is, inside a Lucidos-spawned subprocess). The engine verifies it and
+///   stamps mutating events as Agent-origin instead of "You".
+/// - the target workspace assertion, derived from `$LUCIDOS_WORKSPACE`'s
+///   basename, so a subcommand that reached the wrong engine is refused rather
+///   than served.
+///
+/// A subcommand that deliberately targets ANOTHER workspace (`lucidos
+/// spawn-thread --to`) sets the assertion itself on the request builder, which
+/// wins: reqwest fills default headers into vacant entries only, so a
+/// per-request header is never overwritten by a default of the same name.
 fn default_headers_from_env() -> reqwest::header::HeaderMap {
     let mut h = reqwest::header::HeaderMap::new();
     if let Ok(token) = std::env::var(ENV_AGENT_ORIGIN_TOKEN) {
@@ -28,7 +46,29 @@ fn default_headers_from_env() -> reqwest::header::HeaderMap {
             h.insert(HEADER_AGENT_ORIGIN_TOKEN, v);
         }
     }
+    if let Some(name) = self_workspace_name() {
+        if let Ok(v) = reqwest::header::HeaderValue::from_str(&name) {
+            h.insert(HEADER_TARGET_WORKSPACE, v);
+        }
+    }
     h
+}
+
+/// Basename of `$LUCIDOS_WORKSPACE`, which the engine sets on every subprocess
+/// it spawns. `None` outside a spawned subprocess (a terminal user running
+/// `lucidos` by hand), where the CLI resolves its workspace by walking up for a
+/// ports file instead and has no name to assert at client-construction time.
+/// Absent asserts nothing, which is the documented no-op.
+fn self_workspace_name() -> Option<String> {
+    let raw = std::env::var(ENV_WORKSPACE).ok()?;
+    let name = std::path::Path::new(raw.trim())
+        .file_name()?
+        .to_string_lossy()
+        .into_owned();
+    if name.is_empty() {
+        return None;
+    }
+    Some(name)
 }
 
 /// Blocking HTTP client preconfigured for the local Lucidos engine.
@@ -224,8 +264,12 @@ mod tests {
         let _guard = env_lock().lock().unwrap();
         let token = "00000000-0000-0000-0000-000000000abc.deadbeef";
         // SAFETY: process-wide env mutation gated by env_lock().
+        // `LUCIDOS_WORKSPACE` is cleared because the suite itself often runs
+        // inside a Lucidos-spawned subprocess, where it IS set; leaving it
+        // would make the header count depend on who ran the tests.
         unsafe {
             std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, token);
+            std::env::remove_var(ENV_WORKSPACE);
         }
         let headers = default_headers_from_env();
         unsafe {
@@ -252,6 +296,7 @@ mod tests {
         // SAFETY: process-wide env mutation gated by env_lock().
         unsafe {
             std::env::set_var(ENV_AGENT_ORIGIN_TOKEN, opaque);
+            std::env::remove_var(ENV_WORKSPACE);
         }
         let headers = default_headers_from_env();
         unsafe {
@@ -266,20 +311,82 @@ mod tests {
         assert_eq!(headers.len(), 1, "no second origin header may be sent");
     }
 
-    /// Env var unset → no header. Terminal users running `lucidos ...` by
-    /// hand (no subprocess context) get the honest path: the engine stamps
-    /// `Api { mode: Human }`, the UI says "You".
+    /// Env var unset means no header. Terminal users running `lucidos ...` by
+    /// hand (no subprocess context) get the honest path: the engine has no
+    /// evidence of who they are, so it stamps `Api { mode: Human }` and the UI
+    /// renders "API caller".
     #[test]
     fn default_headers_from_env_yields_empty_when_env_unset() {
         let _guard = env_lock().lock().unwrap();
         // SAFETY: process-wide env mutation gated by env_lock().
         unsafe {
             std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
+            std::env::remove_var(ENV_WORKSPACE);
         }
         let headers = default_headers_from_env();
         assert!(
             headers.is_empty(),
             "no origin header may be sent outside a Lucidos-spawned subprocess"
+        );
+    }
+
+    /// Inside a spawned subprocess the CLI asserts which workspace it is
+    /// talking to, so a subcommand that reached the wrong engine (several run
+    /// on one machine, each on its own port) is refused with 409 instead of
+    /// being served by whichever one was listening.
+    #[test]
+    fn default_headers_from_env_asserts_the_target_workspace() {
+        let _guard = env_lock().lock().unwrap();
+        // SAFETY: process-wide env mutation gated by env_lock().
+        unsafe {
+            std::env::set_var(ENV_WORKSPACE, "/Users/me/workspaces/dev");
+            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
+        }
+        let headers = default_headers_from_env();
+        unsafe {
+            std::env::remove_var(ENV_WORKSPACE);
+        }
+        assert_eq!(
+            headers
+                .get(HEADER_TARGET_WORKSPACE)
+                .and_then(|v| v.to_str().ok()),
+            Some("dev"),
+            "the assertion is the workspace BASENAME, matching what the engine calls itself"
+        );
+    }
+
+    /// A trailing slash is how a path shows up when it came from a shell
+    /// variable, and it must not turn the basename into something the engine
+    /// will not recognise.
+    #[test]
+    fn the_target_workspace_assertion_survives_a_trailing_slash() {
+        let _guard = env_lock().lock().unwrap();
+        // SAFETY: process-wide env mutation gated by env_lock().
+        unsafe {
+            std::env::set_var(ENV_WORKSPACE, " /Users/me/workspaces/dev/ ");
+        }
+        let name = self_workspace_name();
+        unsafe {
+            std::env::remove_var(ENV_WORKSPACE);
+        }
+        assert_eq!(name.as_deref(), Some("dev"));
+    }
+
+    /// Outside a spawned subprocess there is no workspace to name, and
+    /// asserting nothing is the documented no-op: the engine proceeds exactly
+    /// as it did before the header existed.
+    #[test]
+    fn no_workspace_env_asserts_nothing() {
+        let _guard = env_lock().lock().unwrap();
+        // SAFETY: process-wide env mutation gated by env_lock().
+        unsafe {
+            std::env::remove_var(ENV_WORKSPACE);
+            std::env::remove_var(ENV_AGENT_ORIGIN_TOKEN);
+        }
+        let headers = default_headers_from_env();
+        assert!(
+            headers.is_empty(),
+            "a terminal user outside a subprocess sends neither header"
         );
     }
 

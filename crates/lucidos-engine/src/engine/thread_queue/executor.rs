@@ -436,6 +436,7 @@ impl LucidosEngine {
                         None,
                         title.as_deref(),
                         origin,
+                        crate::engine::FollowUpUrgency::Normal,
                     )
                     .await;
                 match result {

@@ -21,7 +21,7 @@ import {
   ensureOnThreadPane,
   waitForVisibleInput,
   userMessageBody,
-  REAL_THREAD_NAV,
+  focusedThreadId,
 } from './helpers';
 import { clearAllThreads } from './db-helpers';
 
@@ -67,11 +67,8 @@ test.describe('Mobile thread content rendering', () => {
     await sendMessage(page, `Say exactly: "alpha ${msgA}"`);
     await waitForResponse(page);
 
-    // Get thread A's nav element for later
-    await openThreadDrawer(page);
-    const threadANav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
-    await expect(threadANav).toBeVisible({ timeout: 10_000 });
-    const threadAId = await threadANav.getAttribute('data-thread-nav');
+    // Remember thread A by identity, not by drawer position.
+    const threadAId = await focusedThreadId(page);
 
     // 2. Create thread B
     await newThread(page);
@@ -106,10 +103,8 @@ test.describe('Mobile thread content rendering', () => {
     await sendMessage(page, `Say exactly: "height ${msgA}"`);
     await waitForResponse(page);
 
-    // Get thread A's ID
-    await openThreadDrawer(page);
-    const threadANav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
-    const threadAId = await threadANav.getAttribute('data-thread-nav');
+    // Get thread A's ID by identity, not by drawer position.
+    const threadAId = await focusedThreadId(page);
 
     // Create thread B to force a thread switch
     await newThread(page);
@@ -148,9 +143,7 @@ test.describe('Mobile thread content rendering', () => {
     await sendMessage(page, `Say exactly: "combo ${msgA}"`);
     await waitForResponse(page);
 
-    await openThreadDrawer(page);
-    const threadANav = page.locator(`${REAL_THREAD_NAV}:visible`).first();
-    const threadAId = await threadANav.getAttribute('data-thread-nav');
+    const threadAId = await focusedThreadId(page);
 
     // Create thread B
     await newThread(page);

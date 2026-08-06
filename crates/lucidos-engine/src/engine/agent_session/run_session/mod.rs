@@ -5,12 +5,15 @@
 //! - [`spawn_context`] — the "start" stage: worktree / branch / system-prompt
 //!   resolution ([`spawn_context::SpawnWorktreeContext`]).
 //! - [`completion`] — the teardown stage: safety net, cleanup, change proposal.
+//! - [`idle_change_state`]: the idle's branch + diff resolution, the one place
+//!   that decides what a turn believes about its own changes.
 //! - [`idle_snapshot`] — `CodingAgentIdled` emission helper.
 //! - [`entry_guard`] — RAII backstop that reaps the `agent_sessions` entry when
 //!   the run future is dropped instead of completed.
 
 mod completion;
 mod entry_guard;
+mod idle_change_state;
 mod idle_snapshot;
 mod run;
 mod spawn_context;

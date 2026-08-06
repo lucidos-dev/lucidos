@@ -57,6 +57,7 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...overrides,
     },
     events: new Map(),

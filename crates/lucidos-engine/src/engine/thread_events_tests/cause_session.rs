@@ -145,44 +145,79 @@ fn session_ended_reason_serialization() {
     }
 }
 
-/// Every `AbortCause` states which side of the verdict split it lands on, so a
-/// new variant cannot inherit `failed` (or `paused`) by default. Adding one
-/// fails this test until its status is decided deliberately.
+/// Every `AbortCause` paired with every kind of actor states which side of the
+/// verdict split it lands on, so neither a new cause variant nor a new actor
+/// case can inherit `failed` (or `paused`) by default. Adding one fails this
+/// test until its status is decided deliberately.
 ///
 /// The three outcomes: `StaleSettle` uses the cancel-style mapping (nothing was
-/// running), a TRANSIENT cause is `paused` (an engine restart interrupted the
-/// turn and either resumes it or offers Continue), everything else is `failed`.
+/// running), a device-actor `EngineShutdown` is `paused` (the user's own *Switch
+/// to new version*, which the engine resumes by itself), everything else is
+/// `failed`. Note the two rows that make the rule narrow rather than
+/// cause-shaped: `EngineShutdown` with a SYSTEM actor is `failed`, and
+/// `RecoveryAfterRestart` is `failed` with EVERY actor, device included, since
+/// the boot floor's promise-withdrawal exists precisely to un-promise the
+/// resume.
 #[test]
-fn abort_cause_status_sql_splits_transient_from_failed() {
+fn abort_status_verdict_keys_on_cause_and_actor() {
     const PAUSED: &str = "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'paused' END";
     const FAILED: &str = "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END";
+    const SETTLED: &str = crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE;
 
-    for (cause, expected) in [
-        (AbortCause::EngineShutdown, PAUSED),
-        (AbortCause::RecoveryAfterRestart, PAUSED),
-        (AbortCause::SafetyNet, FAILED),
-        (AbortCause::ProcessKilled, FAILED),
-        (AbortCause::SessionDropped, FAILED),
-        (AbortCause::Unknown, FAILED),
-        (
-            AbortCause::StaleSettle,
-            crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE,
-        ),
+    let device = MessageOrigin::Device {
+        device_id: "dev-1".to_string(),
+        label: "My MacBook".to_string(),
+    };
+    let system = MessageOrigin::system();
+
+    for (cause, actor, expected) in [
+        // The one shape the engine promised to resume.
+        (AbortCause::EngineShutdown, Some(&device), PAUSED),
+        (AbortCause::EngineShutdown, Some(&system), FAILED),
+        (AbortCause::EngineShutdown, None, FAILED),
+        // The crash boundary, and the boot floor withdrawing a resume promise.
+        (AbortCause::RecoveryAfterRestart, Some(&device), FAILED),
+        (AbortCause::RecoveryAfterRestart, Some(&system), FAILED),
+        (AbortCause::RecoveryAfterRestart, None, FAILED),
+        // Real failures, whoever happened to be attributed.
+        (AbortCause::SafetyNet, Some(&device), FAILED),
+        (AbortCause::SafetyNet, None, FAILED),
+        (AbortCause::ProcessKilled, Some(&device), FAILED),
+        (AbortCause::ProcessKilled, None, FAILED),
+        (AbortCause::SessionDropped, Some(&device), FAILED),
+        (AbortCause::SessionDropped, None, FAILED),
+        (AbortCause::Unknown, Some(&device), FAILED),
+        (AbortCause::Unknown, None, FAILED),
+        // Cleanup of a row whose process was already gone. The device actor is
+        // the button that exposed it (Stop / Apply / Discard / Archive), which
+        // is exactly why a device actor alone cannot mean "switch".
+        (AbortCause::StaleSettle, Some(&device), SETTLED),
+        (AbortCause::StaleSettle, Some(&system), SETTLED),
+        (AbortCause::StaleSettle, None, SETTLED),
     ] {
         assert_eq!(
-            cause.status_sql(),
+            cause.status_sql(actor),
             expected,
-            "{:?} maps to the wrong thread_summaries.status fragment",
-            cause
+            "{:?} with actor {:?} maps to the wrong thread_summaries.status fragment",
+            cause,
+            actor
         );
     }
 }
 
-/// The verdict split is DERIVED from `is_transient()`, not from a second list
-/// that could drift out of step with it. A cause the enum calls transient (a
-/// fresh `SessionStarted` is expected) must never surface the red error dot.
+/// The `paused` verdict is DERIVED from `promises_auto_resume()`, not from a
+/// second list that could drift out of step with it. `paused` and "the engine
+/// will bring this turn back" must be the same statement, because the frontend
+/// withholds the Continue button on that same predicate: any drift tells the
+/// user the opposite of what they can do.
 #[test]
-fn transient_abort_causes_are_exactly_the_paused_ones() {
+fn paused_verdict_is_exactly_a_promised_auto_resume() {
+    let device = MessageOrigin::Device {
+        device_id: "dev-1".to_string(),
+        label: "My MacBook".to_string(),
+    };
+    let system = MessageOrigin::system();
+
     for cause in [
         AbortCause::EngineShutdown,
         AbortCause::SafetyNet,
@@ -192,14 +227,18 @@ fn transient_abort_causes_are_exactly_the_paused_ones() {
         AbortCause::SessionDropped,
         AbortCause::Unknown,
     ] {
-        if cause == AbortCause::StaleSettle {
-            continue; // Settles a row whose process was already gone: no verdict.
+        // `StaleSettle` is in the loop rather than skipped: it writes no verdict
+        // at all, so BOTH sides are false and the equivalence holds trivially.
+        // Excluding it would be excluding the one cause a device actor makes most
+        // tempting to read as a switch.
+        for actor in [Some(&device), Some(&system), None] {
+            assert_eq!(
+                cause.promises_auto_resume(actor),
+                cause.status_sql(actor).contains("'paused'"),
+                "{:?} with actor {:?}: the resume promise and the paused verdict must agree",
+                cause,
+                actor
+            );
         }
-        assert_eq!(
-            cause.is_transient(),
-            cause.status_sql().contains("'paused'"),
-            "{:?}: transience and the paused verdict must agree",
-            cause
-        );
     }
 }

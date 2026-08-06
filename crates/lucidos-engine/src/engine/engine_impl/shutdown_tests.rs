@@ -78,7 +78,7 @@ async fn teardown_skips_abort_for_question_parked_thread() {
 /// is preserved too — the generalized teardown helper keys on the SAME shared
 /// predicate regardless of channel, so `None` (chat bucket) skips the abort just
 /// like the coding-agent bucket. This is the teardown side of the reproduced
-/// "chat Restarted" screenshot.
+/// "chat Paused by restart" screenshot.
 #[tokio::test]
 async fn teardown_skips_abort_for_question_parked_chat_thread() {
     let (pool, db_name) = setup_test_db().await;

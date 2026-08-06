@@ -134,6 +134,7 @@ pub(crate) async fn emit_resume_anchor(
             mode: ActorMode::Engine,
             origin: Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
             injected_message_id: None,
+            delivered_event_id: None,
         },
         meta: EventMeta {
             channel: Some(channel),
@@ -250,20 +251,8 @@ impl LucidosEngine {
             }
         };
 
-        // Walk events between originating and abort, summarize completed tool
-        // pairs and count thinking blocks.
-        let between_events: Vec<(String, serde_json::Value)> = sqlx::query_as(
-            "SELECT event_type, payload FROM events \
-             WHERE aggregate_id = $1 \
-               AND sequence > (SELECT sequence FROM events WHERE id = $2) \
-               AND sequence < (SELECT sequence FROM events WHERE id = $3) \
-             ORDER BY sequence ASC",
-        )
-        .bind(thread_id.to_string())
-        .bind(originating_event_id)
-        .bind(abort_event_id)
-        .fetch_all(self.pool())
-        .await?;
+        let between_events =
+            events_between(self.pool(), thread_id, originating_event_id, abort_event_id).await?;
 
         let summary = build_side_effect_summary(&between_events);
         let engine_note = build_engine_note(&summary);
@@ -372,6 +361,7 @@ impl LucidosEngine {
                         Some(PreEmittedOrigin::EngineReentry(anchor_event_id)),
                         None,
                         Some(MessageOrigin::engine(EngineReason::ContinuationStarted)),
+                        crate::engine::FollowUpUrgency::Normal,
                     )
                     .await
                 {
@@ -409,6 +399,36 @@ fn resolve_resume_channel(
         .and_then(EventChannel::from_wire)
         .or_else(|| thread_source.and_then(EventChannel::from_wire))
         .unwrap_or(EventChannel::Chat)
+}
+
+/// The interrupted turn's events: everything strictly between its originating
+/// event and the abort that ended it, oldest first. What
+/// `build_side_effect_summary` turns into the engine note the resumed turn is
+/// given, so the resumed agent knows which tool calls already ran.
+///
+/// The window is only as good as `from_event_id`, which is the abort's
+/// `request_event_id`. While the restart path mis-anchored that on a queued
+/// follow-up, the window opened seconds before the abort and the note came back
+/// nearly empty, telling the resumed agent that nothing had happened
+/// (`docs/plans/2026-08-06-restart-abort-anchors-on-the-in-flight-turn.md`).
+async fn events_between(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    from_event_id: Uuid,
+    to_event_id: Uuid,
+) -> Result<Vec<(String, serde_json::Value)>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT event_type, payload FROM events \
+         WHERE aggregate_id = $1 \
+           AND sequence > (SELECT sequence FROM events WHERE id = $2) \
+           AND sequence < (SELECT sequence FROM events WHERE id = $3) \
+         ORDER BY sequence ASC",
+    )
+    .bind(thread_id.to_string())
+    .bind(from_event_id)
+    .bind(to_event_id)
+    .fetch_all(pool)
+    .await
 }
 
 /// Format the side-effect summary for the engine note.
@@ -647,5 +667,114 @@ mod tests {
         assert!(note.contains("[Engine note — this is a rerun]"));
         assert!(note.contains("send_notification(Hi)"));
         assert!(note.contains("Engine performed no automatic skipping"));
+    }
+
+    /// The Continue note's window is the abort's `request_event_id`, so a
+    /// mis-anchored abort silently empties it. Seeded as the reported shape: a
+    /// turn that ran a tool, a follow-up the user queued mid-turn, then the
+    /// restart teardown. Anchored on the turn, the note names the tool call;
+    /// anchored on the queued follow-up, the window holds nothing and the
+    /// resumed agent is told no actions completed, so it redoes the work.
+    #[tokio::test]
+    async fn continue_note_window_covers_the_interrupted_turn() {
+        use crate::engine::event_bus::{BusEvent, EventBus};
+        use crate::engine::thread_events::{ActorMode, ThreadEvent};
+        use crate::test_support::{setup_test_db, teardown_test_db};
+
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+        let thread_id = Uuid::new_v4();
+
+        async fn emit(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
+            let id = Uuid::new_v4();
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event,
+                meta: EventMeta {
+                    event_id: Some(id),
+                    ..EventMeta::NONE
+                },
+            })
+            .await
+            .expect("event must persist");
+            id
+        }
+        fn message(text: &str) -> ThreadEvent {
+            ThreadEvent::MessageReceived {
+                text: text.to_string(),
+                user_image_hashes: vec![],
+                device_id: None,
+                device: None,
+                image_description: None,
+                parent_thread_id: None,
+                spawning_event_id: None,
+                mode: ActorMode::Human,
+                model: None,
+                reasoning_effort: None,
+                origin: None,
+            }
+        }
+
+        let turn = emit(&bus, thread_id, message("summarize the tickets")).await;
+        emit(
+            &bus,
+            thread_id,
+            ThreadEvent::ToolCalled {
+                name: "send_notification".into(),
+                args: json!({}),
+                description: "Notify: Ping".into(),
+            },
+        )
+        .await;
+        emit(
+            &bus,
+            thread_id,
+            ThreadEvent::ToolResult {
+                name: "send_notification".into(),
+                result: "ok".into(),
+                images: vec![],
+                success: true,
+                tool_called_event_id: None,
+            },
+        )
+        .await;
+        let queued = emit(&bus, thread_id, message("actually, only the open ones")).await;
+        let abort = emit(
+            &bus,
+            thread_id,
+            ThreadEvent::ResponseAborted {
+                text: String::new(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+                cause: crate::engine::thread_events::AbortCause::EngineShutdown,
+            },
+        )
+        .await;
+
+        let anchored = build_side_effect_summary(
+            &events_between(&pool, thread_id, turn, abort)
+                .await
+                .expect("window query"),
+        );
+        assert!(
+            anchored.contains("send_notification"),
+            "anchored on the turn, the note must name the tool call that ran: {}",
+            anchored
+        );
+
+        let mis_anchored = build_side_effect_summary(
+            &events_between(&pool, thread_id, queued, abort)
+                .await
+                .expect("window query"),
+        );
+        assert_eq!(
+            mis_anchored, "No actions completed before the abort.",
+            "the queued follow-up opens an empty window, which is exactly what \
+             the mis-anchored abort used to hand the resumed agent"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
     }
 }

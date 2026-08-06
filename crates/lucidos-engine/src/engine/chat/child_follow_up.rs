@@ -108,14 +108,83 @@ impl std::fmt::Display for ChildFollowUpError {
 
 impl std::error::Error for ChildFollowUpError {}
 
+/// Whether the caller is willing to end the child's current turn to be read now.
+///
+/// A bare `bool` in the twenty-second argument slot of
+/// `process_message_with_steps` would be unreadable at the call site (a lone
+/// `false` among a column of `None`s) and trivially mis-passed, so the two
+/// states are named. Default is `Normal`: a follow-up does not destroy work
+/// unless the caller says it must.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FollowUpUrgency {
+    /// Queue behind the child's current work. On Claude Code and the Lucidos
+    /// Agent the message reaches the child at its next internal boundary, which
+    /// a long tool call can push out by up to that tool's own timeout. That is
+    /// the right trade for a steer: it never throws away an in-flight build.
+    #[default]
+    Normal,
+    /// Preempt the child's in-flight work, accepting that its current turn ends
+    /// as `ResponseCanceled { SupersededByFollowup }` and the follow-up runs as
+    /// the next turn. For the messages that cannot wait for a tool timeout: a
+    /// cancellation, a "stop, you are working from a wrong assumption".
+    ///
+    /// No-op on Codex, which always interrupts because its protocols cannot
+    /// surface a queued message mid-turn at all. See
+    /// `process_helpers::should_redirect_followup`.
+    Urgent,
+}
+
+impl FollowUpUrgency {
+    pub(crate) fn is_urgent(self) -> bool {
+        matches!(self, Self::Urgent)
+    }
+
+    /// Parse the HTTP spelling, where serde has already rejected anything that
+    /// is not a boolean. Absent means `Normal`, so every caller that predates
+    /// the flag keeps its behaviour.
+    pub fn from_flag(urgent: Option<bool>) -> Self {
+        if urgent.unwrap_or(false) {
+            Self::Urgent
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// Parse the LLM tool's raw argument, which has no schema enforcement
+    /// behind it: the model hands us whatever JSON it emitted.
+    ///
+    /// Absent or `null` is `Normal`. A **present non-boolean is an error**, not
+    /// a default. A model that writes `"urgent": "true"` or `"urgent": 1` means
+    /// urgent, and coercing that to `Normal` fails in the one direction that is
+    /// unrecoverable: the tool reports the follow-up sent, the caller believes
+    /// the child was stopped, and the child keeps working. The HTTP route gets
+    /// this for free (serde answers a non-boolean with a 422); this is the same
+    /// answer for the path serde does not cover.
+    pub fn from_tool_arg(urgent: Option<&serde_json::Value>) -> Result<Self, String> {
+        match urgent {
+            None | Some(serde_json::Value::Null) => Ok(Self::Normal),
+            Some(serde_json::Value::Bool(b)) => Ok(Self::from_flag(Some(*b))),
+            Some(other) => Err(format!(
+                "`urgent` must be a boolean (true or false), got {other}. It is not \
+                 defaulted, because reading a malformed urgent as 'not urgent' would \
+                 report the follow-up as sent while the child kept working."
+            )),
+        }
+    }
+}
+
 /// What the child was doing when the follow-up reached it, sampled from
 /// `thread_summaries.status` before anything is delivered. Sampling in the pure
 /// half is what makes it structurally impossible to derive from an await later,
 /// which is the failure the delivery half is shaped to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FollowUpDelivery {
-    /// Mid-turn. The message queues behind the current turn or steers it.
+    /// Mid-turn, and the caller let the turn finish. The message queues behind
+    /// the current turn or steers it.
     Running,
+    /// Mid-turn, and the caller marked the follow-up urgent. The child's turn is
+    /// being interrupted and the follow-up runs as the next one.
+    Interrupted,
     /// Parked on a question or a permission card. The message does **not**
     /// answer the question (that route requires `mode == Human`), so it sits in
     /// the channel until a human answers.
@@ -125,8 +194,12 @@ pub enum FollowUpDelivery {
 }
 
 impl FollowUpDelivery {
-    fn from_status(status: ThreadStatus) -> Self {
+    /// `urgency` only matters for a child that is actually mid-turn: there is
+    /// nothing to preempt on an idle child, and a question-parked child is
+    /// blocked on a human rather than on work, so urgency cannot unblock it.
+    fn from_status(status: ThreadStatus, urgency: FollowUpUrgency) -> Self {
         match status {
+            ThreadStatus::Running if urgency.is_urgent() => Self::Interrupted,
             ThreadStatus::Running => Self::Running,
             ThreadStatus::WaitingForUserAnswer => Self::WaitingForUserAnswer,
             _ => Self::Revived,
@@ -146,9 +219,41 @@ impl FollowUpDelivery {
     ///
     /// `WaitingForUserAnswer` counts as in flight here for the same reason it
     /// does everywhere else: the child never gave up its place on the parent's
-    /// counter, so no re-increment is owed.
+    /// counter, so no re-increment is owed. `Interrupted` counts as in flight
+    /// too, and most strictly of all: the redirect lane has to sequence the
+    /// interrupted turn's `Canceled` terminal BEFORE the follow-up's
+    /// `MessageReceived`, so pre-emitting here would invert the child's
+    /// timeline.
     pub(crate) fn wants_pre_emit(&self) -> bool {
         matches!(self, Self::Revived)
+    }
+
+    /// The urgency the turn actually runs with, derived from the ack rather
+    /// than from what the caller asked for.
+    ///
+    /// **This is the only thing that may hand `Urgent` to the turn**, and the
+    /// reason is that the ack is a promise. `describe()` tells a
+    /// question-parked child's caller "it will not read this until a human
+    /// answers", so a raw `Urgent` reaching the turn would make the engine do
+    /// the opposite of what it just said: a chat child parked on
+    /// `ask_user_question` is blocked INSIDE a tool call, so its `ThreadHandle`
+    /// is still registered and `is_in_flight()` is still true, and the preempt
+    /// would cancel the turn and throw away the question the user was about to
+    /// answer. Same on the coding-agent lane, where a session parked on
+    /// AskUserQuestion also reads as in-flight.
+    ///
+    /// Deriving both from one sampled `FollowUpDelivery` makes the ack and the
+    /// behaviour the same decision, so they cannot drift apart. `Interrupted`
+    /// already means "mid-turn AND the caller asked for urgent", which is
+    /// exactly the case that may preempt.
+    pub(crate) fn effective_urgency(&self) -> FollowUpUrgency {
+        match self {
+            Self::Interrupted => FollowUpUrgency::Urgent,
+            // Nothing to preempt (`Revived`), or preempting would break a
+            // promise (`WaitingForUserAnswer`), or the caller did not ask
+            // (`Running`).
+            Self::Running | Self::WaitingForUserAnswer | Self::Revived => FollowUpUrgency::Normal,
+        }
     }
 
     /// One sentence for the LLM's tool result, so the model knows whether the
@@ -157,6 +262,10 @@ impl FollowUpDelivery {
         match self {
             Self::Running => {
                 "The child was mid-turn, so this queues behind its current work or steers it."
+            }
+            Self::Interrupted => {
+                "The child was mid-turn and this was urgent, so its current turn is being \
+                 stopped and it will act on this next."
             }
             Self::WaitingForUserAnswer => {
                 "The child is parked on a question or a permission card. It will not read \
@@ -244,6 +353,7 @@ impl crate::engine::LucidosEngine {
         caller_thread_id: Option<Uuid>,
         child_thread_id: Uuid,
         caller_workspace: Option<&str>,
+        urgency: FollowUpUrgency,
     ) -> Result<(ChildRow, FollowUpAck), ChildFollowUpError> {
         if caller_workspace.is_some() {
             crate::log!(
@@ -321,7 +431,7 @@ impl crate::engine::LucidosEngine {
         let ack = FollowUpAck {
             child_thread_id,
             child_title: row.label(),
-            delivered_to: FollowUpDelivery::from_status(row.status),
+            delivered_to: FollowUpDelivery::from_status(row.status, urgency),
         };
         Ok((row, ack))
     }
@@ -438,6 +548,13 @@ impl crate::engine::LucidosEngine {
     /// states the bound instead of deriving it, which cuts the cycle at this
     /// one edge. `run_thread` avoids the same recursion a different way, by
     /// handing its spawn to the Thread Queue's trait-object executor.
+    // Eight with `self`, one over clippy's threshold since `urgency` joined.
+    // Same allow, and the same reason, as the `process_message_with_steps` pair
+    // this delegates to: these are the per-request knobs surfaced at the call
+    // boundary on purpose, so a caller wires them through without re-creating a
+    // builder struct. Every one of them is load-bearing and named, and two
+    // (`caller_thread_id`, `caller_workspace`) exist only to be checked.
+    #[allow(clippy::too_many_arguments)]
     pub fn follow_up_child_thread<'a>(
         self: &'a std::sync::Arc<Self>,
         caller_thread_id: Option<Uuid>,
@@ -446,6 +563,7 @@ impl crate::engine::LucidosEngine {
         images: Option<&'a [crate::api::ChatImage]>,
         spawning_event_id: Option<Uuid>,
         caller_workspace: Option<&'a str>,
+        urgency: FollowUpUrgency,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<FollowUpAck, ChildFollowUpError>> + Send + 'a>,
     > {
@@ -455,6 +573,7 @@ impl crate::engine::LucidosEngine {
                 caller_thread_id,
                 child_thread_id,
                 caller_workspace,
+                urgency,
             )
             .await?;
             // Authorized, so the caller is Some and is the child's parent.
@@ -517,6 +636,11 @@ impl crate::engine::LucidosEngine {
             let message = text.to_string();
             let images = images.map(|i| i.to_vec());
             let spawn_origin = origin.clone();
+            // From the ack, never from the caller's raw flag: see
+            // `FollowUpDelivery::effective_urgency`. A question-parked child
+            // must not be preempted, and the ack has already promised it will
+            // not be.
+            let urgency = ack.delivered_to.effective_urgency();
             // Type-erased before it reaches `tokio::spawn`, to break an auto-trait
             // inference cycle: this spawns a turn, that turn can run an agentic
             // loop, that loop reaches `execute_tool`, and one of its arms calls
@@ -550,15 +674,35 @@ impl crate::engine::LucidosEngine {
                             pre_emitted_origin,
                             None,
                             Some(spawn_origin),
+                            urgency,
                         )
                         .await;
-                    if let Err(e) = result {
-                        crate::log!(
-                            "[ChildFollowUp] Follow-up turn failed on child {}: {}",
-                            child_thread_id,
-                            e
-                        );
-                        engine
+                    match result {
+                        // Drain the orphan chain, exactly as the other two spawn
+                        // sites do (`api/chat.rs` for a chat send,
+                        // `thread_queue/executor.rs` for a queued turn). This
+                        // site did not, so a message injected into the turn this
+                        // one started was collected by `drain_turn_orphans` and
+                        // then dropped on the floor: the child went idle having
+                        // never read it. Harmless-looking until the urgent lane
+                        // made it load-bearing, because ending a Lucidos Agent
+                        // turn is precisely how an urgent follow-up gets read.
+                        Ok(res) if !res.orphaned_injections.is_empty() => {
+                            crate::api::chat::process_orphan_chain(
+                                engine.clone(),
+                                child_thread_id,
+                                res.orphaned_injections,
+                            )
+                            .await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            crate::log!(
+                                "[ChildFollowUp] Follow-up turn failed on child {}: {}",
+                                child_thread_id,
+                                e
+                            );
+                            engine
                             .event_bus
                             .emit_or_log(
                                 crate::engine::event_bus::BusEvent::Thread {
@@ -572,6 +716,7 @@ impl crate::engine::LucidosEngine {
                                 "[ChildFollowUp] ResponseFailed after a failed follow-up turn",
                             )
                             .await;
+                        }
                     }
                 });
             let handle = tokio::spawn(turn);

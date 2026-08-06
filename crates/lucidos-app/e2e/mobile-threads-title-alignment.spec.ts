@@ -14,11 +14,23 @@
  * Both edges are asserted because the reserve is SYMMETRIC: it is sized off the
  * wider cluster, so a button added to one side spends the other side's
  * clearance. The thread header's trailing cluster grew to compose + search +
- * menu when the hamburger moved to that edge, which is what makes the right-edge
- * assertion load-bearing rather than decorative.
+ * menu when the hamburger moved to that edge, and again to setup-interview +
+ * compose + search + menu, which is what makes the right-edge assertion
+ * load-bearing rather than decorative. Each addition spends real clearance at
+ * 375px, so measure against whatever is currently leftmost in that cluster
+ * (`TRAILING_LEFTMOST`) rather than naming one button.
  */
 import { test, expect, Page } from './fixtures';
 import { assertHealthy, navigateToApp, openThreadDrawer } from './helpers';
+
+/** The leftmost element of the trailing cluster, whichever it currently is.
+ *  `querySelector` takes the first match in DOCUMENT order, so the
+ *  setup-interview button wins when it is rendered and the compose button is the
+ *  fallback when it is not (it is hidden with no LLM provider configured, and
+ *  the e2e workspace may have none). Naming `.brand-compose-btn` alone stopped
+ *  being right the moment an icon was added to its left: the assertions would
+ *  still pass while the brand overlapped the icon nobody was measuring. */
+const TRAILING_LEFTMOST = '[data-role="setup-interview-toggle"], .brand-compose-btn';
 
 interface Metrics {
   center: number;
@@ -89,7 +101,7 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     // compose + search + the menu hamburger, which the hamburger's move to that
     // edge left with the same one-gap clearance the leading side has.
     const brand = await measure(
-      page, '.mobile-thread-header', '.pane-header-brand', '.mobile-nav-slot', '.brand-compose-btn',
+      page, '.mobile-thread-header', '.pane-header-brand', '.mobile-nav-slot', TRAILING_LEFTMOST,
     );
     expect(brand, 'brand / nav slot / compose button not found').not.toBeNull();
     expect(
@@ -123,7 +135,7 @@ test.describe('Mobile header titles are centered and clear of the leading icons'
     // clear of the Filter control.
     await openThreadDrawer(page);
     const threads = await measure(
-      page, '.mobile-threads-header', '.pane-header-title', '.view-selector-slot', '.brand-compose-btn', 'Threads',
+      page, '.mobile-threads-header', '.pane-header-title', '.view-selector-slot', TRAILING_LEFTMOST, 'Threads',
     );
     expect(threads, 'Threads title / filter slot not found').not.toBeNull();
     expect(

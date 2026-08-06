@@ -10,7 +10,7 @@
  * entries carry the scopes the engine actually checks.
  */
 import { describe, it, expect } from 'vitest';
-import { PROVIDER_SCOPES, oauthProviderFor } from '../backupProviderScopes';
+import { PROVIDER_SCOPES, oauthProviderFor, pickInitialProvider } from '../backupProviderScopes';
 
 /** Mirrors `PROVIDER_IDS` in `crates/lucidos-engine/src/core/backup/mod.rs`,
  *  which the engine's own `provider_ids_match_registry` test keeps in step with
@@ -61,5 +61,44 @@ describe('the OAuth provider behind each backup provider', () => {
 
   it('leaves every other id alone', () => {
     expect(oauthProviderFor('dropbox')).toBe('dropbox');
+  });
+});
+
+describe('which provider the Backup page opens on', () => {
+  // Registry order, which is where the old unconditional `available[0].id`
+  // seed always landed.
+  const REGISTRY = [{ id: 'google_drive' }, { id: 'dropbox' }];
+
+  it('opens on the configured provider, not the first in the registry', () => {
+    // The reported bug: an install configured for Dropbox rendered its health
+    // card, ready verdict, Grant access and Back up now against Google Drive,
+    // and a schedule change from there would have rewritten `backup_provider`
+    // to a provider the user never picked.
+    expect(pickInitialProvider('dropbox', REGISTRY)).toBe('dropbox');
+  });
+
+  it('opens on the configured provider even when it is already first', () => {
+    expect(pickInitialProvider('google_drive', REGISTRY)).toBe('google_drive');
+  });
+
+  it.each([
+    ['nothing configured', null],
+    ['the preference unset', undefined],
+    ['a blank preference', ''],
+  ])('falls back to the first registered provider with %s', (_label, configured) => {
+    expect(pickInitialProvider(configured, REGISTRY)).toBe('google_drive');
+  });
+
+  it('falls back when the configured provider is not in the registry', () => {
+    // A retired provider, or a hand-edited preference. Selecting it would leave
+    // every provider-scoped control disabled with nothing explaining why.
+    expect(pickInitialProvider('sftp', REGISTRY)).toBe('google_drive');
+  });
+
+  it('selects nothing when the registry is empty', () => {
+    // The providers request failed. The empty string is the component's own
+    // "no provider" state, which already disables Back up now.
+    expect(pickInitialProvider('dropbox', [])).toBe('');
+    expect(pickInitialProvider(null, [])).toBe('');
   });
 });

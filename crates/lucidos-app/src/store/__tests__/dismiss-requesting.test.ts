@@ -68,6 +68,7 @@ function makeCCThread(id: string, status: 'idle' | 'running' | 'waiting' | 'wait
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

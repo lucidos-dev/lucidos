@@ -23,6 +23,96 @@ interface PermissionBodyProps {
   terminated?: boolean;
 }
 
+/** What a Codex change `kind` means in a sentence. The app-server sends it as
+ *  `{type: "add" | "update" | "delete"}`; older frames used a bare string, so
+ *  both shapes resolve. Anything unrecognized reads "change", which is true of
+ *  every kind and claims nothing extra.
+ *
+ *  A `Map`, not an object literal: the key is a string codex chose, and a plain
+ *  object answers `constructor` / `toString` / `valueOf` / `__proto__` off its
+ *  prototype. `CHANGE_VERBS['constructor'] ?? 'change'` returns the `Object`
+ *  FUNCTION, not the default, so the `: string` below would be a lie and a
+ *  function would be rendered into the card. A `Map` only ever answers what was
+ *  put in it. */
+const CHANGE_VERBS: ReadonlyMap<string, string> = new Map([
+  ['add', 'create'],
+  ['update', 'change'],
+  ['delete', 'delete'],
+]);
+const DEFAULT_CHANGE_VERB = 'change';
+
+function changeVerb(kind: unknown): string {
+  const name = typeof kind === 'string'
+    ? kind
+    : (kind && typeof kind === 'object' && typeof (kind as { type?: unknown }).type === 'string')
+      ? (kind as { type: string }).type
+      : '';
+  return CHANGE_VERBS.get(name) ?? DEFAULT_CHANGE_VERB;
+}
+
+/** The files a Codex `file_change` approval is about, as `{verb, path}` pairs.
+ *  The approval request itself carries no paths (only a nullable `reason` and
+ *  `grantRoot`, both null in practice). The engine's app-server driver copies
+ *  them across from the item's `item/started`, which codex emits first. Empty
+ *  when it could not, which is the degrade case `renderFileChangeQuestion`
+ *  handles. */
+function fileChanges(input: Record<string, unknown>): { verb: string; path: string }[] {
+  const raw = input.changes;
+  if (!Array.isArray(raw) || raw.length === 0) return [];
+  const changes: { verb: string; path: string }[] = [];
+  for (const entry of raw) {
+    const path = entry && typeof entry === 'object' ? (entry as { path?: unknown }).path : null;
+    // One entry we cannot read discards the WHOLE set (mirroring the engine's
+    // `FileTargets::Unresolved`). Listing only the files that parsed would show
+    // a complete-looking card for a patch whose unnamed half writes elsewhere,
+    // which is worse than the honest "wants to change files" degrade.
+    if (typeof path !== 'string' || !path) return [];
+    changes.push({ verb: changeVerb((entry as { kind?: unknown }).kind), path });
+  }
+  return changes;
+}
+
+/** The card for a Codex out-of-sandbox patch. Says what is happening to which
+ *  files, because the alternative the user actually saw was a card reading
+ *  "wants to use the file_change tool. Allow?" with nothing else on it. */
+function renderFileChangeQuestion(input: Record<string, unknown>) {
+  const changes = fileChanges(input);
+  if (changes.length === 0) {
+    // Nothing was announced for this item. Say the least that is still true,
+    // and pass codex's own explanation through when it sent one.
+    const reason = typeof input.reason === 'string' ? input.reason.trim() : '';
+    return (
+      <>
+        The coding agent wants to change files{reason ? `: ${reason}` : ''}. Allow?
+      </>
+    );
+  }
+  if (changes.length === 1) {
+    return (
+      <>
+        The coding agent wants to {changes[0].verb} <code>{changes[0].path}</code>. Allow?
+      </>
+    );
+  }
+  // One verb for the whole set only when they agree; a mixed patch is "change".
+  const verb = changes.every(c => c.verb === changes[0].verb) ? changes[0].verb : DEFAULT_CHANGE_VERB;
+  return (
+    <>
+      The coding agent wants to {verb} {changes.length} files. Allow?
+      {/* Keyed by index, not by path: a patch may touch the same path twice
+          (an update plus a move), and this list is static, so an index is both
+          unique and stable where the path is only the latter. */}
+      <ul class="permission-file-list">
+        {changes.map((c, i) => (
+          <li key={i}>
+            <span class="permission-file-verb">{c.verb}</span> <code>{c.path}</code>
+          </li>
+        ))}
+      </ul>
+    </>
+  );
+}
+
 /** Frame the prompt around the tool name itself ("the **Edit** tool on `/path`")
  *  rather than burying it as a flat prefix in the summary. The original wording
  *  ("Claude Code wants to use Edit /path") read like a sentence about an action
@@ -30,8 +120,32 @@ interface PermissionBodyProps {
  *  were about to grant. The subject is "the coding agent" — the same card is
  *  raised by Claude Code's MCP permission prompt AND the Codex app-server
  *  approval bridge, so naming Claude Code here would misattribute a Codex
- *  escalation at the exact moment the user is making a security decision. */
-export function renderQuestion(toolName: string, summary: string) {
+ *  escalation at the exact moment the user is making a security decision.
+ *
+ *  **The two Codex tools are the exception and get their own sentence.**
+ *  `Edit` / `Bash` / `Skill` are names a user meets elsewhere, so naming the
+ *  tool orients them. `file_change` and `command_execution` are app-server wire
+ *  identifiers that surface nowhere else, so the same framing produced "wants
+ *  to use the file_change tool. Allow?": a security decision phrased in
+ *  protocol jargon, about files it did not name. Those two say what the agent
+ *  wants to DO instead, and `command_execution` borrows the command-guard
+ *  card's wording so the two "wants to run" prompts read alike. */
+export function renderQuestion(
+  toolName: string,
+  summary: string,
+  input: Record<string, unknown> = {},
+) {
+  if (toolName === 'file_change') return renderFileChangeQuestion(input);
+  if (toolName === 'command_execution') {
+    const command = typeof input.command === 'string' ? input.command.trim() : '';
+    return command ? (
+      <>
+        The coding agent wants to run <code>{command}</code>. Allow?
+      </>
+    ) : (
+      <>The coding agent wants to run a command. Allow?</>
+    );
+  }
   const space = summary.indexOf(' ');
   const arg = space === -1 ? null : summary.slice(space + 1);
   return arg ? (
@@ -136,15 +250,22 @@ export function sessionLabel(toolName: string, input: Record<string, unknown>): 
 /** Codex backend tool names (raised by the app-server approval bridge).
  *  Persisted scopes (Broad / Narrow) are meaningless for them — only Claude
  *  Code reads `cc-allowed-tools` — and `file_change` additionally derives no
- *  session pattern (its input has no stable identifier, so a session grant
- *  would blanket-approve every future out-of-sandbox write). Mirror of
+ *  session pattern (see `SESSION_ALLOW_INEFFECTIVE`). Mirror of
  *  `CODEX_BACKEND_TOOLS` in `claude_code.rs`. */
 const CODEX_BACKEND_TOOLS: ReadonlySet<string> = new Set(['command_execution', 'file_change']);
 
 /** Tools whose "Allow for this thread" click would record nothing (the
  *  engine derives no session pattern) — the button is hidden so a click
  *  can't silently behave as allow-once. Mirror of the `file_change` arm in
- *  `derive_allow_pattern`'s Session branch. */
+ *  `derive_allow_pattern`'s Session branch.
+ *
+ *  `file_change` is a deliberate choice, not a data gap. Its approval input now
+ *  carries the changed paths (the driver copies them off the item's
+ *  `item/started`), so a per-file `file_change(<path>)` pattern would be as
+ *  derivable as `Edit(<path>)`. Two reasons it still gets none: codex raises
+ *  this approval only for a patch that escaped its sandbox, which is exactly
+ *  the thing worth re-confirming each time, and a `changes` list names several
+ *  files at once, so there is no single key a grant could stand for. */
 const SESSION_ALLOW_INEFFECTIVE: ReadonlySet<string> = new Set(['file_change']);
 
 /** Tools whose bare entry in `--allowedTools` cannot be respected by CC.
@@ -409,7 +530,7 @@ export function PermissionBody({ event, resolved, terminated }: PermissionBodyPr
   return (
     <PermissionBodyShell
       requestId={event.request_id}
-      question={renderQuestion(event.tool_name, event.summary)}
+      question={renderQuestion(event.tool_name, event.summary, event.input)}
       buttons={buttons}
       selected={selected}
       answered={answered}

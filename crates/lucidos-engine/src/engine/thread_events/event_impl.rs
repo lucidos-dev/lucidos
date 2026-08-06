@@ -167,6 +167,10 @@ impl ThreadEvent {
             Self::ChildThreadCompleted { .. } => "ChildThreadCompleted",
             Self::ContextDismissed { .. } => "ContextDismissed",
             Self::ImageDescribed { .. } => "ImageDescribed",
+            Self::EventWaitStarted { .. } => "EventWaitStarted",
+            Self::EventWaitDelivered { .. } => "EventWaitDelivered",
+            Self::EventWaitExpired { .. } => "EventWaitExpired",
+            Self::EventWaitCanceled { .. } => "EventWaitCanceled",
             // Transient
             Self::CumulativeTextUpdated { .. } => "CumulativeTextUpdated",
             Self::LlmCallRetried { .. } => "LlmCallRetried",
@@ -176,7 +180,6 @@ impl ThreadEvent {
             Self::PluginUninstallRequested { .. } => "PluginUninstallRequested",
             Self::EmailConfirmRequested { .. } => "EmailConfirmRequested",
             Self::PushNotificationRequested => "PushNotificationRequested",
-            Self::FileRefreshRequested { .. } => "FileRefreshRequested",
             Self::AppUiRefreshRequested { .. } => "AppUiRefreshRequested",
             Self::AppUiCaptureRequested { .. } => "AppUiCaptureRequested",
             Self::NavigationRequested { .. } => "NavigationRequested",
@@ -215,7 +218,6 @@ impl ThreadEvent {
                 | Self::PluginUninstallRequested { .. }
                 | Self::EmailConfirmRequested { .. }
                 | Self::PushNotificationRequested
-                | Self::FileRefreshRequested { .. }
                 | Self::AppUiRefreshRequested { .. }
                 | Self::AppUiCaptureRequested { .. }
                 | Self::NavigationRequested { .. }

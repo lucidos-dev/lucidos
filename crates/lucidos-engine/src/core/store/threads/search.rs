@@ -116,6 +116,7 @@ impl EventStore {
             compose_images: serde_json::Value,
             compose_mode: Option<String>,
             compose_selection: Option<serde_json::Value>,
+            compose_epoch: i64,
             score: f64,
         }
 
@@ -166,6 +167,7 @@ impl EventStore {
                         compose_images: r.compose_images,
                         compose_mode: r.compose_mode,
                         compose_selection: r.compose_selection,
+                        compose_epoch: r.compose_epoch,
                     },
                     score: r.score,
                 })

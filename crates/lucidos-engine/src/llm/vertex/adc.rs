@@ -113,13 +113,26 @@ struct TokenResponse {
     // the ~3600s lifetime, same as the gcloud path.
 }
 
+/// Wall-clock budget for the token exchange. `reqwest` applies no timeout of its
+/// own, so a black-holed connection to the token endpoint (TCP established, no
+/// response) leaves `send().await` pending forever. That is not hypothetical
+/// here: this runs on the Vertex chat path every time the cached access token
+/// ages out, so the hang becomes a chat turn that never returns and never emits
+/// a terminal event, the same failure `STREAM_HEADER_TIMEOUT_SECS` bounds for
+/// the streaming request. A token exchange is one small POST; 60s (the value
+/// `llm::web_search` uses for its outbound calls) is far past any real latency,
+/// and on timeout `fetch_access_token` still falls back to the gcloud path.
+const TOKEN_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// Exchange the refresh token for a fresh access token. Errors carry the HTTP
 /// status + Google's `error_description` body (which never contains the secrets
 /// we send), never the credential fields themselves.
 pub async fn refresh_access_token(
     creds: &AdcCredentials,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let resp = reqwest::Client::new()
+    let resp = reqwest::Client::builder()
+        .timeout(TOKEN_REQUEST_TIMEOUT)
+        .build()?
         .post(GOOGLE_TOKEN_URI)
         .form(&[
             ("client_id", creds.client_id.as_str()),

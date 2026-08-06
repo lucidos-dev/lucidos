@@ -349,8 +349,22 @@ mod tests {
                 && m.enabled),
             "Opus 5 builtin must be seeded on the vertex provider, enabled"
         );
-        // Ordered by sort_order — Fable 5 (0) sorts before Opus 5 (5) before
-        // Opus 4.8 (10).
+        assert!(
+            models.iter().any(|m| m.id == "claude-sonnet-5"
+                && m.provider == "vertex"
+                && m.is_builtin()
+                && m.enabled),
+            "Sonnet 5 builtin must be seeded on the vertex provider, enabled"
+        );
+        assert!(
+            models
+                .iter()
+                .any(|m| m.id == "claude-sonnet-4-6" && m.is_builtin() && m.enabled),
+            "Sonnet 4.6 stays an enabled builtin: Sonnet 5 is added above it, not swapped in"
+        );
+        // Ordered by sort_order: Fable 5 (0) sorts before Opus 5 (5) before
+        // Sonnet 5 (7) before Opus 4.8 (10), grouping the current generation at
+        // the top of the picker.
         let fable = models
             .iter()
             .position(|m| m.id == "claude-fable-5")
@@ -359,12 +373,16 @@ mod tests {
             .iter()
             .position(|m| m.id == "claude-opus-5@default")
             .unwrap();
+        let sonnet5 = models
+            .iter()
+            .position(|m| m.id == "claude-sonnet-5")
+            .unwrap();
         let opus = models
             .iter()
             .position(|m| m.id == "claude-opus-4-8@default")
             .unwrap();
         assert!(
-            fable < opus5 && opus5 < opus,
+            fable < opus5 && opus5 < sonnet5 && sonnet5 < opus,
             "sort_order must drive display order"
         );
         pool.close().await;
@@ -606,6 +624,7 @@ mod tests {
             ("claude-opus-4-8@default[1m]", 1_000_000),
             ("claude-opus-4-7[1m]", 1_000_000),
             ("claude-opus-4-6[1m]", 1_000_000),
+            ("claude-sonnet-5[1m]", 1_000_000),
             ("claude-sonnet-4-6[1m]", 1_000_000),
             // OpenAI — no context opt-in either; the 400k guess understates these.
             ("gpt-5.5-pro", 1_050_000),
@@ -633,6 +652,7 @@ mod tests {
             "claude-opus-5@default",
             "claude-opus-4-8@default",
             "claude-opus-4-7",
+            "claude-sonnet-5",
             "claude-sonnet-4-6",
         ] {
             let m = ModelStore::get(&pool, id).await.unwrap().unwrap();

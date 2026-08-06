@@ -24,6 +24,21 @@
 //! Adding an operation here forces the generated surfaces to follow (staleness
 //! test) and forces a handler (the handler's recognised-action set is checked
 //! against the manifest by a unit test — see `engine/tools/notifications.rs`).
+//!
+//! ## Deliberate non-domain: `await_event`
+//!
+//! `await_event` (`engine::event_wait`, ADR 0047) is a standalone LLM tool and
+//! is deliberately NOT a domain here, so its absence is a decision rather than
+//! the drift this manifest exists to catch.
+//!
+//! Parity is unreachable for it, not merely unimplemented. The tool's whole
+//! effect is to END THE CALLING AGENT'S TURN and leave the thread parked, which
+//! only means something inside an agent turn. A CLI invocation has no turn to
+//! park (`lucidos await-event` would block a shell process, which is the
+//! polling this replaces, with worse ergonomics), and an SDK call from an app
+//! iframe has none either. The capability an app or a script actually wants
+//! here is the `triggers` domain, which IS in the manifest: a standing rule
+//! that reacts to an event without a turn to suspend.
 
 use crate::llm::provider::ToolDefinition;
 use serde_json::{Map, Value};

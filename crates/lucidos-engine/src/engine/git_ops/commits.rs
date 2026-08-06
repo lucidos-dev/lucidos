@@ -170,6 +170,104 @@ pub(crate) async fn describe_branch_changes(
     }
 }
 
+/// Does `refs/heads/<branch_name>` resolve in this repo?
+///
+/// `GitAnswer` rather than a bool so callers can tell "the ref is gone" from
+/// "git could not be asked", which is the distinction that matters to anything
+/// deciding whether to go looking for the branch somewhere else.
+pub(crate) async fn local_branch_exists(repo_root: &Path, branch_name: &str) -> GitAnswer {
+    git_answer(
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{}", branch_name),
+        ],
+        repo_root,
+    )
+    .await
+}
+
+/// The one local branch whose history contains `sha`, ignoring `excluded` (the
+/// default branch, which contains the commit once the work is merged).
+///
+/// Pass the LOCAL default branch, not just whatever `default_diff_base`
+/// returned: that resolves to `origin/<default>` when the local default has
+/// diverged, and `for-each-ref refs/heads/` lists local branches only, so
+/// excluding the remote-tracking name alone leaves the local default eligible.
+/// A thread whose work was merged and whose branch was then deleted would come
+/// back as the default branch itself.
+///
+/// This answers "where did this thread's work end up" from git rather than from
+/// a name recorded when the session started. The tracked name goes stale the
+/// moment a skill inside the repo runs `git branch -m`, and unlike the live
+/// session paths there is no worktree left to ask once it has been reclaimed:
+/// the thread's last known commit is then the only handle on its work.
+///
+/// Returns `None` when nothing contains the commit (the branch was deleted) and
+/// when SEVERAL branches do (someone branched off the work, so which one the
+/// thread meant is genuinely ambiguous). Both cases are for the caller to report
+/// honestly rather than guess at.
+///
+/// Containment is deliberately the whole test, with no rename evidence
+/// required. A sole containing branch can be a sibling the agent cut from the
+/// tracked branch before deleting it, rather than the tracked branch renamed,
+/// and that branch may carry commits this thread never made. Two reasons that
+/// is the right answer anyway: this feeds a READ-ONLY view whose response names
+/// the branch it resolved, so nothing is claimed about provenance and nothing
+/// destructive is authorized; and the live path it stands in for
+/// (`diff_via_worktree`, which diffs `base...HEAD`) has exactly the same
+/// property, so demanding more here would make the two disagree about the same
+/// repository. Requiring a reflog rename record instead, the way branch
+/// adoption does when it retargets a whole SESSION, would answer the ordinary
+/// `git checkout -b` case with "no diff" rather than the diff sitting right
+/// there. See `docs/code-review-priors.md`.
+pub(crate) async fn sole_branch_containing(
+    repo_root: &Path,
+    sha: &str,
+    excluded: &[&str],
+) -> Option<String> {
+    let out = git_cmd(
+        &[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "--contains",
+            sha,
+            "refs/heads/",
+        ],
+        repo_root,
+    )
+    .await
+    .ok()?;
+    if !out.status.success() {
+        log!(
+            "[Git] for-each-ref --contains {} failed: {}",
+            sha,
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let candidates: Vec<&str> = stdout
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !excluded.contains(l))
+        .collect();
+    match candidates.as_slice() {
+        [only] => Some((*only).to_string()),
+        [] => None,
+        [first, second, ..] => {
+            log!(
+                "[Git] {} is contained by more than one branch ({}, {}, ...), refusing to guess",
+                sha,
+                first,
+                second
+            );
+            None
+        }
+    }
+}
+
 /// Check if a branch has commits vs main (i.e., the branch has diverged from the default branch).
 /// Returns `true` if there are commits on the branch not on main, or on error (safe default).
 ///

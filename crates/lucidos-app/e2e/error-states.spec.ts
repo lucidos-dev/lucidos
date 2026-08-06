@@ -166,7 +166,7 @@ test.describe('Resume after restart — boundary panels', () => {
     }
   });
 
-  test('chat thread aborted by /api/v1/restart: iconless action label + Continue button', async ({ page }) => {
+  test('chat thread aborted by /api/v1/restart: iconless action label, no Continue button', async ({ page }) => {
     const threadId = randomUUID();
     const userMsgId = randomUUID();
     const abortedId = randomUUID();
@@ -174,10 +174,16 @@ test.describe('Resume after restart — boundary panels', () => {
     const t1 = new Date(Date.now() - 2_000).toISOString();
 
     const userPayload = JSON.stringify({ text: 'fix the bug', channel: 'chat' });
+    // Both halves of the switch-teardown fingerprint, because
+    // `isSwitchTeardownAbort` requires both: the `engine_shutdown` cause AND
+    // the device that clicked Switch. A device actor alone is not it, since
+    // `stale_settle` also carries the actor of the user button that exposed the
+    // stuck row, so an actor-only fixture reads as a plain interruption.
     const abortedPayload = JSON.stringify({
       text: '',
       images: [],
       request_event_id: userMsgId,
+      cause: 'engine_shutdown',
       actor: { kind: 'device', device_id: 'd-test', label: 'My Mac' },
     });
 
@@ -197,11 +203,18 @@ test.describe('Resume after restart — boundary panels', () => {
       await expect(exchanges).toHaveCount(2, { timeout: 10_000 });
       const abortExchange = exchanges.nth(1);
       // Device-driven abort (you hit Restart) renders like the ResponseCanceled
-      // boundary: iconless, the action AS the label ("Restarted"), no "You" chip
-      // — who/what is in the timestamp popover.
+      // boundary: iconless, the action AS the label ("Paused by restart"), no
+      // "You" chip; who/what is in the timestamp popover.
       await expect(abortExchange.locator('.initiator-icon')).toHaveCount(0);
-      await expect(abortExchange.locator('.initiator-label')).toContainText('Restarted');
-      await expect(abortExchange.getByRole('button', { name: 'Continue' })).toBeVisible();
+      await expect(abortExchange.locator('.initiator-label')).toContainText('Paused by restart');
+      // And NO Continue button, which is the point of the "paused" wording: the
+      // engine promised to resume this turn itself (ADR 0045), so offering a
+      // Continue would invite the user to run it a second time.
+      // `continuableAbortIndex` withholds it on exactly the fingerprint that
+      // produces the label above, so the two can never contradict each other.
+      // If the boot declines to resume, it emits a fresh `recovery_after_restart`
+      // abort, which does not match, and the button comes back.
+      await expect(abortExchange.getByRole('button', { name: 'Continue' })).toHaveCount(0);
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,
@@ -392,7 +405,7 @@ test.describe('Question-parked thread preserved across restart', () => {
       // No restart/abort boundary anywhere in the thread.
       await expect(page.getByRole('button', { name: 'Continue' })).toHaveCount(0);
       await expect(page.getByText('Response interrupted')).toHaveCount(0);
-      await expect(page.locator('.initiator-label', { hasText: 'Restarted' })).toHaveCount(0);
+      await expect(page.locator('.initiator-label', { hasText: 'Paused by restart' })).toHaveCount(0);
     } finally {
       psql([
         `DELETE FROM events WHERE aggregate_id = '${threadId}'`,

@@ -20,11 +20,13 @@
    scroll container: a chat event or change, a settings item, a plugin row
    (driven by components/shared/focusMarker.ts). A Slack-style BACKGROUND
    HIGHLIGHT (.nav-focus-stuck) that glows like a spotlight: the marked element's
-   own box is washed with the accent, and the wash blooms softly past its edge. It
-   sticks until the user takes any action (scroll / keypress / click / new nav /
-   explicit scroll), then smoothly fades out via .nav-focus-fading before being
-   removed. It replaced an accent `outline` FRAME around the box, which read as a
-   heavy dialog border on a landed chat turn rather than as a highlight.
+   own box is washed in the marker's own colour, and the wash blooms softly past
+   its edge. It is a light being switched on: it ramps up, holds at full for at least
+   NAV_FOCUS_HOLD_MS however fast the user engages, and only then dissolves via
+   .nav-focus-fading on the user's action (scroll / keypress / click / new nav /
+   explicit scroll) before being removed. It replaced an accent `outline` FRAME
+   around the box, which read as a heavy dialog border on a landed chat turn rather
+   than as a highlight.
 
    All three layers ride ONE `box-shadow`, which is what makes the whole thing
    work:
@@ -49,7 +51,23 @@
    are both plain keyframe animations rather than an opacity-faded pseudo-element
    that would collide with the host elements' own ::before/::after.
 
-   Every colour is a color-mix over --accent, so both themes work off one token.
+   Every colour is a color-mix over --nav-focus-glow, so this rule is hue-agnostic
+   and both themes work off one token. That token is NOT the accent: the marker used
+   to be an --accent wash and it read as a picked surface instead of as a marker,
+   because --picked-surface is the same accent hue at nearly the same alpha and
+   because every other piece of chrome here is blue already. Do NOT fold it back
+   onto --accent to "reuse the theme token": owning no other surface's colour is the
+   entire point, and reverting it reintroduces the collision.
+
+   The two themes deliberately resolve that token to DIFFERENT values, which is why
+   nothing here names a colour: retuning either value must never mean editing this
+   rule, so naming them would only create a second place to keep in step. base.css
+   carries both values and the reasoning, including why they differ rather than
+   matching. Note also that this rule PAINTS NOTHING
+   if the token is missing rather than degrading: an unresolved var makes each
+   color-mix invalid at computed-value time, which drops the whole box-shadow. Both
+   theme blocks defining it is pinned by nav-focus-marker-paint.test.ts.
+
    This per-turn marker is why the `.thread-content` scroll region itself shows no
    focus outline (input-messages.css): the marker signals focus, not a ring around
    the whole conversation. Always-on; not applied to apps or whole-pane opens
@@ -57,10 +75,10 @@
 .nav-focus-stuck {
     border-radius: 0.375rem;
     box-shadow:
-        inset 0 0 0 100vmax color-mix(in srgb, var(--accent) 13%, transparent),
-        0 0 0.375rem color-mix(in srgb, var(--accent) 22%, transparent),
-        0 0 1.5rem color-mix(in srgb, var(--accent) 12%, transparent);
-    animation: nav-focus-spotlight-on 0.5s ease-out;
+        inset 0 0 0 100vmax color-mix(in srgb, var(--nav-focus-glow) 16%, transparent),
+        0 0 0.375rem color-mix(in srgb, var(--nav-focus-glow) 28%, transparent),
+        0 0 1.5rem color-mix(in srgb, var(--nav-focus-glow) 15%, transparent);
+    animation: nav-focus-spotlight-on 0.45s ease-out;
     /* Forced-colors fallback, the same one every focus ring in this codebase
        carries (see .icon-btn / .action-btn in shared-components.css): high-contrast
        mode STRIPS box-shadow, so a marker made only of shadows would leave a
@@ -71,21 +89,30 @@
     outline: 0.125rem solid transparent;
 }
 
-/* The spotlight switching ON: the marker ramps up from nothing over half a second
-   rather than appearing at full strength. The shape is a lamp coming up, not a
-   linear ramp: `ease-out` drives a fast rise to a SURGE at 55% (brighter than
-   resting, and the wide layer's blur pushed out to 2.75rem so the bloom swells),
-   which then settles back into the resting values. The implicit `to` keyframe is
-   the element's own computed value, i.e. the base rule, so the resting state is
-   written once and the surge can never drift out of step with it.
+/* The spotlight switching ON: the marker ramps up from nothing rather than appearing
+   at full strength, and it ONLY rises. `ease-out` gives the fast-then-easing rise of
+   a lamp reaching steady state, and the implicit `to` keyframe is the element's own
+   computed value, i.e. the base rule, so the ramp lands exactly on the resting wash
+   and cannot drift from it.
+
+   Monotonic is a REQUIREMENT, not a shape preference, and it is why there is no
+   intermediate stop here. An earlier cut overshot to a surge at 55% and settled back
+   into the resting values, on the theory that a surge sells "switching on". It sells
+   the opposite: the drop from the surge to resting is a third of the brightness lost
+   a quarter-second after landing, and it reads as the light immediately turning back
+   down (reported exactly that way). A real lamp rises monotonically to steady state;
+   only a camera flash overshoots. Any stop added between 0% and the implicit end must
+   therefore stay BELOW the resting values, and the guard asserts the simplest form of
+   that, which is no intermediate stop at all.
 
    This deliberately gives up the decay-only property the first version had, where
    the marker was at full strength from its first painted frame so a glance-away or
    a slow iOS load could not miss it. The user asked for a real turn-on, and the
-   trade is small **because the marker persists**: after 0.5s it is there until the
-   user acts, so the only thing a look-away can miss is the ramp itself, never the
-   marker. That reasoning does NOT extend to a ramp that ends in nothing, which is
-   what fd61d7af9 removed and must not come back.
+   trade is small **because the marker persists**: once the ramp lands it is there
+   until the user acts, and for at least NAV_FOCUS_HOLD_MS even then, so the only
+   thing a look-away can miss is the ramp itself, never the marker. That reasoning
+   does NOT extend to a ramp that ends in nothing, which is what fd61d7af9 removed
+   and must not come back.
 
    No fill-mode, so once it ends the computed value falls back to the base rule.
    Layer count and inset-ness match the base rule at every keyframe, or the layers
@@ -108,19 +135,17 @@
             0 0 0.375rem transparent,
             0 0 1.5rem transparent;
     }
-    55% {
-        box-shadow:
-            inset 0 0 0 100vmax color-mix(in srgb, var(--accent) 20%, transparent),
-            0 0 0.375rem color-mix(in srgb, var(--accent) 34%, transparent),
-            0 0 2.75rem color-mix(in srgb, var(--accent) 22%, transparent);
-    }
 }
 
-/* The spotlight switching OFF: a slow dissolve, deliberately much longer than the
-   turn-on. The marker is not being dismissed because it is in the way, it is being
-   retired because the user has moved on, so it should drain away at the edge of
-   attention instead of blinking off. focusMarker.ts removes both classes once it
-   completes, and NAV_FOCUS_FADE_MS must match this duration.
+/* The spotlight switching OFF: a dissolve rather than a cut, and still slower than
+   the turn-on. The marker is not being dismissed because it is in the way, it is
+   being retired because the user has moved on, so it should drain instead of blinking
+   off. Only just, though: the dismiss is triggered BY the action that moves them on,
+   so past a certain length the drain stops reading as a graceful exit and starts
+   reading as the marker being slow to let go, which is what this rule's original 2.5s
+   did. Time at FULL brightness is NAV_FOCUS_HOLD_MS's job, not this one.
+   focusMarker.ts removes both classes once it completes, and NAV_FOCUS_FADE_MS must
+   match this duration.
 
    An ANIMATION, not a transition, and that is a correctness requirement rather than
    a style preference. The turn-on is an animation, and while an animation is running
@@ -128,7 +153,7 @@
    start. Cancelling the turn-on with `animation: none` to free the property does not
    help either, because the value then lands on the after-change style in the same
    frame, with no transition to interpolate it. Measured on the real rule: with that
-   shape, a dismiss anywhere inside the 0.5s ramp dropped the marker to fully
+   shape, a dismiss anywhere inside the ramp dropped the marker to fully
    transparent within two frames in Chromium (WebKit diverged, snapping below ~100ms
    and interpolating above ~300ms), so the marker BLINKED OFF exactly when the user
    acted quickly, which is the one thing this rule exists to prevent. Replacing the
@@ -139,29 +164,29 @@
    cannot drift from it. `forwards` holds the end state for the sliver between the
    animation finishing and focusMarker.ts stripping the classes.
 
-   The residual cost is honest: dismissing mid-ramp steps from wherever the ramp had
-   got to onto the resting value, then dissolves properly from there. Measured, that
-   step is +0.10 alpha at 16ms into the ramp, +0.03 at 80ms, -0.07 at the 250ms
-   surge, and nil from 450ms on. So a very early dismiss reads as popping to full
-   brightness before draining, which is a step between two VISIBLE states rather than
-   the disappearance the old shape produced, and is correctly signed in that the
-   marker never vanishes. From there the dissolve is strictly monotonic in both
-   engines, to within a frame of each other.
+   Interrupting the ramp costs a step: the dissolve begins from the resting value
+   rather than from wherever the ramp had got to. Since the ramp is monotonic and
+   never exceeds resting, that step is always UPWARD and at most the full resting
+   alpha, so the worst case is the light snapping to full before draining, never
+   dimming or vanishing. In practice NAV_FOCUS_HOLD_MS makes it unreachable: the
+   dissolve cannot start until well after the ramp has finished, so the two only
+   overlap if a supersede lands mid-ramp, which replaces the marker anyway. From
+   whatever value it starts at, the dissolve itself was measured strictly monotonic
+   in both engines, to within a frame of each other.
 
-   `linear`, not an ease: over 1.5s an `ease-out` dumps most of the alpha in the
-   first few hundred ms and then drags a nearly-invisible tail, which reads as a
-   quick fade followed by a lag rather than as a slow one. An even ramp is what
-   actually looks slow.
+   `linear`, not an ease: an `ease-out` dumps most of the alpha in the first couple of
+   hundred ms and then drags a nearly-invisible tail, which reads as a cut followed by
+   a lag rather than as a drain. An even ramp is what actually looks like draining.
 
    If scroll jank on the transcript is ever traced to this rule, this is why: an
    animated box-shadow is NOT GPU-composited, so every frame repaints the marked
    element (which can be a full-width chat turn) and what shows through it, and the
    dismiss is usually triggered BY a scroll gesture, so the repaint window overlaps
-   the moment jank shows most. The duration is a deliberate product choice and the
-   blurs are small, so it is left alone until someone actually measures a drop;
-   shortening it is the first knob, not a rewrite. */
+   the moment jank shows most. The duration is short and the blurs are small, so it is
+   left alone until someone actually measures a drop; shortening it further is the
+   first knob, not a rewrite. */
 .nav-focus-stuck.nav-focus-fading {
-    animation: nav-focus-spotlight-off 1.5s linear forwards;
+    animation: nav-focus-spotlight-off 0.8s linear forwards;
 }
 
 @keyframes nav-focus-spotlight-off {
@@ -648,6 +673,10 @@ html[data-theme="dark"] .split-button.open::before {
    --text-secondary; this one only ever appears in the Info popover, beside the
    word "Waiting".) */
 .thread-info-dot-waiting { background: var(--accent-notable); }
+/* Parked on an event wait. Shares the neutral in-between tone with waiting and
+   paused, because it is the same class of state: nothing is wrong and nothing
+   is being asked of the user. The word beside it ("Waiting for an event")
+   carries the distinction. */
 .thread-info-dot-paused { background: var(--accent-notable); }
 .thread-info-dot-failed { background: var(--accent-red); }
 

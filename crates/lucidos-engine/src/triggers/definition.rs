@@ -19,7 +19,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::core::DATA_DIR;
 use crate::engine::command_guard::SideEffectCategory;
-use crate::triggers::config::{EventSubscription, TriggerConfig, TriggerRun};
+use crate::triggers::config::{TriggerConfig, TriggerRun};
+use crate::triggers::EventSubscription;
 
 fn default_timezone() -> String {
     "UTC".to_string()

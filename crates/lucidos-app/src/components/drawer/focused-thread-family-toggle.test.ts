@@ -39,6 +39,7 @@ function makeThread(id: string, totalChildrenCount: number): ThreadState {
         parentThreadId: undefined,
         state: 'active',
         latestTodoList: null,
+    liveEventWaits: [],
     };
     return {
         meta,

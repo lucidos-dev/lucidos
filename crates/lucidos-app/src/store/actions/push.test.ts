@@ -13,14 +13,24 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 const originalFetch = globalThis.fetch;
 
 /** Generate a real 65-byte uncompressed VAPID point (0x04 || X(32) || Y(32))
- *  so `pushManager.subscribe`'s applicationServerKey validation accepts it. */
-function makeVapidKey(): string {
+ *  so `pushManager.subscribe`'s applicationServerKey validation accepts it.
+ *  `seed` varies the point so two workspaces can be given distinct keys. */
+function makeVapidKey(seed = 0): string {
   const bytes = new Uint8Array(65);
   bytes[0] = 0x04;
-  for (let i = 1; i < bytes.length; i++) bytes[i] = i;
+  for (let i = 1; i < bytes.length; i++) bytes[i] = (i + seed) % 256;
   let bin = '';
   for (const b of bytes) bin += String.fromCharCode(b);
   return btoa(bin).replace(/=/g, '').replace(/\+/g, '-').replace(/\//g, '_');
+}
+
+/** The raw bytes a browser reports in `subscription.options.applicationServerKey`
+ *  for a subscription created against `key`. */
+function vapidKeyBytes(key: string): ArrayBuffer {
+  const bin = atob(key.replace(/-/g, '+').replace(/_/g, '/'));
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+  return out.buffer;
 }
 
 /** Install a `granted`-permission Notification + PushManager stub on globalThis,
@@ -73,13 +83,14 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
 
     const fakeRegistration = {
       pushManager: {
+        getSubscription: async () => null,
         subscribe: async () => ({
           toJSON: () => ({ endpoint: 'https://push/x', keys: { p256dh: 'p', auth: 'a' } }),
         }),
       },
     };
     Object.defineProperty(globalThis.navigator, 'serviceWorker', {
-      value: { register: async () => fakeRegistration },
+      value: { register: async () => fakeRegistration, ready: Promise.resolve(fakeRegistration) },
       configurable: true,
     });
     installPermissionStubs();
@@ -159,6 +170,233 @@ describe('push.ts uses api/client helpers (not raw fetch)', () => {
     expect(subscribePost!.body).toContain('self-heal');
     const subscribePayload = JSON.parse(subscribePost!.body!) as Record<string, string>;
     expect(subscribePayload.scope_url).toBe('https://lucidos.test/');
+  });
+});
+
+/**
+ * Regression: a workspace recreated at the same gateway slug mints a fresh
+ * VAPID keypair, but the browser keeps its subscription at the unchanged
+ * `/<slug>/` service-worker scope. Enabling push then died on the browser's
+ * "A subscription with a different applicationServerKey (or gcm_sender_id)
+ * already exists" with no way out of the UI, while the background refresh
+ * silently re-POSTed a subscription the engine could never sign a push for.
+ */
+describe('stale applicationServerKey reconciliation', () => {
+  function sameBytes(a: ArrayBuffer, b: ArrayBuffer): boolean {
+    const x = new Uint8Array(a);
+    const y = new Uint8Array(b);
+    return x.length === y.length && x.every((v, i) => v === y[i]);
+  }
+
+  /** A PushManager fake carrying the browser's real contract: `subscribe()`
+   *  rejects with `InvalidStateError` while a subscription created under a
+   *  different applicationServerKey is still present. `existing.key === null`
+   *  models a browser that hides `options.applicationServerKey`; pair it with
+   *  `hiddenKeyMismatch` to make that hidden key a stale one. */
+  function makeRegistration(existing?: {
+    key: string | null;
+    endpoint: string;
+    hiddenKeyMismatch?: boolean;
+  }) {
+    const calls: string[] = [];
+    let fresh = 0;
+    const makeSub = (keyBytes: ArrayBuffer | null, endpoint: string) => ({
+      endpoint,
+      options: { applicationServerKey: keyBytes },
+      toJSON: () => ({ endpoint, keys: { p256dh: 'p', auth: 'a' } }),
+      unsubscribe: async () => {
+        calls.push(`unsubscribe:${endpoint}`);
+        current = null;
+        return true;
+      },
+    });
+    let current: ReturnType<typeof makeSub> | null = existing
+      ? makeSub(existing.key === null ? null : vapidKeyBytes(existing.key), existing.endpoint)
+      : null;
+
+    const registration = {
+      pushManager: {
+        getSubscription: async () => current,
+        subscribe: async (opts: { applicationServerKey: ArrayBuffer }) => {
+          calls.push('subscribe');
+          if (current) {
+            const reported = current.options.applicationServerKey;
+            const matches = reported
+              ? sameBytes(reported, opts.applicationServerKey)
+              : !existing?.hiddenKeyMismatch;
+            if (!matches) {
+              const err = new Error(
+                'Registration failed - A subscription with a different applicationServerKey (or gcm_sender_id) already exists; to change the applicationServerKey, unsubscribe then resubscribe.',
+              );
+              err.name = 'InvalidStateError';
+              throw err;
+            }
+            return current;
+          }
+          fresh += 1;
+          current = makeSub(opts.applicationServerKey, `https://fcm.googleapis.com/fcm/send/fresh-${fresh}`);
+          return current;
+        },
+      },
+    };
+    return { registration, calls, subscription: () => current };
+  }
+
+  /** Serve `vapidKey` from the engine and accept every POST; returns the log. */
+  function installFetch(vapidKey: string) {
+    const seen: Array<{ url: string; method: string; body?: string }> = [];
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === 'string' ? input : input.toString();
+      seen.push({
+        url,
+        method: init?.method ?? 'GET',
+        body: typeof init?.body === 'string' ? init.body : undefined,
+      });
+      if (url.endsWith('/api/v1/push/vapid-key')) {
+        return new Response(JSON.stringify({ public_key: vapidKey }), {
+          status: 200,
+          headers: { 'content-type': 'application/json' },
+        });
+      }
+      return new Response('{}', { status: 200, headers: { 'content-type': 'application/json' } });
+    }) as typeof fetch;
+    return seen;
+  }
+
+  const subscribedEndpoint = (seen: Array<{ url: string; method: string; body?: string }>) => {
+    const post = seen.find((s) => s.url.endsWith('/api/v1/push/subscribe') && s.method === 'POST');
+    return post ? (JSON.parse(post.body!) as { endpoint: string }).endpoint : null;
+  };
+
+  const OLD_KEY = makeVapidKey(1);
+  const CURRENT_KEY = makeVapidKey(2);
+  const STALE_ENDPOINT = 'https://fcm.googleapis.com/fcm/send/previous-workspace';
+
+  beforeEach(() => {
+    localStorage.setItem('lucidos-device-id', 'dev-test-vapid');
+    Object.defineProperty(window, 'location', {
+      value: { origin: 'https://lucidos.test' },
+      configurable: true,
+    });
+    installPermissionStubs();
+  });
+  afterEach(() => {
+    globalThis.fetch = originalFetch;
+    localStorage.removeItem('lucidos-device-id');
+    vi.resetModules();
+  });
+
+  it('initPushSubscription replaces a subscription bound to a previous VAPID key instead of failing', async () => {
+    const seen = installFetch(CURRENT_KEY);
+    const { registration, calls } = makeRegistration({ key: OLD_KEY, endpoint: STALE_ENDPOINT });
+    Object.defineProperty(globalThis.navigator, 'serviceWorker', {
+      value: { register: async () => registration, ready: Promise.resolve(registration) },
+      configurable: true,
+    });
+
+    const { initPushSubscription } = await import('./push');
+    expect(
+      await initPushSubscription(),
+      'enabling push must recover from a stale applicationServerKey, not report failure',
+    ).toBe(true);
+
+    expect(calls).toEqual([`unsubscribe:${STALE_ENDPOINT}`, 'subscribe']);
+    expect(subscribedEndpoint(seen)).toBe('https://fcm.googleapis.com/fcm/send/fresh-1');
+  });
+
+  it('refreshPushSubscription replaces the stale subscription rather than re-POSTing it', async () => {
+    const seen = installFetch(CURRENT_KEY);
+    const { registration, calls } = makeRegistration({ key: OLD_KEY, endpoint: STALE_ENDPOINT });
+
+    const { refreshPushSubscription } = await import('./push');
+    await refreshPushSubscription(registration as unknown as ServiceWorkerRegistration);
+
+    expect(calls).toEqual([`unsubscribe:${STALE_ENDPOINT}`, 'subscribe']);
+    expect(
+      subscribedEndpoint(seen),
+      'the engine must never be handed an endpoint it cannot sign a push for',
+    ).toBe('https://fcm.googleapis.com/fcm/send/fresh-1');
+  });
+
+  it('a subscription already on the current key is reused, not churned', async () => {
+    const seen = installFetch(CURRENT_KEY);
+    const live = 'https://fcm.googleapis.com/fcm/send/still-good';
+    const { registration, calls } = makeRegistration({ key: CURRENT_KEY, endpoint: live });
+
+    const { refreshPushSubscription } = await import('./push');
+    await refreshPushSubscription(registration as unknown as ServiceWorkerRegistration);
+
+    expect(calls, 'a matching subscription needs neither unsubscribe nor subscribe').toEqual([]);
+    expect(subscribedEndpoint(seen)).toBe(live);
+  });
+
+  it('recovers when the browser hides applicationServerKey and only subscribe() reveals the mismatch', async () => {
+    const seen = installFetch(CURRENT_KEY);
+    const { registration, calls } = makeRegistration({
+      key: null,
+      endpoint: STALE_ENDPOINT,
+      hiddenKeyMismatch: true,
+    });
+
+    const { refreshPushSubscription } = await import('./push');
+    await refreshPushSubscription(registration as unknown as ServiceWorkerRegistration);
+
+    expect(calls).toEqual(['subscribe', `unsubscribe:${STALE_ENDPOINT}`, 'subscribe']);
+    expect(subscribedEndpoint(seen)).toBe('https://fcm.googleapis.com/fcm/send/fresh-1');
+  });
+
+  it('an InvalidStateError with nothing to unsubscribe is surfaced, not retried', async () => {
+    installFetch(CURRENT_KEY);
+    const calls: string[] = [];
+    const registration = {
+      pushManager: {
+        getSubscription: async () => null,
+        subscribe: async () => {
+          calls.push('subscribe');
+          // What subscribing before the worker is active looks like.
+          const err = new Error('Subscription failed - no active Service Worker');
+          err.name = 'InvalidStateError';
+          throw err;
+        },
+      },
+    };
+    Object.defineProperty(globalThis.navigator, 'serviceWorker', {
+      value: { register: async () => registration, ready: Promise.resolve(registration) },
+      configurable: true,
+    });
+
+    const { initPushSubscription } = await import('./push');
+    expect(await initPushSubscription()).toBe(false);
+    expect(calls, 'no subscription to drop means no retry loop').toEqual(['subscribe']);
+  });
+
+  it('subscribes against the active worker, not the registration register() returns', async () => {
+    const seen = installFetch(CURRENT_KEY);
+    // A first-ever registration for this scope comes back still 'installing',
+    // and subscribe() rejects against it. `ready` resolves to the one that
+    // owns the active worker.
+    const installing = {
+      pushManager: {
+        getSubscription: async () => null,
+        subscribe: async () => {
+          const err = new Error('Subscription failed - no active Service Worker');
+          err.name = 'InvalidStateError';
+          throw err;
+        },
+      },
+    };
+    const { registration: active } = makeRegistration();
+    Object.defineProperty(globalThis.navigator, 'serviceWorker', {
+      value: { register: async () => installing, ready: Promise.resolve(active) },
+      configurable: true,
+    });
+
+    const { initPushSubscription } = await import('./push');
+    expect(
+      await initPushSubscription(),
+      'enabling push must wait for the active worker rather than subscribing pre-activation',
+    ).toBe(true);
+    expect(subscribedEndpoint(seen)).toBe('https://fcm.googleapis.com/fcm/send/fresh-1');
   });
 });
 

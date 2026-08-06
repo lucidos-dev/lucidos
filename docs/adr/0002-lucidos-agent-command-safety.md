@@ -267,3 +267,93 @@ Implementation: `engine/cc_permission.rs` (`worktree_write_auto_allowed`,
 `path_inside_worktree`, `lookup_session_worktree`, `hydrate_session_allows`,
 `WORKTREE_WRITE_ALLOW_REASON`, `PermissionState::hydrated_threads`). Plan:
 `docs/plans/2026-07-30-cc-permission-worktree-writes-and-durable-session-allows.md`.
+
+## Addendum (2026-08-06): Undo removes what the command created, and a command that captured nothing shows no card
+
+**Context.** A user ran a `run_python` step the guard classified `ReversibleDanger`
+(it contained `shutil.rmtree(...)`), clicked **Undo**, watched the card flip to
+"Reverted", and nothing observable changed. Two separate holes, both hit at once:
+
+1. The step's destruction target was `.lucidos/tmp/...`, and `.lucidos/` is
+   gitignored. `create_command_checkpoint` snapshots with `git add -A`, which
+   honours `.gitignore`, so the destroyed directory was **never in the snapshot**
+   and Undo had nothing to restore. The card was still offered.
+2. The step's output, a plugin archive under `data/artifacts/`, was created after
+   the snapshot, and the Phase 4 limit above says undo never removes created
+   files. So the one file the user wanted gone stayed.
+
+Together the card offered an Undo that could neither restore what the command
+destroyed nor remove what it made, and then reported success. The user's third
+observation was the one that shaped the fix: **Undo was a blind button.** There
+was no way to see what the step had done before clicking, or what the click did
+after.
+
+**Decision.**
+
+1. **Bracket the command with two snapshots, not one.** The pre image is
+   unchanged. After the command returns, a **post** image is written the same way
+   onto `refs/lucidos/command-post-images/<id>` (a separate namespace: git cannot
+   hold both `refs/x/<id>` and `refs/x/<id>/post`). One
+   `git diff-tree -r -z --no-renames` over the pair names exactly what that
+   command created (`A`), overwrote (`M`) and deleted (`D`).
+2. **Undo removes the files the command created**, lifting the Phase 4 limit.
+   This is safe where the blanket `git clean` rejected above was not, and the
+   difference is the post image rather than a change of nerve: anything that
+   happened *after* the command cannot be in the `A` set, so the deletion is
+   scoped to that one command's own output instead of to everything untracked. A
+   second guard narrows it further: a created file is removed only if git still
+   calls it unchanged against the post image, so a file the user has edited
+   since is kept. That comparison is git's own (`read-tree` the post tree into a
+   throwaway index, an index-wide `update-index --refresh`, then `diff-files`)
+   rather than a blob-sha compare, because a sha compare is wrong for a symlink:
+   git stores the link target path as the blob, while hashing the path follows
+   the link and reads the target file, and a dangling link does not open at all.
+   The refresh deliberately takes no pathspec, since `update-index <path>`
+   re-registers that path from the working tree and would make every file
+   compare equal.
+3. **No card when the pair shows nothing.** An empty diff means the command
+   changed nothing git-visible, so Undo would be a no-op in both directions.
+   Both refs are dropped and no `CommandCheckpointed` is emitted. This is the
+   fix for hole 1, and it is deliberately expressed as "did the snapshot capture
+   a change" rather than as a rule about which paths are ignored, so the guard
+   needs no ignore-awareness of its own.
+4. **The card carries a diff.** `GET /api/v1/command-checkpoint/diff` returns the
+   pre-to-post diff in the same `RepoDiff` shape the repository and change diffs
+   already return, so the frontend renders it with the same components. The card
+   also states what Undo will do, from `restores` / `removes` counts on the
+   event.
+5. **`CommandCheckpointed` moves from before the command to after it.** The
+   decision now depends on the outcome. The card was never actionable early in
+   any case: undoing a command that is still running would fight the running
+   process.
+6. **The refs survive the undo** (they back the diff viewer) and are reclaimed by
+   an opportunistic sweep at checkpoint-creation time, 30 days after the pre
+   image's commit date. Idempotence was already guarded by the persisted
+   `CommandCheckpointReverted` event rather than by the ref's absence, so keeping
+   them changes nothing there.
+
+**Accepted limits.**
+
+- **Content the snapshot cannot capture is still unrecoverable.** Widening the
+  snapshot to ignored paths is not affordable: `.lucidos/` holds coding-agent
+  worktrees, which are full repo copies. What changed is that such a command now
+  says nothing instead of claiming a recovery it cannot perform.
+- **A concurrent writer during the command's own execution window** can land a
+  file in the `A` set. The window is one command's runtime and the byte-identity
+  check narrows it further; distinguishing writers would need process-level file
+  tracking.
+- **Undo remains working-tree-only.** Removing a file that has since been
+  committed leaves an uncommitted deletion, the same shape restoring a committed
+  deletion already had.
+
+**Non-goals.** No change to the classifier, the risk lanes, the judge, the
+trigger side-effect grant, or the coding-agent permission path. No per-file
+selective undo: the diff is read-only and Undo stays all-or-nothing for one
+command.
+
+Implementation: `engine/git_ops/checkpoint.rs` (`create_command_post_image`,
+`diff_checkpoint_effects`, `CheckpointEffects`, `remove_created_files`,
+`prune_expired_checkpoints`), `engine/command_permission.rs`
+(`finalize_command_checkpoint`), `api/command_checkpoint.rs`, `api/diff.rs`,
+`components/chat/CheckpointDiffModal.tsx`. Plan:
+`docs/plans/2026-08-06-command-checkpoint-undo-removes-created-files.md`.

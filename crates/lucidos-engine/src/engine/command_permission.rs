@@ -32,6 +32,7 @@ use crate::engine::command_guard::{
     StaticVerdict,
 };
 use crate::engine::event_bus::{BusEvent, EventBus};
+use crate::engine::git_ops::CheckpointEffects;
 use crate::engine::thread_events::{EventChannel, EventMeta, MessageOrigin, ThreadEvent};
 use crate::engine::LucidosEngine;
 use crate::llm::tool_names as tn;
@@ -96,11 +97,22 @@ pub fn derive_command_allow_pattern(
 /// `Bash(git:*)` grant. A command with no derivable head is never auto-allowed
 /// (the card is shown). Python: the coarse `Python` pattern (the python tool
 /// has no finer sub-scope).
+///
+/// A head-derived grant is refused outright when the command carries a
+/// code-injecting `VAR=value` preamble. The head walk skips that preamble, so
+/// `LD_PRELOAD=/tmp/evil.so ls` resolves to `ls` and a `Bash(ls:*)` grant would
+/// auto-allow arbitrary loaded code with no card and no checkpoint. The Safe
+/// fast path already refuses it; this is the same refusal on the grant lane, via
+/// the one shared predicate. A broad `Bash` grant is deliberately still honoured:
+/// it means "any command", which this is one of.
 pub fn command_is_allowed(tool_name: &str, command: &str, allowed: impl Fn(&str) -> bool) -> bool {
     match tool_name {
         tn::RUN_BASH | tn::RUN_BASH_BACKGROUND => {
             if allowed("Bash") {
                 return true;
+            }
+            if command_guard::command_has_code_injecting_env(command) {
+                return false;
             }
             let heads = command_guard::segment_heads(command);
             !heads.is_empty() && heads.iter().all(|h| allowed(&format!("Bash({h}:*)")))
@@ -598,6 +610,69 @@ fn action_for_lane(
     }
 }
 
+/// Why a checkpoint's two refs are being dropped without ever showing a card.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiscardReason {
+    /// The pre and post images are identical, so the command changed nothing
+    /// git-visible. The usual cause is destruction inside a gitignored path
+    /// (`.lucidos/`, `data/blobs/`), which `git add -A` never captured: undo
+    /// could neither restore it nor find anything to remove.
+    NothingCaptured,
+    /// The post image could not be written or diffed, so there is no way to say
+    /// what the command did.
+    PostImageFailed,
+}
+
+impl DiscardReason {
+    fn explain(self) -> &'static str {
+        match self {
+            Self::NothingCaptured => {
+                "the command changed nothing git-visible (its target is gitignored, \
+                 or it destroyed nothing)"
+            }
+            Self::PostImageFailed => "no post image, so what it changed is unknowable",
+        }
+    }
+}
+
+/// What [`LucidosEngine::finalize_command_checkpoint`] does once the post image
+/// has been attempted.
+///
+/// Split out as a pure decision because the three no-card paths are the whole
+/// point of the 2026-08-06 change and each is a different judgment. Only the
+/// emit and the ref delete need an engine; deciding between them does not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CheckpointOutcome {
+    /// The command changed something git-visible: show the card, with what
+    /// Undo would put back and what it would remove.
+    Card { restores: u32, removes: u32 },
+    /// Nothing worth keeping. Drop both refs and emit no event.
+    Discard(DiscardReason),
+    /// The refs are fine but the diff could not be read. Keep them and show no
+    /// card: the pre image is still a usable restore point, and the retention
+    /// sweep reclaims it in its own time.
+    KeepRefsNoCard,
+}
+
+/// Map the post-image attempt onto what to do about it.
+///
+/// The `Ok(None)` arm is the subtle one. `diff_checkpoint_effects` returns it
+/// for a missing ref, but both refs were written moments ago here, so at this
+/// call site it can only mean a ref probe that could not run. That is a reason
+/// to say nothing, never a reason to delete the one snapshot standing between
+/// the user and an unrecoverable command.
+fn checkpoint_outcome(effects: Result<Option<CheckpointEffects>, String>) -> CheckpointOutcome {
+    match effects {
+        Err(_) => CheckpointOutcome::Discard(DiscardReason::PostImageFailed),
+        Ok(None) => CheckpointOutcome::KeepRefsNoCard,
+        Ok(Some(e)) if e.is_empty() => CheckpointOutcome::Discard(DiscardReason::NothingCaptured),
+        Ok(Some(e)) => CheckpointOutcome::Card {
+            restores: e.restores,
+            removes: e.removes(),
+        },
+    }
+}
+
 impl LucidosEngine {
     /// The command guard's pre-dispatch decision for one bash/python tool call
     /// (ADR 0002). Always `Proceed` when the guard is off (`ctx.enabled` false),
@@ -656,17 +731,15 @@ impl LucidosEngine {
             GuardAction::Checkpoint => {
                 // Snapshot the workspace before the in-workspace destruction so
                 // the user can one-click Undo. A failed snapshot logs and still
-                // proceeds (unguarded) — the pre-Phase-4 behavior — rather than
+                // proceeds (unguarded), the pre-Phase-4 behavior, rather than
                 // block a legitimate cleanup on a git hiccup.
-                self.checkpoint_before_reversible_command(
-                    thread_id,
-                    tool_name,
-                    input,
-                    meta,
-                    summary.as_deref(),
-                )
-                .await;
-                GuardDecision::Proceed
+                match self
+                    .checkpoint_before_reversible_command(tool_name, input, summary.as_deref())
+                    .await
+                {
+                    Some(pending) => GuardDecision::ProceedCheckpointed(pending),
+                    None => GuardDecision::Proceed,
+                }
             }
             GuardAction::Refuse => {
                 crate::log!(
@@ -703,24 +776,23 @@ impl LucidosEngine {
         }
     }
 
-    /// Snapshot the workspace before a `ReversibleDanger` command and emit
-    /// `CommandCheckpointed` so the user can one-click Undo (ADR 0002, Phase 4).
-    /// Best-effort: a failed snapshot logs and emits nothing, and the command
-    /// still runs — in-workspace destruction was recoverable-in-principle before
+    /// Take the **pre** image before a `ReversibleDanger` command runs (ADR
+    /// 0002, Phase 4). Nothing is emitted here: what the command turns out to
+    /// change is what decides whether a card is worth showing, and that is only
+    /// knowable afterwards (`finalize_command_checkpoint`).
+    ///
+    /// Best-effort: a failed snapshot logs and returns `None`, and the command
+    /// still runs. In-workspace destruction was recoverable-in-principle before
     /// Phase 4 too, so a git hiccup must not block a legitimate cleanup. With no
     /// `CommandCheckpointed` event the UI simply shows no Undo affordance (never
     /// a button that can't actually restore).
     async fn checkpoint_before_reversible_command(
         &self,
-        thread_id: Uuid,
         tool_name: &str,
         input: &Value,
-        meta: &EventMeta,
         summary_override: Option<&str>,
-    ) {
-        let command = command_guard::command_text(tool_name, input)
-            .unwrap_or_default()
-            .to_string();
+    ) -> Option<command_guard::PendingCheckpoint> {
+        let command = command_guard::command_text(tool_name, input).unwrap_or_default();
         let checkpoint_id = Uuid::new_v4().to_string();
         if let Err(e) =
             crate::engine::git_ops::create_command_checkpoint(self.workspace_path(), &checkpoint_id)
@@ -730,37 +802,94 @@ impl LucidosEngine {
                 "[CommandGuard] checkpoint failed ({}); running the command without an undo point",
                 e
             );
-            return;
+            return None;
         }
-        let summary = summary_override.map(str::to_string).unwrap_or_else(|| {
-            "Deletes or overwrites files inside the workspace (recoverable).".to_string()
-        });
-        // Same postgres-URL redaction the agentic loop applies to ToolCalled.args
-        // before the command text is persisted + SSE-broadcast.
-        let command_for_event = crate::core::redact_postgres_secrets(&command);
-        self.event_bus
-            .emit_or_log(
-                BusEvent::Thread {
-                    thread_id,
-                    event: ThreadEvent::CommandCheckpointed {
-                        checkpoint_id,
-                        command: command_for_event,
-                        summary,
-                    },
-                    meta: meta.clone(),
-                },
-                "[CommandGuard] CommandCheckpointed",
-            )
-            .await;
+        Some(command_guard::PendingCheckpoint {
+            checkpoint_id,
+            // Same postgres-URL redaction the agentic loop applies to
+            // ToolCalled.args before the command text is persisted and
+            // SSE-broadcast.
+            command: crate::core::redact_postgres_secrets(command),
+            summary: summary_override.map(str::to_string).unwrap_or_else(|| {
+                "Deletes or overwrites files inside the workspace (recoverable).".to_string()
+            }),
+        })
     }
 
-    /// Undo a command checkpoint (ADR 0002, Phase 4): restore the workspace
-    /// working tree from the checkpoint ref, delete the ref, and emit
-    /// `CommandCheckpointReverted`. The originating thread is resolved from the
-    /// `CommandCheckpointed` event (so the revert lands on the right thread).
-    /// Idempotent: a checkpoint already reverted (or whose ref is gone) is a
-    /// no-op error-free return on the duplicate, an `Err` only on a genuinely
-    /// unknown id or a failed git restore.
+    /// Close the checkpoint bracket once the command has returned: write the
+    /// **post** image, diff it against the pre image, and emit
+    /// `CommandCheckpointed` only if the command actually changed something
+    /// git-visible.
+    ///
+    /// The empty case is the one this exists for. A command whose destruction
+    /// landed entirely in a gitignored path (`.lucidos/`, `data/blobs/`) leaves
+    /// the two images identical, because `git add -A` never captured it. Before
+    /// 2026-08-06 that still produced a card, whose Undo restored nothing,
+    /// removed nothing, and then reported "Reverted". Now it produces no card
+    /// and both refs are dropped.
+    ///
+    /// Best-effort throughout, on the same reasoning as the pre image: a git
+    /// failure here costs the undo affordance, never the command's result.
+    pub(crate) async fn finalize_command_checkpoint(
+        &self,
+        pending: command_guard::PendingCheckpoint,
+        thread_id: Uuid,
+        meta: &EventMeta,
+    ) {
+        let workspace = self.workspace_path();
+        let id = &pending.checkpoint_id;
+        let effects = match crate::engine::git_ops::create_command_post_image(workspace, id).await {
+            Ok(()) => crate::engine::git_ops::diff_checkpoint_effects(workspace, id).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = &effects {
+            crate::log!("[CommandGuard] checkpoint {} post image failed: {}", id, e);
+        }
+        match checkpoint_outcome(effects) {
+            CheckpointOutcome::Discard(reason) => {
+                crate::log!(
+                    "[CommandGuard] checkpoint {} dropped: {}",
+                    id,
+                    reason.explain()
+                );
+                crate::engine::git_ops::delete_command_checkpoint_pair(workspace, id).await;
+            }
+            CheckpointOutcome::KeepRefsNoCard => crate::log!(
+                "[CommandGuard] checkpoint {} effects unavailable; refs kept, no card shown",
+                id
+            ),
+            CheckpointOutcome::Card { restores, removes } => {
+                self.event_bus
+                    .emit_or_log(
+                        BusEvent::Thread {
+                            thread_id,
+                            event: ThreadEvent::CommandCheckpointed {
+                                checkpoint_id: pending.checkpoint_id.clone(),
+                                command: pending.command,
+                                summary: pending.summary,
+                                restores,
+                                removes,
+                            },
+                            meta: meta.clone(),
+                        },
+                        "[CommandGuard] CommandCheckpointed",
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Undo a command checkpoint (ADR 0002, Phase 4 and the 2026-08-06
+    /// addendum): restore the workspace working tree from the pre image, remove
+    /// the files the command created, and emit `CommandCheckpointReverted`. The
+    /// originating thread is resolved from the `CommandCheckpointed` event (so
+    /// the revert lands on the right thread).
+    ///
+    /// Idempotent: a checkpoint already reverted is an error-free no-op on the
+    /// duplicate, an `Err` only on a genuinely unknown id or a failed git
+    /// restore. The guard for that is the persisted `CommandCheckpointReverted`
+    /// event rather than the absence of the ref, which is what lets the refs
+    /// survive the undo for the card's diff viewer to read.
     pub async fn undo_command_checkpoint(
         &self,
         checkpoint_id: &str,
@@ -802,10 +931,43 @@ impl LucidosEngine {
             return Ok(());
         }
 
-        crate::engine::git_ops::restore_command_checkpoint(self.workspace_path(), checkpoint_id)
-            .await?;
-        crate::engine::git_ops::delete_command_checkpoint_ref(self.workspace_path(), checkpoint_id)
-            .await;
+        let workspace = self.workspace_path();
+        // Put back what the command deleted or overwrote …
+        crate::engine::git_ops::restore_command_checkpoint(workspace, checkpoint_id).await?;
+        // … then drop what it created. `Ok(None)` is a checkpoint with no post
+        // image (written before 2026-08-06, reclaimed by the retention sweep, or
+        // orphaned by a crash), which degrades to the restore-only behaviour
+        // those checkpoints were taken under. A diff error does the same rather
+        // than fail an undo whose restore half already landed.
+        match crate::engine::git_ops::diff_checkpoint_effects(workspace, checkpoint_id).await {
+            Ok(Some(effects)) => {
+                let removed = crate::engine::git_ops::remove_created_files(
+                    workspace,
+                    checkpoint_id,
+                    &effects.created,
+                )
+                .await;
+                crate::log!(
+                    "[CommandGuard] undo {}: restored {} file(s), removed {} of {} created",
+                    checkpoint_id,
+                    effects.restores,
+                    removed,
+                    effects.removes()
+                );
+            }
+            Ok(None) => crate::log!(
+                "[CommandGuard] undo {}: restore only (no post image for this checkpoint)",
+                checkpoint_id
+            ),
+            Err(e) => crate::log!(
+                "[CommandGuard] undo {}: restored, but the created-file diff failed ({})",
+                checkpoint_id,
+                e
+            ),
+        }
+        // The refs deliberately survive: they are what the card's diff viewer
+        // reads, and a reverted card must still be able to show what happened.
+        // `prune_expired_checkpoints` reclaims them once they age out.
 
         self.event_bus
             .emit_or_log(
@@ -1020,6 +1182,71 @@ impl LucidosEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The reported bug, at the decision layer. A `run_python` step whose only
+    /// destruction was an `rmtree` of a gitignored staging directory leaves the
+    /// two images identical. Before 2026-08-06 that still drew a card, whose
+    /// Undo restored nothing, removed nothing, and then said "Reverted".
+    #[test]
+    fn a_command_that_captured_nothing_gets_no_card_and_loses_its_refs() {
+        assert_eq!(
+            checkpoint_outcome(Ok(Some(CheckpointEffects::default()))),
+            CheckpointOutcome::Discard(DiscardReason::NothingCaptured)
+        );
+    }
+
+    #[test]
+    fn a_command_that_changed_something_gets_a_card_carrying_both_counts() {
+        let effects = CheckpointEffects {
+            restores: 3,
+            created: vec!["data/artifacts/out.zip".to_string()],
+        };
+        assert_eq!(
+            checkpoint_outcome(Ok(Some(effects))),
+            CheckpointOutcome::Card {
+                restores: 3,
+                removes: 1
+            }
+        );
+    }
+
+    /// A destruction with nothing created still earns a card: restoring is the
+    /// original point of the lane.
+    #[test]
+    fn a_pure_destruction_still_gets_a_card() {
+        let effects = CheckpointEffects {
+            restores: 2,
+            created: vec![],
+        };
+        assert_eq!(
+            checkpoint_outcome(Ok(Some(effects))),
+            CheckpointOutcome::Card {
+                restores: 2,
+                removes: 0
+            }
+        );
+    }
+
+    /// A failed post image means we cannot say what the command did, so there
+    /// is nothing a card could honestly offer.
+    #[test]
+    fn a_failed_post_image_drops_the_pair() {
+        assert_eq!(
+            checkpoint_outcome(Err("git write-tree exploded".to_string())),
+            CheckpointOutcome::Discard(DiscardReason::PostImageFailed)
+        );
+    }
+
+    /// Both refs were written moments before this call, so `Ok(None)` here is a
+    /// probe that could not run, not a missing pair. It must NOT be read as a
+    /// licence to delete the pre image: that snapshot is the only thing
+    /// standing between the user and an unrecoverable command.
+    #[test]
+    fn an_unreadable_diff_keeps_the_refs_rather_than_dropping_them() {
+        assert_eq!(
+            checkpoint_outcome(Ok(None)),
+            CheckpointOutcome::KeepRefsNoCard
+        );
+    }
 
     #[test]
     fn derive_pattern_bash_scopes() {
@@ -1087,6 +1314,36 @@ mod tests {
         assert!(command_is_allowed(
             tn::RUN_BASH,
             "git pull",
+            allowed_in(&["Bash"])
+        ));
+    }
+
+    /// The head walk skips a `VAR=value` preamble, so a narrow grant on the head
+    /// would otherwise auto-allow arbitrary loaded code with no card. The Safe
+    /// fast path already refuses these; this is the same refusal on the grant
+    /// lane.
+    #[test]
+    fn a_narrow_grant_never_covers_a_code_injecting_env_preamble() {
+        for cmd in [
+            "LD_PRELOAD=/tmp/evil.so ls",
+            "PATH=data/bin ls",
+            "ls && LD_PRELOAD=/tmp/evil.so ls",
+        ] {
+            assert!(
+                !command_is_allowed(tn::RUN_BASH, cmd, allowed_in(&["Bash(ls:*)"])),
+                "{cmd} must not be auto-allowed by a narrow grant"
+            );
+        }
+        // An ordinary assignment is unaffected.
+        assert!(command_is_allowed(
+            tn::RUN_BASH,
+            "FOO=1 ls",
+            allowed_in(&["Bash(ls:*)"])
+        ));
+        // A broad grant means "any command", so it still covers it.
+        assert!(command_is_allowed(
+            tn::RUN_BASH,
+            "LD_PRELOAD=/tmp/evil.so ls",
             allowed_in(&["Bash"])
         ));
     }

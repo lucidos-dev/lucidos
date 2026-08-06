@@ -95,8 +95,8 @@ impl LucidosEngine {
             .and_then(|s| s.cancel_actor.take())
     }
 
-    /// Read and clear the redirect flag set by `arm_codex_redirect` when a
-    /// follow-up interrupts a mid-turn Codex turn. The run_session interrupt arm
+    /// Read and clear the redirect flag set by `arm_followup_redirect` when a
+    /// follow-up interrupts a mid-turn coding-agent turn. The run_session interrupt arm
     /// calls this so the interrupted turn's `ResponseCanceled` carries
     /// `CancelCause::SupersededByFollowup` (neutral render) rather than
     /// `UserStop`. Drained on read — a resumed session must not carry a stale

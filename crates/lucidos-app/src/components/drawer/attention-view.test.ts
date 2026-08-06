@@ -59,6 +59,7 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         lastRevivedAt: '',
         state: opts.state ?? 'active',
         latestTodoList: null,
+    liveEventWaits: [],
     };
     return {
         meta,

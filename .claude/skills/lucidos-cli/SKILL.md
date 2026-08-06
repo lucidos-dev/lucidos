@@ -24,6 +24,7 @@ The `lucidos` CLI is on your `PATH`. Use it whenever you need to:
 | Look up prior events | `lucidos events query` |
 | Apply a pending change | `lucidos changes apply <id>` |
 | Spawn a sub-thread or hand a task to another workspace | `lucidos spawn-thread` |
+| Wait on something the engine will emit, without polling | `lucidos await-event` |
 
 **This rule extends to bash and python you write.** A Python script using `open('artifacts/foo.html', 'w')` from inside the worktree has the same problem your `Write` tool has — the file lands in the worktree, not the workspace. Inside scripts, shell out to `lucidos`:
 
@@ -110,6 +111,43 @@ $ lucidos changes apply fbcc4a3a-2c14-4d5b-8d1a-9e84d4c9d4ec
 **Always use this instead of hand-rolling the HTTP call.** A `Bash` block that runs `curl -X POST .../api/v1/changes/<id>/apply` from inside this worktree ships without the subprocess-origin headers, so the engine stamps `Api { mode: Human }` and the UI shows the resulting Apply card as **"You"**, wrongly attributing your action to the user. The CLI forwards `x-lucidos-agent-origin-token` from the engine-injected env var, so the card correctly says "Lucidos Agent" with the source thread linked. That one header carries both facts: the token is bound to the thread it was minted for, and the engine reads the source thread off the token itself.
 
 `status` is `applied`, `noop`, `hardening`, or `conflict`. See `docs/apply-change-api.md` for the full response shape. Exit non-zero on transport / HTTP error with the engine's error body on stderr.
+
+### `lucidos await-event --on <EventType> [--condition <json>] --timeout-secs <n> --reason <text>`
+
+Subscribe THIS thread to a Lucidos event, then **finish your session**. Returns
+immediately and blocks nothing: the engine re-opens this thread with a follow-up
+message when a matching event lands, or tells you the deadline passed. Wraps
+`POST /api/v1/threads/<id>/event-waits`; `$LUCIDOS_THREAD_ID` names the thread.
+
+```bash
+# Spawn a sidequest, subscribe to its completion, and STOP.
+$ lucidos spawn-thread --relation child --to "$(basename "$LUCIDOS_WORKSPACE")" --cc \
+    --title "Run the e2e suite" --message "Run ./scripts/e2e.sh and report."
+$ lucidos await-event --on ChildThreadCompleted --timeout-secs 5400 \
+    --reason "waiting for the e2e sidequest"
+```
+
+**Use it instead of a sleep-and-recheck loop.** A `while sleep 60; do lucidos
+events query ...; done` for anything the engine emits burns a tool call per
+poll, samples on an interval so it can miss a transition, and dies with your
+session. This does not: the subscription is persisted and survives an engine
+restart.
+
+**Then actually stop.** Say what you subscribed to and end the turn. Do not poll
+for it afterwards, and do not keep the session alive waiting. The thread is
+plain idle while it watches, and the wake starts a fresh turn with the whole
+conversation behind it.
+
+Not for external state with no Lucidos event (a third-party API you can only
+re-query, a file another process might write): nothing would wake you, so poll
+for those. A rendezvous, not a stream: the first match consumes it, and a
+standing "every time X happens" rule is a *trigger* instead.
+
+`--on` repeats to watch several types. `--condition` is a JSON object filtering
+the event's own payload fields, applied to every `--on`. `--timeout-secs` is
+required and capped at 24 h. `--reason` is one line the user reads in the
+subscription indicator. A refusal comes back as a `400` with the reason: read it
+rather than retrying.
 
 ### `lucidos spawn-thread --to <ws> [--relation child|top] [--cc] [--repo <name>] --message <text> --title <text>`
 

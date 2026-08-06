@@ -337,15 +337,16 @@ fn both_teardown_sites_consult_the_preserve_guard() {
         (
             "emit_stop_terminal (skips the terminal and the text flush)",
             include_str!("../agent_session/runtime_helpers.rs"),
-            // The second needle pins the cause gate's widening. `is_shutdown`
-            // alone is the PER-SESSION flag, so dropping the OR silently
-            // un-guards the very race the guard's doc names: a session inserted
-            // after `shutdown_agent_sessions` took its flag pass. Every
-            // behavioural test would still pass, because they drive the guard
-            // directly rather than through this call site.
+            // The second needle pins the WIDENING, which the guard depends on
+            // and does not perform: the parameter arrives as the PER-SESSION
+            // flag, which reads `false` for a session inserted after
+            // `shutdown_agent_sessions` took its pass, and un-widened it would
+            // un-guard the very race the guard's doc names. Every behavioural
+            // test would still pass, because they drive the guard directly
+            // rather than through this call site.
             &[
                 "agent_recovery::preserve_question_park_at_shutdown(",
-                "is_shutdown || self.is_shutting_down()",
+                "let is_shutdown = self.session_is_shutting_down(is_shutdown);",
             ][..],
         ),
     ] {
@@ -357,4 +358,33 @@ fn both_teardown_sites_consult_the_preserve_guard() {
             );
         }
     }
+
+    // The needles above prove the widening EXISTS and the guard is CALLED. They
+    // do not, on their own, prove the guard is handed the widened value: moving
+    // the rebinding below the call, or passing the raw parameter while keeping
+    // the shadow for `stop_terminal_kind`, would satisfy both and silently
+    // restore the race. Before 2026-08-06 the second needle was the call's own
+    // argument expression, so it carried that proof; the named accessor moved
+    // the widening onto its own line and cost it. Pin the ORDER back.
+    let source = include_str!("../agent_session/runtime_helpers.rs");
+    let widen_at = source
+        .find("let is_shutdown = self.session_is_shutting_down(is_shutdown);")
+        .expect("asserted above");
+    let guard_at = source
+        .find("agent_recovery::preserve_question_park_at_shutdown(")
+        .expect("asserted above");
+    assert!(
+        widen_at < guard_at,
+        "emit_stop_terminal must widen `is_shutdown` BEFORE the preserve guard \
+         reads it, or the guard runs on the per-session flag alone and a session \
+         registered after the teardown snapshot loses its question park"
+    );
+    // And the guard must actually receive that binding rather than some other
+    // expression. The call spans a few lines, so look at its argument list.
+    let guard_call = &source[guard_at..(guard_at + 240).min(source.len())];
+    assert!(
+        guard_call.contains("is_shutdown,"),
+        "the preserve guard must be passed the widened `is_shutdown`; its \
+         argument list reads:\n{guard_call}"
+    );
 }

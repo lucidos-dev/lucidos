@@ -64,7 +64,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   submitChat: vi.fn().mockResolvedValue(undefined),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
-  putComposeOnThread: vi.fn().mockResolvedValue(undefined),
+  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
@@ -1151,7 +1151,7 @@ describe('handleArchiveThread — unsent draft confirm', () => {
   beforeEach(() => {
     toasts.value = [];
     confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
-    (putComposeOnThread as ReturnType<typeof vi.fn>).mockClear().mockResolvedValue(undefined);
+    (putComposeOnThread as ReturnType<typeof vi.fn>).mockClear().mockResolvedValue({ status: 'applied' });
   });
 
   function seedDraftThread(): void {

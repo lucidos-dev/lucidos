@@ -897,11 +897,11 @@ fn engine_restart_interrupt_reason_constant_is_stable() {
     );
 }
 
-/// The *Switch to new version* fingerprint has a THIRD consumer now, in another
-/// language: `abortPromisesAutoResume` in
-/// `crates/lucidos-app/src/store/thread-events/exchange-render.ts` reads the same
-/// `engine_shutdown` + device-actor pair off the event to withhold the Continue
-/// button while the engine auto-resumes the turn.
+/// The *Switch to new version* fingerprint has consumers beyond the two resume
+/// gates now, and one of them is in another language: `abortPromisesAutoResume`
+/// in `crates/lucidos-app/src/store/thread-events/exchange-render.ts` reads the
+/// same `engine_shutdown` + device-actor pair off the event to withhold the
+/// Continue button while the engine auto-resumes the turn.
 ///
 /// TypeScript cannot import this constant, so this is the canary: change either
 /// half of the pair and the frontend keeps reading the old shape, which is wrong
@@ -910,8 +910,15 @@ fn engine_restart_interrupt_reason_constant_is_stable() {
 /// separately because both are load-bearing: a device actor alone is not the
 /// fingerprint, since `StaleSettle` deliberately carries the actor of whichever
 /// button exposed the stuck row.
+///
+/// The in-Rust consumer, `AbortCause::promises_auto_resume`, is checked against
+/// the same constant here rather than trusted to stay parallel by inspection: it
+/// decides the `paused` verdict, so a drift between it and the SQL would show a
+/// user a pause glyph on a turn no gate will resume.
 #[test]
 fn switch_teardown_fingerprint_is_stable_for_the_frontend_mirror() {
+    use crate::engine::thread_events::{AbortCause, MessageOrigin};
+
     let sql = crate::engine::agent_recovery::SWITCH_TEARDOWN_ABORT_SQL;
     assert!(
         sql.contains("event_type = 'ResponseAborted'"),
@@ -924,6 +931,23 @@ fn switch_teardown_fingerprint_is_stable_for_the_frontend_mirror() {
     assert!(
         sql.contains("'device'"),
         "the actor half of the fingerprint changed; update abortPromisesAutoResume: {sql}"
+    );
+
+    let device = MessageOrigin::Device {
+        device_id: "dev-1".to_string(),
+        label: "My MacBook".to_string(),
+    };
+    assert!(
+        AbortCause::EngineShutdown.promises_auto_resume(Some(&device)),
+        "the Rust predicate must match the same pair the SQL selects"
+    );
+    assert!(
+        !AbortCause::EngineShutdown.promises_auto_resume(Some(&MessageOrigin::system())),
+        "a system actor is not the switch fingerprint, so it promises no resume"
+    );
+    assert!(
+        !AbortCause::RecoveryAfterRestart.promises_auto_resume(Some(&device)),
+        "the boot floor's withdrawal carries no promise, whoever it is attributed to"
     );
 }
 

@@ -15,7 +15,7 @@ import { toFailed } from '../types';
 import { errorDetail } from '../../utils/errorDetail';
 import { postClientLog } from '../../utils/liveness';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
-import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft } from './compose';
+import { pendingComposePuts, composeEditedAt, composePutSettledAt, hasUnsentLocalDraft, clearSupersededDraft, noteServerDraft, noteComposeEpoch } from './compose';
 
 /** Buffer for batched compose draft writes during loadAllThreads — hundreds
  *  of threads through the upsertThread loop should land in one signal write,
@@ -74,6 +74,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       codingAgent: info.coding_agent || undefined,
       state: info.state,
       latestTodoList: null,
+  liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',
@@ -111,6 +112,10 @@ function stageDraftFromApi(info: ThreadSummary, batch?: DraftBatch): void {
   // Callers gate this whole function on the staleness guards, so a snapshot
   // known to predate a local write never lands here.
   noteServerDraft(info.thread_id, text, image_hashes);
+  // The snapshot's *compose epoch*, recorded on the same "this is what the
+  // engine holds" footing as the draft itself, and likewise before the guard
+  // below can decide to keep a local draft instead.
+  noteComposeEpoch(info.thread_id, info.compose_epoch);
   const mode = info.compose_mode ?? null;
   const isEmpty = composeSnapshotIsEmpty(info);
   // A bulk loadAllThreads/upsert snapshot must NEVER clear a non-empty draft

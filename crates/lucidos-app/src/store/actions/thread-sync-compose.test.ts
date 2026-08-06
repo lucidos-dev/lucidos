@@ -52,6 +52,7 @@ function makeActiveThread(overrides: MakeThreadOpts = {}): ThreadState {
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...metaOverrides,
     },
     events: new Map(),

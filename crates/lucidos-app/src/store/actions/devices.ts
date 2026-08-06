@@ -101,22 +101,70 @@ export async function reconcileDesktopDeviceId(workspace: string): Promise<void>
   if (timer) clearTimeout(timer);
 }
 
+/** This page load's registration attempt, resolving when it has settled either
+ *  way. Set by `registerCurrentDevice`; read via `pendingDeviceRegistration`. */
+let registration: Promise<void> | null = null;
+/** Whether [`registration`] has already settled, readable SYNCHRONOUSLY. The
+ *  send path needs to know without awaiting: see `pendingDeviceRegistration`. */
+let registrationHasSettled = false;
+
 /** Register this device with the backend on startup */
 export async function registerCurrentDevice(): Promise<void> {
   const deviceId = getDeviceId();
-  try {
-    // Tag the registered UA with the desktop-app token when in Tauri, so the
-    // engine (and the Lucidos Agent's device context) can tell the native
-    // desktop client from a browser and give the right notification advice.
-    await apiRegisterDevice(deviceId, registrationUserAgent(navigator.userAgent, isTauri()));
-  } catch (e) {
-    // Telemetry carve-out (.claude/rules/frontend.md): startup probe runs on
-    // every page load without user intent. A toast on every transient backend
-    // hiccup would be too noisy; the device retries on next reload, and
-    // user-facing features that need a registered device (push, per-device
-    // prefs) surface their own toasts when they fail.
-    console.warn('[Devices] Failed to register device:', e);
-  }
+  const attempt = (async () => {
+    try {
+      // Tag the registered UA with the desktop-app token when in Tauri, so the
+      // engine (and the Lucidos Agent's device context) can tell the native
+      // desktop client from a browser and give the right notification advice.
+      await apiRegisterDevice(deviceId, registrationUserAgent(navigator.userAgent, isTauri()));
+    } catch (e) {
+      // Telemetry carve-out (.claude/rules/frontend.md): startup probe runs on
+      // every page load without user intent. A toast on every transient backend
+      // hiccup would be too noisy; the device retries on next reload, and
+      // user-facing features that need a registered device (push, per-device
+      // prefs) surface their own toasts when they fail.
+      console.warn('[Devices] Failed to register device:', e);
+    }
+  })();
+  registrationHasSettled = false;
+  // `attempt` swallows its own errors, so this never rejects.
+  registration = attempt.finally(() => {
+    registrationHasSettled = true;
+  });
+  return registration;
+}
+
+/** How long a send will wait on registration before going anyway. */
+const REGISTRATION_WAIT_MS = 3000;
+
+/** What a send must wait for before claiming `mode: 'human'`, or `null` when
+ *  there is nothing to wait for.
+ *
+ *  `useStartup` fires `registerCurrentDevice()` without awaiting it, and the
+ *  engine refuses a human-mode chat POST whose device id is not in `devices`
+ *  (ADR 0050). A send issued in the first moments of a page load could
+ *  therefore race its own registration and come back 403, which for a real
+ *  person typing is both wrong and unexplainable.
+ *
+ *  Returns `null` (rather than an already-resolved promise) once registration
+ *  has settled, which is the state every send but the very first is in.
+ *  That is not an optimisation: `sendMessage` must dispatch a lone send inside
+ *  the caller's synchronous turn, because callers assert on the fetch mock
+ *  right after `sendFollowup` without awaiting, and awaiting even a resolved
+ *  promise costs a microtask and breaks them. Same shape as the send chain's
+ *  `waitForTurn` for the same reason, and pinned by
+ *  `dispatches a lone send synchronously, without deferring a microtask`.
+ *
+ *  The returned promise never rejects and is capped, so a registration that
+ *  hangs delays a send by at most [`REGISTRATION_WAIT_MS`]. Going ahead
+ *  unregistered is the honest fallback: the send may then be refused, which is
+ *  the right answer if this client genuinely cannot register. */
+export function pendingDeviceRegistration(): Promise<void> | null {
+  if (!registration || registrationHasSettled) return null;
+  return Promise.race([
+    registration,
+    new Promise<void>((resolve) => setTimeout(resolve, REGISTRATION_WAIT_MS)),
+  ]);
 }
 
 /** Load all devices from the backend */

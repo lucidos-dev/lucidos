@@ -105,7 +105,7 @@ pub(crate) fn fetch_source(
     workspace: &Path,
     source: &Source,
 ) -> Result<(tempfile::TempDir, PathBuf, SourceType), String> {
-    let parent = workspace.join(".lucidos").join("tmp").join("plugins");
+    let parent = workspace.join(crate::core::TMP_DIR).join("plugins");
     std::fs::create_dir_all(&parent).map_err(|e| format!("create scratch dir: {}", e))?;
     let scratch =
         tempfile::TempDir::new_in(&parent).map_err(|e| format!("create scratch dir: {}", e))?;

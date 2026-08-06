@@ -8,7 +8,8 @@ import {
   openEditApp,
   closeAppSearch,
 } from '../../store/actions/apps';
-import { loadPluginCatalog, installMarketplacePlugin } from '../../store/actions/plugin-marketplaces';
+import { loadPluginCatalog } from '../../store/actions/plugin-marketplaces';
+import { installMarketplacePlugin } from '../../store/actions/plugin-install';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf } from '../shared/Skeleton';

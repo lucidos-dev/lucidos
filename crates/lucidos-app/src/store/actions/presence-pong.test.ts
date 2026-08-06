@@ -15,7 +15,7 @@ vi.mock('../../api/client', () => ({ API_BASE: 'http://test', API: 'http://test/
 vi.mock('../../utils/pageActive', () => ({ isPageActive: isPageActiveMock }));
 vi.mock('../../utils/viewport', () => ({ isInViewport: isInViewportMock }));
 vi.mock('../store', () => ({ focusedThreadId: focusedThreadIdSignal }));
-vi.mock('./devices', () => ({ getDeviceId: getDeviceIdMock }));
+vi.mock('./devices', () => ({ getDeviceId: getDeviceIdMock, pendingDeviceRegistration: vi.fn() }));
 vi.mock('./in-app-notification-toast', () => ({
   showInAppNotificationToast: showInAppNotificationToastMock,
   handleNotificationToastRequested: vi.fn(),

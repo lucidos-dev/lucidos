@@ -3,14 +3,11 @@ import {
   fetchPluginCatalog,
   isTransportError,
   removePluginMarketplace,
-  stagePluginInstall,
 } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
-import { marketplaceCatalog, panelOverlay, showConfirm, showToast } from '../store';
+import { marketplaceCatalog, showToast } from '../store';
 import { setLoadingIfFresh, toFailed } from '../types';
-import type { MarketplaceCatalog, MarketplacePlugin } from '../types';
-import { pushNavState } from './navigation';
-import { revealContentPane } from './pane';
+import type { MarketplaceCatalog } from '../types';
 
 /** The official Lucidos plugin marketplace. Suggested as a one-click add in the
  *  Plugins panel catalog and Settings → Marketplaces empty states so a fresh workspace has a
@@ -107,29 +104,8 @@ export async function removePluginMarketplaceAction(id: string): Promise<void> {
   }
 }
 
-export async function installMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
-  // An update overwrites the plugin's shipped content. If the user has locally
-  // modified that content (the "Modified" badge), warn before staging — the
-  // update will discard their changes. A fresh install, or an update with no
-  // local edits, proceeds straight through.
-  if (plugin.status === 'update_available' && plugin.modified) {
-    const paths = plugin.modified_paths ?? [];
-    const changed = paths.length
-      ? ` Changed: ${paths.slice(0, 6).join(', ')}${paths.length > 6 ? ', …' : ''}.`
-      : '';
-    const ok = await showConfirm(
-      `You've locally modified "${plugin.name}". Updating to v${plugin.version} will overwrite your changes.${changed}`,
-      'Update anyway',
-      { title: 'Overwrite local changes?', variant: 'danger' },
-    );
-    if (!ok) return;
-  }
-  try {
-    const request = await stagePluginInstall(plugin.source);
-    panelOverlay.value = { type: 'form', form: { type: 'plugin-install', request } };
-    pushNavState();
-    revealContentPane();
-  } catch (e) {
-    showToast(`Failed to stage plugin install: ${errorDetail(e)}`, 'error');
-  }
-}
+// `installMarketplacePlugin` lives in `plugin-install.ts`, beside the opener it
+// routes through, exactly as `uninstallMarketplacePlugin` lives in
+// `plugin-uninstall.ts`. It cannot live here: this module is what both of those
+// import `refreshPluginCatalog` from, so calling the opener from here would
+// close an import cycle.

@@ -14,7 +14,7 @@ import { oauthAccounts, panelOverlay, toasts } from '../store';
 const THIS_DEVICE = 'device-aaa';
 const OTHER_DEVICE = 'device-bbb';
 
-vi.mock('./devices', () => ({ getDeviceId: () => THIS_DEVICE }));
+vi.mock('./devices', () => ({ getDeviceId: () => THIS_DEVICE, pendingDeviceRegistration: vi.fn() }));
 
 const platformMocks = vi.hoisted(() => ({ isTauri: true }));
 vi.mock('../../utils/platform', () => ({

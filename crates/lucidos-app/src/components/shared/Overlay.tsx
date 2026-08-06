@@ -203,7 +203,11 @@ export function Overlay({
       data-role={dataRole}
       // Stays interactive while `.app-shell` behind it is made inert (see the
       // `data-overlay-open` mechanism above + `global/modal-overlay.css`).
-      data-overlay-panel=""
+      // Carries this overlay's `overlayStack` id as its VALUE so a panel can be
+      // matched back to its stack entry (`dialogKeyScope` asks whether it is the
+      // top overlay). Every selector is presence-only (`[data-overlay-panel]`),
+      // so the value is free.
+      data-overlay-panel={idRef.current}
     >
       {children}
     </div>

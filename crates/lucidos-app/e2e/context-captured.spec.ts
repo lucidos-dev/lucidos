@@ -26,11 +26,13 @@ test.describe('ContextCaptured modal', () => {
     await expect(showStepsBtn).toBeVisible({ timeout: 30_000 });
     await showStepsBtn.click();
 
-    const visibleStep = page
-      .locator('[data-role="inline-step"]:visible')
+    // The context counter on the step row is the viewer's only door: the rest
+    // of the row opens the step detail instead (asserted at the end).
+    const counter = page
+      .locator('[data-role="inline-step"]:visible [data-role="step-context"]')
       .first();
-    await expect(visibleStep).toBeVisible({ timeout: 30_000 });
-    await visibleStep.click();
+    await expect(counter).toBeVisible({ timeout: 30_000 });
+    await counter.click();
 
     const modal = page.locator('[data-role="context-captured-modal"]:visible');
     await expect(modal).toBeVisible();
@@ -49,6 +51,20 @@ test.describe('ContextCaptured modal', () => {
     if ((await usageRow.count()) > 0) {
       await expect(usageRow).toContainText(/input/i);
     }
+
+    // The other half of the split: the rest of the row opens what the step DID,
+    // and that view must NOT carry a second copy of the context. A duplicate
+    // there is what would make the counter a pointless door.
+    await modal.locator('.step-detail-close').click();
+    await expect(modal).toHaveCount(0);
+    await page
+      .locator('[data-role="inline-step"]:visible [data-role="step-main"]')
+      .first()
+      .click();
+    const stepDetail = page.locator('[data-role="step-detail-modal"]:visible');
+    await expect(stepDetail).toBeVisible();
+    await expect(stepDetail.locator('[data-role="budget-bar"]')).toHaveCount(0);
+    await expect(stepDetail.locator('[data-role="section-row"]')).toHaveCount(0);
   });
 
   // The snapshot endpoint strips ContextCaptured.sections + tools (api/threads.rs
@@ -88,11 +104,11 @@ test.describe('ContextCaptured modal', () => {
     await expect(showStepsBtn).toBeVisible({ timeout: 30_000 });
     await showStepsBtn.click();
 
-    const visibleStep = page
-      .locator('[data-role="inline-step"]:visible')
+    const counter = page
+      .locator('[data-role="inline-step"]:visible [data-role="step-context"]')
       .first();
-    await expect(visibleStep).toBeVisible({ timeout: 30_000 });
-    await visibleStep.click();
+    await expect(counter).toBeVisible({ timeout: 30_000 });
+    await counter.click();
 
     const modal = page.locator('[data-role="context-captured-modal"]:visible');
     await expect(modal).toBeVisible();

@@ -606,7 +606,12 @@ describe('ContextCaptured projection — main_llm vs claude_code', () => {
   // to whatever step is on top of the stack at emission time —
   // typically the tool that just finished. Without this split, every CC
   // step's modal would still show "No context snapshot captured."
-  it('main_llm snapshot binds to the most recent Thinking step', () => {
+  it('a main_llm snapshot survives the tool call that names its row', () => {
+    // The ordering this depends on is the engine's, not luck: one iteration of
+    // the agentic loop emits ThoughtStreamed, then ContextCaptured, then
+    // ToolCalled. So the snapshot binds to the Thinking row first, and the fold
+    // (`nameThinkingRow`) has to carry it onto the named row, or the counter
+    // disappears from every chat turn that called a tool.
     const events = new Map<number, ThreadEvent>([
       [1, { type: 'MessageReceived', text: 'hi', created: '2026-05-12T10:00:00Z' } as ThreadEvent],
       [2, { type: 'ThoughtStreamed', text: 'Context: 100 tokens, 1 messages' } as ThreadEvent],
@@ -624,10 +629,9 @@ describe('ContextCaptured projection — main_llm vs claude_code', () => {
     ]);
     const exchanges = groupIntoExchanges(events);
     const respSteps = exchangeResponseEvents(exchanges[0]).filter(e => e.type === 'step') as Array<{ description: string; contextCapture?: { producer: string } }>;
-    const thinking = respSteps.find(s => s.description === 'Thinking');
-    const tool = respSteps.find(s => s.description !== 'Thinking');
-    expect(thinking?.contextCapture?.producer).toBe('main_llm');
-    expect(tool?.contextCapture).toBeUndefined();
+    expect(respSteps).toHaveLength(1);
+    expect(respSteps[0].description).not.toBe('Thinking');
+    expect(respSteps[0].contextCapture?.producer).toBe('main_llm');
   });
 
   it('claude_code snapshot binds to the most recent step (any kind)', () => {

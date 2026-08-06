@@ -273,22 +273,7 @@ impl LucidosEngine {
                     .await,
             );
         }
-        if tool_name == tn::REFRESH_FILE {
-            let path = tool_args["path"].as_str().unwrap_or("");
-            self.event_bus
-                .emit_or_log(
-                    BusEvent::Thread {
-                        thread_id,
-                        event: ThreadEvent::FileRefreshRequested {
-                            path: path.to_string(),
-                        },
-                        meta: EventMeta::NONE,
-                    },
-                    "[AgenticLoop] FileRefreshRequested",
-                )
-                .await;
-            Some(format!("File preview refreshed for {}", path))
-        } else if tool_name == tn::CAPTURE_APP || tool_name == tn::REFRESH_APP {
+        if tool_name == tn::CAPTURE_APP || tool_name == tn::REFRESH_APP {
             let app_id = tool_args
                 .get("app_id")
                 .and_then(|v| v.as_str())

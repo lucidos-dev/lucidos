@@ -147,25 +147,38 @@ function findMatchingParen(s: string, openIdx: number): number {
   return -1;
 }
 
-/** Receivers that consume promises themselves. A bare-looking call passed as
- *  their first argument (`useLoadableFetch(() => name())`) is not floating —
- *  the receiver awaits / chains it. Listed by exact identifier name. */
-const PROMISE_CONSUMING_RECEIVERS = ['useLoadableFetch'];
-
-/** True if the call at `lines[i]` is the body of an arrow that is itself the
- *  first argument to a known promise-consuming receiver on the preceding line.
- *  Pattern: `useLoadableFetch<...>(` ends the previous line; this line begins
- *  with `() => name(...)`. */
-function isInsideAsyncConsumer(lines: string[], i: number): boolean {
+/** True if this line is an element of an argument list or array literal that
+ *  opened on an earlier line.
+ *
+ *  The same-line rules below already exempt a call passed as an argument
+ *  (`before` ending in `(` or `,`), because handing a promise to a receiver is
+ *  the receiver's problem, not a float. They just cannot see across a line
+ *  break, so the multi-line spelling of the same thing was flagged:
+ *
+ *      await Promise.allSettled([
+ *        getA(),          <- reported as floating
+ *        getB(),
+ *      ]);
+ *
+ *  That is the idiomatic shape for `Promise.all` / `allSettled`, and
+ *  `allSettled` in particular is the most thoroughly handled a promise can be.
+ *
+ *  Sound because no bare statement can FOLLOW a line ending in `(`, `[` or `,`:
+ *  each of those leaves an expression open, so whatever comes next is part of
+ *  it. A line ending in `)`, `]` or `;` closes the expression and the next call
+ *  is flagged as before.
+ *
+ *  This SUBSUMES the former `isInsideAsyncConsumer` / `PROMISE_CONSUMING_RECEIVERS`
+ *  pair, which exempted an arrow passed to a hook that consumes the promise
+ *  (`useLoadableFetch<T>(\n  () => fetchIt(),\n  [deps])`). Every such call site
+ *  ends its opening line with `(`, so the general rule already covers it, and
+ *  the hand-maintained receiver allow-list was one more thing to keep in step
+ *  with the codebase for no added coverage. */
+function isOpenArgListElement(lines: string[], i: number): boolean {
   for (let j = i - 1; j >= 0; j--) {
     const ln = lines[j].trimEnd();
-    if (ln === '') continue;
-    for (const receiver of PROMISE_CONSUMING_RECEIVERS) {
-      if (new RegExp(`\\b${receiver}(?:\\s*<[^>]*>)?\\s*\\(\\s*$`).test(ln)) {
-        return true;
-      }
-    }
-    return false;
+    if (ln === '' || /^\s*(\/\/|\*|\/\*)/.test(ln)) continue;
+    return /[([,]$/.test(ln);
   }
   return false;
 }
@@ -224,9 +237,11 @@ function findFloatingCalls(source: string, name: string): string[] {
       }
     }
 
-    // The receiver above this line might be a promise-consuming hook (e.g.
-    // `useLoadableFetch(\n  () => name(...),\n  [...])`). Don't flag those.
-    if (isInsideAsyncConsumer(lines, i)) continue;
+    // An element of an argument list / array literal opened on an earlier line
+    // (`Promise.allSettled([\n  getA(),\n  getB(),\n])`, or an arrow handed to
+    // a promise-consuming hook) is the multi-line spelling of the same-line
+    // "passed as an argument" exemption above.
+    if (isOpenArgListElement(lines, i)) continue;
 
     offenders.push(`${i + 1}: ${line.trim()}`);
   }
@@ -269,6 +284,64 @@ describe('no floating promises in components/', () => {
       expect(offenders).toEqual([]);
     });
   }
+
+  // The detector's own exemptions are what decide whether this lint has teeth,
+  // so the widest one is pinned from both sides: it must swallow the shape it
+  // was added for, and must NOT swallow a genuine float that merely sits near
+  // a multi-line call.
+  describe('the multi-line argument-list exemption', () => {
+    it('accepts an element of an argument list opened on an earlier line', () => {
+      const source = [
+        'async function go() {',
+        '  const [a, b] = await Promise.allSettled([',
+        '    getThing(),',
+        '    getOther(),',
+        '  ]);',
+        '}',
+      ].join('\n');
+      expect(findFloatingCalls(source, 'getThing')).toEqual([]);
+      expect(findFloatingCalls(source, 'getOther')).toEqual([]);
+    });
+
+    it('still flags a float on the line after the list closes', () => {
+      // `]);` closes the expression, so the next call is a bare statement
+      // again. This is the assertion that keeps the exemption from turning
+      // "anywhere below a multi-line call" into a blanket amnesty.
+      const source = [
+        'async function go() {',
+        '  await Promise.allSettled([',
+        '    getThing(),',
+        '  ]);',
+        '  getOther();',
+        '}',
+      ].join('\n');
+      expect(findFloatingCalls(source, 'getThing')).toEqual([]);
+      expect(findFloatingCalls(source, 'getOther')).toHaveLength(1);
+    });
+
+    it('covers the promise-consuming hook shape it replaced', () => {
+      // The case the deleted `isInsideAsyncConsumer` existed for. Its opening
+      // line ends with `(`, so the general rule catches it and the receiver
+      // allow-list is not needed.
+      const source = [
+        'function C() {',
+        '  const { loadable } = useLoadableFetch<string>(',
+        '    () => readAppSource(app.id),',
+        '    [app.id],',
+        '  );',
+        '}',
+      ].join('\n');
+      expect(findFloatingCalls(source, 'readAppSource')).toEqual([]);
+    });
+
+    it('still flags consecutive bare statements', () => {
+      // A line ending in `;` leaves nothing open, so the following call is not
+      // a continuation however it is indented.
+      const source = ['function go() {', '  getThing();', '  getOther();', '}'].join('\n');
+      expect(findFloatingCalls(source, 'getThing')).toHaveLength(1);
+      expect(findFloatingCalls(source, 'getOther')).toHaveLength(1);
+    });
+  });
 
   // The exclusion list is a debt marker, not a permanent skip. Each entry
   // must still be a real file (typo guard) so a rename surfaces the entry

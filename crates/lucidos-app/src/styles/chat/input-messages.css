@@ -627,10 +627,11 @@
        scrollbars are overlay (iOS, default macOS), and the track is painted in
        --bg-primary, so an always-present empty track is invisible.
 
-       utils/scrollbarGutter.ts probes a container declaring EXACTLY this pair
-       and publishes the result as --scrollbar-gutter-width, which every
-       non-scrolling sibling that must line up with the transcript adds to its
-       own right inset. Change these two lines and you must change the probe. */
+       utils/scrollbarGutter.ts publishes what THIS element reserves as
+       --scrollbar-gutter-width, which every non-scrolling sibling that must line
+       up with the transcript adds to its own right inset. Before one is mounted
+       it falls back to a probe declaring EXACTLY this pair, so changing these two
+       lines means changing the probe. */
     overflow-y: scroll;
     scrollbar-gutter: stable;
     overflow-anchor: none; /* manual scroll anchoring — prevent browser interference */
@@ -951,12 +952,28 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     opacity: 0.5;
 }
 
-/* Paused: an engine restart interrupted the turn. Deliberately NOT the failed
-   red, because nothing failed and the thread usually resumes on its own within
-   seconds. --accent-notable is the same neutral in-between tone the Info
-   popover's Waiting dot uses. */
-.progress-dot-paused {
-    background: var(--accent-notable);
+/* Paused: the user's own switch to a new version interrupted the turn. The
+   standard pause glyph (two bars) rather than a dot, because this is the one
+   status a universal symbol states outright instead of leaving to a color the
+   user has to learn. Deliberately NOT the failed red, because nothing failed and
+   the engine resumes the turn on its own within seconds. --accent-notable is the
+   same neutral in-between tone the Info popover's Waiting dot uses. */
+.thread-status-paused-icon {
+    display: inline-flex;
+    align-items: center;
+    color: var(--accent-notable);
+}
+
+/* Sized to PauseIcon's own 12:16 viewBox so the bars fill the box exactly, with
+   no letterboxing. The status slot is a flex row that left-aligns its children
+   and every other occupant fills its box, so a centered glyph would leave a
+   paused row indented against every neighbouring row's dot. 0.5rem tall sits
+   between the 0.4rem dots and the 0.7rem question badge: the glyph reads as one
+   of the status marks rather than as the largest thing in the column, which is
+   what 0.75rem made it. */
+.thread-status-paused-icon svg {
+    width: 0.375rem;
+    height: 0.5rem;
 }
 
 .progress-dot-failed {
@@ -1146,7 +1163,9 @@ button.initiator-actor,
     border-radius: 0.9rem;
     padding: 0.55rem 0.85rem;
     max-width: 85%;
-    line-height: 1.55;
+    /* Matches .response-content, so a user bubble and the reply under it set
+       their text on the same rhythm. */
+    line-height: 1.5;
 }
 .user-bubble .markdown-content p:last-child {
     margin-bottom: 0;

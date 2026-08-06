@@ -302,43 +302,66 @@ pub(super) async fn wait_for_cc_session_alive(
 }
 
 /// Backstop on how long the follow-up fast-path blocks waiting for an
-/// interrupted Codex turn to reach a boundary before routing the follow-up
-/// anyway. The graceful `turn/interrupt` normally idles the turn in ~1-2s; the
-/// engine's 8s interrupt-escalation hard-kill guarantees `process_exited` well
-/// under this cap, so this only fires in a pathological non-idling case.
+/// interrupted turn to reach a boundary before routing the follow-up anyway.
+/// The graceful interrupt (Codex `turn/interrupt`, Claude Code
+/// `control_request:interrupt`) normally idles the turn in ~1-2s; the engine's
+/// 8s interrupt-escalation hard-kill guarantees `process_exited` well under
+/// this cap, so this only fires in a pathological non-idling case.
 pub(super) const REDIRECT_INTERRUPT_MAX_WAIT: Duration = Duration::from_secs(30);
 
 /// Whether a follow-up routed to a live coding-agent session should first
-/// interrupt the in-flight turn (Codex "interrupt-and-redirect") instead of
-/// being forwarded as-is.
+/// interrupt the in-flight turn ("interrupt-and-redirect") instead of being
+/// forwarded as-is.
 ///
-/// Claude Code accepts a follow-up mid-turn — its driver writes it to the CC
-/// process's stdin immediately and CC steers the live turn — so a CC follow-up
-/// is always forwarded as-is (`false`). Codex's app-server / exec protocols
-/// accept input only at a turn boundary (`turn/start` needs no turn in flight),
-/// so a Codex follow-up that lands mid-turn would otherwise sit invisibly in
-/// the driver's queue behind a long turn. For Codex we interrupt the running
-/// turn first; the queued follow-up then runs as the next turn on the same
-/// thread (full context preserved). Pure so the routing rule is unit-tested
-/// without standing up a session.
+/// The two backends reach the same rule from opposite directions, so the
+/// asymmetry in `urgent` is structural rather than a policy choice:
+///
+/// - **Codex redirects whether or not the caller said urgent.** Its app-server
+///   / exec protocols accept input only at a turn boundary (`turn/start` needs
+///   no turn in flight), so a mid-turn follow-up would otherwise sit invisibly
+///   in the driver's queue behind a long turn. Queueing is not a gentler
+///   option there, it is an invisible one, so `urgent` is a no-op for Codex and
+///   the LLM tool description says so.
+/// - **Claude Code redirects only when urgent.** CC accepts a follow-up
+///   mid-turn (the driver writes it to stdin at once), so a plain follow-up is
+///   forwarded as-is and steers the child at its next turn boundary, which is
+///   what keeps a benign steer from throwing away an in-flight build. But CC
+///   surfaces a queued stdin message ONLY at that boundary, and a blocking tool
+///   call pushes the boundary out by up to its own timeout: on 2026-08-06 a
+///   child parked in `TaskOutput(block: true, timeout: 600000)` did not read a
+///   STOP for nine and a half minutes. `urgent` buys the interrupt for the
+///   messages that cannot wait for it.
+///
+/// Pure so the routing rule is unit-tested without standing up a session.
 ///
 /// - `is_in_flight`: the session is alive and NOT at a turn boundary
-///   (`AgentSession::is_in_flight`). A follow-up to an idle-but-alive Codex
-///   session routes via `turn/start` immediately — no interrupt needed.
+///   (`AgentSession::is_in_flight`). A follow-up to an idle-but-alive session
+///   is picked up immediately on either backend, so there is nothing to
+///   interrupt and urgency does not manufacture a turn to stop.
 /// - `is_user_message`: the input is a genuine user follow-up, not an
 ///   engine-internal child-wake (`AgentInputKind::WakeFromChild`). Child-wakes
-///   never redirect — they resume a thread that is waiting on a child.
-pub(super) fn should_redirect_codex_followup(
+///   never redirect, urgent or not: they resume a thread that is waiting on a
+///   child.
+/// - `urgent`: the caller marked the follow-up as one the child must act on
+///   now, accepting that its current turn ends. See `FollowUpDelivery`.
+pub(super) fn should_redirect_followup(
     coding_agent: crate::runtime::CodingAgent,
     is_in_flight: bool,
     is_user_message: bool,
+    urgent: bool,
 ) -> bool {
-    coding_agent == crate::runtime::CodingAgent::Codex && is_in_flight && is_user_message
+    if !is_in_flight || !is_user_message {
+        return false;
+    }
+    match coding_agent {
+        crate::runtime::CodingAgent::Codex => true,
+        crate::runtime::CodingAgent::ClaudeCode => urgent,
+    }
 }
 
-/// Arm the Codex interrupt-and-redirect for a follow-up, operating on the
-/// already-locked `agent_sessions` map. When `thread_id`'s session is a Codex
-/// turn in flight (per `should_redirect_codex_followup`), this:
+/// Arm the interrupt-and-redirect for a follow-up, operating on the
+/// already-locked `agent_sessions` map. When `thread_id`'s session is a turn in
+/// flight that should be redirected (per `should_redirect_followup`), this:
 ///   1. **Pre-counts the follow-up** (`pending_followups += 1`) so the
 ///      interrupted turn's idle reads `> 1` and `terminate_decision` keeps the
 ///      subprocess alive (`pending_followups` starts at 1 for the initial
@@ -352,19 +375,21 @@ pub(super) fn should_redirect_codex_followup(
 ///
 /// Returns the session's `idle_notify` so the caller can wait for the turn to
 /// wind down before emitting the follow-up's `MessageReceived` (correct event
-/// ordering). Returns `None` when no redirect applies (CC, idle Codex,
-/// child-wake, or no live session) — the caller routes the follow-up normally.
+/// ordering). Returns `None` when no redirect applies (a plain Claude Code
+/// follow-up, an idle session, a child-wake, or no live session) and the caller
+/// routes the follow-up normally.
 ///
 /// Pure over the map (no engine, no async) so the arming behavior is unit-tested
 /// with a fake session, like `wait_for_cc_session_alive`.
-pub(super) fn arm_codex_redirect(
+pub(super) fn arm_followup_redirect(
     sessions: &mut HashMap<Uuid, AgentSession>,
     thread_id: Uuid,
     is_user_message: bool,
+    urgent: bool,
     origin: &Option<MessageOrigin>,
 ) -> Option<std::sync::Arc<tokio::sync::Notify>> {
     let s = sessions.get_mut(&thread_id)?;
-    if !should_redirect_codex_followup(s.coding_agent, s.is_in_flight(), is_user_message) {
+    if !should_redirect_followup(s.coding_agent, s.is_in_flight(), is_user_message, urgent) {
         return None;
     }
     // Keep the interrupted turn's idle from terminating the subprocess:

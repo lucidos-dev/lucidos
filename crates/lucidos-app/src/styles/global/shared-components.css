@@ -444,12 +444,91 @@ html:not([data-theme="light"]) .action-btn-confirm {
     color: var(--text-primary);
 }
 
+/* Tables. `renderMarkdown` wraps every table in this scroll container, the
+ * pattern GitHub, Bootstrap's .table-responsive, ChatGPT and Docusaurus all
+ * use. A table never grows past its pane on purpose, so this is a SAFETY NET
+ * rather than the normal path: it catches the one overflow that cannot be
+ * designed away, a single token wider than the pane, and scrolls it here
+ * instead of widening the page. `overscroll-behavior-x: contain` keeps that
+ * pan from chaining into the mobile pane swipe; MobileSwipeContainer already
+ * declines to hijack a touch that starts on a horizontally scrollable child. */
 .markdown-content .table-scroll-wrapper {
     overflow-x: auto;
+    overscroll-behavior-x: contain;
     margin: 0.75rem 0;
 }
 
+/* Images. `renderMarkdown` wraps every one in this scroll container, the same
+ * treatment a table gets above. Unlike a table an image cannot be reflowed, so
+ * this is the NORMAL path rather than a safety net: a screenshot is commonly
+ * 2560px wide, and something has to absorb that. The overflow is panned here
+ * with the ordinary scrollbar, the affordance the table wrapper already
+ * established, rather than a bespoke one. `overscroll-behavior-x: contain`
+ * keeps the pan from chaining into the transcript behind it, and into the
+ * mobile pane swipe (MobileSwipeContainer already declines to hijack a touch
+ * that starts on a horizontally scrollable child). Both declarations are the
+ * table wrapper's x-axis form rather than the unsuffixed one, because the
+ * wrapper can never overflow VERTICALLY (its height is the capped image's), so
+ * a y-axis containment would have nothing to contain here and would only risk
+ * swallowing a wheel scroll aimed at the transcript.
+ *
+ * Panning here is NOT a reversal of the decision below that a table must never
+ * pan. That one rests on a table being able to reflow, which makes the
+ * sideways scroll pure cost. An image cannot reflow, so the only alternatives
+ * to panning it are shrinking it or cropping it.
+ *
+ * The image itself is deliberately NOT capped at `max-width: 100%`: capping it
+ * is what shrinks a wide screenshot to an unreadable thumbnail instead of
+ * letting it pan at full size. That is also why `max-width` is reset to `none`
+ * below, which overrides the mobile-only `.response-content img` cap in
+ * mobile.css. Deliberate, and the choice is "the wrapper wins at every width":
+ * one behavior to learn, rather than pan-on-desktop and fit-on-phone diverging
+ * at a breakpoint the reader never sees.
+ *
+ * A `<span>` carries the class (marked puts an image inside a `<p>`, where a
+ * `<div>` would be invalid and split the paragraph), so it needs an explicit
+ * `display: block`, which also drops the baseline descender gap an inline image
+ * leaves under itself. Spacing comes from the containing paragraph, so the
+ * wrapper adds no margin of its own. An image smaller than the pane is
+ * untouched by all of this: the wrapper has no minimum, no padding and no
+ * background, so it shows the image at its natural size with no scrollbar.
+ *
+ * This file is `include_str!`d into /api/v1/sdk-iframe.css, so both rules are
+ * scoped to the wrapper class. An app's own hand-written <img> has no wrapper
+ * around it and keeps whatever sizing the app gave it. */
+.markdown-content .image-scroll-wrapper {
+    display: block;
+    max-width: 100%;
+    overflow-x: auto;
+    overscroll-behavior-x: contain;
+}
+
+.markdown-content .image-scroll-wrapper > img {
+    display: block;
+    max-width: none;
+    /* Half the height of a laptop transcript, so a screenshot is legible at a
+     * glance while the prose under it stays on screen and a second image is
+     * still one short scroll away. In rem so it tracks the user's UI scale, and
+     * paired with `height: auto` so a tall capture narrows proportionally
+     * instead of squashing. */
+    max-height: 24rem;
+    height: auto;
+}
+
 .markdown-content table {
+    /* A table always fits its pane, at every width. Letting a wrapped table
+     * grow to twice the pane and pan was tried and reverted: measured on a
+     * two-column commit table it cost a FULL PANE of sideways scrolling at
+     * 700/900/1200px alike, which is a bad trade at any size in a transcript
+     * you read vertically. Note this is also the value that was here when the
+     * key column collapsed, and it was never the cause: the cells' min-content
+     * (below) was, and restoring it is what fixed the collapse.
+     *
+     * A second constraint binds any future attempt to let tables grow again:
+     * this file is `include_str!`d into /api/v1/sdk-iframe.css, so an app's
+     * own hand-written table lands here with NO .table-scroll-wrapper and
+     * therefore nothing to absorb an overflow. Growth would widen the iframe
+     * body outright. Pinned by markdown-table-columns.spec.ts. */
     width: 100%;
     border-collapse: collapse;
     font-size: var(--font-size-sm);
@@ -457,9 +536,45 @@ html:not([data-theme="light"]) .action-btn-confirm {
 
 .markdown-content th,
 .markdown-content td {
+    /* A cell must never break mid-word, because a break opportunity inside a
+     * word lowers the column's MIN-CONTENT width to a single character, and a
+     * column that can be one character wide is one the table layout will make
+     * one character wide. Two rules reach in and do exactly that, so both are
+     * overridden here: `word-break: break-word` on .response-content
+     * (mobile.css), which despite its name means `overflow-wrap: anywhere`,
+     * and `word-break: break-all` on .markdown-content a (below). The
+     * replacement, `overflow-wrap: break-word`, still breaks a token that
+     * genuinely does not fit, but does not count toward min-content. */
+    word-break: normal;
+    overflow-wrap: break-word;
+    /* No single column may exceed a comfortable line length. Auto table layout
+     * splits the spare width in proportion to each column's max-content, so a
+     * prose column beside a key column takes nearly all of it: on the reported
+     * table in a 900px pane, 671px of prose against 223px of key. That is both
+     * columns wrong at once, since 671px is well past the 45-75 characters
+     * prose is readable at, and the key column is starved to pay for it.
+     * Capping the greedy column hands the remainder back (447/447 there), and
+     * because it is a max the columns that genuinely want less keep their
+     * natural width: a 3-column table's 57px status column stays 57px, which
+     * is what ruled out `table-layout: fixed` (it made that table 60% taller
+     * by forcing every column to an equal third).
+     *
+     * `ch`, not the usual `rem`, and deliberately: this is a LINE LENGTH, so
+     * it has to track the text it measures, and cell font-size drops a step at
+     * 600px (below). A rem value would stay put across that change and stop
+     * meaning 60 characters. It satisfies what the rem rule is for, since `ch`
+     * derives from the cell's font-size, which derives from a --font-size-*
+     * token, so the cap still follows the user's UI scale. */
+    max-width: 60ch;
     padding: 0.375rem 0.625rem;
     text-align: left;
     border-bottom: 1px solid var(--border-color);
+}
+
+.markdown-content th a,
+.markdown-content td a {
+    word-break: normal;
+    overflow-wrap: break-word;
 }
 
 .markdown-content th {
@@ -468,9 +583,80 @@ html:not([data-theme="light"]) .action-btn-confirm {
     font-weight: 500;
 }
 
+/* Narrow viewports: tighter type and padding, so each column fits more text
+ * per line before the cells have to wrap. Lived in settings/toggle.css keyed
+ * on .response-content, which meant chat only, in an unrelated stylesheet. */
+@media (max-width: 600px) {
+    .markdown-content table {
+        font-size: var(--font-size-xs);
+    }
+
+    .markdown-content th,
+    .markdown-content td {
+        padding: 0.25rem 0.375rem;
+    }
+}
+
 @media (hover: hover) {
     .markdown-content tr:hover {
         background: var(--bg-hover);
+    }
+}
+
+/* A phone never pans a table sideways. It either FITS (the desktop growth rule
+ * above does not apply here, so the table stays capped at the pane and wraps)
+ * or it STACKS: from four columns up, every column is narrow AND the pan is
+ * long, so each row becomes a card and each cell carries its column header as a
+ * label. `renderMarkdown` decides which tables qualify (STACK_MIN_COLUMNS) and
+ * stamps `data-stack` plus a `data-label` per cell, because an attribute
+ * selector cannot compare a column count and the threshold is unit-testable in
+ * TS. App authors writing their own table markup can stamp the same attributes;
+ * see the component-class table in system-knowhow/js-sdk.md. */
+@media (max-width: 768px) {
+    .markdown-content table[data-stack],
+    .markdown-content table[data-stack] tbody,
+    .markdown-content table[data-stack] tr,
+    .markdown-content table[data-stack] td {
+        display: block;
+    }
+
+    .markdown-content table[data-stack] {
+        /* Undo the bounded-scroll sizing: a stacked table never scrolls. */
+        width: 100%;
+        min-width: 0;
+        max-width: 100%;
+    }
+
+    /* Redundant once every cell states its own column. */
+    .markdown-content table[data-stack] thead {
+        display: none;
+    }
+
+    /* The row is the card, so it owns the separator the cells used to draw. */
+    .markdown-content table[data-stack] tr {
+        padding: 0.5rem 0;
+        border-bottom: 1px solid var(--border-color);
+    }
+
+    .markdown-content table[data-stack] tr:last-child {
+        border-bottom: none;
+    }
+
+    .markdown-content table[data-stack] td {
+        padding: 0.125rem 0;
+        border-bottom: none;
+    }
+
+    .markdown-content table[data-stack] td::before {
+        content: attr(data-label);
+        display: block;
+        font-size: var(--font-size-xs);
+        color: var(--text-secondary);
+    }
+
+    /* An empty cell would otherwise render as a label with nothing under it. */
+    .markdown-content table[data-stack] td:empty {
+        display: none;
     }
 }
 

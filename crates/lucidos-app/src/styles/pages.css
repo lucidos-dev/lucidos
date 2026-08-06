@@ -153,16 +153,19 @@
     word-break: break-all;
 }
 
-/* Sent receipt — the panel after a successful send. Status line reads as a
-   chip + timestamp; no left accent bar (see .claude/rules/frontend.md). */
-.email-confirm-sent-status {
+/* Receipt status line, shared by every confirm panel that turns into a
+   read-only record of what it did: the sent email, and a completed plugin
+   install / uninstall. Reads as a chip plus a timestamp; no left accent bar
+   (see .claude/rules/frontend.md). One rule rather than one per panel, since
+   the receipts are the same idea wearing the same badge. */
+.panel-receipt-status {
     display: flex;
     align-items: baseline;
     gap: 0.5rem;
     margin-bottom: 0.75rem;
 }
 
-.email-confirm-sent-badge {
+.panel-receipt-badge {
     font-size: var(--font-size-xs);
     font-weight: 600;
     text-transform: uppercase;
@@ -173,7 +176,7 @@
     padding: 0.125rem 0.5rem;
 }
 
-.email-confirm-sent-time {
+.panel-receipt-time {
     font-size: var(--font-size-sm);
     color: var(--text-muted);
 }
@@ -548,7 +551,7 @@
    different matter and IS cut there: a plugin row is full-bleed against that clip,
    the shrink buys only 0.5rem, and the wide glow layer's 1.5rem blur reaches
    further. That is accepted. What gets terminated at the pane edge is the tail of a
-   12%-alpha gaussian, already near-invisible where it meets a boundary the eye
+   15%-alpha gaussian, already near-invisible where it meets a boundary the eye
    reads as a boundary anyway. It is NOT the failure 4f901b586 fixed, which was a
    crisp 0.1875rem accent outline having its side edges and rounded corners sliced
    flat. Do not "fix" it by shrinking the box further: that would pull the wash off

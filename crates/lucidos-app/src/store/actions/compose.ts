@@ -37,13 +37,16 @@ import {
 import type { ComposeDestination } from '../composeDestination';
 import { makeOptimisticThreadState, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
-import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, isTransientFetchError } from '../../api/client';
+import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, isTransientFetchError, type ComposePutResult } from '../../api/client';
 import { errorDetail } from '../../utils/errorDetail';
 import { createFailureCounter } from '../../utils/failureCounter';
 import { sendMessage } from './chat';
 // Cycle-safe: `compose -> chat -> thread-loading -> compose` already exists, and
 // this is a function declaration called at runtime, never at module init.
 import { forgetThreadEventsFailures } from './thread-loading';
+// Same shape of cycle (`compose -> threads -> thread-loading -> compose`), same
+// reason it is safe: called at runtime, never at module init.
+import { unfocusThread } from './threads';
 import type { ChatContext } from './chatContext';
 import { markHashesAsSent } from '../../components/chat/pastedImages';
 import { requestPromptOverrideSync } from '../../components/chat/promptValueSync';
@@ -207,6 +210,34 @@ export function noteServerDraft(threadId: string, text: string, imageHashes: rea
   serverDraft.set(threadId, { text, imageHashes: [...imageHashes] });
 }
 
+/** This device's knowledge of each thread's *compose epoch* (`docs/glossary.md`):
+ *  how many times a submission has consumed the thread's compose slot. Echoed on
+ *  every compose PUT so the engine can refuse a write composed before a
+ *  submission that has since landed, which is what stops a stalled draft PUT
+ *  from resurrecting the text a send already consumed.
+ *
+ *  Absent = never heard, so the PUT goes out unfenced. That is the honest
+ *  reading of "we do not know", and it matches how the engine treats a missing
+ *  epoch. Learned from three places, all of them the engine reporting its own
+ *  state: a thread-summary snapshot, a `ThreadComposeChanged` broadcast, and the
+ *  `412` that refuses a stale write. */
+const composeEpoch = new Map<string, number>();
+
+/** Record an engine report of the thread's compose epoch. Monotonic: a frame
+ *  delayed past a newer one must not walk the value backwards, which would make
+ *  the next write fail a fence it had already cleared. */
+export function noteComposeEpoch(threadId: string, epoch: number | undefined): void {
+  if (typeof epoch !== 'number') return;
+  const known = composeEpoch.get(threadId);
+  if (known !== undefined && epoch <= known) return;
+  composeEpoch.set(threadId, epoch);
+}
+
+/** Test-only: what this device believes the engine's compose epoch to be. */
+export function _composeEpochForTesting(threadId: string): number | undefined {
+  return composeEpoch.get(threadId);
+}
+
 function markLocallyEdited(threadId: string): void {
   composeEditedAt.set(threadId, Date.now());
   // `.peek()`, not `.value`: this runs from input/event handlers on the
@@ -259,7 +290,10 @@ function sameHashes(a: readonly string[], b: readonly string[]): boolean {
  *  Cheap by construction: the O(1) early-outs reject every thread without a
  *  locally-authored, server-cleared draft before the event scan, so nothing
  *  walks history on the keystroke path (never called from `updateCompose`). */
-export function draftIsSuperseded(threadId: string): boolean {
+export function draftIsSuperseded(
+  threadId: string,
+  opts?: { writeRefused?: boolean },
+): boolean {
   const draft = getDraft(threadId);
   if (draftIsEmpty(draft)) return false;
   const watermark = composeEditWatermark.get(threadId);
@@ -267,7 +301,15 @@ export function draftIsSuperseded(threadId: string): boolean {
   // A write of ours is in flight (or still inside the debounce), so what the
   // server holds is not yet knowable — every other compose guard yields to this
   // set for the same reason.
-  if (pendingComposePuts.has(threadId)) return false;
+  //
+  // `writeRefused` is the one case where that uncertainty is already resolved:
+  // the engine answered our in-flight write with a stale-epoch `412`, which says
+  // both that it did NOT apply the write and that a submission consumed the
+  // slot. Without the opt-out this whole rule is DEAD on that path, because a
+  // write is in flight for the entire life of `pushNow` by construction, and a
+  // draft the user already sent from another device would be re-pushed by the
+  // retry as a live draft on every device.
+  if (!opts?.writeRefused && pendingComposePuts.has(threadId)) return false;
   const text = draft.text.trim();
   const onServer = serverDraft.get(threadId);
   // Never heard from the server (e.g. the draft's PUT has only ever failed) —
@@ -299,8 +341,11 @@ export function draftIsSuperseded(threadId: string): boolean {
  *  of their own — most importantly event replay on wake / SSE reconnect, where
  *  `loadAllThreads` runs BEFORE the missed messages arrive, so the
  *  empty-snapshot guard had no evidence to go on yet. */
-export function clearSupersededDraft(threadId: string): void {
-  if (!draftIsSuperseded(threadId)) return;
+export function clearSupersededDraft(
+  threadId: string,
+  opts?: { writeRefused?: boolean },
+): boolean {
+  if (!draftIsSuperseded(threadId, opts)) return false;
   clearDraft(threadId);
   // The thread's own history proves this draft was already submitted, so a
   // later flush must not push it back onto the server. Nothing was delivered,
@@ -311,6 +356,7 @@ export function clearSupersededDraft(threadId: string): void {
   // state from diverging — the replay path reaches this without ever passing
   // through `setComposeSelectionFromServer`, so nothing else would.
   clearComposeSelection(threadId);
+  return true;
 }
 
 /** True when this device holds UNSENT work for the thread: a non-empty draft it
@@ -489,63 +535,33 @@ const composePushFailures = createFailureCounter(3, () => {
   );
 });
 
-/** Monotonic counter claiming "this attempt carries the newest local intent",
- *  bumped by each `pushNow` at the moment it reads the draft, and the newest
- *  value seen per thread.
- *
- *  Needed because two PUTs for one thread can be in flight at once (that is what
- *  `inFlightPushes` is for: a PUT slower than the 250ms debounce overlaps the
- *  next one) and they can COMPLETE out of order. Without this, an older push
- *  landing last would answer for the newer one: it would clear the re-send this
- *  thread is owed even though the server only ever received the older text, and
- *  the newest draft would then die with the next eviction. That is precisely the
- *  data loss this whole section exists to prevent, so an outcome only speaks for
- *  the thread while it is still the latest attempt.
- *
- *  Deliberately NOT applied to `noteServerDraft` below, which has the same
- *  out-of-order shape but a different consequence (a self-healing wrong belief
- *  about what the server holds, already an accepted residual: see
- *  `docs/code-review-priors.md` § Frontend and `applyRemoteCompose`). */
-let composePushSeq = 0;
-const latestComposePushSeq = new Map<string, number>();
-
-function claimComposePush(threadId: string): number {
-  const seq = ++composePushSeq;
-  latestComposePushSeq.set(threadId, seq);
-  return seq;
-}
-
-function isLatestComposePush(threadId: string, seq: number): boolean {
-  return latestComposePushSeq.get(threadId) === seq;
-}
-
 /** The engine answered about this thread. Both answers land here, accepted and
  *  refused alike, because both prove the engine is reachable: the unreachable
  *  banner has to be retracted whichever way the queue drained, or it keeps
  *  insisting nothing is getting through while the rejection card next to it says
  *  otherwise.
  *
- *  The re-send obligation is cleared only when this attempt `carriedLatestDraft`.
- *  An answer to a superseded attempt says nothing about the text the user can
- *  currently see, so it must not settle on the newer attempt's behalf. */
-function settleComposeDelivered(threadId: string, carriedLatestDraft: boolean): void {
+ *  It can settle unconditionally because compose writes for one thread are
+ *  serialized (see `runComposePushes`): the answer always belongs to the newest
+ *  intent, since no newer attempt can have started while this one was running.
+ *  Before that, two attempts could overlap and complete out of order, so an
+ *  outcome had to prove it was still the latest (`latestComposePushSeq`) before
+ *  it was allowed to speak. Serializing removed the overlap rather than the
+ *  need to reason about it. */
+function settleComposeDelivered(threadId: string): void {
   composePushFailures.recordSuccess();
-  if (!carriedLatestDraft) return;
   undeliveredComposeDrafts.delete(threadId);
   if (undeliveredComposeDrafts.size === 0) removeToast(COMPOSE_UNREACHABLE_TOAST);
 }
 
-/** Outcome of a compose PUT that did NOT succeed. Owned here rather than at the
- *  call site so the attempt's `seq` (and therefore whether it still speaks for
- *  the thread) is in scope for both branches. */
-function handleComposePushFailure(threadId: string, seq: number, err: unknown): void {
-  const latest = isLatestComposePush(threadId, seq);
+/** Outcome of a compose PUT that did NOT succeed. A stale-epoch refusal never
+ *  reaches here: it is not a failure, and `pushNow` handles it by adopting the
+ *  epoch and re-queueing. */
+function handleComposePushFailure(threadId: string, err: unknown): void {
   if (isTransientFetchError(err)) {
     // No answer: cancelled, timed out, or dropped in transit. Says nothing about
     // the request, and the user can see their text, so stay quiet and owe them a
-    // re-send. Escalates once if this keeps happening. A superseded attempt is
-    // not the one to decide either of those: the newer attempt will.
-    if (!latest) return;
+    // re-send. Escalates once if this keeps happening.
     undeliveredComposeDrafts.add(threadId);
     composePushFailures.recordFailure();
     return;
@@ -553,9 +569,8 @@ function handleComposePushFailure(threadId: string, seq: number, err: unknown): 
   // The engine ANSWERED and refused. No retry can change that and the user is
   // owed the reason: their local state has diverged from the server and they are
   // typing into thin air. It also proves the engine is reachable, so the failure
-  // count resets (and, if this attempt was the latest, the thread stops being
-  // owed a re-send).
-  settleComposeDelivered(threadId, latest);
+  // count resets and the thread stops being owed a re-send.
+  settleComposeDelivered(threadId);
   showToast(`Compose sync failed: ${errorDetail(err)}`, 'error', {
     key: COMPOSE_REJECTED_TOAST,
   });
@@ -602,9 +617,28 @@ export function _undeliveredComposeDraftsForTesting(): string[] {
  *  undelivered draft can't leak into the next. */
 export function _resetUndeliveredComposeDraftsForTesting(): void {
   undeliveredComposeDrafts.clear();
-  latestComposePushSeq.clear();
+  runningComposePushes.clear();
+  owedComposePushes.clear();
+  composeEpoch.clear();
   composePushFailures.recordSuccess();
 }
+
+/** Threads with a compose write running RIGHT NOW. */
+const runningComposePushes = new Set<string>();
+
+/** Threads that owe another compose write once the running one settles. A set,
+ *  not a queue: successive intents COALESCE, because the write re-reads the
+ *  draft when it finally goes out, so the only thing worth remembering is that
+ *  one more write is owed. */
+const owedComposePushes = new Set<string>();
+
+/** How many times one runner cycle re-issues after a stale-epoch refusal before
+ *  giving up and parking the draft. A refusal means a submission consumed the
+ *  slot, so the retry carries a strictly newer epoch and normally lands first
+ *  try. The bound exists for the pathological case (a peer submitting over and
+ *  over while we write), where spinning would be worse than waiting for the
+ *  next resume flush. */
+const MAX_STALE_EPOCH_RETRIES = 2;
 
 function schedulePush(threadId: string): void {
   const existing = pendingTimers.get(threadId);
@@ -613,14 +647,52 @@ function schedulePush(threadId: string): void {
   pendingComposePuts.add(threadId);
   const t = setTimeout(() => {
     pendingTimers.delete(threadId);
-    // `pushNow` owns every outcome itself (see `handleComposePushFailure`), so
-    // there is nothing left to reject. The catch is the unhandled-rejection
-    // silencer for a genuine defect in that handling, not an error path.
-    pushNow(threadId).catch((err) => {
-      console.error('[compose] push outcome handling threw', err);
-    });
+    runComposePushes(threadId);
   }, DEBOUNCE_MS);
   pendingTimers.set(threadId, t);
+}
+
+/** Issue the thread's owed compose write, one at a time.
+ *
+ *  **Compose writes for one thread are serialized.** At most one PUT is in
+ *  flight; an intent raised while one is running is recorded as owed and issued
+ *  when that one settles, re-reading the draft at that moment. So "last write
+ *  wins" means the last *intent* wins, which is what the rest of this file has
+ *  always assumed.
+ *
+ *  Before this, `pushNow` fired straight off the debounce and a PUT slower than
+ *  250ms simply overlapped the next one. Overlapping writes can be APPLIED out
+ *  of order, and on a stalled link that is how a pre-send draft ends up stored
+ *  after the message that consumed it: the send goes through, the engine clears
+ *  compose, the older write lands last and puts the draft back, and the next
+ *  resync stages that stale revision into the composer. The engine's compose
+ *  epoch refuses such a write outright; serializing is the other half, and the
+ *  half that also keeps two ordinary keystroke writes from landing backwards. */
+function runComposePushes(threadId: string): void {
+  owedComposePushes.add(threadId);
+  if (runningComposePushes.has(threadId)) return;
+  runningComposePushes.add(threadId);
+  void (async () => {
+    try {
+      while (owedComposePushes.delete(threadId)) {
+        await pushNow(threadId);
+      }
+    } catch (err) {
+      // `pushNow` owns every outcome itself (see `handleComposePushFailure`),
+      // so there is nothing left to reject. This is the unhandled-rejection
+      // silencer for a genuine defect in that handling, not an error path.
+      console.error('[compose] push outcome handling threw', err);
+    } finally {
+      runningComposePushes.delete(threadId);
+      owedComposePushes.delete(threadId);
+      // Release ONLY when nothing newer is queued. An edit made during the last
+      // PUT scheduled a fresh debounce; dropping the flag here would advertise
+      // "the engine has seen our latest intent" while a later write is still
+      // pending, which is exactly what every consumer of this set reads it to
+      // mean.
+      if (!pendingTimers.has(threadId)) pendingComposePuts.delete(threadId);
+    }
+  })();
 }
 
 /** When the next push has the same array as the last one we synced, send
@@ -634,13 +706,11 @@ function imageHashesUnchanged(threadId: string, current: string[]): boolean {
   return prev.every((h, i) => h === current[i]);
 }
 
-/** In-flight `pushNow` calls per thread. A PUT slower than the debounce is
- *  still running when the next one starts, so the first to finish must not
- *  release `pendingComposePuts` on behalf of the later one. */
-const inFlightPushes = new Map<string, number>();
-
-async function pushNow(threadId: string): Promise<void> {
-  inFlightPushes.set(threadId, (inFlightPushes.get(threadId) ?? 0) + 1);
+/** One compose write, reading the draft at the moment it goes out. Only ever
+ *  called from `runComposePushes`, which guarantees no sibling write is in
+ *  flight for the same thread. `staleRetries` counts the re-issues this runner
+ *  cycle has already spent adopting a newer epoch. */
+async function pushNow(threadId: string, staleRetries = 0): Promise<void> {
   try {
     try {
       // PUT 404s if the 250ms debounce elapses before POST /threads settles.
@@ -652,13 +722,9 @@ async function pushNow(threadId: string): Promise<void> {
     }
     const thread = threadMap.value.get(threadId);
     // Discarded threads stay in threadMap with state='discarded' until the
-    // SSE confirms the DELETE, so existence alone is not enough — a PUT here
+    // SSE confirms the DELETE, so existence alone is not enough: a PUT here
     // would 410 against a thread the user already discarded.
     if (!thread || thread.meta.state === 'discarded') return;
-    // Claim the intent this attempt carries, at the moment it reads the draft.
-    // A later attempt supersedes it, so an out-of-order completion cannot answer
-    // on the newer one's behalf. See `latestComposePushSeq`.
-    const seq = claimComposePush(threadId);
     const draft = getDraft(threadId);
     // null = preserve via COALESCE (avoids the SSE re-broadcast).
     const wireHashes: string[] | null = imageHashesUnchanged(threadId, draft.image_hashes)
@@ -671,8 +737,9 @@ async function pushNow(threadId: string): Promise<void> {
     const selectionOverride = getComposeSelectionOverride(threadId);
     const selectionForPut: ComposeSelectionOverride | undefined =
       Object.keys(selectionOverride).length > 0 ? selectionOverride : undefined;
+    let result: ComposePutResult;
     try {
-      await putComposeOnThread(
+      result = await putComposeOnThread(
         threadId,
         draft.text,
         wireHashes,
@@ -680,39 +747,53 @@ async function pushNow(threadId: string): Promise<void> {
         // channel field is authoritative and the server rejects mode changes.
         thread.meta.state === 'composing' ? draft.mode : null,
         selectionForPut,
+        composeEpoch.get(threadId),
       );
     } catch (err) {
-      handleComposePushFailure(threadId, seq, err);
+      handleComposePushFailure(threadId, err);
+      return;
+    }
+    if (result.status === 'stale') {
+      // A submission consumed the compose slot after this write was composed,
+      // so the engine dropped it. Nothing is wrong and nothing is owed to the
+      // user: adopt the epoch and re-issue.
+      noteComposeEpoch(threadId, result.composeEpoch);
+      // The refusal is also a report about the engine's compose state, and the
+      // only one that arrives while a write of ours is in flight. The
+      // submission that moved the epoch cleared the stored draft in the same
+      // transaction, and this write was not applied, so the engine holds
+      // nothing. Recording it is what lets the supersede rule below see past
+      // its own "the server still has our text" re-type protection.
+      noteServerDraft(threadId, '', []);
+      // Give that rule its say before re-issuing, because the submission may
+      // have BEEN this draft, sent from another device, and the retry would
+      // then put the sent message back as a live draft on every device.
+      if (clearSupersededDraft(threadId, { writeRefused: true })) return;
+      if (staleRetries < MAX_STALE_EPOCH_RETRIES) {
+        await pushNow(threadId, staleRetries + 1);
+        return;
+      }
+      // Something keeps consuming the slot faster than we can write. Park it
+      // rather than spin; the next resume flush re-reads the current draft.
+      undeliveredComposeDrafts.add(threadId);
       return;
     }
     // Acked: the server now holds exactly what we sent. Recording it here is
     // what keeps a draft typed while this device was behind a peer's submission
-    // from being mistaken for that submission — see `serverDraft`. A `null`
+    // from being mistaken for that submission (see `serverDraft`). A `null`
     // wireHashes preserved the stored array, which is `draft.image_hashes` by
     // construction (that's the condition for sending `null`).
     noteServerDraft(threadId, draft.text, draft.image_hashes);
     if (wireHashes !== null) {
       lastSyncedImageHashes.set(threadId, wireHashes);
     }
-    // Accepted. The engine holds what THIS attempt sent, so it stops owing a
-    // re-send only while this attempt is still the latest one.
-    settleComposeDelivered(threadId, isLatestComposePush(threadId, seq));
+    settleComposeDelivered(threadId);
   } finally {
-    const stillRunning = (inFlightPushes.get(threadId) ?? 1) - 1;
-    if (stillRunning > 0) inFlightPushes.set(threadId, stillRunning);
-    else inFlightPushes.delete(threadId);
-    // Release ONLY when nothing newer is queued or still running. An edit made
-    // during this PUT scheduled a fresh debounce (and a slow PUT can overlap
-    // the next one outright); dropping the flag here would advertise "the
-    // server has seen our latest intent" while a later write is still pending —
-    // which is exactly what every consumer of this set reads it to mean.
-    if (stillRunning === 0 && !pendingTimers.has(threadId)) pendingComposePuts.delete(threadId);
-    // Stamp the settle moment AFTER clearing pendingComposePuts: from here a
-    // GET that started before this settle (its server snapshot read before our
-    // PUT committed) must not clobber local compose state. See
-    // `composePutSettledAt`. Set even on the awaitThreadStarted early-return /
-    // PUT-failure path — local is still the user's latest intent, and a failed
-    // sync already toasted.
+    // From here a GET that started before this settle (its server snapshot read
+    // before our PUT committed) must not clobber local compose state. See
+    // `composePutSettledAt`. Set even on the awaitThreadStarted early-return and
+    // the PUT-failure path: local is still the user's latest intent, and a
+    // failed sync already toasted.
     composePutSettledAt.set(threadId, Date.now());
   }
 }
@@ -724,6 +805,11 @@ function cancelPendingPush(threadId: string): void {
     pendingTimers.delete(threadId);
     pendingComposePuts.delete(threadId);
   }
+  // A debounce is no longer the only place an uncommitted intent waits: one
+  // whose timer already fired while a write was running sits QUEUED instead,
+  // with no timer to clear. Both callers are dropping the draft (send consumed
+  // it, discard destroyed it), so a queued write for it is at best redundant.
+  owedComposePushes.delete(threadId);
   // Shared teardown for send and discard, so both stop owing a re-send here.
   // Unconditional (outside the timer branch): a push that already failed has no
   // timer left, and that is exactly the thread a later flush would resurrect.
@@ -834,11 +920,45 @@ export function ensureFocusedComposeThread(): string {
  *  along with the unrelated suggestion (`image_hashes: []` is a no-op on a
  *  brand-new draft). Does NOT send — the user reviews/edits, picks a
  *  destination, and hits Send themselves. Returns the thread id the text
- *  landed on. */
+ *  landed on.
+ *
+ *  Lands on whatever `ensureFocusedComposeThread` resolves, which is the FOCUSED
+ *  thread when there is one, active threads included. A caller that must not
+ *  write into an already-sent thread calls `dropNonComposingFocus()` first;
+ *  `applySuggestion` does, and has to do it there rather than here because it
+ *  reads the target before prefilling. */
 export function prefillCompose(text: string): string {
   const threadId = ensureFocusedComposeThread();
   updateCompose(threadId, { text, image_hashes: [] });
   return threadId;
+}
+
+/** Release the focus when it points at a thread that has already been sent, so
+ *  the next `ensureFocusedComposeThread` allocates a fresh draft instead of
+ *  returning the open thread.
+ *
+ *  `ensureFocusedComposeThread` hands back the focused id whatever its state,
+ *  which is right for typing (an active thread's composer writes a follow-up
+ *  draft onto that thread) and wrong for anything that COMPOSES a new message on
+ *  the user's behalf. The setup interview is the sharp case: its header button
+ *  is a permanent control, so it can be tapped with any thread focused, and
+ *  without this it aimed the interview at whatever the user was looking at. On a
+ *  coding-agent thread the engine's continuity lock rejected the send with a 409
+ *  and `sendCompose`'s rollback left the thread rendering as a Lucidos Agent
+ *  thread; on a chat thread the interview landed silently in an unrelated
+ *  conversation. `handleNavigationRequest`'s `new-chat` branch drops focus for
+ *  exactly this reason.
+ *
+ *  A focused DRAFT is left alone: replacing it in place (after the confirm) is
+ *  what a suggestion is supposed to do. `unfocusThread` rather than a bare
+ *  `setFocusedThread(null)` so the coding-agent pending picks of the thread we
+ *  are leaving are reset and the thread pane is revealed, which is how a mobile
+ *  user tapping the header button gets taken to the conversation that starts. */
+function dropNonComposingFocus(): void {
+  const id = focusedThreadId.value;
+  if (!id) return;
+  if (threadMap.value.get(id)?.meta.state === 'composing') return;
+  unfocusThread();
 }
 
 /** Apply a welcome-message starter suggestion to the compose input.
@@ -857,6 +977,7 @@ export function prefillCompose(text: string): string {
  *  Returns true when the suggestion was applied, false when the user declined the
  *  override. Does NOT send — the user reviews/edits and hits Send themselves. */
 export async function applySuggestion(text: string): Promise<boolean> {
+  dropNonComposingFocus();
   const existingId = focusedThreadId.value;
   if (existingId && !draftIsEmpty(getDraft(existingId))) {
     const ok = await showConfirm(
@@ -871,6 +992,62 @@ export async function applySuggestion(text: string): Promise<boolean> {
   applyDestination(focusedThreadId.value, { kind: 'lucidos-agent' });
   prefillCompose(text);
   requestPromptOverrideSync();
+  return true;
+}
+
+/** The message the setup-interview entry points send.
+ *
+ *  Deliberately an ordinary English sentence rather than a magic token: it lands
+ *  in the transcript as the user's own message, so the mechanism is visible and
+ *  they can retype or reword it later without the button. That is the
+ *  prompt-first side of `docs/philosophy.md` principle 3, applied to the one
+ *  surface a newcomer meets first.
+ *
+ *  The phrase "help me get the most out of Lucidos" is load-bearing on the
+ *  engine side: the chat system prompt's `SETUP_INTERVIEW_RULE` keys on it to
+ *  route the turn at `load_knowhow('system-knowhow/setup-interview')`, and the
+ *  knowhow's own frontmatter `description` repeats it for the retrieval path.
+ *  All three are pinned together by
+ *  `setup_interview_route_matches_the_frontend_seeded_prompt`, which reads THIS
+ *  file, so reword the sentence freely but keep that clause.
+ *
+ *  "my work and my life" rather than "my work and my week" is deliberate: the
+ *  interview covers personal admin, training and learning on the same footing
+ *  as a job (see `system-knowhow/setup-interview.md`, rung 1), and the sentence
+ *  the user watches themselves send should not narrow it back down. */
+export const SETUP_INTERVIEW_PROMPT =
+  'Help me get the most out of Lucidos: interview me about my work and my life, '
+  + 'then build me the apps and automations that fit, here in my workspace.';
+
+/** Start the setup interview: seed {@link SETUP_INTERVIEW_PROMPT} and SEND it.
+ *
+ *  Unlike {@link applySuggestion}, this does not stop at the draft. A first-run
+ *  user staring at a prefilled box they did not write has to decide whether to
+ *  send it, which is the hesitation the entry point exists to remove, so the
+ *  click is the whole gesture. Nothing is hidden by sending: the seeded sentence
+ *  is what appears in the transcript, on the same code path a typed message
+ *  takes.
+ *
+ *  Reuses `applySuggestion` for the parts that are identical (force the Lucidos
+ *  Agent destination, confirm before replacing a non-empty draft, force-sync the
+ *  textarea), so the draft-protection rule cannot drift between the two.
+ *
+ *  Returns true when the interview was sent, false when the user declined the
+ *  draft override or no draft resolved. */
+export async function startSetupInterview(): Promise<boolean> {
+  if (!(await applySuggestion(SETUP_INTERVIEW_PROMPT))) return false;
+  const threadId = focusedThreadId.value;
+  if (!threadId) return false;
+  try {
+    await sendCompose(threadId, { focus: true });
+  } catch (err) {
+    // `sendCompose` rethrows after rolling the draft back, and its other callers
+    // toast (see `beginSend` in PromptInput). Both entry points here fire this
+    // as `void`, so swallowing would surface a failed first-run click as
+    // nothing happening at all.
+    showToast(`Failed to start the setup interview: ${errorDetail(err)}`, 'error');
+    return false;
+  }
   return true;
 }
 
@@ -913,6 +1090,26 @@ function snapshotDraft(threadId: string): ComposeDraft | undefined {
 
 function isAlreadyGone(err: unknown): boolean {
   return err instanceof ApiError && (err.httpCode === 404 || err.httpCode === 410);
+}
+
+/** The last thing a send owes the engine: one compose write carrying the
+ *  cleared draft. Because writes are serialized, it is issued only after every
+ *  earlier write for the thread has settled, which makes it the last one the
+ *  engine applies, so a pre-send draft PUT can never be the resting state
+ *  whichever order the engine happened to receive things in.
+ *
+ *  `sendCompose` calls this; `sendFollowup` reaches the same guarantee through
+ *  its `updateCompose(id, {text: '', …})`, which clears the draft locally and
+ *  schedules the same write. Two entry points rather than one because the
+ *  follow-up path owes a local clear as well, and routing it through here too
+ *  would schedule a second, redundant write.
+ *
+ *  It goes through the ordinary debounced path rather than a bespoke request,
+ *  so it re-reads the draft when it fires. That is what makes the awkward case
+ *  right for free: type a new follow-up straight after sending, and this write
+ *  carries the new text instead of an empty draft. */
+function pushClearedComposeAfterSend(threadId: string): void {
+  schedulePush(threadId);
 }
 
 /** Send the focused thread's current compose contents as the first message.
@@ -976,6 +1173,19 @@ export async function sendCompose(
   const shouldFocus = opts.focus ?? true;
   if (shouldFocus) setFocusedThread(threadId);
   try {
+    // The chat POST needs the thread row to exist server-side, and on a
+    // first-send `POST /threads` may still be in flight: `ensureFocusedComposeThread`
+    // fires it without awaiting. Every optimistic local step above stays
+    // synchronous (the input must clear on the gesture), so this sits as late as
+    // possible, immediately before the only network call.
+    //
+    // Typing used to hide this: the draft PUT awaits the same promise in
+    // `pushNow`, and a human takes far longer than a POST to reach Send. Neither
+    // holds for a button that composes and sends in one gesture, and
+    // `cancelPendingPush` above has just dropped the PUT that was awaiting. A
+    // failed start rejects here and lands in the catch below, which rolls the
+    // draft back and rethrows for the caller to toast.
+    await awaitThreadStarted(threadId);
     await sendMessage(text, wireHashes.length > 0 ? wireHashes : undefined, {
       useCodingAgent: opts.useCodingAgent,
       context: opts.context,
@@ -992,6 +1202,16 @@ export async function sendCompose(
     // longer composing. Follow-ups (sendFollowup) don't go through here — an
     // active thread has no compose selection entry.
     clearComposeSelection(threadId);
+    // Scheduled here, AFTER the send resolved and the selection was consumed,
+    // for two reasons. `cancelPendingPush` above dropped the debounced write and
+    // a write already in flight cannot be recalled, so without this the engine's
+    // last word on this thread's draft could be the pre-send text. And ordering
+    // it after `clearComposeSelection` is what keeps the write from carrying the
+    // draft's dropdown picks back onto a row whose `compose_selection` the
+    // MessageReceived projection has just set to NULL. A send that FAILS
+    // schedules nothing: it consumed no draft, so there is no stale write to
+    // out-order, and the rollback's restored text must stay put.
+    pushClearedComposeAfterSend(threadId);
   } catch (err) {
     // Roll back state. Restore text/images only if the user hasn't started
     // typing into the now-empty textarea — overwriting fresh keystrokes
@@ -1021,6 +1241,10 @@ export async function sendFollowup(
 ): Promise<void> {
   // Must run before the draft clear — see `markHashesAsSent`.
   if (imageHashes?.length) markHashesAsSent(imageHashes);
+  // Clears the draft locally AND schedules the write the send owes the engine.
+  // `updateCompose` is the entry point that does both, so this path reaches
+  // `pushClearedComposeAfterSend`'s guarantee through it rather than by
+  // scheduling a second write.
   updateCompose(threadId, { text: '', image_hashes: [] });
   lastSyncedImageHashes.delete(threadId);
   await sendMessage(text, imageHashes, { ...opts, threadId, focus: opts?.focus ?? true });
@@ -1037,8 +1261,18 @@ function flushAllPending(): void {
   const deviceId = typeof localStorage !== 'undefined' ? localStorage.getItem('lucidos-device-id') : null;
   if (deviceId) headers['x-lucidos-device-id'] = deviceId;
 
-  for (const [threadId, timer] of pendingTimers) {
-    clearTimeout(timer);
+  // Every thread holding an intent the engine has not seen. Two states now
+  // qualify, not one: a debounce still counting down (`pendingTimers`), and an
+  // intent whose debounce already fired but which is QUEUED behind a running
+  // write (`owedComposePushes`). The queued one has no timer, and before writes
+  // were serialized it did not exist at all: the newest text had already been
+  // dispatched as its own overlapping request. Flushing only the timers would
+  // therefore drop exactly the text this whole change is about, on exactly the
+  // link that produces it (a write hanging on a stalled connection while the
+  // user keeps typing, then the page is closed or iOS suspends it).
+  const owed = new Set([...pendingTimers.keys(), ...owedComposePushes]);
+  for (const timer of pendingTimers.values()) clearTimeout(timer);
+  for (const threadId of owed) {
     const thread = threadMap.value.get(threadId);
     if (!thread) continue;
     const draft = getDraft(threadId);
@@ -1048,11 +1282,15 @@ function flushAllPending(): void {
     const selectionOverride = getComposeSelectionOverride(threadId);
     const selectionForFlush = Object.keys(selectionOverride).length > 0 ? selectionOverride : undefined;
     // Always emit the full array on tab close — hashes are tiny.
+    // Fenced like every other write. The page is unloading, so this is the last
+    // thing we can say; if a submission has since consumed the slot, the engine
+    // refusing it is exactly right.
     const body = JSON.stringify({
       text: draft.text,
       image_hashes: draft.image_hashes,
       mode: thread.meta.state === 'composing' ? draft.mode : null,
       selection: selectionForFlush,
+      compose_epoch: composeEpoch.get(threadId),
     });
     if (body.length > 64 * 1024) {
       // Telemetry carve-out (.claude/rules/frontend.md): the tab is unloading,
@@ -1077,7 +1315,10 @@ function flushAllPending(): void {
   pendingTimers.clear();
   // iOS bfcache can resume the page with frozen JS state; without this, stale
   // entries would block the next loadAllThreads from refreshing those threads.
+  // `owedComposePushes` goes with them: its intents have just been flushed, and
+  // a frozen entry would make a resumed page's runner issue a redundant write.
   pendingComposePuts.clear();
+  owedComposePushes.clear();
 }
 
 if (typeof window !== 'undefined') {

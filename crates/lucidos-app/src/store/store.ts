@@ -17,13 +17,16 @@ import type {
   MarketplaceCatalog,
   ConfirmState,
   ConfirmDetails,
+  ContextCapture,
   PromptState,
   ResponseEvent,
   ToastAction, ToastItem, ToastType,
   CredentialRequest,
   EmailConfirmRequest,
   PluginInstallRequest,
+  PluginInstallReceipt,
   PluginUninstallRequest,
+  PluginUninstallReceipt,
 } from './types';
 import { MENU_ITEMS } from './types';
 import type { AppUpdateRunning } from '../utils/tauri';
@@ -49,8 +52,8 @@ export type InlineForm =
   | { type: 'new-app' }
   | { type: 'trigger'; triggerId?: string }
   | { type: 'email-confirm'; request: EmailConfirmRequest; sentAt?: string }
-  | { type: 'plugin-install'; request: PluginInstallRequest }
-  | { type: 'plugin-uninstall'; request: PluginUninstallRequest };
+  | { type: 'plugin-install'; request: PluginInstallRequest; installed?: PluginInstallReceipt }
+  | { type: 'plugin-uninstall'; request: PluginUninstallRequest; removed?: PluginUninstallReceipt };
 
 /** The email confirmation panel, before or after the send. `sentAt` (an ISO
  *  timestamp) present ⇒ the email went out and the panel is a read-only receipt;
@@ -59,6 +62,19 @@ export type InlineForm =
  *  component state, so an already-sent email can never present a Send button
  *  again after a remount (a Back/Forward walk onto the entry, or a reload). */
 export type EmailConfirmForm = Extract<InlineForm, { type: 'email-confirm' }>;
+
+/** The plugin install panel, before or after the confirm. `installed` present ⇒
+ *  the files landed and the panel is a read-only receipt. Same shape and the
+ *  same reasons as `EmailConfirmForm`'s `sentAt`: one field so "did it happen"
+ *  and "what happened" can't desync, and it lives on the form (persisted panel
+ *  state) so a remount can never present an Install button for a staged
+ *  `install_id` the engine has already popped. */
+export type PluginInstallForm = Extract<InlineForm, { type: 'plugin-install' }>;
+
+/** The plugin uninstall panel, before or after the confirm. `removed` present ⇒
+ *  the files are gone and the panel is a read-only receipt. Mirrors
+ *  `PluginInstallForm`. */
+export type PluginUninstallForm = Extract<InlineForm, { type: 'plugin-uninstall' }>;
 
 // --- Panel overlay (discriminated union replacing 6 independent signals) ---
 export type PanelOverlay =
@@ -159,6 +175,16 @@ export function closeInlineForm(): void {
   const form = activeInlineForm.value;
   if (form?.type === 'trigger') resetContentScroll('triggers');
   panelOverlay.value = null;
+}
+
+/** Close `form`, but only while it is still the one on screen.
+ *
+ *  For any panel that resolves over an HTTP round trip: Escape dismisses during
+ *  the request, so a bare `closeInlineForm()` afterwards would close whatever
+ *  the user opened in the meantime. Identity comparison, not a type check, so a
+ *  second staged request of the same kind is not mistaken for this one. */
+export function closeInlineFormIfActive(form: InlineForm): void {
+  if (activeInlineForm.value === form) closeInlineForm();
 }
 
 // --- Settings subview ---
@@ -750,12 +776,14 @@ export function threadNeedsAttention(thread: ThreadState): boolean {
   const section = getThreadDisplaySection(thread);
   if (section !== 'current' && section !== 'saved') return false;
   const status = effectiveThreadStatus(thread);
-  // `paused` is deliberately absent. An engine restart interrupted that turn,
-  // and the engine either resumes it by itself (a Switch to new version, within
-  // seconds) or hands the Continue button back via the boot floor sweep. Neither
-  // is "nothing progresses until you act", and counting it here would flash the
-  // badge on every version switch. It still floats to the top of Current with
-  // its own dot via `reviewTier`.
+  // `paused` is deliberately absent, and since 2026-08-06 that is precise rather
+  // than a judgement call: the backend writes `paused` for exactly one shape, the
+  // user's own Switch to new version, which the engine resumes by itself within
+  // seconds. Nothing progresses *because* of the user there, so counting it would
+  // flash the badge on every version switch. Every OTHER interruption, including
+  // a boot that could not keep that resume promise, is written `failed` and lands
+  // in the `failed` arm below with its Continue button. A paused thread still
+  // floats to the top of Current with its own dot via `reviewTier`.
   return status === 'waiting_for_user_answer' || status === 'failed';
 }
 
@@ -1820,6 +1848,27 @@ export function showPrompt(
 // Set to a step ResponseEvent to open the per-step detail modal; null = closed.
 export type StepDetailModalState = Extract<ResponseEvent, { type: 'step' }> | null;
 export const stepDetailModal = signal<StepDetailModalState>(null);
+
+// --- Command checkpoint diff modal ---
+// Set to a checkpoint ResponseEvent to show what that command changed; null =
+// closed. Opened by "View changes" on the checkpoint card, so the Undo beside
+// it is not a blind button. A modal rather than an inline expansion because a
+// destructive command can touch a lot of files, and the transcript is not where
+// that belongs.
+export type CheckpointDiffModalState = Extract<ResponseEvent, { type: 'checkpoint' }> | null;
+export const checkpointDiffModal = signal<CheckpointDiffModalState>(null);
+
+// --- Context viewer ---
+// Set to a captured context to open the viewer; null = closed. Opened by the
+// context counter on a step row, which is its only door (the rest of the row
+// opens the step detail instead). It holds the snapshot rather than the step so
+// the viewer cannot be opened for a row that has none; `description` is carried
+// along purely as the subtitle naming which call the context belongs to.
+export interface ContextViewerState {
+  snapshot: ContextCapture;
+  description?: string;
+}
+export const contextViewer = signal<ContextViewerState | null>(null);
 
 // --- Image popup + message route panel state live in their own modules; re-exported
 // so importers keep using `from '../store/store'`. ---

@@ -223,6 +223,32 @@ fn test_describe_tool_ask_user_question_falls_back_to_header() {
     );
 }
 
+/// The one step label that outlives its turn: the thread parks on it, so this
+/// row is what the user reads for as long as the wait lasts. It has to say what
+/// the agent is waiting FOR, in the agent's own words, not name the event types
+/// (the engine's vocabulary) and not read as a generic "Executing …".
+#[test]
+fn test_describe_tool_await_event_leads_with_the_reason() {
+    let args = serde_json::json!({
+        "on": [{ "event_type": "ChangeProposed" }],
+        "timeout_secs": 3600,
+        "reason": "waiting for the release build to finish"
+    });
+    assert_eq!(
+        describe_tool("await_event", &args),
+        "Waiting: waiting for the release build to finish"
+    );
+}
+
+#[test]
+fn test_describe_tool_await_event_without_a_reason_still_says_what_it_is() {
+    let args = serde_json::json!({ "on": [{ "event_type": "ChangeProposed" }] });
+    assert_eq!(
+        describe_tool("await_event", &args),
+        "Waiting for an event..."
+    );
+}
+
 #[test]
 fn test_describe_tool_ask_user_question_multiple() {
     let args = serde_json::json!({

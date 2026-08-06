@@ -83,10 +83,8 @@ const SESSION_PATH_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit"];
 // claim a suppression nothing enforces while polluting CC's allowlist.
 // Session scope stays available where a meaningful sub-scope exists
 // (`command_execution(<first-token>:*)` — see `narrow_subscope`); `file_change`
-// gets NO session pattern at all (its approval input carries no stable
-// identifier, so the only derivable pattern would be the bare tool name —
-// one click would blanket-approve every future out-of-sandbox write in the
-// thread). Mirrors the TS-side `CODEX_BACKEND_TOOLS` /
+// gets NO session pattern at all (see the Session arm of
+// `derive_allow_pattern`). Mirrors the TS-side `CODEX_BACKEND_TOOLS` /
 // `SESSION_ALLOW_INEFFECTIVE` constants in `PermissionCard.tsx`.
 const CODEX_BACKEND_TOOLS: &[&str] = &["command_execution", "file_change"];
 
@@ -194,11 +192,17 @@ pub(crate) fn derive_allow_pattern(
                 }
                 return Some(format!("{}({})", tool_name, path));
             }
-            // file_change carries no stable identifier (its approval input
-            // is only reason/grant_root) — the bare-name fallback below
-            // would let one "Allow for this thread" click blanket-approve
-            // every future out-of-sandbox write. No session pattern: every
-            // file_change approval renders its own card.
+            // No session pattern for file_change: every one of its approvals
+            // renders its own card. A deliberate choice rather than a data
+            // gap, now that the app-server driver attaches the changed paths
+            // (`AppServerTracker::attach_known_file_changes`), which would make
+            // a per-file `file_change(<path>)` as derivable as `Edit(<path>)`.
+            // Two reasons it still gets none. Codex raises this approval only
+            // for a patch that escaped its sandbox, which is precisely what is
+            // worth re-confirming each time; and a `changes` list names several
+            // files at once, so no single key can stand for the grant. The
+            // bare-name fallback below would be worse than either: one click
+            // blanket-approving every future out-of-sandbox write.
             if tool_name == "file_change" {
                 return None;
             }
@@ -575,8 +579,8 @@ pub(crate) const SESSION_ALREADY_WAITING: &str = "Session is already waiting";
 /// exists to *cancel*, so this is system-driven cleanup of stuck projection
 /// state. The user's actor flows onto the event so the chip reads "You" (the
 /// user *did* push the button); the cause is `StaleSettle` so the summary
-/// reads "Settled stuck response" rather than "Restarted" or "Response
-/// interrupted".
+/// reads "Settled stuck response" rather than "Paused by restart" or
+/// "Response interrupted".
 ///
 /// Returns `Ok(true)` if an event was emitted, `Ok(false)` if the thread was
 /// already settled (or doesn't exist).

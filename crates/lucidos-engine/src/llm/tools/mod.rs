@@ -104,7 +104,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
     tools.extend(web::web_search_tools()); // web_search
     tools.extend(misc::request_credential_tools()); // request_credential
     tools.extend(email::email_tools()); // configure/send/read emails + save attachment
-    tools.extend(apps::app_tools()); // create_app, list_apps, load_knowhow, refresh_file, refresh_app, capture_app
+    tools.extend(apps::app_tools()); // create_app, list_apps, load_knowhow, refresh_app, capture_app
     tools.extend(misc::connect_oauth_tools()); // connect_oauth_account
     tools.extend(threads::spawn_tools()); // run_thread, run_coding_agent, follow_up_child_thread
                                           // correct_memory/correct_memory_by_id are the grouped `memory` manifest tool
@@ -120,6 +120,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                                                 // plugin + MCP management are the grouped `plugins` / `mcp` manifest tools
                                                 // (spliced from capability_manifest::llm_tools() by the chat/intent callers).
     tools.extend(misc::ask_user_question_tools()); // ask_user_question
+    tools.extend(misc::await_event_tools()); // await_event
     tools.extend(memory::dismiss_from_context_tools()); // dismiss_from_context
     tools.extend(misc::todo_write_tools()); // todo_write
     tools

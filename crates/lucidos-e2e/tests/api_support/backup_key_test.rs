@@ -56,8 +56,13 @@ fn decode_key_len(b64: &str) -> usize {
 
 /// One end-to-end pass over the whole contract, in a single test so the
 /// assertions don't race each other on the shared key file.
+///
+/// The lock covers the OTHER file that touches the key: enabling a backup
+/// schedule calls `crypto::ensure_key`, so `backup_schedule_test` would re-mint
+/// the key this test has deliberately removed, and the failure would land here.
 #[tokio::test]
 async fn backup_key_reveal_is_read_only_and_generate_never_overwrites() {
+    let _lock = crate::support::backup_key_lock().lock().await;
     let _guard = KeyFileGuard::capture();
     let client = http_client();
     let key_url = format!("{}/api/v1/backup/key", base_url());

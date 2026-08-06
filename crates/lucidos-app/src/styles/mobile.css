@@ -311,9 +311,11 @@
         max-width: calc(100vw - 4.5rem);
     }
 
-    /* Response content — prevent overflow */
-    .response-content pre,
-    .response-content table {
+    /* Response content: prevent overflow. Tables are deliberately NOT here.
+       They scroll inside the .table-scroll-wrapper renderMarkdown emits around
+       each one (shared-components.css), and 100vw is not the pane width once
+       the viewport carries a split, so the cap it applied was wrong anyway. */
+    .response-content pre {
         overflow-x: auto;
         max-width: calc(100vw - 1.5rem);
     }
@@ -585,19 +587,38 @@
     }
 
     .mobile-content-title {
-        /* Symmetric max-width MEASURED in JS: useHeaderActionCollapse's mobile
-           branch publishes `--mobile-content-title-max` on `.mobile-header-row`
-           (the title reads it via inheritance). A constant rem reserve cannot
-           clear the trailing cluster (refresh/open/fullscreen/notifications, plus
-           file toggles) at every ui-scale — the cluster is rem-sized but the
-           viewport is a fixed device width, so the safe centered width shifts with
-           scale AND with how many actions the content view carries. The hook first
-           collapses the nearest-title actions into the ⋮ overflow menu to widen
-           this box so the full title shows centered; only when even the
-           fully-collapsed row can't host it does this clamp truncate the title
-           (still centered) rather than let it paint under the icons. The fallback
-           (pre-measure / a display:none layout copy) keeps the old reserve.
-           Inherits overflow/ellipsis from .mobile-header-title. */
+        /* Box geometry MEASURED in JS: useHeaderActionCollapse's mobile branch
+           publishes `--mobile-content-title-max` and `--mobile-content-title-shift`
+           on `.mobile-header-row` (the title reads both via inheritance). A
+           constant rem reserve cannot clear the trailing cluster
+           (refresh/open/fullscreen/notifications, plus file toggles) at every
+           ui-scale, because the cluster is rem-sized while the viewport is a fixed
+           device width, so the safe centered width shifts with scale AND with how
+           many actions the content view carries. The hook first collapses the
+           nearest-title actions into the ⋮ overflow menu to widen this box so the
+           full title shows centered; failing that it slides the box off centre
+           (the shift) into whichever side has slack, since the symmetric reserve
+           is sized off the NEARER cluster and a view with no context actions
+           strands the whole trailing half; only when even the full span between
+           the clusters can't host it does this clamp truncate the title rather
+           than let it paint under the icons. The fallback (pre-measure /
+           a display:none layout copy) keeps the old reserve and no shift.
+           Inherits overflow/ellipsis from .mobile-header-title.
+
+           Positioned edge-to-edge with auto margins rather than inheriting that
+           rule's `left: 50%`: an absolutely positioned box with `left` set and
+           `right: auto` shrink-to-fits against the containing block MINUS `left`,
+           so a row-centered title silently caps at HALF the row. The symmetric
+           reserve never reached that cap; a shifted box spanning most of the row
+           does, and would have re-truncated exactly the title this shift exists
+           to show. Auto margins centre it on the row middle identically, then the
+           shift offsets it (overriding the shared translate, which is why the
+           -50% Y half is repeated here). */
+        left: 0;
+        right: 0;
+        width: fit-content;
+        margin-inline: auto;
+        transform: translate(var(--mobile-content-title-shift, 0px), -50%);
         max-width: var(--mobile-content-title-max, calc(100% - 12rem));
         /* Bare text node (no element child for `.mobile-header-title > *` to
            re-enable), so re-enable pointer events here — the tap tooltip

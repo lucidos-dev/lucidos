@@ -209,3 +209,94 @@ fn cli_follow_up_reaches_the_route() {
         "the CLI must surface the engine's refusal verbatim, got: {stderr}"
     );
 }
+
+/// `urgent` is accepted on the wire and changes nothing about authorization.
+/// The refusal ladder runs before the flag is ever consulted, so an urgent
+/// follow-up from a caller with no origin token is refused exactly like a plain
+/// one. Worth pinning: `urgent` is the only field on this route that CHANGES
+/// the child's state rather than describing the message, so a version of it
+/// that skipped a gate would be the serious kind of bug.
+#[tokio::test]
+async fn urgent_follow_up_is_still_subject_to_the_refusal_ladder() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let child = uuid::Uuid::new_v4();
+    seed_chat_thread_summary(&pool, child, "running").await;
+
+    let resp = post_follow_up(
+        &client,
+        &child.to_string(),
+        serde_json::json!({ "message": "stop the run", "urgent": true }),
+    )
+    .await;
+
+    assert_eq!(
+        resp.status(),
+        403,
+        "urgency must not buy a caller-less request any reach"
+    );
+    let body: serde_json::Value = resp.json().await.expect("standard error body");
+    assert!(
+        !body["error"]
+            .as_str()
+            .expect("error is a string")
+            .is_empty(),
+        "the refusal keeps the standard error body"
+    );
+}
+
+/// A malformed `urgent` is a 400 from the body parse, not a silent coercion to
+/// `false`. Silently reading `"true"` (the string) as not-urgent would drop a
+/// cancellation on the floor and report success, which is the worst shape this
+/// flag can fail in: the caller believes the child was stopped.
+#[tokio::test]
+async fn follow_up_refuses_a_non_boolean_urgent() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let child = uuid::Uuid::new_v4();
+    seed_chat_thread_summary(&pool, child, "running").await;
+
+    let resp = post_follow_up(
+        &client,
+        &child.to_string(),
+        serde_json::json!({ "message": "stop the run", "urgent": "yes" }),
+    )
+    .await;
+
+    assert_eq!(
+        resp.status(),
+        422,
+        "a non-boolean urgent must be rejected, never coerced to not-urgent"
+    );
+}
+
+/// Omitting `urgent` is legal and means not urgent, so every caller written
+/// before the flag existed keeps working unchanged. Proven here by the plain
+/// body still reaching the same refusal rather than a parse error.
+#[test]
+fn cli_follow_up_sends_urgent_only_when_asked() {
+    for (args, label) in [
+        (vec!["--urgent"], "with --urgent"),
+        (vec![], "without --urgent"),
+    ] {
+        let mut cmd = std::process::Command::new(crate::lucidos_cli_test::lucidos_bin());
+        cmd.args([
+            "threads",
+            "follow-up",
+            "--thread",
+            &uuid::Uuid::new_v4().to_string(),
+            "--message",
+            &unique_marker("cli-urgent"),
+        ]);
+        cmd.args(&args);
+        let out = cmd
+            .env("LUCIDOS_WORKSPACE", crate::support::workspace_path())
+            .output()
+            .expect("lucidos threads follow-up runs");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("403"),
+            "{label}: the body must parse and reach the ladder, got: {stderr}"
+        );
+    }
+}

@@ -1,6 +1,6 @@
 import { EVENT_CLASSIFICATION, LAST_ACTIVITY_EVENTS } from '../../generated/thread-lifecycle';
 import type { EventChannel, ThreadStatus } from '../../generated/thread-lifecycle';
-import type { StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
+import type { EventWaitSummary, StoredEvent, ThreadInitiator, ThreadSection, TodoItem } from './thread-event-types';
 
 /** Post-event projection snapshot carried on persisted SSE thread events
  *  (`data.aggregate`) and on `fetchThreadEvents` HTTP responses
@@ -238,6 +238,16 @@ export type ThreadMeta = {
    *  per render) so the prompt-bar indicator doesn't walk the events Map on
    *  every threadMap flush — see `TodoListIndicator`. */
   latestTodoList: TodoItem[] | null;
+  /** Live *event waits* on this thread, oldest first. Maintained in
+   *  `handleEvent`: `EventWaitStarted` appends, the three resolutions remove by
+   *  `wait_id`, and the filler `ToolResult` flips `attached` to false.
+   *
+   *  Separate from `status` on purpose (S10b). The status tracks the TURN, so a
+   *  thread holding only DETACHED waits reads as `idle` while still watching;
+   *  this list is what the always-visible subscription indicator renders, and
+   *  it is the only surface that answers "what is this thread subscribed to
+   *  right now" without scrolling the transcript. */
+  liveEventWaits: EventWaitSummary[];
 };
 
 /** Compose state machine — mirrors the Rust `ThreadState` enum. The archive
@@ -332,6 +342,7 @@ export function makeOptimisticThreadState(opts: {
       codingAgent: opts.codingAgent,
       state: opts.state ?? 'active',
       latestTodoList: null,
+      liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

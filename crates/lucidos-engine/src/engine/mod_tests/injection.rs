@@ -713,3 +713,49 @@ fn partition_chat_thread_ids_keeps_chat_threads() {
     assert!(chat.contains(&a));
     assert!(chat.contains(&b));
 }
+
+// --- urgent follow-up redirect (the Lucidos Agent lane) --------------------
+
+/// The redirect flag starts clear, so an ordinary Stop keeps meaning
+/// `UserStop`. Only `cancel_thread_for_followup` sets it.
+#[test]
+fn redirect_followup_starts_clear() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, _rx, _guard) = register(&threads, tid);
+
+    let handle_flag = {
+        let map = threads.lock().unwrap();
+        map.get(&tid).unwrap().redirect_followup.clone()
+    };
+    assert!(
+        !handle_flag.load(Ordering::Acquire),
+        "a fresh turn must not look like a redirect: that would relabel a real Stop"
+    );
+}
+
+/// Drained on read, exactly like `cancel_actor`. A flag left set would relabel
+/// the NEXT turn's Stop on the same thread as a redirect, which would then be
+/// withheld from the parent as a non-terminal outcome and leave the parent
+/// waiting on a child that had stopped.
+#[test]
+fn redirect_followup_is_drained_on_read() {
+    let threads = make_threads();
+    let tid = Uuid::new_v4();
+    let (_token, _rx, _guard) = register(&threads, tid);
+
+    let flag = {
+        let map = threads.lock().unwrap();
+        map.get(&tid).unwrap().redirect_followup.clone()
+    };
+    flag.store(true, Ordering::Release);
+
+    assert!(
+        flag.swap(false, Ordering::AcqRel),
+        "the first read sees the redirect"
+    );
+    assert!(
+        !flag.swap(false, Ordering::AcqRel),
+        "the second read must not: a stale flag would relabel the next turn"
+    );
+}

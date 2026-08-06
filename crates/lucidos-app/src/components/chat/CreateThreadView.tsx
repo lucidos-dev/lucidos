@@ -49,6 +49,62 @@ function buildProposedChangeInfo(exchanges: Exchange[]): Map<string, ProposedCha
 
 const NO_PROPOSED_CHANGE_INFO = new Map<string, ProposedChangeInfo>();
 
+/** The matched event of a detached wake, keyed by the `EventWaitDelivered`'s own
+ *  event id, which is what the wake's `UserPromptInjected.delivered_event_id`
+ *  names.
+ *
+ *  Resolved at thread level because the two events land in DIFFERENT exchanges:
+ *  the delivery is not an exchange-start type, so it attaches to whatever
+ *  exchange was open, and the injection immediately after it starts a new one.
+ *  A `ChatExchange` therefore cannot see its own wake's payload, and having it
+ *  read `threadMap` to go find one would resubscribe every exchange to the
+ *  store and undo the memo (see `chatExchangePropsEqual`).
+ *
+ *  The payload is stringified HERE, once per grouping pass, for two reasons: a
+ *  string is a primitive the memo can compare without a deep walk, and the
+ *  formatting is a pure function of the value with nothing per-render about it. */
+type DeliveredEventInfo = { eventType: string; payloadJson?: string };
+
+function buildDeliveredEventInfo(exchanges: Exchange[]): Map<string, DeliveredEventInfo> {
+  const map = new Map<string, DeliveredEventInfo>();
+  for (const ex of exchanges) {
+    for (const { event } of ex.steps) {
+      if (event.type !== 'EventWaitDelivered' || !event._eventId) continue;
+      map.set(event._eventId, {
+        eventType: event.event_type,
+        payloadJson: formatDeliveredPayload(event.payload),
+      });
+    }
+  }
+  return map;
+}
+
+/** Pretty-print a delivered payload for the disclosure, or return undefined when
+ *  there is nothing worth expanding. An empty object is the common shape for a
+ *  marker event, and a disclosure that opens onto `{}` is a worse affordance
+ *  than no disclosure at all. */
+export function formatDeliveredPayload(payload: unknown): string | undefined {
+  if (payload === null || payload === undefined) return undefined;
+  if (typeof payload === 'object' && Object.keys(payload as object).length === 0) return undefined;
+  try {
+    return JSON.stringify(payload, null, 2);
+  } catch {
+    // Cyclic or otherwise unserializable: the event NAME is still the answer to
+    // "why did this thread wake", so drop only the payload rather than the row.
+    return undefined;
+  }
+}
+
+const NO_DELIVERED_EVENT_INFO = new Map<string, DeliveredEventInfo>();
+
+/** The `EventWaitDelivered` id this exchange is the detached wake for, if it is
+ *  one at all. Exported shape of the "is this a wake" test, so the cheap
+ *  has-any check and the per-exchange lookup can't drift apart. */
+function wakeDeliveryId(ex: Exchange): string | undefined {
+  const ev = ex.userEvent;
+  return ev.type === 'UserPromptInjected' ? ev.delivered_event_id : undefined;
+}
+
 /** Threads the last model/effort across exchanges so each child sees its predecessors' state. */
 export function renderExchanges(
   exchanges: Exchange[],
@@ -114,6 +170,10 @@ export function renderExchanges(
   // change-lifecycle card to seed — the common (chat) thread pays nothing.
   const hasChangePanel = exchanges.some(ex => isChangeLifecycleEvent(ex.userEvent));
   const proposedChangeInfo = hasChangePanel ? buildProposedChangeInfo(exchanges) : NO_PROPOSED_CHANGE_INFO;
+  // Same shape, same reason: only a thread that actually holds a detached wake
+  // pays for the scan, so an ordinary thread pays nothing.
+  const hasEventWake = exchanges.some(ex => wakeDeliveryId(ex) !== undefined);
+  const deliveredEventInfo = hasEventWake ? buildDeliveredEventInfo(exchanges) : NO_DELIVERED_EVENT_INFO;
 
   const renderOne = (ex: Exchange, i: number): VNode => {
     // The active exchange plays the 'last' role (gets the stream, reads
@@ -130,6 +190,10 @@ export function renderExchanges(
       ? (ex.userEvent as { change_id?: string }).change_id
       : undefined;
     const proposedSeed = seedChangeId ? proposedChangeInfo.get(seedChangeId) : undefined;
+    // Undefined when this is not a wake, and ALSO when the delivery it names is
+    // outside the loaded window. Both fall back to the injected prose, which is
+    // the honest thing to show when the structured half is not in hand.
+    const wakeDelivery = deliveredEventInfo.get(wakeDeliveryId(ex) ?? '');
     return (
       <ChatExchange
         // Key by the stable event id (not userSeq) so an optimistic pending
@@ -158,6 +222,8 @@ export function renderExchanges(
         threadCanceling={threadCanceling}
         proposedChangeDesc={proposedSeed?.description}
         proposedChangeFileCount={proposedSeed?.fileCount}
+        wakeEventType={wakeDelivery?.eventType}
+        wakePayloadJson={wakeDelivery?.payloadJson}
       />
     );
   };

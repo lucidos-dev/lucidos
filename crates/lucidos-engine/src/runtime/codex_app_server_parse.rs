@@ -140,6 +140,12 @@ pub(super) fn parse_approval_request(
             })
         }
         "item/fileChange/requestApproval" => {
+            // These params carry NO paths, and both optional fields below are
+            // null in practice (verified live against codex-cli 0.146.1). What
+            // names the files is the `item/started` notification codex sends
+            // for the SAME item id just before this request. See
+            // [`AppServerTracker::attach_known_file_changes`], which the driver
+            // calls on the way out.
             let mut input = serde_json::Map::new();
             if let Some(reason) = params.get("reason").and_then(|v| v.as_str()) {
                 input.insert("reason".to_string(), reason.into());
@@ -207,6 +213,11 @@ pub(super) struct AppServerTracker {
     /// Approval-gated command/file items whose visible `ToolUse` must wait
     /// until the user accepts the permission card.
     approval_gates: HashMap<String, ApprovalGate>,
+    /// Stripped `{path, kind}` change lists of the `fileChange` items seen this
+    /// turn, keyed by item id, so an approval for one can name its files. See
+    /// [`Self::attach_known_file_changes`]. Bounded: an entry is dropped when
+    /// its item completes, and the whole map is cleared per turn.
+    file_change_items: HashMap<String, Vec<serde_json::Value>>,
     /// Last plan snapshot emitted from `turn/plan/updated`, for dedup —
     /// mirrors the exec tracker's `last_todo_items`. Deliberately NOT reset
     /// in [`begin_turn`]: the plan persists across turns, so a new turn's
@@ -248,6 +259,7 @@ impl AppServerTracker {
         self.current_turn_id = None;
         self.open_tool_ids.clear();
         self.approval_gates.clear();
+        self.file_change_items.clear();
     }
 
     pub fn turn_text(&self) -> String {
@@ -286,6 +298,46 @@ impl AppServerTracker {
                 id,
             })
             .collect()
+    }
+
+    /// Give a `file_change` approval the paths it is about, so the permission
+    /// card can name them instead of reading as a bare "file_change".
+    ///
+    /// `item/fileChange/requestApproval` carries `itemId` / `threadId` /
+    /// `turnId` / `startedAtMs` and the two nullable fields `reason` and
+    /// `grantRoot`, and nothing else. Verified live against codex-cli 0.146.1:
+    /// on a real out-of-sandbox write BOTH nullable fields came through `null`,
+    /// so the card had nothing at all to show. This is not a shape that will
+    /// grow a path field either: the v1 `applyPatchApproval` carried
+    /// `fileChanges`, and the v2 method deliberately dropped it.
+    ///
+    /// What we do have is the `item/started` notification for the SAME item id,
+    /// which codex emits just *before* the approval request and which carries
+    /// `changes: [{path, kind, diff}]`. [`Self::map_item`] already strips those
+    /// to `{path, kind}` for the visible tool step; this hands the same
+    /// stripped list to the approval.
+    ///
+    /// Deliberately a no-op when the item is unknown (a reordered or dropped
+    /// notification on some future codex): the card degrades to `reason` /
+    /// `grant_root` / the bare tool name, exactly as it behaved before, and the
+    /// approval still round-trips. An enrichment must never be able to wedge a
+    /// permission request.
+    pub fn attach_known_file_changes(&self, approval: &mut ApprovalRequest) {
+        if approval.tool_name != "file_change" {
+            return;
+        }
+        let Some(changes) = self.file_change_items.get(&approval.item_id) else {
+            return;
+        };
+        if changes.is_empty() {
+            return;
+        }
+        if let Some(input) = approval.input.as_object_mut() {
+            input.insert(
+                "changes".to_string(),
+                serde_json::Value::Array(changes.clone()),
+            );
+        }
     }
 
     /// Called when Codex asks Lucidos for approval before it runs a command or
@@ -604,6 +656,9 @@ impl AppServerTracker {
                     })
                     .unwrap_or_default();
                 if completed {
+                    // The approval for this item, if there was one, resolved
+                    // before completion, so nothing needs the paths any more.
+                    self.file_change_items.remove(&id);
                     if self.should_drop_declined_result(&id) {
                         return Vec::new();
                     }
@@ -615,6 +670,10 @@ impl AppServerTracker {
                         id,
                     }]
                 } else {
+                    // Remembered for the approval request codex raises next
+                    // when this patch escapes the sandbox, which carries no
+                    // paths of its own (`attach_known_file_changes`).
+                    self.file_change_items.insert(id.clone(), changes.clone());
                     self.maybe_emit_tool_use(DeferredToolUse {
                         name: "file_change".to_string(),
                         input: serde_json::json!({ "changes": changes }),

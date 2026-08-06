@@ -422,8 +422,8 @@ pub(crate) async fn inventory_worktrees(
             continue;
         };
         let thread_id = match lookup_thread_by_short(pool, &short).await {
-            Some(id) => id,
-            None => continue,
+            ShortThreadLookup::Found(id) => id,
+            ShortThreadLookup::NotFound | ShortThreadLookup::Unknown => continue,
         };
         let size_bytes = directory_size_bytes(&path);
         let is_dirty = is_worktree_dirty(&path).await;
@@ -443,20 +443,44 @@ pub(crate) async fn inventory_worktrees(
     rows
 }
 
+/// The answer to "which thread owns this `thread-<8-hex>` directory?".
+///
+/// `Unknown` is the arm that has to stay distinguishable from `NotFound`, for
+/// exactly the reason [`crate::engine::git_ops::GitAnswer`] exists on the git
+/// side: the caller reacts to `NotFound` by treating the directory as an
+/// ORPHAN, and the orphan arm deletes it without consulting
+/// `active_threads::is_active`. So a lookup that merely could not run must
+/// never be reported as "no thread owns this". That would be an unanswered
+/// probe authorizing a worktree deletion, the class that emptied a live
+/// coding-agent worktree on 2026-08-03.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShortThreadLookup {
+    /// Exactly one thread's id carries this prefix.
+    Found(Uuid),
+    /// The query ran and no thread's id carries this prefix: a real orphan.
+    NotFound,
+    /// The question could not be answered: a sqlx error, or an ambiguous
+    /// prefix matching more than one thread. Callers must skip the entry.
+    Unknown,
+}
+
 /// Resolve a `thread-<8-hex>` directory's short id back to a full `Uuid`
 /// by prefix-matching against the events table. The 8-char prefix is
 /// effectively unique across the per-workspace thread space (collision
 /// probability ~ N²/2³², so for ~10k threads/workspace the expected
-/// collisions are ≪ 1). On the rare collision — or any sqlx error —
-/// returns `None` so the caller skips the worktree. Refusing to act is
-/// always safer than acting on the wrong thread.
-pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> Option<Uuid> {
+/// collisions are ≪ 1).
+///
+/// A collision, or any sqlx error, yields [`ShortThreadLookup::Unknown`] so the
+/// caller skips the worktree entirely. Refusing to act is always safer than
+/// acting on the wrong thread, or than mistaking a database blip for proof that
+/// nobody owns the directory.
+pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> ShortThreadLookup {
     // The id column is uuid; cast to text for the prefix LIKE. We match
     // against `aggregate_id` (the canonical per-event thread id) instead
     // of the legacy `thread_id` column to stay aligned with the rest of
     // the codebase.
     let pattern = format!("{}%", short);
-    let rows: Vec<(Uuid,)> = sqlx::query_as(
+    let rows: Vec<(Uuid,)> = match sqlx::query_as(
         "SELECT DISTINCT aggregate_id::uuid FROM events \
          WHERE aggregate = 'thread' AND aggregate_id LIKE $1 \
          LIMIT 2",
@@ -464,11 +488,28 @@ pub(crate) async fn lookup_thread_by_short(pool: &sqlx::PgPool, short: &str) -> 
     .bind(pattern)
     .fetch_all(pool)
     .await
-    .ok()?;
-    if rows.len() != 1 {
-        None
-    } else {
-        Some(rows[0].0)
+    {
+        Ok(rows) => rows,
+        Err(e) => {
+            log!(
+                "[WorktreeCleanup] cannot resolve thread for short id {}: {}. \
+                 Treating as unknown, never as an orphan",
+                short,
+                e
+            );
+            return ShortThreadLookup::Unknown;
+        }
+    };
+    match rows.len() {
+        0 => ShortThreadLookup::NotFound,
+        1 => ShortThreadLookup::Found(rows[0].0),
+        _ => {
+            log!(
+                "[WorktreeCleanup] short id {} matches more than one thread, skipping",
+                short
+            );
+            ShortThreadLookup::Unknown
+        }
     }
 }
 

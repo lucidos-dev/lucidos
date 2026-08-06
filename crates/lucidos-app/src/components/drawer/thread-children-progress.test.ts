@@ -46,6 +46,7 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...overrides,
     },
     events: new Map(),

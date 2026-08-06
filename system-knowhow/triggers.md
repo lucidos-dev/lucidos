@@ -1,6 +1,6 @@
 ---
 name: Triggers
-description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y", recurring or event-driven background work), or wants an EXISTING trigger to run right now: "run this trigger now", "fire it manually", an ad hoc or off-schedule run, testing a trigger that already exists. Covers cron vs event subscriptions, the intent-vs-procedure rule, notification discipline, and the run action that fires an existing trigger off-schedule (plus when it is refused, and why an event-only trigger needs its event emitted instead).
+description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y", recurring or event-driven background work), or wants an EXISTING trigger to run right now: "run this trigger now", "fire it manually", an ad hoc or off-schedule run, testing a trigger that already exists. Load it for any of those phrasings even if a trigger may not be the answer: § "When a trigger is the right answer" also settles WHETHER this is a trigger at all, and routes "tell me HERE when X happens" to the `await_event` tool instead, since a trigger runs in its own thread and cannot report into the conversation the user is in. Covers cron vs event subscriptions, the intent-vs-procedure rule, notification discipline, and the run action that fires an existing trigger off-schedule (plus when it is refused, and why an event-only trigger needs its event emitted instead).
 ---
 
 # Triggers
@@ -26,6 +26,36 @@ The working reference for *triggers*: choosing one, building it, editing it, and
 | "When either X or Y happens, do Z" | One trigger with multiple entries in `on` — not two parallel triggers |
 | "Check this once and tell me" | Just do it now, no trigger |
 | "Remind me at 5pm today" | One-shot trigger (cron for today) — see "One-shot triggers" below |
+| "Tell me **here** when X happens" | `await_event`, NOT a trigger. See the next section |
+
+### First ask where the answer goes, not just how often
+
+A trigger runs in **its own thread**. It reaches the user as a notification, and
+it cannot continue the conversation they are typing in. So "let me know **here**
+when a coding agent edits code", "tell me in this chat when the build finishes",
+or any request made inside a thread the user is plainly waiting in, is the
+`await_event` tool, not a trigger. That holds **even when the phrasing sounds
+like a standing rule**: "when X happens, tell me" reads as forever, but what the
+user asked for is delivery into this conversation, and only `await_event` does
+that. It parks the turn at zero cost and resumes it when the event lands, so the
+report arrives in the thread they are reading. It is one-shot, so you re-arm per
+event, and consecutive parks are capped (the tool description carries the
+number), which is exactly why an unbounded promise belongs to a trigger instead.
+
+Duration is the *second* question, and it is the one this whole file is about:
+a reaction that must outlive the conversation, run when nobody is present, and
+fire indefinitely is a trigger. Both answers are often right at once. Lead with
+the one that matches where they asked to be told, and offer the other in the
+same breath: "I'll watch and report here; want a trigger too, so it keeps
+running once this thread is done?"
+
+Do **not** build a trigger whose job is to post back into a chat thread.
+`docs/adr/0047-event-wait-is-an-event.md` records that as precisely the
+workaround `await_event` replaced: it costs a persisted trigger row per wait
+(orphaned if the thread dies) plus a whole extra LLM turn in a *different*
+thread just to route one message, and what lands is a fresh message that starts
+a **new exchange** rather than resuming the turn that was waiting. The waiting
+thread has no distinct state either, so it reads as finished.
 
 If the user only wants it to happen **once, right now** — a check, a lookup, a computation — just do it inline; no trigger. But if the one-off is anchored to a **future time** ("remind me at 5pm", "ping me in 20 minutes"), it is NOT an inline task: you are not running at 5pm and nothing auto-resumes you, so an inline "reminder" is silently dropped. A future-time one-off needs a **one-shot trigger** (ideally self-deleting) — see "One-shot triggers" below.
 

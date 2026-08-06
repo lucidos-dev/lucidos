@@ -45,6 +45,7 @@ nav:
   - Home: index.md
   - Quickstart: quickstart.md
   - Concepts: concepts.md
+  - Philosophy: philosophy.md
   - Develop Lucidos: develop.md
   - Tutorials:
       - Build an app: tutorials/build-an-app.md

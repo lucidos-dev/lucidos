@@ -19,35 +19,43 @@ How the project is run, and how you can grow into a maintainer, is described in
 
 This repository is a **published mirror**, not the development repo. Lucidos is
 developed in a private source repository, and each release is exported here as a
-single snapshot. Three consequences are worth knowing before you write any code:
+single commit. Three consequences are worth knowing before you write any code:
 
-- **`main` is replaced wholesale on every release.** A release is one parentless
-  commit, force-pushed to `main` and tagged `v<x.y.z>`. Successive releases share
-  no history at all — the tags are the durable record, each pointing at a
-  standalone snapshot. The published tree is also stripped: internal-only paths
-  (planning docs, the release tooling) never ship.
+- **`main` gains one commit per release.** A release is one commit on `main`,
+  tagged `v<x.y.z>`, carrying the previous release's commit as its single
+  parent. The history is therefore linear and readable: `git log`,
+  `git describe` and a `git diff` between two release tags all work, and a
+  `git pull` fast-forwards.
+  Each commit is still a *snapshot* rather than the source repo's own
+  commit-by-commit history, and the published tree is stripped: internal-only
+  paths (planning docs, the release tooling) never ship.
 - **Your PR is imported, not merged.** A maintainer squashes it onto the previous
   release tag and ships it in the next release. The release commit carries a
   `Co-authored-by:` trailer naming your GitHub account, and the change is ported
   back into the source repo, so it stays in every release after that one.
 - **Your PR is then closed with a link to the release containing it.** GitHub
-  will show it as "Closed", never "Merged" — that's the mirror's mechanics, not a
+  will show it as "Closed", never "Merged": that's the mirror's mechanics, not a
   rejection. If the closing comment says it was released as `v<x.y.z>` and links
   that release, your change shipped.
 
-> **After a release, your fork shares no ancestor with the new `main`.** `git
-> pull` will conflict or produce a nonsense merge. Adopt the new snapshot instead
-> of merging into it, and move in-flight work onto the new tag:
+> **A clone from before `v0.21.0` needs a one-time reset.** Until 2026-08-04
+> each release was a *parentless* commit force-pushed over the last, so the
+> mirror showed a one-commit history with unrelated tags. The repair that
+> chained the published releases rewrote every one of their SHAs. If you cloned
+> or forked before then, `git pull` will conflict or produce a nonsense merge.
+> Adopt the rebuilt history once, and move in-flight work onto it:
 >
 > ```bash
 > # origin = your fork, upstream = this repository
 > git fetch upstream
-> git checkout main && git reset --hard upstream/main   # adopt the snapshot
+> git checkout main && git reset --hard upstream/main   # adopt the history
 > git checkout my-branch
 > git rebase --onto main <commit-you-branched-from>     # replay your work
 > ```
 >
-> Re-forking works just as well if the branch is already shipped.
+> Re-forking works just as well if the branch is already shipped. From `v0.21.0`
+> onward a release is ancestry-preserving, so `git pull` is an ordinary
+> fast-forward.
 
 ## Speak the project's language
 
@@ -189,6 +197,15 @@ Open an issue using the matching template:
 - **Knowhow contribution** — you want to contribute a knowhow doc, app, or
   trigger. See [`docs/taxonomy.md`](docs/taxonomy.md) and the `building-*.md`
   guides under [`system-knowhow/`](system-knowhow/) first.
+
+Before requesting a feature that adds a **surface** (a new place the user
+interacts with Lucidos) or an **integration** (a new relationship with somebody
+else's product), read [`docs/philosophy.md`](docs/philosophy.md) and say in the
+issue how your proposal answers it. That page also lists two ideas already
+settled as a *no*, with the reasoning, so you can tell straight away whether
+yours is one of them. It is deliberately narrow and does not apply to ordinary
+work: nobody will ask you to justify a fix, a refactor or a performance change
+against it.
 
 For open-ended questions and discussion, use
 [GitHub Discussions](https://github.com/lucidos-dev/lucidos/discussions) rather

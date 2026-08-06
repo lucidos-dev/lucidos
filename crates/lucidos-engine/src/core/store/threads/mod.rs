@@ -213,6 +213,13 @@ pub struct ThreadSummary {
     /// the draft's picks (the DB is the authoritative store, like `compose_text`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub compose_selection: Option<serde_json::Value>,
+    /// The thread's *compose epoch* (`docs/glossary.md`): how many times a
+    /// submission has consumed its compose slot. The client echoes it on every
+    /// compose PUT so the engine can refuse a write composed before a
+    /// submission that has since landed. Carried on the summary because a
+    /// reload is one of the two places a device learns it (the other is the
+    /// `ThreadComposeChanged` broadcast).
+    pub compose_epoch: i64,
 }
 
 /// SQL expression that extracts an app id from `{alias}.coding_agent_folder`.
@@ -331,6 +338,7 @@ struct ThreadRow {
     compose_images: serde_json::Value,
     compose_mode: Option<String>,
     compose_selection: Option<serde_json::Value>,
+    compose_epoch: i64,
 }
 
 /// Per-event projection snapshot carried on persisted thread events
@@ -505,7 +513,8 @@ fn thread_cols(alias: &str) -> String {
         {a}.cc_repo_id, \
         {repo_name} AS cc_repo_name, \
         {a}.coding_agent_kind, {a}.coding_agent_folder, {a}.coding_agent, \
-        {a}.state, {a}.compose_text, {a}.compose_images, {a}.compose_mode, {a}.compose_selection",
+        {a}.state, {a}.compose_text, {a}.compose_images, {a}.compose_mode, {a}.compose_selection, \
+        {a}.compose_epoch",
         a = alias,
         repo_name = repo_name_expr(&format!("{alias}.cc_repo_id")),
     )
@@ -596,6 +605,7 @@ impl EventStore {
                     compose_images: r.compose_images,
                     compose_mode: r.compose_mode,
                     compose_selection: r.compose_selection,
+                    compose_epoch: r.compose_epoch,
                 })
             })
             .collect()
@@ -635,6 +645,11 @@ pub struct ThreadSummaryFilters<'a> {
 }
 
 /// Statuses considered "active" — the agentic loop is mid-flow.
+///
+/// A thread merely holding an *event wait* does NOT count: a subscription does
+/// not hold its thread's turn, so a thread watching for a release has genuinely
+/// finished its turn and is idle. It surfaces through the subscription
+/// indicator instead.
 pub fn active_thread_statuses() -> [&'static str; 2] {
     [
         ThreadStatus::Running.as_str(),

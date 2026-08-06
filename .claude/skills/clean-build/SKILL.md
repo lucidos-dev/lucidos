@@ -142,7 +142,7 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-05. Anything not
+The currently-accepted categories, counted as of 2026-08-06. Anything not
 on this list is fair game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 74 sites across 47 files,
@@ -173,17 +173,21 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 169 sites across 58 files, every one of them
-  a test file: 57 `*.test.ts` plus one `*.test.tsx`
-  (`components/chat/__tests__/question-card.test.tsx`, which reads a
-  fixture through `node:fs`). The expectation is real: TS does not know
-  about Node globals, but Vitest provides them. Adding `@types/node` to
-  the project would contaminate the browser type-graph. Only the first
+  `@types/node` in project**, 195 sites across 68 files, every one of them
+  a test file: 66 `*.test.ts` plus two `*.test.tsx`
+  (`components/chat/__tests__/question-card.test.tsx` and
+  `components/chat/__tests__/welcome-onboarding.test.tsx`, both of which
+  read a fixture through `node:fs`). The expectation is real: TS does not
+  know about Node globals, but Vitest provides them. Adding `@types/node`
+  to the project would contaminate the browser type-graph. Only the first
   site in a file spells the reason out; the rest say `same`, which counts
   as justified because it points at an explanation in the same file. The
-  `.test.tsx` site is why the regeneration snippet above filters on
+  `.test.tsx` sites are why the regeneration snippet above filters on
   `\.test\.ts$` and prints the leftovers: the older wording asserted there
-  were none, and nothing checked it.
+  were none, and nothing checked it. The count grows with the test suite,
+  so treat a mismatch here as ordinary drift to restate rather than as a
+  finding, and check only that every leftover the snippet prints is still
+  a test file.
 - **`// eslint-disable-next-line`**, 8 sites across 4 files and 4 rules:
   `react-hooks/exhaustive-deps` in `hooks/useLoadableFetch.ts` (the deps
   list is intentionally narrow), `no-console` five times in

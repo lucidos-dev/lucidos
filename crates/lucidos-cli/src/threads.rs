@@ -106,6 +106,7 @@ pub(crate) fn cmd_follow_up(
     child_thread_id: &str,
     message: &str,
     event_id: Option<&str>,
+    urgent: bool,
 ) -> Result<(), BoxError> {
     let child = child_thread_id.trim();
     if uuid::Uuid::parse_str(child).is_err() {
@@ -129,6 +130,11 @@ pub(crate) fn cmd_follow_up(
     let mut body = serde_json::json!({ "message": message });
     if let Some(id) = event_id.map(str::trim).filter(|s| !s.is_empty()) {
         body["event_id"] = serde_json::Value::String(id.to_string());
+    }
+    // Only sent when set, so the engine's `#[serde(default)]` is what decides
+    // the default and the CLI never has to restate it.
+    if urgent {
+        body["urgent"] = serde_json::Value::Bool(true);
     }
     send_and_print("POST", &url, http_client()?.post(&url).json(&body))
 }

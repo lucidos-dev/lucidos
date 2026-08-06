@@ -52,7 +52,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   submitChat: vi.fn(),
   cancelChat: vi.fn(),
   stopClaudeCode: vi.fn(),
-  putComposeOnThread: vi.fn().mockResolvedValue(undefined),
+  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
@@ -75,6 +75,7 @@ vi.mock('./thread-loading', () => ({
 
 vi.mock('./devices', () => ({
   getDeviceId: () => 'device-test',
+  pendingDeviceRegistration: vi.fn(),
 }));
 
 vi.mock('../../utils/platform', () => ({
@@ -130,6 +131,7 @@ function makeActiveThread(id: string, overrides: Partial<ThreadState['meta']> = 
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...overrides,
     },
     events: new Map(),

@@ -444,8 +444,7 @@ pub(super) async fn upload_archive(
 
     let upload_dir = state
         .workspace_path
-        .join(".lucidos")
-        .join("tmp")
+        .join(crate::core::TMP_DIR)
         .join("plugins")
         .join("uploads")
         .join(Uuid::new_v4().simple().to_string());

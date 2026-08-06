@@ -134,6 +134,17 @@
     margin-bottom: 1.25rem;
 }
 
+/* A multi-paragraph message (DialogMessage splits on a blank line) sits tighter
+   between its own paragraphs than the gap down to the input or the buttons,
+   which the LAST paragraph keeps. Written as "followed by another paragraph"
+   rather than `:not(:last-of-type)` so it can only ever fire when a second
+   paragraph exists: every single-paragraph dialog keeps the rule above
+   untouched, including markup where the message is not the last element of its
+   type (showcase.html renders it as a div among divs). */
+.confirm-message:has(+ .confirm-message) {
+    margin-bottom: var(--space-md);
+}
+
 /* Text input for the prompt dialog (PromptDialog) — themed to match the
    confirm modal it shares its chrome with. */
 .prompt-input {

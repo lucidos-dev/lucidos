@@ -54,6 +54,11 @@ pub(in crate::api) struct FollowUpRequest {
     /// panel resolves the parent by id either way.
     #[serde(default)]
     event_id: Option<Uuid>,
+    /// Preempt the child's in-flight turn instead of queueing behind it.
+    /// Absent means `false`, so every caller that predates the flag keeps its
+    /// behaviour. See `FollowUpUrgency`.
+    #[serde(default)]
+    urgent: Option<bool>,
     #[serde(default)]
     caller_workspace: Option<String>,
 }
@@ -68,8 +73,8 @@ pub(in crate::api) struct FollowUpResponse {
     /// The child's human-meaningful handle. Callers name the child by this and
     /// never by uuid: no screen in Lucidos is labelled with a uuid.
     child_title: String,
-    /// `running` | `waiting-for-user-answer` | `revived`. Kebab-case because
-    /// it is a public API parameter value (`CLAUDE.md`).
+    /// `running` | `interrupted` | `waiting-for-user-answer` | `revived`.
+    /// Kebab-case because it is a public API parameter value (`CLAUDE.md`).
     delivered_to: &'static str,
     /// One sentence saying what that means, so a caller does not have to keep
     /// its own copy of the table.
@@ -83,6 +88,7 @@ pub(in crate::api) struct FollowUpResponse {
 fn delivered_to_wire(delivery: FollowUpDelivery) -> &'static str {
     match delivery {
         FollowUpDelivery::Running => "running",
+        FollowUpDelivery::Interrupted => "interrupted",
         FollowUpDelivery::WaitingForUserAnswer => "waiting-for-user-answer",
         FollowUpDelivery::Revived => "revived",
     }
@@ -142,6 +148,7 @@ pub(in crate::api) async fn follow_up_child(
             None,
             body.event_id,
             body.caller_workspace.as_deref(),
+            crate::engine::FollowUpUrgency::from_flag(body.urgent),
         )
         .await
         .map(|ack| Json(ack.into()))

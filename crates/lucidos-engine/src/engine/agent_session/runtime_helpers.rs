@@ -70,6 +70,67 @@ impl LucidosEngine {
         }
     }
 
+    /// Is this session shutting down? **The only definition**, for every reader
+    /// that classifies a turn: the two halves are each wrong alone, and the
+    /// interesting failures are two readers disagreeing. (`entry_guard.rs` reads
+    /// the per-session flag bare on purpose, asking who OWNS the terminal rather
+    /// than what it should be; see that field's doc in `engine::types`.)
+    ///
+    /// `per_session` is the caller's own load of
+    /// [`crate::engine::types::AgentSession::shutting_down`], a **snapshot**
+    /// signal: `shutdown_agent_sessions` sets it on the sessions present in
+    /// `agent_sessions` when its pass ran, and on nobody else. A session
+    /// inserted after that pass carries `false` while the engine is very much
+    /// going down. Taking the loaded `bool` rather than the atomic keeps the
+    /// "one read per decision" discipline with the caller, where the read is.
+    ///
+    /// `is_shutting_down()` is the **durable** half: `mark_shutting_down()` is
+    /// the first statement of `abort_in_flight_for_restart`, so it is already
+    /// true before the teardown boundary is even emitted. Neither half is
+    /// sufficient alone: the per-session flag misses a late registration, and
+    /// the global one is not per-session at all.
+    ///
+    /// Reading either half alone has cost us twice, and both were the same
+    /// late-registering session:
+    ///
+    /// * **thread-9e37697e** (data loss): `finalize_direct_agent` read only the
+    ///   per-session flag, ran full normal cleanup on a session whose
+    ///   `spawn_or_resume` finished after the pass, and `git branch -D`'d a
+    ///   still-resumable branch.
+    /// * **The 2026-08-06 switch report**: `emit_stop_terminal` read only the
+    ///   per-session flag when choosing the terminal event, so a *Switch to new
+    ///   version* that landed during a 2.8 s session spawn wrote
+    ///   `ResponseCanceled{user_stop}` on a turn nobody stopped. That cancel is
+    ///   in `TURN_ENDED_EVENT_TYPES_SQL`, so the next boot classified the branch
+    ///   `idle`, declined the auto-resume, and withdrew the "Paused by restart"
+    ///   promise the transcript had already made.
+    ///
+    /// See `docs/plans/2026-08-06-a-session-that-registers-mid-teardown-is-shutting-down.md`.
+    pub(crate) fn session_is_shutting_down(&self, per_session: bool) -> bool {
+        per_session || self.is_shutting_down()
+    }
+
+    /// [`Self::session_is_shutting_down`] for a caller that does not already
+    /// hold the session's flag: looks the session up and reads it. A thread
+    /// with no entry answers on the durable half alone.
+    ///
+    /// **Both flags are monotonic** (neither is ever cleared: the per-session
+    /// one is only ever set `true`, and `mark_shutting_down` says the global one
+    /// stays set because the process is on its way out). So this only ever goes
+    /// false → true, and asking again LATER can only be more true. A caller with
+    /// two decisions to make should therefore ask again at the second one rather
+    /// than reuse the first answer, whenever the later decision is the
+    /// destructive one.
+    pub(crate) async fn thread_session_is_shutting_down(&self, thread_id: Uuid) -> bool {
+        let per_session = {
+            let guard = self.agent_sessions.lock().await;
+            guard
+                .get(&thread_id)
+                .is_some_and(|s| s.shutting_down.load(std::sync::atomic::Ordering::Relaxed))
+        };
+        self.session_is_shutting_down(per_session)
+    }
+
     /// Stamp `actor: System` on `meta` when an aborted-by-host-system terminal
     /// fires (safety-net, shutdown cancel) and no actor has been set already.
     /// Lets the AbortPanel render '⚙ System' for process-killed aborts —
@@ -81,29 +142,6 @@ impl LucidosEngine {
         if is_aborted && meta.actor.is_none() {
             meta.actor = Some(crate::engine::thread_events::MessageOrigin::system());
         }
-    }
-
-    /// True iff an engine-internal path already pre-emitted the boundary
-    /// `ResponseAborted` for this session — `run_session`'s terminal arms
-    /// (Result classify, cancel, chat_cancel, safety net) skip their own emit
-    /// when set, so the user sees one panel instead of two. Set by
-    /// `abort_in_flight_for_restart` (`/api/v1/restart`) and
-    /// `emit_stuck_thread_eviction_abort` (`register_thread_queued` 60s
-    /// timeout).
-    pub(super) fn external_terminal_already_emitted(
-        flag: &std::sync::atomic::AtomicBool,
-        thread_id: Uuid,
-        site: &'static str,
-    ) -> bool {
-        let skip = flag.load(std::sync::atomic::Ordering::Acquire);
-        if skip {
-            crate::log!(
-                "[AgentSession] Skipping terminal emit ({}) for thread {} — external pre-emit already landed",
-                site,
-                thread_id
-            );
-        }
-        skip
     }
 
     /// Build the terminal event for a CC turn from its classified kind.
@@ -184,18 +222,20 @@ impl LucidosEngine {
         cc_reasoning_effort: &Option<String>,
         coding_agent: crate::runtime::CodingAgent,
     ) {
-        // `is_shutdown` is the PER-SESSION flag, which `shutdown_agent_sessions`
-        // sets only on sessions present in `agent_sessions` when its pass ran. A
-        // session inserted after that pass (a slow `--resume` racing the restart)
-        // carries `false` while the engine is very much shutting down, and that
-        // is precisely the race the preserve guard's doc names. OR in the
-        // engine-global flag, exactly as `finalize_direct_agent` does for the
-        // same reason (`completion.rs`, the thread-9e37697e incident).
+        // Resolve "is this session shutting down" ONCE, and use that one value
+        // for every decision below. Two reads of the same question inside this
+        // function is exactly what produced the 2026-08-06 switch report: the
+        // preserve guard asked the widened question and `stop_terminal_kind` got
+        // the bare per-session flag, so a restart that landed mid-spawn wrote
+        // `ResponseCanceled{user_stop}` on a turn nobody stopped. The parameter
+        // arrives as the per-session snapshot; from here on `is_shutdown` is the
+        // real answer.
+        let is_shutdown = self.session_is_shutting_down(is_shutdown);
         if crate::engine::agent_recovery::preserve_question_park_at_shutdown(
             &self.pool,
             arm,
             thread_id,
-            is_shutdown || self.is_shutting_down(),
+            is_shutdown,
         )
         .await
         {
@@ -234,7 +274,16 @@ impl LucidosEngine {
         // Dedup BOTH Aborted and Canceled — eviction-path pre-emits set the
         // flag with actor=System, so a follow-up Canceled here would mask the
         // engine-initiated abort as a user cancel.
-        if Self::external_terminal_already_emitted(external_terminal_emitted, thread_id, arm) {
+        if external_terminal_already_emitted(
+            &self.pool,
+            external_terminal_emitted,
+            thread_id,
+            meta.request_event_id,
+            is_shutdown,
+            arm,
+        )
+        .await
+        {
             return;
         }
         let terminal_event = Self::make_terminal_event(
@@ -370,6 +419,86 @@ impl LucidosEngine {
     }
 }
 
+/// True iff an engine-internal path already emitted the boundary
+/// `ResponseAborted` for this turn, so `run_session`'s terminal arms (Result
+/// classify, cancel, chat_cancel, safety net) skip their own emit and the user
+/// sees one panel instead of two.
+///
+/// Two arms, because the flag alone cannot answer for every session:
+///
+/// * **The in-memory flag**, set by `abort_in_flight_for_restart`
+///   (`/api/v1/restart`) and `emit_stuck_thread_eviction_abort`
+///   (`register_thread_queued`'s 60 s timeout). It covers a boundary emitted
+///   while this session was already in `agent_sessions`.
+/// * **The events table**, consulted only during an effective shutdown. It
+///   covers the opposite order: a boundary emitted BEFORE the session existed.
+///   Both restart emitters iterate a snapshot of `agent_sessions`, so a session
+///   still spawning is invisible to them and has no flag of its own to set.
+///   That is the 2026-08-06 switch report: a session that registered one second
+///   after the teardown boundary stacked a second terminator next to it, and
+///   that extra event then cost the thread its auto-resume.
+///
+/// **The DB arm needs BOTH halves of "covers this turn", and neither alone.**
+/// It goes through [`crate::engine::agent_recovery::boundary_abort_covers_turn`]:
+/// a `ResponseAborted` that out-sequences the thread's newest start event AND
+/// carries this turn's `request_event_id`.
+///
+/// * The **anchor alone** is what `thread_events::has_terminator_for` (the gate
+///   `emit_response_canceled` uses) would give, and it is wrong here: a
+///   coding-agent session keeps ONE `request_event_id` across follow-up turns,
+///   so it would read the first turn's terminator as covering the second.
+///   Observed shape, thread 950f5ebb: `SessionStarted`, `MessageReceived`,
+///   `ResponseGenerated`, `MessageReceived`, `ResponseGenerated`, two genuine
+///   terminators under one anchor.
+/// * The **window alone** is turn-exact only for turns that carry a start
+///   event, and two ordinary shapes carry none (a parent woken by
+///   `ChildThreadCompleted`, and an `answered_after_idle` continuation, which
+///   withholds its `ContinuationStarted` by design). For those a previous
+///   turn's abort sits inside the window forever, so the window alone would
+///   read a stale boundary as covering a live turn and leave it with no
+///   terminator at all.
+///
+/// A turn with no anchor cannot prove either, so it emits.
+///
+/// Gated on `is_shutdown` so the normal path pays no query: outside a teardown
+/// the flag is the whole answer, exactly as before. A free function taking the
+/// pool, so its tests drive it against a seeded pool rather than needing a
+/// whole `LucidosEngine`.
+pub(super) async fn external_terminal_already_emitted(
+    pool: &sqlx::PgPool,
+    flag: &std::sync::atomic::AtomicBool,
+    thread_id: Uuid,
+    request_event_id: Option<Uuid>,
+    is_shutdown: bool,
+    site: &'static str,
+) -> bool {
+    if flag.load(std::sync::atomic::Ordering::Acquire) {
+        crate::log!(
+            "[AgentSession] Skipping terminal emit ({}) for thread {}: external pre-emit already landed",
+            site,
+            thread_id
+        );
+        return true;
+    }
+    if !is_shutdown {
+        return false;
+    }
+    let Some(anchor) = request_event_id else {
+        return false;
+    };
+    if crate::engine::agent_recovery::boundary_abort_covers_turn(pool, thread_id, anchor).await {
+        crate::log!(
+            "[AgentSession] Skipping terminal emit ({}) for thread {}: this session registered \
+             after the teardown boundary, which already covers turn {}",
+            site,
+            thread_id,
+            anchor
+        );
+        return true;
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -399,7 +528,7 @@ mod tests {
 
     /// If a more specific actor is already set (e.g. device for /api/v1/restart
     /// pre-emit), don't overwrite it. The pre-emit's device attribution must
-    /// survive so the AbortPanel reads "You — Restarted" not "System".
+    /// survive so the AbortPanel reads "Paused by restart", not "System".
     #[test]
     fn stamp_system_actor_does_not_overwrite_existing() {
         use crate::engine::thread_events::{EventMeta, MessageOrigin};
@@ -413,6 +542,379 @@ mod tests {
         };
         LucidosEngine::stamp_system_actor_if_aborted(&mut meta, true);
         assert_eq!(meta.actor, Some(device));
+    }
+
+    /// Source-scan tripwire: **`is_shutdown` always holds the effective
+    /// answer**, never the raw per-session flag.
+    ///
+    /// This is the shape of the 2026-08-06 switch report, and a behavioural
+    /// test cannot reach it: every consumer is buried inside `run_session`,
+    /// which needs a whole live `LucidosEngine` plus a subprocess. What went
+    /// wrong was purely textual. One function bound `is_shutdown` from the bare
+    /// atomic, asked the widened question in one place and the narrow one three
+    /// lines later, and the narrow read is the one that chose the terminal
+    /// event. `run_session` then used the same NAME for both meanings in the
+    /// same file, which is what made the discrepancy invisible on review.
+    ///
+    /// So the rule is about the name: in the three production files that decide
+    /// a terminal, every `let is_shutdown = …` must be produced by
+    /// `session_is_shutting_down`. Widening at a site that later re-widens is
+    /// harmless (the OR is idempotent) and worth it, because a reader must
+    /// never have to trace a call chain to learn which of the two questions a
+    /// variable answers.
+    ///
+    /// Scoped to those three deliberately. Test files bind the name to a plain
+    /// literal to drive the pure truth tables (`cancel_lifecycle_tests.rs`), and
+    /// `run_session/entry_guard.rs` reads the per-session flag on purpose (see
+    /// its own doc); neither is a terminal decision.
+    #[test]
+    fn is_shutdown_is_always_the_effective_answer() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("src")
+            .join("engine")
+            .join("agent_session");
+        let files = [
+            dir.join("runtime_helpers.rs"),
+            dir.join("run_session").join("run.rs"),
+            dir.join("run_session").join("completion.rs"),
+        ];
+        let mut violations: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+        for path in &files {
+            let content = std::fs::read_to_string(path).expect("read source");
+            let lines: Vec<&str> = content.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.trim_start().starts_with("let is_shutdown =") {
+                    continue;
+                }
+                checked += 1;
+                // The binding's own statement, which may wrap over several
+                // lines or open a block. Three lines is enough for every
+                // current shape and keeps the scan from swallowing the next
+                // statement.
+                let window = lines[i..(i + 4).min(lines.len())].join(" ");
+                if !window.contains("session_is_shutting_down") {
+                    violations.push(format!(
+                        "{}:{}: {}",
+                        path.file_name().unwrap().to_string_lossy(),
+                        i + 1,
+                        line.trim()
+                    ));
+                }
+            }
+        }
+        assert!(
+            checked >= 6,
+            "the scan found only {checked} `is_shutdown` bindings, so it has \
+             stopped matching the source it is supposed to guard"
+        );
+        assert!(
+            violations.is_empty(),
+            "`is_shutdown` must be the effective answer \
+             (`session_is_shutting_down`), not the raw per-session flag. A bare \
+             read here classifies an engine restart as a user Stop for any \
+             session that registered after the teardown snapshot:\n{}",
+            violations.join("\n")
+        );
+    }
+
+    // -- external_terminal_already_emitted ---------------------------------
+    //
+    // The DB arm is the half added for the 2026-08-06 switch report, where a
+    // session registered AFTER the teardown boundary and so could never have
+    // been handed the in-memory flag. Each test states one leg of the
+    // predicate; between them they pin that the suppression is scoped to the
+    // TURN, not to the session and not to the request id.
+    mod suppression {
+        use crate::engine::event_bus::{BusEvent, EventBus};
+        use crate::engine::thread_events::{
+            AbortCause, ActorMode, EventChannel, EventMeta, MessageOrigin, ThreadEvent,
+        };
+        use crate::test_support::{setup_test_db, teardown_test_db};
+        use std::sync::atomic::AtomicBool;
+        use uuid::Uuid;
+
+        fn cc_meta() -> EventMeta {
+            EventMeta {
+                channel: Some(EventChannel::ClaudeCode),
+                ..EventMeta::NONE
+            }
+        }
+
+        /// A user message: a start event, so it retires every abort before it.
+        /// Returns its own id, which is the anchor the turn it opens will carry.
+        async fn seed_start(bus: &EventBus, thread_id: Uuid) -> Uuid {
+            bus.emit(BusEvent::Thread {
+                thread_id,
+                event: ThreadEvent::MessageReceived {
+                    text: "so go?".into(),
+                    user_image_hashes: vec![],
+                    device_id: None,
+                    device: None,
+                    image_description: None,
+                    parent_thread_id: None,
+                    spawning_event_id: None,
+                    mode: ActorMode::Human,
+                    model: None,
+                    reasoning_effort: None,
+                    origin: None,
+                },
+                meta: cc_meta(),
+            })
+            .await
+            .expect("emit succeeds")
+            .expect("event persisted")
+            .event_id
+        }
+
+        /// The switch teardown boundary the restart pre-emit lands, anchored on
+        /// the turn it is tearing down (what `in_flight_request_event_id`
+        /// resolves for the real emit).
+        async fn seed_teardown_boundary(bus: &EventBus, thread_id: Uuid, anchor: Uuid) {
+            crate::engine::thread_events::emit_response_aborted(
+                bus,
+                thread_id,
+                AbortCause::EngineShutdown,
+                String::new(),
+                vec![],
+                None,
+                None,
+                EventMeta {
+                    request_event_id: Some(anchor),
+                    actor: Some(MessageOrigin::Device {
+                        device_id: "d-1".into(),
+                        label: "My MacBook".into(),
+                    }),
+                    ..cc_meta()
+                },
+                "[test] teardown boundary",
+            )
+            .await;
+        }
+
+        /// Distinct sequence ordering, so "newer than the latest start" has a
+        /// well-defined answer.
+        async fn tick() {
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        /// The reported shape. No flag was ever set (the session did not exist
+        /// when the boundary was emitted), yet the turn is already covered, so
+        /// this session must NOT stack a second terminator on it.
+        #[tokio::test]
+        async fn a_boundary_that_predates_the_session_still_suppresses_its_terminal() {
+            let (pool, db_name) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread_id = Uuid::new_v4();
+
+            let anchor = seed_start(&bus, thread_id).await;
+            tick().await;
+            seed_teardown_boundary(&bus, thread_id, anchor).await;
+
+            let never_set = AtomicBool::new(false);
+            assert!(
+                super::super::external_terminal_already_emitted(
+                    &pool,
+                    &never_set,
+                    thread_id,
+                    Some(anchor),
+                    true,
+                    "test",
+                )
+                .await,
+                "the teardown boundary covers this turn, so a session that \
+                 registered after it must adopt that boundary rather than emit \
+                 its own"
+            );
+
+            pool.close().await;
+            teardown_test_db(&db_name).await;
+        }
+
+        /// The gate that keeps the normal path free: outside a shutdown the DB
+        /// is never consulted, so an ordinary turn pays no query and an old
+        /// abort cannot suppress a live turn's terminal.
+        #[tokio::test]
+        async fn outside_a_shutdown_only_the_flag_answers() {
+            let (pool, db_name) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread_id = Uuid::new_v4();
+
+            let anchor = seed_start(&bus, thread_id).await;
+            tick().await;
+            seed_teardown_boundary(&bus, thread_id, anchor).await;
+
+            let never_set = AtomicBool::new(false);
+            assert!(
+                !super::super::external_terminal_already_emitted(
+                    &pool,
+                    &never_set,
+                    thread_id,
+                    Some(anchor),
+                    false,
+                    "test",
+                )
+                .await,
+                "with no shutdown in progress the flag is the whole answer, \
+                 exactly as before this arm existed"
+            );
+
+            let flagged = AtomicBool::new(true);
+            assert!(
+                super::super::external_terminal_already_emitted(
+                    &pool,
+                    &flagged,
+                    thread_id,
+                    Some(anchor),
+                    false,
+                    "test",
+                )
+                .await,
+                "the in-memory flag still answers on its own, shutdown or not"
+            );
+
+            pool.close().await;
+            teardown_test_db(&db_name).await;
+        }
+
+        /// The counter-case that rules out an anchor-ONLY gate. A live
+        /// coding-agent session keeps ONE anchor across follow-up turns, so the
+        /// window half is load-bearing: once a new start event out-sequences the
+        /// boundary, the turn it opened is owed its own terminal even though the
+        /// anchor is unchanged.
+        ///
+        /// Observed live, thread 950f5ebb / request 603fa6b2:
+        /// `SessionStarted`, `MessageReceived`, `ResponseGenerated`,
+        /// `MessageReceived`, `ResponseGenerated`. An anchor-only gate would
+        /// have swallowed the second `ResponseGenerated` and stuck the thread at
+        /// `running` forever.
+        #[tokio::test]
+        async fn a_new_start_event_re_arms_the_terminal_even_during_shutdown() {
+            let (pool, db_name) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread_id = Uuid::new_v4();
+
+            let anchor = seed_start(&bus, thread_id).await;
+            tick().await;
+            seed_teardown_boundary(&bus, thread_id, anchor).await;
+            tick().await;
+            // The next turn opens. The boundary above now belongs to the
+            // previous one and says nothing about this one. The session keeps
+            // its original anchor, which is exactly why the anchor alone cannot
+            // decide this.
+            seed_start(&bus, thread_id).await;
+
+            let never_set = AtomicBool::new(false);
+            assert!(
+                !super::super::external_terminal_already_emitted(
+                    &pool,
+                    &never_set,
+                    thread_id,
+                    Some(anchor),
+                    true,
+                    "test",
+                )
+                .await,
+                "a turn opened after the boundary is owed its own terminator: \
+                 suppressing it would strand the thread mid-turn"
+            );
+
+            pool.close().await;
+            teardown_test_db(&db_name).await;
+        }
+
+        /// The counter-case that rules out a WINDOW-only gate, and the reason
+        /// the anchor half exists.
+        ///
+        /// Two ordinary turn shapes carry none of `THREAD_START_EVENTS_SQL`: a
+        /// parent woken by `ChildThreadCompleted`, and an `answered_after_idle`
+        /// continuation, whose `ContinuationStarted` is deliberately withheld by
+        /// `continue_should_open_resume_exchange`. For those, a previous turn's
+        /// abort never leaves the window, so a window-only gate reads a stale
+        /// boundary as covering the live turn and the turn gets NO terminator at
+        /// all: the same loss this whole change exists to prevent, in a new
+        /// disguise.
+        #[tokio::test]
+        async fn a_stale_boundary_from_a_previous_turn_does_not_suppress_this_one() {
+            let (pool, db_name) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread_id = Uuid::new_v4();
+
+            // Turn 1, ended by an abort. Nothing after it is a start event.
+            let old_anchor = seed_start(&bus, thread_id).await;
+            tick().await;
+            seed_teardown_boundary(&bus, thread_id, old_anchor).await;
+            tick().await;
+
+            // Turn 2 opens with no start event of its own, the way an
+            // `answered_after_idle` resume does. Its anchor is the
+            // `CodingAgentPromptSent` the continuation emitted.
+            let new_anchor = bus
+                .emit(BusEvent::Thread {
+                    thread_id,
+                    event: ThreadEvent::CodingAgentPromptSent {
+                        text: "continue".into(),
+                        coding_agent: crate::runtime::CodingAgent::ClaudeCode,
+                        origin: None,
+                    },
+                    meta: cc_meta(),
+                })
+                .await
+                .expect("emit succeeds")
+                .expect("event persisted")
+                .event_id;
+
+            assert!(
+                crate::engine::agent_recovery::boundary_abort_already_emitted(&pool, thread_id)
+                    .await,
+                "precondition: the window-only predicate still counts the stale \
+                 abort, because no start event ever superseded it"
+            );
+
+            let never_set = AtomicBool::new(false);
+            assert!(
+                !super::super::external_terminal_already_emitted(
+                    &pool,
+                    &never_set,
+                    thread_id,
+                    Some(new_anchor),
+                    true,
+                    "test",
+                )
+                .await,
+                "the stale boundary names the PREVIOUS turn, so this turn must \
+                 still emit its own terminator"
+            );
+
+            pool.close().await;
+            teardown_test_db(&db_name).await;
+        }
+
+        /// A turn with no anchor cannot prove a boundary covers it, so it emits.
+        /// The safe direction: a duplicate panel is cosmetic, a missing
+        /// terminator strands the turn.
+        #[tokio::test]
+        async fn a_turn_with_no_anchor_still_emits_its_terminal() {
+            let (pool, db_name) = setup_test_db().await;
+            let (bus, _rx) = EventBus::new(pool.clone());
+            let thread_id = Uuid::new_v4();
+
+            let anchor = seed_start(&bus, thread_id).await;
+            tick().await;
+            seed_teardown_boundary(&bus, thread_id, anchor).await;
+
+            let never_set = AtomicBool::new(false);
+            assert!(
+                !super::super::external_terminal_already_emitted(
+                    &pool, &never_set, thread_id, None, true, "test",
+                )
+                .await,
+                "with no anchor there is nothing to match the boundary against"
+            );
+
+            pool.close().await;
+            teardown_test_db(&db_name).await;
+        }
     }
 
     #[test]

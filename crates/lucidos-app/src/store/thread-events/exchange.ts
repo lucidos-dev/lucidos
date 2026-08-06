@@ -282,7 +282,15 @@ const STATIC_MODEL_LABELS: Record<string, string> = Object.fromEntries([
   ['claude-haiku-4-5@20251001', 'Haiku 4.5'],
   ['opus', 'Opus 4.6'],
   ['opus[1m]', 'Opus 4.6 (1M)'],
-  ['sonnet', 'Sonnet 4.6'],
+  // Mirrors the picker row's label, which is deliberately version-free: `sonnet`
+  // is CC's always-latest alias, so a stored one says nothing about WHICH Sonnet
+  // ran. Naming a version here would be a fresh false claim on every old thread
+  // the moment Anthropic repoints the alias, which is how the previous
+  // 'Sonnet 4.6' went stale.
+  ['sonnet', 'Sonnet (latest)'],
+  // `sonnet[1m]` was dropped from the CC picker (it selects nothing different
+  // now that `sonnet` resolves to Sonnet 5 with a native 1M window). Older
+  // threads still carry it, so keep the label they were pinned under.
   ['sonnet[1m]', 'Sonnet 4.6 (1M)'],
   ['haiku', 'Haiku 4.5'],
 ]);
@@ -383,8 +391,7 @@ export function fullCommandForEngineTool(name: string, args: unknown): string | 
     case 'read_file':
     case 'write_file':
     case 'edit_file':
-    case 'delete_file':
-    case 'refresh_file': return s('path');
+    case 'delete_file': return s('path');
     case 'copy_file': return s('destination');
     case 'import_file': return s('source_path');
     case 'browser_open':
@@ -503,7 +510,6 @@ export function describeEngineTool(name: string, args: unknown): string {
     case 'correct_memory': return 'Correct memory';
     case 'set_language': return str('language') ? `Set language: ${str('language')}` : 'Set language';
     case 'set_timezone': return str('timezone') ? `Set timezone: ${str('timezone')}` : 'Set timezone';
-    case 'refresh_file': return str('path') ? `Refresh ${basename(str('path'))}` : 'Refresh file';
     case 'refresh_app': { const n = str('app_name') || str('app_id'); return n ? `Refresh ${n}` : 'Refresh app'; }
     case 'capture_app': { const n = str('app_name') || str('app_id'); return n ? `Capture ${n}` : 'Capture app'; }
     // `service_name` is what `request_credential` takes (required, see

@@ -40,15 +40,15 @@ describe('paused', () => {
     expect(resolveVisualStatus('paused', true, true)).toBe('paused');
   });
 
-  it('paints the neutral paused dot, not progress-dot-failed', () => {
+  it('paints the pause glyph, not a dot and never progress-dot-failed', () => {
     const vnode = ThreadStatusIcon({ status: 'paused' }) as unknown as {
       props: { children: unknown[]; 'data-tooltip-title': string };
     };
     const classes = (vnode.props.children as ({ props?: { class?: string } } | false)[])
       .filter((c): c is { props: { class: string } } => !!c && typeof c === 'object' && !!c.props?.class)
       .map((c) => c.props.class);
-    expect(classes).toContain('progress-dot progress-dot-paused');
-    expect(classes.join(' ')).not.toContain('progress-dot-failed');
+    expect(classes).toContain('thread-status-paused-icon');
+    expect(classes.join(' ')).not.toContain('progress-dot');
     expect(vnode.props['data-tooltip-title']).toBe('Paused');
   });
 });

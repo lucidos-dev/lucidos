@@ -2,7 +2,7 @@
 //!
 //! Originally one large `api::threads` module; split by responsibility seam
 //! into child modules. This barrel re-exports the handler surface its own
-//! `router()`, `api/history.rs` (the two `/events/:event_id/*` routes) and
+//! `router()`, `api/history.rs` (the three `/events/:event_id/*` routes) and
 //! `api/search.rs` consume, so every `api::threads::*` path resolves
 //! unchanged. The request/response shapes stay reachable at
 //! `api::threads::<child>::<Type>`.
@@ -26,7 +26,7 @@ pub(super) use actions::{
 };
 pub(super) use archive::archive_thread;
 pub(super) use events_snapshot::{
-    get_context_capture, get_thread_events_snapshot, get_tool_result,
+    get_context_capture, get_event_location, get_thread_events_snapshot, get_tool_result,
 };
 pub(super) use list::{
     count_thread_summaries, get_archived_count, get_filter_facets, get_older_threads,
@@ -131,6 +131,14 @@ pub(super) fn router() -> Router<super::AppState> {
             get(get_thread_events_snapshot),
         )
         .route("/threads/:thread_id/continue", post(continue_thread))
+        .route(
+            "/threads/:thread_id/event-waits",
+            post(actions::register_thread_event_wait),
+        )
+        .route(
+            "/threads/:thread_id/event-waits/:wait_id/cancel",
+            post(actions::cancel_thread_event_wait),
+        )
         // The parent-to-child edge. `:thread_id` is the CHILD; the parent is
         // whoever the thread-bound origin token says the caller is, never a
         // field on the request. Not a bare `/threads/<param>` leaf, so it is

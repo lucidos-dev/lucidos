@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { TS, makeThreadState } from './thread-events-helpers';
-import { abortPromisesAutoResume, computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, resumeEngineNote, continuableAbortIndex, type Exchange, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
+import { abortPromisesAutoResume, computeExchanges, exchangeKey, exchangeStatus, groupIntoExchanges, handleEvent, isSwitchTeardownAbort, responseAbortedSummary, resumeEngineNote, continuableAbortIndex, type AbortCause, type Exchange, type MessageOrigin, type StoredEvent, type ThreadAggregate, type ThreadEvent, type ThreadState, type TransientEvent } from '../thread-events';
 
 describe('aggregate-takes-precedence over event-type lookups', () => {
   function makeAggregate(overrides: Partial<ThreadAggregate> = {}): ThreadAggregate {
@@ -655,6 +655,51 @@ describe('continuableAbortIndex', () => {
     const exchanges = groupIntoExchanges(events);
     expect(continuableAbortIndex(exchanges)).toBe(2);
   });
+
+  // An abort boundary can ACQUIRE a turn. An event-wait wake anchors on an
+  // event that is not an exchange-start type, so its whole turn folds into
+  // whatever boundary is current, and if that boundary is an abort the turn
+  // renders under it. Continue there re-runs completed work: on 2026-08-06 the
+  // button sat above a turn that had applied a change and spawned a sub-thread
+  // two minutes earlier (real thread ebc787a4).
+  it('returns null when the latest abort has since produced a terminal', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'safety_net' }],
+      [3, { type: 'TextStreamed', text: 'carrying on' }],
+      [4, { type: 'ResponseGenerated' }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(continuableAbortIndex(exchanges)).toBeNull();
+  });
+
+  // A resolved boundary does not STOP the scan: an older unresolved abort above
+  // it is still legitimately continuable, so the walk keeps going rather than
+  // returning null the way ContinuationStarted does.
+  it('skips a resolved abort and offers the older unresolved one', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'safety_net' }],
+      [3, { type: 'MessageReceived', text: 'two' }],
+      [4, { type: 'ResponseAborted', cause: 'safety_net' }],
+      [5, { type: 'ResponseGenerated' }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    // 0: msg, 1: abort (unresolved), 2: msg, 3: abort (resolved by [5]).
+    expect(continuableAbortIndex(exchanges)).toBe(1);
+  });
+
+  // The ordinary shape stays untouched: a bare boundary with no work under it
+  // is exactly what Continue exists for.
+  it('still offers Continue on an abort with steps but no terminal', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'safety_net' }],
+      [3, { type: 'TextStreamed', text: 'partial, then the engine died again' }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(continuableAbortIndex(exchanges)).toBe(1);
+  });
 });
 
 describe('abortPromisesAutoResume', () => {
@@ -676,6 +721,40 @@ describe('abortPromisesAutoResume', () => {
     // Legacy rows carry neither field.
     expect(abortPromisesAutoResume({ type: 'ResponseAborted' })).toBe(false);
     expect(abortPromisesAutoResume({ type: 'ResponseGenerated' })).toBe(false);
+  });
+
+  /** The Continue button and the transcript label read the same fingerprint, so
+   *  a turn can never say "Paused by restart" while offering the button that
+   *  means nothing is resuming it (or the reverse). Both route through
+   *  `isSwitchTeardownAbort`; this pins that they still agree, in both
+   *  directions, across the shapes that differ in only one half of the pair. */
+  it('agrees with the transcript label on every shape', () => {
+    const cases: { actor?: MessageOrigin; cause?: AbortCause }[] = [
+      { cause: 'engine_shutdown', actor: device },
+      { cause: 'engine_shutdown', actor: { kind: 'system' } },
+      { cause: 'engine_shutdown' },
+      { cause: 'recovery_after_restart', actor: device },
+      { cause: 'recovery_after_restart', actor: { kind: 'system' } },
+      { cause: 'process_killed', actor: device },
+      { cause: 'safety_net' },
+      {},
+    ];
+    for (const { actor, cause } of cases) {
+      const promised = abortPromisesAutoResume({ type: 'ResponseAborted', actor, cause });
+      expect(isSwitchTeardownAbort(actor, cause)).toBe(promised);
+      expect(responseAbortedSummary(actor, cause)).toBe(
+        promised ? 'Paused by restart' : 'Response interrupted',
+      );
+    }
+  });
+
+  /** `stale_settle` carries the actor of whichever button exposed the stuck row
+   *  (Stop / Apply / Discard / Archive), so a device actor there must NOT read as
+   *  a switch. It gets its own label, and the engine settles it to idle rather
+   *  than to any verdict. */
+  it('never reads a device-attributed stale_settle as a switch', () => {
+    expect(isSwitchTeardownAbort(device, 'stale_settle')).toBe(false);
+    expect(responseAbortedSummary(device, 'stale_settle')).toBe('Settled stuck response');
   });
 });
 

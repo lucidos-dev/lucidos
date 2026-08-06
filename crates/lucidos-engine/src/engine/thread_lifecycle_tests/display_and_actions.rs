@@ -697,3 +697,61 @@ fn saved_cc_pending_shows_unsave() {
         vec![Action::Discard, Action::Apply, Action::Unsave]
     );
 }
+
+// ── a subscription is not a park ── a thread holding an *event wait* is
+// plain idle: it does not block, it needs no attention, and Archive stays
+// offered. That is the 2026-08-06 change (every wait is detached), and the
+// blocking predicate has two SQL mirrors
+// (`event_bus_projection_propagation.rs`), so pin the relation here.
+
+/// The documented relation in `is_attention_needing`'s doc comment, asserted
+/// across every status rather than trusted as prose.
+#[test]
+fn blocking_equals_attention_or_running() {
+    for status in [
+        ThreadStatus::Idle,
+        ThreadStatus::Running,
+        ThreadStatus::Waiting,
+        ThreadStatus::WaitingForUserAnswer,
+        ThreadStatus::Paused,
+        ThreadStatus::Failed,
+    ] {
+        for archive in [ArchiveState::Inbox, ArchiveState::Archived] {
+            for ttype in [ThreadType::Chat, ThreadType::CodingAgent] {
+                for pending in [false, true] {
+                    for external in [false, true] {
+                        let blocking = is_blocking(ttype, status, archive, pending, external);
+                        let attention =
+                            is_attention_needing(ttype, status, archive, pending, external);
+                        let expected = attention || status == ThreadStatus::Running;
+                        assert_eq!(
+                            blocking, expected,
+                            "is_blocking must equal is_attention_needing OR Running \
+                             (status={:?}, type={:?}, archive={:?}, pending={}, external={})",
+                            status, ttype, archive, pending, external,
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// A subscribed thread is idle, so it keeps the ordinary idle action set,
+/// Archive included. Archiving one is legitimate and is NOT a way to strand a
+/// subscription behind the archive curtain: the archive cancels every live wait
+/// on the thread (`EventWaitCancelCause::ThreadArchived`, applied off the bus in
+/// `event_wait::dispatcher::cancel_waits_ended_by`).
+#[test]
+fn a_subscribed_thread_is_idle_and_offers_archive() {
+    let actions = available_thread_actions(
+        ThreadType::Chat,
+        ThreadStatus::Idle,
+        ArchiveState::Inbox,
+        false,
+        false,
+        false,
+        false,
+    );
+    assert_eq!(actions, vec![Action::Archive, Action::Save]);
+}

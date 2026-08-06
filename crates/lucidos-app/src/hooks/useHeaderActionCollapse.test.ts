@@ -152,12 +152,14 @@ describe('computeHeaderCollapse', () => {
   });
 });
 
-// ── Mobile content header: absolutely row-centered title, symmetric reserve ──
+// ── Mobile content header: row-centered title, symmetric reserve, then a slide ──
 // The mobile header centres the title on the ROW MIDDLE (not a flex zone), so a
 // long title clears the trailing action cluster only if a SYMMETRIC reserve
-// (bounded by whichever cluster is nearer the centre) fits it — else the hook
-// collapses the nearest-title actions into the ⋮ menu to widen the reserve, and
-// only ellipsizes (still centred) when even fully collapsed can't host it.
+// (bounded by whichever cluster is nearer the centre) fits it. Failing that the
+// hook collapses the nearest-title actions into the ⋮ menu to widen the reserve;
+// failing THAT it slides the box off centre to spend the roomier side's slack
+// (the reserve strands it, being sized off the nearer cluster), and only
+// ellipsizes when even the full cluster-to-cluster span can't host it.
 //
 // Numbers approximate a 393pt iPhone viewport at ui-scale 125 (20px root):
 // icons/⋮/bell are 1.75rem ≈ 35px, the flex gap 0.25rem ≈ 5px; the leading
@@ -194,7 +196,24 @@ describe('computeMobileHeaderCollapse', () => {
     const r = computeMobileHeaderCollapse(mobileInput({ titleWidth: 40 }));
     expect(r.collapsed).toBe(0);
     expect(r.titleEllipsized).toBe(false);
+    expect(r.titleShift).toBe(0);
     expect(r.titleMaxWidth).toBeGreaterThanOrEqual(40);
+  });
+
+  // The reported bug: a settings subview carries NO context actions, so the
+  // trailing cluster is the bell alone and the LEADING cluster (hamburger +
+  // back/forward) is the nearer one. The symmetric reserve is therefore sized
+  // off the leading side and truncates the title with the whole right half of
+  // the row empty ("Appearance & Beha…" next to blank space).
+  it('bell-only trailing cluster: the title slides off centre rather than truncating into empty space', () => {
+    const input = mobileInput({ actionWidths: [], titleWidth: 200 });
+    const r = computeMobileHeaderCollapse(input);
+    // The symmetric reserve allowed only 2 * (centre - leadingRight) = 133.
+    expect(r.titleEllipsized).toBe(false);
+    expect(r.titleMaxWidth).toBeGreaterThanOrEqual(200);
+    // Slid right just far enough to clear the leading cluster, no further.
+    expect(ROW / 2 - 200 / 2 + r.titleShift).toBeCloseTo(LEAD, 5);
+    expect(ROW / 2 + 200 / 2 + r.titleShift).toBeLessThanOrEqual(trailingLeft(input, 0) + 0.6);
   });
 
   it('the "Half Marathon" case: collapses two actions so the full title shows centered', () => {
@@ -214,27 +233,56 @@ describe('computeMobileHeaderCollapse', () => {
     }
   });
 
-  it('an over-long title ellipsizes (still centered) at the fully-collapsed reserve', () => {
-    // 200px > the max symmetric room even with only ⋮ + bell → truncate, but only
-    // collapse as far as widens the box (here the leading cluster binds at c=2, so
-    // it does NOT over-collapse to 3).
-    const r = computeMobileHeaderCollapse(mobileInput({ titleWidth: 200 }));
-    expect(r.collapsed).toBe(2);
-    expect(r.titleEllipsized).toBe(true);
+  it('a title past the WIDEST symmetric reserve shows in full off centre instead of truncating', () => {
+    // 160px beats every symmetric reserve (the leading cluster caps them at 133,
+    // whatever the trailing side folds away), so this used to ellipsize. The c=3
+    // span between the clusters is 175, which hosts it once the box may sit off
+    // centre: the full title shows, its left edge parked on the leading cluster.
+    const input = mobileInput({ titleWidth: 160 });
+    const r = computeMobileHeaderCollapse(input);
+    expect(r.collapsed).toBe(3);
+    expect(r.titleEllipsized).toBe(false);
+    expect(r.titleMaxWidth).toBeGreaterThanOrEqual(160);
+    expect(ROW / 2 - 160 / 2 + r.titleShift).toBeCloseTo(LEAD, 5);
+    expect(ROW / 2 + 160 / 2 + r.titleShift).toBeLessThanOrEqual(trailingLeft(input, 3) + 0.6);
   });
 
-  it('when the LEADING cluster binds, an unfittable title does NOT collapse icons for no gain', () => {
-    // A very wide leading cluster caps the symmetric box regardless of trailing
-    // collapse — so collapsing the trailing actions can't help and must not happen.
-    const r = computeMobileHeaderCollapse(mobileInput({ leadingRight: 180, titleWidth: 300 }));
-    expect(r.collapsed).toBe(0);
+  it('an over-long title ellipsizes at the widest span, fully collapsed', () => {
+    // 200px exceeds even the ⋮ + bell span, so it truncates. Unlike the symmetric
+    // reserve (which the leading cluster caps at c=2), the span keeps widening
+    // with every action folded away, so collapsing all three is a real gain.
+    const input = mobileInput({ titleWidth: 200 });
+    const r = computeMobileHeaderCollapse(input);
+    expect(r.collapsed).toBe(3);
     expect(r.titleEllipsized).toBe(true);
+    expect(r.titleMaxWidth).toBeCloseTo(trailingLeft(input, 3) - LEAD, 5);
   });
 
-  it('empty title: no collapse, no ellipsis', () => {
+  it('when the LEADING cluster binds, collapsing still widens the span an unfittable title gets', () => {
+    // A very wide leading cluster caps the SYMMETRIC box regardless of trailing
+    // collapse, which is what used to make collapsing here pointless. The span is
+    // measured cluster-to-cluster, so folding the actions away still buys width
+    // for the truncated title.
+    const input = mobileInput({ leadingRight: 180, titleWidth: 300 });
+    const r = computeMobileHeaderCollapse(input);
+    expect(r.collapsed).toBe(3);
+    expect(r.titleEllipsized).toBe(true);
+    expect(r.titleMaxWidth).toBeCloseTo(trailingLeft(input, 3) - 180, 5);
+  });
+
+  it('empty title: no collapse, no ellipsis, no shift', () => {
     const r = computeMobileHeaderCollapse(mobileInput({ titleWidth: 0 }));
     expect(r.collapsed).toBe(0);
     expect(r.titleEllipsized).toBe(false);
+    expect(r.titleShift).toBe(0);
+  });
+
+  it('the shift is zero for every title the symmetric reserve can host', () => {
+    // Centred is the preferred layout: nothing slides until truncation is the
+    // only alternative left.
+    for (let t = 0; t <= 133; t += 1) {
+      expect(computeMobileHeaderCollapse(mobileInput({ titleWidth: t })).titleShift).toBe(0);
+    }
   });
 
   it('collapse count is monotonic as the title grows (no flip-flop)', () => {
@@ -246,23 +294,23 @@ describe('computeMobileHeaderCollapse', () => {
     }
   });
 
-  // The load-bearing guarantee: the symmetric max-width box, centred on the row
-  // middle, NEVER crosses either cluster's inner edge — at any title width, any
+  // The load-bearing guarantee: the painted title box, wherever the shift puts
+  // it, NEVER crosses either cluster's inner edge, at any title width, any
   // action count, and (below) any ui-scale.
-  it('non-overlap invariant: the centered title box clears BOTH clusters', () => {
+  it('non-overlap invariant: the title box clears BOTH clusters, centred or shifted', () => {
     for (const actions of [[] as number[], [ICON], [ICON, ICON, ICON], [ICON, ICON, ICON, ICON]]) {
       for (let t = 0; t <= 500; t += 5) {
         const input = mobileInput({ actionWidths: actions, titleWidth: t });
-        const { collapsed, titleMaxWidth, titleEllipsized } = computeMobileHeaderCollapse(input);
+        const { collapsed, titleMaxWidth, titleShift, titleEllipsized } = computeMobileHeaderCollapse(input);
         expect(collapsed).not.toBe(1);
-        // The PAINTED title (natural width clamped to the reserve, centred) is
-        // what can overlap; a 0-width clamp paints nothing (empty title), so
-        // assert edges only when something actually renders.
+        // The PAINTED title (natural width clamped to the max, centred on the row
+        // then offset by the shift) is what can overlap; a 0-width clamp paints
+        // nothing (empty title), so assert edges only when something renders.
         const painted = Math.min(t, titleMaxWidth);
         if (painted > 0) {
-          const center = input.rowWidth / 2;
-          expect(center - painted / 2).toBeGreaterThanOrEqual(input.leadingRight - 0.6);
-          expect(center + painted / 2).toBeLessThanOrEqual(trailingLeft(input, collapsed) + 0.6);
+          const left = input.rowWidth / 2 - painted / 2 + titleShift;
+          expect(left).toBeGreaterThanOrEqual(input.leadingRight - 0.6);
+          expect(left + painted).toBeLessThanOrEqual(trailingLeft(input, collapsed) + 0.6);
         }
         // A non-ellipsized result must actually host the full natural title.
         if (!titleEllipsized) expect(titleMaxWidth + 0.5).toBeGreaterThanOrEqual(t);
@@ -271,13 +319,13 @@ describe('computeMobileHeaderCollapse', () => {
   });
 
   // The bug reproduces at 393pt across ui-scale 100/125/150 (16/20/24px root).
-  // A "Half Marathon"-length title never paints under the icons at any of them —
-  // it either fits centered after collapse or truncates centered, never overlaps.
+  // A "Half Marathon"-length title never paints under the icons at any of them:
+  // it either fits after collapse or truncates, never overlaps.
   it('393pt viewport at ui-scale 100/125/150: long title never overlaps the icons', () => {
     for (const rem of [16, 20, 24]) {
       const icon = 1.75 * rem;
       const input: MobileHeaderCollapseInput = {
-        rowWidth: 393,                        // device pts — fixed across scale
+        rowWidth: 393,                        // device pts, fixed across scale
         leadingRight: 12 + 1.75 * rem + 0.25 * rem + 2 * (1.375 * rem) + 0.25 * rem,
         trailingRightGap: 0.625 * rem,
         titleWidth: 13 * 0.6 * rem,           // ~13 chars at the title font size
@@ -286,10 +334,10 @@ describe('computeMobileHeaderCollapse', () => {
         moreWidth: icon,
         gapPx: 0.25 * rem,
       };
-      const { collapsed, titleMaxWidth } = computeMobileHeaderCollapse(input);
-      const center = input.rowWidth / 2;
-      expect(center - titleMaxWidth / 2).toBeGreaterThanOrEqual(input.leadingRight - 0.6);
-      expect(center + titleMaxWidth / 2).toBeLessThanOrEqual(trailingLeft(input, collapsed) + 0.6);
+      const { collapsed, titleMaxWidth, titleShift } = computeMobileHeaderCollapse(input);
+      const left = input.rowWidth / 2 - titleMaxWidth / 2 + titleShift;
+      expect(left).toBeGreaterThanOrEqual(input.leadingRight - 0.6);
+      expect(left + titleMaxWidth).toBeLessThanOrEqual(trailingLeft(input, collapsed) + 0.6);
     }
   });
 });

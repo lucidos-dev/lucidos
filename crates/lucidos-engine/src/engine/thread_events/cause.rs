@@ -17,9 +17,9 @@ pub enum CancelCause {
     /// User clicked Apply / Discard / Archive on a Claude Code session that was still
     /// running — the action implies "stop the current turn first."
     UserAction,
-    /// A user follow-up arrived while a Codex turn was in flight, so the engine
+    /// A user follow-up arrived while a turn was in flight, so the engine
     /// interrupted the live turn to run the follow-up as the next turn (the
-    /// mid-turn redirect — see `arm_codex_redirect`). Mechanically a cancel (no
+    /// mid-turn redirect: see `arm_followup_redirect`). Mechanically a cancel (no
     /// `ResponseGenerated`, no change proposal for the redirected-away partial
     /// work), but NOT a user Stop: the user steered, they didn't abandon. The
     /// frontend renders this neutrally — like the chat/CC follow-up — instead of
@@ -92,42 +92,115 @@ impl AbortCause {
     /// follow — the parent's counter must drop so it doesn't display as Active
     /// forever. `Unknown` is legacy; treat as terminal so the prior
     /// decrement-on-abort behavior holds for old DB rows.
+    ///
+    /// This is a question about the **parent's counter**, not about how the turn
+    /// reads to the user. It has no actor axis, so it cannot tell the user's own
+    /// *Switch to new version* (which auto-resumes) from a crash recovery sweep
+    /// (which does not). [`status_sql`](Self::status_sql) keyed on it until
+    /// 2026-08-06 and got crashes wrong for exactly that reason; the verdict now
+    /// keys on [`promises_auto_resume`](Self::promises_auto_resume) instead.
     pub fn is_transient(&self) -> bool {
         matches!(self, Self::EngineShutdown | Self::RecoveryAfterRestart)
     }
 
+    /// True when this abort is the teardown boundary of a **user-initiated**
+    /// *Switch to new version*, i.e. when the engine has PROMISED to resume the
+    /// turn by itself. The fingerprint is both halves together: cause
+    /// `EngineShutdown` **and** a `Device` actor.
+    ///
+    /// This is the Rust form of `agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`, the
+    /// single definition both resume gates key on (`switch_was_user_initiated`
+    /// for coding agents, `chat::recovery::switch_resume_candidates` for chat and
+    /// trigger threads), and of the frontend's `abortPromisesAutoResume`
+    /// (`store/thread-events/exchange-render.ts`), which withholds the Continue
+    /// button on exactly this shape. Three surfaces, one rule: a turn reads
+    /// `paused` iff a resume was promised iff no Continue button is offered.
+    ///
+    /// **A device actor alone is not the fingerprint.** `StaleSettle`
+    /// deliberately carries the actor of whichever user button exposed a stuck
+    /// row (Stop / Apply / Discard / Archive / Interrupt), so an actor-only test
+    /// would read a user Stop as a switch. Nor is `EngineShutdown` alone: the
+    /// `shutdown_active_threads` fallback stamps a system actor for a thread that
+    /// started after the `/api/v1/restart` pre-emit, and no resume gate picks
+    /// that up either.
+    ///
+    /// Deliberately NOT [`is_transient`](Self::is_transient), which answers a
+    /// different question (may the parent's `active_children_count` decrement?)
+    /// and has no actor axis at all.
+    pub fn promises_auto_resume(&self, actor: Option<&super::MessageOrigin>) -> bool {
+        matches!(self, Self::EngineShutdown)
+            && matches!(actor, Some(super::MessageOrigin::Device { .. }))
+    }
+
     /// SQL fragment for the `status` column on the `thread_summaries` row when
-    /// this abort lands. Three outcomes, and the split keys on
-    /// [`is_transient`](Self::is_transient) rather than on a second hand-written
-    /// cause list, so "the turn is expected to come back" is decided in exactly
-    /// one place:
+    /// this abort lands, given the actor that stamped it. Three outcomes:
     ///
     /// * **`StaleSettle`** is engine cleanup of a stuck row whose process was
     ///   already gone, fired by a user button (Stop / Apply / Discard / Archive /
     ///   Interrupt). No real abort happened, so it uses the cancel-style mapping
     ///   (idle, or waiting if pending changes) rather than any verdict.
-    /// * **Transient** (`EngineShutdown`, `RecoveryAfterRestart`) surfaces
-    ///   `paused`: the engine went away mid-turn and either resumes the work
-    ///   itself (the *Switch to new version* teardown) or offers the manual
-    ///   Continue button. Reporting that as `failed` was the bug this split
-    ///   fixes: a switch painted every in-flight thread with the red error dot,
-    ///   while `is_transient()` three methods up already said a fresh
-    ///   `SessionStarted` was expected.
-    /// * **Everything else** (`SafetyNet`, `ProcessKilled`, `SessionDropped`,
-    ///   `Unknown`) is a real failure and keeps the red `failed` indicator.
+    /// * **A promised auto-resume** ([`promises_auto_resume`](Self::promises_auto_resume),
+    ///   the user's own *Switch to new version*) surfaces `paused`: nothing
+    ///   failed, and the engine brings the turn back by itself, usually within
+    ///   seconds. Reporting that as `failed` was the original bug: a switch
+    ///   painted every in-flight thread with the red error dot for work already
+    ///   on its way back.
+    /// * **Everything else** is a real interruption nobody promised to undo, and
+    ///   keeps the red `failed` indicator: `SafetyNet`, `ProcessKilled`,
+    ///   `SessionDropped`, `Unknown`, every `RecoveryAfterRestart` (the crash
+    ///   boundary, and the boot floor's withdrawal of a resume promise it could
+    ///   not keep), and a system-actor `EngineShutdown`.
+    ///
+    /// The paused arm keyed on [`is_transient`](Self::is_transient) until
+    /// 2026-08-06, which was too wide in exactly the direction that matters:
+    /// `RecoveryAfterRestart` is transient, so a crash, and the boot floor
+    /// handing the Continue button *back*, both sat behind a reassuring pause
+    /// glyph and stayed out of the needs-attention count. Transience is about the
+    /// parent's child counter; the verdict is about whether anyone is coming
+    /// back for this turn, and only the actor can say.
     ///
     /// Pending changes override both verdicts to `waiting`: a change ready to
     /// review is more actionable than either the interruption or the failure.
     ///
     /// Both verdicts must also survive the dying turn's trailing events. See
     /// `event_bus::preserving_verdict`, whose list this function feeds.
-    pub fn status_sql(&self) -> &'static str {
+    pub fn status_sql(&self, actor: Option<&super::MessageOrigin>) -> &'static str {
         match self {
             Self::StaleSettle => crate::engine::event_bus::STATUS_FROM_PROPOSED_CHANGE,
-            _ if self.is_transient() => {
+            _ if self.promises_auto_resume(actor) => {
                 "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'paused' END"
             }
             _ => "CASE WHEN coding_agent_proposed THEN 'waiting' ELSE 'failed' END",
         }
     }
+}
+
+/// Why an `EventWaitCanceled` was emitted. Every arm is the user ending the
+/// wait deliberately.
+///
+/// What is deliberately absent is an ordinary user message. Typing into a
+/// parked thread *detaches* the wait (the engine closes the dangling
+/// `await_event` call so the turn can run) and leaves the subscription live,
+/// so asking a parked thread "how's it going?" cannot silently discard a
+/// forty-minute wait. Cancelling on any `MessageReceived` was the original
+/// design and was rejected for exactly that.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EventWaitCancelCause {
+    /// The **Stop waiting** button on the wait itself, in the subscription
+    /// indicator or the thread card.
+    UserStop,
+    /// A thread-level Stop / Cancel. The user stopped the whole thread, so its
+    /// subscriptions go with it.
+    ThreadCanceled,
+    /// The thread was archived. Archive is a legitimate way to end a wait, and
+    /// leaving one live behind the archive curtain would wake a thread the user
+    /// considers closed.
+    ThreadArchived,
+    /// The thread was discarded.
+    ThreadDiscarded,
+    /// Legacy or unrecognized cause, so old DB rows replay cleanly. Never emit
+    /// fresh.
+    #[serde(other)]
+    Unknown,
 }

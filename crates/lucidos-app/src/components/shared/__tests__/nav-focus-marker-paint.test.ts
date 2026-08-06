@@ -6,14 +6,21 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error same
 import { fileURLToPath } from 'node:url';
 
-import { NAV_FOCUS_FADE_MS } from '../focusMarker';
+import { NAV_FOCUS_FADE_MS, NAV_FOCUS_RAMP_MS } from '../focusMarker';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 /** Comments stripped up front: this file's rules are heavily commented, and a
  *  comment sitting between two declarations otherwise breaks the "a declaration
  *  starts after a `;`" assumption below (and would let prose satisfy a scan). */
-const css = readFileSync(resolve(here, '../../../styles/global/host-components.css'), 'utf-8')
-  .replace(/\/\*[\s\S]*?\*\//g, '');
+const stripComments = (source: string): string => source.replace(/\/\*[\s\S]*?\*\//g, '');
+const css = stripComments(
+  readFileSync(resolve(here, '../../../styles/global/host-components.css'), 'utf-8'),
+);
+/** The marker's paint lives here, but the COLOUR it mixes is a theme token defined
+ *  over in base.css, so that file has to be read too (see the last test). */
+const baseCss = stripComments(
+  readFileSync(resolve(here, '../../../styles/global/base.css'), 'utf-8'),
+);
 
 /** The `{…}` block for a TOP-LEVEL rule with exactly this selector. Two things keep
  *  it exact, and they are different mechanisms: the `\s*\{` right after the selector
@@ -101,76 +108,105 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
     expect(declaration(block('.nav-focus-stuck'), 'outline')).toContain('transparent');
   });
 
-  it('derives every colour from --accent, so both themes work off one token', () => {
+  it('derives every colour from --nav-focus-glow, never from --accent', () => {
     const stuck = block('.nav-focus-stuck');
     const colours = [...stuck.matchAll(/color-mix\([^)]*\)/g)].map(m => m[0]);
     expect(colours.length).toBeGreaterThan(0);
-    expect(colours.every(c => c.includes('var(--accent)'))).toBe(true);
+    // One token for both themes, and it must be the marker's OWN token.
+    expect(colours.every(c => c.includes('var(--nav-focus-glow)'))).toBe(true);
+    // The regression this pins, and the reason a whole token exists for one marker:
+    // the wash used to be --accent at 16%, which is --picked-surface's hue at nearly
+    // its alpha (--accent at 12%, worn by the user bubble, the selected question
+    // option and the collapsed-turn stub). A spotlit turn therefore read as a PICKED
+    // surface, not as a marker, and it could not have read otherwise, since the
+    // header, links and badges are all accent-blue too. Note `var(--accent)` and not
+    // just `--accent`: --accent-yellow and friends would substring-match, and the
+    // marker must not reach for those either (--accent-yellow is caution-only).
+    expect(stuck).not.toMatch(/var\(--accent[-)]/);
     // No hand-picked literals anywhere in the marker's paint.
     expect(stuck).not.toMatch(/#[0-9a-fA-F]{3,8}\b/);
   });
 
-  it('turns on over half a second, ramping up from nothing and settling at rest', () => {
+  it('has that token defined by BOTH themes, since a missing one erases the marker', () => {
+    // This is a cross-file coupling with a silent failure mode, which is why it is
+    // worth a test. `color-mix(in srgb, var(--undefined) 16%, transparent)` is not a
+    // no-op and does not fall back: the unresolved var makes the color-mix invalid at
+    // computed-value time, which takes the WHOLE box-shadow down with it. Drop the
+    // token from one theme and the marker doesn't merely lose its tint there, it
+    // stops painting at all, in that theme only. Every other assertion in this file
+    // reads host-components.css and would stay green through that.
+    const themeBlock = (selector: string): string => {
+      // No nested braces inside a theme block, so `[^}]*` is the whole body. Anchored
+      // at column 0 so a longer selector (html.ios-pwa[data-theme="dark"], which
+      // overrides only the header blues) can't be mistaken for the base theme block.
+      const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+      const body = baseCss.match(new RegExp(`^${escaped}\\s*\\{([^}]*)\\}`, 'm'))?.[1];
+      expect(body, `no top-level \`${selector}\` block in base.css`).toBeDefined();
+      return body ?? '';
+    };
+    // A literal colour, not merely "defined": the assertion above about the marker
+    // block would be trivially satisfiable by `--nav-focus-glow: var(--accent)`,
+    // which passes every scan in this file while painting the exact accent wash the
+    // recolour removed. Requiring a hex here closes that back door, and the marker
+    // block's own no-literals rule is what keeps the hex on this side of the split.
+    for (const selector of ['html, html[data-theme="dark"]', 'html[data-theme="light"]']) {
+      expect(declaration(themeBlock(selector), '--nav-focus-glow')).toMatch(
+        /^#[0-9a-fA-F]{3,8}$/,
+      );
+    }
+  });
+
+  it('turns on by rising to full and STOPPING there, with nothing to sag back from', () => {
     const stuck = block('.nav-focus-stuck');
     const animation = declaration(stuck, 'animation');
-    expect(animation).toMatch(/^nav-focus-spotlight-on\s+0\.5s\b/);
+    expect(animation).toMatch(/^nav-focus-spotlight-on\s/);
+    // Pinned against the constant, not a literal: focusMarker.ts starts the hold when
+    // the ramp ENDS, so it has to know this duration. If the two drift, the hold spends
+    // part of itself on the ramp and delivers less than the full brightness time it
+    // documents.
+    expect(Number(animation?.match(/([\d.]+)s/)?.[1]) * 1000).toBe(NAV_FOCUS_RAMP_MS);
     const keyframes = css.match(/@keyframes\s+nav-focus-spotlight-on\s*\{([\s\S]*?)\n\}/)?.[1];
     expect(keyframes).toBeDefined();
 
     // It starts from NOTHING: every layer at 0% is transparent, which is what makes
-    // it read as a spotlight switching on rather than as a highlight that was always
-    // there. (The first version deliberately did the opposite, starting brighter and
-    // only decaying, so the marker was never missable. The user asked for the real
-    // turn-on instead; that is safe here ONLY because the marker then persists with
-    // no timeout, so a look-away can miss the ramp but never the marker.)
+    // it read as a light being switched on rather than as a highlight that was always
+    // there.
     const zeroStop = keyframes?.match(/0%\s*\{([^}]*)\}/)?.[1] ?? '';
     expect(zeroStop).not.toBe('');
-    // Count first, for the same reason spelled out at the surge below: `layers()` of a
-    // declaration this scanner can't find is [], and `.every()` over [] is true, so
-    // moving the fill to another property would make this assertion report green while
-    // checking nothing. `not.toBe('')` only proves the keyframe BODY parsed.
+    // Count first: `layers()` of a declaration this scanner can't find is [], and
+    // `.every()` over [] is true, so moving the fill to another property would make
+    // this assertion report green while checking nothing. `not.toBe('')` only proves
+    // the keyframe BODY parsed.
     expect(layers(declaration(zeroStop, 'box-shadow')).length).toBe(3);
     expect(layers(declaration(zeroStop, 'box-shadow')).every(l => l.includes('transparent'))).toBe(
       true,
     );
 
+    // ...and it ONLY RISES. This is the assertion that matters most in this file: an
+    // earlier cut overshot to a surge partway through and settled back into the
+    // resting values, which lost a third of the brightness a quarter-second after
+    // landing and was reported as the light immediately turning back down. A ramp with
+    // no intermediate stop cannot dim after arriving. (A stop BELOW resting would also
+    // be monotonic, but "no intermediate stop" is the simplest form of the rule to
+    // state and to keep, so that is what is pinned.)
+    expect(keyframes?.match(/\d+%\s*\{|\b(?:from|to)\s*\{/g)).toEqual(['0% {']);
+    expect(keyframes).not.toMatch(/color-mix/);
+
     // No explicit `to`: the animation settles into the element's own computed value,
     // i.e. the base rule, so the resting state is written once and cannot drift.
     // A fill-mode would freeze the animated value over it and break that.
-    expect(keyframes).not.toMatch(/100%\s*\{|\bto\s*\{/);
     expect(declaration(stuck, 'animation-fill-mode')).toBeUndefined();
     expect(animation).not.toMatch(/forwards|both/);
 
-    // The surge: the mid stop overshoots the resting values on every layer, which is
-    // the difference between a lamp coming up and a linear crossfade. Pin the layer
-    // count FIRST: `alphas` reads integer percentages, so rewriting the colours in a
-    // notation it doesn't match (a fractional `13.5%`, a relative colour, a token
-    // indirection) empties both arrays, and `.every()` over [] is trivially true.
-    const alphas = (source: string) =>
-      [...source.matchAll(/var\(--accent\)\s+(\d+)%/g)].map(m => Number(m[1]));
-    const restingShadow = declaration(stuck, 'box-shadow');
-    const resting = alphas(restingShadow ?? '');
-    const surgeStop = keyframes?.match(/\n\s*55%\s*\{([^}]*)\}/)?.[1] ?? '';
-    const surge = alphas(surgeStop);
-    expect(resting.length).toBe(3);
-    expect(surge.length).toBe(resting.length);
-    expect(surge.every((a, i) => a > resting[i])).toBe(true);
-
-    // Every stop must match the base rule's layer count AND its inset-ness, or the
+    // The 0% stop must match the base rule's layer count AND its inset-ness, or the
     // layers cannot interpolate: box-shadow list interpolation pads the shorter list
     // with a non-inset shadow, the per-layer inset flags then mismatch, and the whole
-    // animation silently goes DISCRETE (the marker pops on instead of ramping). The
-    // CSS comment claims this holds at every keyframe, so pin it at every keyframe.
+    // animation silently goes DISCRETE (the marker pops on instead of ramping).
+    const restingShadow = declaration(stuck, 'box-shadow');
     const insets = (shadow: string | undefined) =>
       layers(shadow).map(l => l.includes('inset')).join(',');
-    for (const [name, stop] of [
-      ['0%', zeroStop],
-      ['55%', surgeStop],
-    ] as const) {
-      const stopShadow = declaration(stop, 'box-shadow');
-      expect(layers(stopShadow).length, name).toBe(layers(restingShadow).length);
-      expect(insets(stopShadow), name).toBe(insets(restingShadow));
-    }
+    expect(layers(declaration(zeroStop, 'box-shadow')).length).toBe(layers(restingShadow).length);
+    expect(insets(declaration(zeroStop, 'box-shadow'))).toBe(insets(restingShadow));
   });
 
   it('dissolves via an ANIMATION so it still runs when it interrupts the turn-on', () => {
@@ -182,7 +218,7 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
     // underneath never starts, and cancelling the turn-on to free the property just
     // lands the value on the after-change style in the same frame with nothing to
     // interpolate. Measured on the real rule, that shape made a dismiss inside the
-    // 0.5s ramp BLINK the marker off within two frames in Chromium. Replacing the
+    // ramp BLINK the marker off within two frames in Chromium. Replacing the
     // running animation by name plays deterministically in both engines.
     expect(declaration(fading, 'transition')).toBeUndefined();
     const animation = declaration(fading, 'animation');
@@ -215,13 +251,21 @@ describe('nav focus marker paint: background highlight, not a frame', () => {
     // the dissolve is cut off (timer shorter) or the class lingers (timer longer).
     const seconds = Number(animation?.match(/([\d.]+)s/)?.[1]);
     expect(seconds * 1000).toBe(NAV_FOCUS_FADE_MS);
-    // Deliberately SLOW, and much slower than the turn-on: the marker is being retired
-    // because the user moved on, not cleared out of their way. Pin the relationship
-    // rather than the number, so either duration can be retuned and keep it.
+    // Slower than the turn-on: the marker is being retired because the user moved on,
+    // not cleared out of their way, so it drains rather than cutting. Pin the
+    // relationship rather than the number, so either duration can be retuned and keep
+    // it.
     const onSeconds = Number(
       declaration(block('.nav-focus-stuck'), 'animation')?.match(/([\d.]+)s/)?.[1],
     );
-    expect(seconds).toBeGreaterThanOrEqual(onSeconds * 2);
+    expect(seconds).toBeGreaterThan(onSeconds);
+    // And only slower. This one IS an absolute ceiling rather than a ratio, because
+    // the thing it guards is a human-scale judgement about the dismiss and not a
+    // relationship to the ramp: the dismiss is triggered BY the action that moves the
+    // user on, so a dissolve running past about a second reads as the marker being
+    // slow to let go rather than as a graceful exit. It shipped at 2.5s and was
+    // reported exactly that way; the prose above the rule invites lengthening it back.
+    expect(seconds).toBeLessThanOrEqual(1);
   });
 
   it('drops both the turn-on and the dissolve under reduced motion', () => {

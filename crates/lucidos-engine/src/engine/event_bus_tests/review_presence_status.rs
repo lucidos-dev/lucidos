@@ -559,6 +559,7 @@ async fn emit_with_existing_event_id_fails_with_pkey_violation() {
                 mode: ActorMode::Human,
                 origin: None,
                 injected_message_id: None,
+                delivered_event_id: None,
             },
             meta: EventMeta {
                 event_id: Some(dup_id),

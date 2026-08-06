@@ -374,6 +374,126 @@ pub(in crate::api) async fn continue_thread(
     Ok(StatusCode::OK)
 }
 
+/// POST /api/v1/threads/:thread_id/event-waits/:wait_id/cancel, the **Stop
+/// waiting** button on one subscription in the indicator.
+///
+/// Cancels that wait and nothing else: a thread may hold several, and stopping
+/// one must not take the others with it (thread-level Stop is
+/// `/api/v1/chat/cancel`, which cancels them all). Emits
+/// `EventWaitCanceled { UserStop }` stamped with the device that pressed it,
+/// plus the closing `ToolResult` when the wait was still holding the turn
+/// parked.
+///
+/// The two failures report differently on purpose. A wait that already resolved
+/// is a stale button and 404s. A wait whose cancel could not be *written* is
+/// still live and still cancellable, so it 500s: telling the user it had
+/// already resolved would send them away from a button that is about to start
+/// working again.
+pub(in crate::api) async fn cancel_thread_event_wait(
+    State(state): State<AppState>,
+    Path((thread_id, wait_id)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Result<StatusCode, (StatusCode, String)> {
+    // `wait_id` alone would find the wait; `thread_id` scopes it, so an id from
+    // one thread's UI can never cancel another thread's subscription.
+    let thread_uuid = Uuid::parse_str(&thread_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    let wait_uuid = Uuid::parse_str(&wait_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid wait_id: {e}")))?;
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+
+    use crate::engine::event_wait::CancelWaitOutcome;
+    match state
+        .engine
+        .cancel_event_wait(
+            thread_uuid,
+            wait_uuid,
+            crate::engine::thread_events::EventWaitCancelCause::UserStop,
+            actor,
+        )
+        .await
+    {
+        CancelWaitOutcome::Canceled => Ok(StatusCode::OK),
+        CancelWaitOutcome::NotLive => Err((
+            StatusCode::NOT_FOUND,
+            "No live wait with that id on this thread. It may have already \
+             delivered, timed out, or been canceled."
+                .to_string(),
+        )),
+        CancelWaitOutcome::EmitFailed => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Could not record the cancel. The wait is still live, so try again.".to_string(),
+        )),
+    }
+}
+
+/// POST /api/v1/threads/:thread_id/event-waits, the way a **coding agent**
+/// subscribes to an event.
+///
+/// The chat agent reaches the same registration through the `await_event` LLM
+/// tool, in process. A coding agent cannot: the engine does not own a Claude
+/// Code or Codex session's tool set, so its route in is the `lucidos
+/// await-event` CLI subcommand over this endpoint.
+///
+/// This is only possible because a subscription no longer holds a turn. The
+/// attached shape needed a dangling `tool_use` in a message array the engine
+/// controls, which is exactly what it does not have for a coding-agent session
+/// (S11 of `docs/plans/2026-08-05-a-thread-parks-on-an-event-wait.md` excluded
+/// them for that reason). Registration now returns immediately and the delivery
+/// arrives as an ordinary follow-up message, which the coding-agent lane
+/// already knows how to deliver.
+///
+/// The body is the same `{on, timeout_secs, reason}` the tool takes, so the
+/// caps, the subscribability gate and the duplicate refusal are one
+/// implementation rather than two. `tool_use_id` is synthesized here: there is
+/// no tool call to pair with, and the field is only an id the wait carries.
+pub(in crate::api) async fn register_thread_event_wait(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    Json(args): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let thread_uuid = Uuid::parse_str(&thread_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+
+    // The thread has to exist, and this is the one caller that can get it
+    // wrong: the LLM tool takes its thread id from `execute_tool` and cannot
+    // name another, while a CLI caller passes `$LUCIDOS_THREAD_ID` and could be
+    // running outside a session or against a stale id. Arming a wait for a
+    // thread with no row is not harmless: it survives restarts, and its
+    // eventual delivery drives a turn on a thread the engine knows nothing
+    // about. A read failure answers "exists", because refusing a legitimate
+    // subscription on a database hiccup is the worse of the two.
+    let known: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM thread_summaries WHERE thread_id = $1)")
+            .bind(thread_uuid)
+            .fetch_one(&state.pool)
+            .await
+            .unwrap_or(true);
+    if !known {
+        return Err((
+            StatusCode::NOT_FOUND,
+            format!("No thread {thread_id} in this workspace."),
+        ));
+    }
+
+    // A refusal is the caller's own fault (a bad `on` entry, a cap it has hit),
+    // so it is a 400 carrying the same text the chat agent would read, not a
+    // 500. The two agents get the identical wording by construction.
+    let synthetic_tool_use_id = format!("cli-{}", Uuid::new_v4());
+    match state
+        .engine
+        .register_event_wait(thread_uuid, &synthetic_tool_use_id, &args)
+        .await
+    {
+        crate::engine::event_wait::AwaitEventOutcome::Registered(message) => Ok(Json(
+            serde_json::json!({ "status": "subscribed", "message": message }),
+        )),
+        crate::engine::event_wait::AwaitEventOutcome::Refused(message) => {
+            Err((StatusCode::BAD_REQUEST, message))
+        }
+    }
+}
+
 /// GET /api/v1/threads/:thread_id/messages — get all messages for a thread
 pub(in crate::api) async fn get_thread_messages(
     State(state): State<AppState>,

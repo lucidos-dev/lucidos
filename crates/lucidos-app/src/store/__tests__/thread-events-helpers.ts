@@ -27,6 +27,7 @@ export function makeThreadState(events: Map<number, ThreadEvent> = new Map()): T
     blockingDescendantCount: 0, attentionDescendantCount: 0,
     state: 'active',
     latestTodoList: null,
+    liveEventWaits: [],
   };
   return { meta, events, streamingBuffer: '', eventsLoaded: true, eventsLoadFailed: false, lastDbSeq: 0, pendingUserMessages: [] };
 }

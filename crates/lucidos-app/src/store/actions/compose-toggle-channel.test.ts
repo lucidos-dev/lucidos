@@ -51,7 +51,7 @@ vi.mock('../../api/client', async (importOriginal) => ({
   submitChat: vi.fn().mockResolvedValue({ event_id: 'srv-evt' }),
   cancelChat: vi.fn().mockResolvedValue(undefined),
   stopClaudeCode: vi.fn().mockResolvedValue(undefined),
-  putComposeOnThread: vi.fn().mockResolvedValue(undefined),
+  putComposeOnThread: vi.fn().mockResolvedValue({ status: 'applied' }),
   ensureThreadStarted: vi.fn().mockResolvedValue(undefined),
   deleteThread: vi.fn().mockResolvedValue(undefined),
 }));
@@ -70,6 +70,7 @@ vi.mock('./thread-loading', () => ({
 
 vi.mock('./devices', () => ({
   getDeviceId: () => 'device-test',
+  pendingDeviceRegistration: vi.fn(),
 }));
 
 vi.mock('../../utils/platform', () => ({
@@ -135,6 +136,7 @@ function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
     lastRevivedAt: '',
     state: 'composing',
     latestTodoList: null,
+    liveEventWaits: [],
     ...overrides,
   };
 }

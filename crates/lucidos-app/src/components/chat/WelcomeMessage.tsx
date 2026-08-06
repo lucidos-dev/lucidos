@@ -1,7 +1,7 @@
 import { useSignal } from '@preact/signals';
 import { dismissWelcomeSuggestions } from '../../store/actions/preferences';
 import { openProviderSettings } from '../../store/actions/menu';
-import { applySuggestion } from '../../store/actions/compose';
+import { applySuggestion, startSetupInterview } from '../../store/actions/compose';
 import { composeHandlers } from './promptFocus';
 import { llmConfigured } from '../../store/store';
 import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
@@ -53,6 +53,46 @@ export function ProviderSetupWelcome() {
         </p>
       </div>
       <WelcomeDisclaimer />
+    </div>
+  );
+}
+
+/** First-run entry point into the *setup interview*: the Lucidos Agent asks
+ *  what the user wants help with, at work or outside it, then builds the apps,
+ *  triggers and knowhow that fit, in this session
+ *  (`system-knowhow/setup-interview` drives it).
+ *
+ *  This is NOT a sixth starter suggestion, and it deliberately looks like a
+ *  sibling of `ProviderSetupWelcome`'s CTA instead: same prominent
+ *  `action-btn action-btn-confirm` plus a hint line. A suggestion hands the
+ *  newcomer a sentence and leaves them holding the hard part, which is working
+ *  out what Lucidos should do for THEM; this hands that part to the agent.
+ *
+ *  Clicking SENDS (see `startSetupInterview`) rather than prefilling, so the
+ *  interview starts on one gesture. Only rendered on the provider-configured
+ *  branch: with no provider the whole surface is `ProviderSetupWelcome`, because
+ *  an interview that cannot reach a model is worse than no button.
+ *
+ *  Dismissing the welcome hides this with it, which is what "Don't show this
+ *  again" says. The durable way back is the header's help button
+ *  (`SetupInterviewButton`), which is never dismissed. */
+export function SetupInterviewWelcome() {
+  return (
+    <div class="welcome-setup-interview">
+      <button
+        type="button"
+        class="action-btn action-btn-confirm welcome-setup-interview-btn"
+        {...composeHandlers(() => { void startSetupInterview(); })}
+      >
+        Help me get the most out of Lucidos
+      </button>
+      <p class="welcome-setup-interview-hint">
+        A few questions about what you want help with, at work or outside it:
+        personal admin, training, learning, whatever fits. Then I build the apps
+        and automations to match, right here in your workspace. You can start
+        this again any time from the <span aria-hidden="true">?</span> button, or
+        by just asking me to set you up.
+      </p>
     </div>
   );
 }
@@ -161,7 +201,8 @@ export function WelcomeMessage() {
         Don't show this again
       </button>
       <h2>Hi, there!</h2>
-      <p class="welcome-suggestions-label">A few suggestions to get you started:</p>
+      <SetupInterviewWelcome />
+      <p class="welcome-suggestions-label">Or ask me anything, for example:</p>
       <SuggestionCarousel />
       <WelcomeDisclaimer />
     </div>

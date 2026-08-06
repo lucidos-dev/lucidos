@@ -55,6 +55,7 @@ function makeThread(channel: ThreadMeta['channel']): ThreadState {
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

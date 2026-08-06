@@ -44,7 +44,7 @@ import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
 import { loadAllThreads, refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
-import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft } from './compose';
+import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft, noteComposeEpoch } from './compose';
 import type { ComposeSelectionOverride } from '../composeSelections';
 import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
@@ -1093,9 +1093,16 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
     //      hasUnsentLocalDraft guard still protects unsent work THIS device
     //      authored.
     case 'ThreadComposeChanged': {
+      const id = data.id as string;
+      // Recorded BEFORE either guard below. The *compose epoch* is a fact about
+      // what the engine holds, not draft content, so neither "this is our own
+      // echo" nor "we have a write in flight" is a reason to ignore it. The
+      // device with a write in flight is in fact the one that needs it most:
+      // its next write is fenced against this value, and learning it here is
+      // what saves a 412 round trip after every send.
+      noteComposeEpoch(id, data.compose_epoch as number | undefined);
       const originDeviceId = data.origin_device_id as string | undefined;
       if (originDeviceId && originDeviceId === getDeviceId()) break;
-      const id = data.id as string;
       if (pendingComposePuts.has(id)) break;
       const text = (data.text as string) ?? '';
       const imageHashes = Array.isArray(data.image_hashes) ? data.image_hashes as string[] : [];
@@ -1141,6 +1148,26 @@ function clearComposeIfUnfocused(threadId: string): void {
   if (isComposeFocusedHere(threadId)) return;
   clearDraft(threadId);
 }
+
+/** Tool names whose `ToolResult` means `data/` may have changed, so the Files
+ *  list and any open file preview must re-read.
+ *
+ *  The five file tools are the obvious members. `bash_output` is here for a
+ *  different reason: a background task (`run_bash_background` /
+ *  `run_python_background`) writes to `data/` UNSTAGED by design, so a
+ *  long-running job can let apps see partial output as it lands (see
+ *  `engine/tools/python.rs`). No `Artifact*` or `DataFile*` event is emitted for
+ *  those writes, which leaves a drain as the only signal the frontend gets that
+ *  output has appeared.
+ *
+ *  Plain `run_bash` is deliberately absent. Its tool description forbids writing
+ *  to `data/` (that is `run_python`'s job), and every entry here costs a full
+ *  `data/` walk server-side via `list_artifacts`, which is not worth paying
+ *  after each curl, ls and git status. A bash write to `data/` is tool misuse;
+ *  the header Refresh button covers it. */
+const ARTIFACT_REFRESHING_TOOLS = [
+  'write_file', 'edit_file', 'copy_file', 'delete_file', 'import_file', 'bash_output',
+];
 
 /** Handle transient ThreadEvent types that trigger side effects (modals, refreshes).
  *
@@ -1206,18 +1233,24 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceT
     // permission card (rendered in ChatExchange via PermissionCard), replacing
     // the old transient `McpConsentPromptRequested` + showConfirm modal.
 
-    case 'FileRefreshRequested':
-      // loadArtifacts sets `artifacts` to `failed` via toFailed on error.
-      void loadArtifacts();
-      break;
-
+    // A tool call that may have changed `data/`. `loadArtifacts` refreshes the
+    // Files list AND bumps `artifactRevision`, which cache-busts an open file
+    // preview, so this arm is what makes an agent edit show up without the user
+    // touching anything. (loadArtifacts sets `artifacts` to `failed` via
+    // toFailed on error.)
     case 'ToolResult': {
       const name = (event as { name: string }).name;
-      if (['write_file', 'edit_file', 'copy_file', 'delete_file', 'import_file'].includes(name)) {
+      if (ARTIFACT_REFRESHING_TOOLS.includes(name)) {
         void loadArtifacts();
       }
       break;
     }
+
+    // The background task finished, so its last writes have landed. Same
+    // reasoning as `bash_output` in ARTIFACT_REFRESHING_TOOLS above.
+    case 'BackgroundBashCompleted':
+      void loadArtifacts();
+      break;
 
     case 'AppUiCaptureRequested': {
       const e = event as { app_id: string; request_id: string };

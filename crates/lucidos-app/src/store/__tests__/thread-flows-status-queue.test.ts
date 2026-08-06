@@ -669,6 +669,7 @@ describe('Bug: SSE-born scheduled trigger thread categorization', () => {
         lastRevivedAt: '',
         state: 'active',
         latestTodoList: null,
+    liveEventWaits: [],
       },
       events: new Map(),
       streamingBuffer: '',

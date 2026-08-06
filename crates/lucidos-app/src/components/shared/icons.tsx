@@ -63,6 +63,18 @@ export function InfoIcon() {
   );
 }
 
+/** Question mark in a circle. Mirrors InfoIcon's geometry (same circle, same
+ *  stroke, same baseline dot) so the two read as one family in a header row. */
+export function HelpIcon() {
+  return (
+    <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="8" cy="8" r="6.25" />
+      <path d="M6.3 6.05a1.75 1.75 0 1 1 2.4 1.62c-.45.18-.7.6-.7 1.08v.35" />
+      <circle cx="8" cy="11.4" r="0.6" fill="currentColor" stroke="none" />
+    </svg>
+  );
+}
+
 export function ClearIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -131,6 +143,16 @@ export function ImageIcon({ className }: { className?: string }) {
       <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
       <circle cx="8.5" cy="8.5" r="1.5"/>
       <polyline points="21 15 16 10 5 21"/>
+    </svg>
+  );
+}
+
+/** Clock face for the *subscription indicator* (an event wait's countdown). */
+export function EventWaitClockIcon({ className }: { className?: string }) {
+  return (
+    <svg class={className} viewBox="0 0 16 16" fill="none" aria-hidden="true">
+      <circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5" />
+      <path d="M8 4.5V8l2.5 1.5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" />
     </svg>
   );
 }
@@ -453,6 +475,27 @@ export function StopIcon() {
   return (
     <svg viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true">
       <rect x="6" y="6" width="12" height="12" rx="2" />
+    </svg>
+  );
+}
+
+// The standard pause glyph: two filled bars. Paints the `paused` thread status
+// (a turn an engine restart interrupted). Same filled family as StopIcon, and
+// deliberately a recognizable transport glyph rather than another colored dot,
+// because "paused" is the one status a universal symbol already says outright.
+//
+// Unlike its neighbours in this file, the viewBox HUGS the bars rather than
+// centring them in a square box, and its consumer sizes it to that same 12:16
+// aspect. Every other occupant of the thread status slot (a 0.4rem dot, the
+// 0.7rem question badge, the spinner) is a shape that fills its box, and the
+// slot is a flex row that left-aligns them, so ink floating in the middle of a
+// square icon box would leave a paused row's glyph visibly indented against
+// every neighbouring row's dot.
+export function PauseIcon() {
+  return (
+    <svg viewBox="0 0 12 16" fill="currentColor" stroke="none" aria-hidden="true">
+      <rect x="0" y="0" width="4.5" height="16" rx="1" />
+      <rect x="7.5" y="0" width="4.5" height="16" rx="1" />
     </svg>
   );
 }

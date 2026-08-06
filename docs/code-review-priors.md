@@ -331,7 +331,110 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   inversion. Re-flag only with a case where the bare row is provably the live
   one. (`migrations/20260805134838_drop_credential_name_prefixes_use_auth_type.sql`.)
 
+- **`normalized_head` stripping an unmatched quote is a deliberate over-block,
+  not a false-positive bug.** It trims quote characters off both ends of the
+  head token independently, so the head of `'rm -rf /'` (whitespace-split to
+  `'rm`) normalizes to `rm` and the command hard-blocks, even though a shell
+  would look for a single executable literally named `rm -rf /` and report
+  "command not found". A reviewer reasonably proposes stripping quotes only when
+  both ends match. That is declined: the over-block costs nothing, because the
+  only commands it catches are ones that cannot run either way, while tightening
+  the rule is the direction that can LOSE a catastrophic detection, and this
+  function is used exclusively by the two danger scans (`segment_is_safe`
+  deliberately does not call it). Re-flag only with a legitimate command that a
+  shell really executes and this refuses. (`engine/command_guard.rs`.)
+
+- **A raw-text region is bounded but still scrubbed, and that is on purpose.**
+  `sanitizeHtmlFragments` skips to the matching end tag for `textarea` / `title`
+  / `xmp` / `noscript` / `plaintext`, then recurses into the content rather than
+  copying it. A reviewer sees the browser treating that content as inert text and
+  proposes passing it through untouched, which would also stop literal markup a
+  reader typed into a textarea being altered. Declined: `title` is RCDATA in HTML
+  but ordinary markup inside `<svg>` / `<math>`, and the walk does not track
+  foreign content, so verbatim is right for one context and wrong for the other.
+  Twice on 2026-08-06 a region that skipped the scrub turned out to be reachable
+  markup. Re-flag only if the walk starts tracking foreign content.
+  (`crates/lucidos-app/src/utils/renderMarkdown.ts`.)
+
+- **`AbortCause::is_transient()` and the `paused` status verdict answer
+  DIFFERENT questions and are supposed to disagree.** `RecoveryAfterRestart` is
+  transient yet settles the thread at `failed`, which reads as a contradiction:
+  two predicates over the same enum, three lines apart, splitting it different
+  ways. Declined, and the split is the fix rather than the bug (2026-08-06).
+  `is_transient` asks whether a fresh `SessionStarted` is expected, so the
+  parent's `active_children_count` must not decrement; it has no actor axis and
+  therefore cannot tell the user's own *Switch to new version* from a crash
+  sweep. The verdict asks whether anyone is coming back for this turn, which
+  ONLY the actor answers, so it keys on `promises_auto_resume` (cause
+  `EngineShutdown` **and** a device actor). Keying the verdict on transience is
+  what made a crash, and the boot floor handing the Continue button *back*, both
+  wear the reassuring pause glyph. The apparent loose end, a transient abort that
+  skips the parent decrement while the child reads `failed`, is closed elsewhere:
+  `active_thread_statuses()` counts neither `paused` nor `failed`, so the boot
+  `rebuild_active_children_count` reconciles the parent either way. Re-flag only
+  if `is_transient` gains an actor axis, or if a caller starts deriving a
+  user-visible status from it again.
+  (`crates/lucidos-engine/src/engine/thread_events/cause.rs`.)
+
+- **`sole_branch_containing` requires no rename evidence, and that is not the
+  same laxity as branch adoption's.** The Diff view's worktree-is-gone fallback
+  (`api/repositories.rs::resolve_recorded_branch`) locates a thread's work by
+  asking which branch contains its last known commit, and a reviewer reasonably
+  objects that a sibling cut from the tracked branch before the tracked ref was
+  deleted also contains it, so the diff could show commits the thread never
+  made. True, and deliberate. The comparison to make is not with *branch
+  adoption* (`try_adopt_branch_at_idle`, which demands a reflog rename record
+  because it retargets a whole session, including where a later Discard would
+  point its `branch -D`) but with the path this fallback stands in for:
+  `diff_via_worktree` diffs `base...HEAD` of whatever the worktree sits on and
+  has exactly the same property. Demanding more in the fallback would make the
+  two disagree about the same repository, and would answer the ordinary
+  `git checkout -b`-then-delete case with "no diff" rather than the diff sitting
+  right there. It is read-only, the response names the branch it resolved, and
+  several candidates already refuse rather than guess. Re-flag only if this
+  starts feeding a write (an apply, a branch delete, a change row).
+  (`crates/lucidos-engine/src/engine/git_ops/commits.rs`,
+  `crates/lucidos-engine/src/api/repositories.rs`.)
+
+- **`in_flight_request_event_id` locks the `active_threads` `std::sync::Mutex`
+  in a function that then `.await`s.** Reviews read that as a guard held across
+  a suspension point, which on a `std` mutex would block the executor thread and
+  can deadlock. It is not held: the guard is a temporary in the initializer of a
+  `let`, so it drops at that statement's semicolon, and the value it yields
+  (`Option<Uuid>`) is `Copy` and borrows nothing. The `.await` is in the `None`
+  arm of the `match` that follows. The borrow checker enforces this rather than
+  convention: binding the `&ThreadHandle` instead would fail to compile at the
+  `.await`. The same shape is why the nested `handle.request_event_id.lock()`
+  inside the `and_then` is safe, and the lock order (`active_threads` outer, the
+  per-handle anchor inner) is the only order any caller uses, since the anchor is
+  reachable only through the map. Re-flag only if the recorded value stops being
+  `Copy`, or if a guard is bound to a named variable that outlives the statement.
+  (`crates/lucidos-engine/src/engine/mod.rs` `in_flight_request_event_id`,
+  `record_request_event_id`.)
+
 ## Frontend
+
+- **`sendCompose`'s catch cannot be reached by a failed chat POST, so a reviewer
+  reasoning about "the send failed after the draft was cleared" is describing an
+  unreachable state.** The shape is a magnet: `sendCompose` clears the draft, a
+  post-send compose write persists that clear, and the catch restores the text
+  with `patchDraft` and schedules nothing, so it reads as "the engine keeps an
+  empty draft while the composer shows text, and a reload loses it". Two
+  independent Codex review passes raised it on 2026-08-06 (once as P1, once as
+  P2 via the queued-write variant). What refutes it is `sendMessage`
+  (`store/actions/chat.ts`): **it never rejects.** Its only awaits are
+  `getWebviewContent()` inside its own `try/catch`, and `sendSlot.waitForTurn` /
+  `submitChat(body)` inside a `try/catch` whose every branch (transport error,
+  HTTP error, unknown) handles the failure and returns, rendering a failed
+  in-thread exchange or toasting. So the only thing that can reject inside
+  `sendCompose`'s try is `awaitThreadStarted`, i.e. `POST /threads` failed. On
+  that path `startComposeIfNeeded` has ALREADY run `rollbackOptimistic`
+  synchronously before the rejection propagates, which deletes the thread from
+  `threadMap` and clears the draft, so there is no server row to hold a stale
+  clear (`pushNow` awaits the same rejected promise and returns early) and
+  nothing to lose. A re-push scheduled there would be dead code. Re-flagging
+  this needs NEW evidence that `sendMessage` gained a throw path, not a fresh
+  re-derivation from the catch block's shape.
 
 - **Space on a focused choice-card button activates it; it does NOT type a
   space into the prompt.** A reviewer tracing `shouldTypeToFocusPrompt`
@@ -511,7 +614,8 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   applied" card cluster in the last (no-scroll-room) viewport, where pure
   scroll-position stepping keys off a pinned `scrollTop` and re-selected the same
   turn (the change card was unreachable — the reported bug). A marker means the
-  user has NOT scrolled since the last nav (any scroll gesture fades it), so index
+  user has NOT scrolled since the last nav (any scroll gesture retires its ref, even
+  while the highlight itself holds), so index
   stepping is unambiguous; the no-marker fallback still handles the
   first-press-from-scroll case and the tested mid-turn "prev snaps to the current
   turn's top" read (both happen precisely when no marker is present), so that
@@ -884,7 +988,7 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   purely an entrance flourish and missing it (a glance away, a slow iOS load)
   meant missing it entirely, with only the border left behind.
   `nav-focus-spotlight-on` ends at the marker's **persistent resting wash**, which
-  then stays until the user acts. A look-away can miss the half-second turn-on; it
+  then stays until the user acts. A look-away can miss the turn-on ramp; it
   cannot miss the marker. Be precise about what IS given up, so a reviewer reading
   `96b2c8e2a`'s literal words ("shown instantly on landing") finds them addressed:
   instant-on is genuinely gone, and that is the deliberate content of the later
@@ -917,6 +1021,62 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only with evidence that the Vitest config stopped faking rAF, in which
   case those tests fail loudly rather than silently.
   (`crates/lucidos-app/src/test-setup.ts`, `components/shared/__tests__/focusMarker.test.ts`.)
+
+- **The navigation focus marker's hold is wall-clock, and it running out in a
+  hidden tab is an accepted limit, not a bug.** A reviewer will notice that
+  `NAV_FOCUS_HOLD_MS` and then `NAV_FOCUS_FADE_MS` both keep counting while the
+  document is hidden (`setTimeout` is throttled in a background tab but still
+  fires, and the class removal is the JS timer's job, not the animation's), so
+  landing, pressing a key, and immediately switching tabs means returning ~3s
+  later to no marker. That is real, and it is deliberately not fixed. It is not
+  a regression: before the hold existed the same keypress dismissed the marker
+  outright and it was gone 0.4s later, so the hold strictly lengthened the
+  window. It is not the case the persistence guarantee covers either
+  (`fd61d7af9` protects a user who has NOT engaged; this path opens with a
+  keydown, which has dismissed the marker by design since `96b2c8e2a`). And the
+  fix, tracking `document.visibilityState` so the hold measures visible painted
+  time, adds another pausable clock to a module in which every bug found so far
+  has been a clock-interaction bug (the stale ref across the dissolve, the frame
+  stranded by hidden-tab timer ordering, the hold anchored before the ramp
+  instead of after). Re-flag only with a report of it actually bothering someone,
+  which would justify the added state. (`components/shared/focusMarker.ts`.)
+
+- **Cutting `NAV_FOCUS_FADE_MS` to 0.8s does NOT undo the round that lengthened
+  it.** A reviewer running `git log` on `components/shared/focusMarker.ts` will
+  find the dissolve walked 0.4s to 1.5s to 2.5s across three rounds of direct
+  user feedback, the last of them answering "the light turns down almost right
+  away", and then find it cut to 0.8s, and reasonably call it a silent reversal
+  of a user request. It is not, for two reasons. A later explicit instruction
+  outranks an earlier one, and this one was explicit ("turning off the lights
+  should be a little faster ... make it maybe 800ms"). More importantly the two
+  requests are about different phases: what actually answered "turns down almost
+  right away" was `NAV_FOCUS_HOLD_MS`, the guaranteed 2s at FULL brightness added
+  in the same round, and the hold is **untouched** here. Lengthening the dissolve
+  alongside it was the part that overshot, because the dismiss is triggered BY the
+  action that moves the user on, so a long drain is time the marker spends going
+  out after they have stopped looking. Time at full is the hold's job; the
+  dissolve only has to avoid blinking off. The relationship is pinned both ways by
+  `nav-focus-marker-paint.test.ts` (slower than the turn-on, and at most a
+  second). Re-flag only if the user asks for a slower dismiss again, or if a
+  change cuts the HOLD, which is the value that request was really about.
+  (`components/shared/focusMarker.ts`, `styles/global/host-components.css`.)
+
+- **The login agent's install swallows every failure on purpose, and that is
+  not the fail-fast violation it looks like.** `ensure_login_agent_installed`
+  (`crates/lucidos-app/src/desktop.rs`) logs and returns on a plist it cannot
+  build, resolve, write, or bootstrap, which reads exactly like the
+  "log-and-proceed instead of failing fast" pattern `/harden` Phase 2.5 hunts
+  for. The difference is what the dependency is *for*: the login agent buys the
+  NEXT boot a client in the menu bar, and nothing in the running session depends
+  on it. Failing the client's startup (or its service install, which happens on
+  the same path) over it would cost the user a working app to gain nothing, and
+  the degraded state is not silent-and-broken but simply the behaviour every
+  build before 2026-08-06 had, namely opening the app by hand. The one failure a
+  user would actually chase, `open` never succeeding at login, does say so:
+  the script echoes why it gave up to `client-login.err.log`. Re-flag only if
+  something in the live session starts depending on that agent.
+  (`crates/lucidos-app/src/desktop.rs` `ensure_login_agent_installed`,
+  `login_launch_script`.)
 
 ## Scripts (bash)
 
@@ -1506,6 +1666,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   is outside the Loadable.
   (`crates/lucidos-app/src/components/settings/NetworkAccessPage.tsx`,
   `SettingsView.tsx` `repositoriesSection`.)
+
+- **`hasRenderableResponseContent` counts a `step` / `event_wait` as drawn even
+  though `renderResponseEvents` gates those on `showSteps`.** Reviews read that
+  as an incomplete mirror: with steps collapsed the renderer returns `null` for
+  them, so a boundary holding only a step would supposedly still open an empty
+  panel. It does not. `getEventToggleState`'s `showStepsToggle` is the same
+  `some(e => e.type === 'step' || e.type === 'event_wait')`, so a step present
+  means the body always renders the "Show steps" button: visible content, and
+  the affordance that reveals the rest. The predicate is about whether a panel
+  is worth opening, not about which of its rows are currently expanded, and
+  threading `showSteps` into it would make an exchange's panel appear and
+  disappear as the user toggles a global preference. The narrower shape the
+  concern usually reaches for, a lone `CodingAgentToolResult`, produces no step
+  at all: that arm only resolves a pending step, it never pushes one. Re-flag
+  only if `showStepsToggle` stops keying on the same predicate, which would make
+  the button genuinely absent.
+  (`crates/lucidos-app/src/store/thread-events/exchange-render.ts`,
+  `store/event-rendering.ts` `getEventToggleState`.)
 
 ## Settled architecture questions
 

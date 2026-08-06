@@ -3,11 +3,10 @@
 **Always loaded** (no `paths:` frontmatter): the inclusion test has to be applied whenever a temporary measure is introduced, which is a judgment made before any particular file is touched.
 
 A **temporary measure** is anything in the codebase that is *meant to end* and
-carries a *concrete condition for when* — a workaround until upstream fixes X, a
-diagnostic that only exists to chase a bug, a crutch for a recurring model mistake,
-a feature flag awaiting cleanup, a back-compat shim with a real removal trigger.
-Left untracked, each silently becomes permanent. They are tracked in
-[`docs/temporary-measures.md`](../../docs/temporary-measures.md).
+carries a *concrete condition for when*: a workaround until upstream fixes X, a
+diagnostic that only exists to chase a bug, a crutch for a recurring model
+mistake, a feature flag awaiting cleanup, a back-compat shim with a real removal
+trigger. Left untracked, each silently becomes permanent.
 
 ## The inclusion test
 
@@ -15,70 +14,34 @@ Apply one line to every candidate:
 
 > **Is this meant to go away, and is there a concrete condition for when?**
 
-**Yes → it goes in the registry** (`docs/temporary-measures.md`). **No → it belongs
-elsewhere** (see OUT, below). If you can't write a concrete removal condition, it
-isn't a temporary measure — it's either a permanent requirement or backlog.
+**Yes** goes in the registry, [`docs/temporary-measures.md`](../../docs/temporary-measures.md).
+**No** belongs elsewhere: permanent back-compat, a site-local `#[allow(...)]`, a
+settled design decision (`docs/adr/`), or backlog with no end condition. If you
+can't write a concrete removal condition, it isn't a temporary measure.
 
-## The four categories
+The registry owns the rest of the taxonomy: its four typed sections (workarounds,
+model-tolerance measures, feature flags and sunset deprecations, open
+investigations as parents), the full OUT list, and the field shape every entry
+uses. Read it when you are about to add one. One judgment from it is worth
+knowing before you get there: for a model-tolerance measure, **"the model" means
+the weakest model in the model registry, not the newest**, so a new flagship is
+never on its own evidence that a crutch is removable.
 
-The registry has four typed sections; a temporary measure is one of:
+## What binds at write time
 
-1. **Temporary measures & workarounds** — diagnostics, scaffolding, "workaround
-   until upstream fixes X".
-2. **Model-tolerance measures** — a crutch added *only* to compensate for current
-   LLMs making a predictable, recurring mistake (a forgiving alias, a tolerated
-   wrong name, a fallback that fires on a model error, a permissive parse for a
-   shape the agent tends to emit). The honest reason it exists is "the model keeps
-   getting it wrong," not "the design needs it." The test: *would we still want
-   this if the model were perfect?* No → it's a tolerance measure. (This category
-   absorbed the retired `model-tolerance-measures.md`.) **"The model" means the
-   weakest model in the *model registry*, not the newest.** Chat routes across
-   Anthropic, OpenAI, OpenRouter, and local endpoints, so a new flagship is not
-   evidence a crutch is removable, and enabling another model can make one more
-   load-bearing — see `docs/temporary-measures.md` § 2 for the sampling rule.
-3. **Feature flags & sunset deprecations** — flags / kill-switches awaiting
-   cleanup, and back-compat shims/aliases that carry a **concrete** removal
-   condition (NOT permanent back-compat).
-4. **Open investigations (parents)** — an investigation is the *reason* a measure
-   exists, not a measure itself. Model it as a parent entry (no "Lives in" site);
-   each measure references its parent investigation by id. Closing an investigation
-   surfaces every measure now eligible for removal.
-
-## Explicitly OUT (so the registry doesn't become a tech-debt swamp)
-
-- **Permanent back-compat / old-data tolerance** (serde aliases for old events,
-  parsers for legacy wire shapes) — real requirements that never leave.
-- **Site-local suppressions** — `#[allow(...)]`, `@ts-expect-error`,
-  `// eslint-disable`. Harden flags those at the site, not here.
-- **Permanent design decisions / accepted non-bugs** — those live in `docs/adr/`
-  and `docs/code-review-priors.md`.
-- **General refactor wishlist / "tech debt" with no concrete end condition** —
-  that's backlog / `docs/plans/`.
-
-## Rules
-
-- **Log it in the same change.** When you add a temporary measure, add an entry to
-  `docs/temporary-measures.md` (in the right typed section, with every field —
-  Added/Opened, Lives in, Impermanent because, Removal/resolution condition,
-  Status, and for a measure the parent Investigation id) in the same commit. A
-  temporary measure that isn't logged silently becomes permanent — that's the
-  failure this prevents. This also closes the loophole where rewording a
-  `TODO: remove after X` into a plain comment dodged tracking: the escape valve is
-  to **register it**, not to launder the marker.
-- **Comment at the site.** Leave a short comment where the measure lives saying
-  it's a temporary measure and pointing at its registry row, so a future reader
-  knows it's removable and why.
-- **Every measure carries a concrete removal condition.** State exactly what has to
-  be true to drop it and how to verify it's safe. "Eventually" is not a condition.
-- **Model investigations as parents.** When a measure exists because of an open
-  investigation, add (or reuse) the investigation parent entry and reference it by
-  id from the measure. Don't bury the reason inside the measure's own row.
-- **Removing one updates the registry, doesn't delete the row.** Flip Status to
-  `removed` / `resolved`, add the date, keep the row as history. Also revert any
-  paired docs/wording the measure softened (the entry's removal condition should
-  name them). Closing an investigation flips every measure tagged with its id.
+- **Log it in the same change.** A temporary measure that isn't logged silently
+  becomes permanent, which is the entire failure this prevents. It also closes
+  the loophole where rewording a `TODO: remove after X` into a plain comment
+  dodged tracking: the escape valve is to **register it**, not to launder the
+  marker.
+- **Comment at the site**, pointing at the registry row, so a future reader knows
+  it's removable and why.
+- **State a concrete removal condition.** Exactly what has to be true to drop it,
+  and how to verify that is safe. "Eventually" is not a condition.
 - **Don't reach for a measure first.** Prefer making the right thing discoverable
-  (docs, prompt, types). Only add a crutch when guidance has already failed — and
+  (docs, prompt, types). Only add a crutch when guidance has already failed, and
   say so in the entry.
+- **Removing one updates the registry, it does not delete the row.** Flip Status
+  to `removed` / `resolved` with the date and keep the row as history.
 
 See also: `docs/glossary.md` § "temporary measure".

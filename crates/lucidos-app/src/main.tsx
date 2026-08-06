@@ -66,6 +66,10 @@ installNoDrag();
 // scrollbar takes that width out of the content box on classic-scrollbar
 // platforms. The inline FOUC script has already applied the UI scale, so the
 // rem-sized scrollbar measures at its final width here.
+//
+// Nothing is mounted yet, so this is the probe's estimate. ThreadView re-publishes
+// from the real transcript the moment one exists, which is the only answer that
+// holds on every engine (utils/scrollbarGutter.ts).
 publishScrollbarGutter();
 
 // E2E test hook — Playwright opens an app by id from `page.evaluate`. The

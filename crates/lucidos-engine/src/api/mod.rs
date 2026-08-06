@@ -11,6 +11,7 @@ mod claude_code;
 mod command_checkpoint;
 mod command_permission;
 mod data_api;
+pub(crate) mod diff;
 mod disk_usage;
 pub(crate) mod error;
 pub(crate) mod frontend_snapshot;
@@ -46,6 +47,7 @@ mod sdk_prefs;
 mod search;
 mod settings;
 pub mod sse_connections;
+pub(crate) mod target_workspace;
 mod thread_queue;
 mod threads;
 mod threads_compose;
@@ -404,6 +406,24 @@ pub struct ChatRequest {
     pub event_id: Option<String>,
     #[serde(default)]
     pub thread_id: Option<String>,
+    /// `true` when `thread_id` names a thread that is EXPECTED not to exist yet,
+    /// because this request is the one creating it.
+    ///
+    /// A thread has no creation event: it exists because an event exists on its
+    /// aggregate id, and the `MessageReceived` projection is an upsert. So a
+    /// `thread_id` naming nothing used to be indistinguishable from a follow-up
+    /// on a thread that does exist, and the engine silently manufactured the
+    /// thread instead of refusing. A caller that reached the wrong engine got a
+    /// thread there, and reading its own message back confirmed the mistake
+    /// rather than catching it (2026-08-06).
+    ///
+    /// So an id-carrying create must now say so. Omitted (or `false`) means "I
+    /// am addressing a thread that already exists", and an id that names nothing
+    /// is a 404. Carrying `parent_thread_id` or `caller_workspace` is an
+    /// equivalent create signal, which is why `lucidos spawn-thread` and the
+    /// cross-workspace client need no flag.
+    #[serde(default)]
+    pub new_thread: Option<bool>,
     /// Required when `mode` is `"agent"` or `"engine"`: the thread that is
     /// spawning this new thread (e.g. the Claude Code session whose `spawn-thread` skill
     /// is making this call). Must be `null` when `mode` is `"human"`. The
@@ -1059,6 +1079,17 @@ pub fn create_router(
         // already carry `content-encoding` (the hand-rolled gzipped SSE in
         // `history.rs`), so the existing streaming transport is unchanged.
         .layer(CompressionLayer::new())
+        // Refuse a request that named a DIFFERENT workspace than this engine
+        // serves (409). Layered here rather than per-handler because a
+        // mis-aimed write is a hazard on every mutating endpoint, and a
+        // per-handler check is one a new endpoint can forget. Applied after
+        // every domain merge for the same reason `DefaultBodyLimit` is:
+        // `Router::layer` only covers routes registered before the call.
+        // See `api::target_workspace`.
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            target_workspace::enforce_target_workspace,
+        ))
         .with_state(state);
 
     let router = Router::new()

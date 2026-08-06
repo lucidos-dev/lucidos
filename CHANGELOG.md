@@ -1,5 +1,55 @@
 # Changelog
 
+## v0.23.0 — 2026-08-06
+
+### Added
+
+- **A thread can wait for something to happen, then carry on by itself.** `await_event` parks a thread on one or more events (a child thread finishing, a change being proposed, a coding agent going idle, a trigger firing, a domain event the workspace emits) and the engine re-opens that thread with a new turn when a match arrives. The wait costs nothing, survives a restart, and reports back in the chat you asked from. A coding-agent session registers the same wait with `lucidos await-event`.
+- **A guided setup interview.** A button on the welcome screen and in every header asks which parts of your life to help with (work, personal admin, health and training, learning, a side project, a household) and builds a starting kit of apps, triggers and knowhow from the answers.
+- **A checkpointed command shows what it changed.** The card opens a diff of what the command created, overwrote and deleted, and Undo removes the files it created as well as restoring the ones it touched. A command that captured nothing gets no card.
+- **Claude Sonnet 5**, in both the chat registry and the Claude Code picker, with a 1M-context variant beside the standard one.
+
+### Changed
+
+- **One model call is one row.** Thinking folds into the step it produced, and the row's token counter opens the context viewer, now a view of its own.
+- **An event wait reads as a step line**, and the wake that ends it names the matched event with its payload folded. "Show it" opens that event where it lives.
+- **A confirmed plugin install or uninstall leaves a receipt in navigation history.**
+- **An archived sub-thread under a live parent is dimmed**, and stays fully interactive.
+- **A paused thread has its own glyph and a "Paused by restart" label.** Paused means the engine is bringing the turn back.
+- **A Codex permission card names the files a change will touch**, and neither Codex card shows its wire tool identifier.
+- **A backup failure notification leads with what to do** and opens the Backup page, which shows the destination actually configured.
+- **The OAuth callback page is unmistakably Lucidos**, on the brand surface the workspace picker uses.
+- **Markdown tables fit the pane** at every width, with a readable minimum column.
+- **A markdown image pointing at a workspace file renders.**
+- **The navigation focus marker is neutral**, white on dark and grey on light.
+- **The Settings index rows are quieter**, matching the drawer's other list of destinations.
+- **The file tools can address `.lucidos/tmp/` scratch.** Reads and copies resolve against the workspace root; writes there are refused with a pointer to `run_python`.
+- **The Files list and an open file preview re-read themselves** when a tool call or a background task writes to `data/`.
+- **`navigate_ui` reports that it sent the request**, not that the page is open.
+
+### Fixed
+
+- The macOS client comes back to the menu bar at login, and a relaunch or auto-update no longer brings it back hidden.
+- A message that was sent no longer stays behind in the composer.
+- A multiline copy block no longer shows a blank line under every bullet and between every paragraph.
+- Prose shaped like `name=value` is no longer deleted from a rendered message.
+- With two dialogs stacked, one Enter answers only the top one.
+- Push can be enabled on a workspace recreated at the same address.
+- The Diff button works on an external-repo thread whose branch was renamed mid-session.
+- A restart no longer labels a thread both paused and canceled, and pauses a thread only when the engine is going to resume it. A coding-agent session that registers while the engine is already tearing down counts as shutting down, so its turn comes back on the next boot instead of ending as canceled.
+- The engine no longer deletes live coding-agent work when a database probe fails or a rescue commit does not land.
+- A domain event emitted from an app can no longer wedge the engine's boot.
+- Memory extraction, a plugin update check against an unreachable remote, and a Vertex token refresh no longer block the runtime.
+- Command-guard bypasses closed: a wrapped payload in a non-head segment, a decorated command head, and a code-injecting environment assignment. A permission card no longer records a secret from the command it is asking about, and an email search cannot carry a line break into the IMAP session.
+- Every WASM signer host allocation is bounded by the module's own memory before anything is reserved.
+- An unattributed caller cannot claim to be the user. Human attribution requires a device or workspace the engine can resolve.
+- A chat popover stays inside the viewport, never wider than the thread pane, and the prompt bar's popovers fit a phone. The close button sits in its own header with a full tap target.
+- The composer aligns with the gutter the transcript actually reserves.
+- On a phone, the content header title uses the space an empty side leaves it.
+- A blocked popup raises a toast with an Open button.
+- A thread link from the content pane re-expands a collapsed thread pane.
+- Resizing the thread pane holds the transcript still instead of carrying the reader up into older turns, and a reader at the bottom stays at the bottom.
+- A child completion wakes a waiting parent exactly once, and a lagged event bus or a failed emit no longer strands a wait.
 ## v0.22.0 — 2026-08-05
 
 ### Added

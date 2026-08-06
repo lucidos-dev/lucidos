@@ -330,7 +330,7 @@ pub const CATALOG: &[PrefSpec] = &[
         scope: PrefScope::Global,
         value: PrefValue::Enum(crate::core::backup::PROVIDER_IDS),
         default: "(unset — ask the user)",
-        description: "Cloud destination for backups. Setting this connects NOTHING: the account is connected separately with connect_oauth_account, or by the user in Settings → Accounts (never on the Backup page, which has no account UI). Until then backups run and the upload fails. Check get_backup_status, which reports whether the account is connected.",
+        description: "Cloud destination for backups, independent of backup_schedule: it stays set with the schedule off, and the Backup page's provider dropdown both opens on it and writes it. Setting this connects NOTHING: the account is connected separately with connect_oauth_account, or by the user in Settings → Accounts (never on the Backup page, which has no account UI). Until then backups run and the upload fails. Check get_backup_status, which reports whether the account is connected.",
         side_effect: PrefSideEffect::None,
     },
     PrefSpec {

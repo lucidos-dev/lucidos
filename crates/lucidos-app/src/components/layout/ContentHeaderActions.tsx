@@ -29,7 +29,12 @@ interface HeaderActionSpec {
   onClick?: (e: MouseEvent) => void;
   /** Renders an `<a target="_blank">` instead of a button (open-in-tab). */
   href?: string | null;
-  /** Extra class(es) on the header button, e.g. `app-fullscreen`. */
+  /** Extra class(es) naming the ACTION, e.g. `app-fullscreen`. Carries no CSS:
+   *  it is how the rest of the app (and the e2e suite) addresses one action, so
+   *  it is stamped on BOTH renderings. Progressive collapse decides placement,
+   *  and an action must stay findable by the same selector wherever it landed.
+   *  A class only on the header button silently disappears the moment a long
+   *  title folds the action into the overflow menu. */
   extraClass?: string;
   /** Toggled-on state — adds `filter-active` (apps/plugins search). */
   active?: boolean;
@@ -67,9 +72,10 @@ function renderHeaderAction(a: HeaderActionSpec): ComponentChild {
  *  closes the menu before firing (links keep their native navigation — `run`
  *  doesn't preventDefault). */
 function renderMenuAction(a: HeaderActionSpec, ctx: OverflowMenuContext): ComponentChild {
+  const cls = `thread-overflow-item${a.extraClass ? ` ${a.extraClass}` : ''}`;
   if (a.href !== undefined) {
     return (
-      <a key={a.key} class="thread-overflow-item" role="menuitem" href={a.href ?? undefined} target="_blank" rel="noopener noreferrer" onClick={ctx.run(() => {})}>
+      <a key={a.key} class={cls} role="menuitem" href={a.href ?? undefined} target="_blank" rel="noopener noreferrer" onClick={ctx.run(() => {})}>
         {a.icon()}
         {a.label}
       </a>
@@ -82,14 +88,14 @@ function renderMenuAction(a: HeaderActionSpec, ctx: OverflowMenuContext): Compon
     // no-op target and strand the arrow-key roving outside the panel. An
     // aria-disabled row stays focusable/perceivable and simply has no onClick.
     return (
-      <button key={a.key} type="button" class="thread-overflow-item" role="menuitem" aria-disabled="true" data-tooltip={a.disabledTooltip}>
+      <button key={a.key} type="button" class={cls} role="menuitem" aria-disabled="true" data-tooltip={a.disabledTooltip}>
         {a.icon()}
         {a.label}
       </button>
     );
   }
   return (
-    <button key={a.key} type="button" class="thread-overflow-item" role="menuitem" onClick={(e: MouseEvent) => ctx.run(() => a.onClick?.(e))(e)}>
+    <button key={a.key} type="button" class={cls} role="menuitem" onClick={(e: MouseEvent) => ctx.run(() => a.onClick?.(e))(e)}>
       {a.icon()}
       {a.label}
     </button>
@@ -339,11 +345,13 @@ export function ContentHeaderActions() {
     });
   }
 
-  // ── Progressive collapse (desktop only — inert inside the mobile header) ──
-  // When the 3-zone header row runs out of room the LEADING context actions
-  // (nearest the title) move into a ⋯ overflow menu, two first and then one
-  // more per step, until only ⋯ + the bell remain; the title starts
-  // ellipsizing only after that. The ⋯ trigger sits nearest the title.
+  // ── Progressive collapse (both layouts; the hook branches on its host) ──
+  // When the header row runs out of room the LEADING context actions (nearest
+  // the title) move into a ⋯ overflow menu, two first and then one more per
+  // step, until only ⋯ + the bell remain; the title starts ellipsizing only
+  // after that. The ⋯ trigger sits nearest the title. Mobile centres its title
+  // absolutely rather than in a flex zone, so the hook measures that row's
+  // geometry separately and also publishes the title box's width and offset.
   const hostRef = useRef<HTMLDivElement>(null);
   const collapsedCount = useHeaderActionCollapse(hostRef, actions.length);
   const collapsed = actions.slice(0, collapsedCount);

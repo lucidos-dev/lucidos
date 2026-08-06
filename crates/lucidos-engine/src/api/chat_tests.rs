@@ -201,6 +201,163 @@ fn subprocess_chat_no_source_thread_still_rejects_cross_thread() {
     ));
 }
 
+// ── human_mode_is_attributed ────────────────────────────────────────
+//
+// Regression coverage for the 2026-08-06 incident: the Lucidos Agent shelled
+// out to `curl` and POSTed `mode: "human"` to /api/v1/chat/stream, and the
+// engine recorded it as a turn the user typed. The matrix above never saw the
+// request, because it only runs for a caller that PRESENTS an origin token,
+// and curl does not forward one. These tests pin the gate that runs for every
+// caller.
+
+#[test]
+fn unattributed_human_mode_is_refused() {
+    // The incident shape exactly: no device, no caller workspace.
+    assert!(!human_mode_is_attributed(ActorMode::Human, false, false));
+}
+
+#[test]
+fn a_registered_device_attributes_a_human() {
+    // The user's own client: it sends `x-lucidos-device-id` on every mutating
+    // fetch, and the id resolves to a `devices` row.
+    assert!(human_mode_is_attributed(ActorMode::Human, true, false));
+}
+
+#[test]
+fn a_cross_workspace_caller_may_still_speak_for_its_human() {
+    // The existing cross-workspace contract: the calling workspace vouches for
+    // its own user. Still only a display hint (`api::actor`), and deliberately
+    // not renegotiated by this gate.
+    assert!(human_mode_is_attributed(ActorMode::Human, false, true));
+}
+
+#[test]
+fn agent_and_engine_modes_need_no_human_evidence() {
+    // They claim no human, so there is nothing to substantiate here.
+    // `validate_mode_and_spawn` requires their provenance and
+    // `subprocess_chat_legitimate` constrains their reach.
+    for mode in [ActorMode::Agent, ActorMode::Engine] {
+        assert!(
+            human_mode_is_attributed(mode, false, false),
+            "mode: {mode:?}"
+        );
+    }
+}
+
+/// The root cause, pinned directly: **dropping the origin token must never buy
+/// more than presenting it.**
+///
+/// Before this gate, a subprocess that presented its token was held to
+/// `subprocess_chat_legitimate` (which refuses `mode: Human` outright), while
+/// the same subprocess shelling out to `curl` read as an ordinary external API
+/// client and was allowed. The constraint was opt-in by the party it
+/// constrained. For every unattributed body, the token-absent path must now be
+/// no more permissive than the token-present one.
+#[test]
+fn dropping_the_origin_token_never_buys_more_than_presenting_it() {
+    let source = Uuid::new_v4();
+    let other = Uuid::new_v4();
+    for (label, target, parent, target_exists) in [
+        ("cross-thread, existing target", Some(other), None, true),
+        ("own thread", Some(source), None, true),
+        ("no target", None, None, false),
+        ("claimed spawn", Some(other), Some(source), false),
+    ] {
+        let with_token = subprocess_chat_legitimate(
+            ActorMode::Human,
+            Some(source),
+            target,
+            parent,
+            target_exists,
+        );
+        let without_token = human_mode_is_attributed(ActorMode::Human, false, false);
+        assert!(
+            !with_token,
+            "{label}: the token-present path must refuse mode=human"
+        );
+        assert!(
+            !without_token,
+            "{label}: the token-absent path must not be more permissive"
+        );
+    }
+}
+
+#[test]
+fn the_human_refusal_tells_the_agent_what_to_do_instead() {
+    // The incident's real failure was the agent not reporting that it was
+    // blocked, so the message has to carry the alternative, not just the "no".
+    let msg = HUMAN_MODE_UNATTRIBUTED;
+    assert!(
+        msg.contains("registered device"),
+        "names the evidence: {msg}"
+    );
+    assert!(
+        msg.contains("follow_up_child_thread"),
+        "names the legitimate route: {msg}"
+    );
+    assert!(
+        msg.contains("tell the user it is not possible"),
+        "names what to do when no tool covers the request: {msg}"
+    );
+}
+
+// ── thread_target_is_addressable ────────────────────────────────────
+//
+// The other half of the incident: the POST hit the wrong engine, whose
+// `MessageReceived` projection is an upsert, so the six unknown thread ids were
+// materialized there instead of refused. Reading them back off the same wrong
+// engine then FOUND them, so the agent's own verification confirmed the
+// mistake.
+
+#[test]
+fn an_existing_thread_is_always_addressable() {
+    assert!(thread_target_is_addressable(true, None, None, false));
+}
+
+#[test]
+fn an_unknown_thread_with_no_create_signal_is_refused() {
+    assert!(!thread_target_is_addressable(false, None, None, false));
+    // An explicit `false` is not a create signal either.
+    assert!(!thread_target_is_addressable(
+        false,
+        Some(false),
+        None,
+        false
+    ));
+}
+
+#[test]
+fn each_create_signal_admits_an_unknown_thread() {
+    // The frontend's raw new send, which mints its own uuid.
+    assert!(thread_target_is_addressable(false, Some(true), None, false));
+    // A same-workspace spawn with callback (`lucidos spawn-thread --relation
+    // child`), which is why that CLI needed no new flag.
+    assert!(thread_target_is_addressable(
+        false,
+        None,
+        Some(Uuid::new_v4()),
+        false
+    ));
+    // A cross-workspace spawn (`workspace_client`, `spawn-thread --to`), same.
+    assert!(thread_target_is_addressable(false, None, None, true));
+}
+
+#[test]
+fn the_unknown_thread_refusal_points_at_the_wrong_engine() {
+    let tid = Uuid::new_v4();
+    let msg = unknown_thread_message(tid);
+    assert!(msg.contains(&tid.to_string()), "names the id: {msg}");
+    assert!(msg.contains("new_thread"), "names the create signal: {msg}");
+    assert!(
+        msg.contains("nothing was written"),
+        "says the write did not happen: {msg}"
+    );
+    assert!(
+        msg.contains("/api/v1/health"),
+        "points at the way to check which engine answered: {msg}"
+    );
+}
+
 fn base_req(mode: ActorMode) -> ChatRequest {
     ChatRequest {
         message: "hi".into(),
@@ -218,6 +375,7 @@ fn base_req(mode: ActorMode) -> ChatRequest {
         cc_model: None,
         event_id: None,
         thread_id: None,
+        new_thread: None,
         conflict_change_id: None,
         repo_id: None,
         folder: None,
@@ -746,6 +904,7 @@ async fn queued_message_lookup_binds_thread_aggregate_id_as_text() {
             mode: ActorMode::Human,
             origin: None,
             injected_message_id: Some(injected_message_id),
+            delivered_event_id: None,
         },
         meta: EventMeta {
             request_event_id: Some(injected_message_id),

@@ -101,12 +101,21 @@ export function filterByTopThread(
     });
 }
 
-/** Per-row data for the "lifted family" cue (see *Lifted family* in
- *  `docs/glossary.md`): which section each row routed to, and which family
- *  roots are lifted. */
+/** Per-row data for the family-routing cues (see *Lifted family* and *Archived
+ *  sub-thread cue* in `docs/glossary.md`): which section each row routed to,
+ *  which family roots are lifted, and which sub-threads are archived while
+ *  rendering outside Archive. */
 export type FamilyDecorations = {
     routedByThread: ReadonlyMap<string, DisplaySection>;
     liftedRoots: ReadonlySet<string>;
+    /** Sub-threads (non-root family members) whose OWN natural section is
+     *  Archive while their family routed to a live section (Current / Pinned):
+     *  the archived child still listed under a parent that has live work. The
+     *  drawer renders these disabled so a thread the user already put away
+     *  can't read as pending work. The family ROOT is deliberately excluded:
+     *  an archived root in a live section is exactly the lifted-parent case,
+     *  which owns that row's cue already (`liftedRoots`). */
+    archivedSubThreads: ReadonlySet<string>;
 };
 
 /** Map of family root id → the display section the family renders in. Default
@@ -143,9 +152,10 @@ export function computeFamilySections(threads: ThreadState[], graph: FamilyGraph
     return familySection;
 }
 
-/** Pure: derive the lifted-parent + responsible-child decoration data the
- *  drawer renders on top of family routing. Pass a precomputed
- *  `familySections` to share the routing pass with `categorizeThreads`. */
+/** Pure: derive the lifted-parent + responsible-child + archived-sub-thread
+ *  decoration data the drawer renders on top of family routing. Pass a
+ *  precomputed `familySections` to share the routing pass with
+ *  `categorizeThreads`. */
 export function computeFamilyDecorations(
     threads: ThreadState[],
     graph: FamilyGraph,
@@ -154,6 +164,7 @@ export function computeFamilyDecorations(
     const familySection = familySections ?? computeFamilySections(threads, graph);
     const routedByThread = new Map<string, DisplaySection>();
     const liftedRoots = new Set<string>();
+    const archivedSubThreads = new Set<string>();
     for (const t of threads) {
         if (isExcludedFromSections(t)) continue;
         const root = graph.rootByThread.get(t.meta.id);
@@ -161,12 +172,22 @@ export function computeFamilyDecorations(
         const routed = familySection.get(root);
         if (routed === undefined) continue;
         routedByThread.set(t.meta.id, routed);
+        // Archived sub-thread rendered in a live section. This reads the
+        // thread's NATURAL section, so a thread STORED as archived but running
+        // (or holding changes, or with a waiting descendant) resolves to
+        // `current` here and is deliberately not dimmed: it has live work to
+        // show. Roots are excluded because `liftedRoots` already owns them.
+        // The two cheap tests come first so the section lookup is skipped for
+        // every root and for every member of an Archive-routed family.
+        if (t.meta.id !== root && routed !== 'archive' && getThreadDisplaySection(t) === 'archive') {
+            archivedSubThreads.add(t.meta.id);
+        }
         const rootThread = graph.byId.get(root);
         if (rootThread && getThreadDisplaySection(rootThread) !== routed) {
             liftedRoots.add(root);
         }
     }
-    return { routedByThread, liftedRoots };
+    return { routedByThread, liftedRoots, archivedSubThreads };
 }
 
 /** True if any ancestor of `threadId` (walking `parentThreadId` via `graph`)

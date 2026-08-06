@@ -6,11 +6,13 @@
 //! them together exactly as the original single function did.
 
 use crate::core::{PreferenceStore, PREF_MODEL_IMAGE_DESCRIPTION, PREF_MODEL_MEMORY};
-use crate::engine::agentic_loop::{meta_with_cancel_actor, terminal_result, until_canceled};
+use crate::engine::agentic_loop::{
+    cancel_cause_for_turn, meta_with_cancel_actor, terminal_result, until_canceled,
+};
 use crate::engine::context::{
     agent_context_char_budget, tool_definitions_chars, trim_history_from_oldest,
 };
-use crate::engine::thread_events::{ActorMode, CancelCause, EventChannel, MessageOrigin};
+use crate::engine::thread_events::{ActorMode, EventChannel, MessageOrigin};
 use crate::engine::types::*;
 use crate::engine::{InjectedPrompt, LucidosEngine, ThreadGuard};
 use crate::llm::{
@@ -131,7 +133,9 @@ impl LucidosEngine {
         title: Option<&str>, // caller-provided title (skips async LLM title gen)
         origin: Option<MessageOrigin>,
         external_cancel: Option<CancellationToken>, // forwarded into the per-thread cancel_token (used by triggers)
+        urgency: crate::engine::FollowUpUrgency, // child follow-up only: preempt the child's in-flight turn
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
+        let urgent = urgency.is_urgent();
         let chat_start = std::time::Instant::now();
         // Track whether a pending change was proposed during this request
         // (set to true when Claude Code proposes changes, used to trigger SSE broadcast)
@@ -388,25 +392,30 @@ impl LucidosEngine {
                 .await;
 
             if has_session {
-                // Codex interrupt-and-redirect: a follow-up that lands while a
-                // Codex turn is in flight can't be injected into the running
-                // turn (its app-server/exec protocols accept input only at a
-                // turn boundary), so it would otherwise queue invisibly behind
-                // a long turn. Interrupt the live turn — it ends as a resumable
-                // Canceled boundary (no spurious ResponseGenerated, no change
-                // proposed for the redirected-away work) — then fall through to
-                // route the follow-up as the next turn on the same Codex thread
-                // (full context preserved). CC steers via stdin, so this is
-                // Codex-only and never fires for a child-wake.
+                // Interrupt-and-redirect. Interrupt the live turn (it ends as a
+                // resumable Canceled boundary: no spurious ResponseGenerated,
+                // no change proposed for the redirected-away work), then fall
+                // through to route the follow-up as the next turn on the same
+                // thread, full context preserved. Never fires for a child-wake.
+                //
+                // Codex arms unconditionally because its app-server / exec
+                // protocols accept input only at a turn boundary, so a mid-turn
+                // follow-up would otherwise queue invisibly behind a long turn.
+                // Claude Code arms only when the caller marked the follow-up
+                // urgent: CC steers via stdin, so a plain follow-up is
+                // forwarded as-is and reaches the child at its next turn
+                // boundary. That boundary is the catch, and `urgent` is the
+                // opt-out from waiting for it. See `should_redirect_followup`.
                 let redirect_idle_notify = {
                     let mut sessions = self.agent_sessions.lock().await;
-                    super::super::process_helpers::arm_codex_redirect(
+                    super::super::process_helpers::arm_followup_redirect(
                         &mut sessions,
                         thread_id,
                         // Genuine user follow-up, not an engine-internal
                         // child-wake. A pre-emitted USER message is still a
                         // user follow-up and must keep arming the redirect.
                         !pre_emitted_origin.is_some_and(PreEmittedOrigin::is_engine_reentry),
+                        urgent,
                         &origin,
                     )
                 };
@@ -600,30 +609,56 @@ impl LucidosEngine {
         // agentic loop, inject the message (with images) mid-flight instead of
         // blocking in register_thread_queued for up to 60s. This mirrors the CC
         // fast-path above but uses injection_tx instead of msg_tx.
+        //
+        // An event-wait delivery takes this path like any other follow-up, and
+        // that is load-bearing rather than incidental. It used to be barred:
+        // an attached wake's prompt was the empty string (the payload lived in
+        // a `ToolResult` the running turn never rebuilt), so it was pushed into
+        // the 60 s queue instead, where the stuck-turn backstop evicted the
+        // running turn to let it in. That is the 2026-08-06 abort. A wake now
+        // carries real prose, so it injects.
         if use_coding_agent != Some(true) && !is_new_thread {
             let has_active = {
                 let threads = self.active_threads.lock().unwrap();
                 threads.contains_key(&thread_id)
             };
 
-            if has_active {
+            // The Lucidos Agent's half of interrupt-and-redirect. An injected
+            // prompt is only READ between loop iterations, so a turn inside a
+            // long tool call sits on it for as long as that call runs. One tool
+            // yields early (`bash_output(wait_secs=…)` parks on
+            // `injection_notify`), and nothing else does, so an urgent
+            // follow-up cannot rely on the soft path.
+            //
+            // Cancel WITHOUT injecting, then fall through to the slow path.
+            // `register_thread_queued` waits for this turn to release the
+            // handle, so the follow-up runs as the next turn with the
+            // interrupted turn's Canceled terminal sequenced first, matching
+            // the coding-agent lane. Injecting first would race the loop's own
+            // drain: a prompt consumed by the dying turn's final iteration is
+            // neither answered nor left for the orphan chain.
+            if urgent && has_active {
+                let preempted = self.cancel_thread_for_followup(thread_id, origin.clone());
+                log!(
+                    "[Chat] Urgent follow-up preempting the live turn on thread {} (preempted={})",
+                    thread_id,
+                    preempted
+                );
+            } else if has_active {
                 // Emit MessageReceived FIRST — same ordering guarantee as the CC
                 // fast-path. The agentic loop emits UserPromptInjected when it
                 // picks up the injection; without this ordering, UserPromptInjected
                 // can race ahead and create a duplicate exchange boundary.
                 //
                 // Skip the emit whenever the caller already persisted the
-                // event. Only a CHILD WAKE also injects as `WakeFromChild`
-                // (see `InjectedPromptKind::WakeFromChild` docs). A
-                // pre-emitted user message still injects as `UserText`, so the
-                // loop acknowledges it with a `UserPromptInjected`.
+                // event. Only an ENGINE WAKE also changes how the input is
+                // projected (see `PreEmittedOrigin::inject_kind` and the
+                // `InjectedPromptKind` docs). A pre-emitted user message still
+                // injects as `UserText`, so the loop acknowledges it with a
+                // `UserPromptInjected`.
                 use crate::engine::thread_events::EventMeta;
                 let inject_kind = if let Some(pre) = pre_emitted_origin {
-                    if pre.is_engine_reentry() {
-                        crate::engine::InjectedPromptKind::WakeFromChild
-                    } else {
-                        crate::engine::InjectedPromptKind::UserText
-                    }
+                    pre.inject_kind()
                 } else {
                     let emit_result = self
                         .event_bus
@@ -822,6 +857,15 @@ impl LucidosEngine {
                 .expect("persisted event must return EmitResult");
             emit_result.event_id
         };
+
+        // Publish this turn's anchor on the handle. Everything below stamps
+        // `request_event_id: Some(origin_id)` on its events and on its own
+        // terminator; an abort emitted from OUTSIDE the loop (restart teardown,
+        // stuck-turn eviction, shutdown sweep) has no other way to learn it, and
+        // guessing it from the newest originating-type event picks a queued
+        // follow-up or a stale message instead. See
+        // `engine::in_flight_request_event_id`.
+        self.set_thread_request_event_id(thread_id, guard.generation(), origin_id);
 
         self.maybe_emit_titles(
             thread_id,
@@ -1312,7 +1356,7 @@ impl LucidosEngine {
         });
 
         // Run the agentic loop (LLM call → parse response → execute tools → repeat)
-        let mut terminator_emitted = false;
+        let mut terminator_settled = false;
         // The firing trigger's side-effect grant (ADR 0002, Phase 5); empty for
         // chat. The command guard consults it only on the trigger channel.
         let trigger_side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory> =
@@ -1340,7 +1384,7 @@ impl LucidosEngine {
                 &cancel_token,
                 &mut injection_rx,
                 guard.generation(),
-                &mut terminator_emitted,
+                &mut terminator_settled,
                 crate::engine::agentic_loop::ContextCaptureSeed {
                     sections: &capture_sections,
                     tools: &capture_tools,
@@ -1359,7 +1403,7 @@ impl LucidosEngine {
         // emit site — the SQL existence check has no functional index on
         // `payload->>'request_event_id'` and would walk the whole thread
         // on every chat turn otherwise.
-        if !terminator_emitted {
+        if !terminator_settled {
             crate::engine::agentic_loop::ensure_terminator_emitted(
                 &self.event_bus,
                 &self.pool,
@@ -1418,9 +1462,11 @@ impl LucidosEngine {
     /// loop ever ran.
     ///
     /// Emits the same terminator the loop's pre-iteration cancel arm would have
-    /// (`ResponseCanceled { UserStop }`, empty body, actor drained from the
-    /// per-thread handle so the timeline records which device clicked Stop),
-    /// then runs the shared turn tail. Setup is where the wait actually is on a
+    /// (`ResponseCanceled`, empty body, cause and actor both drained from the
+    /// per-thread handle so the timeline records which device clicked Stop, and
+    /// so an urgent child follow-up that landed during setup is still labelled
+    /// a redirect rather than an abandonment), then runs the shared turn tail.
+    /// Setup is where the wait actually is on a
     /// large thread: history load, query classification, memory retrieval and
     /// context assembly can run for tens of seconds, and until 2026-08-04
     /// nothing in there looked at the token, so "Canceling…" hung for the whole
@@ -1437,7 +1483,7 @@ impl LucidosEngine {
             &self.event_bus,
             &self.pool,
             cancel.thread_id,
-            CancelCause::UserStop,
+            cancel_cause_for_turn(self, cancel.thread_id),
             String::new(),
             vec![],
             cancel.model.clone(),

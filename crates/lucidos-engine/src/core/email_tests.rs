@@ -248,6 +248,53 @@ fn test_build_imap_query_keyword_passthrough() {
     assert_eq!(build_imap_query(Some("UNSEEN"), None), "UNSEEN");
 }
 
+// --- IMAP command-injection guard ---
+
+/// The query built here is interpolated verbatim into `UID SEARCH <query>` by
+/// async-imap, which does not run its own `validate_str` on that command. A CR
+/// or LF in the model-supplied `search` / `since` argument would end the
+/// command line and run the remainder as a SECOND command, so
+/// `read_emails(search: "ALL\r\nA1 STORE 1:* +FLAGS (\\Deleted)")` would flag
+/// the user's whole mailbox for deletion.
+#[test]
+fn imap_line_break_is_refused_in_a_search_fragment() {
+    let injection = "ALL\r\nA1 STORE 1:* +FLAGS (\\Deleted)";
+    let err = reject_imap_line_break("search", injection)
+        .expect_err("a CRLF-carrying search must be refused, not sent");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("search"),
+        "the error names the argument: {msg}"
+    );
+    assert!(msg.contains("line break"), "got: {msg}");
+
+    // A lone LF is the same injection on a lenient server.
+    assert!(reject_imap_line_break("search", "ALL\nA1 EXPUNGE").is_err());
+    // And the date filter reaches the same command line.
+    assert!(reject_imap_line_break("since", "25-Feb-2026\r\nA1 EXPUNGE").is_err());
+}
+
+/// Every criterion a real caller sends stays accepted, including the quoted,
+/// multi-token and non-ASCII shapes the surrounding tests exercise. Rejecting
+/// CR / LF costs no legitimate search: RFC 3501 makes the line terminator the
+/// command delimiter, so neither can appear inside one.
+#[test]
+fn imap_line_break_guard_accepts_every_real_criterion() {
+    for ok in [
+        "ALL",
+        "UNSEEN",
+        "FROM \"user@example.com\"",
+        "OR SUBJECT \"Ålborg\" FROM \"café@example.com\"",
+        "25-Feb-2026",
+        "",
+    ] {
+        assert!(
+            reject_imap_line_break("search", ok).is_ok(),
+            "legitimate criterion must pass: {ok:?}"
+        );
+    }
+}
+
 // --- Non-ASCII sanitization ---
 
 #[test]

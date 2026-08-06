@@ -58,6 +58,7 @@ function makeActiveThread(overrides: Partial<ThreadMeta> = {}): ThreadState {
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
       ...overrides,
     },
     events: new Map(),

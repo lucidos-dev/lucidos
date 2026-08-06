@@ -126,6 +126,19 @@ describe('inlineFormKey', () => {
       },
     });
     expect(inlineFormKey(uninstall('one'))).not.toBe(inlineFormKey(uninstall('two')));
+
+    // …and ignores the receipt marker, for the same reason `sentAt` is ignored
+    // below: a panel flipping to its receipt is the same panel mutating in
+    // place, so re-keying would cover it and reset its scroll at the moment the
+    // files landed or went.
+    expect(inlineFormKey({
+      ...install('one'),
+      installed: { at: 'now', summary: 's', installed_files: [] },
+    } as InlineForm)).toBe(inlineFormKey(install('one')));
+    expect(inlineFormKey({
+      ...uninstall('one'),
+      removed: { at: 'now', summary: 's', files_deleted: [], files_missing: [] },
+    } as InlineForm)).toBe(inlineFormKey(uninstall('one')));
   });
 
   it('ignores sentAt, so a sent email is still the same panel', () => {

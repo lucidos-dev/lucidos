@@ -69,6 +69,18 @@ impl EmailClient {
         let folder = folder.unwrap_or("INBOX");
         let limit = limit.unwrap_or(20);
 
+        // Both raw IMAP fragments reach `uid_search` verbatim, which does not
+        // validate them. Refuse a line break BEFORE connecting so an injected
+        // second command can never reach the mailbox. See
+        // `reject_imap_line_break`. (`folder` needs no check: `select` runs
+        // async-imap's own `validate_str`.)
+        if let Some(search) = search {
+            reject_imap_line_break("search", search)?;
+        }
+        if let Some(since) = since {
+            reject_imap_line_break("since", since)?;
+        }
+
         let mut session = imap_connect(account, oauth_access_token).await?;
         session.select(folder).await?;
 

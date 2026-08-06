@@ -366,10 +366,6 @@ fn t7_legacy_names_deserialize_via_alias() {
             "AppUiCaptureRequested",
         ),
         (
-            r#"{"type":"RefreshFile","path":"p"}"#,
-            "FileRefreshRequested",
-        ),
-        (
             r#"{"type":"CredentialRequest","payload":"{}"}"#,
             "CredentialPromptRequested",
         ),

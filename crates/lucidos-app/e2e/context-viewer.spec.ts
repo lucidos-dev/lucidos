@@ -39,18 +39,18 @@ test.describe('LLM Context Viewer two-layer grouping', () => {
     await waitForResponse(page);
 
     // Inline steps are collapsed by default — open them to surface the
-    // ContextCaptured badge on the latest step.
+    // context counter on the latest step, which is the viewer's door.
     const showStepsBtn = page
       .locator('button.details-toggle:visible', { hasText: 'Show steps' })
       .first();
     await expect(showStepsBtn).toBeVisible({ timeout: 30_000 });
     await showStepsBtn.click();
 
-    const visibleStep = page
-      .locator('[data-role="inline-step"]:visible')
+    const counter = page
+      .locator('[data-role="inline-step"]:visible [data-role="step-context"]')
       .first();
-    await expect(visibleStep).toBeVisible({ timeout: 30_000 });
-    await visibleStep.click();
+    await expect(counter).toBeVisible({ timeout: 30_000 });
+    await counter.click();
 
     const modal = page.locator('[data-role="context-captured-modal"]:visible');
     await expect(modal).toBeVisible();

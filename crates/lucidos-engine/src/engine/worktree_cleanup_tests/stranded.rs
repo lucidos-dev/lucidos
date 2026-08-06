@@ -230,7 +230,7 @@ async fn stranded_orphan_worktree_removed_without_event() {
     let bus = Arc::new(bus);
 
     let (_tmp, root) = fresh_workspace().await;
-    let orphan_id = Uuid::new_v4(); // no events inserted → lookup returns None
+    let orphan_id = Uuid::new_v4(); // no events inserted → lookup returns NotFound
     let worktree = add_worktree_at_main_for_thread(&root, orphan_id).await;
     strand_worktree(&worktree).await;
 

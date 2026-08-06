@@ -726,3 +726,136 @@ mod switch_resume {
         teardown_test_db(&db_name).await;
     }
 }
+
+// ── Event-wait park (Phase 4 guard, I4 + I5) ────────────────────────
+//
+// The same hazard as the question park, reached by a different route. A thread
+// parked on `await_event` has NO terminator by design and a deliberately
+// dangling `ToolCalled{await_event}`, so both sweeps would treat it as a
+// crashed turn: one would emit "Response interrupted", the other would fill the
+// rendezvous slot with "[Tool execution interrupted…]" and the woken model
+// would read that instead of its event.
+
+/// Park a chat thread on an event wait: the `await_event` call, then the
+/// The real registration shape: an `await_event` `ToolCalled`, its
+/// `EventWaitStarted`, and the `ToolResult` that pairs the call. All three, in
+/// that order, because the pairing is the point: since 2026-08-06 `await_event`
+/// closes its own call, so a subscribed thread leaves no orphan behind and
+/// needs no guard in either sweep.
+async fn emit_event_wait_subscription(bus: &EventBus, thread_id: Uuid, wait_id: Uuid) {
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolCalled {
+            name: "await_event".into(),
+            args: json!({ "reason": "waiting for a change" }),
+            description: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    tick().await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::EventWaitStarted {
+            wait_id,
+            tool_use_id: format!("toolu_{}", wait_id.simple()),
+            on: vec![crate::core::event_subscription::EventSubscription {
+                event_type: "ChangeProposed".into(),
+                condition: None,
+            }],
+            reason: "waiting for a change".into(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            watermark: 0,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap()
+    .expect("EventWaitStarted must persist");
+    tick().await;
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::ToolResult {
+            name: "await_event".into(),
+            result: "Subscribed to ChangeProposed. Nothing is blocking.".into(),
+            images: vec![],
+            success: true,
+            tool_called_event_id: None,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+}
+
+/// **A subscription is not a park, so it gets no exemption.** A thread whose
+/// turn genuinely died mid-flight is an orphan whatever subscriptions it
+/// happens to hold, and the sweep must settle it: withholding the abort would
+/// leave it reading "Working" forever with no Continue button.
+///
+/// Both preserve guards this sweep carries for the event wait were deleted with
+/// the attached shape (2026-08-06). This is their replacement, asserting the
+/// opposite.
+#[tokio::test]
+async fn orphan_threads_query_recovers_a_thread_that_holds_a_subscription() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let subscribed_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, subscribed_id).await;
+    tick().await;
+    emit_event_wait_subscription(&bus, subscribed_id, Uuid::new_v4()).await;
+
+    let rows: Vec<OrphanThreadRow> = sqlx::query_as(&orphan_threads_sql())
+        .bind(Vec::<Uuid>::new())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert!(
+        rows.iter().any(|r| r.0 == subscribed_id),
+        "a crashed turn is an orphan whether or not the thread is watching for \
+         something; only an unanswered question is preserved"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The tool-call sweep needs no exemption either, and for a stronger reason
+/// than "the guard was dropped": `await_event` pairs its own call, so it never
+/// leaves an orphan for the sweep to find in the first place.
+#[tokio::test]
+async fn an_await_event_call_is_never_an_orphan_tool_call() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let subscribed_id = Uuid::new_v4();
+    emit_orphan_turn(&bus, subscribed_id).await;
+    tick().await;
+    emit_event_wait_subscription(&bus, subscribed_id, Uuid::new_v4()).await;
+
+    // The query fetches every `ToolCalled` / `ToolResult` on the thread; the
+    // pairing that decides what is an orphan happens in Rust afterwards, so
+    // assert on that, through the same helper the sweep uses.
+    let rows: Vec<EventRow> = sqlx::query_as(&orphan_tool_calls_sql())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    let mine: Vec<EventRow> = rows
+        .into_iter()
+        .filter(|r| r.thread_id == Some(subscribed_id))
+        .collect();
+    assert!(
+        mine.iter().any(|r| r.event_type == "ToolCalled"),
+        "precondition: the await_event call is in the sweep's candidate set"
+    );
+    let orphans = crate::core::store::find_orphan_tool_called_ids(&mine);
+    assert!(
+        orphans.is_empty(),
+        "await_event pairs its own call, so no synthetic result is owed: {orphans:?}"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}

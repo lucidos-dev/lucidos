@@ -287,7 +287,7 @@ export function renderOriginSection(
   // `kind: 'system'`, so without this branch the panel falls through to the
   // bare "Unknown" fallback below — even though the event carries a typed
   // `cause`. Skip when there's a device actor (e.g. /api/v1/restart) so the
-  // existing "You — Restarted" path keeps rendering.
+  // existing "Paused by restart" path keeps rendering.
   if (
     userEvent.type === 'ResponseAborted'
     && (origin === undefined || origin.kind === 'system')

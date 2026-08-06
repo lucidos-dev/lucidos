@@ -18,6 +18,7 @@ mod context;
 pub mod db_health;
 pub mod engine_version;
 pub mod event_bus;
+pub mod event_wait;
 mod frontend_refresh;
 pub(crate) mod git_ops;
 pub mod http;
@@ -53,7 +54,9 @@ pub(crate) use change_ops::now_epoch_millis;
 // refusal taxonomy: the delivery half stays reachable solely as
 // `LucidosEngine::follow_up_child_thread`, so there is no way to assemble a
 // second delivery path out of its parts.
-pub(crate) use chat::child_follow_up::{ChildFollowUpError, FollowUpAck, FollowUpDelivery};
+pub(crate) use chat::child_follow_up::{
+    ChildFollowUpError, FollowUpAck, FollowUpDelivery, FollowUpUrgency,
+};
 pub(crate) use chat::generate_thread_title;
 pub(crate) use chat::PreEmittedOrigin;
 #[cfg(test)]
@@ -128,6 +131,25 @@ pub enum InjectedPromptKind {
     /// — otherwise the response would split into a duplicate exchange and
     /// strand the rich child-completion card.
     WakeFromChild,
+    /// Event-wait wake on a thread whose subscription had already **detached**
+    /// (see `engine::event_wait`). Same projection rule as `WakeFromChild` and
+    /// for the same reason: `emit_delivery` has already put the wake's
+    /// exchange-starter on the wire (a `UserPromptInjected` carrying the
+    /// matched event), so the loop must project the text inline rather than
+    /// emit a second one.
+    ///
+    /// Distinct from `WakeFromChild` rather than folded into it because the two
+    /// wakes come from different places and say so in the log; the *layout*
+    /// they share is expressed once, by [`InjectedPromptGroup::Standalone`].
+    WakeFromEvent,
+}
+
+impl InjectedPromptKind {
+    /// True for the engine's own wakes, which carry their exchange-starter on
+    /// the wire already and must never emit a second one.
+    pub(crate) fn is_engine_wake(&self) -> bool {
+        matches!(self, Self::WakeFromChild | Self::WakeFromEvent)
+    }
 }
 
 /// Per-thread state: cancellation token + injection channel for mid-flight prompts.
@@ -169,6 +191,39 @@ pub struct ThreadHandle {
     /// once via `take_cancel_actor` to avoid reusing a stale device across
     /// requests. The `CancellationToken` itself remains signal-only.
     pub cancel_actor: Arc<std::sync::Mutex<Option<thread_events::MessageOrigin>>>,
+    /// Set by `cancel_thread_for_followup` when an urgent child follow-up
+    /// preempts this turn, so the cancel arm classifies it as
+    /// `CancelCause::SupersededByFollowup` (rendered neutrally, and excluded
+    /// from the parent-callback terminal set) instead of `UserStop` ("Canceled
+    /// x"). A real Stop click leaves it false.
+    ///
+    /// The Lucidos Agent analog of `AgentSession::redirect_followup`, and
+    /// drained on read for the same reason `cancel_actor` is: a stale flag
+    /// must not relabel the next turn on the same thread.
+    pub redirect_followup: Arc<std::sync::atomic::AtomicBool>,
+    /// The `EventMeta::request_event_id` this turn stamps on every event it
+    /// emits, including its own terminator. Recorded by
+    /// [`LucidosEngine::set_thread_request_event_id`] as soon as the turn's
+    /// originating event is resolved, and read back by
+    /// [`in_flight_request_event_id`] so an abort emitted from OUTSIDE the loop
+    /// (restart teardown, stuck-turn eviction, shutdown sweep) names the turn
+    /// that is actually running.
+    ///
+    /// This is authoritative over `agent_session::latest_originating_event_id`,
+    /// which only guesses: that query returns the NEWEST originating-type event
+    /// on the thread, which is the wrong turn whenever the user queued a
+    /// follow-up mid-turn (the queued `MessageReceived` is newer but never
+    /// anchors a turn) or the running turn was started by an event the query's
+    /// list does not name (`ContinuationStarted` for a chat Continue,
+    /// `ContinuationRequested` for a coding-agent resume). A mis-stamped abort
+    /// defeats the idempotency gate in `thread_events::emit_response_canceled`,
+    /// so the loop's own cancel lands as a SECOND boundary and the transcript
+    /// reads "Paused by restart" and "Response canceled" stacked together
+    /// (`docs/plans/2026-08-06-restart-abort-anchors-on-the-in-flight-turn.md`).
+    ///
+    /// Never needs clearing: the handle IS the turn, and `ThreadGuard::drop`
+    /// removes it, so the value cannot outlive what it describes.
+    pub request_event_id: Arc<std::sync::Mutex<Option<Uuid>>>,
 }
 
 impl ThreadHandle {
@@ -184,6 +239,8 @@ impl ThreadHandle {
             pending_injections: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             generation,
             cancel_actor: Arc::new(std::sync::Mutex::new(None)),
+            redirect_followup: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            request_event_id: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -606,6 +663,23 @@ pub struct LucidosEngine {
     /// In-memory queue/active state mirrors the `thread_queue` projection
     /// and is rebuilt from it at boot (`recover_persisted_entries`).
     pub thread_queue: Arc<thread_queue::ThreadQueue>,
+    /// Live *event waits* (`engine::event_wait`): the threads currently parked
+    /// on, or watching for, an event. One `Arc` so the bus subscriber, the
+    /// deadline sweep, the `await_event` tool (registration, the duplicate
+    /// refusal and the live-wait cap) and the cancel sites all address the same
+    /// cache.
+    ///
+    /// Allowed-ephemeral per CLAUDE.md, and unusually strictly so: the
+    /// persisted `EventWaitStarted` **is** the wait (ADR 0047), and
+    /// `rebuild_event_waits` reconstructs this whole map from the event store
+    /// at boot. There is no `thread_event_waits` table and must not be one.
+    pub(crate) live_waits: Arc<event_wait::LiveWaits>,
+    /// Sender for the event-wait wake task. A resolved wait pushes a
+    /// [`event_wait::EventWakeRequest`] here and the consumer (started at boot
+    /// via `start_event_wake_consumer`) runs the actual turn.
+    ///
+    /// The indirection is required, not stylistic: see `EVENT_WAKE_RX`.
+    pub(crate) event_wake_tx: tokio::sync::mpsc::UnboundedSender<event_wait::EventWakeRequest>,
 }
 
 /// RAII guard that removes a thread from active_threads when dropped.
@@ -669,6 +743,13 @@ thread_local! {
     /// `start_apply_all_driver` (called after `Arc::new(engine)`) can pick
     /// it up.
     static APPLY_ALL_DRIVE_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<apply_all_driver::ApplyAllDriveMsg>>> = const { std::cell::RefCell::new(None) };
+    /// Event-wait wake receiver, same pattern again. Here the channel is
+    /// load-bearing rather than a convenience: registration runs its catch-up
+    /// scan inline, so without it `run_agentic_loop` awaits a delivery which
+    /// awaits a wake which re-enters `run_agentic_loop`, a cyclic future whose
+    /// `Send`-ness rustc cannot infer (exactly as noted on
+    /// `apply_all_drive_tx`). A plain-data message over a channel has no cycle.
+    static EVENT_WAKE_RX: std::cell::RefCell<Option<tokio::sync::mpsc::UnboundedReceiver<event_wait::EventWakeRequest>>> = const { std::cell::RefCell::new(None) };
 }
 
 fn spawn_vertex_region_subscriber(
@@ -945,18 +1026,92 @@ fn partition_chat_thread_ids(
         .collect()
 }
 
+/// Record `request_event_id` on `thread_id`'s handle, unless the registration
+/// has moved on. The write half of [`in_flight_request_event_id`]; a free
+/// function so it can be exercised against a bare `active_threads` map instead
+/// of being re-implemented by its own test. `LucidosEngine::set_thread_request_event_id`
+/// is the production entry point.
+///
+/// `generation` is the caller's own registration ([`ThreadGuard::generation`]).
+/// It matters for the same reason it does in `note_injections_drained`: a turn
+/// force-evicted after the 60 s timeout keeps unwinding while its replacement is
+/// already registered under the same `thread_id`, and a bare thread_id lookup
+/// would let the dying turn stamp its anchor over the live one. The next abort
+/// would then terminate the turn the user already abandoned.
+pub(crate) fn record_request_event_id(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    thread_id: Uuid,
+    generation: u64,
+    request_event_id: Uuid,
+) {
+    if let Some(handle) = active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .filter(|h| h.generation == generation)
+    {
+        *handle.request_event_id.lock().unwrap() = Some(request_event_id);
+    }
+}
+
+/// The `request_event_id` an abort emitted from OUTSIDE the agentic loop must
+/// carry, so it terminates the turn that is actually in flight.
+///
+/// Reads [`ThreadHandle::request_event_id`] first, which the running turn
+/// recorded itself and is therefore the same id the loop will stamp on its own
+/// terminator. That agreement is the whole point: it is what lets the
+/// idempotency gate in [`thread_events::emit_response_canceled`] recognise this
+/// abort and skip the loop's follow-up cancel, instead of leaving two
+/// terminators on two different exchanges.
+///
+/// Falls back to `agent_session::latest_originating_event_id` when there is no
+/// live handle, or in the narrow window between registration and the turn
+/// resolving its originating event. The fallback is a guess (see the field's
+/// docs for how it goes wrong), but a guessed anchor still beats none: a
+/// `NULL` `request_event_id` breaks `chat/rerun.rs`'s Continue window and the
+/// frontend's exchange grouping alike.
+pub(crate) async fn in_flight_request_event_id(
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    fallback_event_types: &[&str],
+) -> Option<Uuid> {
+    let recorded = active_threads
+        .lock()
+        .unwrap()
+        .get(&thread_id)
+        .and_then(|h| *h.request_event_id.lock().unwrap());
+    match recorded {
+        Some(id) => Some(id),
+        None => {
+            crate::engine::agent_session::latest_originating_event_id(
+                pool,
+                thread_id,
+                fallback_event_types,
+            )
+            .await
+        }
+    }
+}
+
 /// Emit a `ResponseAborted` (actor=System) for a thread the engine is
 /// force-evicting after the `register_thread_queued` 60s timeout. Without
 /// this pre-emit, the run-loop's stop arm would default to `ResponseCanceled`
 /// (`is_shutdown=false`, no user-action suppress flag set) and the user would
 /// see a misleading "Canceled". Coding-agent sessions also get `external_terminal_emitted`
-/// set so the run-loop arm skips its duplicate emit; chat threads' `agentic_loop`
-/// may still emit a duplicate `ResponseCanceled`, which the frontend deflates
-/// because `Aborted` is checked before `Canceled` in `exchangeStatus`.
+/// set so the run-loop arm skips its duplicate emit.
+///
+/// Chat threads are covered by the anchor: [`in_flight_request_event_id`] names
+/// the evicted turn, so the gate in `thread_events::emit_response_canceled`
+/// suppresses the loop's own cancel rather than stacking a second boundary. The
+/// frontend's `Aborted`-before-`Canceled` check in `exchangeStatus` only ever
+/// deflated the duplicate when both landed on the SAME exchange; with a
+/// mis-anchored abort they landed on two, and both rendered.
 pub(crate) async fn emit_stuck_thread_eviction_abort(
     bus: &event_bus::EventBus,
     pool: &sqlx::PgPool,
     agent_sessions: &tokio::sync::Mutex<HashMap<Uuid, types::AgentSession>>,
+    active_threads: &Arc<std::sync::Mutex<HashMap<Uuid, ThreadHandle>>>,
     thread_id: Uuid,
 ) {
     use thread_events::{EventChannel, EventMeta, MessageOrigin};
@@ -972,8 +1127,11 @@ pub(crate) async fn emit_stuck_thread_eviction_abort(
         }
     };
 
-    // CC threads anchor on `MessageReceived` / `CodingAgentUserMessageSent` /
-    // `TriggerStarted` / `ChildThreadCompleted` (any can start a CC turn —
+    // The evicted turn recorded its own anchor on the handle, which is still
+    // registered at this point (the caller evicts AFTER this emit). The lists
+    // below are only the fallback for a turn that never got that far. CC
+    // threads fall back on `MessageReceived` / `CodingAgentUserMessageSent` /
+    // `TriggerStarted` / `ChildThreadCompleted` (any can start a CC turn:
     // CCUMS for live follow-ups, CTC for parents waking from a finished
     // child via `notify_parent_of_child_completion`). Chat threads use the
     // same list minus CCUMS. The shared constants live in
@@ -983,12 +1141,8 @@ pub(crate) async fn emit_stuck_thread_eviction_abort(
     } else {
         crate::engine::agent_session::CHAT_ORIGINATING_EVENT_TYPES
     };
-    let request_event_id = crate::engine::agent_session::latest_originating_event_id(
-        pool,
-        thread_id,
-        originating_types,
-    )
-    .await;
+    let request_event_id =
+        in_flight_request_event_id(active_threads, pool, thread_id, originating_types).await;
 
     thread_events::emit_response_aborted(
         bus,
@@ -1024,3 +1178,7 @@ mod lifecycle_tests;
 #[cfg(test)]
 #[path = "mod_tests/injection.rs"]
 mod injection_tests;
+
+#[cfg(test)]
+#[path = "mod_tests/restart_anchor.rs"]
+mod restart_anchor_tests;

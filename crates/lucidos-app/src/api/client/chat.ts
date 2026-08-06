@@ -1,5 +1,6 @@
 import { toFailed } from '../../store/types';
 import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
+import type { DiffFile } from '../../store/store';
 import type { AnswerKind, PersistScope } from '../../store/thread-events';
 import type { Loadable } from '../../store/types';
 import type { ChatRequestBody, CodingAgent } from '../types';
@@ -103,6 +104,19 @@ export async function continueThread(threadId: string): Promise<void> {
   await throwIfNotOk(res);
 }
 
+/** **Stop waiting** on ONE of a thread's live event waits. The thread keeps any
+ *  others (a thread-level Stop, which cancels them all, is
+ *  `POST /api/v1/chat/cancel`).
+ *  404s when the wait already resolved, which is what the row's error toast
+ *  reports rather than silently pretending it stopped something. */
+export async function cancelThreadEventWait(threadId: string, waitId: string): Promise<void> {
+  const res = await mutatingFetch(
+    `${API}/threads/${encodeURIComponent(threadId)}/event-waits/${encodeURIComponent(waitId)}/cancel`,
+    { method: 'POST' },
+  );
+  await throwIfNotOk(res);
+}
+
 export async function sendControlRequest(threadId: string, request: Record<string, string>): Promise<void> {
   await json(`${API}/claude-code/control`, {
     method: 'POST',
@@ -142,7 +156,7 @@ export interface CodingAgentCommandsResponse {
 }
 
 /** Model aliases mirroring the `models` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
-export type CodingAgentModelValue = 'default' | 'claude-fable-5' | 'claude-fable-5[1m]' | 'sonnet' | 'sonnet[1m]' | 'claude-opus-5@default' | 'claude-opus-5[1m]' | 'claude-opus-4-8@default' | 'claude-opus-4-8[1m]' | 'claude-opus-4-7' | 'claude-opus-4-1' | 'opus' | 'opus[1m]' | 'haiku';
+export type CodingAgentModelValue = 'default' | 'claude-fable-5' | 'claude-fable-5[1m]' | 'claude-sonnet-5' | 'sonnet' | 'claude-opus-5@default' | 'claude-opus-5[1m]' | 'claude-opus-4-8@default' | 'claude-opus-4-8[1m]' | 'claude-opus-4-7' | 'claude-opus-4-1' | 'opus' | 'opus[1m]' | 'haiku';
 
 /** Reasoning effort levels mirroring the `reasoning_efforts` list in crates/lucidos-engine/src/runtime/cc_menu_options.json. */
 export type CodingAgentReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
@@ -291,6 +305,16 @@ export async function postCommandCheckpointUndo(checkpointId: string): Promise<v
     body: JSON.stringify({ checkpoint_id: checkpointId }),
   });
   await throwIfNotOk(resp);
+}
+
+/** What the checkpointed command changed, as the diff between the snapshot
+ *  taken before it ran and the one taken after. `reclaimed` is the pair being
+ *  gone (aged out of the 30-day retention, or a checkpoint predating the post
+ *  image), which the modal explains instead of rendering an empty diff. */
+export async function getCommandCheckpointDiff(
+  checkpointId: string,
+): Promise<{ files: DiffFile[]; reclaimed: boolean }> {
+  return json(`${API}/command-checkpoint/diff?checkpoint_id=${encodeURIComponent(checkpointId)}`);
 }
 
 // --- CC allowed tools (~/.lucidos/cc-allowed-tools) ---

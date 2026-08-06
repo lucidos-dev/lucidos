@@ -390,7 +390,7 @@ async fn tick_with_empty_sessions_is_noop() {
 
 /// Stuck session's `external_terminal_emitted` flag MUST flip to true.
 /// This is the suppression the wedged in-loop's safety net checks at
-/// `run_session.rs::external_terminal_already_emitted`. If we forgot to
+/// `runtime_helpers.rs::external_terminal_already_emitted`. If we forgot to
 /// flip it, the wedged loop (when it eventually wakes) would emit a
 /// duplicate `ResponseAborted` on top of our `ContinuationRequested` — the user
 /// would see both an auto-resume AND an "Aborted" terminal.

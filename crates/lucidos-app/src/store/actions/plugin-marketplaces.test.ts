@@ -12,14 +12,9 @@ vi.mock('../../api/client', () => ({
   fetchPluginCatalog: (...args: unknown[]) => mockFetchPluginCatalog(...args),
   addPluginMarketplace: vi.fn(),
   removePluginMarketplace: vi.fn(),
-  stagePluginInstall: vi.fn(),
   isTransportError: (err: unknown) =>
     err instanceof TypeError && /Load failed|Failed to fetch|NetworkError/i.test(err.message),
 }));
-
-// Side-effecting deps used only by installMarketplacePlugin (not under test).
-vi.mock('./navigation', () => ({ pushNavState: vi.fn() }));
-vi.mock('./pane', () => ({ revealContentPane: vi.fn() }));
 
 import { loadPluginCatalog } from './plugin-marketplaces';
 

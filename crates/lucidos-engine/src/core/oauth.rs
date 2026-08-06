@@ -1345,13 +1345,44 @@ async fn respond_to_browser(stream: &mut tokio::net::TcpStream, status: &str, bo
     }
 }
 
+/// The Lucidos mark, baked in from the one file that defines it.
+///
+/// `include_str!` rather than a copy, for the same reason `api/sdk.rs` pulls in
+/// `shared-components.css` from this same crate: the artwork has one definition
+/// and no second copy to keep in step with a rebrand.
+///
+/// It is embedded rather than fetched because this whole page is (see
+/// [`callback_page`]). The file's own `xmlns` rides along, which is the single
+/// URL-shaped string on the page: a namespace IDENTIFIER that no user agent
+/// resolves, and `callback_page_fetches_nothing` allows exactly it and nothing
+/// else.
+const BRAND_MARK: &str = include_str!("../../../lucidos-app/public/favicon.svg");
+
 /// The page the provider's redirect lands on.
 ///
-/// This is the last thing the user sees before coming back to Lucidos, and for a
-/// while it was two unstyled `<h2>`s reading "Authorization successful!" on a
-/// default-white page, which looks like a debug stub rather than the end of a
-/// flow. It now says which provider, what state the connection is in, and what
-/// to do next, on a page that matches the app's dark surface.
+/// This is the last thing the user sees before coming back to Lucidos, and it
+/// has to answer "whose page is this?" on sight. It once did not: two unstyled
+/// `<h2>`s on a default-white page, which read as a debug stub. A dark surface
+/// fixed that much, but on a flat grey that belonged to no product, and a user
+/// landing here in 2026-08-06 still had to ask whether the tab was ours or
+/// Dropbox's.
+///
+/// So it now wears the surface the *workspace picker* wears (`styles/picker.css`
+/// `.ws-picker`): the mark's own radial gradient scaled to fill the viewport,
+/// white on brand blue, the neutral `--font-sans` stack, and the mark itself
+/// above the heading. That is the repo's existing answer to "what does a
+/// standalone Lucidos screen look like", and being unmistakably ours is the
+/// whole job here.
+///
+/// **It fetches nothing.** No stylesheet, script, font or image, which is why
+/// the CSS is inline and the mark is [`BRAND_MARK`] rather than an `<img>`. Two
+/// reasons, both load-bearing: this is served by a one-shot loopback listener
+/// that has no engine URL in hand, so a link would trade a certain render for a
+/// conditional one at the end of the flow; and a redirect landing page that
+/// phones anywhere is a privacy surface. Pinned by
+/// `callback_page_fetches_nothing`. The token values are copied from
+/// `crates/lucidos-app/src/styles/global/base.css` and `styles/picker.css`, the
+/// same bounded duplication `api/sdk_iframe.css` already carries.
 ///
 /// **`provider` is the only interpolated value and it is engine-side** (it comes
 /// from the tool call / the credential name, never from the callback query).
@@ -1390,15 +1421,22 @@ fn callback_page(provider: &str, ok: bool) -> String {
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{title}</title><style>\
-         :root{{color-scheme:dark light}}\
+         :root{{color-scheme:dark}}\
          body{{margin:0;min-height:100vh;display:flex;align-items:center;\
-         justify-content:center;background:#16181d;color:#e6e8ee;\
-         font:16px/1.5 -apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif}}\
-         main{{max-width:26rem;padding:2rem;text-align:center}}\
-         h1{{font-size:1.25rem;margin:0 0 .5rem}}\
-         p{{margin:0;color:#9aa1b1}}\
-         .who{{margin-top:1rem;font-size:.8125rem;color:#6f7788}}\
+         justify-content:center;padding:2rem 1rem;color:#fff;\
+         font:1rem/1.5 system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',\
+         Roboto,Helvetica,Arial,sans-serif;\
+         background:radial-gradient(60% 50% at 80% 0%,rgba(150,200,255,.45),transparent 70%),\
+         radial-gradient(130% 120% at 28% 12%,#4a97ee 0%,#1f6fce 50%,#0c52ad 100%);\
+         background-attachment:fixed}}\
+         main{{max-width:26rem;text-align:center}}\
+         main svg{{width:3rem;height:3rem;display:block;margin:0 auto 1.5rem;\
+         border-radius:.825rem;filter:drop-shadow(0 .45rem 1.05rem rgba(3,33,80,.55))}}\
+         h1{{font-size:1.25rem;font-weight:600;margin:0 0 .5rem}}\
+         p{{margin:0;color:rgba(255,255,255,.78)}}\
+         .who{{margin-top:1.25rem;font-size:.8125rem;color:rgba(255,255,255,.55)}}\
          </style></head><body><main>\
+         {BRAND_MARK}\
          <h1>{heading}</h1><p>{detail}</p>\
          <p class=\"who\">{provider}</p>\
          </main></body></html>"

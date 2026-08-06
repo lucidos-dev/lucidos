@@ -349,15 +349,63 @@
     margin-bottom: calc(-1 * var(--turn-body-inset));
 }
 
-/* Response content — markdown rules inherited from .markdown-content in global.css */
+/* Response content. Markdown rules are inherited from .markdown-content in
+   global.css; the leading is set here. 1.5 rather than the 1.6 it carried:
+   --font-ui is a monospace stack, whose glyphs are already generously spaced
+   horizontally, so prose set in it reads airier at a given leading than the
+   same value would in a proportional face. Kept in step with .user-bubble so
+   both message surfaces share one rhythm. */
 .response-content {
-    line-height: 1.6;
+    line-height: 1.5;
     font-size: var(--font-size-sm);
     padding-left: var(--turn-body-inset);
     white-space: normal;
     word-wrap: break-word;
     overflow-wrap: break-word;
     max-width: 100%;
+}
+
+/* A run of prose between step rows. The chunk owns the space around itself
+   rather than leaving it to the markdown paragraph inside, whose margin is
+   bottom-only: with no top margin, prose sat FLUSH against the step row above
+   it and 0.75rem clear of the one below, so the same break read as too tight
+   going in and too loose coming out. The paragraph margin is the right rhythm
+   BETWEEN paragraphs and the wrong one at a chunk's edges, so it is zeroed on
+   the first and last child (which also covers a chunk that opens on a heading
+   or closes on a list or table) and this even margin takes over there.
+
+   Both edge rules out-rank `.markdown-content p` (0,1,1) on the class count:
+   `:last-child` is a pseudo-class, so `.response-chunk > :last-child` is
+   (0,2,0). Without that the paragraph's own 0.75rem would simply collapse
+   through and the asymmetry would survive. */
+.response-chunk {
+    margin: 0.375rem 0;
+}
+
+.response-chunk > :first-child {
+    margin-top: 0;
+}
+
+.response-chunk > :last-child {
+    margin-bottom: 0;
+}
+
+/* Two chunks touching means the step between them is HIDDEN: with Hide steps
+   on, a step (and an event wait) renders as null, so `text, step, text` leaves
+   two chunk divs as siblings. The even margin above is the gap to a step ROW,
+   and it is too tight for a paragraph break, which is what the boundary
+   becomes once the row is gone. So restore the paragraph gap here, the same
+   0.75rem `.markdown-content p` uses and the same one this boundary had before
+   the chunk owned its own spacing.
+
+   Two stages get it there, and neither alone would: this selector is (0,2,0)
+   against the base rule's (0,1,0), so it takes the second chunk's margin-top
+   on SPECIFICITY, not on source order; the adjacent-sibling collapse against
+   the first chunk's 0.375rem margin-bottom then resolves the gap to the larger
+   of the two. Widening the base rule instead would space every chunk off its
+   step rows, which is the thing being fixed. */
+.response-chunk + .response-chunk {
+    margin-top: 0.75rem;
 }
 
 .response-content li p {
@@ -588,6 +636,30 @@
     margin: 0;
     color: var(--text-secondary);
     font-size: var(--font-size-md);
+    line-height: 1.4;
+}
+
+/* Setup-interview entry point, on the configured-workspace welcome. Same shape
+   as .welcome-provider-setup above (prominent button plus a quiet hint line)
+   because it is the same class of thing: the one action worth taking on this
+   surface, not a suggestion. A step tighter than the provider block, which owns
+   a whole surface of its own, while this one sits above the carousel. */
+.welcome-setup-interview {
+    margin: 0 0 1.25rem 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 0.5rem;
+}
+
+.welcome-setup-interview-btn {
+    font-size: var(--font-size-lg);
+}
+
+.welcome-setup-interview-hint {
+    margin: 0;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
     line-height: 1.4;
 }
 
@@ -1133,23 +1205,46 @@
     word-break: break-word;
 }
 
-/* MCP permission card — the tool arguments the agent wants to call with.
-   Monospace, dimmed, scrollable when long so a big args blob doesn't blow out
-   the card height. */
-.permission-mcp-args {
+/* The two detail blocks a permission card can carry under its question: the
+   MCP card's tool arguments, and the coding-agent card's list of files a
+   multi-file Codex patch touches. Shared shell, because both are the same
+   thing visually: a dimmed inset panel, capped in height and scrollable, so a
+   big args blob or a large patch can't push the buttons off screen. */
+.permission-mcp-args,
+.permission-file-list {
     margin: 0.5rem 0 0;
     padding: 0.5rem 0.625rem;
     background: var(--bg-secondary, rgba(127, 127, 127, 0.1));
     border-radius: 0.375rem;
-    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
     font-size: var(--font-size-md);
-    line-height: 1.45;
     font-weight: 400;
     color: var(--text-secondary);
-    white-space: pre-wrap;
     word-break: break-word;
     max-height: 12rem;
     overflow: auto;
+}
+
+/* Args are one preformatted blob; the file list is rows. */
+.permission-mcp-args {
+    font-family: var(--font-mono, ui-monospace, SFMono-Regular, monospace);
+    line-height: 1.45;
+    white-space: pre-wrap;
+}
+
+.permission-file-list {
+    list-style: none;
+    line-height: 1.6;
+}
+
+/* The per-file verb (create / change / delete). Set apart from the path so the
+   eye reads the action first, without competing with the monospace path. */
+.permission-file-verb {
+    display: inline-block;
+    min-width: 3.75rem;
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+    text-transform: uppercase;
+    letter-spacing: 0.03em;
 }
 
 .permission-actions {
@@ -1290,11 +1385,35 @@
     box-decoration-break: clone;
 }
 
+/* Rendered markdown, NOT preformatted text, so this inherits `white-space:
+   normal` deliberately. postprocessCopyBlocks wraps what marked gave BACK, so
+   the children are marked's own block elements and the markdown structure
+   already carries every line break (`breaks: true` in markedConfig.ts turns
+   even a soft break into a <br>).
+
+   It carried `white-space: pre-wrap` from the feature commit until 2026-08-06,
+   which was correct THEN: the multiline path emitted the literal unparsed text
+   inside a raw <div>. Rendering the markdown instead is what fixed that div
+   being cut short at the first blank line, and it left the declaration behind
+   holding block markup, where it also rendered the newlines marked leaves
+   BETWEEN its blocks: a blank line between every paragraph, between every list
+   item, and two before a list. Guarded by
+   styles/__tests__/copyable-block-whitespace-guard.test.ts. */
 .copyable-block-multi {
     display: block;
     padding: 0.5rem 2.25rem 0.5rem 0.75rem;
     margin: 0.5rem 0;
-    white-space: pre-wrap;
+}
+
+/* The block's own padding is the whole inset, so the outermost markdown margins
+   are dropped. `:nth-last-child(2)` is the last child IN FLOW: .copy-btn is
+   always the last DOM child and is positioned out of flow. */
+.copyable-block-multi > :first-child {
+    margin-top: 0;
+}
+
+.copyable-block-multi > :nth-last-child(2) {
+    margin-bottom: 0;
 }
 
 /* Inline-flow: absolute positioning inside a wrapping inline .copyable-block

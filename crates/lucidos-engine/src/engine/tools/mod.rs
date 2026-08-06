@@ -385,17 +385,25 @@ impl LucidosEngine {
             if url.is_empty() {
                 return Err("Error: url is required when target is 'url'".to_string());
             }
-            // Deliberately does NOT claim "the internal browser panel". Where the
-            // URL lands is the client's decision (`openUrl`): the in-app panel
-            // only when the user has that preference on in the desktop app,
-            // otherwise their system browser or a new tab. Naming one of the
-            // three had the agent telling users to look at a panel that was
-            // never going to open.
+            // Two hedges, both earned by an agent over-claiming. It does NOT
+            // name a surface: where the URL lands is the client's decision
+            // (`openUrl`), the in-app panel only when the user has that
+            // preference on in the desktop app, otherwise their system browser
+            // or a new tab, and naming one of the three had the agent telling
+            // users to look at a panel that was never going to open. And it
+            // does NOT claim the page opened: all this call did was emit the
+            // request. A browser can still refuse it (a blocked popup, which is
+            // exactly what a navigate from a chat turn hits, since the client
+            // handles it with no user activation), in which case the client
+            // offers the user an Open button instead.
             return Ok(format!(
-                "Asked the user's device to open {}. It opens wherever they have \
-                 configured links to open (the in-app browser panel, their system \
-                 browser, or a new tab), so refer to it as their browser rather than \
-                 naming one.",
+                "Sent a request to the user's device to open {}. Emitted is not the \
+                 same as open: the client may be unable to open it (a blocked popup, \
+                 for one) and offer the user an Open button instead, so tell them you \
+                 have sent them the page rather than stating it is already on their \
+                 screen. It opens wherever they have configured links to open (the \
+                 in-app browser panel, their system browser, or a new tab), so refer \
+                 to it as their browser rather than naming one.",
                 url
             ));
         }
@@ -723,6 +731,11 @@ impl LucidosEngine {
                     .to_string()
             })?;
 
+        // Absent means not urgent; a present non-boolean is an error rather
+        // than a silent `false`. See `FollowUpUrgency::from_tool_arg`.
+        let urgency = crate::engine::FollowUpUrgency::from_tool_arg(args.get("urgent"))
+            .map_err(|e| format!("Error: follow_up_child_thread's {e}"))?;
+
         let Some(engine) = self.try_clone_arc() else {
             return Err(
                 "Error: follow_up_child_thread is unavailable on this engine instance.".to_string(),
@@ -736,6 +749,7 @@ impl LucidosEngine {
                 None,
                 None,
                 None,
+                urgency,
             )
             .await
         {

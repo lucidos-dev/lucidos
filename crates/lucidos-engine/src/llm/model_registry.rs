@@ -276,11 +276,16 @@ mod tests {
         let reg = registry(&[
             ("claude-fable-5", ProviderKind::Anthropic),
             ("claude-opus-4-8@default", ProviderKind::Vertex),
+            ("claude-sonnet-5", ProviderKind::Vertex),
             ("gpt-5.5", ProviderKind::OpenAi),
         ]);
         assert_eq!(
             provider_kind_for(&reg, "claude-fable-5"),
             ProviderKind::Anthropic
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-sonnet-5"),
+            ProviderKind::Vertex
         );
         assert_eq!(
             provider_kind_for(&reg, "claude-opus-4-8@default"),
@@ -313,10 +318,18 @@ mod tests {
             provider_kind_for(&reg, "claude-opus-4-7[1m]"),
             ProviderKind::Vertex
         );
-        // Opus 5 is not in the table here; the prefix heuristic routes any
-        // non-fable `claude-*` to Vertex, matching the seeded provider.
+        // Opus 5 and Sonnet 5 are not in the table here; the prefix heuristic
+        // routes any non-fable `claude-*` to Vertex, matching the seeded provider.
         assert_eq!(
             provider_kind_for(&reg, "claude-opus-5@default"),
+            ProviderKind::Vertex
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-sonnet-5"),
+            ProviderKind::Vertex
+        );
+        assert_eq!(
+            provider_kind_for(&reg, "claude-sonnet-5[1m]"),
             ProviderKind::Vertex
         );
         assert_eq!(

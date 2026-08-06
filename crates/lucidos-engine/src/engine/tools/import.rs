@@ -231,7 +231,10 @@ impl LucidosEngine {
                 // Per best-practices rule 8, the agent must explicitly pick the
                 // route — bare names are rejected so we never silently land a
                 // clone under `data/artifacts/`.
-                let dest_route = if let Some(sub) = raw_destination.strip_prefix(".lucidos/tmp/") {
+                let dest_route = if let Some(sub) = raw_destination
+                    .strip_prefix(crate::core::TMP_DIR)
+                    .and_then(|rest| rest.strip_prefix('/'))
+                {
                     GitCloneRoute::Tmp(sub.trim_matches('/').to_string())
                 } else if let Some(sub) = raw_destination
                     .strip_prefix("data/artifacts/imported/")
@@ -273,7 +276,7 @@ impl LucidosEngine {
 
                 let dest_subdir = match dest_route {
                     GitCloneRoute::Tmp(sub) => {
-                        let target = self.workspace_path.join(".lucidos").join("tmp").join(&sub);
+                        let target = self.workspace_path.join(crate::core::TMP_DIR).join(&sub);
                         if let Some(parent) = target.parent() {
                             if let Err(e) = std::fs::create_dir_all(parent) {
                                 return Ok(format!(

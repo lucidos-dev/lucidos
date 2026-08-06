@@ -56,17 +56,22 @@ Skim the "Names you might be tempted to use but shouldn't" lists in `.claude/rul
 
    For each, show the proposed entry (or refined wording) and get one-click approval via `AskUserQuestion`. Suggested option set:
    - *"Add as proposed"* (Recommended when wording is solid)
-   - *"Add with revised wording — I'll type it"*
-   - *"Skip — not a real term"*
+   - *"Skip, not a real term"*
 
-   On approval, write the entry to the correct layer (user-facing → `system-knowhow/glossary.md`; dev-only → `docs/glossary.md`). On revision, take the user's wording. Per `.claude/rules/system-knowhow.md`, the glossary edit ships in the same commit as whatever code or plan it's grounding. **Don't file glossary edits as TODOs** — they're first-class grill work, not bookkeeping.
+   Two options, not three: per the question format above, an *"I'll type revised wording"* button is the escape the prompt textarea already provides, and tapping it just sends that label back as the answer. If the user wants different wording they type it, and it arrives as their answer.
+
+   On approval, write the entry to the correct layer (user-facing → `system-knowhow/glossary.md`; dev-only → `docs/glossary.md`). On revision, take the user's wording. Per `.claude/rules/system-knowhow.md`, the glossary edit ships in the same commit as whatever code or plan it's grounding. **Don't file glossary edits as TODOs**, they're first-class grill work, not bookkeeping.
+
+### Beyond grilling
+
+This practice is not grill-specific. It applies to brainstorming (`superpowers:brainstorming`) and to any back-and-forth where you and the user are pinning down what to build. If you are in a design dialogue and this skill is not loaded, the three behaviours above still hold: phrase in canonical terms, flag synonym reaches in either direction, and propose the glossary edit in the turn the concept crystallizes.
 
 ### The point
 
-Every grill session either reinforces the canonical vocabulary or improves it. Drift never accumulates. The next grill — by you, by another CC session, by the user reading back through `docs/glossary.md` — starts from sharper ground. That's the multiplier.
+Every grill session either reinforces the canonical vocabulary or improves it. Drift never accumulates. The next grill, by you, by another agent session, or by the user reading back through `docs/glossary.md`, starts from sharper ground. That's the multiplier.
 
 ## See also
 
-- `.claude/rules/glossary.md` § "Active use during design dialogue" — the same active-use-and-sharpen rule generalized to brainstorming and any design back-and-forth.
+- `.claude/rules/glossary.md`: the canonical-term rule itself, carrying the synonym list, the cross-layer name-root rule, and the name-accuracy rule.
 - `.claude/rules/system-knowhow.md` — drift enforcement: a glossary entry that lags behind the code is a `/harden` failure.
 - `~/.claude/skills/grill-me/SKILL.md` — upstream plain-text grill (`mattpocock/skills`); this skill is the structured-choice + glossary-aware project variant.

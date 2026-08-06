@@ -1,8 +1,10 @@
 import { useEffect, useRef } from 'preact/hooks';
 import { confirmState } from '../../store/store';
 import { useHidePanelWebviewWhile } from '../../hooks/useHidePanelWebviewWhile';
+import { DialogMessage } from './DialogMessage';
 import { Overlay } from './Overlay';
 import { trapDialogTab } from './dialogFocusTrap';
+import { dialogOwnsKey } from './dialogKeyScope';
 
 function resolve(value: boolean) {
   const state = confirmState.peek();
@@ -25,6 +27,10 @@ export function ConfirmDialog() {
 
     function handleKey(e: KeyboardEvent) {
       const target = e.target as HTMLElement | null;
+      // A keystroke aimed at another open overlay is not ours to answer: a
+      // prompt can sit on top of this confirm, and this listener would
+      // otherwise resolve `true` on the Enter that submits it. See dialogOwnsKey.
+      if (!dialogOwnsKey(target, dialogRef.current)) return;
       if (e.key === 'Enter') {
         // Buttons handle Enter natively (triggers click); textareas need newlines.
         if (target?.tagName === 'BUTTON' || target?.tagName === 'TEXTAREA') return;
@@ -54,7 +60,7 @@ export function ConfirmDialog() {
       panelRef={dialogRef}
     >
         {state.title && <h2 class="confirm-title">{state.title}</h2>}
-        <p class="confirm-message">{state.message}</p>
+        <DialogMessage message={state.message} />
         {state.details && (
           <div class="confirm-details">
             {state.details.intro && <p class="confirm-details-intro">{state.details.intro}</p>}

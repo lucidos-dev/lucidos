@@ -34,11 +34,17 @@ export function describeCancelCause(cause: CancelCause | undefined): string {
 export function describeAbortCause(cause: AbortCause | undefined): string {
   switch (cause) {
     case 'safety_net':
-      return 'The Claude Code event loop ended without a clean response — usually a Claude Code session crash or driver task death. (The 10-minute hung-session watchdog used to land here too, but now auto-resumes the session via ContinuationRequested instead.)';
+      return 'One of two engine safety nets fired. Either a Claude Code event loop ended without a clean response (usually a session crash or driver task death), or the Thread Queue evicted a turn that had held its thread for 60 seconds while something else was waiting to run on it. (The 10-minute hung-session watchdog used to land here too, but now auto-resumes the session via ContinuationRequested instead.)';
     case 'engine_shutdown':
       return 'The engine shut down (or restarted) while this turn was in flight.';
     case 'recovery_after_restart':
-      return 'The engine recovered the thread after a restart; the in-flight turn could not be resumed.';
+      // Not "could not be resumed": it can be, and the button to do it is
+      // right there. Two emit sites, both a deliberate hold, which is why the
+      // text covers both. The boot orphan sweep finds a `running` row with no
+      // live process and never learns what killed the last one; the boot floor
+      // (`settle_unresumed_switch_threads`) withdraws a switch's resume promise
+      // it could not keep. See docs/glossary.md § Cause-gated resume.
+      return 'The engine restarted and found this turn still marked as running, and is not going to resume it: either it cannot tell what stopped the last run, or a resume it did intend never happened. It holds the turn here rather than re-run work that may be what brought the engine down. Continue picks it back up.';
     case 'process_killed':
       return 'The Claude Code session was killed (crash, signal, or out-of-memory).';
     case 'stale_settle':

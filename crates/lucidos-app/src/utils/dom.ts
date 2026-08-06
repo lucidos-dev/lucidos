@@ -47,16 +47,24 @@ export function getRemPx(): number {
   return parseFloat(getComputedStyle(document.documentElement).fontSize) || 16;
 }
 
-/** Clamp a horizontal `left` coordinate so a `width`-wide element fits inside
- *  the `[min, max]` range, leaving `margin` px of breathing room on either edge. */
-export function clampLeftWithin(left: number, width: number, min: number, max: number, margin = 8): number {
-  return Math.max(min + margin, Math.min(left, max - width - margin));
+/** Clamp a `start` coordinate so a `size`-long element fits inside the
+ *  `[min, max]` range, leaving `margin` px of breathing room at either end.
+ *
+ *  Axis-neutral on purpose: the arithmetic is identical for `left`/`width` and
+ *  `top`/`height`, and an anchored popover needs both (it was named
+ *  `clampLeftWithin` while only the horizontal caller existed). When the
+ *  element is LONGER than the range it cannot fit at all, and the `Math.max`
+ *  wins: it pins to the leading edge, which keeps the element's start on screen
+ *  and lets it overflow the far end, rather than pushing its start off screen
+ *  where the content is unreachable. */
+export function clampWithin(start: number, size: number, min: number, max: number, margin = 8): number {
+  return Math.max(min + margin, Math.min(start, max - size - margin));
 }
 
 /** Clamp a horizontal `left` coordinate so a `width`-wide element stays inside the viewport,
  *  leaving `margin` px of breathing room on either edge. */
 export function clampToViewportX(left: number, width: number, margin = 8): number {
-  return clampLeftWithin(left, width, 0, window.innerWidth, margin);
+  return clampWithin(left, width, 0, window.innerWidth, margin);
 }
 
 /** Resize a textarea to fit its content. Setting height to 'auto' first lets

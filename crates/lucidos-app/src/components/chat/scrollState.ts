@@ -522,7 +522,12 @@ export function pinToBottomNow() {
  *  fires. Both layout copies (desktop + mobile) carry the same attributes, so
  *  we filter to the visible one before scrolling and pulsing — otherwise the
  *  pulse runs invisibly on the hidden copy. */
-const EVENT_RESOLVE_DEADLINE_MS = 4000;
+/** How long a deep-link waits for its target to appear before giving up and
+ *  recovering. Exported because it is the budget for waiting out ONE lazily
+ *  loading thread, and a caller that has its own pre-navigation wait on the same
+ *  thread (`showEventWhereItLives`, resolving the anchor before it focuses)
+ *  must spend the same budget rather than a second literal that drifts. */
+export const EVENT_RESOLVE_DEADLINE_MS = 4000;
 /** How long to keep the deep-link claim alive after a SYNCHRONOUS resolve, as a
  *  fallback for browsers where `scrollend` is unsupported/unreliable (older iOS
  *  Safari). smoothScrollToElement's tween settles within SCROLL_MAX_MS; this
@@ -746,7 +751,8 @@ function scrollToSelectorAndPulse(
         : pulseTarget?.(target) ?? null;
     const pulseEl = pulseTarget ? pulseChild ?? target : target;
     // Apply the shared navigation focus marker: a sticky background highlight that
-    // stays until the user takes any action, then fades out. The settle guard defers the
+    // stays until the user takes any action (and never dissolves before its hold has
+    // elapsed), then dissolves slowly. The settle guard defers the
     // dismissal while THIS deep-link's own smooth scroll is still settling
     // (hasPendingEventScroll), so the landing scroll can't self-clear the marker.
     applyNavFocus(pulseEl, { settleGuard: hasPendingEventScroll });
@@ -1041,7 +1047,7 @@ export function stepThreadTurn(direction: 1 | -1): void {
   //
   // When the nav focus marker is on one of these turns, step by INDEX from it
   // rather than by scroll position (see `pickTurnTarget`). A marker means the user
-  // hasn't scrolled since the last nav (a scroll gesture fades it), so index
+  // hasn't scrolled since the last nav (a scroll gesture retires its ref), so index
   // stepping is unambiguous — and it's what makes a cluster of turns sharing a
   // clamped scroll position each reachable: after collapsing the last turn, the
   // collapsed turn + an appended "Change applied" card sit together in the last
@@ -1089,7 +1095,8 @@ export function stepThreadTurn(direction: 1 | -1): void {
   awayFromBottom.value = !landsAtBottom;
 
   // Mark the landed turn with the shared navigation focus marker (a background
-  // highlight that sticks until the user's next scroll gesture). clearPendingEventScroll
+  // highlight that sticks until the user's next scroll gesture, and for its hold even
+  // then). clearPendingEventScroll
   // above already cleared any prior marker via clearNavFocus, so this is a clean
   // supersede; no settleGuard — the animateScroll below is programmatic (emits no
   // wheel/touch/keydown), so it can't self-clear, and a real user scroll should.
@@ -1300,6 +1307,90 @@ export function makeScrollObservers(el: HTMLElement) {
   function syncScrolledFromTop() {
     scrolledFromTop.value = isScrollable() && !isVisuallyAtTop();
   }
+
+  /* ── Reflow anchoring: hold the reader still across a WIDTH change ─────────
+   *  Resizing a pane changes the transcript's width, and every wrapped line
+   *  re-wraps. The content ABOVE the viewport changes height, so the same
+   *  scrollTop shows a different part of the thread: narrowing the thread pane
+   *  makes the transcript taller and carries the reader UP into older turns.
+   *
+   *  The browser will not do this for us. Chromium's scroll anchoring treats a
+   *  width change on the scroll container as a suppression trigger, and WebKit
+   *  has never implemented scroll anchoring at all (WebKit #171099, the same
+   *  gap `withScrollAnchor` covers for DOM mutations).
+   *
+   *  The anchor has to describe the layout BEFORE the reflow, and a
+   *  ResizeObserver only ever runs after it, so both handlers keep a running
+   *  snapshot of it: which child the reader is parked on, and where that child's
+   *  top sat relative to the viewport. Two MEASURED positions, before and after,
+   *  are all the correction needs. That is what makes it immune to the browser
+   *  clamping scrollTop, which it does whenever a widening pane leaves the
+   *  transcript shorter than the reader's old offset: a correction derived from
+   *  a scrollTop delta would read that clamp as the reader having scrolled. */
+  let lastWidth = el.clientWidth;
+  let anchorChild: HTMLElement | null = null;
+  let anchorRelTop = 0;
+
+  function viewportTop() {
+    return el.getBoundingClientRect().top;
+  }
+
+  /** Snapshot the child the reader is parked on: the last one whose top is at or
+   *  above the viewport top. Scanned from the END because the reader is normally
+   *  near the newest turn, so the loop usually stops on its first step. Children
+   *  with no box are skipped, since on desktop the mobile title row is
+   *  `display: none` and reports an all-zero rect that would otherwise read as
+   *  "far above".
+   *
+   *  Cheap on the scroll path despite the rect reads: both callers run
+   *  `isElementVisible(el)` first, which already forces any pending style/layout
+   *  flush, so these reads hit a clean layout tree rather than triggering one. */
+  function recordAnchor() {
+    anchorChild = null;
+    const kids = el.children;
+    if (!kids || typeof el.getBoundingClientRect !== 'function') return;
+    const top = viewportTop();
+    for (let i = kids.length - 1; i >= 0; i--) {
+      const kid = kids[i] as HTMLElement;
+      const rect = kid.getBoundingClientRect();
+      if (rect.height <= 0) continue;
+      if (rect.top - top > 0) continue;
+      anchorChild = kid;
+      anchorRelTop = rect.top - top;
+      return;
+    }
+    // Nothing starts at or above the viewport top: the reader is at the very top
+    // of the transcript, where no content above can grow. Leaving the anchor
+    // null keeps the reflow correction a no-op, which is the right answer there.
+  }
+
+  /** Put the reader back where the width change moved them. Runs inside the
+   *  ResizeObserver callback, i.e. after layout and before paint, so the
+   *  correction is never painted as a jump. */
+  function restoreAfterReflow() {
+    // Riding the bottom means "keep me on the newest turn", and that survives any
+    // reflow: re-pin rather than anchor, or a taller transcript would strand the
+    // reader above the last message. Same 80px stickiness window as every other
+    // bottom-pin here, so inside it the user has not chosen to read history.
+    //
+    // This is a force-pin, so it defers to an in-flight notification deep-link
+    // exactly as the one below does, and for the same reason. Tapping a
+    // notification with the thread pane collapsed calls revealThreadPane(), whose
+    // 300ms re-expansion fires this observer on every frame while the deep-link
+    // is still loading the thread and scrolledUp is still false. Pinning there
+    // would slam the transcript to the bottom during the very load the deep-link
+    // is waiting on. Falling through to the anchor instead holds the reader still,
+    // which is compatible with the deep-link's own scroll whenever it lands.
+    if (!scrolledUp.value && !hasPendingEventScroll()) {
+      el.scrollTop = el.scrollHeight;
+      return;
+    }
+    const child = anchorChild;
+    if (!child || child.isConnected === false) return;
+    const shift = (child.getBoundingClientRect().top - viewportTop()) - anchorRelTop;
+    if (shift !== 0) el.scrollTop = el.scrollTop + shift;
+  }
+
   // Scroll events: can both set and clear scrolledUp (user gesture or
   // programmatic scrollTop assignment — both produce real scroll events).
   // Skip during suppression ('scroll' mode) — scroll events in this window
@@ -1319,8 +1410,9 @@ export function makeScrollObservers(el: HTMLElement) {
     syncNotAtTop();
     syncScrolledFromTop();
     awayFromBottom.value = !isVisuallyAtBottom();
-    if (getResizeMode() === 'scroll') return; // only scrolledUp is suppressed
-    scrolledUp.value = !isAtBottom();
+    if (getResizeMode() !== 'scroll') scrolledUp.value = !isAtBottom(); // only scrolledUp is suppressed
+    // The reader has moved, so the reflow anchor has to follow them.
+    recordAnchor();
   }
   // Resize events: behavior depends on resize mode set by scrollToBottom().
   //
@@ -1335,6 +1427,14 @@ export function makeScrollObservers(el: HTMLElement) {
   //   trigger unwanted auto-scroll.
   function onResize() {
     if (!isElementVisible(el)) return;
+    // A WIDTH change re-wrapped the transcript, so undo the drift it caused
+    // before anything below reads the new geometry (see "Reflow anchoring").
+    // Height-only growth, the streaming case, is left to the branches below.
+    const width = el.clientWidth;
+    if (width !== lastWidth) {
+      lastWidth = width;
+      restoreAfterReflow();
+    }
     // Sync on resize too — if content shrinks below the viewport,
     // clear the chevron even if no scroll event fires.
     syncNotAtTop();
@@ -1350,22 +1450,25 @@ export function makeScrollObservers(el: HTMLElement) {
     if (getResizeMode() === 'scroll' && !hasPendingEventScroll()) {
       el.scrollTop = el.scrollHeight;
       extendSuppression();
-      return;
+    } else {
+      // Gate on the 80px window (see top of file) so streaming tokens don't
+      // trip the chevron before useEffect snaps back. Larger growth (panel
+      // expand, multi-line code block) crosses the window and the chevron
+      // appears immediately, even though no scroll event fired.
+      if (!isAtBottom()) {
+        scrolledUp.value = true;
+        awayFromBottom.value = true;
+      }
+      // Clear path: if content shrinks so the user is now visually at the
+      // bottom (idle banner removed, step collapsed), hide the chevron
+      // without waiting for a scroll event.
+      if (awayFromBottom.value && isVisuallyAtBottom()) {
+        awayFromBottom.value = false;
+      }
     }
-    // Gate on the 80px window (see top of file) so streaming tokens don't
-    // trip the chevron before useEffect snaps back. Larger growth (panel
-    // expand, multi-line code block) crosses the window and the chevron
-    // appears immediately, even though no scroll event fired.
-    if (!isAtBottom()) {
-      scrolledUp.value = true;
-      awayFromBottom.value = true;
-    }
-    // Clear path: if content shrinks so the user is now visually at the
-    // bottom (idle banner removed, step collapsed), hide the chevron
-    // without waiting for a scroll event.
-    if (awayFromBottom.value && isVisuallyAtBottom()) {
-      awayFromBottom.value = false;
-    }
+    // Retake the snapshot last, once the layout above has settled: measuring it
+    // any earlier would describe a position the reader is no longer at.
+    recordAnchor();
   }
   return { onScroll, onResize };
 }

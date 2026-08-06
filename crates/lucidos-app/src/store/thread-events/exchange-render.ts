@@ -1,14 +1,16 @@
 import { SESSION_END_REASONS } from '../../generated/thread-lifecycle';
-import { isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
+import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../event-rendering';
+import { AWAIT_EVENT_TOOL, describeWaitSubscription } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
+import { isSwitchTeardownAbort } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
-import type { ActorMode, SequencedEvent, ThreadEvent } from './thread-event-types';
+import type { ActorMode, EventSubscription, SequencedEvent, ThreadEvent } from './thread-event-types';
 
 /** The two projections' step shapes, as far as the resolvers care. */
-type StepLike = { outcome: StepOutcome; description?: string };
+type StepLike = { outcome: StepOutcome; description?: string; tool_name?: string };
 
 /** How an exchange ended, as far as its pending steps are concerned.
  *  `null` = no terminator yet (or the agent resumed past one).
@@ -34,7 +36,7 @@ function pendingOutcomeFor(terminal: TerminalKind): StepOutcome {
  *  Optional `pred` narrows which pending step to resolve (e.g. only "Thinking" steps). */
 function resolveLastPendingStep(
   steps: StepLike[],
-  pred?: (s: { description?: string }) => boolean,
+  pred?: (s: StepLike) => boolean,
 ): void {
   for (let i = steps.length - 1; i >= 0; i--) {
     if (steps[i].outcome === 'pending' && (!pred || pred(steps[i]))) {
@@ -55,15 +57,71 @@ function resolveLastPendingStep(
 function resolvePendingSteps(
   steps: StepLike[],
   outcome: StepOutcome,
-  pred?: (s: { description?: string }) => boolean,
+  pred?: (s: StepLike) => boolean,
 ): void {
   for (const step of steps) {
     if (step.outcome === 'pending' && (!pred || pred(step))) step.outcome = outcome;
   }
 }
 
-const isThinking = (s: { description?: string }) => s.description === 'Thinking';
-const isNotThinking = (s: { description?: string }) => !isThinking(s);
+/** A step row that has not named itself yet: the model is thinking and has not
+ *  said what it is about to do. Exported because the renderer needs the same
+ *  answer the projection does (`InlineStep` shows the reasoning ticker only
+ *  while the row is still unnamed), and two definitions of "is this row still a
+ *  Thinking marker" would drift the moment either side changed. */
+export const isThinking = (s: StepLike) => s.description === 'Thinking';
+const isNotThinking = (s: StepLike) => !isThinking(s);
+/** The park's own step, i.e. the one the event-wait row replaces. See the
+ *  `EventWaitStarted` arm of `exchangeResponseEvents`. */
+const isAwaitEventStep = (s: StepLike) => s.tool_name === AWAIT_EVENT_TOOL;
+
+/** Name the pending `Thinking` row after the action the model just produced, so
+ *  one LLM call is ONE row in the transcript rather than a resolved
+ *  "Thinking ✓" sitting next to the thing that call decided to do.
+ *
+ *  The row keeps everything it earned before it could name itself: the context
+ *  snapshot the call bound to it, the reasoning it streamed, and the legacy
+ *  token/message counters old rows carry instead of a snapshot. It stays
+ *  `pending`, because the tool it just named is now the thing that is running.
+ *
+ *  The snapshot survives the rename by ordering, not by luck: the engine emits
+ *  `ThoughtStreamed`, then `ContextCaptured`, then `ToolCalled` within one
+ *  iteration of the agentic loop, so a main-LLM capture (which binds to a
+ *  `Thinking` row by construction, see `bindSnapshotToStep`) has already landed
+ *  here by the time the tool call arrives to take the row over.
+ *
+ *  Only the FIRST action of a thinking pass takes the row: naming it stops it
+ *  matching `isThinking`, so parallel tool calls behind it find nothing to fold
+ *  onto and push rows of their own. They must, since a result pairs back by
+ *  `tool_use_id` and two calls sharing a row could not both be resolved.
+ *
+ *  Returns false when there is no pending `Thinking` row (a resumed
+ *  coding-agent session fires no `CodingAgentPromptSent`; legacy rows have
+ *  none), leaving the caller to push a fresh row.
+ *
+ *  Same replace-in-place shape as the `EventWaitStarted` arm further down, for
+ *  the same reason: two rows for one action reads as two actions. */
+function nameThinkingRow<T extends StepLike>(rows: T[], naming: Partial<T>): boolean {
+  for (let i = rows.length - 1; i >= 0; i--) {
+    if (rows[i].outcome === 'pending' && isThinking(rows[i])) {
+      Object.assign(rows[i], naming);
+      return true;
+    }
+  }
+  return false;
+}
+
+/** `nameThinkingRow` for the ResponseEvent projection, whose array also carries
+ *  text / image / event-wait rows. */
+function nameThinkingStep(
+  events: ResponseEvent[],
+  naming: Partial<Extract<ResponseEvent, { type: 'step' }>>,
+): boolean {
+  const idx = lastPendingStepIndex(events, isThinking);
+  if (idx < 0) return false;
+  Object.assign(events[idx], naming);
+  return true;
+}
 
 /** Bag of legacy events. All optional — `synthesizeContextCapture`
  *  produces something useful from any subset (Thinking-only is the
@@ -233,14 +291,20 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         break;
       }
       case 'TextStreamed':
-        // LLM produced visible text — the prior Thinking step is done.
-        resolveLastPendingStep(steps, isThinking);
+        // VISIBLE text ends the thinking pass. A blank chunk does not: it puts
+        // nothing on screen, and resolving on it would hand the pending row a
+        // checkmark that the tool call arriving next can no longer take over.
+        if (hasVisibleText((event as { text?: string }).text)) {
+          resolveLastPendingStep(steps, isThinking);
+        }
         break;
       case 'ToolCalled': {
-        // LLM produced a tool call — the prior Thinking step is done.
-        resolveLastPendingStep(steps, isThinking);
+        // The call the thinking pass produced NAMES the row it came out of,
+        // rather than checking that row off and queueing beneath it. See
+        // `nameThinkingRow`.
         const e = event as { name: string; args: unknown; description?: string };
-        steps.push({ description: e.description || describeEngineTool(e.name, e.args), outcome: 'pending' });
+        const naming = { description: e.description || describeEngineTool(e.name, e.args) };
+        if (!nameThinkingRow(steps, naming)) steps.push({ ...naming, outcome: 'pending' });
         break;
       }
       case 'ToolResult':
@@ -250,9 +314,13 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         steps.push({ description: 'Thinking', outcome: 'pending' });
         break;
       case 'CodingAgentToolCalled': {
-        resolveLastPendingStep(steps, isThinking);
+        // Names the pending Thinking row, same as the chat arm above.
         const e = event as { name: string; args: unknown; description?: string };
-        steps.push({ description: e.description || describeCCTool(e.name, e.args), outcome: 'pending', tool_use_id: toolUseIdOf(event) });
+        const naming = {
+          description: e.description || describeCCTool(e.name, e.args),
+          tool_use_id: toolUseIdOf(event),
+        };
+        if (!nameThinkingRow(steps, naming)) steps.push({ ...naming, outcome: 'pending' });
         terminal = null; // CC resumed, not finished yet
         break;
       }
@@ -305,7 +373,12 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
         break;
       }
       case 'CodingAgentTextStreamed':
-        resolveLastPendingStep(steps, isThinking);
+        // Same visible-text gate as the chat arm above, and this is the arm it
+        // was written for: a coding agent emits a blank chunk before EVERY tool
+        // call.
+        if (hasVisibleText((event as { text?: string }).text)) {
+          resolveLastPendingStep(steps, isThinking);
+        }
         terminal = null; // CC resumed, not finished yet
         break;
     }
@@ -317,12 +390,23 @@ export function exchangeSteps(exchange: Exchange, _isLast = true, threadIdle = f
   return steps;
 }
 
+/** Index of the last pending step matching `pred`, or -1. The lookup half of
+ *  `resolveLastPendingResponseStep`, for the one caller that replaces a step
+ *  rather than resolving it. */
+function lastPendingStepIndex(events: ResponseEvent[], pred: (s: StepLike) => boolean): number {
+  for (let i = events.length - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === 'step' && e.outcome === 'pending' && pred(e)) return i;
+  }
+  return -1;
+}
+
 /** Mark the last pending step in a ResponseEvent[] as completed and return it
  *  so callers can attach extra payload (tool result text, images). Optional
  *  `pred` narrows which pending step to resolve. */
 function resolveLastPendingResponseStep(
   events: ResponseEvent[],
-  pred?: (s: { description?: string }) => boolean,
+  pred?: (s: StepLike) => boolean,
 ): Extract<ResponseEvent, { type: 'step' }> | null {
   for (let i = events.length - 1; i >= 0; i--) {
     const e = events[i];
@@ -436,19 +520,33 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         break;
       }
       case 'ToolCalled': {
-        // LLM produced a tool call — the prior Thinking step is done.
-        resolveLastPendingResponseStep(events, isThinking);
+        // Mirror of exchangeSteps: the call names the Thinking row it came out
+        // of instead of opening a second row. See `nameThinkingRow`.
         const e = event as { name: string; args: unknown; description?: string };
-        const description = e.description || describeEngineTool(e.name, e.args);
-        const full = fullCommandForEngineTool(e.name, e.args);
-        pushStep({ type: 'step', description, tool_name: e.name, outcome: 'pending', full, created });
+        const naming = {
+          description: e.description || describeEngineTool(e.name, e.args),
+          tool_name: e.name,
+          full: fullCommandForEngineTool(e.name, e.args),
+          created,
+        };
+        if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', outcome: 'pending', ...naming });
         break;
       }
       case 'ToolResult': {
-        const toolResult = event as { result?: string; images?: string[]; result_stripped?: boolean };
+        const toolResult = event as { name?: string; result?: string; images?: string[]; result_stripped?: boolean };
         // Skip pending Thinking — ToolCalled already resolved it; this should
         // pair with the matching tool step.
-        const resolved = resolveLastPendingResponseStep(events, isNotThinking);
+        //
+        // `await_event` is narrowed to its OWN step: its result fills the
+        // rendezvous slot of a park whose step the event-wait row has already
+        // replaced, so there is normally nothing left to resolve, and the
+        // generic "last pending step" walk would tick off whatever call the
+        // woken turn has since started. It still resolves the real thing on the
+        // rejected-subscription path, where no row replaced the step.
+        const resolved = resolveLastPendingResponseStep(
+          events,
+          toolResult.name === AWAIT_EVENT_TOOL ? isAwaitEventStep : isNotThinking,
+        );
         if (resolved) {
           if (toolResult.result !== undefined) resolved.result = toolResult.result;
           if (toolResult.images?.length) resolved.result_images = toolResult.images;
@@ -474,11 +572,13 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         }
         break;
       }
-      case 'TextStreamed':
-        // LLM produced visible text — the prior Thinking step is done.
-        resolveLastPendingResponseStep(events, isThinking);
-        events.push({ type: 'text', md: (event as { text: string }).text });
+      case 'TextStreamed': {
+        // Mirror of exchangeSteps: only VISIBLE text ends the thinking pass.
+        const text = (event as { text: string }).text;
+        if (hasVisibleText(text)) resolveLastPendingResponseStep(events, isThinking);
+        events.push({ type: 'text', md: text });
         break;
+      }
       case 'SessionStarted':
         if (hasCCContent) events.push({ type: 'section_break', channel: 'claude_code' });
         break;
@@ -486,11 +586,15 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         pushStep({ type: 'step', description: 'Thinking', outcome: 'pending', created });
         break;
       case 'CodingAgentToolCalled': {
-        resolveLastPendingResponseStep(events, isThinking);
         const e = event as { name: string; args: unknown; description?: string };
-        const description = e.description || describeCCTool(e.name, e.args);
-        const full = fullCommandForCCTool(e.name, e.args);
-        pushStep({ type: 'step', description, tool_name: e.name, outcome: 'pending', tool_use_id: toolUseIdOf(event), full, created });
+        const naming = {
+          description: e.description || describeCCTool(e.name, e.args),
+          tool_name: e.name,
+          tool_use_id: toolUseIdOf(event),
+          full: fullCommandForCCTool(e.name, e.args),
+          created,
+        };
+        if (!nameThinkingStep(events, naming)) pushStep({ type: 'step', outcome: 'pending', ...naming });
         terminal = null; // CC resumed, not finished yet
         break;
       }
@@ -537,25 +641,104 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         terminal = null; // CC actively reasoning, not finished
         break;
       }
-      case 'CodingAgentTextStreamed':
-        resolveLastPendingResponseStep(events, isThinking);
-        events.push({ type: 'text', md: (event as { text: string }).text });
+      case 'CodingAgentTextStreamed': {
+        const text = (event as { text: string }).text;
+        if (hasVisibleText(text)) resolveLastPendingResponseStep(events, isThinking);
+        events.push({ type: 'text', md: text });
         terminal = null; // CC resumed, not finished yet
         break;
+      }
       case 'CodingAgentUserMessageSent':
         // Legacy event — now an exchange boundary in groupIntoExchanges, never a step
         break;
       case 'CommandCheckpointed': {
-        // Command guard snapshot before a ReversibleDanger command (ADR 0002,
-        // Phase 4) — renders inline with a one-click Undo.
-        const e = event as { checkpoint_id: string; command: string; summary: string };
+        // Command guard snapshot pair around a ReversibleDanger command (ADR
+        // 0002, Phase 4). Renders inline with a one-click Undo and the diff.
+        const e = event as {
+          checkpoint_id: string;
+          command: string;
+          summary: string;
+          restores?: number;
+          removes?: number;
+        };
         events.push({
           type: 'checkpoint',
           checkpoint_id: e.checkpoint_id,
           command: e.command,
           summary: e.summary,
           reverted: false,
+          // Absent on pre-2026-08-06 events, where Undo was restore-only and
+          // no counts were recorded. 0 renders as "unknown", not as "none".
+          restores: e.restores ?? 0,
+          removes: e.removes ?? 0,
         });
+        break;
+      }
+      case 'EventWaitStarted': {
+        // The park, as the transcript's ONE record of it. It is a step-level
+        // row, not a divider: the attached wake resumes THIS exchange, and its
+        // steps land below this row.
+        //
+        // It REPLACES the pending step the `await_event` `ToolCalled` pushed a
+        // moment earlier rather than queueing under it. That step's engine
+        // description is `Waiting: <reason>` and this row names the same
+        // reason, so rendering both put two near-identical lines in the
+        // transcript for one action; this is the richer of the two (it carries
+        // the subscription, the resolution state, and the jump to the matched
+        // event), so it is the one that survives. A rejected subscription
+        // emits no `EventWaitStarted` at all, so a failed `await_event` keeps
+        // its ordinary tool step and its error.
+        const e = event as {
+          wait_id: string;
+          on: EventSubscription[];
+          reason: string;
+          expires_at: string;
+        };
+        const row: ResponseEvent = {
+          type: 'event_wait',
+          wait_id: e.wait_id,
+          subscription: describeWaitSubscription(e.on),
+          reason: e.reason,
+          expires_at: e.expires_at,
+          state: 'waiting',
+        };
+        const parked = lastPendingStepIndex(events, isAwaitEventStep);
+        if (parked >= 0) events[parked] = row;
+        else events.push(row);
+        // Registering the wait is the whole of the turn's last action, and
+        // `await_event` is terminal, so the engine emits no terminator here by
+        // design. `exchangeStatus` reads the unresolved park directly.
+        terminal = null;
+        break;
+      }
+      case 'EventWaitDelivered':
+      case 'EventWaitExpired':
+      case 'EventWaitCanceled': {
+        // Flip the card this resolves, matched by wait_id. A resolution can
+        // arrive in a LATER exchange than its park (a detached wait outlives
+        // the turn that registered it), in which case there is no card here to
+        // flip and the resolution renders through its own wake instead.
+        const e = event as {
+          wait_id: string;
+          event_type?: string;
+          event_id?: string;
+        };
+        const state =
+          event.type === 'EventWaitDelivered'
+            ? 'woke'
+            : event.type === 'EventWaitExpired'
+              ? 'timed_out'
+              : 'canceled';
+        for (const prior of events) {
+          if (prior.type === 'event_wait' && prior.wait_id === e.wait_id) {
+            prior.state = state;
+            if (state === 'woke') {
+              prior.matched_event_type = e.event_type;
+              prior.matched_event_id = e.event_id;
+            }
+            break;
+          }
+        }
         break;
       }
       case 'CommandCheckpointReverted': {
@@ -649,6 +832,32 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
     }
   }
   return mergeAdjacentTextEvents(events);
+}
+
+/** Will rendering these response events actually DRAW anything?
+ *
+ *  The mirror of `renderResponseEvents` in `ChatExchange.tsx`, which draws a
+ *  `text` event only when it is `isMeaningfulText` and every other kind
+ *  unconditionally. So the one non-drawing shape is a blank `text`, and it is
+ *  not hypothetical: `exchangeResponseEvents` pushes one for EVERY
+ *  `CodingAgentTextStreamed`, and a subprocess being torn down signs off with a
+ *  bare `"\n\n"`. The "non-empty after trimming" rule is deliberately taken from
+ *  `isMeaningfulText` rather than re-spelled, so this and the renderer cannot
+ *  drift on what counts as visible text.
+ *
+ *  Exists because `events.length > 0` is not the same question. An abort
+ *  boundary that acquired only that flush answered yes and rendered a response
+ *  panel with an empty body, whose sole visible content was a status badge that
+ *  read "Working" while the engine was down (reported 2026-08-06). A caller
+ *  deciding whether a panel is worth showing wants this; a caller asking
+ *  whether the turn produced events wants `length`.
+ *
+ *  A `step` / `event_wait` counts as drawn even though `renderResponseEvents`
+ *  gates those on the `showSteps` toggle: with one present, the body always
+ *  renders the "Show steps" button (`getEventToggleState`'s `showStepsToggle` is
+ *  that same `some(...)`), so the panel is neither empty nor a dead end. */
+export function hasRenderableResponseContent(events: ResponseEvent[]): boolean {
+  return events.some(e => e.type !== 'text' || isMeaningfulText(e));
 }
 
 /** User-facing presentation of a `StepOutcome`. Both the inline-step row and
@@ -759,26 +968,80 @@ export function exchangeError(exchange: Exchange): ExchangeError | null {
   return null;
 }
 
-/** True for the teardown boundary of a user-initiated *Switch to new version*:
- *  an `engine_shutdown` abort stamped with the device that clicked Switch.
+/** Every event id this exchange puts into the DOM as `data-event-id`, i.e. the
+ *  complete set a deep-link can resolve against inside this turn.
  *
- *  This is the TypeScript mirror of the backend's `SWITCH_TEARDOWN_ABORT_SQL`
- *  (`agent_recovery/recovery.rs`), which is the single definition both resume
- *  gates key on: `switch_was_user_initiated` for coding agents and
- *  `switch_resume_candidates` for chat / trigger threads. Both halves of the
- *  pair are load-bearing on the backend, so both are checked here. A device
- *  actor alone is not the fingerprint: `stale_settle` deliberately carries the
- *  actor of whichever button exposed a stuck row.
+ *  There are exactly two today and both live in `ChatExchange`: the root carries
+ *  the turn's STARTER, and the failure card carries its own `ResponseFailed`
+ *  (see `ExchangeError.eventId` above). Every other step is deliberately
+ *  unstamped, inline steps most of all, since the "Show steps" toggle can hide
+ *  them and an id there would resolve only sometimes.
  *
- *  Matching means the engine has PROMISED to resume this turn, which is why the
- *  Continue button is withheld (see `continuableAbortIndex`). The promise is
- *  kept or withdrawn by the engine, never guessed at here: a boot that declines
- *  to resume the thread emits a fresh `recovery_after_restart` abort, which does
- *  not match this and re-arms the button. */
+ *  Declared here rather than inferred at the deep-link site so the stamping rule
+ *  has ONE definition: `deepLinkAnchorForEvent` reads it to decide whether an
+ *  event addresses itself, and a source-scan tripwire in
+ *  `__tests__/deep-link-anchor.test.ts` asserts the `data-event-id` expressions
+ *  in `ChatExchange.tsx` are exactly the two below. (A scan, not a render: there
+ *  is no jsdom in the test infra, matching the `skeleton-guard` /
+ *  `list-row-prose-guard` precedent.) Add a third stamp to the component and
+ *  that tripwire fails until it is declared here too. */
+export function stampedEventIds(exchange: Exchange): string[] {
+  const ids: string[] = [];
+  // Both stamps are conditional in the component (Preact drops an `undefined`
+  // attribute), so an id the DOM will not carry must not be listed here either.
+  if (exchange.userEvent._eventId) ids.push(exchange.userEvent._eventId);
+  const failure = exchangeError(exchange)?.eventId;
+  if (failure) ids.push(failure);
+  return ids;
+}
+
+/** The `data-event-id` a deep-link to `eventId` should actually target within
+ *  `exchanges`, or `null` when no exchange holds that event.
+ *
+ *  An event that stamps its own element (see `stampedEventIds`) is its own
+ *  target, so the pulse stays on the thing the user was sent to see. Anything
+ *  else is a step that renders no addressable element of its own, so the target
+ *  becomes the turn that CONTAINS it: landing on the turn is the honest answer,
+ *  and it is the difference between a link that works and one that spends the
+ *  4s resolve deadline and recovers to the bottom of the thread.
+ *
+ *  This is what the *event wait* step's "show it" needs. A wait can match ANY
+ *  event type, and the common match by far is a `CodingAgentIdled` from another
+ *  thread, which stamps nothing anywhere. Notification deep-links do not need it
+ *  (they point at events that are addressable by construction) and deliberately
+ *  do not use it. */
+export function deepLinkAnchorForEvent(
+  exchanges: Exchange[],
+  eventId: string,
+): string | null {
+  // Backward walk, matching `findExchangeByAnchorId`: on the vanishingly rare
+  // id collision the most recent owner is the one on screen.
+  for (let i = exchanges.length - 1; i >= 0; i--) {
+    const exchange = exchanges[i];
+    if (stampedEventIds(exchange).includes(eventId)) return eventId;
+    if (exchange.steps.some(({ event }) => event._eventId === eventId)) {
+      // A turn whose own starter is unstamped (a legacy row with no event id)
+      // gives the deep-link nothing to aim at, and saying so beats returning an
+      // `undefined` that would read as "not in this thread" further down.
+      return exchange.userEvent._eventId ?? null;
+    }
+  }
+  return null;
+}
+
+/** True when this event is an abort the engine has PROMISED to resume: the
+ *  teardown boundary of a user-initiated *Switch to new version*. The event-shaped
+ *  reading of `isSwitchTeardownAbort`, which is where the fingerprint itself is
+ *  defined and cross-referenced against the backend.
+ *
+ *  This is why the Continue button is withheld (see `continuableAbortIndex`), and
+ *  it is the same predicate that decides the thread's `paused` status on the
+ *  backend, so the dot and the button can never contradict each other. The
+ *  promise is kept or withdrawn by the engine, never guessed at here: a boot that
+ *  declines to resume the thread emits a fresh `recovery_after_restart` abort,
+ *  which does not match this, re-arming the button and turning the dot red. */
 export function abortPromisesAutoResume(ev: ThreadEvent): boolean {
-  return ev.type === 'ResponseAborted'
-    && ev.cause === 'engine_shutdown'
-    && ev.actor?.kind === 'device';
+  return ev.type === 'ResponseAborted' && isSwitchTeardownAbort(ev.actor, ev.cause);
 }
 
 /** Index of the newest ResponseAborted exchange the user may Continue from, or
@@ -786,7 +1049,7 @@ export function abortPromisesAutoResume(ev: ThreadEvent): boolean {
  *  this exchange renders the button, and older aborts the user already
  *  continued past are inert.
  *
- *  Three ways the scan ends in `null`:
+ *  Four ways the scan ends in `null`:
  *
  *  - A later `ContinuationStarted`: the turn was already resumed.
  *  - A stale-settle abort (engine cleanup of a stuck-but-already-gone process,
@@ -797,7 +1060,13 @@ export function abortPromisesAutoResume(ev: ThreadEvent): boolean {
  *    That race is what the user hit on 2026-08-05: the button sat there for the
  *    whole teardown-plus-restart window and their click landed nine seconds in,
  *    turning an engine-attributed "Resumed after engine restart" into a
- *    human-attributed "Continued the response". */
+ *    human-attributed "Continued the response".
+ *  - The abort boundary itself has since RESOLVED: a terminal event landed
+ *    among its steps, so a turn already ran under it and finished. Continue
+ *    there re-runs completed work, which on 2026-08-06 meant offering to redo a
+ *    turn that had applied a change and spawned a sub-thread two minutes
+ *    earlier (real thread ebc787a4). The scan does not stop at such a boundary:
+ *    an OLDER unresolved abort above it is still legitimately continuable. */
 export function continuableAbortIndex(exchanges: Exchange[]): number | null {
   for (let i = exchanges.length - 1; i >= 0; i--) {
     const ev = exchanges[i].userEvent;
@@ -805,11 +1074,26 @@ export function continuableAbortIndex(exchanges: Exchange[]): number | null {
     if (ev.type === 'ResponseAborted') {
       if (ev.cause === 'stale_settle') return null;
       if (abortPromisesAutoResume(ev)) return null;
+      if (abortBoundaryResolved(exchanges[i])) continue;
       return i;
     }
   }
   return null;
 }
+
+/** Did a turn run under this abort boundary and finish? Any terminal among its
+ *  steps says yes, whatever ended it. */
+function abortBoundaryResolved(exchange: Exchange): boolean {
+  return exchange.steps.some(s => TERMINAL_EVENT_TYPES.has(s.event.type));
+}
+
+const TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set([
+  'ResponseGenerated',
+  'ResponseFailed',
+  'ResponseCanceled',
+  'ResponseAborted',
+  'CodingAgentIdled',
+]);
 
 /** Read the engine note (UserPromptInjected step) from a ContinuationStarted
  *  exchange. Returns the full text and a coarse count of bullet entries for
@@ -1076,6 +1360,14 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // while the user thinks. Resume (UserQuestionAnswered followed by CC text)
   // clears this flag and the exchange falls back to coding-agent-working.
   let isWaitingForAnswer = false;
+  // The turn registered an *event wait* and has not been woken out of it
+  // (ADR 0047). `await_event` is terminal and the engine deliberately emits no
+  // terminator for the park, because the dangling `ToolCalled{await_event}` IS
+  // the slot the delivered event lands in. So the generic "steps but nothing
+  // ended it" fallthrough read a parked turn as 'streaming' and the panel said
+  // "Working" for however long the thread slept. It is not working: it did its
+  // work and parked, and the live state belongs to the subscription indicator.
+  let isParkedOnEventWait = false;
   // Track whether the exchange reached a "completed" state BEFORE any
   // abort/shutdown event. When true, the abort is from a system-injected
   // prompt crash (e.g., auto-harden) and the user's work was already done.
@@ -1160,6 +1452,17 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
       case 'CommandPermissionResolved':
       case 'McpPermissionResolved':
         isWaitingForAnswer = false; break;
+      case 'EventWaitStarted': isParkedOnEventWait = true; break;
+      // A delivery and an expiry both hand the parked model a `ToolResult` and
+      // re-enter the turn, so the exchange is live again and falls back to the
+      // ordinary machinery. A CANCEL does not: it closes the dangling call so
+      // the next turn is sendable at all, and the thread settles (the engine's
+      // `status_transitions` maps `EventWaitCanceled` to Idle). Leaving the
+      // flag set there is what keeps a stopped wait reading "Done" instead of
+      // falling through to the stale detector's "Aborted".
+      case 'EventWaitDelivered':
+      case 'EventWaitExpired':
+        isParkedOnEventWait = false; break;
     }
   }
 
@@ -1195,6 +1498,31 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
     && !!onlyStep.injected_message_id
     && !announcesThisExchange;
 
+  // A switch-teardown boundary is CLOSED BY CONSTRUCTION, whatever the thread
+  // projection currently says. The engine went down with it, and its resume
+  // opens an exchange of its own (`ContinuationStarted` is an exchange starter),
+  // so nothing that lands here is new work. What does land is the dying
+  // subprocess's drain: the teardown Esc produces a `CodingAgentToolResult`
+  // rejection and a last `"\n\n"` flush, ~40ms after the abort, and CC events
+  // fold chronologically rather than by request id, so they land in this
+  // boundary as steps.
+  //
+  // Without this the boundary had steps and no terminal, and the stale detector
+  // below could not reach it: that detector is gated on `threadIdle`, and a
+  // switch teardown settles the thread at `paused` (or, when a change was
+  // already proposed, at `waiting`, which the drain then revives to `running`).
+  // Neither is quiescent, so the last branch of this function won and the panel
+  // shimmered "Working" for the whole teardown-plus-restart window, on a thread
+  // whose engine was not running. Reported 2026-08-06; see
+  // `docs/plans/2026-08-06-no-working-label-while-nothing-is-running.md`.
+  //
+  // Keyed on the switch fingerprint rather than on "is an abort boundary",
+  // because a boundary CAN acquire a live turn: a `safety_net` abort fires on a
+  // turn the watchdog thought was stuck, the loop keeps going, and two minutes
+  // of real work lands under it (real thread ebc787a4, the case commit
+  // 3da5620eb exists for). Only the switch teardown takes the engine with it.
+  const isSwitchTeardownBoundary = abortPromisesAutoResume(exchange.userEvent);
+
   // Stale exchange: the thread's projection says quiescent, but this exchange
   // has steps and no terminal event. The agentic loop (or the coding-agent
   // subprocess) died without emitting ResponseGenerated / ResponseAborted /
@@ -1214,8 +1542,14 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   //
   // The absorbed-UPI placeholder is excluded because its lone UPI step means
   // the real response lives in the PRIOR exchange: it is 'done', not crashed.
+  //
+  // A switch-teardown boundary supplies the quiescence itself (see above): the
+  // engine is down, so it does not have to wait for the projection to say so.
+  // It is deliberately NOT exempt from `threadAwaitingAnswer`, which stands for
+  // a live agent mid-answer, a state a torn-down engine cannot be in.
   const isStale =
-    threadIdle && !threadAwaitingAnswer && isLast && !isComplete && hasSteps
+    (threadIdle || isSwitchTeardownBoundary) && !threadAwaitingAnswer
+    && isLast && !isComplete && hasSteps
     && !isAbsorbedUpiPlaceholder;
 
   if (isFailed) return 'error';
@@ -1241,6 +1575,16 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
   // CC idle → done. WaitingBanner handles the "can interact" state separately.
   if (isCCWaiting) return 'done';
+  // Parked on an event wait: the turn ran to its end and registered a
+  // subscription, which is a completed piece of work, not one in flight. Read
+  // as 'done' for the same reason `isWaitingForAnswer` reads as its own state
+  // rather than "Working": nothing is running, and the surface that owns the
+  // live half (the subscription indicator, with its countdown and Stop) is
+  // elsewhere. Placed before the stale detector so a settled thread whose wait
+  // the user stopped doesn't read "Aborted", and before the `!isLast`
+  // 'interrupted' arm so a detached wake landing in a later exchange doesn't
+  // retroactively mark the park as abandoned.
+  if (isParkedOnEventWait) return 'done';
   // Claude Code session ended with a normal reason (changes_proposed, completed, etc.) —
   // terminal even when CodingAgentIdled was missing.
   if (isCC && isSessionEndedNormally) return 'done';

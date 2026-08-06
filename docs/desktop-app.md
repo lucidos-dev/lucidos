@@ -47,9 +47,44 @@ window). On boot it:
 1. installs/updates `~/Library/LaunchAgents/com.lucidos.engine.plist` and
    bootstraps the service if it isn't already loaded (it starts at login via
    `RunAtLoad`),
-2. waits for the gateway health endpoint (`/~/api/v1/health`) on the stable
+2. installs `~/Library/LaunchAgents/com.lucidos.client.plist`, the **login
+   agent**, so the client itself comes back at the next login too (below),
+3. waits for the gateway health endpoint (`/~/api/v1/health`) on the stable
    port, then points the window at `http://localhost:<port>` (smart root: one
    workspace opens directly; multiple workspaces show the picker).
+
+**Two agents, one per role.** `com.lucidos.engine` is the *service agent*: the
+headless always-on stack, `RunAtLoad` + `KeepAlive`. `com.lucidos.client` is the
+*login agent*: a one-shot `RunAtLoad` job whose whole body is
+`/usr/bin/open -g -a <bundle> --args --login`, so the client is in the menu bar
+after a restart instead of only after the user opens the app. Without it a
+rebooted Mac has the engine running but nothing client-side: no menu-bar item,
+no Dock badge, and no native notification banners, since those are shown by the
+client process (`show_native_notification`) and not by the engine.
+
+Three properties of that job are load-bearing:
+
+- **`open`, not the bundle's inner binary.** On an already-running client
+  LaunchServices activates that instance instead of starting a second one, so
+  the job cannot produce a duplicate client no matter what kickstarts it. `-g`
+  keeps the launch out of the foreground.
+- **`--login` means menu-bar-only.** The `main` window is declared
+  `"visible": false` in `tauri.conf.json` and shown in `setup` on every launch
+  except this one, so a login start never flashes a window before hiding it. It
+  comes up in exactly the state closing the window leaves the client in:
+  tray item, no window, `Accessory` (no Dock icon). The hidden window still
+  loads the gateway page, which is what keeps SSE, notifications and the unread
+  count alive.
+- **The user's "off" wins.** macOS lists the job under System Settings → General
+  → Login Items ("Allow in the Background"). Switching it off records a launchd
+  override keyed by the label, which the client's idempotent plist write never
+  clears, and nothing in the code calls `launchctl enable`. The client only
+  bootstraps the job when it actually (re)wrote the plist, which is a first
+  install or a moved bundle.
+
+No login agent is installed when the executable is not inside a `.app` (dev,
+`cargo run`), and `--login` is ignored in dev, where there is no tray to reopen
+a hidden window from.
 
 Closing the window — red X, Cmd+W, or Cmd+Q — only dismisses the window; the
 client stays resident in the macOS menu bar and the service keeps running

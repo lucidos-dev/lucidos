@@ -536,7 +536,11 @@ describe('tool description from event', () => {
     expect(respSteps[0].outcome).toBe('pending');
   });
 
-  it('Thinking resolves to ✓ when ToolCalled arrives', () => {
+  it('ToolCalled NAMES the Thinking row rather than opening a second one', () => {
+    // The fold: one LLM call is one row. The row is born as a shimmering
+    // "Thinking" marker and renames itself to the call it produced, staying
+    // pending because that call is now the thing running. Two rows for one
+    // action read as two actions.
     const thread = makeThreadState();
     const map = new Map([['t', thread]]);
     handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-05-24T19:00:00Z');
@@ -545,16 +549,101 @@ describe('tool description from event', () => {
 
     const exchanges = groupIntoExchanges(map.get('t')!.events);
     const steps = exchangeSteps(exchanges[0], /* isLast */ true);
-    expect(steps[0].description).toBe('Thinking');
-    expect(steps[0].outcome).toBe('success');
-    expect(steps[1].outcome).toBe('pending'); // tool still pending
+    expect(steps).toHaveLength(1);
+    expect(steps[0].description).toBe('Run ls');
+    expect(steps[0].outcome).toBe('pending');
 
     const respSteps = exchangeResponseEvents(exchanges[0]).filter(
       (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
     );
-    expect(respSteps[0].description).toBe('Thinking');
+    expect(respSteps).toHaveLength(1);
+    expect(respSteps[0].description).toBe('Run ls');
+    expect(respSteps[0].tool_name).toBe('run_bash');
+    expect(respSteps[0].outcome).toBe('pending');
+  });
+
+  it('only the FIRST of a pass\'s tool calls takes the row; parallel calls get their own', () => {
+    // A result pairs back by tool_use_id, so two calls sharing a row could not
+    // both be resolved. Naming the row stops it matching `isThinking`, which is
+    // what leaves the second call nothing to fold onto.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-05-24T19:00:00Z');
+    handleEvent(map, 't', 2, { type: 'ThoughtStreamed', text: 'Context: 100 tokens, 1 messages' } as ThreadEvent, '2026-05-24T19:00:01Z');
+    handleEvent(map, 't', 3, { type: 'ToolCalled', name: 'run_bash', args: { command: 'ls' } } as ThreadEvent, '2026-05-24T19:00:02Z');
+    handleEvent(map, 't', 4, { type: 'ToolCalled', name: 'run_bash', args: { command: 'pwd' } } as ThreadEvent, '2026-05-24T19:00:03Z');
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+    const steps = exchangeSteps(exchanges[0], /* isLast */ true);
+    expect(steps.map(s => s.description)).toEqual(['Run ls', 'Run pwd']);
+    expect(steps.every(s => s.outcome === 'pending')).toBe(true);
+  });
+
+  it('a blank text chunk before a coding-agent tool call does not cost the fold its row', () => {
+    // Real stream, read off a live Claude Code thread: EVERY CodingAgentToolCalled
+    // is preceded by a whitespace-only CodingAgentTextStreamed. That chunk used to
+    // resolve the pending Thinking row, so the tool call arrived to find nothing to
+    // rename and opened a second row. The blank text renders as nothing, so the two
+    // rows looked adjacent and the fold looked broken on exactly the threads that
+    // produce the most steps.
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
+      [2, { type: 'CodingAgentPromptSent', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
+      [3, { type: 'CodingAgentTextStreamed', text: ' ', created: '2026-08-06T09:14:01Z' } as ThreadEvent],
+      [4, { type: 'CodingAgentToolCalled', name: 'Grep', args: { pattern: 'Thinking' }, tool_use_id: 'tu-A', created: '2026-08-06T09:14:01Z' } as ThreadEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(
+      (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
+    );
+    expect(respSteps).toHaveLength(1);
+    expect(respSteps[0].description).not.toBe('Thinking');
+    expect(respSteps[0].tool_use_id).toBe('tu-A');
+
+    const steps = exchangeSteps(exchanges[0]);
+    expect(steps).toHaveLength(1);
+    expect(steps[0].description).not.toBe('Thinking');
+  });
+
+  it('a text chunk with real content still resolves the Thinking row', () => {
+    // The gate is on VISIBLE content, not on text events as a class: the model
+    // saying something is genuine output and ends the thinking pass, so a tool
+    // call after it opens its own row below the prose rather than folding into a
+    // marker that sits above it.
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
+      [2, { type: 'CodingAgentPromptSent', text: 'go', created: '2026-08-06T09:14:00Z' } as ThreadEvent],
+      [3, { type: 'CodingAgentTextStreamed', text: 'Let me look at the projection.', created: '2026-08-06T09:14:01Z' } as ThreadEvent],
+      [4, { type: 'CodingAgentToolCalled', name: 'Grep', args: { pattern: 'Thinking' }, tool_use_id: 'tu-A', created: '2026-08-06T09:14:01Z' } as ThreadEvent],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(
+      (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
+    );
+    expect(respSteps.map(s => s.description)).toEqual(['Thinking', "Search 'Thinking'"]);
     expect(respSteps[0].outcome).toBe('success');
     expect(respSteps[1].outcome).toBe('pending');
+  });
+
+  it('a pass that answers in text keeps its Thinking row, which is where its counter lives', () => {
+    // Nothing to fold into: the model called no tool. The row resolves in place
+    // rather than disappearing, because the context counter for that LLM call
+    // hangs off it.
+    const thread = makeThreadState();
+    const map = new Map([['t', thread]]);
+    handleEvent(map, 't', 1, { type: 'MessageReceived', text: 'go' } as ThreadEvent, '2026-05-24T19:00:00Z');
+    handleEvent(map, 't', 2, { type: 'ThoughtStreamed', text: 'Context: 100 tokens, 1 messages', context_tokens: 1_200 } as ThreadEvent, '2026-05-24T19:00:01Z');
+    handleEvent(map, 't', 3, { type: 'TextStreamed', text: 'Here you go.' } as ThreadEvent, '2026-05-24T19:00:02Z');
+    handleEvent(map, 't', 4, { type: 'ResponseGenerated', text: 'Here you go.' } as ThreadEvent, '2026-05-24T19:00:03Z');
+
+    const exchanges = groupIntoExchanges(map.get('t')!.events);
+    const respSteps = exchangeResponseEvents(exchanges[0]).filter(
+      (e): e is Extract<typeof e, { type: 'step' }> => e.type === 'step',
+    );
+    expect(respSteps).toHaveLength(1);
+    expect(respSteps[0].description).toBe('Thinking');
+    expect(respSteps[0].outcome).toBe('success');
+    expect(respSteps[0].context_tokens).toBe(1_200);
   });
 
   it('Thinking resolves to ✓ when TextStreamed arrives', () => {

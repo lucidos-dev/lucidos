@@ -126,6 +126,7 @@ fn indexable_text_skips_an_injection_that_echoes_a_persisted_message() {
         mode: ActorMode::Human,
         origin: None,
         injected_message_id: Some(uuid::Uuid::new_v4()),
+        delivered_event_id: None,
     };
     assert_eq!(
         echo.indexable_text(),
@@ -138,6 +139,7 @@ fn indexable_text_skips_an_injection_that_echoes_a_persisted_message() {
         mode: ActorMode::Engine,
         origin: None,
         injected_message_id: None,
+        delivered_event_id: None,
     };
     assert_eq!(
         engine_note.indexable_text(),

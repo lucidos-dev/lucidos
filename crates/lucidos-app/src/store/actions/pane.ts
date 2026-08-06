@@ -76,12 +76,25 @@ export function revealContentPane() {
  *  existing thread (focusThread), the empty compose view (unfocusThread), or a
  *  brand-new thread spawned from another pane (sendMessage's raw-new-thread
  *  path, e.g. the new-app form in the content pane). Mobile: swipe to the thread
- *  (conversation) pane so the focused thread/compose is visible. Desktop:
- *  re-activate the Threads pane group (`focusedPane = 'thread'`) — but ONLY from
- *  the cross-group case (arriving from the Content pane group), so an existing
- *  'drawer'/'thread' focus is left alone and drawer ↑/↓ browsing isn't
- *  disturbed. `reconcilePaneFocus` then pulls DOM keyboard focus into the thread
- *  pane (when it isn't already there) so the marker and real focus stay in sync.
+ *  (conversation) pane so the focused thread/compose is visible. Desktop, in two
+ *  halves:
+ *
+ *  - **Re-expand a collapsed split** (`splitRatio <= 0`, the Content pane group
+ *    maximized), mirroring `revealContentPane`'s own collapsed branch. Without
+ *    it the navigation lands behind a zero-width pane: the focused thread does
+ *    change, nothing on screen does, and the click reads as a no-op. That is
+ *    what a thread link clicked from the content pane hit (a change toast, a
+ *    Search Everywhere result, a New-thread button); mobile never did, because
+ *    panes there are navigated rather than collapsed.
+ *  - **Re-activate the Threads pane group** (`focusedPane = 'thread'`), then let
+ *    `reconcilePaneFocus` pull DOM keyboard focus into the pane (when it isn't
+ *    already there) so the marker and real focus stay in sync. Normally ONLY
+ *    from the cross-group case (arriving from the Content pane group), so an
+ *    existing 'drawer'/'thread' focus is left alone and drawer ↑/↓ browsing
+ *    isn't disturbed. A collapse we just undid is the exception: the pane was
+ *    invisible (and a collapsed thread pane hides the drawer with it), so a
+ *    marker pointing into it is stale by construction and the reveal owns it.
+ *
  *  Both thread-side callers take a `revealPane: false` opt-out for a focus
  *  change that is bookkeeping rather than navigation (stale-pointer cleanup, the
  *  post-archive hand-off), which must leave the visible pane alone.
@@ -91,7 +104,11 @@ export function revealContentPane() {
 export function revealThreadPane(): void {
   if (isMobile()) {
     navigateToPane('thread');
-  } else if (focusedPane.value === 'content') {
+    return;
+  }
+  const wasCollapsed = splitRatio.value <= 0;
+  if (wasCollapsed) setSplitRatio(DEFAULT_SPLIT_RATIO);
+  if (wasCollapsed || focusedPane.value === 'content') {
     focusedPane.value = 'thread';
     reconcilePaneFocus('thread');
   }

@@ -35,6 +35,7 @@ export function makeThread(id = 'thread-1', status: 'idle' | 'running' | 'waitin
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
+    liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',

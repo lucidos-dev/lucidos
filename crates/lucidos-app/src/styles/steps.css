@@ -1,14 +1,3 @@
-/* Steps render as `.inline-step` rows (further down); this leaf class is a
-   part of one. `.step-context`, its sibling leaf, is defined only in that
-   section: every property of a bare `.step-context` rule here was shadowed by
-   the `.inline-step` one, since the only element carrying the class is inside
-   an `.inline-step` row. */
-.step-icon {
-    flex-shrink: 0;
-    line-height: 1.4;
-}
-
-
 /* Details toggle (intermediate text chunks) */
 .details-toggle {
     background: none;
@@ -32,37 +21,81 @@
     margin-bottom: 0.25rem;
 }
 
-/* Inline steps (between text chunks). Rendered as <button> so the entire row
-   opens the per-step detail modal — strip the native button chrome so it
-   reads as a row of text. */
+/* Inline steps (between text chunks). ONE row per action: the model's thinking
+   and the call it produced share a row (see `nameThinkingRow` in
+   `exchange-render.ts`), so the row carries TWO click targets, `.step-main`
+   (what the step did) and `.step-context` (what the model was sent). That is
+   why the row is a plain flex container with the button chrome pushed down onto
+   the two targets, rather than the row itself being a <button>: a button may
+   not contain another interactive element. */
 .inline-step {
     display: flex;
     align-items: baseline;
     gap: 0.375rem;
-    padding: 0.125rem 0;
+    padding: 0.0625rem 0;
     font-size: var(--font-size-sm);
     color: var(--text-secondary);
     font-family: var(--font-ui);
+    /* Pinned, NOT inherited. The rows render inside `.response-content`, whose
+       1.6 is prose leading for wrapped paragraphs. On a list where every row is
+       one line and the eye scans down a column of them, that leading IS the row
+       pitch, and it read as 1.9em of air per step. A dense list wants its own
+       value, so the row states one rather than taking the enclosing prose's.
+       1.4 is also what `.step-icon` used to declare for itself; with the row on
+       1.4 the icon inherits it and that override is gone. */
+    line-height: 1.4;
     min-width: 0;
     width: 100%;
-    background: none;
-    border: none;
     text-align: left;
-    cursor: pointer;
-    /* Block iOS text selection / callout — tap should open the modal,
-       not select the row's text. */
+    /* Block iOS text selection / callout: a tap should open a modal, not
+       select the row's text. */
     user-select: none;
     -webkit-user-select: none;
     -webkit-touch-callout: none;
 }
 
+/* The main target: holds the icon, description and detail, and is the part that
+   gives way when the row runs out of width (the counter never does). Strips the
+   native button chrome so it reads as a row of text rather than a control. The
+   counter's own reset lives in its rule further down rather than being shared
+   with this one, so each target's look is owned by exactly one rule and neither
+   depends on out-ranking the other. */
+.inline-step .step-main {
+    display: flex;
+    align-items: baseline;
+    gap: 0.375rem;
+    flex: 1 1 auto;
+    min-width: 0;
+    background: none;
+    border: none;
+    padding: 0;
+    margin: 0;
+    font: inherit;
+    color: inherit;
+    text-align: left;
+    cursor: pointer;
+}
+
+/* Element-qualified, and this is the ONLY thing qualified that way: a legacy
+   row's counter has no snapshot to open, so `InlineStep` renders it as a bare
+   <span>, and handing that span a pointer cursor is the same lie as a button
+   that opens nothing. */
+.inline-step button.step-context {
+    cursor: pointer;
+}
+
 @media (hover: hover) {
-    .inline-step:hover .step-description {
+    .inline-step .step-main:hover .step-description {
         color: var(--text-primary);
+    }
+
+    .inline-step button.step-context:hover {
+        color: var(--text-secondary);
     }
 }
 
-.inline-step:focus-visible {
+.inline-step .step-main:focus-visible,
+.inline-step button.step-context:focus-visible {
     /* Shared --focus-ring. */
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
@@ -107,10 +140,10 @@
 }
 
 @media (hover: hover) {
-    /* The row stays muted on hover: the shared .inline-step:hover rule lifts
+    /* The row stays muted on hover: the shared .step-main:hover rule lifts
        the description to --text-primary, which would undo the "this one did
        not finish" signal on exactly the row being inspected. */
-    .inline-step.unfinished:hover .step-description {
+    .inline-step.unfinished .step-main:hover .step-description {
         color: var(--text-secondary);
     }
 }
@@ -137,13 +170,25 @@
 .inline-step .step-detail {
     color: var(--text-muted);
     font-size: 0.85em;
-    overflow-wrap: break-word;
-    word-break: break-word;
-    min-width: 0;
-    /* basis 0 + grow 1 — detail absorbs flex shrinkage first, so a short
-       description (e.g. "Memory searched") next to a long detail isn't
-       proportionally squeezed and ellipsized. */
+    /* One line, ellipsized, exactly like .step-description. The detail used to
+       wrap (`word-break: break-word`, so a long path could break mid-token),
+       and that is what turned the basis-0 flex below into a 935px-tall row: a
+       description wider than the row leaves this box at width 0, and a box that
+       may break anywhere then lays its text out one character per line. The
+       horizontal overflow that wrapping was added for is handled by the
+       ellipsis instead, and the untruncated text is in the step-detail modal. */
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    /* basis 0 + grow 1: the detail takes the space the description doesn't
+       need, so a short description (e.g. "Memory searched") next to a long
+       detail isn't proportionally squeezed and ellipsized. The floor is the
+       other half of that trade. A basis of 0 also means a scaled shrink factor
+       of 0, so the description absorbs ALL shrinkage and a long one crushed the
+       detail out of existence; below the floor the description gives way
+       instead, and both parts end up readable and clipped. */
     flex: 1 1 0;
+    min-width: min(35%, 9rem);
 }
 
 .inline-step .step-detail::before {
@@ -156,6 +201,15 @@
    ellipsizing the description instead, and on mobile the counter itself is
    rendered as the percentage alone (`contextLabel`). */
 .inline-step .step-context {
+    /* Button chrome reset first: the counter is a <button> when a snapshot
+       backs it and a <span> when nothing does, and must read as text either
+       way. `font: inherit` is deliberately above `font-size`, which the
+       shorthand would otherwise clobber. */
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    text-align: left;
     margin-left: 0.25rem;
     color: var(--text-muted);
     font-size: 0.85em;
@@ -497,9 +551,14 @@
     letter-spacing: 0.05em;
 }
 
-/* Command-guard checkpoint card (ADR 0002, Phase 4) — an inline Undo affordance
-   shown before an in-workspace destructive command. */
-.checkpoint-card {
+/* Step-level note card: a boxed aside inside a response, sitting between the
+   steps rather than opening an exchange. One of them today, the command-guard
+   checkpoint (ADR 0002); the shared shell survives its extraction because the
+   box earns its weight only for an inline AFFORDANCE (checkpoint carries an
+   Undo button). The event-wait record used to share it and no longer does: it
+   was a full-width panel for one action the agent took, so it became an
+   ordinary step line instead (see `.inline-step-static`). */
+.step-note-card {
     display: flex;
     align-items: center;
     gap: 0.625rem;
@@ -511,13 +570,13 @@
     font-size: var(--font-size-md);
 }
 
-.checkpoint-icon {
+.step-note-icon {
     flex: 0 0 auto;
     color: var(--text-muted);
     font-size: var(--font-size-xl);
 }
 
-.checkpoint-body {
+.step-note-body {
     flex: 1 1 auto;
     min-width: 0;
     display: flex;
@@ -525,11 +584,12 @@
     gap: 0.125rem;
 }
 
-.checkpoint-summary {
+.step-note-summary {
     color: var(--text-primary);
 }
 
-.checkpoint-command {
+/* The one-line technical detail under the summary: a command, a subscription. */
+.step-note-detail {
     color: var(--text-muted);
     font-size: var(--font-size-sm);
     overflow: hidden;
@@ -537,8 +597,53 @@
     white-space: nowrap;
 }
 
+/* What Undo will do to the workspace, spelled out under the command so the
+   button beside it is not a blind one. Wraps, unlike `.step-note-detail`
+   above: this is a sentence, and truncating it to an ellipsis would hide the
+   half that says what gets removed. */
+.checkpoint-scope {
+    color: var(--text-muted);
+    font-size: var(--font-size-sm);
+}
+
 .checkpoint-reverted {
     flex: 0 0 auto;
     color: var(--text-muted);
     font-size: var(--font-size-sm);
+}
+
+/* The door to the checkpoint's diff. Sits between the body and Undo, and must
+   not be squeezed by a long command: the body is the only flex child that
+   gives. */
+[data-role="checkpoint-diff"] {
+    flex: 0 0 auto;
+}
+
+/* The diff can be long, so the panel takes the room a step detail does and
+   scrolls, rather than growing the modal past the viewport. */
+.checkpoint-diff-modal .folder-tree {
+    overflow-x: auto;
+}
+
+/* An event wait, as one line in the step list (ADR 0047, amended 2026-08-06).
+   It was a boxed `.step-note-card` until the box was dropped: a park is one
+   action the agent took, and a full-width panel repeating what the subscription
+   indicator already shows live was the wrong weight for it in the transcript.
+
+   A step row with no click targets in it. `InlineStep` puts the row's text
+   inside `.step-main`, which opens the step-detail modal; there is none behind
+   an event wait, so this row keeps its text as bare spans and re-enables
+   selection, which the tap-suppression on `.inline-step` turns off. The nested
+   `.event-wait-jump` is the row's only real affordance. */
+.inline-step-static {
+    user-select: text;
+    -webkit-user-select: text;
+}
+
+.event-wait-jump {
+    background: none;
+    border: none;
+    padding: 0;
+    font: inherit;
+    cursor: pointer;
 }

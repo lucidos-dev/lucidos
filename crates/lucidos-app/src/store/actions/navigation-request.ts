@@ -310,7 +310,11 @@ export function handleNavigationRequest(nav: {
       if (nav.purpose === 'oauth') {
         openOAuthAuthorizationUrl(nav.url);
       } else {
-        openUrl(nav.url);
+        // `source` is carried so a browser that refuses the tab can say which
+        // thread (or app) asked for it. A navigate arriving over SSE is not
+        // something the user clicked, so an unattributed toast would read as
+        // coming from nowhere.
+        openUrl(nav.url, opts?.source);
       }
       break;
     default:

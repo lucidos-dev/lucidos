@@ -405,8 +405,10 @@ Two independent version axes:
 
 ### Cutting a Lucidos release
 
-Releases are produced as squashed-orphan commits on `lucidos/main` (one per
-`v<version>` tag); per-release notes live in `CHANGELOG.md`.
+Each release publishes one commit to `lucidos/main`, tagged `v<version>`: a
+stripped tree carrying the previous release's published commit as its single
+parent, so the mirror's `main` is a linear release history. Per-release notes
+live in `CHANGELOG.md`.
 
 ---
 
@@ -420,6 +422,10 @@ dev setup, the branch/PR flow, commit conventions, and the DCO sign-off
 [SECURITY.md](SECURITY.md), and see [GOVERNANCE.md](GOVERNANCE.md) for how the
 project is run. Questions and ideas are welcome in
 [GitHub Discussions](https://github.com/lucidos-dev/lucidos/discussions).
+
+Proposing something that adds a surface or an integration?
+[`docs/philosophy.md`](docs/philosophy.md) is the lens those are held against,
+and it names two ideas already settled as a no.
 
 Thanks to everyone who has contributed, see the full list on the
 [contributors graph](https://github.com/lucidos-dev/lucidos/graphs/contributors).

@@ -131,6 +131,41 @@ pub(super) fn may_touch_change_state_at_idle(
         && matches!(terminal_kind, Some(TerminalKind::Generated))
 }
 
+/// Collapse the idle's ONE diff probe into the `(has_changes,
+/// requires_restart)` pair stamped on `CodingAgentIdled`.
+///
+/// `changed_files` is `None` when git could not answer: a spawn failure, the
+/// 30s `git_cmd` timeout, or a non-zero exit (a deleted or renamed branch ref
+/// is the common one). That is UNKNOWN, never a "no", so it preserves `prior`
+/// rather than writing `false`. Writing `false` there is what left three live
+/// external-repo threads with a dark Diff button: their branch was renamed
+/// mid-session, `git diff <base>...<gone-ref>` exited 128, the swallowing
+/// `branch_changed_files` wrapper turned that into an empty list, and the idle
+/// wrote `has_changes: false` over the correct `true` the post-commit hook had
+/// already put in `thread_summaries.coding_agent_has_diff`. The idle's answer
+/// is the durable one and it runs last, so the hook cannot win that race.
+///
+/// An ANSWERED-but-empty probe still means `(false, false)`: a branch whose
+/// commits cancelled out (commit then revert) genuinely has no diff, and
+/// carrying a stale `true` forward there is the phantom-Apply regression named
+/// in `may_touch_change_state_at_idle`'s doc comment.
+///
+/// `prior` is the thread's last known state: `has_changes` from
+/// `thread_summaries.coding_agent_has_diff` (the column this event writes, and
+/// the one the post-commit hook corrects mid-turn, so it is right even on a
+/// first turn that has no previous idle to read), `requires_restart` from the
+/// most recent CC turn-closer payload.
+pub(super) fn idle_change_flags(
+    changed_files: Option<&[String]>,
+    prior: (bool, bool),
+) -> (bool, bool) {
+    match changed_files {
+        Some([]) => (false, false),
+        Some(files) => (true, crate::engine::git_ops::files_require_restart(files)),
+        None => prior,
+    }
+}
+
 /// Which terminal event closes the current CC turn. Cancel/Abort variants
 /// carry the typed cause so the emit site cannot mis-classify why the turn
 /// ended.

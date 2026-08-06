@@ -53,9 +53,15 @@ async fn authorize(
     caller: Option<Uuid>,
     child: Uuid,
 ) -> Result<FollowUpAck, ChildFollowUpError> {
-    crate::engine::LucidosEngine::authorize_child_follow_up(pool, caller, child, None)
-        .await
-        .map(|(_, ack)| ack)
+    crate::engine::LucidosEngine::authorize_child_follow_up(
+        pool,
+        caller,
+        child,
+        None,
+        crate::engine::FollowUpUrgency::Normal,
+    )
+    .await
+    .map(|(_, ack)| ack)
 }
 
 #[tokio::test]
@@ -223,6 +229,7 @@ async fn follow_up_with_caller_workspace_is_refused() {
         Some(parent),
         child,
         Some("other-workspace"),
+        crate::engine::FollowUpUrgency::Normal,
     )
     .await
     .unwrap_err();
@@ -292,6 +299,7 @@ async fn coding_agent_routing_is_derived_from_the_child_row() {
         Some(parent),
         chat_child,
         None,
+        crate::engine::FollowUpUrgency::Normal,
     )
     .await
     .unwrap();
@@ -326,6 +334,7 @@ async fn coding_agent_routing_is_derived_from_the_child_row() {
         Some(parent),
         cc_child,
         None,
+        crate::engine::FollowUpUrgency::Normal,
     )
     .await
     .unwrap();
@@ -726,6 +735,161 @@ fn the_pre_emit_rule_is_the_in_flight_set() {
         !FollowUpDelivery::WaitingForUserAnswer.wants_pre_emit(),
         "a parked child never left the parent's count, so nothing is owed"
     );
+    assert!(
+        !FollowUpDelivery::Interrupted.wants_pre_emit(),
+        "the redirect lane must sequence the interrupted turn's Canceled terminal \
+         BEFORE the follow-up's MessageReceived, so pre-emitting here would invert \
+         the child's timeline"
+    );
+}
+
+/// Urgency only changes the reading for a child that is actually mid-turn.
+/// There is nothing to preempt on an idle child, and a question-parked child is
+/// blocked on a human rather than on work, so urgency cannot unblock it: saying
+/// otherwise would promise the caller a preemption that never happens.
+#[test]
+fn urgency_upgrades_only_a_running_child() {
+    use crate::engine::thread_lifecycle::ThreadStatus;
+
+    assert_eq!(
+        FollowUpDelivery::from_status(ThreadStatus::Running, FollowUpUrgency::Normal),
+        FollowUpDelivery::Running
+    );
+    assert_eq!(
+        FollowUpDelivery::from_status(ThreadStatus::Running, FollowUpUrgency::Urgent),
+        FollowUpDelivery::Interrupted
+    );
+    for status in [
+        ThreadStatus::WaitingForUserAnswer,
+        ThreadStatus::Idle,
+        ThreadStatus::Failed,
+    ] {
+        assert_eq!(
+            FollowUpDelivery::from_status(status, FollowUpUrgency::Urgent),
+            FollowUpDelivery::from_status(status, FollowUpUrgency::Normal),
+            "urgency must not change the reading for {status:?}: there is no turn to stop"
+        );
+    }
+}
+
+/// The ack is what the model reads back, so the two mid-turn outcomes have to
+/// be distinguishable in prose. A caller that cancelled needs to know the child
+/// is stopping, not that its message is sitting in a queue.
+#[test]
+fn interrupted_and_running_read_differently() {
+    let queued = FollowUpDelivery::Running.describe();
+    let stopped = FollowUpDelivery::Interrupted.describe();
+
+    assert_ne!(queued, stopped);
+    assert!(
+        queued.contains("queues"),
+        "the default has to say the message waits:\n{queued}"
+    );
+    assert!(
+        stopped.contains("stopped"),
+        "an urgent follow-up has to say the child's current turn is ending:\n{stopped}"
+    );
+}
+
+/// Only a mid-turn child that the caller actually marked urgent may be
+/// preempted. The other three readings must hand the turn `Normal`, and the
+/// dangerous one is `WaitingForUserAnswer`: a chat child parked on
+/// `ask_user_question` is blocked INSIDE a tool call, so its `ThreadHandle` is
+/// still registered and reads as in flight. Handing that turn `Urgent` would
+/// cancel it and throw away the question the user was about to answer, while
+/// the ack had just promised "it will not read this until a human answers".
+#[test]
+fn only_an_interrupted_delivery_hands_the_turn_urgency() {
+    assert_eq!(
+        FollowUpDelivery::Interrupted.effective_urgency(),
+        FollowUpUrgency::Urgent
+    );
+    for delivery in [
+        FollowUpDelivery::Running,
+        FollowUpDelivery::WaitingForUserAnswer,
+        FollowUpDelivery::Revived,
+    ] {
+        assert_eq!(
+            delivery.effective_urgency(),
+            FollowUpUrgency::Normal,
+            "{delivery:?} must not preempt: the ack does not promise it, and for \
+             WaitingForUserAnswer it promises the opposite"
+        );
+    }
+}
+
+/// The ack and the behaviour are one decision, so they cannot disagree. Stated
+/// as a property over every reading rather than case by case: whenever
+/// `describe()` tells the caller the child will not read the message yet, the
+/// turn must not be preempted.
+#[test]
+fn the_ack_never_promises_a_wait_it_then_preempts() {
+    for delivery in [
+        FollowUpDelivery::Running,
+        FollowUpDelivery::Interrupted,
+        FollowUpDelivery::WaitingForUserAnswer,
+        FollowUpDelivery::Revived,
+    ] {
+        let says_it_waits = delivery.describe().contains("will not read");
+        assert!(
+            !(says_it_waits && delivery.effective_urgency().is_urgent()),
+            "{delivery:?} tells the caller the child waits, then preempts it anyway: {}",
+            delivery.describe()
+        );
+    }
+}
+
+/// Absent means not urgent, so every caller that predates the flag (and every
+/// model that omits it) gets the non-destructive default.
+#[test]
+fn missing_urgent_flag_is_normal() {
+    assert_eq!(FollowUpUrgency::from_flag(None), FollowUpUrgency::Normal);
+    assert_eq!(
+        FollowUpUrgency::from_flag(Some(false)),
+        FollowUpUrgency::Normal
+    );
+    assert_eq!(
+        FollowUpUrgency::from_flag(Some(true)),
+        FollowUpUrgency::Urgent
+    );
+    assert_eq!(FollowUpUrgency::default(), FollowUpUrgency::Normal);
+}
+
+/// The LLM tool's argument has no schema enforcement behind it, so a malformed
+/// `urgent` has to be REFUSED rather than defaulted. Coercing `"true"` to
+/// not-urgent fails unrecoverably: the tool reports the follow-up sent, the
+/// caller believes the child was stopped, and the child keeps working.
+#[test]
+fn a_malformed_urgent_tool_arg_is_refused_not_defaulted() {
+    use serde_json::json;
+
+    assert_eq!(
+        FollowUpUrgency::from_tool_arg(None),
+        Ok(FollowUpUrgency::Normal)
+    );
+    assert_eq!(
+        FollowUpUrgency::from_tool_arg(Some(&json!(null))),
+        Ok(FollowUpUrgency::Normal)
+    );
+    assert_eq!(
+        FollowUpUrgency::from_tool_arg(Some(&json!(false))),
+        Ok(FollowUpUrgency::Normal)
+    );
+    assert_eq!(
+        FollowUpUrgency::from_tool_arg(Some(&json!(true))),
+        Ok(FollowUpUrgency::Urgent)
+    );
+
+    // Every shape a model plausibly emits for "yes" must error, never read as
+    // not-urgent.
+    for bad in [json!("true"), json!("yes"), json!(1), json!(["true"])] {
+        let err = FollowUpUrgency::from_tool_arg(Some(&bad))
+            .expect_err(&format!("{bad} must be refused, not defaulted"));
+        assert!(
+            err.contains("must be a boolean"),
+            "the refusal must say what shape is expected: {err}"
+        );
+    }
 }
 
 /// A follow-up to a question-parked child is reported as waiting, not as

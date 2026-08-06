@@ -18,7 +18,7 @@
 //! from those rows. The follow-up chat request then produces a
 //! `ContextCaptured` event we can inspect.
 
-use crate::support::{base_url, db_url, http_client, unique_marker};
+use crate::support::{base_url, db_url, unique_marker, user_client};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -225,7 +225,7 @@ async fn load_knowhow_body_lives_once_after_first_call() {
     let pool = sqlx::PgPool::connect(&db_url())
         .await
         .expect("connect e2e db");
-    let client = http_client();
+    let client = user_client().await;
 
     let thread_id = seed_load_knowhow_pair(&pool).await;
 

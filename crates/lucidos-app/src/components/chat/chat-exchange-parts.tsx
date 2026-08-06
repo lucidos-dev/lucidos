@@ -2,13 +2,14 @@ import { blobPreviewUrl, continueThread, postCommandCheckpointUndo } from '../..
 import type { Change } from '../../api/client';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-changes';
+import { showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
-import { findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
-import { LUCIDOS_AGENT_LABEL, resumeEngineNote, stepStatus } from '../../store/thread-events';
+import { checkpointDiffModal, contextViewer, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
+import { LUCIDOS_AGENT_LABEL, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import type { Exchange } from '../../store/thread-events';
-import type { Loadable, ResponseEvent } from '../../store/types';
+import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
@@ -167,6 +168,40 @@ export function ResumeNoteBody({ exchange }: { exchange: Exchange }) {
       <summary>{subline}</summary>
       <pre class="resume-note-body">{note.text}</pre>
     </details>
+  );
+}
+
+/** The body of a detached event-wake exchange: the event that woke the thread,
+ *  named, with its payload folded away (ADR 0047).
+ *
+ *  The alternative it replaces is why this exists at all. The wake's
+ *  `UserPromptInjected.text` has to spell the payload out as pretty-printed
+ *  JSON, because that text IS the prompt the model reads, and rendering it
+ *  through `MarkdownBlock` put a screen and a half of raw JSON in the
+ *  transcript (with markdown helpfully auto-linking the email-shaped part of a
+ *  path inside it). The engine links the anchor back to its
+ *  `EventWaitDelivered` precisely so the client can show the same facts as
+ *  structure instead.
+ *
+ *  Closed by default: the event's NAME is the answer to "why did this thread
+ *  start talking again", and the payload is for the rare follow-up question. */
+export function EventDeliveryBody({
+  eventType,
+  payloadJson,
+}: {
+  eventType: string;
+  payloadJson?: string;
+}) {
+  return (
+    <div class="event-delivery" data-role="event-delivery">
+      <code class="event-delivery-name">{eventType}</code>
+      {payloadJson ? (
+        <details class="event-delivery-payload">
+          <summary>Payload</summary>
+          <pre>{payloadJson}</pre>
+        </details>
+      ) : null}
+    </div>
   );
 }
 
@@ -449,6 +484,13 @@ export function contextLabel(
   return `${formatTokens(used)} tokens${messages != null ? `, ${messages} msgs` : ''}`;
 }
 
+/** One action, as one row: the model's thinking and the call it produced share
+ *  a row rather than taking two (see `nameThinkingRow` in the projection).
+ *
+ *  The row therefore has TWO click targets, which is why it is a `<div>` around
+ *  two buttons rather than one button (a `<button>` may not contain another
+ *  interactive element). The main target opens what the step DID; the context
+ *  counter opens what the model was SENT. */
 export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 'step' }> }) {
   const { label, icon, className } = stepStatus(event.outcome);
   const snap = event.contextCapture;
@@ -456,46 +498,210 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
   const window = snap?.context_window;
   const trimmed = snap?.trimmed ?? event.trimmed;
   const hasContext = used != null;
-  // A "Thinking" step's reasoning streams into `thinkingText`. Show its tail
-  // (latest non-empty line, truncated) inline as a live ticker so a long
-  // reasoning pass visibly progresses; the full text is in the detail modal.
-  const thinkingTail = event.thinkingText ? lastLinePreview(event.thinkingText) : '';
+  // Reasoning streams into `thinkingText` while the row is still an unnamed
+  // "Thinking" marker. Show its tail (latest non-empty line, truncated) as a
+  // live ticker so a long reasoning pass visibly progresses. It stops at the
+  // rename: once the row names the call it produced, a truncated mid-sentence
+  // fragment trailing "Running: cd …" is noise, and the full reasoning is one
+  // click away in the step detail.
+  const thinkingTail = isThinking(event) && event.thinkingText
+    ? lastLinePreview(event.thinkingText)
+    : '';
   const detailText = event.detail || thinkingTail;
 
   const isPending = event.outcome === 'pending';
+  const counter = hasContext && (
+    <>
+      {contextLabel(used!, window, event.context_messages, viewportIsMobile.value)}
+      {trimmed && ' · trimmed'}
+    </>
+  );
 
   return (
-    <button
-      type="button"
+    <div
       class={`inline-step ${className}`}
       data-role="inline-step"
       /* A row the user can't read at a glance needs naming: a killed-mid-call
          step is struck and muted, and the tooltip says what that means without
          a trip through the detail modal. */
       data-tooltip={event.outcome === 'unfinished' ? label : undefined}
-      onClick={() => { stepDetailModal.value = event; }}
     >
-      {/* In-progress step: no leading icon (`stepStatus` returns an empty one),
-          because the shimmering description is the "live" affordance. The empty
-          slot itself is hidden via CSS for `.pending`. */}
-      <span class="step-icon">{icon || null}</span>
-      <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
-      {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
-      {hasContext && (
-        <span class={`step-context${trimmed ? ' trimmed' : ''}`}>
-          {contextLabel(used!, window, event.context_messages, viewportIsMobile.value)}
-          {trimmed && ' · trimmed'}
-        </span>
-      )}
-    </button>
+      <button
+        type="button"
+        class="step-main"
+        data-role="step-main"
+        onClick={() => { stepDetailModal.value = event; }}
+      >
+        {/* In-progress step: no leading icon (`stepStatus` returns an empty one),
+            because the shimmering description is the "live" affordance. The empty
+            slot itself is hidden via CSS for `.pending`. */}
+        <span class="step-icon">{icon || null}</span>
+        <span class={`step-description${isPending ? ' running-shimmer' : ''}`}>{highlightEllipsis(event.description)}</span>
+        {detailText && <span class="step-detail">{highlightEllipsis(detailText)}</span>}
+      </button>
+      {/* The counter is a button only when there is a snapshot behind it. A
+          legacy row carries `context_tokens` with nothing to open, and a button
+          that opens nothing is worse than plain text. */}
+      {counter && (snap ? (
+        <button
+          type="button"
+          class={`step-context${trimmed ? ' trimmed' : ''}`}
+          data-role="step-context"
+          aria-label="Show the context sent for this call"
+          onClick={() => { contextViewer.value = { snapshot: snap, description: event.description }; }}
+        >
+          {counter}
+        </button>
+      ) : (
+        <span class={`step-context${trimmed ? ' trimmed' : ''}`}>{counter}</span>
+      ))}
+    </div>
   );
 }
 
+type EventWaitState = Extract<ResponseEvent, { type: 'event_wait' }>['state'];
+
+/** How each state reads as a STEP: the outcome that picks its icon, and the
+ *  trailing note that says how the wait ended.
+ *
+ *  `waiting` is a `success`, not a `pending`: the step is the agent SETTING UP
+ *  the wait, and that finished. A pending step shimmers as in-progress, which
+ *  for a park means shimmering for however many hours the thread sleeps, and
+ *  claims a turn is running when nothing is. The live half of the wait (its
+ *  countdown, its Stop) belongs to the subscription indicator.
+ *
+ *  `timed_out` and `canceled` are both `unfinished` (muted, struck) rather than
+ *  `error` (red): nothing failed, the wait simply stopped without its event.
+ *  The note is what tells the two apart, so neither needs a colour of its own. */
+const EVENT_WAIT_STEP_STATE: Record<EventWaitState, { outcome: StepOutcome; note?: string }> = {
+  waiting: { outcome: 'success' },
+  woke: { outcome: 'success' },
+  timed_out: { outcome: 'unfinished', note: 'timed out' },
+  canceled: { outcome: 'unfinished', note: 'canceled' },
+};
+
+/** An event wait, as one line in the step list (ADR 0047, amended 2026-08-06).
+ *
+ *  It used to be a boxed `.step-note-card`, which put a full-width panel in the
+ *  transcript for what is really one action the agent took, and repeated state
+ *  the subscription indicator already shows live. The box is gone: this reads
+ *  like every other step ("Loading know-how …", "Listing threads …"), and the
+ *  clock in the prompt bar is where the user goes for the details and the live
+ *  countdown.
+ *
+ *  Still deliberately NOT an exchange divider: an attached delivery resumes the
+ *  SAME exchange, so the wake's steps continue below this line rather than
+ *  under a fresh boundary.
+ *
+ *  Not a `<button>`, unlike `InlineStep`: there is no step-detail modal behind
+ *  it. The one thing that IS clickable is the jump on a resolved wake, which is
+ *  the only route to the matched event once the wait has left the indicator.
+ *
+ *  This is the thin hook-holding wrapper; the markup is `eventWaitStepBody`. */
+export function EventWaitStep({ event }: { event: Extract<ResponseEvent, { type: 'event_wait' }> }) {
+  const matched = event.matched_event_id;
+  // Resolving the matched event's thread is a round-trip in every case except a
+  // match in this same thread, so the jump says it is working and refuses to
+  // fire twice. See `showEventWhereItLives`.
+  const opening = useSignal(false);
+  return eventWaitStepBody({
+    event,
+    opening: opening.value,
+    onOpenMatched: async () => {
+      if (!matched || opening.value) return;
+      opening.value = true;
+      try {
+        await showEventWhereItLives(matched);
+      } finally {
+        opening.value = false;
+      }
+    },
+  });
+}
+
+/** The step line's markup, hookless so it stays a pure function of its state
+ *  (same split as `eventWaitIndicatorBody` next door). The component above owns
+ *  the one hook, which is also why the split exists: there is no jsdom in the
+ *  test infra, so a component carrying a hook cannot be invoked as a plain
+ *  function and the tests drive this instead. */
+export function eventWaitStepBody({
+  event,
+  opening,
+  onOpenMatched,
+}: {
+  event: Extract<ResponseEvent, { type: 'event_wait' }>;
+  opening: boolean;
+  onOpenMatched: () => void;
+}) {
+  const { outcome, note } = EVENT_WAIT_STEP_STATE[event.state];
+  const { icon, className } = stepStatus(outcome);
+  const matched = event.matched_event_id;
+  return (
+    <div
+      class={`inline-step inline-step-static ${className}`}
+      data-role="event-wait-step"
+      data-state={event.state}
+    >
+      <span class="step-icon">{icon || null}</span>
+      {/* "event wait" is the canonical term in both glossaries, and the status
+          chip beside this already reads "Waiting for an event". "event
+          tracking" was the phrasing this line was sketched with and is a
+          synonym for the same concept, which is exactly the drift
+          `.claude/rules/glossary.md` exists to stop.
+
+          A colon rather than "for", because `reason` is the model's own words
+          and it reaches for a gerund as often as a noun phrase: "…an event wait
+          for Watching for the next code edit" is what the preposition produced
+          on a real thread. The colon reads as an introduction either way. */}
+      <span class="step-description">
+        Set up an event wait: {event.reason}
+      </span>
+      <span class="step-detail">
+        {event.state === 'woke' && event.matched_event_type
+          ? event.matched_event_type
+          : note ?? event.subscription}
+      </span>
+      {event.state === 'woke' && matched ? (
+        // The matched event usually lives somewhere ELSE: the headline cases are
+        // a `CodingAgentIdled` or a `ChangeProposed` from the coding-agent thread
+        // this one was watching. So the jump resolves the owning thread first and
+        // navigates there, rather than searching the open thread's DOM for an
+        // event that is by construction not in it.
+        <button
+          type="button"
+          class="accent-link event-wait-jump"
+          data-role="event-wait-jump"
+          disabled={opening}
+          onClick={onOpenMatched}
+        >
+          {opening ? 'opening…' : 'show it'}
+        </button>
+      ) : null}
+    </div>
+  );
+}
+
+/** What Undo will do to the workspace, in words, from the counts the engine
+ *  recorded when it diffed the checkpoint's two snapshots.
+ *
+ *  `null` when both are 0, which is a checkpoint written before the counts
+ *  existed rather than one that changed nothing (a command that changed nothing
+ *  git-visible emits no card at all). Saying "restore 0 files" there would
+ *  invent a fact; saying nothing leaves the diff as the way to find out. */
+export function checkpointUndoScope(restores: number, removes: number): string | null {
+  const parts: string[] = [];
+  if (restores > 0) parts.push(`restore ${formatFileCount(restores)}`);
+  if (removes > 0) parts.push(`remove ${formatFileCount(removes)} this step created`);
+  return parts.length > 0 ? `Undo will ${parts.join(' and ')}.` : null;
+}
+
 /** The command-guard checkpoint card (ADR 0002, Phase 4): an inline affordance
- *  shown before an in-workspace destructive command, with a one-click Undo that
- *  restores the workspace from the snapshot. Once reverted (live via the paired
- *  `CommandCheckpointReverted` event, or on reload), the button is replaced with
- *  a reverted marker. */
+ *  for an in-workspace destructive command, with a one-click Undo that restores
+ *  the workspace from the snapshot taken before it and removes the files it
+ *  created. "View changes" opens the diff between those two snapshots, so the
+ *  Undo beside it is not a blind button. Once reverted (live via the paired
+ *  `CommandCheckpointReverted` event, or on reload), Undo is replaced with a
+ *  reverted marker, while the diff stays available. */
 export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type: 'checkpoint' }> }) {
   const pending = useSignal(false);
   const onUndo = async () => {
@@ -511,13 +717,23 @@ export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type
       pending.value = false;
     }
   };
+  const scope = checkpointUndoScope(event.restores, event.removes);
   return (
-    <div class="checkpoint-card" data-role="checkpoint-card">
-      <span class="checkpoint-icon" aria-hidden="true">{'⎌'}</span>
-      <div class="checkpoint-body">
-        <div class="checkpoint-summary">{event.summary}</div>
-        <code class="checkpoint-command">{event.command}</code>
+    <div class="step-note-card checkpoint-card" data-role="checkpoint-card">
+      <span class="step-note-icon" aria-hidden="true">{'⎌'}</span>
+      <div class="step-note-body">
+        <div class="step-note-summary">{event.summary}</div>
+        <code class="step-note-detail">{event.command}</code>
+        {scope && <div class="checkpoint-scope">{scope}</div>}
       </div>
+      <button
+        type="button"
+        class="accent-link"
+        data-role="checkpoint-diff"
+        onClick={() => { checkpointDiffModal.value = event; }}
+      >
+        View changes
+      </button>
       {event.reverted ? (
         <span class="checkpoint-reverted">Reverted ✓</span>
       ) : (

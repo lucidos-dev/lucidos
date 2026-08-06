@@ -1288,6 +1288,12 @@ impl LucidosEngine {
                 m.insert(CodingAgent::Codex, Arc::new(CodexRuntime));
                 m
             },
+            live_waits: Arc::new(crate::engine::event_wait::LiveWaits::new()),
+            event_wake_tx: {
+                let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+                crate::engine::EVENT_WAKE_RX.with(|cell| cell.borrow_mut().replace(rx));
+                tx
+            },
             last_cc_spawn: std::sync::Mutex::new(HashMap::new()),
             pending_app_spawn: std::sync::Mutex::new(HashMap::new()),
             cc_spawn_coalesce: agent_session::CcSpawnCoalescer::new(),

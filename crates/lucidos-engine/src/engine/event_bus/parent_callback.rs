@@ -84,7 +84,7 @@ impl EventBus {
         // `SessionEnded { reason }` below.
         //
         // Cancel splits on `CancelCause` for the same reason. A
-        // `SupersededByFollowup` is the mid-turn redirect `arm_codex_redirect`
+        // `SupersededByFollowup` is the mid-turn redirect `arm_followup_redirect`
         // arms when a follow-up lands on a live Codex turn: the caller steered,
         // they did not abandon (`thread_events/cause.rs`), and the child runs
         // the redirected turn immediately after. Reporting it would wake the
@@ -574,11 +574,22 @@ impl EventBus {
         // thread's last word — scoped to `aggregate = 'thread'` to match
         // `lookup_last_activity` and never let a same-id non-thread event suppress
         // a real fan-in. See the selection rationale above.
+        //
+        // The OUTER `e.aggregate = 'thread'` is load-bearing for a second reason.
+        // On a DOMAIN event `aggregate_id` holds the event TYPE NAME, not a uuid,
+        // and `POST /api/v1/events/emit` accepts any type name that is not a
+        // reserved `SystemEvent`. `ChildThreadCompleted` is a `ThreadEvent` name,
+        // so an app UI (untrusted, per that handler's own comment) can persist a
+        // row whose `aggregate_id` is the literal string. Events are append-only,
+        // so an unscoped `e.aggregate_id::uuid` JOIN would then fail this sweep
+        // with `invalid input syntax for type uuid` on EVERY later boot, and every
+        // child-completion wake lost to a restart would strand its parent forever.
         let rows: Vec<(Uuid, String, Option<String>, bool)> = match sqlx::query_as(
             "SELECT e.id, e.aggregate_id, e.payload->>'child_thread_id', p.is_coding_agent \
              FROM events e \
              JOIN thread_summaries p ON p.thread_id = e.aggregate_id::uuid \
-             WHERE e.event_type = 'ChildThreadCompleted' \
+             WHERE e.aggregate = 'thread' \
+               AND e.event_type = 'ChildThreadCompleted' \
                AND p.state IS DISTINCT FROM 'discarded' \
                AND NOT EXISTS ( \
                  SELECT 1 FROM events later \

@@ -10,6 +10,7 @@ pub mod device_presence;
 pub mod devices;
 pub mod email;
 pub mod environment_variables;
+pub mod event_subscription;
 pub mod events;
 pub mod home_path;
 pub mod image_described_backfill;
@@ -224,6 +225,31 @@ pub const ARTIFACTS_DIR: &str = "data/artifacts";
 pub const APPS_DIR: &str = "data/apps";
 pub const KNOWHOW_DIR: &str = "data/knowhow";
 pub const TRIGGERS_DIR: &str = "data/triggers";
+
+/// Ephemeral scratch, workspace-root-relative and OUTSIDE `data/`: gitignored,
+/// not indexed, safe to delete. `http_request(temp_path)`, `git_clone`'s tmp
+/// route and the plugin staging paths all land here, and every one of them
+/// prints this prefix back to the LLM, so the string the file tools resolve and
+/// the string those tools advertise must be the same one. Kept as a `/`-joined
+/// relative path (not a `PathBuf`) because it is matched against LLM-supplied
+/// path strings as often as it is joined onto the workspace root.
+pub const TMP_DIR: &str = ".lucidos/tmp";
+
+/// Whether a normalized data path names a file inside [`TMP_DIR`]. Sibling of
+/// [`is_system_knowhow_path`]: the two together are the whole set of prefixes
+/// the file tools resolve outside `data/`, and both gate read-only enforcement.
+///
+/// Anchored on the path separator, so it answers `false` for the bare directory
+/// (`.lucidos/tmp`) and for a sibling that merely shares the prefix
+/// (`.lucidos/tmpfoo`). That matters because this predicate guards a security
+/// boundary: a plain `starts_with(TMP_DIR)` would be correct only as long as
+/// every caller normalized first, which is an invariant a future caller can
+/// silently break.
+pub fn is_tmp_path(data_path: &str) -> bool {
+    data_path
+        .strip_prefix(TMP_DIR)
+        .is_some_and(|rest| rest.starts_with('/'))
+}
 
 pub use apps::{App, AppManager, AppManifest};
 pub use artifacts::{
@@ -684,6 +710,37 @@ pub fn format_byte_size(bytes: usize) -> String {
 }
 
 #[cfg(test)]
+mod is_tmp_path_tests {
+    use super::is_tmp_path;
+
+    #[test]
+    fn matches_files_inside_the_scratch_tree() {
+        assert!(is_tmp_path(".lucidos/tmp/notes.json"));
+        assert!(is_tmp_path(".lucidos/tmp/some-repo/README.md"));
+        assert!(is_tmp_path(".lucidos/tmp/"));
+    }
+
+    #[test]
+    fn is_anchored_on_the_separator_not_the_string() {
+        // The reason this is a named predicate rather than a bare
+        // starts_with: it guards a security boundary, so a sibling that
+        // merely shares the prefix must not slip through.
+        assert!(!is_tmp_path(".lucidos/tmpfoo"));
+        assert!(!is_tmp_path(".lucidos/tmp-old/x"));
+        assert!(!is_tmp_path(".lucidos/tmp"));
+    }
+
+    #[test]
+    fn rejects_paths_outside_the_scratch_tree() {
+        assert!(!is_tmp_path("artifacts/notes.md"));
+        assert!(!is_tmp_path(".lucidos/worktrees/thread-x/src/main.rs"));
+        assert!(!is_tmp_path(".lucidos/exhaust/run.log"));
+        // Not anchored at the start either: an artifact cannot spoof it.
+        assert!(!is_tmp_path("artifacts/.lucidos/tmp/x.md"));
+    }
+}
+
+#[cfg(test)]
 mod format_byte_size_tests {
     use super::format_byte_size;
 
@@ -997,7 +1054,6 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             "Executing intent {}...",
             args["intent_id"].as_str().unwrap_or("intent")
         ),
-        "refresh_file" => format!("Refreshing {}...", args["path"].as_str().unwrap_or("file")),
         "refresh_app" => format!(
             "Refreshing {}...",
             args.get("app_name")
@@ -1115,6 +1171,23 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
             }
             _ => "Asking a question...".to_string(),
         },
+        // The one step whose label outlives its turn: the thread parks here and
+        // this row is what the user reads while it sleeps. So it leads with the
+        // model's own `reason` rather than the event names, which are the
+        // engine's vocabulary and answer a question nobody asked. No trailing
+        // "..." for the same reason as `ask_user_question`: the reason is a
+        // sentence, and `truncate` adds its own when it cuts.
+        "await_event" => {
+            let reason = args
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match reason {
+                Some(reason) => format!("Waiting: {}", truncate(reason, 60)),
+                None => "Waiting for an event...".to_string(),
+            }
+        }
         "todo_write" => match args["todos"].as_array() {
             Some(todos) if todos.is_empty() => "Clearing todo list...".to_string(),
             _ => "Updating todo list...".to_string(),

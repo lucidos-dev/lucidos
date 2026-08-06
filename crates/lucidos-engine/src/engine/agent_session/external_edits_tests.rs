@@ -444,3 +444,196 @@ async fn is_ancestor_false_for_unknown_sha() {
         "unknown SHA must not be reported as ancestor"
     );
 }
+
+// -------------------- try_adopt_branch_at_idle --------------------
+
+/// Put the repo on an engine-named branch with one commit, mimicking a
+/// coding-agent session that has done work. Returns the branch's start SHA
+/// (the anchor a first idle would carry) and the branch name.
+async fn session_on_tracked_branch(repo: &std::path::Path) -> (String, String) {
+    let tracked = "lucidos-claude-code-repo-example-repo-do-the-thing".to_string();
+    let anchor = current_head(repo).await;
+    let _ = git_cmd(&["checkout", "-b", &tracked], repo).await;
+    tokio::fs::write(repo.join("work.txt"), "agent work")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], repo).await;
+    let _ = git_cmd(&["commit", "-m", "agent work"], repo).await;
+    (anchor, tracked)
+}
+
+#[tokio::test]
+async fn idle_adopts_a_branch_renamed_in_place() {
+    // The reported bug: a repo skill runs `git branch -m` mid-session, so the
+    // tracked ref is gone by the time the idle computes the diff.
+    let (_tmp, repo) = make_repo().await;
+    let (anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let _ = git_cmd(
+        &["branch", "-m", &tracked, "ticket-1234-drop-unused-tables"],
+        &repo,
+    )
+    .await;
+
+    let (adopted, note) = try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&anchor))
+        .await
+        .expect("a rename in place must be adopted at idle");
+    assert_eq!(adopted, "ticket-1234-drop-unused-tables");
+    assert!(
+        note.contains("ticket-1234-drop-unused-tables"),
+        "note: {}",
+        note
+    );
+}
+
+#[tokio::test]
+async fn idle_adopts_a_branch_created_off_our_own_work() {
+    // `git checkout -b` mid-turn: the tracked ref still exists and is an
+    // ancestor of HEAD, so the new branch genuinely continues our work.
+    let (_tmp, repo) = make_repo().await;
+    let (anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let _ = git_cmd(&["checkout", "-b", "feature-1234"], &repo).await;
+    tokio::fs::write(repo.join("more.txt"), "more")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "more work"], &repo).await;
+
+    let (adopted, _note) = try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&anchor))
+        .await
+        .expect("a branch built on top of the tracked one must be adopted");
+    assert_eq!(adopted, "feature-1234");
+}
+
+#[tokio::test]
+async fn idle_keeps_the_tracked_branch_when_nothing_moved() {
+    let (_tmp, repo) = make_repo().await;
+    let (anchor, tracked) = session_on_tracked_branch(&repo).await;
+    assert!(
+        try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&anchor))
+            .await
+            .is_none(),
+        "the worktree is still on the tracked branch, nothing to adopt"
+    );
+}
+
+#[tokio::test]
+async fn idle_refuses_a_branch_that_does_not_contain_the_tracked_ref() {
+    // The dangerous shape gate 2 exists for: the worktree was manually checked
+    // out onto a sibling branch that forks from the SAME base, so the anchor
+    // ancestry check alone would pass. The tracked ref is still alive and is
+    // NOT in that branch's history, so this is not our work.
+    let (_tmp, repo) = make_repo().await;
+    let (anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let _ = git_cmd(&["checkout", "-b", "someone-elses-branch", &anchor], &repo).await;
+    tokio::fs::write(repo.join("theirs.txt"), "theirs")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "unrelated work"], &repo).await;
+
+    assert!(
+        try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&anchor))
+            .await
+            .is_none(),
+        "a sibling branch off the same base is not a continuation of our work"
+    );
+}
+
+#[tokio::test]
+async fn idle_refuses_when_head_does_not_descend_from_the_anchor() {
+    // Gate 1: the tracked ref is gone AND the worktree sits on something that
+    // predates where this session started.
+    let (_tmp, repo) = make_repo().await;
+    let (_anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let head_with_work = current_head(&repo).await;
+    let _ = git_cmd(&["checkout", "main"], &repo).await;
+    let _ = git_cmd(&["branch", "-m", &tracked, "renamed-away"], &repo).await;
+
+    assert!(
+        try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&head_with_work))
+            .await
+            .is_none(),
+        "main does not contain the session's work, so it must not be adopted"
+    );
+}
+
+#[tokio::test]
+async fn idle_refuses_a_detached_head() {
+    let (_tmp, repo) = make_repo().await;
+    let (anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let head = current_head(&repo).await;
+    let _ = git_cmd(&["checkout", "--detach", &head], &repo).await;
+
+    assert!(
+        try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&anchor))
+            .await
+            .is_none(),
+        "a detached HEAD names no branch to adopt"
+    );
+}
+
+#[tokio::test]
+async fn idle_refuses_without_an_anchor_sha() {
+    let (_tmp, repo) = make_repo().await;
+    let (_anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let _ = git_cmd(&["branch", "-m", &tracked, "renamed"], &repo).await;
+
+    assert!(
+        try_adopt_branch_at_idle(&repo, &repo, &tracked, None)
+            .await
+            .is_none(),
+        "without an anchor there is no ancestry check to make"
+    );
+}
+
+#[tokio::test]
+async fn idle_refuses_a_sibling_branch_when_the_tracked_ref_was_merely_deleted() {
+    // The absence of the tracked ref is NOT evidence of a rename: checking out
+    // a sibling branch and then deleting the tracked one leaves exactly the
+    // same absence. On a first idle the anchor is only the shared base, so the
+    // ancestry gate alone would pass and the thread would adopt work that was
+    // never its own (and delete it on a later Discard).
+    let (_tmp, repo) = make_repo().await;
+    let (anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let _ = git_cmd(&["checkout", "-b", "someone-elses-branch", &anchor], &repo).await;
+    tokio::fs::write(repo.join("theirs.txt"), "theirs")
+        .await
+        .unwrap();
+    let _ = git_cmd(&["add", "."], &repo).await;
+    let _ = git_cmd(&["commit", "-m", "unrelated work"], &repo).await;
+    let out = git_cmd(&["branch", "-D", &tracked], &repo).await.unwrap();
+    assert!(
+        out.status.success(),
+        "the tracked branch should be deletable once it is not checked out: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    assert!(
+        try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&anchor))
+            .await
+            .is_none(),
+        "a deleted tracked ref is not a rename, so the sibling must not be adopted"
+    );
+}
+
+#[tokio::test]
+async fn idle_refuses_when_the_repo_keeps_no_reflog_to_prove_the_rename() {
+    // Reflogs off means no evidence, and no evidence means no adoption. The
+    // thread keeps its tracked branch and the next spawn re-derives.
+    let (_tmp, repo) = make_repo().await;
+    let (anchor, tracked) = session_on_tracked_branch(&repo).await;
+    let _ = git_cmd(&["config", "core.logAllRefUpdates", "false"], &repo).await;
+    let _ = tokio::fs::remove_dir_all(repo.join(".git/logs")).await;
+    let _ = git_cmd(
+        &["branch", "-m", &tracked, "renamed-without-a-reflog"],
+        &repo,
+    )
+    .await;
+
+    assert!(
+        try_adopt_branch_at_idle(&repo, &repo, &tracked, Some(&anchor))
+            .await
+            .is_none(),
+        "without git's own rename record there is nothing linking the branches"
+    );
+}

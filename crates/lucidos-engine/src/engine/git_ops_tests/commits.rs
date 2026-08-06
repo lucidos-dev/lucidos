@@ -97,3 +97,115 @@ async fn branch_changed_files_checked_errors_on_a_missing_branch() {
         .await
         .is_empty());
 }
+
+// -------------------- local_branch_exists / sole_branch_containing --------------------
+
+#[tokio::test]
+async fn local_branch_exists_answers_yes_and_no() {
+    let (_tmp, repo) = make_test_repo().await;
+    commit_on_branch(&repo, "feature", "added.txt", "body").await;
+
+    assert!(local_branch_exists(&repo, "feature")
+        .await
+        .or_unknown(false));
+    assert!(!local_branch_exists(&repo, "no-such-branch")
+        .await
+        .or_unknown(true));
+}
+
+#[tokio::test]
+async fn sole_branch_containing_finds_the_renamed_branch() {
+    // The reported shape: the branch was renamed in place, so the recorded
+    // name is gone but the thread's commit is still on the new one.
+    let (_tmp, repo) = make_test_repo().await;
+    commit_on_branch(&repo, "tracked", "added.txt", "body").await;
+    let work = {
+        let out = git_cmd(&["rev-parse", "tracked"], &repo).await.unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let _ = git_cmd(&["branch", "-m", "tracked", "renamed"], &repo).await;
+
+    assert_eq!(
+        sole_branch_containing(&repo, &work, &["main"])
+            .await
+            .as_deref(),
+        Some("renamed")
+    );
+}
+
+#[tokio::test]
+async fn sole_branch_containing_ignores_the_base_branch() {
+    // Once the work is merged, the base contains the commit too. The base is
+    // never the answer to "where is this thread's branch".
+    let (_tmp, repo) = make_test_repo().await;
+    commit_on_branch(&repo, "feature", "added.txt", "body").await;
+    let work = {
+        let out = git_cmd(&["rev-parse", "feature"], &repo).await.unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let _ = git_cmd(&["merge", "--no-ff", "--no-edit", "feature"], &repo).await;
+
+    assert_eq!(
+        sole_branch_containing(&repo, &work, &["main"])
+            .await
+            .as_deref(),
+        Some("feature"),
+        "main contains the commit after the merge, but it is the diff base"
+    );
+}
+
+#[tokio::test]
+async fn sole_branch_containing_refuses_when_several_branches_qualify() {
+    let (_tmp, repo) = make_test_repo().await;
+    commit_on_branch(&repo, "feature", "added.txt", "body").await;
+    let work = {
+        let out = git_cmd(&["rev-parse", "feature"], &repo).await.unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    // Somebody branched off the work: which one the thread meant is ambiguous.
+    let _ = git_cmd(&["branch", "spin-off", "feature"], &repo).await;
+
+    assert!(
+        sole_branch_containing(&repo, &work, &["main"])
+            .await
+            .is_none(),
+        "two candidates must not be guessed between"
+    );
+}
+
+#[tokio::test]
+async fn sole_branch_containing_is_none_when_the_work_was_deleted() {
+    let (_tmp, repo) = make_test_repo().await;
+    commit_on_branch(&repo, "feature", "added.txt", "body").await;
+    let work = {
+        let out = git_cmd(&["rev-parse", "feature"], &repo).await.unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let _ = git_cmd(&["branch", "-D", "feature"], &repo).await;
+
+    assert!(sole_branch_containing(&repo, &work, &["main"])
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn sole_branch_containing_ignores_the_local_default_too() {
+    // `default_diff_base` resolves to `origin/<default>` when the local default
+    // has diverged, and for-each-ref lists local refs only, so excluding the
+    // base alone would leave local `main` eligible for merged-and-deleted work.
+    let (_tmp, repo) = make_test_repo().await;
+    commit_on_branch(&repo, "feature", "added.txt", "body").await;
+    let work = {
+        let out = git_cmd(&["rev-parse", "feature"], &repo).await.unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let _ = git_cmd(&["merge", "--no-ff", "--no-edit", "feature"], &repo).await;
+    let _ = git_cmd(&["branch", "-D", "feature"], &repo).await;
+
+    assert!(
+        sole_branch_containing(&repo, &work, &["origin/main", "main"])
+            .await
+            .is_none(),
+        "merged and deleted work must not resolve to the default branch"
+    );
+}

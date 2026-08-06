@@ -556,7 +556,7 @@ async fn ensure_terminator_emitted_scopes_check_to_request_event_id() {
 /// token. The agentic loop's cancel branches fire moments later. Without
 /// the dedup gate inside `emit_response_canceled`, the loop's emit lands
 /// on top of the pre-emitted abort and the timeline shows both
-/// "You — Restarted" AND "You — Canceled the response" stacked together.
+/// "Paused by restart" AND "Response canceled" boundaries stacked together.
 /// The gate must read the request_event_id off `meta`, find the prior
 /// terminator, and skip its own emit.
 #[tokio::test]

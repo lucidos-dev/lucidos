@@ -32,3 +32,33 @@ export const PROVIDER_SCOPES: Record<string, string> = {
 export function oauthProviderFor(backupProviderId: string): string {
   return backupProviderId === 'google_drive' ? 'google' : backupProviderId;
 }
+
+/** Which provider the Backup page should open on.
+ *
+ *  `configured` is the `backup_provider` preference as `GET /backup/schedule`
+ *  reports it; `available` is the engine's provider registry, in registry
+ *  order. The configured provider wins whenever the registry still offers it.
+ *
+ *  The page used to seed `available[0].id` unconditionally, which is always
+ *  `google_drive`. An install configured for Dropbox therefore rendered its
+ *  health card, its connected / ready verdict, its *Grant access* button and
+ *  its *Back up now* button against Google Drive, and a schedule change from
+ *  that state would have rewritten `backup_provider` to the provider the user
+ *  never picked.
+ *
+ *  Falling back to the first registry entry is still right when nothing is
+ *  configured: the dropdown has to show something, and the page reports the
+ *  not-connected state for whatever it lands on. It is only wrong as an
+ *  override of a real preference.
+ *
+ *  A configured id the registry does not offer (a provider retired between
+ *  releases, or a hand-edited preference) also falls back, because selecting it
+ *  would leave every provider-scoped control disabled with nothing on screen
+ *  explaining why. */
+export function pickInitialProvider(
+  configured: string | null | undefined,
+  available: { id: string }[],
+): string {
+  if (configured && available.some((p) => p.id === configured)) return configured;
+  return available[0]?.id ?? '';
+}

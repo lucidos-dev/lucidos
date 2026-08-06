@@ -311,6 +311,15 @@ Entry shape: **Where · Gap · Why · Status / workaround.**
 - **Why:** Safe and catastrophic cases are deterministic, but the ambiguous middle is decided by an LLM judge, and "is this a real side-effect?" is genuinely ambiguous — so false positives and false negatives are inherent.
 - **Status:** Open by design — accepted trade-off; the reopen criterion is a too-high judge error rate (fall back to static-only or move inline).
 
+### The command guard does not see through every shell-wrapper or substitution form
+- **Where:** `crates/lucidos-engine/src/engine/command_guard.rs` (`unwrap_shell_command`, `catastrophic_reason`, `bash_destruction_scope`, `segment_heads`)
+- **Gap:** Three forms still resolve to a head that hides what actually runs, so the command can settle `Safe` (no card on the chat lane with the judge off) or map to `RequestVerdict::Benign` and auto-allow on the unattended coding-agent lane:
+  1. **A wrapper behind a benign prefix.** `unwrap_shell_command` resolves the FIRST token, so `sudo bash -c '...'` and `env bash -c '...'` are not unwrapped. The decorated forms (`\bash`, `"bash"`) are, since 2026-08-06.
+  2. **Command substitution.** `echo $(rm -rf /)` and the backtick form read as head `echo`. `segment_is_safe` refuses to settle them, but `fallback_classify` then reads the same head and lands on `Safe`.
+  3. **`segment_heads` uses a raw head**, so the stored allow pattern for `"rm" -rf x` is `Bash("rm":*)`, which no later `rm` matches.
+- **Why:** Each fix is a policy call, not a mechanical one. Command substitution is pervasive in legitimate shell usage (`cd $(git rev-parse --show-toplevel)`), so routing all of it to a block, or even always to the judge, has a real over-blocking cost. And `segment_heads` feeds both the stored pattern and the grant match, so normalizing it would make an existing `Bash(rm:*)` grant start covering `\rm`, which is the one direction that loosens.
+- **Status:** Open. Tracked as work items `harden-20260806-command-substitution-settles-safe` and the notes in `docs/code-review-priors.md`. The likely shape for (1) and (2) is to have `catastrophic_reason` and `bash_destruction_scope` recurse into wrapper and substitution bodies the way the segment scan already recurses into `sh -c`, so the inner command is classified on its own merits.
+
 ### AskUserQuestion is capped at 4 options and 4 questions
 - **Where:** `docs/adr/0017-ask-user-question-four-option-cap.md`, `crates/lucidos-engine/src/llm/tools/misc.rs` (`maxItems: 4`)
 - **Gap:** A question asked via the agent's `ask_user_question` tool (and Claude Code's `AskUserQuestion`) can present at most 4 tappable options, and at most 4 questions per call.

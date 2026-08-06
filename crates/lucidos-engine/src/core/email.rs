@@ -371,8 +371,36 @@ fn mime_type_from_extension(filename: &str) -> String {
 /// Client for reading and sending emails via IMAP/SMTP
 pub struct EmailClient;
 
+/// Reject a raw IMAP SEARCH fragment that carries a bare CR or LF.
+///
+/// [`build_imap_query`]'s output is interpolated verbatim into the
+/// `UID SEARCH <query>` command line by `async_imap::Session::uid_search`,
+/// which (unlike `select` / `create` / `rename`) does NOT run the crate's own
+/// `validate_str` guard. A line break in `search` or `since` therefore ends the
+/// command line, and everything after it is read by the server as a SECOND
+/// command: a `read_emails` argument of
+/// `ALL<CR><LF>A1 STORE 1:* +FLAGS (\Deleted)` flags the whole mailbox for
+/// deletion. Both arguments come straight off the `read_emails` tool call, and
+/// that tool's own results put untrusted message bodies into the model's
+/// context, so the injection is reachable without a compromised user.
+///
+/// Neither character can appear in a legitimate criterion (RFC 3501 makes the
+/// line terminator the command delimiter), so rejecting them costs no real
+/// search. Mirrors async-imap's `validate_str`, which checks exactly these two.
+fn reject_imap_line_break(label: &str, value: &str) -> Result<(), BoxError> {
+    if value.contains(['\r', '\n']) {
+        return Err(format!(
+            "email {label} must not contain a line break: it is sent verbatim on the IMAP \
+             command line, where a carriage return or newline would run as a second command"
+        )
+        .into());
+    }
+    Ok(())
+}
+
 /// Build an IMAP SEARCH query string from optional search criteria and date filter.
 /// The `search` parameter is passed through directly as IMAP criteria (e.g. `FROM "user@example.com"`).
+/// Callers MUST have run [`reject_imap_line_break`] over both arguments first.
 fn build_imap_query(search: Option<&str>, since: Option<&str>) -> String {
     match (search, since) {
         (Some(s), Some(d)) => format!("SINCE {} {}", d, s),

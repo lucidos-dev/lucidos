@@ -502,7 +502,7 @@ function ThreadList() {
             : {
                 categorized: { current: [], saved: [], archive: [], statusMap: new Map() },
                 familyGraph: { byId: new Map(), rootByThread: new Map() },
-                decorations: { routedByThread: new Map(), liftedRoots: new Set() },
+                decorations: { routedByThread: new Map(), liftedRoots: new Set(), archivedSubThreads: new Set() },
             },
         [hydrated, threadMapValue, filter, triggerSelection, repoSelection, appSelection],
     );
@@ -721,6 +721,7 @@ function ThreadList() {
                                         depth={n.depth}
                                         isLiftedParent={isLiftedParent}
                                         isResponsibleChild={isResponsibleChild}
+                                        isArchivedSubThread={decorations.archivedSubThreads.has(id)}
                                         enableFamilyToggle
                                     />
                                 );
@@ -878,7 +879,7 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
 /** The repo / app / trigger name chip. A long name WRAPS inside the chip's
  *  CSS `max-width` (see `.thread-row-context` in drawer.css), but a constrained
  *  box sits at its constraint, not at the widest resulting line — so a name that
- *  wraps to e.g. "JOBS DATA" / "AQUARIUM" leaves dead space to the right of the
+ *  wraps to e.g. "Habit" / "Tracker" leaves dead space to the right of the
  *  shorter line. Pure CSS can't shrink a box to the longest line of *wrapped*
  *  text (the line breaks depend on the width we'd be deriving from them), so we
  *  measure the rendered line boxes and pin the chip to its widest line. A
@@ -904,8 +905,8 @@ function DrawerSectionTitle({ sectionKey, title, Icon, count, hasRunning, collap
  *     (visual `getBoundingClientRect` width ÷ layout `offsetWidth`).
  *     `getClientRects` returns TRANSFORM-scaled geometry, so a FLIP row animation
  *     (the wrapper animates `scale(0.95 → 1.03)` on mount / reorder) mid-measure
- *     would shrink every line and pin a hair too narrow — the intermittent
- *     "AQUARIU / M" break. Un-scaling recovers the true line widths at any frame.
+ *     would shrink every line and pin a hair too narrow (the intermittent
+ *     "Track / er" break). Un-scaling recovers the true line widths at any frame.
  *
  *  3. Pin the width in `rem` (px ÷ root font-size), NOT `px`. The chip's
  *     font-size and padding are rem-based, so a rem width tracks the text when the
@@ -1073,6 +1074,11 @@ interface ThreadRowContentProps {
      *  matches the routed section, inside a lifted family — i.e. the row that
      *  earned the lift. Drives the bright accent rail. */
     isResponsibleChild?: boolean;
+    /** Set when this row's own natural section is Archive while its family
+     *  routed to a live section (Current / Pinned). Drives the disabled
+     *  styling, so an archived sub-thread listed under a parent with live work
+     *  reads as already put away. */
+    isArchivedSubThread?: boolean;
     /** True when this row anchors a family with sub-threads AND we're in the
      *  nested ThreadList (not search / drafts, which render flat). Enables the
      *  bottom-left disclosure chevron + collapsed-state count. */
@@ -1104,6 +1110,10 @@ function ThreadRowContentImpl(props: Partial<ThreadRowContentProps>) {
 
     const wrapClasses = ['thread-row-wrap'];
     if (depth > 0) wrapClasses.push('is-nested');
+    // On the WRAPPER, not the row: the status dot is the wrapper's child (it
+    // holds a fixed left column at every depth), and it has to dim with the
+    // rest of the row.
+    if (props.isArchivedSubThread) wrapClasses.push('is-archived');
 
     // aria stays a smart-plural bare count; the visible sub-thread count rides
     // in a badge shown only while the family is collapsed (expanded families
@@ -1257,6 +1267,7 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
     && prev.isHighlighted === next.isHighlighted
     && prev.isLiftedParent === next.isLiftedParent
     && prev.isResponsibleChild === next.isResponsibleChild
+    && prev.isArchivedSubThread === next.isArchivedSubThread
     && prev.collapsible === next.collapsible
     && prev.isCollapsed === next.isCollapsed
 );
@@ -1264,12 +1275,13 @@ const ThreadRowContent = memo(ThreadRowContentImpl, (prev, next) =>
 // Reading composeDrafts here would fan a re-render to every visible ThreadRow
 // per keystroke — the lag this signal was added to prevent.
 
-export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, enableFamilyToggle }: {
+export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isResponsibleChild, isArchivedSubThread, enableFamilyToggle }: {
     threadId: string;
     status: ThreadStatus;
     depth?: number;
     isLiftedParent?: boolean;
     isResponsibleChild?: boolean;
+    isArchivedSubThread?: boolean;
     /** Render the bottom-left disclosure chevron when this thread has
      *  sub-threads. Only the nested ThreadList sets it — search / drafts render
      *  flat lists where collapsing nothing visible would be a no-op. */
@@ -1321,6 +1333,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
             isHighlighted={isHighlighted}
             isLiftedParent={isLiftedParent}
             isResponsibleChild={isResponsibleChild}
+            isArchivedSubThread={isArchivedSubThread}
             collapsible={hasFamily}
             isCollapsed={isCollapsed}
             onToggleFamily={() => toggleFamilyCollapse(meta.id)}

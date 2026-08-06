@@ -122,6 +122,70 @@ pub(crate) async fn lookup_latest_worktree_path(
     .map(PathBuf::from)
 }
 
+/// The thread's last known `(has_changes, requires_restart)` coding-agent
+/// change state. This is what an idle preserves when its diff probe could not
+/// be answered: an unanswered probe is UNKNOWN, and writing `false` there is
+/// what left external-repo threads with a dark Diff button after their branch
+/// was renamed mid-session.
+///
+/// Each half is read from the surface that owns it.
+///
+/// `has_changes` comes from `thread_summaries.coding_agent_has_diff`, the exact
+/// column the `CodingAgentIdled` projection writes, so preserving it makes the
+/// emit a no-op instead of a downgrade. It is also the only source that is
+/// right on a **first** turn, because the worktree's post-commit hook
+/// (`coding_agent_diff_refresh`) has already corrected it mid-turn from the
+/// branch the worktree is really on, and there is no previous idle event to
+/// read. An apply or discard resets the column, so a stale `true` cannot
+/// outlive the change it described.
+///
+/// `requires_restart` is NOT projected (the `CodingAgentIdled` arm leaves that
+/// column to `ChangeProposed`), so it comes from the most recent CC turn-closer
+/// payload. Both default to `false` when nothing is recorded yet.
+pub(crate) async fn lookup_prior_change_flags(
+    pool: &sqlx::PgPool,
+    thread_id: uuid::Uuid,
+) -> (bool, bool) {
+    let has_changes = sqlx::query_scalar::<_, bool>(
+        "SELECT coding_agent_has_diff FROM thread_summaries WHERE thread_id = $1",
+    )
+    .bind(thread_id)
+    .fetch_optional(pool)
+    .await
+    .unwrap_or_else(|e| {
+        log!(
+            "[AgentSession] Failed to read prior coding_agent_has_diff for {}: {}",
+            thread_id,
+            e
+        );
+        None
+    })
+    .unwrap_or(false);
+
+    let query = format!(
+        "SELECT payload FROM events \
+         WHERE aggregate_id = $1 AND event_type IN ({}) \
+         ORDER BY created DESC LIMIT 1",
+        CC_TURN_CLOSER_EVENTS,
+    );
+    let requires_restart = sqlx::query_scalar::<_, serde_json::Value>(&query)
+        .bind(thread_id.to_string())
+        .fetch_optional(pool)
+        .await
+        .unwrap_or_else(|e| {
+            log!(
+                "[AgentSession] Failed to read prior requires_restart for {}: {}",
+                thread_id,
+                e
+            );
+            None
+        })
+        .and_then(|payload| payload.get("requires_restart").and_then(|v| v.as_bool()))
+        .unwrap_or(false);
+
+    (has_changes, requires_restart)
+}
+
 /// Resolve the worktree path for the next CC spawn on `thread_id`.
 ///
 /// Resolution order:

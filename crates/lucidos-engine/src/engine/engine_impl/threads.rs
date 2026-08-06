@@ -54,6 +54,29 @@ impl LucidosEngine {
         }
     }
 
+    /// Record the `request_event_id` this turn stamps on its own events, so an
+    /// abort emitted from outside the loop (restart teardown, stuck-turn
+    /// eviction, shutdown sweep) terminates THIS turn rather than whichever
+    /// originating-type event happens to be newest. Read back by
+    /// `engine::in_flight_request_event_id`; see [`ThreadHandle::request_event_id`]
+    /// for what goes wrong without it.
+    ///
+    /// `generation` is the caller's own registration ([`ThreadGuard::generation`])
+    /// and is load-bearing; `record_request_event_id` documents why.
+    pub fn set_thread_request_event_id(
+        &self,
+        thread_id: Uuid,
+        generation: u64,
+        request_event_id: Uuid,
+    ) {
+        crate::engine::record_request_event_id(
+            &self.active_threads,
+            thread_id,
+            generation,
+            request_event_id,
+        );
+    }
+
     /// The `injection_notify` + unread-count pair for a thread, for a tool that
     /// wants to stop blocking when the user says something. `None` once the
     /// thread is deregistered.
@@ -158,6 +181,7 @@ impl LucidosEngine {
                 &self.event_bus,
                 &self.pool,
                 &self.agent_sessions,
+                &self.active_threads,
                 thread_id,
             )
             .await;
@@ -174,7 +198,7 @@ impl LucidosEngine {
     /// `/api/v1/restart` chat pre-emit, where stripping the entry up-front
     /// removes the thread from `processing_thread_ids()` so the subsequent
     /// `shutdown_active_threads` sweep doesn't double-emit a System abort on
-    /// top of the device "Restarted" panel we just persisted.
+    /// top of the device "Paused by restart" panel we just persisted.
     pub(super) fn force_evict_chat_thread(&self, thread_id: Uuid) {
         if let Some(handle) = self.active_threads.lock().unwrap().remove(&thread_id) {
             handle.token.cancel();
@@ -209,6 +233,60 @@ impl LucidosEngine {
         } else {
             false
         }
+    }
+
+    /// Cancel a live Lucidos Agent turn because an urgent child follow-up is
+    /// superseding it. The Lucidos Agent's half of interrupt-and-redirect, and
+    /// deliberately a distinct entry point from [`Self::cancel_thread`]: the
+    /// two differ in what the interrupted turn is *called*, and the difference
+    /// is user-visible. A Stop click is an abandonment (`UserStop`, rendered
+    /// "Canceled x", reported to a parent as a terminal child outcome); a
+    /// redirect is a steer (`SupersededByFollowup`, rendered neutrally, and
+    /// excluded from the parent-callback terminal set so the parent is not
+    /// woken with a false "child canceled" card for work that continues in the
+    /// very next turn).
+    ///
+    /// The caller must NOT also inject the follow-up. The redirected message
+    /// runs as the NEXT turn, routed through `register_thread_queued`, which
+    /// waits for this turn to release the handle. Injecting first would race
+    /// the loop's own drain: a prompt consumed by the dying turn's final
+    /// iteration is neither answered nor left behind for the orphan chain.
+    ///
+    /// Returns `false` when the thread has no live turn, in which case there
+    /// was nothing to preempt and the follow-up simply starts one.
+    pub fn cancel_thread_for_followup(
+        &self,
+        thread_id: Uuid,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> bool {
+        if let Some(handle) = self.active_threads.lock().unwrap().get(&thread_id) {
+            if actor.is_some() {
+                *handle.cancel_actor.lock().unwrap() = actor;
+            }
+            handle
+                .redirect_followup
+                .store(true, std::sync::atomic::Ordering::Release);
+            handle.token.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Read and clear the redirect flag set by
+    /// [`Self::cancel_thread_for_followup`]. The agentic-loop cancel arms call
+    /// this to pick `SupersededByFollowup` over `UserStop`. Drained on read, so
+    /// a stale flag cannot relabel the next turn on the same thread. The
+    /// `active_threads` analog of `take_session_redirect_followup`.
+    pub fn take_redirect_followup(&self, thread_id: Uuid) -> bool {
+        self.active_threads
+            .lock()
+            .unwrap()
+            .get(&thread_id)
+            .is_some_and(|h| {
+                h.redirect_followup
+                    .swap(false, std::sync::atomic::Ordering::AcqRel)
+            })
     }
 
     /// Read and clear the pending cancel actor for `thread_id`. Returns
@@ -258,6 +336,31 @@ impl LucidosEngine {
                 .into());
             }
         };
+        // **The parent may have been waiting for this itself.** A thread can
+        // `await_event` on `ChildThreadCompleted`, and the card the fan-in just
+        // emitted is a bus event like any other, so the event-wait dispatcher
+        // matches it and drives its own wake. Both wakes then want the same
+        // turn: on 2026-08-06 the fan-in's won the race, the wait's queued
+        // behind it, and the 60 s stuck-turn backstop evicted the running turn
+        // to let the second one in. That eviction is gone with the attached
+        // shape, but two turns telling the parent one thing is still wrong.
+        //
+        // So the wait's wake wins and this one stands down. The card is already
+        // persisted and the counter reconciled in its own transaction, so the
+        // parent still learns everything it would have; only the duplicate turn
+        // is dropped.
+        if self
+            .child_completion_has_an_event_wait(parent_thread_id, child_completed_event_id, &row)
+            .await
+        {
+            crate::log!(
+                "[FanOut] Parent {} was awaiting this completion; its event wait carries the \
+                 wake, so the fan-in callback stands down (one turn, not two)",
+                parent_thread_id
+            );
+            return Ok(());
+        }
+
         let block = crate::core::store::format_child_thread_completed_block(&row);
 
         let callback_origin = Some(thread_events::MessageOrigin::thread_link_child(
@@ -286,9 +389,79 @@ impl LucidosEngine {
             Some(PreEmittedOrigin::EngineReentry(child_completed_event_id)),
             None,
             callback_origin,
+            crate::engine::FollowUpUrgency::Normal,
         )
         .await
         .map(|_| ())
+    }
+
+    /// Will one of the parent's own *event waits* carry this
+    /// `ChildThreadCompleted` instead? See the call site for why the fan-in
+    /// callback stands down when it will.
+    ///
+    /// **Two probes, because the two consumers race and either can win.** The
+    /// fan-in and the event-wait dispatcher are both woken by the same
+    /// post-commit broadcast, on separate tasks, in no fixed order:
+    ///
+    /// - The dispatcher has NOT run yet: the wait is still in the live cache and
+    ///   still matches this event, so it is going to resolve it. Standing down
+    ///   is safe, and the persisted-row probe alone would miss this (the row
+    ///   does not exist yet), which is exactly the hole the first version of
+    ///   this gate had. It read the row and nothing else, so it essentially
+    ///   never fired.
+    /// - The dispatcher HAS run: the wait is gone from the cache, but its
+    ///   `EventWaitDelivered` names this event id.
+    ///
+    /// **Both probes answer "no" when they cannot run.** No is the recoverable
+    /// direction: it costs a duplicate turn the user can read, where a wrong
+    /// yes leaves the parent with a completion card and no reaction at all. The
+    /// one gap this leaves is a wait taken from the cache whose delivery emit
+    /// then fails and re-arms it, which is a transient-write path where a
+    /// duplicate is again the right side to land on.
+    async fn child_completion_has_an_event_wait(
+        &self,
+        parent_thread_id: Uuid,
+        child_completed_event_id: Uuid,
+        row: &crate::core::EventRow,
+    ) -> bool {
+        // Probe 1, the live cache. Scoped to a wait that actually MATCHES this
+        // event: a thread may hold several, and one watching something else
+        // says nothing about this completion.
+        if !self.live_waits.is_empty().await {
+            let live = self.live_waits.for_thread(parent_thread_id).await;
+            if !crate::engine::event_wait::waits_matching(&live, &row.event_type, &row.payload)
+                .is_empty()
+            {
+                return true;
+            }
+        }
+
+        // Probe 2, the persisted resolution.
+        match sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS ( \
+                 SELECT 1 FROM events d \
+                 WHERE d.aggregate = 'thread' \
+                   AND d.aggregate_id = $1 \
+                   AND d.event_type = 'EventWaitDelivered' \
+                   AND d.payload->>'event_id' = $2 \
+             )",
+        )
+        .bind(parent_thread_id.to_string())
+        .bind(child_completed_event_id.to_string())
+        .fetch_one(self.pool())
+        .await
+        {
+            Ok(consumed) => consumed,
+            Err(e) => {
+                crate::log!(
+                    "[FanOut] Event-wait consumption probe failed for parent {}: {} \
+                     (sending the callback anyway; a duplicate turn beats a silent parent)",
+                    parent_thread_id,
+                    e
+                );
+                false
+            }
+        }
     }
 
     /// Get a reference to the memory extractor (for Flash title generation, etc.)
@@ -296,8 +469,20 @@ impl LucidosEngine {
         self.extractor.as_ref()
     }
 
+    /// Does this thread have a live chat loop right now?
+    ///
+    /// The single-thread question `processing_thread_ids` answers in bulk, so a
+    /// caller that only cares about one thread does not allocate the whole
+    /// list. Used by the event-wait dispatcher: a wake can only fill a parked
+    /// turn's dangling tool call in, so a thread that is already running has to
+    /// be woken as a new exchange instead.
+    pub fn thread_is_processing(&self, thread_id: Uuid) -> bool {
+        self.active_threads.lock().unwrap().contains_key(&thread_id)
+    }
+
     /// Get list of thread IDs with a live processing task (chat loop running).
-    /// Does NOT include idle coding-agent sessions — those are tracked via thread_summaries.status.
+    /// Does NOT include idle coding-agent sessions, which are tracked via
+    /// `thread_summaries.status`.
     pub fn processing_thread_ids(&self) -> Vec<Uuid> {
         self.active_threads
             .lock()

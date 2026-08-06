@@ -22,19 +22,35 @@ export async function ensureThreadStarted(id: string, mode: string): Promise<voi
   await throwIfNotOk(res);
 }
 
+/** What the engine did with a compose write.
+ *
+ *  `stale` is NOT an error, which is why it is a return value rather than a
+ *  throw: the write was composed against a *compose epoch* a submission has
+ *  since consumed, so the engine dropped it and handed back the current epoch.
+ *  The caller adopts that value and re-issues. Throwing would route it into the
+ *  "the engine refused, tell the user" branch, and the user has nothing to fix. */
+export type ComposePutResult =
+  | { status: 'applied' }
+  | { status: 'stale'; composeEpoch: number };
+
 /** PUT /api/v1/threads/:id/compose. `image_hashes` semantics mirror the
  *  SQL COALESCE on the backend: `null` preserves, `[]` clears, `[h,…]`
  *  replaces. Hashes come from prior `uploadThreadBlob` calls. `selection`
  *  follows the same COALESCE-preserve rule: `undefined` (omitted) preserves the
- *  stored per-draft dropdown selection — so a text-only keystroke PUT never
- *  wipes the draft's picks — while an object replaces it. */
+ *  stored per-draft dropdown selection (a text-only keystroke PUT never wipes
+ *  the draft's picks), while an object replaces it.
+ *
+ *  `composeEpoch` is the write fence: the epoch this draft was composed
+ *  against. Omitting it asks the engine to apply the write unfenced, which only
+ *  a client that predates the epoch should do. */
 export async function putComposeOnThread(
   threadId: string,
   text: string,
   imageHashes: string[] | null,
   mode: string | null,
   selection?: ComposeSelectionOverride,
-): Promise<void> {
+  composeEpoch?: number,
+): Promise<ComposePutResult> {
   const res = await mutatingFetchIdempotent(
     `${API}/threads/${encodeURIComponent(threadId)}/compose`,
     {
@@ -42,10 +58,26 @@ export async function putComposeOnThread(
       headers: { 'Content-Type': 'application/json' },
       // Omit `selection` when undefined so the backend COALESCE preserves the
       // stored value (a bare keystroke PUT must not clobber the picks).
-      body: JSON.stringify({ text, image_hashes: imageHashes, mode, selection }),
+      body: JSON.stringify({
+        text,
+        image_hashes: imageHashes,
+        mode,
+        selection,
+        compose_epoch: composeEpoch,
+      }),
     },
   );
+  if (res.status === 412) {
+    // The body carries the epoch the engine now holds. A malformed one would
+    // leave the caller unable to make progress, so fall through to the throw
+    // rather than guessing an epoch: a refusal the caller cannot act on is at
+    // least a refusal the user is told about.
+    const body = await res.json().catch(() => null);
+    const epoch = (body as { compose_epoch?: unknown } | null)?.compose_epoch;
+    if (typeof epoch === 'number') return { status: 'stale', composeEpoch: epoch };
+  }
   await throwIfNotOk(res);
+  return { status: 'applied' };
 }
 
 /** Response shape from `POST /api/v1/threads/:id/blobs`. */

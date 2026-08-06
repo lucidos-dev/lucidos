@@ -127,7 +127,10 @@ describe('todoListPanelBody', () => {
       { content: 'Write docs', active_form: 'Writing docs', status: 'completed' },
     ];
     const text = vnodeToText(todoListPanelBody({ items, onClose: NOOP }));
-    expect(text).toContain('data-role="todo-panel"');
+    // The body renders the panel's CONTENTS; the `.todo-panel` box itself is
+    // the <Overlay> panel, which is what `useAnchoredPosition` positions. So
+    // the list container is the identity marker here, not the panel's role.
+    expect(text).toContain('todo-panel-list');
     expect(text).toContain('Run tests');
     expect(text).toContain('Write docs');
     // The active_form variants must NOT leak for pending/completed rows.
@@ -158,7 +161,7 @@ describe('todoListPanelBody', () => {
 
   it('renders an empty panel (no rows) when items is empty — used as the cleared state', () => {
     const text = vnodeToText(todoListPanelBody({ items: [], onClose: NOOP }));
-    expect(text).toContain('data-role="todo-panel"');
+    expect(text).toContain('todo-panel-list');
     expect(text).not.toContain('data-status=');
   });
 

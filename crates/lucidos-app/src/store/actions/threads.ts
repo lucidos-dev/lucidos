@@ -91,11 +91,14 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   //
   // The message deliberately does NOT claim where the user was taken, because
   // the recovery scroll is conditional (it stands down for a user who scrolled
-  // away during the wait) while the message is not.
+  // away during the wait) while the message is not. It does not name the SOURCE
+  // either: a notification tap is no longer the only way in, since the event-wait
+  // card's "show it" (`showEventWhereItLives`) lands here too, and telling that
+  // user about a notification they never received would be a plain lie.
   if (targetEventId) {
     scrollToEventAndPulse(targetEventId, {
       onUnresolved: () => showToast(
-        'The event this notification points at is not shown in this thread.',
+        'That event is not shown in this thread.',
         'warning',
       ),
     });

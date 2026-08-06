@@ -73,6 +73,18 @@ pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
 /// token; verified against [`AGENT_ORIGIN_SECRET`] by [`subprocess_origin`].
 pub const HEADER_AGENT_ORIGIN_TOKEN: &str = "x-lucidos-agent-origin-token";
 
+/// Header carrying the workspace the caller believes it is talking to: the
+/// *target workspace assertion*. Verified by `api::target_workspace`, which
+/// refuses the request with 409 when it names a workspace other than the one
+/// this engine serves.
+///
+/// Distinct from the `caller_workspace` body field, and the pair is easy to
+/// confuse: `caller_workspace` says who is CALLING (a display hint, never
+/// authorization), this says who the caller thinks it is CALLING. Same
+/// CLI-mirror rule as [`HEADER_AGENT_ORIGIN_TOKEN`]: the literal is duplicated
+/// in `crates/lucidos-cli/src/http.rs` and the two must be renamed in lockstep.
+pub const HEADER_TARGET_WORKSPACE: &str = "x-lucidos-target-workspace";
+
 /// Env-var name for the thread-bound origin token. Engine sets it; CLI
 /// forwards it as [`HEADER_AGENT_ORIGIN_TOKEN`]. The CLI mirrors this literal
 /// because it can't depend on the engine crate (no `lucidos-common`); rename
