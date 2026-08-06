@@ -8,8 +8,16 @@ pub struct ProviderInfo {
     pub name: &'static str,
     /// Whether an OAuth account exists for this provider.
     pub connected: bool,
-    /// Whether connected AND the account's scopes contain the required scope.
+    /// Whether connected AND the account's scopes contain every required scope.
     pub ready: bool,
+    /// Which required scopes a CONNECTED account is missing, in the provider's
+    /// declared order. Empty for a ready provider and for one with no account.
+    ///
+    /// The page names them. "Access not granted" on its own cannot distinguish a
+    /// grant that never happened from one that came back a scope short, which is
+    /// the dead end a user hit after completing a Dropbox authorization and
+    /// finding the same red line waiting for them.
+    pub missing_scopes: Vec<&'static str>,
     /// Web URL to this provider's backups folder ("View backups folder" link), or
     /// null when the provider can't form one.
     pub folder_url: Option<String>,
@@ -82,10 +90,10 @@ pub async fn list_providers(
         // a transient DB failure must not be reported as "no OAuth account".
         // `provider_readiness` is shared with the agent's `get_backup_status`, so
         // the page and the agent cannot disagree about whether a provider works.
-        let backup::ProviderReadiness { connected, ready } =
-            backup::provider_readiness(&state.pool, &meta)
-                .await
-                .map_err(|e| ApiError::internal(e.to_string()))?;
+        let readiness = backup::provider_readiness(&state.pool, &meta)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        let ready = readiness.ready();
         // Best-effort folder link, computed only for a ready provider (it's the
         // only state the link is shown in). For Drive this resolves the folder id
         // live with one Drive lookup, so bound it — a slow or unreachable provider
@@ -106,8 +114,9 @@ pub async fn list_providers(
         result.push(ProviderInfo {
             id: meta.id,
             name: meta.name,
-            connected,
+            connected: readiness.connected,
             ready,
+            missing_scopes: readiness.missing_scopes,
             folder_url,
         });
     }
@@ -451,6 +460,45 @@ mod tests {
             filename: format!("lucidos-backup-{id}.enc"),
             size_bytes: 1024,
             created_at: Utc::now() - age,
+        }
+    }
+
+    /// The page and the agent both read `missing_scopes` off this response, so
+    /// the field has to survive serialization under that exact name and has to
+    /// be present (as `[]`) rather than skipped when there is no gap: an absent
+    /// key is what the frontend's nullish guard has to treat as "an engine too
+    /// old to answer".
+    #[test]
+    fn provider_info_reports_the_missing_scopes_it_was_built_with() {
+        let short = ProviderInfo {
+            id: "dropbox",
+            name: "Dropbox",
+            connected: true,
+            ready: false,
+            missing_scopes: vec!["files.metadata.read"],
+            folder_url: None,
+        };
+        let v = serde_json::to_value(&short).unwrap();
+        assert_eq!(v["connected"], true);
+        assert_eq!(v["ready"], false);
+        assert_eq!(
+            v["missing_scopes"],
+            serde_json::json!(["files.metadata.read"])
+        );
+
+        // Ready, and not connected, both report an empty list rather than
+        // omitting the key or listing every scope.
+        for (connected, ready) in [(true, true), (false, false)] {
+            let v = serde_json::to_value(ProviderInfo {
+                id: "dropbox",
+                name: "Dropbox",
+                connected,
+                ready,
+                missing_scopes: Vec::new(),
+                folder_url: None,
+            })
+            .unwrap();
+            assert_eq!(v["missing_scopes"], serde_json::json!([]));
         }
     }
 

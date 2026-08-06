@@ -59,17 +59,80 @@
     font-size: var(--font-size-xs);
 }
 
-/* "No <provider> account connected" + the button that fixes it. Same red as the
-   other blocked states on this page, but it is a row rather than a sentence,
-   because the fix lives on another Settings page and the user needs a way to
-   get there rather than a path to walk. Wraps so the button drops below the
-   text on a narrow pane instead of squeezing it. */
-.backup-not-connected-row {
+/* A provider that cannot upload, plus the button that fixes it. ONE class for
+   both blocked states (no account connected, and connected without the
+   permissions a backup needs): they sit in the same slot, say the same kind of
+   thing and offer the same kind of button, so they must not be spaced or sized
+   differently. They were, because the not-granted half was an inline
+   `style="display: flex; …"` copy of this rule that had lost its bottom margin
+   and its wrap, which is why the red line, its button and the row below all
+   collided in the reported screenshot.
+
+   A row rather than a sentence because the fix is a place to go rather than a
+   path to walk, and it wraps so the button drops below the text on a narrow
+   pane instead of squeezing it.
+
+   One step up the type scale from the --font-size-xs the not-connected half
+   used, deliberately: it now sits alongside a permission name the user has to
+   read and act on, and it matches the health card and the section description
+   directly above it, which is the rest of what this page says in prose. */
+.backup-blocked-row {
     display: flex;
     align-items: center;
     gap: var(--space-sm);
     flex-wrap: wrap;
     margin-bottom: var(--space-sm);
+    font-size: var(--font-size-sm);
+    color: var(--accent-red);
+}
+
+/* Back up now + the schedule and retention pickers. The section's rows carried
+   no shared rhythm at all before (five of them were inline styles with their
+   own eyeballed margins, and this one had none), so this row sat flush against
+   whichever state line preceded it. The gap above is what separates "what is
+   wrong with the destination" from "what you can do now". */
+.backup-actions-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    flex-wrap: wrap;
+    margin-top: var(--space-md);
+}
+
+/* Explains when a non-manual schedule actually fires. Sits tight under the row
+   it qualifies. */
+.backup-schedule-hint {
+    margin-top: var(--space-xs);
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+}
+
+/* The encryption key is a separate concern from where and when backups run, so
+   it opens a full gutter below the controls rather than continuing their
+   rhythm. */
+.backup-key-row {
+    display: flex;
+    align-items: center;
+    gap: var(--space-md);
+    flex-wrap: wrap;
+    margin-top: var(--space-lg);
+}
+
+/* The revealed key. Monospace and fully selectable: the user is here to copy it
+   somewhere safe, and the Copy button next to it is not the only way people do
+   that. */
+.backup-key-value {
+    font-size: var(--font-size-xs);
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    user-select: all;
+    overflow-wrap: anywhere;
+}
+
+/* Shown only while the key is revealed: this is the one irreversible obligation
+   on the page. */
+.backup-key-warning {
+    margin-top: var(--space-xs);
     font-size: var(--font-size-xs);
     color: var(--accent-red);
 }

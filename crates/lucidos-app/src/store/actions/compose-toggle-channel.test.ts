@@ -136,6 +136,7 @@ function makeMeta(id: string, overrides: Partial<ThreadMeta>): ThreadMeta {
     lastRevivedAt: '',
     state: 'composing',
     latestTodoList: null,
+    liveEventWaitCount: 0,
     liveEventWaits: [],
     ...overrides,
   };

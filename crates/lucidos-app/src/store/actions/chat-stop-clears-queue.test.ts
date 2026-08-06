@@ -46,7 +46,8 @@ function makeQueuedThread(pending: Array<{ text: string; eventId: string }>): Th
       activeChildrenCount: 0, totalChildrenCount: 0,
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active', latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
     },
     events: new Map<number, StoredEvent>([
       [1, { type: 'MessageReceived', text: 'active', created: TS, _eventId: 'mr-active', channel: 'chat' } as StoredEvent],

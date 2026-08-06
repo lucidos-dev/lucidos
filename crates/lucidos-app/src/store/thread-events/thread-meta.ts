@@ -40,6 +40,10 @@ export type ThreadAggregate = {
    *  bubble the parent to REVIEW even when sibling descendants are still
    *  running. */
   attentionDescendantCount: number;
+  /** How many event waits this thread holds unresolved. Consumed by
+   *  `resolveVisualStatus` via `count > 0`. See `ThreadMeta.liveEventWaitCount`
+   *  for why the count is carried separately from `meta.liveEventWaits`. */
+  liveEventWaitCount: number;
   /** Whether the CC branch has any diff against main on disk — pure git
    *  truth. Backs the WaitingBanner Diff button. Independent of the proposal
    *  lifecycle: a thread can have a diff mid-session before CC has formally
@@ -97,6 +101,7 @@ export function applyAggregateToMeta(meta: ThreadMeta, agg: ThreadAggregate): bo
   if (meta.totalChildrenCount !== agg.totalChildrenCount) { meta.totalChildrenCount = agg.totalChildrenCount; changed = true; }
   if (meta.blockingDescendantCount !== agg.blockingDescendantCount) { meta.blockingDescendantCount = agg.blockingDescendantCount; changed = true; }
   if (meta.attentionDescendantCount !== agg.attentionDescendantCount) { meta.attentionDescendantCount = agg.attentionDescendantCount; changed = true; }
+  if (meta.liveEventWaitCount !== agg.liveEventWaitCount) { meta.liveEventWaitCount = agg.liveEventWaitCount; changed = true; }
   if (meta.codingAgentHasDiff !== agg.codingAgentHasDiff) { meta.codingAgentHasDiff = agg.codingAgentHasDiff; changed = true; }
   if (meta.codingAgentProposed !== agg.codingAgentProposed) { meta.codingAgentProposed = agg.codingAgentProposed; changed = true; }
   if (meta.codingAgentRequiresRestart !== agg.codingAgentRequiresRestart) { meta.codingAgentRequiresRestart = agg.codingAgentRequiresRestart; changed = true; }
@@ -182,6 +187,21 @@ export type ThreadMeta = {
    *  pending changes). Strict subset of `blockingDescendantCount` — drops the
    *  Running case. Consumed by `getThreadDisplaySection` via `count > 0`. */
   attentionDescendantCount: number;
+  /** How many *event waits* this thread holds unresolved, from the backend
+   *  projection (`thread_summaries.live_event_wait_count`). Consumed by
+   *  `resolveVisualStatus` via `count > 0` to paint the same Waiting dot
+   *  active children paint: both mean the thread finished its turn and is not
+   *  done, because something else will wake it.
+   *
+   *  Deliberately NOT derived from `liveEventWaits.length`, even though the
+   *  two agree whenever both are populated. That list is folded from this
+   *  thread's own events, so it is empty for every drawer row whose events
+   *  were never loaded and empty again after a reload, which would make the
+   *  dot vanish exactly when the user is scanning for it. This count arrives
+   *  on the thread list and on every per-event aggregate, so it is right
+   *  everywhere and from the first paint. The list stays the source for the
+   *  subscription indicator, which needs each wait's reason and deadline. */
+  liveEventWaitCount: number;
   /** Whether the CC branch has any diff against main on disk — pure git
    *  truth. Backs the WaitingBanner Diff button. Independent of the proposal
    *  lifecycle: a thread can have a diff mid-session before CC has formally
@@ -238,15 +258,15 @@ export type ThreadMeta = {
    *  per render) so the prompt-bar indicator doesn't walk the events Map on
    *  every threadMap flush — see `TodoListIndicator`. */
   latestTodoList: TodoItem[] | null;
-  /** Live *event waits* on this thread, oldest first. Maintained in
-   *  `handleEvent`: `EventWaitStarted` appends, the three resolutions remove by
-   *  `wait_id`, and the filler `ToolResult` flips `attached` to false.
+  /** Live *event waits* on this thread, oldest first, with each one's reason,
+   *  subscription and deadline. Maintained in `handleEvent`:
+   *  `EventWaitStarted` appends, the three resolutions remove by `wait_id`.
    *
-   *  Separate from `status` on purpose (S10b). The status tracks the TURN, so a
-   *  thread holding only DETACHED waits reads as `idle` while still watching;
-   *  this list is what the always-visible subscription indicator renders, and
-   *  it is the only surface that answers "what is this thread subscribed to
-   *  right now" without scrolling the transcript. */
+   *  This is what the always-visible subscription indicator renders, and the
+   *  only surface answering "what is this thread subscribed to right now"
+   *  without scrolling the transcript. It is populated only for a thread whose
+   *  events are loaded, which is why the status dot reads the projected
+   *  `liveEventWaitCount` instead of this list's length. */
   liveEventWaits: EventWaitSummary[];
 };
 
@@ -327,6 +347,7 @@ export function makeOptimisticThreadState(opts: {
       totalChildrenCount: 0,
       blockingDescendantCount: 0,
       attentionDescendantCount: 0,
+      liveEventWaitCount: 0,
       codingAgentHasDiff: false,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,

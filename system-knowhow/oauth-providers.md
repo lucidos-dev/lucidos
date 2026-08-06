@@ -1,6 +1,6 @@
 ---
 name: OAuth Providers Registry
-description: The registry of OAuth 2.0 provider endpoints (auth_url / token_url / userinfo_url + its userinfo_method, the authorize_params a provider needs to issue a refresh token, default base URL, typical scopes) the agent consults when collecting OAuth client credentials. Also states that an oauth_client credential is named for the provider alone, with auth_type as the thing that marks it (the legacy oauth:<provider> prefix is stripped on write), and that connect_oauth_account is the one call for the whole flow, rather than a hand-rolled request_credential first. Load this BEFORE calling request_credential (auth_type oauth_client) or connect_oauth_account so you can pass the endpoints and the credential modal pre-fills them instead of forcing the user to type Google's / Microsoft's own URLs by hand. Covers the alias rule for dedicated connections (e.g. a health-only Google connection named "ghealth" reuses Google's endpoints), the loopback redirect URI and when to override its host form, the confidential-vs-public client rule (a blank client secret means PKCE), Microsoft Entra's redirect-URI platform buckets and the AADSTS90023 / AADSTS50011 symptoms they cause, the Dropbox App Console rule that its Permissions tab caps what may be requested and that enabling a scope never upgrades a token or grant that already exists (reconnect), the Dropbox scope set a backup needs, and how to add a new provider (edit this file, no engine change). Maintain this file: when you discover a provider's endpoints via web_search, add a row here.
+description: The registry of OAuth 2.0 provider endpoints (auth_url / token_url / userinfo_url + its userinfo_method, the authorize_params a provider needs to issue a refresh token, default base URL, typical scopes) the agent consults when collecting OAuth client credentials. Also states that an oauth_client credential is named for the provider alone, with auth_type as the thing that marks it (the legacy oauth:<provider> prefix is stripped on write), and that connect_oauth_account is the one call for the whole flow, rather than a hand-rolled request_credential first. Load this BEFORE calling request_credential (auth_type oauth_client) or connect_oauth_account so you can pass the endpoints and the credential modal pre-fills them instead of forcing the user to type Google's / Microsoft's own URLs by hand. Covers the alias rule for dedicated connections (e.g. a health-only Google connection named "ghealth" reuses Google's endpoints), the loopback redirect URI and when to override its host form, the confidential-vs-public client rule (a blank client secret means PKCE), Microsoft Entra's redirect-URI platform buckets and the AADSTS90023 / AADSTS50011 symptoms they cause, the Dropbox App Console rule that its Permissions tab caps what may be requested and that enabling a scope never upgrades a token or grant that already exists (reconnect), the Dropbox scope set a backup needs, the one-authorization-at-a-time rule (the callback port is fixed, so starting a flow cancels an abandoned one and a surviving clash means another workspace holds the port), the per-flow state parameter that is generated for you and refused in authorize_params, and how to add a new provider (edit this file, no engine change). Maintain this file: when you discover a provider's endpoints via web_search, add a row here.
 ---
 
 # OAuth providers registry
@@ -182,9 +182,12 @@ table says is exactly what Lucidos sends.
   four-hour access token and no refresh token at all.
 - The value is `key=value&key=value`. Percent-encode a value that itself
   contains `&` or `=`.
-- The flow owns `client_id`, `redirect_uri`, `response_type`, `scope`,
+- The flow owns `client_id`, `redirect_uri`, `response_type`, `scope`, `state`,
   `code_challenge` and `code_challenge_method`. Setting one of those here is
   refused outright, so use the `redirect_uri` and `scopes` arguments for those.
+  `state` is generated per authorization and required back on the callback (see
+  "One authorization at a time" below), so a pinned value would break the
+  callback rather than configure anything.
 - Write `none` for a provider strict enough to reject a parameter it does not
   recognize. That sends neither of the defaults.
 - A **Dropbox client connected before this column existed** was backfilled with
@@ -192,6 +195,35 @@ table says is exactly what Lucidos sends.
   Settings → Accounts renews correctly without the user editing anything. Any
   other provider that turns out to need a value has to be set by hand (or by
   you, on the credential) before reconnecting.
+
+### One authorization at a time
+
+The callback listener binds a **fixed** loopback port (14981), because the
+redirect URI has to be registered with the provider ahead of time. So a
+workspace engine can have **at most one authorization in flight**, whatever the
+provider, and whether it was started by `connect_oauth_account` or by a Connect
+/ Reconnect / *Grant access* button.
+
+Two consequences worth knowing before you diagnose one of them:
+
+- **Starting a new authorization cancels the previous one.** If the user
+  abandoned a consent screen (or you started a flow they never finished), the
+  next one supersedes it rather than failing. The abandoned flow reports
+  *"This authorization was canceled, most likely because a newer one was
+  started"*. That is expected, not an error to chase. Before 2026-08-06 the
+  abandoned flow instead held the port for its full 120 second timeout and every
+  retry inside that window died with *"Address already in use (os error 48)"*.
+- **A port clash that survives that is another program**, almost always a second
+  Lucidos workspace part-way through connecting an account: workspaces run
+  concurrently, each with its own engine, and they share this one machine-wide
+  port. The error says so. Finish or abandon the other one; there is nothing to
+  fix on this credential.
+
+Each authorization also carries its own random `state`, and the listener ignores
+any callback that does not echo it back. So a stale redirect from a superseded
+flow, or a request from anything else that can reach the loopback port, cannot be
+redeemed. Nothing to configure; it is listed here because `state` is refused in
+`authorize_params` for this reason.
 
 ### Notes on scopes
 

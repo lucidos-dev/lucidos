@@ -16,7 +16,7 @@ describe('aggregate-takes-precedence over event-type lookups', () => {
       status: 'idle',
       activeChildrenCount: 0,
       totalChildrenCount: 0,
-      blockingDescendantCount: 0, attentionDescendantCount: 0,
+      blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0,
       codingAgentProposed: false,
       codingAgentRequiresRestart: false,
       codingAgentIsExternalRepo: false,

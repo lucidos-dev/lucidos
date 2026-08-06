@@ -1,6 +1,6 @@
 ---
 name: Backups
-description: How Lucidos backs up a workspace, what's included (workspace files + .git + a database dump, NOT ~/.lucidos), the encrypted-archive pipeline, the schedule (a cron expression in the USER'S timezone), and how the agent reads status with get_backup_status and changes the schedule/provider/retention with set_preference. Covers which Settings page owns which half (the backup itself is Settings → System → Backup; the provider ACCOUNT is connected only in Settings → Accounts, never on the Backup page), that setting backup_provider connects nothing on its own, that backup_provider is independent of backup_schedule (it stays set with the schedule off, and the Backup page's dropdown both opens on it and writes it), which scopes each provider needs (Dropbox needs four, permitted in its App Console first, and a reconnect after any change there), the encryption key (auto-generated, must be stored to restore), retention/pruning, run history + duration, staleness, and that restore happens from the workspace picker (not the engine). Load when the user asks about backups: "when's my next/last backup", "how big/long are backups", "back up to Dropbox", "change the backup time", "is my backup stale".
+description: How Lucidos backs up a workspace, what's included (workspace files + .git + a database dump, NOT ~/.lucidos), the encrypted-archive pipeline, the schedule (a cron expression in the USER'S timezone), and how the agent reads status with get_backup_status and changes the schedule/provider/retention with set_preference. Covers which Settings page owns which half (the backup itself is Settings → System → Backup; the provider ACCOUNT is connected only in Settings → Accounts, never on the Backup page), that setting backup_provider connects nothing on its own, that backup_provider is independent of backup_schedule (it stays set with the schedule off, and the Backup page's dropdown both opens on it and writes it), which scopes each provider needs (Dropbox needs four, permitted in its App Console first, and a reconnect after any change there), that the Backup page and get_backup_status both NAME the scopes a connected account is missing rather than saying only "not granted", the encryption key (auto-generated, must be stored to restore), retention/pruning, run history + duration, staleness, and that restore happens from the workspace picker (not the engine). Load when the user asks about backups: "when's my next/last backup", "how big/long are backups", "back up to Dropbox", "change the backup time", "is my backup stale".
 ---
 
 # Backups
@@ -83,7 +83,16 @@ Settings → Accounts when the selected provider has no connected account. So:
 A connected account is not automatically a *working* account: it also has to
 carry the scopes the backup uses. The Backup page reports that as its own state
 (connected but not ready) and offers **Grant access**, which re-runs the
-authorization with the right scopes. `get_backup_status` reports the same thing.
+authorization with the right scopes.
+
+**Both surfaces name the scopes that are missing**, and they name the same ones:
+the page reads "<provider> is missing the `files.metadata.read` permission" and
+`get_backup_status` lists them on its `Provider:` line. Use them. A grant that
+came back one scope short looks exactly like an authorization that never
+happened if you only report "not granted", and the remedy differs: the short
+grant usually means the permission is not enabled in the provider's own console,
+so pressing *Grant access* again changes nothing until that is fixed. See the
+Dropbox App Console rule below.
 
 **Google Drive** needs `https://www.googleapis.com/auth/drive.file`. A Google
 account connected for calendar or mail alone will not upload.

@@ -57,6 +57,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       totalChildrenCount: info.total_children_count || 0,
       blockingDescendantCount: info.blocking_descendant_count || 0,
       attentionDescendantCount: info.attention_descendant_count || 0,
+      liveEventWaitCount: info.live_event_wait_count || 0,
       codingAgentHasDiff: info.coding_agent_has_diff || false,
       codingAgentProposed: info.coding_agent_proposed || false,
       codingAgentRequiresRestart: info.coding_agent_requires_restart || false,
@@ -74,7 +75,7 @@ function makeThreadState(info: ThreadSummary, saved: boolean, batch?: DraftBatch
       codingAgent: info.coding_agent || undefined,
       state: info.state,
       latestTodoList: null,
-  liveEventWaits: [],
+      liveEventWaits: [],
     },
     events: new Map(),
     streamingBuffer: '',
@@ -218,6 +219,7 @@ export function upsertThread(
     existing.meta.totalChildrenCount = info.total_children_count || 0;
     existing.meta.blockingDescendantCount = info.blocking_descendant_count || 0;
     existing.meta.attentionDescendantCount = info.attention_descendant_count || 0;
+    existing.meta.liveEventWaitCount = info.live_event_wait_count || 0;
     // Update coding-agent state fields from API
     existing.meta.codingAgentHasDiff = info.coding_agent_has_diff || false;
     existing.meta.codingAgentRequiresRestart = info.coding_agent_requires_restart || false;

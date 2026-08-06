@@ -52,6 +52,7 @@ function buildThreadState(
     attentionDescendantCount: 0,
     state: 'active',
     latestTodoList: null,
+    liveEventWaitCount: 0,
     liveEventWaits: [],
   };
   return {

@@ -743,7 +743,12 @@ pub(super) async fn complete_oauth(
     match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
         Ok(Ok(Ok(_))) => ApiResult::ok(),
         Ok(Ok(Err(e))) => ApiResult::err(format!("OAuth flow failed: {}", e)),
-        Ok(Err(_)) => ApiResult::err("OAuth flow task was dropped"),
+        // The sender dropped without a result. Since the loopback callback port
+        // has one owner and a new authorization supersedes the previous one
+        // (`core::oauth::ACTIVE_CALLBACK_FLOW`), that is what this almost always
+        // is, and it is something the user did on purpose rather than an
+        // internal fault. Say so, and say how to get back.
+        Ok(Err(_)) => ApiResult::err(crate::core::oauth::FLOW_SUPERSEDED_MSG),
         Err(_) => ApiResult::err("OAuth flow timed out after 120 seconds"),
     }
 }

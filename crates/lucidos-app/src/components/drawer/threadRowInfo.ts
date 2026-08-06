@@ -71,8 +71,9 @@ export interface TooltipRow {
  *  while the dot said "Waiting". The wording is intentionally a touch more
  *  conversational than the dot's terse `STATUS_INFO` labels ("Changes ready" vs
  *  "Changes to review", "Waiting for you" vs "Waiting for your answer"). Both
- *  `waiting` (active children) and `question` (paused on a question) paint the
- *  same `waiting` tone — the card has no distinct question dot. */
+ *  `waiting` (active children or a live event wait) and `question` (paused on a
+ *  question) paint the same `waiting` tone: the card has no distinct question
+ *  dot. */
 const CARD_STATUS: Record<VisualStatus, { word: string; tone: StatusTone }> = {
   running: { word: 'Running', tone: 'running' },
   waiting: { word: 'Waiting', tone: 'waiting' },
@@ -98,10 +99,16 @@ export function threadInfoRows(meta: ThreadMeta, status: ThreadStatus): TooltipR
   // (test fixtures); production always has them.
   const userAt = meta.lastUserAction || meta.createdAt;
   const agentAt = meta.lastAgentAction || meta.updatedAt || meta.createdAt;
-  // Resolve the visual status from the exact same three inputs the dot uses
-  // (see ThreadDrawer's `resolveVisualStatus(status, …)`), so the Status word
-  // tracks the dot — including the active-children "Waiting" case.
-  const visual = resolveVisualStatus(status, meta.activeChildrenCount > 0, meta.codingAgentProposed);
+  // Resolve the visual status from the exact same inputs the dot uses (see
+  // ThreadDrawer's `resolveVisualStatus(status, …)`), so the Status word tracks
+  // the dot, including both "Waiting" cases: active children, and a live event
+  // wait.
+  const visual = resolveVisualStatus(
+    status,
+    meta.activeChildrenCount > 0,
+    meta.codingAgentProposed,
+    meta.liveEventWaitCount > 0,
+  );
   const { word, tone } = CARD_STATUS[visual];
   return [
     { label: 'Status', value: word, tone },

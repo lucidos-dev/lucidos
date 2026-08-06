@@ -262,7 +262,7 @@ fn backup_settings_tap() -> crate::scheduler::notifications::Tap {
 /// user there to connect is how this flow goes wrong. Every other cause is a
 /// backup-page matter.
 fn backup_failure_tap(
-    readiness: Option<crate::core::backup::ProviderReadiness>,
+    readiness: Option<&crate::core::backup::ProviderReadiness>,
 ) -> crate::scheduler::notifications::Tap {
     match readiness {
         Some(r) if !r.connected => settings_tap("accounts"),
@@ -314,7 +314,7 @@ const BACKUP_FAILURE_DEDUP_MINUTES: i64 = 30;
 /// to be whatever went wrong.
 fn backup_failure_body(
     provider_name: Option<&str>,
-    readiness: Option<crate::core::backup::ProviderReadiness>,
+    readiness: Option<&crate::core::backup::ProviderReadiness>,
     error: &str,
 ) -> String {
     // A provider whose meta we could not resolve is named generically rather
@@ -328,7 +328,7 @@ fn backup_failure_body(
             "{who} has no connected account, so nothing can upload. \
              Connect it in Settings, then Accounts."
         ),
-        Some(r) if !r.ready => format!(
+        Some(r) if !r.ready() => format!(
             "{who} is connected but has not granted the permissions a backup needs. \
              Open Settings, then Backup, and press Grant access."
         ),
@@ -378,7 +378,7 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
         None => None,
     };
 
-    let body = backup_failure_body(meta.as_ref().map(|m| m.name), readiness, error);
+    let body = backup_failure_body(meta.as_ref().map(|m| m.name), readiness.as_ref(), error);
 
     emit_backup_notification(
         engine,
@@ -387,7 +387,7 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
         // Deep-linked for the same reason as the key-generated notification
         // above: a Tap::Modal here opened a card repeating the error and
         // offering nothing to do about it. Which page depends on the remedy.
-        backup_failure_tap(readiness),
+        backup_failure_tap(readiness.as_ref()),
     )
     .await;
 }
@@ -411,18 +411,28 @@ mod tests {
         }
     }
 
-    const CONNECTED_NOT_READY: ProviderReadiness = ProviderReadiness {
-        connected: true,
-        ready: false,
-    };
-    const READY: ProviderReadiness = ProviderReadiness {
-        connected: true,
-        ready: true,
-    };
-    const NOT_CONNECTED: ProviderReadiness = ProviderReadiness {
-        connected: false,
-        ready: false,
-    };
+    /// Connected, but the grant is short a scope the backup needs. Written as
+    /// constructors rather than consts because `missing_scopes` is a `Vec`: the
+    /// verdict now carries WHICH scopes are missing, and `ready` is derived from
+    /// that list so the two can never disagree.
+    fn connected_not_ready() -> ProviderReadiness {
+        ProviderReadiness {
+            connected: true,
+            missing_scopes: vec!["files.metadata.read"],
+        }
+    }
+    fn ready() -> ProviderReadiness {
+        ProviderReadiness {
+            connected: true,
+            missing_scopes: Vec::new(),
+        }
+    }
+    fn not_connected() -> ProviderReadiness {
+        ProviderReadiness {
+            connected: false,
+            missing_scopes: Vec::new(),
+        }
+    }
 
     /// The reported case, and the whole point of the change: a connected
     /// account whose grant is too narrow must be told to press *Grant access*,
@@ -432,7 +442,7 @@ mod tests {
     fn a_connected_but_unready_provider_is_told_to_grant_access() {
         let body = backup_failure_body(
             Some("Dropbox"),
-            Some(CONNECTED_NOT_READY),
+            Some(&connected_not_ready()),
             "OAuth token expired but no refresh token available",
         );
         assert!(body.contains("Grant access"), "{body}");
@@ -446,7 +456,7 @@ mod tests {
     /// connect is how this flow goes wrong).
     #[test]
     fn an_unconnected_provider_is_sent_to_accounts() {
-        let body = backup_failure_body(Some("Dropbox"), Some(NOT_CONNECTED), "no account");
+        let body = backup_failure_body(Some("Dropbox"), Some(&not_connected()), "no account");
         assert!(body.contains("Accounts"), "{body}");
         assert!(
             !body.contains("Grant access"),
@@ -460,9 +470,9 @@ mod tests {
     #[test]
     fn every_remedy_names_the_page_its_tap_opens() {
         for readiness in [
-            Some(CONNECTED_NOT_READY),
-            Some(READY),
-            Some(NOT_CONNECTED),
+            Some(&connected_not_ready()),
+            Some(&ready()),
+            Some(&not_connected()),
             None,
         ] {
             let body = backup_failure_body(Some("Dropbox"), readiness, "e");
@@ -485,10 +495,10 @@ mod tests {
     #[test]
     fn only_the_unconnected_branch_lands_on_accounts() {
         assert_eq!(
-            tapped_view(backup_failure_tap(Some(NOT_CONNECTED))).as_deref(),
+            tapped_view(backup_failure_tap(Some(&not_connected()))).as_deref(),
             Some("accounts")
         );
-        for readiness in [Some(CONNECTED_NOT_READY), Some(READY), None] {
+        for readiness in [Some(&connected_not_ready()), Some(&ready()), None] {
             assert_eq!(
                 tapped_view(backup_failure_tap(readiness)).as_deref(),
                 Some("backup"),
@@ -502,7 +512,7 @@ mod tests {
     /// than inventing advice.
     #[test]
     fn a_ready_provider_gets_the_destination_without_invented_advice() {
-        let body = backup_failure_body(Some("Dropbox"), Some(READY), "upload timed out");
+        let body = backup_failure_body(Some("Dropbox"), Some(&ready()), "upload timed out");
         assert!(body.contains("Backup"), "{body}");
         assert!(!body.contains("Grant access"), "{body}");
         assert!(!body.contains("Accounts"), "{body}");
@@ -525,9 +535,9 @@ mod tests {
     fn every_branch_keeps_the_underlying_error() {
         const ERROR: &str = "OAuth token expired but no refresh token available";
         for readiness in [
-            Some(CONNECTED_NOT_READY),
-            Some(READY),
-            Some(NOT_CONNECTED),
+            Some(&connected_not_ready()),
+            Some(&ready()),
+            Some(&not_connected()),
             None,
         ] {
             let body = backup_failure_body(Some("Dropbox"), readiness, ERROR);
@@ -543,7 +553,7 @@ mod tests {
         assert_eq!(BACKUP_FAILURE_TITLE, "Backup failed");
         // Nothing in the body composition can reach the title: it takes no
         // readiness argument and returns only the body.
-        let bodies: Vec<String> = [Some(CONNECTED_NOT_READY), Some(READY), None]
+        let bodies: Vec<String> = [Some(&connected_not_ready()), Some(&ready()), None]
             .into_iter()
             .map(|r| backup_failure_body(Some("Dropbox"), r, "e"))
             .collect();
@@ -554,7 +564,7 @@ mod tests {
     /// The raw id is a wire value the user has never seen on any screen.
     #[test]
     fn an_unknown_provider_is_not_named_by_its_raw_id() {
-        let body = backup_failure_body(None, Some(CONNECTED_NOT_READY), "e");
+        let body = backup_failure_body(None, Some(&connected_not_ready()), "e");
         assert!(!body.contains("google_drive"), "{body}");
         assert!(body.starts_with("Your backup provider"), "{body}");
     }
@@ -578,9 +588,9 @@ mod tests {
         const RENDERABLE: &[&str] = &["accounts", "backup"];
         let taps = [
             backup_settings_tap(),
-            backup_failure_tap(Some(NOT_CONNECTED)),
-            backup_failure_tap(Some(CONNECTED_NOT_READY)),
-            backup_failure_tap(Some(READY)),
+            backup_failure_tap(Some(&not_connected())),
+            backup_failure_tap(Some(&connected_not_ready())),
+            backup_failure_tap(Some(&ready())),
             backup_failure_tap(None),
         ];
         for tap in taps {

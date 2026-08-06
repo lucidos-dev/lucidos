@@ -98,6 +98,30 @@ one completion card, which is why every read of it is `is_coding_agent`-gated. A
 row with `parent_thread_id IS NULL` is always FALSE: a top-level thread owes no
 parent a card. See ADR 0011.
 
+**`thread_summaries.live_event_wait_count`** (INT NOT NULL DEFAULT 0, added by
+`20260806183944_add_live_event_wait_count.sql`) is how many *event waits* the
+thread itself currently holds unresolved. The `EventWaitStarted` projection arm
+increments it; the three resolution arms decrement it under a
+`GREATEST(0, ...)` floor, because a resolution is emittable with no matching
+start (a hand-emitted row, a wait predating the backfill) and a negative value
+would strand the status dot on forever.
+
+Unlike `blocking_descendant_count` it is NOT a roll-up: a subscription belongs to
+the thread that registered it and nothing bubbles, so there is no ancestor walk
+and no `propagate_*` counterpart. It is consumed as `count > 0` by exactly one
+reader, the frontend's `resolveVisualStatus`, which turns it into the same
+pulsing Waiting dot `active_children_count` produces. **No backend predicate
+reads it**, so `is_blocking`, `is_attention_needing`, `display_section` and
+`available_thread_actions` are untouched and a subscribed thread stays
+non-blocking, non-attention-needing and archivable (ADR 0049).
+
+It exists because the client's own `meta.liveEventWaits` list is folded from a
+thread's loaded events, so it is empty on a drawer row nobody opened and empty
+again after a reload, which made a thread asleep on a wait render exactly like
+one that had finished. The migration backfills from `EventWaitStarted` rows
+whose `payload->>'wait_id'` has no matching resolution on the same
+`aggregate_id`.
+
 **`thread_summaries.compose_epoch`** (BIGINT NOT NULL DEFAULT 0, added by
 `20260806003932_add_compose_epoch_to_thread_summaries.sql`) is the *compose
 epoch* (`docs/glossary.md`): how many times a **submission** has consumed the

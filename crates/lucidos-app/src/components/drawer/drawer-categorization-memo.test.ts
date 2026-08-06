@@ -66,7 +66,8 @@ function makeThread(id: string, opts: ThreadOpts = {}): ThreadState {
         triggerId: opts.triggerId,
         state: opts.state ?? 'active',
         latestTodoList: null,
-    liveEventWaits: [],
+        liveEventWaitCount: 0,
+        liveEventWaits: [],
     };
     return {
         meta,

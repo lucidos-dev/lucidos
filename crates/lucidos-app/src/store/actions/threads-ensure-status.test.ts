@@ -112,7 +112,7 @@ describe('ensureThreadInMap', () => {
       section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
@@ -150,7 +150,7 @@ describe('ensureThreadInMap', () => {
       section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
@@ -608,7 +608,8 @@ describe('event replay must not override API status', () => {
       parentThreadTitle: null,
       state: 'active',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
     } });
 
     await loadAllThreads();
@@ -664,7 +665,8 @@ describe('event replay must not override API status', () => {
       parentThreadTitle: null,
       state: 'active',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
     } });
 
     const { refreshThreadEvents } = await import('./thread-loading');

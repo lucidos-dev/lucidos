@@ -322,6 +322,11 @@ export interface BackupProviderInfo {
   name: string;
   connected: boolean;
   ready: boolean;
+  /** Which required scopes a CONNECTED account is missing, in the provider's
+   *  declared order. Empty for a ready provider and for one with no account.
+   *  Named on the page: "access not granted" alone cannot tell a grant that
+   *  never happened from one that came back a scope short. */
+  missing_scopes: string[];
   /** Web URL to this provider's backups folder ("View backups folder" link), or null. */
   folder_url: string | null;
 }

@@ -39,6 +39,11 @@ export interface ThreadSummary {
    *  the Running case. Consumed by `displaySection` via `count > 0` to bubble
    *  the parent to REVIEW even when sibling descendants are still running. */
   attention_descendant_count: number;
+  /** How many event waits this thread holds unresolved. Consumed by
+   *  `resolveVisualStatus` via `count > 0` to paint the Waiting status dot: a
+   *  thread watching for an event is not finished, and this is what says so on
+   *  a row whose events were never loaded. */
+  live_event_wait_count: number;
   /** Thread status computed by the backend: 'idle', 'running', or 'waiting'. */
   status: string;
   /** Whether the coding-agent branch has any diff against main on disk — pure git

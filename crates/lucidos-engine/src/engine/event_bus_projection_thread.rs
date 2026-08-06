@@ -1115,10 +1115,21 @@ impl EventBus {
             // whatever the turn itself is doing and this arm must not touch it.
             // `last_user_action` is untouched too, since nothing is being asked
             // of anyone.
+            //
+            // `live_event_wait_count` is the one durable fact the three
+            // resolution arms below mirror: it is how a thread that finished
+            // its turn while still watching reads as Waiting rather than as
+            // finished, on a drawer row whose events were never loaded and
+            // across a reload. Read as `count > 0` by the frontend's
+            // `resolveVisualStatus`, and by nothing else. No backend predicate
+            // consumes it, so a subscribed thread stays non-blocking,
+            // non-attention-needing and archivable (ADR 0049).
             ThreadEvent::EventWaitStarted { .. } => {
                 sqlx::query(
                     "UPDATE thread_summaries SET last_activity = NOW(), \
-                     last_agent_action = NOW() WHERE thread_id = $1",
+                     last_agent_action = NOW(), \
+                     live_event_wait_count = live_event_wait_count + 1 \
+                     WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1136,9 +1147,20 @@ impl EventBus {
             // would credit the agent for an event the engine delivered. A
             // cancel IS a user action, because every cancel cause is a person
             // pressing something.
+            //
+            // All three DO decrement `live_event_wait_count`: the wait is gone
+            // either way, and the count is what the Waiting dot reads. The
+            // `GREATEST(0, ...)` floor is not defensive dressing. A resolution
+            // is emittable without a matching start (a test fixture, a
+            // hand-emitted row, a wait whose `EventWaitStarted` predates the
+            // column's backfill), and an unsigned count that went negative
+            // would strand the dot on forever, which is the exact failure this
+            // whole change exists to remove.
             ThreadEvent::EventWaitDelivered { .. } | ThreadEvent::EventWaitExpired { .. } => {
                 sqlx::query(
-                    "UPDATE thread_summaries SET last_activity = NOW() WHERE thread_id = $1",
+                    "UPDATE thread_summaries SET last_activity = NOW(), \
+                     live_event_wait_count = GREATEST(0, live_event_wait_count - 1) \
+                     WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)
@@ -1148,7 +1170,9 @@ impl EventBus {
             ThreadEvent::EventWaitCanceled { .. } => {
                 sqlx::query(
                     "UPDATE thread_summaries SET last_activity = NOW(), \
-                     last_user_action = NOW() WHERE thread_id = $1",
+                     last_user_action = NOW(), \
+                     live_event_wait_count = GREATEST(0, live_event_wait_count - 1) \
+                     WHERE thread_id = $1",
                 )
                 .bind(thread_id)
                 .execute(&mut **tx)

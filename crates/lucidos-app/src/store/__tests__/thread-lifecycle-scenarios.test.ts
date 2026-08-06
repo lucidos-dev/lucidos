@@ -89,7 +89,8 @@ describe('Thread Lifecycle Scenarios (shared contract)', () => {
           lastRevivedAt: '',
           state: 'active',
           latestTodoList: null,
-    liveEventWaits: [],
+          liveEventWaitCount: 0,
+          liveEventWaits: [],
         };
 
         const thread: ThreadState = {

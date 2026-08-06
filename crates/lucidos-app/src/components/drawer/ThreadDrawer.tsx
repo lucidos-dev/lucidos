@@ -1307,6 +1307,7 @@ export function ThreadRow({ threadId, status, depth = 0, isLiftedParent, isRespo
         status,
         meta.activeChildrenCount > 0,
         meta.codingAgentProposed,
+        meta.liveEventWaitCount > 0,
     );
     const isFocused = focusedThreadId.value === meta.id;
     const isHighlighted = highlightedKey.value === meta.id;
@@ -1543,11 +1544,12 @@ function SearchResultRow({ result }: { result: ThreadSearchResult }) {
     const status: ThreadStatus = liveThread ? effectiveThreadStatus(liveThread) : (result.status as ThreadStatus);
     // Same `resolveVisualStatus` formula as the live rows, fed the `status`
     // snapshot above. A search hit not yet hydrated into threadMap has no
-    // child/proposal info, so those default to false.
+    // child/proposal/subscription info, so those default to false.
     const visualStatus = resolveVisualStatus(
         status,
         (liveThread?.meta.activeChildrenCount ?? 0) > 0,
         liveThread?.meta.codingAgentProposed ?? false,
+        (liveThread?.meta.liveEventWaitCount ?? 0) > 0,
     );
     const section = liveThread?.meta.section ?? result.section;
     const isFocused = focusedThreadId.value === result.thread_id;

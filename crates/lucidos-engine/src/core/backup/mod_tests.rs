@@ -52,6 +52,78 @@ fn readiness_requires_every_declared_scope() {
     }
 }
 
+/// A requirement reported to a human must be a scope they can find in the
+/// provider's own console, not the substring the engine matches on.
+#[test]
+fn an_unmet_requirement_is_named_as_a_scope_the_user_can_grant() {
+    // Drive's whole requirement is the FRAGMENT `drive`, which matches the full
+    // URL. Reporting it verbatim names a "drive permission" that exists nowhere.
+    assert_eq!(
+        name_missing_scopes(vec!["drive"], google_drive::GRANT_SCOPES),
+        vec!["https://www.googleapis.com/auth/drive.file"]
+    );
+    // Dropbox's requirements ARE its scope names, and are exactly what its App
+    // Console lists, so the mapping is the identity there.
+    assert_eq!(
+        name_missing_scopes(
+            vec!["files.content.read", "files.metadata.read"],
+            dropbox::GRANT_SCOPES
+        ),
+        vec!["files.content.read", "files.metadata.read"]
+    );
+    // A matcher no grant scope contains keeps its own name. Dropping it would
+    // tell the user a permission is missing without saying which.
+    assert_eq!(
+        name_missing_scopes(vec!["sharing.write"], dropbox::GRANT_SCOPES),
+        vec!["sharing.write"]
+    );
+    assert!(name_missing_scopes(Vec::new(), dropbox::GRANT_SCOPES).is_empty());
+}
+
+/// The two lists must not drift: every requirement has to resolve to something
+/// an authorization actually asks for, or the page and the agent would name a
+/// permission that no *Grant access* press can obtain.
+#[test]
+fn every_requirement_resolves_to_a_scope_the_flow_requests() {
+    for meta in list_providers() {
+        for requirement in meta.required_scopes {
+            assert!(
+                meta.grant_scopes.iter().any(|g| g.contains(requirement)),
+                "{}: nothing in grant_scopes contains the requirement {requirement}",
+                meta.id
+            );
+        }
+    }
+}
+
+/// `ready` is DERIVED from the missing-scope list, so a verdict cannot claim
+/// ready while naming a gap. This pairing has had to be reconciled by hand
+/// twice; the third time it is the type's job.
+#[test]
+fn readiness_is_derived_from_the_missing_scopes_it_carries() {
+    let not_connected = ProviderReadiness {
+        connected: false,
+        missing_scopes: Vec::new(),
+    };
+    // Nothing connected is not "ready", and it lists no gap either: there is no
+    // grant to measure, and naming every scope would describe an absent account
+    // as a half-granted one.
+    assert!(!not_connected.ready());
+    assert!(not_connected.missing_scopes.is_empty());
+
+    assert!(!ProviderReadiness {
+        connected: true,
+        missing_scopes: vec!["files.metadata.read"],
+    }
+    .ready());
+
+    assert!(ProviderReadiness {
+        connected: true,
+        missing_scopes: Vec::new(),
+    }
+    .ready());
+}
+
 /// `backup_run_from_event` parses a persisted `BackupCompleted` event in the
 /// real `{ "type": .., "data": { .. } }` shape (the `#[serde(tag, content)]`
 /// wire format), recovering start/finish/size for the run history.

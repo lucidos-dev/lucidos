@@ -55,18 +55,18 @@ describe('the drawer counters a follow-up must not disturb', () => {
 
   it('the waiting dot tracks activeChildrenCount, so a revived child re-lights it', () => {
     // Parent idle, both children finished.
-    expect(resolveVisualStatus('idle', false, false)).toBe('idle');
+    expect(resolveVisualStatus('idle', false, false, false)).toBe('idle');
     // A follow-up revives one child: the projection re-increments, and the
     // parent pulses "waiting for children" again.
-    expect(resolveVisualStatus('idle', true, false)).toBe('waiting');
+    expect(resolveVisualStatus('idle', true, false, false)).toBe('waiting');
     // A follow-up to a child that was already in flight changes neither.
-    expect(resolveVisualStatus('idle', true, false)).toBe('waiting');
+    expect(resolveVisualStatus('idle', true, false, false)).toBe('waiting');
     // The child's own next terminal brings it back down.
-    expect(resolveVisualStatus('idle', false, false)).toBe('idle');
+    expect(resolveVisualStatus('idle', false, false, false)).toBe('idle');
   });
 
   it('a parent still running outranks the waiting dot', () => {
-    expect(resolveVisualStatus('running', true, false)).toBe('running');
+    expect(resolveVisualStatus('running', true, false, false)).toBe('running');
   });
 });
 

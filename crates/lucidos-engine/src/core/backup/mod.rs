@@ -14,14 +14,18 @@ use crate::core::oauth;
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
-/// Registry entry: (id, name, oauth_provider, required_scopes, constructor).
+/// Registry entry: (id, name, oauth_provider, required_scopes, grant_scopes,
+/// constructor).
 /// The constructor receives the pool AND the entry's `required_scopes`, so the
 /// readiness verdict the Settings page renders and the preflight the backup runs
-/// are checking one list rather than two that can disagree.
+/// are checking one list rather than two that can disagree. `grant_scopes` is
+/// what a user actually grants, used only to NAME an unmet requirement (see
+/// [`name_missing_scopes`]).
 type BackupProviderEntry = (
     &'static str,
     &'static str,
     &'static str,
+    &'static [&'static str],
     &'static [&'static str],
     fn(PgPool, &'static [&'static str]) -> Box<dyn BackupProvider>,
 );
@@ -63,6 +67,7 @@ const PROVIDERS: &[BackupProviderEntry] = &[
         "Google Drive",
         "google",
         google_drive::BACKUP_SCOPES,
+        google_drive::GRANT_SCOPES,
         |pool, scopes| Box::new(google_drive::GoogleDriveBackupProvider::new(pool, scopes)),
     ),
     (
@@ -73,6 +78,7 @@ const PROVIDERS: &[BackupProviderEntry] = &[
         // read as ready however narrow its grant and pushed the failure all the
         // way to `files/create_folder_v2` returning a 400 mid-backup.
         dropbox::BACKUP_SCOPES,
+        dropbox::GRANT_SCOPES,
         |pool, scopes| Box::new(dropbox::DropboxBackupProvider::new(pool, scopes)),
     ),
 ];
@@ -96,17 +102,23 @@ pub struct ProviderMeta {
     /// enabled *Back up now*) and then failed preflight telling the user to
     /// reconnect, with no button left on the page to do it.
     pub required_scopes: &'static [&'static str],
+    /// The scopes an authorization actually asks for. Not a second readiness
+    /// list: it exists so an unmet `required_scopes` matcher can be reported
+    /// under a name the user can find in the provider's own console. See
+    /// [`name_missing_scopes`].
+    pub grant_scopes: &'static [&'static str],
 }
 
 /// List all registered backup providers with their metadata.
 pub fn list_providers() -> Vec<ProviderMeta> {
     PROVIDERS
         .iter()
-        .map(|(id, name, oauth, scopes, _)| ProviderMeta {
+        .map(|(id, name, oauth, scopes, grant_scopes, _)| ProviderMeta {
             id,
             name,
             oauth_provider: oauth,
             required_scopes: scopes,
+            grant_scopes,
         })
         .collect()
 }
@@ -141,6 +153,40 @@ pub fn missing_scopes(granted: &str, required: &'static [&'static str]) -> Vec<&
         .collect()
 }
 
+/// Rewrite a list of unmet requirements into the scopes a user can act on.
+///
+/// `required_scopes` are MATCHERS, not names: readiness asks whether a granted
+/// scope CONTAINS the entry ([`scopes_include`]), which is why Google Drive's
+/// whole requirement is the fragment `drive` and it matches the full
+/// `https://www.googleapis.com/auth/drive.file` URL. Reporting that fragment to
+/// a human names a "drive permission" that appears in no Google console, which
+/// defeats the point of naming it at all.
+///
+/// So each unmet matcher is mapped to the first `grant_scopes` entry containing
+/// it, applying the same containment rule from the other side. Dropbox's
+/// requirements are already whole scope names and map to themselves, which is
+/// also exactly what its App Console lists. A matcher no grant scope contains
+/// falls back to itself: a provider whose two lists have drifted should still
+/// say WHICH permission is short rather than drop it.
+///
+/// Engine-side on purpose. The page and `get_backup_status` both render what
+/// this returns, so they cannot name a requirement differently.
+pub fn name_missing_scopes(
+    missing: Vec<&'static str>,
+    grant_scopes: &'static [&'static str],
+) -> Vec<&'static str> {
+    missing
+        .into_iter()
+        .map(|requirement| {
+            grant_scopes
+                .iter()
+                .copied()
+                .find(|granted| granted.contains(requirement))
+                .unwrap_or(requirement)
+        })
+        .collect()
+}
+
 /// Whether a backup provider can actually upload right now.
 ///
 /// Both halves of "is this working?" in one value: is the OAuth account
@@ -151,13 +197,37 @@ pub fn missing_scopes(granted: &str, required: &'static [&'static str]) -> Vec<&
 /// things about the same provider. Before this existed only the page knew, and
 /// an agent reported a Dropbox backup as fully configured while its upload leg
 /// had no account behind it (2026-08-05).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderReadiness {
     /// An OAuth account row exists for this provider.
     pub connected: bool,
-    /// Connected AND the account's scopes carry every one of the provider's
-    /// `required_scopes`.
-    pub ready: bool,
+    /// Which of the provider's `required_scopes` the connected account does NOT
+    /// carry, in the order the provider declared them. Empty when the provider
+    /// is ready, and also empty when nothing is connected: there is no grant to
+    /// measure, and listing every scope as "missing" would describe a
+    /// not-connected provider as a half-granted one.
+    ///
+    /// Reported all the way to the Backup page, because "access not granted"
+    /// with no permission named cannot distinguish a grant that never happened
+    /// from one that came back a scope short. That was the reported dead end: a
+    /// user pressed *Grant access*, completed the authorization, and came back
+    /// to the same red line.
+    pub missing_scopes: Vec<&'static str>,
+}
+
+impl ProviderReadiness {
+    /// Connected AND holding every required scope.
+    ///
+    /// Derived rather than stored, deliberately. This verdict and the scope list
+    /// it comes from have now had to be reconciled twice (see
+    /// `docs/plans/2026-08-05-dropbox-backup-scopes-and-refresh.md`, where a
+    /// readiness gate checking one scope while preflight demanded three left an
+    /// account reading as ready with no working button on the page). Keeping
+    /// both a boolean and the list it is computed from allows a state where they
+    /// disagree; a method does not.
+    pub fn ready(&self) -> bool {
+        self.connected && self.missing_scopes.is_empty()
+    }
 }
 
 /// Resolve [`ProviderReadiness`] for one provider.
@@ -177,19 +247,28 @@ pub async fn provider_readiness(
             )
             .into()
         })?;
-    let connected = account.is_some();
-    let ready = account
+    // Named on the way out, so every consumer reports one string for one gap.
+    let missing_scopes = account
         .as_ref()
-        .is_some_and(|a| missing_scopes(&a.scopes, meta.required_scopes).is_empty());
-    Ok(ProviderReadiness { connected, ready })
+        .map(|a| {
+            name_missing_scopes(
+                missing_scopes(&a.scopes, meta.required_scopes),
+                meta.grant_scopes,
+            )
+        })
+        .unwrap_or_default();
+    Ok(ProviderReadiness {
+        connected: account.is_some(),
+        missing_scopes,
+    })
 }
 
 /// Create a backup provider by ID.
 pub fn get_provider(provider_id: &str, pool: &PgPool) -> Result<Box<dyn BackupProvider>, String> {
     PROVIDERS
         .iter()
-        .find(|(id, _, _, _, _)| *id == provider_id)
-        .map(|(_, _, _, scopes, ctor)| ctor(pool.clone(), scopes))
+        .find(|(id, _, _, _, _, _)| *id == provider_id)
+        .map(|(_, _, _, scopes, _, ctor)| ctor(pool.clone(), scopes))
         .ok_or_else(|| format!("Unknown backup provider: {}", provider_id))
 }
 

@@ -115,6 +115,12 @@ pub struct ThreadSummary {
     pub active_children_count: i64,
     /// Total number of child threads (active + completed).
     pub total_children_count: i64,
+    /// Number of *event waits* this thread currently holds unresolved. Read as
+    /// `count > 0` by the frontend's `resolveVisualStatus` to paint the same
+    /// Waiting dot `active_children_count` paints, and by nothing else: a
+    /// subscription holds no turn, so no backend predicate consumes it
+    /// (ADR 0049). Its own thread's waits only, never a descendant roll-up.
+    pub live_event_wait_count: i64,
     /// Count of descendants (transitive) currently in a state that blocks this
     /// thread from being archived (per `is_blocking` in `thread_lifecycle.rs`).
     /// Maintained by EventBus on `thread_summaries.blocking_descendant_count`.
@@ -312,6 +318,7 @@ struct ThreadRow {
     total_children_count: i64,
     blocking_descendant_count: i64,
     attention_descendant_count: i64,
+    live_event_wait_count: i64,
     status: String,
     /// Pure git truth — `git diff main..branch` is non-empty.
     coding_agent_has_diff: bool,
@@ -383,6 +390,11 @@ pub struct ThreadAggregate {
     /// per-event SSE aggregate alongside `blocking_descendant_count` so the
     /// frontend can recompute section without a refetch.
     pub attention_descendant_count: i64,
+    /// Count of *event waits* this thread holds unresolved. See
+    /// `ThreadSummary::live_event_wait_count`. Carried on the per-event SSE
+    /// aggregate so the Waiting dot lights the moment a wait is registered or
+    /// resolved, on every open client, without a refetch.
+    pub live_event_wait_count: i64,
     /// Pure git truth — drives the Diff button. See `ThreadSummary::coding_agent_has_diff`.
     pub coding_agent_has_diff: bool,
     /// Coding-agent thread's formal "ready for review" offer — set by `ChangeProposed` only.
@@ -461,6 +473,7 @@ fn row_to_thread_aggregate(
         total_children_count: r.total_children_count,
         blocking_descendant_count: r.blocking_descendant_count,
         attention_descendant_count: r.attention_descendant_count,
+        live_event_wait_count: r.live_event_wait_count,
         coding_agent_has_diff: r.coding_agent_has_diff,
         coding_agent_proposed: r.coding_agent_proposed,
         coding_agent_requires_restart: r.coding_agent_requires_restart,
@@ -504,6 +517,7 @@ fn thread_cols(alias: &str) -> String {
         {a}.last_user_action, {a}.last_agent_action, \
         {a}.message_count::bigint, {a}.archive_state AS section, {a}.active_children_count::bigint, {a}.total_children_count::bigint, \
         {a}.blocking_descendant_count::bigint, {a}.attention_descendant_count::bigint, \
+        {a}.live_event_wait_count::bigint, \
         {a}.status, {a}.coding_agent_has_diff, {a}.coding_agent_proposed, {a}.coding_agent_requires_restart, \
         {a}.coding_agent_is_external_repo, {a}.coding_agent_applying, {a}.last_revived_at, \
         {a}.is_saved, {a}.has_response, \
@@ -584,6 +598,7 @@ impl EventStore {
                     total_children_count: r.total_children_count,
                     blocking_descendant_count: r.blocking_descendant_count,
                     attention_descendant_count: r.attention_descendant_count,
+                    live_event_wait_count: r.live_event_wait_count,
                     status: r.status,
                     coding_agent_has_diff: r.coding_agent_has_diff,
                     coding_agent_proposed: r.coding_agent_proposed,

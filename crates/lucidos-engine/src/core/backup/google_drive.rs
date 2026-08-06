@@ -56,6 +56,12 @@ const DRIVE_QUOTA_MSG: &str =
 /// Settings page renders and the preflight below check one list.
 pub const BACKUP_SCOPES: &[&str] = &["drive"];
 
+/// The scope a user actually grants, as opposed to the matcher above. Naming
+/// the matcher to a human would be naming a "drive permission" that appears in
+/// no Google console; this is the string the authorization request carries and
+/// the console lists. See [`super::name_missing_scopes`].
+pub const GRANT_SCOPES: &[&str] = &["https://www.googleapis.com/auth/drive.file"];
+
 /// Shown by preflight when the granted token is missing the required Drive
 /// scope — the ONLY preflight case that should tell the user to re-grant access.
 const DRIVE_SCOPE_MISSING_MSG: &str = "Google Drive backup is missing the required Drive permission. Go to Settings > Backup and click 'Grant access' to re-authorize.";

@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.23.1 — 2026-08-06
+
+### Changed
+
+- **Every OAuth callback carries a state parameter** that binds it to the flow that requested it. A redirect arriving on the loopback callback port that does not match the flow in progress is refused.
+
+### Fixed
+
+- **A thread parked on an event subscription reads as Waiting.** The dot appears in the drawer and on the thread header, its status card says Waiting, and it survives a reload.
+- **A second Grant access starts** instead of failing with "Address already in use". A new authorization supersedes a flow still holding the callback port.
+- **Settings > Backup names the permissions a connected provider is missing**, rather than saying only that access is not granted. The engine and the page read the same list.
+- **The Backup section's rows no longer collide.** The blocked-state line, its button and the Back up now row sit on the page's spacing scale, and both blocked states are spaced and sized alike.
 ## v0.23.0 — 2026-08-06
 
 ### Added

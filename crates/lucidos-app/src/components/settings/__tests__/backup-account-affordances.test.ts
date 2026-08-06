@@ -178,3 +178,58 @@ describe('the provider dropdown reflects and writes the configured destination',
     expect(source).not.toContain('disabled={scheduleSaving || !selectedProvider}');
   });
 });
+
+/**
+ * The section's rows must sit on the CSS layer that owns this page's rhythm.
+ * Five of them were inline `style="display: flex; …"` attributes with their own
+ * eyeballed margins, invisible to that layer and un-overridable per theme or
+ * breakpoint. One of them, the not-granted state, was a copy of
+ * `.backup-blocked-row` that had lost its bottom margin and its wrap, which is
+ * why the red line, its button and the row below collided in the reported
+ * screenshot.
+ *
+ * Read from the RAW file, not the comment-stripped `source`: an inline style is
+ * a source-level fact, and this test's own explanation of it lives in a comment
+ * in the component.
+ */
+describe('the Backup section is laid out by CSS, not by inline styles', () => {
+  const raw = readFileSync(resolve(here, '../BackupSection.tsx'), 'utf8');
+
+  it('carries no static inline style attribute', () => {
+    // `style={`width: ${pct}%`}` on the progress bar is deliberately excluded:
+    // a computed width has nowhere else to live. A STATIC `style="…"` does.
+    const inline = raw.match(/style="[^"]*"/g) ?? [];
+    expect(inline).toEqual([]);
+  });
+
+  it('gives every row a class', () => {
+    for (const cls of [
+      'backup-blocked-row',
+      'backup-actions-row',
+      'backup-schedule-hint',
+      'backup-key-row',
+      'backup-key-value',
+      'backup-key-warning',
+    ]) {
+      expect(raw).toContain(`class="${cls}"`);
+    }
+  });
+
+  it('renders both blocked states as the same row', () => {
+    // Not-connected and not-granted sit in the same slot and offer the same
+    // kind of button, so a difference in spacing or size between them is a bug
+    // rather than a distinction. One class is how that stays true.
+    const blocked = raw.match(/class="backup-blocked-row"/g) ?? [];
+    expect(blocked).toHaveLength(2);
+    expect(raw).not.toContain('backup-not-connected-row');
+  });
+
+  it('names the missing permissions through the shared line', () => {
+    // The bare sentence is the fallback INSIDE `backupAccessLine`, so the
+    // component must not hand-roll its own copy of it. Asserted against the
+    // comment-stripped source, which is what this file's `code()` helper exists
+    // for: the comment explaining the change discusses the old wording.
+    expect(source).toContain('backupAccessLine(providerInfo.name, providerInfo.missing_scopes)');
+    expect(source).not.toContain('access not granted');
+  });
+});

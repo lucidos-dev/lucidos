@@ -52,8 +52,11 @@ enum ProviderAccount {
     LookupFailed(String),
     /// No OAuth account exists for this provider.
     NotConnected,
-    /// Connected, but the account lacks the scope the provider needs.
-    MissingScope,
+    /// Connected, but the grant is short one or more of the scopes the provider
+    /// needs. Carries WHICH, so the agent can name them exactly as the Backup
+    /// page does: the two read the same `provider_readiness` verdict and must
+    /// not be able to describe it differently.
+    MissingScope(Vec<&'static str>),
     /// Connected with everything the provider needs.
     Ready,
 }
@@ -80,10 +83,11 @@ fn backup_provider_line(provider: &str, account: &ProviderAccount) -> String {
              Settings → Accounts. It cannot be connected on the Backup page. Do not report \
              backup setup as complete until this says connected.)\n"
         ),
-        ProviderAccount::MissingScope => format!(
-            "Provider: {provider} (account connected but MISSING the access backups need. \
+        ProviderAccount::MissingScope(missing) => format!(
+            "Provider: {provider} (account connected but MISSING the access backups need: {}. \
              Re-run connect_oauth_account with the backup scopes, or use 'Grant access' in \
-             Settings → System → Backup. Uploads will fail until then.)\n"
+             Settings → System → Backup. Uploads will fail until then.)\n",
+            missing.join(", ")
         ),
         ProviderAccount::Ready => format!("Provider: {provider} (account connected)\n"),
     }
@@ -141,8 +145,8 @@ impl LucidosEngine {
                 None => ProviderAccount::UnknownProvider,
                 Some(meta) => match backup::provider_readiness(pool, &meta).await {
                     Err(e) => ProviderAccount::LookupFailed(e.to_string()),
-                    Ok(r) if r.ready => ProviderAccount::Ready,
-                    Ok(r) if r.connected => ProviderAccount::MissingScope,
+                    Ok(r) if r.ready() => ProviderAccount::Ready,
+                    Ok(r) if r.connected => ProviderAccount::MissingScope(r.missing_scopes),
                     Ok(_) => ProviderAccount::NotConnected,
                 },
             },
@@ -438,11 +442,18 @@ mod backup_status_tests {
     }
 
     /// Connected-but-underscoped is its own state: telling the user to connect
-    /// an account they already have would send them in a circle.
+    /// an account they already have would send them in a circle. It also names
+    /// WHICH scopes are short, so the agent relays the same specific gap the
+    /// Backup page shows rather than a vaguer version of it.
     #[test]
-    fn missing_scope_is_distinct_from_not_connected() {
-        let line = backup_provider_line("google_drive", &ProviderAccount::MissingScope);
+    fn missing_scope_is_distinct_from_not_connected_and_names_the_scopes() {
+        let line = backup_provider_line(
+            "dropbox",
+            &ProviderAccount::MissingScope(vec!["files.content.read", "files.metadata.read"]),
+        );
         assert!(line.contains("MISSING"), "{line}");
+        assert!(line.contains("files.content.read"), "{line}");
+        assert!(line.contains("files.metadata.read"), "{line}");
         assert!(
             !line.contains("NOT CONNECTED"),
             "the account exists; only its scopes are short: {line}"

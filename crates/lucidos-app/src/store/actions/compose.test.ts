@@ -81,7 +81,8 @@ function makeThread(overrides: MakeThreadOpts = {}): ThreadState {
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
       ...metaOverrides,
     },
     events: new Map(),
@@ -506,7 +507,8 @@ describe('draft threads land in the navigation history', () => {
       id: draftId,
       state: 'composing',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
     }));
 
     await discardCompose(draftId);
@@ -531,7 +533,8 @@ describe('draft threads land in the navigation history', () => {
       id: draftId,
       state: 'composing',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
     }));
 
     await discardCompose(draftId);
@@ -601,7 +604,8 @@ describe('draft threads land in the navigation history', () => {
       id: draftId,
       state: 'composing',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
     }));
 
     updateCompose(draftId, { text: '' });

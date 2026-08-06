@@ -65,6 +65,22 @@ describe('threadInfoRows', () => {
     expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
   });
 
+  // Same word for the other way a thread is finished-but-not-done: it holds a
+  // live event wait. Reading "Idle" here would say the thread gave up.
+  it('reads "Waiting" when idle while holding a live event wait', () => {
+    const rows = threadInfoRows({ ...base, liveEventWaitCount: 1 } as ThreadMeta, 'idle');
+    expect(byLabel(rows, 'Status')?.value).toBe('Waiting');
+    expect(byLabel(rows, 'Status')?.tone).toBe('waiting');
+  });
+
+  it('lets a proposed change win over a live event wait', () => {
+    const rows = threadInfoRows(
+      { ...base, liveEventWaitCount: 1, codingAgentProposed: true } as ThreadMeta,
+      'idle',
+    );
+    expect(byLabel(rows, 'Status')?.value).toBe('Changes ready');
+  });
+
   it('lets the thread\'s own running state win over active children', () => {
     const rows = threadInfoRows({ ...base, activeChildrenCount: 2 } as ThreadMeta, 'running');
     expect(byLabel(rows, 'Status')?.value).toBe('Running');

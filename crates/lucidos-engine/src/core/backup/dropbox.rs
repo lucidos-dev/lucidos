@@ -32,6 +32,22 @@ pub const BACKUP_SCOPES: &[&str] = &[
     "files.metadata.read",
 ];
 
+/// The scopes a user actually grants. Dropbox's requirements ARE whole scope
+/// names, so this is the same list plus `account_info.read`, which is requested
+/// but not required (see above). Exists so every provider answers
+/// [`super::name_missing_scopes`] the same way, including the one whose
+/// requirements are substrings.
+///
+/// Mirrors the request string in `backupProviderScopes.ts`, which is what the
+/// *Grant access* button actually sends. Change one and change the other: a
+/// scope requested but absent here would be named by its raw matcher instead.
+pub const GRANT_SCOPES: &[&str] = &[
+    "files.content.write",
+    "files.content.read",
+    "files.metadata.read",
+    "account_info.read",
+];
+
 /// Pull the scope name out of a Dropbox permission error, whichever shape it
 /// arrives in. Dropbox reports the same condition two ways: a structured
 /// `{"error": {".tag": "missing_scope", "required_scope": "..."}}` body, and a

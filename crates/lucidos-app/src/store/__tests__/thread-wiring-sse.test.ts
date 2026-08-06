@@ -39,7 +39,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // Frontend connects to SSE late, misses MessageReceived, gets later CC events.
     // SSE creates skeleton with eventsLoaded=true, so loadThreadEvents skips DB load.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: true, // Old CodingAgentThreadSpawned behavior — now fixed to false
@@ -65,7 +65,7 @@ describe('SSE skeleton must not prevent DB backfill', () => {
     // After the fix: skeleton.eventsLoaded=false, so loadThreadEvents runs,
     // loads MessageReceived from DB, and the thread shows its messages.
     const skeleton: ThreadState = {
-      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
+      meta: { id: 'recovery-1', title: 'Recovering...', channel: 'claude_code', initiator: 'user', saved: false, createdAt: '', updatedAt: '', status: 'idle', codingAgentProposed: false, codingAgentRequiresRestart: false, codingAgentIsExternalRepo: false, codingAgentApplying: false, codingAgentHasDiff: false, lastRevivedAt: '', messageCount: 0, section: 'archived', activeChildrenCount: 0, totalChildrenCount: 0, blockingDescendantCount: 0, attentionDescendantCount: 0, liveEventWaitCount: 0, state: 'active', latestTodoList: null, liveEventWaits: [] },
       events: new Map(),
       streamingBuffer: '',
       eventsLoaded: false, // Fix: allows DB backfill
@@ -514,7 +514,7 @@ describe('Focused thread preserved across reload', () => {
       section: 'archived',
       active_children_count: 0,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'idle',
       coding_agent_proposed: false,
       coding_agent_requires_restart: false,
@@ -562,7 +562,7 @@ describe('Focused thread preserved across reload', () => {
       section: 'inbox',
       active_children_count: 0,
       total_children_count: 0,
-      blocking_descendant_count: 0, attention_descendant_count: 0,
+      blocking_descendant_count: 0, attention_descendant_count: 0, live_event_wait_count: 0,
       status: 'waiting',
       coding_agent_proposed: true,
       coding_agent_requires_restart: false,

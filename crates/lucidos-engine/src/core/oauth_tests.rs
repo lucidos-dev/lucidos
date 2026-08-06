@@ -737,6 +737,7 @@ fn authorize_url_and_token_exchange_send_an_identical_redirect_uri() {
                 "cid-123",
                 &redirect_uri,
                 "openid email",
+                "the-state",
                 &auth,
                 &default_authorize_params(),
             );
@@ -776,6 +777,7 @@ fn a_credential_with_a_secret_is_a_confidential_client() {
         "cid-123",
         "http://127.0.0.1:14981/oauth/callback",
         "openid email",
+        "the-state",
         &auth,
         &default_authorize_params(),
     );
@@ -786,8 +788,10 @@ fn a_credential_with_a_secret_is_a_confidential_client() {
          &redirect_uri=http%3A%2F%2F127.0.0.1%3A14981%2Foauth%2Fcallback\
          &response_type=code\
          &scope=openid%20email\
+         &state=the-state\
          &access_type=offline&prompt=consent",
-        "the confidential authorize URL must be exactly what it has always been"
+        "the confidential authorize URL must be exactly what it has always been, \
+         plus the per-flow state"
     );
 
     let form = exchange_form(
@@ -832,6 +836,7 @@ fn a_credential_without_a_secret_is_a_public_client_using_pkce() {
             "cid-123",
             "http://127.0.0.1:14981/oauth/callback",
             "offline_access User.Read",
+            "the-state",
             &auth,
             &default_authorize_params(),
         );
@@ -1034,6 +1039,10 @@ fn callback_query_without_code_or_error_is_still_reported() {
 // Callback listener (socket-level)
 // ---------------------------------------------------------------------------
 
+/// The nonce these listener tests pretend their flow put on the authorization
+/// request. A callback that does not echo it is not this flow's.
+const TEST_STATE: &str = "test-flow-state";
+
 /// Drive one HTTP request into the listener, optionally split mid-stream.
 async fn send_callback_request(addr: std::net::SocketAddr, head: String, tail: Option<String>) {
     use tokio::io::AsyncWriteExt;
@@ -1063,11 +1072,14 @@ async fn callback_recovers_a_long_code_split_across_reads() {
     let code = "M.C123_BAY.2.U.".repeat(400);
     let (head, tail) = code.split_at(code.len() / 2);
     let head = format!("GET /oauth/callback?code={head}");
-    let tail = format!("{tail}&session_state=abc HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
+    let tail =
+        format!("{tail}&session_state=abc&state={TEST_STATE} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n");
 
     send_callback_request(addr, head, Some(tail)).await;
 
-    let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
     assert_eq!(
         got, code,
         "the full authorization code must survive a split read"
@@ -1081,14 +1093,15 @@ async fn callback_surfaces_a_provider_denial() {
 
     send_callback_request(
         addr,
-        "GET /oauth/callback?error=access_denied&error_description=The+user+denied+consent \
-         HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
-            .to_string(),
+        format!(
+            "GET /oauth/callback?error=access_denied&error_description=The+user+denied+consent\
+             &state={TEST_STATE} HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ),
         None,
     )
     .await;
 
-    let err = wait_for_oauth_callback(listener, "testprov")
+    let err = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
         .await
         .expect_err("a denial callback must be an error");
     let msg = err.to_string();
@@ -1130,11 +1143,16 @@ async fn callback_is_received_on_every_bound_loopback_family() {
         let addr = listener.local_addrs()[index];
         send_callback_request(
             addr,
-            "GET /oauth/callback?code=family-code HTTP/1.1\r\nHost: localhost\r\n\r\n".to_string(),
+            format!(
+                "GET /oauth/callback?code=family-code&state={TEST_STATE} \
+                 HTTP/1.1\r\nHost: localhost\r\n\r\n"
+            ),
             None,
         )
         .await;
-        let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
+        let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+            .await
+            .unwrap();
         assert_eq!(got, "family-code", "callback over {addr} must be received");
     }
 }
@@ -1155,12 +1173,17 @@ async fn callback_ignores_browser_noise_before_the_real_redirect() {
     tokio::time::sleep(std::time::Duration::from_millis(80)).await;
     send_callback_request(
         addr,
-        "GET /oauth/callback?code=the-real-code HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_string(),
+        format!(
+            "GET /oauth/callback?code=the-real-code&state={TEST_STATE} \
+             HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ),
         None,
     )
     .await;
 
-    let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
     assert_eq!(got, "the-real-code");
 }
 
@@ -1174,6 +1197,7 @@ fn authorize_url_appends_to_an_endpoint_that_already_has_a_query() {
         "cid-123",
         "http://127.0.0.1:14981/oauth/callback",
         "openid",
+        "the-state",
         &auth,
         &default_authorize_params(),
     );
@@ -1203,15 +1227,255 @@ async fn callback_survives_a_connection_that_closes_without_sending() {
         tokio::time::sleep(std::time::Duration::from_millis(80)).await;
         let mut real = tokio::net::TcpStream::connect(addr).await.unwrap();
         use tokio::io::AsyncWriteExt;
-        real.write_all(b"GET /oauth/callback?code=survived HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n")
-            .await
-            .unwrap();
+        real.write_all(
+            format!(
+                "GET /oauth/callback?code=survived&state={TEST_STATE} \
+                 HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .unwrap();
         real.flush().await.unwrap();
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
     });
 
-    let got = wait_for_oauth_callback(listener, "testprov").await.unwrap();
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
     assert_eq!(got, "survived");
+}
+
+// ---------------------------------------------------------------------------
+// The callback port has one owner, and a new authorization supersedes it
+// ---------------------------------------------------------------------------
+
+/// Build a slot entry the way `prepare_oauth_flow` does.
+fn active_flow(task: tokio::task::JoinHandle<()>, holds_port: bool) -> Option<ActiveCallbackFlow> {
+    Some(ActiveCallbackFlow {
+        task,
+        holds_port: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(holds_port)),
+    })
+}
+
+/// The headline invariant: pressing *Grant access* a second time must always be
+/// able to start. It could not, for up to 120 seconds, because the previous
+/// flow's task was spawned detached and held the fixed port with nothing able to
+/// reclaim it.
+///
+/// The rebind here is immediate and unretried on purpose. That is what makes the
+/// test fail if `release_callback_port` ever drops its `await` and only calls
+/// `abort()`: cancellation would then be in flight while the bind runs, and the
+/// socket would still be open often enough to matter.
+#[tokio::test]
+async fn releasing_the_callback_port_frees_it_for_an_immediate_rebind() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let port = listener.local_addrs()[0].port();
+
+    // Stand in for a flow parked on the port waiting out its 120s timeout.
+    let mut slot = active_flow(
+        tokio::spawn(async move {
+            let _held = listener;
+            std::future::pending::<()>().await;
+        }),
+        true,
+    );
+    // Let it reach the await point, as a real waiting flow has.
+    tokio::task::yield_now().await;
+
+    assert!(
+        release_callback_port(&mut slot).await,
+        "a flow that was still waiting counts as superseded"
+    );
+    assert!(slot.is_none(), "the slot is emptied, not left dangling");
+
+    CallbackListener::bind(port)
+        .await
+        .expect("the port must be free the moment the release returns");
+}
+
+/// A flow's task outlives its ownership of the socket: the listener is dropped
+/// when the callback lands, and the token exchange, userinfo call and account
+/// write all run afterwards with the port already free. Superseding must NOT
+/// kill that tail. Aborting there would cancel a redemption the user has already
+/// consented to, and could land between the account row committing and its
+/// `OAuthAccountConnected` event, leaving a connected account no device is told
+/// about.
+#[tokio::test]
+async fn a_flow_that_already_released_the_port_is_detached_not_aborted() {
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel::<()>();
+    let mut slot = active_flow(
+        tokio::spawn(async move {
+            // Stands in for the token exchange: slow, and not holding the port.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            let _ = finished_tx.send(());
+        }),
+        false,
+    );
+
+    assert!(
+        !release_callback_port(&mut slot).await,
+        "a flow that no longer holds the port supersedes nothing"
+    );
+    assert!(slot.is_none());
+
+    // The work ran to completion despite its JoinHandle being dropped. An
+    // `abort()` here would leave this receiver empty.
+    tokio::time::timeout(std::time::Duration::from_secs(2), finished_rx)
+        .await
+        .expect("the detached flow must not be cancelled")
+        .expect("the detached flow must run to completion");
+}
+
+#[tokio::test]
+async fn releasing_an_empty_slot_supersedes_nothing() {
+    let mut empty: Option<ActiveCallbackFlow> = None;
+    assert!(!release_callback_port(&mut empty).await);
+}
+
+/// `EADDRINUSE` is the one bind failure with a remedy, and it reaches the user
+/// as a toast. The raw `Address already in use (os error 48)` they were shown
+/// named nothing they could act on.
+#[test]
+fn a_port_clash_explains_itself_and_every_other_error_keeps_its_words() {
+    let msg = callback_bind_error(
+        14981,
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, "Address already in use"),
+    )
+    .to_string();
+    assert!(msg.contains("14981"), "the port must be named: {msg}");
+    assert!(
+        msg.contains("another Lucidos workspace"),
+        "the likely cause must be named: {msg}"
+    );
+    assert!(
+        msg.contains("try again"),
+        "the message must say what to do: {msg}"
+    );
+
+    // Anything else is not a contention problem and must not be described as
+    // one.
+    let other = callback_bind_error(
+        14981,
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "permission denied"),
+    )
+    .to_string();
+    assert_eq!(other, "permission denied");
+}
+
+// ---------------------------------------------------------------------------
+// `state`: the nonce that binds a callback to the flow that asked for it
+// ---------------------------------------------------------------------------
+
+/// Two jobs, and the test covers both: it must be unpredictable (it is the only
+/// thing stopping anything that can reach the loopback port from injecting a
+/// code) and it must differ per flow (it is how a listener tells its own
+/// redirect from the one a superseded flow is still carrying).
+#[test]
+fn each_flow_gets_its_own_unguessable_state() {
+    let a = generate_oauth_state();
+    let b = generate_oauth_state();
+    assert_ne!(a, b, "two flows must not share a state");
+    // 32 bytes base64url-nopad, same entropy and alphabet as the PKCE verifier.
+    assert_eq!(a.len(), 43, "unexpected length: {a}");
+    assert!(
+        a.chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "state must be URL-safe without escaping: {a}"
+    );
+}
+
+#[test]
+fn a_callback_matches_only_on_this_flows_exact_state() {
+    assert!(callback_state_matches("code=x&state=abc", "abc"));
+    assert!(callback_state_matches("state=abc&code=x", "abc"));
+    // Another flow's value, or none at all, is not ours. A conforming provider
+    // always echoes what it was sent (RFC 6749 §4.1.2), so absent means the
+    // request did not come from our authorization.
+    assert!(!callback_state_matches("code=x&state=other", "abc"));
+    assert!(!callback_state_matches("code=x", "abc"));
+    assert!(!callback_state_matches("code=x&state=", "abc"));
+    // A parameter that merely starts with the key is a different parameter.
+    // Microsoft sends `session_state` on every callback.
+    assert!(!callback_state_matches("code=x&session_state=abc", "abc"));
+    // Percent-encoded on the way out, so decoded on the way in. `+` stays a
+    // literal `+`: the value is an opaque token, not form-encoded prose.
+    assert!(callback_state_matches("state=a%2Fb", "a/b"));
+    assert!(callback_state_matches("state=a+b", "a+b"));
+}
+
+/// The reason `state` is not optional once a new authorization supersedes an
+/// older one: the abandoned flow's redirect can land on a listener that never
+/// issued it. It must be answered and skipped, NOT returned (the code belongs to
+/// another client and PKCE verifier) and NOT failed on (the authorization the
+/// user is completing right now is still on its way).
+#[tokio::test]
+async fn a_callback_from_another_flow_is_ignored_and_the_real_one_still_lands() {
+    let listener = CallbackListener::bind(0).await.unwrap();
+    let addr = listener.local_addrs()[0];
+
+    send_callback_request(
+        addr,
+        "GET /oauth/callback?code=someone-elses-code&state=a-superseded-flow \
+         HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+            .to_string(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    // A forged callback with no state at all gets the same treatment.
+    send_callback_request(
+        addr,
+        "GET /oauth/callback?code=forged HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n".to_string(),
+        None,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+    send_callback_request(
+        addr,
+        format!(
+            "GET /oauth/callback?code=our-code&state={TEST_STATE} \
+             HTTP/1.1\r\nHost: 127.0.0.1\r\n\r\n"
+        ),
+        None,
+    )
+    .await;
+
+    let got = wait_for_oauth_callback(listener, "testprov", TEST_STATE)
+        .await
+        .unwrap();
+    assert_eq!(
+        got, "our-code",
+        "only the callback carrying this flow's state may be redeemed"
+    );
+}
+
+/// The URL half of the same invariant: what the listener demands back is what
+/// the authorization request actually sent, percent-encoded.
+#[test]
+fn the_authorize_url_carries_this_flows_state() {
+    let state = generate_oauth_state();
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        &state,
+        &ClientAuth::from_secret(Some("s")),
+        &default_authorize_params(),
+    );
+    assert_eq!(authorize_param(&url, "state").as_deref(), Some(&*state));
+    // And a value needing escapes survives the round trip as one parameter.
+    let url = build_authorize_url(
+        "https://accounts.example.com/authorize",
+        "cid",
+        "http://127.0.0.1:14981/oauth/callback",
+        "openid",
+        "a b&c=d",
+        &ClientAuth::from_secret(Some("s")),
+        &default_authorize_params(),
+    );
+    assert_eq!(authorize_param(&url, "state").as_deref(), Some("a b&c=d"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1467,6 +1731,7 @@ fn a_provider_can_ask_for_offline_access_in_its_own_spelling() {
         "cid-123",
         "http://127.0.0.1:14981/oauth/callback",
         "files.content.write",
+        "the-state",
         &ClientAuth::from_secret(Some("s")),
         &AuthorizeParams::parse(Some("token_access_type=offline")).unwrap(),
     );
@@ -1505,16 +1770,21 @@ fn none_sends_nothing_extra() {
         "cid-123",
         "http://127.0.0.1:14981/oauth/callback",
         "openid",
+        "the-state",
         &ClientAuth::from_secret(Some("s")),
         &AuthorizeParams::parse(Some("NONE")).unwrap(),
     );
     assert_eq!(
         url,
+        // `none` opts out of the CREDENTIAL's extra parameters. `state` is not
+        // one of them: the flow owns it (it is in RESERVED_AUTHORIZE_KEYS) and
+        // the listener requires it back, so it is sent regardless.
         "https://accounts.example.com/authorize\
          ?client_id=cid-123\
          &redirect_uri=http%3A%2F%2F127.0.0.1%3A14981%2Foauth%2Fcallback\
          &response_type=code\
-         &scope=openid"
+         &scope=openid\
+         &state=the-state"
     );
 }
 
@@ -1528,6 +1798,7 @@ fn the_flows_own_parameters_are_refused() {
         "redirect_uri",
         "response_type",
         "scope",
+        "state",
         "code_challenge",
         "code_challenge_method",
     ] {
@@ -1537,6 +1808,11 @@ fn the_flows_own_parameters_are_refused() {
     }
     // Case is not a way around it.
     assert!(AuthorizeParams::parse(Some("Redirect_URI=evil")).is_err());
+    // `state` joined the list when the flow started sending one. A stored value
+    // would put two `state` parameters on the URL, and the provider would echo
+    // back whichever it liked, so the listener could no longer recognise its own
+    // redirect.
+    assert!(AuthorizeParams::parse(Some("state=pinned")).is_err());
     // A reserved key anywhere in the list fails the whole value, rather than
     // being dropped: a silently ignored parameter is a swallowed error.
     assert!(AuthorizeParams::parse(Some("token_access_type=offline&scope=evil")).is_err());
@@ -1553,12 +1829,14 @@ fn a_value_with_separators_in_it_round_trips_as_one_value() {
         "cid",
         "http://127.0.0.1:14981/oauth/callback",
         "openid",
+        "the-state",
         &ClientAuth::from_secret(Some("s")),
         &params,
     );
     assert_eq!(authorize_param(&url, "claims").as_deref(), Some("a&b=c d"));
-    // One extra pair, not three.
-    assert_eq!(url.matches('&').count(), 4, "{url}");
+    // One extra pair, not three. The four the protocol always sends after the
+    // first parameter (redirect_uri, response_type, scope, state) plus this one.
+    assert_eq!(url.matches('&').count(), 5, "{url}");
 }
 
 #[test]
@@ -1584,6 +1862,7 @@ fn pkce_still_lands_last_for_a_public_client() {
         "cid",
         "http://127.0.0.1:14981/oauth/callback",
         "openid",
+        "the-state",
         &auth,
         &AuthorizeParams::parse(Some("token_access_type=offline")).unwrap(),
     );

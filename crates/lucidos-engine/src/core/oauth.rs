@@ -639,10 +639,7 @@ impl Pkce {
     /// unreserved set, which is the low end of the spec's 43..=128 range and
     /// the recommended entropy.
     fn generate() -> Self {
-        use rand::RngCore;
-        let mut bytes = [0u8; 32];
-        rand::thread_rng().fill_bytes(&mut bytes);
-        let verifier = base64_url_nopad(&bytes);
+        let verifier = random_url_token();
         let challenge = Self::challenge_for(&verifier);
         Self {
             verifier,
@@ -660,6 +657,42 @@ impl Pkce {
 fn base64_url_nopad(bytes: &[u8]) -> String {
     use base64::Engine as _;
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+/// 32 CSPRNG bytes, base64url-encoded to 43 characters that need no escaping in
+/// a URL. The shared generator behind both unguessable values this module puts
+/// on an authorization request: the PKCE verifier (RFC 7636 wants 43..=128 from
+/// the unreserved set, and 32 bytes is its recommended entropy) and the `state`
+/// nonce.
+fn random_url_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    base64_url_nopad(&bytes)
+}
+
+/// The `state` parameter for one authorization: an unguessable value sent on the
+/// authorization request and required back on the callback (RFC 6749 §4.1.2
+/// makes echoing it mandatory when it was sent).
+///
+/// It does two jobs here, and the second is why it is not optional.
+///
+/// 1. **CSRF.** The callback listener is a plain loopback socket, so during the
+///    flow's window ANY local process, and any web page the user happens to be
+///    browsing, can issue `GET 127.0.0.1:<port>/oauth/callback?code=...` and have
+///    the engine redeem a code it did not ask for. Requiring the value back is
+///    the standard defense.
+/// 2. **Identity.** A new authorization supersedes the previous one (see
+///    [`release_callback_port`]), so a redirect from an abandoned flow can arrive
+///    at a listener that never issued it. Without `state` the two are
+///    indistinguishable and the stale code would be redeemed against the new
+///    flow's client and PKCE verifier, failing in a way that names nothing.
+///
+/// Compared with `==` rather than in constant time on purpose: the value is not
+/// a secret the attacker is trying to *guess* one byte at a time, it is a nonce
+/// the legitimate redirect carries and a forged one does not.
+fn generate_oauth_state() -> String {
+    random_url_token()
 }
 
 /// How the client proves itself when redeeming the authorization code.
@@ -767,6 +800,7 @@ const RESERVED_AUTHORIZE_KEYS: &[&str] = &[
     "redirect_uri",
     "response_type",
     "scope",
+    "state",
     "code_challenge",
     "code_challenge_method",
 ];
@@ -846,6 +880,7 @@ fn build_authorize_url(
     client_id: &str,
     redirect_uri: &str,
     scopes: &str,
+    state: &str,
     auth: &ClientAuth,
     extra: &AuthorizeParams,
 ) -> String {
@@ -853,12 +888,13 @@ fn build_authorize_url(
     // user flow with `?p=…`), so appending a second `?` would corrupt the URL.
     let separator = if auth_url.contains('?') { '&' } else { '?' };
     let mut url = format!(
-        "{}{}client_id={}&redirect_uri={}&response_type=code&scope={}",
+        "{}{}client_id={}&redirect_uri={}&response_type=code&scope={}&state={}",
         auth_url,
         separator,
         urlencoding::encode(client_id),
         urlencoding::encode(redirect_uri),
         urlencoding::encode(scopes),
+        urlencoding::encode(state),
     );
     extra.append_to(&mut url);
     if let Some(challenge) = auth.code_challenge() {
@@ -1182,7 +1218,11 @@ struct CallbackListener {
 }
 
 impl CallbackListener {
-    async fn bind(port: u16) -> Result<Self, BoxError> {
+    /// Returns the raw `io::Error` rather than a `BoxError` so the caller can
+    /// branch on its kind: `AddrInUse` is the one failure with a remedy the user
+    /// can act on, and it needs different words from every other bind failure
+    /// (see [`callback_bind_error`]).
+    async fn bind(port: u16) -> std::io::Result<Self> {
         let v4 = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
         // Resolve the port actually bound before adding the second socket — the
         // caller may pass 0 (tests), and both families must land on one port.
@@ -1219,6 +1259,114 @@ impl CallbackListener {
         let (result, _, _) = futures::future::select_all(accepts).await;
         result.map(|(stream, _)| stream)
     }
+}
+
+/// The task that currently owns the loopback callback port, if any.
+///
+/// **Why a process-level slot rather than a field on some caller.** The port is
+/// fixed at [`CALLBACK_PORT`] because the redirect URI has to be registered with
+/// the provider ahead of time, which makes "at most one authorization in flight
+/// per engine" a fact about the world rather than a policy. The owner therefore
+/// belongs next to the code that binds it. Putting it in `AppState` would cover
+/// the Settings buttons and miss [`run_oauth_flow`], which the agent's
+/// `connect_oauth_account` reaches without passing through the API layer, and
+/// which the Backup page's own "Ask Lucidos to set this up" button invites.
+///
+/// **The bug it fixes.** `prepare_oauth_flow` used to `tokio::spawn` the waiter
+/// and drop its `JoinHandle` on the spot. The only handle kept anywhere was the
+/// result `oneshot::Receiver`, and dropping a receiver does not cancel a task,
+/// so an abandoned authorization held the port for its full 120 second timeout
+/// with nothing able to reclaim it. Every retry inside that window died at the
+/// bind with a bare `Address already in use (os error 48)`. A user who reloaded
+/// the page mid-flow hit it every time, because the handler that would have
+/// awaited the flow has already removed its map entry by then, leaving the task
+/// both unreachable and alive.
+static ACTIVE_CALLBACK_FLOW: std::sync::LazyLock<tokio::sync::Mutex<Option<ActiveCallbackFlow>>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(None));
+
+/// The flow registered in [`ACTIVE_CALLBACK_FLOW`], and whether it still holds
+/// the port.
+///
+/// The two are separate because a flow's task OUTLIVES its ownership of the
+/// socket: `wait_for_oauth_callback` takes the listener by value, so the port is
+/// released the moment the callback lands (or the timeout fires), and everything
+/// after that (the token exchange, the userinfo call, the account write) runs
+/// with the port already free. Keying the supersede on the task alone would
+/// abort that tail for a port nobody was waiting on, cancelling a redemption the
+/// user had already completed and, worse, potentially landing between the
+/// account row committing and its `OAuthAccountConnected` event.
+struct ActiveCallbackFlow {
+    task: tokio::task::JoinHandle<()>,
+    /// Set once at registration, cleared by the flow itself the instant it stops
+    /// holding the listener. Ordered so that `false` implies the sockets are
+    /// already closed: the store happens after the future that owns them has
+    /// resolved and dropped them.
+    holds_port: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// What a caller is told when its flow's result channel closed with no result.
+///
+/// The sender drops without sending only when the task went away, and since the
+/// callback port has one owner and a new authorization supersedes the previous
+/// one, that is what this almost always is: something the user did on purpose,
+/// not an internal fault. Shared by BOTH entry points ([`run_oauth_flow`], which
+/// the agent's `connect_oauth_account` uses, and the API's `/oauth/complete`),
+/// because the supersede fires on either and they must not describe it
+/// differently.
+pub const FLOW_SUPERSEDED_MSG: &str =
+    "This authorization was canceled, most likely because a newer one was started. \
+     Start it again if you still need it.";
+
+/// Cancel the flow that owns the callback port, and wait until its socket is
+/// actually closed. Reports whether a live flow was superseded.
+///
+/// **The await is the whole point.** `JoinHandle::abort` only *requests*
+/// cancellation, taking effect when the task next yields, so returning straight
+/// after it would let the caller's `bind` race the socket's close and
+/// reintroduce the exact `EADDRINUSE` this exists to prevent. Awaiting the
+/// handle means the task's future has been dropped, and with it the listener's
+/// file descriptors, before the caller proceeds. The expected outcome is
+/// `Err(JoinError::cancelled)`, which is not a failure and is discarded.
+///
+/// A flow that has already released the port is **detached, not aborted**: it is
+/// not in the caller's way, and killing it would throw away an authorization the
+/// user completed. Dropping its `JoinHandle` lets it finish on its own.
+///
+/// Takes the slot by reference rather than reading [`ACTIVE_CALLBACK_FLOW`]
+/// itself so the release-then-rebind guarantee is testable against a
+/// caller-supplied slot.
+async fn release_callback_port(slot: &mut Option<ActiveCallbackFlow>) -> bool {
+    let Some(flow) = slot.take() else {
+        return false;
+    };
+    if !flow.holds_port.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
+    }
+    flow.task.abort();
+    let _ = flow.task.await;
+    true
+}
+
+/// Explain a callback-listener bind failure.
+///
+/// By the time this runs the engine has already released its own flow, so
+/// `AddrInUse` means a *different* process holds the port. On a machine running
+/// Lucidos that is almost always another workspace part-way through connecting
+/// an account (workspaces run concurrently by design, each with its own engine,
+/// and they all share this one machine-wide port). Say that, because the raw
+/// `Address already in use (os error 48)` the user was shown names nothing they
+/// can act on. Every other error kind keeps its own text.
+fn callback_bind_error(port: u16, e: std::io::Error) -> BoxError {
+    if e.kind() != std::io::ErrorKind::AddrInUse {
+        return e.into();
+    }
+    format!(
+        "the OAuth callback port {port} is already in use. Lucidos has released its own \
+         authorization, so another program on this machine is holding it, most often another \
+         Lucidos workspace part-way through connecting an account. Finish or abandon that one, \
+         then try again."
+    )
+    .into()
 }
 
 /// Cap on the buffered request line. Authorization codes run to kilobytes
@@ -1292,6 +1440,18 @@ fn query_param(query: &str, key: &str, plus_is_space: bool) -> Option<String> {
             .map(|decoded| decoded.into_owned())
             .unwrap_or(raw),
     )
+}
+
+/// Does a callback query carry the `state` this flow sent?
+///
+/// Pure, so the matching rule is testable without a socket. `plus_is_space` is
+/// false because the value is an opaque base64url token, not form-encoded text:
+/// decoding `+` as a space would corrupt a legitimate value. A callback with no
+/// `state` at all does not match, which is the same verdict as a wrong one:
+/// every conforming provider echoes what it was sent (RFC 6749 §4.1.2), so an
+/// absent value means the request did not come from our authorization.
+fn callback_state_matches(query: &str, expected: &str) -> bool {
+    query_param(query, "state", false).is_some_and(|got| got == expected)
 }
 
 /// Turn a callback query string into the authorization code, or into the
@@ -1444,9 +1604,18 @@ fn callback_page(provider: &str, ok: bool) -> String {
 }
 
 /// Wait for the provider's redirect and extract the authorization code.
+///
+/// `expected_state` is the nonce this flow put on its authorization request (see
+/// [`generate_oauth_state`]). A callback that does not echo it back exactly is
+/// answered and SKIPPED, never returned and never failed on: it is either a
+/// forged request or the redirect of a flow this one superseded, and in both
+/// cases the authorization the user is completing right now is still on its way.
+/// Failing here instead would let anything that can reach the loopback port
+/// cancel a legitimate authorization.
 async fn wait_for_oauth_callback(
     listener: CallbackListener,
     provider: &str,
+    expected_state: &str,
 ) -> Result<String, BoxError> {
     loop {
         let mut stream = listener.accept().await?;
@@ -1478,6 +1647,23 @@ async fn wait_for_oauth_callback(
         // this loop.
         if path != CALLBACK_PATH || query.is_empty() {
             respond_to_browser(&mut stream, "404 Not Found", "<html><body></body></html>").await;
+            continue;
+        }
+
+        // Not this flow's redirect: skip it and keep waiting, for the reason on
+        // this function. The BROWSER still gets the real failure page rather
+        // than the probe's empty body, because the likeliest sender is a human
+        // finishing a consent screen this flow superseded, and "nothing was
+        // connected" is both true for that tab and exactly what the styled
+        // callback page exists to say. Nothing from the query is rendered, so
+        // the page's injection contract is unchanged.
+        if !callback_state_matches(query, expected_state) {
+            crate::log!(
+                "[OAuth] Ignoring a {} callback that did not carry this flow's state",
+                provider
+            );
+            let body = callback_page(provider, false);
+            respond_to_browser(&mut stream, "400 Bad Request", &body).await;
             continue;
         }
 
@@ -1576,9 +1762,29 @@ pub async fn prepare_oauth_flow(
     // listener never receives.
     let redirect_uri = resolve_redirect_uri(&client_config)?;
 
+    // This flow's nonce. Generated before the listener binds so the URL and the
+    // listener are handed the same value by construction.
+    let state = generate_oauth_state();
+
+    // The callback port has ONE owner (see `ACTIVE_CALLBACK_FLOW`). Take the
+    // lock before releasing the previous flow and hold it past the bind and the
+    // spawn, so two callers cannot both find the slot empty and race for the
+    // socket. Starting an authorization always supersedes an abandoned one: the
+    // user pressing the button is stating what they want now, and the older
+    // flow is by construction one whose browser tab they walked away from.
+    let mut active_flow = ACTIVE_CALLBACK_FLOW.lock().await;
+    if release_callback_port(&mut active_flow).await {
+        crate::log!(
+            "[OAuth] Superseded an authorization still waiting on port {}",
+            CALLBACK_PORT
+        );
+    }
+
     // Start the temporary loopback listener BEFORE returning the URL, so the
     // callback can't arrive before we're listening.
-    let listener = CallbackListener::bind(CALLBACK_PORT).await?;
+    let listener = CallbackListener::bind(CALLBACK_PORT)
+        .await
+        .map_err(|e| callback_bind_error(CALLBACK_PORT, e))?;
 
     // Build authorization URL with merged scopes, from the same redirect_uri
     // the exchange below will send.
@@ -1587,6 +1793,7 @@ pub async fn prepare_oauth_flow(
         &client_id,
         &redirect_uri,
         &merged_scopes,
+        &state,
         &auth,
         &authorize_params,
     );
@@ -1605,17 +1812,29 @@ pub async fn prepare_oauth_flow(
     let event_bus = event_bus.clone();
     let provider = provider.to_string();
     let initiator = initiator.clone();
+    let holds_port = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let task_holds_port = holds_port.clone();
 
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         let result = async {
             // Wait for callback (with 120s timeout)
-            let code = tokio::time::timeout(
+            let waited = tokio::time::timeout(
                 std::time::Duration::from_secs(120),
-                wait_for_oauth_callback(listener, &provider),
+                wait_for_oauth_callback(listener, &provider, &state),
             )
-            .await
-            .map_err(|_| "OAuth authorization timed out after 120 seconds".to_string())?
-            .map_err(|e| format!("OAuth callback error: {}", e))?;
+            .await;
+
+            // The listener is gone by now whichever way that resolved: the
+            // future owns it, so both the completed and the timed-out path have
+            // already closed the sockets. Publish that BEFORE the token
+            // exchange, which is slow (a network round trip) and must not be
+            // abortable by a supersede: nothing is waiting on the port any more,
+            // and this flow may already have redeemed the user's consent.
+            task_holds_port.store(false, std::sync::atomic::Ordering::Release);
+
+            let code = waited
+                .map_err(|_| "OAuth authorization timed out after 120 seconds".to_string())?
+                .map_err(|e| format!("OAuth callback error: {}", e))?;
 
             // Exchange code for tokens. `exchange_code` already names the leg
             // and carries the provider's own error text, so it is NOT re-wrapped.
@@ -1670,6 +1889,11 @@ pub async fn prepare_oauth_flow(
         let _ = result_tx.send(result);
     });
 
+    // Register the new owner before releasing the lock, so the next flow has
+    // something to supersede and the port is never orphaned again.
+    *active_flow = Some(ActiveCallbackFlow { task, holds_port });
+    drop(active_flow);
+
     Ok(PreparedOAuthFlow {
         auth_url: auth_request_url,
         result_rx,
@@ -1717,7 +1941,7 @@ where
     prepared
         .result_rx
         .await
-        .map_err(|_| "OAuth flow task was dropped")?
+        .map_err(|_| FLOW_SUPERSEDED_MSG)?
         .map_err(|e| e.into())
 }
 

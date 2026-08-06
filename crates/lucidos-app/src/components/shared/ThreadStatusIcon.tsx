@@ -5,13 +5,28 @@ import { PauseIcon } from './icons';
 /** 'changes' = static dot (CC has pending changes); 'question' = "?" badge
  *  (CC paused on AskUserQuestion). 'waiting' = pulsing dot, used only when
  *  the thread has no own state of its own to surface (otherwise own state
- *  wins, even with active children). */
+ *  wins, even with active children or a live subscription). */
 export type VisualStatus = ThreadStatus | 'changes' | 'question';
 
+/** `waiting` covers BOTH ways a thread can be finished-but-not-done: it is
+ *  waiting on child threads it spawned, or on an *event wait* it registered.
+ *  Neither holds the thread's turn, so both land here with a backend
+ *  `status` of `idle`, and both mean the same thing to the reader: something
+ *  else will wake this, do not treat it as finished. They deliberately share
+ *  one dot rather than splitting into two, since the distinction between them
+ *  is detail the subscription indicator carries.
+ *
+ *  Note what this does NOT do: an event wait changes only what the dot draws.
+ *  `is_blocking`, `is_attention_needing`, `displaySection` and the thread
+ *  actions never see it, so a subscribed thread stays non-blocking,
+ *  non-attention-needing and archivable (ADR 0049). `VisualStatus` is the
+ *  right home for the fact precisely because it is already a derived axis:
+ *  `changes` and `question` are not `ThreadStatus` values either. */
 export function resolveVisualStatus(
   status: ThreadStatus,
   hasActiveChildren: boolean,
   codingAgentProposed: boolean,
+  hasLiveEventWaits: boolean,
 ): VisualStatus {
   if (status === 'failed') return 'failed';
   if (status === 'running') return 'running';
@@ -23,8 +38,10 @@ export function resolveVisualStatus(
   // written `waiting`, not `paused`, by `AbortCause::status_sql`), so reaching
   // here means there is nothing to review.
   if (status === 'paused') return 'paused';
+  // `changes` still outranks `waiting`: a proposed change needs the user, and a
+  // subscription does not.
   if (codingAgentProposed) return 'changes';
-  if (hasActiveChildren) return 'waiting';
+  if (hasActiveChildren || hasLiveEventWaits) return 'waiting';
   return 'idle';
 }
 
@@ -40,6 +57,7 @@ export function threadVisualStatus(thread: ThreadState): VisualStatus {
     effectiveThreadStatus(thread),
     thread.meta.activeChildrenCount > 0,
     thread.meta.codingAgentProposed,
+    thread.meta.liveEventWaitCount > 0,
   );
 }
 
@@ -48,7 +66,11 @@ export function threadVisualStatus(thread: ThreadState): VisualStatus {
  *  never drift. (idle has no dot, so it needs no entry.) */
 const STATUS_INFO: { status: VisualStatus; label: string; desc: string }[] = [
   { status: 'running', label: 'Running', desc: 'Actively working on a response.' },
-  { status: 'waiting', label: 'Waiting', desc: 'Waiting for its child threads to finish.' },
+  // One description for both causes, because one dot covers both (see
+  // `resolveVisualStatus`). Naming only children would be a lie on a thread
+  // that is watching for an event, and the per-wait detail is one tap away in
+  // the subscription indicator.
+  { status: 'waiting', label: 'Waiting', desc: 'Not finished: it is waiting for a child thread, or for an event it subscribed to.' },
   { status: 'question', label: 'Waiting for your answer', desc: 'Paused until you answer its question.' },
   { status: 'changes', label: 'Changes to review', desc: 'A coding agent proposed changes to open and Apply.' },
   { status: 'paused', label: 'Paused', desc: 'Your switch to a new version interrupted this turn. It resumes on its own, so there is nothing to do.' },

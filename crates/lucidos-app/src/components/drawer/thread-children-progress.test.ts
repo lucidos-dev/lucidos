@@ -46,7 +46,8 @@ function makeThread(id: string, overrides: Partial<ThreadMeta> = {}): ThreadStat
       blockingDescendantCount: 0, attentionDescendantCount: 0,
       state: 'active',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
       ...overrides,
     },
     events: new Map(),
@@ -85,7 +86,7 @@ function familyRenderState(
     // The control's own tooltip + aria-label, so hovering the badge/chevron
     // never falls through to the row's general thread tooltip.
     disclosureLabel: opts.isCollapsed ? `Show ${a11yCount}` : 'Hide sub-threads',
-    visualStatus: resolveVisualStatus(status, hasActiveChildren, meta.codingAgentProposed),
+    visualStatus: resolveVisualStatus(status, hasActiveChildren, meta.codingAgentProposed, meta.liveEventWaitCount > 0),
   };
 }
 
@@ -205,53 +206,53 @@ describe('visual status resolution', () => {
   // — children's waiting state never overrides the parent's own meaningful state.
 
   it('idle + active children → waiting (only own state is idle)', () => {
-    expect(resolveVisualStatus('idle', true, false)).toBe('waiting');
+    expect(resolveVisualStatus('idle', true, false, false)).toBe('waiting');
   });
 
   it('no active children + idle → idle (no dot)', () => {
-    expect(resolveVisualStatus('idle', false, false)).toBe('idle');
+    expect(resolveVisualStatus('idle', false, false, false)).toBe('idle');
   });
 
   it('no children + running → running (spinner)', () => {
-    expect(resolveVisualStatus('running', false, false)).toBe('running');
+    expect(resolveVisualStatus('running', false, false, false)).toBe('running');
   });
 
   it('no active children + waiting + codingAgentProposed → changes (static dot)', () => {
-    expect(resolveVisualStatus('waiting', false, true)).toBe('changes');
+    expect(resolveVisualStatus('waiting', false, true, false)).toBe('changes');
   });
 
   it('no active children + waiting without codingAgentProposed → idle (no dot)', () => {
     // Defensive: backend shouldn't park threads in 'waiting' without changes,
     // but historical chat threads (pre-fix ResponseAborted/Failed) might.
-    expect(resolveVisualStatus('waiting', false, false)).toBe('idle');
+    expect(resolveVisualStatus('waiting', false, false, false)).toBe('idle');
   });
 
   it('waiting + active children + no changes → waiting (own state is empty)', () => {
-    expect(resolveVisualStatus('waiting', true, false)).toBe('waiting');
+    expect(resolveVisualStatus('waiting', true, false, false)).toBe('waiting');
   });
 
   it('waiting + active children + codingAgentProposed → changes (own changes win)', () => {
-    expect(resolveVisualStatus('waiting', true, true)).toBe('changes');
+    expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
   });
 
   it('failed → failed (red triangle)', () => {
-    expect(resolveVisualStatus('failed', false, false)).toBe('failed');
+    expect(resolveVisualStatus('failed', false, false, false)).toBe('failed');
   });
 
   it('failed + active children → failed (own failure wins)', () => {
-    expect(resolveVisualStatus('failed', true, false)).toBe('failed');
+    expect(resolveVisualStatus('failed', true, false, false)).toBe('failed');
   });
 
   it('running + active children → running (own work wins)', () => {
-    expect(resolveVisualStatus('running', true, false)).toBe('running');
+    expect(resolveVisualStatus('running', true, false, false)).toBe('running');
   });
 
   it('waiting_for_user_answer + active children → question (own question wins)', () => {
-    expect(resolveVisualStatus('waiting_for_user_answer', true, false)).toBe('question');
+    expect(resolveVisualStatus('waiting_for_user_answer', true, false, false)).toBe('question');
   });
 
   it('idle + active children + codingAgentProposed → changes (own changes win)', () => {
-    expect(resolveVisualStatus('idle', true, true)).toBe('changes');
+    expect(resolveVisualStatus('idle', true, true, false)).toBe('changes');
   });
 });
 
@@ -296,15 +297,15 @@ describe('displaySection routing with children', () => {
 
 describe('thread title status icon', () => {
   it('has-changes dot is static (changes, not waiting) in thread title', () => {
-    expect(resolveVisualStatus('waiting', false, true)).toBe('changes');
+    expect(resolveVisualStatus('waiting', false, true, false)).toBe('changes');
   });
 
   it('changes win over children — thread title shows static changes dot', () => {
-    expect(resolveVisualStatus('waiting', true, true)).toBe('changes');
+    expect(resolveVisualStatus('waiting', true, true, false)).toBe('changes');
   });
 
   it('pulsing waiting dot only when own state has nothing else to show', () => {
-    expect(resolveVisualStatus('idle', true, false)).toBe('waiting');
+    expect(resolveVisualStatus('idle', true, false, false)).toBe('waiting');
   });
 });
 

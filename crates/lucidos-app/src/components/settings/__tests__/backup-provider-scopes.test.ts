@@ -10,7 +10,12 @@
  * entries carry the scopes the engine actually checks.
  */
 import { describe, it, expect } from 'vitest';
-import { PROVIDER_SCOPES, oauthProviderFor, pickInitialProvider } from '../backupProviderScopes';
+import {
+  PROVIDER_SCOPES,
+  backupAccessLine,
+  oauthProviderFor,
+  pickInitialProvider,
+} from '../backupProviderScopes';
 
 /** Mirrors `PROVIDER_IDS` in `crates/lucidos-engine/src/core/backup/mod.rs`,
  *  which the engine's own `provider_ids_match_registry` test keeps in step with
@@ -61,6 +66,50 @@ describe('the OAuth provider behind each backup provider', () => {
 
   it('leaves every other id alone', () => {
     expect(oauthProviderFor('dropbox')).toBe('dropbox');
+  });
+});
+
+describe('what the page says when a connected provider cannot upload', () => {
+  it('names the one permission the grant is short', () => {
+    // The reported dead end: the user pressed Grant access, completed the
+    // Dropbox consent screen, and came back to a line reading exactly what it
+    // read before. Naming the scope is what distinguishes "you did not grant"
+    // from "the App Console still does not permit this one".
+    expect(backupAccessLine('Dropbox', ['files.metadata.read'])).toBe(
+      'Dropbox is missing the files.metadata.read permission.',
+    );
+  });
+
+  it('lists several, and agrees with itself about plurals', () => {
+    expect(
+      backupAccessLine('Dropbox', ['files.content.read', 'files.metadata.read']),
+    ).toBe('Dropbox is missing the files.content.read, files.metadata.read permissions.');
+  });
+
+  it('renders whatever the engine named, without re-mapping it', () => {
+    // The engine resolves its substring matchers to real scopes before they
+    // reach the wire (`name_missing_scopes`), so Drive arrives already spelled
+    // as the URL. A second mapping here would be a drifting answer to a question
+    // already settled, and would disagree with `get_backup_status`.
+    expect(backupAccessLine('Google Drive', ['https://www.googleapis.com/auth/drive.file'])).toBe(
+      'Google Drive is missing the https://www.googleapis.com/auth/drive.file permission.',
+    );
+  });
+
+  it('falls back to the bare sentence when the engine names nothing', () => {
+    // A verdict that could not be resolved. Rendering an empty list would read
+    // as a bug.
+    expect(backupAccessLine('Google Drive', [])).toBe(
+      'Google Drive access not granted.',
+    );
+  });
+
+  it('survives an engine too old to send the field at all', () => {
+    // The type says string[], but the wire does not: between a new bundle being
+    // served and the engine restart landing, /backup/providers answers without
+    // the key. A `.length` on that throws inside render and takes the whole
+    // Settings view down with it.
+    expect(backupAccessLine('Dropbox', undefined)).toBe('Dropbox access not granted.');
   });
 });
 

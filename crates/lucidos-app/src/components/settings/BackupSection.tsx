@@ -2,7 +2,12 @@ import { type VNode } from 'preact';
 import { useState, useEffect } from 'preact/hooks';
 import { backupProgress, backupStatusVersion, showToast } from '../../store/store';
 import { grantOAuthScope } from '../../store/actions/oauth';
-import { PROVIDER_SCOPES, oauthProviderFor, pickInitialProvider } from './backupProviderScopes';
+import {
+  PROVIDER_SCOPES,
+  backupAccessLine,
+  oauthProviderFor,
+  pickInitialProvider,
+} from './backupProviderScopes';
 import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -579,7 +584,7 @@ export function BackupSection() {
         // but now with a way out of it. This was static prose naming a path,
         // which left the user to walk it themselves; the button lands them on
         // the Connected accounts section directly.
-        <div class="backup-not-connected-row">
+        <div class="backup-blocked-row">
           <span>No {providerInfo.name} account connected, so backups cannot upload.</span>
           <button class="action-btn action-btn-confirm" onClick={openConnectedAccountsSettings}>
             Connect {providerInfo.name}
@@ -588,8 +593,13 @@ export function BackupSection() {
       )}
 
       {providerInfo && providerInfo.connected && !providerInfo.ready && (
-        <div style="display: flex; align-items: center; gap: 0.5rem; font-size: var(--font-size-xs); color: var(--accent-red);">
-          <span>{providerInfo.name} access not granted.</span>
+        // The other blocked state, and deliberately the same row: an account
+        // exists, so the fix is a re-authorization rather than a connection.
+        // The line names the permissions the grant is short whenever the engine
+        // reports them, because a bare refusal sentence reads identically after
+        // a completed authorization and before one.
+        <div class="backup-blocked-row">
+          <span>{backupAccessLine(providerInfo.name, providerInfo.missing_scopes)}</span>
           <button
             class="action-btn action-btn-confirm"
             disabled={granting}
@@ -613,7 +623,7 @@ export function BackupSection() {
         </div>
       )}
 
-      <div style="display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap;">
+      <div class="backup-actions-row">
         <button
           class="action-btn action-btn-confirm"
           disabled={backingUp || !selectedProvider || !providerInfo?.ready}
@@ -639,7 +649,7 @@ export function BackupSection() {
         )}
       </div>
       {scheduleLoaded && schedule !== 'off' && (
-        <div style="font-size: var(--font-size-xs); color: var(--text-muted); margin-top: 0.25rem;">
+        <div class="backup-schedule-hint">
           Scheduled backups run at the selected time in your timezone (set in Settings → Locale).
         </div>
       )}
@@ -647,7 +657,7 @@ export function BackupSection() {
       {/* Live backup progress is shown by the health card at the top of this
           section (backupHealthCard's running branch) — no duplicate bar here. */}
 
-      <div style="display: flex; align-items: center; gap: 0.75rem; flex-wrap: wrap; margin-top: 0.5rem;">
+      <div class="backup-key-row">
         <button
           class="action-btn"
           onClick={handleKeyButton}
@@ -656,15 +666,13 @@ export function BackupSection() {
         </button>
         {showKey && keyInfo && (
           <>
-            <span style="font-size: var(--font-size-xs); color: var(--text-muted); font-family: var(--font-mono); user-select: all;">
-              {keyInfo.key}
-            </span>
+            <span class="backup-key-value">{keyInfo.key}</span>
             <button class="action-btn" onClick={copyKey}>Copy</button>
           </>
         )}
       </div>
       {showKey && keyInfo && (
-        <div style="font-size: var(--font-size-xs); color: var(--accent-red); margin-top: 0.25rem;">
+        <div class="backup-key-warning">
           Store this key somewhere safe right now — you need it to restore, and it cannot be recovered.
           You restore a backup from the workspace picker.
         </div>

@@ -5,8 +5,9 @@ import {
   formatRemaining,
   secondsRemaining,
 } from '../event-waits';
+import { resolveVisualStatus } from '../../../components/shared/ThreadStatusIcon';
 import type { EventWaitSummary, ThreadEvent } from '../thread-event-types';
-import type { ThreadMeta } from '../thread-meta';
+import { applyAggregateToMeta, type ThreadAggregate, type ThreadMeta } from '../thread-meta';
 
 /** Only the field the projection touches; everything else on ThreadMeta is
  *  irrelevant here and a full fixture would just rot. */
@@ -104,6 +105,43 @@ describe('eventWaitProjection', () => {
     for (const e of stream) eventWaitProjection(replay, e);
     expect(replay.liveEventWaits).toEqual(live.liveEventWaits);
     expect(live.liveEventWaits.map((w) => w.wait_id)).toEqual(['w2']);
+  });
+});
+
+/** The status dot reads `meta.liveEventWaitCount`, which comes from the backend
+ *  projection, NOT from `meta.liveEventWaits.length`. The two agree whenever
+ *  both are populated, and the split is what makes the dot right on a drawer
+ *  row whose events were never loaded and after a reload, where the list is
+ *  empty by construction. These pin that separation. */
+describe('liveEventWaitCount', () => {
+  const aggregate = (liveEventWaitCount: number): ThreadAggregate =>
+    ({ liveEventWaitCount } as unknown as ThreadAggregate);
+
+  it('is what the Waiting dot reads, with an empty liveEventWaits list', () => {
+    const m = { liveEventWaits: [], liveEventWaitCount: 0 } as unknown as ThreadMeta;
+    applyAggregateToMeta(m, aggregate(1));
+    expect(m.liveEventWaitCount).toBe(1);
+    expect(m.liveEventWaits).toHaveLength(0);
+    expect(resolveVisualStatus('idle', false, false, m.liveEventWaitCount > 0)).toBe('waiting');
+  });
+
+  it('clears the dot when the aggregate reports the last wait resolved', () => {
+    const m = { liveEventWaits: [], liveEventWaitCount: 1 } as unknown as ThreadMeta;
+    applyAggregateToMeta(m, aggregate(0));
+    expect(m.liveEventWaitCount).toBe(0);
+    expect(resolveVisualStatus('idle', false, false, m.liveEventWaitCount > 0)).toBe('idle');
+  });
+
+  /** The count alone must flag the meta as changed, or `threadMap` never
+   *  flushes and the dot does not repaint until some unrelated field moves.
+   *  Settling the meta against the same aggregate first is what makes the
+   *  count the ONLY difference the second call can see. */
+  it('flags a meta change on the count alone, and only when it moves', () => {
+    const m = { liveEventWaits: [], liveEventWaitCount: 0 } as unknown as ThreadMeta;
+    applyAggregateToMeta(m, aggregate(0));
+    expect(applyAggregateToMeta(m, aggregate(0))).toBe(false);
+    expect(applyAggregateToMeta(m, aggregate(1))).toBe(true);
+    expect(applyAggregateToMeta(m, aggregate(1))).toBe(false);
   });
 });
 

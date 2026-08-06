@@ -42,7 +42,8 @@ function makeThread(id: string, overrides: Partial<ThreadState['meta']> = {}): T
       lastRevivedAt: '',
       state: 'active',
       latestTodoList: null,
-    liveEventWaits: [],
+      liveEventWaitCount: 0,
+      liveEventWaits: [],
       ...overrides,
     },
     events: new Map(),
@@ -191,7 +192,8 @@ describe('Phantom thread prevention', () => {
         parentThreadTitle: null,
         state: 'active',
         latestTodoList: null,
-    liveEventWaits: [],
+        liveEventWaitCount: 0,
+        liveEventWaits: [],
       } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
     });
 
@@ -240,7 +242,8 @@ describe('Phantom thread prevention', () => {
         parentThreadTitle: null,
         state: 'active',
         latestTodoList: null,
-    liveEventWaits: [],
+        liveEventWaitCount: 0,
+        liveEventWaits: [],
       } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
     });
 
@@ -294,7 +297,8 @@ describe('Phantom thread prevention', () => {
         parentThreadTitle: null,
         state: 'active',
         latestTodoList: null,
-    liveEventWaits: [],
+        liveEventWaitCount: 0,
+        liveEventWaits: [],
       } as unknown as Parameters<typeof handleThreadEvent>[0]['aggregate'],
     });
 
