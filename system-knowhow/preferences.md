@@ -1,6 +1,6 @@
 ---
 name: Preferences
-description: The preferences (Settings) the Lucidos Agent reads and changes with get_preferences / set_preference: theme, language, timezone, push, welcome message, chat model, reasoning effort, UI scale, font and more. Covers the settable keys with their allowed values, defaults and global-vs-device scope, how a write propagates, the device-scope override trap, and which Settings live in other stores.
+description: The preferences (Settings) the Lucidos Agent reads and changes with get_preferences / set_preference: theme, language, timezone, push, welcome message, chat model, reasoning effort, UI scale, font and more, with allowed values, defaults and global-vs-device scope.
 ---
 
 # Preferences (Settings the agent can change)

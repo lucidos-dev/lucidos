@@ -1072,8 +1072,11 @@ async fn interrupted_coding_agent_thread_keeps_paused_status() {
 ///
 /// 1. `EngineShutdown` + device actor: the user's own *Switch to new version*,
 ///    which both resume gates auto-resume. Paused.
-/// 2. `EngineShutdown` + system actor: the `shutdown_active_threads` fallback for
-///    a thread that started after the restart pre-emit. No gate picks it up.
+/// 2. `EngineShutdown` + system actor: a teardown nobody requested (`stop.sh`,
+///    an external SIGUSR1, ctrl-c). No gate picks it up. Note this is now the
+///    ONLY way to get this pair: since 2026-08-07 every emit in one teardown
+///    reads the same `LucidosEngine::teardown_actor`, so a user switch cannot
+///    produce it for a thread that merely started late.
 /// 3. `RecoveryAfterRestart` + system actor: the crash boundary, and the shape
 ///    `settle_unresumed_switch_threads` emits to WITHDRAW a promise this boot
 ///    could not keep. Withdrawing it behind a reassuring pause glyph, and out of
@@ -1168,13 +1171,18 @@ async fn only_a_user_switch_teardown_settles_a_thread_at_paused() {
 /// Regression: the shutdown sweep's phantom `ResponseCanceled` must not walk an
 /// interrupted **Lucidos Agent** thread's error status back to 'idle'.
 ///
-/// `shutdown_active_threads` emits `ResponseAborted` (→ 'failed') with NO
-/// `request_event_id`, then cancels the loop — whose own `ResponseCanceled`
-/// DOES carry one, so `emit_response_canceled`'s idempotency gate cannot pair
-/// them and the phantom lands. The sweep's docstring called that harmless
-/// because "ResponseAborted takes precedence in status derivation", which is
-/// only true of the exchange label; `thread_summaries.status` is
-/// last-write-wins, so the cancel used to erase the red dot.
+/// `shutdown_active_threads` emits `ResponseAborted`, then cancels the loop,
+/// whose own `ResponseCanceled` follows. The sweep's docstring called the
+/// phantom harmless because "ResponseAborted takes precedence in status
+/// derivation", which is only true of the exchange label;
+/// `thread_summaries.status` is last-write-wins, so the cancel used to erase the
+/// verdict. `preserving_verdict` is what stops it.
+///
+/// The sweep anchors both emits on the in-flight turn now, so
+/// `emit_response_canceled`'s idempotency gate usually pairs them and no phantom
+/// is produced at all. This test deliberately reproduces the unpaired ordering
+/// anyway: the gate needs an anchor to match on, and a turn that never got far
+/// enough to record one still reaches this shape.
 #[tokio::test]
 async fn shutdown_phantom_cancel_does_not_clear_the_abort_error_status() {
     let (pool, db_name) = setup_test_db().await;

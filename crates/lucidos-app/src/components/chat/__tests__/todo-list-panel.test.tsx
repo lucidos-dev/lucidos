@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
-import type { ComponentChildren, VNode } from 'preact';
+import type { ComponentChildren, ComponentType, VNode } from 'preact';
 import { todoListIndicatorBody, todoListPanelBody } from '../TodoListPanel';
+import { TodoListIcon } from '../../shared/icons';
 import type { TodoItem } from '../../../store/thread-events';
 
 /** Flatten a vnode tree into HTML-ish text preserving class, data-* attrs,
@@ -23,14 +24,26 @@ function vnodeToText(node: ComponentChildren): string {
   return tag ? `<${tag}${attrs.join('')}>${inner}</${tag}>` : inner;
 }
 
+/** The component vnodes in a tree, in render order. `vnodeToText` can't see
+ *  inside one (it flattens host elements only), and the glyph we care about
+ *  IS a component, so this is how the icon identity is asserted. */
+function componentTypes(node: ComponentChildren): ComponentType[] {
+  if (node === null || node === undefined || typeof node !== 'object') return [];
+  if (Array.isArray(node)) return node.flatMap(componentTypes);
+  const v = node as VNode<{ children?: ComponentChildren }>;
+  const self = typeof v.type === 'function' ? [v.type as ComponentType] : [];
+  return [...self, ...componentTypes(v.props?.children)];
+}
+
 const NOOP = () => {};
 
 // ──────────────────────────────────────────────────────────────────────────
-// Indicator — hidden when no items, otherwise shows a check / in-progress
-// SVG icon (no count). SVGs are pixel-identical to the adjacent ImageIcon
-// because both inherit `.icon-btn.header-icon svg` sizing (--icon-size-lg).
-// Counts go into the tooltip + aria-label instead of the glyph. Tap target
-// opens the panel.
+// Indicator: hidden when no items, otherwise ONE checklist SVG icon (no
+// count) whatever the state. The SVG is pixel-identical to the adjacent
+// ImageIcon because both inherit `.icon-btn.header-icon svg` sizing
+// (--icon-size-lg). State is carried by `data-state` and rendered as COLOR
+// in todo-list.css, never as a different glyph. Counts go into the tooltip
+// and aria-label instead of the glyph. Tap target opens the panel.
 // ──────────────────────────────────────────────────────────────────────────
 
 describe('todoListIndicatorBody', () => {
@@ -56,6 +69,12 @@ describe('todoListIndicatorBody', () => {
     expect(text).not.toContain('1/3');
     expect(text).toContain('1 of 3 done');
     expect(text).toContain('data-tooltip="doing b"');
+    // The aria-label NAMES the in-progress state, it does not just count.
+    // Every state renders the same glyph and differs only in color, which a
+    // screen reader can't read and forced-colors mode overwrites, and the
+    // tooltip is desktop-hover only. So this is the one non-visual channel
+    // that tells idle and in-progress apart.
+    expect(text).toContain('aria-label="Todo list: doing b. 1 of 3 done. Click to expand."');
   });
 
   it('renders the idle state when no item is in progress', () => {
@@ -99,6 +118,23 @@ describe('todoListIndicatorBody', () => {
     expect(text).not.toContain('data-state="idle"');
     expect(text).not.toContain('data-state="in-progress"');
     expect(text).toContain('1 of 3 done, 2 abandoned');
+  });
+
+  it('renders the SAME checklist glyph in every state, so only the color differs', () => {
+    // The state must never switch the shape. The pair this replaced drew a
+    // checkbox for idle and a filled dome inside a checkbox for in-progress,
+    // and the second one read as nothing recognizable at 1.25rem. Whatever
+    // the agent is doing, the button has to keep saying "todo list".
+    const byState: Record<string, TodoItem[]> = {
+      idle: [{ content: 'a', active_form: 'doing a', status: 'pending' }],
+      'in-progress': [{ content: 'a', active_form: 'doing a', status: 'in_progress' }],
+      abandoned: [{ content: 'a', active_form: 'doing a', status: 'abandoned' }],
+    };
+    for (const [state, items] of Object.entries(byState)) {
+      const node = todoListIndicatorBody({ items, onClick: NOOP });
+      expect(vnodeToText(node)).toContain(`data-state="${state}"`);
+      expect(componentTypes(node)).toEqual([TodoListIcon]);
+    }
   });
 
   it('keeps the in-progress state when there are also abandoned items', () => {

@@ -764,13 +764,32 @@
 
     /* Fade the top of the transcript so messages dissolve as they scroll up
      * under the transparent thread title header, instead of cutting off at a
-     * hard edge. Desktop only — on mobile this scroll container holds its own
+     * hard edge. Desktop only: on mobile this scroll container holds its own
      * sticky title bar (.mobile-thread-title-row), which must not be masked.
      * The fade height is --thread-top-fade (base.css) so the deep-link scroll
-     * clearance (.chat-exchange scroll-margin-top, chat/response.css) tracks it. */
+     * clearance (.chat-exchange scroll-margin-top, chat/response.css) tracks it.
+     *
+     * TWO mask layers, because a mask applies to the element's WHOLE rendering,
+     * scrollbar included, and the scrollbar is chrome, not content: a
+     * single full-width fade dissolved the top of the scrollbar thumb along
+     * with the messages. Layer 1 is the fade over everything left of the scroll
+     * gutter; layer 2 is a fully opaque strip exactly --scrollbar-gutter-width
+     * wide pinned to the right edge, which is where a classic scrollbar is
+     * painted (the mask origin is the border box, and the gutter is taken out
+     * between the border edge and the padding box). The var is 0px wherever
+     * scrollbars are overlay, and layer 2 then collapses to nothing while layer
+     * 1 covers the full width, so this is a no-op there. */
     .thread-content {
-        -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade));
-        mask-image: linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade));
+        -webkit-mask:
+            linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade))
+                left top / calc(100% - var(--scrollbar-gutter-width)) 100% no-repeat,
+            linear-gradient(#000, #000)
+                right top / var(--scrollbar-gutter-width) 100% no-repeat;
+        mask:
+            linear-gradient(to bottom, transparent 0, #000 var(--thread-top-fade))
+                left top / calc(100% - var(--scrollbar-gutter-width)) 100% no-repeat,
+            linear-gradient(#000, #000)
+                right top / var(--scrollbar-gutter-width) 100% no-repeat;
     }
 }
 

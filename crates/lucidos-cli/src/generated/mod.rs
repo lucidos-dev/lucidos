@@ -130,7 +130,7 @@ pub fn dispatch_preferences(ws: &Workspace, cmd: PreferencesCmd) -> Result<(), B
 /// Create and manage triggers: scheduled (cron) and event-driven automations. Panel folders are the trigger_groups tool.
 #[derive(clap::Subcommand)]
 pub enum TriggersCmd {
-    /// Create a NEW trigger: cron, event-based `on`, or both. Update an existing one rather than recreating.
+    /// Create a NEW trigger: cron, event-based `on`, or both.
     Create {
         /// A short, descriptive name for the trigger.
         #[arg(long)]
@@ -160,9 +160,9 @@ pub enum TriggersCmd {
         #[arg(long)]
         slug: Option<String>,
     },
-    /// All triggers with their names, schedules, subscriptions and what each runs.
+    /// Every trigger with its schedule, subscriptions and what it runs.
     List,
-    /// Update name, schedule, subscriptions or run config in place. Prefer it over delete plus create, which loses run history. Send the full replacement 'on' array.
+    /// Update name, schedule, subscriptions or run config in place, keeping run history. Send the full replacement 'on' array.
     Update {
         /// UUID of the trigger.
         #[arg(long)]
@@ -198,13 +198,13 @@ pub enum TriggersCmd {
         #[arg(long)]
         slug: Option<String>,
     },
-    /// Delete a trigger by id; it orphans the run history, so prefer update for tweaks.
+    /// Delete a trigger; it orphans the run history, so prefer update for tweaks.
     Delete {
         /// UUID of the trigger.
         #[arg(long)]
         id: String,
     },
-    /// Fire an existing trigger ONCE, right now, off-schedule, under its own identity, side-effect grant and go_to_review, recording TriggerExecuted and last_run. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).
+    /// Fire it ONCE now, off-schedule. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).
     Run {
         /// UUID of the trigger.
         #[arg(long)]
@@ -637,10 +637,10 @@ pub fn dispatch_memory(ws: &Workspace, cmd: MemoryCmd) -> Result<(), BoxError> {
     }
 }
 
-/// Inspect and tune the Thread Queue, the shared admission-control pool for background spawns AND user-initiated work. Call 'list' before a relative change like 'double capacity'. A concurrency cap may be 0 to hold admission; keep max_concurrent_per_trigger at 1 unless one trigger should run its fires concurrently.
+/// The Thread Queue: admission control for background spawns AND user-initiated work. Call 'list' before a relative change like 'double capacity'. A cap of 0 holds admission.
 #[derive(clap::Subcommand)]
 pub enum ThreadQueueCmd {
-    /// Live queue plus the active capacity policy ({ entries, policy }), user-initiated occupants included. Call it before changing capacity, so a relative request starts from the live numbers.
+    /// Live queue and active policy as { entries, policy }, user-initiated occupants included.
     List,
     /// Force-admit a queued entry now, ignoring every cap.
     RunNow {
@@ -739,19 +739,19 @@ pub enum ModelsCmd {
     List,
     /// Register a new model in the picker.
     Add {
-        /// The string sent in API requests (e.g. 'z-ai/glm-5.2'). Required for add/enable/disable/remove.
+        /// The string sent in API requests (e.g. 'z-ai/glm-5.2').
         #[arg(long)]
         id: String,
-        /// Human-friendly display name for 'add' (defaults to the id).
+        /// Display name; defaults to the id.
         #[arg(long)]
         label: Option<String>,
-        /// Backend that serves the model. Required for 'add'.
+        /// Backend that serves the model.
         #[arg(long)]
         provider: String,
         /// Lower sorts first; user models default to 1000.
         #[arg(long)]
         sort_order: Option<i64>,
-        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose: too low only trims context early, too high makes the provider reject the request.
+        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose.
         #[arg(long)]
         context_window: Option<i64>,
     },
@@ -760,7 +760,7 @@ pub enum ModelsCmd {
         /// Model id (the request string, e.g. 'z-ai/glm-5.2').
         #[arg(long)]
         id: String,
-        /// Human-friendly display name for 'add' (defaults to the id).
+        /// Display name; defaults to the id.
         #[arg(long)]
         label: Option<String>,
         /// Backend that serves the model.
@@ -772,11 +772,11 @@ pub enum ModelsCmd {
         /// Whether the model is enabled (shown in the picker).
         #[arg(long)]
         enabled: Option<bool>,
-        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose: too low only trims context early, too high makes the provider reject the request.
+        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose.
         #[arg(long)]
         context_window: Option<i64>,
     },
-    /// Delete a user-added model; a builtin can only be disabled.
+    /// Delete a user-added model.
     Delete {
         /// Model id (the request string, e.g. 'z-ai/glm-5.2').
         #[arg(long)]

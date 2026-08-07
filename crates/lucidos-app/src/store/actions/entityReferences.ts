@@ -5,10 +5,11 @@
  * Wired at the SSE dispatch level in thread-sync.ts, NOT as a side-effect of
  * handleThreadEvent or handleGlobalEvent.
  */
-import { panelOverlay, appsList, installedPlugins, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders } from '../store';
+import { panelOverlay, appsList, installedPlugins, marketplaceCatalog, triggers, credentials, environmentVariables, chatModels, oauthAccounts, repositories, artifacts, llmConfigured, configuredProviders } from '../store';
 import { checkHealth } from '../../api/client';
 import { loadApps } from './apps';
 import { loadInstalledPlugins } from './plugins';
+import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 import { loadChatModels } from './models';
 import { loadTriggers } from './triggers';
 import { loadThreadQueue } from './threadQueue';
@@ -189,6 +190,24 @@ export function processSSEForReferences(type: string, data: Record<string, unkno
       if (appsList.value.status === 'loaded') void loadApps();
       if (triggers.value.status === 'loaded') void loadTriggers();
       if (installedPlugins.value.status === 'loaded') void loadInstalledPlugins();
+      break;
+    // Marketplace registry mutations. One arm serves BOTH surfaces that list
+    // marketplaces, because both render off the single `marketplaceCatalog`
+    // signal: the Plugins panel (StoreTab, for its marketplace-name labels and
+    // empty-state gate) and Settings → Marketplaces (the list itself).
+    // `PluginMarketplaceRegistered` is an upsert event, so this covers a
+    // RENAME as much as a first registration. The rename was the reported bug
+    // (an agent re-registered a source under a new name mid-chat and the open
+    // panel kept the old one until a reload), and gating on "is this new?"
+    // would drop exactly that case.
+    // The `loaded` gate is not optional here: the catalog scan git-clones every
+    // registered marketplace, so refreshing on a device that never opened the
+    // panel is the most expensive possible version of warming an unwanted
+    // cache. The acting client refreshes anyway after its own POST resolves;
+    // that call joins this one's in-flight scan rather than starting a second.
+    case 'PluginMarketplaceRegistered':
+    case 'PluginMarketplaceRemoved':
+      if (marketplaceCatalog.value.status === 'loaded') void refreshPluginCatalogAfterMutation();
       break;
     // Settings-page caches — gated on `status === 'loaded'` (same as Plugin*
     // above) so cross-device events don't warm caches the user hasn't asked

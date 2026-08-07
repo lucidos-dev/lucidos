@@ -1,6 +1,6 @@
 ---
 name: Thread Queue
-description: System-wide admission control for ALL thread work: one shared capacity pool gating event triggers, cron fires, run_thread, run_coding_agent and user-initiated chat and coding-agent threads, queueing the rest. Covers the capacity policy (total, per-kind and per-trigger caps, reserved_background, queue ceiling, overflow), priority and FIFO order, restart requeue, and the Thread Queue panel. Load when a trigger, spawn or chat is waiting, when changing concurrency limits, or when debugging back-pressure.
+description: System-wide admission control for ALL thread work: one shared capacity pool gating event triggers, cron fires, run_thread, run_coding_agent and user chat, queueing the rest. Load when a trigger, spawn or chat is waiting, when changing concurrency limits, or when debugging back-pressure.
 ---
 
 # Thread Queue

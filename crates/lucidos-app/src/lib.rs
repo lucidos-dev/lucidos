@@ -61,7 +61,22 @@ fn safari_user_agent() -> &'static str {
     })
 }
 
-fn open_in_default_browser(url: &str) {
+/// Hand `url` to the OS default handler.
+///
+/// Errs rather than logging, because every caller of the command that wraps this
+/// is user-initiated and every JS caller of `openExternal` already toasts the
+/// rejection (`openUrl`, `openLocalFile`, `popOutApp`). This used to log the
+/// spawn failure and return `()`, so those three `.catch` handlers could never
+/// fire and a launcher that was simply not there (no `xdg-open` on a headless
+/// Linux install) read to the user as the button doing nothing, which is exactly
+/// the class of bug the popout fix exists to remove.
+///
+/// The spawn failure is the ONLY failure observable here: the launcher is a
+/// fire-and-forget child, so one that starts and then fails (no handler for the
+/// scheme, missing file) exits after this has returned. Waiting on it would mean
+/// blocking, and a synchronous `#[tauri::command]` runs on the main thread, so
+/// that trade buys a rare error message at the price of a freezable window.
+fn open_in_default_browser(url: &str) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     let cmd = std::process::Command::new("open").arg(url).spawn();
     #[cfg(target_os = "windows")]
@@ -71,9 +86,8 @@ fn open_in_default_browser(url: &str) {
     #[cfg(target_os = "linux")]
     let cmd = std::process::Command::new("xdg-open").arg(url).spawn();
 
-    if let Err(e) = cmd {
-        eprintln!("[Tauri] Failed to open URL in browser: {e}");
-    }
+    cmd.map(|_| ())
+        .map_err(|e| format!("could not start the system opener: {e}"))
 }
 
 /// Channel for receiving page content extracted from the panel webview.
@@ -382,9 +396,17 @@ fn open_new_window(app: &tauri::AppHandle) -> Result<(), String> {
     // opaque (black) bar. The builder methods are macOS-only, so they're applied
     // via a cfg-gated shadow (the rest of this crate stays cross-platform
     // compilable).
+    // `disable_drag_drop_handler` mirrors `dragDropEnabled: false` in
+    // tauri.conf.json for the same reason the title-bar values are repeated: the
+    // config only describes the declared `main` window. Left on, wry installs its
+    // own NSDraggingDestination handler on the WKWebView and consumes the drag
+    // rather than forwarding it, so no HTML5 `dragover`/`drop` ever reaches the
+    // page and every file drop in the window is silently dead. We listen for no
+    // Tauri drag-drop event, so nothing is given up by turning it off.
     let builder = WebviewWindowBuilder::new(app, &label, new_window_url(app))
         .title("Lucidos")
-        .inner_size(1024.0, 768.0);
+        .inner_size(1024.0, 768.0)
+        .disable_drag_drop_handler();
     #[cfg(target_os = "macos")]
     let builder = builder
         .title_bar_style(tauri::TitleBarStyle::Overlay)
@@ -480,7 +502,12 @@ fn create_panel_webview(
         .user_agent(safari_user_agent())
         .on_navigation(|_nav_url| true)
         .on_new_window(move |url, _features| {
-            open_in_default_browser(url.as_str());
+            // The one site with nowhere to report to: a previewed page asked for
+            // a window from inside the delegate, so there is no promise to reject
+            // and no toast to raise. Log rather than discard.
+            if let Err(e) = open_in_default_browser(url.as_str()) {
+                eprintln!("[Tauri] {url}: {e}");
+            }
             tauri::webview::NewWindowResponse::Deny
         })
         .on_page_load(move |wv, payload| {
@@ -786,11 +813,15 @@ pub(crate) fn exit_after_relaunch_scheduled(app: &tauri::AppHandle) -> ! {
     }
 }
 
-/// Open a URL in the system default browser (not the embedded webview). Used by
-/// the Mobile Access page for the Tailscale download link.
+/// Open a URL in the system default browser (not the embedded webview). Reached
+/// by every "leave the shell" path: the Mobile Access page's Tailscale download
+/// link, `openUrl` with the in-app browser off, `openLocalFile`, and the app
+/// popout. Rejects when the launcher could not be started, which the callers
+/// turn into a toast; see [`open_in_default_browser`] for what that does and
+/// does not cover.
 #[tauri::command]
-fn open_url_external(url: String) {
-    open_in_default_browser(&url);
+fn open_url_external(url: String) -> Result<(), String> {
+    open_in_default_browser(&url)
 }
 
 /// Restart the always-on gateway service via launchd (`launchctl kickstart -k`).

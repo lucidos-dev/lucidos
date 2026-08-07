@@ -1,6 +1,6 @@
 ---
 name: Workspace Consistency Audit
-description: Recipe for auditing the workspace's apps, triggers, knowhow, intents, scripts, and artifacts against the latest Lucidos conventions and SDK/CLI surface. Use when the user asks to audit the workspace, check for drift, verify their setup follows current conventions, or "see what's stale".
+description: Recipe for auditing the workspace's apps, triggers, knowhow, intents, scripts and artifacts against current Lucidos conventions and the SDK/CLI surface. Use when the user asks to audit the workspace, check for drift, or "see what's stale".
 ---
 
 # Workspace Consistency Audit

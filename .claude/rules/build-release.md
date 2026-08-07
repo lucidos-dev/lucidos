@@ -1,6 +1,7 @@
 ---
 paths:
   - "scripts/build*.sh"
+  - "scripts/check-staged-knowhow.sh"
   - "scripts/release*.sh"
   - "scripts/rebuild-mirror-history.sh"
   - "scripts/lib/build_*.sh"
@@ -10,6 +11,9 @@ paths:
   - "scripts/lib/service*.sh"
   - "scripts/lib/release_*.sh"
   - "scripts/lib/tauri_signing_key.sh"
+  # Carries beforeBuildCommand, which is the build gate's only hook inside
+  # `cargo tauri build`. Editing it is a build change, so this rule loads.
+  - "crates/lucidos-app/tauri.conf.json"
   - "scripts/lib/updater_payload*.sh"
   - "scripts/lib/codesign.sh"
   - "scripts/lib/cargo_lock_holders_test.sh"
@@ -194,6 +198,10 @@ The self-contained runtime tree — the 7 `RESOURCE_NAMES`: `lucidos-engine`, `l
 - `stage_runtime_triple` — target-triple resolution from `uname`.
 - `stage_runtime_fetch_postgres` — the theseus-rs PG18 + pgvector fetch/compile recipe; the same code resolves the macOS `*-apple-darwin` and Linux `*-unknown-linux-gnu` relocatable Postgres asset by triple. The `PG_SYSROOT` override applies only on a Darwin host; Linux uses system gcc.
 - the frontend/binary builds, and the 7-resource `stage_runtime_assemble`.
+
+**The stage outlives the build, so it is guarded at the point of consumption.** `stage_runtime_assemble` `rm -rf`s its target before copying, so every sanctioned build path is correct by construction. What is not correct by construction is `build-dmg.sh`'s stage *between* runs: `crates/lucidos-app/bundle-resources/` is gitignored and survives, and a `cargo tauri build --config '<resource map>'` typed by hand skips step 4 and hands Tauri whatever that leftover holds. Found on 2026-08-07 carrying 12,732 characters of stale `system-knowhow` descriptions against 6,584 live, including a doc that had since been rewritten, with nothing anywhere saying so.
+
+`stage_runtime_staged_knowhow_fresh` byte-diffs the staged copy against the live tree, and `scripts/check-staged-knowhow.sh` runs it from `tauri.conf.json`'s `beforeBuildCommand`, the one hook inside **every** `cargo tauri build` regardless of caller. Ordering is safe: `build-dmg.sh` stages at step 4 and builds at step 5, so the guard always sees a stage it just wrote. **Absent is clean, and must stay so**: a developer who has never run `build-dmg.sh` has no `bundle-resources/` at all and their build must not go red. Only `system-knowhow/` is checked, because it is the one staged resource that is a git-tracked SOURCE tree with an exact live counterpart; the binaries, `postgres/`, `frontend/` and `sdk/` are build outputs where "fresh" is undefined without rebuilding, and a timestamp heuristic there would fail open. A new staged resource of the source-tree kind should join the check.
 
 Pure helpers are offline-tested by `scripts/lib/stage_runtime_test.sh`. The `lucidos` CLI is **load-bearing**, not a convenience: the engine resolves it as a sibling of `lucidos-engine` (`find_lucidos_cli_dir`), or by absolute path via `LUCIDOS_CLI_BIN` when the launcher stamps it (`desktop.rs::spawn_gateway` / `service_runtime_env_pairs`), to launch the Claude Code permission-prompt MCP server (`lucidos mcp-permission-server`). A bundle omitting it breaks every coding-agent thread on its first tool call — the engine now fails the CC spawn fast with a descriptive error rather than starting a doomed session (`resolve_lucidos_binary` in `crates/lucidos-engine/src/runtime/claude_code.rs`).
 

@@ -760,9 +760,13 @@ pub(super) fn write_image_files(
 enum TurnOutcome {
     /// Turn ended (completed, failed, interrupted, or synthesized) — keep
     /// serving inputs. Interrupt deliberately does NOT drop queued inputs:
-    /// the engine counts every forwarded follow-up in `pending_followups`
-    /// and waits for one Result each — dropping them would wedge the thread
-    /// at idle. Matches CC, whose stdin-queued messages also run after Esc.
+    /// the engine counts every forwarded input in
+    /// `AgentSession::inputs_awaiting_result` and, for Codex specifically,
+    /// settles it by ONE per Result because this driver owes one Result per
+    /// input. A dropped input would leave that count above zero forever and
+    /// wedge the thread at idle. Matches CC, whose stdin-queued messages also
+    /// run after Esc, though CC answers them all with a single Result and so
+    /// settles to zero (see `lifecycle::settle_inputs_awaiting_result`).
     Continue,
     /// Cancellation token fired or the consumer vanished — wind down.
     Shutdown,

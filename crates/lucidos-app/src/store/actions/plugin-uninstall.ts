@@ -11,7 +11,7 @@ import { errorDetail } from '../../utils/errorDetail';
 import { pushNavState, replaceNavState } from './navigation';
 import { revealContentPane } from './pane';
 import type { MarketplacePlugin, PluginUninstallRequest } from '../types';
-import { refreshPluginCatalog } from './plugin-marketplaces';
+import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 
 /** Open the plugin uninstall panel for the staged uninstall in `request`.
  *  Mirrors `openPluginInstallRequest` — panel takes over the content pane,
@@ -115,7 +115,7 @@ export async function confirmPluginUninstallAction(form: PluginUninstallForm): P
     closeInlineFormIfActive(form);
     return;
   }
-  void refreshPluginCatalog();
+  void refreshPluginCatalogAfterMutation();
   if (!markPluginUninstalled(form, result)) {
     const missingNote = result.files_missing.length > 0
       ? ` (${result.files_missing.length} already gone)`

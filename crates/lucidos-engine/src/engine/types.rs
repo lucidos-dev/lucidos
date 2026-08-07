@@ -309,6 +309,24 @@ pub struct AgentSession {
     /// leaves it `false`. Drained on read so a stale flag can't relabel the next
     /// turn on a resumed session.
     pub redirect_followup: bool,
+    /// Also set by `arm_followup_redirect`, and deliberately NOT the same flag as
+    /// `redirect_followup` above: the two answer different questions and are
+    /// drained by different arms. `redirect_followup` says "the interrupt about to
+    /// land is a redirect, not a Stop" and the interrupt arm takes it before the
+    /// turn's `Result` is even parsed. This one says "a follow-up has been promised
+    /// to this session but not yet routed", and it has to survive until the idle
+    /// decision, which runs after that.
+    ///
+    /// It covers the one window `msg_rx` cannot: `arm_followup_redirect` fires the
+    /// interrupt and returns, and its caller only sends the message after waiting
+    /// for the interrupted turn to reach a boundary, so at the idle decision the
+    /// channel is legitimately empty and the subprocess must still be kept.
+    ///
+    /// **Taken (read-and-clear) by the idle decision**, which gives it exactly one
+    /// turn of grace. That bound is the point: an arming caller that dies before
+    /// routing costs one kept-alive idle, not a subprocess pinned until the engine
+    /// restarts.
+    pub redirect_followup_pending: bool,
     /// Generic stop signal for the run_session loop. Fired by `stop_agent` for
     /// every user-driven termination (Cancel, Apply, Discard, Archive) and by
     /// the engine shutdown timeout. The stop arm reads `pending_stop` and
@@ -394,20 +412,35 @@ pub struct AgentSession {
     /// Current reasoning effort level (low/medium/high).
     /// Not reported in CC's init event — only set via control request.
     pub current_reasoning_effort: Option<String>,
-    /// Number of user-input messages routed to CC since the last `Result`.
-    /// Incremented when a message is queued for CC (initial spawn input +
-    /// each fast-path follow-up via msg_tx); reset to zero by `swap(0)`
-    /// inside the Result handler because every Result is a turn boundary
-    /// (CC merges back-to-back stdin inputs into a single Result, so a 1:1
-    /// decrement leaks the counter). The pre-swap value drives only the
-    /// idle-exit cancel: > 1 means a follow-up was inflight (queued in
-    /// msg_rx OR forwarded but merged) so CC stays alive to avoid killing
-    /// the subprocess between a routed follow-up and its consumption by
-    /// `msg_rx.recv`. Without this guard, a follow-up routed via msg_tx
-    /// during the cancel + follow-up race would get killed mid-second-task
-    /// because the previous turn's Result triggers `agent_cancel.cancel()`
-    /// while CC is still processing the new prompt.
-    pub pending_followups: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// Inputs the run loop has **forwarded to the agent driver** that the driver
+    /// has not yet answered with a `Result`. Seeded to 1 when the spawn carries
+    /// real content (that input is the one `Result` the first turn owes) and 0 for
+    /// a silent resume / warm-up, then incremented in the `msg_rx.recv()` arm.
+    ///
+    /// Incrementing at the FORWARD site rather than at each `msg_tx.send` is what
+    /// keeps this disjoint from the channel itself: a message still sitting in
+    /// `msg_rx` is covered by `msg_rx.is_empty()`, this counter starts where that
+    /// stops, and no message is in both. It also means every sender is counted by
+    /// construction, including the three that never touched the old send-site
+    /// counter (`apply_now`'s hardening prompt, the `run_bash_background`
+    /// auto-wake, `change_ops::propose`).
+    ///
+    /// **Settled per backend at each `Result`**, by
+    /// `lifecycle::settle_inputs_awaiting_result`, because the backends make
+    /// different promises about how many Results an input earns. Claude Code merges
+    /// back-to-back stdin inputs into a SINGLE Result, so one Result answers
+    /// everything forwarded so far and the counter zeroes. The Codex app-server
+    /// driver runs one child per accepted input and emits one Result EACH
+    /// (`TurnOutcome::Continue` keeps queued inputs across an interrupt on exactly
+    /// that promise), so a Result answers one and the counter decrements.
+    ///
+    /// A non-zero remainder after the settle keeps the subprocess alive at idle: the
+    /// driver still owes a turn, and killing it would drop work the user already
+    /// sent. Applying the Codex rule to Claude Code is what made a merged
+    /// three-message turn report two phantom follow-ups, keep a dead session alive,
+    /// and swallow the API-drop auto-resume (2026-08-07; see
+    /// `docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`).
+    pub inputs_awaiting_result: std::sync::Arc<std::sync::atomic::AtomicU32>,
     /// Set by `answer_pending_question` when a user answers an `AskUserQuestion`
     /// on a *live* subprocess (CC continues its turn in-place once the blocked
     /// PreToolUse hook is woken). That resume path does NOT go through `msg_tx`,
@@ -524,6 +557,7 @@ impl AgentSession {
             pending_stop: None,
             cancel_actor: None,
             redirect_followup: false,
+            redirect_followup_pending: false,
             stop: Arc::new(tokio::sync::Notify::new()),
             interrupt: Arc::new(tokio::sync::Notify::new()),
             idle_notify: Arc::new(tokio::sync::Notify::new()),
@@ -542,7 +576,7 @@ impl AgentSession {
             current_model: None,
             current_reasoning_effort: None,
             last_event_at: Arc::new(AtomicI64::new(0)),
-            pending_followups: Arc::new(AtomicU32::new(0)),
+            inputs_awaiting_result: Arc::new(AtomicU32::new(0)),
             question_resume_pending: false,
             tools_in_flight: Arc::new(AtomicI32::new(0)),
             coding_agent: crate::runtime::CodingAgent::ClaudeCode,

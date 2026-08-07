@@ -260,11 +260,24 @@ fn settings_tap(view: &str) -> crate::scheduler::notifications::Tap {
     }
 }
 
-/// Settings → Backup: the page carrying the health card with the last run and
-/// its error, the key, the schedule, and the *Grant access* button.
+/// Settings → System → Backup: the page carrying the health card with the last
+/// run and its error, the key, the schedule, and the *Grant access* button.
 fn backup_settings_tap() -> crate::scheduler::notifications::Tap {
     settings_tap("backup")
 }
+
+/// The two pages a backup notification can send the user to, written the way the
+/// UI's own breadcrumbs read (`SETTINGS_SYSTEM_SUBPANEL_ITEMS` in the frontend
+/// store, and `system-knowhow/backups.md`).
+///
+/// Each sits beside the tap that opens the same page, because the body has to
+/// name a route the user can actually walk when they read the notification
+/// somewhere the tap is not available. **Backup is a subpanel of System, not a
+/// top-level category**: these bodies said "Settings, then Backup" until
+/// 2026-08-07, which is a page with no Backup on it. The 2026-08-05 Settings
+/// restructure moved it and nothing here noticed.
+const BACKUP_PAGE_PATH: &str = "Settings → System → Backup";
+const ACCOUNTS_PAGE_PATH: &str = "Settings → Accounts";
 
 /// Where a failure notification should land, which is NOT always the Backup
 /// page.
@@ -284,20 +297,25 @@ fn backup_failure_tap(
     }
 }
 
+/// The key-generated body, hoisted to a const so a test can hold it to the same
+/// page path the failure bodies name (they all point at one page, and all three
+/// named the pre-restructure route until 2026-08-07).
+const BACKUP_KEY_GENERATED_MESSAGE: &str = concat!(
+    "Your scheduled backup created a new encryption key. ",
+    "Store it somewhere safe: you need it to restore, and it cannot be recovered. ",
+    "Open Settings → System → Backup to view and copy it."
+);
+
 /// Notify the user that the scheduled backup auto-generated a fresh encryption
 /// key. Unlike the manual flow, the user never saw this key as it was created,
-/// so they must be told to store it safely — it cannot be recovered and is
-/// required to restore. The tap deep-links to Settings → Backup, where the key
+/// so they must be told to store it safely: it cannot be recovered and is
+/// required to restore. The tap deep-links to the Backup page, where the key
 /// can be revealed and copied.
 async fn notify_backup_key_generated(engine: &SharedEngine) {
-    const MESSAGE: &str = "Your scheduled backup created a new encryption key. \
-        Store it somewhere safe — you need it to restore, and it cannot be recovered. \
-        Open Settings → Backup to view and copy it.";
-
     emit_backup_notification(
         engine,
         BACKUP_KEY_GENERATED_TITLE,
-        MESSAGE,
+        BACKUP_KEY_GENERATED_MESSAGE,
         backup_settings_tap(),
     )
     .await;
@@ -340,13 +358,13 @@ fn backup_failure_body(
     let remedy = match readiness {
         Some(r) if !r.connected => format!(
             "{who} has no connected account, so nothing can upload. \
-             Connect it in Settings, then Accounts."
+             Connect it in {ACCOUNTS_PAGE_PATH}."
         ),
         Some(r) if !r.ready() => format!(
             "{who} is connected but has not granted the permissions a backup needs. \
-             Open Settings, then Backup, and press Grant access."
+             Open {BACKUP_PAGE_PATH} and press Grant access."
         ),
-        _ => "Open Settings, then Backup, to see the details and retry.".to_string(),
+        _ => format!("Open {BACKUP_PAGE_PATH} to see the details and retry."),
     };
     format!("{remedy}\n\n{error}")
 }
@@ -410,6 +428,7 @@ pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &s
 mod tests {
     use super::{
         backup_failure_body, backup_failure_tap, backup_settings_tap, BACKUP_FAILURE_TITLE,
+        BACKUP_KEY_GENERATED_MESSAGE,
     };
     use crate::core::backup::ProviderReadiness;
     use crate::scheduler::notifications::{NavigateTarget, Tap};
@@ -481,6 +500,11 @@ mod tests {
     /// Every remedy names the page its OWN tap opens. A body naming Accounts
     /// while the tap lands on Backup makes the notification argue with itself,
     /// which is the whole failure this change set out to end.
+    ///
+    /// The expected routes are spelled out here rather than read from
+    /// `BACKUP_PAGE_PATH` / `ACCOUNTS_PAGE_PATH`, so this pins the WORDING too:
+    /// sharing the const with the code under test would let a wrong path stay
+    /// green.
     #[test]
     fn every_remedy_names_the_page_its_tap_opens() {
         for readiness in [
@@ -493,8 +517,8 @@ mod tests {
             let view = tapped_view(backup_failure_tap(readiness))
                 .unwrap_or_else(|| panic!("{readiness:?} must deep-link, not open a modal"));
             let named = match view.as_str() {
-                "accounts" => "Settings, then Accounts",
-                "backup" => "Settings, then Backup",
+                "accounts" => "Settings → Accounts",
+                "backup" => "Settings → System → Backup",
                 other => panic!("unexpected destination {other}"),
             };
             assert!(
@@ -581,6 +605,25 @@ mod tests {
         let body = backup_failure_body(None, Some(&connected_not_ready()), "e");
         assert!(!body.contains("google_drive"), "{body}");
         assert!(body.starts_with("Your backup provider"), "{body}");
+    }
+
+    /// The reported wording bug: Backup is a subpanel of Settings → System, so
+    /// a body that stops at "Settings, then Backup" (what all three of these
+    /// said until 2026-08-07) sends the reader to a page with no Backup on it.
+    /// Someone reading the notification where the tap is not to hand, an email
+    /// mirror, a lock-screen banner they dismiss, has only this route.
+    #[test]
+    fn every_backup_remedy_names_the_system_step() {
+        const PATH: &str = "Settings → System → Backup";
+        for readiness in [Some(&connected_not_ready()), Some(&ready()), None] {
+            let body = backup_failure_body(Some("Dropbox"), readiness, "e");
+            assert!(body.contains(PATH), "{readiness:?}: {body}");
+        }
+        // The sibling notification points at the same page and must agree.
+        assert!(
+            BACKUP_KEY_GENERATED_MESSAGE.contains(PATH),
+            "{BACKUP_KEY_GENERATED_MESSAGE}"
+        );
     }
 
     /// A backup notification deep-links to the page that carries its remedy.

@@ -12,7 +12,7 @@ import { pushNavState, replaceNavState } from './navigation';
 import { revealContentPane } from './pane';
 import { focusThread } from './threads';
 import type { MarketplacePlugin, PluginInstallRequest } from '../types';
-import { refreshPluginCatalog } from './plugin-marketplaces';
+import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 
 /** Open the plugin install panel for the staged install in `request`. The
  *  panel takes over the content pane (same surface as the credential
@@ -33,7 +33,7 @@ export function openPluginInstallRequest(request: PluginInstallRequest): void {
  *  panel. Lives here rather than in `plugin-marketplaces.ts` for two reasons:
  *  it belongs beside the opener it routes through, mirroring
  *  `uninstallMarketplacePlugin` in `plugin-uninstall.ts`, and this module
- *  imports `refreshPluginCatalog` from there, so the call would otherwise close
+ *  imports its catalog refresh from there, so the call would otherwise close
  *  an import cycle. */
 export async function installMarketplacePlugin(plugin: MarketplacePlugin): Promise<void> {
   // An update overwrites the plugin's shipped content. If the user has locally
@@ -125,7 +125,7 @@ export async function confirmPluginInstallAction(form: PluginInstallForm): Promi
     closeInlineFormIfActive(form);
     return;
   }
-  void refreshPluginCatalog();
+  void refreshPluginCatalogAfterMutation();
   const receipted = markPluginInstalled(form, result);
   // When the plugin shipped NEW `setup` instructions the engine spawns a
   // Lucidos Agent thread to walk the user through them. Drop the user straight

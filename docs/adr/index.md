@@ -60,3 +60,5 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0050: The loopback API is unauthenticated, so attribution is evidence-based: an unattributed caller cannot claim to be the user](0050-unattributed-caller-cannot-claim-to-be-the-user.md)
 - [0051: Chat file tools reach .lucidos/tmp/ read-only, never write outside data/](0051-file-tools-scratch-boundary.md)
 - [0052: A thread subscription outlives Stop, and every other end of one is announced](0052-thread-subscription-outlives-stop.md)
+- [0054: The packaged client enables macOS private API so the app view's Fullscreen is real fullscreen](0054-macos-private-api-for-element-fullscreen.md)
+- [0053: A time window over an event-store column is resolved by the database, never by the caller's clock](0053-event-time-windows-are-resolved-by-the-database.md)

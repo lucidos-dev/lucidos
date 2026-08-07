@@ -4,7 +4,7 @@ import type { Ref } from 'preact';
 import { useAnchoredPosition } from '../../hooks/useAnchoredPopover';
 import { focusedThreadId, threadMap } from '../../store/store';
 import type { TodoItem } from '../../store/thread-events';
-import { CloseIcon, TodoCheckIcon, TodoInProgressIcon } from '../shared/icons';
+import { CloseIcon, TodoListIcon } from '../shared/icons';
 import { Overlay } from '../shared/Overlay';
 
 export function todoListIndicatorBody({
@@ -21,9 +21,10 @@ export function todoListIndicatorBody({
   const completed = items.filter((i) => i.status === 'completed').length;
   const abandoned = items.filter((i) => i.status === 'abandoned').length;
   const inProgress = items.find((i) => i.status === 'in_progress');
-  // Three honest indicator states:
-  //   - in-progress: the agent is actively working an item (shows spinner icon)
-  //   - abandoned: no in-progress item AND at least one item was abandoned
+  // Three honest indicator states, stamped as `data-state` and distinguished
+  // by COLOR alone (todo-list.css) over one shared checklist glyph:
+  //   - in-progress: the agent is actively working an item (accent)
+  //   - abandoned: no in-progress item AND at least one item was abandoned (dimmed)
   //   - idle: every non-completed item is gone (all done, or nothing pending)
   const state = inProgress
     ? 'in-progress'
@@ -35,9 +36,17 @@ export function todoListIndicatorBody({
     : abandoned > 0
       ? `${completed} of ${total} done, ${abandoned} abandoned`
       : `${completed} of ${total} done`;
-  const ariaLabel = abandoned > 0
-    ? `Todo list: ${completed} of ${total} done, ${abandoned} abandoned. Click to expand.`
-    : `Todo list: ${completed} of ${total} done. Click to expand.`;
+  // The aria-label names the state, it does not just count. Color is the ONLY
+  // visual channel carrying it now that all three states share one glyph, and
+  // color is exactly the channel a screen reader cannot read and forced-colors
+  // mode overwrites (there both --accent and --text-secondary collapse to the
+  // system foreground, so in-progress and idle would otherwise be identical).
+  // The tooltip can't stand in for it: it is desktop-hover only.
+  const ariaLabel = inProgress
+    ? `Todo list: ${inProgress.active_form}. ${completed} of ${total} done. Click to expand.`
+    : abandoned > 0
+      ? `Todo list: ${completed} of ${total} done, ${abandoned} abandoned. Click to expand.`
+      : `Todo list: ${completed} of ${total} done. Click to expand.`;
   return (
     <button
       type="button"
@@ -50,7 +59,7 @@ export function todoListIndicatorBody({
       data-row-item
       ref={buttonRef}
     >
-      {inProgress ? <TodoInProgressIcon /> : <TodoCheckIcon />}
+      <TodoListIcon />
     </button>
   );
 }

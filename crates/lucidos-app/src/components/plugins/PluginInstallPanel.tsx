@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { activeInlineForm, closeInlineForm } from '../../store/store';
+import { activeInlineForm } from '../../store/store';
 import type { PluginInstallForm } from '../../store/store';
 import {
   cancelPluginInstallAction,
@@ -150,11 +150,17 @@ function PluginInstallConfirm({ form }: { form: PluginInstallForm }) {
  *  `markPluginInstalled`). The list comes off the receipt marker, not off
  *  `request.files`, which was only what the install *would* write.
  *
- *  Deliberately offers no Install and no Cancel: the files have landed, the
- *  staged `install_id` is popped, and the only action left is to close the
- *  panel. The plugin's setup instructions stay on it, since they are the one
- *  thing the user may still need after the install and the setup thread is a
- *  pane away rather than in front of them.
+ *  Deliberately offers NO buttons at all. Install and Cancel are gone because
+ *  the files have landed and the staged `install_id` is popped. Close is gone
+ *  because it broke the nav history the receipt exists to hold:
+ *  `closeInlineForm()` blanks `panelOverlay` without touching the nav stack, so
+ *  the cursor was left pointing at an entry describing a panel no longer on
+ *  screen, and Back/Forward walked from that stale position. The header's back
+ *  arrow is how you leave a receipt, same as any other panel page.
+ *
+ *  The plugin's setup instructions stay on it, since they are the one thing the
+ *  user may still need after the install and the setup thread is a pane away
+ *  rather than in front of them.
  *
  *  Exported for its unit test, which renders it directly: the suite's VNode walk
  *  stops at function components (the confirm branch's hooks would throw), so it
@@ -193,12 +199,6 @@ export function PluginInstallReceiptPanel({ form }: { form: PluginInstallForm })
             />
           </section>
         )}
-
-        <div class="plugin-install-actions">
-          <button type="button" class="action-btn" onClick={() => closeInlineForm()}>
-            Close
-          </button>
-        </div>
       </div>
     </div>
   );

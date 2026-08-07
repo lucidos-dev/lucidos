@@ -6,10 +6,11 @@
   "build": {
     "frontendDist": "./dist",
     "beforeDevCommand": "",
-    "beforeBuildCommand": "npm run build",
+    "beforeBuildCommand": "npm run build && ../../scripts/check-staged-knowhow.sh",
     "devUrl": "http://localhost:5173"
   },
   "app": {
+    "macOSPrivateApi": true,
     "windows": [
       {
         "title": "Lucidos",
@@ -17,7 +18,8 @@
         "height": 768,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "visible": false
+        "visible": false,
+        "dragDropEnabled": false
       }
     ]
   },

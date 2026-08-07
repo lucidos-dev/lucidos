@@ -1333,6 +1333,35 @@ fn merge_scopes(existing: &str, requested: &str) -> String {
     all.join(" ")
 }
 
+/// Which scopes an authorization asked for and did not get, in the order they
+/// were requested.
+///
+/// **Exact token set difference**, not containment: both sides split on
+/// whitespace and a requested scope is missing iff no granted token equals it.
+/// That is deliberately the same rule as `missingScopes` in
+/// `components/settings/oauthConnectForm.ts`, which drives the shortfall line on
+/// the account row, so the agent and the Accounts panel cannot disagree about
+/// whether one account is short.
+///
+/// **Not the same question as [`crate::core::backup::missing_scopes`]**, which
+/// answers whether a backup provider can upload. Its `required_scopes` are
+/// substring MATCHERS (Google Drive's whole requirement is the fragment `drive`,
+/// which has to match `https://www.googleapis.com/auth/drive.file`), so it uses
+/// containment on purpose. Containment here would report a genuinely refused
+/// scope as granted whenever another granted scope happened to contain its name.
+///
+/// An empty requested set yields no shortfall rather than a false one: nothing
+/// was asked for, so nothing can be short. That is the same reading the account
+/// row takes of a `desired_scopes` that predates the column.
+pub fn missing_requested_scopes(requested: &str, granted: &str) -> Vec<String> {
+    let held: std::collections::HashSet<&str> = granted.split_whitespace().collect();
+    requested
+        .split_whitespace()
+        .filter(|scope| !held.contains(scope))
+        .map(str::to_string)
+        .collect()
+}
+
 /// Temporary loopback listener for the OAuth callback.
 ///
 /// Binds **both** loopback families on the same port. IPv4 is required; IPv6 is
@@ -1840,8 +1869,29 @@ async fn wait_for_oauth_callback(
     }
 }
 
-/// Outcome of an OAuth token exchange: (email, display_name, scopes).
-pub type OAuthFlowResult = Result<(Option<String>, Option<String>, String), String>;
+/// What a completed OAuth token exchange produced.
+///
+/// A named struct rather than a tuple because the two scope sets are the whole
+/// point of reporting an authorization and are indistinguishable positionally:
+/// the caller that used to destructure this bound the granted set as
+/// `_merged_scopes` and threw it away, so a provider that refused part of the
+/// request was reported to the agent as an unqualified success.
+pub struct OAuthFlowOutcome {
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+    /// What the provider actually GRANTED. Falls back to [`Self::requested_scopes`]
+    /// when the token response carried no `scope` at all, which is what a
+    /// provider that grants exactly what it was asked for typically does.
+    pub granted_scopes: String,
+    /// What this flow ASKED for: the caller's scopes merged with everything the
+    /// account already held and had ever been asked for. The difference from
+    /// [`Self::granted_scopes`] is the shortfall
+    /// ([`missing_requested_scopes`]).
+    pub requested_scopes: String,
+}
+
+/// Outcome of an OAuth token exchange, or the reason it failed.
+pub type OAuthFlowResult = Result<OAuthFlowOutcome, String>;
 
 /// Result of preparing an OAuth flow — contains the auth URL and a receiver
 /// that resolves when the background flow completes.
@@ -2059,7 +2109,16 @@ pub async fn prepare_oauth_flow(
                 granted_scopes
             );
 
-            Ok((email, display_name, granted_scopes.to_string()))
+            Ok(OAuthFlowOutcome {
+                email,
+                display_name,
+                granted_scopes: granted_scopes.to_string(),
+                // Carried out of the flow rather than recomputed by the caller:
+                // this is the set the authorization URL was actually built
+                // from, and anything derived later from the stored account
+                // could disagree with it.
+                requested_scopes: merged_scopes.clone(),
+            })
         }
         .await;
 
@@ -2099,7 +2158,7 @@ pub async fn run_oauth_flow<F>(
     scopes: &str,
     initiator: Option<MessageOrigin>,
     open_auth_url: F,
-) -> Result<(Option<String>, Option<String>, String), BoxError>
+) -> Result<OAuthFlowOutcome, BoxError>
 where
     F: AsyncFnOnce(&str) -> Result<(), BoxError>,
 {

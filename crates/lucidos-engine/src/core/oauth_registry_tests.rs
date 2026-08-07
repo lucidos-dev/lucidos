@@ -159,6 +159,38 @@ fn the_shipped_registry_parses_and_every_row_is_usable() {
     }
 }
 
+/// How long a console hint may be, in characters.
+///
+/// Both hints are rendered VERBATIM, and as of 2026-08-07 in four places: the
+/// credential form's help block, the shortfall aside beside *Reconnect* on
+/// Settings > Accounts, the blocked state beside *Grant access* on the Backup
+/// page, and the `connect_oauth_account` result the agent reads. So a row that
+/// grows into a paragraph does not become a paragraph in one place, it becomes
+/// one in four. The cap is a character count rather than a sentence count
+/// because a scope name is full of full stops (`files.content.write`), which is
+/// exactly the kind of value these hints list.
+const HINT_MAX_CHARS: usize = 400;
+
+#[test]
+fn every_console_hint_stays_short_enough_to_render_beside_a_button() {
+    for row in shipped_rows() {
+        for (field, hint) in [
+            ("setup_hint", row.setup_hint.as_deref()),
+            ("permissions_hint", row.permissions_hint.as_deref()),
+        ] {
+            let Some(hint) = hint else { continue };
+            assert!(
+                hint.chars().count() <= HINT_MAX_CHARS,
+                "{}'s {field} is {} characters, over the {HINT_MAX_CHARS} a hint may be. \
+                 It renders verbatim next to a button; the long form belongs in \
+                 oauth-providers.md.",
+                row.id,
+                hint.chars().count()
+            );
+        }
+    }
+}
+
 #[test]
 fn the_knowhow_markdown_restates_no_registry_row() {
     // The markdown is the prose beside the registry, not a second copy of it.

@@ -8,7 +8,23 @@ edition = "2021"
 lucidos-tailscale = { path = "../lucidos-tailscale" }
 # image-png: decode the embedded PNG menu-bar template icon via Image::from_bytes
 # (install_tray in lib.rs). Not in tauri's default feature set.
-tauri = { version = "2", features = ["unstable", "tray-icon", "image-png"] }
+#
+# macos-private-api: turns on WebKit's Fullscreen API in the packaged window. It
+# forwards to `wry/fullscreen`, whose only effect is setting the `fullScreenEnabled`
+# key on WKPreferences for every webview wry creates; without it `requestFullscreen`
+# is unavailable and the app view's Fullscreen control silently degrades to its CSS
+# pseudo-fullscreen fallback (see ADR 0054 for why a private key is acceptable here
+# and what happens if Apple removes it). It also enables `wry/transparent`, which we
+# do not use. Paired with `macOSPrivateApi` in tauri.conf.json: the Cargo feature is
+# what compiles the preference in, the config flag is what the Tauri CLI reads, and
+# setting only one leaves `cargo tauri build` and a plain `cargo build` disagreeing
+# about what is in the binary.
+tauri = { version = "2", features = [
+    "unstable",
+    "tray-icon",
+    "image-png",
+    "macos-private-api",
+] }
 tauri-plugin-window-state = "2"
 # Auto-update from GitHub Releases ("update available -> restart") + the confirm
 # dialog it shows. See src/updater.rs and tauri.conf.json plugins.updater.

@@ -1,13 +1,23 @@
 import { type VNode } from 'preact';
-import { useState, useEffect } from 'preact/hooks';
-import { backupProgress, backupStatusVersion, showToast } from '../../store/store';
-import { grantOAuthScope } from '../../store/actions/oauth';
+import { useState, useEffect, useRef } from 'preact/hooks';
+import {
+  backupPreferencesVersion,
+  backupProgress,
+  backupStatusVersion,
+  knownOAuthProviders,
+  showToast,
+} from '../../store/store';
+import { grantOAuthScope, loadKnownOAuthProviders } from '../../store/actions/oauth';
+import {
+  ProviderPermissionsHint,
+  reauthorizationHint,
+} from '../credentials/providerConsoleHint';
 import {
   PROVIDER_SCOPES,
   backupAccessLine,
   oauthProviderFor,
-  pickInitialProvider,
 } from './backupProviderScopes';
+import { backupSeed, refreshMayApply } from './backupSeeding';
 import { openConnectedAccountsSettings } from '../../store/actions/menu';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { formatTimeAgo } from '../../utils/formatTime';
@@ -239,6 +249,26 @@ export function BackupSection() {
   const [retentionSaving, setRetentionSaving] = useState(false);
   const [granting, setGranting] = useState(false);
   const [providerSaving, setProviderSaving] = useState(false);
+  // `PUT /backup/schedule` writes backup_provider AND backup_schedule together,
+  // and each handler sends the other half from captured state. So an in-flight
+  // write of either one has to disable BOTH controls: change the provider, then
+  // the schedule before the first lands, and the later response overwrites one
+  // choice with its stale counterpart. It also gates the SSE refresh below,
+  // which would clobber the same pair from the other side.
+  const backupPairSaving = providerSaving || scheduleSaving;
+
+  /** What an in-flight background refresh has to consult at APPLY time.
+   *
+   *  An effect closure captures the state of the render that created it, which
+   *  is exactly the wrong vintage here: the refresh is asynchronous, and a local
+   *  write that starts while its reads are in the air is newer than anything
+   *  they can return. `writes` is bumped by every write handler, so a refresh
+   *  can tell that one happened under it and drop its result rather than
+   *  flipping the control the user just moved. */
+  const live = useRef({ provider: '', providers: [] as BackupProviderInfo[], writes: 0 });
+  live.current.provider = selectedProvider;
+  live.current.providers =
+    providersLoadable.status === 'loaded' ? providersLoadable.data : [];
 
   useEffect(() => {
     setProvidersLoadable({ status: 'loading' });
@@ -253,7 +283,11 @@ export function BackupSection() {
         getBackupProviders(),
         getBackupSchedule(),
       ]);
+      const seed = backupSeed(providers, schedule, { provider: '', providers: [] });
 
+      // The failed LIST is a mount-only outcome: the user just opened the page,
+      // so an empty dropdown needs a reason in it. A background refresh keeps
+      // whatever was already loaded instead.
       setProvidersLoadable(
         providers.status === 'fulfilled'
           ? { status: 'loaded', data: providers.value }
@@ -266,22 +300,17 @@ export function BackupSection() {
       // that default as known would let a provider pick silently disable a real
       // nightly backup. Unknown therefore hides the schedule control and blocks
       // the provider write instead of guessing.
-      if (schedule.status === 'fulfilled') {
-        setSchedule(schedule.value.schedule || 'off');
-        setScheduleLoaded(true);
-      } else {
+      if (schedule.status === 'rejected') {
         showToast(`Failed to load backup schedule: ${errorDetail(schedule.reason)}`, 'error');
+      } else if (seed.schedule !== null) {
+        setSchedule(seed.schedule);
+        setScheduleLoaded(true);
       }
 
       // Either request failing degrades the seed rather than skipping it: the
       // page still has to select something, and both failures are already
       // surfaced above.
-      setSelectedProvider(
-        pickInitialProvider(
-          schedule.status === 'fulfilled' ? schedule.value.provider : null,
-          providers.status === 'fulfilled' ? providers.value : [],
-        ),
-      );
+      setSelectedProvider(seed.provider);
     })();
 
     getBackupRetention().then((r) => {
@@ -301,7 +330,82 @@ export function BackupSection() {
     getBackupKeyExists()
       .then((r) => setKeyExists(r.exists))
       .catch(() => { /* label falls back to "Show"; the click handler resolves it */ });
+
+    // The *OAuth provider registry*, for the console guidance beside *Grant
+    // access*. Shared with Settings > Accounts through the same signal, so
+    // arriving here after visiting that page costs no second request, and an
+    // empty or failed registry simply shows no guidance.
+    if (knownOAuthProviders.value.status === 'not-loaded') void loadKnownOAuthProviders();
   }, []);
+
+  // A backup preference changed somewhere this page cannot see: the agent wrote
+  // `backup_provider`, or the same settings page is open on another device or in
+  // another tab. `PreferencesChanged` reloads the preferences cache, but these
+  // three controls are not fed from that cache (they come from /backup/schedule,
+  // /backup/providers and /backup/retention, which also carry the connected /
+  // ready verdict), so without this the dropdown kept the old destination until
+  // a manual reload.
+  //
+  // Three things separate it from the mount path above, all deliberate:
+  //   1. It is SILENT, the best-effort carve-out in `.claude/rules/frontend.md`:
+  //      no user intent is on this line, so a toast would arrive out of nowhere
+  //      for someone who did nothing. A failed read leaves the last known good
+  //      values on screen and recovers on its own, since the next change to any
+  //      of these preferences runs the whole refresh again and reopening the
+  //      page re-reads from scratch. Anything the user then DOES touch goes
+  //      through a handler that toasts its own failure.
+  //   2. It never claims a value it did not read. A failed schedule read leaves
+  //      `scheduleLoaded` alone rather than treating the 'off' default as known.
+  //   3. A local action wins. Both halves matter: one in flight blocks the
+  //      refresh from starting, and one that starts while the reads are in the
+  //      air discards them. *Grant access* counts, and is the likeliest to
+  //      overlap: it waits on a browser round trip, and the ready verdict it
+  //      comes back to change is one of the values these reads carry.
+  const appliedPreferencesVersion = useRef(backupPreferencesVersion.value);
+  useEffect(() => {
+    const version = backupPreferencesVersion.value;
+    if (version <= appliedPreferencesVersion.current) return;
+    // Not marked applied, so this effect picks the change up when the local
+    // action finishes (every flag is a dependency) instead of dropping it.
+    if (backupPairSaving || retentionSaving || granting) return;
+    const writesAtStart = live.current.writes;
+    void (async () => {
+      const [providers, schedule, retention] = await Promise.allSettled([
+        getBackupProviders(),
+        getBackupSchedule(),
+        getBackupRetention(),
+      ]);
+      // Two refreshes can be in the air at once (one user action writes two
+      // preferences), and a local action can start under either. See
+      // `refreshMayApply` for what each half is protecting.
+      if (
+        !refreshMayApply({
+          version,
+          applied: appliedPreferencesVersion.current,
+          writesAtStart,
+          writesNow: live.current.writes,
+        })
+      ) {
+        return;
+      }
+      appliedPreferencesVersion.current = version;
+
+      const seed = backupSeed(providers, schedule, {
+        provider: live.current.provider,
+        providers: live.current.providers,
+      });
+      if (seed.providers) setProvidersLoadable({ status: 'loaded', data: seed.providers });
+      if (seed.schedule !== null) {
+        setSchedule(seed.schedule);
+        setScheduleLoaded(true);
+      }
+      setSelectedProvider(seed.provider);
+      if (retention.status === 'fulfilled') {
+        setRetention(String(retention.value.keep));
+        setRetentionLoaded(true);
+      }
+    })();
+  }, [backupPreferencesVersion.value, backupPairSaving, retentionSaving, granting]);
 
   const loadedProviders = providersLoadable.status === 'loaded' ? providersLoadable.data : null;
 
@@ -352,6 +456,9 @@ export function BackupSection() {
       showToast(`No backup permissions are defined for ${info.name}`, 'error');
       return;
     }
+    // A grant changes the ready verdict an in-flight background refresh is
+    // already reading, and it takes as long as the user needs in the browser.
+    live.current.writes++;
     setGranting(true);
     const ok = await grantOAuthScope(oauthProviderFor(info.id), scopes);
     if (ok) {
@@ -470,6 +577,9 @@ export function BackupSection() {
     // dropdown is disabled in this state; the guard is here because the state
     // is what makes the write unsafe, not the control.
     if (!scheduleLoaded) return;
+    // Claim the controls before anything is awaited: an SSE refresh already in
+    // flight has to know its reads predate this pick.
+    live.current.writes++;
     setSelectedProvider(newProvider);
     setProviderSaving(true);
     try {
@@ -501,6 +611,7 @@ export function BackupSection() {
 
   async function handleScheduleChange(newSchedule: string) {
     if (!selectedProvider) return;
+    live.current.writes++;
     setScheduleSaving(true);
     try {
       await setBackupSchedule(selectedProvider, newSchedule);
@@ -520,6 +631,7 @@ export function BackupSection() {
   async function handleRetentionChange(value: string) {
     const keep = parseInt(value, 10);
     if (isNaN(keep) || keep < 1) return;
+    live.current.writes++;
     setRetentionSaving(true);
     try {
       await setBackupRetention(keep);
@@ -533,13 +645,16 @@ export function BackupSection() {
   }
 
   const providerInfo = selectedProviderInfo();
+  // Guidance for the console the *Grant access* button cannot reach into. Only
+  // resolves for a connected provider that is genuinely short of something, so
+  // a ready backup destination shows nothing.
+  const registryLoadable = knownOAuthProviders.value;
+  const consoleRow = reauthorizationHint(
+    registryLoadable.status === 'loaded' ? registryLoadable.data.providers : [],
+    providerInfo ? oauthProviderFor(providerInfo.id) : '',
+    !!providerInfo?.connected && !providerInfo.ready,
+  );
   const backingUp = progress !== null;
-  // `PUT /backup/schedule` writes backup_provider AND backup_schedule together,
-  // and each handler sends the other half from captured state. So an in-flight
-  // write of either one has to disable BOTH controls: change the provider, then
-  // the schedule before the first lands, and the later response overwrites one
-  // choice with its stale counterpart.
-  const backupPairSaving = providerSaving || scheduleSaving;
 
   return (
     <div class="settings-section">
@@ -550,7 +665,14 @@ export function BackupSection() {
           the hand-off instead of leaving the page as the only route. */}
       <p class="settings-section-desc">
         Encrypted backups of this workspace, uploaded to your own cloud storage. Restore
-        happens from the workspace picker, not from here.{' '}
+        happens from the workspace picker, not from here.
+        {/* The offer starts its own line. A `<br />` rather than a second
+            paragraph because .settings-section-desc carries a 0.5rem bottom
+            margin, which between two paragraphs reads as two sections rather
+            than a description and the offer that belongs to it. The `{' '}`
+            after the button stays: its label and the clause following it are
+            one sentence, and a bare JSX newline there collapses to nothing. */}
+        <br />
         <button class="accent-link" onClick={askLucidosToSetUpBackups}>
           Ask Lucidos to set this up
         </button>{' '}
@@ -613,6 +735,12 @@ export function BackupSection() {
         // a completed authorization and before one.
         <div class="backup-blocked-state">
           <span>{backupAccessLine(providerInfo.name, providerInfo.missing_scopes)}</span>
+          {/* The console step, from the OAuth provider registry. *Grant access*
+              re-runs the authorization, and an authorization can only narrow
+              what the provider's own console permits: press it before the
+              permission is enabled there and it grants the same narrow set
+              again, which reads as the button doing nothing. */}
+          {consoleRow && <ProviderPermissionsHint row={consoleRow} />}
           <button
             class="action-btn action-btn-confirm"
             disabled={granting}

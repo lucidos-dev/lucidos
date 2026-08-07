@@ -543,28 +543,21 @@ impl LucidosEngine {
                     let sessions = self.agent_sessions.lock().await;
                     if let Some(session) = sessions.get(&thread_id) {
                         if session.is_live() {
-                            // Track the expected Result before sending. If the
-                            // send fails (channel dropped between the lookup
-                            // and the send), undo the increment so the
-                            // existing session's idle-exit cancel doesn't get
-                            // suppressed by a phantom pending follow-up.
+                            // Nothing to pre-count and nothing to roll back: the
+                            // message is visible to the session's idle decision the
+                            // moment it is in the channel (that decision reads
+                            // `msg_rx` under this same lock), and the run loop counts
+                            // it against `inputs_awaiting_result` when it forwards it
+                            // to the driver. A send that fails put nothing anywhere.
                             session
-                                .pending_followups
-                                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-                            let send_result = session.msg_tx.send(AgentUserInput {
-                                text: user_message.to_string(),
-                                images,
-                                origin_event_id,
-                                kind: input_kind,
-                            });
-                            if send_result.is_err() {
-                                session
-                                    .pending_followups
-                                    .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
-                                false
-                            } else {
-                                true
-                            }
+                                .msg_tx
+                                .send(AgentUserInput {
+                                    text: user_message.to_string(),
+                                    images,
+                                    origin_event_id,
+                                    kind: input_kind,
+                                })
+                                .is_ok()
                         } else {
                             false
                         }

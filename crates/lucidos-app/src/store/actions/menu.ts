@@ -53,22 +53,38 @@ export function switchMenuItem(item: MenuItem) {
   if (item === 'apps') void loadApps();
   if (item === 'plugins') void loadInstalledPlugins();
   if (item === 'triggers') void loadTriggers();
-  if (item === 'settings') void loadDevices();
   if (item === 'notifications') refreshActiveNotificationsTab();
 
   pushNavState();
   revealContentPane();
 }
 
-/** Navigate into a settings subview (from within the settings panel). */
+/** Land on a Settings sub-section, from anywhere, in a SINGLE nav push.
+ *
+ *  This sets the Settings menu item itself, so it is a complete destination
+ *  rather than half of one. It used to set only `settingsSubview`, which forced
+ *  every caller outside the Settings panel (the `navigate_ui` / notification-tap
+ *  router, Search Everywhere, the Plugins → Marketplaces jump, the compose
+ *  destination row) to pair it with `switchMenuItem('settings')`. Since both
+ *  push, one tap then left TWO history entries: the sub-section, and a Settings
+ *  home the user never saw. Back walked onto that phantom before returning where
+ *  they came from. The pairing is gone from all four; a caller that wants the
+ *  home list still calls `switchMenuItem('settings')` alone.
+ *
+ *  `setActiveMenu` does the overlay + localStorage clearing (an open app / file
+ *  preview must not survive a settings deep link), so this owns only the
+ *  sub-section, its data loader, the one push and the pane reveal. */
 export function openSettingsSubview(key: Exclude<SettingsSubview, 'main'>) {
+  setActiveMenu('settings');
   settingsSubview.value = key;
+  // Each loader belongs to the sub-section that renders its data. `devices`
+  // moved here from `switchMenuItem('settings')`, where it fetched on every
+  // visit to the home list (which shows no device data) and not at all on a
+  // deep link that skipped the home list.
   if (key === 'accounts') void loadCredentials();
+  if (key === 'devices') void loadDevices();
   if (key === 'environment-variables') void loadEnvironmentVariables();
   if (key === 'marketplaces') void loadPluginCatalog();
-  panelOverlay.value = null;
-  localStorage.removeItem('file-preview-open');
-  localStorage.removeItem('app-window-open');
   pushNavState();
   revealContentPane();
 }
@@ -89,22 +105,16 @@ export function landOnAccountsWithOverlay(overlay: PanelOverlay): void {
  *  user exactly where they add one. `settingsScrollTarget` drives the
  *  scroll-and-highlight effect in `SettingsView`. */
 export function openProviderSettings(): void {
-  setActiveMenu('settings');
-  settingsSubview.value = 'models';
   settingsScrollTarget.value = 'models:providers';
-  pushNavState();
-  revealContentPane();
+  openSettingsSubview('models');
 }
 
-/** Deep-link to Settings → Backup in a single render. Used by the app-shell
- *  backup reminder's "Set up backup" button. No scroll target: the page is short
- *  and its health card, provider picker and schedule dropdown are all at the top,
- *  which is exactly what someone arriving from the reminder came for. */
+/** Deep-link to Settings → System → Backup in a single render. Used by the
+ *  app-shell backup reminder's "Set up backup" button. No scroll target: the page
+ *  is short and its health card, provider picker and schedule dropdown are all at
+ *  the top, which is exactly what someone arriving from the reminder came for. */
 export function openBackupSettings(): void {
-  setActiveMenu('settings');
-  settingsSubview.value = 'backup';
-  pushNavState();
-  revealContentPane();
+  openSettingsSubview('backup');
 }
 
 /** Deep-link to Settings → Accounts → Connected accounts and scroll to it.
@@ -126,11 +136,7 @@ export function openBackupSettings(): void {
  *  and faced *Grant access*: a second trip through the same screen for one
  *  intent. */
 export function openConnectedAccountsSettings(provider?: string, scopes?: string): void {
-  setActiveMenu('settings');
-  settingsSubview.value = 'accounts';
-  void loadCredentials();
   oauthConnectPrefill.value = provider ? { provider, scopes } : null;
   settingsScrollTarget.value = 'accounts:connected';
-  pushNavState();
-  revealContentPane();
+  openSettingsSubview('accounts');
 }

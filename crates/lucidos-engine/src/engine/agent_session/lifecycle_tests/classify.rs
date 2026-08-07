@@ -24,13 +24,15 @@ fn question_tools_are_suppressed_other_tools_are_not() {
     }
 }
 
-/// CC merges back-to-back stdin inputs into a single Result, so the
-/// engine's `pending_followups` counter cannot be relied on to predict
-/// whether more Results are coming. A normal `Generated` Result must
-/// always emit `CodingAgentIdled` regardless of inflight inputs —
-/// otherwise the thread sits in stored=Archived → DisplaySection::Archive
-/// instead of Current. Inflight-followup race protection lives in the
-/// run-loop's subprocess-termination decision, not here.
+/// CC merges back-to-back stdin inputs into a single Result, so no count of
+/// forwarded inputs can predict whether more Results are coming: for CC the
+/// answer is always "no", which is why
+/// `lifecycle::settle_inputs_awaiting_result` zeroes the count for that backend
+/// and decrements by one for Codex. A normal `Generated` Result must always emit
+/// `CodingAgentIdled` regardless of inflight inputs, otherwise the thread sits in
+/// stored=Archived → DisplaySection::Archive instead of Current.
+/// Inflight-followup race protection lives in the run-loop's
+/// subprocess-termination decision, not here.
 #[test]
 fn generated_result_always_emits_idle() {
     let (terminal, emit_idle) = classify_result(false, false, false, false, None, false);

@@ -15,7 +15,7 @@ import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, hasContentEvents } from '../../store/thread-events';
 import { awayFromBottom, notAtTop, scrollToBottom, scrollToBottomAnimated, scrollToTop, scrolledUp, hasPendingEventScroll, deepLinkRenderAll } from './scrollState';
 import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll } from './threadWindow';
-import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
+import { useScrollMemory, hasSavedScroll, threadScrollKey, dropStaleSavedScroll } from '../../hooks/useScrollMemory';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
@@ -580,17 +580,39 @@ export function ThreadView() {
 
     const savedScrollKey = threadId ? threadScrollKey(threadId) : null;
 
-    // Mark the user as scrolled-up synchronously when a saved scroll exists.
-    // Several auto-scroll callers (visualViewport.resize in MobileSwipeContainer,
-    // useHideOnScroll's focusin/focusout) gate on `wasAtBottom = !scrolledUp.value`
-    // and call scrollToBottom() if true. On iOS PWA those fire repeatedly during
-    // initial load and would override useScrollMemory's restore. Setting
-    // scrolledUp early makes wasAtBottom=false so they skip.
+    // Retire a reading position taken in an older transcript, then mark the user
+    // as scrolled-up synchronously when one survives.
+    //
+    // RETIRE: a saved position is scoped to the transcript it was taken in. Once
+    // the thread has gained TURNS since the save, restoring it parks the reader
+    // in the middle of a thread they opened to see the new part of, which is the
+    // same complaint as an open that fails to reach the end. The revision is the
+    // exchange count, so a streaming turn growing under a parked reader keeps
+    // their position while a new turn retires it. Guarded on `eventsLoaded` and a
+    // non-zero count: before the events land the count is 0, which means "not
+    // rendered yet", never "the thread is empty". This ALSO retires the
+    // positions written before the stamp existed, which is what heals a browser
+    // carrying one from a stranded transcript.
+    //
+    // It runs in a LAYOUT effect so it lands before the passive load effect below
+    // re-reads `hasSavedScroll` and decides whether to scroll to the end: the two
+    // must answer the same question within one open, or the reader lands at
+    // neither position. `focusThread` read the key before this render and skipped
+    // its own scroll-to-bottom; the load effect is what makes good on that.
+    //
+    // MARK: several auto-scroll callers (visualViewport.resize in
+    // MobileSwipeContainer, useHideOnScroll's focusin/focusout) gate on
+    // `wasAtBottom = !scrolledUp.value` and call scrollToBottom() if true. On iOS
+    // PWA those fire repeatedly during initial load and would override
+    // useScrollMemory's restore. Setting scrolledUp early makes wasAtBottom=false
+    // so they skip.
     useLayoutEffect(() => {
-        if (savedScrollKey && hasSavedScroll(savedScrollKey)) {
+        if (!savedScrollKey) return;
+        if (eventsLoaded) dropStaleSavedScroll(savedScrollKey, exchanges.length);
+        if (hasSavedScroll(savedScrollKey)) {
             scrolledUp.value = true;
         }
-    }, [savedScrollKey]);
+    }, [savedScrollKey, eventsLoaded, exchanges.length]);
 
     useEffect(() => {
         if (threadId) {
@@ -730,6 +752,10 @@ export function ThreadView() {
             paused: !eventsLoaded,
             shouldSave: () => scrolledUp.value,
             onRestored: () => { scrolledUp.value = true; },
+            // Stamp every save with the turn count it was taken at, so the
+            // retire check in the layout effect above can tell "nothing has
+            // happened since" from "there are new turns below you".
+            revision: exchanges.length,
             // A notification deep-link (toast / push / inbox) owns the scroll
             // when focusing an UNfocused thread: skip the saved-scroll restore
             // so it doesn't fire after scrollToEventAndPulse and snap away from

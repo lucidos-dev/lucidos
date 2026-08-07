@@ -424,14 +424,38 @@ pub struct LucidosEngine {
     /// engines each get their own latch. See
     /// `engine::frontend_refresh::warn_once_if_frontend_worktree_pinned`.
     frontend_worktree_pin_warned: std::sync::atomic::AtomicBool,
-    /// Device actor stashed by the switch handler (`/api/v1/restart`) at
-    /// request time and read by the graceful-shutdown boundary emit at ACTUAL
-    /// teardown — the HTTP handler has the device, the SIGUSR1 signal handler
-    /// does not. Present → a user-initiated switch (attributes "You" / enables
-    /// auto-resume on recovery); absent → a non-switch stop (System attribution,
-    /// manual Continue). `take`n once at teardown so a later non-switch stop
-    /// can't reuse a stale actor. See `engine_version` + Phase 3/4 of the plan.
+    /// Device actor stashed at restart-REQUEST time and read by the
+    /// graceful-shutdown boundary emit at ACTUAL teardown: the HTTP handler has
+    /// the device, the SIGUSR1 signal handler does not. Present → a user asked
+    /// for this teardown (attributes "You" / enables auto-resume on recovery);
+    /// absent → nobody did (System attribution, manual Continue). `take`n once
+    /// at teardown so a later unrequested stop can't reuse a stale actor.
+    ///
+    /// Two writers, one per way a user can ask: the in-workspace *Switch to new
+    /// version* (`/api/v1/restart`) and the gateway's restart-intent notify
+    /// (`/api/v1/internal/restart-intent`), which fires just before the picker's
+    /// Restart / Stop signals this process. First writer wins. See
+    /// `engine_version::stash_first_restart_actor`.
     restart_actor: std::sync::Mutex<Option<thread_events::MessageOrigin>>,
+    /// The actor of the teardown currently under way: `restart_actor` above
+    /// taken ONCE by `engine_version::begin_teardown` and then readable for the
+    /// rest of the process, by every `EngineShutdown` abort the teardown emits.
+    ///
+    /// `restart_actor` answers "did a user ask for this?", which is a question
+    /// about the teardown. This field is what stops the ANSWER from depending on
+    /// when a thread happened to become in-flight. Until 2026-08-07 there was no
+    /// such field: `main.rs` handed the only copy to the pre-emit, so the two
+    /// emits that run after it (`shutdown_active_threads` and the
+    /// `emit_stop_terminal` abort arm) hardcoded a system actor. A chat thread
+    /// woken by an event 1.5s into a *Switch to new version* therefore settled
+    /// `failed` with a manual Continue while its two siblings settled `paused`
+    /// and auto-resumed, because the device actor is half the switch fingerprint
+    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`).
+    ///
+    /// `None` means either "no teardown yet" or "a teardown nobody requested".
+    /// Neither needs distinguishing: both stamp `MessageOrigin::system()`, and
+    /// nothing reads this outside a teardown.
+    teardown_actor: std::sync::Mutex<Option<thread_events::MessageOrigin>>,
     /// Thread ids `recover_orphaned_worktrees` decided to auto-resume after a
     /// user-initiated *Switch to new version* (in-flight coding-agent threads with
     /// a device-attributed teardown boundary). Drained by `main.rs` AFTER the spawn

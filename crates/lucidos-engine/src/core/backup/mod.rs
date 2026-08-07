@@ -145,6 +145,12 @@ pub fn provider_meta(provider_id: &str) -> Option<ProviderMeta> {
 /// `https://www.googleapis.com/auth/drive.file` URL. Dropbox's scopes are whole
 /// names (`files.content.write`), where the two readings coincide. An empty
 /// requirement always passes.
+///
+/// This is NOT the question
+/// [`crate::core::oauth::missing_requested_scopes`] answers. That one reports
+/// what an authorization asked for and did not get, so it compares whole
+/// tokens: containment there would read a refused scope as granted whenever
+/// another granted scope happened to contain its name. Keep the two apart.
 pub fn scopes_include(granted: &str, required: &str) -> bool {
     required.is_empty() || granted.contains(required)
 }

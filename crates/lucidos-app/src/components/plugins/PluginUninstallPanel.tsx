@@ -1,5 +1,5 @@
 import { useState } from 'preact/hooks';
-import { activeInlineForm, closeInlineForm } from '../../store/store';
+import { activeInlineForm } from '../../store/store';
 import type { PluginUninstallForm } from '../../store/store';
 import {
   cancelPluginUninstallAction,
@@ -119,8 +119,13 @@ function PluginUninstallConfirm({ form }: { form: PluginUninstallForm }) {
  *  `markPluginUninstalled`). The lists come off the receipt marker, not off
  *  `request.files_present`, which was only what existed at prepare time.
  *
- *  Deliberately offers no Confirm and no Cancel: the files are gone, the staged
- *  `uninstall_id` is popped, and the only action left is to close the panel.
+ *  Deliberately offers NO buttons at all. Confirm and Cancel are gone because
+ *  the files are gone and the staged `uninstall_id` is popped. Close is gone
+ *  because it broke the nav history the receipt exists to hold:
+ *  `closeInlineForm()` blanks `panelOverlay` without touching the nav stack, so
+ *  the cursor was left pointing at an entry describing a panel no longer on
+ *  screen, and Back/Forward walked from that stale position. The header's back
+ *  arrow is how you leave a receipt, same as any other panel page.
  *
  *  Exported for its unit test, which renders it directly: the suite's VNode walk
  *  stops at function components (the confirm branch's hooks would throw), so it
@@ -156,12 +161,6 @@ export function PluginUninstallReceiptPanel({ form }: { form: PluginUninstallFor
             files={removed.files_missing}
           />
         )}
-
-        <div class="plugin-install-actions">
-          <button type="button" class="action-btn" onClick={() => closeInlineForm()}>
-            Close
-          </button>
-        </div>
       </div>
     </div>
   );

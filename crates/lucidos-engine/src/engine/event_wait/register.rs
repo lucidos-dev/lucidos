@@ -18,7 +18,7 @@
 //! * **The duplicate refusal** (S6b): the same `on` list twice on one thread.
 //!   One event would then produce two wakes.
 
-use chrono::{DateTime, Duration, Utc};
+use chrono::{Duration, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -178,7 +178,7 @@ impl LucidosEngine {
             timeout_secs,
             wait.wait_id,
         );
-        let registered = registered_tool_result_text(&wait, lookback.as_ref(), Utc::now());
+        let registered = registered_tool_result_text(&wait, lookback.as_ref());
         self.live_waits.insert(wait.clone()).await;
         // Same scan the boot rebuild runs, and here it closes the live race:
         // an event emitted between the watermark read and the insert above was
@@ -255,25 +255,32 @@ impl LucidosEngine {
         &self,
         wait: &LiveWait,
     ) -> Option<crate::engine::event_wait::ArmingLookback> {
-        let since = Utc::now() - Duration::seconds(ARMING_LOOKBACK_SECS);
-        let delivered = match delivered_event_ids(&self.pool, wait.thread_id, since).await {
-            Ok(ids) => ids,
-            Err(e) => {
-                // Not an empty set: without the exclusion the lookback would
-                // re-report an event this thread was already handed, so an
-                // unreadable exclusion means no report at all.
-                crate::log!(
-                    "[EventWait] Lookback delivered-set read failed for thread {}: {e}",
-                    wait.thread_id
-                );
-                return None;
-            }
-        };
+        // Both halves are given the WINDOW, and each resolves it against the
+        // database clock, because `created` is written by the database (see
+        // `arming_lookback_matches`). The exclusion set is read FIRST on
+        // purpose: its `now()` is therefore the earlier of the two, so its
+        // window is the wider one and it cannot fail to cover an event the
+        // scan below is willing to report. Reversing these two calls would
+        // leave a sliver in which an already-handed event is reported again.
+        let delivered =
+            match delivered_event_ids(&self.pool, wait.thread_id, ARMING_LOOKBACK_SECS).await {
+                Ok(ids) => ids,
+                Err(e) => {
+                    // Not an empty set: without the exclusion the lookback would
+                    // re-report an event this thread was already handed, so an
+                    // unreadable exclusion means no report at all.
+                    crate::log!(
+                        "[EventWait] Lookback delivered-set read failed for thread {}: {e}",
+                        wait.thread_id
+                    );
+                    return None;
+                }
+            };
         match crate::engine::event_wait::arming_lookback_matches(
             &self.pool,
             &wait.on,
             wait.watermark,
-            since,
+            ARMING_LOOKBACK_SECS,
             &delivered,
             ARMING_LOOKBACK_MAX_REPORTED,
         )
@@ -324,7 +331,6 @@ impl LucidosEngine {
 pub(super) fn registered_tool_result_text(
     wait: &LiveWait,
     lookback: Option<&crate::engine::event_wait::ArmingLookback>,
-    now: DateTime<Utc>,
 ) -> String {
     let subscribed = format!(
         "Subscribed to {}. Nothing is blocking: finish this turn and end your response \
@@ -334,7 +340,7 @@ pub(super) fn registered_tool_result_text(
     );
     match lookback.filter(|l| !l.is_empty()) {
         None => subscribed,
-        Some(found) => format!("{}\n\n{subscribed}", arming_lookback_notice(found, now)),
+        Some(found) => format!("{}\n\n{subscribed}", arming_lookback_notice(found)),
     }
 }
 
@@ -345,10 +351,7 @@ pub(super) fn registered_tool_result_text(
 /// the model already had and did not act on. It states the trap explicitly:
 /// this subscription will not wake it for these, so a turn that ends here ends
 /// with the event unhandled.
-fn arming_lookback_notice(
-    found: &crate::engine::event_wait::ArmingLookback,
-    now: DateTime<Utc>,
-) -> String {
+fn arming_lookback_notice(found: &crate::engine::event_wait::ArmingLookback) -> String {
     let mut text = String::from(
         "ALREADY HAPPENED, before this subscription existed. Your subscription watches \
          FORWARD only, so it will NOT wake you for anything below. Decide now, in this \
@@ -359,7 +362,7 @@ fn arming_lookback_notice(
         text.push_str(&format!(
             "\n{} ({} ago):\n{}\n",
             m.event_type,
-            humanize_age(now - m.created),
+            humanize_age(m.age_secs),
             capped_payload(&m.payload),
         ));
     }
@@ -401,8 +404,8 @@ fn capped_payload(payload: &Value) -> String {
 /// Whole seconds up to a minute, then minutes and seconds. The window is a few
 /// minutes wide, so anything coarser would render every match as "0m" and the
 /// age is the whole basis on which the model tells a miss from its own work.
-fn humanize_age(age: Duration) -> String {
-    let secs = age.num_seconds().max(0);
+fn humanize_age(age_secs: i64) -> String {
+    let secs = age_secs.max(0);
     if secs < 60 {
         format!("{secs}s")
     } else {
@@ -419,9 +422,11 @@ fn humanize_age(age: Duration) -> String {
 /// events nobody had reported: see [`arming_lookback_matches`] for the two
 /// sequence floors that died and why.
 ///
-/// Scoped by `since`, which loses nothing: a delivery is always at or after the
-/// event it delivers, so any delivery of an event inside the window is itself
-/// inside the window.
+/// Scoped to the same `window_secs`, which loses nothing: a delivery is always
+/// at or after the event it delivers, so any delivery of an event inside the
+/// window is itself inside the window. A **duration** rather than a cutoff
+/// instant for the reason [`arming_lookback_matches`] spells out: `created` is
+/// the database's clock, so the boundary has to be too.
 ///
 /// A free function on the pool, matching [`consecutive_subscriptions`], so the
 /// SQL can be tested against a real database without standing up an engine.
@@ -432,17 +437,17 @@ fn humanize_age(age: Duration) -> String {
 pub(crate) async fn delivered_event_ids(
     pool: &sqlx::PgPool,
     thread_id: Uuid,
-    since: DateTime<Utc>,
+    window_secs: i64,
 ) -> Result<std::collections::HashSet<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
     let rows: Vec<(Option<String>,)> = sqlx::query_as(
         "SELECT payload->>'event_id' FROM events \
          WHERE aggregate = 'thread' \
            AND aggregate_id = $1 \
            AND event_type = 'EventWaitDelivered' \
-           AND created >= $2",
+           AND created >= now() - make_interval(secs => $2)",
     )
     .bind(thread_id.to_string())
-    .bind(since)
+    .bind(window_secs)
     .fetch_all(pool)
     .await?;
     Ok(rows

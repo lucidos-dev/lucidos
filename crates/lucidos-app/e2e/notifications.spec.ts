@@ -301,8 +301,17 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     // synchronously and loses the race, so it doesn't reproduce — the bug is the
     // observer-driven restore.) Without the fix the bottom-most deep-link target
     // never enters the viewport.
+    //
+    // The `:999` is the position's REVISION stamp (the turn count it was taken
+    // at), and it is what keeps this test exercising its regression: a reading
+    // position is retired once the thread has gained turns since the save, and
+    // an UNSTAMPED value is retired on sight (see `savedScrollIsStale`). A bare
+    // '100' would therefore be dropped before useScrollMemory ever read it, so
+    // nothing would race the deep-link and the assertion below would pass for
+    // the wrong reason. A revision far above this thread's 16 turns says "this
+    // position is current", so the restore still competes.
     await page.evaluate((tid) => {
-      localStorage.setItem(`lucidos-scroll-thread-${tid}`, '100');
+      localStorage.setItem(`lucidos-scroll-thread-${tid}`, '100:999');
     }, threadId);
 
     await postNotification(page, {

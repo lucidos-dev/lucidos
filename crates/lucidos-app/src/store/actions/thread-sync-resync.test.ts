@@ -1,11 +1,19 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
-// thread-loading is the side-effect we're verifying: capture all three calls.
-const loadAllThreads = vi.fn(async () => {});
+// The per-thread half of the side-effect we're verifying.
 const refreshThreadEvents = vi.fn(async (_id: string) => {});
 const markLoadedThreadsStale = vi.fn();
-vi.mock('./thread-loading', () => ({ loadAllThreads, refreshThreadEvents, markLoadedThreadsStale }));
+vi.mock('./thread-loading', () => ({ refreshThreadEvents, markLoadedThreadsStale }));
+
+// The metadata read goes through the shared wrapper, which is what owns the one
+// keyed card this shares with the resume sync (see thread-list-refresh.test.ts
+// for the reporting rules themselves). Mocked here so this suite stays about
+// resync ORDERING; asserting on it also pins that the site still routes through
+// the wrapper rather than calling `loadAllThreads` directly and growing its own
+// catch block, which is the divergence the shared module exists to prevent.
+const refreshThreadList = vi.fn(async () => {});
+vi.mock('./thread-list-refresh', () => ({ refreshThreadList }));
 
 // Stub the threadMap + focusedThreadId signals so the test can set fixture state
 // without pulling in the full store graph (which depends on browser-only modules).
@@ -90,7 +98,7 @@ describe('resyncLoadedThreads', () => {
     // "Thinking" spinner this function exists for reads `meta.status`), and it
     // covers every thread in one request. Only the transcript on screen needs
     // its events now; the rest are marked and catch up on focus.
-    expect(loadAllThreads).toHaveBeenCalledTimes(1);
+    expect(refreshThreadList).toHaveBeenCalledTimes(1);
     expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
     expect(refreshThreadEvents.mock.calls.map((c) => c[0])).toEqual(['thread-c']);
   });
@@ -106,7 +114,7 @@ describe('resyncLoadedThreads', () => {
 
     await resyncLoadedThreads();
 
-    expect(loadAllThreads).toHaveBeenCalledTimes(1);
+    expect(refreshThreadList).toHaveBeenCalledTimes(1);
     expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
     expect(refreshThreadEvents).not.toHaveBeenCalled();
   });
@@ -137,7 +145,7 @@ describe('resyncLoadedThreads', () => {
       resyncLoadedThreads(),
     ]);
 
-    expect(loadAllThreads).toHaveBeenCalledTimes(1);
+    expect(refreshThreadList).toHaveBeenCalledTimes(1);
     expect(markLoadedThreadsStale).toHaveBeenCalledTimes(1);
     expect(refreshThreadEvents).toHaveBeenCalledTimes(1);
   });

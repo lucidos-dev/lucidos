@@ -10,6 +10,7 @@ import { updateAvailable } from './store/store';
 import { installActionBtnBlurListener } from './components/chat/promptFocus';
 import { installNoAutofill } from './utils/noAutofill';
 import { installNoDrag } from './utils/noDrag';
+import { installStrayFileDropGuard } from './utils/strayFileDrop';
 import { publishScrollbarGutter } from './utils/scrollbarGutter';
 import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
@@ -84,6 +85,11 @@ installNoAutofill();
 // badge + translucent text/image ghost) that otherwise flashes while dragging
 // the window by the header. See utils/noDrag.ts. No-op off Tauri.
 installNoDrag();
+// Both render roots: swallow an OS file drop that lands outside a drop zone, so
+// a near-miss cannot navigate the document to the dropped file. The app root got
+// this from <DropZone/>; the picker root had nothing, which stopped mattering
+// only because the desktop shell used to eat every drop. See utils/strayFileDrop.ts.
+installStrayFileDropGuard();
 // Publish --scrollbar-gutter-width before the first render: the chat composer
 // sizes its horizontal inset off it to stay aligned with the transcript, whose
 // scrollbar takes that width out of the content box on classic-scrollbar

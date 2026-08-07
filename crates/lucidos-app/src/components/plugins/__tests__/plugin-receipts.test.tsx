@@ -158,7 +158,7 @@ describe('plugin uninstall receipt', () => {
     expect(acc.text).toContain('Uninstalled');
   });
 
-  it('offers only Close: the files are gone and the staged id is popped', () => {
+  it('offers no buttons: the files are gone and the staged id is popped', () => {
     const acc = render(PluginUninstallReceiptPanel({
       form: uninstallForm({
         at: '2026-08-06T10:00:00.000Z',
@@ -168,7 +168,10 @@ describe('plugin uninstall receipt', () => {
       }),
     }));
 
-    expect(buttonLabels(acc)).toEqual(['Close']);
+    // Not even a Close: it blanked `panelOverlay` without touching the nav
+    // stack, leaving the cursor on an entry for a panel no longer on screen.
+    // The header's back arrow leaves the receipt.
+    expect(buttonLabels(acc)).toEqual([]);
   });
 });
 
@@ -189,7 +192,7 @@ describe('plugin install receipt', () => {
     expect(acc.text).toContain('Installed');
   });
 
-  it('offers only Close', () => {
+  it('offers no buttons', () => {
     const acc = render(PluginInstallReceiptPanel({
       form: installForm({
         at: '2026-08-06T10:00:00.000Z',
@@ -198,6 +201,6 @@ describe('plugin install receipt', () => {
       }),
     }));
 
-    expect(buttonLabels(acc)).toEqual(['Close']);
+    expect(buttonLabels(acc)).toEqual([]);
   });
 });

@@ -34,7 +34,7 @@ import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-
 import { restoreRepoSelectionFromStorage } from '../store/actions/repositories';
 import { openThreadAcrossWorkspaces } from '../store/actions/cross-workspace';
 import { CHECK_ICON, COPY_ICON } from '../utils/markedConfig';
-import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
+import { activeMenuItem, notificationsFilter, settingsSubview, serviceWorkerBuildId, threadsLoaded, showToast, showConfirm, showPrompt, CONNECTION_POLL_INTERVAL_MS, FOCUSED_THREAD_KEY, setFocusedThread } from '../store/store';
 import { installContentPaneIframeFocusTracking } from '../components/layout/paneFocus';
 import { requestServiceWorkerBuildId } from './sw-update';
 import { syncClientUpdateFromBuild } from '../store/actions/client-update';
@@ -51,7 +51,6 @@ import { isKnownAppFrame } from '../utils/appFrame';
 import { handleAppToastMessage } from '../store/actions/app-toast-bridge';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
 
-const CONNECTION_POLL_INTERVAL = 5000;
 // Cold-start recovery window: if the very first connect hasn't landed by this
 // point, return to the workspace picker rather than strand the user in a cached
 // shell that can't load (the PWA auto-open-into-an-unreachable-engine case).
@@ -632,7 +631,7 @@ export function useStartup(): void {
     // Periodic health polling as connection watchdog.
     const connectionInterval = setInterval(() => {
       checkConnection();
-    }, CONNECTION_POLL_INTERVAL);
+    }, CONNECTION_POLL_INTERVAL_MS);
 
     // Cold-start recovery: if we never reach the engine, bounce back to the
     // workspace picker (the always-reachable recovery surface). No-op once

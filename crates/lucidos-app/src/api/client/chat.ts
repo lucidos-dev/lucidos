@@ -1,4 +1,5 @@
 import { toFailed } from '../../store/types';
+import { HEALTH_PROBE_TIMEOUT_MS } from '../../store/store';
 import { API, json, mutatingFetch, mutatingFetchIdempotent, throwIfNotOk } from './_core';
 import type { DiffFile } from '../../store/store';
 import type { AnswerKind, PersistScope } from '../../store/thread-events';
@@ -39,10 +40,16 @@ export interface HealthInfo {
 /** Probe `/api/v1/health`. Failed without `httpCode` = transport unreachable;
  *  with `httpCode` = engine answered non-2xx. The connection watchdog only
  *  reads `loaded` vs `failed` today, but downstream telemetry / smarter
- *  recovery can branch on the discriminator without another round-trip. */
+ *  recovery can branch on the discriminator without another round-trip.
+ *
+ *  Its own deadline rather than the shared 10s default, because this probe's
+ *  latency IS its answer and it has to answer before the next poll: see
+ *  `HEALTH_PROBE_TIMEOUT_MS` for why that number is what it is. The service
+ *  worker leaves this endpoint alone (`public/sw.js`) so the whole budget
+ *  belongs to one attempt. */
 export async function checkHealth(): Promise<Loadable<HealthInfo>> {
   try {
-    return { status: 'loaded', data: await json<HealthInfo>(`${API}/health`, undefined, 3000) };
+    return { status: 'loaded', data: await json<HealthInfo>(`${API}/health`, undefined, HEALTH_PROBE_TIMEOUT_MS) };
   } catch (err) {
     return toFailed<HealthInfo>(err);
   }

@@ -2,19 +2,18 @@
 //!
 //! This module owns the user-confirm staging flows (install + uninstall),
 //! the `LucidosEngine` tool dispatch, and the shared pending-map plumbing.
-//! Two helper concerns live in child modules:
+//! Three helper concerns live in child modules:
 //!
 //! - [`source`] — install-source detection + fetching.
 //! - [`registry`] — installed-plugin projection / query / update-check.
+//! - [`marketplaces`]: the single write path for the marketplace registry,
+//!   shared with `api::plugins` and announcing every mutation.
 //!
 //! Splitting is purely structural; the public surface stays reachable at
 //! `crate::engine::tools::plugins::*` via the re-exports below.
 
 use std::path::{Path, PathBuf};
 
-use crate::core::plugin_marketplaces::{
-    add_marketplace, load_registry, save_registry, MARKETPLACES_DATA_PATH,
-};
 use crate::core::plugins::{
     compare_versions, detect_conflicts, validate_tree, PlannedFile, UpdateDecision,
     AUTH_MODULES_DIR,
@@ -26,6 +25,7 @@ use crate::engine::tools::agent_tool_actor;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::engine::LucidosEngine;
 
+pub(crate) mod marketplaces;
 mod registry;
 mod source;
 
@@ -204,54 +204,16 @@ impl LucidosEngine {
             .map(str::trim)
             .filter(|s| !s.is_empty());
 
-        let response = {
-            let _repo_guard = self.lock_workspace_repo().await;
-            let mut registry = load_registry(&self.workspace_path)
-                .map_err(|e| format!("Error: read marketplace registry: {e}"))?;
-            let (marketplace, created) =
-                add_marketplace(&mut registry, source, name).map_err(|e| format!("Error: {e}"))?;
-            save_registry(&self.workspace_path, &registry)
-                .map_err(|e| format!("Error: write marketplace registry: {e}"))?;
+        let registration = self
+            .register_plugin_marketplace(source, name, Some(agent_tool_actor(thread_id)))
+            .await
+            .map_err(|e| format!("Error: {e}"))?;
 
-            let commit_message = if created {
-                "Register plugin marketplace"
-            } else {
-                "Update plugin marketplace"
-            };
-            let commit = self
-                .artifact_manager
-                .commit_data_path(MARKETPLACES_DATA_PATH, commit_message)
-                .await
-                .map_err(|e| format!("Error: commit marketplace registry: {e}"))?;
-
-            let actor = Some(agent_tool_actor(thread_id));
-            self.event_bus
-                .emit_or_log(
-                    BusEvent::System(SystemEvent::DataFileWritten {
-                        path: MARKETPLACES_DATA_PATH.to_string(),
-                        commit: Some(commit.clone()),
-                        actor,
-                    }),
-                    "[Plugins] DataFileWritten",
-                )
-                .await;
-
-            serde_json::json!({
-                "marketplace": marketplace,
-                "marketplaces": registry.marketplaces,
-                "created": created,
-                "commit": commit,
-            })
-        };
-
-        let update_engine = self.clone_arc();
-        let update_pool = self.pool.clone();
-        tokio::spawn(async move {
-            crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(
-                update_engine,
-                update_pool,
-            )
-            .await;
+        let response = serde_json::json!({
+            "marketplace": registration.marketplace,
+            "marketplaces": registration.marketplaces,
+            "created": registration.created,
+            "commit": registration.commit,
         });
 
         serde_json::to_string_pretty(&response)

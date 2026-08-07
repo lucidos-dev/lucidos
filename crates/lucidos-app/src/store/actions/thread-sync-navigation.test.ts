@@ -122,8 +122,10 @@ describe('handleNavigationRequest', () => {
     // The `thread-queue` NavigateTarget stays stable in the SDK + engine; the
     // frontend reinterprets it to the System subpanel under Settings.
     handleNavigationRequest({ target: 'thread-queue' });
-    expect(switchMenuItem).toHaveBeenCalledWith('settings');
     expect(openSettingsSubview).toHaveBeenCalledWith('thread-queue');
+    // openSettingsSubview lands the Settings menu item too, so pairing it with
+    // switchMenuItem would push the Settings home list as its own history entry.
+    expect(switchMenuItem).not.toHaveBeenCalled();
   });
 
   it('opens app by id (delegates to openAppById, no stale-cache pre-check)', () => {
@@ -151,10 +153,10 @@ describe('handleNavigationRequest', () => {
     expect(openUrl).toHaveBeenCalledWith('https://example.com', 'thread "X"');
   });
 
-  it('opens settings with subview', () => {
+  it('opens settings with subview, as a single nav entry', () => {
     handleNavigationRequest({ target: 'settings', settings_view: 'accounts' });
-    expect(switchMenuItem).toHaveBeenCalledWith('settings');
     expect(openSettingsSubview).toHaveBeenCalledWith('accounts');
+    expect(switchMenuItem).not.toHaveBeenCalled();
   });
 
   it('opens new-trigger form atomically (single nav push)', () => {

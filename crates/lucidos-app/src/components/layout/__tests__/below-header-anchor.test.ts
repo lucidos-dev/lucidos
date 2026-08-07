@@ -6,6 +6,8 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
+import { block, decl } from '../../../styles/__tests__/css-rule-helpers';
+
 const here: string = dirname(fileURLToPath(import.meta.url));
 const styles = (rel: string): string =>
   readFileSync(resolve(here, '../../../styles', rel), 'utf-8');
@@ -14,27 +16,6 @@ const baseCss = styles('global/base.css');
 const shellCss = styles('panels/shell.css');
 const componentsCss = styles('components.css');
 const mobileCss = styles('mobile.css');
-
-/** Body of the first rule/at-rule block whose header matches `needle`, starting
- *  the search at `from`. Brace-matched, so a nested block (a `:root` inside a
- *  `@media`) is returned whole instead of being cut at the first `}`. */
-function block(css: string, needle: string, from = 0): string {
-  const at = css.indexOf(needle, from);
-  expect(at, `"${needle}" not found`).toBeGreaterThanOrEqual(0);
-  const open = css.indexOf('{', at);
-  let depth = 0;
-  for (let i = open; i < css.length; i++) {
-    if (css[i] === '{') depth++;
-    else if (css[i] === '}' && --depth === 0) return css.slice(open + 1, i);
-  }
-  throw new Error(`unterminated block for "${needle}"`);
-}
-
-/** A declaration's value, or null when the block doesn't set that property. */
-function decl(body: string, prop: string): string | null {
-  const m = body.match(new RegExp(`(?:^|[;{]|\\*/)\\s*${prop}:\\s*([^;]+);`));
-  return m ? m[1].replace(/\s+/g, ' ').trim() : null;
-}
 
 /**
  * Regression (packaged macOS build): toasts overlapped the header.

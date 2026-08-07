@@ -368,11 +368,12 @@ pub(super) fn should_redirect_followup(
 /// Arm the interrupt-and-redirect for a follow-up, operating on the
 /// already-locked `agent_sessions` map. When `thread_id`'s session is a turn in
 /// flight that should be redirected (per `should_redirect_followup`), this:
-///   1. **Pre-counts the follow-up** (`pending_followups += 1`) so the
-///      interrupted turn's idle reads `> 1` and `terminate_decision` keeps the
-///      subprocess alive (`pending_followups` starts at 1 for the initial
-///      turn). The caller's normal `msg_tx` send increments again for the
-///      follow-up's own expected `Result`.
+///   1. **Reserves the subprocess** (`redirect_followup_pending = true`) so the
+///      interrupted turn's idle keeps it alive. This is the one follow-up window
+///      `msg_rx` cannot see: the caller below waits for the interrupted turn to
+///      reach a boundary before it routes the message, so at the idle decision the
+///      channel is legitimately empty. The idle decision TAKES the flag, so the
+///      reservation is worth exactly one idle.
 ///   2. **Stamps the redirecting device** onto `cancel_actor` — the same slot
 ///      `interrupt_agent` uses for the Stop button; the run_session interrupt
 ///      arm drains it onto `ResponseCanceled.actor`.
@@ -398,23 +399,17 @@ pub(super) fn arm_followup_redirect(
     if !should_redirect_followup(s.coding_agent, s.is_in_flight(), is_user_message, urgent) {
         return None;
     }
-    // Keep the interrupted turn's idle from terminating the subprocess:
-    // `terminate_decision` keeps it alive only when the pre-swap count is `> 1`.
-    // A normal turn pre-counts its own Result as 1 at session creation, so a
-    // single `+1` reaches 2; a silent-resume / warm-up turn starts at 0, so a
-    // lone `+1` would land at 1 → `Terminate`, killing the queued follow-up.
-    // Bump to at least 2 in that case. The follow-up's own expected Result is
-    // counted separately by the caller's `msg_tx` send. Race-free w.r.t. the
-    // idle handler's lock-free `swap`: the run loop flips `is_waiting` under the
-    // same `agent_sessions` lock we hold here, and `is_in_flight()` was just
-    // observed true, so its `swap` happens strictly after we release.
-    if s.pending_followups
-        .fetch_add(1, std::sync::atomic::Ordering::AcqRel)
-        == 0
-    {
-        s.pending_followups
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    }
+    // Keep the interrupted turn's idle from terminating the subprocess. A flag
+    // rather than a count, because the thing being expressed is a promise ("a
+    // message is coming"), not a quantity, and it has to hold across a window in
+    // which the message provably is not in `msg_rx` yet. It needs no special case
+    // for a silent-resume / warm-up turn, which the old arithmetic did: a count of
+    // 1 was ambiguous between "the initial turn owes a Result" and "a follow-up is
+    // queued", so the pre-count had to bump twice to clear the `> 1` threshold.
+    // Race-free with respect to the idle handler: the run loop flips `is_waiting`
+    // under the same `agent_sessions` lock we hold here, and `is_in_flight()` was
+    // just observed true, so the idle decision runs strictly after we release.
+    s.redirect_followup_pending = true;
     s.cancel_actor = origin.clone();
     // Mark this interrupt as a redirect (not a Stop click) so the run_session
     // interrupt arm classifies the interrupted turn as

@@ -29,9 +29,9 @@ vi.mock('../../api/client', async (importOriginal) => ({
   stagePluginInstall: (...a: unknown[]) => stagePluginInstall(...a),
 }));
 
-const refreshPluginCatalog = vi.fn();
+const refreshPluginCatalogAfterMutation = vi.fn();
 vi.mock('./plugin-marketplaces', () => ({
-  refreshPluginCatalog: (...a: unknown[]) => refreshPluginCatalog(...a),
+  refreshPluginCatalogAfterMutation: (...a: unknown[]) => refreshPluginCatalogAfterMutation(...a),
 }));
 
 const showToast = vi.fn();
@@ -147,7 +147,7 @@ describe('confirmPluginInstallAction', () => {
     expect(receipt.installed).toBeTruthy();
     expect(showToast).not.toHaveBeenCalled();
     expect(focusThread).not.toHaveBeenCalled();
-    expect(refreshPluginCatalog).toHaveBeenCalled();
+    expect(refreshPluginCatalogAfterMutation).toHaveBeenCalled();
   });
 
   it('still jumps into the setup thread, and keeps the receipt too', async () => {

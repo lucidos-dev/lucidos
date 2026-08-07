@@ -90,6 +90,67 @@ pub(super) async fn permission_prompt(
     .into_response()
 }
 
+/// POST /api/v1/internal/restart-intent: the workspace gateway telling this
+/// engine that a HUMAN asked for the teardown it is about to signal, and which
+/// device they were on. Called immediately before the picker's Restart / Stop
+/// sends `SIGUSR1` (`lucidos-gateway` `server.rs`, `notify_restart_intent`).
+///
+/// Without it the two restart paths are indistinguishable at teardown. The
+/// in-workspace *Switch to new version* stashes its actor in its own handler
+/// (`/api/v1/restart`) and the boundary emit reads it back, so those threads
+/// settle `paused` with "Paused by restart" and auto-resume; a picker Restart
+/// stashed nothing, so the identical teardown read as a crash and settled
+/// `failed` with "Response interrupted" and no resume. This endpoint is the
+/// missing half of that signal, and nothing downstream changes: the actor lands
+/// in the same slot the switch handler writes, and `abort_in_flight_for_restart`
+/// cannot tell the two apart (which is the point).
+///
+/// **It only stashes.** No respawn, no signal, no event, so it cannot recurse
+/// with `/api/v1/restart` (whose respawn is what asks the gateway to call here).
+///
+/// Two refusals, both narrowing to "the gateway, on behalf of a named device":
+///
+///  * A request that came THROUGH the gateway proxy is rejected (403). A page on
+///    the gateway origin, including a same-origin app iframe, could otherwise
+///    set this engine's restart actor and so defeat the crash-loop protection in
+///    *cause-gated resume*. See `base_path::arrived_through_gateway_proxy` for
+///    why provenance rather than peer address is the discriminator.
+///  * A caller with no resolvable DEVICE is rejected (400).
+///    `user_actor_resolved` falls back to `Api { mode: Human }` with no device
+///    id, and that is not the switch fingerprint (which needs
+///    `actor.kind = 'device'`), so stashing it would not resume anything while
+///    still replacing the honest "System" attribution with an API caller. The
+///    gateway skips the call entirely when it has no device to name; this is the
+///    engine-side floor under that.
+pub(super) async fn restart_intent(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> impl IntoResponse {
+    if crate::api::base_path::arrived_through_gateway_proxy(&headers) {
+        return (
+            StatusCode::FORBIDDEN,
+            "restart-intent is not reachable through the gateway proxy",
+        )
+            .into_response();
+    }
+    let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let Some(actor @ crate::engine::thread_events::MessageOrigin::Device { .. }) = actor else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "restart-intent requires a device actor",
+        )
+            .into_response();
+    };
+    // First writer wins: an in-workspace *Switch* stashed its own actor before it
+    // asked the gateway for this respawn, and that one is the click's.
+    let stashed = state.engine.stash_restart_actor(Some(actor));
+    crate::log!(
+        "[Restart] Gateway restart intent recorded (stashed={})",
+        stashed
+    );
+    StatusCode::NO_CONTENT.into_response()
+}
+
 #[derive(Deserialize)]
 pub(super) struct ClientLogRequest {
     pub category: String,
@@ -729,6 +790,7 @@ pub(super) fn router() -> Router<AppState> {
     Router::new()
         .route("/internal/permission-prompt", post(permission_prompt))
         .route("/internal/ask-user-question", post(ask_user_question))
+        .route("/internal/restart-intent", post(restart_intent))
         .route("/internal/mark-hardened", post(mark_hardened))
         .route(
             "/internal/coding-agent-diff-refresh",

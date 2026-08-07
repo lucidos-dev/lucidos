@@ -17,8 +17,9 @@ use uuid::Uuid;
 
 use crate::engine::agent_session::io_helpers::{drain_lost_followups, lost_followups_to_orphans};
 use crate::engine::agent_session::lifecycle::{
-    classify_result, idle_action, is_definitive_session_not_found, is_resume_settle_result,
-    is_silent_resume, is_stale_resume_signal, may_touch_change_state_at_idle, reset_per_turn_flags,
+    agent_event_may_predate_forward, classify_result, idle_action, is_definitive_session_not_found,
+    is_resume_settle_result, is_silent_resume, is_stale_resume_signal,
+    may_touch_change_state_at_idle, reset_per_turn_flags, settle_inputs_awaiting_result,
     should_auto_commit_on_cleanup, terminal_clears_user_hit_stop, terminate_decision,
     watchdog_gate, IdleAction, StaleResumeInputs, TerminalKind, TerminateDecision, WatchdogGate,
     WATCHDOG_DIAG_LOG_THRESHOLD_MS, WATCHDOG_HUNG_TOOL_CEILING_MS, WATCHDOG_INACTIVITY_LIMIT_MS,
@@ -299,9 +300,11 @@ impl LucidosEngine {
                         // already emitted MessageReceived with the frontend UUID.
                         log!("[AgentSession] Session already running and idle — routing follow-up via msg_tx");
                         let images = user_images.map(|imgs| imgs.to_vec());
-                        session
-                            .pending_followups
-                            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                        // No counter to bump here: the message becomes visible to the
+                        // idle decision the moment it is in the channel (that decision
+                        // reads `msg_rx` under this same lock), and the run loop counts
+                        // it against `inputs_awaiting_result` when it forwards it to the
+                        // driver. Nothing to roll back on a failed send either.
                         if session
                             .msg_tx
                             .send(AgentUserInput {
@@ -315,9 +318,6 @@ impl LucidosEngine {
                             })
                             .is_err()
                         {
-                            session
-                                .pending_followups
-                                .fetch_sub(1, std::sync::atomic::Ordering::AcqRel);
                             drop(guard);
                             return Err("Coding agent session ended while routing message. Please try again.".into());
                         }
@@ -843,9 +843,10 @@ impl LucidosEngine {
         let external_continuation_requested =
             std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let mut normalized_model = cc_model.clone();
-        // Initial input (when has_content) produces one expected `Result` event;
-        // see AgentSession.pending_followups for the full rationale.
-        let pending_followups =
+        // Initial input (when has_content) is the one `Result` the first turn owes;
+        // a silent resume / warm-up owes none. See
+        // AgentSession.inputs_awaiting_result for the full rationale.
+        let inputs_awaiting_result =
             std::sync::Arc::new(std::sync::atomic::AtomicU32::new(if has_content {
                 1
             } else {
@@ -864,6 +865,7 @@ impl LucidosEngine {
                 pending_stop: None,
                 cancel_actor: None,
                 redirect_followup: false,
+                redirect_followup_pending: false,
                 stop: stop.clone(),
                 interrupt: interrupt.clone(),
                 idle_notify: idle_notify.clone(),
@@ -884,7 +886,7 @@ impl LucidosEngine {
                 skill_commands: prev_skill,
                 current_model: normalized_model.clone(),
                 current_reasoning_effort: cc_reasoning_effort.clone(),
-                pending_followups: pending_followups.clone(),
+                inputs_awaiting_result: inputs_awaiting_result.clone(),
                 question_resume_pending: false,
                 tools_in_flight: tools_in_flight_shared.clone(),
                 coding_agent,
@@ -1099,6 +1101,24 @@ impl LucidosEngine {
         // child died from a signal the engine did NOT initiate (the exit=143
         // stray-SIGTERM bug). Consumed by the safety net to auto-resume.
         let mut killed_by_signal = false;
+        // True when the `msg_rx` arm forwarded an input and the agent has not yet
+        // produced output that provably post-dates it. `events_rx` and `msg_rx` are
+        // separate channels with no causal ordering, so `select!` can hand us a
+        // `Result` the agent produced BEFORE that input reached it, and
+        // `settle_inputs_awaiting_result` needs the difference: a Result that
+        // predates a forward cannot have answered it, and settling it away would
+        // terminate the subprocess with the user's message still inside.
+        //
+        // "Provably post-dates" is why this needs the companion counter below rather
+        // than clearing on the next event. Events the driver had ALREADY queued when
+        // we forwarded say nothing about what the agent did afterwards, and the run
+        // loop routinely leaves several queued while it awaits an emit. Clearing on
+        // those would read a Result that was sitting in the channel the whole time as
+        // proof the agent had accepted an input it has not seen.
+        let mut forwarded_input_unconfirmed = false;
+        // How many events were already waiting in `events_rx` at the moment of that
+        // forward. Each is skipped before any event is allowed to confirm it.
+        let mut agent_events_queued_at_forward = 0usize;
 
         // Bounded Esc fallback. A real Cancel (Stop) forwards CC's native
         // interrupt (Esc) and waits for CC to wind down and emit a `Result`. If
@@ -1124,6 +1144,14 @@ impl LucidosEngine {
                         );
                         break;
                     };
+                    // Advance the forward-confirmation state for this event. Done
+                    // here rather than in the Result arm because a tool call or a
+                    // token of text confirms a forward just as well as a Result
+                    // does. The rules and their cost live in the helper.
+                    let result_may_predate_a_forward = agent_event_may_predate_forward(
+                        &mut forwarded_input_unconfirmed,
+                        &mut agent_events_queued_at_forward,
+                    );
                     if let AgentEvent::Exited { killed_by_signal: ev_killed_by_signal } = ev {
                         killed_by_signal = ev_killed_by_signal;
                         // Final flush of any pending reasoning (process exited
@@ -2110,35 +2138,74 @@ impl LucidosEngine {
                                             IdleAction::ExitSubprocess => {
                                                 // Hold the `agent_sessions` lock across the whole
                                                 // read-decide-act so the chat fast-path's
-                                                // check-increment-send (`chat::process`, which
-                                                // takes the SAME lock) is mutually exclusive with
-                                                // this terminate decision. Without that serialization
-                                                // a follow-up could `fetch_add` + `msg_tx.send` into
-                                                // a subprocess this arm is about to cancel — the
+                                                // check-and-send (`chat::process`, which takes the
+                                                // SAME lock) is mutually exclusive with this
+                                                // terminate decision. Without that serialization a
+                                                // follow-up could `msg_tx.send` into a subprocess
+                                                // this arm is about to cancel, which is the
                                                 // idle-termination race that silently drops the
                                                 // follow-up (the subprocess dies before producing a
                                                 // Result; see docs/plans/2026-06-27-cc-idle-
-                                                // termination-followup-race.md). No `.await` runs
-                                                // inside this section other than the lock acquire,
-                                                // and every operation (swap / decide / field set /
-                                                // notify / cancel / log) is sync, so holding the
-                                                // lock cannot deadlock.
+                                                // termination-followup-race.md). The lock is also
+                                                // what makes `msg_rx.len()` below an exact answer
+                                                // rather than a sample. No `.await` runs inside this
+                                                // section other than the lock acquire, and every
+                                                // operation (settle / decide / field set / notify /
+                                                // cancel / log) is sync, so holding the lock cannot
+                                                // deadlock.
                                                 let mut sessions = self.agent_sessions.lock().await;
-                                                // `swap(0)` resets per-Result (turn boundary).
-                                                // AcqRel pairs with the fast-path `fetch_add` in
-                                                // `chat::process` so a racing increment is
-                                                // observed; now serialized by the lock above. The
-                                                // pure decision lives in `terminate_decision` so the
+                                                // Read all three follow-up windows here, under the
+                                                // lock, because that is what makes them exact: the
+                                                // fast-path check-increment-send in `chat::process`
+                                                // takes the same lock, so a message that was sent is
+                                                // already in `msg_rx` by the time we look. The pure
+                                                // decision lives in `terminate_decision` so the
                                                 // precedence rules and the per-reason log line both
                                                 // read from one place (see `TerminateDecision`).
-                                                let prev = pending_followups
-                                                    .swap(0, std::sync::atomic::Ordering::AcqRel);
+                                                //
+                                                // The settle is per backend and is the reason this is
+                                                // not a plain `swap(0)`: Claude Code answers every
+                                                // forwarded input with one Result, Codex answers one
+                                                // each. `result_may_predate_a_forward` is what keeps
+                                                // the Claude Code rule from eating an input this
+                                                // Result cannot have answered.
+                                                //
+                                                // The load-then-store is not an atomic
+                                                // read-modify-write and does not need to be. The only
+                                                // other writer is the `fetch_add` in the `msg_rx` arm
+                                                // below, which is another branch of THIS `select!` in
+                                                // this same task, so the two cannot interleave. The
+                                                // atomic exists to share the value with the session
+                                                // struct, not to arbitrate between writers.
+                                                let awaiting_result = settle_inputs_awaiting_result(
+                                                    coding_agent,
+                                                    inputs_awaiting_result
+                                                        .load(std::sync::atomic::Ordering::Acquire),
+                                                    result_may_predate_a_forward,
+                                                );
+                                                inputs_awaiting_result.store(
+                                                    awaiting_result,
+                                                    std::sync::atomic::Ordering::Release,
+                                                );
+                                                // Taken, not read: one turn of grace, so an arming
+                                                // caller that dies before routing costs one kept-alive
+                                                // idle rather than a pinned subprocess.
+                                                let redirect_pending = sessions
+                                                    .get_mut(&thread_id)
+                                                    .map(|s| std::mem::take(&mut s.redirect_followup_pending))
+                                                    .unwrap_or(false);
                                                 match terminate_decision(
-                                                    prev,
+                                                    msg_rx.len(),
+                                                    awaiting_result,
+                                                    redirect_pending,
                                                     bg_bash_running,
                                                 ) {
-                                                    TerminateDecision::KeepAliveForFollowup { inflight } => {
-                                                        log!("[AgentSession] Skipping subprocess termination for thread {} — {} follow-up(s) inflight (queued or merged)", thread_id, inflight);
+                                                    TerminateDecision::KeepAliveForFollowup {
+                                                        queued,
+                                                        awaiting_result,
+                                                        redirect_pending,
+                                                    } => {
+                                                        log!("[AgentSession] Skipping subprocess termination for thread {}: a follow-up is still on its way ({} queued, {} awaiting a Result, redirect pending: {})", thread_id, queued, awaiting_result, redirect_pending);
                                                     }
                                                     TerminateDecision::KeepAliveForBgBash => {
                                                         log!("[AgentSession] Skipping subprocess termination for thread {} — background bash still running (auto-wake will resume CC on completion)", thread_id);
@@ -2256,6 +2323,21 @@ impl LucidosEngine {
                 }
 
                 Some(user_input) = msg_rx.recv() => {
+                    // The input just left the channel and is about to reach the
+                    // driver, so it moves from the "sent, not yet forwarded" window
+                    // (`msg_rx`) into the "forwarded, not yet answered" one. Counting
+                    // here rather than at each `msg_tx.send` is what keeps the two
+                    // windows disjoint, and it catches every sender, including the
+                    // ones that never touched the old send-site counter (`apply_now`'s
+                    // hardening prompt, the `run_bash_background` auto-wake,
+                    // `change_ops::propose`).
+                    inputs_awaiting_result.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    // Arm the "this input may outrun the next Result" flag, and
+                    // record how many events the driver had already queued, since
+                    // those were produced before the agent could have seen this input
+                    // and must not be allowed to confirm it. See the declaration.
+                    forwarded_input_unconfirmed = true;
+                    agent_events_queued_at_forward = events_rx.len();
                     reset_per_turn_flags(
                         &mut is_waiting,
                         &mut last_emitted_idle,

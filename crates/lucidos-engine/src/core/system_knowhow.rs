@@ -256,6 +256,60 @@ mod tests {
         assert!(pkg_warning.contains("LUCIDOS_SYSTEM_KNOWHOW_DIR"));
     }
 
+    /// A system-knowhow `description:` is a ROUTING signal, not a summary: the
+    /// engine semantically matches the user's message against it to decide
+    /// which doc to offer, and every one of them sits in the prompt of every
+    /// turn whether or not it is ever loaded. So it carries two things and
+    /// nothing else: what the doc covers, and the phrases a user might say that
+    /// should reach it. The doc body one `load_knowhow` away carries the
+    /// conclusions, the worked examples and the caveats.
+    ///
+    /// The ceiling is per-file rather than a total, because a total lets one
+    /// runaway description hide behind twenty short ones. Same reasoning as
+    /// `PER_TOOL_SCHEMA_CEILING_CHARS`.
+    ///
+    /// A RATCHET, set just above where the 2026-08-07 trim landed: 24 files,
+    /// 6,584 characters of description, mean 274, largest 362
+    /// (`thread-events`). It was 700 before that trim, which let a description
+    /// carry a summary of the doc rather than a route to it (`oauth-providers`
+    /// was 692). Raising it means a description has earned the room, in a
+    /// change that says why.
+    #[test]
+    fn system_knowhow_descriptions_stay_routing_sized() {
+        const MAX_DESCRIPTION_CHARS: usize = 400;
+
+        let repo = crate::paths::repo_root().expect("repo root resolves under cargo test");
+        let summaries = SystemKnowhowStore::load_summaries(&repo.join("system-knowhow"));
+        assert!(
+            !summaries.is_empty(),
+            "no system-knowhow files loaded, the scan is broken rather than the \
+             descriptions being clean"
+        );
+
+        let mut oversized = Vec::new();
+        for kh in &summaries {
+            assert!(
+                !kh.description.trim().is_empty(),
+                "system-knowhow/{} has an empty description, so nothing can route to it",
+                kh.id
+            );
+            if kh.description.chars().count() > MAX_DESCRIPTION_CHARS {
+                oversized.push(format!(
+                    "  {:>5} chars  system-knowhow/{}",
+                    kh.description.chars().count(),
+                    kh.id
+                ));
+            }
+        }
+        assert!(
+            oversized.is_empty(),
+            "system-knowhow description(s) over {MAX_DESCRIPTION_CHARS} chars. A \
+             description carries coverage plus the phrases that should route to \
+             the doc; the doc itself carries the detail:\n{}",
+            oversized.join("\n")
+        );
+    }
+
     /// Files without `---\nname: ...\n---` are silently dropped at load time,
     /// so `load_knowhow("system-knowhow/<id>")` returns missing and the LLM
     /// concludes the file doesn't exist.

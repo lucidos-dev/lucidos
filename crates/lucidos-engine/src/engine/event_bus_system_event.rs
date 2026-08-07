@@ -522,6 +522,36 @@ pub enum SystemEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         actor: Option<MessageOrigin>,
     },
+    /// A plugin marketplace was registered, or an existing one re-registered
+    /// under a new name. One variant covers both because registration is an
+    /// **upsert**: `core::plugin_marketplaces::add_marketplace` keys on a hash
+    /// of the canonical source, so re-registering the same source rewrites the
+    /// existing entry's `name` (and its raw `source` string, which can differ
+    /// by a `.git` suffix or owner/repo casing while hashing the same) instead
+    /// of adding a second one. That is the rename path, and a `Renamed` variant
+    /// would misdescribe the source-only case. Same shape as `RepositoryAdded`
+    /// and `McpServerRegistered`, which are upserts for the same reason. The
+    /// payload carries the resulting `name` + `source`, so a reader sees what
+    /// the marketplace is now rather than what changed.
+    ///
+    /// Emitted from `engine::tools::plugins::marketplaces`, the single write
+    /// path both the HTTP handler and the `plugins` tool go through, so the
+    /// Plugins panel and Settings, Marketplaces refresh live from any origin.
+    PluginMarketplaceRegistered {
+        marketplace_id: String,
+        name: String,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
+    /// A plugin marketplace was unregistered. Its already-installed plugins
+    /// stay on disk (the installed list is a separate projection), they just
+    /// stop appearing in the catalog scan.
+    PluginMarketplaceRemoved {
+        marketplace_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        actor: Option<MessageOrigin>,
+    },
     /// A device pinned an app to its home / dock surface. Audit-worthy because
     /// the pinned set is what powers the app launcher on that device.
     PinnedAppPinned {
@@ -953,6 +983,8 @@ impl SystemEvent {
                 | Self::PluginUninstalled { .. }
                 | Self::PluginInstallCanceled { .. }
                 | Self::PluginUninstallCanceled { .. }
+                | Self::PluginMarketplaceRegistered { .. }
+                | Self::PluginMarketplaceRemoved { .. }
                 | Self::PinnedAppPinned { .. }
                 | Self::PinnedAppUnpinned { .. }
                 | Self::DeviceRegistered { .. }
@@ -1046,6 +1078,8 @@ impl SystemEvent {
             Self::PluginUninstalled { .. } => "PluginUninstalled",
             Self::PluginInstallCanceled { .. } => "PluginInstallCanceled",
             Self::PluginUninstallCanceled { .. } => "PluginUninstallCanceled",
+            Self::PluginMarketplaceRegistered { .. } => "PluginMarketplaceRegistered",
+            Self::PluginMarketplaceRemoved { .. } => "PluginMarketplaceRemoved",
             Self::ThreadComposeChanged { .. } => "ThreadComposeChanged",
             Self::PinnedAppPinned { .. } => "PinnedAppPinned",
             Self::PinnedAppUnpinned { .. } => "PinnedAppUnpinned",
@@ -1142,6 +1176,8 @@ impl SystemEvent {
         "PluginUninstalled",
         "PluginInstallCanceled",
         "PluginUninstallCanceled",
+        "PluginMarketplaceRegistered",
+        "PluginMarketplaceRemoved",
         "ThreadComposeChanged",
         "PinnedAppPinned",
         "PinnedAppUnpinned",
@@ -1231,6 +1267,12 @@ impl SystemEvent {
             | Self::PluginUninstalled { .. }
             | Self::PluginInstallCanceled { .. }
             | Self::PluginUninstallCanceled { .. } => "plugin",
+            // Its own aggregate, not "plugin": a marketplace is the source a
+            // plugin can be installed FROM, and registering one installs
+            // nothing.
+            Self::PluginMarketplaceRegistered { .. } | Self::PluginMarketplaceRemoved { .. } => {
+                "plugin_marketplace"
+            }
             Self::ThreadComposeChanged { .. } => "thread",
             Self::PinnedAppPinned { .. } | Self::PinnedAppUnpinned { .. } => "pinned_app",
             Self::DeviceRegistered { .. }
@@ -1328,6 +1370,8 @@ impl SystemEvent {
             Self::PluginUninstalled { id, .. } => id.clone(),
             Self::PluginInstallCanceled { id, .. } => id.clone(),
             Self::PluginUninstallCanceled { id, .. } => id.clone(),
+            Self::PluginMarketplaceRegistered { marketplace_id, .. }
+            | Self::PluginMarketplaceRemoved { marketplace_id, .. } => marketplace_id.clone(),
             Self::ThreadComposeChanged { id, .. } => id.to_string(),
             Self::PinnedAppPinned {
                 app_id, device_id, ..

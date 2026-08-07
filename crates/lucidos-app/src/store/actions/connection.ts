@@ -1,9 +1,9 @@
-import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
-import { checkHealth, API_BASE, isTransportError } from '../../api/client';
+import { connectionStatus, databaseReachable, dismissToast, removeToast, showToast, workspaceName, workspacePath, engineStartedAt, lucidosRelease, lucidosReleaseDirty, engineVersion, latestEngineVersion, latestTauriAppVersion, enginePackaged, llmConfigured, configuredProviders, updateAvailable, focusedThreadId, threadMap, engineRestarting, threadsLoaded, restartRequired, engineVersionReady, TOAST_AUTO_DISMISS_MS, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
+import { checkHealth, API_BASE } from '../../api/client';
 import type { HealthInfo } from '../../api/client';
-import { errorDetail, isAbortError } from '../../utils/errorDetail';
 import { connectThreadEvents, disconnectThreadEvents } from './thread-sync';
 import { loadAllThreads, loadThreadEvents, refreshThreadEvents, clearThreadFetchGuards, markLoadedThreadsStale } from './thread-loading';
+import { refreshThreadList } from './thread-list-refresh';
 import { runWithConcurrency } from '../../utils/concurrentPool';
 import { refreshChangesState, clearRestartInFlight, RESTART_LS_KEY, RESTART_TOAST_KEY } from './chat-changes';
 import { loadUnreadNotifications } from './notifications';
@@ -11,6 +11,7 @@ import { flushUndeliveredComposeDrafts } from './compose';
 import { isNewerVersion } from '../../utils/version';
 import { syncClientUpdateFromBuild } from './client-update';
 import { gatewayPickerHref } from '../../utils/basePath';
+import { postClientLog } from '../../utils/clientLog';
 
 /** User-facing copy when `submitChat` couldn't reach the engine — laptop
  *  woke up to a stale connection, the engine is genuinely down, etc.
@@ -86,6 +87,62 @@ const MAX_SUPPRESSED_FAILURES = 3;
 /** Consecutive health successes while disconnected — prevents red→green flicker. */
 let consecutiveSuccesses = 0;
 const MIN_RECONNECT_SUCCESSES = 2;
+
+/** When the dot last changed colour, so the next change can report how long the
+ *  previous one held. `null` until the first transition, which is reported as a
+ *  `held_ms` of `null` rather than as a duration measured from page load: the
+ *  client has no idea how long the engine was in that state before it started
+ *  watching. */
+let lastTransitionAt: number | null = null;
+
+/** Leave a breadcrumb in the engine log every time the dot actually changes
+ *  colour, and only then.
+ *
+ *  It exists because the dot was, until this line, the one user-visible signal
+ *  in the product with no record on either side. `/api/v1/health` is excluded
+ *  from the engine's request log (`api/mod.rs`), correctly: the gateway probes
+ *  every workspace every 2s for the picker badge, which would bury everything
+ *  else. So a report of "a lot of red blinking" on a phone could be read from
+ *  the source but not measured, and the thresholds below could only be tuned by
+ *  guessing. A transition costs at least four polls to reach, so this cannot
+ *  approach the rate of the gateway probe already in the log.
+ *
+ *  Three fields, each carrying something that cannot be derived from the other
+ *  two. `probe_ok` is the RAW health result: alongside `to` it says whether the
+ *  dot moved because the engine answered differently or because a counter
+ *  crossed its threshold. `held_ms` is how long the previous colour lasted,
+ *  which is the actual question behind "a lot of red blinking" (twenty seconds
+ *  of red every other minute is a different fault from five minutes of it).
+ *  `visible` separates the case that matters on iOS, flickering while the user
+ *  is watching, from a transition noticed on a wake.
+ *
+ *  The two counters are deliberately NOT carried. Both are reset before this
+ *  line runs and both sit at their threshold by definition when the dot flips,
+ *  so they could only ever log a constant, and a constant that reads like a
+ *  measurement is worse than no field at all.
+ *
+ *  Permanent observability, not a diagnostic to be removed once this bug is
+ *  understood: the dot is a permanent surface, so a record of when it changed
+ *  keeps its value. Same standing as the `[Client/lifecycle] startup`
+ *  breadcrumb, which `docs/temporary-measures.md` retained on exactly that
+ *  reasoning. Best-effort per `.claude/rules/frontend.md`: no user intent, no
+ *  toast, nothing to recover. `postClientLog` never throws and never rejects,
+ *  and is not awaited, so a slow or failing breadcrumb cannot delay or fail the
+ *  probe it describes; if one is lost, the dot is still the user-facing surface
+ *  and the next transition logs again. */
+function recordConnectionTransition(to: 'connected' | 'disconnected', probeOk: boolean): void {
+  const now = Date.now();
+  const heldMs = lastTransitionAt === null ? null : now - lastTransitionAt;
+  lastTransitionAt = now;
+  postClientLog('connection', 'state_changed', {
+    from: connectionStatus.peek(),
+    to,
+    probe_ok: probeOk,
+    held_ms: heldMs,
+    ever_connected: hasEverConnected,
+    visible: typeof document !== 'undefined' ? document.visibilityState === 'visible' : null,
+  });
+}
 
 /** Set when handleResume fails due to engine being unreachable.
  *  The 5s health poll picks this up and runs the sync once connected. */
@@ -182,19 +239,12 @@ function runResumeSync(): void {
   void runWithConcurrency(retryIds, THREAD_EVENTS_FETCH_CONCURRENCY, loadThreadEvents);
 
   // Also load thread list to pick up any brand-new threads. `loadAllThreads`
-  // REJECTS on a failed GET and has no Loadable or toast of its own, so surface
-  // it here rather than swallowing. Transient iOS-PWA wake / stale-connection
-  // rejections stay silent (the next resume re-syncs), matching
-  // `refreshThreadEvents`; a genuine failure toasts.
-  loadAllThreads().catch((err) => {
-    if (isAbortError(err) || isTransportError(err)) {
-      console.warn('[Connection] resume thread-list refresh failed transiently; next resume re-syncs', err);
-      return;
-    }
-    showToast(`Failed to refresh the thread list: ${errorDetail(err)}`, 'error', {
-      key: THREAD_LIST_REFRESH_TOAST_KEY,
-    });
-  });
+  // REJECTS on a failed GET and has no Loadable or toast of its own, so it goes
+  // through `refreshThreadList`, which owns the single keyed card, the rule for
+  // when raising it is honest, and its retraction. The SSE resync reports the
+  // same failure of the same request through the same key, so both sites share
+  // that one wrapper rather than each keeping a catch block in step with it.
+  void refreshThreadList();
 }
 
 /** Guards against concurrent handleResume calls — iOS Safari PWA fires
@@ -324,7 +374,41 @@ function retireDatabaseClaim(): void {
   databaseReachable.value = true;
 }
 
-export async function checkConnection(): Promise<boolean> {
+/** The probe currently in flight, so overlapping callers share one verdict
+ *  instead of each buying their own. See `checkConnection`. */
+let connectionCheckInFlight: Promise<boolean> | null = null;
+
+/** Probe the engine and reconcile everything the answer decides: the dot, the
+ *  database claim, the health-derived signals, restart detection, and the resume
+ *  sync.
+ *
+ *  Coalesced, because the failure/success counters below are module state
+ *  carrying a documented tolerance (four bad ticks to red) and there are five
+ *  ways in: the 5s poll and the startup probe in `useStartup`, `handleResume`,
+ *  `handleRestartTimeout`, and the `ThreadView` Retry button. Two of those
+ *  routinely land together. An iOS wake fires `visibilitychange`, `focus` AND
+ *  `pageshow` at the same moment the frozen 5s timer unfreezes, so `handleResume`
+ *  probes while the poll is probing. Un-coalesced, both read `wasConnected`
+ *  before either writes and both increment `consecutiveFailures`, charging one
+ *  bad moment twice against a budget of four. `resumeInFlight` does not cover
+ *  this: it guards `handleResume`, not the function the poll calls directly.
+ *
+ *  It returns the in-flight promise rather than a placeholder because the
+ *  verdict is load-bearing for two callers: `handleResume` parks the whole sync
+ *  on `false`, and `useStartup` arms the cold-start picker bounce on it. A
+ *  second probe would answer the same question about the same moment, so
+ *  sharing the first one's answer is not an approximation. Same shape as
+ *  `loadAllThreads`' `loadingAll` guard, which returns early rather than
+ *  sharing, because nothing reads its result. */
+export function checkConnection(): Promise<boolean> {
+  if (connectionCheckInFlight) return connectionCheckInFlight;
+  connectionCheckInFlight = runConnectionCheck().finally(() => {
+    connectionCheckInFlight = null;
+  });
+  return connectionCheckInFlight;
+}
+
+async function runConnectionCheck(): Promise<boolean> {
   const wasConnected = connectionStatus.value === 'connected';
   const healthResult = await checkHealth();
   const health = healthResult.status === 'loaded' ? healthResult.data : null;
@@ -378,7 +462,11 @@ export async function checkConnection(): Promise<boolean> {
     consecutiveSuccesses = 0;
   }
 
-  connectionStatus.value = connected ? 'connected' : 'disconnected';
+  const nextStatus = connected ? 'connected' : 'disconnected';
+  if (nextStatus !== connectionStatus.value) {
+    recordConnectionTransition(nextStatus, healthOk);
+  }
+  connectionStatus.value = nextStatus;
   // A settled disconnect with NO health to speak for it retires any database
   // claim: see `retireDatabaseClaim`. Both halves matter. The displayed status
   // (not the raw probe result) keeps a blip inside the failure-tolerance window
@@ -451,8 +539,13 @@ export async function checkConnection(): Promise<boolean> {
     // Retry thread list load if initial load failed — prevents permanent
     // blank screen when startup loadAllThreads hit a transient error.
     if (!threadsLoaded.value) {
-      // loadAllThreads stamps Loadable failed via thread-loading's catch path;
-      // the swallow is just the rejection-tracker silencer.
+      // Deliberately NOT `refreshThreadList`, which is for refreshing a list the
+      // user can already see. This recovers one that never arrived, so the
+      // failure is on screen without a card: `threadsLoaded` stays false, which
+      // holds the drawer in its hydrating state, and the dot reports whether the
+      // engine is reachable. A card per 5s tick on top of that would say the
+      // same thing repeatedly about a load that is still being retried. The
+      // swallow is just the rejection-tracker silencer.
       loadAllThreads().catch(() => {});
     }
     // Recovery for focused thread with eventsLoaded=true but 0 events:

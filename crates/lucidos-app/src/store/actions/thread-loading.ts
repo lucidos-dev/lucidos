@@ -298,13 +298,41 @@ export function _clearFamilyExtensionIdsForTest(): void {
 /** Prevents duplicate concurrent loadAllThreads calls (e.g. 5s health poll + resume). */
 let loadingAll = false;
 
-/** Load thread list metadata, then lazy-load events by priority. */
-export async function loadAllThreads(): Promise<void> {
-  if (loadingAll || engineRestarting.value) return;
+/** Load thread list metadata, then lazy-load events by priority. Resolves TRUE
+ *  when THIS call performed a load, FALSE when it declined to.
+ *
+ *  The boolean is the whole point of the signature: "resolved" alone cannot be
+ *  read as "the list is now fresh", and one caller has to know the difference.
+ *  `refreshThreadList` retracts its stale-list card on a landed refresh, and a
+ *  declined call resolving indistinguishably from a landed one made it clear a
+ *  warning that was still true, and hide the real load's failure while doing it.
+ *
+ *  Two ways to decline, both FALSE rather than a rejection because nothing went
+ *  wrong: the engine is on its way down (every GET in that window fails, and the
+ *  reconnect path re-runs the reads), or another load is already in flight.
+ *
+ *  A declining caller does NOT await the in-flight load, and that is deliberate
+ *  rather than the easy option. Sharing the promise would give a joining caller
+ *  the truth, and would also restore an ordering `resyncLoadedThreads` wants (it
+ *  awaits this so the per-thread refresh after it sees authoritative metadata).
+ *  It costs two things that are worse. WebKit routinely leaves a fetch hanging
+ *  across an iOS suspension, which is the whole reason `clearThreadFetchGuards`
+ *  exists next door; the request's own `AbortSignal.timeout` cannot save it,
+ *  because that timer is frozen with the page. Sharing turns one such fetch from
+ *  something later callers step around into something that blocks all of them
+ *  for the length of the suspension. And releasing the guard early to escape
+ *  that would put two loads in flight, where the older one can land last and
+ *  write stale `meta` over newer, which is the mutual exclusion this guard is
+ *  for. Sharing safely needs a superseded-attempt token like the per-thread
+ *  fetches carry (`fetchAttemptSeq`), which is a bigger change than the defect
+ *  being fixed here. */
+export async function loadAllThreads(): Promise<boolean> {
+  if (loadingAll || engineRestarting.value) return false;
   loadingAll = true;
 
   try {
     await loadAllThreadsInner();
+    return true;
   } finally {
     loadingAll = false;
   }

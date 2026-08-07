@@ -51,11 +51,19 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   `str::find()` matches (the match start/end of an ASCII needle is always a
   boundary). The "never slice by byte index" rule targets *arithmetic*
   indices, not guard-derived ones.
-- **The CC fast-path has no `pending_followups` TOCTOU.** In
-  `chat/process/run.rs` the session lookup, `process_exited` check, counter
-  increment, send, and failure-rollback all run under one
-  `agent_sessions.lock().await` — the external watchdog can't remove the
-  session mid-sequence because removal takes the same lock.
+- **The CC fast-path follow-up send has no TOCTOU, and needs no counter.** In
+  `chat/process/run.rs` the session lookup, the `is_live()` check and the
+  `msg_tx.send` all run under one `agent_sessions.lock().await`, and the run
+  loop's idle decision takes that same lock, so the external watchdog can't
+  remove the session mid-sequence and the idle decision can't observe a
+  half-sent follow-up. That is also why `msg_rx.len()` is an exact answer to
+  "is a follow-up still unread" at the idle decision rather than a sample:
+  an unbounded-channel send is synchronous, so under the lock a message that
+  was sent is a message that is in the channel. A send that fails put nothing
+  anywhere, so there is nothing to roll back. (Until 2026-08-07 the send site
+  also bumped a `pending_followups` counter with a rollback arm; the counter
+  guessed at what the channel could be asked directly, and the guess broke for
+  Claude Code, which merges forwarded inputs into a single Result.)
 - **`save_thread` / `unsave_thread` do stamp the actor.** They use
   `EventMeta::with_actor(actor)` on a `BusEvent::Thread` emit —
   `emit_user_system` is for `SystemEvent`s; `BusEvent::Thread` emits are a
@@ -447,6 +455,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   Re-flag only if a Windows target lands, at which point the fix is one
   normalization at the walk, not per-predicate. (`core/artifacts.rs`,
   `engine/chat/process/workspace_payload.rs`.)
+
+- **Binding an `i64` into `make_interval(secs => $n)` is correct, not a
+  reinterpreted float.** `make_interval` declares `secs` as `double precision`,
+  so the event-wait window queries look like they hand Postgres eight bytes of
+  int8 to read as a float, which would collapse a 180-second window to a
+  denormal near zero and silently empty it. Flagged that way by a Codex review
+  on 2026-08-07. It is not what happens: sqlx declares the parameter's type in
+  `Parse` from the bound Rust type, so Postgres resolves
+  `make_interval(secs => int8)` and applies the standard implicit int8 to
+  float8 cast to the *value*. There is no bit reinterpretation across a
+  declared type boundary. Measured directly through sqlx's binary protocol:
+  `SELECT EXTRACT(EPOCH FROM make_interval(secs => $1))` with an `i64` 180
+  returns exactly 180. `the_lookback_window_is_measured_by_the_database_clock`
+  is also two-sided on this by construction, since it puts one row 120s back
+  and one 240s back and demands exactly the first: a zero interval would
+  return neither and an oversized one both. Re-flag only with evidence that
+  sqlx stopped sending the parameter type, which would show up as that test
+  failing rather than as a reading of the SQL.
+  (`engine/event_wait/mod.rs`, `engine/event_wait/register.rs`, ADR 0053.)
 
 ## Frontend
 

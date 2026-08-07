@@ -153,17 +153,16 @@ fn describe_subscriptions_reads_as_the_or_it_is() {
 /// earlier wait. Nothing else is evidence the thread has seen it.
 #[tokio::test]
 async fn a_delivered_event_is_excluded_from_the_lookback() {
-    use crate::engine::event_bus::{BusEvent, EventBus};
-    use crate::engine::thread_events::{EventMeta, ThreadEvent};
-    use crate::test_support::{setup_test_db, teardown_test_db};
+    use crate::engine::event_bus::EventBus;
+    use crate::engine::thread_events::ThreadEvent;
+    use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = uuid::Uuid::new_v4();
-    let since = chrono::Utc::now() - chrono::Duration::minutes(3);
 
     assert!(
-        delivered_event_ids(&pool, thread_id, since)
+        delivered_event_ids(&pool, thread_id, ARMING_LOOKBACK_SECS)
             .await
             .unwrap()
             .is_empty(),
@@ -171,21 +170,22 @@ async fn a_delivered_event_is_excluded_from_the_lookback() {
     );
 
     let handed = uuid::Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        &bus,
         thread_id,
-        event: ThreadEvent::EventWaitDelivered {
+        ThreadEvent::EventWaitDelivered {
             wait_id: uuid::Uuid::new_v4(),
             event_id: handed,
             event_type: "ChangeProposed".into(),
             payload: json!({}),
             matched_index: 0,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 
-    let excluded = delivered_event_ids(&pool, thread_id, since).await.unwrap();
+    let excluded = delivered_event_ids(&pool, thread_id, ARMING_LOOKBACK_SECS)
+        .await
+        .unwrap();
     assert!(
         excluded.contains(&handed),
         "the delivery names the exact event the thread saw"
@@ -194,7 +194,7 @@ async fn a_delivered_event_is_excluded_from_the_lookback() {
 
     // Another thread's deliveries are none of this thread's business.
     assert!(
-        delivered_event_ids(&pool, uuid::Uuid::new_v4(), since)
+        delivered_event_ids(&pool, uuid::Uuid::new_v4(), ARMING_LOOKBACK_SECS)
             .await
             .unwrap()
             .is_empty(),
@@ -217,14 +217,13 @@ async fn a_delivered_event_is_excluded_from_the_lookback() {
 /// and a delivery contributes exactly one event id rather than a cutoff.
 #[tokio::test]
 async fn only_a_delivery_suppresses_and_only_the_event_it_named() {
-    use crate::engine::event_bus::{BusEvent, EventBus};
-    use crate::engine::thread_events::{EventMeta, ThreadEvent};
-    use crate::test_support::{setup_test_db, teardown_test_db};
+    use crate::engine::event_bus::EventBus;
+    use crate::engine::thread_events::ThreadEvent;
+    use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
     let thread_id = uuid::Uuid::new_v4();
-    let since = chrono::Utc::now() - chrono::Duration::minutes(3);
     let wait_id = uuid::Uuid::new_v4();
 
     // A whole wait lifecycle that hands the thread no event.
@@ -243,17 +242,11 @@ async fn only_a_delivery_suppresses_and_only_the_event_it_named() {
         },
         ThreadEvent::EventWaitExpired { wait_id },
     ] {
-        bus.emit(BusEvent::Thread {
-            thread_id,
-            event,
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        seed_thread_event(&bus, thread_id, event).await;
     }
 
     assert!(
-        delivered_event_ids(&pool, thread_id, since)
+        delivered_event_ids(&pool, thread_id, ARMING_LOOKBACK_SECS)
             .await
             .unwrap()
             .is_empty(),
@@ -263,21 +256,22 @@ async fn only_a_delivery_suppresses_and_only_the_event_it_named() {
 
     // A delivery of a DIFFERENT event does not suppress an unrelated one.
     let other = uuid::Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        &bus,
         thread_id,
-        event: ThreadEvent::EventWaitDelivered {
+        ThreadEvent::EventWaitDelivered {
             wait_id,
             event_id: other,
             event_type: "ChildThreadCompleted".into(),
             payload: json!({}),
             matched_index: 0,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 
-    let excluded = delivered_event_ids(&pool, thread_id, since).await.unwrap();
+    let excluded = delivered_event_ids(&pool, thread_id, ARMING_LOOKBACK_SECS)
+        .await
+        .unwrap();
     assert_eq!(
         excluded.len(),
         1,

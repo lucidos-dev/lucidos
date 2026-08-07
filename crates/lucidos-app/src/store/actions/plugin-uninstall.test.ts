@@ -26,9 +26,9 @@ vi.mock('../../api/client', async (importOriginal) => ({
   stagePluginUninstall: (...a: unknown[]) => stagePluginUninstall(...a),
 }));
 
-const refreshPluginCatalog = vi.fn();
+const refreshPluginCatalogAfterMutation = vi.fn();
 vi.mock('./plugin-marketplaces', () => ({
-  refreshPluginCatalog: (...a: unknown[]) => refreshPluginCatalog(...a),
+  refreshPluginCatalogAfterMutation: (...a: unknown[]) => refreshPluginCatalogAfterMutation(...a),
 }));
 
 const showToast = vi.fn();
@@ -148,7 +148,7 @@ describe('confirmPluginUninstallAction', () => {
     expect(receipt.removed).toBeTruthy();
     // The receipt says everything the toast would, so the toast is redundant.
     expect(showToast).not.toHaveBeenCalled();
-    expect(refreshPluginCatalog).toHaveBeenCalled();
+    expect(refreshPluginCatalogAfterMutation).toHaveBeenCalled();
   });
 
   it('falls back to a toast when the panel was dismissed mid-uninstall', async () => {

@@ -33,6 +33,7 @@ import { pushNavState } from './navigation';
 import { openPluginUninstallRequest } from './plugin-uninstall';
 import { isElementVisible } from '../../components/chat/scrollState';
 import { errorDetail } from '../../utils/errorDetail';
+import { openExternal } from '../../utils/tauri';
 
 // Shared in-flight load so concurrent callers await the SAME fetch instead of
 // racing duplicate GETs: the compose destination picker's render-path kick-off
@@ -333,6 +334,38 @@ export function getAppFrameSrc(): string | null {
   // copy. When no preview thread is set, serve live.
   const tid = wipPreviewThreadId.value;
   return appUrl(app.id, tid ?? undefined);
+}
+
+/** Open the app that's in the content pane as a top-level page of its own,
+ *  outside the Lucidos shell (ADR 0044: the popout is a bare app tab).
+ *
+ *  The packaged desktop client ONLY. Everywhere else the control stays a real
+ *  `<a target="_blank">`, which keeps cmd-click, middle-click and "copy link
+ *  address" working and opens on the anchor's own user activation. That anchor
+ *  is a dead click in the packaged client, for two reasons that stack: the app's
+ *  href is root-relative, so the delegated `onGlobalClick` funnel (which claims
+ *  `^https?://` only) never routes it; and WKWebView then asks wry's UI delegate
+ *  to make the new window, which wry installs only when a builder called
+ *  `.on_new_window()`. The app calls that for the in-app browser preview webview
+ *  and nowhere else, so `main` (declared in `tauri.conf.json`) has no delegate
+ *  and the navigation is dropped with no error anywhere.
+ *
+ *  Deliberately NOT `openUrl`: with the experimental in-app browser preference
+ *  on, that mounts the url-preview panel, which is INSIDE the shell and would
+ *  replace the very app the user asked to pop out of it. The OS opener is
+ *  unconditional here, the same route `openLocalFile` takes. */
+export function popOutApp(): void {
+  const src = getAppFrameSrc();
+  if (!src) {
+    showToast("Couldn't open the app in a browser: no app is open", 'error');
+    return;
+  }
+  // Absolute, resolved against this document, so the gateway origin, its port
+  // and the workspace slug prefix all survive the hop out to the OS.
+  const url = new URL(src, location.href).href;
+  void openExternal(url).catch((err) =>
+    showToast(`Couldn't open ${url}: ${errorDetail(err)}`, 'error'),
+  );
 }
 
 export async function captureAppUI(appId: string, requestId: string): Promise<void> {

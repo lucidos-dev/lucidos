@@ -1,6 +1,6 @@
 ---
 name: Lucidos JavaScript SDK
-description: Complete API reference for the lucidos JS SDK — functions, types, parameters, and return types for building Lucidos apps
+description: API reference for the `lucidos` JS SDK that app UIs call: the data, events, proxy, oauth, triggers, apps, preferences, notifications, threads, ui and sse namespaces, plus the component classes and theme variables apps style with.
 ---
 
 # Lucidos JavaScript SDK

@@ -362,23 +362,34 @@ describe('response-panel collapse → expand re-shows the scroll-to-bottom chevr
   });
   afterEach(() => { setActiveScrollElement(null); });
 
-  it('non-streaming: ResizeObserver alone escalates the chevron after expand', () => {
-    // Baseline: with no auto-scroll racing, the existing onResize logic does
-    // the right thing. Captures the contract that the streaming-mode test
-    // breaks below.
+  it('non-streaming: the toggle shows the chevron and holds the reader still', () => {
+    // Baseline: the same collapse → expand with no auto-scroll racing it.
+    //
+    // The toggle marks the reader parked ITSELF, via preserveOnToggle, on both
+    // the pointer path (ChatExchange) and the keyboard one, which is what makes
+    // the chevron this test's subject rather than a side effect. onResize
+    // deliberately no longer infers "the reader scrolled up" from the expand's
+    // growth (see its follow branch): an inference from the app's own layout
+    // could not tell this expand apart from a markdown image decoding late, and
+    // it stranded the transcript above the newest turn for the rest of the
+    // visit when it got that wrong.
     const el = makeClampingEl({ scrollTop: 1000, scrollHeight: 1500, clientHeight: 500 });
     const { onScroll, onResize } = makeScrollObservers(el);
     el.addEventListener('scroll', onScroll);
 
+    preserveOnToggle();
     el.scrollHeight = 700;  // collapse
     onResize();
     expect(awayFromBottom.value).toBe(false);
 
+    preserveOnToggle();
     el.scrollHeight = 1500; // expand
     onResize();
 
     expect(awayFromBottom.value).toBe(true);
     expect(scrolledUp.value).toBe(true);
+    // Held where they were: the expand is read, not scrolled past.
+    expect(el.scrollTop).toBeLessThan(el.scrollHeight - el.clientHeight);
   });
 
   it('streaming-mode: chevron must appear after expand even when auto-scroll races onResize', () => {

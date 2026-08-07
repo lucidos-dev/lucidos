@@ -18,6 +18,10 @@ import {
   providerToSend,
   reconnectScopes,
 } from './oauthConnectForm';
+import {
+  ProviderPermissionsHint,
+  reauthorizationHint,
+} from '../credentials/providerConsoleHint';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { initPushSubscription } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
@@ -644,6 +648,16 @@ export function SettingsView() {
           // nobody had asked. Reconnect is the fix, and it is the button beside
           // this line.
           const shortfall = missingScopes(account);
+          // Where to go and what to enable there, from the same registry row the
+          // Connect form renders. Reconnect on its own grants the same narrow
+          // set again whenever the provider's console is the thing that refused
+          // it, so naming the shortfall without naming the console leaves the
+          // user pressing a button that cannot work.
+          const consoleRow = reauthorizationHint(
+            registryProviders,
+            account.provider,
+            shortfall.length > 0,
+          );
           return (
           <div class="list-row oauth-account-row" key={account.id}>
             <div class="list-row-info">
@@ -664,6 +678,7 @@ export function SettingsView() {
                   then Reconnect.
                 </div>
               )}
+              {consoleRow && <ProviderPermissionsHint row={consoleRow} />}
               <div class="list-row-date">
                 <span data-tooltip={formatDateTime(new Date(account.created_at))}>
                   Connected {formatShortDateWithYear(new Date(account.created_at))}

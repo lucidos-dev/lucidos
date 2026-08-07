@@ -1,6 +1,6 @@
 ---
 name: Plugin Setup
-description: Use when a thread asks to "set up the newly installed <name> plugin" (a plugin setup thread spawned right after an install). Covers how to find the plugin author's setup instructions, plan the steps as a todo list, do the wiring, ask the user for what only they can provide, and confirm when done.
+description: Use when a thread asks to "set up the newly installed <name> plugin" (a plugin setup thread spawned right after an install): finding the author's setup instructions, planning the steps, doing the wiring, and asking the user for what only they can provide.
 ---
 
 # Plugin Setup

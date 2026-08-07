@@ -208,24 +208,37 @@ impl LucidosEngine {
     /// abort's, because the `ResponseCanceled` projection arm is
     /// `preserving_verdict`.
     ///
-    /// Stamps `actor: System` so the AbortPanel renders ⚙ System — the host
-    /// system killed these in-flight responses (engine shutdown). The
-    /// user-driven `/api/v1/restart` path pre-emits with `actor: Device {..}`
-    /// BEFORE shutdown for in-flight threads it knows about; this fallback
-    /// covers anything that started after that pre-emit.
+    /// Stamps the **teardown's** actor, the same one
+    /// `abort_in_flight_for_restart` pre-emitted with, read back off the engine
+    /// via `teardown_actor()`. A user-driven restart therefore settles a thread
+    /// reached only by this fallback at `'paused'` with an auto-resume, exactly
+    /// like one the pre-emit knew about; a teardown nobody requested has no actor
+    /// to read, falls back to `MessageOrigin::system()` (⚙ System on the
+    /// AbortPanel: the host system killed these responses) and settles
+    /// `'failed'`, which is what puts it in the needs-attention count.
     ///
-    /// The actor decides the verdict, so this fallback settles at `'failed'`
-    /// while the pre-emit settles at `'paused'`
-    /// (`AbortCause::promises_auto_resume`). That is not a discrepancy: the two
-    /// resume gates key on the same device-actor fingerprint, so a thread reached
-    /// only by this fallback is one NO resume gate will pick up. It keeps the
-    /// Continue button, and `'failed'` is what puts it in the needs-attention
-    /// count where the user will find it.
+    /// This fallback hardcoded `MessageOrigin::system()` until 2026-08-07, and
+    /// the doc here argued that was fine because no resume gate picks up a
+    /// system-actor abort. That is a description of the consequence, not a
+    /// reason: the actor decides the verdict
+    /// (`AbortCause::promises_auto_resume`), so hardcoding it made ONE user
+    /// switch produce two different verdicts depending only on whether a thread
+    /// became in-flight before or after the pre-emit's `processing_thread_ids()`
+    /// snapshot. A chat thread woken by an `await_event` delivery 1.5s into a
+    /// switch got "Response interrupted" and a manual Continue while its two
+    /// siblings got "Paused by restart" and resumed by themselves. See
+    /// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.
     pub async fn shutdown_active_threads(&self) {
         let active_ids = self.processing_thread_ids();
         if active_ids.is_empty() {
             return;
         }
+        // Resolved once for the whole sweep: it is one teardown, so it is one
+        // actor, and re-reading per thread could only introduce a way for two
+        // threads in the same sweep to disagree.
+        let actor = self
+            .teardown_actor()
+            .unwrap_or_else(crate::engine::thread_events::MessageOrigin::system);
         // CC threads (in-flight or idle) are handled by shutdown_agent_sessions.
         let all_cc_thread_ids: std::collections::HashSet<uuid::Uuid> =
             self.agent_sessions.lock().await.keys().copied().collect();
@@ -269,7 +282,7 @@ impl LucidosEngine {
                     },
                     meta: crate::engine::thread_events::EventMeta {
                         request_event_id,
-                        actor: Some(crate::engine::thread_events::MessageOrigin::system()),
+                        actor: Some(actor.clone()),
                         ..crate::engine::thread_events::EventMeta::NONE
                     },
                 })

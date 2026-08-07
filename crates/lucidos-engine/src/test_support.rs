@@ -49,6 +49,35 @@ pub async fn setup_test_db() -> (PgPool, String) {
     (pool, db_name)
 }
 
+/// Emit one thread event as test setup and return the id of the row it wrote.
+///
+/// **Unwraps both levels of `EventBus::emit`, and that is the whole point.**
+/// It returns `Result<Option<EmitResult>>`, so a seed written as
+/// `bus.emit(...).await.unwrap();` sails straight past an inner `None`. The
+/// fixture is then simply absent, and the first thing that notices is some
+/// later `assert_eq!(found.len(), 3)` reporting a 0. A count is a terrible way
+/// to learn that the setup never ran, and it sends the next reader hunting
+/// through the query instead of the seed, so this fails at the emit and names
+/// the event.
+///
+/// An inner `None` means the variant is transient (`ThreadEvent::is_persisted`)
+/// or was deliberately suppressed, rather than that a write was lost, which is
+/// its own thing worth being told: a seeding call site wants a row either way.
+pub async fn seed_thread_event(bus: &EventBus, thread_id: Uuid, event: ThreadEvent) -> Uuid {
+    let event_type = event.event_type();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap_or_else(|e| panic!("seed {event_type} on thread {thread_id}: {e}"))
+    .unwrap_or_else(|| {
+        panic!("seed {event_type} on thread {thread_id} was not persisted (emit returned None)")
+    })
+    .event_id
+}
+
 /// Build a tiny git repo with `main` + initial commit and a worktree on
 /// `branch`. Returns `(tmpdir, repo_root, worktree_path)`. Caller must keep
 /// `tmpdir` in scope for the test duration — dropping it `rm -rf`'s the repo.

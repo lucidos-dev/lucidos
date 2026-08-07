@@ -1,10 +1,15 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, activeInlineForm, connectionStatus, focusedThreadId, threadMap, THREAD_EVENTS_FETCH_CONCURRENCY } from '../store';
+import { panelOverlay, activeInlineForm, connectionStatus, focusedThreadId, threadMap, threadsLoaded, toasts, THREAD_EVENTS_FETCH_CONCURRENCY, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
 import type { CredentialRequest, EmailConfirmRequest } from '../types';
 import { makeThreadState } from './threads-test-helpers';
+import { ApiError } from '../../api/client';
 
 // Mock all external dependencies so handleResume can run in isolation.
-vi.mock('../../api/client', () => ({
+vi.mock('../../api/client', async (importActual) => ({
+  // `ApiError` and `isTransientFetchError` are pure and are the very thing the
+  // thread-list refresh branches on, so they come from the real module rather
+  // than a stub that would let the test agree with itself.
+  ...(await importActual<typeof import('../../api/client')>()),
   checkHealth: vi.fn().mockResolvedValue({
     status: 'loaded',
     data: { workspace: 'test', workspace_path: '/tmp/test' },
@@ -193,5 +198,49 @@ describe('handleResume thread-events refresh', () => {
     expect(peak).toBeLessThanOrEqual(THREAD_EVENTS_FETCH_CONCURRENCY);
     load.mockReset();
     load.mockResolvedValue(undefined);
+  });
+});
+
+describe('handleResume thread-list refresh', () => {
+  beforeEach(() => {
+    threadMap.value = new Map();
+    focusedThreadId.value = null;
+    toasts.value = [];
+    connectionStatus.value = 'connected';
+    // A resume happens on a client that already has its list. Load-bearing for
+    // these two: with it false, `checkConnection`'s separate cold-start retry
+    // (`!threadsLoaded`) issues its OWN `loadAllThreads` first, deliberately
+    // swallows the rejection, and the resume refresh below then gets the mock's
+    // default resolve, so both cases would pass without exercising anything.
+    threadsLoaded.value = true;
+  });
+
+  /** Drive one resume with `loadAllThreads` rejecting, and let the fire-and-forget
+   *  refresh settle (`runResumeSync` does not await it). */
+  async function resumeWithFailingThreadList(err: unknown): Promise<void> {
+    const { loadAllThreads } = await import('./thread-loading');
+    const load = loadAllThreads as unknown as ReturnType<typeof vi.fn>;
+    load.mockRejectedValueOnce(err);
+    await handleResume();
+    for (let i = 0; i < 10; i++) await Promise.resolve();
+    load.mockResolvedValue(undefined);
+  }
+
+  // The reported iOS PWA card. Over a dropped tunnel the GET hangs rather than
+  // refusing, so the 10s client deadline fires while the engine is answering
+  // this endpoint in milliseconds. The dot owns a sustained outage; this site
+  // must not report the link as a refusal. The rules themselves are covered in
+  // thread-list-refresh.test.ts; this pins that the resume site routes through
+  // them rather than keeping a catch block of its own.
+  it('raises no card when the refresh times out', async () => {
+    await resumeWithFailingThreadList(new DOMException('Request timed out after 10000ms', 'TimeoutError'));
+    expect(toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY)).toBeUndefined();
+  });
+
+  it('still raises one card when the engine answers and refuses', async () => {
+    await resumeWithFailingThreadList(new ApiError(500, 'Failed to get saved threads'));
+    const card = toasts.value.find(t => t.key === THREAD_LIST_REFRESH_TOAST_KEY);
+    expect(card).toBeDefined();
+    expect(card!.message).toContain('Failed to get saved threads');
   });
 });

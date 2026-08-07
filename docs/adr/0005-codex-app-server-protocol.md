@@ -120,11 +120,16 @@ to an idle-but-alive Codex session still routes via `turn/start` immediately).
 (`engine/chat/process/run.rs`), which reuses the existing Stop-button machinery
 (`interrupt_agent`'s `cancel_actor` + `interrupt` notify) and the existing
 "interrupt superseded by inflight follow-ups" accounting
-(`pending_followups` / `terminate_decision::KeepAliveForFollowup`): the fast-path
-pre-counts the follow-up so the interrupted turn's idle keeps the subprocess
-alive, fires the interrupt, waits for idle (so the `Canceled` terminal is
-sequenced before the follow-up's `MessageReceived`), then routes the follow-up
-normally. The app-server driver is unchanged — it still queues the input and
+(`terminate_decision::KeepAliveForFollowup`): the fast-path **reserves** the
+subprocess (`AgentSession::redirect_followup_pending`) so the interrupted turn's
+idle keeps it alive, fires the interrupt, waits for idle (so the `Canceled`
+terminal is sequenced before the follow-up's `MessageReceived`), then routes the
+follow-up normally. The reservation is a flag rather than a count because it has to
+hold across a window in which the message provably is not in `msg_rx` yet, and the
+idle decision takes it, so it is worth exactly one idle. (Until 2026-08-07 this was
+a pre-count on a `pending_followups` counter; see
+`docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`.)
+The app-server driver is unchanged: it still queues the input and
 runs it the instant the interrupted turn ends. Gated on
 `AgentSession::coding_agent == Codex` and `is_in_flight()`; never fires for an
 engine-internal child-wake. Decision + arming are pure functions

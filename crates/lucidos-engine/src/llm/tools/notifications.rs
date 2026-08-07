@@ -14,7 +14,7 @@ use serde_json::json;
 pub fn get_notification_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SEND_NOTIFICATION.to_string(),
-        description: "Send a notification to the user. It always lands in the inbox. How it ALSO surfaces depends on whether any device is active: with the app open and focused on ANY device the OS push is suppressed on EVERY device and the active ones show an in-app toast, so a device never gets both. A push fires only when NO device is active. So a user chatting with you right now will see a toast, never a push: do not tell them to 'check your device for the push'. Every notification is openable.".to_string(),
+        description: "Send a notification to the user. It always lands in the inbox. With the app open and focused on ANY device the OS push is suppressed on EVERY device and the active ones show an in-app toast; a push fires only when NO device is active. So a user chatting with you right now sees a toast, never a push: do not tell them to 'check your device for the push'.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
@@ -28,15 +28,15 @@ pub fn get_notification_tool() -> ToolDefinition {
                 },
                 "app_id": {
                     "type": "string",
-                    "description": "Optional app id from the Available Apps list, driving the modal's \"Open <app>\" button. Independent of `tap`, so pass it whenever the notification is about an app."
+                    "description": "App id from the Available Apps list, driving the modal's \"Open <app>\" button. Independent of `tap`, so pass it whenever the notification is about an app."
                 },
                 "tap": {
                     "type": "object",
-                    "description": "Where a tap lands. `{\"kind\":\"modal\"}` (the default) opens the inbox modal, for anything info-only. `{\"kind\":\"navigate\",\"to\":{…}}` deep-links through the same router and arg shape `navigate_ui` takes, e.g. `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"<uuid>\"}}`."
+                    "description": "Where a tap lands. `{\"kind\":\"modal\"}` (the default) opens the inbox modal. `{\"kind\":\"navigate\",\"to\":{…}}` takes the same router args `navigate_ui` does, e.g. `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"<uuid>\"}}`."
                 },
                 "event_id": {
                     "type": "string",
-                    "description": "Optional event uuid inside the originating thread; the modal's \"Open thread\" button and a `navigate` tap both scroll to it and pulse it on land. Pass the source event id from a trigger's `## Triggering Event` block. Ignored with no linked thread."
+                    "description": "Event uuid inside the originating thread; the \"Open thread\" button and a `navigate` tap scroll to it and pulse it on land. Pass the source event id from a trigger's `## Triggering Event` block. Ignored with no linked thread."
                 }
             },
             "required": ["title", "message"]

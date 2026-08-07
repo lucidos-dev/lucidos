@@ -5,7 +5,7 @@ import { NotificationsBell } from '../notifications/NotificationsBell';
 import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
 import { sideBySideDiffAvailable } from '../../store/diffBody';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
-import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
+import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, refreshAppUI, toggleAppSearch, popOutApp } from '../../store/actions/apps';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
@@ -21,7 +21,7 @@ import { useHeaderActionCollapse } from '../../hooks/useHeaderActionCollapse';
  *  menu. `icon` is a thunk — the header and the menu each need their own
  *  vnode. The notifications bell is NOT one of these: it's the always-visible,
  *  never-overflowed anchor and renders separately. */
-interface HeaderActionSpec {
+export interface HeaderActionSpec {
   key: string;
   /** aria-label, tooltip, and the ⋯ menu row text. */
   label: string;
@@ -100,6 +100,33 @@ function renderMenuAction(a: HeaderActionSpec, ctx: OverflowMenuContext): Compon
       {a.label}
     </button>
   );
+}
+
+/** The control that takes the open app out of the shell and into a top-level
+ *  page of its own, or null where the platform cannot offer one.
+ *
+ *  Exported so the platform decision is testable without standing the header up:
+ *  which of the two shapes is returned is the whole bug fix, and neither shape
+ *  is observable from the rendered markup alone (a dead anchor and a live one
+ *  look identical).
+ *
+ *  Three platforms, three answers. An installed iOS PWA gets nothing: it cannot
+ *  open a same-origin link anywhere but its own inescapable in-app web view (a
+ *  limitation every WebKit-based iOS browser shares). A browser gets a real
+ *  anchor, so cmd-click, middle-click and "copy link address" all work. The
+ *  packaged desktop client gets a button, because its WKWebView silently drops
+ *  a `target="_blank"` navigation, and there are no tabs there to open one in:
+ *  see `popOutApp`, which hands the URL to the OS opener instead. */
+export function appPopoutAction(): HeaderActionSpec | null {
+  if (isIOSPwa()) return null;
+  const spec = {
+    key: 'open-in-tab',
+    icon: () => <PopOutIcon />,
+    extraClass: 'app-open-in-tab',
+  };
+  return isTauri()
+    ? { ...spec, label: 'Open in browser', onClick: () => popOutApp() }
+    : { ...spec, label: 'Open in new tab', href: getAppFrameSrc() };
 }
 
 /** Shared action buttons for the content side of the header (used by both mobile and desktop). */
@@ -215,17 +242,8 @@ export function ContentHeaderActions() {
     // file-source edits still drop WIP — those paths call refreshAppUI()
     // with the default options.
     addAction(reloadSpec('refresh', () => void refreshAppUI(undefined, { preserveWip: true })));
-    // iOS standalone PWA cannot open same-origin links in an external browser
-    // (all WebKit-based browsers on iOS share this limitation).
-    if (!isIOSPwa()) {
-      addAction({
-        key: 'open-in-tab',
-        label: 'Open in new tab',
-        icon: () => <PopOutIcon />,
-        href: getAppFrameSrc(),
-        extraClass: 'app-open-in-tab',
-      });
-    }
+    const popout = appPopoutAction();
+    if (popout) addAction(popout);
     addAction({
       key: 'fullscreen',
       label: isFullscreen ? 'Exit fullscreen' : 'Fullscreen',

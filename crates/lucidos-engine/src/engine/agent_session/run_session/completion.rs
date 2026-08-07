@@ -91,6 +91,16 @@ impl LucidosEngine {
     /// `run_direct_agent` invocation emits at most one continuation and no
     /// idempotence guard is needed.
     ///
+    /// "Both ways a session run can end" is true and was, on its own, incomplete:
+    /// the idle handler can decline to end the run at all. When
+    /// `terminate_decision` returns a `KeepAlive` the loop keeps the subprocess and
+    /// continues, reaching neither site. That is a legitimate stand-down when a
+    /// follow-up really is coming, and it was a silent cancellation of this recovery
+    /// for four weeks while the decision guessed from a count of messages sent
+    /// rather than reading the three windows a follow-up can actually be in
+    /// (2026-08-07; see
+    /// `docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`).
+    ///
     /// Both sites also call it after their follow-up drain and pass
     /// `followups_queued`, because this recovery is for the UNATTENDED case. A
     /// drained follow-up is re-submitted by the caller, so the thread is already
@@ -280,7 +290,17 @@ impl LucidosEngine {
             }
             SafetyNetAction::EmitAbortedSafetyNet => {
                 let mut emit_meta = meta.clone();
-                Self::stamp_system_actor_if_aborted(&mut emit_meta, true);
+                // `System`, explicitly, and NOT the teardown actor: the safety
+                // net is the host giving up on a session that hung, which is a
+                // real interruption nobody promised to undo
+                // (`AbortCause::SafetyNet` keeps the `failed` verdict). A device
+                // actor here would read "Paused by restart" and buy a resume the
+                // engine never promised.
+                Self::stamp_host_actor_if_aborted(
+                    &mut emit_meta,
+                    true,
+                    crate::engine::thread_events::MessageOrigin::system(),
+                );
                 crate::engine::thread_events::emit_response_aborted(
                     &self.event_bus,
                     thread_id,

@@ -1,6 +1,10 @@
 import { effect } from '@preact/signals';
 import { engineRestarting } from '../../store/store';
 import { BASE_PATH } from '../../utils/basePath';
+// A leaf, not devices.ts (which imports json() from here). The gateway control
+// client needs the same header and must not pull in the store to get it, so the
+// one copy lives in utils/.
+import { deviceIdHeader } from '../../utils/deviceIdHeader';
 
 // Base-path aware (ADR 0014): behind the workspace gateway the bundle is served
 // under `/<slug>/`, so every API URL must carry that prefix. `BASE_PATH` is
@@ -25,13 +29,6 @@ export class ApiError extends Error {
     super(`${httpCode} ${reason}`);
     this.name = 'ApiError';
   }
-}
-
-// Inlined to avoid a circular import with devices.ts (which imports json()).
-function deviceIdHeader(): Record<string, string> {
-  if (typeof localStorage === 'undefined') return {};
-  const id = localStorage.getItem('lucidos-device-id');
-  return id ? { 'x-lucidos-device-id': id } : {};
 }
 
 /** The engine drops every connection while it restarts (Apply & Restart). A

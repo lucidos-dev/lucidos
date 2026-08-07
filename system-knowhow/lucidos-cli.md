@@ -1,6 +1,6 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: The `lucidos` shell command, on PATH in every subprocess Lucidos spawns (Python, bash, Claude Code, Codex): write files under data/, emit and query domain events, await an event instead of polling (and read or stop those subscriptions with `event-waits list` / `cancel`), list and spawn threads, list and apply pending changes, read system-knowhow, and call an external API through the engine proxy so credentials never reach script source, args, env or logs. Prefer it over hand-rolled HTTP back to the engine.
+description: The `lucidos` shell command, on PATH in every subprocess Lucidos spawns (Python, bash, Claude Code, Codex): write files under data/, emit and query domain events, await an event instead of polling, spawn threads, apply pending changes, and call an external API through the engine proxy.
 ---
 
 # `lucidos` CLI

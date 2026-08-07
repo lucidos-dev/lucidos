@@ -41,7 +41,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn drain_returns_pending_followups() {
+    fn drain_returns_unconsumed_followups() {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<AgentUserInput>();
         let eid = uuid::Uuid::new_v4();
         tx.send(AgentUserInput {

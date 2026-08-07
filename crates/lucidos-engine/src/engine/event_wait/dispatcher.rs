@@ -17,7 +17,7 @@
 //!
 //! # Restart
 //!
-//! Four mechanisms, and the plan's I3 / I3b hang off them:
+//! Five mechanisms, and the plan's I3 / I3b hang off them:
 //!
 //! 1. The wait is an event, so the record survives by construction.
 //! 2. [`LucidosEngine::rebuild_event_waits`] re-derives the cache at boot.
@@ -27,6 +27,24 @@
 //! 4. [`LucidosEngine::refire_unresolved_event_wakes`] re-drives a resolution
 //!    whose wake never ran, which is the one gap the first three leave: a crash
 //!    after the resolution is persisted but before the turn re-entered.
+//! 5. **A teardown declines to resolve at all.** Once
+//!    `LucidosEngine::is_shutting_down` is true, all three resolution paths
+//!    named at the top of this doc return before taking the wait out of the
+//!    cache, so it stays live and unresolved and mechanisms 2 and 3 deliver it
+//!    on the next engine. This is the deliberate reason a wait can survive a
+//!    restart still armed with a match already in the store, or past its own
+//!    deadline.
+//!
+//!    It is a restart mechanism because a wake is a chat TURN. Without the gate
+//!    a match landing mid-teardown starts a fresh turn against an engine on its
+//!    way out: on 2026-08-07 one ran for fourteen seconds and was thrown away,
+//!    and because it became in-flight after the teardown pre-emit's snapshot it
+//!    took the `shutdown_active_threads` fallback and settled `failed` with a
+//!    manual Continue while its siblings settled `paused` and auto-resumed. The
+//!    actor half of that is fixed separately (`LucidosEngine::teardown_actor`),
+//!    and has to be: no flag read can close the window between the check and the
+//!    turn registering. This half is what stops the wasted turn, and leaves the
+//!    thread simply waking cleanly on the new engine instead.
 
 use std::sync::Arc;
 
@@ -98,6 +116,35 @@ impl LucidosEngine {
         });
     }
 
+    /// True when the engine is tearing down, so this entry point must leave
+    /// every live wait exactly as it is.
+    ///
+    /// **Every one of the three resolution paths must consult this BEFORE
+    /// `LiveWaits::take`, never after** (the live match, the catch-up scan, and
+    /// the deadline sweep).
+    /// After the take the wait is out of the cache, and a bare return then
+    /// strands it in the worst state available: no event can match it, no sweep
+    /// can expire it, and its `EventWaitStarted` is still unresolved in the
+    /// store, so only a restart would ever notice. Before the take, declining
+    /// costs nothing at all, because the wait stays live with its watermark
+    /// intact and the next engine's rebuild plus catch-up scan finds the same
+    /// match (mechanisms 2 and 3 in the module doc).
+    ///
+    /// Logged rather than silent: a wake held back is a thread that will not run
+    /// until the next boot, which is the sort of thing that should be findable
+    /// in the log rather than inferred from a gap in a transcript.
+    fn shutdown_declines_wake(&self, site: &'static str) -> bool {
+        if !self.is_shutting_down() {
+            return false;
+        }
+        crate::log!(
+            "[EventWait] Engine shutting down, not resolving waits from the {} path. \
+             They stay armed, and the next engine's catch-up scan delivers them",
+            site
+        );
+        true
+    }
+
     /// Cancel a thread's waits when the bus says the thread itself has ended.
     ///
     /// Archive and discard are handled here rather than at each endpoint for
@@ -145,6 +192,11 @@ impl LucidosEngine {
     /// `BusEvent::Thread`, and `SystemEvent::DomainEvent` (a workspace's own
     /// `emit_event`). Awaiting a `ReleasePublished` is a first-class case, not
     /// an afterthought.
+    ///
+    /// Declines outright during a teardown (mechanism 5 in the module doc): the
+    /// events an engine emits on its way down are exactly the ones a wait is
+    /// most likely to match, and resolving one here starts a chat turn the
+    /// teardown is about to kill.
     async fn offer_event_to_waits(self: &Arc<Self>, emitted: &EmittedEvent) {
         // Emptiness FIRST. Building the payload below is a full
         // `serde_json::to_value` of the event (a `ResponseGenerated` carries
@@ -153,6 +205,12 @@ impl LucidosEngine {
         // would allocate and discard a complete JSON tree on every event the
         // engine emits. Same one-map-read idiom as `cancel_waits_ended_by`.
         if self.live_waits.is_empty().await {
+            return;
+        }
+        // AFTER the emptiness check, so a teardown on a workspace with nothing
+        // armed says nothing, and one that really is holding a wake back says so
+        // once per event it declined.
+        if self.shutdown_declines_wake("live match") {
             return;
         }
         let (event_type, payload) = match &emitted.typed {
@@ -435,7 +493,22 @@ impl LucidosEngine {
     }
 
     /// Resolve every wait whose deadline has passed. One tick of the sweep.
+    ///
+    /// An expiry WAKES, so it is a chat turn like any other and needs the same
+    /// teardown gate as the two match paths. The caller's loop already breaks on
+    /// the flag, and that is not enough: it reads it once per tick, on a ten
+    /// second interval, against a teardown that routinely takes longer than that
+    /// (`shutdown_agent_sessions` alone polls for up to ten seconds). A tick that
+    /// passes the loop check microseconds before `begin_teardown` still reaches
+    /// the take below. Re-reading it here, immediately before the take, is what
+    /// makes the contract in `shutdown_declines_wake` true of every resolution
+    /// path rather than of two out of three. The wait then stays armed past its
+    /// deadline and `rebuild_event_waits` re-arms it on the next engine, whose
+    /// own first sweep expires it (`rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down`).
     async fn sweep_expired_event_waits(self: &Arc<Self>) {
+        if self.shutdown_declines_wake("deadline sweep") {
+            return;
+        }
         let snapshot = self.live_waits.snapshot().await;
         if snapshot.is_empty() {
             return;
@@ -457,7 +530,16 @@ impl LucidosEngine {
     /// `EventWaitStarted` and this module inserting the cache entry.
     ///
     /// Only the FIRST hit is used. A wait is a rendezvous, not a stream.
+    ///
+    /// Declines during a teardown for the same reason the live match path does.
+    /// The registration caller is the one this reaches: an `await_event` armed
+    /// while the engine is going down would otherwise scan, find its match, and
+    /// wake the thread into a turn with seconds to live. The boot caller can
+    /// never see the flag set, since a fresh engine is not shutting down.
     pub(crate) async fn catch_up_event_wait(&self, wait: &LiveWait) {
+        if self.shutdown_declines_wake("catch-up scan") {
+            return;
+        }
         let hit = match catch_up_from_watermark(&self.pool, wait).await {
             Ok(hit) => hit,
             Err(e) => {

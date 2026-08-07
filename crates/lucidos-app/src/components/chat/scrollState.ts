@@ -1364,25 +1364,46 @@ export function makeScrollObservers(el: HTMLElement) {
     // null keeps the reflow correction a no-op, which is the right answer there.
   }
 
+  /** Is the reader riding the newest turn, with nothing of higher priority
+   *  owning the container? Then a resize means the transcript moved under them
+   *  and they must be put back on the bottom.
+   *
+   *  Riding the bottom means "keep me on the newest turn", and that survives any
+   *  resize: re-pin rather than anchor, or a taller transcript would strand the
+   *  reader above the last message. Same 80px stickiness window as every other
+   *  bottom-pin here, so inside it the user has not chosen to read history.
+   *
+   *  A follow is a force-pin, so it defers to an in-flight notification
+   *  deep-link. Tapping a notification with the thread pane collapsed calls
+   *  revealThreadPane(), whose 300ms re-expansion fires this observer on every
+   *  frame while the deep-link is still loading the thread and scrolledUp is
+   *  still false. Pinning there would slam the transcript to the bottom during
+   *  the very load the deep-link is waiting on. */
+  function shouldFollowBottom() {
+    return !scrolledUp.value && !hasPendingEventScroll();
+  }
+
+  /** Put the reader back on the newest turn. One implementation, shared by the
+   *  reflow correction and by onResize's follow branch, so "riding the bottom"
+   *  cannot come to mean two different things depending on which axis moved.
+   *
+   *  The write is skipped when they are already there (the steady state while a
+   *  response streams): re-assigning the same offset changes nothing but does
+   *  re-enter the scroll handlers for a round of forced layout reads. Same 2px
+   *  slack, and same reason, as pinToBottomNow's guard. */
+  function followBottom() {
+    if (!isVisuallyAtBottom()) el.scrollTop = el.scrollHeight;
+    awayFromBottom.value = false;
+  }
+
   /** Put the reader back where the width change moved them. Runs inside the
    *  ResizeObserver callback, i.e. after layout and before paint, so the
-   *  correction is never painted as a jump. */
+   *  correction is never painted as a jump. A reader who was NOT riding the
+   *  bottom is held still on their anchor instead, which is also what keeps a
+   *  live deep-link's landing intact. */
   function restoreAfterReflow() {
-    // Riding the bottom means "keep me on the newest turn", and that survives any
-    // reflow: re-pin rather than anchor, or a taller transcript would strand the
-    // reader above the last message. Same 80px stickiness window as every other
-    // bottom-pin here, so inside it the user has not chosen to read history.
-    //
-    // This is a force-pin, so it defers to an in-flight notification deep-link
-    // exactly as the one below does, and for the same reason. Tapping a
-    // notification with the thread pane collapsed calls revealThreadPane(), whose
-    // 300ms re-expansion fires this observer on every frame while the deep-link
-    // is still loading the thread and scrolledUp is still false. Pinning there
-    // would slam the transcript to the bottom during the very load the deep-link
-    // is waiting on. Falling through to the anchor instead holds the reader still,
-    // which is compatible with the deep-link's own scroll whenever it lands.
-    if (!scrolledUp.value && !hasPendingEventScroll()) {
-      el.scrollTop = el.scrollHeight;
+    if (shouldFollowBottom()) {
+      followBottom();
       return;
     }
     const child = anchorChild;
@@ -1414,17 +1435,26 @@ export function makeScrollObservers(el: HTMLElement) {
     // The reader has moved, so the reflow anchor has to follow them.
     recordAnchor();
   }
-  // Resize events: behavior depends on resize mode set by scrollToBottom().
+  // Resize events. What a resize MEANS depends on whether the reader is parked,
+  // and on nothing else:
   //
   // 'scroll' mode: content is rendering after a scrollToBottom() call —
   //   actively scroll to bottom on each resize and extend the suppression
   //   window. This keeps us pinned to the bottom as content progressively
-  //   renders (especially important on mobile where rendering is slow).
+  //   renders (especially important on mobile where rendering is slow). It is a
+  //   FORCE-pin: it re-pins even a parked reader, which is what the deliberate
+  //   go-to-bottom callers (answering a question, resolving a permission card)
+  //   are asking for.
   //
-  // 'ignore' mode (normal): can only *escalate* scrolledUp to true.
-  //   Must NEVER clear scrolledUp — otherwise a layout change (textarea shrink
-  //   after submit, idle banner removal) can falsely reset scrolledUp and
-  //   trigger unwanted auto-scroll.
+  // 'ignore' mode (normal): follow the bottom while the reader rides it, and
+  //   otherwise touch only the chevron. A resize NEVER decides that the reader
+  //   scrolled up: see the follow branch below for why that inference was wrong.
+  //   It never CLEARS scrolledUp either, and that half is older and just as
+  //   load-bearing: a layout change the reader did not make (the textarea
+  //   shrinking after a submit, an idle banner going away) would otherwise read
+  //   as them returning to the bottom and re-arm auto-scroll under someone
+  //   reading history. Neither direction is inferable from geometry, which is
+  //   why nothing in this handler writes that signal at all.
   function onResize() {
     if (!isElementVisible(el)) return;
     // A WIDTH change re-wrapped the transcript, so undo the drift it caused
@@ -1450,15 +1480,40 @@ export function makeScrollObservers(el: HTMLElement) {
     if (getResizeMode() === 'scroll' && !hasPendingEventScroll()) {
       el.scrollTop = el.scrollHeight;
       extendSuppression();
+    } else if (shouldFollowBottom()) {
+      // The reader is riding the newest turn, so the transcript grew (or the
+      // composer took height) UNDER them: keep them on it. Same rule as the
+      // reflow correction above, so a resize means one thing whichever axis
+      // moved, and it holds however long after the open the growth lands.
+      //
+      // This branch used to read "grew, and we are now more than 80px off the
+      // bottom" as "the reader scrolled up" and set scrolledUp. Nothing the
+      // reader did produced that conclusion: the app was inferring intent from
+      // its own layout. Every auto-scroll path then defers to scrolledUp, so
+      // one late grow stranded the transcript above the newest turn for the
+      // rest of the visit, with no gesture able to be blamed and nothing to
+      // recover it. A markdown image is enough on its own, reserving no box
+      // (max-height only, no width/height and no aspect-ratio), so decoding one
+      // adds up to 24rem whenever the fetch happens to land after the pin
+      // window has closed.
+      //
+      // It also contradicted useAutoScroll's layout effect, which snaps to the
+      // bottom whenever !scrolledUp however much content arrived. Two rules
+      // over one event, with the winner decided by whether a Preact render
+      // happened to accompany the growth: the "opening a thread sometimes does
+      // not land at the end" report, and why it was intermittent.
+      //
+      // scrolledUp is now written only by an explicit decision: a scroll event,
+      // a navigation (scrollToTop / turn-nav / a deep-link landing), a panel
+      // toggle (preserveOnToggle, which is what keeps expanding a step showing
+      // the chevron instead of re-pinning), or a saved-scroll restore.
+      followBottom();
     } else {
-      // Gate on the 80px window (see top of file) so streaming tokens don't
-      // trip the chevron before useEffect snaps back. Larger growth (panel
-      // expand, multi-line code block) crosses the window and the chevron
-      // appears immediately, even though no scroll event fired.
-      if (!isAtBottom()) {
-        scrolledUp.value = true;
-        awayFromBottom.value = true;
-      }
+      // Parked, or a deep-link owns the scroll: hold the transcript still and
+      // reconcile only the chevron against where the resize left them. The 80px
+      // window (see top of file) keeps streaming tokens from tripping it on
+      // before the layout effect snaps back.
+      if (!isAtBottom()) awayFromBottom.value = true;
       // Clear path: if content shrinks so the user is now visually at the
       // bottom (idle banner removed, step collapsed), hide the chevron
       // without waiting for a scroll event.

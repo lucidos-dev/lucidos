@@ -16,7 +16,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::RUN_THREAD.to_string(),
-            description: "Start a new Lucidos thread for a non-code subtask (research, analysis, drafting). For code, use run_coding_agent. It runs its own agentic loop with full tool access, and with the default relation=\"child\" resumes THIS thread with its result, so you never poll. Spawn several in parallel and each reports back independently. Review what comes back before acting on it, and re-spawn with a refined prompt if it is incomplete.".to_string(),
+            description: "Start a new Lucidos thread for a non-code subtask (research, analysis, drafting). For code, use run_coding_agent. It runs its own agentic loop with full tool access, and with the default relation=\"child\" resumes THIS thread with its result, so you never poll. Spawn several in parallel and each reports back independently. Review what comes back before acting on it, and re-spawn if it is incomplete.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -26,7 +26,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "title": {
                         "type": "string",
-                        "description": "3-6 words. Set it: this is how you will refer to this child later, in your prose and in follow_up_child_thread results. Auto-generated if omitted."
+                        "description": "3-6 words, and this is how you will refer to this child later in your prose. Auto-generated if omitted."
                     },
                     "relation": {
                         "type": "string",
@@ -39,13 +39,13 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::RUN_CODING_AGENT.to_string(),
-            description: "Run a coding agent to edit source code: Lucidos itself, an installed app, or a registered external repo. ONLY when the user explicitly asks to modify code, never for workspace work the native tools cover. Default backend is Claude Code; set `coding_agent=\"codex\"` whenever the user asks for Codex. Spawning returns immediately and the ack is not a result: read the child's final response text for pass/fail before acting on it or reporting.\n\nPick `folder` first, asking which one if it is ambiguous. Omitting it means Lucidos itself, AVAILABLE ONLY on an install whose engine was launched from a Lucidos source checkout: the system prompt's \"WHAT A CODING AGENT CAN EDIT ON THIS INSTALL\" section says which install this is. load_knowhow('system-knowhow/coding-agent-events') for the folder table and cross-workspace.".to_string(),
+            description: "Run a coding agent to edit source code: Lucidos itself, an installed app, or a registered repo. ONLY when the user explicitly asks to modify code, never for workspace work the native tools cover. Spawning returns immediately and the ack is NOT a result: read the child's final response text for pass/fail before acting on it or reporting.\n\nPick `folder` first, asking which one if it is ambiguous. Omitting it means Lucidos itself, AVAILABLE ONLY on an install whose engine was launched from a Lucidos source checkout: the system prompt's \"WHAT A CODING AGENT CAN EDIT ON THIS INSTALL\" section says which install this is. load_knowhow('system-knowhow/coding-agent-events') for the folder table and cross-workspace.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "prompt": {
                         "type": "string",
-                        "description": "The coding task. Be specific about which files to change and the outcome."
+                        "description": "The coding task. Be specific about the files and the outcome."
                     },
                     "coding_agent": {
                         "type": "string",
@@ -54,7 +54,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "folder": {
                         "type": "string",
-                        "description": "What to edit, which also picks the spawn kind: `data/apps/<id>`, or a registered repository name or UUID from `manage_repositories`. Omit to edit Lucidos source, which works only on an install launched from a Lucidos source checkout; a `folder`-less call against this install is otherwise refused, though one carrying `workspace` still forwards."
+                        "description": "What to edit, which also picks the spawn kind: `data/apps/<id>`, or a registered repository name or UUID from `manage_repositories`. Omit to edit Lucidos source, which works only on an install launched from a Lucidos source checkout; otherwise a `folder`-less call is refused unless it carries `workspace`."
                     },
                     // Temporary measure — registered in docs/temporary-measures.md
                     // § "`repo` → `folder` deprecated alias on `run_coding_agent`".
@@ -64,7 +64,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "workspace": {
                         "type": "string",
-                        "description": "Target workspace basename. Omit for this workspace. Another one requires `relation=\"top\"` and resolves `folder` there."
+                        "description": "Target workspace basename. Omit for this one. Another requires `relation=\"top\"` and resolves `folder` there."
                     },
                     "allowed_tools": {
                         "type": "string",
@@ -76,7 +76,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "append_system_prompt": {
                         "type": "string",
-                        "description": "Extra instructions appended to the agent's system prompt."
+                        "description": "Appended to the agent's system prompt."
                     },
                     "images": {
                         "type": "array",
@@ -85,7 +85,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                     },
                     "title": {
                         "type": "string",
-                        "description": "3-6 words. Set it: this is how you will refer to this child later, in your prose and in follow_up_child_thread results. Auto-generated if omitted."
+                        "description": "3-6 words, and this is how you will refer to this child later in your prose. Auto-generated if omitted."
                     },
                     "relation": {
                         "type": "string",
@@ -104,7 +104,7 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
                 "properties": {
                     "thread_id": {
                         "type": "string",
-                        "description": "The child's uuid, from the spawn result, a completion card, or the threads tool's 'list' with my_children: true. Titles are not accepted: they are not unique."
+                        "description": "The child's uuid, from the spawn result, a completion card, or the threads tool's 'list' with my_children: true. Titles are not accepted."
                     },
                     "message": {
                         "type": "string",
@@ -124,17 +124,15 @@ pub(super) fn spawn_tools() -> Vec<ToolDefinition> {
 /// Kept out of the `vec!` so the invariants below can assert on it by name
 /// rather than by digging the tool back out of the list.
 const FOLLOW_UP_CHILD_THREAD_DESCRIPTION: &str = concat!(
-    "Send a follow-up message to a child thread YOU already spawned: redirect one going the ",
-    "wrong way, hand it something a sibling learned, or tell a stalled one to continue. It ",
-    "does NOT consume a child slot and the child gets a fresh ",
-    "turn with the full tool set, so reviving one beats spawning another near the per-thread ",
+    "Send a follow-up to a child thread YOU already spawned: redirect one going the wrong ",
+    "way, hand it something a sibling learned, or tell a stalled one to continue. It does ",
+    "NOT consume a child slot, so reviving one beats spawning another near the per-thread ",
     "limit. Refer to the child by TITLE in anything you write for the user. Returns as soon ",
-    "as the message lands and does NOT wait for the child, so issue it and end your turn.\n\n",
+    "as the message lands, so issue it and end your turn.\n\n",
     "By default the message QUEUES: a mid-turn child reads it at its next natural break, ",
     "which inside a long tool call can be many minutes, and nothing in flight is thrown away. ",
     "urgent: true stops the child's current turn instead. On a CODEX child urgent changes ",
-    "nothing, since a Codex turn cannot read a queued message until it ends, so pass it by ",
-    "what you MEAN rather than by which backend the child runs.\n\n",
+    "nothing, since a Codex turn cannot read a queued message until it ends.\n\n",
     "Side effects invisible from the verb, all three in ",
     "`system-knowhow/coding-agent-events`: it RESOLVES ANY PENDING PERMISSION CARD on the ",
     "child as superseded; a follow-up racing the child's own finish can produce a completion ",

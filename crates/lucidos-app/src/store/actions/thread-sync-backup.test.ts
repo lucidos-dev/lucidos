@@ -19,6 +19,7 @@ vi.mock('../store', () => ({
   memoryRebuildProgress: signal(null),
   backupProgress,
   backupStatusVersion,
+  backupPreferencesVersion: signal(0),
   recoveryProgress: signal(null),
   panelOverlay: signal(null),
   showConfirm: vi.fn(),

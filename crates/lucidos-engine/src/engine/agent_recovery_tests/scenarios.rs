@@ -951,6 +951,50 @@ fn switch_teardown_fingerprint_is_stable_for_the_frontend_mirror() {
     );
 }
 
+/// The second producer of that fingerprint, added 2026-08-07: a restart the user
+/// starts from the gateway workspace picker. The gateway forwards the picker's
+/// device id to `/api/v1/internal/restart-intent`, which resolves it with the
+/// same `user_actor_resolved` the in-workspace switch handler uses and stashes
+/// the result for the teardown emit.
+///
+/// So the picker's contribution is exactly one thing: a device id in a header.
+/// This asserts that header alone produces an actor the fingerprint accepts,
+/// which is the whole mechanism. Everything downstream (the emit, both resume
+/// gates, the `paused` verdict, the withheld Continue button) is shared with the
+/// switch path and already covered above.
+#[test]
+fn a_device_id_header_alone_produces_the_switch_fingerprints_actor() {
+    use crate::engine::thread_events::{AbortCause, MessageOrigin};
+
+    let mut headers = axum::http::HeaderMap::new();
+    headers.insert(
+        crate::api::actor::HEADER_DEVICE_ID,
+        axum::http::HeaderValue::from_static("picker-device"),
+    );
+    let actor = crate::api::actor::user_actor(&headers, None, None)
+        .expect("a device-id header always resolves to some actor");
+    assert!(
+        matches!(actor, MessageOrigin::Device { .. }),
+        "the picker's header must resolve to a Device actor, not an Api one"
+    );
+    assert!(
+        AbortCause::EngineShutdown.promises_auto_resume(Some(&actor)),
+        "a gateway-initiated restart must promise the same auto-resume as the \
+         in-workspace switch, or the picker keeps settling turns at 'failed'"
+    );
+
+    // The negative half, and the reason the restart-intent handler refuses a
+    // caller with no device: `user_actor` still returns an actor (an `Api` one),
+    // and stashing THAT would promise nothing while overwriting the honest
+    // System attribution with an API caller.
+    let no_device = crate::api::actor::user_actor(&axum::http::HeaderMap::new(), None, None)
+        .expect("an actor is produced even with no device");
+    assert!(
+        !AbortCause::EngineShutdown.promises_auto_resume(Some(&no_device)),
+        "an Api actor is not the fingerprint, so it must never reach the stash"
+    );
+}
+
 /// Phase 5.3 contract: a synthetic `CodingAgentIdled` carrying
 /// `reason = engine_restart_interrupt` must round-trip through serde so
 /// the projection + SSE consumers see the reason field intact. Without

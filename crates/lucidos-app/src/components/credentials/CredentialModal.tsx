@@ -14,6 +14,7 @@ import {
   rowForService,
   secretIsExpected,
 } from './oauthClientForm';
+import { ConsoleLink } from './providerConsoleHint';
 import { loadedOr, toFailed } from '../../store/types';
 import type { AuthType, CredentialInfo, CredentialRequest, EmailAccountInfo, Loadable } from '../../store/types';
 import { getCredentialValue, getEmailAccount } from '../../api/client';
@@ -576,16 +577,9 @@ function CredentialFormInner({
                 providers change and the agent reads the same rows. */}
             {helpRow && (
               <div class="credential-console-help">
-                {helpRow.console_url && (
-                  <a
-                    class="accent-link"
-                    href={helpRow.console_url}
-                    target="_blank"
-                    rel="noopener noreferrer"
-                  >
-                    Open the {helpRow.console_label ?? `${helpRow.label} console`} ↗
-                  </a>
-                )}
+                {/* Shared with the two re-authorization surfaces, so the link
+                    reads the same wherever the registry's console appears. */}
+                <ConsoleLink row={helpRow} />
                 {helpRow.setup_hint && <p>{helpRow.setup_hint}</p>}
                 {helpRow.permissions_hint && <p>{helpRow.permissions_hint}</p>}
                 {redirectUri && (

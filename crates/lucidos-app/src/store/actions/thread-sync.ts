@@ -1,7 +1,7 @@
-import { API, isTransportError } from '../../api/client';
+import { API } from '../../api/client';
 import type { Change } from '../../api/client';
 import { threadMap, focusedThreadId, changes, appliedChanges, applyingChangeIds, applyingNowThreadIds, applyAllInProgress, generatedTitleIds, codingAgentSessionVersion, setFocusedThread, archivingThreadIds, removingQueuedMessageIds, queuedMessageRemovalKey } from '../store';
-import { memoryRebuildProgress, backupProgress, backupStatusVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS, THREAD_LIST_REFRESH_TOAST_KEY } from '../store';
+import { memoryRebuildProgress, backupProgress, backupStatusVersion, backupPreferencesVersion, recoveryProgress, showConfirm, showToast, dismissToast, toasts, repoSource, TOAST_AUTO_DISMISS_MS } from '../store';
 import { handleEvent, isChannelDefiningEvent, makeOptimisticThreadState, modeToInitiator, PENDING_TITLE_PLACEHOLDER, type ActorMode, type ThreadAggregate, type ThreadMeta, type ThreadEvent, type TransientEvent } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
 import type { ThreadChannel } from '../store';
@@ -43,14 +43,15 @@ import { focusThread } from './threads';
 import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
 import { processSSEForReferences } from './entityReferences';
-import { loadAllThreads, refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
+import { refreshThreadEvents, loadThreadEvents, forgetThreadEventsFailures, markLoadedThreadsStale } from './thread-loading';
+import { refreshThreadList } from './thread-list-refresh';
 import { applyRemoteCompose, pendingComposePuts, hasUnsentLocalDraft, clearSupersededDraft, noteComposeEpoch } from './compose';
 import type { ComposeSelectionOverride } from '../composeSelections';
 import { clearDraft, setDraft } from '../composeDrafts';
 import { removeThreadNavEntries } from './thread-navigation';
 import { isComposeFocusedHere } from '../../components/chat/promptFocus';
 import { formatBytes } from '../../utils/formatBytes';
-import { errorDetail, isAbortError } from '../../utils/errorDetail';
+import { errorDetail } from '../../utils/errorDetail';
 import { handleNavigationRequest, describeNavTarget } from './navigation-request';
 import { applyEmbeddingModelStatus } from './backgroundActivity';
 import type { EmbeddingModelStatus } from '../../api/types';
@@ -88,6 +89,16 @@ const APPLY_NOW_CLEAR_EVENTS = new Set([
   // long reasoning pass holds the state ~minutes longer than its siblings would.
   'CodingAgentThoughtStreamed',
   'CodingAgentUserMessageSent', 'CodingAgentPromptSent', 'MessageReceived',
+]);
+
+/** The preference keys the Backup page renders, mirroring the `PREF_BACKUP_*`
+ *  constants in the engine's `core/backup/mod.rs`. A `PreferencesChanged`
+ *  carrying one of them is the only kind that page has to re-read for; every
+ *  other key (theme, model, locale) must leave its endpoints alone. */
+const BACKUP_PREFERENCE_KEYS = new Set([
+  'backup_provider',
+  'backup_schedule',
+  'backup_retention',
 ]);
 
 /** Toast key for the "merge conflict — resolving automatically" banner. Shared
@@ -294,23 +305,13 @@ export function resyncLoadedThreads(): Promise<void> {
       markLoadedThreadsStale();
       // Refresh thread-level metadata (status, section, message_count) first
       // so any per-thread refresh sees the authoritative state. `loadAllThreads`
-      // REJECTS on a failed GET and has no Loadable or toast of its own, so
-      // contain it here: letting it propagate skipped the per-thread refreshes
-      // below, which are what clear a stuck "Thinking" spinner after an SSE gap
-      // (the very failure this function exists to repair). Transient iOS-PWA
-      // wake / stale-connection rejections stay silent, matching
-      // `refreshThreadEvents`; a genuine failure toasts.
-      try {
-        await loadAllThreads();
-      } catch (err) {
-        if (isAbortError(err) || isTransportError(err)) {
-          console.warn('[SSE] resync thread-list refresh failed transiently (iOS PWA wake / engine restart); per-thread refresh still runs', err);
-        } else {
-          showToast(`Failed to refresh the thread list: ${errorDetail(err)}`, 'error', {
-            key: THREAD_LIST_REFRESH_TOAST_KEY,
-          });
-        }
-      }
+      // REJECTS on a failed GET and has no Loadable or toast of its own, and
+      // letting that propagate would skip the per-thread refresh below, which is
+      // what clears a stuck "Thinking" spinner after an SSE gap (the very
+      // failure this function exists to repair). `refreshThreadList` never
+      // rejects, and owns the single keyed card this shares with the resume
+      // sync, so the two report one failure of one request identically.
+      await refreshThreadList();
       // One request, for the thread on screen. This used to be one per loaded
       // thread, four at a time, which on a large workspace an SSE drop re-ran in
       // full on every 3s reconnect, down a link that had just come back. The
@@ -869,6 +870,17 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // loadPreferences sets `preferences` to `failed` via toFailed on error — no
       // extra surface needed here.
       void loadPreferences().then(() => syncClientUpdateFromBuild()).catch(() => { /* best-effort re-derive */ });
+      // The Backup page does NOT read its three values out of the preferences
+      // cache: they arrive from `/backup/schedule`, `/backup/providers` and
+      // `/backup/retention`, which is where the provider's connected/ready
+      // verdict comes from too. So reloading the cache above leaves that page
+      // stale, and only a re-read of those endpoints fixes it. Keyed, because a
+      // theme or model change must not hit the backup endpoints. `value` is
+      // null when a preference was deleted (reset to default), which is a
+      // change like any other: what the page shows has to move either way.
+      if (BACKUP_PREFERENCE_KEYS.has(String(data.key ?? ''))) {
+        backupPreferencesVersion.value++;
+      }
       break;
     // `set_language` / `set_timezone` (chat-agent tools) write the preference
     // and emit LanguageSet / TimezoneSet but NOT PreferencesChanged, so without

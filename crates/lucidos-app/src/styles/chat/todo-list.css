@@ -71,12 +71,21 @@
     text-decoration-style: dashed;
 }
 
-/* Indicator glanceable signal: a clean idle list and an abandoned-tail list
-   render the same TodoCheckIcon glyph, so the tooltip alone would force the
-   user to hover (and tooltips are desktop-only per the project rule). Tint
-   the icon down so abandonment is visible at-a-glance without expanding the
-   panel — desaturated + semi-transparent visually reads as "incomplete /
-   walked away from" against the brighter idle/in-progress icons. */
+/* Indicator glanceable signal. All three states render the SAME TodoListIcon
+   checklist glyph, so the button keeps reading as "todo list" whatever the
+   agent is doing; the state rides on color alone. Shape-switching is what the
+   old two-glyph pair did, and its in-progress glyph (a filled dome inside a
+   checkbox, an SVG translation of the panel's ◐) read as nothing at all.
+   Counts stay in the tooltip + aria-label, which is where the detail belongs.
+
+   Color has to carry it because the tooltip is desktop-only per the project
+   rule, so on mobile the glyph is the whole signal. Accent for in-progress
+   reads as "live, being worked"; desaturated + semi-transparent for abandoned
+   reads as "incomplete / walked away from" against the brighter two. */
+.icon-btn[data-role="todo-indicator"][data-state="in-progress"] {
+    color: var(--accent);
+}
+
 .icon-btn[data-role="todo-indicator"][data-state="abandoned"] {
     color: var(--text-secondary);
     opacity: 0.6;

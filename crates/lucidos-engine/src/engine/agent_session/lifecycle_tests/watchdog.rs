@@ -615,3 +615,81 @@ fn both_session_exits_reach_the_api_drop_auto_resume() {
          follow-up is already queued, and it can only know that once `orphans` exists.",
     );
 }
+
+/// **The second regression test for the same incident, one layer up.** Reaching the
+/// idle exit is necessary but not sufficient: the idle handler can decline to end
+/// the run at all. When `terminate_decision` returns a `KeepAlive`, the loop keeps
+/// the subprocess and continues, so `run_direct_agent` reaches neither call site the
+/// test above pins. That is how a Claude Code turn which merged three instructions
+/// into one Result reported two phantom follow-ups in flight and swallowed the
+/// recovery on 2026-08-07, with the sibling test green throughout.
+///
+/// The fix was to stop guessing. Each of the three windows a follow-up can be in
+/// gets a signal that is exact under the lock the decision already holds, so this
+/// guards the two that a future edit could quietly turn back into a guess: the
+/// channel read, and the per-backend settle. Same source-text rationale as its
+/// sibling, and the same honest limit.
+/// See `docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`.
+#[test]
+fn the_idle_keep_alive_cannot_be_fed_by_a_phantom_count() {
+    const RUN_SRC: &str = include_str!("../run_session/run.rs");
+
+    assert!(
+        !RUN_SRC.contains("pending_followups"),
+        "the phantom counter must stay deleted. It counted messages SENT and settled once \
+         per Result, so a Claude Code turn that merged N inputs into one Result reported \
+         N-1 follow-ups that had already been consumed.",
+    );
+
+    let exit_arm = RUN_SRC
+        .find("IdleAction::ExitSubprocess => {")
+        .expect("run.rs must still carry the idle-exit subprocess decision");
+    let arm = &RUN_SRC[exit_arm..];
+    let decision = arm
+        .find("match terminate_decision(")
+        .expect("the ExitSubprocess arm must still route through terminate_decision");
+    let settle = arm.find("settle_inputs_awaiting_result(").expect(
+        "the ExitSubprocess arm must settle the forwarded-input count through the shared \
+         per-backend helper. Inlining the rule is how one backend's promise (Codex answers \
+         one input per Result) got applied to the other (Claude Code answers all of them).",
+    );
+    assert!(
+        settle < decision,
+        "the settle must run before the decision reads its remainder",
+    );
+    // Scoped to the call's own argument list rather than the whole arm, so a
+    // passing mention of `msg_rx` in a comment cannot satisfy the guard. (It did:
+    // the comment above the lock names the read, and an arm-wide search found that
+    // instead of the argument.)
+    let args_end = arm[decision..]
+        .find(") {")
+        .expect("terminate_decision's argument list must be closed");
+    assert!(
+        arm[decision..decision + args_end].contains("msg_rx.len()"),
+        "the channel depth must be an ARGUMENT of terminate_decision. `msg_rx` is the only \
+         authoritative answer to `is a follow-up still unread`, and it is exact here because \
+         this arm holds the same agent_sessions lock the fast-path send takes.",
+    );
+
+    // The ordering qualifier on the Claude Code merge rule. Without it the settle
+    // trades the phantom for a dropped message, because `select!` can forward an
+    // input and only then hand the loop a Result that predates it.
+    assert!(
+        RUN_SRC.contains("forwarded_input_unconfirmed = true;")
+            && RUN_SRC.contains("agent_events_queued_at_forward = events_rx.len();")
+            && RUN_SRC.contains("agent_event_may_predate_forward("),
+        "the run loop must arm the forward-ordering state when it forwards an input, record how \
+         many events were ALREADY queued at that moment, and advance it through \
+         `agent_event_may_predate_forward` on every agent event. Dropping the queued-event count \
+         is the buffered-event hole: a Result that sat in the channel the whole time then reads \
+         as proof the agent accepted an input it has never seen.",
+    );
+
+    // The `Terminate` branch is what carries an API-drop turn to the idle exit the
+    // sibling test pins. If it ever stops cancelling, the recovery goes with it.
+    assert!(
+        arm[decision..].contains("TerminateDecision::Terminate =>"),
+        "terminate_decision's Terminate branch must still exist in this arm: it is the only \
+         path from a transient API drop to the auto-resume emit site.",
+    );
+}

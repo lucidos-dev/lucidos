@@ -2221,3 +2221,76 @@ async fn a_legacy_account_with_no_desired_set_is_never_narrowed() {
     pool.close().await;
     crate::test_support::teardown_test_db(&db).await;
 }
+
+// ─── The shortfall: what was asked for and did not arrive ──────────────────
+//
+// `missing_requested_scopes` is the engine's half of a pair. The other half is
+// `missingScopes` in `components/settings/oauthConnectForm.ts`, which draws the
+// same shortfall on the account row. These cases are the ones that would let
+// the two answers diverge.
+
+#[test]
+fn a_full_grant_is_short_of_nothing() {
+    assert!(missing_requested_scopes("read write", "read write").is_empty());
+}
+
+#[test]
+fn a_partial_grant_names_every_refused_scope_in_request_order() {
+    assert_eq!(
+        missing_requested_scopes(
+            "files.content.write files.content.read files.metadata.read account_info.read",
+            "account_info.read",
+        ),
+        vec![
+            "files.content.write".to_string(),
+            "files.content.read".to_string(),
+            "files.metadata.read".to_string(),
+        ],
+    );
+}
+
+#[test]
+fn a_provider_that_reports_no_scope_string_is_not_reported_short() {
+    // `granted_scopes` falls back to the requested set when the token response
+    // carries no `scope` at all, which is what a provider granting exactly what
+    // it was asked for typically does. Reading that as a total shortfall would
+    // make every such connection look broken.
+    let requested = "read write";
+    let granted = requested;
+    assert!(missing_requested_scopes(requested, granted).is_empty());
+}
+
+#[test]
+fn an_unrecorded_request_reports_no_shortfall_rather_than_a_false_one() {
+    // The engine's mirror of the account row's `desired_scopes` being NULL:
+    // nothing was recorded as asked for, so nothing can be missing.
+    assert!(missing_requested_scopes("", "read write").is_empty());
+    assert!(missing_requested_scopes("", "").is_empty());
+}
+
+#[test]
+fn everything_is_missing_when_the_provider_granted_nothing() {
+    assert_eq!(
+        missing_requested_scopes("read write", ""),
+        vec!["read".to_string(), "write".to_string()],
+    );
+}
+
+#[test]
+fn the_granted_side_is_a_set_so_order_and_spacing_do_not_matter() {
+    assert!(missing_requested_scopes("read write", "write   read").is_empty());
+    assert!(missing_requested_scopes("read", "read read").is_empty());
+    // Newlines and tabs split like spaces: a provider is free to send either.
+    assert!(missing_requested_scopes("read write", "read\twrite\n").is_empty());
+}
+
+#[test]
+fn containment_never_stands_in_for_a_granted_scope() {
+    // The whole reason this is not `core::backup::missing_scopes`. That helper's
+    // requirements are substring MATCHERS, so `files.content` would "match"
+    // here and hide a genuinely refused scope.
+    assert_eq!(
+        missing_requested_scopes("files.content.write", "files.content"),
+        vec!["files.content.write".to_string()],
+    );
+}

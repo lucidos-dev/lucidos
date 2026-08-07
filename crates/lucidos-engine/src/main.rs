@@ -65,26 +65,32 @@ async fn shutdown_signal(
 
     log!("\n[Shutdown] Shutting down gracefully...");
 
-    // Stop the scheduler firing event-triggers before any cleanup event is
-    // emitted. `shutdown_agent_sessions`/`shutdown_active_threads` below emit
-    // terminator events (CodingAgentIdled, SessionEnded, ResponseAborted) that
-    // otherwise fan out to triggers; a trigger script's `lucidos ...` callback
-    // would then hit the HTTP API being torn down (line below) and die with a
-    // spurious "<trigger> failed" push. The scheduler's own shutdown flag is
-    // set much later (scheduler.shutdown()), too late to gate these events.
-    engine.mark_shutting_down();
+    // Open the teardown. Two things happen here, and both must happen before
+    // any cleanup event is emitted:
+    //
+    // 1. The engine is marked shutting down, which stops the scheduler firing
+    //    event-triggers and stops an event-wait resolution waking a thread into
+    //    a brand-new turn. The sweeps below emit terminator events
+    //    (CodingAgentIdled, SessionEnded, ResponseAborted) that would otherwise
+    //    fan out to triggers; a trigger script's `lucidos ...` callback would
+    //    then hit the HTTP API being torn down (line below) and die with a
+    //    spurious "<trigger> failed" push. The scheduler's own shutdown flag is
+    //    set much later (scheduler.shutdown()), too late to gate these events.
+    // 2. The teardown's ACTOR is decided, once, for every emit inside it. A
+    //    device actor means a user asked for this ("You" attribution + the
+    //    `paused` verdict + auto-resume on the next boot); `None` means nobody
+    //    did (a bare stop.sh / external SIGUSR1, or a crash, which never reaches
+    //    this path) and yields System attribution + a manual Continue.
+    let teardown_actor = engine.begin_teardown();
 
     // Emit the boundary "Switched to new version" / abort events NOW, at real
     // teardown — never at switch-request time, so nothing shows "Switched/Aborted"
-    // while the old engine is still alive through a dev rebuild. Reads the actor
-    // the switch handler stashed: a device actor → "You" attribution + recovery
-    // auto-resumes in-flight coding-agent threads; `None` (a bare stop.sh /
-    // external SIGUSR1, or a crash — which never reaches this path) → System
-    // attribution + manual Continue. Runs BEFORE the session sweeps below so its
-    // `external_terminal_emitted` flags suppress their duplicate emits.
-    engine
-        .abort_in_flight_for_restart(engine.take_restart_actor())
-        .await;
+    // while the old engine is still alive through a dev rebuild. Runs BEFORE the
+    // session sweeps below so its `external_terminal_emitted` flags suppress
+    // their duplicate emits. The sweeps read the same actor back off the engine
+    // (`teardown_actor()`), so a thread that only became in-flight after this
+    // pre-emit's snapshot gets the same verdict as one that was already running.
+    engine.abort_in_flight_for_restart(teardown_actor).await;
 
     // Gracefully stop coding-agent sessions — interrupts active work,
     // waits for CodingAgentIdled events (which persist cc_session_id),

@@ -1,6 +1,6 @@
 ---
 name: Coding Agent Lifecycle Events
-description: Which ThreadEvents a Claude Code or Codex coding-agent session emits, their payloads, which ones the scheduler blocks, and which can wire a trigger or an `await_event` wait. Also how to spawn one: picking `run_coding_agent`'s `folder`, cross-workspace, and a follow-up's side effects. Load for "notify me when a coding agent finishes / asks a question / errors", "which folder should the coding agent edit", "wait until the agent is idle", "watch for a permission prompt", "CC session", "permission request", "AskUserQuestion".
+description: ThreadEvents a Claude Code or Codex session emits, which ones the scheduler blocks, and how to spawn one with `run_coding_agent`. Load for "notify me when a coding agent finishes / asks a question / errors", "which folder should the coding agent edit", "wait until the agent is idle", "watch for a permission prompt", "CC session", "AskUserQuestion".
 ---
 
 # Coding Agent Lifecycle Events

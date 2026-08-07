@@ -1,6 +1,11 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { signal } from '@preact/signals-core';
 
+// Held outside the factory so the assertions below can read them: the Backup
+// page's freshness rides on which of the two a PreferencesChanged moves.
+const backupStatusVersion = signal(0);
+const backupPreferencesVersion = signal(0);
+
 // Mirror the mock scaffold of the sibling thread-sync-*.test.ts files so we can
 // import handleGlobalEvent in isolation.
 vi.mock('../store', () => ({
@@ -16,7 +21,8 @@ vi.mock('../store', () => ({
   codingAgentSessionVersion: signal(0),
   memoryRebuildProgress: signal(null),
   backupProgress: signal(null),
-  backupStatusVersion: signal(0),
+  backupStatusVersion,
+  backupPreferencesVersion,
   recoveryProgress: signal(null),
   panelOverlay: signal(null),
   showConfirm: vi.fn(),
@@ -73,6 +79,8 @@ const { syncClientUpdateFromBuild } = await import('./client-update');
 describe('handleGlobalEvent — preference events refresh the preferences cache', () => {
   beforeEach(() => {
     vi.clearAllMocks();
+    backupStatusVersion.value = 0;
+    backupPreferencesVersion.value = 0;
   });
 
   it('PreferencesChanged reloads preferences AND re-derives the client-update surface', async () => {
@@ -101,5 +109,54 @@ describe('handleGlobalEvent — preference events refresh the preferences cache'
     expect(loadPreferences).toHaveBeenCalledTimes(1);
     await Promise.resolve();
     expect(syncClientUpdateFromBuild).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * The Backup page reads its provider, schedule and retention from the backup
+ * endpoints, NOT from the preferences cache the arm above reloads. So a
+ * PreferencesChanged that reloads the cache still leaves that page showing the
+ * old destination, which is what happened live on 2026-08-07 when the agent
+ * wrote `backup_provider` and the dropdown did not move until a manual reload.
+ */
+describe('handleGlobalEvent: a backup preference change bumps the Backup page', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    backupStatusVersion.value = 0;
+    backupPreferencesVersion.value = 0;
+  });
+
+  it.each(['backup_provider', 'backup_schedule', 'backup_retention'])(
+    '%s bumps the backup preferences version',
+    (key) => {
+      handleGlobalEvent('PreferencesChanged', { key, value: 'google_drive' });
+      expect(backupPreferencesVersion.value).toBe(1);
+    },
+  );
+
+  it('counts a deleted preference as a change', () => {
+    // `value: null` is the engine's reset-to-default. What the page shows has to
+    // move either way, so skipping it would leave the dropdown on a destination
+    // the preference no longer names.
+    handleGlobalEvent('PreferencesChanged', { key: 'backup_provider', value: null });
+    expect(backupPreferencesVersion.value).toBe(1);
+  });
+
+  it('leaves the Backup page alone for every other key', () => {
+    // The bump costs three HTTP reads, one of which resolves the provider's
+    // connected / ready verdict. A theme flip must not pay for them.
+    for (const key of ['theme', 'chat_model', 'language', '']) {
+      handleGlobalEvent('PreferencesChanged', { key, value: 'x' });
+    }
+    handleGlobalEvent('PreferencesChanged', {});
+    expect(backupPreferencesVersion.value).toBe(0);
+  });
+
+  it('does not refetch backup STATUS for a preference change', () => {
+    // The two signals mean different things: backupStatusVersion is "a backup
+    // RUN reached a terminal state" and the health card hits /backup/status on
+    // it, which lists the remote folder. A retention edit must not.
+    handleGlobalEvent('PreferencesChanged', { key: 'backup_retention', value: '10' });
+    expect(backupStatusVersion.value).toBe(0);
   });
 });

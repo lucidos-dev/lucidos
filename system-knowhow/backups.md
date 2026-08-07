@@ -1,6 +1,6 @@
 ---
 name: Backups
-description: Workspace backups: what is included, the encrypted archive, the cron schedule in the user's timezone, the encryption key that must be stored to restore, retention, run history, staleness, the provider scopes each backend needs, and which Settings page owns which half. Load for "when is my next backup", "back up to Dropbox", "change the backup time", "is my backup stale", or a restore.
+description: Workspace backups: coverage, the encrypted archive, the schedule, the encryption key needed to restore, retention, staleness, and provider scopes. Load for "when is my next backup", "back up to Dropbox", "change the backup time", "is my backup stale", or a restore.
 ---
 
 # Backups

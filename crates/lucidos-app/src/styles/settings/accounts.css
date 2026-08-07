@@ -136,3 +136,23 @@
 .oauth-connect-hint {
     margin: 0;
 }
+
+/* What to enable in the provider's own console before re-authorizing, from the
+   OAuth provider registry. Rendered under the line that states the shortfall
+   (the yellow one on an account row, the red one on the Backup page), so it is
+   deliberately muted and small: the shortfall is the alarm, this is the
+   instruction. Lives here rather than in backup.css because both surfaces share
+   the component. */
+.oauth-permissions-hint {
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-xs);
+    margin-top: var(--space-xs);
+    color: var(--text-muted);
+    font-size: var(--font-size-xs);
+}
+
+.oauth-permissions-hint p {
+    margin: 0;
+}

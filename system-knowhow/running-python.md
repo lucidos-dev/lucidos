@@ -1,6 +1,6 @@
 ---
 name: Running Python
-description: How to use run_python, run_python_background, and bash_output — picking the right one, the venv layout, importing from app scripts, and the antipatterns to avoid (sleep-poll, sys.path thrashing). Load this BEFORE writing run_python / run_python_background code if you haven't already this thread.
+description: How to use run_python, run_python_background and bash_output: picking the right one, the venv layout, importing from app scripts, and the antipatterns (sleep-poll, sys.path thrashing). Load BEFORE writing run_python code if you haven't already this thread.
 ---
 
 # Running Python

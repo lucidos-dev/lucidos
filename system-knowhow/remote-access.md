@@ -1,6 +1,6 @@
 ---
 name: Remote Access & HTTPS
-description: Use when the user wants to reach Lucidos from a phone, tablet or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "reverse proxy". Covers the Settings, Access page and its controls, the Expose run and the tailnet approval it can wait on, which gateway listens on which port, the three routes to HTTPS, and per-device certificate trust.
+description: Use when the user wants to reach Lucidos from a phone, tablet or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "reverse proxy".
 ---
 
 # Remote Access & HTTPS

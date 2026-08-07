@@ -1222,6 +1222,7 @@ impl LucidosEngine {
             frontend_refresh_task: std::sync::Mutex::new(None),
             frontend_worktree_pin_warned: std::sync::atomic::AtomicBool::new(false),
             restart_actor: std::sync::Mutex::new(None),
+            teardown_actor: std::sync::Mutex::new(None),
             pending_switch_resumes: std::sync::Mutex::new(Vec::new()),
             active_threads: Arc::new(std::sync::Mutex::new(HashMap::new())),
             thread_completion: Arc::new(std::sync::Mutex::new(HashMap::new())),

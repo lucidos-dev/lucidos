@@ -321,8 +321,15 @@ export interface ConnectInfo {
   tailscale: TailscaleInfo;
 }
 
-/** Open a URL in the system default browser (not the embedded webview). Only
- *  call when isTauri() is true. */
+/** Open a URL in the system default browser (not the embedded webview).
+ *
+ *  Rejects when the OS launcher could not be STARTED (`open` / `xdg-open` /
+ *  `rundll32` missing or unspawnable), so callers owe the user a toast. It does
+ *  NOT reject for a launcher that starts and then fails, e.g. no application
+ *  registered for the scheme: the child is fire-and-forget on the Rust side, for
+ *  the reason spelled out on `open_in_default_browser` in `src/lib.rs`.
+ *
+ *  Only call when isTauri() is true. */
 export function openExternal(url: string): Promise<void> {
   return invoke('open_url_external', { url });
 }

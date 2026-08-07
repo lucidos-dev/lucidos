@@ -484,13 +484,26 @@ async fn rename(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The device the caller is on, from the header the app sends on every mutating
+/// request. Absent for every non-browser client (the dev launcher, `stop.sh`,
+/// the packaged smoke test), which is what keeps those teardowns unattributed.
+///
+/// A display hint only, exactly as it is at the engine's own endpoints: it names
+/// who to credit, never what they may do. Authorization for this whole surface
+/// is [`control_authz`] plus the gateway's loopback bind, neither of which reads
+/// this header.
+fn requesting_device(headers: &HeaderMap) -> Option<&str> {
+    header_str(headers, crate::stack::HEADER_DEVICE_ID)
+}
+
 async fn restart(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     reject_invalid_id(&id)?;
     state
-        .restart_workspace(&id)
+        .restart_workspace(&id, requesting_device(&headers))
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(StatusCode::ACCEPTED)
@@ -502,10 +515,11 @@ async fn restart(
 async fn stop(
     State(state): State<GatewayState>,
     Path(id): Path<String>,
+    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     reject_invalid_id(&id)?;
     state
-        .stop_workspace(&id)
+        .stop_workspace(&id, requesting_device(&headers))
         .await
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     Ok(StatusCode::ACCEPTED)

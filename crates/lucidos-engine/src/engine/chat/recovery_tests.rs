@@ -615,6 +615,43 @@ mod switch_resume {
         teardown_test_db(&db_name).await;
     }
 
+    /// The gateway picker's Restart / Stop reaches this gate too, and it must be
+    /// indistinguishable from the in-workspace Switch above. The actor is built
+    /// here the way the restart-intent handler builds it (out of the picker's
+    /// `x-lucidos-device-id` header) rather than from the `device_actor()`
+    /// literal, so this pins the one link the feature turns on: that the header
+    /// resolves to a `Device` and therefore satisfies the fingerprint.
+    #[tokio::test]
+    async fn a_gateway_picker_restart_makes_a_chat_thread_a_resume_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let mut headers = axum::http::HeaderMap::new();
+        headers.insert(
+            crate::api::actor::HEADER_DEVICE_ID,
+            axum::http::HeaderValue::from_static("picker-device"),
+        );
+        let actor = crate::api::actor::user_actor(&headers, None, None);
+        assert!(
+            matches!(actor, Some(MessageOrigin::Device { .. })),
+            "the picker's device-id header must resolve to a Device actor"
+        );
+
+        let thread_id = Uuid::new_v4();
+        seed_turn(&bus, thread_id, None).await;
+        tick().await;
+        emit_abort(&bus, thread_id, actor, AbortCause::EngineShutdown).await;
+
+        assert!(
+            candidates_contain(&pool, thread_id).await,
+            "a chat thread interrupted by a picker Restart must auto-resume, exactly \
+             as one interrupted by the in-workspace Switch does"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
     /// Loop-breaker: `continue_chat` emits `ContinuationStarted`, which is in the
     /// shared start set — so a resume that itself dies before producing anything
     /// else falls back to the manual Continue instead of resuming forever.
@@ -651,6 +688,95 @@ mod switch_resume {
         assert!(
             !candidates_contain(&pool, thread_id).await,
             "the switch abort has been consumed by a resume — a second boot must not re-resume it"
+        );
+
+        pool.close().await;
+        teardown_test_db(&db_name).await;
+    }
+
+    /// THE 2026-08-07 REPORT, at the shape it actually had. A chat thread whose
+    /// previous turn had already ENDED (`ResponseGenerated`) was woken 1.5
+    /// seconds into a *Switch to new version* by a `BackgroundBashCompleted`
+    /// resolving its `await_event`, ran for fourteen seconds, and was then
+    /// aborted by the teardown. It settled `failed` with a manual Continue while
+    /// its two coding-agent siblings settled `paused` and auto-resumed.
+    ///
+    /// Two things had to hold for it to be a candidate, and only one of them is
+    /// about the actor:
+    ///
+    /// * The abort has to carry the teardown's DEVICE actor. It did not: the
+    ///   thread reached `processing_thread_ids()` after the pre-emit's snapshot,
+    ///   so it took the `shutdown_active_threads` fallback, which hardcoded a
+    ///   system actor. That is what `teardown_actor()` fixes.
+    /// * The loop-breaker has to leave the abort unsuperseded. A wake turn is
+    ///   anchored on a `UserPromptInjected`, which is deliberately NOT in
+    ///   `THREAD_START_EVENTS_SQL`, so "newer than the latest start" is measured
+    ///   against the ORIGINAL `MessageReceived`, several turns back. It holds,
+    ///   and it is worth pinning: the completed turn in between is exactly the
+    ///   shape that would make a start-set edit look harmless here.
+    #[tokio::test]
+    async fn a_thread_woken_by_an_event_mid_teardown_is_a_resume_candidate() {
+        let (pool, db_name) = setup_test_db().await;
+        let (bus, _rx) = EventBus::new(pool.clone());
+
+        let thread_id = Uuid::new_v4();
+        seed_turn(&bus, thread_id, None).await;
+        tick().await;
+        // That turn finished normally: the model armed an `await_event` and
+        // ended its response. Nothing is in flight at this point.
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::ResponseGenerated {
+                text: "The watcher is armed and I am done for now.".into(),
+                images: vec![],
+                model: None,
+                reasoning_effort: None,
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+
+        // The subscribed event lands and wakes the thread into a NEW turn. The
+        // anchor is the injection, not a `MessageReceived`.
+        tick().await;
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event: ThreadEvent::UserPromptInjected {
+                text: "An event you subscribed to has arrived.".into(),
+                mode: ActorMode::Agent,
+                origin: None,
+                injected_message_id: None,
+                delivered_event_id: Some(Uuid::new_v4()),
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+
+        tick().await;
+        emit_abort(
+            &bus,
+            thread_id,
+            Some(device_actor()),
+            AbortCause::EngineShutdown,
+        )
+        .await;
+
+        assert!(
+            candidates_contain(&pool, thread_id).await,
+            "a wake turn interrupted by the same user switch as its siblings must \
+             auto-resume too: when it became in-flight is not a property of the teardown"
+        );
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
+                .bind(thread_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            status, "paused",
+            "and it must read as paused, not as the red 'failed' the user reported"
         );
 
         pool.close().await;

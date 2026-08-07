@@ -9,7 +9,8 @@
  *     → SSE frame { type: "ThreadEvent",
  *                   data: { event: { type: "NavigationRequested", payload } } }
  *     → thread-sync.ts handleTransientSideEffects → handleNavigationRequest
- *     → switchMenuItem('settings') + openSettingsSubview('backup')
+ *     → openSettingsSubview('backup')   (one call: it lands the Settings menu
+ *       item AND the sub-section, so the deep link is a single nav-history entry)
  *     → SettingsView renders <BackupSection/>.
  *
  * We drive the same POST /api/v1/ui/navigate endpoint the SDK's

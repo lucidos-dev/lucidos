@@ -77,6 +77,7 @@ import {
   type RestoreDraft,
 } from './workspaceForms';
 import { pickerFooter, type FooterMode } from './PickerFooter';
+import { restoreBanner } from './RestoreBanner';
 
 /** Derived display state — collapses health + last_error into one status the row
  *  renders as a dot. A stopped workspace reports `unhealthy` + "not started"; we
@@ -96,17 +97,10 @@ const STATE_LABEL: Record<PickerState, string> = {
   unhealthy: 'Unhealthy',
 };
 
-/** Coarse phase labels the engine `restore-archive` CLI reports through the
- *  gateway's restore status. */
-const RESTORE_PHASE_LABELS: Record<string, string> = {
-  starting: 'Starting…',
-  restoring: 'Restoring…',
-  decrypting: 'Decrypting…',
-  decompressing: 'Decompressing…',
-  initializing: 'Unpacking files…',
-  restoring_db: 'Restoring database…',
-  done: 'Finishing…',
-};
+/** How long the "Restored X" confirmation stays up before the picker clears the
+ *  gateway's terminal status and the banner leaves. Long enough to read, short
+ *  enough that it is gone by the time the user reaches for the new row. */
+const RESTORE_DONE_LINGER_MS = 6000;
 
 /** Quick-fill names offered in the create form while the name field is empty —
  *  the first-run "name your first workspace" nudge. Clicking one fills the
@@ -524,8 +518,9 @@ export function WorkspacePicker() {
   }, [autoOpening.value]);
 
   // First run: when the picker loads with zero workspaces, unfold the create
-  // form so the user names their first workspace right away, instead of the
-  // passive "No workspaces yet" dead-end (and instead of a pre-made `default`).
+  // form so the user names their first workspace right away, instead of an
+  // empty screen (and instead of a pre-made `default`). The unfolded form is
+  // what says "start here", so nothing narrates it in prose above.
   // The field stays empty and editable; the suggestion chips ("personal" /
   // "work") offer a one-click fill. Both entry points stay visible above it, so
   // this never hides restore: the case ADR 0015 exists for (a user with a backup
@@ -540,6 +535,42 @@ export function WorkspacePicker() {
       footerMode.value = 'create';
     }
   }, [workspaces.value]);
+
+  // A finished restore states itself once and then gets out of the way. The
+  // restored workspace is already a row in the list above, healthy and
+  // clickable, so the completed banner carries no buttons (see RestoreBanner);
+  // clearing the gateway's terminal status is what makes it leave, and the
+  // picker does that on a timer rather than asking the user to tidy up after a
+  // success. A FAILED restore is deliberately excluded: it keeps its Dismiss.
+  //
+  // Keyed on the restored workspace's id, NOT on the status object: the 2s poll
+  // hands back a fresh object every tick, and an object-keyed effect would
+  // cancel and re-arm the timer on every one of them, so it would never fire.
+  // `clearRetry` re-arms after a failed clear, which is the only other way the
+  // key can change.
+  const clearRetry = useSignal(0);
+  const completedRestoreId =
+    restoreStatus.value?.status === 'completed' ? restoreStatus.value.id : null;
+  useEffect(() => {
+    if (!completedRestoreId) return;
+    const timer = setTimeout(() => {
+      void clearRestoreStatus()
+        .then(() => {
+          // Drop the banner now rather than waiting up to a poll tick for the
+          // gateway to answer idle.
+          if (restoreStatus.value?.status === 'completed') restoreStatus.value = { status: 'idle' };
+        })
+        .catch((e) => {
+          // Best-effort and self-recovering, per frontend.md's telemetry
+          // carve-out: nothing the user asked for failed (they pressed nothing),
+          // and bumping the retry re-arms the timer for another attempt, so a
+          // blip cannot strand a buttonless banner on screen.
+          console.warn('[picker] clearing the finished restore failed; retrying', e);
+          clearRetry.value++;
+        });
+    }, RESTORE_DONE_LINGER_MS);
+    return () => clearTimeout(timer);
+  }, [completedRestoreId, clearRetry.value]);
 
   // Ref to the create form's name input so a suggestion chip can fill it and
   // hand focus back (select the filled text so the user can type over it).
@@ -779,7 +810,6 @@ export function WorkspacePicker() {
             <LucidosMark />
             <h1>Lucidos</h1>
           </div>
-          <p>Choose a workspace</p>
         </header>
 
         {error.value && <div class="ws-picker-error">{error.value}</div>}
@@ -789,16 +819,9 @@ export function WorkspacePicker() {
         )}
 
         <LoadingFade showSkeleton={showListSkeleton} skeleton={<PickerSkeleton rows={skeletonRows} />}>
-        {v.status === 'loaded' && v.data.length === 0 && (
-          <div class="ws-picker-empty">
-            {footerMode.value === 'restore'
-              ? 'Bring a workspace back from a backup you already have.'
-              : footerMode.value === 'create'
-                ? 'Name your first workspace to get started, or restore one from a backup.'
-                : 'No workspaces yet. Create one, or restore from a backup.'}
-          </div>
-        )}
-
+        {/* Nothing stands in for an empty list: the two footer entry points and
+            their fields say what they do, so a sentence restating them is noise
+            on the first screen a new user meets. */}
         {v.status === 'loaded' && (
           <ul class="ws-picker-list">
             {v.data.map((w) => {
@@ -1047,25 +1070,7 @@ export function WorkspacePicker() {
         )}
         </LoadingFade>
 
-        {restore && restore.status === 'running' && (
-          <div class="ws-picker-restore-banner" data-state="running">
-            <span class="ws-picker-restore-spinner" />
-            <span>Restoring “{restore.name}” — {RESTORE_PHASE_LABELS[restore.phase] || restore.phase}</span>
-          </div>
-        )}
-        {restore && restore.status === 'completed' && (
-          <div class="ws-picker-restore-banner" data-state="completed">
-            <span>Restored “{restore.name}”</span>
-            <button class="ws-picker-btn ws-picker-btn-confirm" onClick={() => openWorkspace(restore.id)}>Open</button>
-            <button class="ws-picker-btn" disabled={busy.value} onClick={onDismissRestore}>Dismiss</button>
-          </div>
-        )}
-        {restore && restore.status === 'failed' && (
-          <div class="ws-picker-restore-banner" data-state="failed">
-            <span>Restore failed: {restore.error}</span>
-            <button class="ws-picker-btn" disabled={busy.value} onClick={onDismissRestore}>Dismiss</button>
-          </div>
-        )}
+        {restoreBanner({ status: restore, busy: busy.value, onDismiss: onDismissRestore })}
 
         {pickerFooter({
           mode: footerMode.value,

@@ -39,7 +39,7 @@ const MAX_FILES_TOTAL: usize = 120;
 /// semantically, and the doc body one `load_knowhow` away carries the detail,
 /// so length buys nothing here and is billed on every turn of every thread.
 ///
-/// The engine's OWN system-knowhow descriptions are held to 700 chars by
+/// The engine's OWN system-knowhow descriptions are held to 400 chars by
 /// `system_knowhow_descriptions_stay_routing_sized`, a hard-failing test. That
 /// instrument does not work on text the user owns, so the engine truncates at
 /// render time instead. Same intent, enforced where it can be.

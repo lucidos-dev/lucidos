@@ -252,9 +252,10 @@
         display: none;
     }
 
-    /* The content-dissolve fade (background + upward bg-colored box-shadow)
-       now lives in the base .prompt-area rule (panels/content.css) so it
-       renders on desktop too. Mobile keeps only its layout-specific overrides. */
+    /* The content-dissolve fade (opaque background + the .prompt-area::before
+       gradient band above it) now lives in the base .prompt-area rule
+       (panels/content.css) so it renders on desktop too. Mobile keeps only its
+       layout-specific overrides. */
     .prompt-area {
         margin-bottom: 0;
         /* No horizontal override: the base rule's --thread-pane-gutter (plus the

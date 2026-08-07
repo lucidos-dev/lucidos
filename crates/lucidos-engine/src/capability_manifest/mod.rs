@@ -560,23 +560,23 @@ const TRIGGER_SLUG_ARG: Arg = Arg {
 // run object) so execute_scheduler_tool reads the args unchanged. `cron`/`on`
 // allow null so the unioned property serves both create and update (clearing).
 const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
-  "name": {"type":"string","description":"A short, descriptive name for the trigger."},
-  "run": {"type":"object","description":"{ type: 'intent', intent: '…' }, one sentence in the user's voice with the procedure left to knowhow the trigger loads at fire time, or { type: 'script', path: 'name/run.py' }."},
+  "name": {"type":"string","description":"Short and descriptive."},
+  "run": {"type":"object","description":"{ type: 'intent', intent: '…' } in the user's voice with the procedure left to knowhow, or { type: 'script', path: 'name/run.py' }."},
   "cron": {"description":"6 fields in the USER'S LOCAL TIME (second minute hour day-of-month month day-of-week); '0 0 8 * * *' is 8am daily. Fields AND within one expression, expressions OR across the array. A string, an array, or null.","oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"minItems":1},{"type":"null"}]},
   "on": {"description":"Each { event_type: 'X', condition?: {…} }, operators $eq/$ne/$lt/$lte/$gt/$gte/$in. A string, an array, or null.","anyOf":[{"type":"null"},{"type":"string"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"object","properties":{"event_type":{"type":"string"},"condition":{"type":"object"}},"required":["event_type"]}]}}]},
-  "app_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Owning app directory name; notifications deep-link there. Null for a standalone trigger."},
-  "go_to_review": {"type":"boolean","description":"Threads this trigger spawns surface in REVIEW on completion, not ARCHIVE. Default false."},
-  "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Omit or null for ungrouped."}
+  "app_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Owning app directory name; notifications deep-link there. Null for standalone."},
+  "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
+  "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."}
 }"#;
 const TRIGGER_UPDATE_LLM_SCHEMA: &str = r#"{
   "trigger_id": {"type":"string","description":"UUID of the trigger to act on."},
-  "paused": {"type":"boolean","description":"Pause (true) or resume (false) inside a multi-field update; prefer the standalone actions."}
+  "paused": {"type":"boolean","description":"Pause/resume inside a multi-field update; prefer the standalone actions."}
 }"#;
 
 const TRIGGERS_OPS: &[Operation] = &[
     Operation {
         action: "create",
-        summary: "Create a NEW trigger: cron, event-based `on`, or both. Update an existing one rather than recreating.",
+        summary: "Create a NEW trigger: cron, event-based `on`, or both.",
         method: Method::Post,
         path: "/triggers",
         args: &[
@@ -601,7 +601,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "list",
-        summary: "All triggers with their names, schedules, subscriptions and what each runs.",
+        summary: "Every trigger with its schedule, subscriptions and what it runs.",
         method: Method::Get,
         path: "/triggers",
         args: &[],
@@ -616,7 +616,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "update",
-        summary: "Update name, schedule, subscriptions or run config in place. Prefer it over delete plus create, which loses run history. Send the full replacement 'on' array.",
+        summary: "Update name, schedule, subscriptions or run config in place, keeping run history. Send the full replacement 'on' array.",
         method: Method::Put,
         path: "/triggers",
         args: &[
@@ -643,7 +643,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "delete",
-        summary: "Delete a trigger by id; it orphans the run history, so prefer update for tweaks.",
+        summary: "Delete a trigger; it orphans the run history, so prefer update for tweaks.",
         method: Method::Delete,
         path: "/triggers",
         args: &[TRIGGER_ID_QUERY_ARG],
@@ -658,7 +658,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "pause",
-        summary: "Stop it firing on its schedule and matching events; config preserved.",
+        summary: "Stop it firing; config preserved.",
         method: Method::Put,
         path: "/triggers",
         args: &[],
@@ -675,7 +675,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "resume",
-        summary: "Fire on its schedule and match events again.",
+        summary: "Fire on schedule and match events again.",
         method: Method::Put,
         path: "/triggers",
         args: &[],
@@ -690,7 +690,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "run",
-        summary: "Fire an existing trigger ONCE, right now, off-schedule, under its own identity, side-effect grant and go_to_review, recording TriggerExecuted and last_run. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).",
+        summary: "Fire it ONCE now, off-schedule. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).",
         method: Method::Post,
         path: "/triggers/run",
         args: &[TRIGGER_ID_QUERY_ARG],
@@ -1040,7 +1040,7 @@ const EVENTS_OPS: &[Operation] = &[
     },
     Operation {
         action: "count",
-        summary: "Count by type and time without materialising payloads. With event_type: {count, byte_total}; without: a per-type breakdown, count desc. Call BEFORE 'query' on busy windows.",
+        summary: "Count by type and time without materialising payloads. With event_type: {count, byte_total}; without: a per-type breakdown, count desc.",
         method: Method::Get,
         path: "/events/count",
         args: &[],
@@ -1058,7 +1058,7 @@ const EVENTS_OPS: &[Operation] = &[
 const EVENTS_DOMAIN: Domain = Domain {
     name: "events",
     tool_name: "events",
-    tool_summary: "The workspace's event store, domain and engine events alike in one table. Call 'count' first on a busy workspace, then 'query' the narrowest types, rather than enumerating everything into context.",
+    tool_summary: "The workspace's event store, domain and engine events alike in one table. On a busy workspace call 'count' first, then 'query' the narrowest types.",
     llm: true,
     // The `lucidos events` CLI is a richer hand-written command (before/after
     // cursors); not regenerated. No SDK consumer. Grouped LLM tool only.
@@ -1143,7 +1143,7 @@ const MODEL_ID_BODY_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "The string sent in API requests (e.g. 'z-ai/glm-5.2'). Required for add/enable/disable/remove.",
+    description: "The string sent in API requests (e.g. 'z-ai/glm-5.2').",
 };
 const MODEL_ID_QUERY_ARG: Arg = Arg {
     name: "id",
@@ -1159,7 +1159,7 @@ const MODEL_LABEL_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Human-friendly display name for 'add' (defaults to the id).",
+    description: "Display name; defaults to the id.",
 };
 const MODEL_PROVIDER_ARG: Arg = Arg {
     name: "provider",
@@ -1167,7 +1167,7 @@ const MODEL_PROVIDER_ARG: Arg = Arg {
     enum_values: MODEL_PROVIDER_ENUM,
     required: true,
     loc: ArgIn::Body,
-    description: "Backend that serves the model. Required for 'add'.",
+    description: "Backend that serves the model.",
 };
 const MODEL_PROVIDER_OPT_ARG: Arg = Arg {
     name: "provider",
@@ -1199,7 +1199,7 @@ const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose: too low only trims context early, too high makes the provider reject the request.",
+    description: "Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose.",
 };
 
 const MODELS_OPS: &[Operation] = &[
@@ -1241,7 +1241,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "enable",
-        summary: "Show an existing model in the picker.",
+        summary: "Show it in the picker.",
         method: Method::Put,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1258,8 +1258,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "disable",
-        summary:
-            "Disable an existing model (hide it from the picker; builtins disable, never delete).",
+        summary: "Hide it from the picker; builtins disable, never delete.",
         method: Method::Put,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1297,7 +1296,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "remove",
-        summary: "Delete a user-added model; a builtin can only be disabled.",
+        summary: "Delete a user-added model.",
         method: Method::Delete,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1814,21 +1813,21 @@ const TQ_ENTRY_ID_ARG: Arg = Arg {
 // Mirrors the flat update_thread_queue_policy schema (cap_schema + overflow).
 // Every field optional — the handler merges the patch with the live policy.
 const TQ_POLICY_LLM_SCHEMA: &str = r#"{
-  "max_concurrent_total": {"type":"integer","minimum":0,"description":"Concurrent threads of every kind, background and user-initiated alike."},
-  "max_concurrent_event_trigger": {"type":"integer","minimum":0,"description":"Concurrent event-trigger fires."},
-  "max_concurrent_cron": {"type":"integer","minimum":0,"description":"Concurrent cron-trigger fires."},
-  "max_concurrent_sub_thread": {"type":"integer","minimum":0,"description":"Concurrent agent-spawned sub-thread chats."},
-  "max_concurrent_coding_agent": {"type":"integer","minimum":0,"description":"Concurrent agent-spawned coding-agent threads."},
-  "max_concurrent_per_trigger": {"type":"integer","minimum":0,"description":"Concurrent runs of one trigger; 1 preserves strict per-trigger FIFO."},
-  "max_queued_per_trigger": {"type":"integer","minimum":1,"description":"Queued backlog for one trigger before overflow applies."},
-  "reserved_background": {"type":"integer","minimum":0,"description":"Slots background work can reclaim ahead of user work. 0 is pure user priority."},
+  "max_concurrent_total": {"type":"integer","minimum":0,"description":"Every kind, background and user work alike."},
+  "max_concurrent_event_trigger": {"type":"integer","minimum":0},
+  "max_concurrent_cron": {"type":"integer","minimum":0},
+  "max_concurrent_sub_thread": {"type":"integer","minimum":0,"description":"Agent-spawned sub-thread chats."},
+  "max_concurrent_coding_agent": {"type":"integer","minimum":0},
+  "max_concurrent_per_trigger": {"type":"integer","minimum":0,"description":"Runs of one trigger; 1 preserves strict per-trigger FIFO."},
+  "max_queued_per_trigger": {"type":"integer","minimum":1,"description":"Backlog for one trigger before overflow applies."},
+  "reserved_background": {"type":"integer","minimum":0,"description":"Slots background work reclaims ahead of user work; 0 is pure user priority."},
   "overflow": {"type":"string","enum":["drop-oldest","pause-trigger"],"description":"On reaching max_queued_per_trigger."}
 }"#;
 
 const THREAD_QUEUE_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "Live queue plus the active capacity policy ({ entries, policy }), user-initiated occupants included. Call it before changing capacity, so a relative request starts from the live numbers.",
+        summary: "Live queue and active policy as { entries, policy }, user-initiated occupants included.",
         method: Method::Get,
         path: "/thread-queue",
         args: &[],
@@ -1843,7 +1842,7 @@ const THREAD_QUEUE_OPS: &[Operation] = &[
     },
     Operation {
         action: "update_policy",
-        summary: "Change only the cap fields you send, merged with the live policy. max_queued_per_trigger is at least 1.",
+        summary: "Only the cap fields you send, merged with the live policy.",
         method: Method::Put,
         path: "/thread-queue/policy",
         args: &[],
@@ -1894,7 +1893,7 @@ const THREAD_QUEUE_OPS: &[Operation] = &[
 const THREAD_QUEUE_DOMAIN: Domain = Domain {
     name: "thread_queue",
     tool_name: "thread_queue",
-    tool_summary: "Inspect and tune the Thread Queue, the shared admission-control pool for background spawns AND user-initiated work. Call 'list' before a relative change like 'double capacity'. A concurrency cap may be 0 to hold admission; keep max_concurrent_per_trigger at 1 unless one trigger should run its fires concurrently.",
+    tool_summary: "The Thread Queue: admission control for background spawns AND user-initiated work. Call 'list' before a relative change like 'double capacity'. A cap of 0 holds admission.",
     llm: true,
     cli: true,
     sdk: false,

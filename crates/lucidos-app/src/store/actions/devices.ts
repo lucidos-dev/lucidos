@@ -8,8 +8,9 @@ import { errorDetail } from '../../utils/errorDetail';
 import { isTauri, registrationUserAgent } from '../../utils/platform';
 import { getOrCreateDeviceId } from '../../utils/tauri';
 import { generateUuid } from '../../utils/uuid';
-
-const DEVICE_ID_KEY = 'lucidos-device-id';
+// The key is owned by the leaf that also builds the request header, so the id
+// this module mints and the id every API call sends cannot drift apart.
+import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
 
 /** Upper bound on the native-store reconcile so a wedged IPC can't hold the boot
  *  splash — past it, boot proceeds on the existing localStorage value. */

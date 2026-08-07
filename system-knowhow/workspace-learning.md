@@ -1,6 +1,6 @@
 ---
 name: Workspace Learning
-description: Recipe for learning from a workspace's recent events — proposing improvements to apps, triggers, knowhow, and scripts based on observed friction. Use when the user asks what to learn from the runtime, where things aren't working well, or what patterns the events show.
+description: Recipe for learning from a workspace's recent events, proposing improvements to apps, triggers, knowhow and scripts based on observed friction. Use when the user asks what to learn from the runtime, where things aren't working, or what patterns the events show.
 ---
 
 # Workspace Learning

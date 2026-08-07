@@ -1,6 +1,7 @@
+use super::register::ARMING_LOOKBACK_SECS;
 use super::*;
-use crate::engine::event_bus::{BusEvent, EventBus};
-use crate::test_support::{setup_test_db, teardown_test_db};
+use crate::engine::event_bus::EventBus;
+use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 use serde_json::json;
 
 fn sub(event_type: &str, condition: Option<Value>) -> EventSubscription {
@@ -19,7 +20,7 @@ fn lookback_of(items: &[(&str, Value, i64)]) -> ArmingLookback {
             .map(|(event_type, payload, ago)| LookbackMatch {
                 event_type: (*event_type).to_string(),
                 payload: payload.clone(),
-                created: Utc::now() - chrono::Duration::seconds(*ago),
+                age_secs: *ago,
             })
             .collect(),
         more: false,
@@ -233,7 +234,6 @@ fn the_registration_result_says_nothing_is_blocking() {
     let engine_side = super::register::registered_tool_result_text(
         &wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0),
         None,
-        Utc::now(),
     );
     assert!(engine_side.contains("ChangeProposed"), "{engine_side}");
     assert!(
@@ -292,7 +292,7 @@ fn every_subscription_text_says_where_the_subscription_stands() {
     let shapes: Vec<(&str, String, &str)> = vec![
         (
             "registration",
-            super::register::registered_tool_result_text(&w, None, Utc::now()),
+            super::register::registered_tool_result_text(&w, None),
             "Nothing is blocking",
         ),
         (
@@ -300,7 +300,6 @@ fn every_subscription_text_says_where_the_subscription_stands() {
             super::register::registered_tool_result_text(
                 &w,
                 Some(&lookback_of(&[("ChangeProposed", payload.clone(), 26)])),
-                Utc::now(),
             ),
             "will NOT wake you",
         ),
@@ -342,24 +341,21 @@ async fn a_child_completion_card_matches_a_wait_watching_for_one() {
 
     let parent_id = Uuid::new_v4();
     seed_thread(&bus, parent_id).await;
-    let emitted = bus
-        .emit(BusEvent::Thread {
-            thread_id: parent_id,
-            event: ThreadEvent::ChildThreadCompleted {
-                child_thread_id: Uuid::new_v4(),
-                child_thread_title: Some("Nightly E2E".into()),
-                status: crate::engine::thread_events::ChildCompletionStatus::Success,
-                summary: "all green".into(),
-                pending_change_ids: vec![],
-            },
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap()
-        .expect("the card must persist");
+    let card_id = seed_thread_event(
+        &bus,
+        parent_id,
+        ThreadEvent::ChildThreadCompleted {
+            child_thread_id: Uuid::new_v4(),
+            child_thread_title: Some("Nightly E2E".into()),
+            status: crate::engine::thread_events::ChildCompletionStatus::Success,
+            summary: "all green".into(),
+            pending_change_ids: vec![],
+        },
+    )
+    .await;
 
     let row = crate::core::store::EventStore::new(pool.clone())
-        .get_event_by_id(emitted.event_id)
+        .get_event_by_id(card_id)
         .await
         .unwrap()
         .expect("the card row");
@@ -401,9 +397,10 @@ async fn a_child_completion_card_matches_a_wait_watching_for_one() {
 
 async fn emit_subscribe(bus: &EventBus, thread_id: Uuid, on: Vec<EventSubscription>) -> Uuid {
     let wait_id = Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        bus,
         thread_id,
-        event: ThreadEvent::EventWaitStarted {
+        ThreadEvent::EventWaitStarted {
             wait_id,
             tool_use_id: format!("toolu_{}", wait_id.simple()),
             on,
@@ -412,11 +409,8 @@ async fn emit_subscribe(bus: &EventBus, thread_id: Uuid, on: Vec<EventSubscripti
             expires_at: Utc::now() + chrono::Duration::hours(1),
             watermark: 0,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .expect("EventWaitStarted emit")
-    .expect("EventWaitStarted persisted");
+    )
+    .await;
     wait_id
 }
 
@@ -431,18 +425,17 @@ async fn rebuild_recovers_a_live_wait_and_skips_resolved_ones() {
     // A wait that already resolved must NOT come back on boot.
     let done_thread = Uuid::new_v4();
     let done_id = emit_subscribe(&bus, done_thread, vec![sub("ChangeProposed", None)]).await;
-    bus.emit(BusEvent::Thread {
-        thread_id: done_thread,
-        event: ThreadEvent::EventWaitCanceled {
+    seed_thread_event(
+        &bus,
+        done_thread,
+        ThreadEvent::EventWaitCanceled {
             wait_id: done_id,
             cause: crate::engine::thread_events::EventWaitCancelCause::UserStop,
             on: vec![],
             reason: String::new(),
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 
     let waits = LiveWaits::new();
     let loaded = rebuild_live_waits(&pool, &waits).await.unwrap();
@@ -473,9 +466,10 @@ async fn rebuild_keeps_armed_at_and_falls_back_to_the_row_for_a_legacy_payload()
     let armed_at = Utc::now() - chrono::Duration::minutes(7);
     let recorded_thread = Uuid::new_v4();
     let recorded_id = Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
-        thread_id: recorded_thread,
-        event: ThreadEvent::EventWaitStarted {
+    seed_thread_event(
+        &bus,
+        recorded_thread,
+        ThreadEvent::EventWaitStarted {
             wait_id: recorded_id,
             tool_use_id: "toolu_armed".into(),
             on: vec![sub("ChangeProposed", None)],
@@ -484,10 +478,8 @@ async fn rebuild_keeps_armed_at_and_falls_back_to_the_row_for_a_legacy_payload()
             expires_at: Utc::now() + chrono::Duration::hours(1),
             watermark: 0,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 
     // A pre-2026-08-07 row: the same event with the field stripped from its
     // persisted payload, which is exactly what is on disk for a subscription
@@ -541,9 +533,10 @@ async fn rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down() {
 
     let thread_id = Uuid::new_v4();
     let wait_id = Uuid::new_v4();
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        &bus,
         thread_id,
-        event: ThreadEvent::EventWaitStarted {
+        ThreadEvent::EventWaitStarted {
             wait_id,
             tool_use_id: "toolu_stale".into(),
             on: vec![sub("ChangeProposed", None)],
@@ -552,10 +545,8 @@ async fn rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down() {
             expires_at: Utc::now() - chrono::Duration::hours(2),
             watermark: 0,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 
     let waits = LiveWaits::new();
     assert_eq!(rebuild_live_waits(&pool, &waits).await.unwrap(), 1);
@@ -580,13 +571,7 @@ async fn catch_up_finds_matches_after_the_watermark_and_ignores_earlier_ones() {
 
     let other_thread = Uuid::new_v4();
     // An event BEFORE the wait registers. It must not satisfy the wait.
-    bus.emit(BusEvent::Thread {
-        thread_id: other_thread,
-        event: ThreadEvent::ThreadArchived,
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    seed_thread_event(&bus, other_thread, ThreadEvent::ThreadArchived).await;
 
     let watermark: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM events")
         .fetch_one(&pool)
@@ -595,21 +580,9 @@ async fn catch_up_finds_matches_after_the_watermark_and_ignores_earlier_ones() {
 
     // Two matching events after the watermark, plus a non-matching one.
     for _ in 0..2 {
-        bus.emit(BusEvent::Thread {
-            thread_id: other_thread,
-            event: ThreadEvent::ThreadArchived,
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        seed_thread_event(&bus, other_thread, ThreadEvent::ThreadArchived).await;
     }
-    bus.emit(BusEvent::Thread {
-        thread_id: other_thread,
-        event: ThreadEvent::ThreadSaved,
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    seed_thread_event(&bus, other_thread, ThreadEvent::ThreadSaved).await;
 
     let wait = wait_with(Uuid::new_v4(), vec![sub("ThreadArchived", None)], watermark);
     // Only the FIRST match is returned: a wait is a rendezvous, and the scan
@@ -637,17 +610,16 @@ async fn catch_up_applies_the_condition_not_just_the_event_name() {
         .unwrap();
 
     for name in ["run_bash", "run_python"] {
-        bus.emit(BusEvent::Thread {
+        seed_thread_event(
+            &bus,
             thread_id,
-            event: ThreadEvent::ToolCalled {
+            ThreadEvent::ToolCalled {
                 name: name.into(),
                 args: json!({}),
                 description: String::new(),
             },
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        )
+        .await;
     }
 
     let wait = wait_with(
@@ -694,7 +666,6 @@ fn the_arming_lookback_leads_the_result_and_names_the_trap() {
             json!({"file_count": 11}),
             26,
         )])),
-        Utc::now(),
     );
 
     let report_at = text
@@ -729,12 +700,8 @@ fn the_arming_lookback_leads_the_result_and_names_the_trap() {
 #[test]
 fn an_empty_lookback_leaves_the_registration_result_untouched() {
     let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
-    let plain = super::register::registered_tool_result_text(&w, None, Utc::now());
-    let empty = super::register::registered_tool_result_text(
-        &w,
-        Some(&ArmingLookback::default()),
-        Utc::now(),
-    );
+    let plain = super::register::registered_tool_result_text(&w, None);
+    let empty = super::register::registered_tool_result_text(&w, Some(&ArmingLookback::default()));
     assert_eq!(plain, empty);
     assert!(!plain.contains("ALREADY HAPPENED"), "{plain}");
 }
@@ -751,7 +718,6 @@ fn the_report_renders_an_age_the_model_can_act_on() {
             ("ChangeProposed", json!({}), 5),
             ("ChangeProposed", json!({}), 134),
         ])),
-        Utc::now(),
     );
     assert!(text.contains("5s ago"), "{text}");
     assert!(text.contains("2m 14s ago"), "{text}");
@@ -767,7 +733,6 @@ fn a_fat_payload_is_truncated_but_still_identifies_its_event() {
     let text = super::register::registered_tool_result_text(
         &w,
         Some(&lookback_of(&[("ChangeProposed", huge, 12)])),
-        Utc::now(),
     );
 
     assert!(
@@ -798,7 +763,6 @@ fn truncating_a_payload_never_splits_a_character() {
     let text = super::register::registered_tool_result_text(
         &w,
         Some(&lookback_of(&[("ChangeProposed", emoji, 1)])),
-        Utc::now(),
     );
     assert!(text.contains("payload truncated"), "{text}");
     assert!(text.is_char_boundary(text.len()));
@@ -812,7 +776,7 @@ fn a_truncated_report_says_so_and_says_what_to_do() {
     let w = wait_with(Uuid::new_v4(), vec![sub("ToolCalled", None)], 0);
     let mut found = lookback_of(&[("ToolCalled", json!({"name": "run_bash"}), 3)]);
     found.more = true;
-    let text = super::register::registered_tool_result_text(&w, Some(&found), Utc::now());
+    let text = super::register::registered_tool_result_text(&w, Some(&found));
     assert!(text.contains("More matched than are shown"), "{text}");
     assert!(text.contains("condition"), "{text}");
     assert!(text.contains("trigger"), "{text}");
@@ -827,20 +791,14 @@ async fn the_lookback_finds_a_match_that_landed_before_the_wait_was_armed() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
-    bus.emit(BusEvent::Thread {
-        thread_id: Uuid::new_v4(),
-        event: ThreadEvent::ThreadArchived,
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    seed_thread_event(&bus, Uuid::new_v4(), ThreadEvent::ThreadArchived).await;
     let watermark = max_sequence(&pool).await;
 
     let found = arming_lookback_matches(
         &pool,
         &[sub("ThreadArchived", None)],
         watermark,
-        Utc::now() - chrono::Duration::minutes(3),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -874,13 +832,7 @@ async fn the_lookback_ignores_a_match_older_than_the_window() {
     let (pool, db_name) = setup_test_db().await;
     let (bus, _rx) = EventBus::new(pool.clone());
 
-    bus.emit(BusEvent::Thread {
-        thread_id: Uuid::new_v4(),
-        event: ThreadEvent::ThreadArchived,
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    seed_thread_event(&bus, Uuid::new_v4(), ThreadEvent::ThreadArchived).await;
     let watermark = max_sequence(&pool).await;
     // Back-date the row rather than sleeping: the boundary is `created`, and a
     // test that waits out a real window is a test nobody runs.
@@ -893,13 +845,101 @@ async fn the_lookback_ignores_a_match_older_than_the_window() {
         &pool,
         &[sub("ThreadArchived", None)],
         watermark,
-        Utc::now() - chrono::Duration::minutes(3),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
     .await
     .unwrap();
     assert!(found.is_empty(), "older than the window: {found:?}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// **Both ends of the window are the database's clock**, which is the whole
+/// reason the scan takes a duration instead of a cutoff instant (ADR 0053).
+///
+/// `created` is stamped by the server. A boundary the engine computes from its
+/// own `Utc::now()` therefore puts two clocks on opposite sides of one `>=`,
+/// and once they drift by more than the window EVERY row falls outside it: the
+/// scan reports nothing, the model is told nothing already happened, and it
+/// misses the event this mechanism exists to surface. Seven tests in this
+/// module failed together that way on 2026-08-07, every one of them reporting
+/// zero matches. The three that assert an EMPTY result could not see it.
+///
+/// Both rows are placed in SERVER time, so what is pinned here is the boundary
+/// itself rather than the agreement of two clocks. The margin is wide on
+/// purpose: a tighter one would only be testing how promptly the test ran.
+#[tokio::test]
+async fn the_lookback_window_is_measured_by_the_database_clock() {
+    /// Distance from the boundary, on each side. Slack for a loaded machine,
+    /// while still landing one row in the window and one out of it.
+    const MARGIN_SECS: i64 = 60;
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let other = Uuid::new_v4();
+
+    let mut ids = Vec::new();
+    for name in ["inside", "outside"] {
+        ids.push(
+            seed_thread_event(
+                &bus,
+                other,
+                ThreadEvent::ToolCalled {
+                    name: name.into(),
+                    args: json!({}),
+                    description: String::new(),
+                },
+            )
+            .await,
+        );
+    }
+    let watermark = max_sequence(&pool).await;
+
+    // Aged by the server, because that is the clock the scan will compare
+    // against. Doing this with a host-side timestamp is the bug itself.
+    for (id, age) in [
+        (ids[0], ARMING_LOOKBACK_SECS - MARGIN_SECS),
+        (ids[1], ARMING_LOOKBACK_SECS + MARGIN_SECS),
+    ] {
+        sqlx::query("UPDATE events SET created = now() - make_interval(secs => $2) WHERE id = $1")
+            .bind(id)
+            .bind(age)
+            .execute(&pool)
+            .await
+            .unwrap();
+    }
+
+    let found = arming_lookback_matches(
+        &pool,
+        &[sub("ToolCalled", None)],
+        watermark,
+        ARMING_LOOKBACK_SECS,
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+
+    let names: Vec<&str> = found
+        .matches
+        .iter()
+        .map(|m| m.payload["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        names,
+        vec!["inside"],
+        "one row each side of the boundary, both aged by the server"
+    );
+    // The age is server-arithmetic too, so it reflects the back-dating rather
+    // than the difference between two machines' idea of now.
+    let age = found.matches[0].age_secs;
+    assert!(
+        (ARMING_LOOKBACK_SECS - MARGIN_SECS..ARMING_LOOKBACK_SECS).contains(&age),
+        "the reported age is the database's own subtraction, was {age}s"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -916,26 +956,16 @@ async fn the_lookback_skips_an_event_the_thread_was_already_handed() {
 
     let mut ids = Vec::new();
     for _ in 0..2 {
-        let emitted = bus
-            .emit(BusEvent::Thread {
-                thread_id: other,
-                event: ThreadEvent::ThreadArchived,
-                meta: EventMeta::NONE,
-            })
-            .await
-            .unwrap()
-            .expect("persisted");
-        ids.push(emitted.event_id);
+        ids.push(seed_thread_event(&bus, other, ThreadEvent::ThreadArchived).await);
     }
     let watermark = max_sequence(&pool).await;
-    let since = Utc::now() - chrono::Duration::minutes(3);
 
     let handed: std::collections::HashSet<Uuid> = [ids[0]].into_iter().collect();
     let found = arming_lookback_matches(
         &pool,
         &[sub("ThreadArchived", None)],
         watermark,
-        since,
+        ARMING_LOOKBACK_SECS,
         &handed,
         3,
     )
@@ -947,7 +977,7 @@ async fn the_lookback_skips_an_event_the_thread_was_already_handed() {
         &pool,
         &[sub("ThreadArchived", None)],
         watermark,
-        since,
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -973,17 +1003,16 @@ async fn the_lookback_reports_the_newest_matches_up_to_the_limit() {
     let other = Uuid::new_v4();
 
     for name in ["a", "b", "c", "d", "e"] {
-        bus.emit(BusEvent::Thread {
-            thread_id: other,
-            event: ThreadEvent::ToolCalled {
+        seed_thread_event(
+            &bus,
+            other,
+            ThreadEvent::ToolCalled {
                 name: name.into(),
                 args: json!({}),
                 description: String::new(),
             },
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        )
+        .await;
     }
     let watermark = max_sequence(&pool).await;
 
@@ -991,7 +1020,7 @@ async fn the_lookback_reports_the_newest_matches_up_to_the_limit() {
         &pool,
         &[sub("ToolCalled", None)],
         watermark,
-        Utc::now() - chrono::Duration::minutes(3),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -1020,17 +1049,16 @@ async fn the_lookback_applies_the_condition_not_just_the_event_name() {
     let other = Uuid::new_v4();
 
     for name in ["run_bash", "run_python"] {
-        bus.emit(BusEvent::Thread {
-            thread_id: other,
-            event: ThreadEvent::ToolCalled {
+        seed_thread_event(
+            &bus,
+            other,
+            ThreadEvent::ToolCalled {
                 name: name.into(),
                 args: json!({}),
                 description: String::new(),
             },
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        )
+        .await;
     }
     let watermark = max_sequence(&pool).await;
 
@@ -1038,7 +1066,7 @@ async fn the_lookback_applies_the_condition_not_just_the_event_name() {
         &pool,
         &[sub("ToolCalled", Some(json!({"name": "run_bash"})))],
         watermark,
-        Utc::now() - chrono::Duration::minutes(3),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -1061,19 +1089,13 @@ async fn the_lookback_stops_at_the_watermark() {
     let other = Uuid::new_v4();
 
     let watermark = max_sequence(&pool).await;
-    bus.emit(BusEvent::Thread {
-        thread_id: other,
-        event: ThreadEvent::ThreadArchived,
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    seed_thread_event(&bus, other, ThreadEvent::ThreadArchived).await;
 
     let found = arming_lookback_matches(
         &pool,
         &[sub("ThreadArchived", None)],
         watermark,
-        Utc::now() - chrono::Duration::minutes(3),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -1102,17 +1124,16 @@ async fn the_lookback_gives_up_rather_than_paging_a_busy_window() {
 
     let seeded = ARMING_LOOKBACK_MAX_PAGES * (CATCH_UP_PAGE as usize) + 50;
     for i in 0..seeded {
-        bus.emit(BusEvent::Thread {
-            thread_id: other,
-            event: ThreadEvent::ToolCalled {
+        seed_thread_event(
+            &bus,
+            other,
+            ThreadEvent::ToolCalled {
                 name: format!("noise_{i}"),
                 args: json!({}),
                 description: String::new(),
             },
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        )
+        .await;
     }
     let watermark = max_sequence(&pool).await;
 
@@ -1124,7 +1145,7 @@ async fn the_lookback_gives_up_rather_than_paging_a_busy_window() {
             Some(json!({"name": "nothing_matches_this"})),
         )],
         watermark,
-        Utc::now() - chrono::Duration::minutes(3),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -1142,22 +1163,21 @@ async fn the_lookback_gives_up_rather_than_paging_a_busy_window() {
 
     // A match inside the budget is still found, so the cap did not simply
     // break the scan.
-    bus.emit(BusEvent::Thread {
-        thread_id: other,
-        event: ThreadEvent::ToolCalled {
+    seed_thread_event(
+        &bus,
+        other,
+        ThreadEvent::ToolCalled {
             name: "findable".into(),
             args: json!({}),
             description: String::new(),
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
     let near = arming_lookback_matches(
         &pool,
         &[sub("ToolCalled", Some(json!({"name": "findable"})))],
         max_sequence(&pool).await,
-        Utc::now() - chrono::Duration::minutes(3),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -1176,7 +1196,7 @@ async fn the_lookback_on_an_empty_subscription_list_queries_nothing() {
         &pool,
         &[],
         i64::MAX,
-        Utc::now(),
+        ARMING_LOOKBACK_SECS,
         &std::collections::HashSet::new(),
         3,
     )
@@ -1304,13 +1324,70 @@ async fn a_delivered_wait_does_not_come_back_on_the_next_boot() {
     teardown_test_db(&db_name).await;
 }
 
+/// A wake the teardown declined costs nothing, because the next engine
+/// delivers it. This is the property that makes
+/// `LucidosEngine::shutdown_declines_wake` safe, and the reason it must be
+/// consulted BEFORE `LiveWaits::take` rather than after.
+///
+/// Declining is, by construction, doing nothing: the wait is never taken and no
+/// resolution is emitted, so what the next engine sees is exactly the state this
+/// test sets up. The 2026-08-07 report is the case it covers. A
+/// `BackgroundBashCompleted` matched a live wait 1.5 seconds into a *Switch to
+/// new version*, and the wake ran a chat turn against an engine with fourteen
+/// seconds to live. With the gate, that same match is simply picked up by the
+/// engine that replaces it.
+#[tokio::test]
+async fn a_wait_the_teardown_declined_is_delivered_by_the_next_engine() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let thread_id = Uuid::new_v4();
+    let wait_id = emit_subscribe(&bus, thread_id, vec![sub("ThreadArchived", None)]).await;
+
+    // The match lands while the engine is tearing down. The gate returns before
+    // the take, so nothing is resolved and nothing is persisted for it.
+    bus.emit(BusEvent::Thread {
+        thread_id: Uuid::new_v4(),
+        event: ThreadEvent::ThreadArchived,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    // The next engine boots and rebuilds its cache.
+    let after_restart = LiveWaits::new();
+    assert_eq!(
+        rebuild_live_waits(&pool, &after_restart).await.unwrap(),
+        1,
+        "an undelivered wait must come back armed: the declined resolution left \
+         no `EventWaitDelivered` to retire it"
+    );
+    let rebuilt = after_restart
+        .take(wait_id)
+        .await
+        .expect("the wait is live again");
+
+    // And its own catch-up scan finds the event it slept through, because the
+    // watermark is still the registration sequence, below the match.
+    let (_, event_type, _, idx) = catch_up_from_watermark(&pool, &rebuilt)
+        .await
+        .unwrap()
+        .expect("the match the teardown declined");
+    assert_eq!(event_type, "ThreadArchived");
+    assert_eq!(idx, 0);
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 /// Seed a chat thread so `thread_summaries` has a row. The `EventWaitStarted`
 /// projection is an UPDATE, not an upsert, so a status assertion needs a real
 /// turn to have started first (in production one always has).
 async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        bus,
         thread_id,
-        event: ThreadEvent::MessageReceived {
+        ThreadEvent::MessageReceived {
             text: "start the work".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1323,10 +1400,8 @@ async fn seed_thread(bus: &EventBus, thread_id: Uuid) {
             reasoning_effort: None,
             origin: None,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 }
 
 // ── no resolution moves the status ──────────────────────────────────
@@ -1376,13 +1451,7 @@ async fn no_event_wait_resolution_touches_the_status() {
         },
     ] {
         let label = event.event_type();
-        bus.emit(BusEvent::Thread {
-            thread_id,
-            event,
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        seed_thread_event(&bus, thread_id, event).await;
         assert_eq!(
             status(pool.clone()).await,
             "running",
@@ -1405,18 +1474,17 @@ async fn a_thread_holding_a_subscription_is_idle() {
     let thread_id = Uuid::new_v4();
     seed_thread(&bus, thread_id).await;
     emit_subscribe(&bus, thread_id, vec![sub("ChangeProposed", None)]).await;
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        &bus,
         thread_id,
-        event: ThreadEvent::ResponseGenerated {
+        ThreadEvent::ResponseGenerated {
             text: "subscribed, I will report back".into(),
             images: vec![],
             model: None,
             reasoning_effort: None,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 
     let status: String =
         sqlx::query_scalar("SELECT status FROM thread_summaries WHERE thread_id = $1")
@@ -1631,18 +1699,17 @@ async fn the_lost_wake_sweep_skips_a_wake_that_already_ran() {
     assert_eq!(lost_event_wakes(&pool).await.unwrap().len(), 1);
 
     // One event from the woken turn is enough to prove it ran.
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        &bus,
         thread_id,
-        event: ThreadEvent::ResponseGenerated {
+        ThreadEvent::ResponseGenerated {
             text: "the change landed".into(),
             images: vec![],
             model: None,
             reasoning_effort: None,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
 
     assert!(
         lost_event_wakes(&pool).await.unwrap().is_empty(),
@@ -1699,9 +1766,10 @@ async fn consecutive_subscriptions_counts_only_since_the_last_human_message() {
 
     // An AGENT message must NOT reset the counter: cross-thread ping-pong is
     // made of exactly those, so counting it would disarm the cap it should trip.
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        &bus,
         thread_id,
-        event: ThreadEvent::MessageReceived {
+        ThreadEvent::MessageReceived {
             text: "[CHILD THREAD COMPLETED]".into(),
             user_image_hashes: vec![],
             device_id: None,
@@ -1714,10 +1782,8 @@ async fn consecutive_subscriptions_counts_only_since_the_last_human_message() {
             reasoning_effort: None,
             origin: None,
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
     assert_eq!(
         consecutive_subscriptions(&pool, thread_id).await.unwrap(),
         2,
@@ -1907,17 +1973,16 @@ async fn the_catch_up_scan_pages_past_non_matching_rows_and_terminates() {
     // the condition, so the scan cannot stop at the first page. Conditions are
     // evaluated in Rust, which is exactly why a bare `LIMIT 1` would be wrong.
     for i in 0..(super::CATCH_UP_PAGE + 5) {
-        bus.emit(BusEvent::Thread {
+        seed_thread_event(
+            &bus,
             thread_id,
-            event: ThreadEvent::ToolCalled {
+            ThreadEvent::ToolCalled {
                 name: "run_bash".into(),
                 description: format!("call {i}"),
                 args: json!({}),
             },
-            meta: EventMeta::NONE,
-        })
-        .await
-        .unwrap();
+        )
+        .await;
     }
 
     let wait = wait_with(
@@ -1937,17 +2002,16 @@ async fn the_catch_up_scan_pages_past_non_matching_rows_and_terminates() {
     );
 
     // Now put a match beyond the first page and prove paging reaches it.
-    bus.emit(BusEvent::Thread {
+    seed_thread_event(
+        &bus,
         thread_id,
-        event: ThreadEvent::ToolCalled {
+        ThreadEvent::ToolCalled {
             name: "the_one_that_matches".into(),
             description: "found".into(),
             args: json!({}),
         },
-        meta: EventMeta::NONE,
-    })
-    .await
-    .unwrap();
+    )
+    .await;
     let hit = catch_up_from_watermark(&pool, &wait)
         .await
         .unwrap()

@@ -123,7 +123,12 @@ This builds the frontend, the release gateway + engine, fetches the relocatable
 PostgreSQL 18 and compiles pgvector against it (the proven
 `scripts/prototype/desktop-pg-pgvector-spike.sh` recipe), stages everything into
 `crates/lucidos-app/bundle-resources/`, and runs `cargo tauri build --bundles
-app,dmg`. The result is an **unsigned** `.dmg` under `target/release/bundle/dmg/`
+app,dmg`. The staging directory is gitignored and survives between runs, so
+`cargo tauri build` verifies the staged `system-knowhow/` copy against the live
+tree before it packages anything (`scripts/check-staged-knowhow.sh`, wired into
+`beforeBuildCommand`). A build driven by hand rather than through this script
+therefore cannot silently ship a months-old copy; it stops and prints the diff.
+The result is an **unsigned** `.dmg` under `target/release/bundle/dmg/`
 — Gatekeeper blocks it on other Macs (right-click → Open to run locally).
 
 **The `.app` inside it is signed with the stable dev identity, when you have

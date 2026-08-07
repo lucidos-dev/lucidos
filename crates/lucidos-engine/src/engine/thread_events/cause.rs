@@ -119,10 +119,17 @@ impl AbortCause {
     /// **A device actor alone is not the fingerprint.** `StaleSettle`
     /// deliberately carries the actor of whichever user button exposed a stuck
     /// row (Stop / Apply / Discard / Archive / Interrupt), so an actor-only test
-    /// would read a user Stop as a switch. Nor is `EngineShutdown` alone: the
-    /// `shutdown_active_threads` fallback stamps a system actor for a thread that
-    /// started after the `/api/v1/restart` pre-emit, and no resume gate picks
-    /// that up either.
+    /// would read a user Stop as a switch. Nor is `EngineShutdown` alone: a
+    /// teardown nobody requested (`stop.sh`, an external SIGUSR1, ctrl-c) emits
+    /// the same cause with a system actor, and no resume gate picks that up.
+    ///
+    /// Which threads get the device half is a question about the TEARDOWN, never
+    /// about when a thread became in-flight. Every `EngineShutdown` emit in one
+    /// teardown reads the same `LucidosEngine::teardown_actor`, so the pre-emit,
+    /// the `shutdown_active_threads` fallback and the `emit_stop_terminal` abort
+    /// arm cannot disagree. They did until 2026-08-07, when only the pre-emit had
+    /// the actor: see
+    /// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.
     ///
     /// Deliberately NOT [`is_transient`](Self::is_transient), which answers a
     /// different question (may the parent's `active_children_count` decrement?)

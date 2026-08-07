@@ -333,13 +333,12 @@ fn redirect_skips_urgent_claude_code_child_wake() {
 use super::arm_followup_redirect;
 
 /// A live Codex session mid-turn: alive (`process_exited=false`), not at a turn
-/// boundary (`is_waiting=false`), with `pending_followups=1` as a normal turn
-/// has after session creation (the initial turn pre-counts its own Result).
+/// boundary (`is_waiting=false`), owing one Result for the turn it is running.
 fn codex_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
     let (mut s, msg_rx) = make_test_session(false);
     s.is_waiting = false; // turn in flight
     s.coding_agent = CodingAgent::Codex;
-    s.pending_followups
+    s.inputs_awaiting_result
         .store(1, std::sync::atomic::Ordering::Release);
     (s, msg_rx)
 }
@@ -350,7 +349,6 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
     let mut sessions = HashMap::new();
     let (session, _msg_rx) = codex_in_flight_session();
     let interrupt = session.interrupt.clone();
-    let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
     let idle = arm_followup_redirect(&mut sessions, thread_id, true, false, &None);
@@ -364,10 +362,12 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
         "arming the redirect must flag the session so the interrupt arm classifies \
          the interrupted turn as SupersededByFollowup (neutral), not UserStop"
     );
-    assert_eq!(
-        pending.load(std::sync::atomic::Ordering::Acquire),
-        2,
-        "a normal in-flight turn (count 1) plus the follow-up reaches 2 so the interrupted turn's idle keeps the subprocess alive (terminate_decision needs > 1)"
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_followup_pending,
+        "arming must also reserve the subprocess: the caller routes the message only \
+         after the interrupted turn reaches a boundary, so at the idle decision the \
+         message provably is not in msg_rx yet and this flag is the only thing \
+         standing between it and a terminated subprocess"
     );
     // The interrupt fired: notify_one stores a permit, so a notified() created
     // AFTER the call still resolves immediately.
@@ -381,34 +381,33 @@ async fn arm_redirect_fires_for_codex_mid_turn_user_followup() {
 
 #[test]
 fn arm_redirect_keeps_warmup_turn_alive() {
-    // A silent-resume / warm-up turn starts at pending_followups=0. A lone +1
-    // would land at 1 → terminate_decision → Terminate, killing the queued
-    // follow-up. arm_followup_redirect must bump it to >= 2 so the interrupted
-    // warm-up turn's idle keeps the subprocess alive.
+    // A silent-resume / warm-up turn owes no Result of its own. Under the old
+    // counter that made it a special case: a lone +1 landed at 1, below the `> 1`
+    // threshold, and the interrupted warm-up turn's idle killed the queued
+    // follow-up, so the pre-count had to bump twice. A reservation flag says the
+    // same thing for every turn shape, with no arithmetic to get wrong.
     let thread_id = Uuid::new_v4();
     let mut sessions = HashMap::new();
     let (session, _msg_rx) = codex_in_flight_session();
     session
-        .pending_followups
+        .inputs_awaiting_result
         .store(0, std::sync::atomic::Ordering::Release);
-    let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
     assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &None).is_some());
-    assert_eq!(
-        pending.load(std::sync::atomic::Ordering::Acquire),
-        2,
-        "a warm-up turn (count 0) must be bumped to 2, not 1, to survive the interrupt idle"
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_followup_pending,
+        "a warm-up turn that owes nothing must still be reserved for the incoming follow-up"
     );
 }
 
 /// A live Claude Code session mid-turn, the shape the 2026-08-06 incident had:
-/// alive, not at a turn boundary, with `pending_followups=1` from its own turn.
+/// alive, not at a turn boundary, owing one Result for its own turn.
 fn claude_code_in_flight_session() -> (AgentSession, mpsc::UnboundedReceiver<AgentUserInput>) {
     let (mut s, msg_rx) = make_test_session(false);
     s.is_waiting = false; // turn in flight
     debug_assert_eq!(s.coding_agent, CodingAgent::ClaudeCode);
-    s.pending_followups
+    s.inputs_awaiting_result
         .store(1, std::sync::atomic::Ordering::Release);
     (s, msg_rx)
 }
@@ -419,7 +418,6 @@ async fn arm_redirect_skips_plain_claude_code_mid_turn() {
     let mut sessions = HashMap::new();
     let (session, _msg_rx) = claude_code_in_flight_session();
     let interrupt = session.interrupt.clone();
-    let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
     let idle = arm_followup_redirect(&mut sessions, thread_id, true, false, &None);
@@ -432,10 +430,10 @@ async fn arm_redirect_skips_plain_claude_code_mid_turn() {
         !sessions.get(&thread_id).unwrap().redirect_followup,
         "a plain CC follow-up must not be flagged for redirect"
     );
-    assert_eq!(
-        pending.load(std::sync::atomic::Ordering::Acquire),
-        1,
-        "no interrupt means no pre-count: the caller's own msg_tx send does the counting"
+    assert!(
+        !sessions.get(&thread_id).unwrap().redirect_followup_pending,
+        "no interrupt means no reservation: the message goes straight into msg_rx, \
+         where the idle decision can see it for itself"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(50), interrupt.notified())
@@ -451,7 +449,6 @@ async fn arm_redirect_fires_for_urgent_claude_code_mid_turn() {
     let mut sessions = HashMap::new();
     let (session, _msg_rx) = claude_code_in_flight_session();
     let interrupt = session.interrupt.clone();
-    let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
     let idle = arm_followup_redirect(&mut sessions, thread_id, true, true, &None);
@@ -464,10 +461,9 @@ async fn arm_redirect_fires_for_urgent_claude_code_mid_turn() {
         sessions.get(&thread_id).unwrap().redirect_followup,
         "the interrupted turn must classify as SupersededByFollowup (neutral), not UserStop"
     );
-    assert_eq!(
-        pending.load(std::sync::atomic::Ordering::Acquire),
-        2,
-        "the interrupted turn's idle must keep the subprocess alive (terminate_decision needs > 1)"
+    assert!(
+        sessions.get(&thread_id).unwrap().redirect_followup_pending,
+        "the interrupted turn's idle must keep the subprocess alive for the reservation"
     );
     assert!(
         tokio::time::timeout(Duration::from_millis(100), interrupt.notified())
@@ -483,14 +479,13 @@ fn arm_redirect_skips_idle_claude_code_even_when_urgent() {
     let mut sessions = HashMap::new();
     // make_test_session(false) leaves is_waiting=true, i.e. idle but alive.
     let (session, _msg_rx) = make_test_session(false);
-    let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
     assert!(
         arm_followup_redirect(&mut sessions, thread_id, true, true, &None).is_none(),
         "an idle CC session reads stdin at once: there is no turn to interrupt"
     );
-    assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    assert!(!sessions.get(&thread_id).unwrap().redirect_followup_pending);
 }
 
 #[test]
@@ -499,12 +494,11 @@ fn arm_redirect_skips_idle_codex() {
     let mut sessions = HashMap::new();
     let (mut session, _msg_rx) = make_test_session(false); // is_waiting=true → idle, not in flight
     session.coding_agent = CodingAgent::Codex;
-    let pending = session.pending_followups.clone();
     sessions.insert(thread_id, session);
 
     // Idle Codex: route via turn/start immediately, no interrupt.
     assert!(arm_followup_redirect(&mut sessions, thread_id, true, false, &None).is_none());
-    assert_eq!(pending.load(std::sync::atomic::Ordering::Acquire), 0);
+    assert!(!sessions.get(&thread_id).unwrap().redirect_followup_pending);
 }
 
 #[test]

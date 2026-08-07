@@ -2,12 +2,15 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 import {
   listWorkspaces,
   createWorkspace,
+  restartWorkspace,
+  stopWorkspace,
   restoreBackup,
   getGatewayStatus,
   reloadGateway,
   slugifyWorkspaceName,
   parseWorkspaceNameFromArchive,
 } from './control';
+import { DEVICE_ID_KEY } from '../../utils/deviceIdHeader';
 
 // The control plane lives under the reserved sigil namespace
 // `/~/api/v1/control/*` (ADR 0014 §2) — an absolute path that can never collide
@@ -24,8 +27,13 @@ function withFetch(impl: () => Promise<Response>): ReturnType<typeof vi.fn> {
 
 afterEach(() => {
   globalThis.fetch = originalFetch;
+  localStorage.removeItem(DEVICE_ID_KEY);
   vi.restoreAllMocks();
 });
+
+function headersOf(mock: ReturnType<typeof vi.fn>, call = 0): Record<string, string> {
+  return (mock.mock.calls[call][1]?.headers ?? {}) as Record<string, string>;
+}
 
 describe('control client', () => {
   it('lists workspaces from the sigil control route', async () => {
@@ -93,6 +101,39 @@ describe('control client', () => {
     await reloadGateway();
     expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/gateway/reload');
     expect(mock.mock.calls[0][1]?.method).toBe('POST');
+  });
+
+  // Restart and Stop are the two control calls a PERSON makes about a running
+  // engine, so they are the two that must say which device made them. The
+  // gateway forwards the id to that engine right before it signals it, and it is
+  // the only thing that tells the engine apart from a crash: without it the
+  // interrupted threads settle at `failed` with "Response interrupted" and no
+  // auto-resume instead of `paused` with "Paused by restart".
+  it('sends the device-id header on restart so the engine can attribute the teardown', async () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'device-abc');
+    const mock = withFetch(() => Promise.resolve(new Response(null, { status: 202 })));
+    await restartWorkspace('dev');
+    expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces/dev/restart');
+    expect(mock.mock.calls[0][1]?.method).toBe('POST');
+    expect(headersOf(mock)['x-lucidos-device-id']).toBe('device-abc');
+  });
+
+  it('sends the device-id header on stop', async () => {
+    localStorage.setItem(DEVICE_ID_KEY, 'device-abc');
+    const mock = withFetch(() => Promise.resolve(new Response(null, { status: 202 })));
+    await stopWorkspace('dev');
+    expect(String(mock.mock.calls[0][0])).toBe('/~/api/v1/control/workspaces/dev/stop');
+    expect(headersOf(mock)['x-lucidos-device-id']).toBe('device-abc');
+  });
+
+  // A browser that has never opened a workspace has no id to send. It must not
+  // mint one here (that would register a device nobody named); the restart just
+  // goes through unattributed, exactly as it did before.
+  it('omits the header entirely when this browser has no device id yet', async () => {
+    const mock = withFetch(() => Promise.resolve(new Response(null, { status: 202 })));
+    await restartWorkspace('dev');
+    expect(headersOf(mock)['x-lucidos-device-id']).toBeUndefined();
+    expect(localStorage.getItem(DEVICE_ID_KEY)).toBeNull();
   });
 
   it('surfaces a 409 collision as an Error carrying the server message', async () => {

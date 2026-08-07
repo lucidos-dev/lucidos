@@ -78,12 +78,12 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
                 "target": {
                     "type": "string",
                     "enum": NAVIGATE_TARGETS,
-                    "description": "Most values are a panel needing nothing else; 'app-store' is the Plugins panel, whose 'Installed only' filter is on by default. Companion args: 'app' takes app_id, 'file' file_path, 'trigger' and 'thread' id, 'settings' settings_view. 'url' opens the browser the user configured."
+                    "description": "Most values need nothing else. Companion args: 'app' takes app_id, 'file' file_path, 'trigger' and 'thread' id, 'settings' settings_view, 'url' url. 'app-store' is the Plugins panel."
                 },
                 "settings_view": {
                     "type": "string",
                     "enum": NAVIGABLE_SETTINGS_VIEWS,
-                    "description": "Only with target 'settings'; omitting it lands on the Settings home list. The non-obvious ones: 'models' also holds the current chat model, 'permissions' the command guard and allowlists, 'coding-agents' binary paths and repositories, 'accounts' credentials and OAuth, 'access' reaching this engine from another device, 'appearance' theme, font and scale."
+                    "description": "Only with target 'settings'; omitting it lands on the Settings home list. Non-obvious: 'models' also holds the current chat model, 'permissions' the command guard, 'coding-agents' binary paths and repositories, 'accounts' credentials and OAuth, 'access' remote reach, 'appearance' theme, font and scale."
                 },
                 "app_id": {
                     "type": "string",
@@ -91,15 +91,15 @@ pub fn get_navigate_ui_tool() -> ToolDefinition {
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "Required for 'file'. Path with its directory prefix (e.g. 'artifacts/notes.md'). A file in a registered repository clone takes 'repo:<repoId>:file:<path>' at the clone's HEAD, or 'repo:<repoId>:file#<ref>:<path>' for a branch, tag or sha."
+                    "description": "Required for 'file'. Path with its directory prefix (e.g. 'artifacts/notes.md'). In a registered repository clone: 'repo:<repoId>:file:<path>' at HEAD, or 'repo:<repoId>:file#<ref>:<path>' for a branch, tag or sha."
                 },
                 "line": {
                     "type": "integer",
-                    "description": "1-based line to open at; 'file' only. The preview scrolls to it and switches a rendered file to source view. Pass it whenever you cite a line."
+                    "description": "1-based line; 'file' only. The preview scrolls to it and switches a rendered file to source view. Pass it whenever you cite a line."
                 },
                 "line_end": {
                     "type": "integer",
-                    "description": "Last line of the highlighted range, 1-based inclusive. Omit to highlight only 'line'. 'file' only."
+                    "description": "Last line of the range, inclusive. Omit to highlight only 'line'. 'file' only."
                 },
                 "id": {
                     "type": "string",
@@ -185,17 +185,17 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::REQUEST_CREDENTIAL.to_string(),
-            description: "Request an API credential through a secure modal, so the user types it into a popup rather than into the conversation and the event log. ONE at a time: wait for each to resolve before requesting the next.".to_string(),
+            description: "Request an API credential through a secure modal, keeping the secret out of the conversation and the event log. ONE at a time: wait for each to resolve before requesting the next.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "service_name": {
                         "type": "string",
-                        "description": "Name of the service (e.g. 'oura'). For 'oauth_client' pass the BARE provider name: the auth type is what marks the row as an app registration."
+                        "description": "Service name (e.g. 'oura'). For 'oauth_client' pass the BARE provider name: the auth type marks the row as an app registration."
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Instructions shown in the modal, including where to find it."
+                        "description": "Shown in the modal, including where to find the credential."
                     },
                     "base_url": {
                         "type": "string",
@@ -204,11 +204,11 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     "auth_type": {
                         "type": "string",
                         "enum": ["api_key", "bearer", "basic", "password", "oauth_client"],
-                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. PREFER connect_oauth_account over 'oauth_client': it opens this same modal itself and then authorizes, one call instead of two. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
+                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. PREFER connect_oauth_account over 'oauth_client', which does the same modal plus the authorize in one call. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
                     },
                     "auth_url": {
                         "type": "string",
-                        "description": "oauth_client only, from the oauth-providers knowhow."
+                        "description": "oauth_client only, from the knowhow."
                     },
                     "token_url": {
                         "type": "string",
@@ -216,7 +216,7 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     },
                     "userinfo_url": {
                         "type": "string",
-                        "description": "oauth_client only. Without one the account reports no email."
+                        "description": "oauth_client only; without one the account reports no email."
                     },
                     "userinfo_method": {
                         "type": "string",
@@ -225,19 +225,19 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
                     },
                     "authorize_params": {
                         "type": "string",
-                        "description": "oauth_client only. Extra authorization-URL parameters from the knowhow row. Omit for the default."
+                        "description": "oauth_client only. Extra authorization-URL parameters from the knowhow row."
                     },
                     "scopes": {
                         "type": "string",
-                        "description": "oauth_client only. Space-separated scopes, to pre-fill the modal."
+                        "description": "oauth_client only. Space-separated, pre-fills the modal."
                     },
                     "redirect_uri": {
                         "type": "string",
-                        "description": "oauth_client only. Omit for the default loopback URI; the knowhow lists the three accepted forms."
+                        "description": "oauth_client only. Omit for the default loopback URI; the knowhow lists the other forms."
                     },
                     "env_var_name": {
                         "type": "string",
-                        "description": "Optional extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."
+                        "description": "Extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."
                     }
                 },
                 "required": ["service_name", "prompt", "base_url", "auth_type"]
@@ -250,7 +250,7 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::CONNECT_OAUTH_ACCOUNT.to_string(),
-            description: "Connect an OAuth account so Lucidos can call an API on the user's behalf. Any OAuth 2.0 provider, ONE call for the whole flow: with no client credentials yet it opens the credential modal itself, then authorizes. The page opens on the USER'S DEVICE in whichever browser they configured, so tell them to complete it there; tokens are stored automatically. Provider and scopes alone suffice for a provider the registry knows, otherwise load_knowhow('system-knowhow/oauth-providers').".to_string(),
+            description: "Connect an OAuth account so Lucidos can call an API on the user's behalf. ONE call for the whole flow: with no client credentials yet it opens the credential modal itself, then authorizes. The page opens on the USER'S DEVICE in the browser they configured, so tell them to complete it there. Provider and scopes alone suffice for a provider the registry knows, otherwise load_knowhow('system-knowhow/oauth-providers').".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -260,36 +260,36 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
                     },
                     "scopes": {
                         "type": "string",
-                        "description": "Space-separated scopes to request."
+                        "description": "Space-separated scopes."
                     },
                     "auth_url": {
                         "type": "string",
-                        "description": "Optional, from the oauth-providers knowhow; pre-fills the modal."
+                        "description": "From the knowhow; pre-fills the modal."
                     },
                     "token_url": {
                         "type": "string",
-                        "description": "Optional, from that knowhow."
+                        "description": "From that knowhow."
                     },
                     "userinfo_url": {
                         "type": "string",
-                        "description": "Optional. Without one the account reports no email."
+                        "description": "Without one the account reports no email."
                     },
                     "userinfo_method": {
                         "type": "string",
                         "enum": ["GET", "POST"],
-                        "description": "Optional. GET unless the row says POST."
+                        "description": "GET unless the row says POST."
                     },
                     "authorize_params": {
                         "type": "string",
-                        "description": "Optional extra authorization-URL parameters, key=value&key=value, from the knowhow row."
+                        "description": "Extra authorization-URL parameters, key=value&key=value, from the knowhow row."
                     },
                     "base_url": {
                         "type": "string",
-                        "description": "Optional API base URL, to pre-fill the modal."
+                        "description": "API base URL, pre-fills the modal."
                     },
                     "redirect_uri": {
                         "type": "string",
-                        "description": "Optional. Omit for the default loopback URI; the knowhow names the other two forms and when to use them."
+                        "description": "Omit for the default loopback URI; the knowhow names the other forms."
                     }
                 },
                 "required": ["provider", "scopes"]
@@ -325,7 +325,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::ASK_USER_QUESTION.to_string(),
-            description: "Ask the user a multiple-choice question and wait for their pick. Each renders as a card of clickable buttons, one at a time; pass up to 4 only for a tight batch answered in sequence. Returns a JSON object mapping each question text to the chosen label, or to the user's typed text when they answer freeform.\n\nNEVER add an \"Other\" / \"Something else\" / \"Let me type it\" option. Lucidos has no text-entry option, so tapping one just hands that label back as the answer, a dead end. Both escapes are on every card without you: the user can type any reply in the prompt textarea and it arrives as their answer to this question, and Cancel dismisses the question so they can steer you elsewhere. An option carrying a decision you can act on is different and still welcome (\"None of these\", \"Cancel the deploy\").\n\nNever ask purely to get resumed while something you could subscribe to is pending: a card makes the human your scheduler and blocks Apply until they tap.".to_string(),
+            description: "Ask a multiple-choice question and wait for the pick. Each renders as a card of buttons, one at a time; pass up to 4 only for a tight batch answered in sequence. Returns a JSON object mapping each question text to the chosen label, or to the user's typed text when they answer freeform.\n\nNEVER add an \"Other\" / \"Something else\" / \"Let me type it\" option: Lucidos has no text-entry option, so tapping one hands that label back as the answer, a dead end. Both escapes are already there, without you: the user can type in the prompt textarea and it arrives as their answer, and Cancel dismisses the question. An option carrying a decision you can act on is different and still welcome (\"None of these\").\n\nNever ask purely to get resumed while something you could subscribe to is pending.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -333,7 +333,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 4,
-                        "description": "1 to 4 questions, one card at a time, answered in order.",
+                        "description": "One card at a time, answered in order.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -349,7 +349,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                                     "type": "array",
                                     "minItems": 2,
                                     "maxItems": 4,
-                                    "description": "2 to 4 buttons, mutually exclusive unless `multiSelect`.",
+                                    "description": "Mutually exclusive unless `multiSelect`.",
                                     "items": {
                                         "type": "object",
                                         "properties": {
@@ -391,7 +391,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::AWAIT_EVENT.to_string(),
-            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a domain event. Returns immediately and blocks nothing; the engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing; a wait armed for one already gone by idles to the timeout. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a wake.\n\nAND NOT FOR A THREAD YOU SPAWNED AS A CHILD OF THIS ONE, which already re-opens this thread with its result. Await `ChildThreadCompleted` only for a completion that is not your own child's, named with a `child_thread_id` condition.\n\nTHE SUBSCRIPTION IS SPENT once it wakes you, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in a row with no message from the user the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
+            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a domain event. The engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a wake.\n\nAND NOT FOR A THREAD YOU SPAWNED AS A CHILD OF THIS ONE, which already re-opens this thread with its result. Await `ChildThreadCompleted` only for a completion that is not your own child's, named with a `child_thread_id` condition.\n\nTHE SUBSCRIPTION IS SPENT once it wakes you, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in a row with no message from the user the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -418,7 +418,7 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 86400,
-                        "description": "REQUIRED. Seconds before giving up, max 86400; there is no unbounded wait. Add margin: waking early costs one turn, waking late costs the whole wait."
+                        "description": "REQUIRED. Seconds before giving up; there is no unbounded wait. Add margin: waking early costs one turn, waking late costs the whole wait."
                     },
                     "reason": {
                         "type": "string",
@@ -441,7 +441,7 @@ pub(super) fn event_wait_agent_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::LIST_EVENT_WAITS.to_string(),
-            description: "What THIS thread is subscribed to right now: each subscription's id, what it watches, your reason, when you armed it, and when it times out. CALL IT BEFORE TELLING THE USER WHETHER YOU ARE STILL WATCHING, because a spend, a timeout and a user pressing Stop waiting all land while you are not running, so memory is a guess that has been wrong by two hours. It is also where the `wait_id` comes from.".to_string(),
+            description: "What THIS thread is subscribed to right now: each subscription's id, what it watches, your reason, when you armed it, and when it times out. CALL IT BEFORE TELLING THE USER WHETHER YOU ARE STILL WATCHING: a spend, a timeout and a user pressing Stop waiting all land while you are not running. It is also where the `wait_id` comes from.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {},

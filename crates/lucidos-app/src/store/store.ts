@@ -1928,6 +1928,23 @@ export const backupProgress = signal<{ phase: string; progress: number; total: n
  *  so the health card reflects the new last-run outcome. */
 export const backupStatusVersion = signal(0);
 
+/** Bumped when a `PreferencesChanged` carries one of the three keys the Backup
+ *  page renders: `backup_provider`, `backup_schedule`, `backup_retention`.
+ *  BackupSection re-seeds its provider, schedule and retention controls on it.
+ *
+ *  A SIBLING of `backupStatusVersion` rather than a widening of it, on purpose.
+ *  That signal means "a backup RUN reached a terminal state" and the health
+ *  card refetches `/backup/status` on it, which lists the remote folder. Making
+ *  a retention or schedule write bump the same counter would put a cloud
+ *  round-trip behind a local preference edit, and would leave the name lying
+ *  about what the signal reports. Two meanings, two signals.
+ *
+ *  Without either, the panel read its three values once on mount and nothing
+ *  moved them: an agent writing `backup_provider` (or the same page open on a
+ *  second device) left the dropdown showing the old destination until a manual
+ *  reload. */
+export const backupPreferencesVersion = signal(0);
+
 /** Updated from SSE RecoveryProgress events. null = not recovering. */
 export const recoveryProgress = signal<{ completed: number; total: number } | null>(null);
 
@@ -1992,7 +2009,10 @@ export const NEW_VERSION_TOAST_KEY = 'engine-new-version';
 // Toast key for a failed thread-list refresh. Both surfacing sites (the SSE
 // resync in thread-sync.ts and the resume sync in connection.ts) share it so a
 // sustained outage replaces one toast instead of stacking a new one on every
-// 3s SSE reconnect.
+// 3s SSE reconnect. Neither site reads this key directly anymore: they both go
+// through `refreshThreadList` (store/actions/thread-list-refresh.ts), which is
+// the only writer, so the card's copy, the rule for raising it and its
+// retraction cannot drift between the two.
 export const THREAD_LIST_REFRESH_TOAST_KEY = 'thread-list-refresh-failed';
 
 // Toast keys for the two per-thread event fetches (thread-loading.ts). The LOAD
@@ -2034,6 +2054,32 @@ export const THREAD_EVENTS_REFRESH_TOAST_KEY = 'thread-events-refresh-failed';
  *  keys above do: its other consumer is an action module that would otherwise
  *  import it across a mocked boundary. */
 export const THREAD_EVENTS_FETCH_CONCURRENCY = 4;
+
+/** How often the connection watchdog probes `/api/v1/health`. The dot the user
+ *  sees is driven SOLELY by this poll, so the pair below is the whole timing
+ *  contract of that dot, and the two numbers are only meaningful against each
+ *  other. They live here, together, for that reason and for the one the
+ *  concurrency limit above gives: their consumers (`hooks/useStartup.ts` and
+ *  `api/client/chat.ts`) would otherwise each own half of a relation neither can
+ *  see. */
+export const CONNECTION_POLL_INTERVAL_MS = 5000;
+
+/** Deadline for one health probe. Must stay STRICTLY BELOW
+ *  `CONNECTION_POLL_INTERVAL_MS`, which is what keeps at most one probe in
+ *  flight from the timer: overlapping probes would queue on the same HTTP/2
+ *  connection and time out in turn, manufacturing the outage the dot is meant to
+ *  report. `connection-poll-budget.test.ts` pins the relation so a later change
+ *  to either number cannot quietly break it.
+ *
+ *  It was 3s, sized against nothing in particular, and 3s is not a lot for a
+ *  phone reaching a laptop over cellular and a Tailscale tunnel: a radio state
+ *  transition alone can spend most of it, and a DERP relay hop adds more. Four
+ *  consecutive misses paint the dot red, so a deadline that is merely tight
+ *  reads as an outage. 4.5s costs no extra requests, and the case it buys
+ *  patience for is exactly the case where the dot is most likely lying: a
+ *  genuinely dead engine REFUSES the connection and fails fast whatever the
+ *  deadline says, so only a hanging request is affected. */
+export const HEALTH_PROBE_TIMEOUT_MS = 4500;
 
 // Toast key for the "frontend change applied — takes effect on Switch" hint,
 // shown when the engine emits FrontendUpdateDeferred (a frontend-only Apply

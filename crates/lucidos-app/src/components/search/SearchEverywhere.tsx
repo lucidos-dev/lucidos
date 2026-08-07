@@ -5,7 +5,7 @@ import { searchEverywhere, type SearchCategory, type SearchResultItem } from '..
 import { focusThreadOrBootstrap } from '../../store/actions/threads';
 import { openFilePreview } from '../../store/actions/artifacts';
 import { openAppById } from '../../store/actions/apps';
-import { switchMenuItem, openSettingsSubview } from '../../store/actions/menu';
+import { openSettingsSubview } from '../../store/actions/menu';
 import { viewChangeDiffById } from '../../store/actions/repositories';
 import { navigateToTrigger } from '../../store/actions/triggers';
 import { focusPaneMainControl } from '../layout/paneFocus';
@@ -265,7 +265,8 @@ export function SearchEverywhere() {
       case 'settings': {
         const entry = findSettingsEntry(item.id);
         if (!entry) break;
-        switchMenuItem('settings');
+        // One call, one nav-history entry: openSettingsSubview lands the
+        // Settings panel and the sub-section together.
         openSettingsSubview(entry.subview);
         // An anchored entry scrolls to a specific row; SettingsView's scroll
         // effect lands focus on that row's control (e.g. the Language dropdown).

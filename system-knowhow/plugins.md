@@ -1,6 +1,6 @@
 ---
 name: Plugins
-description: Use when the user wants to author, package, publish, share, install, update, or uninstall a Lucidos plugin -- phrases like "build a plugin", "publish a plugin", "share this app as a plugin", "package this for other workspaces", "ship a knowhow bundle", "install the X plugin", "update plugins", "make a .lucidos-plugin". Covers the manifest schema, plugin layout, the five LLM tools, distribution shapes, and the v1 guide-only uninstall semantics.
+description: Use when the user wants to author, package, publish, share, install, update, or uninstall a Lucidos plugin: "build a plugin", "publish a plugin", "share this app as a plugin", "package this for other workspaces", "ship a knowhow bundle", "install the X plugin", "update plugins", "make a .lucidos-plugin".
 ---
 
 # Plugins
@@ -129,6 +129,8 @@ Each card has a primary button that progresses **Install → Setup → Open**, p
 
 Installed marketplace plugins are **not** auto-updated — the engine notifies, the user decides. Registered marketplaces are scanned at startup, after a marketplace is registered or renamed, and every five minutes. When a scanned marketplace has a newer version of an already-installed plugin, the engine emits a single deduplicated `NotificationCreated` ("Plugin update(s) available") whose tap deep-links to the Plugins panel's installed list (the **Installed only** filter on) and scrolls to / pulse-highlights the plugin with the pending update (carried as the navigate `id`; with several updates it focuses the alphabetically-first by name, the rest stay chipped); it does NOT install anything. The user applies the update from that row's **Update button** (works for *any* plugin, app or not), the catalog card (with **Installed only** unchecked), or — for a plugin that ships an app — the app row's **Update** button on the Apps panel; each stages the same confirmation panel as any install. Dedup is tracked in a `.lucidos/plugin-update-notice.json` marker so the five-minute re-scan only re-notifies when a *new* update appears (a fresh plugin or a bumped version), not every cycle.
 
+Every marketplace mutation is **announced**, so an open Plugins panel and Settings → Marketplaces update in place with no reload: registering a marketplace (or re-registering one under a new name) emits `PluginMarketplaceRegistered`, unregistering emits `PluginMarketplaceRemoved`, and the frontend re-scans the catalog on either. `Registered` is an upsert event covering the rename as much as the create, because the marketplace id hashes the canonical source: re-registering a source already on the list rewrites its entry in place rather than adding a second one. The announcement lives inside the one shared registry write path, so it fires whichever surface asked (the HTTP endpoints below, or the `register_plugin_marketplace` tool when the user asks in chat).
+
 Marketplace HTTP surface:
 
 - `GET /api/v1/plugins/marketplaces` -> registered marketplace list.
@@ -141,7 +143,7 @@ Marketplace HTTP surface:
 
 Marketplace LLM surface:
 
-- `register_plugin_marketplace(source, name?)` registers or renames the same plugin marketplace registry the Plugins panel browses, commits `data/config/plugin-marketplaces.json`, and kicks off the marketplace scan / update-check pass (which notifies the user of any available plugin updates rather than applying them). Use it when a user asks conversationally to add a plugin repo, marketplace, or plugin marketplace source.
+- `register_plugin_marketplace(source, name?)` registers or renames the same plugin marketplace registry the Plugins panel browses, commits `data/config/plugin-marketplaces.json`, announces the change (so any open panel refreshes without a reload), and kicks off the marketplace scan / update-check pass (which notifies the user of any available plugin updates rather than applying them). Use it when a user asks conversationally to add a plugin repo, marketplace, or plugin marketplace source. There is no unregister tool: removing a marketplace is done from Settings → Marketplaces.
 
 For GitHub monorepo marketplaces, register either the repo URL (`https://github.com/lucidos-dev/plugins`) or a tree URL (`https://github.com/lucidos-dev/plugins/tree/main/community`). The scanner turns discovered subdirectory plugins into installable GitHub tree URLs. For non-GitHub monorepos, use one repo per plugin or provide a GitHub tree URL equivalent; the install tool only knows how to install a subdirectory when it has a GitHub tree URL.
 

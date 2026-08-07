@@ -420,14 +420,22 @@ pub async fn catch_up_from_watermark(
 /// One event the *arming lookback* found: something matching the subscription
 /// that had already happened by the time the wait was armed.
 ///
-/// Carries `created` because the age is what makes the report usable. The model
+/// Carries the age because the age is what makes the report usable. The model
 /// is the only party that can tell a miss from something it handled itself a
 /// moment ago, and it tells them apart by when.
+///
+/// An **age** rather than the row's `created`, for the reason
+/// [`arming_lookback_matches`] takes a window rather than a cutoff: `created`
+/// is written by the database, so subtracting it from the engine's `Utc::now()`
+/// is a cross-clock comparison and renders a ten-second-old event as "3m 40s
+/// ago" whenever the two drift. The subtraction happens where both operands
+/// come from the same clock, which is inside the query.
 #[derive(Debug, Clone)]
 pub struct LookbackMatch {
     pub event_type: String,
     pub payload: Value,
-    pub created: DateTime<Utc>,
+    /// Whole seconds between the event and the scan, measured by the database.
+    pub age_secs: i64,
 }
 
 /// What the *arming lookback* found, bounded.
@@ -484,11 +492,35 @@ impl ArmingLookback {
 /// right answer on its own terms: the scan runs newest-first, and this reports
 /// "what you just missed", so a match buried hundreds of rows back is not the
 /// thing the model is arming a watch for.
+///
+/// # The window is a duration, and the database resolves it
+///
+/// `window_secs` is how far back to look, NOT a cutoff instant, and that is
+/// load-bearing rather than a matter of taste. `created` is stamped by the
+/// server (`INSERT ... VALUES (..., NOW(), ...)` in the EventBus), so a cutoff
+/// computed by the engine from `Utc::now()` puts the host clock and the
+/// database clock on opposite sides of one `>=`. Let those drift by more than
+/// the window and EVERY row fails the predicate: the scan reports nothing, the
+/// model is told nothing already happened, and it misses the event this whole
+/// mechanism exists to surface. The failure is silent, which is the worst
+/// property a probe can have.
+///
+/// It is not hypothetical. Seven of these tests failed together on 2026-08-07,
+/// all reporting zero matches, when a `Utc::now() - 3 minutes` cutoff met rows
+/// the container had stamped from a clock that had drifted behind the host.
+/// Only the tests asserting a NON-empty result noticed. `pg_now` in
+/// `core/changes_projection_tests/helpers.rs` is the same bug found once
+/// before, in one test module, and never generalised. See ADR 0053.
+///
+/// Each page resolves `now()` afresh, so the boundary creeps later by one round
+/// trip across a paging scan. That is microseconds against a window measured in
+/// minutes, and it can only ever drop a row already at the far edge of a report
+/// the module doc calls approximate on purpose.
 pub async fn arming_lookback_matches(
     pool: &sqlx::PgPool,
     on: &[EventSubscription],
     watermark: i64,
-    since: DateTime<Utc>,
+    window_secs: i64,
     already_delivered: &std::collections::HashSet<Uuid>,
     limit: usize,
 ) -> Result<ArmingLookback, Box<dyn std::error::Error + Send + Sync>> {
@@ -513,13 +545,20 @@ pub async fn arming_lookback_matches(
             break;
         }
         pages += 1;
-        let rows: Vec<(Uuid, String, Value, DateTime<Utc>, i64)> = sqlx::query_as(
-            "SELECT id, event_type, payload, created, sequence FROM events \
-             WHERE sequence <= $1 AND created >= $2 AND event_type = ANY($3) \
+        // `now()` on both sides of the window and of the age: the cutoff and
+        // the elapsed time are the database's own arithmetic, so neither can be
+        // thrown off by the engine host's clock. See the doc comment.
+        let rows: Vec<(Uuid, String, Value, i64, i64)> = sqlx::query_as(
+            "SELECT id, event_type, payload, \
+                    EXTRACT(EPOCH FROM now() - created)::bigint, sequence \
+             FROM events \
+             WHERE sequence <= $1 \
+               AND created >= now() - make_interval(secs => $2) \
+               AND event_type = ANY($3) \
              ORDER BY sequence DESC LIMIT $4",
         )
         .bind(upper)
-        .bind(since)
+        .bind(window_secs)
         .bind(&types)
         .bind(CATCH_UP_PAGE)
         .fetch_all(pool)
@@ -529,14 +568,14 @@ pub async fn arming_lookback_matches(
         if let Some(&(_, _, _, _, last_seq)) = rows.last() {
             upper = last_seq - 1;
         }
-        for (id, event_type, payload, created, _) in rows {
+        for (id, event_type, payload, age_secs, _) in rows {
             if !already_delivered.contains(&id)
                 && EventSubscription::any_matches(on, &event_type, &payload)
             {
                 found.push(LookbackMatch {
                     event_type,
                     payload,
-                    created,
+                    age_secs,
                 });
                 if found.len() == wanted {
                     break;

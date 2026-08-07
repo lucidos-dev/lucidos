@@ -1,6 +1,6 @@
 ---
 name: Migrate Notification Tap Shape
-description: Recipe for rewriting old-form `tap` strings ('modal' | 'open_app' | 'open_thread' | 'none') in a workspace's triggers and apps to the new structured `Tap` object ({kind, to?}). Use when the workspace audit flags old-form taps, after upgrading to an engine version where the notification API rejects old-form strings.
+description: Recipe for rewriting old-form `tap` strings ('modal' | 'open_app' | 'open_thread' | 'none') in a workspace's triggers and apps to the structured `Tap` object ({kind, to?}). Use when the workspace audit flags old-form taps.
 ---
 
 # Migrate Notification Tap Shape

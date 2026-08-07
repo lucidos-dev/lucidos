@@ -1,6 +1,6 @@
 ---
 name: Building Knowhow
-description: Use when writing or updating a knowhow file — capturing API quirks, payload shapes, integration recipes, workarounds. Covers when knowhow is the right artifact, standalone vs app-scoped placement, and how to write descriptions the engine LLM will actually pick.
+description: Use when writing or updating a knowhow file (API quirks, payload shapes, integration recipes, workarounds): whether knowhow is the right artifact, standalone vs app-scoped placement, and writing descriptions the engine LLM will actually pick.
 ---
 
 # Building Knowhow

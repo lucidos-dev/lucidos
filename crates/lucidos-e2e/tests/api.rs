@@ -68,6 +68,9 @@ mod threads_compose_test;
 #[path = "api_support/client_log_test.rs"]
 mod client_log_test;
 
+#[path = "api_support/restart_intent_test.rs"]
+mod restart_intent_test;
+
 #[path = "api_support/proxy_test.rs"]
 mod proxy_test;
 

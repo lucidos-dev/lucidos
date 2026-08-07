@@ -133,6 +133,53 @@ if [ $rc -ne 0 ] && echo "$out" | grep -qi "system-knowhow dir not found"; then 
 if [ -d "$STAGE" ]; then fail "stage dir should not exist after a refusal"; else pass "no stage written on refusal"; fi
 rm -rf "$IN"
 
+# ── staged-knowhow freshness (the hand-run-build guard) ──────────────────────
+# The stage survives between builds, so a `cargo tauri build` typed by hand can
+# package a months-old copy. Clean must mean "absent OR identical", never
+# "absent" alone: a developer who has never run build-dmg.sh has no stage at all
+# and their build must not go red.
+
+echo ""
+echo "test: stage_runtime_staged_knowhow_fresh accepts an absent or knowhow-less stage"
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
+if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "absent stage is clean"; else fail "absent stage should be clean"; fi
+mkdir -p "$STAGE"
+if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "stage with no system-knowhow/ is clean"; else fail "knowhow-less stage should be clean"; fi
+# ABSENT is the only thing the fast path waves through: a staged system-knowhow
+# that is not a directory is drift, not "nothing to check".
+printf 'not a directory\n' > "$STAGE/system-knowhow"
+if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a non-directory staged system-knowhow must not read as clean"; else pass "non-directory staged copy caught"; fi
+rm -rf "$IN" "$STAGE"
+
+echo ""
+echo "test: stage_runtime_staged_knowhow_fresh accepts a stage assemble just wrote"
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
+stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then pass "freshly staged copy is clean"; else fail "a copy assemble just made must be clean"; fi
+
+echo ""
+echo "test: stage_runtime_staged_knowhow_fresh catches every shape of drift"
+printf '# glossary v2\n' > "$IN/system-knowhow/glossary.md"
+out="$(stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "drifted from the live tree"; then pass "changed file caught"; else fail "expected changed-file drift (rc=$rc): $out"; fi
+if echo "$out" | grep -q "rm -rf"; then pass "drift message says how to fix it"; else fail "drift message must name the remedy: $out"; fi
+stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+printf '# new doc\n' > "$IN/system-knowhow/triggers.md"
+if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc added since staging should be drift"; else pass "added file caught"; fi
+stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+rm -f "$IN/system-knowhow/triggers.md"
+if stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>/dev/null; then fail "a doc deleted since staging should be drift"; else pass "removed file caught"; fi
+rm -rf "$IN" "$STAGE"
+
+echo ""
+echo "test: stage_runtime_staged_knowhow_fresh refuses a missing live tree"
+IN="$(new_inputs)"; STAGE="$(mktemp -d)/stage"
+stage_runtime_assemble "$STAGE" "$IN/engine" "$IN/gateway" "$IN/cli" "$IN/frontend" "$IN/pg" "$IN/sdk" "$IN/system-knowhow" >/dev/null
+rm -rf "$IN/system-knowhow"
+out="$(stage_runtime_staged_knowhow_fresh "$STAGE" "$IN/system-knowhow" 2>&1)"; rc=$?
+if [ $rc -ne 0 ] && echo "$out" | grep -qi "system-knowhow dir not found"; then pass "missing live tree refused, never read as clean"; else fail "expected missing-live-tree refusal (rc=$rc): $out"; fi
+rm -rf "$IN" "$STAGE"
+
 echo ""
 echo "test: stage_runtime_build_binaries requires at least one package"
 out="$(stage_runtime_build_binaries /tmp/nope 2>&1)"; rc=$?

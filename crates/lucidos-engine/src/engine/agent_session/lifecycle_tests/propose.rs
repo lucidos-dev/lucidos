@@ -44,36 +44,126 @@ fn normal_idle_during_shutdown_does_nothing() {
 
 /// Anchor: the default idle path with no inflight work kills CC. The next
 /// turn arrives via `--resume` against a fresh subprocess.
+///
+/// This is also the arm that carries a turn which died on a transient upstream API
+/// error to the idle exit where `maybe_auto_resume_after_api_error` lives, so a
+/// false keep-alive here does not merely leak a subprocess, it silently cancels
+/// that recovery.
 #[test]
 fn terminate_decision_default_terminates() {
     assert_eq!(
-        terminate_decision(1, false),
+        terminate_decision(0, 0, false, false),
         TerminateDecision::Terminate,
-        "no follow-up queued, no bg bash — terminate is the default"
+        "nothing queued, nothing owed, no reservation, no bg bash: terminate is the default"
     );
 }
 
-/// `prev_pending_followups == 0` happens on resume turns where
-/// `has_content` was false (warm-up) and nothing arrived since. Still
-/// terminates — the > 1 threshold is what keeps CC alive, not ≥ 1.
+/// A warm-up / silent-resume turn seeds `inputs_awaiting_result` at 0 and its
+/// Result settles to 0. It used to need its own reasoning because a count of 1 was
+/// ambiguous between "the initial turn owes a Result" and "a follow-up is queued";
+/// now it reaches the same state as the default case by a different route.
 #[test]
-fn terminate_decision_zero_followups_terminates() {
+fn terminate_decision_warm_up_turn_terminates() {
+    let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 0, false);
     assert_eq!(
-        terminate_decision(0, false),
+        terminate_decision(0, awaiting, false, false),
         TerminateDecision::Terminate,
-        "zero is below the > 1 threshold — terminate"
+        "a warm-up turn owes nothing after its Result: terminate"
     );
 }
 
-/// A follow-up arrived between the prior turn and this one. Keep CC
-/// alive so the next turn consumes it without a respawn round-trip.
-/// `inflight` is `prev - 1` to match the pre-existing log line text.
+/// The regression this signature exists for. Claude Code merged three forwarded
+/// instructions into one Result, so nothing is owed and nothing is queued, and the
+/// old `> 1` rule read the raw count of 3 as two follow-ups in flight. It kept a
+/// finished session alive and swallowed the API-drop auto-resume on 2026-08-07.
 #[test]
-fn terminate_decision_inflight_followup_keeps_alive() {
+fn terminate_decision_merged_claude_code_turn_terminates() {
+    let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 3, false);
     assert_eq!(
-        terminate_decision(3, false),
-        TerminateDecision::KeepAliveForFollowup { inflight: 2 },
-        "prev > 1 means at least one follow-up is queued or merged — keep alive"
+        terminate_decision(0, awaiting, false, false),
+        TerminateDecision::Terminate,
+        "a merged Claude Code turn owes nothing: terminate so the API-drop resume can run"
+    );
+}
+
+/// The other half of the same rule, and the one that keeps this fix from trading
+/// the phantom for a dropped message. `select!` can forward an input and only then
+/// hand the loop a `Result` the agent produced before that input arrived, so the
+/// Result cannot have answered it. Zeroing there would cancel the subprocess with
+/// the user's message still inside.
+#[test]
+fn terminate_decision_claude_code_result_predating_a_forward_keeps_alive() {
+    let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 2, true);
+    assert_eq!(
+        terminate_decision(0, awaiting, false, false),
+        TerminateDecision::KeepAliveForFollowup {
+            queued: 0,
+            awaiting_result: 1,
+            redirect_pending: false,
+        },
+        "a Result that predates the forward leaves that input owed: keep the subprocess"
+    );
+}
+
+/// A follow-up was sent but the run loop has not forwarded it yet, so it is sitting
+/// in `msg_rx`. Keep CC alive so the next turn consumes it without a respawn
+/// round-trip. This is the window the idle-termination race lives in
+/// (`docs/plans/2026-06-27-cc-idle-termination-followup-race.md`).
+#[test]
+fn terminate_decision_queued_followup_keeps_alive() {
+    assert_eq!(
+        terminate_decision(1, 0, false, false),
+        TerminateDecision::KeepAliveForFollowup {
+            queued: 1,
+            awaiting_result: 0,
+            redirect_pending: false,
+        },
+        "a message unread in msg_rx must not die with the subprocess"
+    );
+}
+
+/// Codex emits one Result per accepted input, so after the interrupted turn's
+/// Result the driver still owes one and `TurnOutcome::Continue` is holding it.
+/// Killing the subprocess here would drop work the user already sent.
+#[test]
+fn terminate_decision_codex_still_owes_a_result_keeps_alive() {
+    let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::Codex, 2, false);
+    assert_eq!(
+        terminate_decision(0, awaiting, false, false),
+        TerminateDecision::KeepAliveForFollowup {
+            queued: 0,
+            awaiting_result: 1,
+            redirect_pending: false,
+        },
+        "Codex owes one more Result: keep the driver alive to run its queued input"
+    );
+}
+
+/// The same Codex session one turn later: the queued input has been answered, so
+/// nothing is owed and the subprocess goes.
+#[test]
+fn terminate_decision_codex_fully_settled_terminates() {
+    let awaiting = settle_inputs_awaiting_result(crate::runtime::CodingAgent::Codex, 1, false);
+    assert_eq!(
+        terminate_decision(0, awaiting, false, false),
+        TerminateDecision::Terminate,
+        "Codex has answered every forwarded input: terminate"
+    );
+}
+
+/// `arm_followup_redirect` reserved the subprocess and its caller has not routed
+/// the message yet, so it provably is not in `msg_rx`. This is the only window the
+/// channel cannot answer for.
+#[test]
+fn terminate_decision_armed_redirect_keeps_alive() {
+    assert_eq!(
+        terminate_decision(0, 0, true, false),
+        TerminateDecision::KeepAliveForFollowup {
+            queued: 0,
+            awaiting_result: 0,
+            redirect_pending: true,
+        },
+        "an armed redirect's follow-up is coming even though the channel is empty"
     );
 }
 
@@ -84,9 +174,9 @@ fn terminate_decision_inflight_followup_keeps_alive() {
 #[test]
 fn terminate_decision_chat_bg_bash_keeps_alive() {
     assert_eq!(
-        terminate_decision(1, true),
+        terminate_decision(0, 0, false, true),
         TerminateDecision::KeepAliveForBgBash,
-        "chat-agent bg bash pending — keep CC alive for the auto-wake"
+        "chat-agent bg bash pending: keep CC alive for the auto-wake"
     );
 }
 
@@ -95,10 +185,125 @@ fn terminate_decision_chat_bg_bash_keeps_alive() {
 #[test]
 fn terminate_decision_followup_wins_over_bg_bash() {
     assert_eq!(
-        terminate_decision(2, true),
-        TerminateDecision::KeepAliveForFollowup { inflight: 1 },
-        "user follow-up beats chat-agent bg bash — consume the message first"
+        terminate_decision(1, 0, false, true),
+        TerminateDecision::KeepAliveForFollowup {
+            queued: 1,
+            awaiting_result: 0,
+            redirect_pending: false,
+        },
+        "user follow-up beats chat-agent bg bash: consume the message first"
     );
+}
+
+/// Claude Code merges back-to-back stdin inputs into a single Result, so one Result
+/// answers everything forwarded so far, whatever N was, as long as the agent had
+/// spoken since the last forward.
+#[test]
+fn settle_claude_code_zeroes_any_backlog() {
+    for before in [0_u32, 1, 2, 3, 17] {
+        assert_eq!(
+            settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, before, false),
+            0,
+            "a Claude Code Result answers all {before} forwarded input(s) at once"
+        );
+    }
+}
+
+/// The qualifier. A Result the loop received with no agent output since the last
+/// forward may have been produced before that input arrived, so it cannot have
+/// answered it: one input stays owed and the next Result settles it. Without this,
+/// the merge rule silently cancels a subprocess that is still holding the user's
+/// message, which is the race the counter this replaced was written against.
+#[test]
+fn settle_claude_code_keeps_one_when_the_result_may_predate_the_forward() {
+    assert_eq!(
+        settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 2, true),
+        1,
+        "the forwarded-but-unanswered input stays owed"
+    );
+    assert_eq!(
+        settle_inputs_awaiting_result(crate::runtime::CodingAgent::ClaudeCode, 0, true),
+        0,
+        "nothing forwarded means nothing to keep owed, and no underflow"
+    );
+}
+
+/// With nothing forwarded, no event can predate anything and the state stays put.
+#[test]
+fn no_forward_means_no_event_predates_it() {
+    let (mut unconfirmed, mut queued) = (false, 0usize);
+    for _ in 0..3 {
+        assert!(!agent_event_may_predate_forward(
+            &mut unconfirmed,
+            &mut queued
+        ));
+    }
+}
+
+/// The common shape: a forward lands with the channel drained, the agent then works
+/// for a while. The first event still counts as possibly-predating (an event never
+/// vouches for itself), every one after it is proof the agent took the input.
+#[test]
+fn a_forward_into_a_drained_channel_is_confirmed_by_the_second_event() {
+    let (mut unconfirmed, mut queued) = (true, 0usize);
+    assert!(
+        agent_event_may_predate_forward(&mut unconfirmed, &mut queued),
+        "the first event may itself be the one that predates the forward"
+    );
+    assert!(!agent_event_may_predate_forward(
+        &mut unconfirmed,
+        &mut queued
+    ));
+    assert!(!agent_event_may_predate_forward(
+        &mut unconfirmed,
+        &mut queued
+    ));
+}
+
+/// **The buffered-event hole**, flagged by the Codex reviewer on this very change.
+/// The run loop routinely leaves several events queued while it awaits an emit, so
+/// a forward can be followed by an older non-Result event and then the older
+/// `Result`. Letting that first buffered event confirm the forward would settle the
+/// new input to zero and cancel the subprocess before the agent ever ran it.
+#[test]
+fn events_buffered_before_the_forward_cannot_confirm_it() {
+    let (mut unconfirmed, mut queued) = (true, 2usize);
+    for stale in 0..2 {
+        assert!(
+            agent_event_may_predate_forward(&mut unconfirmed, &mut queued),
+            "event {stale} was already in the channel at the forward and proves nothing"
+        );
+    }
+    assert!(
+        agent_event_may_predate_forward(&mut unconfirmed, &mut queued),
+        "the first genuinely-later event still does not vouch for itself"
+    );
+    assert!(
+        !agent_event_may_predate_forward(&mut unconfirmed, &mut queued),
+        "only now is the agent proven to have taken the input"
+    );
+}
+
+/// Codex runs one child per accepted input and emits one Result each, so a Result
+/// answers exactly one, whatever the ordering flag says. Saturating because a
+/// warm-up turn seeds 0 and still produces a Result.
+#[test]
+fn settle_codex_decrements_one_and_saturates() {
+    for may_predate in [false, true] {
+        assert_eq!(
+            settle_inputs_awaiting_result(crate::runtime::CodingAgent::Codex, 3, may_predate),
+            2
+        );
+        assert_eq!(
+            settle_inputs_awaiting_result(crate::runtime::CodingAgent::Codex, 1, may_predate),
+            0
+        );
+        assert_eq!(
+            settle_inputs_awaiting_result(crate::runtime::CodingAgent::Codex, 0, may_predate),
+            0,
+            "a warm-up Codex turn owes nothing and must not underflow"
+        );
+    }
 }
 
 #[test]

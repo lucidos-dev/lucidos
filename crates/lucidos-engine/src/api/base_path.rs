@@ -45,6 +45,29 @@ pub fn forwarded_prefix(headers: &HeaderMap) -> String {
     }
 }
 
+/// Whether this request reached the engine THROUGH the workspace gateway's
+/// proxy, rather than arriving at the engine's own port. Reads the same
+/// `X-Forwarded-Prefix` header as [`forwarded_prefix`], but as a yes/no about
+/// provenance rather than a value (that function's `/` default is deliberately
+/// indistinguishable from a direct hit, which is right for stamping a base href
+/// and wrong for deciding who is calling).
+///
+/// **This is a trust boundary, and it holds because the gateway is one.**
+/// `lucidos-gateway`'s proxy STRIPS any client-supplied `x-forwarded-prefix` and
+/// injects its own, so the header is present on every proxied request and
+/// forgeable on none. A caller that carries it is therefore provably on the far
+/// side of the gateway (in practice: a browser, including a same-origin app
+/// iframe), and one that does not came straight to this engine's port, which
+/// under the gateway is bound to loopback.
+///
+/// Used by the engine-internal routes that must not be reachable from a page.
+/// A peer-address check cannot serve that purpose here: the gateway proxies
+/// browser traffic to the engine over loopback, so a hostile page's request and
+/// the gateway's own control call arrive from the same `127.0.0.1`.
+pub fn arrived_through_gateway_proxy(headers: &HeaderMap) -> bool {
+    headers.contains_key("x-forwarded-prefix")
+}
+
 /// Insert `<base href="…">` as the first child of `<head>` so every relative ref
 /// in the document resolves against it. A `prefix` of `/` is a no-op (direct
 /// access needs no base). Falls back to prepending when there is no `<head>`.
@@ -179,6 +202,25 @@ mod tests {
         assert_eq!(forwarded_prefix(&headers_with("/dev/")), "/dev/");
         assert_eq!(forwarded_prefix(&headers_with("/dev")), "/dev/");
         assert_eq!(forwarded_prefix(&headers_with("dev")), "/dev/");
+    }
+
+    #[test]
+    fn a_proxied_request_is_told_apart_from_a_direct_one() {
+        // The provenance question, not the value question: only the header's
+        // PRESENCE answers it. This is what keeps the engine-internal routes off
+        // limits to a page served through the gateway.
+        assert!(arrived_through_gateway_proxy(&headers_with("/dev/")));
+        assert!(!arrived_through_gateway_proxy(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn an_empty_forwarded_prefix_still_marks_the_request_as_proxied() {
+        // `forwarded_prefix` maps an empty value to `/` (nothing to stamp), which
+        // is indistinguishable from a direct hit. Provenance must not inherit
+        // that: a blank header a proxy set is still a proxy having set it, and
+        // reading it as "direct" would hand a page the one bypass there is.
+        assert_eq!(forwarded_prefix(&headers_with("")), "/");
+        assert!(arrived_through_gateway_proxy(&headers_with("")));
     }
 
     #[test]

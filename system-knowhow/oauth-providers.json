@@ -53,7 +53,7 @@
       "console_label": "Dropbox App Console",
       "console_url": "https://www.dropbox.com/developers/apps",
       "setup_hint": "Create an app, add the redirect URI below under OAuth 2, and copy its App key as the Client ID. Leave the client secret blank to connect as a public client.",
-      "permissions_hint": "The Permissions tab caps what may be requested: enable every scope you need BEFORE connecting, because ticking a box never upgrades a token or grant that already exists. Backups need files.content.write, files.content.read, files.metadata.read and account_info.read."
+      "permissions_hint": "On the Permissions tab, tick every scope you need and then press Submit at the bottom of that tab, because an unsubmitted tick changes nothing and the button sits below the fold. Do it BEFORE connecting (a tick never upgrades a token or grant that already exists); backups need files.content.write, files.content.read, files.metadata.read and account_info.read."
     },
     {
       "id": "spotify",

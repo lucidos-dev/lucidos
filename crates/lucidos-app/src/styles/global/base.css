@@ -142,10 +142,11 @@ html {
        from the chevron's OWN size + top inset and can never drift from it. */
     --scroll-chevron-size: 2rem;   /* button diameter (width == height) */
     --scroll-chevron-top: 0.75rem; /* desktop top inset (see @media hover) */
-    /* Upward reach of the transcript's bottom dissolve — the bg-colored box-shadow
-       cast over the scroll area by .prompt-area (panels/content.css). The
+    /* Height of the transcript's bottom dissolve: the bg-colored gradient band
+       .prompt-area::before (panels/content.css) draws over the scroll area. The
        transcript's bottom padding reserves this plus --nav-focus-reach so the
-       last turn's focus marker clears it. Keep matched to that box-shadow. */
+       last turn's focus marker clears it. The band sizes itself from this var,
+       so the two are coupled by construction rather than by hand. */
     --prompt-fade: 1rem;
     /* Left inset shared by a turn's body content — LLM response body and every
        initiator body (change card, question, permission, child completion) line

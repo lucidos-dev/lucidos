@@ -69,9 +69,27 @@ describe('handleNavigationRequest — settings sub-sections', () => {
 
   it('opens a valid settings sub-section (models — the triggering case)', () => {
     handleNavigationRequest({ target: 'settings', settings_view: 'models' });
-    expect(switchMenuItem).toHaveBeenCalledWith('settings');
     expect(openSettingsSubview).toHaveBeenCalledWith('models');
     expect(showToast).not.toHaveBeenCalled();
+  });
+
+  it('lands a sub-section in ONE nav push, with no Settings-home entry first', () => {
+    // The reported bug: the Backup failure notification's "Open settings"
+    // landed on Settings → System → Backup correctly, but pairing
+    // switchMenuItem('settings') with openSettingsSubview pushed the Settings
+    // home list as its own history entry, so Back went there instead of back to
+    // the notification. openSettingsSubview lands both, so the pairing is gone.
+    handleNavigationRequest({ target: 'settings', settings_view: 'backup' });
+    expect(openSettingsSubview).toHaveBeenCalledWith('backup');
+    expect(switchMenuItem).not.toHaveBeenCalled();
+  });
+
+  it('lands the Thread Queue subpanel in ONE nav push too', () => {
+    // Same pairing, same fix: `thread-queue` is a NavigateTarget of its own that
+    // the frontend reinterprets as the Settings → System subpanel.
+    handleNavigationRequest({ target: 'thread-queue' });
+    expect(openSettingsSubview).toHaveBeenCalledWith('thread-queue');
+    expect(switchMenuItem).not.toHaveBeenCalled();
   });
 
   it('aliases a retired settings_view onto the category that absorbed it', () => {
@@ -89,6 +107,7 @@ describe('handleNavigationRequest — settings sub-sections', () => {
       vi.clearAllMocks();
       handleNavigationRequest({ target: 'settings', settings_view: sent });
       expect(openSettingsSubview, `"${sent}" should land on "${expected}"`).toHaveBeenCalledWith(expected);
+      expect(switchMenuItem, `"${sent}" should not also push Settings home`).not.toHaveBeenCalled();
       expect(showToast).not.toHaveBeenCalled();
     }
   });

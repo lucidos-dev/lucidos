@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
-import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts } from '../store';
+import { panelOverlay, pinnedApps, credentials, environmentVariables, oauthAccounts, repositories, artifacts, marketplaceCatalog } from '../store';
 import type { App } from '../types';
 
 // Mock loader functions to prevent API calls
@@ -10,6 +10,7 @@ vi.mock('./credentials', () => ({ loadCredentials: vi.fn() }));
 vi.mock('./environmentVariables', () => ({ loadEnvironmentVariables: vi.fn() }));
 vi.mock('./oauth', () => ({ loadOAuthAccounts: vi.fn(), handleOAuthAccountConnected: vi.fn() }));
 vi.mock('./repositoriesLoader', () => ({ loadRepositories: vi.fn() }));
+vi.mock('./plugin-marketplaces', () => ({ refreshPluginCatalogAfterMutation: vi.fn() }));
 // Partial-mock the HTTP client so the credential-event /health re-probe is
 // observable without a real network call (keeps every other export real for the
 // modules below that legitimately use them, e.g. pinnedApps).
@@ -42,6 +43,7 @@ import { loadCredentials } from './credentials';
 import { loadEnvironmentVariables } from './environmentVariables';
 import { loadOAuthAccounts, handleOAuthAccountConnected } from './oauth';
 import { loadRepositories } from './repositoriesLoader';
+import { refreshPluginCatalogAfterMutation } from './plugin-marketplaces';
 import { loadDevices, devices } from './devices';
 import { loadPinnedApps } from './pinnedApps';
 
@@ -81,6 +83,7 @@ describe('processSSEForReferences', () => {
     repositories.value = { status: 'not-loaded' };
     devices.value = { status: 'not-loaded' };
     artifacts.value = { status: 'not-loaded' };
+    marketplaceCatalog.value = { status: 'not-loaded' };
     vi.clearAllMocks();
     // Safe default for the credential-event /health re-probe so the other
     // Credential* tests (which don't care about it) don't hit `undefined.status`.
@@ -253,6 +256,62 @@ describe('processSSEForReferences', () => {
       processSSEForReferences('ArtifactUpdated', { artifact_path: 'a.md', commit: 'c', source: 'change_apply' });
       processSSEForReferences('ArtifactDeleted', { artifact_path: 'a.md', commit: 'c' });
       expect(loadArtifacts).toHaveBeenCalledTimes(3);
+    });
+  });
+
+  // ── PluginMarketplace* (the live marketplace list) ───────────────────────
+
+  describe('PluginMarketplace* events', () => {
+    const loadedCatalog = {
+      status: 'loaded' as const,
+      data: { marketplaces: [], plugins: [], errors: [] },
+    };
+
+    it('refreshes the catalog when a marketplace is registered', () => {
+      marketplaceCatalog.value = loadedCatalog;
+      processSSEForReferences('PluginMarketplaceRegistered', {
+        marketplace_id: 'example-repo-1a2b3c4d',
+        name: 'Example plugins',
+        source: 'https://github.com/example-org/example-repo',
+      });
+      expect(refreshPluginCatalogAfterMutation).toHaveBeenCalledTimes(1);
+    });
+
+    // The reported bug: an agent re-registered an already-registered source
+    // under a new name and the open panel kept showing the old one. The rename
+    // rides the same upsert event as the create, so an arm that only handled
+    // "new marketplace" would leave this case broken.
+    it('refreshes the catalog when a marketplace is renamed', () => {
+      marketplaceCatalog.value = loadedCatalog;
+      processSSEForReferences('PluginMarketplaceRegistered', {
+        marketplace_id: 'example-repo-1a2b3c4d',
+        name: "Example's plugins",
+        source: 'https://github.com/example-org/example-repo',
+      });
+      expect(refreshPluginCatalogAfterMutation).toHaveBeenCalledTimes(1);
+    });
+
+    it('refreshes the catalog when a marketplace is removed', () => {
+      marketplaceCatalog.value = loadedCatalog;
+      processSSEForReferences('PluginMarketplaceRemoved', {
+        marketplace_id: 'example-repo-1a2b3c4d',
+      });
+      expect(refreshPluginCatalogAfterMutation).toHaveBeenCalledTimes(1);
+    });
+
+    // The scan git-clones every registered marketplace, so a device that never
+    // opened the Plugins panel must not be made to do that work.
+    it('does not scan when the catalog was never loaded', () => {
+      marketplaceCatalog.value = { status: 'not-loaded' };
+      processSSEForReferences('PluginMarketplaceRegistered', {
+        marketplace_id: 'example-repo-1a2b3c4d',
+        name: 'Example plugins',
+        source: 'https://github.com/example-org/example-repo',
+      });
+      processSSEForReferences('PluginMarketplaceRemoved', {
+        marketplace_id: 'example-repo-1a2b3c4d',
+      });
+      expect(refreshPluginCatalogAfterMutation).not.toHaveBeenCalled();
     });
   });
 

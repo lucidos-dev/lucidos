@@ -1,6 +1,6 @@
 ---
 name: ThreadEvent Reference
-description: Every `ThreadEvent` the engine emits, by family (chat, coding-agent, thread lifecycle, changes, background bash, plugin, repo, merge conflict, and the transient SSE-only request events), with each one's payload, volume class, persistence, and whether a trigger can subscribe. Load for "what events fire on a thread", "can I trigger on ResponseGenerated / ChangeApplied / BackgroundBashCompleted", "is X persisted", "what payload does Y carry", or whether an app can read engine events.
+description: Every `ThreadEvent` the engine emits, by family (chat, coding-agent, lifecycle, changes, background bash, plugin, repo, merge conflict, transient SSE-only), with payload, persistence, and whether a trigger can subscribe. Load for "what events fire on a thread", "can I trigger on ResponseGenerated / ChangeApplied / BackgroundBashCompleted", or "is X persisted".
 ---
 
 # ThreadEvent Reference

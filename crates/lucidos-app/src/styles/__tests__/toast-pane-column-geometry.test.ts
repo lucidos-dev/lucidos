@@ -19,28 +19,11 @@ import { dirname, resolve } from 'node:path';
 // @ts-expect-error: same
 import { fileURLToPath } from 'node:url';
 
+import { block, decl } from './css-rule-helpers';
+
 const here: string = dirname(fileURLToPath(import.meta.url));
 const componentsCss = readFileSync(resolve(here, '../components.css'), 'utf-8');
 const shellCss = readFileSync(resolve(here, '../panels/shell.css'), 'utf-8');
-
-/** Body of the first rule block whose header matches `needle`, from `from`. */
-function block(css: string, needle: string, from = 0): string {
-  const at = css.indexOf(needle, from);
-  expect(at, `"${needle}" not found`).toBeGreaterThanOrEqual(0);
-  const open = css.indexOf('{', at);
-  let depth = 0;
-  for (let i = open; i < css.length; i++) {
-    if (css[i] === '{') depth++;
-    else if (css[i] === '}' && --depth === 0) return css.slice(open + 1, i);
-  }
-  throw new Error(`unterminated block for "${needle}"`);
-}
-
-/** A declaration's value, or null when the block doesn't set that property. */
-function decl(body: string, prop: string): string | null {
-  const m = body.match(new RegExp(`(?:^|[;{]|\\*/)\\s*${prop}:\\s*([^;]+);`));
-  return m ? m[1].replace(/\s+/g, ' ').trim() : null;
-}
 
 describe('per-pane toast columns', () => {
   it('stacks toasts on the column, not on the shared container', () => {

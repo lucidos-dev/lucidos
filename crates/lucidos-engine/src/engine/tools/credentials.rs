@@ -102,6 +102,113 @@ fn oauth_defaults_from_args(
     defaults
 }
 
+/// A userinfo field the provider actually answered.
+///
+/// A present-but-blank field is the same as an absent one, and it does reach
+/// here: userinfo parsing takes whatever string the JSON carries, so a provider
+/// answering `"name": ""` would otherwise produce "the account for ." and one
+/// answering `"email": ""` would produce "account ()".
+fn reported(field: Option<&String>) -> Option<&str> {
+    field.map(String::as_str).filter(|s| !s.trim().is_empty())
+}
+
+/// Connected, and whose account it is. Says nothing about scopes.
+fn connected_sentence(provider: &str, outcome: &oauth::OAuthFlowOutcome) -> String {
+    match (
+        reported(outcome.email.as_ref()),
+        reported(outcome.display_name.as_ref()),
+    ) {
+        (Some(email), _) => format!("Successfully connected {provider} account ({email})."),
+        // No email, but the provider did say who this is. Naming the account
+        // beats reporting it as unidentified, which is what this branch did for
+        // as long as the display name was dropped on the floor here.
+        (None, Some(name)) => format!(
+            "Successfully connected the {provider} account for {name}. The provider reported no \
+             email address for it, so refer to it by that name and do not go looking for one."
+        ),
+        // The provider gave no userinfo endpoint, or it returned neither field.
+        // Say that, rather than reporting the account as literally named
+        // "unknown" and sending the agent off to curl the provider's API to
+        // find out who it is.
+        (None, None) => format!(
+            "Successfully connected the {provider} account. The provider did not report which \
+             account it is (no userinfo endpoint configured for {provider}, or it returned no \
+             email), so do not guess or go looking for one."
+        ),
+    }
+}
+
+/// What the authorization asked for and did not get, and what to do about it.
+///
+/// The per-provider half comes from the *OAuth provider registry* row, never
+/// from a branch on the provider name: which console to open and what has to be
+/// enabled there is data, and the same data already drives the credential
+/// form's help block. A provider with no row (or an install with no staged
+/// system-knowhow) still gets the generic instruction, which is the part that
+/// actually unblocks the user.
+fn scope_shortfall_sentences(
+    missing: &[String],
+    row: Option<&oauth_registry::OAuthProviderRow>,
+) -> String {
+    let noun = if missing.len() == 1 {
+        "scope"
+    } else {
+        "scopes"
+    };
+    let pronoun = if missing.len() == 1 { "it" } else { "them" };
+    let mut text = format!(
+        "The provider did not grant everything that was requested. Missing {noun}: {}. The \
+         account is connected and works for what it did get, but any call needing {pronoun} will \
+         fail. Enable {pronoun} for this app in the provider's own console, then RECONNECT the \
+         account (the Reconnect button on Settings > Accounts, or another connect_oauth_account \
+         call): neither a token refresh nor the existing grant picks up a newly enabled scope.",
+        missing.join(", ")
+    );
+    let Some(row) = row else { return text };
+    if let Some(hint) = row.permissions_hint.as_deref() {
+        text.push(' ');
+        text.push_str(hint);
+    }
+    if let Some(url) = row.console_url.as_deref() {
+        let label = row.console_label.as_deref().unwrap_or("Console");
+        text.push_str(&format!(" {label}: {url}"));
+    }
+    text
+}
+
+/// The agent-facing result of a completed authorization.
+///
+/// A full grant reads exactly as it always did. A partial one still reports the
+/// connection (it happened, and refusing to say so would send the agent back
+/// through a flow that worked) but names the shortfall, because the alternative
+/// is what shipped until now: an unqualified success for an account holding one
+/// of the four scopes it asked for, with the Accounts panel as the only surface
+/// that knew.
+fn connect_result_message(
+    provider: &str,
+    outcome: &oauth::OAuthFlowOutcome,
+    row: Option<&oauth_registry::OAuthProviderRow>,
+) -> String {
+    let missing =
+        oauth::missing_requested_scopes(&outcome.requested_scopes, &outcome.granted_scopes);
+    let mut message = connected_sentence(provider, outcome);
+    if missing.is_empty() {
+        // Nothing follows, so an unidentified account gets its closing
+        // instruction here. With a shortfall the closing instruction is the
+        // reconnect one instead, and "just say it is connected" would
+        // contradict it.
+        if reported(outcome.email.as_ref()).is_none()
+            && reported(outcome.display_name.as_ref()).is_none()
+        {
+            message.push_str(&format!(" Just say the {provider} account is connected."));
+        }
+        return message;
+    }
+    message.push(' ');
+    message.push_str(&scope_shortfall_sentences(&missing, row));
+    message
+}
+
 impl LucidosEngine {
     /// `thread_id` + `device_id` are here for `connect_oauth_account`: the
     /// authorization page is opened by the user's own client (see
@@ -259,7 +366,7 @@ impl LucidosEngine {
                         format!("could not open the authorization page: {e}").into()
                     })
                 };
-                let (email, _display_name, _merged_scopes) = oauth::run_oauth_flow(
+                let outcome = oauth::run_oauth_flow(
                     &self.pool,
                     &self.event_bus,
                     &provider,
@@ -271,21 +378,15 @@ impl LucidosEngine {
                 )
                 .await?;
 
-                match email.as_deref() {
-                    Some(email) => Ok(format!(
-                        "Successfully connected {provider} account ({email})."
-                    )),
-                    // The provider gave no userinfo endpoint, or it did not
-                    // return an email. Say that, rather than reporting the
-                    // account as literally named "unknown" and sending the agent
-                    // off to curl the provider's API to find out who it is.
-                    None => Ok(format!(
-                        "Successfully connected the {provider} account. The provider did not \
-                         report which account it is (no userinfo endpoint configured for \
-                         {provider}, or it returned no email), so do not guess or go looking \
-                         for one: just say the {provider} account is connected."
-                    )),
-                }
+                // The registry row supplies the per-provider half of a shortfall
+                // message (which console to open, what has to be enabled there).
+                // Looked up the same way the no-credentials branch above does,
+                // and absent registry rows are a supported state.
+                let row = oauth_registry::find_provider(
+                    self.system_knowhow_dir(),
+                    &oauth::client_provider_name(&provider),
+                );
+                Ok(connect_result_message(&provider, &outcome, row.as_ref()))
             }
             _ => Ok(format!("Unknown credential tool: {}", name)),
         }
@@ -481,6 +582,223 @@ mod tests {
             assert!(
                 parsed.get("env_var_name").is_none(),
                 "a blank env_var_name ({name:?}) must omit the field: {parsed}"
+            );
+        }
+    }
+
+    // ─── What the agent is told a connection actually got ──────────────────
+    //
+    // Until 2026-08-07 this said "Successfully connected {provider} account"
+    // whatever came back, so a Dropbox app whose App Console had not been
+    // submitted connected an account holding one of its four requested scopes
+    // and reported it as done. The Accounts panel drew the shortfall the whole
+    // time; the agent had no way to see it.
+
+    fn outcome(
+        email: Option<&str>,
+        display_name: Option<&str>,
+        granted: &str,
+        requested: &str,
+    ) -> oauth::OAuthFlowOutcome {
+        oauth::OAuthFlowOutcome {
+            email: email.map(str::to_string),
+            display_name: display_name.map(str::to_string),
+            granted_scopes: granted.to_string(),
+            requested_scopes: requested.to_string(),
+        }
+    }
+
+    /// A registry row with only the fields a shortfall message reads. Named for
+    /// nothing shipped, so the source scan below stays meaningful.
+    fn row_with_console() -> oauth_registry::OAuthProviderRow {
+        oauth_registry::OAuthProviderRow {
+            id: "acme".to_string(),
+            label: "Acme".to_string(),
+            base_url: "https://api.acme.test".to_string(),
+            auth_url: "https://acme.test/authorize".to_string(),
+            token_url: "https://api.acme.test/token".to_string(),
+            userinfo_url: None,
+            userinfo_method: None,
+            authorize_params: None,
+            redirect_uri: None,
+            client_type: None,
+            console_label: Some("Acme Developer Console".to_string()),
+            console_url: Some("https://acme.test/apps".to_string()),
+            setup_hint: None,
+            permissions_hint: Some("Tick the permission and press Submit.".to_string()),
+        }
+    }
+
+    #[test]
+    fn a_full_grant_reports_exactly_what_it_always_did() {
+        // Pinned character for character: this string is what every working
+        // connection has read since the tool existed, and a shortfall report is
+        // not a licence to reword the success case.
+        assert_eq!(
+            connect_result_message(
+                "acme",
+                &outcome(Some("user@example.com"), None, "read write", "read write"),
+                Some(&row_with_console()),
+            ),
+            "Successfully connected acme account (user@example.com)."
+        );
+    }
+
+    #[test]
+    fn a_partial_grant_names_every_missing_scope_and_says_reconnect() {
+        let message = connect_result_message(
+            "acme",
+            &outcome(
+                Some("user@example.com"),
+                None,
+                "account_info.read",
+                "files.content.write files.metadata.read account_info.read",
+            ),
+            None,
+        );
+        assert!(
+            message.starts_with("Successfully connected acme account (user@example.com)."),
+            "the account did connect and the message must still say so: {message}"
+        );
+        for scope in ["files.content.write", "files.metadata.read"] {
+            assert!(message.contains(scope), "{scope} must be named: {message}");
+        }
+        assert!(
+            !message.contains("Missing scope: account_info.read"),
+            "a granted scope must not be reported as missing: {message}"
+        );
+        assert!(
+            message.contains("RECONNECT"),
+            "the fix is a reconnect, and a refresh will not do it: {message}"
+        );
+        assert!(
+            message.contains("refresh"),
+            "the message must say why a refresh does not help: {message}"
+        );
+    }
+
+    #[test]
+    fn a_shortfall_carries_the_registry_row_and_not_a_hardcoded_provider_rule() {
+        let message = connect_result_message(
+            "acme",
+            &outcome(Some("user@example.com"), None, "", "files.content.write"),
+            Some(&row_with_console()),
+        );
+        assert!(
+            message.contains("Tick the permission and press Submit."),
+            "the per-provider sentence comes from the registry: {message}"
+        );
+        assert!(
+            message.contains("Acme Developer Console: https://acme.test/apps"),
+            "the console link is what makes the instruction actionable: {message}"
+        );
+    }
+
+    #[test]
+    fn a_shortfall_with_no_registry_row_still_says_what_to_do() {
+        // A derived provider, or an install with no staged system-knowhow. The
+        // generic instruction is the half that unblocks the user, so it cannot
+        // depend on the row being there.
+        let message = connect_result_message(
+            "ghealth",
+            &outcome(
+                None,
+                None,
+                "",
+                "https://www.googleapis.com/auth/cloud-healthcare",
+            ),
+            None,
+        );
+        assert!(message.contains("https://www.googleapis.com/auth/cloud-healthcare"));
+        assert!(message.contains("RECONNECT"));
+    }
+
+    #[test]
+    fn an_account_with_a_name_but_no_email_is_named_rather_than_unknown() {
+        // `display_name` used to be bound and dropped, so a provider that
+        // reports a name and no email (Dropbox nests one as
+        // `name.display_name`) was reported as unidentifiable.
+        let message = connect_result_message(
+            "acme",
+            &outcome(None, Some("Ada Lovelace"), "read", "read"),
+            None,
+        );
+        assert!(
+            message.contains("Ada Lovelace"),
+            "the provider said whose account this is: {message}"
+        );
+        assert!(
+            !message.contains("did not report which account"),
+            "it did report which account: {message}"
+        );
+    }
+
+    #[test]
+    fn a_blank_userinfo_field_counts_as_not_reported() {
+        // Userinfo parsing takes whatever string the JSON carries, so a provider
+        // answering `"email": ""` or `"name": ""` reaches here as Some(""). Read
+        // literally that renders "account ()" and "the account for .".
+        let message =
+            connect_result_message("acme", &outcome(Some("  "), Some(""), "read", "read"), None);
+        assert!(
+            message.contains("did not report which account it is"),
+            "a blank field is not an answer: {message}"
+        );
+        assert!(!message.contains("account ()"));
+        assert!(!message.contains("account for ."));
+    }
+
+    #[test]
+    fn an_unidentified_account_keeps_its_do_not_go_looking_instruction() {
+        let message = connect_result_message("acme", &outcome(None, None, "read", "read"), None);
+        assert!(message.contains("do not guess or go looking for one"));
+        assert!(message.contains("Just say the acme account is connected."));
+    }
+
+    #[test]
+    fn an_unidentified_account_short_of_a_scope_is_not_told_to_say_it_is_fine() {
+        // The two closing instructions contradict each other, so only one runs.
+        let message =
+            connect_result_message("acme", &outcome(None, None, "read", "read write"), None);
+        assert!(
+            !message.contains("Just say the acme account is connected."),
+            "a shortfall's closing instruction is the reconnect one: {message}"
+        );
+        assert!(message.contains("RECONNECT"));
+    }
+
+    #[test]
+    fn the_result_message_names_no_provider() {
+        // CLAUDE.md bans provider-specific instructions in engine code, and the
+        // per-provider half of a shortfall message is exactly the kind of thing
+        // that invites one. It comes from the registry row instead, so a
+        // literal here would be a second copy free to drift from the JSON.
+        //
+        // Scoped to the three message builders rather than the whole file: the
+        // rest of the module legitimately quotes a provider name in comments
+        // about historical credential spellings, and the tests below name
+        // providers on purpose.
+        let source = include_str!("credentials.rs");
+        let builders = source
+            .split("fn connected_sentence")
+            .nth(1)
+            .and_then(|rest| rest.split("impl LucidosEngine").next())
+            .expect("the message builders sit between their first fn and the impl block");
+        assert!(
+            builders.contains("fn connect_result_message"),
+            "the scanned slice must cover every message builder"
+        );
+        let dir = crate::paths::repo_root()
+            .expect("repo root resolves under cargo test")
+            .join("system-knowhow");
+        let rows = oauth_registry::load_providers(Some(dir.as_path()));
+        assert!(!rows.is_empty(), "the shipped registry must list providers");
+        for row in rows {
+            assert!(
+                !builders.to_lowercase().contains(&row.id.to_lowercase()),
+                "the connect result message names the provider '{}'. Per-provider wording \
+                 belongs in system-knowhow/oauth-providers.json.",
+                row.id
             );
         }
     }

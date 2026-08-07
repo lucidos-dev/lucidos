@@ -19,6 +19,7 @@ import {
   rowForService,
   secretIsExpected,
 } from '../oauthClientForm';
+import { reauthorizationHint } from '../providerConsoleHint';
 import { emptyFields, type CredentialFields } from '../credentialSecret';
 import type { KnownOAuthProvider } from '../../../store/types';
 
@@ -261,5 +262,67 @@ describe('the repair path renders against the stored credential', () => {
     // and the selected base provider's base_url never reaches the save.
     expect(source).not.toMatch(/baseUrlRef\.current\.value\s*=/);
     expect(source).toContain('setBaseUrl(row.base_url)');
+  });
+});
+
+/**
+ * The console guidance beside a re-authorization button.
+ *
+ * `permissions_hint` and `console_url` reached only the registration form until
+ * 2026-08-07, which is the wrong moment for them: a user pressing *Reconnect*
+ * or *Grant access* has an app already registered and is short of a permission
+ * the provider's console has to enable first. Pressing the button without that
+ * step grants the same narrow set again.
+ */
+describe('reauthorizationHint', () => {
+  const withHint: KnownOAuthProvider = {
+    id: 'acme',
+    label: 'Acme',
+    base_url: 'https://api.acme.test',
+    auth_url: 'https://acme.test/authorize',
+    token_url: 'https://api.acme.test/token',
+    console_label: 'Acme Developer Console',
+    console_url: 'https://acme.test/apps',
+    permissions_hint: 'Tick the permission and press Submit.',
+  };
+  const providers = [withHint];
+
+  it('resolves the row when the account is genuinely short of a scope', () => {
+    expect(reauthorizationHint(providers, 'acme', true)).toBe(withHint);
+    // The provider name arrives from an account row or a backup provider id, so
+    // case and stray whitespace are not the caller's problem.
+    expect(reauthorizationHint(providers, ' Acme ', true)).toBe(withHint);
+  });
+
+  it('shows nothing when there is no shortfall', () => {
+    // A working account gets no console lecture. This gate is what keeps the
+    // guidance tied to a problem the user actually has.
+    expect(reauthorizationHint(providers, 'acme', false)).toBeUndefined();
+  });
+
+  it('shows nothing for a provider the registry does not know', () => {
+    // A derived provider, or an install with no staged system-knowhow, where
+    // the registry loads empty. The button still works.
+    expect(reauthorizationHint(providers, 'acme-archive', true)).toBeUndefined();
+    expect(reauthorizationHint([], 'acme', true)).toBeUndefined();
+    expect(reauthorizationHint(providers, '', true)).toBeUndefined();
+  });
+
+  it('shows nothing for a row with neither a hint nor a console', () => {
+    // Rendering the wrapper for it would leave an empty box under the line.
+    const bare: KnownOAuthProvider = {
+      ...withHint,
+      console_url: undefined,
+      console_label: undefined,
+      permissions_hint: undefined,
+    };
+    expect(reauthorizationHint([bare], 'acme', true)).toBeUndefined();
+  });
+
+  it('resolves a row carrying only one of the two', () => {
+    const hintOnly: KnownOAuthProvider = { ...withHint, console_url: undefined };
+    const consoleOnly: KnownOAuthProvider = { ...withHint, permissions_hint: undefined };
+    expect(reauthorizationHint([hintOnly], 'acme', true)).toBe(hintOnly);
+    expect(reauthorizationHint([consoleOnly], 'acme', true)).toBe(consoleOnly);
   });
 });

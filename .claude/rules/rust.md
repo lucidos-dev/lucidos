@@ -30,6 +30,8 @@ paths:
 
 Lucidos uses **event sourcing** — the `events` table is the source of truth, with cached projections (`thread_summaries`, `notifications`) maintained by EventBus. Schema reference (tables, event types, column notes, query patterns) lives in `.claude/rules/db.md` — auto-loaded when editing `*.sql` or `migrations/**`.
 
+- **"The last N seconds" over a DB timestamp is resolved in SQL, never from `Utc::now()` (ADR 0053).** `events.created` is stamped by Postgres, so `WHERE created >= $cutoff` with a cutoff the engine computed puts the host clock and the database clock on opposite sides of one `>=`. In dev both the workspace PG and `lucidos-pg-test` run in a Docker VM whose clock drifts, and once it drifts past the window EVERY row falls outside it: the query returns nothing and the caller reads that as "nothing happened". Pass a **duration** (`window_secs: i64`) and write `created >= now() - make_interval(secs => $n)`, so there is no timestamp parameter to fill in from the wrong clock. Same for anything derived for the caller to read: an age is `EXTRACT(EPOCH FROM now() - created)::bigint`, not `Utc::now() - row.created`. This has bitten twice (`pg_now` in `changes_projection_tests/helpers.rs`, then seven event-wait tests reporting "0 matches" on 2026-08-07); the ADR names the two sites deliberately left alone.
+
 ## Timezone Handling
 
 UTC in database, user timezone in UI. Cron: 6 fields — `second minute hour day-of-month month day-of-week` (e.g., `0 0 8 * * *` = 8am daily). Stored with user timezone for DST. IANA format (e.g., `Europe/Oslo`). Convert: `utc_time.with_timezone(&user_tz)`.

@@ -18,17 +18,15 @@ import { loadInstalledPlugins } from '../../store/actions/plugins';
 import { openAppById } from '../../store/actions/apps';
 import { focusThread } from '../../store/actions/threads';
 import { uninstallMarketplacePlugin } from '../../store/actions/plugin-uninstall';
-import { openSettingsSubview, switchMenuItem } from '../../store/actions/menu';
+import { openSettingsSubview } from '../../store/actions/menu';
 import { AddOfficialMarketplaceButton } from './AddOfficialMarketplaceButton';
 import { contentLabel } from './pluginContent';
 import { applyNavFocus } from '../shared/focusMarker';
 
-/** Jump to Settings → Marketplaces from anywhere. `switchMenuItem` sets the
- *  Settings panel as the active menu item (resetting the subview to main);
- *  `openSettingsSubview` then lands on Marketplaces — the same two-step the
- *  navigate_ui settings deep-link uses. */
+/** Jump to Settings → Marketplaces from anywhere. One call: `openSettingsSubview`
+ *  lands the Settings panel and the sub-section together, so the jump is a single
+ *  nav-history entry (the same shape the navigate_ui settings deep link uses). */
 function openMarketplaceSettings() {
-  switchMenuItem('settings');
   openSettingsSubview('marketplaces');
 }
 

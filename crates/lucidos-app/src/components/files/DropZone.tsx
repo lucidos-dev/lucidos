@@ -4,6 +4,7 @@ import { showToast } from '../../store/store';
 import { attachDroppedFilesToDraft } from '../chat/attachToDraft';
 import { errorDetail } from '../../utils/errorDetail';
 import { findDropZone, dispatchDrop, type DropZoneKind, type DropZoneMatch } from './dropDispatch';
+import { dragCarriesFiles } from '../../utils/strayFileDrop';
 
 const ZONE_CLASS: Record<DropZoneKind, string> = {
   attach: 'drag-over-attach',
@@ -11,20 +12,20 @@ const ZONE_CLASS: Record<DropZoneKind, string> = {
 };
 const ALL_ZONE_CLASSES = Object.values(ZONE_CLASS);
 
-/** Document-level drag-and-drop dispatcher.
+/** Document-level drag-and-drop dispatcher: routes a file drop to the zone it
+ *  landed on (attach to the draft, or import into files) and highlights the zone
+ *  under the cursor.
  *
- *  Drops outside any registered zone are swallowed (preventDefault) so the
- *  browser doesn't navigate to the dropped file — without that, releasing
- *  outside the thread/files panes would open the file in a new tab. */
+ *  Drops outside any registered zone are swallowed here too, but the guarantee
+ *  that a stray drop can never navigate the document belongs to
+ *  `installStrayFileDropGuard` (utils/strayFileDrop.ts), which is installed for
+ *  BOTH render roots rather than only wherever this component happens to be
+ *  mounted. */
 export function DropZone() {
   const enterCounterRef = useRef(0);
   const currentZoneRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    function isFileDrag(e: DragEvent): boolean {
-      return !!e.dataTransfer?.types?.includes('Files');
-    }
-
     function applyHighlight(zone: DropZoneMatch | null) {
       const newEl = zone?.el ?? null;
       if (currentZoneRef.current === newEl) return;
@@ -43,14 +44,14 @@ export function DropZone() {
     }
 
     function onDragEnter(e: DragEvent) {
-      if (!isFileDrag(e)) return;
+      if (!dragCarriesFiles(e)) return;
       e.preventDefault();
       enterCounterRef.current++;
       applyHighlight(findDropZone(e.target));
     }
 
     function onDragOver(e: DragEvent) {
-      if (!isFileDrag(e)) return;
+      if (!dragCarriesFiles(e)) return;
       e.preventDefault();
       const zone = findDropZone(e.target);
       if (e.dataTransfer) {
@@ -60,8 +61,8 @@ export function DropZone() {
     }
 
     function onDragLeave(_e: DragEvent) {
-      // Don't gate on isFileDrag — some browsers strip dataTransfer.types on
-      // dragleave, which would desync the counter and strand the highlight.
+      // Don't gate on dragCarriesFiles: some browsers strip dataTransfer.types
+      // on dragleave, which would desync the counter and strand the highlight.
       // If we incremented in dragenter, we must decrement here unconditionally.
       if (enterCounterRef.current === 0) return;
       enterCounterRef.current--;
@@ -69,7 +70,7 @@ export function DropZone() {
     }
 
     async function onDrop(e: DragEvent) {
-      if (!isFileDrag(e)) return;
+      if (!dragCarriesFiles(e)) return;
       e.preventDefault();
       const target = e.target;
       const files = e.dataTransfer?.files;

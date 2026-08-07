@@ -32,6 +32,7 @@ function code(path: string): string {
 }
 
 const source = code('../BackupSection.tsx');
+const seedingSource = code('../backupSeeding.ts');
 const menuSource = code('../../../store/actions/menu.ts');
 
 describe('the not-connected state offers a way out, not a path to walk', () => {
@@ -107,7 +108,12 @@ describe('the chat hand-off', () => {
  */
 describe('the provider dropdown reflects and writes the configured destination', () => {
   it('seeds through the shared decision instead of the first registry entry', () => {
-    expect(source).toContain('pickInitialProvider(');
+    // The decision moved into `backupSeeding.ts` when a second caller appeared
+    // (the SSE refresh for a backup preference changed elsewhere). Both halves
+    // are pinned: the page must route through it, and it must still be the
+    // thing that consults the configured destination.
+    expect(source).toContain('backupSeed(');
+    expect(seedingSource).toContain('pickInitialProvider(');
     // The exact shape of the old bug. `p[0]` as the unconditional seed is what
     // overrode `backup_provider`.
     expect(source).not.toMatch(/setSelectedProvider\(\s*p\[0\]\.id\s*\)/);

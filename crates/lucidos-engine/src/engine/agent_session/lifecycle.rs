@@ -26,48 +26,160 @@ pub(super) fn idle_action(is_conflict: bool, is_shutdown: bool) -> IdleAction {
     }
 }
 
+/// Settle `AgentSession::inputs_awaiting_result` for one `Result` and return what
+/// the driver still owes.
+///
+/// The two backends make different promises about how many Results an input earns,
+/// and that asymmetry is the whole reason the counter needs a function rather than
+/// a constant:
+///
+/// * **Claude Code** merges back-to-back stdin inputs into a SINGLE Result. One
+///   Result therefore answers every input forwarded so far, and the remainder is
+///   zero.
+/// * **Codex** runs one app-server / exec child per accepted input and emits one
+///   Result EACH. `TurnOutcome::Continue` in `runtime/codex.rs` deliberately keeps
+///   queued inputs across an interrupt on exactly that promise, so a Result answers
+///   one input and the rest are still owed.
+///
+/// Applying the Codex rule to Claude Code is the defect this replaced: a turn that
+/// merged three instructions settled to two, reported two phantom follow-ups in
+/// flight, kept a finished session alive, and swallowed the API-drop auto-resume.
+/// See `docs/plans/2026-08-07-api-drop-resume-suppressed-by-phantom-followup-count.md`.
+///
+/// `result_may_predate_a_forward` is the load-bearing qualifier on the Claude Code
+/// rule, and without it the fix trades one dropped-work bug for another. "One
+/// Result answers everything forwarded so far" holds only for inputs the agent had
+/// actually taken when it ended the turn. `events_rx` and `msg_rx` are separate
+/// channels with no causal ordering, so `select!` can forward an input and only
+/// then hand the loop a `Result` the agent produced before that input arrived.
+/// Zeroing there would terminate the subprocess with the user's message still
+/// inside it, which is the exact race the counter this replaced was written
+/// against. The run loop sets the flag when it forwards and clears it on any agent
+/// output, so a set flag means "nothing from the agent since, this Result may not
+/// be the answer": keep one input owed and let the next Result settle it.
+///
+/// Saturating everywhere the count decrements, because it can legitimately already
+/// be zero: a silent resume / warm-up turn seeds 0 and still produces a Result.
+pub(super) fn settle_inputs_awaiting_result(
+    coding_agent: crate::runtime::CodingAgent,
+    before: u32,
+    result_may_predate_a_forward: bool,
+) -> u32 {
+    match coding_agent {
+        crate::runtime::CodingAgent::Codex => before.saturating_sub(1),
+        crate::runtime::CodingAgent::ClaudeCode if result_may_predate_a_forward => {
+            before.saturating_sub(1)
+        }
+        crate::runtime::CodingAgent::ClaudeCode => 0,
+    }
+}
+
+/// Advance the forward-confirmation state for one agent event, and answer whether
+/// THIS event might have been produced before the last forwarded input reached the
+/// agent.
+///
+/// `events_rx` and `msg_rx` are separate channels with no causal ordering, so an
+/// agent event is not self-evidently a reaction to the input the run loop just
+/// forwarded. Two rules make the answer safe:
+///
+/// 1. **Events already queued at the forward are skipped.** They were produced
+///    before the agent could have seen the input, so they prove nothing. Without
+///    this, a `Result` that had been sitting in the channel the whole time reads as
+///    confirmation, which is the buffered-event hole.
+/// 2. **An event never vouches for itself.** The answer is the state as it stood
+///    BEFORE this event, so the first genuinely-later event still counts as
+///    possibly-predating. That covers the irreducible remainder: the agent can
+///    write a Result to stdout microseconds before reading stdin, and nothing in
+///    either protocol acknowledges an input.
+///
+/// The cost of both is at most one extra kept-alive idle. The cost of getting it
+/// wrong in the other direction is a subprocess cancelled while it still holds the
+/// user's message. Mutable-state-in, answer-out like `reset_per_turn_flags`, so the
+/// run loop keeps the state as plain locals and this stays testable.
+pub(super) fn agent_event_may_predate_forward(
+    forwarded_input_unconfirmed: &mut bool,
+    agent_events_queued_at_forward: &mut usize,
+) -> bool {
+    let may_predate = *forwarded_input_unconfirmed;
+    if *forwarded_input_unconfirmed {
+        if *agent_events_queued_at_forward > 0 {
+            *agent_events_queued_at_forward -= 1;
+        } else {
+            *forwarded_input_unconfirmed = false;
+        }
+    }
+    may_predate
+}
+
 /// Per-Result termination decision once `idle_action` returned
 /// `ExitSubprocess`. Each `KeepAlive` variant names its own reason so the
-/// log line at the call site is derived from the variant — no risk of the
+/// log line at the call site is derived from the variant, with no risk of the
 /// log message drifting from the actual cause.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum TerminateDecision {
     /// Kill CC via `agent_cancel.cancel()`. The next message resumes a
     /// fresh CC process via `--resume`.
     Terminate,
-    /// One or more follow-up user messages are inflight (queued in
-    /// `msg_rx` or already merged into this Result). Keep CC alive so the
-    /// next turn consumes them without a respawn round-trip. `inflight` is
-    /// `prev_pending_followups - 1` to match the pre-existing log line.
-    KeepAliveForFollowup { inflight: u32 },
+    /// A follow-up is genuinely still on its way to this session. Keep CC alive so
+    /// it lands without a respawn round-trip. The fields carry which of the three
+    /// windows said so, so the log line names the real reason.
+    KeepAliveForFollowup {
+        /// Sent, not yet forwarded: messages sitting unread in `msg_rx`.
+        queued: usize,
+        /// Forwarded, not yet answered: what the driver still owes after
+        /// [`settle_inputs_awaiting_result`].
+        awaiting_result: u32,
+        /// Armed, not yet sent: `arm_followup_redirect` reserved this subprocess
+        /// and its caller has not routed the message yet.
+        redirect_pending: bool,
+    },
     /// The chat-agent's `run_bash_background` LLM tool still has a task
     /// running for this thread. `spawn_bash_completion_watcher` will push a
     /// resume prompt into `msg_tx` when the bash completes; killing CC
-    /// here would force the wake path through stale-session recovery —
+    /// here would force the wake path through stale-session recovery,
     /// exactly the regression that gate exists to prevent.
     KeepAliveForBgBash,
 }
 
 /// Decide whether to terminate the CC subprocess at idle.
 ///
-/// `prev_pending_followups` is the value of `pending_followups` **after**
-/// the per-Result `swap(0)` — values > 1 mean a follow-up message arrived
-/// between the prior turn and this one and CC must stay alive to consume
-/// it without a respawn round-trip.
+/// A follow-up has three disjoint windows between the moment it is promised and the
+/// moment the driver answers it, and each gets its own signal rather than one
+/// counter standing in for all three:
 ///
-/// Precedence: followup > chat-agent bg bash > terminate. Followup wins
-/// because it's user-initiated and the strongest signal; the chat-agent
-/// bg-bash signal only matters when there's nothing queued — it keeps CC
-/// alive so `spawn_bash_completion_watcher` can push a resume prompt when
-/// the bash finishes (killing CC would force that wake through stale-session
-/// recovery).
+/// | Window | Signal |
+/// |---|---|
+/// | armed, not yet sent | `redirect_pending`, taken from `AgentSession::redirect_followup_pending` |
+/// | sent, not yet forwarded | `queued`, i.e. `msg_rx.len()` |
+/// | forwarded, not yet answered | `awaiting_result`, the post-settle remainder |
+///
+/// Every one of them is read under the `agent_sessions` lock the caller already
+/// holds, which is what makes them exact rather than approximate: that lock
+/// serializes against the fast-path check-increment-send in `chat::process`, and an
+/// unbounded-channel send is synchronous, so a message that was sent is a message
+/// that is in the channel.
+///
+/// Precedence: followup > chat-agent bg bash > terminate. Followup wins because it
+/// is user-initiated and the strongest signal. The chat-agent bg-bash signal only
+/// matters when nothing is coming: it keeps CC alive so
+/// `spawn_bash_completion_watcher` can push a resume prompt when the bash finishes
+/// (killing CC would force that wake through stale-session recovery).
+///
+/// When all three windows are empty this returns `Terminate`, which is also what
+/// carries a turn that died on a transient upstream API error to the idle exit where
+/// `maybe_auto_resume_after_api_error` lives. A false positive here does not merely
+/// leak a subprocess, it silently cancels that recovery.
 pub(super) fn terminate_decision(
-    prev_pending_followups: u32,
+    queued: usize,
+    awaiting_result: u32,
+    redirect_pending: bool,
     bg_bash_running: bool,
 ) -> TerminateDecision {
-    if prev_pending_followups > 1 {
+    if queued > 0 || awaiting_result > 0 || redirect_pending {
         TerminateDecision::KeepAliveForFollowup {
-            inflight: prev_pending_followups - 1,
+            queued,
+            awaiting_result,
+            redirect_pending,
         }
     } else if bg_bash_running {
         TerminateDecision::KeepAliveForBgBash
@@ -230,8 +342,8 @@ pub(super) const EMPTY_RESPONSE_ERROR: &str =
 ///
 /// Every non-silent, non-shutdown Result is a turn boundary and emits
 /// `CodingAgentIdled`. Inflight-followup race protection (deciding whether to
-/// keep the subprocess alive) is the run-loop's responsibility — see
-/// `AgentSession.pending_followups`.
+/// keep the subprocess alive) is the run-loop's responsibility, via
+/// [`terminate_decision`].
 ///
 /// Precedence: silent_resume > shutdown > user_hit_stop > cc_error >
 /// text_is_empty > generated. Shutdown wins because the engine is going down

@@ -13,7 +13,6 @@ function destinationDeps() {
   return {
     apply: vi.fn(),
     focusPrompt: vi.fn(),
-    switchMenuItem: vi.fn(),
     openSettingsSubview: vi.fn(),
     scrollToSetting: vi.fn(),
   };
@@ -27,7 +26,7 @@ describe('compose destination final selection focus', () => {
 
     expect(deps.apply).toHaveBeenCalledWith('thread-1', { kind: 'lucidos-agent' });
     expect(deps.focusPrompt).toHaveBeenCalledOnce();
-    expect(deps.switchMenuItem).not.toHaveBeenCalled();
+    expect(deps.openSettingsSubview).not.toHaveBeenCalled();
   });
 
   it('focuses the prompt after selecting a coding destination', () => {
@@ -46,9 +45,11 @@ describe('compose destination final selection focus', () => {
 
     expect(deps.apply).not.toHaveBeenCalled();
     expect(deps.focusPrompt).not.toHaveBeenCalled();
-    expect(deps.switchMenuItem).toHaveBeenCalledWith('settings');
     // Repositories share the Coding Agents page with the binaries that run
     // them, so the jump names the page AND the section it wants inside it.
+    // ONE call: openSettingsSubview lands the menu item too, so the jump leaves
+    // a single nav-history entry rather than a phantom Settings home behind it.
+    expect(deps.openSettingsSubview).toHaveBeenCalledOnce();
     expect(deps.openSettingsSubview).toHaveBeenCalledWith('coding-agents');
     expect(deps.scrollToSetting).toHaveBeenCalledWith('coding-agents:repositories');
   });

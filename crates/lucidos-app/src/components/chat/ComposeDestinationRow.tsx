@@ -5,7 +5,7 @@ import { resolveScope, resolveCodingAgent } from '../../store/composeSelections'
 import { loadApps } from '../../store/actions/apps';
 import { loadRepositories } from '../../store/actions/chat';
 import { applyDestination, updateComposeSelection, type ComposeMode } from '../../store/actions/compose';
-import { switchMenuItem, openSettingsSubview } from '../../store/actions/menu';
+import { openSettingsSubview } from '../../store/actions/menu';
 import {
   destinationFromState,
   destinationToOptionValue,
@@ -22,7 +22,6 @@ import { focusPromptNow } from './promptFocus';
 type DestinationSelectionDeps = {
   apply: typeof applyDestination;
   focusPrompt: () => void;
-  switchMenuItem: typeof switchMenuItem;
   openSettingsSubview: typeof openSettingsSubview;
   /** Anchor to scroll to once the subview has rendered. Injected rather than
    *  writing `settingsScrollTarget` inline so the jump stays assertable. */
@@ -40,7 +39,6 @@ export function handleComposeDestinationSelection(
   deps: DestinationSelectionDeps = {
     apply: applyDestination,
     focusPrompt: focusPromptNow,
-    switchMenuItem,
     openSettingsSubview,
     scrollToSetting: (anchor) => { settingsScrollTarget.value = anchor; },
   },
@@ -48,11 +46,9 @@ export function handleComposeDestinationSelection(
   if (value === REGISTER_REPO_OPTION_VALUE) {
     // Action row, not a destination: land on Settings → Coding Agents, scrolled
     // to its Repositories section (repositories share that page with the
-    // coding-agent binaries they run under).
-    // openSettingsSubview only sets the subview — ContentPane renders
-    // SettingsView only when the settings menu item is active, so switch first
-    // (same pairing as SearchEverywhere).
-    deps.switchMenuItem('settings');
+    // coding-agent binaries they run under). One call: openSettingsSubview
+    // activates the settings menu item too, which is what ContentPane keys off
+    // to render SettingsView at all.
     deps.openSettingsSubview('coding-agents');
     deps.scrollToSetting('coding-agents:repositories');
     return;

@@ -1,6 +1,6 @@
 ---
 name: Intent Registry — Source of "Available Intents"
-description: How the engine builds the "Available Intents" list shown in the system prompt and exposed via execute_intent. Filesystem-driven, no cache, no projection. Trigger files in apps/<app>/triggers/ also count as intents — common source of "phantom intent" confusion.
+description: How the engine builds the "Available Intents" list it exposes via execute_intent: filesystem-driven, no cache, no projection. Trigger files in apps/<app>/triggers/ also count as intents, the usual source of "phantom intent" confusion.
 ---
 
 # Intent Registry

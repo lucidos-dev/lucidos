@@ -38,11 +38,13 @@
 
 /* ── Header / animated mark ───────────────────────────────────────────────── */
 
-/* Header is centered (brand lockup + "Choose a workspace"), with a tight gap to
-   the list below. */
+/* Header is the centered brand lockup, nothing else: the list and the footer
+   entry points below it are self-describing, so there is no subtitle. This
+   margin is therefore the whole gap to whatever follows (the brand lockup owns
+   none of its own, or the two would collapse into one). */
 .ws-picker-header {
   text-align: center;
-  margin-bottom: 1rem;
+  margin-bottom: 1.5rem;
   position: relative;
 }
 
@@ -343,7 +345,6 @@
   align-items: center;
   justify-content: center;
   gap: 1rem;
-  margin-bottom: 1.5rem;
 }
 
 .ws-picker-mark {
@@ -419,12 +420,6 @@
   letter-spacing: -0.01em;
 }
 
-.ws-picker-header p {
-  margin: 0.25rem 0 0;
-  color: rgba(255, 255, 255, 0.72);
-  font-size: var(--font-size-xl);
-}
-
 /* ── States ──────────────────────────────────────────────────────────────── */
 
 .ws-picker-error {
@@ -435,12 +430,6 @@
   padding: 0.625rem 0.875rem;
   margin-bottom: 1rem;
   font-size: var(--font-size-lg);
-}
-
-.ws-picker-empty {
-  color: rgba(255, 255, 255, 0.7);
-  padding: 1.5rem 0;
-  text-align: center;
 }
 
 /* ── Loading skeleton ────────────────────────────────────────────────────────
@@ -821,12 +810,15 @@
 
 /* ── Footer ──────────────────────────────────────────────────────────────── */
 
+/* The gap is what separates the two entry points from whichever form is
+   unfolded under them, so it is wide enough to read as a break rather than as
+   part of the same control cluster. */
 .ws-picker-footer {
   margin-top: 1.5rem;
   text-align: center;
   display: flex;
   flex-direction: column;
-  gap: 0.75rem;
+  gap: 1.5rem;
 }
 
 .ws-picker-new {
@@ -980,7 +972,13 @@
   border-color: rgba(255, 138, 128, 0.6);
   color: #ffd9d4;
 }
-.ws-picker-restore-banner > span:first-of-type { flex: 1 1 auto; min-width: 0; }
+/* The message is addressed by class, never by position. `> span:first-of-type`
+   reads as "the message", but in the running banner the SPINNER is the first
+   span, and at (0,2,1) that selector outranks `.ws-picker-restore-spinner`'s
+   `flex: 0 0 auto` (0,1,0): the spinner grew to the full banner width and
+   `border-radius: 50%` turned it into a rotating ellipse spilling out of the
+   box. */
+.ws-picker-restore-banner > .ws-picker-restore-text { flex: 1 1 auto; min-width: 0; }
 
 .ws-picker-restore-spinner {
   flex: 0 0 auto;

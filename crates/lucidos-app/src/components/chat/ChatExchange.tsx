@@ -291,13 +291,24 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
     }
   }
 
+  // More/Less and Show steps/Hide steps grow the turn the reader is looking at,
+  // so they mark the reader parked first, exactly as the two collapse toggles
+  // do. `withScrollAnchor` does NOT cover this on its own: it holds the
+  // `.chat-exchange` ROOT still, and everything these two reveal grows BELOW
+  // that root's top, so its offset never moves, the compensating scrollTop write
+  // never happens, and no scroll event follows. The transcript's
+  // ResizeObserver is then the only handler that sees the growth, and it keeps a
+  // reader who is riding the bottom on the bottom, which would scroll the thing
+  // they just opened straight back off the top.
   function toggleDetails() {
+    preserveOnToggle();
     withScrollAnchor(rootRef.current, () => {
       detailsExpanded.value = !detailsExpanded.value;
     });
   }
 
   function toggleSteps() {
+    preserveOnToggle();
     withScrollAnchor(rootRef.current, () => {
       stepsExpanded.value = !stepsExpanded.value;
     });
@@ -562,7 +573,10 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         collapsible={canCollapseInitiator}
         collapsed={isInitiatorCollapsed}
         onToggle={canCollapseInitiator
-          ? () => toggleInitiatorCollapsed(threadId, exchange.userSeq)
+          ? () => {
+              preserveOnToggle();
+              toggleInitiatorCollapsed(threadId, exchange.userSeq);
+            }
           : undefined}
       />
 

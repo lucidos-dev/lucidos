@@ -163,6 +163,17 @@ self.addEventListener('fetch', (event) => {
     // SSE: Chrome keeps the SW alive for the whole streaming connection, so
     // intercepting it hangs the worker — let the browser handle it natively.
     if (rel === '/api/v1/events') return;
+    // The connection watchdog's probe, and the one request whose LATENCY is the
+    // signal rather than its body. It carries its own short deadline (sized
+    // against the poll interval, see HEALTH_PROBE_TIMEOUT_MS) and that deadline
+    // covers whatever happens in here, so fetchWithRetry's second attempt cannot rescue
+    // the probe: it can only spend what is left of the budget belonging to the
+    // attempt that matters, and turn a fast honest failure into a timeout. The
+    // retry it is giving up is worth nothing here anyway, because a failed probe
+    // is already cheap by construction: three consecutive ones are suppressed
+    // and the next is 5s away. Same reasoning as the SSE line above, for a
+    // different reason: this endpoint's semantics are not what the SW assumes.
+    if (rel === '/api/v1/health') return;
     // Content-addressed blobs are immutable for the lifetime of the hash.
     if (rel.startsWith('/api/v1/blobs/')) {
       event.respondWith(cacheFirst(event.request, BLOB_CACHE));

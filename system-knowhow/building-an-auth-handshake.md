@@ -1,6 +1,6 @@
 ---
 name: Building an Auth Handshake
-description: Authenticating an external API when a static header is not enough: the apis.json proxy auth pipeline and its four layer types (static_credential, script_handshake, hmac_signed, wasm_signer), and authoring, installing and debugging a no_std WASM signer. Load for "can't log into X", "needs a session token", "OAuth password grant", "HMAC signing", "sign every request", an exchange API, "wasm signer", "wasmtime incompatible import type", or a sha256/hmac/hex host import.
+description: Authenticating an external API when a static header is not enough: the apis.json proxy auth pipeline and authoring a no_std WASM signer. Load for "can't log into X", "needs a session token", "OAuth password grant", "HMAC signing", "sign every request", "wasm signer", or "wasmtime incompatible import type".
 ---
 
 # Building an auth handshake

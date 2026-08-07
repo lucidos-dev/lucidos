@@ -20,11 +20,10 @@ use uuid::Uuid;
 
 use crate::api::AppState;
 use crate::core::plugin_marketplaces::{
-    add_marketplace, load_registry, remove_marketplace, save_registry, scan_catalog,
-    InstalledPluginSummary, MarketplaceCatalog, PluginMarketplace, MARKETPLACES_DATA_PATH,
+    load_registry, scan_catalog, InstalledPluginSummary, MarketplaceCatalog, PluginMarketplace,
 };
 use crate::core::plugins::PLUGIN_ARCHIVE_EXT;
-use crate::core::ArtifactManager;
+use crate::engine::tools::plugins::marketplaces::MarketplaceWriteError;
 use crate::engine::tools::plugins::{
     cancel_pending_install, cancel_pending_uninstall, confirm_pending_install,
     confirm_pending_uninstall, installed_plugin_summaries, stage_install_request,
@@ -91,42 +90,6 @@ pub(super) struct StageUninstallRequest {
     pub id: String,
 }
 
-async fn commit_marketplaces_registry(
-    state: &AppState,
-    headers: &HeaderMap,
-    message: &str,
-) -> Result<String, (StatusCode, Json<JsonValue>)> {
-    let am = ArtifactManager::new(state.workspace_path.clone()).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("open workspace git repo: {e}"),
-        )
-    })?;
-    let commit = am
-        .commit_data_path(MARKETPLACES_DATA_PATH, message)
-        .await
-        .map_err(|e| {
-            err(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &format!("commit marketplace registry: {e}"),
-            )
-        })?;
-
-    state
-        .engine
-        .event_bus
-        .emit_user_system(headers, &state.pool, "[Plugins] DataFileWritten", |actor| {
-            crate::engine::event_bus::SystemEvent::DataFileWritten {
-                path: MARKETPLACES_DATA_PATH.to_string(),
-                commit: Some(commit.clone()),
-                actor,
-            }
-        })
-        .await;
-
-    Ok(commit)
-}
-
 pub(super) async fn list_marketplaces(
     State(state): State<AppState>,
 ) -> Result<Json<MarketplacesResponse>, (StatusCode, Json<JsonValue>)> {
@@ -141,83 +104,53 @@ pub(super) async fn list_marketplaces(
     }))
 }
 
+/// `POST /api/v1/plugins/marketplaces` (Settings, Marketplaces "Add", and the
+/// one-click official-marketplace button). Registers a new marketplace or
+/// re-registers an existing source under a new name; the shared write path
+/// announces either outcome, so every open Plugins panel refreshes in place.
 pub(super) async fn add_marketplace_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<AddMarketplaceRequest>,
 ) -> Result<Json<AddMarketplaceResponse>, (StatusCode, Json<JsonValue>)> {
-    let _repo_guard = state.engine.lock_workspace_repo().await;
-    let mut registry = load_registry(&state.workspace_path).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("read marketplace registry: {e}"),
-        )
-    })?;
-    let (marketplace, created) = add_marketplace(&mut registry, &body.source, body.name.as_deref())
-        .map_err(|e| err(StatusCode::BAD_REQUEST, &e))?;
-    save_registry(&state.workspace_path, &registry).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("write marketplace registry: {e}"),
-        )
-    })?;
-    let commit = commit_marketplaces_registry(
-        &state,
-        &headers,
-        if created {
-            "Register plugin marketplace"
-        } else {
-            "Update plugin marketplace"
-        },
-    )
-    .await?;
-
-    let update_engine = state.engine.clone();
-    let update_pool = state.pool.clone();
-    tokio::spawn(async move {
-        crate::scheduler::plugin_updates::run_plugin_marketplace_update_check(
-            update_engine,
-            update_pool,
-        )
-        .await;
-    });
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let registration = state
+        .engine
+        .register_plugin_marketplace(&body.source, body.name.as_deref(), actor)
+        .await
+        .map_err(|e| match e {
+            MarketplaceWriteError::InvalidSource(msg) => err(StatusCode::BAD_REQUEST, &msg),
+            MarketplaceWriteError::Failed(msg) => err(StatusCode::INTERNAL_SERVER_ERROR, &msg),
+        })?;
 
     Ok(Json(AddMarketplaceResponse {
-        marketplace,
-        marketplaces: registry.marketplaces,
-        created,
-        commit,
+        marketplace: registration.marketplace,
+        marketplaces: registration.marketplaces,
+        created: registration.created,
+        commit: registration.commit,
     }))
 }
 
+/// `DELETE /api/v1/plugins/marketplaces/:id`. 404 when the id was never
+/// registered (nothing is written or announced); 500 for a registry the engine
+/// could not write or commit.
 pub(super) async fn remove_marketplace_handler(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
 ) -> Result<Json<RemoveMarketplaceResponse>, (StatusCode, Json<JsonValue>)> {
-    let _repo_guard = state.engine.lock_workspace_repo().await;
-    let mut registry = load_registry(&state.workspace_path).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("read marketplace registry: {e}"),
-        )
-    })?;
-    let removed = remove_marketplace(&mut registry, &id);
-    if !removed {
-        return Err(err(StatusCode::NOT_FOUND, "marketplace not found"));
-    }
-    save_registry(&state.workspace_path, &registry).map_err(|e| {
-        err(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("write marketplace registry: {e}"),
-        )
-    })?;
-    let commit =
-        commit_marketplaces_registry(&state, &headers, "Remove plugin marketplace").await?;
+    let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
+    let removal = state
+        .engine
+        .unregister_plugin_marketplace(&id, actor)
+        .await
+        .map_err(|e| err(StatusCode::INTERNAL_SERVER_ERROR, &e))?
+        .ok_or_else(|| err(StatusCode::NOT_FOUND, "marketplace not found"))?;
+
     Ok(Json(RemoveMarketplaceResponse {
-        marketplaces: registry.marketplaces,
-        removed,
-        commit,
+        marketplaces: removal.marketplaces,
+        removed: true,
+        commit: removal.commit,
     }))
 }
 

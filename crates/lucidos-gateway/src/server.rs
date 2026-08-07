@@ -275,6 +275,33 @@ impl GatewayState {
         }
     }
 
+    /// Tell ONE stack's engine that a person asked for the teardown it is about
+    /// to be signalled for. Binds this gateway's health client + engine scheme to
+    /// that stack's own port, which is what keeps the notify per-workspace: a
+    /// restart of workspace A can reach nothing but A's engine.
+    ///
+    /// Deliberately called from the two control-plane entry points
+    /// ([`Self::restart_workspace`], [`Self::stop_workspace`]) and NOT from
+    /// [`Self::respawn_stack`], which is also the supervisor's health-respawn
+    /// path. An engine the supervisor culls for being unhealthy was not stopped
+    /// by anyone, so attributing it to a device would auto-resume work after a
+    /// crash, which is exactly what cause-gated resume exists to prevent. The
+    /// supervisor has no device id to pass either way; keeping the call out of
+    /// the shared respawn is the structural half of that.
+    async fn notify_restart_intent(
+        &self,
+        s: &StackRuntime,
+        requested_by: Option<&str>,
+    ) -> stack::RestartIntentNotify {
+        stack::notify_restart_intent(
+            &self.inner.health_client,
+            self.engine_scheme(),
+            s.ws.port,
+            requested_by,
+        )
+        .await
+    }
+
     fn set_route(&self, id: &str, port: u16) {
         if let Ok(mut r) = self.inner.routes.write() {
             r.insert(id.to_string(), port);
@@ -1288,7 +1315,17 @@ impl GatewayState {
     ///     engine onto a rebuilt binary (the Apply case);
     ///   * if none exists → bring it up from the registry entry (start a stopped
     ///     workspace).
-    pub async fn restart_workspace(&self, id: &str) -> Result<(), BoxError> {
+    ///
+    /// `requested_by` is the device id the picker sent on its control request,
+    /// and `None` for every caller that is not a person clicking (the dev
+    /// launcher, `stop.sh`'s curl). Present, it is handed to the engine just
+    /// before the signal so its in-flight threads settle as a user restart
+    /// rather than a crash; see [`crate::stack::notify_restart_intent`].
+    pub async fn restart_workspace(
+        &self,
+        id: &str,
+        requested_by: Option<&str>,
+    ) -> Result<(), BoxError> {
         // The dev launcher writes the shared registry file directly before
         // POSTing here, so pick up any newly-seeded entry / flag change.
         self.sync_registry_from_disk();
@@ -1297,6 +1334,11 @@ impl GatewayState {
             Some(stack) => {
                 let mut s = stack.lock().await;
                 s.restart_attempts = 0;
+                // BEFORE the respawn, whose first act is to signal the engine.
+                // Awaited rather than spawned: the actor has to be stashed by the
+                // time the engine reaches its shutdown handler, and losing that
+                // race would silently restore the old crash-shaped attribution.
+                self.notify_restart_intent(&s, requested_by).await;
                 self.respawn_stack(&mut s).await;
                 Ok(())
             }
@@ -1319,10 +1361,22 @@ impl GatewayState {
     /// entry survives so the picker still lists it. Postgres is left untouched
     /// (dev PG is externally managed; a packaged cluster stays up for a quick
     /// restart). A no-op if the workspace isn't currently running.
-    pub async fn stop_workspace(&self, id: &str) -> Result<(), BoxError> {
+    ///
+    /// `requested_by` carries the picker's device id when a person clicked Stop,
+    /// and is `None` for `stop.sh` (which curls this route with no such header)
+    /// and for every other non-human caller. Same contract as
+    /// [`Self::restart_workspace`]: a named device makes the engine's in-flight
+    /// threads settle as a deliberate pause that resumes when the workspace next
+    /// boots, rather than as the crash they used to look like.
+    pub async fn stop_workspace(
+        &self,
+        id: &str,
+        requested_by: Option<&str>,
+    ) -> Result<(), BoxError> {
         let removed = self.inner.stacks.lock().await.remove(id);
         if let Some(stack) = removed {
             let mut s = stack.lock().await;
+            self.notify_restart_intent(&s, requested_by).await;
             stop_engine_process(&mut s);
         }
         self.clear_route(id);

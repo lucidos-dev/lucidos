@@ -51,6 +51,17 @@ async function fetchCatalogWithRetry(): Promise<MarketplaceCatalog> {
   }
 }
 
+// Set when a caller that KNOWS something just changed arrives mid-scan (see
+// `refreshPluginCatalogAfterMutation`). Drained by whichever scan is in flight
+// when it settles. A single flag rather than a queue, so a burst of events
+// collapses into ONE follow-up scan; it is cleared before that follow-up
+// starts, so a steady stream can never build a backlog or spin.
+let catalogRefreshQueued = false;
+
+/** Load the catalog. `force` re-reads even when it is already loaded, but a
+ *  call landing during another scan still JOINS that scan: this is the reader's
+ *  entry point, and a reader has no mutation to be fresher than. Use
+ *  `refreshPluginCatalogAfterMutation` when the caller does. */
 export function loadPluginCatalog(force = false): Promise<void> {
   if (!force && marketplaceCatalog.value.status === 'loaded') return Promise.resolve();
   if (catalogLoadInFlight) return catalogLoadInFlight;
@@ -61,11 +72,44 @@ export function loadPluginCatalog(force = false): Promise<void> {
     } catch (e) {
       marketplaceCatalog.value = toFailed(e);
     }
-  })().finally(() => { catalogLoadInFlight = null; });
+  })().finally(() => {
+    catalogLoadInFlight = null;
+    if (catalogRefreshQueued) {
+      catalogRefreshQueued = false;
+      void loadPluginCatalog(true);
+    }
+  });
   return catalogLoadInFlight;
 }
 
+/** Re-scan now, for a caller that just wants current data (the Plugins panel
+ *  opening, its 5-minute poll). Joining an in-flight scan is good enough: there
+ *  is no specific change it has to be newer than. */
 export async function refreshPluginCatalog(): Promise<void> {
+  await loadPluginCatalog(true);
+}
+
+/** Re-scan for a caller reacting to a mutation that has ALREADY landed: a
+ *  marketplace registered/renamed/removed (locally or over SSE), a plugin
+ *  installed or uninstalled.
+ *
+ *  Such a caller must not settle on a scan that started before its mutation.
+ *  That scan already read the registry, so joining it silently lands pre-change
+ *  data with nothing left to correct it, and the reported bug is exactly that
+ *  shape: an agent registered a marketplace and renamed it seconds later, well
+ *  inside one scan (each scan git-clones every registered marketplace), so the
+ *  rename's refresh joined the registration's scan and the panel kept the OLD
+ *  name. So a mid-scan arrival queues a trailing re-scan instead of joining.
+ *
+ *  Deliberately NOT what `refreshPluginCatalog` does. The trailing scan is a
+ *  second clone-everything pass, and spending it on a caller with nothing to be
+ *  fresher than is what the in-flight sharing above exists to prevent. */
+export async function refreshPluginCatalogAfterMutation(): Promise<void> {
+  if (catalogLoadInFlight) {
+    catalogRefreshQueued = true;
+    await catalogLoadInFlight;
+    return;
+  }
   await loadPluginCatalog(true);
 }
 
@@ -78,7 +122,7 @@ export async function addPluginMarketplaceAction(source: string, name?: string):
   try {
     await addPluginMarketplace(trimmed, name?.trim() || undefined);
     showToast('Marketplace registered', 'success');
-    await refreshPluginCatalog();
+    await refreshPluginCatalogAfterMutation();
     return true;
   } catch (e) {
     showToast(`Failed to register marketplace: ${errorDetail(e)}`, 'error');
@@ -98,7 +142,7 @@ export async function removePluginMarketplaceAction(id: string): Promise<void> {
   try {
     await removePluginMarketplace(id);
     showToast('Marketplace removed', 'success');
-    await refreshPluginCatalog();
+    await refreshPluginCatalogAfterMutation();
   } catch (e) {
     showToast(`Failed to remove marketplace: ${errorDetail(e)}`, 'error');
   }
@@ -107,5 +151,5 @@ export async function removePluginMarketplaceAction(id: string): Promise<void> {
 // `installMarketplacePlugin` lives in `plugin-install.ts`, beside the opener it
 // routes through, exactly as `uninstallMarketplacePlugin` lives in
 // `plugin-uninstall.ts`. It cannot live here: this module is what both of those
-// import `refreshPluginCatalog` from, so calling the opener from here would
+// import their catalog refresh from, so calling the opener from here would
 // close an import cycle.

@@ -399,6 +399,102 @@ pub async fn fetch_unread_count(client: &reqwest::Client, scheme: &str, port: u1
     json.get("unread_count")?.as_u64()
 }
 
+/// Header the engine reads the originating device off. Mirrors
+/// `api::actor::HEADER_DEVICE_ID` in `lucidos-engine`, which the gateway cannot
+/// depend on (see this crate's `Cargo.toml`); rename one and the other must
+/// follow in lockstep, same rule as the CLI's copy of the token header.
+pub const HEADER_DEVICE_ID: &str = "x-lucidos-device-id";
+
+/// How long the restart-intent notify may take before it is abandoned. Short on
+/// purpose: this sits directly in front of a user-visible Restart click, and the
+/// restart proceeds regardless, so waiting longer buys attribution at the cost of
+/// the responsiveness of the thing the user actually asked for. Well clear of a
+/// loopback round-trip to a healthy engine, which is sub-millisecond.
+///
+/// The whole budget is only ever spent on an engine that is NOT answering, and
+/// the caller holds that stack's lock while it waits, so a picker poll can stall
+/// behind it. Accepted rather than optimised away: `respawn_stack` runs on the
+/// very next line and holds the same lock across Postgres provisioning and the
+/// spawn, which is longer. Skipping the notify for an `Unhealthy` stack was the
+/// alternative and is worse: a merely BUSY engine misses health probes without
+/// being dead (a `Slow` probe never culls one), and a busy engine is exactly the
+/// one whose in-flight threads the attribution is for.
+const RESTART_INTENT_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// What a restart-intent notify did. Returned rather than logged-and-dropped so
+/// the call sites (and the tests) can state the three outcomes apart; **no
+/// caller may treat any of them as a reason not to restart**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestartIntentNotify {
+    /// No device asked, so there is nothing to attribute and no call was made.
+    /// This is the supervisor's health respawn, `stop.sh`'s curl, the dev
+    /// launcher: every teardown that is genuinely not a user action.
+    Skipped,
+    /// The engine acknowledged. Its next teardown will be device-attributed.
+    Delivered,
+    /// The engine could not be reached, was too slow, or refused. The restart
+    /// goes ahead and its threads settle the way they did before this existed.
+    Failed,
+}
+
+/// Tell one workspace's engine that a HUMAN asked for the teardown it is about
+/// to be signalled for, and which device they were on. Called immediately before
+/// `stop_engine_process` on the control-plane restart/stop path, and nowhere
+/// else.
+///
+/// The engine cannot work this out for itself: `SIGUSR1` carries no sender, so
+/// without this call the picker's Restart is indistinguishable from a crash and
+/// its in-flight threads settle at `failed` with "Response interrupted" and no
+/// auto-resume, while the in-workspace *Switch to new version* (which stashes
+/// its actor over HTTP before asking us to respawn) settles the same threads at
+/// `paused` with "Paused by restart". See the engine's `restart_intent` handler.
+///
+/// **Best effort, and bounded.** A failure here costs attribution on one
+/// restart; blocking or failing the restart itself would cost the user the thing
+/// they clicked. So every failure mode collapses to [`RestartIntentNotify`] and
+/// the caller carries on.
+///
+/// **`None` means skip, not "unknown device".** Attribution has to be earned:
+/// the engine refuses a call with no device anyway (it would resolve to an `Api`
+/// actor, which promises no resume and would replace an honest System
+/// attribution), so not calling is both cheaper and the same answer.
+///
+/// Scheme comes from the caller's `GatewayState::engine_scheme()`, the same
+/// resolution `probe_health` and `fetch_unread_count` use on this hop: the
+/// gateway spawned this engine and decided its TLS, so it is not guessing and
+/// needs no protocol fallback.
+pub async fn notify_restart_intent(
+    client: &reqwest::Client,
+    scheme: &str,
+    port: u16,
+    device_id: Option<&str>,
+) -> RestartIntentNotify {
+    let Some(device_id) = device_id.map(str::trim).filter(|d| !d.is_empty()) else {
+        return RestartIntentNotify::Skipped;
+    };
+    let url = format!("{scheme}://127.0.0.1:{port}/api/v1/internal/restart-intent");
+    let sent = client
+        .post(&url)
+        .header(HEADER_DEVICE_ID, device_id)
+        .timeout(RESTART_INTENT_TIMEOUT)
+        .send()
+        .await;
+    match sent {
+        Ok(r) if r.status().is_success() => RestartIntentNotify::Delivered,
+        Ok(r) => {
+            crate::log!(
+                "[Gateway] restart intent to :{port} returned {}",
+                r.status()
+            );
+            RestartIntentNotify::Failed
+        }
+        Err(e) => {
+            crate::log!("[Gateway] restart intent to :{port} failed: {e}");
+            RestartIntentNotify::Failed
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -610,6 +706,127 @@ mod tests {
         assert_eq!(json["id"], serde_json::json!("dev"));
         // Unknown count → field omitted (no misleading zero badge).
         assert!(json.get("unread_count").is_none());
+    }
+
+    // ── Restart intent ───────────────────────────────────────────────────────
+    //
+    // The notify that turns a picker Restart / Stop from something the engine
+    // cannot distinguish from a crash into a user action it attributes to a
+    // device. Exercised against a mock engine on a real socket, the same shape
+    // `proxy.rs`'s tests use, because the thing worth pinning is the wire: the
+    // method, the path and the header the engine reads the device off.
+
+    /// A one-shot engine that records the raw request it was sent, then 204s.
+    async fn capturing_engine() -> (u16, std::sync::Arc<tokio::sync::Mutex<String>>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let captured = std::sync::Arc::new(tokio::sync::Mutex::new(String::new()));
+        let c = captured.clone();
+        tokio::spawn(async move {
+            if let Ok((mut sock, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 4096];
+                let n = sock.read(&mut buf).await.unwrap_or(0);
+                *c.lock().await = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let _ = sock
+                    .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                    .await;
+                let _ = sock.flush().await;
+            }
+        });
+        (port, captured)
+    }
+
+    /// A free port nothing is listening on, for the unreachable-engine case.
+    async fn dead_port() -> u16 {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        port
+    }
+
+    #[tokio::test]
+    async fn a_named_device_reaches_the_engines_restart_intent_route() {
+        let (port, captured) = capturing_engine().await;
+        let outcome =
+            notify_restart_intent(&build_health_client(), "http", port, Some("picker-device"))
+                .await;
+
+        assert_eq!(outcome, RestartIntentNotify::Delivered);
+        let got = captured.lock().await.to_lowercase();
+        assert!(
+            got.starts_with("post /api/v1/internal/restart-intent"),
+            "must POST the engine's restart-intent route; engine saw:\n{got}"
+        );
+        assert!(
+            got.contains("x-lucidos-device-id: picker-device"),
+            "the device the picker named must ride the request, or the engine \
+             refuses it and the restart stays unattributed; engine saw:\n{got}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_notify_is_aimed_at_the_stack_being_signalled_and_no_other() {
+        // Cross-workspace isolation: restarting one workspace must not touch
+        // another. The port is the only thing that selects a target, so a second
+        // engine on a second port must see nothing at all.
+        let (target, target_saw) = capturing_engine().await;
+        let (bystander, bystander_saw) = capturing_engine().await;
+
+        notify_restart_intent(&build_health_client(), "http", target, Some("d1")).await;
+
+        assert!(
+            !target_saw.lock().await.is_empty(),
+            "the target was notified"
+        );
+        assert!(
+            bystander_saw.lock().await.is_empty(),
+            "a peer workspace's engine must not see a restart it was not part of"
+        );
+        assert_ne!(target, bystander);
+    }
+
+    #[tokio::test]
+    async fn no_device_means_no_call_at_all() {
+        // This is what keeps every non-user teardown honest: the supervisor's
+        // health respawn, `stop.sh`'s curl, the dev launcher. None of them names
+        // a device, so none of them can make a crash look like a user restart.
+        let (port, captured) = capturing_engine().await;
+
+        for absent in [None, Some(""), Some("   ")] {
+            assert_eq!(
+                notify_restart_intent(&build_health_client(), "http", port, absent).await,
+                RestartIntentNotify::Skipped,
+                "no device to name means no notify, not an empty one"
+            );
+        }
+        assert!(
+            captured.lock().await.is_empty(),
+            "the engine must not have been contacted at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_engine_fails_the_notify_and_nothing_else() {
+        // The restart proceeds whatever happens here, so the only thing this
+        // must do is come back, promptly, with a verdict the caller can log. An
+        // engine that is already gone (or wedged) is the common case: the user
+        // is restarting it for a reason.
+        let port = dead_port().await;
+        let started = Instant::now();
+        let outcome = notify_restart_intent(&build_health_client(), "http", port, Some("d1")).await;
+
+        assert_eq!(outcome, RestartIntentNotify::Failed);
+        assert!(
+            started.elapsed() < RESTART_INTENT_TIMEOUT * 2,
+            "the notify must give up well inside its own budget, not hold the \
+             restart open: took {:?}",
+            started.elapsed()
+        );
     }
 
     /// A polled count surfaces as `unread_count` for the picker's per-row badge.

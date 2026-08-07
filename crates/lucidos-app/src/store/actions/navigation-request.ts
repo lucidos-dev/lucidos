@@ -140,7 +140,6 @@ export function handleNavigationRequest(nav: {
       // panel). The `thread-queue` NavigateTarget stays stable in the SDK +
       // engine (notification overflow taps / navigate_ui still emit it); the
       // frontend just reinterprets it to land on the System subpanel.
-      switchMenuItem('settings');
       openSettingsSubview('thread-queue');
       break;
     case 'app-store':
@@ -162,29 +161,37 @@ export function handleNavigationRequest(nav: {
       switchMenuItem('plugins');
       if (nav.id) pluginScrollTarget.value = nav.id;
       break;
-    case 'settings':
-      switchMenuItem('settings');
-      if (nav.settings_view) {
-        // A request from OUTSIDE this build can name a subview a restructure
-        // has since moved: a stored notification's deep link, an app compiled
-        // against an older SDK `SettingsViewTarget`, an LLM working from a
-        // stale schema. Alias those onto the category that absorbed them
-        // (`repositories` → Coding Agents, `mobile-access` → Access, …) so an
-        // old payload still lands where the user expects.
-        //
-        // Then validate against the renderable set, don't trust the input: an
-        // unknown subview would otherwise land on a blank settings panel
-        // (a silent error). Fail loud instead; we still showed Settings home.
-        // The toast names what the CALLER sent, not the alias, so the sender
-        // can see which value was wrong.
-        const view = aliasRetiredSettingsSubview(nav.settings_view);
-        if (isRenderableSettingsView(view)) {
-          openSettingsSubview(view as SettingsNavKey);
-        } else {
-          showToast(`Unknown settings section: "${nav.settings_view}"`, 'error');
-        }
+    case 'settings': {
+      if (!nav.settings_view) {
+        switchMenuItem('settings');
+        break;
+      }
+      // A request from OUTSIDE this build can name a subview a restructure
+      // has since moved: a stored notification's deep link, an app compiled
+      // against an older SDK `SettingsViewTarget`, an LLM working from a
+      // stale schema. Alias those onto the category that absorbed them
+      // (`repositories` → Coding Agents, `mobile-access` → Access, …) so an
+      // old payload still lands where the user expects.
+      //
+      // Then validate against the renderable set, don't trust the input: an
+      // unknown subview would otherwise land on a blank settings panel
+      // (a silent error). Fail loud instead; we still show Settings home.
+      // The toast names what the CALLER sent, not the alias, so the sender
+      // can see which value was wrong.
+      const view = aliasRetiredSettingsSubview(nav.settings_view);
+      if (isRenderableSettingsView(view)) {
+        // ONE call, so ONE nav-history entry. Pairing this with
+        // `switchMenuItem('settings')` pushed the Settings home list as a
+        // separate destination first, and Back from a deep-linked sub-section
+        // (the Backup notification's "Open settings") walked onto a page the
+        // user never visited.
+        openSettingsSubview(view as SettingsNavKey);
+      } else {
+        switchMenuItem('settings');
+        showToast(`Unknown settings section: "${nav.settings_view}"`, 'error');
       }
       break;
+    }
     case 'app':
     case 'app-ui':
       // `app-ui` is a historical alias of `app` — current producers (LLM

@@ -1,6 +1,6 @@
 ---
 name: Workspace File Conventions
-description: How files and data are organized in a Lucidos workspace
+description: How files and data are organized in a Lucidos workspace: artifacts/, apps/, knowhow/, intents/, scripts/, config/, and per-workspace environment variables.
 ---
 
 # Workspace File Conventions

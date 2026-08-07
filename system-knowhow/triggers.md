@@ -1,6 +1,6 @@
 ---
 name: Triggers
-description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y") or wants an EXISTING trigger to run right now ("run this trigger now", "fire it manually", an ad hoc off-schedule run). Load it even if a trigger may not be the answer: § "When a trigger is the right answer" settles whether this is a trigger at all, and routes "tell me HERE when X happens" to `await_event` instead, since a trigger runs in its own thread. Covers cron vs event subscriptions, the intent-vs-procedure rule, notification discipline, and the run action.
+description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y") or an EXISTING trigger to run right now ("run this trigger now", "fire it manually"). Load it even if a trigger may not be the answer: it settles that, and routes "tell me HERE when X happens" to `await_event` instead.
 ---
 
 # Triggers

@@ -729,12 +729,15 @@ impl EventBus {
                 // the user should see the thread).
                 //
                 // `preserving_verdict` covers the shutdown sweep's ordering:
-                // `shutdown_active_threads` emits `ResponseAborted` (→ 'paused',
-                // since an `EngineShutdown` cause is transient)
-                // with NO `request_event_id`, then cancels the loop, whose own
-                // `ResponseCanceled` DOES carry one — so `emit_response_canceled`'s
-                // idempotency gate can't match the two and the phantom cancel
-                // lands on top. `ResponseAborted` "taking precedence" holds for
+                // `shutdown_active_threads` emits `ResponseAborted` (whose
+                // verdict is 'paused' for a user-initiated switch and 'failed'
+                // otherwise, per `AbortCause::promises_auto_resume`), then
+                // cancels the loop, whose own `ResponseCanceled` follows. Both
+                // are anchored on the in-flight turn, so
+                // `emit_response_canceled`'s idempotency gate normally pairs
+                // them, but a turn that never recorded an anchor leaves nothing
+                // to match and the phantom cancel lands on top.
+                // `ResponseAborted` "taking precedence" holds for
                 // the exchange label (`exchangeStatus` checks aborted before
                 // canceled, order-independently) but the status column is
                 // last-write-wins, so without this guard the sweep walked an

@@ -220,20 +220,131 @@ pub struct VersionStatus {
     pub pending_commits: Option<PendingCommits>,
 }
 
+/// The stash rule, extracted from [`LucidosEngine::stash_restart_actor`] so it
+/// is testable without an engine: **first writer wins, and `None` is never
+/// stored**. Returns whether `actor` was taken.
+///
+/// Two writers race for one slot on a single restart. The in-workspace *Switch*
+/// (`/api/v1/restart`) stashes the device that clicked it and only THEN asks the
+/// gateway to respawn the stack; the gateway now notifies the engine back before
+/// it signals (`/api/v1/internal/restart-intent`), so the same restart arrives
+/// twice. Keeping the first is what makes the second harmless: the two carry the
+/// same device in the normal case, and where they could disagree the one holding
+/// the actual HTTP context of the click is the honest answer.
+///
+/// A `None` is not an answer, it is the absence of one, so it must never erase a
+/// stashed actor. That matters for the notify path in particular, whose caller
+/// skips it entirely when it has no device to name.
+fn stash_first_restart_actor(
+    slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
+    actor: Option<crate::engine::thread_events::MessageOrigin>,
+) -> bool {
+    match (slot.is_some(), actor) {
+        (false, Some(actor)) => {
+            *slot = Some(actor);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Move the restart stash into the teardown slot: spend it exactly once, and
+/// leave a COPY where every later emit in this teardown can read it.
+///
+/// The two halves are the whole point, and each answers a different failure:
+///
+/// * Spending it (`take`) is what `take_restart_actor` documents. A stash
+///   belongs to the restart that made it, so a later teardown nobody asked for
+///   cannot inherit a device actor and auto-resume work on the strength of it.
+/// * KEEPING a copy is what stops the answer depending on timing. Before
+///   2026-08-07 the take was all there was, so the pre-emit consumed the only
+///   copy and the two emits that run after it hardcoded a system actor. One
+///   *Switch to new version* then produced two verdicts, decided by whether a
+///   thread became in-flight before or after the pre-emit's snapshot.
+///
+/// A free function over the two slots, like [`stash_first_restart_actor`] above,
+/// so the rule is testable without standing up an engine.
+fn open_teardown(
+    restart_slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
+    teardown_slot: &mut Option<crate::engine::thread_events::MessageOrigin>,
+) -> Option<crate::engine::thread_events::MessageOrigin> {
+    let actor = restart_slot.take();
+    *teardown_slot = actor.clone();
+    actor
+}
+
 impl LucidosEngine {
-    /// Stash the device actor at switch-request time so the graceful-shutdown
+    /// Stash the device actor at restart-request time so the graceful-shutdown
     /// boundary emit (which runs in the signal handler, with no HTTP context) can
-    /// attribute the switch to "You" and recovery can auto-resume in-flight
-    /// coding-agent threads. Called by the `/api/v1/restart` switch handler.
-    pub fn set_restart_actor(&self, actor: Option<crate::engine::thread_events::MessageOrigin>) {
-        *self.restart_actor.lock().unwrap() = actor;
+    /// attribute the restart to "You" and recovery can auto-resume in-flight
+    /// threads. Returns whether this call is the one that stashed.
+    ///
+    /// Two callers, one per way a user can ask for this engine to go down:
+    /// the in-workspace *Switch to new version* handler (`/api/v1/restart`) and
+    /// the gateway's restart-intent notify (`/api/v1/internal/restart-intent`),
+    /// which fires just before the picker's Restart / Stop signals the process.
+    /// Both go through the first-writer-wins rule in
+    /// [`stash_first_restart_actor`]; see there for why.
+    pub fn stash_restart_actor(
+        &self,
+        actor: Option<crate::engine::thread_events::MessageOrigin>,
+    ) -> bool {
+        stash_first_restart_actor(&mut self.restart_actor.lock().unwrap(), actor)
     }
 
-    /// Take (and clear) the stashed switch actor. Cleared so a later non-switch
-    /// stop (stop.sh, external SIGUSR1) doesn't reuse a stale device actor — it
-    /// then falls back to System attribution + manual Continue.
+    /// Take (and clear) the stashed restart actor. Cleared so a later teardown
+    /// nobody asked for (stop.sh, an external SIGUSR1, a crash-respawn) doesn't
+    /// reuse a stale device actor: it then falls back to System attribution and
+    /// a manual Continue.
+    ///
+    /// Two callers, and the second is why this is not simply "read it at
+    /// teardown": [`begin_teardown`](Self::begin_teardown), and `restart_engine`
+    /// undoing its OWN stash when the respawn it asked for never happened. Under
+    /// first-writer-wins an abandoned stash is not merely stale, it is a block on
+    /// the next restart's actor.
     pub fn take_restart_actor(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
         self.restart_actor.lock().unwrap().take()
+    }
+
+    /// Open the teardown: mark the engine shutting down, decide the teardown's
+    /// actor ONCE, and return it for the boundary pre-emit.
+    ///
+    /// Called from `main.rs::shutdown_signal` and nowhere else. Everything after
+    /// it reads the decision back through
+    /// [`teardown_actor`](Self::teardown_actor) rather than re-deriving it, which
+    /// is the whole point: **who tore the engine down is a property of the
+    /// teardown, not of when a thread became in-flight.**
+    ///
+    /// It was not, until 2026-08-07. `main.rs` called `take_restart_actor()` and
+    /// handed the only copy to `abort_in_flight_for_restart`, so the two emits
+    /// that run after it hardcoded a system actor: `shutdown_active_threads` for
+    /// a chat thread that reached `processing_thread_ids()` after the pre-emit's
+    /// snapshot, and `emit_stop_terminal`'s abort arm for a coding-agent session
+    /// registered after `shutdown_agent_sessions` took its flag pass. A device
+    /// actor is half the switch fingerprint
+    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`), so those threads lost the
+    /// `paused` verdict, the withheld Continue button, and the auto-resume, all
+    /// three from a timing difference of a second and a half. See
+    /// `docs/plans/2026-08-07-teardown-actor-is-one-value-for-the-whole-teardown.md`.
+    ///
+    /// Still spends the stash rather than peeking at it, so the invariant
+    /// `take_restart_actor` documents holds unchanged: a stash is consumed by the
+    /// teardown it belongs to. See [`open_teardown`] for both halves of that.
+    pub fn begin_teardown(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
+        self.mark_shutting_down();
+        open_teardown(
+            &mut self.restart_actor.lock().unwrap(),
+            &mut self.teardown_actor.lock().unwrap(),
+        )
+    }
+
+    /// The actor of the teardown under way, for an `EngineShutdown` abort that
+    /// runs after the boundary pre-emit. `None` outside a teardown, and `None`
+    /// for one nobody requested (bare `stop.sh`, an external SIGUSR1, ctrl-c);
+    /// callers fall back to `MessageOrigin::system()` for both, which is the
+    /// honest answer in either case.
+    pub(crate) fn teardown_actor(&self) -> Option<crate::engine::thread_events::MessageOrigin> {
+        self.teardown_actor.lock().unwrap().clone()
     }
 
     /// Enqueue a thread for auto-resume after a user-initiated switch (recovery).
@@ -1209,11 +1320,137 @@ async fn run_engine_build(workspace: &std::path::Path) -> EngineBuildOutcome {
 mod tests {
     use super::{
         acquire_engine_build_lock_waiting, build_id_commit, classify_pending_commits,
-        commit_is_strict_ancestor, disk_upgrade_verdict, lock_held_at, parse_pending_commits,
-        self_heal_is_wedged, try_lock_file, BuildProcessGroupGuard, BuildState,
-        PENDING_COMMIT_SUBJECT_CAP,
+        commit_is_strict_ancestor, disk_upgrade_verdict, lock_held_at, open_teardown,
+        parse_pending_commits, self_heal_is_wedged, stash_first_restart_actor, try_lock_file,
+        BuildProcessGroupGuard, BuildState, PENDING_COMMIT_SUBJECT_CAP,
     };
+    use crate::engine::thread_events::MessageOrigin;
     use std::time::Duration;
+
+    // ── The restart-actor stash ──────────────────────────────────────────────
+
+    fn device(id: &str) -> Option<MessageOrigin> {
+        Some(MessageOrigin::Device {
+            device_id: id.to_string(),
+            label: format!("device {id}"),
+        })
+    }
+
+    fn device_id_of(slot: &Option<MessageOrigin>) -> Option<&str> {
+        match slot {
+            Some(MessageOrigin::Device { device_id, .. }) => Some(device_id.as_str()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn the_first_restart_actor_wins_and_a_later_one_cannot_overwrite_it() {
+        // The in-workspace Switch stashes the device that clicked it, then asks
+        // the gateway to respawn the stack; the gateway notifies back before it
+        // signals, so the SAME restart tries to stash twice. The click's own
+        // actor is the one that must survive.
+        let mut slot = None;
+        assert!(stash_first_restart_actor(&mut slot, device("the-click")));
+        assert!(
+            !stash_first_restart_actor(&mut slot, device("the-notify")),
+            "a second stash must report that it did not store"
+        );
+        assert_eq!(device_id_of(&slot), Some("the-click"));
+    }
+
+    #[test]
+    fn stashing_none_never_erases_an_actor_and_never_fills_an_empty_slot() {
+        // `None` is the absence of an answer, not an answer. The notify path
+        // skips itself when it has no device to name, and nothing else may turn
+        // that silence into a cleared stash.
+        let mut slot = device("the-click");
+        assert!(!stash_first_restart_actor(&mut slot, None));
+        assert_eq!(device_id_of(&slot), Some("the-click"));
+
+        let mut empty = None;
+        assert!(!stash_first_restart_actor(&mut empty, None));
+        assert!(empty.is_none());
+    }
+
+    #[test]
+    fn a_taken_slot_accepts_the_next_restarts_actor() {
+        // First-writer-wins is per restart, not for the engine's lifetime, and
+        // this is the half that makes the rule safe. `take_restart_actor` empties
+        // the slot both at teardown and when a restart request FAILS before the
+        // engine was signalled (`restart_engine` undoing its own stash), and the
+        // freed slot has to be writable again: otherwise one abandoned stash
+        // would refuse every later restart's actor for the life of the process.
+        let mut slot = None;
+        assert!(stash_first_restart_actor(&mut slot, device("first")));
+        slot.take();
+        assert!(stash_first_restart_actor(&mut slot, device("second")));
+        assert_eq!(device_id_of(&slot), Some("second"));
+    }
+
+    // ── Opening the teardown ─────────────────────────────────────────────────
+
+    #[test]
+    fn opening_the_teardown_spends_the_stash_and_keeps_a_copy_for_every_later_emit() {
+        // THE 2026-08-07 BUG. The pre-emit is not the only thing that emits an
+        // `EngineShutdown` abort during a teardown: `shutdown_active_threads`
+        // and `emit_stop_terminal`'s abort arm run after it, for threads that
+        // became in-flight after its snapshot. All three must attribute the
+        // teardown the same way, because a `Device` actor is half the switch
+        // fingerprint and therefore decides the `paused` verdict and the
+        // auto-resume. Handing the only copy to the first reader is what left a
+        // chat thread on "Response interrupted" with a manual Continue while
+        // its two siblings read "Paused by restart" and resumed by themselves.
+        let mut restart = device("the-click");
+        let mut teardown = None;
+
+        let returned = open_teardown(&mut restart, &mut teardown);
+
+        assert_eq!(
+            device_id_of(&returned),
+            Some("the-click"),
+            "the pre-emit still gets the actor as its argument"
+        );
+        assert_eq!(
+            device_id_of(&teardown),
+            Some("the-click"),
+            "and every later emit in the same teardown can still read it"
+        );
+        assert!(
+            restart.is_none(),
+            "the stash is still SPENT: a later teardown nobody asked for must \
+             not inherit this device actor and auto-resume on the strength of it"
+        );
+    }
+
+    #[test]
+    fn a_teardown_nobody_requested_opens_with_no_actor() {
+        // A bare `stop.sh`, an external SIGUSR1, ctrl-c. Every emit site falls
+        // back to `MessageOrigin::system()`, so the threads settle `failed` and
+        // keep their manual Continue: work that may have crashed the engine
+        // can't be looped.
+        let mut restart = None;
+        let mut teardown = None;
+
+        assert!(open_teardown(&mut restart, &mut teardown).is_none());
+        assert!(teardown.is_none());
+    }
+
+    #[test]
+    fn a_non_device_actor_is_still_stashable_by_this_rule() {
+        // The device-only requirement is enforced at the HTTP boundary (the
+        // restart-intent handler 400s a non-device caller), NOT here: the
+        // in-workspace Switch legitimately stashes whatever `user_actor_resolved`
+        // gave it, and downstream reads the actor's kind for itself. Pinned so a
+        // later "tighten the stash" edit has to notice it would change that path.
+        let mut slot = None;
+        let api = Some(MessageOrigin::Api {
+            user_agent: Some("curl".to_string()),
+            mode: crate::engine::thread_events::ActorMode::Human,
+            source_thread_id: None,
+        });
+        assert!(stash_first_restart_actor(&mut slot, api));
+        assert!(slot.is_some());
+    }
 
     /// Poll `cond` until it holds, up to ~2 s.
     ///

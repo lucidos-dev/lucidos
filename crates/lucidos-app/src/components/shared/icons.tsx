@@ -157,20 +157,25 @@ export function EventWaitClockIcon({ className }: { className?: string }) {
   );
 }
 
-export function TodoCheckIcon({ className }: { className?: string }) {
+/** The todo indicator's ONE glyph, for every state it can be in.
+ *
+ *  A checklist: two ticked rows and one still-open row, echoing the ✓ / ○
+ *  markers the panel itself uses. Idle, in-progress and abandoned differ only
+ *  in COLOR (see `styles/chat/todo-list.css`), never in shape, so the button
+ *  keeps saying "todo list" at a glance.
+ *
+ *  The open row's circle carries its own thinner stroke on purpose: at the
+ *  1.25rem the indicator renders, `stroke-width="2"` closes a circle this
+ *  small into a blob and it stops reading as an unticked row. */
+export function TodoListIcon({ className }: { className?: string }) {
   return (
     <svg class={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-      <polyline points="8 12 11 15 16 9"/>
-    </svg>
-  );
-}
-
-export function TodoInProgressIcon({ className }: { className?: string }) {
-  return (
-    <svg class={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
-      <path d="M7 12 A5 5 0 0 1 17 12 Z" fill="currentColor" stroke="none"/>
+      <path d="M3 6l2 2 4-4"/>
+      <path d="M3 12l2 2 4-4"/>
+      <circle cx="5" cy="18" r="2.4" stroke-width="1.5"/>
+      <path d="M13 6h8"/>
+      <path d="M13 12h8"/>
+      <path d="M13 18h8"/>
     </svg>
   );
 }

@@ -367,9 +367,10 @@ async fn interrupt_kills_in_flight_turn_and_synthesizes_canceled_result() {
     ));
 
     // Queue a follow-up BEFORE interrupting. The engine counted it in
-    // pending_followups and expects a Result for it — the driver must run
-    // it as a fresh turn after the interrupt (CC's stdin queue behaves the
-    // same way after Esc).
+    // `AgentSession::inputs_awaiting_result` and, because Codex settles that
+    // count by one per Result, expects a Result for it. The driver must run it
+    // as a fresh turn after the interrupt (CC's stdin queue behaves the same way
+    // after Esc, though CC answers the whole queue with one Result).
     input_tx
         .send(AgentInput {
             text: "queued".into(),

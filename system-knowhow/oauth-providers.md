@@ -1,6 +1,6 @@
 ---
 name: OAuth Providers Registry
-description: The rules around OAuth 2.0 providers, beside the endpoint rows in the sibling oauth-providers.json. The engine reads that file, so for a known provider connect_oauth_account needs only the provider name and scopes. Covers: connect_oauth_account is one call for the whole flow, an oauth_client credential takes the bare provider name, the loopback redirect URI and when to override its host form, confidential vs public client (a blank secret means PKCE), Microsoft Entra's AADSTS errors, and the per-provider quirks a row cannot express. Load BEFORE collecting an OAuth credential for a provider the registry does not know, or when a connection fails; add a new provider as a row in the JSON.
+description: OAuth 2.0 provider rules, beside the endpoint rows in the sibling oauth-providers.json: connect_oauth_account, the oauth_client credential, the loopback redirect URI, PKCE vs a client secret, and Microsoft Entra AADSTS errors. Load before collecting an OAuth credential, when a connection fails, or to add a provider.
 ---
 
 # OAuth providers registry
@@ -41,6 +41,15 @@ When a service needs OAuth client credentials:
    again: a credential fully describes its own flow.
    `client_secret` and `redirect_uri` are optional, see the two sections below
    for what their absence means.
+
+**Read the result, do not assume it means everything worked.** A provider can
+grant part of what was asked for and still complete the authorization, so
+`connect_oauth_account` reports the account as connected AND names any scope it
+did not get. When it does, the connection is real but cannot do the thing it was
+connected for: relay the missing scopes, have the user enable them in the
+provider's console (the result carries that provider's own console link and
+instruction), and then RECONNECT. Do not retry the same call first, and do not
+refresh the token: neither picks up a newly enabled scope.
 
 A provider that is in neither the registry nor your args leaves the user typing
 URLs in by hand, so only do that for one you genuinely cannot find. **Better:
@@ -269,23 +278,30 @@ redeemed. Nothing to configure; it is listed here because `state` is refused in
 ### Dropbox: the App Console decides what may be asked for
 
 Dropbox is the one provider in this table where enabling the app is a separate
-step from requesting the scope, and the two failure modes look identical to a
-user, so walk them through both:
+step from requesting the scope, and every way of getting it wrong looks
+identical to the user, so walk them through all three:
 
 1. **The Permissions tab of their app in the Dropbox App Console is the maximum
    AND the default set.** An authorization request can narrow that set, never
    widen it. Ask for a scope the app has not been permitted and the call that
    needs it fails with *"Your app … does not have the required scope"*.
-2. **Ticking a box there changes nothing that already exists.** Neither an
+2. **A ticked box is not a saved box until they press Submit.** The Permissions
+   tab keeps the ticks as unsaved page state and its **Submit** button sits at
+   the bottom, below the fold, so it is easy to tick four boxes, navigate away,
+   and change nothing at all. Have them scroll down and press Submit, then
+   reload the tab and confirm the ticks survived. This one step cost a user an
+   hour on 2026-08-07: everything else had been done correctly.
+3. **Ticking a box there changes nothing that already exists.** Neither an
    issued access token nor the user's existing grant picks up a newly enabled
    scope. After changing the permissions they MUST reconnect the account from
    Settings → Accounts (the Backup page's *Grant access* button does the same
    thing for a backup provider). A refresh does not help: refreshing renews the
    scopes the token already has.
 
-So the order is: enable the permissions in the App Console first, then connect.
-If they connected first, the fix is to enable and then reconnect, and saying
-"tick the box" alone leaves them looking at the same error.
+So the order is: enable the permissions in the App Console, press Submit, then
+connect. If they connected first, the fix is to enable, Submit, and then
+reconnect, and saying "tick the box" alone leaves them looking at the same
+error.
 
 ## Microsoft (Entra) — redirect URI platform buckets
 

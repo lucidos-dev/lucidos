@@ -1,6 +1,6 @@
 ---
 name: Building an App
-description: Use when the user wants to build, scaffold, edit, or extend an app — phrases like "make me an app", "build a tracker", "dashboard for X", "habit app". Covers when an app is the wrong fit, what to clarify before scaffolding, and how to iterate.
+description: Use when the user wants to build, scaffold, edit, or extend an app: "make me an app", "build a tracker", "dashboard for X", "habit app". Covers when an app is the wrong fit, what to clarify before scaffolding, and how to iterate.
 ---
 
 # Building an App

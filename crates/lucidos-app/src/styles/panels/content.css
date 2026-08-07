@@ -953,16 +953,37 @@
     padding-bottom: 0.75rem;
     flex-shrink: 0;
     margin-top: auto;
-    /* Dissolve transcript content into the prompt: an opaque base plus a
-       bg-colored shadow cast UPWARD over the bottom of the scroll area, so
-       any thread content fades out as it nears the prompt instead of cutting
-       off at a hard edge. Base rule (all viewports) — mobile keeps only its
-       layout-specific overrides. Previously this lived in the mobile-only
-       @media block, so the fade rendered on iOS Safari but not on desktop
-       Chrome/Safari. Tuned gradient-dominant (small solid offset, longer blur)
-       to read as gently as the title-header fade rather than a hard bg band.
-       Its upward reach (|offset| + blur = 1rem) is --prompt-fade (base.css); the
-       transcript's bottom padding tracks that var, so keep them matched. */
+    /* Opaque base the transcript dissolves into; the ::before below is the
+       dissolve itself and needs something solid to land on. */
     background: var(--bg-primary);
-    box-shadow: 0 -0.375rem 0.625rem 0 var(--bg-primary);
+}
+
+/* Dissolve transcript content into the prompt: a bg-colored gradient band drawn
+   directly above the composer, so any thread content fades out as it nears the
+   prompt instead of cutting off at a hard edge. Base rule (all viewports):
+   mobile keeps only its layout-specific overrides. Previously this lived in the
+   mobile-only @media block, so the fade rendered on iOS Safari but not on
+   desktop Chrome/Safari. The band's height IS --prompt-fade (base.css), the
+   same var the transcript's bottom padding reserves, so the two cannot drift.
+
+   It stops short of the transcript's scroll gutter (--scrollbar-gutter-width,
+   0px wherever scrollbars are overlay), because the scrollbar is chrome, not
+   content, and must never dissolve: this band paints over .thread-content,
+   whose classic scrollbar sits in exactly that rightmost strip, and a
+   full-width one ate the bottom of the thumb. That inset is also why the band
+   is a gradient rather than the bg-colored box-shadow it replaces
+   (0 -0.375rem 0.625rem): a shadow feathers past the box it is cast from on
+   every side, so no horizontal inset gives it a clean edge at the gutter.
+
+   pointer-events: none because a shadow is never hit-tested and an element is,
+   and the band sits over the last turn's content. */
+.prompt-area::before {
+    content: '';
+    position: absolute;
+    left: 0;
+    right: var(--scrollbar-gutter-width);
+    bottom: 100%;
+    height: var(--prompt-fade);
+    background: linear-gradient(to top, var(--bg-primary), transparent);
+    pointer-events: none;
 }

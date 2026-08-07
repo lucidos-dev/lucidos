@@ -10,6 +10,8 @@
  * these routes don't exist, so callers treat a failure as "no gateway".
  */
 
+import { deviceIdHeader } from '../../utils/deviceIdHeader';
+
 const CONTROL = '/~/api/v1/control';
 
 export type WorkspaceHealth = 'booting' | 'healthy' | 'unhealthy';
@@ -68,18 +70,32 @@ export async function renameWorkspace(id: string, name: string): Promise<void> {
 }
 
 /** Start a stopped workspace, retry an unhealthy one, or respawn a running one
- *  (all route to the gateway's restart control). */
+ *  (all route to the gateway's restart control).
+ *
+ *  Sends the device-id header, and that is load-bearing rather than bookkeeping:
+ *  the gateway forwards it to the engine it is about to signal, which is the
+ *  only way that engine can tell a person's Restart from a crash. Without it the
+ *  interrupted threads settle at `failed` with "Response interrupted" and no
+ *  auto-resume, instead of `paused` with "Paused by restart" like the
+ *  in-workspace Switch. A browser with no id yet (the picker opened before any
+ *  workspace ever was) simply sends no header and gets the old behaviour. */
 export async function restartWorkspace(id: string): Promise<void> {
   await controlJson<void>(`/workspaces/${encodeURIComponent(id)}/restart`, {
     method: 'POST',
+    headers: deviceIdHeader(),
   });
 }
 
 /** Stop a workspace's engine. It stays listed in the picker as stopped (the
- *  registry entry survives — membership is "all ever launched"). */
+ *  registry entry survives, since membership is "all ever launched").
+ *
+ *  Carries the device id for the same reason {@link restartWorkspace} does: a
+ *  Stop somebody clicked is a deliberate pause of the work, and its threads
+ *  resume when the workspace next boots. */
 export async function stopWorkspace(id: string): Promise<void> {
   await controlJson<void>(`/workspaces/${encodeURIComponent(id)}/stop`, {
     method: 'POST',
+    headers: deviceIdHeader(),
   });
 }
 

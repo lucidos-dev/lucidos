@@ -185,6 +185,35 @@ describe('openSettingsSubview', () => {
     expect(pushNavState).toHaveBeenCalledTimes(1);
   });
 
+  it('lands the Settings menu item itself, in a SINGLE nav push', () => {
+    // The reported bug: a deep link from outside Settings (the Backup failure
+    // notification's "Open settings", a Search Everywhere hit, the Marketplaces
+    // jump) had to pair this with switchMenuItem('settings') because it set only
+    // the subview. Both push, so one tap left two history entries and Back
+    // walked onto a Settings home the user never visited. This helper is now a
+    // complete destination, so the pairing is gone from every caller.
+    activeMenuItem.value = 'notifications';
+
+    openSettingsSubview('backup');
+
+    expect(activeMenuItem.value).toBe('settings');
+    expect(settingsSubview.value).toBe('backup');
+    expect(pushNavState).toHaveBeenCalledTimes(1);
+  });
+
+  it('clears an open overlay so a deep link is not covered by it', () => {
+    // setActiveMenu's clearing, inherited now that this helper routes through
+    // it: arriving from a notification-detail panel (which IS an overlay) must
+    // show the settings page, not the panel that was open behind the tap.
+    activeMenuItem.value = 'notifications';
+    panelOverlay.value = { type: 'app-ui', app: fakeApp };
+
+    openSettingsSubview('backup');
+
+    expect(panelOverlay.value).toBeNull();
+    expect(settingsSubview.value).toBe('backup');
+  });
+
   it('reveals the content pane (mobile swipe, desktop expand)', () => {
     // Settings sub-sections live inside the content pane. Opening one from
     // any source (deep link, search result, in-panel nav) must swipe to it

@@ -162,6 +162,34 @@ describe('Service Worker fetch handler', () => {
     expect(event.respondWith).not.toHaveBeenCalled();
   });
 
+  // The connection watchdog's probe. Its 4.5s deadline covers whatever happens
+  // inside the SW, so `fetchWithRetry`'s second attempt would run on what is
+  // left of the budget belonging to the attempt that matters, turning a fast
+  // honest failure into a timeout and the dot red. The retry buys nothing here
+  // either: three consecutive failed probes are suppressed and the next is 5s
+  // away.
+  it('GET to /api/v1/health: does NOT call respondWith', () => {
+    const event = makeEvent('https://example.com/api/v1/health');
+    handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  it('GET to /api/v1/health with query string: does NOT call respondWith', () => {
+    const event = makeEvent('https://example.com/api/v1/health?probe=1');
+    handlers.fetch(event);
+    expect(event.respondWith).not.toHaveBeenCalled();
+  });
+
+  // Exempting the probe must not exempt its neighbours: everything else under
+  // /api/v1/ keeps the retry, which does earn its keep on an ordinary read
+  // inside a 10s budget.
+  it('GET to a path merely starting with health: still calls respondWith', () => {
+    mockFetch.mockResolvedValue(new Response('ok'));
+    const event = makeEvent('https://example.com/api/v1/health-history');
+    handlers.fetch(event);
+    expect(event.respondWith).toHaveBeenCalledTimes(1);
+  });
+
   it('cross-origin GET: does NOT call respondWith', () => {
     const event = makeEvent('https://other.com/api/v1/foo');
     handlers.fetch(event);
@@ -1145,6 +1173,15 @@ describe('Service Worker base-path awareness (gateway scope)', () => {
   it('does NOT intercept the scoped SSE stream', () => {
     const { handlers } = loadSw({ scope: SCOPE });
     const ev = makeEvent('https://example.com/ws/work/api/v1/events');
+    handlers.fetch(ev);
+    expect(ev.respondWith).not.toHaveBeenCalled();
+  });
+
+  // Matching is scope-relative, so the exemption has to survive the gateway's
+  // /<slug>/ prefix. Behind the gateway is where the phone actually runs.
+  it('does NOT intercept the scoped health probe', () => {
+    const { handlers } = loadSw({ scope: SCOPE });
+    const ev = makeEvent('https://example.com/ws/work/api/v1/health');
     handlers.fetch(ev);
     expect(ev.respondWith).not.toHaveBeenCalled();
   });

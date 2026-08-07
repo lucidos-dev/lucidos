@@ -131,16 +131,30 @@ impl LucidosEngine {
         self.session_is_shutting_down(per_session)
     }
 
-    /// Stamp `actor: System` on `meta` when an aborted-by-host-system terminal
-    /// fires (safety-net, shutdown cancel) and no actor has been set already.
-    /// Lets the AbortPanel render '⚙ System' for process-killed aborts —
-    /// distinct from engine-deliberate work like hardening retrigger.
-    pub(super) fn stamp_system_actor_if_aborted(
+    /// Stamp `actor` on `meta` when an aborted-by-the-host terminal fires and no
+    /// actor has been set already. Lets the AbortPanel attribute the abort:
+    /// '⚙ System' for a process-killed one, the device for a user-initiated
+    /// *Switch to new version*, and neither for engine-deliberate work like a
+    /// hardening retrigger, which sets its own actor upstream.
+    ///
+    /// The actor is a PARAMETER rather than a hardcoded `System` because the two
+    /// callers are not asking the same question, and the difference is
+    /// load-bearing. `completion.rs`'s safety net really is the host giving up
+    /// on a hung session, so it passes `System`. `emit_stop_terminal`'s abort arm
+    /// is the engine teardown, whose actor is
+    /// [`LucidosEngine::teardown_actor`](crate::engine::LucidosEngine::teardown_actor):
+    /// a device there is half the switch fingerprint
+    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`) and is what buys the session
+    /// its `paused` verdict and its auto-resume. Hardcoding `System` here cost
+    /// exactly that to any session registered after
+    /// `shutdown_agent_sessions` took its flag pass.
+    pub(super) fn stamp_host_actor_if_aborted(
         meta: &mut crate::engine::thread_events::EventMeta,
         is_aborted: bool,
+        actor: crate::engine::thread_events::MessageOrigin,
     ) {
         if is_aborted && meta.actor.is_none() {
-            meta.actor = Some(crate::engine::thread_events::MessageOrigin::system());
+            meta.actor = Some(actor);
         }
     }
 
@@ -292,11 +306,21 @@ impl LucidosEngine {
             normalized_model.clone(),
             cc_reasoning_effort.clone(),
         );
-        // Aborted-during-shutdown means the host system killed the process;
-        // stamp `actor: System` so the AbortPanel reads ⚙ System. User-driven
-        // Canceled inherits the existing meta.
+        // `is_aborted` here means exactly `Aborted(EngineShutdown)`:
+        // `stop_terminal_kind` yields an abort only when `is_shutdown`. So the
+        // actor is the TEARDOWN's, the same one the pre-emit stamped, which is
+        // what lets a session registered after `shutdown_agent_sessions` took
+        // its flag pass still read "Paused by restart" and still auto-resume. No
+        // stashed actor (a bare stop.sh, an external SIGUSR1) falls back to
+        // System, and the AbortPanel reads ⚙ System. User-driven Canceled
+        // inherits the existing meta.
         let mut emit_meta = meta.clone();
-        Self::stamp_system_actor_if_aborted(&mut emit_meta, is_aborted);
+        Self::stamp_host_actor_if_aborted(
+            &mut emit_meta,
+            is_aborted,
+            self.teardown_actor()
+                .unwrap_or_else(crate::engine::thread_events::MessageOrigin::system),
+        );
         let log_label = format!("[AgentSession] terminal event ({})", arm);
         self.event_bus
             .emit_or_log(
@@ -503,26 +527,46 @@ pub(super) async fn external_terminal_already_emitted(
 mod tests {
     use super::*;
 
-    /// `stamp_system_actor_if_aborted` stamps `MessageOrigin::System` (NOT
-    /// `Engine{OrphanRecovery}`) on aborted terminals — the host system killed
-    /// the process; the engine just emits the marker. Engine actor stays for
-    /// engine-deliberate work like hardening retrigger or scheduler.
+    /// `stamp_host_actor_if_aborted` stamps the actor its caller supplies (NOT
+    /// `Engine{OrphanRecovery}`) on aborted terminals. The safety-net caller
+    /// supplies `System`: the host killed the process, and the engine just emits
+    /// the marker. Engine actor stays for engine-deliberate work like hardening
+    /// retrigger or scheduler.
     #[test]
-    fn stamp_system_actor_stamps_system_when_aborted_and_no_actor() {
+    fn stamp_host_actor_stamps_the_supplied_actor_when_aborted_and_no_actor() {
         use crate::engine::thread_events::{EventMeta, MessageOrigin};
         let mut meta = EventMeta::NONE;
-        LucidosEngine::stamp_system_actor_if_aborted(&mut meta, true);
+        LucidosEngine::stamp_host_actor_if_aborted(&mut meta, true, MessageOrigin::system());
         assert!(matches!(meta.actor, Some(MessageOrigin::System)));
+    }
+
+    /// The teardown caller supplies the device that clicked *Switch to new
+    /// version*, and that must reach the event: a `Device` actor on an
+    /// `EngineShutdown` abort IS the switch fingerprint
+    /// (`agent_recovery::SWITCH_TEARDOWN_ABORT_SQL`), so it is what buys the
+    /// session its `paused` verdict and its auto-resume. Hardcoding `System`
+    /// here is what cost a chat thread both on 2026-08-07.
+    #[test]
+    fn stamp_host_actor_stamps_the_teardown_device_when_aborted() {
+        use crate::engine::thread_events::{AbortCause, EventMeta, MessageOrigin};
+        let device = MessageOrigin::Device {
+            device_id: "d-1".into(),
+            label: "iOS Safari PWA".into(),
+        };
+        let mut meta = EventMeta::NONE;
+        LucidosEngine::stamp_host_actor_if_aborted(&mut meta, true, device.clone());
+        assert_eq!(meta.actor, Some(device));
+        assert!(AbortCause::EngineShutdown.promises_auto_resume(meta.actor.as_ref()));
     }
 
     /// Non-aborted terminals (Generated, Canceled) carry the inbound meta
     /// untouched — Generated is a normal turn end, Canceled is user-driven.
-    /// Stamping system on those would mis-attribute the AbortPanel.
+    /// Stamping a host actor on those would mis-attribute the AbortPanel.
     #[test]
-    fn stamp_system_actor_no_op_when_not_aborted() {
-        use crate::engine::thread_events::EventMeta;
+    fn stamp_host_actor_no_op_when_not_aborted() {
+        use crate::engine::thread_events::{EventMeta, MessageOrigin};
         let mut meta = EventMeta::NONE;
-        LucidosEngine::stamp_system_actor_if_aborted(&mut meta, false);
+        LucidosEngine::stamp_host_actor_if_aborted(&mut meta, false, MessageOrigin::system());
         assert!(meta.actor.is_none());
     }
 
@@ -530,7 +574,7 @@ mod tests {
     /// pre-emit), don't overwrite it. The pre-emit's device attribution must
     /// survive so the AbortPanel reads "Paused by restart", not "System".
     #[test]
-    fn stamp_system_actor_does_not_overwrite_existing() {
+    fn stamp_host_actor_does_not_overwrite_existing() {
         use crate::engine::thread_events::{EventMeta, MessageOrigin};
         let device = MessageOrigin::Device {
             device_id: "d-1".into(),
@@ -540,7 +584,7 @@ mod tests {
             actor: Some(device.clone()),
             ..EventMeta::NONE
         };
-        LucidosEngine::stamp_system_actor_if_aborted(&mut meta, true);
+        LucidosEngine::stamp_host_actor_if_aborted(&mut meta, true, MessageOrigin::system());
         assert_eq!(meta.actor, Some(device));
     }
 

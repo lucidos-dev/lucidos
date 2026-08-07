@@ -321,9 +321,46 @@ pub(super) async fn restart_engine(
 ) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     let actor = super::actor::user_actor_resolved(&headers, &state.pool, None).await;
     // Stash the device actor for the teardown-time boundary emit (Phase 3) and the
-    // recovery auto-resume signal (Phase 4). No pre-emit here.
-    state.engine.set_restart_actor(actor);
+    // recovery auto-resume signal (Phase 4). No pre-emit here. First writer wins,
+    // and this IS the first writer: the gateway's restart-intent notify fires on
+    // the respawn we are about to ask for, and must not overwrite the click's own
+    // actor (see `stash_first_restart_actor`).
+    let stashed = state.engine.stash_restart_actor(actor);
 
+    let outcome = respawn_this_engine(&state).await;
+
+    // Nothing asked this engine to go down after all: every arm below fails
+    // BEFORE the process is signalled (an unreachable gateway, a gateway that
+    // refused the id, launchctl or `web-dev.sh` failing to spawn), so the stash
+    // now describes a restart that never happened. Left in place it would attach
+    // to whatever teardown came next, and under first-writer-wins it would also
+    // REFUSE that teardown's own actor, which is the case that actually bites: a
+    // stale non-device actor here (an API caller with no device header) would
+    // then block a later picker Restart from attributing itself at all, costing
+    // its threads the pause and the auto-resume. Only clear what THIS call
+    // stashed, so a concurrent notify's actor is never dropped on our behalf.
+    if outcome.is_err() && stashed {
+        state.engine.take_restart_actor();
+        log!("[Restart] Respawn request failed, cleared the stashed restart actor");
+    }
+    outcome
+}
+
+/// Ask something to respawn this engine, by whichever route exists. Split out of
+/// [`restart_engine`] so its several failure exits meet the stash-cleanup above
+/// at one place instead of each having to remember it.
+///
+/// Prefer the gateway control API whenever the gateway spawned us (dev AND
+/// packaged, since it injects `LUCIDOS_GATEWAY_PORT` + `LUCIDOS_WORKSPACE_ID`);
+/// fall back to launchd (packaged, no gateway) or `web-dev.sh --engine-only`
+/// (legacy `LUCIDOS_NO_GATEWAY` dev, where there's no gateway to do the respawn).
+///
+/// `Ok` means the teardown is under way, not merely requested: the gateway
+/// signals the engine inside the call it answers, and launchctl / `web-dev.sh`
+/// have been spawned. Every `Err` leaves this process running.
+async fn respawn_this_engine(
+    state: &AppState,
+) -> Result<StatusCode, (StatusCode, Json<serde_json::Value>)> {
     // The gateway (dev or packaged) respawns this workspace's stack in place onto
     // the already-on-disk binary — no rebuild here.
     if let (Ok(port), Ok(id)) = (

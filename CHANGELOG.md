@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.24.1 — 2026-08-07
+
+### Changed
+
+- **The always-loaded chat context is smaller again.** The static prompt body and the System Knowhow routing list were each rewritten to their shortest correct form, the per-tool schema ceiling is now 1,500 characters, and a test holds the combined always-loaded budget at 103,200.
+- **The connection dot records every transition as a client breadcrumb**, so a red or blinking dot on a phone leaves a trail that can be read back.
+
+### Fixed
+
+- **A coding-agent turn that dies on a transient upstream API error resumes by itself again**, including a Claude Code turn that merged several instructions into one reply.
+- **A message sent to a running coding-agent session is not thrown away.** The session keeps the message when a reply the agent produced before it arrives afterwards, and an unrelated buffered event no longer counts as that message being taken.
+- **The connection dot on iOS stops flickering red on wake.** Overlapping health probes settle on a single verdict, and the probe has its own deadline sized against the poll interval.
+- **A thread list that times out is reported as a delivery failure**, and the sticky refresh card it left on the iOS PWA is gone. Two overlapping thread-list loads now share one result, so a skipped load cannot be read as a fresh list.
+- **An OAuth connection that comes back with fewer scopes than asked for says which ones the provider refused.** The Connect form also shows the console step beside Reconnect and Grant access, and names the Submit step at the bottom of Dropbox's Permissions tab.
+- **The Backup panel updates when a backup preference is changed somewhere else.**
+- **The todo indicator in the composer uses one checklist glyph across its three states**, with the state carried by color and named in its accessible label.
+- **A build whose staged system-knowhow copy has drifted from the source is refused**, and a staged copy that is not a directory counts as drift.
+- **Opening a thread lands on its newest turn.** A saved reading position gives way once the thread has grown, and resizing the window keeps the transcript at the bottom.
+- **Open in new tab and Fullscreen work in the desktop app.** A popout hands the app to the system browser, the app view goes to real fullscreen, and an opener that fails to launch says so.
+- **The marketplace list in the Plugins panel updates as marketplaces are registered and removed**, without a reload.
+- **A thread interrupted by an engine restart names the restart** as the reason it stopped.
+- **The transcript's fade edges stay off the scrollbar.**
+- **The install and uninstall receipts in the Plugins panel no longer show a Close button** that left the panel stranded.
+- **An event subscription's arming window is measured against the database clock**, so a subscription armed under load cannot miss an event that arrived beside it.
 ## v0.24.0 — 2026-08-07
 
 ### Added
