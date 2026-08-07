@@ -481,6 +481,52 @@ Apple's notary service routinely outlives the process waiting on it, and the orc
 
 Offline-tested by `scripts/lib/release_notarize_test.sh` (the pure handle: round-trip, checksum/commit/missing-DMG refusals, UUID shape, notarytool JSON parsing) and the resume section of `build_dmg_test.sh` (flag parsing, the end-to-end gate, and the `release.sh` phase plumbing). Knobs: `NOTARIZE_POLL_INTERVAL` (30 s), `NOTARIZE_POLL_TIMEOUT` (7200 s — bounds the process, not the handle), `NOTARIZE_POLL_MAX_FAILURES` (5).
 
+### Preparing a release unattended: preflight, deadline, abandon
+
+Three flags on `release.sh` let a nightly take a release from "should we?" to
+"built, gated, waiting for a human" and stop dead there. **None of them
+publishes, pushes to `main`, creates a `v*` tag or publishes a Release**, and
+that is the property to preserve when touching any of them.
+
+- **`--prep-preflight <version|auto>`** is a READ-ONLY verdict machine
+  (`scripts/lib/release_preflight.sh`, withheld from the mirror): one JSON object
+  on stdout, progress on stderr, and an exit code that is the contract (**0** GO,
+  **10** SKIP, **1** ERROR). Zero side effects, so it is safe mid-flight. Its
+  base selection follows the release knowhow and must never become `git
+  describe`, which answers "nearest *reachable* tag" and so picks an older one
+  exactly when the newest is an orphan. Two asymmetries are deliberate: an
+  unreadable mirror fails CLOSED to skip (stacking a second release on an
+  unfinished one is unrecoverable by script), while an unreachable CI-weather
+  signal is `"unknown"` and never a skip on its own. It is also stricter than
+  `release.sh`'s own deletion gate: no intent-keyword exemption, because an
+  unattended run may never decide for itself that a deletion was intentional.
+- **`--notarize-deadline <spec>`** bounds the wait for Apple on `--verify-build`
+  / `--resume-notarize`. On expiry `notarize_poll` returns instead of dying, the
+  run exits 0, the `notarize` step is closed as **Succeeded** with the verdict
+  recorded as outstanding, and **nothing is staged**. That last part is the
+  safety property: with no staging dir there is no manifest `--publish-verified`
+  could promote. With a deadline set it REPLACES `NOTARIZE_POLL_TIMEOUT` rather
+  than sitting beside it (two bounds means the shorter wins, which would defeat
+  a deadline further out than the 7200s default). Do not confuse it with
+  `--defer-notarization`, its opposite in intent: deferring stages an unstapled
+  DMG so the release can publish behind a banner. They are refused together.
+- **`--abandon <version>`** removes a Phase A's whole footprint in one
+  idempotent command with a per-item table, and REFUSES once `v<version>` is
+  published or the mirror's `main` already names it. That is a yank, a different
+  and far more dangerous operation. It never touches the workspace changelog
+  artifact; it reports where it is.
+
+Both Phase-A entry points invoke the build through **one** helper,
+`run_release_build_dmg`, which owns the interpretation of build-dmg.sh's exit
+status. Keep it that way: a second call site would be a second place deciding
+whether a deadline pause is a failure, and its `|| rc=$?` sits INSIDE the
+subshell because `set -E` puts release.sh's exiting ERR trap in there.
+
+Offline-tested by `release_preflight_test.sh`, `release_deadline_test.sh` and
+`release_abandon_test.sh` (throwaway git repos, a fake `gh`, a `file://` status
+URL, and the build-dmg.sh functions pulled in by the same awk extraction the
+other suites use).
+
 ### The release does not wait on Apple — deferred DMG (ADR 0027)
 
 Resumability stopped a slow verdict costing a *rebuild*; it did not stop it blocking the *release*. **`--defer-notarization` does, for the DMG's verdict.** Since ADR 0033 a release makes TWO notary submissions in Apple's order, the `.app` and then the DMG, and only the second is deferrable: the DMG is built FROM the stapled app, so there is nothing to stage until the app's verdict lands. A deferred release therefore waits once (1 to 20 hours, 8h06m on v0.16.0) rather than not at all. That is the cost of F5 and it is recorded in ADR 0033, not hidden here. Notarization still gates exactly one *shipped* artifact, the `.dmg` a browser downloads. The headless tarball and the updater trio (`.app.tar.gz` + `.sig` + `latest.json`) are never quarantined, so Gatekeeper never assesses them: existing users and `curl … | sh` installs are wholly unaffected.

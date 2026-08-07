@@ -11,9 +11,9 @@
  * but the thread is still missing from `threadMap`, clear the persisted id
  * and emit a `cleared_ghost_focus` lifecycle breadcrumb.
  *
- * Observed in personal workspace iOS PWA — every Client/lifecycle startup
- * since at least 15:27 reported `prev_focused_thread:"5e7139f5-…"` for a
- * thread with zero rows in `events` and no `thread_summaries` entry.
+ * Observed on an iOS PWA: every Client/lifecycle startup since at least 15:27
+ * reported `prev_focused_thread:"5e7139f5-…"` for a thread with zero rows in
+ * `events` and no `thread_summaries` entry.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 

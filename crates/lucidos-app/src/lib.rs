@@ -12,6 +12,11 @@ mod desktop;
 mod device_id_store;
 mod mobile;
 mod notifications;
+/// Login-shell environment hydration for a GUI launch. macOS-only: it exists
+/// because launchd hands a packaged process an environment the user's profile
+/// never touched, which is a macOS packaging fact.
+#[cfg(target_os = "macos")]
+mod shell_env;
 mod updater;
 
 /// Headless launchd entry point — `Lucidos --service` (see `desktop::run_service`).
@@ -989,23 +994,56 @@ fn heartbeat(app: tauri::AppHandle) {
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Bring the main window to the front.
+/// What the packaged startup is waiting on, for the pre-gateway boot splash.
 ///
-/// The same reshow the tray's "Open Lucidos" and a notification tap perform
-/// ([`show_main_window`]: leave menu-bar-only, unminimize, show, focus, activate
-/// frontmost), exposed to the page for the one flow that finishes somewhere
-/// else: an OAuth authorization the user completes in a browser. Without it they
-/// approve the provider's consent screen and are left staring at the callback
-/// tab with Lucidos behind it.
+/// The window paints that splash on the bundled asset scheme, where it can
+/// reach no API at all until `desktop::launch` navigates it to the gateway, so
+/// this IPC call is its only source of news. The label is composed in Rust
+/// (`desktop::startup_label`) rather than assembled here or in the page, so the
+/// wording has one home and is unit-tested.
+#[tauri::command]
+fn startup_status(app: tauri::AppHandle) -> String {
+    app.state::<desktop::StartupStatus>().label()
+}
+
+/// Bring the CALLING page's own window to the front.
 ///
-/// Deliberately NOT a general "focus me" the page may call whenever it likes.
-/// Its one caller (`handleOAuthAccountConnected`) fires only for a flow THIS
-/// device started, seconds after the user's own click, and only once. A window
+/// Exposed to the page for the one flow that finishes somewhere else: an OAuth
+/// authorization the user completes in a browser. Without it they approve the
+/// provider's consent screen and are left staring at the callback tab with
+/// Lucidos behind it.
+///
+/// It fronts `window`, the window whose webview invoked the command, and
+/// deliberately NOT [`show_main_window`], which this used to call while it was
+/// named `focus_main_window`. That targeted the window labelled `main`
+/// specifically, and built a NEW one when it was gone, so an authorization
+/// finished from a New Window (`window-<n>`) raised a different window over the
+/// one the user was working in: each app window can sit on its own workspace, and
+/// a packaged close only HIDES `main`, so a window the user had dismissed came
+/// back carrying a workspace they had not asked for ("it opened the workspace
+/// again in another window", 2026-08-06). The caller's window exists by
+/// construction, so there is no create-a-window branch here at all. Leaving
+/// menu-bar-only first is kept: the calling page may live in a hidden window,
+/// and `Accessory` cannot front anything.
+///
+/// Still NOT a general "focus me" the page may call whenever it likes. Its one
+/// caller (`handleOAuthAccountConnected`) fires only in the page that OPENED the
+/// authorization URL, seconds after the user's own click, and only once. A window
 /// that fronts itself on a background event is a nuisance, so keep new callers
 /// to that shape.
 #[tauri::command]
-fn focus_main_window(app: tauri::AppHandle) {
-    show_main_window(&app);
+fn focus_calling_window(app: tauri::AppHandle, window: tauri::Window) {
+    // Restore `Regular` BEFORE showing, for the reason on `show_main_window`:
+    // the AppKit `Accessory`->`Regular` transition otherwise leaves the app
+    // behind other apps with an unclickable menu bar.
+    set_menu_bar_only(&app, false);
+    let _ = window.unminimize();
+    let _ = window.show();
+    let _ = window.set_focus();
+    activate_app_frontmost();
+    // `set_focus()` also fires `WindowEvent::Focused(true)`, but emit explicitly
+    // so the reshow is deterministic regardless of event timing.
+    emit_window_active(&app, window.label(), true);
 }
 
 #[tauri::command]
@@ -1380,6 +1418,7 @@ pub fn run() {
         .manage(device_id_store::DeviceIdStore::default())
         .manage(updater::AppUpdateRun::default())
         .manage(mobile::MobileAccessRuns::default())
+        .manage(desktop::StartupStatus::default())
         .manage(DockBadgeNudge(Mutex::new(dock_badge_nudge_tx)))
         .invoke_handler(tauri::generate_handler![
             create_panel_webview,
@@ -1395,6 +1434,7 @@ pub fn run() {
             webview_get_content,
             __panel_content_report,
             heartbeat,
+            startup_status,
             restart_app,
             restart_service,
             quit_lucidos,
@@ -1402,7 +1442,7 @@ pub fn run() {
             open_url_external,
             show_native_notification,
             dismiss_native_notification,
-            focus_main_window,
+            focus_calling_window,
             nudge_dock_badge,
             get_native_window_active,
             take_pending_native_taps,

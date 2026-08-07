@@ -69,11 +69,19 @@ const SDK_PREFS_JS: &str = r##"(function() {
   };
   var fontKey = localStorage.getItem(wsKey("lucidos-font-family"));
   d.style.setProperty("--font-ui", FONTS[fontKey] || FONTS.monospace);
-  // Programming ligatures, only for fonts that ship them (Fira Code); every
-  // other font gets `normal` (CSS initial -> unchanged). Mirrors FONT_FEATURES
-  // in preferences.ts and the same map in the index.html FOUC IIFE.
-  var FEATURES = { "fira-code": '"liga" 1, "calt" 1' };
-  d.style.setProperty("font-feature-settings", FEATURES[fontKey] || "normal");
+  // Programming ligatures: OFF for text, ON for code, and only for fonts that
+  // ship them (Fira Code). Every other font gets `normal` for both, leaving its
+  // rendering unchanged. Mirrors FONT_FEATURES in preferences.ts and the same
+  // map in the index.html FOUC IIFE; consumed by the two rules in
+  // api/sdk_iframe.css. The off value MUST be the zeros, never `normal`: liga
+  // and calt are default-ON, so `normal` renders identically to `1` and Fira
+  // Code's calt still collapses a typed `...` into what reads as two dots. And
+  // the text rule has to name form controls, which do not inherit this property.
+  // See preferences.ts for the full why.
+  var FEATURES = { "fira-code": { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' } };
+  var feat = FEATURES[fontKey] || { text: "normal", code: "normal" };
+  d.style.setProperty("--font-features-text", feat.text);
+  d.style.setProperty("--font-features-code", feat.code);
   var scale = localStorage.getItem(wsKey("lucidos-ui-scale"));
   if (scale) {
     // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
@@ -161,12 +169,24 @@ mod tests {
     }
 
     #[test]
-    fn script_sets_font_feature_settings_for_ligatures() {
+    fn script_publishes_ligatures_off_for_text_and_on_for_code() {
         // Fira Code's ligatures are gated to the fira-code key; every other
-        // font resolves to `normal` (CSS initial), leaving its rendering
-        // unchanged. Mirrors FONT_FEATURES in preferences.ts + index.html FOUC.
-        assert!(SDK_PREFS_JS.contains("setProperty(\"font-feature-settings\""));
-        assert!(SDK_PREFS_JS.contains("\"fira-code\": '\"liga\" 1, \"calt\" 1'"));
+        // font resolves to `normal` for both, leaving its rendering unchanged.
+        // Mirrors FONT_FEATURES in preferences.ts + index.html FOUC.
+        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-text\""));
+        assert!(SDK_PREFS_JS.contains("setProperty(\"--font-features-code\""));
+        assert!(SDK_PREFS_JS.contains("text: '\"liga\" 0, \"calt\" 0'"));
+        assert!(SDK_PREFS_JS.contains("code: '\"liga\" 1, \"calt\" 1'"));
+        // Fira Code's off value is the ZEROS above, never `normal`. `liga` and
+        // `calt` are default-ON features, so `normal` means "the font's
+        // defaults" and renders identically to `1`: an app's prose would keep
+        // the ligatures and a typed `...` would still read as two dots. Proven
+        // by pixel comparison, not by the computed value, which shows neither.
+        // (`normal` IS right for the non-Fira fallback, which wants defaults.)
+        //
+        // Never the bare property either: scope is decided by the two rules in
+        // api/sdk_iframe.css, which is the only thing that consumes the values.
+        assert!(!SDK_PREFS_JS.contains("setProperty(\"font-feature-settings\""));
     }
 
     #[test]

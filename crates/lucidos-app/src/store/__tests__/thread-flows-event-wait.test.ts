@@ -173,7 +173,95 @@ describe('a turn parked on an event wait', () => {
     ] as ThreadEvent[]);
 
     const exchange = getExchanges(map, id)[0];
-    expect(waits(exchangeResponseEvents(exchange))[0]).toMatchObject({ state: 'canceled' });
+    const events = exchangeResponseEvents(exchange);
+    // ONE row, not two: the stop landed in the same exchange as the arming, so
+    // it flips that row rather than adding its own beneath it.
+    expect(waits(events)).toHaveLength(1);
+    expect(waits(events)[0]).toMatchObject({ state: 'canceled', cause: 'user_stop' });
     expect(exchangeStatus(exchange, '', true, false, false, /* threadIdle */ true)).toBe('done');
+  });
+
+  /** **A stop leaves a mark where it happened.**
+   *
+   *  A subscription routinely outlives the turn that armed it by hours, so the
+   *  arming row is far up the transcript by the time it is stopped, in an
+   *  earlier exchange entirely. A stop is also the one resolution with no wake,
+   *  so nothing else renders for it. Before this row, a watch armed at 00:08
+   *  and stopped at 02:07 left NOTHING anywhere near where the user was
+   *  reading: no toast, no line, and the indicator row simply gone.
+   *
+   *  The row is self-contained because the event is: `EventWaitCanceled`
+   *  carries what it stopped, exactly as a delivery carries what it matched. */
+  it('adds its own row when the stop lands in a later exchange than the arming', () => {
+    const { map, id } = makeThread();
+    insertEvents(map, id, [
+      ...park,
+      { type: 'ResponseGenerated', text: "I'll watch for that." },
+      // A later turn entirely, hours after the subscription was armed.
+      { type: 'MessageReceived', text: 'never mind, stop watching' },
+      {
+        type: 'EventWaitCanceled',
+        wait_id: 'w1',
+        cause: 'agent_stand_down',
+        on: [{ event_type: 'ChangeProposed' }],
+        reason: REASON,
+      },
+      { type: 'ResponseGenerated', text: 'Stopped.' },
+    ] as ThreadEvent[]);
+
+    const exchanges = getExchanges(map, id);
+    // The arming row stays where it was, still saying it was set up: that turn
+    // really did arm a subscription, and rewriting its history would lose when
+    // the watch started.
+    expect(waits(exchangeResponseEvents(exchanges[0]))).toMatchObject([{ state: 'waiting' }]);
+    // And the stop has its own row in the turn where it happened, naming what
+    // it stopped and how.
+    expect(waits(exchangeResponseEvents(exchanges[1]))).toMatchObject([
+      {
+        wait_id: 'w1',
+        state: 'canceled',
+        cause: 'agent_stand_down',
+        subscription: 'ChangeProposed',
+        reason: REASON,
+      },
+    ]);
+  });
+
+  /** Neither a delivery nor an expiry gets one: both WAKE the thread, so each
+   *  already reads as its own turn further down. A second row would report the
+   *  same thing twice. */
+  it.each(['EventWaitDelivered', 'EventWaitExpired'] as const)(
+    'adds no row for a %s that lands in a later exchange',
+    (type) => {
+      const { map, id } = makeThread();
+      insertEvents(map, id, [
+        ...park,
+        { type: 'ResponseGenerated', text: "I'll watch for that." },
+        { type: 'MessageReceived', text: 'any news?' },
+        type === 'EventWaitDelivered'
+          ? { type, wait_id: 'w1', event_id: 'evt-9', event_type: 'ChangeProposed', payload: {}, matched_index: 0, was_attached: false }
+          : { type, wait_id: 'w1', was_attached: false },
+        { type: 'ResponseGenerated', text: 'Here it is.' },
+      ] as ThreadEvent[]);
+
+      expect(waits(exchangeResponseEvents(getExchanges(map, id)[1]))).toHaveLength(0);
+    },
+  );
+
+  /** A pre-2026-08-07 `EventWaitCanceled` carries neither what it stopped nor
+   *  why. It still gets its row (the alternative is the silence this fixes),
+   *  and the row names nothing rather than inventing a subscription. */
+  it('renders a legacy stop with nothing to name', () => {
+    const { map, id } = makeThread();
+    insertEvents(map, id, [
+      ...park,
+      { type: 'ResponseGenerated', text: "I'll watch for that." },
+      { type: 'MessageReceived', text: 'stop' },
+      { type: 'EventWaitCanceled', wait_id: 'w1', cause: 'user_stop' },
+    ] as ThreadEvent[]);
+
+    expect(waits(exchangeResponseEvents(getExchanges(map, id)[1]))).toMatchObject([
+      { state: 'canceled', subscription: '', reason: '' },
+    ]);
   });
 });

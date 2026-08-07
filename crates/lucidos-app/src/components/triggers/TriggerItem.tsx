@@ -25,6 +25,10 @@ export function TriggerItem({ trigger }: Partial<Props>) {
   const lastRunStr = lastRunDate ? `${formatShortDate(lastRunDate)} ${formatShortTime(lastRunDate)}` : null;
   const triggerType = trigger ? deriveTriggerType(trigger) : 'schedule';
   const noMoreRuns = trigger ? hasNoMoreRuns(trigger) : false;
+  const nextRunsStr = (trigger?.next_runs ?? [])
+    .map(iso => new Date(iso))
+    .map(d => `${formatShortDate(d)} ${formatShortTime(d)}`)
+    .join(', ');
   // Mirrors the two server-side refusals, so the row never offers a button
   // that is guaranteed to error: an off-schedule run needs a cron schedule (an
   // event-only trigger has to have its event emitted instead) and an unpaused
@@ -41,7 +45,11 @@ export function TriggerItem({ trigger }: Partial<Props>) {
         <SkText class="title list-row-name" as="div" w="9rem">{trigger?.name}</SkText>
         <div class="list-row-details">
           <SkBlock w="3rem" h="1.25rem" round>
-            {noMoreRuns ? (
+            {trigger?.schedule_error ? (
+              <span class="trigger-schedule-error" data-tooltip={trigger.schedule_error}>
+                Schedule error
+              </span>
+            ) : noMoreRuns ? (
               <span class="trigger-no-more-runs">No more runs</span>
             ) : (
               <span class={trigger?.paused ? 'trigger-paused' : 'trigger-enabled'}>
@@ -74,6 +82,12 @@ export function TriggerItem({ trigger }: Partial<Props>) {
               </li>
             ))}
           </ul>
+        )}
+        {/* The cheapest way to make a wrong schedule visible before it costs
+            anything: a "monthly" trigger listing three dates a year apart gives
+            itself away at a glance. */}
+        {nextRunsStr && (
+          <div class="trigger-next-runs">Next {nextRunsStr}</div>
         )}
         {trigger?.on && trigger.on.length > 0 && (
           <ul class="trigger-event-list">

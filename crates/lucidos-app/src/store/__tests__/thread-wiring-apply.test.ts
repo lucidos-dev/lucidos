@@ -354,7 +354,7 @@ describe('ThreadTitleRenamed event handling', () => {
     expect(thread.meta.status).toBe('waiting');
   });
 
-  it('ThreadPinned does not change idle thread to running', () => {
+  it('ThreadSaved does not change idle thread to running', () => {
     const thread = makeThread({ eventsLoaded: true });
     const map = new Map([['t1', thread]]);
 

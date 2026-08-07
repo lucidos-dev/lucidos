@@ -5,8 +5,11 @@
  * Rendered standalone (see main.tsx — when `IS_PICKER`, i.e. the stamped base
  * href is `/~/`) instead of the full app, so it never boots the app's SSE /
  * thread machinery. It lists every registered workspace with health, and is the
- * always-reachable recovery surface: Open / Create / Rename / Delete / Retry.
- * A self-contained screen with inline forms — no global store, no native dialogs.
+ * always-reachable recovery surface: Open / Create / Restore / Rename / Delete /
+ * Retry. A self-contained screen with inline forms, no global store and no
+ * native dialogs. The footer (`PickerFooter.tsx`) keeps Create and Restore side
+ * by side in every state, since this is also the FIRST screen a new user meets,
+ * with nothing on it yet.
  *
  * Visual language: the Lucidos app mark is the hero (animated), painted on the
  * brand-blue gradient the mark itself uses. Rows are flat (no card chrome): the
@@ -46,8 +49,6 @@ import {
   restoreBackup,
   getRestoreStatus,
   clearRestoreStatus,
-  slugifyWorkspaceName,
-  parseWorkspaceNameFromArchive,
   getGatewayStatus,
   reloadGateway,
   getGatewayNetworkConfig,
@@ -63,6 +64,19 @@ import {
   type BindDraft,
 } from '../../utils/bindMode';
 import { networkAccessBody, type NetworkEditor } from './NetworkAccessPopover';
+import {
+  applyRestoreFile,
+  createNote as buildCreateNote,
+  nameTakenBy,
+  nameTakenMessage,
+  restoreBlocker,
+  restoreFileNote,
+  showsAddress,
+  workspaceAddress,
+  EMPTY_RESTORE_DRAFT,
+  type RestoreDraft,
+} from './workspaceForms';
+import { pickerFooter, type FooterMode } from './PickerFooter';
 
 /** Derived display state — collapses health + last_error into one status the row
  *  renders as a dot. A stopped workspace reports `unhealthy` + "not started"; we
@@ -250,18 +264,18 @@ export function WorkspacePicker() {
   const error = useSignal<string | null>(null);
   // Skeleton row count, captured once at mount (see where it's read below).
   const skeletonRowsRef = useRef<number | undefined>(undefined);
-  // Inline form state.
-  const creating = useSignal(false);
+  // Which footer form is open. ONE signal rather than a boolean per form: both
+  // entry points stay on screen whatever is open (they're how the user switches
+  // between them), so "both forms open at once" must not be representable.
+  const footerMode = useSignal<FooterMode>('none');
   const newName = useSignal('');
   const renamingId = useSignal<string | null>(null);
   const renameValue = useSignal('');
   const deletingId = useSignal<string | null>(null);
   const deleteConfirm = useSignal('');
-  // Restore-from-backup form + flow state.
-  const restoreOpen = useSignal(false);
-  const restoreFile = useSignal<File | null>(null);
-  const restoreKey = useSignal('');
-  const restoreName = useSignal('');
+  // Restore-from-backup form + flow state. The three fields travel as one draft
+  // so the pure rules in `workspaceForms.ts` decide what the user is told.
+  const restoreDraft = useSignal<RestoreDraft>(EMPTY_RESTORE_DRAFT);
   const restoreStatus = useSignal<GwRestoreStatus | null>(null);
   // Gateway self-update: drives the header reload control + "new gateway
   // available" badge. Null until the first poll lands (legacy non-gateway mode
@@ -509,24 +523,27 @@ export function WorkspacePicker() {
     if (!autoOpening.value) dismissBootSplash();
   }, [autoOpening.value]);
 
-  // First run: when the picker loads with zero workspaces, open the create form
-  // so the user names their first workspace right away — instead of the passive
-  // "No workspaces yet" dead-end (and instead of a pre-made `default`). The field
-  // stays empty and editable; the suggestion chips ("personal" / "work") offer a
-  // one-click fill. Runs once; a manual Cancel then stays cancelled.
+  // First run: when the picker loads with zero workspaces, unfold the create
+  // form so the user names their first workspace right away, instead of the
+  // passive "No workspaces yet" dead-end (and instead of a pre-made `default`).
+  // The field stays empty and editable; the suggestion chips ("personal" /
+  // "work") offer a one-click fill. Both entry points stay visible above it, so
+  // this never hides restore: the case ADR 0015 exists for (a user with a backup
+  // and no workspace) IS the first-run state. Runs once; a manual Cancel then
+  // stays cancelled.
   const firstRunPrompted = useSignal(false);
   useEffect(() => {
     const list = workspaces.value;
     if (firstRunPrompted.value) return;
-    if (list.status === 'loaded' && list.data.length === 0 && !creating.value && !restoreOpen.value) {
+    if (list.status === 'loaded' && list.data.length === 0 && footerMode.value === 'none') {
       firstRunPrompted.value = true;
-      creating.value = true;
+      footerMode.value = 'create';
     }
   }, [workspaces.value]);
 
   // Ref to the create form's name input so a suggestion chip can fill it and
   // hand focus back (select the filled text so the user can type over it).
-  const nameInputRef = useRef<HTMLInputElement | null>(null);
+  const nameInputRef = useRef<HTMLInputElement>(null);
   function pickSuggestion(name: string) {
     newName.value = name;
     const el = nameInputRef.current;
@@ -553,7 +570,7 @@ export function WorkspacePicker() {
     if (!name) return;
     void withBusy(async () => {
       const ws = await createWorkspace(name);
-      creating.value = false;
+      footerMode.value = 'none';
       newName.value = '';
       await refresh();
       openWorkspace(ws.id);
@@ -579,27 +596,26 @@ export function WorkspacePicker() {
     });
   }
 
-  function pickRestoreFile(file: File | null) {
-    restoreFile.value = file;
-    // Prefill the name from the archive filename (editable). Empty when the file
-    // isn't a recognizable backup — the user then types one.
-    restoreName.value = file ? (parseWorkspaceNameFromArchive(file.name) ?? '') : '';
+  /** Apply a chosen or dropped file. An empty selection (cancelled dialog,
+   *  file-less drop) leaves the draft alone: see `applyRestoreFile`. */
+  function pickRestoreFile(file: File | null | undefined) {
+    restoreDraft.value = applyRestoreFile(restoreDraft.value, file);
+  }
+
+  function patchRestore(patch: Partial<RestoreDraft>) {
+    restoreDraft.value = { ...restoreDraft.value, ...patch };
   }
 
   function closeRestore() {
-    restoreOpen.value = false;
-    restoreFile.value = null;
-    restoreKey.value = '';
-    restoreName.value = '';
+    footerMode.value = 'none';
+    restoreDraft.value = EMPTY_RESTORE_DRAFT;
   }
 
   function onRestore() {
-    const file = restoreFile.value;
-    const key = restoreKey.value.trim();
-    const name = restoreName.value.trim();
-    if (!file || !key || !name) return;
+    const { file, key, name } = restoreDraft.value;
+    if (!file || !key.trim() || !name.trim()) return;
     void withBusy(async () => {
-      const started = await restoreBackup(file, key, name);
+      const started = await restoreBackup(file, key.trim(), name.trim());
       // Optimistically show the running banner; the poll keeps it current.
       restoreStatus.value = { status: 'running', id: started.id, name: started.name, phase: 'starting' };
       closeRestore();
@@ -650,15 +666,23 @@ export function WorkspacePicker() {
     skeletonRowsRef.current = recallLastWorkspaceCount() ?? 3;
   }
   const skeletonRows = skeletonRowsRef.current;
-  // Predict a slug collision so the picker can warn before uploading (the
-  // gateway re-checks authoritatively). Compares the typed name's slug against
-  // the loaded workspace ids.
-  const existingIds = v.status === 'loaded' ? v.data.map((w) => w.id) : [];
-  const restoreSlug = restoreName.value.trim() ? slugifyWorkspaceName(restoreName.value.trim()) : '';
-  const restoreCollision = restoreSlug !== '' && existingIds.includes(restoreSlug);
-  const restoreCanSubmit =
-    restoreFile.value != null && restoreKey.value.trim() !== '' && restoreName.value.trim() !== '' && !restoreCollision;
+  // What still stands between the draft and a submittable restore, stated to the
+  // user rather than expressed only as a dead button (a disabled Restore with no
+  // reason is what made a missing file read as "the app is broken"). Includes
+  // the address collision, which the gateway re-checks authoritatively.
+  const known = v.status === 'loaded' ? v.data : [];
+  const blocker = restoreBlocker(restoreDraft.value, known);
+  const fileNote = restoreFileNote(restoreDraft.value.file);
+  const createNote = buildCreateNote(newName.value, known);
+  // A rename may not take another workspace's name (renaming to its own current
+  // name is not a collision, hence the exclusion).
+  const renameTaken = renamingId.value
+    ? nameTakenBy(renameValue.value, known, renamingId.value)
+    : null;
+  // One condition for Save and for the Enter key, so they cannot drift apart.
+  const canRename = !busy.value && renameValue.value.trim() !== '' && renameTaken === null;
   const restore = restoreStatus.value;
+  const restoreRunning = restore?.status === 'running';
 
   // Smart-root auto-open in progress: render nothing so the inline boot splash
   // (index.html, kept up by the effect above) stays the only thing on screen —
@@ -767,9 +791,11 @@ export function WorkspacePicker() {
         <LoadingFade showSkeleton={showListSkeleton} skeleton={<PickerSkeleton rows={skeletonRows} />}>
         {v.status === 'loaded' && v.data.length === 0 && (
           <div class="ws-picker-empty">
-            {creating.value
-              ? 'Name your first workspace to get started.'
-              : 'No workspaces yet — create your first one.'}
+            {footerMode.value === 'restore'
+              ? 'Bring a workspace back from a backup you already have.'
+              : footerMode.value === 'create'
+                ? 'Name your first workspace to get started, or restore one from a backup.'
+                : 'No workspaces yet. Create one, or restore from a backup.'}
           </div>
         )}
 
@@ -781,16 +807,29 @@ export function WorkspacePicker() {
               return (
                 <li class="ws-picker-row" key={w.id}>
                   {renamingId.value === w.id ? (
-                    <div class="ws-picker-inline">
-                      <input
-                        class="ws-picker-input"
-                        value={renameValue.value}
-                        onInput={(e) => (renameValue.value = (e.target as HTMLInputElement).value)}
-                        onKeyDown={(e) => e.key === 'Enter' && onRename(w.id)}
-                        autoFocus
-                      />
-                      <button class="ws-picker-btn ws-picker-btn-confirm" disabled={busy.value} onClick={() => onRename(w.id)}>Save</button>
-                      <button class="ws-picker-btn" onClick={() => (renamingId.value = null)}>Cancel</button>
+                    <div class="ws-picker-rename">
+                      <div class="ws-picker-inline">
+                        <input
+                          class="ws-picker-input"
+                          value={renameValue.value}
+                          onInput={(e) => (renameValue.value = (e.target as HTMLInputElement).value)}
+                          onKeyDown={(e) => e.key === 'Enter' && canRename && onRename(w.id)}
+                          autoFocus
+                        />
+                        <button
+                          class="ws-picker-btn ws-picker-btn-confirm"
+                          disabled={!canRename}
+                          onClick={() => onRename(w.id)}
+                        >Save</button>
+                        <button class="ws-picker-btn" onClick={() => (renamingId.value = null)}>Cancel</button>
+                      </div>
+                      {/* Renaming onto another workspace's name is how the picker
+                          ended up with two rows reading the same thing. Refused
+                          here and at the gateway; renaming to what this workspace
+                          is already called is not a collision with itself. */}
+                      {renameTaken && (
+                        <p class="ws-picker-note ws-picker-note-warn">{nameTakenMessage(renameTaken)}</p>
+                      )}
                     </div>
                   ) : deletingId.value === w.id ? (
                     <div class="ws-picker-inline ws-picker-delete">
@@ -837,6 +876,20 @@ export function WorkspacePicker() {
                         aria-label={w.last_error || STATE_LABEL[state]}
                       />
                       <span class="ws-picker-name">{w.name}</span>
+                      {/* The address is normally invisible, and normally that's
+                          fine (it matches the name). It is shown exactly when it
+                          would otherwise surprise: a rename left the name off its
+                          address, or two rows share a name and this is the only
+                          thing telling them apart. See `showsAddress`. */}
+                      {showsAddress(w, v.data) && (
+                        <span
+                          class="ws-picker-address"
+                          data-tooltip={`Served at ${workspaceAddress(w.id)}`}
+                          aria-label={`Address ${workspaceAddress(w.id)}`}
+                        >
+                          {workspaceAddress(w.id)}
+                        </span>
+                      )}
                       {typeof w.unread_count === 'number' && w.unread_count > 0 && (
                         <span
                           class="ws-picker-badge"
@@ -1014,101 +1067,34 @@ export function WorkspacePicker() {
           </div>
         )}
 
-        <footer class="ws-picker-footer">
-          {creating.value ? (
-            <div class="ws-picker-create">
-              {!newName.value.trim() && (
-                <div class="ws-picker-suggestions">
-                  <span class="ws-picker-suggestions-label">Try</span>
-                  {WORKSPACE_NAME_SUGGESTIONS.map((s) => (
-                    <button
-                      key={s}
-                      type="button"
-                      class="ws-picker-suggestion"
-                      disabled={busy.value}
-                      onClick={() => pickSuggestion(s)}
-                    >
-                      {s}
-                    </button>
-                  ))}
-                </div>
-              )}
-              <div class="ws-picker-inline">
-                <input
-                  ref={nameInputRef}
-                  class="ws-picker-input"
-                  placeholder="Workspace name"
-                  value={newName.value}
-                  onInput={(e) => (newName.value = (e.target as HTMLInputElement).value)}
-                  onKeyDown={(e) => e.key === 'Enter' && onCreate()}
-                  onFocus={(e) => (e.target as HTMLInputElement).select()}
-                  autoFocus
-                />
-                <button class="ws-picker-btn ws-picker-btn-confirm" disabled={busy.value || !newName.value.trim()} onClick={onCreate}>
-                  {busy.value ? 'Creating…' : 'Create'}
-                </button>
-                <button class="ws-picker-btn" onClick={() => { creating.value = false; newName.value = ''; }}>Cancel</button>
-              </div>
-            </div>
-          ) : restoreOpen.value ? (
-            <div class="ws-picker-restore-form">
-              <label
-                class="ws-picker-restore-drop"
-                onDragOver={(e) => e.preventDefault()}
-                onDrop={(e) => {
-                  e.preventDefault();
-                  pickRestoreFile(e.dataTransfer?.files?.[0] ?? null);
-                }}
-              >
-                <input
-                  type="file"
-                  accept=".enc"
-                  hidden
-                  onChange={(e) => pickRestoreFile((e.target as HTMLInputElement).files?.[0] ?? null)}
-                />
-                <span>{restoreFile.value ? restoreFile.value.name : 'Drop a .enc backup here, or click to choose'}</span>
-              </label>
-              <input
-                class="ws-picker-input"
-                type="password"
-                placeholder="Backup key"
-                value={restoreKey.value}
-                onInput={(e) => (restoreKey.value = (e.target as HTMLInputElement).value)}
-              />
-              <input
-                class="ws-picker-input"
-                placeholder="Workspace name"
-                value={restoreName.value}
-                onInput={(e) => (restoreName.value = (e.target as HTMLInputElement).value)}
-                onKeyDown={(e) => e.key === 'Enter' && restoreCanSubmit && !busy.value && onRestore()}
-              />
-              {restoreCollision && (
-                <span class="ws-picker-restore-warn">“{restoreName.value.trim()}” already exists — choose another name</span>
-              )}
-              <div class="ws-picker-inline">
-                <button
-                  class="ws-picker-btn ws-picker-btn-confirm"
-                  disabled={!restoreCanSubmit || busy.value}
-                  onClick={onRestore}
-                >
-                  {busy.value ? 'Starting…' : 'Restore'}
-                </button>
-                <button class="ws-picker-btn" onClick={closeRestore}>Cancel</button>
-              </div>
-            </div>
-          ) : (
-            <div class="ws-picker-footer-actions">
-              <button class="ws-picker-new" onClick={() => (creating.value = true)}>+ New workspace</button>
-              <button
-                class="ws-picker-new ws-picker-restore-open"
-                disabled={restore?.status === 'running'}
-                onClick={() => (restoreOpen.value = true)}
-              >
-                Restore from backup
-              </button>
-            </div>
-          )}
-        </footer>
+        {pickerFooter({
+          mode: footerMode.value,
+          // Re-activating the open entry point closes its form; the draft is
+          // kept, so flipping between the two never costs the user their typing.
+          onMode: (m) => (footerMode.value = footerMode.value === m ? 'none' : m),
+          busy: busy.value,
+          restoreRunning,
+          name: newName.value,
+          onName: (n) => (newName.value = n),
+          onCreate,
+          onCancelCreate: () => { footerMode.value = 'none'; newName.value = ''; },
+          suggestions: WORKSPACE_NAME_SUGGESTIONS,
+          onSuggestion: pickSuggestion,
+          nameInputRef,
+          createNote,
+          draft: restoreDraft.value,
+          onDraft: patchRestore,
+          onPickFile: pickRestoreFile,
+          onRestore,
+          onCancelRestore: closeRestore,
+          blocker,
+          fileNote,
+          // Route the way out of a collision through the row's existing
+          // type-the-name delete confirm (which autofocuses), rather than
+          // inventing a second, weaker destructive path: deleting a workspace
+          // drops its database.
+          onDeleteColliding: (id) => { deletingId.value = id; deleteConfirm.value = ''; },
+        })}
       </div>
     </div>
   );

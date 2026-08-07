@@ -99,7 +99,7 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
       actor: { kind: 'system' },
     });
     const desc = describeInitiator(ex, '', [], 'tid');
-    expect(desc.summary).toBe('Resumed after an interruption');
+    expect(desc.summary).toBe('Resumed after the session stopped responding');
     expect(desc.summary).not.toBe('Resumed after engine restart');
   });
 

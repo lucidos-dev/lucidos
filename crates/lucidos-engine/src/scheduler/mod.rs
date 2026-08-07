@@ -132,6 +132,13 @@ impl SchedulerManager {
         // Replay trigger lifecycle events to rebuild in-memory state
         self.replay_triggers_from_events().await;
 
+        // Name any replayed schedule that can never fire. Create and update
+        // reject those now, so these are triggers stored before the guard
+        // existed: they keep their config and stay registered (the runner exits
+        // cleanly on "no more occurrences"), but they would otherwise sit in the
+        // panel looking healthy while doing nothing forever.
+        self.warn_on_dead_schedules();
+
         // Rebuild the on-disk trigger.toml projection from the replayed set
         // (derived read-model — ADR 0019): ensure it's git-ignored, write every
         // current definition, and prune orphans from renames/deletes that
@@ -542,6 +549,25 @@ impl SchedulerManager {
 
         if updated > 0 {
             log!("[Scheduler] Migrated {} stale trigger prompt(s)", updated);
+        }
+    }
+
+    /// Log one warning per replayed trigger whose cron schedule can never fire.
+    ///
+    /// Covers paused triggers too, which is why it does not live in
+    /// `register_trigger_from_config`: registration skips them, and a paused
+    /// trigger with a dead schedule is exactly as broken as an active one.
+    fn warn_on_dead_schedules(&self) {
+        let configs = self.trigger_configs.read().unwrap();
+        for config in configs.values() {
+            if let Some(problem) = config.schedule_error() {
+                log!(
+                    "[Scheduler] Trigger '{}' ({}) has a schedule that can never fire: {}. It stays registered but will not run until its cron is fixed.",
+                    config.name,
+                    config.id,
+                    problem
+                );
+            }
         }
     }
 

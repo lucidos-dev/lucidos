@@ -130,6 +130,30 @@ mod tests {
     }
 
     #[test]
+    fn replay_keeps_a_trigger_whose_cron_can_never_fire() {
+        // Create and update reject `0 0 9 31 2 *` now, but a workspace can hold
+        // one stored before the guard existed. Boot must not panic on it and must
+        // not drop it: the row keeps its schedule and stays in the registry, and
+        // the panel gets a diagnosis instead of a healthy-looking trigger.
+        let mut payload = created_payload("dead", "Feb 31 report");
+        payload["schedule"] = json!(["0 0 9 31 2 *"]);
+        let triggers = replay_trigger_events(vec![make_event("TriggerCreated", payload)]);
+
+        let t = triggers
+            .get("dead")
+            .expect("a never-firing trigger must survive replay, not vanish");
+        assert_eq!(t.schedule, vec!["0 0 9 31 2 *"], "schedule must be intact");
+        let problem = t
+            .schedule_error()
+            .expect("a never-firing schedule must report an error");
+        assert!(
+            problem.contains("day-of-month 31 never occurs in month 2 (February)"),
+            "got: {problem}"
+        );
+        assert!(t.next_runs(1).is_empty());
+    }
+
+    #[test]
     fn replay_created_then_updated_merges() {
         let events = vec![
             make_event("TriggerCreated", created_payload("t1", "Trigger 1")),

@@ -4,19 +4,16 @@ export function formatTokens(n: number): string {
   return String(n);
 }
 
-/**
- * Conservative chars-to-tokens estimate matching the engine's trim budget
- * (1.5 chars/token — see `agent_context_char_budget` in
- * `crates/lucidos-engine/src/engine/context.rs`).
- *
- * The old prose-shaped `chars / 4` undercounted JSON-heavy tool I/O ~2.4×
- * — the modal would show "200 K tokens" for a request the API then
- * rejected at 1.5 M. Callers must still label with ≈ (Claude's tokenizer
- * varies a bit per content type).
- */
-export function estimateTokens(chars: number): number {
-  return Math.round((chars * 2) / 3);
-}
+// There is deliberately NO chars-to-tokens helper here. `estimateTokens`
+// (`chars × 2/3`) lived at this spot and was a hand copy of the engine's
+// *trim-budget* ratio of 1.5 chars/token, which is conservative on purpose so
+// the packer cannot overflow the context window. Displaying it made the LLM
+// Context Viewer report a measured 205k prompt as 361k, contradicting the
+// `usage.input_tokens` header directly above the tree. The viewer now scales
+// each section against the capture's own headline total instead
+// (`components/chat/sectionTokens.ts`), which both fixes the number and means
+// the ratio is no longer duplicated across two languages with nothing keeping
+// them in step. Do not reintroduce one here.
 
 /** Render a model's declared context window for the Settings → Models row.
  *  `null` means the engine infers it from the id — worth saying out loud,

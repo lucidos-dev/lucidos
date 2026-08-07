@@ -59,3 +59,4 @@ Create an entry with `./scripts/adr-new.sh`, never by hand. See
 - [0049: Every event wait is detached: a subscription never holds a turn](0049-every-event-wait-is-detached.md)
 - [0050: The loopback API is unauthenticated, so attribution is evidence-based: an unattributed caller cannot claim to be the user](0050-unattributed-caller-cannot-claim-to-be-the-user.md)
 - [0051: Chat file tools reach .lucidos/tmp/ read-only, never write outside data/](0051-file-tools-scratch-boundary.md)
+- [0052: A thread subscription outlives Stop, and every other end of one is announced](0052-thread-subscription-outlives-stop.md)

@@ -214,6 +214,14 @@ export const CONTINUATION_AUTO_RESUME_AFTER_SWITCH_REASON = 'auto_resume_after_s
  *  is the engine picking the same work back up. */
 export const CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON = 'auto_resume_after_api_error';
 
+/** `CodingAgentIdled.reason` stamped by crash recovery on the synthetic idle it
+ *  emits directly beneath its own `ResponseAborted` boundary. Mirrors Rust's
+ *  `ENGINE_RESTART_INTERRUPT_REASON` (`agent_recovery/helpers.rs`). It is the
+ *  engine SAYING a mid-turn session was interrupted, not a turn reporting that
+ *  it finished, and `continuableAbortIndex` has to tell those apart to know
+ *  whether the boundary still wants a Continue button. */
+export const IDLE_ENGINE_RESTART_INTERRUPT_REASON = 'engine_restart_interrupt';
+
 /** Header label / preview text for a `ContinuationStarted` turn. The reason
  *  takes precedence: an `auto_recovery_after_hang` or
  *  `auto_resume_after_api_error` resume is a LOCAL interruption (a hang, a stray
@@ -221,16 +229,23 @@ export const CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON = 'auto_resume_afte
  *  "Resumed after engine restart" (which once made a user think restarting an
  *  unrelated workspace had restarted theirs). A human actor means the user
  *  clicked Continue; anything else on a restart-recovery continuation is the
- *  engine resuming after a real restart. */
+ *  engine resuming after a real restart.
+ *
+ *  The two local interruptions get their OWN wording rather than a shared
+ *  "Resumed after an interruption". They can happen minutes apart on one thread
+ *  (an upstream drop, then the hang watchdog on the session that replaced it),
+ *  and two identical rows told the user neither what had happened nor that the
+ *  causes differed. Each label mirrors its `describeContinuationReason`
+ *  explainer, and neither claims a restart. */
 export function continuationStartedSummary(
   reason: string | undefined,
   actor: MessageOrigin | undefined,
 ): string {
-  if (
-    reason === CONTINUATION_AUTO_RECOVERY_REASON ||
-    reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON
-  ) {
-    return 'Resumed after an interruption';
+  if (reason === CONTINUATION_AUTO_RECOVERY_REASON) {
+    return 'Resumed after the session stopped responding';
+  }
+  if (reason === CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON) {
+    return 'Resumed after the model connection dropped';
   }
   return originMode(actor) === 'human' ? 'Continued the response' : 'Resumed after engine restart';
 }
@@ -258,15 +273,23 @@ export interface EventSubscription {
   condition?: unknown;
 }
 
-/** Mirrors the Rust `EventWaitCancelCause` (serde rename_all = "snake_case").
- *  Every arm is the user ending the wait deliberately. Note what is absent: an
- *  ordinary message into a parked thread DETACHES the wait and leaves it live,
- *  so a passing question cannot silently discard a long wait. */
+/** Mirrors the Rust `EventWaitCancelCause` (serde rename_all = "snake_case"):
+ *  how a *thread subscription* was stopped short of its own resolution.
+ *
+ *  Two arms are not what they look like. `thread_canceled` is RETIRED and only
+ *  ever read: a thread-level Stop used to stop every subscription on the thread
+ *  and no longer does, but rows written before 2026-08-07 carry it. And a
+ *  timeout is not here at all, since that is `EventWaitExpired`.
+ *
+ *  Note what is absent: an ordinary message into a subscribed thread runs a
+ *  normal turn and leaves every subscription live, so a passing question cannot
+ *  silently throw away a long watch. */
 export type EventWaitCancelCause =
   | 'user_stop'
-  | 'thread_canceled'
+  | 'agent_stand_down'
   | 'thread_archived'
   | 'thread_discarded'
+  | 'thread_canceled'
   | 'unknown';
 
 export type ThreadEvent =
@@ -337,7 +360,10 @@ export type ThreadEvent =
   | { type: 'CodingAgentUserMessageSent'; text: string; coding_agent?: CodingAgent }
   | { type: 'CodingAgentPromptSent'; text: string; origin?: MessageOrigin; coding_agent?: CodingAgent }
   | { type: 'MissingHardeningDetected'; origin?: MessageOrigin }
-  | { type: 'CodingAgentIdled'; has_changes?: boolean; requires_restart?: boolean; is_external_repo?: boolean; cc_session_id?: string; coding_agent?: CodingAgent }
+  // `reason` is absent on an ordinary idle (the agent simply finished its turn)
+  // and carries `IDLE_ENGINE_RESTART_INTERRUPT_REASON` on the synthetic idle
+  // crash recovery emits under its own abort boundary.
+  | { type: 'CodingAgentIdled'; has_changes?: boolean; requires_restart?: boolean; is_external_repo?: boolean; cc_session_id?: string; coding_agent?: CodingAgent; reason?: string }
   // Continuation requested — emitted when an interrupted CC turn (engine restart
   // mid-turn, watchdog, missing-hardening sweep) needs to resume without a new
   // user message. The spawn dispatcher picks it up and re-spawns via --resume.
@@ -447,10 +473,15 @@ export type ThreadEvent =
   // `was_attached` records whether the delivery filled in the model's own
   // dangling `await_event` tool call (a seamless mid-thought resume) or arrived
   // as a new exchange because a user message had already forced that call shut.
-  | { type: 'EventWaitStarted'; wait_id: string; tool_use_id: string; on: EventSubscription[]; reason: string; expires_at: string; watermark: number }
+  | { type: 'EventWaitStarted'; wait_id: string; tool_use_id: string; on: EventSubscription[]; reason: string; armed_at?: string; expires_at: string; watermark: number }
   | { type: 'EventWaitDelivered'; wait_id: string; event_id: string; event_type: string; payload: unknown; matched_index: number; was_attached: boolean }
   | { type: 'EventWaitExpired'; wait_id: string; was_attached: boolean }
-  | { type: 'EventWaitCanceled'; wait_id: string; cause: EventWaitCancelCause; was_attached?: boolean };
+  // `on` / `reason` are a copy of what was stopped, so the transcript's stop
+  // row is self-contained: a subscription routinely outlives the turn that
+  // armed it, so its `EventWaitStarted` is outside the loaded window by the
+  // time it is stopped. Absent on pre-2026-08-07 rows, which fall back to the
+  // in-window lookup and then to naming nothing.
+  | { type: 'EventWaitCanceled'; wait_id: string; cause: EventWaitCancelCause; on?: EventSubscription[]; reason?: string; was_attached?: boolean };
 
 /** Every `ThreadEvent['type']` discriminant, as a compile-time-checked object.
  *  The `satisfies Record<ThreadEvent['type'], true>` annotation forces this map

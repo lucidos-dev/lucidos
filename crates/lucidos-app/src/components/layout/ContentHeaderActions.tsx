@@ -5,7 +5,7 @@ import { NotificationsBell } from '../notifications/NotificationsBell';
 import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
 import { sideBySideDiffAvailable } from '../../store/diffBody';
 import { closeUrl, refreshFilePreview } from '../../store/actions/artifacts';
-import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
+import { getAppFrameSrc, getVisibleAppFrame, getVisibleAppPanel, exitAppFullscreen, exitPseudoFullscreen, refreshAppUI, toggleAppSearch } from '../../store/actions/apps';
 import { nativeFullscreenElement } from '../../store/appFullscreenHost';
 import { CloseIcon, ReloadIcon, SearchIcon, PopOutIcon, FullscreenIcon, ExitFullscreenIcon, CodeIcon, EyeIcon, EditIcon, FileIcon, DiffIcon, SideBySideColumnsIcon } from '../shared/icons';
 import { RENDERABLE_EXTS, REPO_RENDERABLE_EXTS, isEditableDataFile } from '../files/previewExts';
@@ -138,23 +138,10 @@ export function ContentHeaderActions() {
   const isFullscreen = isNativeFullscreen || isPseudo;
 
   function toggleFullscreen() {
-    const doc = document as unknown as Record<string, unknown>;
-
-    // Exit native fullscreen
-    if (nativeFullscreenElement() !== null) {
-      if (typeof doc.exitFullscreen === 'function') {
-        (doc.exitFullscreen as () => Promise<void>)().catch(() => { /* user is exiting; failure is benign */ });
-      } else if (typeof doc.webkitExitFullscreen === 'function') {
-        (doc.webkitExitFullscreen as () => void)();
-      }
-      return;
-    }
-
-    // Exit pseudo-fullscreen
-    if (appPseudoFullscreen.value) {
-      exitPseudoFullscreen();
-      return;
-    }
+    // Already fullscreen (native, or the CSS fallback): come back to the normal
+    // layout. Shared with the navigation that has to reveal something other
+    // than the app, so there is one definition of how to leave.
+    if (exitAppFullscreen()) return;
 
     // Try native fullscreen on the app PANEL (not the iframe), fall back to CSS
     // pseudo-fullscreen. The panel is the target because a natively fullscreen

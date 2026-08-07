@@ -644,12 +644,17 @@ else
     # succeeds, so the verify-build state must already be on disk by then. If this
     # write moved back after the build, a kill in that window would strand staged
     # artifacts that neither --resume-notarize nor --publish-verified can pick up.
-    # There are exactly two of each call site — run_resume_notarize's, then Phase
-    # A's — so comparing them pairwise in file order pins both blocks. The build
-    # pattern keeps the closing quote of "$WORKTREE_DIR/scripts/build-dmg.sh" so it
-    # matches the real invocations and not the command shown in an error message.
+    # There are exactly two of each call site (run_resume_notarize's, then Phase
+    # A's), so comparing them pairwise in file order pins both blocks.
+    #
+    # The build marker is the run_release_build_dmg helper, which is where both
+    # Phase-A entry points now invoke build-dmg.sh from: that helper is the one
+    # place that interprets its exit status, because a --notarize-deadline expiry
+    # is a PAUSE rather than a failure and the ERR trap must not see it. Matching
+    # the helper name also cannot collide with the invocation printed inside an
+    # error message, which the old closing-quote pattern was guarding against.
     WRITE_LINES="$(grep -n 'write_verify_build_state$' "$RELEASE_SH" | cut -d: -f1 | tr '\n' ' ')"
-    BUILD_LINES="$(grep -n 'build-dmg.sh" --release-build' "$RELEASE_SH" | cut -d: -f1 | tr '\n' ' ')"
+    BUILD_LINES="$(grep -n 'run_release_build_dmg --release-build' "$RELEASE_SH" | cut -d: -f1 | tr '\n' ' ')"
     for slot in 1:resume 2:phase-a; do
         idx="${slot%%:*}"; name="${slot#*:}"
         w="$(printf '%s' "$WRITE_LINES" | cut -d' ' -f"$idx")"

@@ -95,6 +95,22 @@
 # tasks at 3600s: a notarization slower than that can never be held in a
 # foreground wait, so resumability is the only fix.
 #
+# ── Notarization deadline (--notarize-deadline) ──────────────────────────────
+# Resumability made a lost waiter cheap; it did not make a slow verdict a
+# non-event for an UNATTENDED run, because the poll still dies at
+# NOTARIZE_POLL_TIMEOUT and a nightly reads that as a failed release. With a
+# deadline (a duration, a local wall-clock time, or an absolute epoch, parsed by
+# scripts/lib/release_deadline.sh) the poll stops at that instant, the run exits
+# with RELEASE_NOTARY_PENDING_EXIT down a "notary pending" path, and NOTHING is
+# staged. The build, the codesigns, the signed DMG, the submission and the resume
+# handle all survive, so the outstanding verdict is picked up later by the very
+# same --resume-notarize above.
+#
+# It is NOT the deferred mode below wearing a different name. Deferring stages an
+# unstapled DMG so the release can PUBLISH now, behind a pending banner; a
+# deadline stages nothing and publishes nothing, which is what makes it safe for
+# a caller with no human attached. See notarize_deadline_handoff.
+#
 # ── Deferred DMG (--defer-notarization) ──────────────────────────────────────
 # Resumability keeps a slow verdict from costing a rebuild, but the RELEASE still
 # waited on it — for 1 to 20 hours, every time. It never had to: notarization
@@ -239,6 +255,14 @@ source "$SCRIPT_DIR/lib/headless_tarball.sh"
 # shellcheck source=scripts/lib/release_notarize.sh
 source "$SCRIPT_DIR/lib/release_notarize.sh"
 
+# The notarization deadline (--notarize-deadline). Turns a slow Apple verdict
+# from a FAILED run into a clean, resumable pause: the poll stops at a given
+# instant, nothing is staged, and the resume handle is left for a later
+# --resume-notarize. Pure arithmetic, public-mirror-safe, so source it
+# unconditionally like the libs above.
+# shellcheck source=scripts/lib/release_deadline.sh
+source "$SCRIPT_DIR/lib/release_deadline.sh"
+
 # Compiled-input fingerprint (scripts/lib/release_build_fingerprint.sh): lets a
 # release re-fold tell "the shipped bytes changed" from "a docs commit landed",
 # so a rebuild + a fresh Apple notarization submission is spent only when it can
@@ -363,6 +387,17 @@ ALLOW_PENDING_NOTARIZATION=0
 NOTARIZE_POLL_INTERVAL="${NOTARIZE_POLL_INTERVAL:-30}"
 NOTARIZE_POLL_TIMEOUT="${NOTARIZE_POLL_TIMEOUT:-7200}"
 NOTARIZE_POLL_MAX_FAILURES="${NOTARIZE_POLL_MAX_FAILURES:-5}"
+# --notarize-deadline: the absolute epoch past which an outstanding verdict stops
+# being worth waiting for. EMPTY on every path that did not pass the flag, and
+# every deadline test is written so that empty means "never expires", which is
+# what keeps the default behaviour (die on NOTARIZE_POLL_TIMEOUT) untouched.
+#
+# When it IS set it REPLACES NOTARIZE_POLL_TIMEOUT as the loop's bound rather
+# than sitting beside it. Two bounds would mean the shorter one wins, so a
+# deadline further out than the 7200s default would still die at 7200s, which is
+# precisely the failure the flag exists to remove.
+NOTARIZE_DEADLINE=""
+NOTARIZE_DEADLINE_EXPIRED=0   # set by notarize_poll when it stops at the deadline
 
 step() { printf '\n==> %s\n' "$*"; }
 
@@ -527,6 +562,17 @@ Resumable notarization:
                        disk. Implies --resume-notarize. Only one of the two adopt
                        flags may be given, since only one submission is ever
                        outstanding.
+  --notarize-deadline S
+                       stop waiting for Apple at S and exit 0 down a "notary
+                       pending" path instead of dying: the resume handle, the
+                       worktree and the signed artifacts are all left in place,
+                       and NOTHING is staged (so no manifest exists for a later
+                       publish to promote). S is a duration (90m, 2h, 5400s), a
+                       local wall-clock time (06:30, meaning the next time it is
+                       06:30), or an absolute epoch (@1785000000). Build-grade
+                       runs only, and not with --defer-notarization, which never
+                       waits for the DMG's verdict at all. With a deadline set,
+                       NOTARIZE_POLL_TIMEOUT no longer bounds the poll.
   Env: NOTARIZE_POLL_INTERVAL (default 30s), NOTARIZE_POLL_TIMEOUT (default
   7200s — bounds this process only; the handle outlives it),
   NOTARIZE_POLL_MAX_FAILURES (default 5 consecutive transient errors).
@@ -991,18 +1037,32 @@ notarize_submit() {
 }
 
 # notarize_poll <submission-id> — block until Apple's verdict; sets NOTARIZE_STATUS.
-# Three outcomes are distinguished, because they need different human responses:
+# Four outcomes are distinguished, because they need different human responses:
 #   • a terminal status                 → return, caller acts on it
 #   • an id Apple doesn't recognise     → the handle is stale; a fresh submit is
 #                                         required (never silently re-submit)
 #   • a transient failure               → retry, up to NOTARIZE_POLL_MAX_FAILURES
 #                                         consecutively (a network blip must not
 #                                         throw away a 40-minute wait)
+#   • --notarize-deadline reached       → set NOTARIZE_DEADLINE_EXPIRED and
+#                                         return with NO status. The caller stops
+#                                         the run cleanly instead of failing it.
+#                                         Only reachable when the flag was given.
 notarize_poll() {
     local id="$1"
     local waited=0 fails=0 out status lowered err errfile
     errfile="$(mktemp -t lucidos-notarytool)"
     while :; do
+        # Checked at the TOP of the loop as well as before each sleep, so a
+        # deadline already in the past when polling starts (a resume picked up
+        # after the operator's window closed) stops immediately rather than
+        # spending one more round-trip to Apple.
+        if release_deadline_expired "$NOTARIZE_DEADLINE"; then
+            rm -f "$errfile"
+            NOTARIZE_STATUS=""
+            NOTARIZE_DEADLINE_EXPIRED=1
+            return 0
+        fi
         if out="$(notarytool_run info "$id" --output-format json 2>"$errfile")"; then
             fails=0
             status="$(printf '%s' "$out" | release_notarize_json_field status 2>/dev/null || true)"
@@ -1041,7 +1101,10 @@ notarize_poll() {
             echo "    notarytool info failed (attempt $fails/$NOTARIZE_POLL_MAX_FAILURES) — retrying in ${NOTARIZE_POLL_INTERVAL}s: $err"
         fi
 
-        if [ "$waited" -ge "$NOTARIZE_POLL_TIMEOUT" ]; then
+        # The process ceiling, and the ONE place --notarize-deadline changes an
+        # existing behaviour: with a deadline set, the deadline governs and this
+        # die is skipped. Without one, this is byte-for-byte what it always did.
+        if [ -z "$NOTARIZE_DEADLINE" ] && [ "$waited" -ge "$NOTARIZE_POLL_TIMEOUT" ]; then
             rm -f "$errfile"
             die "submission $id is still In Progress after ${waited}s. Nothing is lost — the resume handle is at $NOTARIZE_STATE_FILE; pick it back up with: scripts/build-dmg.sh --release-build --resume-notarize"
         fi
@@ -1061,13 +1124,74 @@ notarize_print_log() {
     notarytool_run log "$id" || echo "    (could not fetch the notary log for $id)"
 }
 
+# notarize_deadline_handoff <submission-id>: stop the run at the deadline,
+# cleanly. This is the whole behavioural change --notarize-deadline buys, and it
+# is deliberately a full stop rather than a branch the rest of the build flows
+# through.
+#
+# NOTHING IS STAGED. The two options were "stage the unstapled DMG honestly as
+# notarized:false" (what --defer-notarization does) and "stage nothing", and this
+# path takes the second, for two reasons that are not the deferred case's:
+#   1. A release makes two notary submissions and the .app's comes first, so a
+#      deadline can expire when no DMG exists at all. There is nothing to stage,
+#      and one behaviour for both stages beats two.
+#   2. --defer-notarization INTENDS to publish, behind a pending banner. This
+#      path must never publish. With no staging dir, --publish-verified refuses
+#      outright ("Phase A staging missing") instead of finding a manifest it
+#      would happily promote. Fail-closed by absence beats fail-closed by flag.
+# Everything expensive survives: the build, the codesigns, the signed DMG, the
+# submission with Apple, and the resume handle that ties them together.
+#
+# The cockpit step SUCCEEDS. A deadline expiry is a pause the operator asked for,
+# not a failure, so emitting ReleaseStepFailed would paint the one surface that
+# reports release health red for a run that did exactly what it was told. The
+# summary carries the outstanding verdict instead. This is the same choice
+# --defer-notarization already makes in run_dmg_notarize_stage, and it needs no
+# new event type.
+notarize_deadline_handoff() {
+    local id="$1" version="${EFFECTIVE_VERSION:-<version>}"
+    end_step notarize "Reached the --notarize-deadline with Apple's verdict on submission $id still outstanding. Nothing was staged and nothing failed; finish with release.sh --resume-notarize $version."
+    cat <<EOF
+
+────────────────────────────────────────────────────────────────────────────
+NOTARY PENDING: the deadline passed before Apple answered.
+────────────────────────────────────────────────────────────────────────────
+  Submission: $id  (still in flight with Apple)
+  Deadline:   $(release_deadline_format "$NOTARIZE_DEADLINE")
+  Handle:     $NOTARIZE_STATE_FILE
+  Worktree:   $REPO_ROOT
+
+  This is NOT a failure. The build, the codesigns and the signed artifacts are
+  all on disk, and the submission is still with Apple, so finishing costs a poll
+  rather than a rebuild.
+
+  NOTHING WAS STAGED, on purpose: with no staging dir there is no manifest for
+  --publish-verified to promote, so this run cannot have left an unstapled DMG
+  anywhere it could be published from.
+
+  Pick it back up once the verdict lands:
+      scripts/release.sh --resume-notarize $version
+EOF
+    exit "$RELEASE_NOTARY_PENDING_EXIT"
+}
+
 # notarize_await_verdict <submission-id> — poll to a terminal status and act:
 # Accepted continues to stapling; anything else prints the notary log and fails
 # loud WITHOUT stapling or staging (a rejected build must never reach a staging
 # manifest, which is what --publish-verified would go on to ship).
+#
+# A --notarize-deadline expiry is handled HERE rather than at each of the three
+# call sites, because "the deadline passed" has the same answer at every one of
+# them and this is the single chokepoint they all pass through. It is also the
+# last point before anything is stapled or staged, which is what makes the
+# no-staging promise a property of the code rather than of three call sites
+# remembering.
 notarize_await_verdict() {
     local id="$1"
     notarize_poll "$id"
+    if [ "$NOTARIZE_DEADLINE_EXPIRED" = "1" ]; then
+        notarize_deadline_handoff "$id"
+    fi
     if [ "$NOTARIZE_STATUS" = "Accepted" ]; then
         echo "    notarization Accepted for submission $id"
         return 0
@@ -2252,6 +2376,11 @@ while [ $# -gt 0 ]; do
         --emit-tarball)    EMIT_TARBALL=1; shift ;;
         --resume-notarize) DO_RESUME_NOTARIZE=1; shift ;;
         --defer-notarization) DEFER_NOTARIZATION=1; shift ;;
+        --notarize-deadline)
+            [ $# -ge 2 ] || die "--notarize-deadline requires $(release_deadline_accepted_forms)"
+            NOTARIZE_DEADLINE="$(release_deadline_parse "$2")" \
+                || die "--notarize-deadline: could not read '$2' (see above)."
+            shift 2 ;;
         --allow-pending-notarization) ALLOW_PENDING_NOTARIZATION=1; shift ;;
         --adopt-submission)
             [ $# -ge 2 ] || die "--adopt-submission requires a notary submission UUID"
@@ -2303,6 +2432,22 @@ if [ "$DEFER_NOTARIZATION" = "1" ]; then
         || die "--defer-notarization only applies to a build (--release-build); there is nothing to defer otherwise."
     [ "$DO_ATTACH" != "1" ] \
         || die "--defer-notarization cannot be combined with --release / --release-attach. A deferred DMG must be published through the two-phase flow, which is what adds the 'notarization pending' banner: release.sh --verify-build --defer-notarization, then --publish-verified."
+fi
+
+# --notarize-deadline bounds a WAIT, so it needs a run that waits. The three
+# refusals below are each a different mistake, and each is worth naming rather
+# than silently ignoring a flag whose whole purpose is to change what happens
+# hours from now.
+if [ -n "$NOTARIZE_DEADLINE" ]; then
+    # The attach check comes FIRST because --release-attach satisfies neither
+    # condition, and "cannot be combined with an upload" tells the operator
+    # something "only applies to a build" does not.
+    [ "$DO_ATTACH" != "1" ] \
+        || die "--notarize-deadline cannot be combined with --release / --release-attach. Those upload in this same process, so there is no later run to hand an outstanding verdict to."
+    [ "$DO_BUILD" = "1" ] \
+        || die "--notarize-deadline only applies to a build (--release-build, with or without --resume-notarize); nothing else here waits on Apple."
+    [ "$DEFER_NOTARIZATION" != "1" ] \
+        || die "--notarize-deadline and --defer-notarization are alternatives, not a pair. Deferring never waits for the DMG's verdict at all, so there is no wait for a deadline to bound. Deferring publishes behind a 'notarization pending' banner; a deadline publishes nothing."
 fi
 
 # ── --release-attach (no build): verify the staged artifacts and upload them ──

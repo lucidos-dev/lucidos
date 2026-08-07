@@ -3,10 +3,18 @@ paths:
   - "system-knowhow/**"
   - "docs/taxonomy.md"
   - "docs/glossary.md"
-  - "crates/lucidos-engine/src/engine/thread_events.rs"
-  - "crates/lucidos-engine/src/engine/event_bus.rs"
+  # These four were single files and are now directories. A `paths:` entry
+  # naming the old `.rs` matched nothing, so this rule silently stopped
+  # loading for the very edits it governs (caught 2026-08-07, while editing
+  # `thread_events/event.rs` and `agentic_loop/run.rs`). Per CLAUDE.md, "a
+  # rule that silently fails to load looks exactly like a rule that doesn't
+  # exist": when a module here becomes a directory, widen its entry in the
+  # same change.
+  - "crates/lucidos-engine/src/engine/thread_events/**"
+  - "crates/lucidos-engine/src/engine/event_bus/**"
+  - "crates/lucidos-engine/src/engine/agentic_loop/**"
   - "crates/lucidos-engine/src/scheduler/mod.rs"
-  - "crates/lucidos-engine/src/llm/tools.rs"
+  - "crates/lucidos-engine/src/llm/tools/**"
   - "crates/lucidos-engine/src/engine/tools/**"
   - "crates/lucidos-engine/src/engine/agent_session/prompts.rs"
   - "crates/lucidos-engine/src/api/history.rs"
@@ -39,7 +47,6 @@ paths:
   - "crates/lucidos-tailscale/**"
   - "crates/lucidos-app/src/components/settings/MobileAccessPage.tsx"
   - "crates/lucidos-engine/src/runtime/python.rs"
-  - "crates/lucidos-engine/src/engine/agentic_loop.rs"
   - "crates/lucidos-engine/src/engine/thread_queue/**"
   - "crates/lucidos-engine/src/api/thread_queue.rs"
 ---
@@ -61,9 +68,9 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 
 | You changed… | You MUST also update… |
 |---|---|
-| `crates/lucidos-engine/src/engine/thread_events.rs` (`ThreadEvent` enum — variant added/removed/renamed, payload field changed, persistence flipped, alias added/removed) | `system-knowhow/thread-events.md` (master enumeration + payload shapes), AND if the change touches a `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*` variant, also `system-knowhow/coding-agent-events.md` |
-| `crates/lucidos-engine/src/engine/event_bus.rs` (`SystemEvent` enum — variant added/removed/renamed, aggregate name changed, persistence/projection routing changed) | `.claude/rules/db.md` § Key event types, AND any `system-knowhow/*.md` that references that event by name (grep first — workspace-learning + thread-events + coding-agent-events all index events by name) |
-| `ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events.rs`, or the scheduler trigger gate in `crates/lucidos-engine/src/scheduler/mod.rs` that consumes it (adding/removing a blocklisted variant, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "Triggerable" column + "Today the scheduler uses a blocklist" section, AND `system-knowhow/coding-agent-events.md` "Triggerability: blocklist semantics" section, AND `system-knowhow/triggers.md` if the change opens a new "you can now `on_event:` X" path |
+| `crates/lucidos-engine/src/engine/thread_events/` (`ThreadEvent` enum: variant added/removed/renamed, payload field changed, persistence flipped, alias added/removed) | `system-knowhow/thread-events.md` (master enumeration + payload shapes), AND if the change touches a `CodingAgent*` / `UserQuestion*` / `CodingAgentPermission*` variant, also `system-knowhow/coding-agent-events.md` |
+| `crates/lucidos-engine/src/engine/event_bus/` (`SystemEvent` enum: variant added/removed/renamed, aggregate name changed, persistence/projection routing changed) | `.claude/rules/db.md` § Key event types, AND any `system-knowhow/*.md` that references that event by name (grep first: workspace-learning + thread-events + coding-agent-events all index events by name) |
+| `ThreadEvent::is_per_token_streaming` in `crates/lucidos-engine/src/engine/thread_events/`, or the scheduler trigger gate in `crates/lucidos-engine/src/scheduler/mod.rs` that consumes it (adding/removing a blocklisted variant, changing the trigger matcher routing) | `system-knowhow/thread-events.md` "Triggerable" column + "Today the scheduler uses a blocklist" section, AND `system-knowhow/coding-agent-events.md` "Triggerability: blocklist semantics" section, AND `system-knowhow/triggers.md` if the change opens a new "you can now `on_event:` X" path |
 | `packages/lucidos-sdk/**` (the `window.lucidos.*` JS surface — new/changed method, signature change, namespace addition) | `system-knowhow/js-sdk.md` § matching `lucidos.<namespace>` heading (also see `.claude/rules/sdk.md` for the same rule from the SDK side) |
 | `crates/lucidos-app/src/styles/global/shared-components.css` (the app-facing shared component layer — the engine `include_str!`s it into `/api/v1/sdk-iframe.css` via `crates/lucidos-engine/src/api/sdk.rs`, so any class here ships to every opted-in app) — OR the iframe-only `crates/lucidos-engine/src/api/sdk_iframe.css` (tokens served to apps, `.action-btn-secondary`) | `system-knowhow/js-sdk.md` § "Component classes" + § "Theme variables" (the app-author contract — add/rename the class or token row, and keep documented token VALUES matching the CSS). Also keep the three-file split honest (reusable → `shared-components.css`; host-chrome → `host-components.css`; iframe-only → `sdk_iframe.css`) per `.claude/rules/frontend.md`. |
 | `crates/lucidos-cli/**` (the `lucidos` CLI — new subcommand, flag change, output shape change) | `system-knowhow/lucidos-cli.md` |
@@ -71,7 +78,7 @@ When you touch any of the surfaces in the left column, you MUST update the file 
 | `crates/lucidos-engine/src/{api,core}/plugins.rs` + `crates/lucidos-engine/src/engine/tools/plugins.rs` (plugin manifest schema, install / uninstall / list flow, plugin LLM tools) | `system-knowhow/plugins.md`, AND `docs/taxonomy.md` § plugins if the layout / install semantics changed |
 | `crates/lucidos-engine/src/llm/tools/**` + `crates/lucidos-engine/src/engine/tools/**` (LLM tool added/removed/renamed, args schema changed) | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (system prompts advertise tools), AND `system-knowhow/best-practices.md` / `system-knowhow/intent-registry.md` if the tool's intent maps there |
 | `crates/lucidos-engine/src/core/preference_catalog.rs` (the *preference catalog* — a settable-key added/removed/renamed, its scope/allowed-values/default/side-effect changed, or an `INTERNAL_KEYS` entry changed) | `system-knowhow/preferences.md` (the agent-facing key table — a `cargo test` sync test in `preference_catalog.rs` already fails if a catalog or internal key is undocumented), AND the *preference* / *preference catalog* glossary entries if the user-facing semantics shifted |
-| `crates/lucidos-engine/src/engine/tools/bash_background.rs` (`BackgroundBashRegistry` — `read_output_in_memory_wait`, `BASH_OUTPUT_MAX_WAIT_SECS`, the `Notify`-on-chunk semantics), `crates/lucidos-engine/src/engine/tools/bash.rs` (`execute_bash_output_tool` — `wait_secs` arg handling, clamping), `crates/lucidos-engine/src/runtime/python.rs` (`truncate_python_error` — frame-trim shape, line/byte budgets), or `crates/lucidos-engine/src/engine/agentic_loop.rs` (`derive_call_key` / `python_call_key` for `RUN_PYTHON*`, the `excluded` list in the generic 3-strike guard) | `system-knowhow/running-python.md` (drain pattern, `wait_secs` semantics, error-truncation behavior, anti-pattern list — the LLM acts on what this file says about `bash_output(wait_secs)`, the auto-truncation, and the repeated-call guard) |
+| `crates/lucidos-engine/src/engine/tools/bash_background.rs` (`BackgroundBashRegistry`: `read_output_in_memory_wait`, `BASH_OUTPUT_MAX_WAIT_SECS`, the `Notify`-on-chunk semantics), `crates/lucidos-engine/src/engine/tools/bash.rs` (`execute_bash_output_tool`: `wait_secs` arg handling, clamping), `crates/lucidos-engine/src/runtime/python.rs` (`truncate_python_error`: frame-trim shape, line/byte budgets), or `crates/lucidos-engine/src/engine/agentic_loop/` (`derive_call_key` / `python_call_key` for `RUN_PYTHON*`, the `excluded` list in the generic 3-strike guard) | `system-knowhow/running-python.md` (drain pattern, `wait_secs` semantics, error-truncation behavior, anti-pattern list, since the LLM acts on what this file says about `bash_output(wait_secs)`, the auto-truncation, and the repeated-call guard) |
 | `crates/lucidos-engine/src/api/history.rs` + `crates/lucidos-engine/src/api/app_ui.rs` (HTTP shapes for events / app UI bridge) | `system-knowhow/js-sdk.md` (the SDK calls these), AND `system-knowhow/building-an-app.md` if the app-side contract shifts |
 | `crates/lucidos-engine/src/api/proxy_pipeline_config.rs` + `proxy*.rs` siblings (the on-disk `data/config/apis.json` schema — auth pipeline, signer kinds, header/body shapes) | `system-knowhow/building-an-auth-handshake.md`, AND `system-knowhow/best-practices.md` § `config/` |
 | `crates/lucidos-engine/src/engine/agent_session/prompts.rs` (engine system prompts — the taxonomy/trigger sections, the intent registry advertise-list, the knowhow listing) | `system-knowhow/intent-registry.md` if intents added/removed, AND `system-knowhow/workspace-audit.md` (audit's reference table names sections of this file by heading) |

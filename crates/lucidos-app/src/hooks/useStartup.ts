@@ -14,6 +14,7 @@ import { loadThreadQueue } from '../store/actions/threadQueue';
 import { loadRepositories } from '../store/actions/chat';
 import { loadPreferences, flushPendingPreferenceWrites } from '../store/actions/preferences';
 import { loadPinnedApps } from '../store/actions/pinnedApps';
+import { loadWorkspaceDisplayName } from '../store/actions/workspace-label';
 import { connectThreadEvents, disconnectThreadEvents } from '../store/actions/thread-sync';
 import { loadAllThreads, loadFilterFacets } from '../store/actions/thread-loading';
 import { refreshPushSubscription, recoverServiceWorker } from '../store/actions/push';
@@ -47,6 +48,7 @@ import { reportStartupKind, startLivenessTracking } from '../utils/liveness';
 import { createLeadingEdgeGate } from '../utils/leadingEdgeGate';
 import { flushUndeliveredComposeDrafts } from '../store/actions/compose';
 import { isKnownAppFrame } from '../utils/appFrame';
+import { handleAppToastMessage } from '../store/actions/app-toast-bridge';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
 
 const CONNECTION_POLL_INTERVAL = 5000;
@@ -116,6 +118,10 @@ export function useStartup(): void {
       void checkEngineVersion();
     }).catch(() => { /* loadPreferences sets Loadable failed internally — UI shows the error */ });
     void loadPinnedApps();
+    // The name the user gave this workspace lives in the gateway registry, not
+    // in the engine, so ask for it (see actions/workspace-label.ts). Until it
+    // lands, every surface shows the engine's own name.
+    void loadWorkspaceDisplayName();
     // Snapshot the embedding-model load. On a fresh workspace the ~465 MB
     // download starts at engine boot, seconds before this document exists, so
     // every SSE frame so far has already been missed; without this read the
@@ -411,7 +417,7 @@ export function useStartup(): void {
         id?: unknown;
         payload?: {
           title?: unknown; message?: unknown; okLabel?: unknown; cancelLabel?: unknown; danger?: unknown;
-          type?: unknown; durationMs?: unknown; dismissable?: unknown; key?: unknown;
+          type?: unknown; durationMs?: unknown; dismissable?: unknown; key?: unknown; spinning?: unknown;
           defaultValue?: unknown; placeholder?: unknown; multiline?: unknown;
           file_path?: unknown; line?: unknown; line_end?: unknown;
         };
@@ -419,6 +425,7 @@ export function useStartup(): void {
       if (!data || typeof data !== 'object') return;
       if (
         data.type !== 'lucidos:ui:confirm' && data.type !== 'lucidos:ui:toast'
+        && data.type !== 'lucidos:ui:dismissToast'
         && data.type !== 'lucidos:ui:prompt' && data.type !== 'lucidos:ui:preview-file'
       ) return;
       const payload = data.payload;
@@ -464,22 +471,13 @@ export function useStartup(): void {
         return;
       }
 
-      // Confirm, toast and prompt all carry a message and are useless without one.
-      if (typeof payload.message !== 'string' || payload.message.length === 0) return;
+      // Toast and its dismissal: fire-and-forget, no id, no result reply. Ahead
+      // of the message guard below deliberately, since a dismissal carries only
+      // a key and that guard would swallow it.
+      if (handleAppToastMessage(data.type, payload)) return;
 
-      // Toast — fire-and-forget; no id, no result reply.
-      if (data.type === 'lucidos:ui:toast') {
-        const allowed = ['success', 'info', 'warning', 'error'] as const;
-        type ToastT = (typeof allowed)[number];
-        const toastType: ToastT = allowed.includes(payload.type as ToastT) ? payload.type as ToastT : 'info';
-        const key = typeof payload.key === 'string' && payload.key.length > 0 ? payload.key : undefined;
-        showToast(payload.message, toastType, {
-          key,
-          autoDismissMs: typeof payload.durationMs === 'number' ? payload.durationMs : undefined,
-          dismissable: typeof payload.dismissable === 'boolean' ? payload.dismissable : undefined,
-        });
-        return;
-      }
+      // Confirm and prompt both carry a message and are useless without one.
+      if (typeof payload.message !== 'string' || payload.message.length === 0) return;
 
       // Both confirm and prompt carry an id and post a result back.
       if (typeof data.id !== 'string') return;

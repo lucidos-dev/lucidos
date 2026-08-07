@@ -121,3 +121,18 @@
 .oauth-provider-input:focus {
     border-color: var(--accent);
 }
+
+/* What a connection was asked for and did not get. A warning rather than an
+   error: the account works, it just cannot do everything it was asked to, and
+   the Reconnect button on the same row is the fix. */
+.oauth-account-shortfall {
+    margin-top: 0.25rem;
+    color: var(--accent-yellow);
+    font-size: var(--font-size-xs);
+}
+
+/* The hand-off to the agent, which can walk the user through the provider's app
+   console. Sits under the controls as a quiet aside, not a competing action. */
+.oauth-connect-hint {
+    margin: 0;
+}

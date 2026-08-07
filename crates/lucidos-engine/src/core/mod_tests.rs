@@ -1319,3 +1319,57 @@ fn pin_workspace_vite_port_noop_when_file_exists() {
         "no new commit should be made when file exists"
     );
 }
+
+fn index_locked_error() -> git2::Error {
+    git2::Error::new(
+        git2::ErrorCode::Locked,
+        git2::ErrorClass::Index,
+        "the index is locked",
+    )
+}
+
+#[test]
+fn retry_while_index_locked_waits_out_a_transient_lock() {
+    let mut attempts = 0;
+    let out = retry_while_index_locked(|| {
+        attempts += 1;
+        if attempts < 3 {
+            Err(index_locked_error())
+        } else {
+            Ok("committed")
+        }
+    });
+    assert_eq!(out.unwrap(), "committed");
+    assert_eq!(attempts, 3, "it must retry until the lock clears");
+}
+
+/// Retrying is only ever right for the lock. Anything else (a missing path, a
+/// corrupt repo) is the caller's answer and must come straight back, or a real
+/// failure is delayed by the whole backoff budget on every write.
+#[test]
+fn retry_while_index_locked_returns_any_other_error_at_once() {
+    let mut attempts = 0;
+    let out: Result<(), git2::Error> = retry_while_index_locked(|| {
+        attempts += 1;
+        Err(git2::Error::new(
+            git2::ErrorCode::NotFound,
+            git2::ErrorClass::Index,
+            "no such path",
+        ))
+    });
+    assert_eq!(out.unwrap_err().code(), git2::ErrorCode::NotFound);
+    assert_eq!(attempts, 1, "a non-lock error must not be retried");
+}
+
+/// A lock nobody ever releases (a crashed writer's stale `index.lock`) must
+/// surface as the error it is rather than hang the caller forever.
+#[test]
+fn retry_while_index_locked_gives_up_and_reports_the_lock() {
+    let mut attempts = 0;
+    let out: Result<(), git2::Error> = retry_while_index_locked(|| {
+        attempts += 1;
+        Err(index_locked_error())
+    });
+    assert_eq!(out.unwrap_err().code(), git2::ErrorCode::Locked);
+    assert!(attempts > 1, "it must have retried before giving up");
+}

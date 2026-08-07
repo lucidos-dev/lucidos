@@ -293,14 +293,22 @@ impl TriggerConfig {
         None
     }
 
-    /// Compute the next scheduled run time (UTC) from cron expressions and timezone.
-    /// Returns None if the trigger is paused, has no cron expressions, or no future match exists.
-    pub fn next_run(&self) -> Option<DateTime<Utc>> {
-        if self.paused || self.schedule.is_empty() {
-            return None;
-        }
-        let schedules: Vec<cron::Schedule> = self
-            .schedule
+    /// This trigger's timezone, falling back to UTC on an unparseable name.
+    fn timezone_or_utc(&self) -> chrono_tz::Tz {
+        self.timezone.parse().unwrap_or_else(|_| {
+            log!(
+                "[Triggers] Invalid timezone '{}' for trigger {}, using UTC",
+                self.timezone,
+                self.id
+            );
+            chrono_tz::UTC
+        })
+    }
+
+    /// Parse every cron expression, dropping (and logging) any that no longer
+    /// parses so one corrupt entry can't hide the rest of the schedule.
+    fn parsed_schedules(&self) -> Vec<cron::Schedule> {
+        self.schedule
             .iter()
             .filter_map(|expr| {
                 crate::engine::tools::scheduler::parse_standard_cron(expr)
@@ -314,17 +322,66 @@ impl TriggerConfig {
                     })
                     .ok()
             })
-            .collect();
-        let tz: chrono_tz::Tz = self.timezone.parse().unwrap_or_else(|_| {
-            log!(
-                "[Triggers] Invalid timezone '{}' for trigger {}, using UTC",
-                self.timezone,
-                self.id
-            );
-            chrono_tz::UTC
-        });
-        crate::engine::tools::scheduler::next_occurrence_multi(&schedules, tz)
-            .map(|dt| dt.with_timezone(&Utc))
+            .collect()
+    }
+
+    /// The next `n` scheduled run times (UTC), merged across every cron
+    /// expression: a trigger fires on the earliest match from any of them.
+    /// Empty if the trigger is paused, has no cron expressions, or has no
+    /// future match.
+    pub fn next_runs(&self, n: usize) -> Vec<DateTime<Utc>> {
+        if self.paused || self.schedule.is_empty() {
+            return Vec::new();
+        }
+        let schedules = self.parsed_schedules();
+        crate::engine::tools::scheduler::next_occurrences_multi(
+            &schedules,
+            self.timezone_or_utc(),
+            n,
+        )
+        .into_iter()
+        .map(|dt| dt.with_timezone(&Utc))
+        .collect()
+    }
+
+    /// A diagnosis when this trigger's schedule can never fire, for the errored
+    /// state in the panel and the boot warning.
+    ///
+    /// Deliberately independent of `paused`, unlike [`Self::next_run`]: a paused
+    /// trigger with a dead schedule is still misconfigured, and resuming it would
+    /// change nothing. Also deliberately all-or-nothing: one live expression means
+    /// the trigger genuinely fires, so flagging it because a *sibling* expression
+    /// is dead would put a red chip on a working trigger. Create and update now
+    /// reject a dead expression outright, so the only way to reach this state is a
+    /// trigger stored before the guard existed.
+    pub fn schedule_error(&self) -> Option<String> {
+        if self.schedule.is_empty() {
+            return None;
+        }
+        let tz = self.timezone_or_utc();
+        let mut first_problem: Option<String> = None;
+        for expr in &self.schedule {
+            match crate::engine::tools::scheduler::parse_standard_cron(expr) {
+                Ok(schedule) => {
+                    if schedule.upcoming(tz).next().is_some() {
+                        return None;
+                    }
+                    first_problem.get_or_insert_with(|| {
+                        format!(
+                            "'{}' can never fire: {}",
+                            expr,
+                            crate::engine::tools::scheduler::diagnose_never_fires(&schedule)
+                        )
+                    });
+                }
+                Err(e) => {
+                    first_problem.get_or_insert_with(|| {
+                        format!("'{}' is not a valid cron expression: {}", expr, e)
+                    });
+                }
+            }
+        }
+        first_problem
     }
 
     /// Human-readable trigger type label.

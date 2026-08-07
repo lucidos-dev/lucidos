@@ -14,6 +14,7 @@ import {
   appSearchQuery,
   setFocusedThread,
 } from '../store';
+import { nativeFullscreenElement } from '../appFullscreenHost';
 import { clearWipIfMatches } from './wipPreview';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { App } from '../types';
@@ -429,4 +430,32 @@ export function getVisibleAppPanel(): HTMLElement | null {
 /** Exit CSS-based pseudo-fullscreen mode. */
 export function exitPseudoFullscreen(): void {
   appPseudoFullscreen.value = false;
+}
+
+/** Leave whichever fullscreen mode an app panel is in, and report whether there
+ *  was one to leave. The single definition of "come back to the normal layout",
+ *  shared by the header's Fullscreen toggle and by navigation that has to make
+ *  something OTHER than the app visible while keeping the app open (the
+ *  `new-chat` navigate, which lands a prefilled compose in the thread pane).
+ *
+ *  Native first: the two modes are never active at once (the CSS fallback is
+ *  taken only when the native request fails), and a natively fullscreen element
+ *  is painted alone, so it is the one that actually hides the rest of the shell.
+ *  Pseudo-fullscreen only stacks at `--z-app-fullscreen`, but it covers the
+ *  viewport just the same. */
+export function exitAppFullscreen(): boolean {
+  if (nativeFullscreenElement() !== null) {
+    const doc = document as unknown as Record<string, unknown>;
+    if (typeof doc.exitFullscreen === 'function') {
+      (doc.exitFullscreen as () => Promise<void>)().catch(() => { /* already leaving; failure is benign */ });
+    } else if (typeof doc.webkitExitFullscreen === 'function') {
+      (doc.webkitExitFullscreen as () => void)();
+    }
+    return true;
+  }
+  if (appPseudoFullscreen.value) {
+    exitPseudoFullscreen();
+    return true;
+  }
+  return false;
 }

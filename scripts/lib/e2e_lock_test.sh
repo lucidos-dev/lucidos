@@ -67,6 +67,24 @@ EOF
     return 0
 }
 
+# ── neutralize the real cwd lookup ──────────────────────────────────────
+# The `agent` kind asks the kernel for a pid's cwd, which for a sleeper is this
+# test's own directory and would never match. SYNTHETIC_CWD holds "PID PATH"
+# rows so a fixture can claim to be running inside (or outside) the sandbox
+# workspace. Fails CLOSED like the ps seam above: an unlisted pid answers empty,
+# never a real lookup, so a synthetic fixture can never resolve a host process.
+SYNTHETIC_CWD=""
+_e2e_proc_cwd() {
+    local want="$1" pid path
+    while read -r pid path; do
+        [ -z "$pid" ] && continue
+        [ "$pid" = "$want" ] && { printf '%s\n' "$path"; return 0; }
+    done <<EOF
+$SYNTHETIC_CWD
+EOF
+    return 0
+}
+
 PASS=0
 FAIL=0
 
@@ -103,9 +121,47 @@ spawn_sleeper() {
     SPAWNED="$SPAWNED $SLEEPER_PID"
 }
 
+# A sleeper that IGNORES SIGTERM, standing in for a coding agent wedged past the
+# polite ask. The agent reap escalates to SIGKILL for exactly this case.
+spawn_stubborn_sleeper() {
+    # A LOOP, not a bare `sleep`: bash exec-optimizes a single trailing command
+    # and the trap goes with it, so `trap "" TERM; sleep 600` dies on SIGTERM
+    # and never exercises the escalation this fixture exists for.
+    #
+    # And the caller must WAIT for the trap to be installed. `&` returns before
+    # the child has run a single line, so a reap firing immediately catches it
+    # with the default disposition and it dies on the polite SIGTERM: the test
+    # then passes (the process is gone) while proving nothing. The readiness
+    # file is what makes the escalation the only path that can clear it.
+    local ready="$TMPROOT/stubborn-ready.$$"
+    rm -f "$ready"
+    bash -c 'trap "" TERM; : > "$1"; while :; do sleep 1; done' _ "$ready" >/dev/null 2>&1 &
+    SLEEPER_PID=$!
+    SPAWNED="$SPAWNED $SLEEPER_PID"
+    local waited=0
+    while [ ! -e "$ready" ] && [ "$waited" -lt 100 ]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    [ -e "$ready" ] || fail "stubborn sleeper never installed its SIGTERM trap"
+    rm -f "$ready"
+}
+
 # A SIGKILL'd child becomes a zombie until reaped, and `kill -0` reports a zombie
 # as still-existing — so treat "gone OR zombie" as dead. This mirrors production,
 # where a reaped orphan (reparented to init) is truly gone after SIGKILL.
+# Wait (bounded, ~3s) for a signalled pid to actually be gone. Signal delivery
+# and reaping are asynchronous, so an assertion fired the instant after a kill
+# reads a live process and fails for a reason that has nothing to do with the
+# code under test.
+wait_until_dead() {
+    local pid="$1" waited=0
+    while orphan_alive "$pid" && [ "$waited" -lt 60 ]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+}
+
 orphan_alive() {
     local pid="$1"
     kill -0 "$pid" 2>/dev/null || return 1
@@ -311,6 +367,131 @@ if [ -s "$OUT_DIR"/test-6b.out ]; then
 else
     pass "warning goes to stderr, leaving the scan's stdout parseable"
 fi
+
+# ── 6c. Coding-agent orphans are found by CWD, never by argv ─────────────
+# The 2026-08-07 gap: the suite's own tests spawn Claude Code subprocesses, the
+# engine dies, they are re-parented to init, and nothing looked for them. Four
+# survived 55 minutes and drove the host into memory exhaustion.
+#
+# The discriminator has to be the cwd. argv[0] is the same `.../bin/claude` for
+# the user's own sessions, and the rest of the command line is worse than
+# useless: a coding agent carries the thread history in a ~22 KB
+# --append-system-prompt, so a session DISCUSSING this workspace quotes its
+# paths verbatim. That is the 2026-08-03 kill, reproduced here as the `mention`
+# fixture.
+echo "Test 6c: coding-agent orphans matched on cwd, not on argv"
+reset_lock_dir
+spawn_sleeper; inside=$SLEEPER_PID     # e2e-spawned agent: cwd in the workspace
+spawn_sleeper; outside=$SLEEPER_PID    # the user's own session, elsewhere
+spawn_sleeper; mention=$SLEEPER_PID    # a session that only QUOTES the path
+spawn_sleeper; eng2=$SLEEPER_PID       # the workspace engine: has its own kind
+SYNTHETIC_PS="$inside /Users/x/.local/bin/claude --settings /whatever/cc-settings.json
+$outside /Users/x/.local/bin/claude --settings /Users/x/other/cc-settings.json
+$mention /Users/x/.local/bin/claude --append-system-prompt THREAD HISTORY: orphans under $E2E_WORKSPACE/.lucidos/worktrees/ survived 55 minutes
+$eng2 /Users/x/target/release/launch/e2e-test-hooks/lucidos-engine"
+SYNTHETIC_CWD="$inside $E2E_WORKSPACE/.lucidos/worktrees/thread-abc
+$outside /Users/x/workspaces/dev/.lucidos/worktrees/thread-def
+$mention /Users/x/workspaces/dev/.lucidos/worktrees/thread-ghi
+$eng2 $E2E_WORKSPACE"
+scan_out="$(_e2e_list_orphans)"
+SYNTHETIC_PS=""; SYNTHETIC_CWD=""
+if printf '%s\n' "$scan_out" | grep -qx "agent $inside"; then
+    pass "agent with cwd inside the e2e workspace detected"
+else
+    fail "e2e-spawned agent not detected (scan: $scan_out)"
+fi
+if printf '%s\n' "$scan_out" | grep -q "$outside"; then
+    fail "the user's own coding-agent session wrongly flagged (scan: $scan_out)"
+else
+    pass "coding-agent session with a cwd elsewhere correctly ignored"
+fi
+if printf '%s\n' "$scan_out" | grep -q "$mention"; then
+    fail "session that only QUOTES the workspace path wrongly flagged (scan: $scan_out)"
+else
+    pass "argv mentioning the workspace path is not a match (2026-08-03 class)"
+fi
+if printf '%s\n' "$scan_out" | grep -q "agent $eng2"; then
+    fail "the engine was reported as an agent as well as via its pidfile"
+else
+    pass "engine not double-reported as an agent (lucidos-engine is off the list)"
+fi
+kill -KILL "$inside" "$outside" "$mention" "$eng2" 2>/dev/null; wait 2>/dev/null
+
+# ── 6d. An agent that ignores SIGTERM is escalated to SIGKILL ────────────
+# The polite ask is right first (an agent owns a git worktree and a child MCP
+# server), but it must not be trusted: one that ignores it keeps ~150 MB and a
+# node runtime for the life of the host.
+echo "Test 6d: agent reap escalates SIGTERM to SIGKILL"
+spawn_stubborn_sleeper; stubborn=$SLEEPER_PID
+E2E_ORPHAN_AGENT_GRACE_S=1 _e2e_reap_orphans > /dev/null 2> "$OUT_DIR"/test-6d.err <<EOF
+agent $stubborn
+EOF
+# SIGKILL is the last thing the reap does, so the corpse can still be unreaped
+# when it returns. Production polls for the same reason (the reclaim path
+# re-scans on a deadline); assert on death, not on the instant after the signal.
+wait_until_dead "$stubborn"
+if orphan_alive "$stubborn"; then
+    fail "agent ignoring SIGTERM survived the reap (pid $stubborn)"
+else
+    pass "agent ignoring SIGTERM was escalated to SIGKILL"
+fi
+# Without this the test above passes on a fixture that simply died of SIGTERM,
+# which is the one thing it is not meant to prove.
+if grep -q "ignored SIGTERM, killed" "$OUT_DIR"/test-6d.err; then
+    pass "the escalation path is what cleared it, not the polite SIGTERM"
+else
+    fail "SIGTERM alone cleared the fixture, so escalation was never exercised (stderr: $(cat "$OUT_DIR"/test-6d.err))"
+fi
+kill -KILL "$stubborn" 2>/dev/null; wait 2>/dev/null
+
+# ── 6e. Teardown sweeps, so a clean run cleans up after itself ───────────
+# The other half of the 2026-08-07 gap. Reclaim-time sweeping only ever fires
+# when a LATER run finds a stale lock, so a run that ended cleanly (or whose
+# successor never came) left its agents alive indefinitely.
+echo "Test 6e: sweep_e2e_orphans reaps at teardown"
+spawn_sleeper; leftover=$SLEEPER_PID
+SYNTHETIC_PS="$leftover /Users/x/.local/bin/claude --settings /whatever/cc-settings.json"
+SYNTHETIC_CWD="$leftover $E2E_WORKSPACE/.lucidos/worktrees/thread-xyz"
+E2E_ORPHAN_AGENT_GRACE_S=1 sweep_e2e_orphans 2> "$OUT_DIR"/test-6e.err
+sweep_rc=$?
+SYNTHETIC_PS=""; SYNTHETIC_CWD=""
+assert_eq "0" "$sweep_rc" "teardown sweep returns 0 (never reds a green run)"
+if orphan_alive "$leftover"; then
+    fail "teardown sweep left the agent alive (pid $leftover)"
+else
+    pass "teardown sweep reaped the leftover agent"
+fi
+if grep -q "orphan: agent $leftover" "$OUT_DIR"/test-6e.err; then
+    pass "teardown sweep logs what it reaped (never a silent kill)"
+else
+    fail "teardown sweep killed silently (stderr: $(cat "$OUT_DIR"/test-6e.err))"
+fi
+kill -KILL "$leftover" 2>/dev/null; wait 2>/dev/null
+
+# ── 6f2. A trailing slash on the workspace root must not disarm the scan ──
+# `_e2e_workspace_dir` returns $E2E_WORKSPACE verbatim, so an operator export
+# with a trailing slash would make the `<root>/*` prefix read `<root>//*` and
+# match nothing. Same disarming class as the whitespace browsers path.
+echo "Test 6f2: a trailing slash on the workspace root still matches"
+if _e2e_path_under "/a/b/c/d" "/a/b/c/"; then
+    pass "trailing slash on the root still matches a path beneath it"
+else
+    fail "a trailing slash silently disarmed the cwd prefix test"
+fi
+if _e2e_path_under "/a/b/cx/d" "/a/b/c"; then
+    fail "sibling directory '/a/b/cx' wrongly matched root '/a/b/c'"
+else
+    pass "a sibling sharing a name prefix is not 'under' the root"
+fi
+
+# ── 6f. An empty process feed sweeps nothing ─────────────────────────────
+# The seam fails closed (see `_e2e_orphan_ps`): an empty feed means "no
+# candidates", never "fall back to real ps". A regression here puts the host's
+# whole process table into a real kill, which is exactly what happened to
+# webkit_reaper_test.sh on 2026-08-03.
+echo "Test 6f: an empty process feed finds nothing to sweep"
+SYNTHETIC_PS=""; SYNTHETIC_CWD=""
+assert_eq "" "$(_e2e_list_orphans)" "empty feed yields no orphans"
 
 # ── 7. Release only removes a lock we own ────────────────────────────────
 echo "Test 7: release does not remove another owner's lock"

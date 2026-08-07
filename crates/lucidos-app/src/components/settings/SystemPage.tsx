@@ -16,7 +16,7 @@ import {
   SETTINGS_SYSTEM_SUBPANEL_ITEMS,
   type SettingsNavKey,
   updateAvailable,
-  workspaceName,
+  visibleWorkspaceName,
   workspacePath,
 } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
@@ -81,7 +81,7 @@ function SystemPanelSwitcher({ activePanel }: { activePanel: SystemPanel }) {
 export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
   const status = connectionStatus.value;
   const connected = status === 'connected';
-  const name = workspaceName.value;
+  const name = visibleWorkspaceName.value;
   const path = workspacePath.value;
   const startedAt = engineStartedAt.value;
   const release = lucidosRelease.value;

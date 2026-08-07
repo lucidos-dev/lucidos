@@ -459,11 +459,10 @@ mod tests {
 
     #[test]
     fn sh_quote_handles_path_with_spaces() {
-        // A workspace under "/Users/Anne Doe/workspaces/dev" must not
-        // shell-split into `/Users/Anne` + `Doe/...` when we hand the
-        // command to `sh -c`.
-        let q = sh_quote(&PathBuf::from("/Users/Anne Doe/ws"));
-        assert_eq!(q, "'/Users/Anne Doe/ws'");
+        // A workspace under "/Users/me/my ws" must not shell-split into
+        // `/Users/me/my` + `ws` when we hand the command to `sh -c`.
+        let q = sh_quote(&PathBuf::from("/Users/me/my ws"));
+        assert_eq!(q, "'/Users/me/my ws'");
     }
 
     #[test]

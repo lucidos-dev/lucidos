@@ -39,7 +39,21 @@ describe('the not-connected state offers a way out, not a path to walk', () => {
     expect(source).toContain('openConnectedAccountsSettings');
     // A <button onClick>, so it is clickable and keyboard-reachable. Prose
     // naming the path is what this replaced.
-    expect(source).toMatch(/onClick=\{openConnectedAccountsSettings\}/);
+    expect(source).toMatch(/onClick=\{[\s\S]*?openConnectedAccountsSettings\(/);
+  });
+
+  // The deep-link hands over BOTH halves of what the user asked for. The
+  // provider so they do not retype the name they were just looking at, and the
+  // scopes so the single consent screen covers signing in AND granting upload
+  // access. Passing only the provider is what left them back on this page
+  // facing *Grant access*, a second trip through the same screen.
+  it('carries the provider and the scopes an upload needs', () => {
+    const call = source.slice(
+      source.indexOf('openConnectedAccountsSettings('),
+      source.indexOf('Connect {providerInfo.name}'),
+    );
+    expect(call).toContain('oauthProviderFor(providerInfo.id)');
+    expect(call).toContain('PROVIDER_SCOPES[providerInfo.id]');
   });
 
   it('no longer instructs the user to navigate there themselves', () => {
@@ -184,9 +198,8 @@ describe('the provider dropdown reflects and writes the configured destination',
  * Five of them were inline `style="display: flex; …"` attributes with their own
  * eyeballed margins, invisible to that layer and un-overridable per theme or
  * breakpoint. One of them, the not-granted state, was a copy of
- * `.backup-blocked-row` that had lost its bottom margin and its wrap, which is
- * why the red line, its button and the row below collided in the reported
- * screenshot.
+ * `.backup-blocked-state` that had lost its bottom margin, which is why the red
+ * line, its button and the row below collided in the reported screenshot.
  *
  * Read from the RAW file, not the comment-stripped `source`: an inline style is
  * a source-level fact, and this test's own explanation of it lives in a comment
@@ -204,7 +217,7 @@ describe('the Backup section is laid out by CSS, not by inline styles', () => {
 
   it('gives every row a class', () => {
     for (const cls of [
-      'backup-blocked-row',
+      'backup-blocked-state',
       'backup-actions-row',
       'backup-schedule-hint',
       'backup-key-row',
@@ -215,11 +228,11 @@ describe('the Backup section is laid out by CSS, not by inline styles', () => {
     }
   });
 
-  it('renders both blocked states as the same row', () => {
+  it('renders both blocked states through the same class', () => {
     // Not-connected and not-granted sit in the same slot and offer the same
     // kind of button, so a difference in spacing or size between them is a bug
     // rather than a distinction. One class is how that stays true.
-    const blocked = raw.match(/class="backup-blocked-row"/g) ?? [];
+    const blocked = raw.match(/class="backup-blocked-state"/g) ?? [];
     expect(blocked).toHaveLength(2);
     expect(raw).not.toContain('backup-not-connected-row');
   });
@@ -231,5 +244,16 @@ describe('the Backup section is laid out by CSS, not by inline styles', () => {
     // for: the comment explaining the change discusses the old wording.
     expect(source).toContain('backupAccessLine(providerInfo.name, providerInfo.missing_scopes)');
     expect(source).not.toContain('access not granted');
+  });
+
+  it('puts the blocked-state button on its own line under the message', () => {
+    // Side by side, the red sentence and the green button read as one strip of
+    // competing colour and the button's left edge moves with the length of the
+    // provider name. Stacking is the fix, so a wrapping row must not come back:
+    // `flex-wrap` only reads as "stacked" once the pane is narrow enough.
+    const css = code('../../../styles/settings/backup.css');
+    const rule = css.match(/\.backup-blocked-state\s*\{([^}]*)\}/)?.[1] ?? '';
+    expect(rule).toContain('flex-direction: column');
+    expect(rule).not.toContain('flex-wrap');
   });
 });

@@ -743,7 +743,8 @@ fn coding_agent_file_targets(tool_name: &str, input: &serde_json::Value) -> File
 /// `..` component (absolute OR relative) can escape and can't be proven
 /// contained lexically → treat as outside (conservative: grant-gated). A
 /// relative path with no `..` resolves against the worktree (inside the
-/// workspace) → inside. Otherwise check containment against the workspace root.
+/// workspace) → inside. Otherwise check containment against the workspace root,
+/// lexically first and then against the RESOLVED filesystem.
 fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     let p = Path::new(path);
     // Checked FIRST, before the relative-is-inside shortcut — a relative
@@ -756,7 +757,24 @@ fn path_outside_workspace(path: &str, workspace_path: &Path) -> bool {
     if !p.is_absolute() {
         return false;
     }
-    !p.starts_with(workspace_path)
+    if !p.starts_with(workspace_path) {
+        return true;
+    }
+    // A lexical prefix check is escapable, which is why its sibling
+    // `path_inside_worktree` resolves both sides: a symlink INSIDE the workspace
+    // pointing at an external directory makes `<ws>/link/crontab` read as
+    // contained while the write lands in `/etc`, and on the unattended lane that
+    // is an auto-allow. Resolve here too, but only to OVERRIDE a lexical
+    // "inside": when either side fails to resolve we keep the lexical answer,
+    // because the ordinary case is a `Write` naming a file that does not exist
+    // yet and calling that outside would card every new file.
+    match (
+        std::fs::canonicalize(workspace_path),
+        canonical_existing_prefix(p),
+    ) {
+        (Ok(root), Some(resolved)) => !resolved.starts_with(&root),
+        _ => false,
+    }
 }
 
 /// A path component that disqualifies a target from the in-worktree fast path:
@@ -2285,6 +2303,40 @@ mod tests {
                                                            // Relative `..` escapes the worktree too, so it must be caught (the gate is
                                                            // checked before the relative-is-inside shortcut).
         assert!(path_outside_workspace("../../etc/cron.d/evil", ws));
+    }
+
+    /// The same symlink escape `path_inside_worktree` resolves for: a link
+    /// inside the workspace pointing at an external directory made
+    /// `<ws>/escape/<file>` pass a purely lexical prefix check, so the write
+    /// landed outside and the unattended lane auto-allowed it as `Benign`.
+    #[test]
+    #[cfg(unix)]
+    fn path_outside_workspace_rejects_a_symlink_escape() {
+        let f = worktree_fixture();
+        // Through the symlink, both to an existing target and to a new file
+        // under it (where resolution walks up through the link).
+        assert!(path_outside_workspace(
+            &under(&f.root, "escape/.claude/settings.json"),
+            &f.root
+        ));
+        assert!(path_outside_workspace(
+            &under(&f.root, "escape/not-created-yet.txt"),
+            &f.root
+        ));
+        assert!(path_outside_workspace(
+            &f.outside.join("x").to_string_lossy(),
+            &f.root
+        ));
+        // A genuine in-workspace target stays inside, including one that does
+        // not exist yet.
+        assert!(!path_outside_workspace(
+            &under(&f.root, ".claude/rules/frontend.md"),
+            &f.root
+        ));
+        assert!(!path_outside_workspace(
+            &under(&f.root, "crates/lucidos-engine/src/brand_new.rs"),
+            &f.root
+        ));
     }
 
     // --- decision matrix (pure, no DB) -------------------------------------

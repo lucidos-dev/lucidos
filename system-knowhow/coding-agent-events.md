@@ -1,6 +1,6 @@
 ---
 name: Coding Agent Lifecycle Events
-description: What ThreadEvents the engine emits during a Claude Code / Codex coding-agent session, and which can wire a trigger or an `await_event` wait. Load when a workspace wants to "notify me when a coding agent finishes / asks a question / errors", "trigger on a coding-agent session event", "wait until the agent is idle", "watch for a permission prompt", or talks about "claude code", "CC session", "coding agent", "agent idle", "session waiting on me", "permission request", "AskUserQuestion". This file names the EVENTS; it does not decide the mechanism. A request to be told in the current conversation ("let me know here when an agent edits code") is `await_event`, not a trigger, because a trigger runs in its own thread and reports as a notification. See `system-knowhow/triggers.md` § "When a trigger is the right answer". Documents the full payload of each event, the per-token streaming events the scheduler blocks, the question-vs-permission unification, and the gap that no `CodingAgentErrored` exists today.
+description: Which ThreadEvents a Claude Code or Codex coding-agent session emits, their payloads, which ones the scheduler blocks, and which can wire a trigger or an `await_event` wait. Also how to spawn one: picking `run_coding_agent`'s `folder`, cross-workspace, and a follow-up's side effects. Load for "notify me when a coding agent finishes / asks a question / errors", "which folder should the coding agent edit", "wait until the agent is idle", "watch for a permission prompt", "CC session", "permission request", "AskUserQuestion".
 ---
 
 # Coding Agent Lifecycle Events
@@ -14,6 +14,39 @@ The session's *worktree* wraps the enclosing git, which differs by `coding_agent
 - `external` — full checkout of the user-registered external git repository. No Apply / Discard surface.
 
 `coding_agent_kind` ships on every `SessionStarted` event and is persisted in `thread_summaries.coding_agent_kind` so the apply path can dispatch correctly without re-reading the event log.
+
+### Choosing `folder` when you spawn one
+
+`run_coding_agent`'s `folder` argument is what selects the kind above, so pick it
+before you call rather than discovering the refusal afterwards. Ambiguous? Ask
+which folder first.
+
+| `folder` | Kind | Notes |
+|---|---|---|
+| omitted | `lucidos` | Edits the Lucidos platform's own source. Available ONLY on an install whose engine was launched from a Lucidos source checkout; the chat system prompt's "WHAT A CODING AGENT CAN EDIT ON THIS INSTALL" section states which install this is. Full `/harden`; Apply may need an engine restart. |
+| `data/apps/<id>` (workspace-relative), or an absolute app-folder path | `app` | Whole app folders only. For a one-line edit prefer the chat path (file tools plus the `lucidos` CLI) over a whole session. |
+| a registered repository name or UUID from `manage_repositories` | `external` | Register the repo first; an unregistered git folder is refused. |
+
+Refused, each with an error rather than a silent fallback: an unregistered git
+folder, a non-git directory, any `data/` path outside `data/apps/<id>/`, a
+subpath inside an app, a bare file path, the whole of `data/`,
+`<workspace>/.lucidos/`, and system paths.
+
+**Spawning returns immediately, and the spawn ack is not a result.** Read the
+child's final response text for pass or fail before you act on it or report it.
+
+**Cross-workspace.** Set `workspace` to the target workspace's basename and the
+tool POSTs to that engine, where the session lands. It requires
+`relation: "top"`, because a child auto-resume callback does not cross
+workspaces, and child plus cross-workspace is refused with an error. `folder`
+then resolves on the TARGET workspace, so the app must be installed or the repo
+registered *there*, and that engine applies its own source-checkout check. This
+is the route that stays open on a packaged install: the refusal above is about
+THIS install, not about the caller.
+
+What happens after Apply (which changes need a rebuild, who triggers the restart,
+how to verify a new build is live) is the chat system prompt's ENGINE RESTARTS
+and APPLYING & VERIFYING CHANGES sections, not something to restate here.
 
 **Backend selection (Claude Code vs Codex).** Which backend drives a thread is chosen at the thread's FIRST send (the compose destination picker's coding-agent chip → `coding_agent` on the chat request; default `claude-code`, remembered per workspace via the `coding_agent_default` preference), shipped on `SessionStarted.coding_agent`, and persisted in `thread_summaries.coding_agent`. The value is **locked**: follow-ups and recovery always resume on the stored backend (the other backend has no session to resume, so a flip would silently lose the conversation), and a follow-up requesting a different backend is rejected with `409 Conflict`. Backend differences a workspace can observe:
 
@@ -37,7 +70,7 @@ That means right now (each line is one entry inside a trigger's `on` list, see `
 - `event_type: UserQuestionAsked` — works. Wire this to a trigger that calls `send_notification` with `tap: { kind: 'navigate', to: { target: 'thread', id: '<thread_id>', event_id: '<source_event_id>' } }` (event_id taken from the trigger's `Source event id:` line) to push the user with a deep-link straight to the question.
 - `event_type: CodingAgentIdled` — **works**. Pair with the entry's `condition: { has_changes: true }` to scope to "the coding agent finished and left work to review."
 - `event_type: CodingAgentPermissionRequest` — **works**. Lets a workspace react to "the coding agent is asking permission for a tool call."
-- `event_type: CodingAgentToolCalled` / `CodingAgentToolResult` / `CodingAgentPromptSent` — **works**, but these are per-action and chatty. Always pair with the entry's `condition:` (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`) — without one the trigger fires many times per turn.
+- `event_type: CodingAgentToolCalled` / `CodingAgentToolResult` / `CodingAgentPromptSent`: **works**, but these are per-action and chatty. Always pair with the entry's `condition:` (e.g. `name: "Bash"`) or the trigger fires many times per turn. A condition reads TOP-LEVEL payload fields only and has no regex operator, so the command text inside `args` cannot be filtered on: scope by `name` and let the run intent judge the rest.
 - `event_type: CodingAgentTextStreamed` / `CodingAgentThoughtStreamed` — does not fire; per-token streaming is the only thing the scheduler blocks. Subscribing to either is a no-op.
 - `event_type: <any chat-side lifecycle event>` (`ResponseGenerated`, `ResponseFailed`, `ChangeApplied`, …) — works; same blocklist semantics. See `system-knowhow/thread-events.md` for the full set.
 
@@ -59,7 +92,7 @@ All variants below are defined on `ThreadEvent` in `crates/lucidos-engine/src/en
 
 ### Persisted, high-volume — pair with `condition:` (or, for streaming, blocked entirely)
 
-These fire many times per turn. `CodingAgentTextStreamed` and `CodingAgentThoughtStreamed` are per-token streaming and are **blocked** by the scheduler — subscribing is a no-op. `CodingAgentToolCalled` / `CodingAgentToolResult` are per-tool-call (a few to a few dozen per turn): they flow through the matcher, but a trigger without a `condition:` filter will fire on every tool call. Always scope (e.g. `name: "Bash"`, `args.command: { $regex: "rm -rf" }`).
+These fire many times per turn. `CodingAgentTextStreamed` and `CodingAgentThoughtStreamed` are per-token streaming and are **blocked** by the scheduler, so subscribing is a no-op. `CodingAgentToolCalled` / `CodingAgentToolResult` are per-tool-call (a few to a few dozen per turn): they flow through the matcher, but a trigger without a `condition:` filter will fire on every tool call. Always scope by a top-level field, e.g. `name: "Bash"`.
 
 | Event | When it fires | Triggerable |
 |---|---|---|
@@ -227,6 +260,24 @@ Used by the MCP permission-prompt subprocess (the `mcp__permission-prompt` tool 
 `summary` names up to three paths and then appends `+N more`. A trigger condition matching on it should key off `tool_name` and `input.changes[].path`, not the prose. If the `changes` list was never announced the `changes` key is absent and the summary falls back to `reason` / `grant_root` / the bare tool name, which is what the card degrades to as well.
 
 **Supersession.** If the user types a new message while a permission card is still pending, the engine resolves the card as `allowed: false` (`reason: "Superseded by a new message"`) before routing the typed text to the coding agent as a normal follow-up — so the buttons stop dangling instead of leaving the thread stuck on `waiting_for_user_answer` while the coding agent moves on. This mirrors the AskUserQuestion free-form path, where typing becomes a `FreeText` answer; permissions have no "answer", so the pending request is denied instead. Emitted from `resolve_pending_permissions_as_superseded` (`engine/cc_permission.rs`).
+
+**A parent's `follow_up_child_thread` takes the same path**, and that is the one
+side effect of a redirect that is invisible from the verb. Sending a child a
+follow-up resolves any permission card pending on it as superseded, so a request
+a human was about to approve is cancelled by the redirect. Worth weighing before
+steering a child you know is parked on one. Two related facts about following up
+a coding-agent child:
+
+- A child parked on a **question** is blocked on a human, not on work. Your
+  message is not an answer to that question and is not read until a human
+  answers it, and `urgent` does not change that.
+- A follow-up that RACES the child's own finish can produce a completion card
+  for the turn you interrupted. That does not mean the redirect failed: the
+  redirected turn reports separately when it ends.
+
+For everything else about follow-ups (queued versus urgent, what urgency costs,
+why it is a no-op on Codex, and that it consumes no child slot) see the *child
+follow-up* and *urgent follow-up* entries in `system-knowhow/glossary.md`.
 
 **Session-ended clear + non-resurrecting resolution.** A permission card is answered by unblocking an **in-memory** broadcast waiter — it never spawns a resume (unlike `UserQuestionAnswered`, which can resume an already-idled thread). Two consequences: (1) when a coding-agent session **idles** with a card still pending (a workflow whose parallel subagent's card outlived the main turn, a canceled turn), `emit_coding_agent_idled` clears it via `resolve_pending_permissions_as_session_ended` (`reason: "Coding agent session ended before answering — request expired"`), so a finished thread leaves no dangling clickable card; and (2) the projection flips a thread to `running` on `CodingAgentPermissionResolved` **only from `waiting_for_user_answer`** — a resolution on an already-idle/terminal thread (a stale click hours after the session ended, or the session-ended clear itself) leaves the status unchanged. Before this, tapping such a stale card flipped the sessionless thread to a dead `running` that only a restart's settle sweep recovered (`docs/plans/2026-07-02-cc-permission-card-zombie-running.md`). The same non-resurrecting rule applies to the chat `CommandPermissionResolved` / `McpPermissionResolved` lanes (shared projection arm).
 

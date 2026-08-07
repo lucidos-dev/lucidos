@@ -25,20 +25,33 @@
 //! test) and forces a handler (the handler's recognised-action set is checked
 //! against the manifest by a unit test — see `engine/tools/notifications.rs`).
 //!
-//! ## Deliberate non-domain: `await_event`
+//! ## Deliberate non-domain: the `event_wait` family
 //!
-//! `await_event` (`engine::event_wait`, ADR 0047) is a standalone LLM tool and
-//! is deliberately NOT a domain here, so its absence is a decision rather than
+//! `await_event`, `list_event_waits` and `cancel_event_wait`
+//! (`engine::event_wait`, ADR 0047) are standalone LLM tools and are
+//! deliberately NOT a domain here, so their absence is a decision rather than
 //! the drift this manifest exists to catch.
 //!
-//! Parity is unreachable for it, not merely unimplemented. The tool's whole
-//! effect is to END THE CALLING AGENT'S TURN and leave the thread parked, which
-//! only means something inside an agent turn. A CLI invocation has no turn to
-//! park (`lucidos await-event` would block a shell process, which is the
-//! polling this replaces, with worse ergonomics), and an SDK call from an app
-//! iframe has none either. The capability an app or a script actually wants
-//! here is the `triggers` domain, which IS in the manifest: a standing rule
-//! that reacts to an event without a turn to suspend.
+//! **They already have CLI parity**, hand-wired as `lucidos await-event` and
+//! `lucidos event-waits list` / `cancel`. What they cannot have is *generated*
+//! parity, and the reason is structural: all three are scoped to the CALLING
+//! THREAD and take no thread argument at all, which is what stops one thread
+//! reading or ending another's subscriptions. The generators build an HTTP
+//! request out of declared `Arg`s, so a `:thread_id` path segment would have to
+//! be one, and then it would be a flag a caller could point anywhere. The CLI
+//! reads `$LUCIDOS_THREAD_ID` by hand instead
+//! (`crates/lucidos-cli/src/{await_event,event_waits}.rs`), which the manifest
+//! has no way to express.
+//!
+//! No SDK either: an app iframe is not a thread and holds no subscriptions of
+//! its own. The capability an app or a script actually wants there is the
+//! `triggers` domain, which IS in the manifest: a standing rule that reacts to
+//! an event with no thread to resume.
+//!
+//! This note used to argue that parity was unreachable because `await_event`
+//! ended the turn and a CLI invocation had no turn to park. ADR 0049 retired
+//! that shape (a subscription holds nothing, and the wake is an ordinary new
+//! turn), which is exactly what made the CLI verbs possible.
 
 use crate::llm::provider::ToolDefinition;
 use serde_json::{Map, Value};
@@ -266,7 +279,7 @@ const FILTER_ARG: Arg = Arg {
     enum_values: &["unread", "all"],
     required: false,
     loc: ArgIn::Query,
-    description: "Which notifications to return: 'unread' (default) or 'all'.",
+    description: "'unread' (default) or 'all'.",
 };
 const LIMIT_ARG: Arg = Arg {
     name: "limit",
@@ -274,7 +287,7 @@ const LIMIT_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Query,
-    description: "Maximum number of notifications to return (1-50, default 20).",
+    description: "1-50, default 20.",
 };
 const NOTIFICATION_ID_ARG: Arg = Arg {
     name: "id",
@@ -282,13 +295,13 @@ const NOTIFICATION_ID_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Query,
-    description: "UUID of the notification to mark read (from the 'list' action).",
+    description: "UUID from the 'list' action.",
 };
 
 const NOTIFICATIONS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List inbox notifications (unread by default, or all). Returns id/title/message/read/created_at.",
+        summary: "Inbox notifications, unread by default: id, title, message, read, created_at.",
         method: Method::Get,
         path: "/notifications",
         args: &[FILTER_ARG, LIMIT_ARG],
@@ -319,7 +332,7 @@ const NOTIFICATIONS_OPS: &[Operation] = &[
     },
     Operation {
         action: "mark_all_read",
-        summary: "Mark every unread notification read (clears the inbox badge).",
+        summary: "Mark every unread one read, clearing the inbox badge.",
         method: Method::Post,
         path: "/notifications/read-all",
         args: &[],
@@ -347,7 +360,7 @@ const PREF_GET_DEVICE_ID_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Query,
-    description: "Device id to read device-scoped overrides for; omit for the global view.",
+    description: "Read device-scoped overrides; omit for the global view.",
 };
 const PREF_KEY_ARG: Arg = Arg {
     name: "key",
@@ -355,7 +368,7 @@ const PREF_KEY_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Query,
-    description: "Preference key (e.g. 'theme', 'language', 'timezone', 'chat_model').",
+    description: "e.g. 'theme', 'language', 'timezone', 'chat_model'.",
 };
 const PREF_VALUE_ARG: Arg = Arg {
     name: "value",
@@ -363,7 +376,7 @@ const PREF_VALUE_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "New value as a string ('true'/'false' for booleans, '125' for numbers, an allowed enum value).",
+    description: "A string: 'true'/'false', '125', or an allowed enum value.",
 };
 const PREF_SET_DEVICE_ID_ARG: Arg = Arg {
     name: "device_id",
@@ -371,13 +384,13 @@ const PREF_SET_DEVICE_ID_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Device id for a per-device key; omit for global keys.",
+    description: "For a per-device key; omit for global ones.",
 };
 
 const PREFERENCES_OPS: &[Operation] = &[
     Operation {
         action: "get",
-        summary: "List the settable preferences with each one's current value, allowed values, default, and scope (global vs per-device).",
+        summary: "Every settable key with its current value, allowed values, default and scope (global or per-device).",
         method: Method::Get,
         path: "/preferences",
         args: &[PREF_GET_DEVICE_ID_ARG],
@@ -393,7 +406,7 @@ const PREFERENCES_OPS: &[Operation] = &[
     },
     Operation {
         action: "set",
-        summary: "Change a single preference (theme, language, timezone, chat_model, …). Call 'get' first if unsure of the key or its allowed values.",
+        summary: "Change one preference. Call 'get' first if unsure of the key or its allowed values.",
         method: Method::Put,
         path: "/preferences",
         args: &[PREF_KEY_ARG, PREF_VALUE_ARG, PREF_SET_DEVICE_ID_ARG],
@@ -405,8 +418,8 @@ const PREFERENCES_OPS: &[Operation] = &[
         // passes a device id, so the grouped tool omits it (unlike CLI/SDK).
         llm_schema: Some(
             r#"{
-              "key": {"type":"string","description":"The preference key, e.g. 'theme', 'language', 'timezone', 'chat_model'. Use the 'get' action to see the full list of settable keys."},
-              "value": {"type":"string","description":"The new value, as a string. Booleans are 'true'/'false'; numbers like ui-scale are '125'; enums must match an allowed value (see the 'get' action)."}
+              "key": {"type":"string","description":"e.g. 'theme', 'language', 'timezone', 'chat_model'. The 'get' action lists every settable key."},
+              "value": {"type":"string","description":"A string: 'true'/'false', '125', or an allowed enum value from the 'get' action."}
             }"#,
         ),
         llm: None,
@@ -418,13 +431,7 @@ const PREFERENCES_OPS: &[Operation] = &[
 const PREFERENCES_DOMAIN: Domain = Domain {
     name: "preferences",
     tool_name: "preferences",
-    tool_summary: "Read and change user preferences (Settings). 'get' lists every \
-        settable key with its current value, allowed values, default, and scope \
-        (global vs per-device); 'set' changes one key. Call 'get' before 'set' when \
-        unsure of a key or its allowed values. Device-scoped keys (theme, font, \
-        ui-scale, push) auto-apply to the calling device. This does NOT set secrets \
-        (use request_credential), add chat models (use manage_models), or change \
-        command-safety settings.",
+    tool_summary: "Read and change user preferences (Settings). A device-scoped key (theme, font, ui-scale, push) applies to the calling device. NOT for secrets (request_credential), chat models (manage_models), or command-safety settings.",
     llm: true,
     cli: true,
     sdk: true,
@@ -480,7 +487,7 @@ const TRIGGER_RUN_OPT_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "JSON run config to change: { \"type\": \"intent\", \"intent\": \"…\" } or { \"type\": \"script\", \"path\": \"…\" }.",
+    description: "JSON run config: { \"type\": \"intent\", … } or { \"type\": \"script\", … }.",
 };
 const TRIGGER_CRON_EXPRESSIONS_ARG: Arg = Arg {
     name: "cron_expressions",
@@ -488,8 +495,7 @@ const TRIGGER_CRON_EXPRESSIONS_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description:
-        "JSON array of 6-field cron strings in the user's local time, e.g. [\"0 0 8 * * *\"].",
+    description: "6-field cron strings in the user's local time, e.g. [\"0 0 8 * * *\"].",
 };
 const TRIGGER_ON_ARG: Arg = Arg {
     name: "on",
@@ -497,8 +503,7 @@ const TRIGGER_ON_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description:
-        "JSON array of event subscriptions, e.g. [{\"event_type\":\"X\",\"condition\":{...}}].",
+    description: "Event subscriptions, e.g. [{\"event_type\":\"X\",\"condition\":{...}}].",
 };
 const TRIGGER_PAUSED_ARG: Arg = Arg {
     name: "paused",
@@ -514,8 +519,7 @@ const TRIGGER_APP_ID_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description:
-        "Owning app directory name (e.g. 'trigger-workflow'); deep-links notifications to that app.",
+    description: "Owning app directory name; deep-links notifications to that app.",
 };
 const TRIGGER_GO_TO_REVIEW_ARG: Arg = Arg {
     name: "go_to_review",
@@ -523,7 +527,7 @@ const TRIGGER_GO_TO_REVIEW_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "When true, threads spawned by this trigger surface in REVIEW on completion instead of ARCHIVE.",
+    description: "Threads this trigger spawns surface in REVIEW on completion, not ARCHIVE.",
 };
 const TRIGGER_GROUP_ID_ARG: Arg = Arg {
     name: "group_id",
@@ -539,7 +543,8 @@ const TRIGGER_SIDE_EFFECT_GRANT_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "JSON array of irreversible side-effect categories this trigger may perform unattended (e.g. [\"email\"]).",
+    description:
+        "Irreversible side-effect categories this trigger may perform unattended, e.g. [\"email\"].",
 };
 const TRIGGER_SLUG_ARG: Arg = Arg {
     name: "slug",
@@ -547,7 +552,8 @@ const TRIGGER_SLUG_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Stable kebab-case slug (directory segment for per-trigger knowhow); derived from name when omitted.",
+    description:
+        "Kebab-case slug, the directory segment for per-trigger knowhow. Derived from name.",
 };
 
 // The grouped LLM tool keeps the existing flat-tool shapes (shorthand cron/on,
@@ -555,22 +561,22 @@ const TRIGGER_SLUG_ARG: Arg = Arg {
 // allow null so the unioned property serves both create and update (clearing).
 const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "name": {"type":"string","description":"A short, descriptive name for the trigger."},
-  "run": {"type":"object","description":"What to execute. Either { type: 'intent', intent: '…' } for an LLM intent (one sentence in the user's voice — keep procedure out of the intent; the trigger loads knowhow itself at fire time), or { type: 'script', path: 'name/run.py' } for a script."},
-  "cron": {"description":"Cron schedule(s), 6 fields in the USER'S LOCAL TIME (second minute hour day-of-month month day-of-week). A single string, an array of strings, or null. Example: '0 0 8 * * *' for 8am daily.","oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"minItems":1},{"type":"null"}]},
-  "on": {"description":"Event subscriptions. Each entry is { event_type: 'X', condition?: {…} } (condition operators $eq/$ne/$lt/$lte/$gt/$gte/$in). A bare string, an array of strings/objects, or null.","anyOf":[{"type":"null"},{"type":"string"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"object","properties":{"event_type":{"type":"string"},"condition":{"type":"object"}},"required":["event_type"]}]}}]},
-  "app_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Owning app directory name (e.g. 'trigger-workflow'); notifications deep-link to that app. Omit/null for standalone triggers."},
-  "go_to_review": {"type":"boolean","description":"When true, threads spawned by this trigger surface in REVIEW on completion instead of ARCHIVE. Default false."},
-  "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id (from list_trigger_groups). Organizational only. Omit/null for ungrouped."}
+  "run": {"type":"object","description":"{ type: 'intent', intent: '…' }, one sentence in the user's voice with the procedure left to knowhow the trigger loads at fire time, or { type: 'script', path: 'name/run.py' }."},
+  "cron": {"description":"6 fields in the USER'S LOCAL TIME (second minute hour day-of-month month day-of-week); '0 0 8 * * *' is 8am daily. Fields AND within one expression, expressions OR across the array. A string, an array, or null.","oneOf":[{"type":"string"},{"type":"array","items":{"type":"string"},"minItems":1},{"type":"null"}]},
+  "on": {"description":"Each { event_type: 'X', condition?: {…} }, operators $eq/$ne/$lt/$lte/$gt/$gte/$in. A string, an array, or null.","anyOf":[{"type":"null"},{"type":"string"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"object","properties":{"event_type":{"type":"string"},"condition":{"type":"object"}},"required":["event_type"]}]}}]},
+  "app_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Owning app directory name; notifications deep-link there. Null for a standalone trigger."},
+  "go_to_review": {"type":"boolean","description":"Threads this trigger spawns surface in REVIEW on completion, not ARCHIVE. Default false."},
+  "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Omit or null for ungrouped."}
 }"#;
 const TRIGGER_UPDATE_LLM_SCHEMA: &str = r#"{
-  "trigger_id": {"type":"string","description":"UUID of the trigger to update/delete/pause/resume."},
-  "paused": {"type":"boolean","description":"Pause (true) or resume (false) as part of a multi-field update; prefer the pause/resume actions for that alone."}
+  "trigger_id": {"type":"string","description":"UUID of the trigger to act on."},
+  "paused": {"type":"boolean","description":"Pause (true) or resume (false) inside a multi-field update; prefer the standalone actions."}
 }"#;
 
 const TRIGGERS_OPS: &[Operation] = &[
     Operation {
         action: "create",
-        summary: "Create a NEW trigger (schedule-based via cron, event-based via on, or both). list/update existing workflows instead of recreating. Set timezone first.",
+        summary: "Create a NEW trigger: cron, event-based `on`, or both. Update an existing one rather than recreating.",
         method: Method::Post,
         path: "/triggers",
         args: &[
@@ -595,7 +601,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "list",
-        summary: "List all triggers with their names, schedules, event subscriptions, and what each runs.",
+        summary: "All triggers with their names, schedules, subscriptions and what each runs.",
         method: Method::Get,
         path: "/triggers",
         args: &[],
@@ -610,7 +616,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "update",
-        summary: "Update an existing trigger's name/schedule/subscriptions/run config. Prefer over delete+create (keeps run history). Send the full replacement 'on' array.",
+        summary: "Update name, schedule, subscriptions or run config in place. Prefer it over delete plus create, which loses run history. Send the full replacement 'on' array.",
         method: Method::Put,
         path: "/triggers",
         args: &[
@@ -637,7 +643,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "delete",
-        summary: "Delete a trigger by id (orphans its run history — prefer update for tweaks).",
+        summary: "Delete a trigger by id; it orphans the run history, so prefer update for tweaks.",
         method: Method::Delete,
         path: "/triggers",
         args: &[TRIGGER_ID_QUERY_ARG],
@@ -652,7 +658,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "pause",
-        summary: "Pause a trigger so it stops firing on its schedule and stops matching events (config preserved).",
+        summary: "Stop it firing on its schedule and matching events; config preserved.",
         method: Method::Put,
         path: "/triggers",
         args: &[],
@@ -669,7 +675,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "resume",
-        summary: "Resume a previously paused trigger so it fires on its schedule and matches events again.",
+        summary: "Fire on its schedule and match events again.",
         method: Method::Put,
         path: "/triggers",
         args: &[],
@@ -684,7 +690,7 @@ const TRIGGERS_OPS: &[Operation] = &[
     },
     Operation {
         action: "run",
-        summary: "Fire an existing trigger ONCE, right now, off-schedule ('run it now', 'fire it manually', an ad hoc run). The real thing: it records TriggerExecuted / last_run and runs under the trigger's own identity, side-effect grant and go_to_review, so never imitate it by copying run.intent into run_thread. Returns as soon as the run starts. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).",
+        summary: "Fire an existing trigger ONCE, right now, off-schedule, under its own identity, side-effect grant and go_to_review, recording TriggerExecuted and last_run. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).",
         method: Method::Post,
         path: "/triggers/run",
         args: &[TRIGGER_ID_QUERY_ARG],
@@ -706,12 +712,7 @@ const TRIGGERS_OPS: &[Operation] = &[
 const TRIGGERS_DOMAIN: Domain = Domain {
     name: "triggers",
     tool_name: "triggers",
-    tool_summary: "Create and manage triggers: scheduled (cron) and/or event-driven \
-        automations. 'create' a new trigger, 'list' existing ones, 'update' a trigger \
-        in place (prefer over delete+create, which keeps run history), 'delete', and \
-        'pause'/'resume'. Use 'run' to fire an existing trigger once, right now, \
-        off-schedule. Cron times are in the user's local timezone (set it first). \
-        To organize triggers into panel folders, use the trigger_groups tool.",
+    tool_summary: "Create and manage triggers: scheduled (cron) and event-driven automations. Panel folders are the trigger_groups tool.",
     llm: true,
     cli: true,
     sdk: true,
@@ -762,7 +763,7 @@ const TG_ORDERING_ARG: Arg = Arg {
 const TRIGGER_GROUPS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List trigger groups (id, name, order, member_count). Pure organizational folders.",
+        summary: "Groups with id, name, order and member_count.",
         method: Method::Get,
         path: "/trigger-groups",
         args: &[],
@@ -777,7 +778,7 @@ const TRIGGER_GROUPS_OPS: &[Operation] = &[
     },
     Operation {
         action: "create",
-        summary: "Create a trigger group (a named folder). Names are unique (case-insensitive).",
+        summary: "Create a named folder. Names are unique, case-insensitively.",
         method: Method::Post,
         path: "/trigger-groups",
         args: &[TG_NAME_ARG, TG_ORDER_ARG],
@@ -797,7 +798,7 @@ const TRIGGER_GROUPS_OPS: &[Operation] = &[
     },
     Operation {
         action: "rename",
-        summary: "Rename a trigger group. Fails if another group already uses the new name (case-insensitive).",
+        summary: "Rename a group. Fails if another already uses the name, case-insensitively.",
         method: Method::Put,
         path: "/trigger-groups",
         args: &[TG_ID_QUERY_ARG, TG_NAME_ARG],
@@ -817,7 +818,7 @@ const TRIGGER_GROUPS_OPS: &[Operation] = &[
     },
     Operation {
         action: "reorder",
-        summary: "Atomic batch reorder of trigger groups — pass an array of { id, order } entries.",
+        summary: "Atomic batch reorder: an array of { id, order } entries.",
         method: Method::Post,
         path: "/trigger-groups/reorder",
         args: &[TG_ORDERING_ARG],
@@ -836,7 +837,7 @@ const TRIGGER_GROUPS_OPS: &[Operation] = &[
     },
     Operation {
         action: "delete",
-        summary: "Delete a trigger group. Refuses (with member ids) when the group still has triggers — move them first.",
+        summary: "Refused, with member ids, while the group still holds triggers: move them first.",
         method: Method::Delete,
         path: "/trigger-groups",
         args: &[TG_ID_QUERY_ARG],
@@ -844,7 +845,9 @@ const TRIGGER_GROUPS_OPS: &[Operation] = &[
         sdk_name: "delete",
         mutating: true,
         llm_alias: Some("delete_trigger_group"),
-        llm_schema: Some(r#"{"group_id":{"type":"string","description":"UUID of the group to delete."}}"#),
+        llm_schema: Some(
+            r#"{"group_id":{"type":"string","description":"UUID of the group to delete."}}"#,
+        ),
         llm: None,
         cli: None,
         sdk: None,
@@ -854,10 +857,7 @@ const TRIGGER_GROUPS_OPS: &[Operation] = &[
 const TRIGGER_GROUPS_DOMAIN: Domain = Domain {
     name: "trigger_groups",
     tool_name: "trigger_groups",
-    tool_summary: "Manage trigger groups — user-visible folders that organize triggers \
-        in the panel. Pure organizational label: groups don't fire or schedule \
-        anything. 'list' groups, 'create' / 'rename' / 'delete' a group, or 'reorder' \
-        them. Assign a trigger to a group via the triggers tool's group_id field.",
+    tool_summary: "User-visible folders organizing triggers in the panel. Purely a label: a group fires and schedules nothing. Assign a trigger to one with the triggers tool's group_id.",
     llm: true,
     cli: true,
     // No app/SDK consumer manages trigger groups — declared N/A (parity is per
@@ -907,7 +907,7 @@ const APP_DESCRIPTION_ARG: Arg = Arg {
 const APPS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List all apps in the workspace (id, name, description, icon).",
+        summary: "All apps: id, name, description, icon.",
         method: Method::Get,
         path: "/apps",
         args: &[],
@@ -922,7 +922,7 @@ const APPS_OPS: &[Operation] = &[
     },
     Operation {
         action: "get",
-        summary: "Get one app's metadata by id.",
+        summary: "One app's metadata by id.",
         method: Method::Get,
         path: "/app",
         args: &[APP_ID_QUERY_ARG],
@@ -937,7 +937,7 @@ const APPS_OPS: &[Operation] = &[
     },
     Operation {
         action: "update",
-        summary: "Update an app's name/description.",
+        summary: "Update an app's name or description.",
         method: Method::Put,
         path: "/app",
         args: &[APP_ID_QUERY_ARG, APP_NAME_ARG, APP_DESCRIPTION_ARG],
@@ -953,7 +953,7 @@ const APPS_OPS: &[Operation] = &[
     },
     Operation {
         action: "delete",
-        summary: "Delete an app by id (plugin-installed apps must be removed via the plugin).",
+        summary: "Delete an app by id; a plugin-installed one goes through the plugin.",
         method: Method::Delete,
         path: "/app",
         args: &[APP_ID_QUERY_ARG],
@@ -971,10 +971,7 @@ const APPS_OPS: &[Operation] = &[
 const APPS_DOMAIN: Domain = Domain {
     name: "apps",
     tool_name: "apps",
-    tool_summary: "Manage apps — 'list' all apps, 'get' one by id, 'update' an \
-        app's name/description, or 'delete' an app. (Creating an app is the \
-        separate create_app tool; editing app source is done in the app's \
-        coding-agent worktree.)",
+    tool_summary: "Manage apps. Creating one is the separate create_app tool, and app source is edited in the app's coding-agent worktree.",
     // LLM keeps the standalone create_app + list_apps tools; nothing to group
     // here (create has no HTTP peer). This domain enforces CLI + SDK parity.
     llm: false,
@@ -994,26 +991,26 @@ const APPS_DOMAIN: Domain = Domain {
 // ---------------------------------------------------------------------------
 
 const EVENTS_EMIT_LLM_SCHEMA: &str = r#"{
-  "event_type": {"type":"string","description":"Event type in PascalCase past tense (e.g., GoogleDocEdited, DataImported)."},
-  "payload": {"type":"object","description":"Event payload — REQUIRED. Include enough context to understand what happened.","properties":{"summary":{"type":"string","description":"Human-readable description of what happened"}},"required":["summary"]}
+  "event_type": {"type":"string","description":"PascalCase past tense, e.g. GoogleDocEdited."},
+  "payload": {"type":"object","description":"REQUIRED. Enough context to understand what happened.","properties":{"summary":{"type":"string","description":"What happened, in one line."}},"required":["summary"]}
 }"#;
 const EVENTS_QUERY_LLM_SCHEMA: &str = r#"{
-  "event_type": {"type":"string","description":"Filter by event type (e.g., DataImported). Omit to query all — but prefer a specific filter on busy workspaces."},
-  "since": {"type":"string","description":"Only return events after this ISO 8601 / RFC 3339 timestamp."},
-  "until": {"type":"string","description":"Only return events before this ISO 8601 / RFC 3339 timestamp."},
-  "limit": {"type":"integer","description":"Max events (1-200, default 50). Raise only for full enumeration of a small type."},
-  "byte_limit": {"type":"integer","description":"Per-call byte budget for the compact-JSON response (1024-524288, default 131072 = 128 KB). On truncation follow the response hint — narrow the query before bumping this."}
+  "event_type": {"type":"string","description":"Omitting it queries all, worth avoiding on a busy workspace."},
+  "since": {"type":"string","description":"After this RFC 3339 timestamp."},
+  "until": {"type":"string","description":"Before this RFC 3339 timestamp."},
+  "limit": {"type":"integer","description":"1-200, default 50. Raise only to fully enumerate a small type."},
+  "byte_limit": {"type":"integer","description":"Response byte budget (1024-524288, default 131072). On truncation follow the hint and narrow the query before raising it."}
 }"#;
 const EVENTS_COUNT_LLM_SCHEMA: &str = r#"{
-  "event_type": {"type":"string","description":"Filter by event type. Omit for a per-type breakdown across all event types."},
-  "since": {"type":"string","description":"Only count events after this ISO 8601 / RFC 3339 timestamp."},
-  "until": {"type":"string","description":"Only count events before this ISO 8601 / RFC 3339 timestamp."}
+  "event_type": {"type":"string","description":"Omit for a per-type breakdown across all types."},
+  "since": {"type":"string","description":"After this RFC 3339 timestamp."},
+  "until": {"type":"string","description":"Before this RFC 3339 timestamp."}
 }"#;
 
 const EVENTS_OPS: &[Operation] = &[
     Operation {
         action: "emit",
-        summary: "Emit a domain event (immutable, past-tense fact). The payload must include a 'summary'. (requires: event_type, payload)",
+        summary: "Record an immutable past-tense fact. The payload must include a 'summary'. (requires: event_type, payload)",
         method: Method::Post,
         path: "/events/emit",
         args: &[],
@@ -1028,7 +1025,7 @@ const EVENTS_OPS: &[Operation] = &[
     },
     Operation {
         action: "query",
-        summary: "Query events newest-first, wrapped as {events, total_matching, returned, byte_size, truncated, hint?}. Call 'count' first to size a busy sweep; treat 3 calls/turn as a soft ceiling.",
+        summary: "Events newest-first as {events, total_matching, returned, byte_size, truncated, hint?}. Three calls a turn is a soft ceiling.",
         method: Method::Get,
         path: "/events/query",
         args: &[],
@@ -1043,7 +1040,7 @@ const EVENTS_OPS: &[Operation] = &[
     },
     Operation {
         action: "count",
-        summary: "Count events by type/time without materialising payloads. With event_type → {count, byte_total}; without → a per-type breakdown sorted by count desc. Call BEFORE 'query' on busy windows.",
+        summary: "Count by type and time without materialising payloads. With event_type: {count, byte_total}; without: a per-type breakdown, count desc. Call BEFORE 'query' on busy windows.",
         method: Method::Get,
         path: "/events/count",
         args: &[],
@@ -1061,14 +1058,7 @@ const EVENTS_OPS: &[Operation] = &[
 const EVENTS_DOMAIN: Domain = Domain {
     name: "events",
     tool_name: "events",
-    tool_summary: "Work with the workspace's event store. 'emit' records an immutable \
-        past-tense fact (payload must include a 'summary'); 'query' reads events newest-first \
-        (honours a 128 KB byte budget — narrow on truncation); 'count' sizes a sweep by type/time \
-        without materialising payloads. On a busy workspace, 'count' first, then 'query' the \
-        narrowest type(s): do NOT enumerate everything into context. 'query' and 'count' see the \
-        WHOLE store, not just what the workspace emitted: domain events AND the engine's own \
-        thread/system events (ChildThreadCompleted, ResponseGenerated, ChangeApplied, \
-        TriggerCompleted) are rows in one table, so there is no second stream to reach for.",
+    tool_summary: "The workspace's event store, domain and engine events alike in one table. Call 'count' first on a busy workspace, then 'query' the narrowest types, rather than enumerating everything into context.",
     llm: true,
     // The `lucidos events` CLI is a richer hand-written command (before/after
     // cursors); not regenerated. No SDK consumer. Grouped LLM tool only.
@@ -1088,7 +1078,7 @@ const EVENTS_DOMAIN: Domain = Domain {
 const CHANGES_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List pending + recently-applied changes (coding-agent branches awaiting Apply). Returns { pending, applied, total_pending }; read .pending[].id before 'apply'. Read-only.",
+        summary: "Pending and recently-applied changes as { pending, applied, total_pending }. Read .pending[].id before 'apply'.",
         method: Method::Get,
         path: "/changes",
         args: &[],
@@ -1103,7 +1093,7 @@ const CHANGES_OPS: &[Operation] = &[
     },
     Operation {
         action: "apply",
-        summary: "Apply a pending change — merge the coding-agent branch into main, exactly as the Apply button does. ONLY when the user asked. Returns the typed apply result (status/SHAs/restart_required). (requires: change_id)",
+        summary: "Merge the coding-agent branch into main, exactly as the Apply button does; returns status, SHAs and restart_required. ONLY when the user asked. (requires: change_id)",
         method: Method::Post,
         path: "/changes/:change_id/apply",
         args: &[],
@@ -1121,11 +1111,7 @@ const CHANGES_OPS: &[Operation] = &[
 const CHANGES_DOMAIN: Domain = Domain {
     name: "changes",
     tool_name: "changes",
-    tool_summary: "Inspect and apply *changes*: coding-agent-proposed branches awaiting the Apply \
-        button. 'list' returns pending + recently-applied changes (find a change's id here before \
-        applying); 'apply' merges one into the workspace's main exactly as the Apply button does \
-        (Lucidos-source applies run /harden and may need a restart; app applies ff-merge). Only \
-        'apply' when the user asked to.",
+    tool_summary: "Changes: coding-agent-proposed branches awaiting the Apply button. 'list' is where you find a change's id. Only 'apply' when the user asked.",
     llm: true,
     // `lucidos changes list|apply` is a hand-written CLI; not regenerated. No SDK
     // consumer. Grouped LLM tool only.
@@ -1157,7 +1143,7 @@ const MODEL_ID_BODY_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "Model id — the string sent in API requests (e.g. 'z-ai/glm-5.2', 'claude-opus-4-8@default'). Required for add/enable/disable/remove.",
+    description: "The string sent in API requests (e.g. 'z-ai/glm-5.2'). Required for add/enable/disable/remove.",
 };
 const MODEL_ID_QUERY_ARG: Arg = Arg {
     name: "id",
@@ -1197,7 +1183,7 @@ const MODEL_SORT_ORDER_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Optional display order (lower sorts first; user models default to 1000).",
+    description: "Lower sorts first; user models default to 1000.",
 };
 const MODEL_ENABLED_ARG: Arg = Arg {
     name: "enabled",
@@ -1213,13 +1199,13 @@ const MODEL_CONTEXT_WINDOW_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Body,
-    description: "Context window in tokens (e.g. 1048576). Set it to the window the model actually serves. Omitting it falls back to guessing from the model id (claude-* → 200k unless the id ends in [1m], gpt-5* → 400k, anything else → 200k) — that guess has no rule for OpenRouter / Gemini / local ids, so they are treated as 200k however large they really are. Guesses err low on purpose: too low only trims context early, too high makes the provider reject the request.",
+    description: "Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose: too low only trims context early, too high makes the provider reject the request.",
 };
 
 const MODELS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List all models in the registry (enabled + disabled, builtin + user).",
+        summary: "Every model, enabled and disabled, builtin and user.",
         method: Method::Get,
         path: "/models",
         args: &[],
@@ -1255,7 +1241,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "enable",
-        summary: "Enable an existing model (show it in the picker).",
+        summary: "Show an existing model in the picker.",
         method: Method::Put,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1288,7 +1274,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "update",
-        summary: "Edit a model's label/provider/sort_order/enabled (CLI generic PUT).",
+        summary: "Edit label, provider, sort_order or enabled.",
         method: Method::Put,
         path: "/models",
         args: &[
@@ -1311,7 +1297,7 @@ const MODELS_OPS: &[Operation] = &[
     },
     Operation {
         action: "remove",
-        summary: "Delete a user-added model (builtins can't be removed — disable instead).",
+        summary: "Delete a user-added model; a builtin can only be disabled.",
         method: Method::Delete,
         path: "/models",
         args: &[MODEL_ID_QUERY_ARG],
@@ -1331,10 +1317,7 @@ const MODELS_DOMAIN: Domain = Domain {
     // Keep the existing LLM tool name so cached prompts/threads don't churn; the
     // schema is now built from this manifest entry (no more get_manage_models_tool).
     tool_name: "manage_models",
-    tool_summary: "Manage the chat-model registry that powers the Lucidos Agent's model picker. \
-        Add a model the user wants available, enable/disable an existing one, or remove a \
-        user-added model. To switch the ACTIVE model instead, use set_preference(key='chat_model'). \
-        Builtin models can be disabled but not removed.",
+    tool_summary: "The chat-model registry behind the Lucidos Agent's model picker. A builtin can be disabled but not removed. Switch the ACTIVE model with set_preference(key='chat_model').",
     llm: true,
     cli: true,
     sdk: false,
@@ -1346,10 +1329,15 @@ const MODELS_DOMAIN: Domain = Domain {
 // repositories — registered external git repos for coding-agent sessions.
 // Migrates the already-grouped `manage_repositories` LLM tool into the manifest
 // (tool_name kept; schema now manifest-built SSOT, replacing
-// misc::get_manage_repositories_tool). LLM-only: add/remove run in-process via
-// RepositoryStore (no add/remove HTTP route), so cli/sdk = false — pure
-// drift-safety, no new surface. execute_tool keeps routing manage_repositories →
-// the unchanged execute_manage_repositories handler. See engine/tools/mod.rs.
+// misc::get_manage_repositories_tool). Declared LLM-only (cli/sdk = false) so
+// the migration adds no new generated surface: the LLM handler reaches
+// `RepositoryStore` in-process. HTTP routes for the same verbs DO exist
+// (`POST /api/v1/repositories` and `DELETE /api/v1/repositories/:id`, see
+// `api::repositories::router`); the `path` values recorded below are the
+// conceptual mapping, not something a generator could emit today, since
+// `remove` is keyed there by an `:id` path segment rather than by the body
+// `name` this tool takes. execute_tool keeps routing manage_repositories to the
+// unchanged execute_manage_repositories handler. See engine/tools/mod.rs.
 // ---------------------------------------------------------------------------
 
 const REPO_NAME_ARG: Arg = Arg {
@@ -1358,8 +1346,7 @@ const REPO_NAME_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description:
-        "Repository display name (required for 'add'; used to find the repo for 'remove').",
+    description: "Display name. Required for 'add', and what 'remove' looks up.",
 };
 const REPO_PATH_ARG: Arg = Arg {
     name: "path",
@@ -1367,7 +1354,7 @@ const REPO_PATH_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "Absolute path to the git repository on disk (required for 'add'). Supports ~/.",
+    description: "Absolute path to the repo on disk, ~ allowed. Required for 'add'.",
 };
 const REPO_DESC_ARG: Arg = Arg {
     name: "description",
@@ -1411,7 +1398,7 @@ const REPOSITORIES_OPS: &[Operation] = &[
     },
     Operation {
         action: "remove",
-        summary: "Unregister a repository by name.",
+        summary: "Unregister one by name.",
         method: Method::Delete,
         path: "/repositories",
         args: &[REPO_NAME_ARG],
@@ -1429,11 +1416,12 @@ const REPOSITORIES_OPS: &[Operation] = &[
 const REPOSITORIES_DOMAIN: Domain = Domain {
     name: "repositories",
     tool_name: "manage_repositories",
-    tool_summary: "Manage registered external git repositories for coding-agent sessions. Users \
-        can register local repos so Claude Code or Codex can work on them.",
+    tool_summary: "External git repositories registered for coding-agent sessions, so a coding agent can work on a local repo.",
     llm: true,
-    // add/remove are in-process (RepositoryStore) with no HTTP route, so no
-    // generated CLI/SDK is possible — declared N/A. Pure schema-SSOT migration.
+    // Declared N/A: the LLM handler runs add/remove in-process against
+    // `RepositoryStore`, and this entry is a pure schema-SSOT migration that
+    // deliberately ships no generated surface. Not because the routes are
+    // missing, they are not: see the block comment above `REPO_NAME_ARG`.
     cli: false,
     sdk: false,
     operations: REPOSITORIES_OPS,
@@ -1456,7 +1444,7 @@ const ENV_NAME_BODY_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "Variable name: uppercase letters, digits, underscores; not starting with a digit (e.g. GITHUB_TOKEN). Engine-owned names (CRED_*, OAUTH_*, PG*, PATH, internal LUCIDOS_*) are rejected.",
+    description: "Uppercase letters, digits and underscores, not starting with a digit. An engine-owned name (CRED_*, OAUTH_*, PG*, PATH, LUCIDOS_*) is rejected.",
 };
 const ENV_VALUE_BODY_ARG: Arg = Arg {
     name: "value",
@@ -1464,7 +1452,7 @@ const ENV_VALUE_BODY_ARG: Arg = Arg {
     enum_values: &[],
     required: true,
     loc: ArgIn::Body,
-    description: "Variable value (plaintext, non-secret). For secrets use a credential instead.",
+    description: "Plaintext, non-secret. Use a credential for a secret.",
 };
 const ENV_NAME_QUERY_ARG: Arg = Arg {
     name: "name",
@@ -1478,7 +1466,7 @@ const ENV_NAME_QUERY_ARG: Arg = Arg {
 const ENV_VARS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List all user environment variables (name + value). These are injected into every subprocess Lucidos spawns.",
+        summary: "Every variable with its value.",
         method: Method::Get,
         path: "/env-vars",
         args: &[],
@@ -1493,7 +1481,7 @@ const ENV_VARS_OPS: &[Operation] = &[
     },
     Operation {
         action: "set",
-        summary: "Create or replace a non-secret environment variable. Takes effect on the next subprocess — no restart.",
+        summary: "Create or replace one.",
         method: Method::Post,
         path: "/env-vars",
         args: &[ENV_NAME_BODY_ARG, ENV_VALUE_BODY_ARG],
@@ -1510,7 +1498,7 @@ const ENV_VARS_OPS: &[Operation] = &[
     },
     Operation {
         action: "delete",
-        summary: "Remove an environment variable by name.",
+        summary: "Remove one by name.",
         method: Method::Delete,
         path: "/env-vars",
         args: &[ENV_NAME_QUERY_ARG],
@@ -1528,11 +1516,7 @@ const ENV_VARS_OPS: &[Operation] = &[
 const ENV_VARS_DOMAIN: Domain = Domain {
     name: "env_vars",
     tool_name: "env_vars",
-    tool_summary: "Manage non-secret environment variables injected into every subprocess Lucidos \
-        spawns (run_bash, run_python, scheduled scripts, coding agents). 'list' shows all \
-        name+value pairs, 'set' creates or replaces one (takes effect on the next subprocess — no \
-        restart), 'delete' removes one by name. These are NOT secret (they appear in logs/events) — \
-        for API keys, tokens, or passwords use request_credential instead.",
+    tool_summary: "Non-secret environment variables injected into every subprocess Lucidos spawns, effective on the next one with no restart. They appear in logs and events, so use request_credential for an API key, token or password.",
     // Full LLM/CLI parity (list/set/delete). The retired standalone
     // set_environment_variable tool stays wired as a back-compat alias to the
     // `set` action (see ENV_VARS_OPS). No SDK consumer (apps don't manage env vars).
@@ -1554,21 +1538,21 @@ const ENV_VARS_DOMAIN: Domain = Domain {
 // ---------------------------------------------------------------------------
 
 const THREADS_LIST_LLM_SCHEMA: &str = r#"{
-  "active": {"type":"boolean","description":"When true, restrict to threads where the agentic loop is mid-flow (running or waiting_for_user_answer); when false, invert. Omit for no filter. Note: 'waiting' is NOT active (the coding agent stopped and proposed changes)."},
-  "source": {"type":"string","description":"Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent' (legacy 'claude_code' also accepted). Omit for all."},
-  "my_children": {"type":"boolean","description":"When true, restrict to threads THIS thread spawned as children (its direct children only, not grandchildren). Resolved from the calling thread, so it needs no id. Use it to recover a child's thread_id, to see which of your children are still working, and to spot one parked on a question."},
-  "limit": {"type":"integer","description":"Maximum number of threads to return (1-1000, default 100)."}
+  "active": {"type":"boolean","description":"Restrict to threads mid-flow (running or waiting_for_user_answer); false inverts, omitting means no filter. 'waiting' is NOT active: the coding agent stopped and proposed a change."},
+  "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent' (legacy 'claude_code' accepted). Omit for all."},
+  "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children, not grandchildren; resolved from the calling thread, so no id. How you recover a child's thread_id, see which are still working, and spot one parked on a question."},
+  "limit": {"type":"integer","description":"1-1000, default 100."}
 }"#;
 const THREADS_COUNT_LLM_SCHEMA: &str = r#"{
-  "active": {"type":"boolean","description":"When true, count only threads mid-flow (running or waiting_for_user_answer); when false, the inverse. Omit for total count."},
-  "source": {"type":"string","description":"Filter by source. Comma-separated list of 'chat', 'trigger', 'coding-agent'. Omit for all."},
-  "my_children": {"type":"boolean","description":"When true, restrict to threads THIS thread spawned as children (its direct children only, not grandchildren). Resolved from the calling thread, so it needs no id. Use it to recover a child's thread_id, to see which of your children are still working, and to spot one parked on a question."}
+  "active": {"type":"boolean","description":"Count only threads mid-flow (running or waiting_for_user_answer); false inverts. Omit for the total."},
+  "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent'. Omit for all."},
+  "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children; resolved from the calling thread, so no id."}
 }"#;
 
 const THREADS_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List thread summaries newest-first (the projection rows). Cheaper than query_events for 'what threads exist / their status / age'. Each row carries thread_id, title, channel, status, last_activity, parent_thread_id, trigger_id, …",
+        summary: "Thread summaries newest-first: thread_id, title, channel, status, last_activity, parent_thread_id, trigger_id.",
         method: Method::Get,
         path: "/threads/list",
         args: &[],
@@ -1583,7 +1567,7 @@ const THREADS_OPS: &[Operation] = &[
     },
     Operation {
         action: "count",
-        summary: "Count thread summaries matching the same filters as 'list'. Returns { count: N } — the cheap 'is anything still running?' check.",
+        summary: "Same filters as 'list', returning { count: N }: the cheap 'is anything still running?' check.",
         method: Method::Get,
         path: "/threads/count",
         args: &[],
@@ -1601,14 +1585,7 @@ const THREADS_OPS: &[Operation] = &[
 const THREADS_DOMAIN: Domain = Domain {
     name: "threads",
     tool_name: "threads",
-    tool_summary: "Introspect threads. 'list' returns thread summaries newest-first (thread_id, \
-        title, channel, status, last_activity, parent/trigger ids); 'count' returns just the \
-        matching count. Both take the same optional filters (active, source, my_children, limit) \
-        and are far cheaper than query_events for 'what threads exist / their status'. \
-        'my_children: true' scopes either one to the threads THIS thread spawned, which is how \
-        you recover a child's thread_id and see which of your children are still working. To \
-        START a thread, use the separate run_thread / run_coding_agent tools; to REDIRECT one you \
-        already spawned, use follow_up_child_thread.",
+    tool_summary: "Introspect threads, far cheaper than querying events for what exists and its status. Both actions take the same optional filters. To START a thread use run_thread or run_coding_agent, to REDIRECT one follow_up_child_thread.",
     llm: true,
     // The `lucidos threads list|count` CLI is hand-written (kept, not regenerated)
     // and no SDK consumer needs this. Grouped LLM tool only.
@@ -1666,7 +1643,7 @@ const MEM_IMPORTANCE_ARG: Arg = Arg {
     enum_values: &[],
     required: false,
     loc: ArgIn::Query,
-    description: "Comma-separated importance levels to include: low,medium,high,critical.",
+    description: "Importance levels to include: low,medium,high,critical.",
 };
 const MEM_SOURCE_ID_ARG: Arg = Arg {
     name: "source_id",
@@ -1704,7 +1681,7 @@ const MEM_COMMIT_ARG: Arg = Arg {
 const MEMORY_OPS: &[Operation] = &[
     Operation {
         action: "correct",
-        summary: "Search for and correct wrong memories by keyword + semantic match to the wrong claim. (requires: search_query, wrong_fact)",
+        summary: "Delete the entries semantically matching a wrong claim. (requires: search_query, wrong_fact)",
         method: Method::Post,
         path: "/memory/correct",
         args: &[],
@@ -1715,7 +1692,7 @@ const MEMORY_OPS: &[Operation] = &[
         llm_schema: Some(
             r#"{
               "search_query": {"type":"string","description":"Keyword to find candidate memories (e.g., 'Acme Corp'). Broad is OK — semantic filtering narrows it down."},
-              "wrong_fact": {"type":"string","description":"The specific wrong claim to delete (e.g., 'User works at Acme Corp'). Only memories semantically similar to this are deleted."},
+              "wrong_fact": {"type":"string","description":"The specific wrong claim (e.g. 'User works at Acme Corp'). Only memories semantically similar to it are deleted."},
               "correction": {"type":"string","description":"Optional corrected fact to store after deleting the wrong memories. Omit to just delete."}
             }"#,
         ),
@@ -1726,7 +1703,7 @@ const MEMORY_OPS: &[Operation] = &[
     },
     Operation {
         action: "correct_by_id",
-        summary: "Delete (and optionally replace) ONE memory by its id — the precise path when the [id: <uuid>] is visible in the [Long-term Memory] block. (requires: id)",
+        summary: "Delete (and optionally replace) ONE memory by its id, the precise path when the [id: <uuid>] is visible. (requires: id)",
         method: Method::Post,
         path: "/memory/correct",
         args: &[],
@@ -1736,7 +1713,7 @@ const MEMORY_OPS: &[Operation] = &[
         llm_alias: Some("correct_memory_by_id"),
         llm_schema: Some(
             r#"{
-              "id": {"type":"string","description":"The memory entry's id (a UUID), copied verbatim from the [id: <uuid>] at the end of its bullet in the [Long-term Memory] block."},
+              "id": {"type":"string","description":"The entry's UUID, copied verbatim from the [id: <uuid>] at the end of its bullet."},
               "correction": {"type":"string","description":"Optional corrected fact to store after deleting this entry. Omit to just delete."}
             }"#,
         ),
@@ -1746,7 +1723,7 @@ const MEMORY_OPS: &[Operation] = &[
     },
     Operation {
         action: "stats",
-        summary: "Memory index stats (entry counts, sources). Read-only.",
+        summary: "Index stats: entry counts and sources.",
         method: Method::Get,
         path: "/memory/stats",
         args: &[],
@@ -1762,7 +1739,7 @@ const MEMORY_OPS: &[Operation] = &[
     },
     Operation {
         action: "entries",
-        summary: "Paginated long-term-memory entries with their importance and source. Read-only.",
+        summary: "Paginated entries with their importance and source.",
         method: Method::Get,
         path: "/memory/entries",
         args: &[
@@ -1783,7 +1760,7 @@ const MEMORY_OPS: &[Operation] = &[
     },
     Operation {
         action: "source",
-        summary: "Inspect one memory's source (the originating event or artifact) plus the entries derived from it. Read-only.",
+        summary: "One memory's originating event or artifact, plus the entries derived from it.",
         method: Method::Get,
         path: "/memory/source",
         args: &[
@@ -1806,11 +1783,7 @@ const MEMORY_OPS: &[Operation] = &[
 const MEMORY_DOMAIN: Domain = Domain {
     name: "memory",
     tool_name: "memory",
-    tool_summary: "Correct long-term memory. 'correct' searches by keyword and deletes only the \
-        entries that semantically match a wrong claim (optionally storing a correction); \
-        'correct_by_id' removes exactly one entry by the [id: <uuid>] shown in the [Long-term \
-        Memory] block. Use 'correct_by_id' when the id is visible, 'correct' otherwise. (Reading \
-        memory is the `lucidos memory` CLI; the agent gets memory injected into its context.)",
+    tool_summary: "Correct long-term memory. Prefer 'correct_by_id' when the [id: <uuid>] is visible. There is no read action: memory is injected into your context.",
     llm: true,
     cli: true,
     sdk: false,
@@ -1841,21 +1814,21 @@ const TQ_ENTRY_ID_ARG: Arg = Arg {
 // Mirrors the flat update_thread_queue_policy schema (cap_schema + overflow).
 // Every field optional — the handler merges the patch with the live policy.
 const TQ_POLICY_LLM_SCHEMA: &str = r#"{
-  "max_concurrent_total": {"type":"integer","minimum":0,"description":"Maximum concurrently running threads across all kinds — background spawns AND user-initiated work."},
-  "max_concurrent_event_trigger": {"type":"integer","minimum":0,"description":"Maximum concurrently running event-trigger fires."},
-  "max_concurrent_cron": {"type":"integer","minimum":0,"description":"Maximum concurrently running cron-trigger fires."},
-  "max_concurrent_sub_thread": {"type":"integer","minimum":0,"description":"Maximum concurrently running agent-spawned sub-thread chats."},
-  "max_concurrent_coding_agent": {"type":"integer","minimum":0,"description":"Maximum concurrently running agent-spawned coding-agent threads."},
-  "max_concurrent_per_trigger": {"type":"integer","minimum":0,"description":"Maximum concurrent runs for one trigger. 1 preserves strict per-trigger FIFO."},
-  "max_queued_per_trigger": {"type":"integer","minimum":1,"description":"Maximum queued backlog for one trigger before overflow handling applies."},
-  "reserved_background": {"type":"integer","minimum":0,"description":"Slots background work can always reclaim ahead of user-initiated work. 0 = pure user priority."},
-  "overflow": {"type":"string","enum":["drop-oldest","pause-trigger"],"description":"Overflow behavior when one trigger reaches max_queued_per_trigger."}
+  "max_concurrent_total": {"type":"integer","minimum":0,"description":"Concurrent threads of every kind, background and user-initiated alike."},
+  "max_concurrent_event_trigger": {"type":"integer","minimum":0,"description":"Concurrent event-trigger fires."},
+  "max_concurrent_cron": {"type":"integer","minimum":0,"description":"Concurrent cron-trigger fires."},
+  "max_concurrent_sub_thread": {"type":"integer","minimum":0,"description":"Concurrent agent-spawned sub-thread chats."},
+  "max_concurrent_coding_agent": {"type":"integer","minimum":0,"description":"Concurrent agent-spawned coding-agent threads."},
+  "max_concurrent_per_trigger": {"type":"integer","minimum":0,"description":"Concurrent runs of one trigger; 1 preserves strict per-trigger FIFO."},
+  "max_queued_per_trigger": {"type":"integer","minimum":1,"description":"Queued backlog for one trigger before overflow applies."},
+  "reserved_background": {"type":"integer","minimum":0,"description":"Slots background work can reclaim ahead of user work. 0 is pure user priority."},
+  "overflow": {"type":"string","enum":["drop-oldest","pause-trigger"],"description":"On reaching max_queued_per_trigger."}
 }"#;
 
 const THREAD_QUEUE_OPS: &[Operation] = &[
     Operation {
         action: "list",
-        summary: "List the live Thread Queue + active capacity policy ({ entries, policy }), including user-initiated occupants. Read-only — call before changing capacity so relative requests are computed from the live policy.",
+        summary: "Live queue plus the active capacity policy ({ entries, policy }), user-initiated occupants included. Call it before changing capacity, so a relative request starts from the live numbers.",
         method: Method::Get,
         path: "/thread-queue",
         args: &[],
@@ -1870,7 +1843,7 @@ const THREAD_QUEUE_OPS: &[Operation] = &[
     },
     Operation {
         action: "update_policy",
-        summary: "Update the capacity policy. Only provided fields change (merged with the live policy); emits the persisted CapacityPolicyChanged. Caps may be 0 to hold admission; max_queued_per_trigger ≥ 1.",
+        summary: "Change only the cap fields you send, merged with the live policy. max_queued_per_trigger is at least 1.",
         method: Method::Put,
         path: "/thread-queue/policy",
         args: &[],
@@ -1921,11 +1894,7 @@ const THREAD_QUEUE_OPS: &[Operation] = &[
 const THREAD_QUEUE_DOMAIN: Domain = Domain {
     name: "thread_queue",
     tool_name: "thread_queue",
-    tool_summary: "Inspect and tune the Thread Queue — the shared admission-control pool for \
-        background spawns AND user-initiated work. 'list' shows live entries + the active capacity \
-        policy (call it before relative changes like 'double capacity'); 'update_policy' changes \
-        caps in place (only provided fields change). Concurrency caps may be 0 to hold admission; \
-        keep max_concurrent_per_trigger at 1 unless one trigger should run fires concurrently.",
+    tool_summary: "Inspect and tune the Thread Queue, the shared admission-control pool for background spawns AND user-initiated work. Call 'list' before a relative change like 'double capacity'. A concurrency cap may be 0 to hold admission; keep max_concurrent_per_trigger at 1 unless one trigger should run its fires concurrently.",
     llm: true,
     cli: true,
     sdk: false,
@@ -1942,17 +1911,17 @@ const THREAD_QUEUE_DOMAIN: Domain = Domain {
 // ---------------------------------------------------------------------------
 
 const MCP_SETUP_LLM_SCHEMA: &str = r#"{
-  "id": {"type":"string","description":"Unique identifier for this server (e.g., 'blender-mcp', 'roblox-studio'). Use lowercase with hyphens."},
-  "name": {"type":"string","description":"Human-readable name (e.g., 'Blender MCP', 'Roblox Studio MCP')"},
-  "command": {"type":"string","description":"Command to run the MCP server (e.g., 'npx', 'uvx', 'node')"},
-  "args": {"type":"array","items":{"type":"string"},"description":"Arguments for the command (e.g., ['blender-mcp'] for 'uvx blender-mcp')"},
-  "env": {"type":"object","additionalProperties":{"type":"string"},"description":"Optional environment variables for the server process"}
+  "id": {"type":"string","description":"Lowercase with hyphens, e.g. 'blender-mcp'."},
+  "name": {"type":"string","description":"Human-readable name."},
+  "command": {"type":"string","description":"Command to run the server (e.g. 'npx', 'uvx')."},
+  "args": {"type":"array","items":{"type":"string"},"description":"Arguments for the command, e.g. ['blender-mcp']."},
+  "env": {"type":"object","additionalProperties":{"type":"string"},"description":"Optional environment variables for the process."}
 }"#;
 
 const MCP_OPS: &[Operation] = &[
     Operation {
         action: "setup",
-        summary: "Register and connect a new MCP server (spawns the process and discovers its tools). web_search first to find the right package + command. (requires: id, name, command, args)",
+        summary: "Register and connect a server, spawning it and discovering its tools. (requires: id, name, command, args)",
         method: Method::Post,
         path: "/mcp/servers",
         args: &[],
@@ -2030,10 +1999,7 @@ const MCP_OPS: &[Operation] = &[
 const MCP_DOMAIN: Domain = Domain {
     name: "mcp",
     tool_name: "mcp",
-    tool_summary: "Manage MCP (Model Context Protocol) servers: 'setup' (register + connect a new \
-        server, spawning the process and discovering its tools), 'list' configured servers with \
-        their status, and 'start'/'stop'/'remove' an existing one by id. Use web_search first to \
-        find the right package + install command for the server the user wants.",
+    tool_summary: "Manage MCP (Model Context Protocol) servers. web_search first for the right package and command.",
     llm: true,
     // setup/start/stop/remove run in-process; only list has an HTTP route. No
     // app/SDK consumer manages MCP servers — declared N/A (parity per surface).
@@ -2054,7 +2020,7 @@ const MCP_DOMAIN: Domain = Domain {
 const PLUGINS_OPS: &[Operation] = &[
     Operation {
         action: "install",
-        summary: "Stage a plugin install for the user to confirm in a panel (GitHub tree URL, git URL, or a .lucidos-plugin path). Do NOT respond about success after calling — the panel resolves it. (requires: source)",
+        summary: "Stage an install for the user to confirm in a panel, which resolves the source. (requires: source)",
         method: Method::Post,
         path: "/plugins/install-request",
         args: &[],
@@ -2062,14 +2028,14 @@ const PLUGINS_OPS: &[Operation] = &[
         sdk_name: "install",
         mutating: true,
         llm_alias: Some("install_plugin"),
-        llm_schema: Some(r#"{"source":{"type":"string","description":"GitHub tree URL (e.g. 'https://github.com/lucidos-dev/plugins/tree/main/browser-learning'), a plain git URL, or an absolute path to a .lucidos-plugin file."}}"#),
+        llm_schema: Some(r#"{"source":{"type":"string","description":"A GitHub tree URL, a plain git URL, or an absolute path to a .lucidos-plugin file."}}"#),
         llm: None,
         cli: None,
         sdk: None,
     },
     Operation {
         action: "register_marketplace",
-        summary: "Register or rename a plugin marketplace (a git repo / GitHub tree URL scanned for plugin manifests) that the Plugins panel browses. (requires: source)",
+        summary: "Register or rename a marketplace, a git or GitHub tree URL the Plugins panel scans for manifests. (requires: source)",
         method: Method::Post,
         path: "/plugins/marketplaces",
         args: &[],
@@ -2089,7 +2055,7 @@ const PLUGINS_OPS: &[Operation] = &[
     },
     Operation {
         action: "check_updates",
-        summary: "Check installed plugins for newer versions at their source URL. Omit id to survey all installed plugins.",
+        summary: "Check installed plugins for newer versions at their source URL; omit id for all. A per-plugin fetch failure is an `error` entry, not an abort.",
         method: Method::Get,
         path: "/plugins/updates",
         args: &[],
@@ -2104,7 +2070,7 @@ const PLUGINS_OPS: &[Operation] = &[
     },
     Operation {
         action: "update",
-        summary: "Apply the update for one installed plugin (re-fetches the manifest, re-installs if newer). (requires: id)",
+        summary: "Re-fetch one plugin's manifest and re-install if newer; already-at-latest is a no-op. (requires: id)",
         method: Method::Post,
         path: "/plugins/update",
         args: &[],
@@ -2119,7 +2085,7 @@ const PLUGINS_OPS: &[Operation] = &[
     },
     Operation {
         action: "uninstall",
-        summary: "Stage a plugin uninstall for the user to confirm in a panel (resolves id against plugin id, manifest name, or app folder). Do NOT respond about success after calling. (requires: id)",
+        summary: "Stage an uninstall for the user to confirm in a panel. (requires: id)",
         method: Method::Post,
         path: "/plugins/uninstall-request",
         args: &[],
@@ -2127,7 +2093,7 @@ const PLUGINS_OPS: &[Operation] = &[
         sdk_name: "uninstall",
         mutating: true,
         llm_alias: Some("uninstall_plugin"),
-        llm_schema: Some(r#"{"id":{"type":"string","description":"Plugin id, manifest name, or app folder installed by the plugin (e.g. 'browser-learning'). Case- and dash/underscore/whitespace-insensitive."}}"#),
+        llm_schema: Some(r#"{"id":{"type":"string","description":"Plugin id, manifest name, or the app folder it installed. Case- and separator-insensitive."}}"#),
         llm: None,
         cli: None,
         sdk: None,
@@ -2137,11 +2103,7 @@ const PLUGINS_OPS: &[Operation] = &[
 const PLUGINS_DOMAIN: Domain = Domain {
     name: "plugins",
     tool_name: "plugins",
-    tool_summary: "Manage Lucidos plugins — coherent bundles of workspace content (apps, knowhow, \
-        triggers, scripts) another author shipped. 'install' stages a confirm panel for a plugin \
-        source, 'uninstall' stages a removal panel, 'register_marketplace' adds a marketplace source the Plugins panel browses, \
-        and 'check_updates'/'update' survey and apply newer versions. install/uninstall resolve in a \
-        panel — after calling them, do NOT claim success; the next user message reports the outcome.",
+    tool_summary: "Lucidos plugins: bundles of workspace content (apps, knowhow, triggers, scripts) another author shipped.",
     llm: true,
     // install/uninstall are a UI confirm-panel handshake (not a clean CLI); no
     // app/SDK consumer. Declared N/A — the grouped LLM tool is the agent surface.
@@ -2155,10 +2117,8 @@ const DOMAINS: &[Domain] = &[
     Domain {
         name: "notifications",
         tool_name: "notifications",
-        tool_summary: "Read and clear the notification inbox. Use 'list' to see what \
-            notifications have been sent (task errors, agent nudges, etc.), 'mark_read' \
-            to clear one by id, and 'mark_all_read' to clear the whole unread inbox. To \
-            SEND a notification, use the separate send_notification tool.",
+        tool_summary:
+            "Read and clear the notification inbox. SENDING is the separate send_notification tool.",
         llm: true,
         cli: true,
         sdk: true,
@@ -2270,7 +2230,10 @@ pub fn build_llm_tool(domain: &Domain) -> ToolDefinition {
     let mut description = String::from(domain.tool_summary);
     description.push_str("\n\nActions:");
     for op in &llm_ops {
-        description.push_str(&format!("\n• {} — {}", op.action, op.summary));
+        // Colon rather than an em dash: this string is LLM-facing prose the
+        // engine emits on every turn, so `.claude/rules/no-em-dashes.md`
+        // applies to it exactly as to a source line.
+        description.push_str(&format!("\n• {}: {}", op.action, op.summary));
         // Required-args hint: from the raw llm_schema when the op supplies one
         // (its shape may differ from the HTTP args), else from `args`.
         let required = required_arg_names(op);

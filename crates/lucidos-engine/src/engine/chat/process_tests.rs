@@ -878,11 +878,11 @@ fn chat_prompt_nudges_use_of_ask_user_question() {
          to the model when it next debates the format",
     );
     assert!(
-        rule.contains("INVOKE AS A TOOL CALL ONLY") || rule.contains("never write the tag as text"),
+        rule.contains("INVOKE IT AS A TOOL CALL, NEVER AS TEXT"),
         "chat ASK_USER_QUESTION_RULE must carry the anti-inline-tag clause \
-         (header `INVOKE AS A TOOL CALL ONLY — NEVER WRITE THE TAG AS TEXT`) \
-         — without it the rule only nudges *when* to ask, not *how*, and \
-         Opus 4.7 keeps inventing `<ask_user_question>` wrappers",
+         under a heading of its own. Without it the rule only nudges *when* \
+         to ask, not *how*, and Opus 4.7 keeps inventing \
+         `<ask_user_question>` wrappers",
     );
 }
 

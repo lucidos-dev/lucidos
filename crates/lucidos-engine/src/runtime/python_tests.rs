@@ -561,8 +561,8 @@ async fn execute_kills_subprocess_when_future_dropped() {
 // -----------------------------------------------------------------
 // truncate_python_error — context-trim tests.
 //
-// Real-world cases from `dev` thread 9d44e81c-… in the personal
-// workspace. The agent there returned ~30-line ModuleNotFoundError
+// Real-world cases from a live `dev` thread, 9d44e81c-….
+// The agent there returned ~30-line ModuleNotFoundError
 // tracebacks for every retry; the relevant signal is the exception
 // line + the user frame, so the truncator must always preserve
 // those.
@@ -760,7 +760,7 @@ fn exception_preserved_when_last_frame_has_no_source_line() {
 
 #[test]
 fn module_not_found_realistic_shape() {
-    // Reproduces the shape observed in the personal-workspace
+    // Reproduces the shape observed in a live `dev`
     // thread: short-ish stderr but the import chain through
     // `_bootstrap`, `_find_and_load`, etc. fills the frame list.
     // Under the 4-frame threshold + under byte budget → return

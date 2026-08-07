@@ -409,7 +409,12 @@ pub struct RetentionRequest {
 pub async fn get_retention(
     State(state): State<AppState>,
 ) -> Result<Json<RetentionResponse>, ApiError> {
-    let keep = backup::get_retention_count(&state.pool).await;
+    // Display only: showing the default beats failing the Settings page, and
+    // nothing is deleted off this read. The prune caller in `scheduler::backup`
+    // deliberately does NOT take the default here.
+    let keep = backup::get_retention_count(&state.pool)
+        .await
+        .unwrap_or(backup::DEFAULT_BACKUP_RETENTION);
     Ok(Json(RetentionResponse { keep }))
 }
 

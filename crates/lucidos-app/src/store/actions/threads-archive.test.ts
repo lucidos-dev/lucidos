@@ -37,7 +37,7 @@ import { _resetComposeDraftsForTesting, draftPresentThreadIds, getDraft } from '
 import { ALL_CHANNELS, archivingThreadIds, confirmState, drawerView, focusedThreadId, generatedTitleIds, getCurrentThreads, mobileView, resetCodingAgentPendingPreferences, selectedAppIds, selectedRepoIds, selectedTriggerIds, threadChannelFilter, threadDrawerOpen, threadMap, threadSearchQuery, threadSearchResults, toasts } from '../store';
 import { upsertThread } from './thread-loading';
 import { handleThreadEvent } from './thread-sync';
-import { focusThread, handleArchiveThread } from './threads';
+import { focusThread, handleArchiveThread, subscriptionsStoppedByArchive } from './threads';
 
 // Mock the API module
 vi.mock('../../api/threads', () => ({
@@ -1305,5 +1305,281 @@ describe('handleArchiveThread — unsent draft confirm', () => {
     expect(getDraft('t').text).toBe('half-written reply');
     expect(draftPresentThreadIds.value.has('t')).toBe(true);
     expect(toasts.value.some(t => t.type === 'error')).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// handleArchiveThread: the live thread-subscription confirm
+// ---------------------------------------------------------------------------
+// Archiving cancels every live *thread subscription* in the cascade, which is
+// correct and stays. It used to happen in silence: an ordinary unsaved thread
+// with no draft and three live subscriptions archived on the first tap and the
+// dispatcher cancelled all three, with nothing on screen. Now it asks, and it
+// names what each one is watching rather than printing a count.
+// ---------------------------------------------------------------------------
+
+describe('handleArchiveThread: live subscription confirm', () => {
+  beforeEach(() => {
+    toasts.value = [];
+    confirmState.value = { visible: false, message: '', okLabel: 'Delete' };
+  });
+
+  const wait = (id: string, reason: string, eventType: string) => ({
+    wait_id: id,
+    on: [{ event_type: eventType }],
+    reason,
+    expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+  });
+
+  /** Every detail line the dialog would render, headers included. */
+  function detailLines(): string[] {
+    const d = confirmState.value.details;
+    if (!d) return [];
+    return d.groups.flatMap((g) => [g.header, ...g.items]);
+  }
+
+  it('archives on one tap when the cascade holds no subscriptions', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: { id: 't', title: 'Quiet', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    focusThread('t');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    await handleArchiveThread('t');
+
+    expect(confirmState.value.visible).toBe(false);
+    expect(archiveThread).toHaveBeenCalledWith('t');
+  });
+
+  it('names what each subscription is watching, rather than printing a count', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: {
+        id: 't', title: 'Watching', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox',
+        liveEventWaitCount: 2,
+        liveEventWaits: [
+          wait('w1', 'waiting for the release build', 'ChangeProposed'),
+          wait('w2', 'waiting for the nightly import', 'OuraSleepImported'),
+        ],
+      },
+    }));
+    threadMap.value = map;
+    focusThread('t');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    expect(confirmState.value.visible).toBe(true);
+    expect(confirmState.value.message).toBe('Archiving stops 2 subscriptions. They will not fire.');
+    expect(confirmState.value.okLabel).toBe('Archive');
+    expect(confirmState.value.cancelLabel).toBe('Cancel');
+    // The agent's own reason plus the event, the same pair the subscription
+    // indicator renders.
+    expect(detailLines()).toEqual([
+      'This thread',
+      'waiting for the release build (ChangeProposed)',
+      'waiting for the nightly import (OuraSleepImported)',
+    ]);
+
+    confirmState.value.resolve?.(false); // tidy the pending promise
+    await pending;
+  });
+
+  it('Cancel aborts the archive and leaves the thread where it was', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: {
+        id: 't', title: 'Watching', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox',
+        liveEventWaitCount: 1,
+        liveEventWaits: [wait('w1', 'waiting for the release build', 'ChangeProposed')],
+      },
+    }));
+    threadMap.value = map;
+    focusThread('t');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    expect(confirmState.value.message).toBe(
+      'Archiving stops what this thread is waiting for. It will not fire.',
+    );
+    confirmState.value.resolve?.(false);
+    await pending;
+
+    expect(archiveThread).not.toHaveBeenCalled();
+    // No optimistic flip either: the thread is still in Current.
+    expect(threadMap.value.get('t')!.meta.section).toBe('inbox');
+  });
+
+  it('Archive proceeds, and the archive still cancels the subscriptions', async () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: {
+        id: 't', title: 'Watching', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox',
+        liveEventWaitCount: 1,
+        liveEventWaits: [wait('w1', 'waiting for the release build', 'ChangeProposed')],
+      },
+    }));
+    threadMap.value = map;
+    focusThread('t');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    confirmState.value.resolve?.(true);
+    await pending;
+
+    expect(archiveThread).toHaveBeenCalledWith('t');
+  });
+
+  it('walks the whole cascade, so a sub-thread parked on a long watch is counted', async () => {
+    // The parent holds none. Without the cascade walk this archives silently
+    // and takes the grandchild's subscription with it.
+    const map = new Map<string, ThreadState>();
+    map.set('parent', makeThreadState('parent', {
+      meta: { id: 'parent', title: 'Parent', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox' },
+    }));
+    map.set('child', makeThreadState('child', {
+      meta: { id: 'child', title: 'Child', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox', parentThreadId: 'parent' },
+    }));
+    map.set('grandchild', makeThreadState('grandchild', {
+      meta: {
+        id: 'grandchild', title: 'Grandchild', channel: 'chat', status: 'idle', messageCount: 1,
+        section: 'inbox', parentThreadId: 'child',
+        liveEventWaitCount: 1,
+        liveEventWaits: [wait('w1', 'waiting for the deploy to land', 'ReleasePublished')],
+      },
+    }));
+    threadMap.value = map;
+    focusThread('parent');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('parent');
+    expect(confirmState.value.visible).toBe(true);
+    // Attributed to the descendant by title, not merged into "this thread".
+    expect(detailLines()).toEqual([
+      'Grandchild',
+      'waiting for the deploy to land (ReleasePublished)',
+    ]);
+
+    confirmState.value.resolve?.(false);
+    await pending;
+  });
+
+  it('counts what it cannot name, for a sub-thread whose events were never loaded', async () => {
+    // `meta.liveEventWaits` is folded from a thread's LOADED events, so an
+    // unopened row has the projected count and an empty list. Naming nothing
+    // there is honest; omitting it would under-report what the archive stops.
+    const map = new Map<string, ThreadState>();
+    map.set('parent', makeThreadState('parent', {
+      meta: {
+        id: 'parent', title: 'Parent', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox',
+        liveEventWaitCount: 1,
+        liveEventWaits: [wait('w1', 'waiting for the release build', 'ChangeProposed')],
+      },
+    }));
+    map.set('child', makeThreadState('child', {
+      meta: {
+        id: 'child', title: 'Unopened', channel: 'chat', status: 'idle', messageCount: 1,
+        section: 'inbox', parentThreadId: 'parent',
+        liveEventWaitCount: 2,
+        liveEventWaits: [],
+      },
+    }));
+    threadMap.value = map;
+    focusThread('parent');
+
+    const pending = handleArchiveThread('parent');
+    expect(confirmState.value.message).toBe('Archiving stops 3 subscriptions. They will not fire.');
+    expect(detailLines()).toEqual([
+      'This thread',
+      'waiting for the release build (ChangeProposed)',
+      '2 more on sub-threads',
+    ]);
+
+    confirmState.value.resolve?.(false);
+    await pending;
+  });
+
+  it('asks about the draft first, then about the subscriptions', async () => {
+    // Two confirms, in the order the user meets them. Cancelling the draft one
+    // aborts before the subscription question is ever asked.
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: {
+        id: 't', title: 'Both', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox',
+        composeText: 'half-written reply',
+        liveEventWaitCount: 1,
+        liveEventWaits: [wait('w1', 'waiting for the release build', 'ChangeProposed')],
+      },
+    }));
+    threadMap.value = map;
+    focusThread('t');
+    (archiveThread as ReturnType<typeof vi.fn>).mockClear();
+
+    const pending = handleArchiveThread('t');
+    expect(confirmState.value.message).toBe('This thread has an unsent draft. Discard it too?');
+    confirmState.value.resolve?.(true); // "Keep draft"
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(confirmState.value.message).toBe(
+      'Archiving stops what this thread is waiting for. It will not fire.',
+    );
+    confirmState.value.resolve?.(true); // Archive
+    await pending;
+
+    expect(archiveThread).toHaveBeenCalledWith('t');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// subscriptionsStoppedByArchive: the count when a thread is partly loaded
+// ---------------------------------------------------------------------------
+
+describe('subscriptionsStoppedByArchive', () => {
+  const wait2 = (id: string, reason: string, eventType: string) => ({
+    wait_id: id,
+    on: [{ event_type: eventType }],
+    reason,
+    expires_at: new Date(Date.now() + 3_600_000).toISOString(),
+  });
+
+  /** A thread's events load in a window, so one holding two subscriptions can
+   *  have the newer `EventWaitStarted` inside it and the older one outside.
+   *  Counting only the all-or-nothing case named one and dropped the other,
+   *  under-reporting the total in the one dialog whose job is not to. */
+  it('counts the shortfall even when the thread named SOME of its subscriptions', () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: {
+        id: 't', title: 'Partly loaded', channel: 'chat', status: 'idle', messageCount: 1,
+        section: 'inbox',
+        liveEventWaitCount: 3,
+        liveEventWaits: [wait2('w1', 'waiting for the release build', 'ChangeProposed')],
+      },
+    }));
+    threadMap.value = map;
+
+    const stopping = subscriptionsStoppedByArchive(new Set(['t']), 't')!;
+    expect(stopping.message).toBe('Archiving stops 3 subscriptions. They will not fire.');
+    expect(stopping.details.groups.map((g) => g.header)).toEqual([
+      'This thread',
+      '2 more on sub-threads',
+    ]);
+  });
+
+  it('returns null when nothing in the cascade is watching', () => {
+    const map = new Map<string, ThreadState>();
+    map.set('t', makeThreadState('t', {
+      meta: { id: 't', title: 'Quiet', channel: 'chat', status: 'idle', messageCount: 1, section: 'inbox' },
+    }));
+    threadMap.value = map;
+    expect(subscriptionsStoppedByArchive(new Set(['t']), 't')).toBeNull();
+  });
+
+  /** A cascade id whose thread left the map between the walk and here counts
+   *  nothing, rather than throwing inside a confirm the user is waiting on. */
+  it('skips a cascade member that is no longer in the map', () => {
+    threadMap.value = new Map();
+    expect(subscriptionsStoppedByArchive(new Set(['gone']), 'gone')).toBeNull();
   });
 });

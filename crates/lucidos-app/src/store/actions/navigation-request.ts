@@ -1,5 +1,5 @@
 import { switchMenuItem, openSettingsSubview, setActiveMenu } from './menu';
-import { openAppById } from './apps';
+import { openAppById, exitAppFullscreen } from './apps';
 import { openFilePreview, openUrl } from './artifacts';
 import { resolveFileTarget } from './fileTarget';
 import { openOAuthAuthorizationUrl } from './oauth';
@@ -10,6 +10,7 @@ import { revealContentPane } from './pane';
 import { ensureFocusedComposeThread, updateCompose } from './compose';
 import { openEncodedRepoFilePreview } from './repositories';
 import { focusPromptNow } from '../../components/chat/promptFocus';
+import { isMobile } from '../../utils/viewport';
 import { showToast, panelOverlay, pluginScrollTarget, setPluginsInstalledOnly, parseRepoPath, normalizeLineRange, selectedLines, lineScrollTarget, filePreviewSource, SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, aliasRetiredSettingsSubview } from '../store';
 import type { SettingsNavKey } from '../store';
 import type { MenuItem } from '../types';
@@ -279,18 +280,42 @@ export function handleNavigationRequest(nav: {
       revealContentPane();
       break;
     case 'new-chat': {
-      // Close any open overlay (app, file preview, settings panel) so the
-      // chat panel underneath becomes the visible target for the prefill.
-      panelOverlay.value = null;
+      // On a SINGLE-PANE layout an open overlay (app, file preview, settings
+      // panel) really is covering the conversation, so it has to close for the
+      // chat panel underneath to become the visible target for the prefill.
+      // The split layout renders the thread pane and the content pane side by
+      // side and `panelOverlay` only ever affects the content one, so the
+      // conversation is already visible in its own pane: clearing there would
+      // just throw away the app the user was working in (ContentPane's
+      // `{!overlay && …}` fallback drops back to the Files panel) to reveal
+      // something that was never hidden. Same predicate the pane reveals
+      // branch on, so the two stay consistent.
+      //
+      // The split has one case where the content pane IS the whole viewport: a
+      // fullscreen app panel. Leave fullscreen there rather than closing the
+      // app, so the content pane keeps it and the compose view becomes visible
+      // beside it. (Single pane doesn't need the call: dropping the overlay
+      // unmounts the panel, which exits native fullscreen, and ends the CSS
+      // fallback through ContentHeaderActions' not-an-app-anymore effect.)
+      if (isMobile()) {
+        panelOverlay.value = null;
+      } else {
+        exitAppFullscreen();
+      }
       // Drop any focused thread so ensureFocusedComposeThread allocates a
       // fresh one — without this it returns the existing focused id and the
-      // prefill would land on whatever thread the user was viewing.
+      // prefill would land on whatever thread the user was viewing. This is
+      // also what makes the conversation visible: unfocusThread owns the
+      // `revealThreadPane()` call for the compose view (mobile swipes to the
+      // thread pane, desktop re-activates the Threads pane group and
+      // re-expands a collapsed split), so the branch must not pass the
+      // `{ revealPane: false }` bookkeeping opt-out.
       unfocusThread();
       const id = ensureFocusedComposeThread();
       if (typeof nav.prompt === 'string' && nav.prompt.length > 0) {
         updateCompose(id, { text: nav.prompt });
       }
-      // rAF — Preact hasn't committed the panelOverlay/unfocusThread mutations
+      // rAF: Preact hasn't committed the pane/unfocusThread mutations
       // yet, so a sync focus would query the pre-render DOM and miss (or hit
       // the wrong layout's) prompt-input element. Mirrors the keyboard
       // shortcut path in useKeyboardShortcuts.ts.

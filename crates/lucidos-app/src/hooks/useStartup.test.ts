@@ -171,3 +171,44 @@ describe('useStartup coalesces the iOS wake burst', () => {
     expect(src).toContain('createLeadingEdgeGate(RESUME_COALESCE_MS)');
   });
 });
+
+/**
+ * The app-facing toast bridge reaches the handler at all.
+ *
+ * `lucidos.ui.dismissToast(key)` posts a payload carrying a key and NO message,
+ * which puts it between two filters that would each swallow it silently and
+ * identically: the message-type allow-list at the top of `onAppFrameMessage`,
+ * and the "confirm and prompt carry a message" early return further down. Either
+ * one drops the message with no error anywhere, so from the app's side a dismiss
+ * simply does nothing and the spinner it was meant to clear spins forever.
+ *
+ * What the bridge DOES once reached is behaviour, tested as behaviour in
+ * `components/shared/__tests__/toast-app-bridge.test.tsx`. Only the two ordering
+ * facts that live in this file are pinned here, for the same reason as the
+ * guards above: the routing is unreachable without standing the whole hook up.
+ */
+describe('useStartup app toast bridge wiring', () => {
+  const src = stripComments(readFileSync(SOURCE, 'utf8'));
+  const body = handlerBody(src, 'function onAppFrameMessage(');
+
+  it('admits the dismiss message type past the allow-list', () => {
+    expect(body, 'a type missing from the allow-list never reaches any branch')
+      .toContain(`data.type !== 'lucidos:ui:dismissToast'`);
+  });
+
+  it('routes the toast bridge BEFORE the message guard that would swallow a dismiss', () => {
+    const bridgeAt = body.indexOf('handleAppToastMessage(');
+    const guardAt = body.indexOf(`typeof payload.message !== 'string'`);
+    expect(bridgeAt, 'the toast bridge must be wired into the handler').toBeGreaterThan(-1);
+    expect(guardAt).toBeGreaterThan(-1);
+    expect(guardAt, 'a dismiss carries no message, so the guard must come second').toBeGreaterThan(bridgeAt);
+  });
+
+  it('keeps the frame-authenticity check ahead of both', () => {
+    // An unattributed frame gets no host chrome, whatever it asked for: a nested
+    // embed must not be able to clear a toast the real app is showing.
+    const frameAt = body.indexOf('isKnownAppFrame(source)');
+    expect(frameAt).toBeGreaterThan(-1);
+    expect(body.indexOf('handleAppToastMessage(')).toBeGreaterThan(frameAt);
+  });
+});

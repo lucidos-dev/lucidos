@@ -1,13 +1,16 @@
+import { computed } from '@preact/signals';
 import { useRef, useLayoutEffect } from 'preact/hooks';
-import { toasts, dismissToast, focusedPane, speedMultiplier } from '../../store/store';
-import type { ToastType } from '../../store/types';
+import { toasts, dismissToast, focusedPane, speedMultiplier, splitRatio } from '../../store/store';
+import type { ToastItem, ToastType } from '../../store/types';
 import { CloseIcon } from './icons';
 import { parseToastMessage } from './toastMessage';
 import { linkifyText } from './linkifyText';
 import { toastAutofocusTarget, toastTabTarget } from './toastFocus';
 import { computeToastShifts } from './toastReflow';
+import { toastColumns, toastLayout } from './toastColumns';
 import { focusPaneMainControl } from '../layout/paneFocus';
 import { hasHoverPointer, prefersReducedMotion } from '../../utils/platform';
+import { viewportIsMobile } from '../../utils/viewport';
 
 // Reflow (FLIP) timing for the toast stack. When a toast is added/removed the
 // survivors are re-laid-out instantly by the flex column; these values play that
@@ -16,6 +19,13 @@ import { hasHoverPointer, prefersReducedMotion } from '../../utils/platform';
 // causes move in lockstep — keep the two in sync.
 const REFLOW_DURATION_MS = 260;
 const REFLOW_EASING = 'cubic-bezier(0.22, 0, 0, 1)';
+
+/** Which per-pane stacks the toast container lays out this frame. Derived
+ *  rather than read inline so the toast list re-renders when the LAYOUT flips,
+ *  not on every `splitRatio` write: a divider drag writes the ratio on every
+ *  pointermove, and a computed only wakes its readers when its value actually
+ *  changes. */
+const paneLayout = computed(() => toastLayout(viewportIsMobile.value, splitRatio.value));
 
 const icons: Record<ToastType, string> = {
   success: '<circle cx="12" cy="12" r="10" fill="none" stroke="currentColor" stroke-width="2"/><path d="M8 12l2.5 2.5L16 9" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
@@ -223,62 +233,80 @@ export function ToastList({ containerRef }: { containerRef?: { current: HTMLDivE
   // when the slider is off-centre.
   const entryDurationMs = REFLOW_DURATION_MS / speedMultiplier.value;
 
+  // One stack per VISIBLE pane, so a toast only ever pushes down the toasts of
+  // its own pane (`toastColumns`). The pane split is decided here rather than
+  // left to CSS because a collapsed pane has to MERGE the two stacks back into
+  // one, which no amount of positioning can do to two separate columns.
+  const columns = toastColumns(items, paneLayout.value);
+
   return (
     <div ref={containerRef} class="toast-container" onKeyDown={handleToastKeyDown}>
-      {items.map((t) => {
-        const autoTarget = toastAutofocusTarget(t);
-        return (
-          <div key={t.id} class={`toast toast-${t.type}`} style={{ animationDuration: `${entryDurationMs}ms` }} data-toast-id={t.id} data-toast-pane={t.pane}>
-            <div class="toast-body">
-              {t.spinning
-                ? <span class="mini-spinner toast-icon" />
-                : <svg class="toast-icon" viewBox="0 0 24 24" dangerouslySetInnerHTML={{ __html: icons[t.type] }} />
-              }
-              <span
-                class={`toast-message${t.onClick ? ' toast-clickable' : ''}`}
-                onClick={t.onClick}
-              >{renderMessage(t.message)}</span>
-            </div>
-            {/* Determinate progress for a long operation (a packaged update's
-                download). Absent when the operation has no honest percentage —
-                the spinner and the message carry it instead. `toastProgressWidth`
-                clamps, so a bad fraction can never paint outside the track. */}
-            {t.progress != null && (
-              <div class="progress-bar toast-progress">
-                <div class="progress-bar-fill" style={{ width: toastProgressWidth(t.progress) }} />
-              </div>
-            )}
-            {(t.action || t.secondaryAction) && (
-              <div class="toast-actions">
-                {t.secondaryAction && (
-                  <button
-                    class={`action-btn${t.secondaryAction.variant ? ' action-btn-' + t.secondaryAction.variant : ''}`}
-                    ref={autoTarget === 'secondary' ? (el) => autofocusToastButton(t.id, el) : undefined}
-                    onClick={t.secondaryAction.onClick}
-                  >{t.secondaryAction.label}</button>
-                )}
-                {t.action && (
-                  <button
-                    class={`action-btn${t.action.variant ? ' action-btn-' + t.action.variant : ''}`}
-                    ref={autoTarget === 'primary' ? (el) => autofocusToastButton(t.id, el) : undefined}
-                    onClick={t.action.onClick}
-                  >{t.action.label}</button>
-                )}
-              </div>
-            )}
-            {t.dismissable !== false && (
-              <button
-                class="icon-btn toast-close"
-                ref={autoTarget === 'close' ? (el) => autofocusToastButton(t.id, el) : undefined}
-                onClick={() => dismissToast(t.key ?? t.id)}
-                aria-label="Dismiss"
-              >
-                <CloseIcon />
-              </button>
-            )}
-          </div>
-        );
-      })}
+      {columns.map((column) => (
+        <div
+          key={column.pane ?? 'single'}
+          class="toast-column"
+          data-toast-pane={column.pane ?? undefined}
+        >
+          {column.items.map((t) => renderToast(t, entryDurationMs))}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** One toast row. A plain function rather than a component so the surrounding
+ *  `ToastList` stays hook-free and directly callable from unit tests. */
+function renderToast(t: ToastItem, entryDurationMs: number) {
+  const autoTarget = toastAutofocusTarget(t);
+  return (
+    <div key={t.id} class={`toast toast-${t.type}`} style={{ animationDuration: `${entryDurationMs}ms` }} data-toast-id={t.id}>
+      <div class="toast-body">
+        {t.spinning
+          ? <span class="mini-spinner toast-icon" />
+          : <svg class="toast-icon" viewBox="0 0 24 24" dangerouslySetInnerHTML={{ __html: icons[t.type] }} />
+        }
+        <span
+          class={`toast-message${t.onClick ? ' toast-clickable' : ''}`}
+          onClick={t.onClick}
+        >{renderMessage(t.message)}</span>
+      </div>
+      {/* Determinate progress for a long operation (a packaged update's
+          download). Absent when the operation has no honest percentage: the
+          spinner and the message carry it instead. `toastProgressWidth` clamps,
+          so a bad fraction can never paint outside the track. */}
+      {t.progress != null && (
+        <div class="progress-bar toast-progress">
+          <div class="progress-bar-fill" style={{ width: toastProgressWidth(t.progress) }} />
+        </div>
+      )}
+      {(t.action || t.secondaryAction) && (
+        <div class="toast-actions">
+          {t.secondaryAction && (
+            <button
+              class={`action-btn${t.secondaryAction.variant ? ' action-btn-' + t.secondaryAction.variant : ''}`}
+              ref={autoTarget === 'secondary' ? (el) => autofocusToastButton(t.id, el) : undefined}
+              onClick={t.secondaryAction.onClick}
+            >{t.secondaryAction.label}</button>
+          )}
+          {t.action && (
+            <button
+              class={`action-btn${t.action.variant ? ' action-btn-' + t.action.variant : ''}`}
+              ref={autoTarget === 'primary' ? (el) => autofocusToastButton(t.id, el) : undefined}
+              onClick={t.action.onClick}
+            >{t.action.label}</button>
+          )}
+        </div>
+      )}
+      {t.dismissable !== false && (
+        <button
+          class="icon-btn toast-close"
+          ref={autoTarget === 'close' ? (el) => autofocusToastButton(t.id, el) : undefined}
+          onClick={() => dismissToast(t.key ?? t.id)}
+          aria-label="Dismiss"
+        >
+          <CloseIcon />
+        </button>
+      )}
     </div>
   );
 }

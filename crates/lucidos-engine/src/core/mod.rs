@@ -20,6 +20,7 @@ pub mod knowhow;
 pub mod mcp_servers;
 pub mod models;
 pub mod oauth;
+pub mod oauth_registry;
 pub mod pinned_apps;
 pub mod plugin_marketplaces;
 pub mod plugins;
@@ -253,7 +254,8 @@ pub fn is_tmp_path(data_path: &str) -> bool {
 
 pub use apps::{App, AppManager, AppManifest};
 pub use artifacts::{
-    list_searchable_data_files, ArtifactChange, ArtifactManager, WriteAnnouncement,
+    is_vendored_path, list_searchable_data_files, ArtifactChange, ArtifactManager,
+    WriteAnnouncement,
 };
 pub use credentials::{AuthType, Credential, CredentialInfo, CredentialStore};
 pub use devices::DeviceStore;
@@ -262,6 +264,7 @@ pub use environment_variables::{EnvironmentVariable, EnvironmentVariableStore};
 pub use intents::{Intent, IntentStore};
 pub use knowhow::{Knowhow, KnowhowDirs, KnowhowStore, KnowhowSummary};
 pub use oauth::{OAuthAccount, OAuthAccountInfo, OAuthStore};
+pub use oauth_registry::OAuthProviderRow;
 pub use pinned_apps::{PinnedAppStore, PinnedAppUi};
 pub use shell::{command_shell, TaskOutcome};
 pub use system_knowhow::{is_system_knowhow_path, resolve_system_knowhow_dir, SystemKnowhowStore};
@@ -438,6 +441,51 @@ pub fn reset_index_to_head(
         }
     }
     Ok(())
+}
+
+/// Run a git2 index operation, retrying briefly while some other process holds
+/// the repository's `.git/index.lock`.
+///
+/// That lock is CROSS-PROCESS and non-blocking. Any other writer of the same
+/// repo (a merge or discard shelling out to the `git` CLI, a coding agent
+/// committing in the workspace, an operator's own `git add`) holds it for the
+/// length of its own index write, and a git2 write landing inside that window
+/// fails outright with `ErrorClass::Index` / `ErrorCode::Locked` rather than
+/// waiting for it. The window is milliseconds, so waiting it out is the only
+/// sane response: without this, a `POST /api/v1/data/edit` issued while a
+/// change applied returned a 500 that an immediate retry of the very same
+/// request would have satisfied (it fails ~half of full e2e API runs, where
+/// the suite's own git invocations are the competing writer).
+///
+/// Two things bind on callers:
+///
+/// - `op` re-runs from the start on every attempt, so it must be idempotent.
+///   Stage INSIDE it, never before: each `commit_*` here opens with
+///   `reset_index_to_head`, which is what makes a repeat safe.
+/// - It sleeps the calling thread, so call it from a blocking context
+///   (`spawn_blocking`), never straight off an async task.
+///
+/// Any other error returns at once, and the final `Locked` is returned once the
+/// budget is spent, so a genuinely stuck lock still surfaces instead of hanging.
+pub fn retry_while_index_locked<T>(
+    mut op: impl FnMut() -> Result<T, git2::Error>,
+) -> Result<T, git2::Error> {
+    const ATTEMPTS: u32 = 25;
+    const BACKOFF: std::time::Duration = std::time::Duration::from_millis(40);
+    let mut attempt = 1;
+    loop {
+        match op() {
+            Err(e)
+                if attempt < ATTEMPTS
+                    && e.class() == git2::ErrorClass::Index
+                    && e.code() == git2::ErrorCode::Locked =>
+            {
+                std::thread::sleep(BACKOFF);
+                attempt += 1;
+            }
+            settled => return settled,
+        }
+    }
 }
 
 /// Brand-new workspace: write `lucidos.toml` pinning the allocated vite
@@ -1188,6 +1236,14 @@ pub(crate) fn tool_label(name: &str, args: &serde_json::Value) -> Option<String>
                 None => "Waiting for an event...".to_string(),
             }
         }
+        "list_event_waits" => "Checking what this thread is waiting for...".to_string(),
+        // Names WHAT is being stopped rather than an id: the row sits in the
+        // transcript beside the `EventWaitStarted` step that armed it, and a
+        // uuid there is a string the user cannot resolve to anything.
+        "cancel_event_wait" => match args.get("all").and_then(|v| v.as_bool()) {
+            Some(true) => "Stopping every subscription on this thread...".to_string(),
+            _ => "Stopping a subscription...".to_string(),
+        },
         "todo_write" => match args["todos"].as_array() {
             Some(todos) if todos.is_empty() => "Clearing todo list...".to_string(),
             _ => "Updating todo list...".to_string(),

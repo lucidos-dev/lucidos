@@ -435,7 +435,7 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                 </ul>
               )}
 
-              <div class="removable-input-row">
+              <div class={`input-with-action${cronError ? ' input-error' : ''}`}>
                 <input
                   type="text"
                   value={cronInput}
@@ -445,7 +445,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                   }}
                   onKeyDown={handleCronKeyDown}
                   placeholder="0 0 8 * * *"
-                  class={cronError ? 'input-error' : ''}
                 />
                 <button
                   type="button"

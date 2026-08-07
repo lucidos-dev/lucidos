@@ -92,6 +92,65 @@ describe('lucidos.ui.applyPreferences — device-scoped fetch', () => {
 
     expect(styleMock.background).toBe('#ffffff');
   });
+
+  it('publishes ligatures to the iframe as OFF for text and ON for code', async () => {
+    // The OFF value is the explicit zeros, never `normal`: liga and calt are
+    // default-ON in CSS, so `normal` means "the font's defaults" and renders
+    // byte-identically to `1`, which is how an earlier attempt at this fix
+    // shipped as a no-op. The values render nothing until the two rules in the
+    // engine's api/sdk_iframe.css consume them. Mirrors the host-side
+    // assertion in actions/preferences.test.ts.
+    globalThis.fetch = vi.fn(async () => new Response(
+      JSON.stringify({ preferences: { theme: 'light', 'font-family': 'fira-code' } }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    )) as unknown as typeof globalThis.fetch;
+
+    const inlineProps: Record<string, string> = {};
+    const realStyle = (document as any).documentElement.style;
+    (document as any).documentElement.style = {
+      setProperty: (k: string, v: string) => { inlineProps[k] = v; },
+      getPropertyValue: (k: string) => inlineProps[k] ?? '',
+      removeProperty: (k: string) => { delete inlineProps[k]; },
+      background: '',
+    };
+    // fira-code is a Google font, so applyPreferences appends a <link>; the
+    // test-setup document stub has no `head`.
+    const realHead = (document as any).head;
+    (document as any).head = { appendChild: () => {} };
+
+    try {
+      await lucidos.ui.applyPreferences();
+    } finally {
+      (document as any).documentElement.style = realStyle;
+      (document as any).head = realHead;
+    }
+
+    expect(inlineProps['--font-features-text']).toBe('"liga" 0, "calt" 0');
+    expect(inlineProps['--font-features-code']).toBe('"liga" 1, "calt" 1');
+    expect(inlineProps['font-feature-settings']).toBeUndefined();
+  });
+
+  it('resolves both properties to normal for a font that ships no ligatures', async () => {
+    // beforeEach's mock returns no font-family, so the SDK falls back to
+    // monospace: both must clear rather than leave a stale value behind.
+    const inlineProps: Record<string, string> = {};
+    const realStyle = (document as any).documentElement.style;
+    (document as any).documentElement.style = {
+      setProperty: (k: string, v: string) => { inlineProps[k] = v; },
+      getPropertyValue: (k: string) => inlineProps[k] ?? '',
+      removeProperty: (k: string) => { delete inlineProps[k]; },
+      background: '',
+    };
+
+    try {
+      await lucidos.ui.applyPreferences();
+    } finally {
+      (document as any).documentElement.style = realStyle;
+    }
+
+    expect(inlineProps['--font-features-text']).toBe('normal');
+    expect(inlineProps['--font-features-code']).toBe('normal');
+  });
 });
 
 // The systemic theme bug: `applyPreferences()` ran AFTER sdk-prefs.js (which

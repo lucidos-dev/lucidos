@@ -32,7 +32,9 @@ tool, and:
    consumes it. `await_event` is a rendezvous, not a stream.
 3. **A watermark plus a catch-up scan closes the restart gap.** Each wait
    records the event `sequence` at registration; registration and boot recovery
-   run the same forward scan.
+   run the same forward scan. The scan stays **forward-only**: what happened
+   before the wait existed is reported to the model, never delivered to it (see
+   the arming lookback below).
 4. **One predicate language.** `EventSubscription` and its matcher moved out of
    `triggers/` to `core::event_subscription` and are shared verbatim, so a
    `condition` that fires for a trigger fires for a wait.
@@ -63,6 +65,29 @@ field rather than a special case: events that landed while the engine was down,
 and the live race between emitting `EventWaitStarted` and the dispatcher
 inserting its cache entry. Both are "events after sequence N that I have not
 matched yet."
+
+**The third gap is reported, not closed** (added 2026-08-06). The gap the
+watermark cannot cover is the stretch between the model deciding to wait and the
+call landing: a thread checked the change list, spent 84 seconds spawning an
+unrelated thread, and armed a wait 26 seconds after the `ChangeProposed` it
+wanted had already landed, 34 sequences below its own watermark. Registration
+now scans a short window backwards (the **arming lookback**) and puts what it
+finds in the tool result.
+
+Two repairs were rejected, and both are the obvious next proposal. **Backdating
+the watermark** so the catch-up scan delivers the match is wrong because a turn
+is not short: one ran 95 minutes that same day driving a release build, and it
+would have resolved instantly off a change the model applied ninety minutes
+earlier. A wait resolved on the wrong event is worse than one that times out,
+because a timeout is reported to the user while a wrong wake makes the thread
+act. **Scoping the window to the turn** is wrong for a sharper reason: the model
+decides to subscribe mid-turn, so events from early in a long turn are
+archaeology rather than a missed rendezvous, and the turn boundary has nothing
+to do with when the model started caring. The window is therefore a stated
+constant. Reporting rather than delivering is also what lets it be approximate:
+the cost of naming one event too many is a sentence the model reads, and only
+the model can tell "I missed this" from "I handled this", because only the model
+has the turn in its context.
 
 **Attachment is derived, never stored.** The elegant property of the design is
 that the model's `await_event` tool call stays unpaired across the park, so the

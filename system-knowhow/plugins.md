@@ -259,7 +259,7 @@ A plugin ships a trigger by declaring it in a **`trigger.toml`** at
 `triggers/<slug>/trigger.toml` — mirroring how an app is its own folder
 (`apps/<id>/manifest.json`). The file is a *trigger definition* (see
 `triggers.md` § "On-disk trigger definition"): `name`, `run`
-(`intent` or `script`), `on` (event subscriptions), and the usual optional
+(`intent` or `script`), `on` (trigger subscriptions), and the usual optional
 fields (`app_id`, `go_to_review`, `group_id`, `side_effect_grant`). Put any
 procedure the trigger needs in `triggers/<slug>/knowhow/`, beside it.
 

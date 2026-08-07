@@ -1209,6 +1209,63 @@ async fn reconcile_re_adds_user_slot_after_question_answered() {
     teardown_test_db(&f.db).await;
 }
 
+/// The guard's backstop has to survive the park/resume round trip above.
+/// `reconcile_user_slot` used to RE-FILE the resumed slot under a fresh `Uuid`,
+/// so the gate's `UserSlotGuard` (which matches its own `entry_id`) could never
+/// release it again. Pair that with a settle missed on broadcast lag and the
+/// slot leaked for the life of the process; enough leaks and every chat POST
+/// blocks on the pool. The resume now re-files under the parked key.
+///
+/// The fix is deliberately NOT a release-by-thread fallback: after a second
+/// gate for the same thread that would drop the NEWER request's slot and admit
+/// queued work above the pool limit.
+#[tokio::test]
+async fn a_dropped_guard_still_releases_a_slot_that_survived_a_park_resume() {
+    let f = fixture(2).await;
+    f.queue.spawn_settle_subscriber();
+    let tid = Uuid::new_v4();
+    emit_message_received(&f.bus, tid).await;
+
+    let release = spawn_user_slot(f.queue.clone(), tid);
+    let q = f.queue.clone();
+    wait_until(|| {
+        let q = q.clone();
+        async move { user_status(&q, tid).await == Some("admitted") }
+    })
+    .await;
+
+    for event in [user_question_asked(), user_question_answered()] {
+        let expect_admitted = matches!(
+            event,
+            crate::engine::thread_events::ThreadEvent::UserQuestionAnswered { .. }
+        );
+        f.bus
+            .emit(BusEvent::Thread {
+                thread_id: tid,
+                event,
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            })
+            .await
+            .expect("park/resume emit");
+        wait_until(|| {
+            let q = q.clone();
+            async move { (user_status(&q, tid).await == Some("admitted")) == expect_admitted }
+        })
+        .await;
+    }
+
+    // The chat task ends. Its guard must still find the re-filed slot.
+    drop(release);
+    wait_until(|| {
+        let q = q.clone();
+        async move { user_status(&q, tid).await.is_none() }
+    })
+    .await;
+
+    f.pool.close().await;
+    teardown_test_db(&f.db).await;
+}
+
 #[tokio::test]
 async fn reconcile_frees_the_pool_when_thread_leaves_running_under_a_held_guard() {
     let f = fixture(1).await;

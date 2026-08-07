@@ -64,23 +64,25 @@
    permissions a backup needs): they sit in the same slot, say the same kind of
    thing and offer the same kind of button, so they must not be spaced or sized
    differently. They were, because the not-granted half was an inline
-   `style="display: flex; …"` copy of this rule that had lost its bottom margin
-   and its wrap, which is why the red line, its button and the row below all
-   collided in the reported screenshot.
+   `style="display: flex; …"` copy of this rule that had lost its bottom margin,
+   which is why the red line, its button and the row below all collided in the
+   reported screenshot.
 
-   A row rather than a sentence because the fix is a place to go rather than a
-   path to walk, and it wraps so the button drops below the text on a narrow
-   pane instead of squeezing it.
+   A button rather than a sentence because the fix is a place to go rather than
+   a path to walk, and it sits on its own line under the message at every pane
+   width: side by side, the red line and a green button read as one strip of
+   competing colour, and the button's position drifted with the length of the
+   provider name until the pane got narrow enough to wrap it.
 
    One step up the type scale from the --font-size-xs the not-connected half
    used, deliberately: it now sits alongside a permission name the user has to
    read and act on, and it matches the health card and the section description
    directly above it, which is the rest of what this page says in prose. */
-.backup-blocked-row {
+.backup-blocked-state {
     display: flex;
-    align-items: center;
+    flex-direction: column;
+    align-items: flex-start;
     gap: var(--space-sm);
-    flex-wrap: wrap;
     margin-bottom: var(--space-sm);
     font-size: var(--font-size-sm);
     color: var(--accent-red);

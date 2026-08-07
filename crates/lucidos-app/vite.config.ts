@@ -264,7 +264,7 @@ export default defineConfig({
   plugins: [buildIdVirtualModule(), suppressMergeReload(), syncPublicDir(), stampServiceWorker(), preact(), atomicDistPublish()],
   build: {
     // The eager entry chunk is the first-paint-critical app core (shell, store,
-    // SSE/event handling, signals, layout) — ~517 kB minified / ~154 kB gzipped,
+    // SSE/event handling, signals, layout): ~585 kB minified / ~179 kB gzipped,
     // a healthy first-load for a feature-rich SPA. Views are already extensively
     // lazy-loaded and the heavy libs (marked, highlight.js) + the framework
     // (vendor, below) are split out, so the remaining core is irreducible without
@@ -272,6 +272,15 @@ export default defineConfig({
     // metric. Rollup's 500 kB default advisory is too conservative here; raise it
     // to 600 kB so the guard still fires on a genuine regression (e.g. a heavy
     // lib accidentally pulled into the eager graph) without flagging the baseline.
+    //
+    // 600 is a CEILING, not a budget to spend: it was tripped once already, by
+    // ordinary app growth rather than by any one heavy import, and the fix was to
+    // code-split the workspace picker out of the entry chunk (main.tsx), not to
+    // raise the number. Raising it is the move this repo has already made and
+    // backed out of once ("bump chunkSizeWarningLimit to 800 for SPA bundle",
+    // reverted two commits later once real code-splitting landed). When this
+    // fires again, find the next thing the eager graph does not need on first
+    // paint.
     chunkSizeWarningLimit: 600,
     rollupOptions: {
       output: {

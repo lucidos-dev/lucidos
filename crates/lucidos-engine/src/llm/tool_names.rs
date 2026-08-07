@@ -168,6 +168,13 @@ pub const ASK_USER_QUESTION: &str = "ask_user_question";
 /// `event_wait::settle_legacy_attached_event_waits`, which closes the unpaired
 /// `await_event` calls left by the pre-2026-08-06 shape.
 pub const AWAIT_EVENT: &str = "await_event";
+/// Read the calling thread's own live subscriptions. The answer to "is that
+/// watch still armed?", which the agent previously had no way to get right.
+pub const LIST_EVENT_WAITS: &str = "list_event_waits";
+/// Stand one of the calling thread's own subscriptions down, or all of them.
+/// The revoke half of `await_event`: without it an agent told to stop watching
+/// had to admit the subscription would wake it later regardless.
+pub const CANCEL_EVENT_WAIT: &str = "cancel_event_wait";
 
 // Image generation
 pub const GENERATE_IMAGE: &str = "generate_image";

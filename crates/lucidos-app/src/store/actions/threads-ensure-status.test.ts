@@ -418,8 +418,11 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
     // Scenario: SSE creates a CC thread skeleton with status='running'
     // (from CodingAgentThreadSpawned). Then loadAllThreads runs and the API doesn't
     // include this thread in the active set (Claude Code session hasn't registered yet).
-    // Previously, upsertThread would set status='idle', causing the
-    // thread to show in Archive instead of Active.
+    // The API snapshot is NOT older than the live `updatedAt`, so
+    // `upsertThread`'s staleness guard lets it through and the server's
+    // 'idle' replaces the skeleton's 'running'. `eventsLoaded` plays no part
+    // in that decision (the sibling case below pins the same outcome with it
+    // set), so the two differ only in setup.
     const map = new Map<string, ThreadState>();
     map.set('cc-1', makeThreadState('cc-1', {
       meta: {
@@ -456,7 +459,8 @@ describe('CC thread spawned by chat — status from API is authoritative', () =>
 
     await loadAllThreads();
 
-    // status must NOT be downgraded — events not loaded yet, SSE skeleton's running status takes precedence
+    // The API status is authoritative: a non-stale snapshot overwrites the SSE
+    // skeleton's 'running'.
     expect(threadMap.value.get('cc-1')!.meta.status).toBe('idle');
   });
 

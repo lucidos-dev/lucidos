@@ -249,6 +249,56 @@ pub fn bind_socket_addrs(choice: &BindChoice, port: u16) -> Vec<SocketAddr> {
     }
 }
 
+/// [`bind_socket_addrs`] split by what a bind failure MEANS, which is not the
+/// same question as which addresses to listen on.
+///
+/// `required` is the set the gateway cannot usefully run without: failing to
+/// bind one is fatal, exactly as every address was before this split existed.
+/// `optional` is the set that may simply not exist yet, so a failure there is
+/// retried in the background rather than taken as the end of the process.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindPlan {
+    /// Fatal on failure. Never empty.
+    pub required: Vec<SocketAddr>,
+    /// Retried on failure, forever, with backoff. Usually empty.
+    pub optional: Vec<SocketAddr>,
+}
+
+/// Split the addresses for a resolved choice into fatal and retryable.
+///
+/// **Only a configured `Address(ip)` is optional**, and only the `ip` half of
+/// it: loopback stays required. That asymmetry is the whole point. A tailnet or
+/// LAN address is a *reachability addition* whose interface may not be up when
+/// launchd starts the service at boot (`tailscaled` assigns the `100.x` address
+/// well after login), and binding it then fails with `EADDRNOTAVAIL`. Before
+/// this split, that failure took the loopback listener down with it and the
+/// packaged window sat on its "Starting Lucidos…" splash for two minutes waiting
+/// for a gateway that had already exited. Loopback is what the desktop client,
+/// each engine's Apply-restart callback and the dev control POSTs actually
+/// speak, so a machine that can serve loopback can serve its user.
+///
+/// `Loopback` and `All` keep fail-fast: their single address is required. An
+/// operator who asked to be reachable on all interfaces is owed an error when
+/// that cannot happen, not a quiet demotion, and a failure there is a held port
+/// rather than an absent interface.
+pub fn bind_plan(choice: &BindChoice, port: u16) -> BindPlan {
+    let addrs = bind_socket_addrs(choice, port);
+    match choice {
+        BindChoice::Loopback | BindChoice::All => BindPlan {
+            required: addrs,
+            optional: Vec::new(),
+        },
+        // `bind_socket_addrs` puts the configured address first and appends
+        // loopback, and collapses the two when the configured address IS
+        // loopback (leaving one entry, which is required).
+        BindChoice::Address(_) => {
+            let loopback = SocketAddr::from((Ipv4Addr::LOCALHOST, port));
+            let (required, optional) = addrs.into_iter().partition(|a| *a == loopback);
+            BindPlan { required, optional }
+        }
+    }
+}
+
 /// Human-readable scope for the startup log — reports the actual address chosen.
 /// A specific address notes the retained loopback (see [`bind_socket_addrs`]).
 pub fn bind_scope_label(choice: &BindChoice) -> String {
@@ -397,6 +447,83 @@ mod tests {
         assert_eq!(
             bind_socket_addrs(&BindChoice::Address(loop4), 5251),
             vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 5251))]
+        );
+    }
+
+    #[test]
+    fn bind_plan_makes_only_the_configured_address_optional() {
+        // The failure this split exists for: the tailnet address is not up at
+        // boot, and loopback must serve anyway.
+        let plan = bind_plan(&BindChoice::Address(TAILNET.parse().unwrap()), 5251);
+        assert_eq!(
+            plan.required,
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 5251))]
+        );
+        assert_eq!(
+            plan.optional,
+            vec![SocketAddr::from((TAILNET.parse::<IpAddr>().unwrap(), 5251))]
+        );
+    }
+
+    #[test]
+    fn bind_plan_keeps_loopback_and_all_fail_fast() {
+        // An operator who asked for all interfaces is owed an error, not a quiet
+        // demotion to loopback, so neither of these has anything retryable.
+        for choice in [BindChoice::Loopback, BindChoice::All] {
+            let plan = bind_plan(&choice, 5251);
+            assert_eq!(plan.required, bind_socket_addrs(&choice, 5251));
+            assert!(
+                plan.optional.is_empty(),
+                "{choice:?} must have no retryable address"
+            );
+        }
+    }
+
+    #[test]
+    fn bind_plan_of_explicit_loopback_is_required_and_not_duplicated() {
+        let plan = bind_plan(&BindChoice::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)), 5251);
+        assert_eq!(
+            plan.required,
+            vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 5251))]
+        );
+        assert!(plan.optional.is_empty());
+    }
+
+    #[test]
+    fn every_bind_plan_has_something_required() {
+        // A plan with an empty `required` would serve nothing at all while
+        // reporting success, which is worse than the fail-fast it replaced.
+        for choice in [
+            BindChoice::Loopback,
+            BindChoice::All,
+            BindChoice::Address(TAILNET.parse().unwrap()),
+            BindChoice::Address(IpAddr::V4(Ipv4Addr::LOCALHOST)),
+        ] {
+            assert!(
+                !bind_plan(&choice, 5251).required.is_empty(),
+                "{choice:?} must bind something fatally"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unassigned_address_fails_to_bind_while_loopback_succeeds() {
+        // Pins the OS behaviour the whole fix rests on, rather than assuming it:
+        // binding an address this machine does not hold fails with
+        // `AddrNotAvailable` (the `Os { code: 49 }` from the reported stall),
+        // and it fails INDEPENDENTLY of the loopback bind in the same plan.
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737), assigned on no machine.
+        let plan = bind_plan(&BindChoice::Address("192.0.2.1".parse().unwrap()), 0);
+        let required = std::net::TcpListener::bind(plan.required[0]);
+        assert!(
+            required.is_ok(),
+            "loopback must bind even though the configured address cannot"
+        );
+        let optional = std::net::TcpListener::bind(plan.optional[0]);
+        assert_eq!(
+            optional.err().map(|e| e.kind()),
+            Some(std::io::ErrorKind::AddrNotAvailable),
+            "an unassigned address must be reported as unavailable, not held"
         );
     }
 

@@ -223,6 +223,38 @@ pub async fn seed_oauth_account(
     token_expiry: Option<chrono::DateTime<chrono::Utc>>,
     scopes: &str,
 ) -> Result<uuid::Uuid, sqlx::Error> {
+    seed_oauth_account_with_desired(
+        pool,
+        provider,
+        email,
+        display_name,
+        access_token,
+        refresh_token,
+        token_expiry,
+        scopes,
+        scopes,
+    )
+    .await
+}
+
+/// Seed an account whose GRANTED scopes differ from the set it was ASKED for.
+///
+/// The shape a provider produces when it refuses part of a request (a Dropbox
+/// app whose Permissions tab has not enabled a scope). [`seed_oauth_account`]
+/// cannot express it: it seeds granted and desired identically, which is the
+/// ordinary case and says nothing about recovery.
+#[allow(clippy::too_many_arguments)] // mirrors the store's column list
+pub async fn seed_oauth_account_with_desired(
+    pool: &PgPool,
+    provider: &str,
+    email: Option<&str>,
+    display_name: Option<&str>,
+    access_token: &str,
+    refresh_token: Option<&str>,
+    token_expiry: Option<chrono::DateTime<chrono::Utc>>,
+    scopes: &str,
+    desired_scopes: &str,
+) -> Result<uuid::Uuid, sqlx::Error> {
     let (bus, _callback_rx) = EventBus::new(pool.clone());
     crate::core::OAuthStore::connect(
         pool,
@@ -234,6 +266,7 @@ pub async fn seed_oauth_account(
         refresh_token,
         token_expiry,
         scopes,
+        desired_scopes,
         None,
     )
     .await

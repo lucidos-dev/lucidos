@@ -37,7 +37,11 @@ with open(os.path.join(_STATE, "result.json"), "w") as f:
 print("ok")
 "#;
 
-fn write_probe_trigger(slug: &str) -> PathBuf {
+/// Async only so it can take the shared-tree read guard: these files appearing
+/// in the working tree must not land mid-snapshot for the command-checkpoint
+/// test (see `workspace_tree_lock`).
+async fn write_probe_trigger(slug: &str) -> PathBuf {
+    let _tree = crate::support::workspace_tree_lock().read().await;
     let trigger_dir = workspace_path().join("data/triggers").join(slug);
     std::fs::create_dir_all(trigger_dir.join("scripts")).expect("create scripts dir");
     std::fs::create_dir_all(trigger_dir.join("state")).expect("create state dir");
@@ -74,7 +78,9 @@ async fn find_trigger_id(client: &reqwest::Client, name: &str) -> Option<String>
 /// would leave the e2e workspace's working tree dirty for every later test.
 /// Best-effort: the engine may hold `index.lock` for another run's auto-commit,
 /// and a failed cleanup must not fail the assertion this test exists for.
-fn remove_and_commit(trigger_dir: &Path, slug: &str) {
+async fn remove_and_commit(trigger_dir: &Path, slug: &str) {
+    // Removing them is a working-tree change too; same guard as the write.
+    let _tree = crate::support::workspace_tree_lock().read().await;
     let _ = std::fs::remove_dir_all(trigger_dir);
     let pathspec = format!("data/triggers/{}", slug);
     // Pathspec form: commits the working-tree state of exactly these paths,
@@ -111,7 +117,7 @@ async fn script_trigger_runs_in_place_and_reaches_its_sibling_state_dir() {
     let name = format!("In-place probe {}", slug);
     let event_type = format!("E2eInPlaceProbe{}", slug.replace('-', ""));
 
-    let trigger_dir = write_probe_trigger(&slug);
+    let trigger_dir = write_probe_trigger(&slug).await;
 
     let created: serde_json::Value = client
         .post(format!("{}/api/v1/triggers", base_url()))
@@ -159,7 +165,7 @@ async fn script_trigger_runs_in_place_and_reaches_its_sibling_state_dir() {
             .send()
             .await;
     }
-    remove_and_commit(&trigger_dir, &slug);
+    remove_and_commit(&trigger_dir, &slug).await;
     let _ = std::fs::remove_dir_all(&phantom);
 
     assert!(

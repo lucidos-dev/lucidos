@@ -5,9 +5,10 @@
 //! `data/config/apis.json` but matches one of the model-registry providers
 //! (`vertex`, `openai`, `openrouter`, `anthropic`, `local`), the engine
 //! synthesizes the upstream target here — the provider's API base URL plus a
-//! server-side auth layer sourced from the engine's OWN provider credentials —
-//! so a workspace never has to duplicate a provider credential into
-//! `apis.json`.
+//! server-side auth layer sourced from the engine's OWN provider auth, resolved
+//! exactly as the LLM providers resolve it (a stored credential first, then the
+//! provider's env fallback), so a workspace never has to duplicate a provider
+//! credential into `apis.json`.
 //!
 //! **Precedence.** `apis.json` is consulted first (`resolve_proxy_target`);
 //! this fallback fires only on that 404, so an `apis.json` entry with the same
@@ -32,8 +33,8 @@ use crate::core::{
 };
 use crate::llm::vertex::{self, TokenCache};
 use crate::llm::{
-    resolve_bearer_key, resolve_openai_api_key, ANTHROPIC_API_BASE_URL, OPENAI_DEFAULT_BASE_URL,
-    OPENROUTER_BASE_URL,
+    resolve_anthropic_auth, resolve_bearer_key, resolve_openai_api_key, AnthropicAuth,
+    ANTHROPIC_API_BASE_URL, OPENAI_DEFAULT_BASE_URL, OPENROUTER_BASE_URL,
 };
 use async_trait::async_trait;
 use axum::http::{HeaderName, StatusCode};
@@ -127,43 +128,46 @@ async fn resolve_openrouter(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (Statu
 }
 
 async fn resolve_anthropic(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (StatusCode, String)> {
-    let Some((auth_type, value)) = credential_pair(pool, "anthropic").await? else {
+    let cred = credential_pair(pool, "anthropic").await?;
+    // Same resolution order as the Anthropic LLM provider: credential → env.
+    // A credential whose auth_type carries no usable Anthropic auth is logged
+    // and skipped inside the resolver, so it falls through to the env var here
+    // exactly as it does at provider-build time.
+    let auth = resolve_anthropic_auth(cred, std::env::var("ANTHROPIC_API_KEY").ok());
+    anthropic_target(auth.map(|(auth, _source)| auth))
+}
+
+/// Shape the `anthropic` builtin target from already-resolved auth. Split from
+/// the credential/env read above so the per-auth-kind header shaping is
+/// testable without mutating process env.
+fn anthropic_target(auth: Option<AnthropicAuth>) -> Result<BuiltinTarget, (StatusCode, String)> {
+    let Some(auth) = auth else {
         return Err(unconfigured_msg(
             "anthropic",
-            "a credential",
-            "add an 'anthropic' credential in Settings → Models → Providers",
+            "an Anthropic API key or OAuth token",
+            "add an 'anthropic' credential in Settings → Models → Providers, set ANTHROPIC_API_KEY",
         ));
     };
-    let value = value.trim().to_string();
-    if value.is_empty() {
-        return Err(unconfigured_msg(
-            "anthropic",
-            "a non-empty credential value",
-            "set the 'anthropic' credential in Settings → Models → Providers",
-        ));
-    }
     // API keys go on `x-api-key`; OAuth subscription tokens on
-    // `Authorization: Bearer` — mirrors `anthropic::chat::auth_header`.
-    let layers: Vec<Arc<dyn AuthLayer>> = match auth_type {
-        AuthType::ApiKey => vec![Arc::new(
-            StaticHeaderLayer::api_key("anthropic".to_string(), "x-api-key", value).map_err(
-                |e| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        format!("failed to build anthropic auth header: {e}"),
-                    )
-                },
-            )?,
+    // `Authorization: Bearer`. Mirrors `anthropic::chat::auth_header`.
+    let layers: Vec<Arc<dyn AuthLayer>> = match auth {
+        AnthropicAuth::ApiKey(key) => vec![Arc::new(
+            StaticHeaderLayer::api_key("anthropic".to_string(), "x-api-key", key).map_err(|e| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to build anthropic auth header: {e}"),
+                )
+            })?,
         )],
         // An OAuth subscription token ALSO requires the `anthropic-beta` OAuth
         // companion header — the direct provider adds it via
         // `anthropic_beta_header`. It's part of what makes OAuth auth work, and
         // the app can't add it (it doesn't know the credential is OAuth), so the
         // engine injects it here too.
-        AuthType::Bearer => vec![
+        AnthropicAuth::OAuthBearer(token) => vec![
             Arc::new(StaticHeaderLayer::bearer(
                 "anthropic-auth".to_string(),
-                value,
+                token,
             )),
             Arc::new(
                 StaticHeaderLayer::api_key(
@@ -179,14 +183,6 @@ async fn resolve_anthropic(pool: &sqlx::PgPool) -> Result<BuiltinTarget, (Status
                 })?,
             ),
         ],
-        other => {
-            return Err((
-                StatusCode::NOT_FOUND,
-                format!(
-                    "proxy 'anthropic' credential auth_type {other} is unsupported (expected api_key or bearer)"
-                ),
-            ));
-        }
     };
     Ok((ANTHROPIC_API_BASE_URL.to_string(), layers))
 }
@@ -487,7 +483,8 @@ mod tests {
     }
 
     /// An `anthropic` API-key credential is injected on `x-api-key` (not
-    /// `Authorization`), mirroring the Anthropic LLM path.
+    /// `Authorization`), mirroring the Anthropic LLM path. The credential wins
+    /// over any ambient `ANTHROPIC_API_KEY`, so this is deterministic in CI.
     #[tokio::test]
     async fn resolve_anthropic_api_key_injects_x_api_key() {
         let (pool, db) = setup_test_db().await;
@@ -543,11 +540,32 @@ mod tests {
         teardown_test_db(&db).await;
     }
 
+    /// With no stored credential, an `ANTHROPIC_API_KEY` in the environment
+    /// resolves the builtin proxy and is injected on `x-api-key` (an exported
+    /// key is a pay-per-token API key, never a subscription token). Driven
+    /// through the resolver + target shaping rather than by mutating process
+    /// env, which would race every other test in the binary.
+    #[tokio::test]
+    async fn anthropic_env_key_resolves_and_injects_x_api_key() {
+        let auth = resolve_anthropic_auth(None, Some("sk-ant-env".to_string()))
+            .map(|(auth, _source)| auth);
+        let target = anthropic_target(auth).expect("the env key resolves the builtin");
+        assert_eq!(target.0, ANTHROPIC_API_BASE_URL);
+        assert_eq!(
+            injected_headers(&target).await,
+            vec![("x-api-key".to_string(), "sk-ant-env".to_string())]
+        );
+    }
+
     /// A recognized-but-unconfigured builtin returns an actionable 404 that
-    /// names the provider and the `apis.json` escape hatch. Anthropic has no env
-    /// fallback, so "no credential → 404" is deterministic in CI.
+    /// names the provider and the `apis.json` escape hatch. Skipped when
+    /// `ANTHROPIC_API_KEY` is exported: the proxy honors that fallback, so
+    /// resolving is then correct and "no credential → 404" is not.
     #[tokio::test]
     async fn resolve_anthropic_unconfigured_is_actionable_404() {
+        if std::env::var("ANTHROPIC_API_KEY").is_ok() {
+            return;
+        }
         let (pool, db) = setup_test_db().await;
         let err = match resolve_anthropic(&pool).await {
             Ok(_) => panic!("no anthropic credential must be unconfigured"),

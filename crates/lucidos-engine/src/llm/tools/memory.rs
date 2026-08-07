@@ -13,13 +13,13 @@ pub(super) fn dismiss_from_context_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::DISMISS_FROM_CONTEXT.to_string(),
-            description: "Drop a prior tool result or child-thread completion from your future resume context. Use when you're done with that information and want to keep your context lean across long pipelines. Pass the event_id from prior history: tool blocks show `evt-<uuid>` as the tool_use_id, and ChildThreadCompleted blocks include an `event_id: <uuid>` line. Either form is accepted.".to_string(),
+            description: "Drop a prior tool result or child-thread completion from your future resume context, to keep it lean across a long pipeline. Pass the event_id from history: a tool block shows `evt-<uuid>` as its tool_use_id, a ChildThreadCompleted block carries an `event_id: <uuid>` line, and either form is accepted.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "event_id": {
                         "type": "string",
-                        "description": "Event id of the ToolCalled or ChildThreadCompleted event to dismiss. Accepts either the bare UUID (hyphenated or simple) or the `evt-<uuid>` form rendered as tool_use_id in tool blocks."
+                        "description": "Event id of the ToolCalled or ChildThreadCompleted event to dismiss. Bare UUID or the `evt-<uuid>` form."
                     }
                 },
                 "required": ["event_id"]

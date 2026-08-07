@@ -2,11 +2,14 @@
  * `handleOAuthAccountConnected`: what happens the moment an authorization the
  * user completed in a BROWSER lands back in the engine.
  *
- * The device scoping is the whole point and is what these tests exist to pin.
- * The engine stamps the flow's initiating device onto `OAuthAccountConnected`
- * (see `prepare_oauth_flow`), and only that device may be fronted. An account
- * connected from a phone must not yank a desktop window forward, and an
- * engine-internal reconnect (no actor) belongs to nobody.
+ * The scoping is the whole point and is what these tests exist to pin, and it
+ * has two levels. The engine stamps the flow's initiating device onto
+ * `OAuthAccountConnected` (see `prepare_oauth_flow`), and only that device is
+ * told: an account connected from a phone must not yank a desktop window
+ * forward, and an engine-internal reconnect (no actor) belongs to nobody. The
+ * WINDOW fronting is narrower still, because a device id is per-app and every
+ * window of the desktop app shares it: only the page that opened the
+ * authorization URL fronts itself.
  */
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { oauthAccounts, panelOverlay, toasts } from '../store';
@@ -23,10 +26,10 @@ vi.mock('../../utils/platform', () => ({
   isIOS: () => false,
 }));
 
-const focusMainWindow = vi.hoisted(() => vi.fn());
+const focusCallingWindow = vi.hoisted(() => vi.fn());
 const openExternal = vi.hoisted(() => vi.fn(() => Promise.resolve()));
 vi.mock('../../utils/tauri', () => ({
-  focusMainWindow,
+  focusCallingWindow,
   openExternal,
   setTitlebarColor: () => Promise.resolve(),
 }));
@@ -48,7 +51,7 @@ vi.mock('./artifacts', () => ({ openUrl }));
 const {
   handleOAuthAccountConnected,
   openOAuthAuthorizationUrl,
-  oauthAuthPanelUrl,
+  oauthAuthFlow,
   grantOAuthScope,
 } = await import('./oauth');
 
@@ -66,10 +69,10 @@ describe('handleOAuthAccountConnected', () => {
   beforeEach(() => {
     panelOverlay.value = null;
     oauthAccounts.value = { status: 'not-loaded' };
-    oauthAuthPanelUrl.value = null;
+    oauthAuthFlow.value = null;
     toasts.value = [];
     platformMocks.isTauri = true;
-    focusMainWindow.mockClear();
+    focusCallingWindow.mockClear();
     openUrl.mockClear();
     listOAuthAccounts.mockClear();
     reauthorizeOAuth.mockClear();
@@ -88,32 +91,72 @@ describe('handleOAuthAccountConnected', () => {
     expect(listOAuthAccounts).toHaveBeenCalledTimes(1);
   });
 
-  it('fronts the window and toasts on the device that started the flow', () => {
+  it('fronts the window and toasts on the page that started the flow', () => {
+    openOAuthAuthorizationUrl(AUTH_URL, 'dropbox');
     handleOAuthAccountConnected(connected(THIS_DEVICE));
-    expect(focusMainWindow).toHaveBeenCalledTimes(1);
+    expect(focusCallingWindow).toHaveBeenCalledTimes(1);
     expect(toasts.value).toHaveLength(1);
     expect(toasts.value[0].message).toContain('dropbox');
     expect(toasts.value[0].message).toContain('me@example.com');
   });
 
+  // The engine keeps ONE live callback flow (`core::oauth ACTIVE_CALLBACK_FLOW`),
+  // so a second Connect supersedes the first and the window holding the dead one
+  // is still carrying a marker. It must not ride the survivor's completion
+  // forward. Its panel still closes, which is the point of clearing the marker
+  // for every page: that window is the one left on a dead authorization page.
+  it('does not front a window whose own flow was superseded by another provider', () => {
+    const dead = 'https://accounts.google.com/o/oauth2/auth';
+    openOAuthAuthorizationUrl(dead, 'google');
+    panelOverlay.value = { type: 'url-preview', url: dead };
+
+    handleOAuthAccountConnected(connected(THIS_DEVICE));
+    expect(focusCallingWindow).not.toHaveBeenCalled();
+    // …but its dead authorization page is still cleaned up.
+    expect(panelOverlay.value).toBeNull();
+    expect(oauthAuthFlow.value).toBeNull();
+  });
+
+  // The agent path (`NavigationRequested`) carries no provider, so its marker
+  // cannot be matched and any completion counts as this page's.
+  it('fronts a flow opened without a provider on any completion', () => {
+    openOAuthAuthorizationUrl(AUTH_URL);
+    handleOAuthAccountConnected(connected(THIS_DEVICE));
+    expect(focusCallingWindow).toHaveBeenCalledTimes(1);
+  });
+
+  // The regression that put a second Lucidos window on screen when an
+  // authorization landed. Every window of the desktop app reports the same
+  // device id, so the device gate above cannot tell them apart; the page that
+  // handed the authorization URL to `openUrl` is the one that may come forward.
+  it('does not front a window that never opened an authorization page', () => {
+    handleOAuthAccountConnected(connected(THIS_DEVICE));
+    expect(focusCallingWindow).not.toHaveBeenCalled();
+    // The toast is deliberately still device-scoped, not narrowed with it.
+    expect(toasts.value).toHaveLength(1);
+  });
+
   // The regression the device actor exists to prevent.
   it('leaves a device that did not start the flow alone', () => {
+    openOAuthAuthorizationUrl(AUTH_URL);
     handleOAuthAccountConnected(connected(OTHER_DEVICE));
-    expect(focusMainWindow).not.toHaveBeenCalled();
+    expect(focusCallingWindow).not.toHaveBeenCalled();
     expect(toasts.value).toHaveLength(0);
   });
 
   // An engine-internal reconnect has no initiating device, so nobody is fronted.
   it('does nothing device-scoped when the event carries no actor', () => {
+    openOAuthAuthorizationUrl(AUTH_URL);
     handleOAuthAccountConnected(connected(null));
-    expect(focusMainWindow).not.toHaveBeenCalled();
+    expect(focusCallingWindow).not.toHaveBeenCalled();
     expect(toasts.value).toHaveLength(0);
   });
 
   it('does not reach for the native window outside the desktop app', () => {
     platformMocks.isTauri = false;
+    openOAuthAuthorizationUrl(AUTH_URL);
     handleOAuthAccountConnected(connected(THIS_DEVICE));
-    expect(focusMainWindow).not.toHaveBeenCalled();
+    expect(focusCallingWindow).not.toHaveBeenCalled();
     // The toast still fires: a browser user wants to know it landed.
     expect(toasts.value).toHaveLength(1);
   });
@@ -134,7 +177,7 @@ describe('handleOAuthAccountConnected', () => {
 
       handleOAuthAccountConnected(connected(THIS_DEVICE));
       expect(panelOverlay.value).toBeNull();
-      expect(oauthAuthPanelUrl.value).toBeNull();
+      expect(oauthAuthFlow.value).toBeNull();
     });
 
     // Matching on the URL rather than a "flow in flight" flag is what makes
@@ -172,12 +215,12 @@ describe('grantOAuthScope success feedback', () => {
   beforeEach(() => {
     panelOverlay.value = null;
     oauthAccounts.value = { status: 'not-loaded' };
-    oauthAuthPanelUrl.value = null;
+    oauthAuthFlow.value = null;
     toasts.value = [];
     platformMocks.isTauri = false;
     reauthorizeOAuth.mockResolvedValue({ success: true, auth_url: AUTH_URL });
     completeOAuth.mockResolvedValue({ success: true });
-    focusMainWindow.mockClear();
+    focusCallingWindow.mockClear();
   });
 
   it('toasts itself when no connected-event reached this device', async () => {

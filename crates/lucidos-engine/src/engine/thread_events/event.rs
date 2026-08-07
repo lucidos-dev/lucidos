@@ -132,9 +132,14 @@ pub enum ThreadEvent {
     /// providers that don't report it (OpenAI, Gemini); when present it
     /// reflects the real prompt-token cost from the provider's `usage`
     /// block. `estimated_total_tokens` is the engine's pre-call estimate
-    /// (`estimate_tokens_from_chars` — 1.5 chars/token, matching the trim
-    /// budget); the modal renders both so the user can spot estimator
-    /// drift.
+    /// (`estimate_tokens_from_chars`, a measured 2.5 chars/token; NOT the
+    /// trim budget's conservative 1.5); the modal renders both so the user
+    /// can spot estimator drift.
+    ///
+    /// `sections` sum to exactly the chars behind `estimated_total_tokens`,
+    /// which is what lets the LLM Context Viewer render each section as a
+    /// share of the capture's headline total rather than re-deriving a ratio
+    /// of its own. Keep that true when adding a section.
     ContextCaptured {
         producer: crate::engine::ContextProducer,
         model: String,
@@ -1074,6 +1079,17 @@ pub enum ThreadEvent {
         /// subscription indicator and the thread card, so the user can tell an
         /// asleep thread from a stalled one.
         reason: String,
+        /// When the subscription was armed.
+        ///
+        /// Recorded rather than derived, because `expires_at - timeout_secs`
+        /// stops being the arming time the moment anything about the deadline
+        /// changes, and the age is exactly what makes `list_event_waits`
+        /// answerable ("armed 3 minutes ago" versus "armed yesterday"). Rows
+        /// written before 2026-08-07 have no such field and fall back to the
+        /// event row's own `created`, which is the same instant to within the
+        /// emit; see `live_wait_from_payload`.
+        #[serde(default = "chrono::Utc::now")]
+        armed_at: chrono::DateTime<chrono::Utc>,
         expires_at: chrono::DateTime<chrono::Utc>,
         /// The event `sequence` at registration. Both the registration path and
         /// the boot rebuild scan forward from here, which closes the restart
@@ -1104,12 +1120,25 @@ pub enum ThreadEvent {
         wait_id: uuid::Uuid,
     },
 
-    /// The user ended the wait deliberately. Note what is NOT here: an ordinary
-    /// message into a subscribed thread leaves every subscription untouched, so
-    /// a passing "how's it going?" cannot silently discard a long wait.
+    /// The subscription was stopped short of its own resolution. Note what is
+    /// NOT a cause: neither an ordinary message into a subscribed thread nor a
+    /// thread-level Stop disturbs a subscription, so neither a passing "how's
+    /// it going?" nor stopping an unrelated turn can silently throw away a long
+    /// watch.
+    ///
+    /// Carries what it stopped, so the transcript entry is self-contained on
+    /// replay, exactly as `EventWaitDelivered` carries its matched event. A
+    /// cancel is the one resolution with no wake, so it renders at its own
+    /// position in the timeline, and the `EventWaitStarted` it resolves is
+    /// routinely a day older and outside the loaded window. Absent on rows
+    /// written before 2026-08-07, which fall back to the in-window lookup.
     EventWaitCanceled {
         wait_id: uuid::Uuid,
         cause: EventWaitCancelCause,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        on: Vec<EventSubscription>,
+        #[serde(default, skip_serializing_if = "String::is_empty")]
+        reason: String,
     },
 
     // ---- Transient — never persisted ----

@@ -1,6 +1,6 @@
 import type { VNode } from 'preact';
 import { useEffect, useRef } from 'preact/hooks';
-import { artifacts, repositories, repoSource, repoPending, repoFiles, repoDiff, repoViewMode, workspaceName } from '../../store/store';
+import { artifacts, repositories, repoSource, repoPending, repoFiles, repoDiff, repoViewMode, visibleWorkspaceName } from '../../store/store';
 import { uploadFiles } from '../../store/actions/artifacts';
 import { loadRepositories } from '../../store/actions/chat';
 import { switchRepoSource } from '../../store/actions/repositories';
@@ -30,7 +30,7 @@ export function FilesView() {
   const showRepoView = isRepo || isAppCcDiff;
 
   const sourceOptions = repos.length > 0 ? [
-    { value: '', label: `Current Workspace (${workspaceName.value || 'unknown'})` },
+    { value: '', label: `Current Workspace (${visibleWorkspaceName.value || 'unknown'})` },
     ...repos.map(r => ({ value: r.id, label: r.name })),
   ] : [];
   const hasSwitcher = sourceOptions.length > 0;

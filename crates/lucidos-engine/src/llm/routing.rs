@@ -53,7 +53,7 @@ impl RoutingProvider {
                 "OpenAI model requested but no OpenAI credential is configured (Settings → Models → Providers) and OPENAI_API_KEY is not set".into()
             }),
             ProviderKind::Anthropic => self.anthropic.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
-                "Anthropic model requested but no Anthropic credential is configured (Settings → Models → Providers)".into()
+                "Anthropic model requested but no Anthropic credential is configured (Settings → Models → Providers) and ANTHROPIC_API_KEY is not set".into()
             }),
             ProviderKind::OpenRouter => self.openrouter.as_deref().map(|p| p as &dyn LlmProvider).ok_or_else(|| {
                 "OpenRouter model requested but no OpenRouter credential is configured (Settings → Models → Providers) and LUCIDOS_OPENROUTER_API_KEY is not set".into()

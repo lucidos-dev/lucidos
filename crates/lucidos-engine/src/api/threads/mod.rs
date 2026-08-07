@@ -133,7 +133,16 @@ pub(super) fn router() -> Router<super::AppState> {
         .route("/threads/:thread_id/continue", post(continue_thread))
         .route(
             "/threads/:thread_id/event-waits",
-            post(actions::register_thread_event_wait),
+            post(actions::register_thread_event_wait).get(actions::list_thread_event_waits),
+        )
+        // An agent standing its own subscriptions down, which records
+        // `AgentStandDown`. Distinct from the per-wait route below, the UI's
+        // **Stop waiting** button, which records `UserStop`: the cause is what
+        // the two differ in, so it is decided by which route was called rather
+        // than by a body field.
+        .route(
+            "/threads/:thread_id/event-waits/cancel",
+            post(actions::cancel_thread_event_waits_for_agent),
         )
         .route(
             "/threads/:thread_id/event-waits/:wait_id/cancel",

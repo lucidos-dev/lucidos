@@ -83,6 +83,24 @@
     font-style: italic;
 }
 
+/* A cron that can never fire (Feb 31 and friends). Replaces the status chip
+   rather than sitting beside it: the trigger is neither Active nor spent, and
+   "No more runs" would read as a one-shot that already did its job. */
+.trigger-schedule-error {
+    color: var(--accent-red);
+    font-weight: 500;
+    text-transform: uppercase;
+    font-size: var(--font-size-xs);
+}
+
+/* The next few fire times, under the cron list. A "monthly" trigger listing
+   three dates a year apart gives itself away here, before it costs anything. */
+.trigger-next-runs {
+    margin-top: 0.125rem;
+    font-size: var(--font-size-2xs);
+    color: var(--text-muted);
+}
+
 .trigger-type-schedule,
 .trigger-type-event,
 .trigger-type-hybrid {
@@ -194,6 +212,9 @@
     text-align: left;
     color: inherit;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     min-width: 0;
 }
 
@@ -393,13 +414,55 @@
     align-items: stretch;
 }
 
-.removable-input-row input,
 .removable-input-row .dropdown {
     flex: 1;
     min-width: 0;
 }
 
-.removable-input-row input.input-error {
+/* Add row where the button sits INSIDE the field's frame: the wrapper owns the
+   border/background/focus ring (same shape as .dropdown-input-wrap) and the
+   input is bare, so the button keeps its own natural height instead of being
+   stretched to the field's by a sibling flex row. */
+.input-with-action {
+    display: flex;
+    align-items: center;
+    padding-right: 0.375rem;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.25rem;
+    transition: border-color var(--duration-normal), box-shadow var(--duration-normal);
+}
+
+.input-with-action:focus-within {
+    /* Matches .form-group input:focus, except the whole frame lights up rather
+       than the borderless field inside it. */
+    border-color: var(--accent);
+    box-shadow: var(--focus-ring);
+}
+
+/* Prefixed to outrank `.form-group input` (pages.css) on specificity rather
+   than on the main.tsx import order. */
+.form-group .input-with-action input,
+.form-group .input-with-action input:focus {
+    flex: 1;
+    min-width: 0;
+    background: transparent;
+    border: none;
+    border-radius: 0;
+    box-shadow: none;
+}
+
+/* Invalid field, flagged by the form: the frame around a field (the cron add
+   row) or the field itself (the subscription condition textarea). The red has
+   to survive while the user is fixing the value, so the focus variants are
+   listed explicitly: they carry three classes and so outrank
+   `.form-group textarea:focus` and `.input-with-action:focus-within`, which
+   the two-class base selector alone would lose to (textarea) or tie with
+   (frame). A tie resolved by source order is not something a later edit to
+   this file should be able to flip. */
+.form-group .input-error,
+.form-group .input-error:focus,
+.form-group .input-error:focus-within {
     border-color: var(--accent-red);
 }
 

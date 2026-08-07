@@ -241,7 +241,7 @@ difference between a considered surface dependency and a trap.
 
 ## Principles
 
-Three, and each is a clause of the vision on an ordinary Tuesday.
+Five, and each is a clause of the vision on an ordinary Tuesday.
 
 **1. Nothing consequential happens without user intent.** This is what "augment
 a person, not replace them" looks like in the running system. Lucidos automates
@@ -274,6 +274,56 @@ good design. It is enforced rather than hoped for, since the agent-facing
 surfaces are generated from a single capability parity manifest and a capability
 cannot land on one of them while silently skipping its declared siblings
 ([ADR 0018](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0018-capability-parity-manifest.md)).
+
+**4. Open standards, or we do not depend on it.** This is "on their own devices"
+reaching the parts a person never sees: ownership that only works inside one
+vendor's runtime is a license with extra steps. So the client is the web
+platform and nothing else. One HTML, CSS and JavaScript build serves every
+device, installed from the browser as a PWA on a phone and loaded into the
+operating system's own webview by the macOS app. There is no Swift, Kotlin, Java
+or C# anywhere in the tree, and the native code that does exist (Apple's
+notification and window APIs, reached from Rust through `objc2`) is a shim
+behind that one build, never a second implementation of it. The wire is the same
+choice made again: HTTP, Server-Sent Events, Web Push, OAuth with PKCE, git,
+PostgreSQL, and a deep-link mechanism that is an ordinary HTTPS URL into the
+engine's own URL space
+([ADR 0048](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0048-deep-links-are-https-into-the-engines-url-space.md),
+which settles that on structural grounds rather than this one).
+The apps a person makes are the strict version of it: an `index.html` and a
+`manifest.json` under `data/apps/<id>/`, reaching the workspace through a
+`<script src="/api/v1/sdk.js">`, with no build step, no bundler and no framework
+to keep current, so one written today still opens in five years. The same test
+sorts a library from a platform, which is why the frontend's whole runtime
+dependency list is our own SDK plus Preact and its signals package, `marked`,
+`highlight.js`, and Tauri's JS bridge: a small library you could replace in an
+afternoon is a cost, a runtime you cannot leave is a landlord.
+
+**That principle is what makes "we own the fallback" payable.** A fallback is
+only worth claiming when it already exists and is already running, and here it
+is the default rather than the contingency: the notarized app is that same build
+in a borrowed window, so losing Apple costs the packaging and not the product.
+The bill arrives in the other direction and we pay it knowingly. A PWA on iOS
+gets less than a native app does, particularly around push and background work,
+and the workarounds in
+[notifications](https://github.com/lucidos-dev/lucidos/blob/main/system-knowhow/notifications.md)
+are the receipt. A second, native client would close that gap and spend the
+reason any of this is ours.
+
+**5. What a person makes travels; what they accumulate does not.** This is the
+mission's "travels matters as much as stays", and the reason the two halves come
+apart at all. A plugin is a directory with a `manifest.toml` plus a subset of
+five content directories mirroring `data/` one for one, passed on as a git
+repository or a single archive, and installing it merges those files into the
+recipient's own workspace, where the plugin's setup thread runs against their
+data rather than the author's. What travels is the setup that produces a view:
+apps, knowhow, scripts, event-driven triggers. What stays is everything that
+made it yours, and that line is enforced rather than advised, since a shipped
+trigger declaring a cron schedule is rejected at install before a single file is
+written, and credentials and accumulated records have no directory to travel in
+([ADR 0019](https://github.com/lucidos-dev/lucidos/blob/main/docs/adr/0019-plugins-panel-and-trigger-autoregistration.md)).
+Handing on a thing without handing on your records is what lets a fitted version
+beat a mass-produced one, which is the only way any of this reaches somebody who
+was not looking for it.
 
 Two things that would fit a list like this are deliberately absent, because they
 already have an owner and a second copy drifts from the first. The event model
@@ -326,7 +376,10 @@ What this does **not** rule out, and the distinction is the whole point:
 **The lens is silent on anything that points at our own client.** That is the
 second thing it does not judge, alongside the internals named at the top. When
 the destination is ours, argue the cost and the mechanics, and do not reach for
-this page to win it.
+the lens to win it. Silent about the destination is not silent about the
+construction: Principle 4 binds there and nowhere is exempt from it, so "it
+points at our own client" settles the lens question and leaves open what that
+client is built out of.
 
 ## Relationship to the decision log
 

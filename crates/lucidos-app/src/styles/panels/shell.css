@@ -709,8 +709,14 @@
        widths: content that can't shrink further (badge, status dot) clips at the
        box edges — which sit inside the side reserves — instead of spilling over
        the clusters. overflow-y stays visible (matching the parent .pane-header-brand
-       above) so the brand-badge's upward `top:-0.25rem` superscript shift isn't
-       clipped at the box's top edge — plain `overflow:hidden` cropped it. */
+       above) so the brand badge's oversized touch target
+       (.brand-badge-action::after) keeps its full height where an engine honours
+       the pairing. NOTHING VISIBLE MAY RELY ON IT: the packaged macOS webview
+       clips both axes as soon as one of them is `clip`, so anything that has to
+       be seen stays inside this box. That is why the badge's superscript lift is
+       a bottom margin inside the flex line rather than a paint-time `top`
+       offset (see .brand-badge); as a `top` offset it rendered whole in Chromium
+       and cropped flat in the Tauri app. */
     .app-header .pane-header-brand .pane-header-brand-label {
         position: absolute;
         left: 50%;
@@ -871,6 +877,7 @@
     :root[data-pane-resizing] .threads-header,
     :root[data-pane-resizing] .thread-drawer,
     :root[data-pane-resizing] .header-focus-wash,
+    :root[data-pane-resizing] .toast-column,
     :root[data-pane-resizing] .split-layout.snap-animate .pane {
         transition: none;
     }
@@ -1082,6 +1089,9 @@
     background: transparent;
     border-radius: 0.25rem;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     text-align: left;
     cursor: pointer;
     transition: background 0.15s ease, color var(--duration-fast);
@@ -1216,6 +1226,9 @@
     border-radius: 0.25rem;
     padding: 0.1875rem 0.5rem;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     font-size: var(--font-size-sm);
     font-weight: 600;
     cursor: pointer;
@@ -1252,16 +1265,42 @@
 /* Brand badge — flex sibling of the title (not a child), so the title can
    keep overflow:hidden / text-overflow:ellipsis and truncate when narrow.
    Negative margin tucks the badge over the trailing character of the title;
-   it shifts up so it sits above the baseline like a notification dot. */
+   it shifts up so it sits above the baseline like a notification dot.
+
+   That lift is a MARGIN, never a `position: relative; top:` offset, so it is
+   part of the flex line's box instead of paint spilling out above it. Its host
+   .pane-header-brand-label pairs `overflow-x: clip` (the horizontal
+   non-overlap guarantee) with `overflow-y: visible`, and the packaged macOS
+   webview does not honour that pairing: it clips BOTH axes, which sliced the
+   lift flat off the top of the badge in the Tauri app while Chromium and
+   Playwright's WebKit rendered it whole. `align-items: center` centers a flex
+   item's MARGIN box, so a bottom margin of twice the lift puts the border box
+   the same 0.25rem high with nothing outside the line for an ancestor to
+   clip. */
 .brand-badge {
+    /* Relative rather than the base .badge's absolute, so the badge keeps its
+       flex slot and still anchors .brand-badge-action::after. That makes the
+       base rule's right offset apply as a relative nudge, so reset it. */
     position: relative;
-    /* Nudged a little lower than a strict superscript so the "!" / spinner sits
-       closer to the title's cap height. */
-    top: -0.25rem;
-    /* Reset right from the base .badge absolute-positioning rule */
     right: auto;
+    /* Twice the lift: half of it is the 0.25rem the badge rises, nudged a
+       little lower than a strict superscript so the "!" / spinner sits closer
+       to the title's cap height. */
+    margin-bottom: 0.5rem;
     margin-left: -0.25rem;
     flex-shrink: 0;
+}
+
+/* The `top` half of that reset, doubled up so it wins on SPECIFICITY rather
+   than source order. mobile.css re-corners every `.badge` for the smaller
+   mobile icon buttons (`top: -0.125rem; right: -0.125rem`), and it is both
+   equal-specificity and imported after panels.css, so a plain `.brand-badge`
+   reset loses to it under 768px. Left alone, that paint-time lift would stack
+   on top of the margin one above and land the badge half a step too high. Only
+   `top` is claimed back: the horizontal nudge does not stack (it is the only
+   thing positioning the badge sideways on mobile), so it is left where it is. */
+.badge.brand-badge {
+    top: auto;
 }
 
 /* Background-activity badge: a spinning refresh glyph in place of the "!",
@@ -1275,6 +1314,9 @@
     appearance: none;
     border: 0;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     color: inherit;
     cursor: pointer;
 }
@@ -1308,6 +1350,11 @@
         min-height: 0.75rem;
         line-height: 0.75rem;
         border-radius: 0.5rem;
+        /* Half the desktop lift, matching the trimmed glyph. This is also what
+           mobile has always rendered: the mobile `.badge` corner reset that the
+           doubled-class rule above now shuts out gave the brand badge a
+           0.125rem lift, so keeping that value here leaves mobile untouched. */
+        margin-bottom: 0.25rem;
     }
 
     .brand-badge-spinner svg {

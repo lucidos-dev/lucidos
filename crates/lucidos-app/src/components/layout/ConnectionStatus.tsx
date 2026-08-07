@@ -1,10 +1,10 @@
 import { useRef, useState, useLayoutEffect } from 'preact/hooks';
-import { connectionStatus, workspaceName } from '../../store/store';
+import { connectionStatus, visibleWorkspaceName } from '../../store/store';
 import { getRemPx } from '../../utils/dom';
 
 export function ConnectionStatus() {
   const status = connectionStatus.value;
-  const name = workspaceName.value;
+  const name = visibleWorkspaceName.value;
   const labelRef = useRef<HTMLSpanElement>(null);
   const [hidden, setHidden] = useState(false);
 

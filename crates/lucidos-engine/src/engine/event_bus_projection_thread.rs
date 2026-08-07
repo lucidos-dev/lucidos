@@ -975,30 +975,24 @@ impl EventBus {
                 // Continue the child is alive again, so the parent's count
                 // must bounce back — otherwise its `ThreadStatusIcon` stays
                 // 'idle' (no pulsing dot) while the child is actively running.
-                // Gated on the pre-sample's `is_blocking`: a duplicate
-                // ContinuationRequested (rapid double click) arrives with the child
-                // already 'running' and must not double-increment.
-                let was_blocking = prev_sample
-                    .as_ref()
-                    .map(|s| s.is_blocking())
-                    .unwrap_or(false);
-                if !was_blocking {
-                    let parent_id: Option<Uuid> = sqlx::query_scalar(
-                        "SELECT parent_thread_id FROM thread_summaries WHERE thread_id = $1",
-                    )
-                    .bind(thread_id)
-                    .fetch_optional(&mut **tx)
-                    .await?
-                    .flatten();
-                    if let Some(pid) = parent_id {
-                        sqlx::query(
-                            "UPDATE thread_summaries SET active_children_count = \
-                             active_children_count + 1 WHERE thread_id = $1",
-                        )
-                        .bind(pid)
-                        .execute(&mut **tx)
-                        .await?;
-                    }
+                //
+                // Through the SHARED helper, like every other revive arm, and
+                // that is the whole point. This arm used to hand-roll the same
+                // parent lookup and `+1` behind an `is_blocking()` gate, which
+                // the helper's own doc names as the wrong predicate: an idle CC
+                // child holding a pending change is `is_blocking = true` (clause
+                // 3) while its status is `idle`, i.e. NOT counted in the parent.
+                // The hand-rolled gate therefore skipped the re-increment on
+                // exactly the shape it was written for, and the parent's dot
+                // stayed idle for the whole resumed turn.
+                // `active_thread_statuses()` asks the question that actually
+                // matters (was the child already counted?) and still suppresses
+                // the double-increment a rapid double click would cause, since a
+                // re-clicked child is already `running`.
+                if let Some(pid) =
+                    reincrement_parent_active_count_if_revived(tx, thread_id, &prev_sample).await?
+                {
+                    extra_ancestors.push(pid);
                 }
                 Vec::new()
             }

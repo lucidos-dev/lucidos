@@ -1,6 +1,6 @@
 ---
 name: Lucidos Glossary
-description: Canonical user-facing terms used across Lucidos. Core terms (app, artifact, intent, knowhow, plugin, script, thread, trigger, workspace, event, …) plus advanced coding-agent terms (Apply, change, Claude Code, coding agent, coding-agent thread, external-repo coding-agent thread, hardening). The single place these words are defined; every other system-knowhow file, the engine system prompt, and the UI use these definitions verbatim. Load when the user (or the LLM) needs to disambiguate one of these words, when the same concept seems to have two names, or before writing user-facing prose that mentions any of them. Dev-only terms (actor, ActorMode, aggregate, BusEvent, EventBus, ThreadEvent, projection, signer, worktree, …) live in `docs/glossary.md`, which extends this file.
+description: Canonical user-facing terms: the core ones (app, artifact, intent, knowhow, plugin, script, thread, trigger, workspace, event, …) plus the coding-agent ones (Apply, change, Claude Code, coding agent, coding-agent thread, hardening). The single place these words are defined, used verbatim by every other system-knowhow file, the engine system prompt and the UI. Load to disambiguate one, when a concept seems to have two names, or before writing user-facing prose.
 ---
 
 # Lucidos Glossary
@@ -80,7 +80,7 @@ A direct descendant *thread* created by a `relation: "child"` spawn (`run_thread
 An opt-in safety gate over the *Lucidos Agent*'s shell/Python tools. Toggled under **Settings → Permissions → Command safety** (off by default). When enabled, a command that's clearly catastrophic (`rm -rf /`, a fork bomb, formatting a disk) is refused without running; a command that looks like an irreversible real-world side-effect (sending mail, a mutating HTTP request, a cloud-CLI change, spending money) or destruction outside the workspace pauses and shows the user a *command permission card* to approve; an in-workspace deletion/overwrite (recoverable) runs after a *command checkpoint* is taken, leaving a one-click Undo. A fast static check settles the obvious cases and a cheap LLM **judge** decides the ambiguous middle, erring toward asking. Under the master toggle, two sub-settings (only active while the guard is on): an **LLM judge** on/off switch (off falls back to a static classifier: the dangerous-command list plus a destruction scan, so out-of-workspace deletes/overwrites still ask and in-workspace ones still checkpoint) and the **judge model** (defaults to Haiku). Commands the user has chosen to always allow are kept in an editable list under **Settings → Permissions → Lucidos Agent permissions** (`~/.lucidos/agent-allowed-commands`). A *trigger* fires unattended, so it can't be asked, so it instead runs irreversible commands only within its declared *side-effect grant*; an ungranted one is blocked and fails the run. The safe majority of commands, including reads anywhere and writes inside the workspace, run untouched. See `system-knowhow/running-python.md` § The command guard.
 
 ### Command checkpoint
-A pair of snapshots of the workspace's tracked content the *command guard* takes around an in-workspace destructive command (a delete or overwrite under the workspace), the recoverable, "reversible" lane. Instead of asking, the guard saves the current state, runs the command, saves the state again, and shows the command's card with a one-click **Undo** and a **View changes** button. Comparing the two snapshots is what tells Lucidos exactly what that command did, so Undo puts back what it deleted or overwrote **and** removes the files it created (leaving alone any you have edited since), and View changes shows you the whole thing as a diff. If the command turns out to have changed nothing Lucidos can see, no card appears at all: that happens when the target is a path git ignores, which the snapshot never captured, and an Undo there could neither restore nor remove anything. The snapshots are kept for 30 days so the diff stays viewable, then reclaimed. Out-of-workspace destruction can't be checkpointed, so it goes to the *command permission card* (ask) lane instead. Only taken when the *command guard* is on.
+A pair of snapshots of the workspace's tracked content the *command guard* takes around an in-workspace destructive command (a delete or overwrite under the workspace), the recoverable, "reversible" lane. Instead of asking, the guard saves the current state, runs the command, saves the state again, and shows the command's card with a one-click **Undo** and a **Diff** button. Comparing the two snapshots is what tells Lucidos exactly what that command did, so Undo puts back what it deleted or overwrote **and** removes the files it created (leaving alone any you have edited since), and Diff shows you the whole thing. If the command turns out to have changed nothing Lucidos can see, no card appears at all: that happens when the target is a path git ignores, which the snapshot never captured, and an Undo there could neither restore nor remove anything. The snapshots are kept for 30 days so the diff stays viewable, then reclaimed. Out-of-workspace destruction can't be checkpointed, so it goes to the *command permission card* (ask) lane instead. Only taken when the *command guard* is on.
 
 ### Command permission card
 The approval card the *command guard* shows when a shell/Python command needs the user's go-ahead. Same UI as the *coding-agent permission card*: Deny, Allow once, Allow for this thread, or Always allow (remembered for similar commands). Until answered, the thread waits on the user; answering lets the command run or refuses it. Unlike the coding-agent card, this lane's "Allow for this thread" is forgotten if Lucidos restarts.
@@ -106,12 +106,23 @@ Distinct from the *credential* that backs it. A connected account is a **sign-in
 the OAuth Client credential beside it is the **app registration**
 (`client_id`, optional `client_secret`, and the provider's endpoint URLs) that
 made the sign-in possible. One provider therefore shows one row in each list,
-which is expected and not a duplicate. A provider name may be *derived*
-(`ghealth`) to hold a narrowly-scoped connection separately from the base
-provider's, which is a distinct connected account on the base provider's
-endpoints. Backup uploads read the connected account for their
-`backup_provider`; the Backup page has no account UI of its own and links here.
-See also: *credential*, *OAuth client type*, *OAuth redirect URI*,
+which is expected and not a duplicate. The registration is created inside the
+Connect flow, prefilled from the *OAuth provider registry*, and saving it
+continues straight into the browser: there is no second button to press. A
+provider name may be a *derived provider*.
+
+It records **two** scope sets: what the provider **granted**, and what it was
+**asked for**. They differ whenever a provider refuses part of a request, which
+is a real state rather than an error (a Dropbox app whose Permissions tab has not
+enabled a scope). *Reconnect* re-requests the asked-for set, because re-requesting
+the granted one could only ever ask for what the account already had.
+
+Backup uploads read the connected account for their `backup_provider`; the Backup
+page has no account UI of its own and links here, handing over the provider AND
+the scopes an upload needs, so one authorization covers signing in and granting
+access.
+See also: *credential*, *OAuth provider registry*, *derived provider*,
+*OAuth client type*, *OAuth redirect URI*,
 `system-knowhow/oauth-providers.md`.
 
 ### Connected-but-hidden
@@ -165,6 +176,20 @@ provider or the mailbox account.) An OAuth Client is the one type NOT injected a
 `CRED_<NAME>`: only the OAuth flow reads it, and it reads it from the database.
 A secret is never a *preference*.
 See also: *connected account*, *environment variable*, *config*.
+
+### Derived provider
+A provider name that is not itself a service, but a second, separately scoped
+connection to one that is: a health-only connection on Google's endpoints under
+its own name, say, so a narrowly-scoped *connected account* can be held apart
+from the everyday one. Some APIs require this, refusing any token that also
+carries unrelated scopes.
+
+It gets its own *credential* and its own connected-account row, and runs on the
+base provider's endpoints. Because aliases are ad hoc, a derived name is
+deliberately absent from the *OAuth provider registry* and is never guessed from
+its spelling: the Connect form asks which known provider it runs on, then fills
+that provider's endpoints in while keeping the name you gave it.
+See also: *connected account*, *OAuth provider registry*.
 
 ### Domain event
 An *event* the workspace itself emits via the `emit_event` LLM tool or `lucidos events emit` CLI — anything observable about the user's world (`MorningRoutineCompleted`, `JobListingFound`, `PanasonicHeatpumpAdjusted`). Persisted with the inner event type (not the literal string `"DomainEvent"`). Flows through the trigger matcher unconditionally, so a *trigger*'s `on_event:` can subscribe to any domain event name. Persisted `ThreadEvent` variants are also subscribable except per-token streaming ones — see *scheduler blocklist* (dev).
@@ -221,10 +246,32 @@ The approval card the *Lucidos Agent* shows when it wants to call a tool on an *
 The database-backed list of chat models the user manages in **Settings → Models**. It drives the *Lucidos Agent* model picker and tells the engine which *provider* serves each model. Known models are seeded by the engine; the user can add their own (id + label + provider, and optionally the model's *context window*) and enable/disable or delete them (builtins are disable-only). Separate from the *Claude Code* model picker, which keeps its own list.
 
 ### Provider
-The backend that serves a *model*: **Vertex AI**; **Anthropic** (direct, via `api.anthropic.com` — supports a Claude subscription OAuth token or an API key); **OpenAI** (direct, via `api.openai.com` — an API key, with the `OPENAI_API_KEY` launch env var as a fallback, and below that an auto-detected key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` `apikey` login as a lowest-precedence fallback — the parallel of Vertex reading the gcloud ADC file); **OpenRouter** (via `openrouter.ai/api/v1` — a Bearer API key, with the `LUCIDOS_OPENROUTER_API_KEY` env var as a fallback; serves e.g. GLM 5.2); or **Local** (any OpenAI-compatible server — Ollama / LM Studio / vLLM / llama.cpp — at a configurable base URL, default Ollama `http://localhost:11434/v1`, API key optional). OpenAI, OpenRouter, and Local all speak the OpenAI Chat Completions wire format but are distinct backends. Each entry in the *model registry* names its provider; the provider's credentials are configured once under Settings → Models → Providers. The same Claude model can be offered through more than one provider (e.g. Fable 5 via direct Anthropic, other Claude models via Vertex).
+The backend that serves a *model*: **Vertex AI**; **Anthropic** (direct, via `api.anthropic.com`: supports a Claude subscription OAuth token or an API key, with the `ANTHROPIC_API_KEY` launch env var as a fallback below the stored credential); **OpenAI** (direct, via `api.openai.com`: an API key, with the `OPENAI_API_KEY` launch env var as a fallback, and below that an auto-detected key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` `apikey` login as a lowest-precedence fallback, the parallel of Vertex reading the gcloud ADC file); **OpenRouter** (via `openrouter.ai/api/v1`: a Bearer API key, with the `LUCIDOS_OPENROUTER_API_KEY` env var as a fallback; serves e.g. GLM 5.2); or **Local** (any OpenAI-compatible server, Ollama / LM Studio / vLLM / llama.cpp, at a configurable base URL, default Ollama `http://localhost:11434/v1`, API key optional). OpenAI, OpenRouter, and Local all speak the OpenAI Chat Completions wire format but are distinct backends. Each entry in the *model registry* names its provider; the provider's credentials are configured once under Settings → Models → Providers. The same Claude model can be offered through more than one provider (e.g. Fable 5 via direct Anthropic, other Claude models via Vertex).
 
 ### Builtin provider proxy
 A *provider*'s API exposed to app UIs through the engine's proxy route (`lucidos.proxy(<name>).fetch(path, init)` → `/api/v1/proxy/<name>/<path>`) **without** the workspace re-entering the credential in `data/config/apis.json`. When `<name>` matches a *model registry* provider (`vertex`, `openai`, `openrouter`, `anthropic`, `local`) and no `apis.json` entry exists, the engine forwards to that provider's API root and injects the provider's own credential server-side — the same one configured under Settings → Models → Providers — so the secret never reaches the iframe. An `apis.json` entry with the same name overrides the builtin (it is consulted first). `vertex` is addressed by the publisher/model suffix only: the engine owns the `…/projects/<project>/locations/<region>` URL prefix and mints the access token, so the app never needs the project id or a token. See `system-knowhow/js-sdk.md` § `lucidos.proxy`.
+
+### OAuth provider registry
+The list of OAuth providers Lucidos knows the endpoints for, stored as
+`system-knowhow/oauth-providers.json`. Each row carries a provider's
+authorization, token and userinfo URLs, its userinfo method, its authorization
+parameters, its base URL, and where to register an app with it: the console link,
+which client type to pick, which permissions to enable.
+
+It is what makes **Settings → Accounts** offer a quick button per provider and
+prefill a whole app registration, so a *credential* of type OAuth Client needs
+only a Client ID. Endpoints are copied into the credential when it is saved, so
+the credential still fully describes its own flow and a registry that later moves
+an endpoint cannot silently change one that already works; the *Lucidos Agent*
+repairs a stale credential on request. A provider absent from the registry still
+connects: the form asks for its endpoints, or for which known provider a *derived
+provider* name runs on.
+
+`system-knowhow/oauth-providers.md` is the prose beside it (redirect URI forms,
+confidential versus public clients, scope notes) and does not restate the rows.
+Adding a provider is an edit to the JSON, never an engine change.
+See also: *connected account*, *credential*, *derived provider*,
+*OAuth client type*.
 
 ### OAuth redirect URI
 The loopback URL the provider sends the user back to after they authorize, and which Lucidos must repeat byte-for-byte when it redeems the authorization code. Lucidos runs a temporary listener on a fixed port for exactly this callback, binding **both** loopback families, so three host forms are receivable: `http://127.0.0.1:14981/oauth/callback` (the default), `http://localhost:14981/oauth/callback`, and `http://[::1]:14981/oauth/callback`. The port and path are the engine's; only the host form is configurable, via the optional `redirect_uri` key on the *credential* — needed because providers disagree (Spotify rejects the name form, Microsoft's Entra portal rejects the IP form under its Web platform). The user must register the resolved URI with the provider exactly. Which form a given provider wants is recorded in `system-knowhow/oauth-providers.md`, never in engine code.
@@ -310,17 +357,23 @@ Any descendant in the *thread* tree (transitive). A *child thread* is a sub-thre
 A single conversation — a stream of events sharing one `aggregate_id`. Every chat reply, trigger run, and *coding-agent thread* run is a thread. Threads have a persisted `source` (`chat` / `trigger` / `claude_code` today — values are *channel* identifiers; see dev glossary), while user-facing/API source filters call the coding-agent bucket `coding-agent` and accept legacy `claude_code`. Threads also have a compose state (`composing` / `active` / `discarded` on the compose side; running / idled / failed on the runtime side), an archive flag (`inbox` / `archived`, orthogonal to compose state — an archived thread keeps `state='active'` and only flips `archive_state`), and may spawn other threads.
 
 ### Event wait
-A *thread* asking to be woken when something happens, instead of checking over and over. The agent says what it is waiting for (an event, optionally filtered), why, and for how long, then finishes its turn. The thread holds nothing and blocks nothing while it watches, and Lucidos re-opens it the moment a matching *event* arrives, or tells it the wait timed out. The *subscription indicator* shows what it is watching and how long is left. Available to the *Lucidos Agent* and to a *coding agent* alike.
+The internal name for a **thread subscription**: a *thread* asking to be woken when something happens, instead of checking over and over. The word survives because it is on disk, in the persisted `EventWait*` events and in the `await_event` tool's own name, so the code and the event log say *event wait* where this glossary says *thread subscription*. They are the same thing.
+
+The agent says what it is waiting for (an *event subscription*, optionally filtered), why, and for how long, then finishes its turn. The thread holds nothing and blocks nothing while it watches, and Lucidos re-opens it the moment a matching *event* arrives, or tells it the wait timed out. The *subscription indicator* shows what it is watching and how long is left. Available to the *Lucidos Agent* and to a *coding agent* alike, and each can also list what it is watching and stop watching (`list_event_waits` / `cancel_event_wait`, or `lucidos event-waits list` / `cancel`).
 
 A watching thread reads as **Waiting**, the same status a thread waiting on its *sub-threads* shows, because it means the same thing: this is not finished, and something else will wake it. You do not have to open the thread to see it, and it is still there after a reload.
 
 Two things separate it from a *trigger*, and the first is the one people skip. **Where the answer goes:** a trigger runs in its own thread and reaches you as a *notification*; an event wait resumes the conversation you are already reading, so the report lands in it. **How long it lasts:** a trigger is a standing rule that starts a NEW thread every time, indefinitely; an event wait resolves on the first match and the agent re-arms it per event, bounded by a cap on consecutive parks. So "tell me **here** when a change is proposed" is an event wait even though it sounds like a standing rule, while "notify me whenever a change is proposed, from now on" is a trigger. Both are often right at once: watch here now, and add a trigger if it should keep running after this conversation is done.
 
-**Sending a message to a waiting thread does not cancel the wait.** The thread answers you and keeps watching. A wait that actually *fires* is the opposite: it is used up, and the agent has to subscribe again to catch the next one. To end a wait, use **Stop waiting** on the thread, or archive it (archiving cancels every wait the thread holds).
-See also: *trigger*, *subscription indicator*, `system-knowhow/thread-events.md`.
+**Neither a message nor Stop ends it.** Sending a message to a watching thread runs an ordinary turn and leaves every subscription exactly as it was, and **Stop** ends the running turn and nothing else. A wait that actually *fires* is the opposite: it is used up, and the agent has to subscribe again to catch the next one.
+
+**Four things do end one, and each says so.** **Stop waiting** in the *subscription indicator*, archiving the thread (which asks first, naming every subscription the archive would stop, its *sub-threads* included), discarding it, and the agent standing it down when you tell it to. Each leaves a line in the conversation saying what stopped and how, so a watch can never end in silence.
+See also: *event subscription*, *trigger*, *subscription indicator*, `system-knowhow/thread-events.md`.
 
 ### Subscription indicator
-The control on the prompt bar showing what the open *thread* is currently waiting for. It appears only when there is at least one live *event wait*, and lists each one with the agent's reason, the event it is watching, a countdown to its deadline, and a **Stop waiting** button. It is the answer to "is this thread stuck, or is it asleep on purpose?", readable at any time without scrolling back through the conversation. The thread's **Waiting** status says *that* it is watching, on every list it appears in; this says *what for*, on the one thread you have open.
+The control on the prompt bar showing what the open *thread* is currently waiting for. It appears only when the thread holds at least one live *thread subscription* (an *event wait*), and lists each one with the agent's reason, the event it is watching, a countdown to its deadline, and a **Stop waiting** button. It is the answer to "is this thread stuck, or is it asleep on purpose?", readable at any time without scrolling back through the conversation. The thread's **Waiting** status says *that* it is watching, on every list it appears in; this says *what for*, on the one thread you have open.
+
+Its header is the unqualified **SUBSCRIPTIONS**, and that is exact rather than loose: a *trigger subscription* belongs to a trigger and never appears on a thread screen, so the only species that can be listed here is the thread one.
 
 ### Thread drawer
 The pane listing your *threads*: the Pinned, *Current* and Archive sections, with the attention badge and the thread filter. That badge has a second home: the same needs-attention count rides the **thread-drawer toggle** whenever the list itself is hidden (the drawer closed on desktop; any pane other than the threads pane on mobile), so a *thread* waiting on you stays visible from the conversation. Exactly one of the two shows it at a time. On mobile the toggle is the leading control of the *thread pane* header and takes you to the threads pane, with the hamburger **menu drawer** mirrored at that header's trailing edge (it slides out from the right, the edge its button sits on). First of the three panes; one of the two making up the *Conversation* side, the other being the *thread pane*. CSS container `.thread-drawer` (`FocusedPane = 'drawer'`; on mobile the leftmost swipe pane, `MobileView = 'threads'`). Always say *thread drawer*, never a bare "drawer". The hamburger **menu drawer** (Files / Apps / Plugins / Triggers plus pinned *apps*, `Drawer.tsx` / `drawerOpen`) is a different surface.
@@ -356,6 +409,7 @@ A workspace configuration that fires either on a schedule (`run.cron`) or on one
 - `run.type: "script"` — executes the *script* at `run.path` directly, no LLM. The engine sets `TRIGGER_EVENT_TYPE` / `TRIGGER_EVENT_PAYLOAD` / `TRIGGER_EVENT_ID` / `TRIGGER_EVENT_THREAD_ID` env vars on event fires so the script can branch deterministically and deep-link any notification back to the originating event. Right when the work is a deterministic transformation that doesn't need LLM judgement.
 
 Lifecycle (both shapes): defined by `TriggerCreated`; each firing emits `TriggerStarted` then `TriggerCompleted`. The trigger's panel row surfaces its **last-run status** (OK / failed — the most recent firing's outcome) beside the last-run time; there is no built-in run-history view. Deeper run detail comes from the trigger's own *event* stream — ask the *Lucidos Agent* ("what has this trigger been finding?") or build an *app* on the events.
+The row also shows the **next runs**: the next few fire times, merged across every cron expression. A cron that can *never* fire (`0 0 9 31 2 *`, Feb 31) is rejected at create and update, with an error naming the offending fields. A trigger stored before that guard existed keeps loading and wears a **schedule error** instead of the "No more runs" a spent one-shot earns. Both have no next run, but one never worked and the other finished its job.
 See also: `system-knowhow/triggers.md`, `docs/taxonomy.md` § Triggers.
 <!--gloss-trigger-end-->
 
@@ -369,8 +423,14 @@ See also: `system-knowhow/triggers.md` § "Running an existing trigger once, off
 The on-disk `trigger.toml` at `data/triggers/<slug>/trigger.toml`, a **derived read-model** of a *trigger*'s durable config, maintained by the engine from the trigger events (written on create/update, removed on delete, rebuilt from events on boot). NOT the source of truth (events are, and the scheduler never reads the file) and **not version-controlled** (the engine adds it to the repo's local `.git/info/exclude`); a hand-edit changes nothing that fires and is overwritten. It exists so a trigger is inspectable and so a *plugin* can SHIP a trigger by declaring one (plugin install parses the declaration into a `TriggerCreated`). See ADR 0019, `system-knowhow/triggers.md` § "On-disk trigger definition".
 
 ### Event subscription
-One entry in a *trigger*'s `on` list: an `event_type` plus an optional payload `condition` scoped to that event. A trigger fires when an incoming event matches *any* of its subscriptions' `event_type` and that subscription's `condition` (if any) evaluates true. A trigger may carry several subscriptions — the same workflow can react to multiple event types without duplicating the trigger, and each entry's filter only constrains its own event so different payload shapes never interfere.
-See also: `system-knowhow/triggers.md` § "One trigger, multiple events".
+A standing request to be told when a matching *event* happens: an `event_type` plus an optional payload `condition` scoped to that event. One shape, one matcher, and two species. A subscription with no condition matches every event of its type; with one, only the events whose payload satisfies it.
+
+A **trigger subscription** is one entry in a *trigger*'s `on` list. On a match it **spawns a new thread** and **stays armed** for the next one. That is what makes a trigger a standing rule: it outlives every thread it starts, and it keeps firing until you pause or delete it. A trigger may carry several, and each entry's filter constrains only its own event, so different payload shapes never interfere.
+
+A **thread subscription** is one an existing *thread* armed for itself, with `await_event` (the *Lucidos Agent*) or `lucidos await-event` (a *coding agent*). On a match it **resumes that thread**, and it is **spent**: the first match uses it up, so watching for the next one means arming another. Its internal name is *event wait*, which is the word the code and the event log use.
+
+Both are waiting for events from their subscriptions, and the same matcher decides both, so a `condition` that fires for one fires for the other. What differs is who consumes the match and what it costs them. On a thread screen only the thread species can appear, which is why the *subscription indicator* needs no qualifier.
+See also: *trigger*, *event wait*, *subscription indicator*, `system-knowhow/triggers.md` § "One trigger, multiple events".
 
 ### Trigger thread
 A *thread* spawned by a *trigger* firing. Distinguished by `source = 'trigger'`. The LLM driving it has the same knowhow access as a chat thread: the system prompt advertises the intent registry, and the LLM calls `load_knowhow` when it judges a recipe relevant. No per-trigger knowhow allowlist. Terminal event: `TriggerCompleted`.
@@ -387,7 +447,10 @@ An `ask_user_question` called with exactly one option. The *Lucidos Agent* uses 
 See also: `system-knowhow/running-python.md` § The drain pattern.
 
 ### Workspace
-A user's complete Lucidos instance: one PostgreSQL database inside the shared Lucidos Postgres cluster + `data/` directory (artifacts, apps, knowhow, triggers, intents, config, auth-modules, scripts). Multiple workspaces run concurrently (each is its own isolated engine + database), fronted by a single *workspace gateway* (dev term) that addresses each one by path prefix `/<slug>/`; you switch between them, and create / rename / delete them — toggle each one's *auto-start*, or **restore one from a backup** (drop in an encrypted `.enc` backup file + its backup key; you're asked for a workspace name only if the backup's original name collides with an existing one) — from the workspace picker (at `/~/`, or just `/` when there's more than one). Every workspace you've launched stays **listed** in the picker even after it stops; opening a stopped one starts it on demand. On first run there are no workspaces yet, so the picker asks you to name your first one (suggesting "personal" or "work") — nothing is auto-created for you.
+A user's complete Lucidos instance: one PostgreSQL database inside the shared Lucidos Postgres cluster + `data/` directory (artifacts, apps, knowhow, triggers, intents, config, auth-modules, scripts). Multiple workspaces run concurrently (each is its own isolated engine + database), fronted by a single *workspace gateway* (dev term) that addresses each one by its *workspace address*, the path prefix `/<slug>/`. From the workspace picker (at `/~/`, or just `/` when there's more than one) you switch between them, create / rename / delete them, toggle each one's *auto-start*, and **restore one from a backup** (drop in an encrypted `.enc` backup file + its backup key; the name is filled in from the backup, and you must change it when its address is already taken). Every workspace you've launched stays **listed** in the picker even after it stops; opening a stopped one starts it on demand. On first run there are no workspaces yet, so the picker offers both ways in side by side: name your first workspace (suggesting "personal" or "work"), or restore one from a backup. Nothing is auto-created for you.
+
+### Workspace address
+The path a *workspace* is served at (`/personal/`), also the name of its folder and of its database. It is derived from the workspace's name when the workspace is created (lower-cased, with anything that is not a letter or digit turned into `-`) and then **fixed forever**: renaming a workspace changes its label, never its address, so the two can end up different. The picker shows a workspace's address only when it would otherwise surprise you, which is exactly when a rename has moved the label off the address, or when two workspaces share a label and the address is the only thing telling them apart. **No two workspaces can share an address, and no two can share a name either**: creating or renaming to a name another workspace already has is refused, naming the one that has it (a name a running restore is about to give its workspace counts as taken too, and you can wait for it instead) (matched ignoring case and surrounding spaces, since "Work" and "work" are no more tellable apart in a list than two identical names). Where only the *address* is taken, because the workspace holding it goes by a different name now, a create simply gets the next free address, `/personal-2/`, and the picker says so before you create it; a restore is refused instead, since restoring into a suffixed address would quietly leave you with a second copy of the same workspace. Workspaces that already shared a name before this rule keep working untouched, and the picker shows their addresses so you can still tell them apart.
 
 ### Auto-start
 A per-workspace toggle (set in the workspace picker) controlling whether the *workspace gateway* brings that workspace's engine up automatically when the gateway starts. **On** = always-on: the workspace is spawned on every gateway (re)start (a packaged install's login-launched gateway brings up its auto-start workspaces). **Off** (the default for a newly-created workspace; turned on only via this toggle) = the workspace is still listed in the picker but its engine starts only when you explicitly open or launch it. An already-running workspace is re-adopted across a gateway restart regardless of this setting.

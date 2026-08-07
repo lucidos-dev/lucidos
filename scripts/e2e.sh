@@ -48,6 +48,11 @@ teardown_e2e() {
     stop_e2e_background_guards
     cleanup_e2e_worktrees
     stop_e2e_workspace
+    # After the engine is down, so the coding-agent subprocesses the suite
+    # spawned are leftovers rather than its live children. Without this a run
+    # that ended cleanly left them alive until some LATER run happened to find a
+    # stale lock, which is how four reached 55 minutes on 2026-08-07.
+    sweep_e2e_orphans
     release_e2e_lock
 }
 trap teardown_e2e EXIT

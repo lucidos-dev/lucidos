@@ -393,19 +393,111 @@
 /* Two chunks touching means the step between them is HIDDEN: with Hide steps
    on, a step (and an event wait) renders as null, so `text, step, text` leaves
    two chunk divs as siblings. The even margin above is the gap to a step ROW,
-   and it is too tight for a paragraph break, which is what the boundary
-   becomes once the row is gone. So restore the paragraph gap here, the same
-   0.75rem `.markdown-content p` uses and the same one this boundary had before
-   the chunk owned its own spacing.
+   and it is too tight for the boundary this becomes once the row is gone.
 
-   Two stages get it there, and neither alone would: this selector is (0,2,0)
-   against the base rule's (0,1,0), so it takes the second chunk's margin-top
-   on SPECIFICITY, not on source order; the adjacent-sibling collapse against
-   the first chunk's 0.375rem margin-bottom then resolves the gap to the larger
-   of the two. Widening the base rule instead would space every chunk off its
-   step rows, which is the thing being fixed. */
+   Whitespace alone used to carry that boundary, at the 0.75rem `.markdown-content
+   p` uses, and air is a poor thing to carry it with: the column runs at 1.5
+   leading on --font-size-sm, an 18px line pitch, so every hidden step opened a
+   30px hole and a run of ten of them (a coding-agent turn with steps off is
+   mostly that) read as a list of disconnected sentences rather than as one
+   response with its mechanics folded away. The gap is now 0.3125rem either side
+   of a hairline, an 11px boundary. Barely tighter in raw pixels, and that is the
+   point: the same air now says something, because the mark is what the eye reads
+   as the boundary instead of the size of the hole.
+
+   Do not drop the mark and keep the 0.3125rem. The UNMARKED version of this
+   boundary has been tried at both ends and neither worked: at the collapsed
+   0.375rem, reverted on 2026-08-06 because a break with nothing in it stopped
+   registering as a break at all, and at the 0.75rem that replaced it, which
+   registered but as a hole. The mark is the third answer, and the air either
+   side is tuned around it rather than being the thing doing the work.
+
+   Both gaps are rem, not px, because the boundary's job is a RATIO to the line
+   pitch and the line pitch is itself rem-derived. Pinned to px it would hold at
+   11px while the pitch grew to 22.5px at a 125% root, so the break would quietly
+   tighten from 1.61x to 1.49x exactly when the user asked for more room. The
+   1px hairline is the one thing that does NOT scale, for the reason below.
+
+   Both sides of the boundary are set, and both are load-bearing: adjacent-sibling
+   margins collapse to the LARGER of the two, so leaving the first chunk on the
+   base 0.375rem would hold the gap above the tick at 6px against 5px below it.
+   `:has()` takes the specificity of its argument, so both rules are (0,2,0)
+   against the base rule's (0,1,0) and win on specificity rather than source
+   order. Widening the base rule instead would space every chunk off its step
+   rows, which is the thing being avoided. */
 .response-chunk + .response-chunk {
-    margin-top: 0.75rem;
+    margin-top: 0.3125rem;
+}
+
+.response-chunk:has(+ .response-chunk) {
+    margin-bottom: 0.3125rem;
+}
+
+/* The elision mark. Spans the full text column and fades in and back out across
+   it: there is no `width`, because a block ::before already fills its containing
+   block, and no percentage would survive a pane resize any better than that
+   does.
+
+   The GRADIENT is what keeps a full-width rule from reading as a section
+   divider, and it has NO hard end at either side. That is not symmetry for its
+   own sake: `.markdown-content hr` (shared-components.css) is also 1px of
+   --border-color across this same column, so a response containing a literal
+   `---` puts an author's section divider and this chrome mark in one transcript.
+   They must not be the same shape. The hr is a bar of uniform weight with two
+   crisp ends; this swells from nothing and decays back to nothing, so it is
+   inked at neither edge and the two silhouettes separate at a glance rather
+   than on inspection.
+
+   The load-bearing part is the ZERO alpha at x=0 and x=100%, not where the peak
+   sits between them. The original shape started at full --border-color flush on
+   the text's left edge and was indistinguishable from an hr for the first third
+   of the column, and the left end is the one that mattered: the other
+   differences (the hr's 1.25rem of air against this mark's 0.3125rem, and this
+   one's decay) all live to the RIGHT of, or BELOW, the edge the eye samples
+   first.
+
+   Given that, the peak POSITION is a preference rather than a mechanism, and
+   15% is the one that was picked: a left-aligned monospace column is scanned
+   down its left edge, so the mark carries its weight where the reader already
+   is and trails off across the rest. A centred peak was tried and is the more
+   symmetric object, but it puts the only strong region in the middle of the
+   column, away from that edge. Neither is louder than the other, which is worth
+   knowing before re-tuning it: with stops at transparent / colour@p /
+   transparent the alpha profile is a triangle of base 1 and height 1, so the
+   mean is 0.5 at ANY peak. Moving it redistributes ink and never adds any.
+
+   A solid full-width rule was rejected before any of this: ten of those down one
+   screen is furniture, while ten of these read as a rhythm.
+
+   Not matched by `.response-chunk > :first-child` above, which is an element
+   selector, so the chunk's first real child still gets its margin-top zeroed and
+   sits directly under the mark.
+
+   `height` is a literal 1px for the same reason the rem rule exempts border
+   widths: this IS a hairline. A rem value would land on a fraction at a scaled
+   root and be silently snapped, which on a 1px line is the difference between
+   drawing it and drawing an antialiased smear. It is deliberately the one value
+   here that does NOT scale with the UI, exactly like every border in the app.
+
+   No forced-colors fallback, deliberately, unlike the focus rings elsewhere in
+   these stylesheets. Forced colors strips a gradient background image, so the
+   mark disappears there and the boundary degrades to 11px of plain whitespace
+   (the band keeps its 1px of layout), which still reads as a break. A focus ring
+   going missing loses the user their place; a decorative elision mark going
+   missing does not, and a forced CanvasText rule would paint the exact thing the
+   gradient exists to avoid: a hard, full-contrast line across the whole column
+   at every hidden step. */
+.response-chunk + .response-chunk::before {
+    content: '';
+    display: block;
+    height: 1px;
+    background: linear-gradient(
+        to right,
+        transparent,
+        var(--border-color) 15%,
+        transparent
+    );
+    margin-bottom: 0.3125rem;
 }
 
 .response-content li p {

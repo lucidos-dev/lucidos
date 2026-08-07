@@ -1,11 +1,19 @@
 import { useRef, useEffect, useState } from 'preact/hooks';
-import { activeInlineForm, credentials, showToast } from '../../store/store';
+import { activeInlineForm, credentials, knownOAuthProviders, showToast } from '../../store/store';
 import {
   closeCredentialForm,
   submitNewCredential,
   submitCredentialEdit,
+  submitRequestedCredential,
   loadCredentials,
 } from '../../store/actions/credentials';
+import { loadKnownOAuthProviders } from '../../store/actions/oauth';
+import {
+  describeMissingFields,
+  oauthClientSubmitError,
+  rowForService,
+  secretIsExpected,
+} from './oauthClientForm';
 import { loadedOr, toFailed } from '../../store/types';
 import type { AuthType, CredentialInfo, CredentialRequest, EmailAccountInfo, Loadable } from '../../store/types';
 import { getCredentialValue, getEmailAccount } from '../../api/client';
@@ -36,10 +44,29 @@ export function CredentialModal() {
   if (form?.type !== 'credential') return null;
 
   // Editing pre-loads the stored secret (+ email settings) so the uncontrolled
-  // inputs initialise from real values; create/request needs no async load.
+  // inputs initialise from real values; a plain create needs no async load.
   // Keyed by the credential: switching edit targets remounts the loader, so a
   // stale `data` from the previous credential can never seed the next form.
-  if (form.editing) return <CredentialEditLoader key={form.editing} editing={form.editing} />;
+  if (form.editing) return <CredentialStoredLoader key={form.editing} credentialId={form.editing} />;
+
+  // A REPAIR targets a credential that already exists, so it loads the stored
+  // secret too. Saving rebuilds the whole `auth_value` from the form, so a form
+  // seeded only with the request's `client_id` would drop every other stored
+  // field on save: a confidential client would silently lose its
+  // `client_secret` and start failing the token exchange, and a provider the
+  // registry does not know would lose its endpoints, scopes and redirect
+  // override as well. The stored values win; the request's registry defaults
+  // fill only what is genuinely missing (see `initialAuthUrl` and friends).
+  const repairing = form.request?.existing_credential_id;
+  if (repairing) {
+    return (
+      <CredentialStoredLoader
+        key={repairing}
+        credentialId={repairing}
+        request={form.request}
+      />
+    );
+  }
 
   return (
     <CredentialFormInner
@@ -57,15 +84,30 @@ interface EditData {
   emailInfo: EmailAccountInfo | null;
 }
 
-/** Loads the current secret value + email settings for an edit, then renders
- *  the form pre-filled. The secret is fetched via the same endpoint the copy
- *  buttons use — no new exposure. */
-/** `editing` is the credential's `id`, not its service name: a name no longer
+/** Loads a credential's stored secret (+ email settings), then renders the form
+ *  pre-filled. The secret is fetched via the same endpoint the copy buttons use,
+ *  so this is no new exposure.
+ *
+ *  Serves the form's two "this row already exists" entry points, which differ
+ *  only in what happens on save. An **edit** the user opened updates the row and
+ *  stops. A **repair** was opened by the engine refusing to start an
+ *  authorization, so it carries the `request` and saving continues that flow
+ *  (`submitRequestedCredential`, routed to update by `existing_credential_id`).
+ *  Passing `request` is what tells the two apart, and a repair deliberately
+ *  leaves `editing` unset so the form applies the stricter create rules: the
+ *  endpoints it reopened for are genuinely required.
+ *
+ *  `credentialId` is the row's `id`, not its service name: a name no longer
  *  identifies one row (an `oauth_client` registration may share it with an API
  *  key), and the form can change `auth_type`, so even name-plus-type could not
- *  name the row being edited. The service name for display comes off the
- *  resolved row instead. */
-function CredentialEditLoader({ editing }: { editing: string }) {
+ *  name it. The service name for display comes off the resolved row instead. */
+function CredentialStoredLoader({
+  credentialId,
+  request,
+}: {
+  credentialId: string;
+  request?: CredentialRequest;
+}) {
   const credLoadable = credentials.value;
   const [data, setData] = useState<Loadable<EditData>>({ status: 'not-loaded' });
 
@@ -75,7 +117,7 @@ function CredentialEditLoader({ editing }: { editing: string }) {
 
   const creds = loadedOr(credLoadable, []);
   const existingCred =
-    credLoadable.status === 'loaded' ? creds.find((c) => c.id === editing) ?? null : null;
+    credLoadable.status === 'loaded' ? creds.find((c) => c.id === credentialId) ?? null : null;
 
   useEffect(() => {
     if (credLoadable.status !== 'loaded') return;
@@ -88,7 +130,7 @@ function CredentialEditLoader({ editing }: { editing: string }) {
     setData({ status: 'loading' });
     (async () => {
       try {
-        const secret = await getCredentialValue(editing);
+        const secret = await getCredentialValue(credentialId);
         const fields = parseSecret(existingCred.auth_type, secret.auth_value);
         const emailInfo =
           existingCred.auth_type === 'email_password'
@@ -103,7 +145,7 @@ function CredentialEditLoader({ editing }: { editing: string }) {
       cancelled = true;
     };
     // existingCred identity changes only with the credentials list / editing key.
-  }, [credLoadable.status, editing, existingCred?.auth_type]);
+  }, [credLoadable.status, credentialId, existingCred?.auth_type]);
 
   // Delay the spinner so a fast secret fetch never flashes it. The failed
   // branches below render first.
@@ -139,9 +181,9 @@ function CredentialEditLoader({ editing }: { editing: string }) {
 
   return (
     <CredentialFormInner
-      key={editing}
-      editing={editing}
-      request={undefined}
+      key={credentialId}
+      editing={request ? undefined : credentialId}
+      request={request}
       existingCred={existingCred}
       initialFields={data.data.fields}
       emailInfo={data.data.emailInfo}
@@ -190,6 +232,85 @@ function CredentialFormInner({
   const initialRedirectUri = initialFields.redirectUri || oauthDefaults?.redirect_uri || '';
 
   const [selectedAuthType, setSelectedAuthType] = useState<AuthType>(initialAuthType);
+  /** The Base URL field. State rather than a ref write, because the input is
+   *  controlled and every re-render would otherwise restore `initialBaseUrl`. */
+  const [baseUrl, setBaseUrl] = useState(initialBaseUrl);
+
+  // The *OAuth provider registry*, for the console help and the derived-provider
+  // picker. Absent or failed degrades to no help and no picker, which is the
+  // form exactly as it was before the registry existed.
+  const registryLoadable = knownOAuthProviders.value;
+  const knownProviders =
+    registryLoadable.status === 'loaded' ? registryLoadable.data.providers : [];
+  const redirectUri =
+    registryLoadable.status === 'loaded' ? registryLoadable.data.default_redirect_uri : '';
+  const registryRow = rowForService(knownProviders, initialService);
+  /** What the repair notice compares the engine's `missing` list against: the
+   *  values the form is actually showing, which for a known provider are the
+   *  registry's rather than the broken row's. */
+  const repairNotice = describeMissingFields(request?.missing, {
+    client_id: initialFields.clientId,
+    auth_url: initialAuthUrl,
+    token_url: initialTokenUrl,
+  });
+  /** A repair that reopened the form FOR the endpoints shows them, prefilled or
+   *  not. Collapsing them is what made the autofill look like it never ran: the
+   *  notice named two fields as the whole reason the form is on screen, and both
+   *  sat behind a shut disclosure carrying the word "pre-filled". */
+  const repairNamedEndpoints = !!request?.missing?.some(
+    (m) => m === 'auth_url' || m === 'token_url',
+  );
+  /** Which known provider a derived name was told to run on. Empty until picked.
+   *
+   *  Declared BEFORE `expectsSecret`, which reads it. That read happens inside a
+   *  `.find` callback, so TypeScript's used-before-declaration check does not
+   *  see it (the reference is in a function body, and the compiler cannot know
+   *  when one runs) while `.find` in fact invokes it synchronously: the wrong
+   *  order threw a temporal-dead-zone `ReferenceError` on every render of this
+   *  form, and neither `tsc` nor the suite caught it because nothing mounts the
+   *  modal. */
+  const [basedOn, setBasedOn] = useState('');
+  /** The provider whose console this registration is actually made in.
+   *
+   *  For a derived name that is the BASE provider the user picked, not the
+   *  service name: the app is registered with the base provider, so its console
+   *  link, redirect URI, client type and permissions are the ones that apply.
+   *  Keying the help off the service name alone left a derived connection with
+   *  no console link and no URI to copy, at exactly the moment the user is
+   *  standing in that console needing both. */
+  const helpRow = registryRow ?? knownProviders.find((p) => p.id === basedOn);
+  const expectsSecret = secretIsExpected(helpRow);
+
+  useEffect(() => {
+    if (registryLoadable.status === 'not-loaded') void loadKnownOAuthProviders();
+  }, [registryLoadable.status]);
+
+  /** Fill the endpoint fields from a base provider's row.
+   *
+   *  Writes through the refs rather than through state because the endpoint
+   *  inputs are uncontrolled (they hold `defaultValue`), so re-rendering would
+   *  not move them. */
+  function applyBaseProvider(id: string) {
+    setBasedOn(id);
+    const row = knownProviders.find((p) => p.id === id);
+    if (!row) return;
+    setBaseUrl(row.base_url);
+    if (authUrlRef.current) authUrlRef.current.value = row.auth_url;
+    if (tokenUrlRef.current) tokenUrlRef.current.value = row.token_url;
+    if (userinfoUrlRef.current) userinfoUrlRef.current.value = row.userinfo_url ?? '';
+    if (authorizeParamsRef.current) authorizeParamsRef.current.value = row.authorize_params ?? '';
+    if (redirectUriRef.current) redirectUriRef.current.value = row.redirect_uri ?? '';
+    setUserinfoMethod(row.userinfo_method ?? 'GET');
+  }
+
+  async function copyRedirectUri() {
+    try {
+      await navigator.clipboard.writeText(redirectUri);
+      showToast('Redirect URI copied to clipboard', 'success');
+    } catch {
+      showToast('Failed to copy the redirect URI to clipboard', 'error');
+    }
+  }
 
   const serviceRef = useRef<HTMLInputElement>(null);
   const baseUrlRef = useRef<HTMLInputElement>(null);
@@ -281,16 +402,16 @@ function CredentialFormInner({
     const envVarName = isEmailPassword ? undefined : envVarNameRef.current?.value.trim() || undefined;
 
     if (authType === 'oauth_client') {
-      // Pair validation: if either custom endpoint URL is given, both must be.
-      if ((fields.authUrl && !fields.tokenUrl) || (!fields.authUrl && fields.tokenUrl)) {
-        showToast('Authorization URL and Token URL must both be provided for a custom OAuth provider.', 'error');
+      // Genuinely enforced now, and it says which field. The old rule was a PAIR
+      // check that both-blank passed, so a client with no endpoints saved fine
+      // and failed on the next Connect with "Missing auth_url in OAuth
+      // credentials". A blank client SECRET is still fine: it is how a public
+      // client is expressed (PKCE), not an omission.
+      const refusal = oauthClientSubmitError(fields, !!editing);
+      if (refusal) {
+        showToast(refusal, 'error');
         return;
       }
-      // Only the client ID is mandatory. A blank client secret is a valid
-      // choice, not an omission: it makes Lucidos a public client that
-      // authenticates with PKCE — the correct shape when the provider's app
-      // registration is a desktop/native app rather than a web app.
-      if (!editing && !fields.clientId) return;
     } else if (authType === 'password') {
       if (!editing && (!fields.username || !fields.password)) return;
     }
@@ -325,6 +446,12 @@ function CredentialFormInner({
         env_var_name: envVarName,
       };
       await submitCredentialEdit(editing, body);
+    } else if (request) {
+      // A credential the ENGINE asked for. Routed apart from a plain create for
+      // two reasons: a repair carries the id of the row it must update (creating
+      // would make a second OAuth Client for one provider), and a save here has
+      // an authorization waiting behind it that must now continue.
+      await submitRequestedCredential(request, service, baseUrl, authType, authValue, envVarName);
     } else {
       await submitNewCredential(service, baseUrl, authType, authValue, envVarName);
     }
@@ -351,10 +478,18 @@ function CredentialFormInner({
             </div>
             <div class="form-group">
               <label>Base URL</label>
+              {/* Real state, not a bare `value=` with no handler. This input is
+                  CONTROLLED, so every re-render rewrites it from its prop: it
+                  only appeared to accept typing because nothing re-rendered.
+                  Anything that does (picking an Auth Type, picking the base
+                  provider a derived name runs on) silently reverted it, which
+                  is how a derived connection kept the guessed
+                  `https://<name>.com` instead of the registry row's base URL. */}
               <input
                 ref={baseUrlRef}
                 type="url"
-                value={initialBaseUrl}
+                value={baseUrl}
+                onInput={(e) => setBaseUrl((e.target as HTMLInputElement).value)}
                 placeholder="e.g. https://api.github.com"
                 required
               />
@@ -433,6 +568,62 @@ function CredentialFormInner({
         )}
         {isOAuthClient ? (
           <>
+            {repairNotice && <p class="credential-repair-notice">{repairNotice}</p>}
+            {/* The one step this form cannot do for the user: the Client ID
+                only exists once an app is registered with the provider, and the
+                redirect URI has to be entered there character for character.
+                Everything shown comes from the registry, so it stays true as
+                providers change and the agent reads the same rows. */}
+            {helpRow && (
+              <div class="credential-console-help">
+                {helpRow.console_url && (
+                  <a
+                    class="accent-link"
+                    href={helpRow.console_url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >
+                    Open the {helpRow.console_label ?? `${helpRow.label} console`} ↗
+                  </a>
+                )}
+                {helpRow.setup_hint && <p>{helpRow.setup_hint}</p>}
+                {helpRow.permissions_hint && <p>{helpRow.permissions_hint}</p>}
+                {redirectUri && (
+                  <div class="credential-redirect-uri">
+                    <span class="label">Redirect URI</span>
+                    <code>{redirectUri}</code>
+                    <button
+                      type="button"
+                      class="action-btn"
+                      onClick={() => void copyRedirectUri()}
+                    >Copy</button>
+                  </div>
+                )}
+              </div>
+            )}
+            {/* A name the registry does not know is a derived provider: a second,
+                narrowly-scoped connection under its own name, running on a known
+                provider's endpoints. Asking which one beats guessing from the
+                spelling, and beats making the user paste four URLs they could
+                have had for free. */}
+            {!registryRow && !editing && knownProviders.length > 0 && (
+              <div class="form-group">
+                <label>Runs on <span class="form-hint">(optional)</span></label>
+                <Dropdown
+                  options={[
+                    { value: '', label: 'A provider Lucidos does not know' },
+                    ...knownProviders.map((p) => ({ value: p.id, label: p.label })),
+                  ]}
+                  value={basedOn}
+                  onChange={applyBaseProvider}
+                />
+                <div class="form-hint">
+                  Pick the service this connection actually signs in to, and its
+                  endpoints fill in below. Use this for a separate, narrowly-scoped
+                  connection you want held apart from your everyday one.
+                </div>
+              </div>
+            )}
             <div class="form-group">
               <label>Client ID</label>
               <input
@@ -444,21 +635,43 @@ function CredentialFormInner({
               />
             </div>
             <div class="form-group">
-              <label>Client Secret <span class="form-hint">(optional)</span></label>
+              {/* Advisory, from the registry: the engine still derives the real
+                  client type from whether a secret was saved. But "leave it
+                  blank" is wrong advice for a provider that only issues
+                  confidential clients, and both mismatches (a secret sent by a
+                  public client, a secret-less redemption by a confidential one)
+                  are refused by the provider late, looking nothing like their
+                  cause. */}
+              <label>
+                Client Secret{' '}
+                <span class="form-hint">
+                  {expectsSecret ? '(required by this provider)' : '(optional)'}
+                </span>
+              </label>
               <SecretInput
                 inputRef={clientSecretRef}
                 defaultValue={initialFields.clientSecret}
-                placeholder="Leave blank for a desktop/native app"
+                placeholder={
+                  expectsSecret
+                    ? 'Paste the secret generated with the client ID'
+                    : 'Leave blank for a desktop/native app'
+                }
               />
               <div class="form-hint">
-                Leave blank when the provider's app registration is a desktop or native app —
-                Lucidos then connects as a public client using PKCE instead of a secret.
+                {expectsSecret
+                  ? "This provider's app registrations are confidential clients, so the "
+                    + 'secret is part of the registration rather than an extra.'
+                  : "Leave blank when the provider's app registration is a desktop or native app: "
+                    + 'Lucidos then connects as a public client using PKCE instead of a secret.'}
               </div>
             </div>
-            <details class="credential-oauth-endpoints" open={!hasPrefilledEndpoints}>
+            <details
+              class="credential-oauth-endpoints"
+              open={!hasPrefilledEndpoints || repairNamedEndpoints}
+            >
               <summary>
                 {hasPrefilledEndpoints
-                  ? 'OAuth endpoints (pre-filled — edit if needed)'
+                  ? 'OAuth endpoints (pre-filled, edit if needed)'
                   : 'OAuth endpoints (required)'}
               </summary>
               <div class="form-group">

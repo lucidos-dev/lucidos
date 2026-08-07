@@ -184,14 +184,35 @@ pub(super) async fn update_app(
         Some(n) => n,
         None => return (StatusCode::BAD_REQUEST, "name is required").into_response(),
     };
-    let description = body
-        .get("description")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    // An ABSENT `description` key means "leave it as it is", never "clear it".
+    // `update_app_metadata` rewrites the whole `manifest.json` from the two
+    // values it is handed, and the generated CLI omits the key entirely when
+    // `--description` isn't passed (`lucidos apps update --id X --name Y`), so
+    // defaulting to "" silently erased the stored description and committed the
+    // erasure. A key that IS present still sets the value, including to "".
+    let description = match body.get("description").and_then(|v| v.as_str()) {
+        Some(d) => d.to_string(),
+        None => match state.app_manager.get_app(&query.id) {
+            Ok(app) => app.description,
+            Err(e) => {
+                return (
+                    StatusCode::NOT_FOUND,
+                    Json(serde_json::json!({ "error": e.to_string() })),
+                )
+                    .into_response()
+            }
+        },
+    };
     let actor = crate::api::actor::user_actor_resolved(&headers, &state.pool, None).await;
     match state
         .app_manager
-        .update_app_metadata(&state.engine.event_bus, &query.id, name, description, actor)
+        .update_app_metadata(
+            &state.engine.event_bus,
+            &query.id,
+            name,
+            &description,
+            actor,
+        )
         .await
     {
         Ok(commit) => Json(serde_json::json!({ "commit": commit })).into_response(),

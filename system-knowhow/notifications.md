@@ -1,6 +1,6 @@
 ---
 name: Notification Routing
-description: How Lucidos decides whether a notification reaches the user as an OS push, an in-app toast, a bell-badge increment, or is silently auto-marked-read. Covers the two notification surfaces (in-app + OS), the three device presence states (active / connected-but-hidden / offline), the PresenceCheck SSE protocol the engine uses at notification time to decide push without relying on stale heartbeats, and the per-device matrix the page evaluates locally for in-app display. Load when the user asks "why didn't I get a push on my X?", when adding a new notification source, when changing presence tracking, or when debugging cross-device notification noise.
+description: How Lucidos decides whether a notification reaches the user as an OS push, an in-app toast, a bell-badge increment, or is silently auto-marked-read: the two surfaces, the three device presence states (active, connected-but-hidden, offline), the PresenceCheck SSE protocol the engine runs at notification time, and the per-device matrix the page evaluates locally. Load for "why didn't I get a push on my X" or when debugging cross-device noise.
 ---
 
 # Notification Routing

@@ -121,6 +121,7 @@ pub fn get_default_tools() -> Vec<ToolDefinition> {
                                                 // (spliced from capability_manifest::llm_tools() by the chat/intent callers).
     tools.extend(misc::ask_user_question_tools()); // ask_user_question
     tools.extend(misc::await_event_tools()); // await_event
+    tools.extend(misc::event_wait_agent_tools()); // list_event_waits, cancel_event_wait
     tools.extend(memory::dismiss_from_context_tools()); // dismiss_from_context
     tools.extend(misc::todo_write_tools()); // todo_write
     tools

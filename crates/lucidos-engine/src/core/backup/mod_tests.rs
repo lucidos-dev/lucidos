@@ -1316,7 +1316,7 @@ async fn get_retention_count_reads_preference() {
     crate::test_support::seed_preference(&pool, PREF_BACKUP_RETENTION, "10")
         .await
         .unwrap();
-    assert_eq!(get_retention_count(&pool).await, 10);
+    assert_eq!(get_retention_count(&pool).await.unwrap(), 10);
 
     crate::test_support::teardown_test_db(&db_name).await;
 }
@@ -1329,13 +1329,19 @@ async fn get_retention_count_falls_back_to_default() {
     let (pool, db_name) = crate::test_support::setup_test_db().await;
 
     // Absent → default.
-    assert_eq!(get_retention_count(&pool).await, DEFAULT_BACKUP_RETENTION);
+    assert_eq!(
+        get_retention_count(&pool).await.unwrap(),
+        DEFAULT_BACKUP_RETENTION
+    );
 
     // Unparseable → default, not 0.
     crate::test_support::seed_preference(&pool, PREF_BACKUP_RETENTION, "not-a-number")
         .await
         .unwrap();
-    assert_eq!(get_retention_count(&pool).await, DEFAULT_BACKUP_RETENTION);
+    assert_eq!(
+        get_retention_count(&pool).await.unwrap(),
+        DEFAULT_BACKUP_RETENTION
+    );
 
     crate::test_support::teardown_test_db(&db_name).await;
 }

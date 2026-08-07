@@ -42,7 +42,7 @@ pub(super) struct TriggerContext {
 /// to instruct users to start a NEW thread after a restart instead of
 /// returning to the existing one (observed in the
 /// `Status of Authentication Migration` thread).
-pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGHT WORK, NOT THREAD MEMORY:\nThe thread itself survives engine restarts — every message, tool call, and response is persisted in the event store, and your next turn after a restart loads the full history. The user can return to THIS thread (don't tell them to start a new one) and re-prompt to wake you up; you will see what was discussed. What does NOT survive is in-flight work: a streaming response, a child thread you were waiting on a callback from, an autonomous loop, or a `sleep N minutes then check back` intent. The LLM (you) is not running between turns; once a restart cuts off a response, no continuation fires automatically. So: never promise to do something \"after the restart\", \"once it comes back up\", \"in a minute when it's live\", or to \"check back later\" — those promises require a process that no longer exists. If a restart is about to happen, tell the user to come back to this same thread and re-prompt.";
+pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGHT WORK, NOT THREAD MEMORY:\nThe thread survives a restart: every message, tool call and response is persisted, and your next turn loads the full history. Send the user back to THIS thread to re-prompt, never to a fresh one. In-flight work does NOT survive: a streaming response, a child callback you were waiting on, an autonomous loop, a `sleep N minutes then check back` intent. You do not run between turns, and nothing resumes on its own once a restart cuts a response off, so never promise anything \"after the restart\", \"once it comes back up\", or \"check back later\".";
 
 /// Stops the chat agent from bouncing yes/no "did you apply it? / did you
 /// restart?" confirmations back at the user during the apply→restart loop.
@@ -64,7 +64,7 @@ pub(super) const ENGINE_RESTART_RULE: &str = "ENGINE RESTARTS INTERRUPT IN-FLIGH
 /// [`APPLY_VERIFY_DEV_ADDENDUM`] and is spliced only when a source checkout
 /// exists — a packaged install never rebuilds the engine, and an app change
 /// never restarts it, so promising that dance there is simply wrong.
-pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES — ACT AND VERIFY, DON'T ASK:\nYou have the `changes` tool (action 'list' / 'apply') — you can inspect and apply *changes* (coding-agent-proposed branches awaiting Apply) yourself, so NEVER bounce a yes/no question back to the user about state you can check.\n- NEVER ask \"have you applied it?\" / \"did you apply the change?\" — call `changes` with action 'list' and read whether it is `pending` or `applied`. If the user asked for it to be applied, call `changes` with action 'apply' directly; don't ask permission for the thing they just told you to do.\n- PROBE SERVED ASSETS UNDER THE WORKSPACE-PREFIXED ROUTE: bundled SDK / static assets are served under the workspace route, e.g. `https://<host>/<workspace>/api/v1/sdk-iframe.css` — NOT a bare `/api/v1/...` path. A bare path makes the gateway resolve the first segment (`api`) as a workspace name and 404 with \"unknown workspace 'api'\".\n- NEVER end an apply/restart loop with a confirmation question like \"does it look right now?\" or \"does it match?\". State what you verified, objectively. Reserve `ask_user_question` for a genuine decision the user has to make — not to confirm a step you could check yourself.";
+pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES, ACT AND VERIFY RATHER THAN ASK:\nYou have the `changes` tool (action 'list' / 'apply'), so never bounce a yes/no question back at the user about state you can check yourself.\n- NEVER ask \"have you applied it?\". Call action 'list' and read whether it is `pending` or `applied`. If they asked for it to be applied, call action 'apply' rather than asking permission for what they just told you to do.\n- PROBE SERVED ASSETS UNDER THE WORKSPACE-PREFIXED ROUTE, e.g. `https://<host>/<workspace>/api/v1/sdk-iframe.css`, never a bare `/api/v1/...`: a bare path makes the gateway read the first segment (`api`) as a workspace name and 404 with \"unknown workspace 'api'\".\n- State what you verified, objectively, and never close an apply loop with \"does it look right now?\". Reserve `ask_user_question` for a genuine decision, not to confirm a step you could check.";
 
 /// The half of the apply/verify rule that is only true on an install launched
 /// from a Lucidos source checkout: the engine rebuild+restart choreography for
@@ -76,7 +76,7 @@ pub(super) const APPLY_VERIFY_RULE: &str = "APPLYING & VERIFYING CHANGES — ACT
 /// changes never restart the engine, so an agent reciting this would be
 /// instructing the user through a flow that does not exist — which is precisely
 /// what happened in the reported failure.
-pub(super) const APPLY_VERIFY_DEV_ADDENDUM: &str = "\n- The user works on Lucidos constantly and knows the apply/restart/reload dance cold — do not re-explain it, and do not ask them to confirm they did it.\n- NEVER ask \"did you restart?\" / \"is the engine back up yet?\". You CANNOT restart the engine yourself — only the user can trigger the rebuild/restart, and Lucidos shows them the restart toast. So for a change that touches Rust/backend files (`requires_restart: true`): (a) apply it, (b) state plainly that a restart is required and that the USER must trigger it (don't promise the change is live immediately), then (c) VERIFY whether the new build is live by probing the served asset or behavior YOURSELF — e.g. `curl` the served file — rather than asking. If the probe still shows the old output, say so factually (\"the engine is still serving the pre-restart build\") instead of asking \"did you restart?\".";
+pub(super) const APPLY_VERIFY_DEV_ADDENDUM: &str = "\n- The user works on Lucidos constantly and knows the apply/restart/reload dance cold, so do not re-explain it or ask them to confirm they did it.\n- NEVER ask \"did you restart?\". You CANNOT restart the engine yourself: only the user triggers the rebuild, and Lucidos shows them the toast. For a change touching Rust or backend files (`requires_restart: true`), apply it, say plainly that the USER must trigger the restart rather than promising the change is live, then VERIFY the new build YOURSELF by probing the served asset. If the probe still shows the old output, say so factually (\"the engine is still serving the pre-restart build\").";
 
 /// Build the TriggerStarted thread-event + meta for a scheduler-fired trigger
 /// run. Extracted as a pure function so the wiring rule "the `config.id`
@@ -207,9 +207,15 @@ pub(super) fn build_trigger_knowhow_section(triggers_dir: &std::path::Path, slug
         Use `load_knowhow` with the id shown.\n\n",
     );
     for kh in &summaries {
+        // Same ceiling as the workspace Know-how list: this is user-authored
+        // routing text in the same bullet shape, so it cannot be allowed to
+        // cost more per line just because it arrives via a trigger.
         section.push_str(&format!(
             "- **{}** (id: `triggers/{}/{}`): {}\n",
-            kh.name, slug, kh.id, kh.description
+            kh.name,
+            slug,
+            kh.id,
+            super::process::workspace_payload::routing_description(&kh.description)
         ));
     }
     section

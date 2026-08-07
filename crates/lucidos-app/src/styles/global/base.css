@@ -475,6 +475,58 @@ label {
     user-select: none;
 }
 
+/* Programming ligatures belong to CODE, never to prose. The font preference
+   (store/actions/preferences.ts, mirrored by the index.html FOUC IIFE)
+   publishes two values on <html>: --font-features-text and
+   --font-features-code. For Fira Code they are '"liga" 0, "calt" 0' and
+   '"liga" 1, "calt" 1'; for every other font both are `normal`, so nothing but
+   Fira Code changes. These two rules are their ONLY consumers in the host,
+   because a custom property inherits as a value and renders nothing until
+   something applies it: the scope of the feature is decided right here.
+
+   Why the feature has to be turned off at all: Fira Code's `calt` deliberately
+   re-spaces dot runs (`..` and `...` are separate contextual rules so the font
+   can tighten range operators), and a typed `...` comes out kerned tight enough
+   to read as two dots in the composer and in the transcript. That is
+   tonsky/FiraCode#1561, open upstream, with no way to disable one sequence.
+
+   TWO TRAPS, both of which shipped as a silent no-op on 2026-08-07 and were
+   settled by pixel comparison in headless Chromium. The computed value shows
+   neither, so do not "verify" a change here with getComputedStyle:
+
+   1. `normal` is NOT off. `liga` and `calt` are default-ON features, so
+      `normal` means "the font's defaults" and renders byte-identically to
+      '"liga" 1, "calt" 1'. Only the explicit zeros disable them. Deleting the
+      declaration achieves nothing at all.
+   2. Form controls do NOT inherit font-feature-settings. The UA stylesheet
+      applies the `font` shorthand to them and that shorthand resets this
+      property, so `html` alone reaches prose but stops at the composer, which
+      is the surface the bug was reported against. Hence the explicit list,
+      the same reason the app sets `font-family` on inputs by hand. */
+html,
+input,
+textarea,
+select,
+button {
+    font-feature-settings: var(--font-features-text, normal);
+}
+
+/* Element selectors on purpose, so a new code surface is covered with nothing
+   to maintain: fenced blocks and inline code in markdown, the shell commands in
+   step rows (<code class="step-note-detail">), LineNumberedCode (which backs the
+   file preview and both side-by-side diff columns), RenderedDiff's removals and
+   the slides tree are all <pre>/<code>. .diff-line-content is named because
+   DiffView builds its lines out of spans instead. These re-enable explicitly
+   rather than resetting to `normal`, because they now inherit an OFF value.
+   Mirrored for app iframes in the engine's api/sdk_iframe.css. */
+code,
+pre,
+kbd,
+samp,
+.diff-line-content {
+    font-feature-settings: var(--font-features-code, normal);
+}
+
 /* Global tooltip (JS-positioned, appended to body) */
 #tooltip {
     position: fixed;

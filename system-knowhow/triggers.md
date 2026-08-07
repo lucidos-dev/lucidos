@@ -1,6 +1,6 @@
 ---
 name: Triggers
-description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y", recurring or event-driven background work), or wants an EXISTING trigger to run right now: "run this trigger now", "fire it manually", an ad hoc or off-schedule run, testing a trigger that already exists. Load it for any of those phrasings even if a trigger may not be the answer: § "When a trigger is the right answer" also settles WHETHER this is a trigger at all, and routes "tell me HERE when X happens" to the `await_event` tool instead, since a trigger runs in its own thread and cannot report into the conversation the user is in. Covers cron vs event subscriptions, the intent-vs-procedure rule, notification discipline, and the run action that fires an existing trigger off-schedule (plus when it is refused, and why an event-only trigger needs its event emitted instead).
+description: Use when the user wants something to happen automatically ("every morning", "notify me when X happens", "watch for Y") or wants an EXISTING trigger to run right now ("run this trigger now", "fire it manually", an ad hoc off-schedule run). Load it even if a trigger may not be the answer: § "When a trigger is the right answer" settles whether this is a trigger at all, and routes "tell me HERE when X happens" to `await_event` instead, since a trigger runs in its own thread. Covers cron vs event subscriptions, the intent-vs-procedure rule, notification discipline, and the run action.
 ---
 
 # Triggers
@@ -30,17 +30,24 @@ The working reference for *triggers*: choosing one, building it, editing it, and
 
 ### First ask where the answer goes, not just how often
 
+Both answers are the same *event subscription* underneath, `{event_type,
+condition}` matched by the same code. They differ in WHO CONSUMES THE MATCH: a
+**trigger subscription** spawns a new thread and stays armed for the next one, a
+**thread subscription** resumes an existing thread and is spent once it fires.
+
 A trigger runs in **its own thread**. It reaches the user as a notification, and
 it cannot continue the conversation they are typing in. So "let me know **here**
 when a coding agent edits code", "tell me in this chat when the build finishes",
-or any request made inside a thread the user is plainly waiting in, is the
-`await_event` tool, not a trigger. That holds **even when the phrasing sounds
-like a standing rule**: "when X happens, tell me" reads as forever, but what the
-user asked for is delivery into this conversation, and only `await_event` does
-that. It parks the turn at zero cost and resumes it when the event lands, so the
-report arrives in the thread they are reading. It is one-shot, so you re-arm per
-event, and consecutive parks are capped (the tool description carries the
-number), which is exactly why an unbounded promise belongs to a trigger instead.
+or any request made inside a thread the user is plainly waiting in, is a thread
+subscription (`await_event`), not a trigger. That holds **even when the phrasing
+sounds like a standing rule**: "when X happens, tell me" reads as forever, but
+what the user asked for is delivery into this conversation, and only
+`await_event` does that. It costs nothing while it watches: the call returns
+immediately, the turn ends normally, and the engine re-opens the thread when the
+event lands, so the report arrives where they are reading. It is one-shot, so you
+re-arm per event, and consecutive subscriptions are capped (the tool description
+carries the number), which is exactly why an unbounded promise belongs to a
+trigger instead.
 
 Duration is the *second* question, and it is the one this whole file is about:
 a reaction that must outlive the conversation, run when nobody is present, and
@@ -70,7 +77,7 @@ The trigger thread inherits the same knowhow surface a chat thread has: the syst
 ## Cron vs. `on` vs. both
 
 - **Cron** — "every morning at 8" / "weekdays at noon". Time-driven.
-- **`on`** — "when X happens". Reactive. Each entry in the `on` array names an event type plus an optional payload filter. The event must already be emitted by something (an app, another trigger, an integration).
+- **`on`**: "when X happens". Reactive. Each entry in the `on` array is a *trigger subscription*: an event type plus an optional payload filter. The event must already be emitted by something (an app, another trigger, an integration). A match spawns a new *trigger thread* and leaves the subscription armed for the next one, which is what makes a trigger a standing rule.
 - **Both** — rare; usually means cron with a payload-shaped condition that should be event-driven instead. Re-examine before doing this.
 
 If the user says "notify me when X" and X isn't an event yet, you have two work items: (1) make X emit an event, (2) trigger on it. Tell the user that explicitly.
@@ -92,9 +99,75 @@ Each entry carries its own `condition`, scoped to *that* event:
 
 The `sleep_score` filter does NOT apply to `EmailReceived` — its payload doesn't have that field at all. Per-entry conditions mean different event payload shapes never constrain each other.
 
+## Writing cron expressions
+
+Six fields, `second minute hour day-of-month month day-of-week`, in the user's local timezone. Two rules decide what a trigger actually fires on, and they pull in opposite directions:
+
+- **Within one expression, the fields are ANDed.** Every field must match. So when day-of-month AND day-of-week are both set, the expression fires only on days that satisfy both. (Vixie cron ORs those two specific fields. Lucidos does not. Never write a cron on the Vixie assumption.)
+- **Across the array, the expressions are ORed.** A trigger's `cron` takes a list, and it fires at the earliest match from any entry. This is how you express "either of these".
+
+Both rules are load-bearing for the recipes below. Neither is a bug, and neither is going to change.
+
+### The footgun: one expression is not "either"
+
+`0 0 9 1 * Mon` reads to almost everyone as "the 1st, plus every Monday". It means "the 1st, but only when the 1st IS a Monday". That happens about 1.7 times a year on average and in lumpy gaps: it fires 2026-06-01, then nothing until 2027-02-01, then 2027-03-01, then nothing until 2027-11-01.
+
+"The 1st, plus every Monday" is two expressions:
+
+```json
+{ "cron": ["0 0 9 1 * *", "0 0 9 * * Mon"] }
+```
+
+The engine warns (without refusing) when a single expression restricts both fields in a shape that fires rarely. It stays deliberately quiet for the 7-day windows below, which use the same AND on purpose.
+
+### nth weekday of the month
+
+The AND is the mechanism here, not a trap: pin day-of-week and give day-of-month a **7-day window**. Any 7 consecutive dates contain each weekday exactly once, so this fires exactly once a month.
+
+| Want | Cron |
+|---|---|
+| First Monday, 09:00 | `0 0 9 1-7 * Mon` |
+| Second Tuesday, 09:00 | `0 0 9 8-14 * Tue` |
+| Third Friday, 09:00 | `0 0 9 15-21 * Fri` |
+
+All three verified exact for every month from 2026 to 2100.
+
+### Last weekday of the month
+
+Same trick from the other end, except the window has to move with the month's length, so it takes three ORed expressions:
+
+```json
+{
+  "cron": [
+    "0 0 9 25-31 1,3,5,7,8,10,12 Mon",
+    "0 0 9 24-30 4,6,9,11 Mon",
+    "0 0 9 22-28 2 Mon"
+  ]
+}
+```
+
+Verified against every month from 2026 to 2100 (900 months): exact in 898, with zero double-fires. The two misses are **February 2044 and February 2072**, the only leap years in that range where Feb 29 falls on a Monday; there it fires Feb 22 instead. Adding `0 0 9 23-29 2 Mon` as a fourth expression fixes those two months but makes them fire **twice** (the 22nd and the 29th), so three is the better trade. Say so when you build one, rather than hiding the edge.
+
+Swapping the weekday gives last Friday, last Tuesday and so on, with the same shape and its own leap-February exception (for Friday it is 2036, 2064 and 2092). For plain **month end** with no weekday, pin the last day per month-length class instead: `["0 0 9 31 1,3,5,7,8,10,12 *", "0 0 9 30 4,6,9,11 *", "0 0 9 28 2 *"]`. February is the awkward one either way, since its last day moves; `28` is a day early in leap years, and `28,29` fires twice in them. Pick one with the user.
+
+### Expressions that can never fire
+
+A day-of-month that the month is never long enough to contain is syntactically valid and semantically dead. These parse cleanly, and before the guard they were accepted, registered, and shown as healthy while doing nothing forever:
+
+| Expression | Why it never fires |
+|---|---|
+| `0 0 9 31 2 *` | February has no 31st |
+| `0 0 9 30 2 *` | February has no 30th |
+| `0 0 9 31 4,6,9,11 *` | April, June, September and November have 30 days |
+| `0 0 9 30 2 Sun` | impossible date; the weekday is irrelevant |
+
+**The engine now rejects all of these at create and update**, naming the offending fields (`day-of-month 31 never occurs in month 2 (February)`). So you will get an error rather than a silently dead trigger. Fix the expression; there is nothing to work around.
+
+`0 0 9 29 2 *` is NOT in this class. Feb 29 is rare, not impossible: it fires 2028, 2032, then 2036. Every create and update reports the **next 3 fire times** back to you, and the trigger's row in the panel shows them too. Read them against what the user asked for before you confirm: three dates a year apart when they said "monthly" is the tell.
+
 ## `condition` — when to filter
 
-Set `condition` on a subscription when the event is high-volume and you only care about a slice. Example: subscribe to `EmailReceived` but only fire on emails from a specific sender. Without a condition, the trigger fires for every email and the LLM has to filter inside the run — wasteful and slow.
+Set `condition` on a trigger subscription when the event is high-volume and you only care about a slice. Example: subscribe to `EmailReceived` but only fire on emails from a specific sender. Without a condition, the trigger fires for every email and the LLM has to filter inside the run, which is wasteful and slow.
 
 Don't use `condition` for logic that depends on external state (e.g. "only if this app's data file says X"). Conditions are pure payload filters. Stateful checks belong inside the run.
 
@@ -358,7 +431,7 @@ Both stay fine for **debugging** ("does the script still crash?"), as long as yo
 Don't call `create_trigger` from the user's first message. Most "create a trigger for X" requests leave at least one of these unsettled — confirm before writing the trigger. Skip questions only when the user has already answered them in the same turn.
 
 1. **Recurring or one-shot — and if one-shot, now or at a future time?** Triggers are for things that should keep happening, so a recurring need is always a trigger. A one-off splits by *when*: if it's "do this **now**" ("check X and tell me"), handle it inline — no trigger. If it's anchored to a **future time** ("remind me at 5pm today", "ping me in 20 minutes"), it CANNOT be handled inline — you are not running then and nothing auto-resumes you, so an inline reminder is silently dropped — so it needs a **one-shot trigger** (cron for that time, ideally self-deleting). Whenever you create a one-shot (a future reminder, or an explicit test like "fire once in 2 min"), ask whether it should delete itself after firing — it won't on its own. Create it with `go_to_review` omitted (so the fire-thread lands in Archive, not the Current section) unless the user explicitly wants to read the run afterwards. See "One-shot triggers" below for the procedure.
-2. **Cron or `on`?** "Every morning at 8" is cron. "When my package ships" is an event subscription. If the user names several events the same workflow should react to ("when X *or* Y happens"), they belong in one trigger with multiple `on` entries — not parallel triggers. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
+2. **Cron or `on`?** "Every morning at 8" is cron. "When my package ships" is a trigger subscription. If the user names several events the same workflow should react to ("when X *or* Y happens"), they belong in one trigger with multiple `on` entries, not parallel triggers. If the event doesn't exist yet, name the work (emit the event from somewhere, then trigger on it) and confirm.
 3. **What's the run.intent in the user's voice?** One sentence the user would actually say. If you're tempted to write the procedure here, stop and put it in knowhow instead.
 4. **Should it notify, and on what?** Default is silent — `send_notification` only fires when there's something the user wants to hear about. Confirm whether a successful run should notify, and what the message should look like.
 5. **Surface to review or stay silent?** Always ask unless the user's phrasing clearly answers it (see the table in "Where the thread lands"). `go_to_review: true` for "I want to read this when it finishes" (daily summaries, scheduled reports, alerts that need acknowledgement); omit for silent housekeeping. A `send_notification` doesn't answer this — notifications and review-surface are independent.
@@ -439,7 +512,7 @@ in `list_triggers`.
 
 ## Setup checklist
 
-1. **Set timezone first** if not already set. Cron is 6 fields (`second minute hour day-of-month month day-of-week`) in the user's local timezone, DST-aware via IANA tz. The `create_trigger` tool refuses without a timezone.
+1. **Set timezone first** if not already set. Cron is 6 fields (`second minute hour day-of-month month day-of-week`) in the user's local timezone, DST-aware via IANA tz. The `create_trigger` tool refuses without a timezone. For anything beyond a plain daily or weekly time, read § "Writing cron expressions" above: the AND/OR split, the nth-weekday and last-weekday recipes, and the combinations the engine rejects.
 2. **`list_triggers` first** to check whether an existing trigger should be updated instead of creating a new one.
 3. **Decide cron vs. `on` (and whether `on` needs multiple entries)** before writing the trigger.
 4. **Write `run.intent` as the user would say it.**
@@ -451,7 +524,9 @@ in `list_triggers`.
 - **Hand-editing `trigger.toml`.** It's a derived read-model the scheduler never reads: the edit silently no-ops (the trigger keeps its old config) and is clobbered by the next trigger event or restart. Change the config with `update_trigger`, then verify against `list_triggers` — never by reading the file back. See "On-disk trigger definition" above.
 - **Resuming a paused trigger to "run it now", or hand-rolling the run.** Resume restores the schedule and runs nothing by itself. Use `triggers(action="run")` (or emit the subscribed event, for an event-only trigger) rather than copying the intent into `run_thread` or executing the script yourself. See "Running an existing trigger once, off-schedule" above.
 - **Recipe-in-text.** Putting procedure into `run.intent` instead of knowhow. See "The most important rule" above.
-- **Cron when an event subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
+- **Cron when a trigger subscription fits.** Polling burns runs and adds latency. If an event exists, prefer it.
+- **Assuming day-of-month and day-of-week are ORed.** They are ANDed, so `0 0 9 1 * Mon` is "the 1st when it falls on a Monday", not "the 1st and every Monday". Vixie cron behaves the other way, which is where the assumption comes from. See § "Writing cron expressions".
+- **A cron that can never fire.** `0 0 9 31 2 *` is valid syntax and a dead trigger. The engine rejects these now, but the surer habit is to read the next-3 fire times it reports on every create and update: they catch the whole class, including the expressions that fire far more rarely than the user meant.
 - **Parallel triggers for one workflow that reacts to several events.** Use one trigger with multiple `on` entries; never duplicate the intent across siblings — editing one and forgetting the other silently drifts behaviour.
 - **No knowhow file for a procedure the trigger clearly needs.** Without a discoverable knowhow file, the LLM re-derives the procedure every run and gets it slightly different each time. Write the recipe down — semantic discovery will surface it on the next fire.
 - **Vague `name`/`description` frontmatter on a trigger-scoped knowhow.** Discovery is semantic, not by id, so a knowhow titled `notes.md` with `name: Notes` won't surface when the LLM is reasoning about an API call. Name the file by what it teaches (`openai-availability-check.md`), and write the `description` as the kind of question that should retrieve it.

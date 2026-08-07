@@ -1,0 +1,72 @@
+{
+  "note": "The OAuth provider registry: the machine-readable rows behind Settings > Accounts > Connect. The engine serves these to the Connect form so a known provider prefills every endpoint and asks only for a Client ID. The prose that goes with them (redirect URI host forms, confidential versus public clients, scope notes, the Dropbox App Console rule, Microsoft Entra's platform buckets) lives in oauth-providers.md, which deliberately does not restate these rows. Add a provider by adding a row here.",
+  "providers": [
+    {
+      "id": "google",
+      "label": "Google",
+      "base_url": "https://www.googleapis.com",
+      "auth_url": "https://accounts.google.com/o/oauth2/v2/auth",
+      "token_url": "https://oauth2.googleapis.com/token",
+      "userinfo_url": "https://www.googleapis.com/oauth2/v2/userinfo",
+      "client_type": "public",
+      "console_label": "Google Cloud Console",
+      "console_url": "https://console.cloud.google.com/apis/credentials",
+      "setup_hint": "Create an OAuth client of type Desktop app under APIs & Services > Credentials, then copy its Client ID here. A desktop client needs no client secret.",
+      "permissions_hint": "Enable the API you want to use, and add its scopes on the OAuth consent screen, before connecting."
+    },
+    {
+      "id": "microsoft",
+      "label": "Microsoft",
+      "base_url": "https://graph.microsoft.com",
+      "auth_url": "https://login.microsoftonline.com/common/oauth2/v2.0/authorize",
+      "token_url": "https://login.microsoftonline.com/common/oauth2/v2.0/token",
+      "userinfo_url": "https://graph.microsoft.com/v1.0/me",
+      "client_type": "public",
+      "console_label": "Microsoft Entra portal",
+      "console_url": "https://entra.microsoft.com/",
+      "setup_hint": "Under App registrations > Authentication, add a Mobile and desktop applications platform with the redirect URI below, and set Allow public client flows to Yes. Leave the client secret blank here. Registering the URI under the Web platform instead fails at the token exchange with AADSTS90023.",
+      "permissions_hint": "Include offline_access in the scopes or Microsoft issues no refresh token."
+    },
+    {
+      "id": "github",
+      "label": "GitHub",
+      "base_url": "https://api.github.com",
+      "auth_url": "https://github.com/login/oauth/authorize",
+      "token_url": "https://github.com/login/oauth/access_token",
+      "userinfo_url": "https://api.github.com/user",
+      "client_type": "confidential",
+      "console_label": "GitHub Developer settings",
+      "console_url": "https://github.com/settings/developers",
+      "setup_hint": "Create an OAuth App and copy both its Client ID and a generated client secret. A GitHub OAuth App is a confidential client, so the secret is required.",
+      "permissions_hint": "Scopes are short names such as repo or read:user. GitHub tokens do not expire and carry no refresh token, which is expected."
+    },
+    {
+      "id": "dropbox",
+      "label": "Dropbox",
+      "base_url": "https://api.dropboxapi.com",
+      "auth_url": "https://www.dropbox.com/oauth2/authorize",
+      "token_url": "https://api.dropboxapi.com/oauth2/token",
+      "userinfo_url": "https://api.dropboxapi.com/2/users/get_current_account",
+      "userinfo_method": "POST",
+      "authorize_params": "token_access_type=offline",
+      "client_type": "public",
+      "console_label": "Dropbox App Console",
+      "console_url": "https://www.dropbox.com/developers/apps",
+      "setup_hint": "Create an app, add the redirect URI below under OAuth 2, and copy its App key as the Client ID. Leave the client secret blank to connect as a public client.",
+      "permissions_hint": "The Permissions tab caps what may be requested: enable every scope you need BEFORE connecting, because ticking a box never upgrades a token or grant that already exists. Backups need files.content.write, files.content.read, files.metadata.read and account_info.read."
+    },
+    {
+      "id": "spotify",
+      "label": "Spotify",
+      "base_url": "https://api.spotify.com",
+      "auth_url": "https://accounts.spotify.com/authorize",
+      "token_url": "https://accounts.spotify.com/api/token",
+      "userinfo_url": "https://api.spotify.com/v1/me",
+      "client_type": "public",
+      "console_label": "Spotify Developer Dashboard",
+      "console_url": "https://developer.spotify.com/dashboard",
+      "setup_hint": "Create an app and add the redirect URI below to its settings, then copy the Client ID. Spotify rejects the localhost name form, so register the loopback IP exactly as shown.",
+      "permissions_hint": "Scopes are short names per Spotify's docs."
+    }
+  ]
+}

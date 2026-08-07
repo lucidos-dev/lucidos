@@ -38,6 +38,10 @@ async fn post_file_edit(client: &reqwest::Client, body: serde_json::Value) -> re
 #[tokio::test]
 async fn edit_json_and_text_modes() {
     let client = http_client();
+    // Creates and then edits files in the shared working tree, both of which
+    // show up in a command checkpoint's diff if they land mid-snapshot; see
+    // `workspace_tree_lock`. Held for the whole test, which is short.
+    let _tree = crate::support::workspace_tree_lock().read().await;
 
     // --- JSON mode ---
     let json_marker = unique_marker("edit-json");
@@ -145,6 +149,8 @@ async fn edit_old_string_not_found_returns_400() {
     let marker = unique_marker("edit-nomatch");
     let path = format!("{}.md", marker);
 
+    // A new file in the shared working tree; see `workspace_tree_lock`.
+    let _tree = crate::support::workspace_tree_lock().read().await;
     write_file_to_disk(&path, "some content");
 
     let resp = post_file_edit(

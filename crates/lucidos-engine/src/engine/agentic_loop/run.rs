@@ -300,14 +300,10 @@ impl LucidosEngine {
             // removes no messages, so pre-trim chars can be wildly inflated.
             let context_chars: usize = messages.iter().map(estimate_message_chars).sum();
 
-            // chars-to-tokens at the same 1.5 chars/token rate the trim budget
-            // assumes (see `agent_context_char_budget`). The previous chars/4
-            // estimate matched English prose but undercounted JSON-heavy tool
-            // results by ~2.4× — the May 25 workspace-learning trigger reported
-            // 649 K tokens to the UI then sent 1.54 M to the API. Matching the
-            // budget's ratio gives an honest signal: if the displayed estimate
-            // approaches the model's context window, the request really IS that
-            // close to the cap.
+            // chars-to-tokens at the measured 2.5 chars/token display rate, not
+            // the budget's conservative 1.5 (see both doc comments in
+            // `context.rs`). This line is read by a human next to the model's
+            // context window, so it wants accuracy; the budget wants a margin.
             let context_tokens = estimate_tokens_from_chars(context_chars);
             let context_messages = messages.len();
             let trimmed_str = if trimmed { " (trimmed)" } else { "" };
@@ -490,8 +486,10 @@ impl LucidosEngine {
             };
 
             // `usage` only when the provider reported it (Anthropic);
-            // OpenAI/Gemini stay None and the conservative chars*2/3 estimate
-            // stands (see `estimate_tokens_from_chars`).
+            // OpenAI/Gemini stay None and the chars*2/5 estimate stands (see
+            // `estimate_tokens_from_chars`). Those two tokenizers measured more
+            // efficient than the Claude-calibrated ratio, so the fallback errs
+            // toward over-reporting there, which is the safe direction.
             //
             // Sections describe the prompt-time breakdown (system + memory
             // + history + … + user message). All non-system sections are
@@ -564,13 +562,14 @@ impl LucidosEngine {
                     cache_read_tokens: response.cache_read_tokens.unwrap_or(0),
                     cache_creation_tokens: response.cache_creation_tokens.unwrap_or(0),
                 });
-            // Calibration breadcrumb for the chars/token assumption baked into
-            // `estimate_tokens_from_chars`. The ratio is a single hardcoded 1.5
-            // that has never been measured across models — and the one time it
-            // was eyeballed from a single capture, the sample was misleading
-            // (two OpenRouter routes in one thread reported the same prompt as
-            // 2.76 and 1.79 chars/token). Logging estimate-vs-actual per turn is
-            // what makes a future retune evidence-based instead of a guess.
+            // Calibration breadcrumb for the chars/token ratio baked into
+            // `estimate_tokens_from_chars`. This line is what retuned it from
+            // 1.5 to the measured 2.5: 12,069 captures gave p01 2.28, p50 2.60,
+            // p99 2.74, tight enough to act on where a single eyeballed capture
+            // had not been (two OpenRouter routes in one thread once reported
+            // the same prompt as 2.76 and 1.79). Keep logging it. The ratio is
+            // still one Claude-calibrated constant, and a per-family split
+            // needs this same query run against a fatter GPT/Gemini sample.
             // `estimated` deliberately includes the tool schemas, matching what
             // the budget subtracts, so the comparison is like-for-like.
             if let Some(u) = usage {
@@ -1395,6 +1394,76 @@ impl LucidosEngine {
                                 meta: meta.clone(),
                             },
                             "[AgenticLoop] ToolResult (await_event)",
+                        )
+                        .await;
+                    tool_outputs.push((tool_call.id.clone(), result));
+                    continue;
+                }
+
+                // The other two verbs on this thread's own subscriptions. Here
+                // for the same reason `await_event` is: both are scoped to the
+                // calling thread, and the thread id is what `handle_special_tool`
+                // does not have. Neither takes a thread argument, so an agent
+                // cannot reach another thread's subscriptions through them.
+                if tool_call.name == tn::LIST_EVENT_WAITS || tool_call.name == tn::CANCEL_EVENT_WAIT
+                {
+                    let (result, success) = if tool_call.name == tn::LIST_EVENT_WAITS {
+                        (self.list_event_waits_text(thread_id).await, true)
+                    } else {
+                        let wait_id = tool_call
+                            .arguments
+                            .get("wait_id")
+                            .and_then(|v| v.as_str())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty());
+                        let all = tool_call
+                            .arguments
+                            .get("all")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false);
+                        // A malformed id is refused rather than read as "no id
+                        // given", which with `all` unset would have reported the
+                        // generic "pass one of the two" and hidden the typo.
+                        match wait_id.map(uuid::Uuid::parse_str) {
+                            Some(Err(e)) => (
+                                format!(
+                                    "Error: `wait_id` is not a valid id ({e}). Call \
+                                     list_event_waits for the ids of what this thread is \
+                                     actually watching."
+                                ),
+                                false,
+                            ),
+                            parsed => {
+                                let id = parsed.and_then(Result::ok);
+                                match self.cancel_event_waits_for_agent(thread_id, id, all).await {
+                                    crate::engine::event_wait::CancelEventWaitOutcome::Stopped(
+                                        msg,
+                                    ) => (msg, true),
+                                    crate::engine::event_wait::CancelEventWaitOutcome::Refused(
+                                        msg,
+                                    ) => (msg, false),
+                                }
+                            }
+                        }
+                    };
+                    if !success {
+                        last_call_was_error = true;
+                        had_errors = true;
+                    }
+                    self.event_bus
+                        .emit_or_log(
+                            crate::engine::event_bus::BusEvent::Thread {
+                                thread_id,
+                                event: crate::engine::thread_events::ThreadEvent::ToolResult {
+                                    name: tool_call.name.clone(),
+                                    result: result.clone(),
+                                    images: vec![],
+                                    success,
+                                    tool_called_event_id,
+                                },
+                                meta: meta.clone(),
+                            },
+                            "[AgenticLoop] ToolResult (event-wait agent surface)",
                         )
                         .await;
                     tool_outputs.push((tool_call.id.clone(), result));

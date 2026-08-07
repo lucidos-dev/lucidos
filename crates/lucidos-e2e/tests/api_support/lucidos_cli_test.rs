@@ -409,6 +409,11 @@ fn data_write_announces_the_artifact_against_a_running_workspace() {
     let src = std::env::temp_dir().join(format!("{marker}.md"));
     std::fs::write(&src, b"# announced\n").expect("write source file");
 
+    // The write lands a new file in the shared working tree, which a command
+    // checkpoint images whole; see `workspace_tree_lock`. `blocking_read` is
+    // the right call here and only here: this is a plain `#[test]`, so there is
+    // no async runtime to park.
+    let _tree = crate::support::workspace_tree_lock().blocking_read();
     let out = Command::new(&bin)
         .args(["data", "write", &rel, "--from"])
         .arg(&src)

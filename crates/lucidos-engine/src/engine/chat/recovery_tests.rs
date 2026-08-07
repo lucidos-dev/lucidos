@@ -765,6 +765,7 @@ async fn emit_event_wait_subscription(bus: &EventBus, thread_id: Uuid, wait_id: 
                 condition: None,
             }],
             reason: "waiting for a change".into(),
+            armed_at: chrono::Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             watermark: 0,
         },

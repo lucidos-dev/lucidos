@@ -391,9 +391,12 @@ fn append_query_param_url_encodes_value_with_special_chars() {
 
 #[test]
 fn append_query_param_redacted_form_does_not_contain_credential() {
-    // Mirrors what apply_auth does for ProxyAuth::QueryParam to build
-    // log_url: same key, value replaced with REDACTED. Guards against
-    // the credential leaking into log lines.
+    // Pins the shape `QueryParamLayer` relies on when it builds its redacted
+    // `log_url_replacement` output (proxy_static_layers.rs): the same key, the
+    // value replaced with REDACTED. The layer's own end-to-end redaction is
+    // covered by `query_param_layer_publishes_redacted_log_url` there; this
+    // only asserts that `append_query_param` places the substituted value where
+    // the real one would go.
     let base = "https://api.example.com/v1/x";
     let real = append_query_param(base, "api-key", "actual-secret-value");
     let redacted = append_query_param(base, "api-key", "REDACTED");
@@ -887,9 +890,9 @@ async fn forward_request_does_not_auto_follow_30x() {
 
 #[tokio::test]
 async fn upstream_unreachable_returns_502() {
-    // Bind a port and drop the listener — the OS keeps the address
-    // briefly unreachable, but on most OSes the connect call fails fast
-    // with ECONNREFUSED. We pick port 1 (privileged, never bound by us).
+    // Port 1 is privileged and nothing in this suite binds it, so the connect
+    // fails fast with ECONNREFUSED rather than hanging until the client's
+    // connect timeout.
     let resp = forward_request(
         Method::GET,
         "http://127.0.0.1:1/nope",

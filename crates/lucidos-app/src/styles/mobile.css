@@ -998,6 +998,110 @@
         ));
     }
 
+    /* ─── The transcript's own scroll indicator ─── */
+    /* WHY we draw one: `.app-header` is position:fixed and the header space
+       inside the transcript is the ::before spacer above, with the title bar
+       sticky inside the same scroller. Both are load-bearing (content has to
+       scroll UNDER the chrome for hide-on-scroll to reclaim the space), and the
+       consequence is that .thread-content's box starts at viewport y=0. A
+       scrollbar is laid out against its scroller's padding box, so WebKit's
+       overlay indicator spanned the full pane: it painted inside the title band
+       and its thumb sat well above the content it was reporting on. Nothing in
+       CSS insets an overlay indicator (a border-top would shrink the track but
+       is not scrollable, which would kill hide-on-scroll), so the native one is
+       suppressed HERE and replaced below.
+
+       Scoped to the wrap that actually carries a replacement, never to
+       .thread-content at large: suppressing the native indicator on a scroller
+       with nothing drawn in its place would leave that surface with no scroll
+       feedback at all. `scrollbar-width` covers Safari 18.2+ and Android;
+       ::-webkit-scrollbar covers older WebKit.
+
+       TOUCH-PRIMARY ONLY, and the suppression and the replacement share this one
+       gate so they cannot drift apart. The replacement is summoned by
+       `isUserScrolling()` (utils/scrollActivity.ts), which keys off `touchmove`
+       and therefore says nothing about a wheel or an arrow key. Gating the
+       suppression on viewport WIDTH alone would hit a narrow window driven by a
+       mouse, trackpad or keyboard: native indicator gone, replacement never
+       summoned, no scroll feedback at all. `hover: none` + `pointer: coarse` is
+       exactly the input class the replacement serves, so anything else keeps its
+       native scrollbar. */
+    @media (hover: none) and (pointer: coarse) {
+        .mobile-swipe-pane .thread-content-wrap.has-scroll-indicator .thread-content {
+            scrollbar-width: none;
+        }
+
+        .mobile-swipe-pane .thread-content-wrap.has-scroll-indicator .thread-content::-webkit-scrollbar {
+            display: none;
+        }
+
+        /* The track: pinned to the pane's right edge, starting at the chrome's
+           RESTING bottom edge (the same --mobile-header-height +
+           --mobile-thread-title-height pair .scroll-to-top anchors to above, so
+           the two cannot drift). Deliberately static rather than riding
+           --mobile-header-offset like the chevron does: a transform would carry
+           the track's BOTTOM up with its top and open a gap above the prompt,
+           and once the chrome is scrolled away there is nothing left to overlap
+           anyway.
+
+           Outside this gate it stays `display: none` (the base rule in
+           chat/input-messages.css), which also idles the hook for free: a
+           display:none track measures 0, so computeScrollIndicator reports
+           nothing to draw. */
+        .mobile-swipe-pane .thread-scroll-indicator {
+            display: block;
+            position: absolute;
+            right: 0.125rem;
+            top: calc(var(--mobile-header-height, 3rem) + var(--mobile-thread-title-height, 2.75rem) + 0.25rem);
+            bottom: 0.25rem;
+            width: 0.25rem;
+            pointer-events: none;
+            /* Above .thread-content (z:2 in this wrap, and a stacking context via
+               its translateZ) so the thumb is not buried under the transcript. */
+            z-index: 3;
+        }
+
+        /* The thumb. Its height here is the BASE that useThreadScrollIndicator
+           scales from: the hook writes `translateY(...) scaleY(...)`, never a
+           layout property, so the whole per-scroll path stays composited. Hidden
+           at rest and faded in while the user is dragging.
+
+           The base is the FULL track, so the thumb is only ever scaled DOWN. A
+           short base scaled up instead would rasterize this layer at its small
+           size and stretch it (`will-change: transform` keeps the layer), which
+           smears the rounded caps.
+
+           `border-radius` is authored here only as the fallback before the first
+           paint. The hook overwrites it every frame with a vertical radius
+           divided by the current scale, because a transform scales the painted
+           radius too and a stretched cap on a bar this thin reads as a POINT
+           (see counterScaledRadiusPx). Keep the horizontal value at half the
+           width above so the cap is a true semicircle. */
+        .mobile-swipe-pane .thread-scroll-thumb {
+            position: absolute;
+            top: 0;
+            left: 0;
+            right: 0;
+            height: 100%;
+            transform-origin: 0 0;
+            border-radius: 0.125rem;
+            /* Weight lives in the COLOUR, not in `opacity`, which is reserved as
+               the fade channel the hook drives. A solid --text-muted bar reads
+               loud against the transcript for something the eye should only
+               catch while it is moving, so it is mixed back toward the page. */
+            background: color-mix(in srgb, var(--text-muted) 55%, transparent);
+            opacity: 0;
+            transition: opacity var(--duration-fast) ease;
+            will-change: transform, opacity;
+        }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+        .mobile-swipe-pane .thread-scroll-thumb {
+            transition: none;
+        }
+    }
+
     /* Hide thread title bar on mobile — app header handles navigation */
     .mobile-swipe-pane .thread-view-header {
         display: none;

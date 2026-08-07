@@ -97,11 +97,18 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
   let originalSetAttribute: any;
   let originalGetAttribute: any;
   let originalRemoveAttribute: any;
+  let originalHead: any;
 
   beforeEach(() => {
     localStorage.clear();
     inlineProps = {};
     attrs = {};
+    // A Google-font preference calls ensureFontLoaded, which appends a <link>.
+    // The test-setup document stub has no `head`, so give it one: the font
+    // fetch is orthogonal to what this block asserts, but the fira-code tests
+    // below cannot avoid triggering it.
+    originalHead = (document as any).head;
+    (document as any).head = { appendChild: () => {} };
     const el = (document as any).documentElement;
     originalStyle = el.style;
     originalSetAttribute = el.setAttribute;
@@ -125,6 +132,7 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     el.setAttribute = originalSetAttribute;
     el.getAttribute = originalGetAttribute;
     el.removeAttribute = originalRemoveAttribute;
+    (document as any).head = originalHead;
   });
 
   it('applyTheme writes lucidos-theme to localStorage', () => {
@@ -157,6 +165,38 @@ describe('apply* functions mirror to localStorage for FOUC inline script', () =>
     applyFontFamily('monospace');
     expect(localStorage.getItem('lucidos-font-family')).toBe('monospace');
     expect(inlineProps['--font-ui']).toContain('SF Mono');
+  });
+
+  it('applyFontFamily turns Fira Code ligatures OFF for text with explicit zeros, not `normal`', () => {
+    // `normal` does NOT disable ligatures. `liga` and `calt` are default-ON
+    // features in CSS, so `normal` means "the font's defaults" and renders
+    // BYTE-IDENTICALLY to `"liga" 1, "calt" 1` (established by pixel
+    // comparison in headless Chromium, since the computed value shows no
+    // difference). An earlier attempt at this fix merely stopped setting the
+    // property, which left the defaults in place and changed nothing at all.
+    applyFontFamily('fira-code');
+    expect(inlineProps['--font-features-text']).toBe('"liga" 0, "calt" 0');
+    // Scope is decided by CSS, so no set-point writes the bare property.
+    expect(inlineProps['font-feature-settings']).toBeUndefined();
+  });
+
+  it('applyFontFamily turns them back ON for code', () => {
+    // Code surfaces inherit the OFF value now, so they must re-enable
+    // explicitly. `normal` would work today (defaults are on) but re-encodes
+    // the exact trap above, so the value is spelled out.
+    applyFontFamily('fira-code');
+    expect(inlineProps['--font-features-code']).toBe('"liga" 1, "calt" 1');
+  });
+
+  it('applyFontFamily resolves BOTH properties to normal for every other font', () => {
+    // Switching away from Fira Code must clear both rather than leave a stale
+    // value on <html>. `normal` is right HERE: a non-Fira font wants its own
+    // defaults untouched, and an unconditional `"liga" 0` would also kill the
+    // fi/fl ligatures a proportional font like Inter legitimately wants.
+    applyFontFamily('fira-code');
+    applyFontFamily('monospace');
+    expect(inlineProps['--font-features-text']).toBe('normal');
+    expect(inlineProps['--font-features-code']).toBe('normal');
   });
 
   it('applyUiScale writes lucidos-ui-scale to localStorage', () => {

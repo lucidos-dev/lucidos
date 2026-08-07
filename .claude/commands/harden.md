@@ -38,26 +38,48 @@ This is a backstop, not the first time invariants should appear. Do not invent a
 
 ### Phase 1 kickoff: launch Codex review in parallel (advisory, Claude Code only)
 
-Before running the `code-review` skill, kick off a Codex review of the branch diff **in the background** so it overlaps Phases 1–3 and adds ~no wall-clock (empirically ~2 min median on this repo, which fits inside the Claude review phases). It is a fourth reviewer running on the *same* cadence as the others — because `/harden` loops (Phase 4.5 failure → back to Phase 1), each iteration launches a fresh Codex review on the updated diff, exactly like `code-review` and the Phase 2 agents re-run.
+Before running the `code-review` skill, kick off a Codex review of the branch diff **in the background** so it overlaps Phases 1–3 and adds ~no wall-clock (median 97s across the 25 recorded runs on this repo, with a tail out to 11 min, so it fits inside the Claude review phases). It is a fourth reviewer running on the *same* cadence as the others: because `/harden` loops (Phase 4.5 failure → back to Phase 1), each iteration launches a fresh Codex review on the updated diff, exactly like `code-review` and the Phase 2 agents re-run.
 
 This step is **advisory**: its findings feed the same validate→fix pipeline as every other reviewer (joined in Phase 3), but Codex being unavailable, slow, erroring, or timing out NEVER blocks the hardened marker.
 
 - **Claude Code only.** A Codex-backed `/harden` run is already Codex reviewing this diff — skip this step and note "Codex review: skipped (Codex-backend run)".
 - **Docs-only:** this whole phase is skipped, so Codex review is skipped too (it's a code reviewer, not a prose reviewer).
 
-Resolve the companion script (installed with the `codex` plugin — do not hardcode a path) and launch the review in **one** Bash call, so the resolved path and the launch share a shell (variables do not persist across Bash tool calls). The `--background` flag queues the review and returns a job id immediately; `--base main` matches `/harden`'s diff base of `main...HEAD`:
+Resolve the companion script (installed with the `codex` plugin, do not hardcode a path) and launch the review in **one** Bash call, so the resolved path and the launch share a shell (variables do not persist across Bash tool calls). Run that Bash call with the tool's own `run_in_background: true` and join it in Phase 3 with `TaskOutput`. The companion's `--background` flag does NOT work for `review`: it is parsed and then ignored (only `task` honours it), so the flag is deliberately absent below and the parallelism comes from the Bash tool instead. Passing it bought nothing and cost the phase its whole premise, since the call actually blocked for the length of the review. `--base main` matches `/harden`'s diff base of `main...HEAD`:
 
 ```bash
 CODEX_COMPANION=$(find "$HOME/.claude/plugins" -name codex-companion.mjs -path '*codex*' 2>/dev/null | sort | tail -1)
 if [ -z "$CODEX_COMPANION" ]; then
-  echo "Codex review: unavailable (plugin not installed) — proceeding"
+  echo "Codex review: unavailable (plugin not installed), proceeding"
 else
   echo "CODEX_COMPANION=$CODEX_COMPANION"
-  node "$CODEX_COMPANION" review --scope branch --base main --background --json
+  ready=""
+  for probe in 1 2 3; do
+    if codex --version > /dev/null 2>&1 && codex app-server --help > /dev/null 2>&1; then ready=1; break; fi
+    if [ "$probe" != 3 ]; then
+      echo "Codex CLI not answering (probe $probe of 3), an update may be rewriting it, retrying in 30s"
+      sleep 30
+    fi
+  done
+  if [ -n "$ready" ]; then
+    node "$CODEX_COMPANION" review --scope branch --base main --json
+  else
+    echo "Codex review: unavailable (CLI not answering after 3 probes), proceeding"
+  fi
 fi
 ```
 
-From the output, **record two literals for the Phase 3 join**: the printed `CODEX_COMPANION=...` path and the returned job id string (don't rely on the shell variable — the join is a separate Bash call). If the plugin was unavailable, there is nothing to join. Do NOT wait for the review here — continue immediately into the `code-review` skill below.
+**The probe loop is not defensive padding.** The companion runs exactly those two
+checks before it will review, and collapses any failure of either into one generic
+`Codex CLI is not installed or is missing required runtime support`, discarding the
+real reason. An `npm install -g` of the Codex CLI empties and rewrites the directory
+the `codex` symlink points into, so for a few seconds mid-update neither check
+answers and the reviewer is written off for the whole run. Every recorded Codex
+failure on this repo is that one error, each returning in under a quarter of a
+second, against 25 reviews that completed. Retrying rides the window out instead,
+and costs nothing on the normal path because the whole call is backgrounded.
+
+**Record the Bash task id: that is the handle for the Phase 3 join.** There is no companion job id to capture, because the review runs in the foreground of that backgrounded shell and prints its findings only when it finishes. If the plugin was unavailable, or all three probes failed, there is nothing to join. Do NOT wait for the review here, continue immediately into the `code-review` skill below.
 
 ### Phase 1 review
 
@@ -165,15 +187,11 @@ If the diff edits `RESOURCE_NAMES` or a staging/service/spawn-env path, also con
 
 ### Join the Codex review (if launched in Phase 1)
 
-If you launched a background Codex review in Phase 1, join it now — poll its status using the literal companion path and job id you captured there:
+If you launched a background Codex review in Phase 1, join it now with `TaskOutput` on the Bash task id you recorded there. Its stdout is the review itself, not a status line, so there is nothing further to poll.
 
-```bash
-node "<codex-companion.mjs path>" status <job-id> --json
-```
-
-- **Completed:** fold Codex's findings into the validation set below — treat each finding exactly like one from the other reviewers (confirm against source, fix real 🔴 in Phase 4, discard false positives, log recurring dismissals to `docs/code-review-priors.md`). Codex frequently returns "no actionable bugs" — record that outcome and move on.
-- **Still running:** give it a bounded wait — poll until it completes or until ~5 minutes have elapsed *since it was launched in Phase 1* (usually it is already done, since Phases 1–2 ran in parallel with it).
-- **Timed out / failed / unavailable / plugin not installed:** it is advisory — note "Codex review: unavailable (advisory) — proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex job is still running when a new one launches, you may abandon the stale one.)
+- **Completed:** fold Codex's findings into the validation set below. Treat each finding exactly like one from the other reviewers (confirm against source, fix real 🔴 in Phase 4, discard false positives, log recurring dismissals to `docs/code-review-priors.md`). Codex frequently returns "no actionable bugs": record that outcome and move on.
+- **Still running:** give it a bounded wait with `TaskOutput` `block: true`, until it completes or until ~5 minutes have elapsed *since it was launched in Phase 1* (usually it is already done, since Phases 1 to 2 ran in parallel with it). Remember the probe loop can hold the task for up to a minute before the review even starts.
+- **Failed / unavailable / plugin not installed:** it is advisory. Note "Codex review: unavailable (advisory), proceeding" and continue. NEVER block the marker or stall the turn on Codex. (If a prior iteration's Codex task is still running when a new one launches, you may abandon the stale one.)
 
 Then validate every finding (Codex's included) per the rest of this phase.
 

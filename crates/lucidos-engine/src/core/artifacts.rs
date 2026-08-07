@@ -12,6 +12,49 @@ use crate::engine::event_bus::{BusEvent, EventBus, SystemEvent};
 /// store, .lucidos/ runtime cache, etc. — is intentionally excluded.
 pub const BROWSEABLE_DATA_SUBDIRS: &[&str] = &["artifacts", "apps", "knowhow", "triggers"];
 
+/// Directory names holding vendored dependencies or build output. **The single
+/// source of truth for that list**: anything that needs to tell the user's own
+/// files apart from machine-generated ones reads this, so a second copy
+/// somewhere else is a drift bug rather than a convenience.
+///
+/// There was nothing to reuse when this was written. The workspace has no
+/// `.gitignore` parsing at all, and `WORKSPACE_GITIGNORE_ENTRIES` describes
+/// what the workspace repo tracks (`.lucidos/`, `data/postgres/`,
+/// `data/blobs/`, `data/.env`), not what a walk returns.
+pub const VENDORED_DIR_NAMES: &[&str] = &[
+    "node_modules",
+    ".git",
+    "target",
+    "dist",
+    "build",
+    ".next",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".pytest_cache",
+    "out",
+];
+
+/// True when any DIRECTORY segment of `data_relative` (a path in the shape
+/// [`list_searchable_data_files`] returns, e.g.
+/// `apps/demo/remotion/node_modules/x.js`) names a vendored or build
+/// directory. Every segment is tested, not just the first: a workspace's
+/// vendored tree is typically buried several levels down, which a root-only
+/// check misses entirely. The file name itself is never tested, so a file the
+/// user called `build` or `out` is still theirs.
+///
+/// Deliberately NOT applied by [`list_searchable_data_files`]. That walk backs
+/// the `list_files`, `glob_files` and `grep_files` tools, where filtering would
+/// remove the agent's only way to reach a vendored file on purpose. It is for
+/// code that SHAPES a payload, where a listing is a sample rather than an
+/// answer: see `engine::chat::process::workspace_payload`.
+pub fn is_vendored_path(data_relative: &str) -> bool {
+    let Some((dirs, _file)) = data_relative.rsplit_once('/') else {
+        return false;
+    };
+    dirs.split('/').any(|seg| VENDORED_DIR_NAMES.contains(&seg))
+}
+
 /// Walk the four browseable data/ subdirs and return each file as
 /// `(data-relative path, absolute path)`, sorted lexicographically.
 /// Shared by `ArtifactManager::list_artifacts` and the search tools so
@@ -267,17 +310,19 @@ impl ArtifactManager {
         let paths: Vec<String> = artifact_paths.to_vec();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            let repo = repo.lock().unwrap();
-            let mut index = repo.index()?;
-            super::reset_index_to_head(&repo, &mut index)?;
+            super::retry_while_index_locked(|| {
+                let repo = repo.lock().unwrap();
+                let mut index = repo.index()?;
+                super::reset_index_to_head(&repo, &mut index)?;
 
-            for artifact_path in &paths {
-                let repo_path = format!("{}/{}", ARTIFACTS_DIR, artifact_path);
-                index.add_path(Path::new(&repo_path))?;
-            }
-            index.write()?;
+                for artifact_path in &paths {
+                    let repo_path = format!("{}/{}", ARTIFACTS_DIR, artifact_path);
+                    index.add_path(Path::new(&repo_path))?;
+                }
+                index.write()?;
 
-            super::commit_index(&repo, &message)
+                super::commit_index(&repo, &message)
+            })
         })
         .await
         .unwrap()
@@ -309,17 +354,19 @@ impl ArtifactManager {
         let paths: Vec<String> = data_relative_paths.to_vec();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            let repo = repo.lock().unwrap();
-            let mut index = repo.index()?;
-            super::reset_index_to_head(&repo, &mut index)?;
+            super::retry_while_index_locked(|| {
+                let repo = repo.lock().unwrap();
+                let mut index = repo.index()?;
+                super::reset_index_to_head(&repo, &mut index)?;
 
-            for data_path in &paths {
-                let repo_path = format!("data/{}", data_path);
-                index.add_path(Path::new(&repo_path))?;
-            }
-            index.write()?;
+                for data_path in &paths {
+                    let repo_path = format!("data/{}", data_path);
+                    index.add_path(Path::new(&repo_path))?;
+                }
+                index.write()?;
 
-            super::commit_index(&repo, &message)
+                super::commit_index(&repo, &message)
+            })
         })
         .await
         .unwrap()
@@ -379,14 +426,16 @@ impl ArtifactManager {
         let repo_path = repo_path.to_string();
         let message = message.to_string();
         tokio::task::spawn_blocking(move || {
-            let repo = repo.lock().unwrap();
-            let mut index = repo.index()?;
-            super::reset_index_to_head(&repo, &mut index)?;
+            super::retry_while_index_locked(|| {
+                let repo = repo.lock().unwrap();
+                let mut index = repo.index()?;
+                super::reset_index_to_head(&repo, &mut index)?;
 
-            index.add_path(Path::new(&repo_path))?;
-            index.write()?;
+                index.add_path(Path::new(&repo_path))?;
+                index.write()?;
 
-            super::commit_index(&repo, &message)
+                super::commit_index(&repo, &message)
+            })
         })
         .await
         .unwrap()
@@ -419,25 +468,30 @@ impl ArtifactManager {
             // closure returns, on every path out of it. That drop point is the
             // whole guarantee.
             let _worktree_guard = worktree_guard;
-            let repo = repo.lock().unwrap();
-            let mut index = repo.index()?;
-            super::reset_index_to_head(&repo, &mut index)?;
+            // The worktree guard excludes the engine's OWN git-CLI paths, not a
+            // git process outside this engine, so the index can still be locked
+            // under us here; see `retry_while_index_locked`.
+            super::retry_while_index_locked(|| {
+                let repo = repo.lock().unwrap();
+                let mut index = repo.index()?;
+                super::reset_index_to_head(&repo, &mut index)?;
 
-            // Add all changes under data/ (artifacts, apps, and any other data subdirs)
-            index.add_all([super::DATA_DIR], git2::IndexAddOption::DEFAULT, None)?;
-            index.write()?;
+                // Add all changes under data/ (artifacts, apps, and any other data subdirs)
+                index.add_all([super::DATA_DIR], git2::IndexAddOption::DEFAULT, None)?;
+                index.write()?;
 
-            // Check if there's anything to commit
-            let tree_id = index.write_tree()?;
-            if let Ok(head) = repo.head() {
-                if let Ok(head_commit) = head.peel_to_commit() {
-                    if head_commit.tree()?.id() == tree_id {
-                        return Ok(None); // No changes
+                // Check if there's anything to commit
+                let tree_id = index.write_tree()?;
+                if let Ok(head) = repo.head() {
+                    if let Ok(head_commit) = head.peel_to_commit() {
+                        if head_commit.tree()?.id() == tree_id {
+                            return Ok(None); // No changes
+                        }
                     }
                 }
-            }
 
-            super::commit_index(&repo, &message).map(Some)
+                super::commit_index(&repo, &message).map(Some)
+            })
         })
         .await
         .unwrap()

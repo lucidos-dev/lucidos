@@ -351,3 +351,70 @@ fn semantic_only_is_halved() {
 fn empty_signals_score_zero() {
     assert_eq!(combined_score(None, None), 0.0);
 }
+
+// ── event-wait routes are the calling thread's own ──────────────────
+
+use super::actions::refuse_event_waits_for_another_thread;
+use crate::api::actor::{
+    init_agent_origin_secret, mint_agent_origin_token, HEADER_AGENT_ORIGIN_TOKEN,
+};
+use axum::http::HeaderMap;
+
+/// Headers as a Lucidos-spawned subprocess sends them: a thread-bound origin
+/// token it cannot re-point, minted over `thread_id`.
+///
+/// The secret is per-engine-startup and installed first-writer-wins, so each
+/// test installs one rather than assuming a booted engine did: without it
+/// minting returns `None`, every header map comes out empty, and the guard
+/// tests would pass by reading a forged-token caller as an ordinary untokened
+/// one, which is the opposite of what they assert.
+fn agent_headers(thread_id: Option<Uuid>) -> HeaderMap {
+    init_agent_origin_secret("harden-test-secret".to_string());
+    let mut h = HeaderMap::new();
+    let token = mint_agent_origin_token(thread_id)
+        .expect("the secret is installed above, so minting cannot fail");
+    h.insert(HEADER_AGENT_ORIGIN_TOKEN, token.parse().unwrap());
+    h
+}
+
+/// The isolation the three agent-facing event-wait routes promise. The tools
+/// take no thread argument at all, but the HTTP form has a path segment, and a
+/// subprocess substituting another thread's id there would get back exactly the
+/// capability the argument-less shape removes.
+#[test]
+fn an_agent_may_only_reach_its_own_thread_s_event_waits() {
+    let mine = Uuid::new_v4();
+    let theirs = Uuid::new_v4();
+
+    assert!(
+        refuse_event_waits_for_another_thread(&agent_headers(Some(mine)), mine).is_ok(),
+        "its own thread is the whole point of the route"
+    );
+
+    let refused = refuse_event_waits_for_another_thread(&agent_headers(Some(mine)), theirs)
+        .expect_err("another thread's id must be refused");
+    assert_eq!(refused.0, axum::http::StatusCode::FORBIDDEN);
+    // Actionable: it says what to do instead, which is to drop the id.
+    assert!(refused.1.contains("event-waits"), "{}", refused.1);
+}
+
+/// A subprocess with a token but NO thread (a scheduled `script:` trigger) has
+/// no subscriptions of its own, so there is no thread to scope it to. Refused
+/// rather than handed the run of every thread.
+#[test]
+fn a_threadless_subprocess_is_refused_rather_than_given_every_thread() {
+    let headers = agent_headers(None);
+    assert!(
+        refuse_event_waits_for_another_thread(&headers, Uuid::new_v4()).is_err(),
+        "a caller with no thread of its own cannot act on one"
+    );
+}
+
+/// A caller presenting no token is not an agent claiming to be another thread.
+/// It is the ordinary local API surface, which every other `/threads/:id/...`
+/// route treats the same way, so this check leaves it exactly where it was
+/// rather than quietly moving a trust boundary that is not its to move.
+#[test]
+fn an_untokened_caller_is_left_to_the_ordinary_local_api_rules() {
+    assert!(refuse_event_waits_for_another_thread(&HeaderMap::new(), Uuid::new_v4()).is_ok());
+}

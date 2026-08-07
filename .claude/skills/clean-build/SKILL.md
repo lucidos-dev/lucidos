@@ -142,10 +142,10 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-06. Anything not
+The currently-accepted categories, counted as of 2026-08-07. Anything not
 on this list is fair game to remove and re-fix:
 
-- **`#[allow(clippy::too_many_arguments)]`**, 74 sites across 47 files,
+- **`#[allow(clippy::too_many_arguments)]`**, 76 sites across 48 files,
   by far the largest category. Internal helpers that legitimately need
   that many parameters (event constructors, runtime spawn helpers,
   scheduler entry points, `LucidosEngine::new`'s boot wiring). The
@@ -173,8 +173,8 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 195 sites across 68 files, every one of them
-  a test file: 66 `*.test.ts` plus two `*.test.tsx`
+  `@types/node` in project**, 207 sites across 72 files, every one of them
+  a test file: 70 `*.test.ts` plus two `*.test.tsx`
   (`components/chat/__tests__/question-card.test.tsx` and
   `components/chat/__tests__/welcome-onboarding.test.tsx`, both of which
   read a fixture through `node:fs`). The expectation is real: TS does not

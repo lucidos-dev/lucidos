@@ -190,7 +190,7 @@ describe('lucidos.ui.toast', () => {
     const ret = ui.toast('Saved', 'success', { durationMs: 2000, dismissable: false });
     expect(ret).toBeUndefined();
     expect(postMessage).toHaveBeenCalledWith(
-      { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false, key: undefined } },
+      { type: 'lucidos:ui:toast', payload: { message: 'Saved', type: 'success', durationMs: 2000, dismissable: false, key: undefined, spinning: undefined } },
       '*',
     );
   });
@@ -198,9 +198,23 @@ describe('lucidos.ui.toast', () => {
   it('defaults type to info and leaves opts undefined when omitted', () => {
     ui.toast('Heads up');
     expect(postMessage).toHaveBeenCalledWith(
-      { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined, key: undefined } },
+      { type: 'lucidos:ui:toast', payload: { message: 'Heads up', type: 'info', durationMs: undefined, dismissable: undefined, key: undefined, spinning: undefined } },
       '*',
     );
+  });
+
+  it('forwards opts.spinning for an indeterminate "work in progress" toast', () => {
+    ui.toast('Reindexing…', 'info', { key: 'reindex', spinning: true });
+    expect(postMessage.mock.calls[0][0].payload.spinning).toBe(true);
+  });
+
+  // Same defensive shape as durationMs/dismissable: a bad value must not cross
+  // the bridge as a truthy non-boolean the host would then treat as `true`.
+  it('leaves spinning undefined when omitted or non-boolean', () => {
+    ui.toast('No spinner');
+    expect(postMessage.mock.calls[0][0].payload.spinning).toBeUndefined();
+    ui.toast('Bad spinner', 'info', { spinning: 'yes' as unknown as boolean });
+    expect(postMessage.mock.calls[1][0].payload.spinning).toBeUndefined();
   });
 
   it('forwards opts.key for in-place replacement when provided', () => {
@@ -237,6 +251,48 @@ describe('lucidos.ui.toast', () => {
     expect(postMessage).not.toHaveBeenCalled();
     logSpy.mockRestore();
     errSpy.mockRestore();
+  });
+});
+
+describe('lucidos.ui.dismissToast', () => {
+  let origParent: unknown;
+  let postMessage: ReturnType<typeof vi.fn>;
+
+  beforeEach(() => {
+    origParent = (globalThis as { parent?: unknown }).parent;
+    postMessage = vi.fn();
+    (globalThis as { parent?: unknown }).parent = { postMessage };
+  });
+  afterEach(() => {
+    (globalThis as { parent?: unknown }).parent = origParent;
+    vi.unstubAllGlobals();
+  });
+
+  it('posts lucidos:ui:dismissToast with the key and returns void', () => {
+    const ret = ui.dismissToast('reindex');
+    expect(ret).toBeUndefined();
+    expect(postMessage).toHaveBeenCalledWith(
+      { type: 'lucidos:ui:dismissToast', payload: { key: 'reindex' } },
+      '*',
+    );
+  });
+
+  // A missing key is a programming error, not a runtime condition: without one
+  // the host has nothing to look up, so failing loudly beats a silent no-op.
+  it('throws TypeError on an empty/non-string key', () => {
+    expect(() => ui.dismissToast('')).toThrow(TypeError);
+    expect(() => ui.dismissToast(undefined as unknown as string)).toThrow(TypeError);
+    expect(() => ui.dismissToast(7 as unknown as string)).toThrow(TypeError);
+    expect(postMessage).not.toHaveBeenCalled();
+  });
+
+  it('standalone (no host parent): logs to console, never posts', () => {
+    (globalThis as { parent?: unknown }).parent = globalThis; // window.parent === window
+    const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+    ui.dismissToast('reindex');
+    expect(logSpy).toHaveBeenCalled();
+    expect(postMessage).not.toHaveBeenCalled();
+    logSpy.mockRestore();
   });
 });
 

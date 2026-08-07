@@ -18,7 +18,7 @@
 //! * **The duplicate refusal** (S6b): the same `on` list twice on one thread.
 //!   One event would then produce two wakes.
 
-use chrono::{Duration, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use uuid::Uuid;
 
@@ -40,6 +40,30 @@ pub(crate) const MAX_CONSECUTIVE_SUBSCRIPTIONS: i64 = 10;
 /// background subscriptions: none holds the thread's turn, so this bounds how
 /// many watchers one thread can accumulate, nothing more.
 pub(crate) const MAX_LIVE_WAITS_PER_THREAD: usize = 5;
+
+/// How far back registration looks for a match that landed while the model was
+/// still working towards this call (the **arming lookback**, see
+/// `docs/plans/2026-08-06-await-event-covers-the-observe-then-arm-gap.md`).
+///
+/// Sized to the gap it covers, and deliberately not to any structural boundary.
+/// The gap is between the model deciding to wait and the call landing: on
+/// 2026-08-06 that was 84 seconds, spent composing and spawning an unrelated
+/// thread. Three minutes is roughly double that.
+///
+/// The turn is NOT the boundary, and that is the whole reason this is a
+/// constant. A turn ran from 17:39 to 19:14 that day driving a release build,
+/// and a model decides to subscribe mid-turn: it can form the intent at minute
+/// 88 of a ninety-minute turn, having never looked at that state before, in
+/// which case events from minute 2 are archaeology rather than a missed
+/// rendezvous. Tight on purpose: a slower check-then-arm falls outside and is
+/// simply not reported, which is exactly today's behaviour, while a longer
+/// window starts surfacing work the model did earlier in the same stretch.
+pub(crate) const ARMING_LOOKBACK_SECS: i64 = 3 * 60;
+
+/// How many lookback matches the report names before it just says there were
+/// more. A tool result is read in full by the model, so a busy window must not
+/// turn one registration into a wall of payloads.
+pub(crate) const ARMING_LOOKBACK_MAX_REPORTED: usize = 3;
 
 /// What `await_event` did.
 ///
@@ -105,15 +129,23 @@ impl LucidosEngine {
             }
         };
 
+        let armed_at = Utc::now();
         let wait = LiveWait {
             wait_id: Uuid::new_v4(),
             thread_id,
             tool_use_id: tool_use_id.to_string(),
             on,
             reason: reason.to_string(),
-            expires_at: Utc::now() + Duration::seconds(timeout_secs),
+            armed_at,
+            expires_at: armed_at + Duration::seconds(timeout_secs),
             watermark,
         };
+
+        // The arming lookback. Bounded at `sequence <= watermark`, so it cannot
+        // see anything this registration is about to write and its position
+        // relative to the emit below is not load-bearing. It sits here so a
+        // refused call (the caps above) does no lookback work.
+        let lookback = self.arming_lookback(&wait).await;
 
         if let Err(e) = self
             .event_bus
@@ -124,6 +156,7 @@ impl LucidosEngine {
                     tool_use_id: wait.tool_use_id.clone(),
                     on: wait.on.clone(),
                     reason: wait.reason.clone(),
+                    armed_at: wait.armed_at,
                     expires_at: wait.expires_at,
                     watermark: wait.watermark,
                 },
@@ -145,7 +178,7 @@ impl LucidosEngine {
             timeout_secs,
             wait.wait_id,
         );
-        let registered = registered_tool_result_text(&wait);
+        let registered = registered_tool_result_text(&wait, lookback.as_ref(), Utc::now());
         self.live_waits.insert(wait.clone()).await;
         // Same scan the boot rebuild runs, and here it closes the live race:
         // an event emitted between the watermark read and the insert above was
@@ -211,6 +244,53 @@ impl LucidosEngine {
         }
     }
 
+    /// Run the **arming lookback** for a wait about to be registered.
+    ///
+    /// Returns `None` when there is nothing to report AND when the probe could
+    /// not run. Collapsing those two is deliberate and is the fail-open half of
+    /// `.claude/rules/rust.md`'s unknown-state rule: the report is advisory, so
+    /// a database hiccup must cost the model a note, never the subscription it
+    /// asked for. The failure is logged rather than swallowed.
+    async fn arming_lookback(
+        &self,
+        wait: &LiveWait,
+    ) -> Option<crate::engine::event_wait::ArmingLookback> {
+        let since = Utc::now() - Duration::seconds(ARMING_LOOKBACK_SECS);
+        let delivered = match delivered_event_ids(&self.pool, wait.thread_id, since).await {
+            Ok(ids) => ids,
+            Err(e) => {
+                // Not an empty set: without the exclusion the lookback would
+                // re-report an event this thread was already handed, so an
+                // unreadable exclusion means no report at all.
+                crate::log!(
+                    "[EventWait] Lookback delivered-set read failed for thread {}: {e}",
+                    wait.thread_id
+                );
+                return None;
+            }
+        };
+        match crate::engine::event_wait::arming_lookback_matches(
+            &self.pool,
+            &wait.on,
+            wait.watermark,
+            since,
+            &delivered,
+            ARMING_LOOKBACK_MAX_REPORTED,
+        )
+        .await
+        {
+            Ok(found) if found.is_empty() => None,
+            Ok(found) => Some(found),
+            Err(e) => {
+                crate::log!(
+                    "[EventWait] Lookback scan failed for thread {}: {e}",
+                    wait.thread_id
+                );
+                None
+            }
+        }
+    }
+
     /// The event store's current high-water sequence, used as a wait's
     /// watermark.
     async fn latest_event_sequence(&self) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
@@ -236,13 +316,139 @@ impl LucidosEngine {
 /// delivery that will arrive as its own turn much later. Naming the
 /// re-registration ban here is the cheap half of the duplicate refusal in
 /// `event_wait_caps_refusal`.
-pub(super) fn registered_tool_result_text(wait: &LiveWait) -> String {
-    format!(
+///
+/// The **arming lookback** leads when there is one, because it is the only part
+/// of this result the model has to act on within this turn: the subscription
+/// watches forward, so a match from before it was armed will never produce a
+/// wake and reading past it is how the 2026-08-06 change went unapplied.
+pub(super) fn registered_tool_result_text(
+    wait: &LiveWait,
+    lookback: Option<&crate::engine::event_wait::ArmingLookback>,
+    now: DateTime<Utc>,
+) -> String {
+    let subscribed = format!(
         "Subscribed to {}. Nothing is blocking: finish this turn and end your response \
          normally. You will be woken as a NEW turn when it matches, or told it timed out \
          at the deadline you set. Do not call await_event again for this.",
         describe_subscriptions(&wait.on),
+    );
+    match lookback.filter(|l| !l.is_empty()) {
+        None => subscribed,
+        Some(found) => format!("{}\n\n{subscribed}", arming_lookback_notice(found, now)),
+    }
+}
+
+/// The report itself: what already happened, how long ago, and what the model
+/// owes it.
+///
+/// Written as an instruction rather than a fact because the fact alone is what
+/// the model already had and did not act on. It states the trap explicitly:
+/// this subscription will not wake it for these, so a turn that ends here ends
+/// with the event unhandled.
+fn arming_lookback_notice(
+    found: &crate::engine::event_wait::ArmingLookback,
+    now: DateTime<Utc>,
+) -> String {
+    let mut text = String::from(
+        "ALREADY HAPPENED, before this subscription existed. Your subscription watches \
+         FORWARD only, so it will NOT wake you for anything below. Decide now, in this \
+         turn: if one of these is what you were waiting for, act on it before you finish. \
+         If you already handled it earlier in this turn, ignore it and carry on.\n",
+    );
+    for m in &found.matches {
+        text.push_str(&format!(
+            "\n{} ({} ago):\n{}\n",
+            m.event_type,
+            humanize_age(now - m.created),
+            capped_payload(&m.payload),
+        ));
+    }
+    if found.more {
+        text.push_str(
+            "\nMore matched than are shown; these are the most recent. If that many are \
+             arriving, what you want is probably a narrower `condition`, or a trigger.\n",
+        );
+    }
+    text
+}
+
+/// One reported payload, pretty-printed and bounded.
+///
+/// The notice rides on a call the model made only to REGISTER, so its whole
+/// budget is a couple of sentences plus enough of each payload to recognise the
+/// event. Three uncapped ones would be tens of KB for a fat type (a
+/// `ResponseGenerated`, a `ChangeProposed` with a long file list) spent on a
+/// tool result that mostly says "subscribed". The identity and the age are what
+/// the notice tells the model to act on, and both survive the cut.
+///
+/// Cut on a char boundary per `.claude/rules/rust.md`: a payload is arbitrary
+/// user or workspace text, so a byte index lands mid-character eventually.
+fn capped_payload(payload: &Value) -> String {
+    const MAX_BYTES: usize = 1200;
+    const MARKER: &str = "\n… (payload truncated)";
+
+    let pretty = serde_json::to_string_pretty(payload)
+        .unwrap_or_else(|_| "<unserializable payload>".to_string());
+    if pretty.len() <= MAX_BYTES {
+        return pretty;
+    }
+    let cut = pretty.floor_char_boundary(MAX_BYTES.saturating_sub(MARKER.len()));
+    format!("{}{MARKER}", &pretty[..cut])
+}
+
+/// How long ago, at the granularity the lookback window makes meaningful.
+///
+/// Whole seconds up to a minute, then minutes and seconds. The window is a few
+/// minutes wide, so anything coarser would render every match as "0m" and the
+/// age is the whole basis on which the model tells a miss from its own work.
+fn humanize_age(age: Duration) -> String {
+    let secs = age.num_seconds().max(0);
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {}s", secs / 60, secs % 60)
+    }
+}
+
+/// Events this thread has already been **handed** by an earlier wait, among
+/// those recent enough for the arming lookback to consider.
+///
+/// The lookback's one suppression, and the only sound one. A delivery names an
+/// exact `event_id`, so excluding it says precisely "the thread has seen this
+/// event" and nothing more. Everything coarser that was tried here suppressed
+/// events nobody had reported: see [`arming_lookback_matches`] for the two
+/// sequence floors that died and why.
+///
+/// Scoped by `since`, which loses nothing: a delivery is always at or after the
+/// event it delivers, so any delivery of an event inside the window is itself
+/// inside the window.
+///
+/// A free function on the pool, matching [`consecutive_subscriptions`], so the
+/// SQL can be tested against a real database without standing up an engine.
+/// `aggregate = 'thread'` is the same load-bearing guard `LIVE_WAITS_SQL`
+/// documents. A row whose `event_id` will not parse is skipped rather than
+/// failing the read: events are append-only, so one malformed payload would
+/// otherwise disable the lookback on this thread permanently.
+pub(crate) async fn delivered_event_ids(
+    pool: &sqlx::PgPool,
+    thread_id: Uuid,
+    since: DateTime<Utc>,
+) -> Result<std::collections::HashSet<Uuid>, Box<dyn std::error::Error + Send + Sync>> {
+    let rows: Vec<(Option<String>,)> = sqlx::query_as(
+        "SELECT payload->>'event_id' FROM events \
+         WHERE aggregate = 'thread' \
+           AND aggregate_id = $1 \
+           AND event_type = 'EventWaitDelivered' \
+           AND created >= $2",
     )
+    .bind(thread_id.to_string())
+    .bind(since)
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|(id,)| id?.parse::<Uuid>().ok())
+        .collect())
 }
 
 /// `EventWaitStarted` events since the last **human** message on this thread.

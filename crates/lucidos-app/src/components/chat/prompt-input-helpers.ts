@@ -186,6 +186,36 @@ export function composeHasContent(
   return hasText || attachedImagesCount > 0 || pendingUploadsCount > 0;
 }
 
+/** Whether the optimistic `submittingThreadIds` flag should be released.
+ *
+ *  **Stop is offered only while the focused thread has a turn in flight**, and
+ *  this predicate is the half of that rule the real status cannot express. The
+ *  flag exists to bridge the click → SSE gap right after Send, when the thread
+ *  has not reported `running` yet; every frame it survives past that gap is a
+ *  frame showing a red Stop with nothing behind it. Since the thread-level Stop
+ *  stopped ending subscriptions, such a Stop does *nothing at all* when pressed.
+ *
+ *  Two ways to release, and the second is the one that was missing:
+ *
+ *  - **The real status took over** (`isMidTurn`). The bridge did its job and
+ *    `getWaitingState` drives the same button from here on.
+ *  - **Nothing is in flight.** A turn that settles without the client ever
+ *    observing `running` never hit the first case, so the flag stuck for the
+ *    life of the page. The reproducible shape is a send that fails outright: the
+ *    thread goes straight to `failed`, which is not mid-turn, and the Stop
+ *    stayed on screen on an idle thread until reload.
+ *
+ *  `status` is the EFFECTIVE status, which already folds a confirmed pending
+ *  user message into `running`, so an in-flight send is covered by the first
+ *  case and the second cannot cut the bridge short. A *queued upload send* is
+ *  the one pending thing the status does not know about: no turn is running,
+ *  but a real send is waiting on an image hash and Stop drops it, so the flag
+ *  is held until the upload settles. */
+export function shouldClearSubmitting(status: ThreadStatus, uploadSendQueued: boolean): boolean {
+  if (isMidTurn(status)) return true;
+  return !uploadSendQueued;
+}
+
 // The button is always rendered EXCEPT in 'hidden' mode so Send↔Cancel keeps
 // its color morph without a DOM swap; the leave path snap-unmounts like the
 // sibling section buttons — no fade-out, no position:absolute jump.

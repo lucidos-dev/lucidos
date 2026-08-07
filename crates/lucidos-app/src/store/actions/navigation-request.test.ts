@@ -23,7 +23,10 @@ const setActiveMenu = vi.fn();
 vi.mock('./menu', () => ({ openSettingsSubview, switchMenuItem, setActiveMenu }));
 
 const openAppById = vi.fn();
-vi.mock('./apps', () => ({ openAppById }));
+// The `new-chat` branch leaves a fullscreen app panel on a split layout, so the
+// contract sweep below reaches this even though it never opens an app.
+const exitAppFullscreen = vi.fn(() => false);
+vi.mock('./apps', () => ({ openAppById, exitAppFullscreen }));
 
 const openFilePreview = vi.fn();
 const openUrl = vi.fn();

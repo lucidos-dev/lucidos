@@ -575,10 +575,10 @@ export function ScrollControls({ showUp, showDown, onScrollUp, onScrollDown }: {
 }) {
   return (
     <>
-      <button class={`scroll-to-top${showUp ? ' visible' : ''}`} onClick={onScrollUp}>
+      <button class={`scroll-to-top${showUp ? ' visible' : ''}`} onClick={onScrollUp} aria-label="Scroll to top">
         <ChevronUpIcon />
       </button>
-      <button class={`scroll-to-bottom${showDown ? ' visible' : ''}`} onClick={onScrollDown}>
+      <button class={`scroll-to-bottom${showDown ? ' visible' : ''}`} onClick={onScrollDown} aria-label="Scroll to bottom">
         <ChevronDownIcon />
       </button>
     </>

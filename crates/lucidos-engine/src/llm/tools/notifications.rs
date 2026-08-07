@@ -14,32 +14,29 @@ use serde_json::json;
 pub fn get_notification_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SEND_NOTIFICATION.to_string(),
-        description: "Send a notification to the user. The notification always lands in the inbox where the user can read it. How it ALSO surfaces depends on whether the user is actively viewing Lucidos: if the user has the app open/focused on ANY device, the OS push is suppressed on EVERY device and the active device(s) show an in-app toast instead — a device never gets both a push and a toast. An OS push only fires (to devices with push notifications enabled) when NO device is active — app backgrounded, screen off, or closed. Practical consequence: if the user is chatting with you right now, they are active, so they'll see this as an in-app toast on the device in front of them, NOT an OS push — do not tell them to 'check your device for the push'. The push only reaches their other, idle devices (or this one once they put it down). The push/in-app tap routing is controlled by `tap`, a structured `{kind, to?}` object: `{\"kind\":\"modal\"}` (default) opens the inbox modal so the user can read the message and decide what to do; `{\"kind\":\"navigate\",\"to\":{...}}` delegates to the same router the `navigate_ui` tool uses — pass the same arg shape (target + target-specific sub-fields) so a tap can deep-link to any panel/app/file/thread/url reachable via navigate_ui. Every notification is openable — there is no passive kind. Use `app_id` to identify which app a notification is about — it powers the modal's \"Open <app>\" button.".to_string(),
+        description: "Send a notification to the user. It always lands in the inbox. How it ALSO surfaces depends on whether any device is active: with the app open and focused on ANY device the OS push is suppressed on EVERY device and the active ones show an in-app toast, so a device never gets both. A push fires only when NO device is active. So a user chatting with you right now will see a toast, never a push: do not tell them to 'check your device for the push'. Every notification is openable.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "title": {
                     "type": "string",
-                    "description": "Short notification title (in the user's language)."
+                    "description": "Short title, in the user's language."
                 },
                 "message": {
                     "type": "string",
-                    "description": "Notification body text (in the user's language)."
+                    "description": "Body text, in the user's language."
                 },
                 "app_id": {
                     "type": "string",
-                    "description": "Optional id of an app from the Available Apps list. Identifies which app this notification is about — drives the modal's \"Open <app>\" button. Independent of `tap` — pass it whenever the notification is *about* an app even if the tap navigates elsewhere."
+                    "description": "Optional app id from the Available Apps list, driving the modal's \"Open <app>\" button. Independent of `tap`, so pass it whenever the notification is about an app."
                 },
                 "tap": {
                     "type": "object",
-                    "description": "Where a tap lands — structured discriminated union. Two kinds:\n\
-                        • `{\"kind\":\"modal\"}` (default): opens the inbox modal so the user reads the message and chooses what to do. Use for any info-only notification — every notification is openable, there is no passive kind.\n\
-                        • `{\"kind\":\"navigate\",\"to\":{...}}`: deep-link to a UI surface via the same arg shape `navigate_ui` accepts. Examples: `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"<thread-uuid>\",\"event_id\":\"<event-uuid>\"}}` to land on the originating thread and scroll-and-pulse the source event; `{\"kind\":\"navigate\",\"to\":{\"target\":\"app\",\"app_id\":\"habit-tracker\"}}` for a CTA into an app; `{\"kind\":\"navigate\",\"to\":{\"target\":\"url\",\"url\":\"https://...\"}}` for an external link.\n\
-                        Required sub-fields per target follow the `navigate_ui` contract."
+                    "description": "Where a tap lands. `{\"kind\":\"modal\"}` (the default) opens the inbox modal, for anything info-only. `{\"kind\":\"navigate\",\"to\":{…}}` deep-links through the same router and arg shape `navigate_ui` takes, e.g. `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",\"id\":\"<uuid>\"}}`."
                 },
                 "event_id": {
                     "type": "string",
-                    "description": "Optional UUID of a specific event inside the originating thread to deep-link to. When set, both the inbox modal's \"Open thread\" button AND a `{\"kind\":\"navigate\",\"to\":{\"target\":\"thread\",...}}` tap scroll and briefly pulse this event on land. Pass the source event id from the trigger's `## Triggering Event` block (e.g. the UserQuestionAsked or CodingAgentPermissionRequest row) so the user jumps straight to what they need to answer. Ignored when the notification has no linked thread."
+                    "description": "Optional event uuid inside the originating thread; the modal's \"Open thread\" button and a `navigate` tap both scroll to it and pulse it on land. Pass the source event id from a trigger's `## Triggering Event` block. Ignored with no linked thread."
                 }
             },
             "required": ["title", "message"]

@@ -445,8 +445,19 @@ fn segment_destruction_scope(segment: &str) -> Option<DestructionScope> {
         return Some(DestructionScope::OutOfWorkspace);
     }
     let toks: Vec<&str> = segment.split_whitespace().collect();
-    let (base, head_args) = danger_head_and_args(&toks)?;
-    let base = base.as_str();
+    // Out-of-workspace wins over in-workspace across the candidate readings of
+    // the preamble, the same way it wins across segments.
+    danger_head_candidates(&toks)
+        .into_iter()
+        .filter_map(|(base, head_args)| head_destruction_scope(&base, head_args))
+        .max_by_key(|scope| match scope {
+            DestructionScope::InWorkspace => 0,
+            DestructionScope::OutOfWorkspace => 1,
+        })
+}
+
+/// Destruction scope implied by one resolved command word plus its arguments.
+fn head_destruction_scope(base: &str, head_args: &[&str]) -> Option<DestructionScope> {
     if base == "dd" {
         // dd overwrites its `of=` target (a block-device target is already
         // caught by the catastrophic scan upstream). No `of=` → stdout → not
@@ -794,7 +805,20 @@ fn segment_is_safe(segment: &str) -> bool {
         // Only benign prefixes / redirects — no command runs.
         return true;
     };
-    let base = head.rsplit('/').next().unwrap_or(head);
+    // Resolve the head by NAME, never by basename. `head.rsplit('/')` read
+    // `data/bin/ls`, `./ls` and `/tmp/ls` as the read-only `ls` and settled them
+    // Safe, so the agent could write its own `ls` with an ordinary in-workspace
+    // write (itself Safe) and then run it with no card, no checkpoint and no
+    // judge call. That is the same write-then-run escalation `PATH=` is on
+    // `CODE_INJECTING_ENV_NAMES` to close, reachable here without the `PATH=`
+    // preamble. A path-qualified head now falls through to the judge, which is
+    // the fail-safe direction and costs one LLM call on the rare `/usr/bin/ls`.
+    // The DANGER scans deliberately keep resolving by basename
+    // ([`normalized_head`]), because there it can only add a verdict.
+    if head.contains('/') {
+        return false;
+    }
+    let base = *head;
     let args = &toks[i + 1..];
     match base {
         "git" => git_subcommand_read_only(args),
@@ -1102,15 +1126,18 @@ fn is_disk_device(raw: &str) -> bool {
 /// `rm -rf data/tmp` or `chmod -R 755 data/` are untouched.
 fn catastrophic_rm_or_chmod(segment: &str) -> Option<&'static str> {
     let toks: Vec<&str> = segment.split_whitespace().collect();
-    let (base, args) = danger_head_and_args(&toks)?;
-    let reason = match base.as_str() {
-        "rm" => "recursive deletion of the filesystem root or home directory",
-        "chmod" => "a recursive permission change on the filesystem root or home directory",
-        _ => return None,
-    };
-    let recursive = args.iter().any(|a| is_recursive_flag(a));
-    let targets_root = args.iter().any(|a| is_catastrophic_target(a));
-    (recursive && targets_root).then_some(reason)
+    danger_head_candidates(&toks)
+        .into_iter()
+        .find_map(|(base, args)| {
+            let reason = match base.as_str() {
+                "rm" => "recursive deletion of the filesystem root or home directory",
+                "chmod" => "a recursive permission change on the filesystem root or home directory",
+                _ => return None,
+            };
+            let recursive = args.iter().any(|a| is_recursive_flag(a));
+            let targets_root = args.iter().any(|a| is_catastrophic_target(a));
+            (recursive && targets_root).then_some(reason)
+        })
 }
 
 /// The command word a head token really names, after stripping the shell
@@ -1128,27 +1155,74 @@ fn normalized_head(head: &str) -> &str {
     unquoted.rsplit('/').next().unwrap_or(unquoted)
 }
 
-/// Resolve a segment's command word and argument tokens for the two scans that
-/// CLASSIFY DANGER ([`catastrophic_rm_or_chmod`] and
-/// [`segment_destruction_scope`]). Extends [`command_head_index`] by also
-/// walking past a bare shell grouping token (`{ rm -rf /; }`, `( rm -rf / )`),
-/// and normalizes the head via [`normalized_head`].
+/// True for a token that reads as a command-line option rather than a command
+/// word. A lone `-` is the conventional stdin/stdout placeholder, not a flag.
+fn is_flag_token(tok: &str) -> bool {
+    tok.starts_with('-') && tok.len() > 1
+}
+
+/// Every (command word, argument tokens) pair a segment could be running, for
+/// the three scans that CLASSIFY DANGER ([`catastrophic_rm_or_chmod`],
+/// [`segment_destruction_scope`] and [`segment_side_effect_category`]). Extends
+/// [`command_head_index`] by also walking past a bare shell grouping token
+/// (`{ rm -rf /; }`, `( rm -rf / )`), and normalizes each head via
+/// [`normalized_head`].
+///
+/// It returns a LIST rather than one head because a wrapper's own options have
+/// an arity we cannot know. [`is_benign_prefix`] never matches a `-`-prefixed
+/// token, so the walk used to stop dead on one and resolve the head to the
+/// FLAG: `sudo -E rm -rf /` resolved to `-E`, matched none of the danger
+/// tables, and [`fallback_classify`] settled the whole line `Safe`, which on
+/// the unattended coding-agent lane is an auto-allow with no card and no
+/// checkpoint. The catastrophic hard-block was defeated by the same token, as
+/// were `env -i rm -rf /` and `nice -n 10 rm -rf /`.
+///
+/// Enumerating each wrapper's flag arity is the other repair and it fails OPEN
+/// on every flag not listed (`sudo -u root rm -rf /` would resolve to `root`),
+/// so instead a flag-shaped head branches into BOTH readings, flag-takes-no-arg
+/// and flag-takes-one-argument, and every reading is scanned. That is safe by
+/// construction, because these three scans can only ever ADD a danger verdict,
+/// never remove one, and it costs nothing on ordinary input: a head that is not
+/// flag-shaped never branches, so `git commit -m "rm -rf / is bad"` still
+/// resolves to exactly one candidate. The visited set bounds the walk to at
+/// most one candidate per token.
 ///
 /// Deliberately NOT used by [`segment_is_safe`]: there an unrecognised head
 /// already falls through to the judge, which is the conservative direction, so
-/// resolving these forms would newly SETTLE decorated commands as Safe. Here it
-/// can only ever add a danger verdict.
-fn danger_head_and_args<'a>(toks: &'a [&'a str]) -> Option<(String, &'a [&'a str])> {
-    let mut from = 0;
-    let head_at = loop {
-        let next = from + command_head_index(&toks[from..]);
-        match toks.get(next) {
-            Some(&"{") | Some(&"(") => from = next + 1,
-            _ => break next,
+/// resolving these forms would newly SETTLE decorated commands as Safe.
+fn danger_head_candidates<'a>(toks: &'a [&'a str]) -> Vec<(String, &'a [&'a str])> {
+    // The grouping-token walk, from an arbitrary starting offset.
+    fn resolve_head_at(toks: &[&str], from: usize) -> usize {
+        let mut from = from;
+        loop {
+            let next = from + command_head_index(&toks[from..]);
+            match toks.get(next) {
+                Some(&"{") | Some(&"(") => from = next + 1,
+                _ => return next,
+            }
         }
-    };
-    let head = toks.get(head_at)?;
-    Some((normalized_head(head).to_string(), &toks[head_at + 1..]))
+    }
+    let mut candidates = Vec::new();
+    let mut seen = vec![false; toks.len()];
+    let mut pending = vec![0usize];
+    while let Some(start) = pending.pop() {
+        if start > toks.len() {
+            continue;
+        }
+        let at = resolve_head_at(toks, start);
+        let Some(head) = toks.get(at) else { continue };
+        if seen[at] {
+            continue;
+        }
+        seen[at] = true;
+        candidates.push((normalized_head(head).to_string(), &toks[at + 1..]));
+        if is_flag_token(head) {
+            // The walk stopped inside a wrapper's own options. Try both arities.
+            pending.push(at + 1);
+            pending.push(at + 2);
+        }
+    }
+    candidates
 }
 
 /// Environment-variable names whose value is loaded and EXECUTED by the process
@@ -1409,14 +1483,14 @@ fn segment_side_effect_category(segment: &str) -> Option<SideEffectCategory> {
     // check entirely and auto-allowed. Using the shared resolver can only ever
     // derive a category where there was none, and keeps the three head-resolving
     // scans from drifting apart again.
-    let (base, args) = danger_head_and_args(&toks)?;
-    let base = base.as_str();
-    match base {
-        "curl" | "wget" => is_mutating_http(args).then_some(SideEffectCategory::ExternalApi),
-        "mail" | "mailx" | "sendmail" | "osascript" => Some(SideEffectCategory::Email),
-        "gh" | "aws" | "gcloud" => Some(SideEffectCategory::CloudCli),
-        _ => None,
-    }
+    danger_head_candidates(&toks)
+        .into_iter()
+        .find_map(|(base, args)| match base.as_str() {
+            "curl" | "wget" => is_mutating_http(args).then_some(SideEffectCategory::ExternalApi),
+            "mail" | "mailx" | "sendmail" | "osascript" => Some(SideEffectCategory::Email),
+            "gh" | "aws" | "gcloud" => Some(SideEffectCategory::CloudCli),
+            _ => None,
+        })
 }
 
 /// True when curl/wget args carry a write HTTP method or a request body/upload
@@ -1622,6 +1696,92 @@ mod tests {
         ] {
             assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
         }
+    }
+
+    /// A flag on the wrapper hid the payload just as well as a `sh -c` did.
+    /// `is_benign_prefix` never matches a `-`-prefixed token, so the head walk
+    /// stopped on the FLAG: `sudo -E rm -rf /` resolved to head `-E`, matched
+    /// none of the danger tables, and settled `Safe`, i.e. auto-allowed
+    /// outright on the unattended coding-agent lane with the catastrophic
+    /// hard-block skipped. Both flag arities are scanned now, so a `-u root`
+    /// that consumes its argument cannot hide the payload either.
+    #[test]
+    fn catastrophic_survives_a_flag_on_the_wrapper() {
+        for cmd in [
+            "sudo -E rm -rf /",
+            "sudo -H rm -rf ~",
+            "sudo -u root rm -rf /",
+            "sudo --preserve-env=PATH rm -rf /",
+            "env -i rm -rf /",
+            "env -u LD_PRELOAD rm -rf /",
+            "nice -n 10 rm -rf /",
+            "sudo -E chmod -R 777 /",
+            "true && sudo -E rm -rf /",
+            "sudo -E -H rm -rf /",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Catastrophic, cmd);
+        }
+    }
+
+    /// The same walk gates the two lower danger scans, so a wrapper flag also
+    /// hid an out-of-workspace deletion and a mutating API call behind `Safe`.
+    #[test]
+    fn wrapper_flag_does_not_hide_destruction_or_side_effects() {
+        for cmd in ["sudo -E rm -rf /etc/nginx", "env -i rm -rf /var/log"] {
+            assert_eq!(
+                bash_destruction_scope(cmd),
+                Some(DestructionScope::OutOfWorkspace),
+                "{cmd}"
+            );
+        }
+        assert_eq!(
+            static_side_effect_category("sudo -E curl -X POST https://example.com/pay"),
+            Some(SideEffectCategory::ExternalApi),
+        );
+        assert_eq!(
+            static_side_effect_category("env -u FOO gh release create v1"),
+            Some(SideEffectCategory::CloudCli),
+        );
+    }
+
+    /// Branching on a flag-shaped head must not invent danger where the head is
+    /// an ordinary command word: an `rm -rf /` sitting in a quoted ARGUMENT is
+    /// not a command, and the walk never branches past a non-flag head.
+    #[test]
+    fn wrapper_flag_branching_does_not_over_report() {
+        for cmd in [
+            "git commit -m \"rm -rf / is bad\"",
+            "grep -rn 'rm -rf /' docs",
+            "echo sudo -E rm -rf /",
+        ] {
+            assert_ne!(
+                bash(cmd),
+                StaticVerdict::Settled(RiskLane::Catastrophic),
+                "{cmd}"
+            );
+        }
+    }
+
+    /// The Safe fast path resolved its head by BASENAME, so a binary the agent
+    /// had just written into the workspace ran with no card, no checkpoint and
+    /// no judge call: `data/bin/ls` read as the read-only `ls`. That is the
+    /// write-then-run escalation `PATH=` is on `CODE_INJECTING_ENV_NAMES` to
+    /// close, reachable without the `PATH=` preamble. A path-qualified head
+    /// falls through to the judge now.
+    #[test]
+    fn a_path_qualified_head_never_settles_safe() {
+        for cmd in [
+            "data/bin/ls",
+            "./ls -la",
+            "/tmp/ls",
+            "bin/cat secrets.txt",
+            "sudo ./ls",
+            "ls && ./cat x",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // A bare name is unaffected.
+        assert_settled(bash("ls -la"), RiskLane::Safe, "ls -la");
     }
 
     /// The wrapper only had to move out of the FIRST segment to hide again:

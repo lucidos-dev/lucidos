@@ -15,8 +15,9 @@ const AUTH_KINDS = [
 
 /** Configure the direct-Anthropic provider credential (Settings → Models →
  *  Providers). Stores a credential named `anthropic`; the engine's
- *  AnthropicProvider reads it and picks the header by auth kind (`api_key` →
- *  `x-api-key`, `bearer` → `Authorization: Bearer` + the OAuth beta). The secret
+ *  AnthropicProvider reads it (preferring it over the ANTHROPIC_API_KEY launch
+ *  env var) and picks the header by auth kind (`api_key` → `x-api-key`,
+ *  `bearer` → `Authorization: Bearer` + the OAuth beta). The secret
  *  is write-only — once set we show "Configured", never the value.
  *
  *  Renders only the provider block (label/auth/secret/save rows + note); the
@@ -94,7 +95,9 @@ export function AnthropicProviderSettings() {
       </div>
       <div class="settings-row-note">
         Direct Anthropic serves models on the <strong>anthropic</strong> provider (e.g. Fable 5).
-        OAuth subscription tokens are short-lived — if requests start failing with a 401, re-paste a
+        Stored here, the secret is used instead of the <strong>ANTHROPIC_API_KEY</strong> launch
+        environment variable, which stays as a fallback when nothing is set here. OAuth
+        subscription tokens are short-lived: if requests start failing with a 401, re-paste a
         fresh token here.
       </div>
     </>

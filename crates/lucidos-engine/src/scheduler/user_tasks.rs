@@ -250,29 +250,29 @@ async fn execute_llm_task(
         .scope(trigger_id.to_string(), process_fut)
         .await;
     let result = match result {
-        Ok(r) => {
-            // Broadcast "done" so the frontend immediately moves this thread to archive.
-            engine
-                .event_bus
-                .emit_or_log(
-                    crate::engine::event_bus::BusEvent::Thread {
-                        thread_id: r.thread_id,
-                        event: crate::engine::thread_events::ThreadEvent::ResponseGenerated {
-                            text: String::new(),
-                            images: vec![],
-                            model: None,
-                            reasoning_effort: None,
-                        },
-                        meta: crate::engine::thread_events::EventMeta {
-                            channel: Some(crate::engine::thread_events::EventChannel::Trigger),
-                            ..crate::engine::thread_events::EventMeta::NONE
-                        },
-                    },
-                    "[Scheduler] trigger completion ResponseGenerated",
-                )
-                .await;
-            r
-        }
+        // The scheduler emits NO terminator of its own, deliberately. One turn,
+        // one terminator (`system-knowhow/thread-events.md`): the turn's own
+        // terminator comes from the agentic loop, and `ensure_terminator_emitted`
+        // covers any path that returned without one. A completion broadcast here
+        // is a SECOND one, anchored on nothing (no `request_event_id`), and it
+        // lies in every case where the turn did not end cleanly:
+        //
+        // - after a user Stop it lands ~10ms behind `ResponseCanceled`, so the
+        //   frontend folds it into the cancel boundary and renders "Done ✓ / the
+        //   model returned an empty response" under "Response canceled";
+        // - it re-reports a canceled or failed trigger child to its parent as
+        //   `Success` and decrements `active_children_count` twice, since
+        //   `parent_callback` relies on exactly one terminator per chat turn;
+        // - on the early-return paths of `process_message_with_steps_internal`
+        //   (a free-text answer routed into a parked question) it declares the
+        //   thread done while the loop is still running.
+        //
+        // It was a transient SSE `ChatProgress{done}` when it was added in
+        // 2026-03 (scheduled threads bypassed the HTTP endpoint's forwarder);
+        // once it became a persisted `ResponseGenerated` it stopped being a
+        // nudge and became a phantom terminator. Nothing needs re-adding: the
+        // loop's terminator fans out over the same bus.
+        Ok(r) => r,
         Err(e) => {
             let err_str = e.to_string();
             let is_transient = crate::llm::is_transient_error(&err_str);
@@ -455,6 +455,60 @@ async fn has_recent_error_notification(pool: &PgPool, task_id: uuid::Uuid) -> bo
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Source-scan tripwire, in the repo's existing idiom (see
+    /// `engine::trigger_writes::only_the_chokepoint_constructs_a_trigger_lifecycle_event`).
+    ///
+    /// A "the run finished, tell the frontend" broadcast is the most natural
+    /// thing in the world to reach for from the scheduler, and it reads as
+    /// harmless at the call site: the turn really has finished, and the event is
+    /// empty. It is not harmless. It is a second terminator for a turn that
+    /// already has one, anchored on no `request_event_id`, and the case it gets
+    /// wrong is the one nobody writes the code for: the turn that ended because
+    /// the user pressed Stop. `execute_llm_task` carried exactly that from 2026-03
+    /// until 2026-08-07 and put "Done ✓ / the model returned an empty response"
+    /// under every canceled trigger fire.
+    ///
+    /// Nothing here may construct one. The terminator belongs to the agentic
+    /// loop, which owns the turn's `request_event_id`; the scheduler observes.
+    #[test]
+    fn the_scheduler_never_constructs_a_chat_terminator() {
+        use crate::test_support::source_scan::{is_test_path, production_sources};
+
+        // The chat-mode terminator set (`TERMINATOR_EVENT_TYPES`), spelled out
+        // rather than imported so a new variant joining that constant does not
+        // silently widen what this test forbids without a look at this comment.
+        const TERMINATORS: [&str; 4] = [
+            "ResponseGenerated",
+            "ResponseCanceled",
+            "ResponseAborted",
+            "ResponseFailed",
+        ];
+
+        let mut offenders: Vec<String> = Vec::new();
+        for (rel, text) in production_sources() {
+            if !rel.starts_with("scheduler/") || is_test_path(&rel) {
+                continue;
+            }
+            for event in TERMINATORS {
+                // `ThreadEvent::ResponseX {` is construction; a match arm spells
+                // `ThreadEvent::ResponseX { .. }` and binds no field.
+                let ctor = format!("ThreadEvent::{} {{", event);
+                if text.contains(&ctor) && !text.contains(&format!("{} .. }}", ctor)) {
+                    offenders.push(format!("{rel}: {event}"));
+                }
+            }
+        }
+        offenders.sort();
+        assert!(
+            offenders.is_empty(),
+            "the scheduler must not emit a terminator: a trigger turn's terminator \
+             is the agentic loop's, and a second one anchored on no request_event_id \
+             renders as a phantom 'empty response' turn under a cancel and reports a \
+             canceled child to its parent as Success. Constructed in:\n  {}",
+            offenders.join("\n  ")
+        );
+    }
 
     #[test]
     fn build_event_env_schedule_fire_is_empty() {

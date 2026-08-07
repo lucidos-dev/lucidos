@@ -281,6 +281,9 @@
   background: none;
   padding: 0;
   font: inherit;
+  /* `font` resets font-feature-settings to initial; keep inheriting it
+     so a Fira Code user does not get ligatures back here. */
+  font-feature-settings: inherit;
   font-weight: 600;
   color: #bcd8ff;
   cursor: pointer;
@@ -523,6 +526,20 @@
   white-space: nowrap;
 }
 
+/* The workspace address (`/slug/`), shown only when it would otherwise surprise:
+   a rename moved the name off its address, or two rows share a name. Quiet and
+   monospaced so it reads as the path it is, and never competes with the name. */
+.ws-picker-address {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--font-size-sm);
+  color: rgba(255, 255, 255, 0.6);
+}
+
 /* Per-workspace unread-notification count. Sits between the (flex-grow) name and
  * the row actions, so a long name ellipsizes before crowding the badge. A calm
  * white-on-translucent pill — distinct from the status dot's green/gold/red so it
@@ -716,6 +733,18 @@
   color: rgba(255, 255, 255, 0.85);
 }
 
+/* Rename: the field row plus the "that name is taken" line under it. */
+.ws-picker-rename {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  width: 100%;
+  padding-bottom: 0.5rem;
+}
+.ws-picker-rename .ws-picker-note {
+  padding: 0 0.25rem;
+}
+
 .ws-picker-input {
   flex: 1;
   min-width: 8rem;
@@ -795,6 +824,9 @@
 .ws-picker-footer {
   margin-top: 1.5rem;
   text-align: center;
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
 }
 
 .ws-picker-new {
@@ -813,6 +845,14 @@
   border-color: rgba(255, 255, 255, 0.7);
 }
 .ws-picker-new:disabled { opacity: 0.45; cursor: default; }
+/* The entry point whose form is unfolded below it: solid border and a lifted
+   surface, so the two permanent controls read as a pair with one of them open
+   rather than as two identical buttons. */
+.ws-picker-new.is-open {
+  border-style: solid;
+  border-color: rgba(255, 255, 255, 0.75);
+  background: rgba(255, 255, 255, 0.18);
+}
 
 /* The two footer entry points (New / Restore) sit side by side. */
 .ws-picker-footer-actions {
@@ -834,6 +874,47 @@
   padding: 0.5rem 0.25rem;
 }
 
+/* Labelled field: a caption above its control. Placeholders alone left the
+   restore form unreadable (three unlabelled boxes, one of them a password), and
+   a caption survives being filled in. */
+.ws-picker-field {
+  display: flex;
+  flex-direction: column;
+  gap: 0.25rem;
+  text-align: left;
+}
+
+.ws-picker-field-label {
+  font-size: var(--font-size-md);
+  font-weight: 500;
+  color: rgba(255, 255, 255, 0.75);
+}
+
+/* Lead sentence for a form: what this does and what you need for it. */
+.ws-picker-lead {
+  margin: 0;
+  font-size: var(--font-size-md);
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.75);
+}
+.ws-picker-lead code {
+  font-size: inherit;
+  padding: 0 0.1875rem;
+  border-radius: 0.25rem;
+  background: rgba(0, 0, 0, 0.25);
+}
+
+/* Explanatory line under a form: what is still missing, or what the address
+   will end up being. Never an error, so it stays in the muted voice. */
+.ws-picker-note {
+  margin: 0;
+  text-align: left;
+  font-size: var(--font-size-md);
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.72);
+}
+.ws-picker-note-warn { color: #ffd9d4; }
+
 /* Drop-or-click target for the .enc file. Dashed like the New button so it
    reads as the same family of affordance. */
 .ws-picker-restore-drop {
@@ -854,11 +935,30 @@
   background: rgba(255, 255, 255, 0.1);
   border-color: rgba(255, 255, 255, 0.7);
 }
+/* A chosen file must be unmistakable: the empty and filled states differed only
+   by their text, so a form that had silently lost its file looked ready. */
+.ws-picker-restore-drop[data-picked="true"] {
+  border-style: solid;
+  border-color: rgba(86, 211, 100, 0.7);
+  background: rgba(86, 211, 100, 0.12);
+  color: #fff;
+  font-weight: 500;
+  word-break: break-all;
+}
 
+/* Collision: the message plus the way out of it (delete the workspace holding
+   the address), on one line that wraps on a narrow screen. */
 .ws-picker-restore-warn {
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  flex-wrap: wrap;
+  gap: 0.5rem;
+  text-align: left;
   font-size: var(--font-size-md);
   color: #ffd9d4;
 }
+.ws-picker-restore-warn > span { flex: 1 1 12rem; min-width: 0; }
 
 /* Status banner above the footer (running / completed / failed). */
 .ws-picker-restore-banner {

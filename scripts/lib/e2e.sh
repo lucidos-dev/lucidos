@@ -23,6 +23,26 @@ _E2E_PROJECT_DIR="$(dirname "$_E2E_SCRIPTS_DIR")"
 # dist/ forever. This opt-in is the sanctioned exception, not a workaround.
 export LUCIDOS_ALLOW_WORKTREE_STACK=1
 
+# Test THIS checkout's engine-shipped knowhow, not whichever one the binary
+# happens to sit under.
+#
+# The engine resolves `system-knowhow/` from `<repo_root>/system-knowhow`, and
+# `repo_root` walks up from the running executable. The dev launcher publishes
+# the engine binary to a launch dir shared by every workspace, which lives under
+# the MAIN checkout, so a run started from a coding-agent worktree exercised the
+# worktree's Rust against main's knowhow. Everything under `system-knowhow/` was
+# therefore untestable by e2e until after it landed: the assertions passed or
+# failed on a copy the branch had not touched.
+#
+# `LUCIDOS_SYSTEM_KNOWHOW_DIR` is the authoritative override (resolution rule 1
+# in `core::system_knowhow`), and is what packaged builds already use. Pointing
+# it at the checkout THESE SCRIPTS live in makes the knowhow half agree with the
+# code half. Skipped when the dir is absent, which keeps the engine's own
+# "set but missing is a packaging bug" warning meaningful.
+if [ -z "${LUCIDOS_SYSTEM_KNOWHOW_DIR:-}" ] && [ -d "$_E2E_PROJECT_DIR/system-knowhow" ]; then
+    export LUCIDOS_SYSTEM_KNOWHOW_DIR="$_E2E_PROJECT_DIR/system-knowhow"
+fi
+
 # Use mock LLM provider by default for e2e tests (override with LUCIDOS_MODEL=... before calling)
 export LUCIDOS_MODEL="${LUCIDOS_MODEL:-mock}"
 
@@ -529,6 +549,12 @@ setup_e2e_session() {
     # session. Both are idempotent no-ops when nothing was started (e.g.
     # e2e-api.sh), so it's safe in all branches.
     # shellcheck disable=SC2329 # all three variants are invoked by `trap teardown_e2e EXIT` below
+    #
+    # `sweep_e2e_orphans` comes AFTER `stop_e2e_workspace` in both stopping
+    # variants: the coding-agent subprocesses the tests spawned are the engine's
+    # children, so they are only leftovers once the engine is gone. The
+    # `--no-reset` variant deliberately skips it, since that branch leaves the
+    # workspace RUNNING for the next invocation and its agents are not orphans.
     if [ -n "${NO_RESET:-}" ]; then
         # Leave the workspace running so the next invocation starts immediately
         # instead of paying the boot cost again.
@@ -538,12 +564,14 @@ setup_e2e_session() {
             stop_e2e_background_guards
             cleanup_e2e_worktrees
             stop_e2e_workspace
+            sweep_e2e_orphans
             release_e2e_lock
         }
     else
         teardown_e2e() {
             stop_e2e_background_guards
             stop_e2e_workspace
+            sweep_e2e_orphans
             release_e2e_lock
         }
     fi

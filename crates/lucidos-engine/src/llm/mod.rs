@@ -15,7 +15,9 @@ pub mod validate;
 pub mod vertex;
 pub mod web_search;
 
-pub use anthropic::{AnthropicAuth, AnthropicProvider};
+pub use anthropic::{
+    resolve_anthropic_auth, AnthropicAuth, AnthropicAuthSource, AnthropicProvider,
+};
 pub use image::{ImageProvider, ImageSize};
 pub use model_registry::{ModelRegistry, ProviderKind};
 pub use openai::{

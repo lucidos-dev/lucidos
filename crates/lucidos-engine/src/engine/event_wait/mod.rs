@@ -23,6 +23,43 @@
 //! * the live race between emitting `EventWaitStarted` and this module
 //!   inserting the cache entry.
 //!
+//! # The third gap is REPORTED, not closed
+//!
+//! There is a third gap and the watermark deliberately does not cover it: the
+//! stretch between the model deciding to wait for something and the call
+//! landing. Every honest `await_event` is preceded by a check ("has it happened
+//! already?"), and the work between that check and the call is a window in
+//! which the answer can change permanently. On 2026-08-06 a thread checked the
+//! change list, spent 84 seconds spawning an unrelated thread, and armed a wait
+//! 26 seconds after the `ChangeProposed` it was waiting for had already landed.
+//! The change sat 34 sequences below the watermark, so the forward scan could
+//! never see it, and the thread watched for 24 hours for something that had
+//! happened.
+//!
+//! [`arming_lookback_matches`] scans a short window BACKWARDS at registration
+//! and puts what it finds in the tool result. **It reports; it never delivers.**
+//! Two shapes were rejected on the way here, and both are the obvious next
+//! proposal:
+//!
+//! * **Backdate the watermark and let the catch-up scan deliver the match.** A
+//!   turn is not short: one ran from 17:39 to 19:14 that same day driving a
+//!   release build, and a turn that long contains matching-by-type events the
+//!   model already saw and acted on. That `await_event` would have resolved
+//!   instantly off a change applied ninety minutes earlier. A wait resolved on
+//!   the wrong event is worse than one that times out: a timeout is reported to
+//!   the user, a wrong wake makes the thread act.
+//! * **Scope the window to the turn.** The model decides to subscribe
+//!   mid-turn. It can form the intent at minute 88 of a ninety-minute turn,
+//!   having never looked at that state before, so events from minute 2 are
+//!   archaeology rather than a missed rendezvous. The turn boundary has nothing
+//!   to do with when the model started caring, which is why the window is a
+//!   stated constant (`ARMING_LOOKBACK_SECS`) instead.
+//!
+//! Only the model can tell "I missed this" from "I already handled this",
+//! because only the model has the turn in its context. Reporting is also what
+//! lets the window be approximate at all: the cost of naming one event too many
+//! is a sentence the model reads, not an action it takes.
+//!
 //! # One wake shape
 //!
 //! A subscribed thread is an ordinary **idle** thread. `await_event` returns
@@ -46,14 +83,16 @@
 //! let it in. All of it is gone. See
 //! `docs/plans/2026-08-06-every-event-wait-is-detached.md`.
 
+mod agent_surface;
 mod dispatcher;
 mod register;
 
-pub(crate) use register::AwaitEventOutcome;
+pub(crate) use agent_surface::CancelEventWaitOutcome;
 /// Re-exported so the `await_event` tool description can interpolate the real
 /// cap instead of restating a number that would silently drift from the
 /// refusal the model actually hits.
 pub(crate) use register::MAX_CONSECUTIVE_SUBSCRIPTIONS;
+pub(crate) use register::{describe_subscriptions, AwaitEventOutcome};
 
 use std::collections::HashMap;
 
@@ -77,6 +116,11 @@ pub struct LiveWait {
     pub tool_use_id: String,
     pub on: Vec<EventSubscription>,
     pub reason: String,
+    /// When the subscription was armed. Recorded on the event rather than
+    /// derived from `expires_at`, because the age is what makes
+    /// `list_event_waits` answerable and a derived one would drift from the
+    /// truth the moment a deadline did.
+    pub armed_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
     pub watermark: i64,
 }
@@ -211,7 +255,7 @@ pub fn is_awaitable_event(event: &ThreadEvent) -> bool {
 /// append-only, so that would break the boot rebuild on EVERY later boot and
 /// leave the live-wait cache permanently empty.
 const LIVE_WAITS_SQL: &str = "\
-    SELECT e.aggregate_id::uuid, e.payload, e.sequence \
+    SELECT e.aggregate_id::uuid, e.payload, e.sequence, e.created \
     FROM events e \
     WHERE e.aggregate = 'thread' \
       AND e.event_type = 'EventWaitStarted' \
@@ -237,10 +281,11 @@ pub async fn rebuild_live_waits(
     pool: &sqlx::PgPool,
     waits: &LiveWaits,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let rows: Vec<(Uuid, Value, i64)> = sqlx::query_as(LIVE_WAITS_SQL).fetch_all(pool).await?;
+    let rows: Vec<(Uuid, Value, i64, DateTime<Utc>)> =
+        sqlx::query_as(LIVE_WAITS_SQL).fetch_all(pool).await?;
     let mut loaded = 0usize;
-    for (thread_id, payload, sequence) in rows {
-        match live_wait_from_payload(thread_id, &payload, sequence) {
+    for (thread_id, payload, sequence, created) in rows {
+        match live_wait_from_payload(thread_id, &payload, sequence, created) {
             Some(wait) => {
                 waits.insert(wait).await;
                 loaded += 1;
@@ -259,9 +304,15 @@ pub async fn rebuild_live_waits(
 ///
 /// Reads the fields individually rather than deserializing the whole
 /// `ThreadEvent`, because the persisted payload has its `type` tag stripped
-/// (see `ThreadEvent::to_payload`). `sequence` is the row's own sequence, used
-/// as the watermark fallback for a payload written before the field existed.
-fn live_wait_from_payload(thread_id: Uuid, payload: &Value, sequence: i64) -> Option<LiveWait> {
+/// (see `ThreadEvent::to_payload`). `sequence` and `created` are the row's own,
+/// used as the fallbacks for the two fields a payload written before they
+/// existed does not carry: the watermark, and the arming time.
+fn live_wait_from_payload(
+    thread_id: Uuid,
+    payload: &Value,
+    sequence: i64,
+    created: DateTime<Utc>,
+) -> Option<LiveWait> {
     let wait_id = payload.get("wait_id")?.as_str()?.parse().ok()?;
     let tool_use_id = payload.get("tool_use_id")?.as_str()?.to_string();
     let on: Vec<EventSubscription> = serde_json::from_value(payload.get("on")?.clone()).ok()?;
@@ -275,6 +326,15 @@ fn live_wait_from_payload(thread_id: Uuid, payload: &Value, sequence: i64) -> Op
         .as_str()?
         .parse::<DateTime<Utc>>()
         .ok()?;
+    // The row's own `created` is the right fallback rather than a computed
+    // `expires_at - timeout`: the event was written at registration, so the two
+    // differ by the emit, while the computed one is a guess that gets a
+    // pre-2026-08-07 subscription's age wrong by up to its whole timeout.
+    let armed_at = payload
+        .get("armed_at")
+        .and_then(|v| v.as_str())
+        .and_then(|s| s.parse::<DateTime<Utc>>().ok())
+        .unwrap_or(created);
     let watermark = payload
         .get("watermark")
         .and_then(|v| v.as_i64())
@@ -285,6 +345,7 @@ fn live_wait_from_payload(thread_id: Uuid, payload: &Value, sequence: i64) -> Op
         tool_use_id,
         on,
         reason,
+        armed_at,
         expires_at,
         watermark,
     })
@@ -300,6 +361,17 @@ fn live_wait_from_payload(thread_id: Uuid, payload: &Value, sequence: i64) -> Op
 /// old unbounded `fetch_all` pulled every one of them into memory on the
 /// startup path to look at the first.
 const CATCH_UP_PAGE: i64 = 200;
+
+/// How many pages the **arming lookback** may read before giving up.
+///
+/// The forward scan has no such budget and needs none: it stops at its first
+/// match, and it is the mechanism that must not miss one. The lookback is
+/// advisory and runs synchronously inside `await_event`, so an unbounded page
+/// count would let a busy workspace add database round trips to every
+/// registration. Three pages is 600 events of the subscribed type inside the
+/// lookback window, which is far past the point where the newest few are what
+/// the model meant.
+const ARMING_LOOKBACK_MAX_PAGES: usize = 3;
 
 /// The first event after a wait's watermark that matches it, if any.
 ///
@@ -343,6 +415,145 @@ pub async fn catch_up_from_watermark(
             return Ok(None);
         }
     }
+}
+
+/// One event the *arming lookback* found: something matching the subscription
+/// that had already happened by the time the wait was armed.
+///
+/// Carries `created` because the age is what makes the report usable. The model
+/// is the only party that can tell a miss from something it handled itself a
+/// moment ago, and it tells them apart by when.
+#[derive(Debug, Clone)]
+pub struct LookbackMatch {
+    pub event_type: String,
+    pub payload: Value,
+    pub created: DateTime<Utc>,
+}
+
+/// What the *arming lookback* found, bounded.
+#[derive(Debug, Clone, Default)]
+pub struct ArmingLookback {
+    /// Newest first, at most the caller's limit.
+    pub matches: Vec<LookbackMatch>,
+    /// There were more than the limit. Deliberately a bool rather than a total:
+    /// counting them all would mean scanning the whole window, which is the
+    /// unbounded read this function exists to avoid.
+    pub more: bool,
+}
+
+impl ArmingLookback {
+    pub fn is_empty(&self) -> bool {
+        self.matches.is_empty()
+    }
+}
+
+/// **The arming lookback**: matches that landed in a short window BEFORE the
+/// wait was armed, for the tool result to report.
+///
+/// The third gap, and the one the watermark deliberately does NOT close. See
+/// the module doc: a match found here is reported, never delivered, so this
+/// scan is allowed to be approximate in a way the watermark is not.
+///
+/// `already_delivered` is the ONE thing suppressed: events this thread was
+/// literally handed by an earlier wait. **Nothing coarser is sound.** Two
+/// successive rounds of review killed a sequence floor here, each time for the
+/// same reason at a finer grain: flooring at the thread's last `EventWait*`
+/// event of ANY kind let an unrelated child-completion delivery hide a missed
+/// `ChangeProposed`, and flooring on shared event *type* let a wait conditioned
+/// on A hide a `B` the earlier wait never looked for. "Already told" is a
+/// property of an individual event under a specific predicate, not of a point
+/// on the timeline, and only a delivery names an individual event. So the
+/// suppression is an exact set, and the residual cost is that two overlapping
+/// subscriptions may each report the same undelivered event: a paragraph the
+/// model is explicitly told it may ignore, against a missed event that is the
+/// entire bug this exists to fix.
+///
+/// Scans newest first and stops as soon as it has `limit + 1` matches, so the
+/// caller can say "and more" without the total. Filters by the subscribed names
+/// in SQL and evaluates the conditions in Rust, exactly as
+/// [`catch_up_from_watermark`] does, so the `$eq/$ne/$lt/$gt/$in` language keeps
+/// one implementation.
+///
+/// **Bounded in pages, not just per page** ([`ARMING_LOOKBACK_MAX_PAGES`]), and
+/// unlike the forward scan that budget is a semantic rather than a safety
+/// valve. Because the condition is evaluated in Rust, the row `LIMIT` bounds
+/// one round trip but not their number: a high-cardinality type
+/// (`ToolCalled`) with a selective condition that matches nothing would
+/// otherwise page through every event of that type in the window, and
+/// registration awaits this probe inside the tool call. The budget is also the
+/// right answer on its own terms: the scan runs newest-first, and this reports
+/// "what you just missed", so a match buried hundreds of rows back is not the
+/// thing the model is arming a watch for.
+pub async fn arming_lookback_matches(
+    pool: &sqlx::PgPool,
+    on: &[EventSubscription],
+    watermark: i64,
+    since: DateTime<Utc>,
+    already_delivered: &std::collections::HashSet<Uuid>,
+    limit: usize,
+) -> Result<ArmingLookback, Box<dyn std::error::Error + Send + Sync>> {
+    let types: Vec<String> = on.iter().map(|s| s.event_type.clone()).collect();
+    if types.is_empty() {
+        return Ok(ArmingLookback::default());
+    }
+    // One past the limit, so `more` can be set without counting the rest.
+    let wanted = limit.saturating_add(1);
+    let mut found: Vec<LookbackMatch> = Vec::with_capacity(wanted);
+    let mut upper = watermark;
+    let mut pages = 0;
+    while found.len() < wanted {
+        if pages == ARMING_LOOKBACK_MAX_PAGES {
+            // Not silent: a budget nobody can see reads as "the window was
+            // empty", which is the wrong conclusion to hand a debugger.
+            crate::log!(
+                "[EventWait] Arming lookback hit its {ARMING_LOOKBACK_MAX_PAGES}-page budget \
+                 for {types:?}; reporting the {} match(es) found so far",
+                found.len(),
+            );
+            break;
+        }
+        pages += 1;
+        let rows: Vec<(Uuid, String, Value, DateTime<Utc>, i64)> = sqlx::query_as(
+            "SELECT id, event_type, payload, created, sequence FROM events \
+             WHERE sequence <= $1 AND created >= $2 AND event_type = ANY($3) \
+             ORDER BY sequence DESC LIMIT $4",
+        )
+        .bind(upper)
+        .bind(since)
+        .bind(&types)
+        .bind(CATCH_UP_PAGE)
+        .fetch_all(pool)
+        .await?;
+
+        let exhausted = (rows.len() as i64) < CATCH_UP_PAGE;
+        if let Some(&(_, _, _, _, last_seq)) = rows.last() {
+            upper = last_seq - 1;
+        }
+        for (id, event_type, payload, created, _) in rows {
+            if !already_delivered.contains(&id)
+                && EventSubscription::any_matches(on, &event_type, &payload)
+            {
+                found.push(LookbackMatch {
+                    event_type,
+                    payload,
+                    created,
+                });
+                if found.len() == wanted {
+                    break;
+                }
+            }
+        }
+        if exhausted {
+            break;
+        }
+    }
+
+    let more = found.len() > limit;
+    found.truncate(limit);
+    Ok(ArmingLookback {
+        matches: found,
+        more,
+    })
 }
 
 /// Has this wait already been resolved?
@@ -553,11 +764,13 @@ pub async fn emit_expiry(
 /// ended the subscription, so the thread is left exactly as it was. There is
 /// nothing to close, because `await_event` paired its own call at registration.
 ///
-/// `actor` is the device that ended it, and it is the one resolution that HAS
-/// one: a delivery and an expiry are the engine acting on its own, but every
-/// cancel cause is a person pressing something. Stamped per
-/// `.claude/rules/rust.md` so the timeline can say who, the same way the Stop
-/// button's `ResponseCanceled` does.
+/// `actor` is the device that ended it, and it is the one resolution that can
+/// have one: a delivery and an expiry are the engine acting on its own, while
+/// every cancel cause traces back to a person, either pressing something or
+/// telling the agent to stand down. Stamped per `.claude/rules/rust.md` so the
+/// timeline can say who, the same way the Stop button's `ResponseCanceled`
+/// does. `None` for the engine-internal causes (archive and discard), whose
+/// actor is already on the `ThreadArchived` / `ThreadDiscarded` event.
 pub async fn emit_cancel(
     bus: &crate::engine::event_bus::EventBus,
     wait: &LiveWait,
@@ -570,6 +783,11 @@ pub async fn emit_cancel(
         ThreadEvent::EventWaitCanceled {
             wait_id: wait.wait_id,
             cause,
+            // Self-contained, like a delivery: a cancel renders at its own
+            // place in the transcript and the `EventWaitStarted` it resolves is
+            // routinely outside the loaded window by then.
+            on: wait.on.clone(),
+            reason: wait.reason.clone(),
         },
         EventMeta::with_actor(actor),
     )

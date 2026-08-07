@@ -427,6 +427,53 @@ pub(in crate::api) async fn cancel_thread_event_wait(
     }
 }
 
+/// Refuse an AGENT reaching an event-wait route for a thread that is not its
+/// own.
+///
+/// The three agent-facing event-wait routes are the HTTP form of three tools
+/// that take no thread argument at all: `await_event`, `list_event_waits` and
+/// `cancel_event_wait` each act on the calling thread and have no way to name
+/// another. The CLI keeps that shape by reading `$LUCIDOS_THREAD_ID` rather
+/// than taking a flag. But a path segment is a path segment, so a subprocess
+/// could substitute another thread's id and get back the capability the
+/// argument-less shape removed. This is the check that stops it.
+///
+/// **Scoped to callers that HAVE a thread**, which is the whole realistic set:
+/// a Lucidos-spawned subprocess carries a thread-bound origin token it cannot
+/// re-point (`api::actor::subprocess_origin`, HMAC over the thread id), and
+/// that is exactly what an agent session is. A caller presenting no token is
+/// not an agent claiming to be another thread; it is the ordinary local API
+/// surface, which every other `/threads/:id/...` route treats the same way and
+/// whose trust boundary is not this function's to move. A subprocess with a
+/// token but no thread (a scheduled script) has no subscriptions of its own, so
+/// it has nothing to be scoped to and is refused rather than granted the run of
+/// every thread.
+///
+/// Deliberately NOT applied to `.../event-waits/:wait_id/cancel`: that is the
+/// **Stop waiting** button, a person acting through the UI, which carries no
+/// token by construction.
+pub(super) fn refuse_event_waits_for_another_thread(
+    headers: &HeaderMap,
+    thread_id: Uuid,
+) -> Result<(), (StatusCode, String)> {
+    use crate::api::actor::SubprocessOrigin;
+    match crate::api::actor::subprocess_origin(headers) {
+        SubprocessOrigin::Subprocess { source_thread_id }
+            if source_thread_id != Some(thread_id) =>
+        {
+            Err((
+                StatusCode::FORBIDDEN,
+                "A thread's event subscriptions are its own. This route acts on the \
+                 calling thread, and the id in the path is not it. Drop the id: \
+                 `lucidos event-waits list` / `cancel` and `lucidos await-event` \
+                 already act on the thread you are running in."
+                    .to_string(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// POST /api/v1/threads/:thread_id/event-waits, the way a **coding agent**
 /// subscribes to an event.
 ///
@@ -450,10 +497,12 @@ pub(in crate::api) async fn cancel_thread_event_wait(
 pub(in crate::api) async fn register_thread_event_wait(
     State(state): State<AppState>,
     Path(thread_id): Path<String>,
+    headers: HeaderMap,
     Json(args): Json<serde_json::Value>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let thread_uuid = Uuid::parse_str(&thread_id)
         .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
 
     // The thread has to exist, and this is the one caller that can get it
     // wrong: the LLM tool takes its thread id from `execute_tool` and cannot
@@ -489,6 +538,86 @@ pub(in crate::api) async fn register_thread_event_wait(
             serde_json::json!({ "status": "subscribed", "message": message }),
         )),
         crate::engine::event_wait::AwaitEventOutcome::Refused(message) => {
+            Err((StatusCode::BAD_REQUEST, message))
+        }
+    }
+}
+
+/// GET /api/v1/threads/:thread_id/event-waits, the read half of a **coding
+/// agent**'s subscription surface (`lucidos event-waits list`).
+///
+/// The chat agent reaches the same set through the `list_event_waits` LLM tool,
+/// in process. Both read the dispatcher's live cache rather than the event
+/// store, so neither can disagree with what will actually wake the thread.
+///
+/// Scoped to the calling thread by
+/// [`refuse_event_waits_for_another_thread`], which is what makes this route
+/// keep the promise the tool keeps structurally by taking no thread argument at
+/// all.
+pub(in crate::api) async fn list_thread_event_waits(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let thread_uuid = Uuid::parse_str(&thread_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
+    let waits = state.engine.list_event_waits_for_thread(thread_uuid).await;
+    Ok(Json(serde_json::json!({
+        "count": waits.len(),
+        "event_waits": waits,
+    })))
+}
+
+/// POST /api/v1/threads/:thread_id/event-waits/cancel, an **agent standing its
+/// own subscriptions down** (`lucidos event-waits cancel`).
+///
+/// Deliberately a separate route from the per-wait
+/// `.../event-waits/:wait_id/cancel`, which is the UI's **Stop waiting** button
+/// and stamps `UserStop`. The two differ in the cause they record and in what
+/// they can address: this one also takes `all`, and it never claims a person
+/// pressed anything. Folding them into one route would mean a body field
+/// deciding whose action the event log attributes it to, which is exactly the
+/// thing an actor must not be.
+///
+/// Body: `{"wait_id": "..."}` or `{"all": true}`, exactly one.
+pub(in crate::api) async fn cancel_thread_event_waits_for_agent(
+    State(state): State<AppState>,
+    Path(thread_id): Path<String>,
+    headers: HeaderMap,
+    Json(args): Json<serde_json::Value>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let thread_uuid = Uuid::parse_str(&thread_id)
+        .map_err(|e| (StatusCode::BAD_REQUEST, format!("Invalid thread_id: {e}")))?;
+    refuse_event_waits_for_another_thread(&headers, thread_uuid)?;
+    let all = args.get("all").and_then(|v| v.as_bool()).unwrap_or(false);
+    let wait_id = match args
+        .get("wait_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(raw) => Some(Uuid::parse_str(raw).map_err(|e| {
+            (
+                StatusCode::BAD_REQUEST,
+                format!("Invalid wait_id: {e}. Run `lucidos event-waits list` for the ids."),
+            )
+        })?),
+        None => None,
+    };
+
+    // A refusal is the caller's own fault (both arguments, neither, or an id
+    // that is not live here), so it is a 400 carrying the same words the chat
+    // agent would read. The two agents get identical wording by construction.
+    match state
+        .engine
+        .cancel_event_waits_for_agent(thread_uuid, wait_id, all)
+        .await
+    {
+        crate::engine::event_wait::CancelEventWaitOutcome::Stopped(message) => Ok(Json(
+            serde_json::json!({ "status": "stopped", "message": message }),
+        )),
+        crate::engine::event_wait::CancelEventWaitOutcome::Refused(message) => {
             Err((StatusCode::BAD_REQUEST, message))
         }
     }

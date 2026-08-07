@@ -1,5 +1,6 @@
 import {
   activeMenuItem,
+  oauthConnectPrefill,
   panelOverlay,
   settingsSubview,
   settingsScrollTarget,
@@ -114,11 +115,21 @@ export function openBackupSettings(): void {
  *  user has to walk themselves (and one a 2026-08-05 session got wrong by
  *  naming the Backup page instead). Now it is a link that lands them on the
  *  section. Mirrors `openProviderSettings`, including the
- *  `settingsScrollTarget` scroll-and-highlight. */
-export function openConnectedAccountsSettings(): void {
+ *  `settingsScrollTarget` scroll-and-highlight.
+ *
+ *  `provider` prefills the Connect field, so arriving from Backup does not mean
+ *  typing the name of the provider you were just looking at.
+ *
+ *  `scopes` carries what the connection is FOR, and is the difference between
+ *  one consent screen and two. Without it Connect requests a bare sign-in, so a
+ *  user arriving from Backup completed the provider's consent screen, returned,
+ *  and faced *Grant access*: a second trip through the same screen for one
+ *  intent. */
+export function openConnectedAccountsSettings(provider?: string, scopes?: string): void {
   setActiveMenu('settings');
   settingsSubview.value = 'accounts';
   void loadCredentials();
+  oauthConnectPrefill.value = provider ? { provider, scopes } : null;
   settingsScrollTarget.value = 'accounts:connected';
   pushNavState();
   revealContentPane();

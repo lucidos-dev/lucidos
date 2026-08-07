@@ -40,21 +40,47 @@ pub(super) fn agent_context_char_budget(context_window: usize) -> usize {
     usable_tokens.saturating_mul(3) / 2
 }
 
-/// Inverse of the budget's chars/token assumption: turn a measured char
-/// count into a conservative token estimate. Uses the same 1.5 chars/token
-/// ratio as [`agent_context_char_budget`] so the displayed
-/// `ContextCaptured.estimated_total_tokens` (and the `Context: N tokens`
-/// thought-stream line) stays honest against the trim budget.
-///
-/// History: was previously `chars / 4` (the prose ratio), which silently
-/// undercounted JSON-heavy tool-result content by ~2.4×. A May 25
-/// `workspace-learning` trigger reported "Context: 649 K tokens" to the
-/// UI then sent 1.54 M tokens to the API — past the 1 M-cap Opus
-/// window — and the request 400'd. Matching the budget's ratio means an
-/// estimate near the window is a real warning, not an optimistic one.
-pub(crate) fn estimate_tokens_from_chars(chars: usize) -> usize {
+/// Exact inverse of [`agent_context_char_budget`]: how many tokens the
+/// *budget* believes a char count is worth, at its own conservative 1.5
+/// chars/token. Only for talking about the budget, chiefly the trim log
+/// lines, which state the content and the budget side by side and would be
+/// unreadable in mismatched units. For "how many tokens is this really",
+/// use [`estimate_tokens_from_chars`].
+pub(super) fn budget_tokens_from_chars(chars: usize) -> usize {
     // Inverse of `chars = tokens * 3 / 2` → `tokens = chars * 2 / 3`.
     chars.saturating_mul(2) / 3
+}
+
+/// Best estimate of the real token count behind a char count, at a measured
+/// 2.5 chars/token. Feeds `ContextCaptured.estimated_total_tokens` and the
+/// `Context: N tokens` thought-stream line, i.e. everything the user reads.
+///
+/// **Deliberately NOT the budget's ratio**, and the two must not be
+/// re-conflated. They answer different questions. The budget's 1.5 exists so
+/// the packer can never overflow the window: being conservative there is the
+/// whole point, and it stays. A number shown to the user has the opposite
+/// duty, and 1.5 made the LLM Context Viewer report a 205k prompt as 361k,
+/// contradicting the measured `usage.input_tokens` printed directly above it.
+///
+/// 2.5 is measured, not guessed. Across 12,069 `ContextCaptured` rows with
+/// real usage on `producer = main_llm`, taken after `a997aa403` started
+/// counting tool schemas in the total so estimate and actual cover the same
+/// content, the implied ratio was p01 2.28, p50 2.60, p99 2.74. Sitting just
+/// under the median keeps a small conservative lean, and the other tokenizers
+/// measured (Gemini ~3.3, GPT-5.6 ~4.0 once the schemas are corrected for) are
+/// more efficient still, so one Claude-calibrated constant errs the safe way
+/// for them too. `[Context] calibration` in `agentic_loop/run.rs` keeps
+/// logging the comparison, which is what a future per-family split would need.
+///
+/// History: this was `chars / 4` (the prose ratio) until May 25, when a
+/// `workspace-learning` trigger reported "Context: 649 K tokens" to the UI,
+/// sent 1.54 M tokens to the API past the 1 M Opus cap, and 400'd. The fix
+/// pinned it to the budget's 1.5, which cured the under-count by conflating
+/// the two jobs; splitting them is what lets this one be accurate without
+/// touching the budget's safety margin.
+pub(crate) fn estimate_tokens_from_chars(chars: usize) -> usize {
+    // 2/5 = 2.5 chars/token (integer math).
+    chars.saturating_mul(2) / 5
 }
 
 /// Number of tail messages to always preserve (2 assistant+user pairs).
@@ -116,7 +142,14 @@ pub(super) fn sanitize_file_content_for_llm(content: String, path: &str, offset:
         .into_owned();
 
     if sanitized.len() != original_len {
-        let stripped_kb = (original_len - sanitized.len()) / 1024;
+        // `saturating_sub`, because the replacement can be LONGER than what it
+        // replaced: the regex's shortest possible match is 17 bytes
+        // (`data:a/b;base64,x`) while `[embedded image, 0KB]` is 21. A file
+        // whose only data-URI-shaped substrings are that short therefore grows,
+        // and a bare `-` underflows: a panic under `overflow-checks` (every
+        // debug/test build) and a wrapped ~18-quintillion-KB figure in the log
+        // otherwise. The raw before/after byte counts below stay exact either way.
+        let stripped_kb = original_len.saturating_sub(sanitized.len()) / 1024;
         log!(
             "[Context] read_file '{}': stripped {}KB of base64 image data ({} → {} bytes)",
             path,
@@ -203,6 +236,17 @@ pub(crate) fn tool_definitions_chars(tools: &[crate::llm::provider::ToolDefiniti
 pub(super) const IMAGE_BUDGET_TOKEN_ESTIMATE: usize = 1_600;
 
 /// Estimate the total character count of all content in a message.
+///
+/// The unit is **budget-chars**, not literal characters: an image contributes
+/// `IMAGE_BUDGET_TOKEN_ESTIMATE * 3 / 2`, i.e. a token count converted at the
+/// budget's own 1.5 chars/token, because its base64 byte length says nothing
+/// about what it costs. That is exact for the budget, which is the caller that
+/// matters. It does skew [`estimate_tokens_from_chars`], which divides those
+/// same budget-chars by the measured 2.5: an image goes in at 1,600 tokens,
+/// becomes 2,400 budget-chars, and reads back as 960, so the capture
+/// under-reports it by 640 tokens (0.6x). Bounded and well inside the ratio's
+/// own spread, so it is accepted rather than plumbed around; revisit if
+/// image-heavy turns ever dominate a capture.
 pub(super) fn estimate_message_chars(message: &Message) -> usize {
     match &message.content {
         MessageContent::Text(s) => s.len(),
@@ -375,8 +419,8 @@ pub(super) fn trim_context_if_needed(
     let total_after_pass1: usize = messages.iter().map(estimate_message_chars).sum();
     if total_after_pass1 <= budget {
         log!("[Context] Context trimming: pass 1 reduced ~{}k -> ~{}k tokens ({} -> {} chars, {} msgs, budget ~{}k tokens)",
-            estimate_tokens_from_chars(total) / 1000, estimate_tokens_from_chars(total_after_pass1) / 1000,
-            total, total_after_pass1, messages.len(), estimate_tokens_from_chars(budget) / 1000
+            budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(total_after_pass1) / 1000,
+            total, total_after_pass1, messages.len(), budget_tokens_from_chars(budget) / 1000
         );
         return TrimOutcome {
             messages_removed: 0,
@@ -414,8 +458,8 @@ pub(super) fn trim_context_if_needed(
         total_after_truncation = messages.iter().map(estimate_message_chars).sum();
         if total_after_truncation <= budget {
             log!("[Context] Context trimming: pass 1.5 (tail trim) reduced ~{}k -> ~{}k tokens ({} -> {} chars, budget ~{}k tokens)",
-                estimate_tokens_from_chars(total_after_pass1) / 1000, estimate_tokens_from_chars(total_after_truncation) / 1000,
-                total_after_pass1, total_after_truncation, estimate_tokens_from_chars(budget) / 1000
+                budget_tokens_from_chars(total_after_pass1) / 1000, budget_tokens_from_chars(total_after_truncation) / 1000,
+                total_after_pass1, total_after_truncation, budget_tokens_from_chars(budget) / 1000
             );
             return TrimOutcome {
                 messages_removed: 0,
@@ -494,13 +538,13 @@ pub(super) fn trim_context_if_needed(
     }
 
     log!("[Context] Context trimming: ~{}k -> ~{}k tokens ({} -> {} chars), removed {} messages, {} remaining (budget ~{}k tokens)",
-        estimate_tokens_from_chars(total) / 1000, estimate_tokens_from_chars(current_total) / 1000,
-        total, current_total, removed, messages.len(), estimate_tokens_from_chars(budget) / 1000
+        budget_tokens_from_chars(total) / 1000, budget_tokens_from_chars(current_total) / 1000,
+        total, current_total, removed, messages.len(), budget_tokens_from_chars(budget) / 1000
     );
     if current_total > budget {
         log!(
             "[Context] Warning: context still over budget after trimming (~{}k tokens, {} chars > {} budget)",
-            estimate_tokens_from_chars(current_total) / 1000,
+            budget_tokens_from_chars(current_total) / 1000,
             current_total,
             budget
         );
@@ -970,6 +1014,65 @@ mod tool_definition_sizing_tests {
         assert!(
             with > without,
             "tool schemas must count toward the reported total ({with} vs {without})"
+        );
+    }
+}
+
+#[cfg(test)]
+mod chars_per_token_ratio_tests {
+    use super::{agent_context_char_budget, budget_tokens_from_chars, estimate_tokens_from_chars};
+
+    /// Pin the measured display ratio at 2.5 chars/token. The number the user
+    /// reads is the one this produces, and it was 1.5 (the budget's safety
+    /// ratio) until the LLM Context Viewer was caught reporting a 205k prompt
+    /// as 361k, contradicting the measured `usage.input_tokens` above it.
+    #[test]
+    fn display_estimate_uses_the_measured_ratio() {
+        assert_eq!(estimate_tokens_from_chars(1_000), 400);
+        assert_eq!(estimate_tokens_from_chars(0), 0);
+    }
+
+    /// And pin the budget ratio at 1.5, separately, so a future edit has to
+    /// touch two assertions to re-conflate them.
+    #[test]
+    fn budget_conversion_keeps_the_conservative_ratio() {
+        assert_eq!(budget_tokens_from_chars(1_000), 666);
+        assert_eq!(budget_tokens_from_chars(0), 0);
+    }
+
+    /// The two answer different questions and must stay apart. Conflating them
+    /// is the actual regression this split prevents, in either direction: give
+    /// the budget the display's ratio and the packer overflows the window (the
+    /// May 25 400); give the display the budget's ratio and every context
+    /// readout runs ~1.7x high.
+    #[test]
+    fn the_two_ratios_are_deliberately_different() {
+        let chars = 540_100; // the reported capture: 540.1K chars, 205k real tokens
+        let displayed = estimate_tokens_from_chars(chars);
+        let budgeted = budget_tokens_from_chars(chars);
+        assert!(
+            budgeted > displayed,
+            "the budget must stay the conservative one ({budgeted} vs {displayed})"
+        );
+        // Within 10% of the 205k the provider actually charged for, where the
+        // budget ratio was out by 73%. This capture's own implied ratio was
+        // 2.63, a shade above the 2.60 median, so 2.5 reads it ~5% high: the
+        // deliberate conservative lean, not slack in the assertion.
+        assert!(
+            (185_000..=226_000).contains(&displayed),
+            "displayed estimate {displayed} should be within 10% of the measured 205k"
+        );
+        assert_eq!(budgeted, 360_066, "the budget ratio's 73% overcount");
+    }
+
+    /// The budget itself is untouched by the split: it is still expressed in
+    /// chars at 1.5 chars/token, and the display ratio must not leak into it.
+    #[test]
+    fn the_split_did_not_move_the_budget() {
+        assert_eq!(agent_context_char_budget(200_000), 288_000);
+        assert_eq!(
+            budget_tokens_from_chars(agent_context_char_budget(200_000)),
+            192_000
         );
     }
 }

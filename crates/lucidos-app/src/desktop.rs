@@ -110,6 +110,146 @@ const HEALTH_ENSURE_CYCLE: Duration = Duration::from_secs(30);
 #[cfg(target_os = "macos")]
 const DOCK_BADGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
+// ── What the startup splash is told ─────────────────────────────────────────
+
+/// How long a start may take before the splash says anything beyond
+/// [`STARTING_LABEL`]. An ordinary launch resolves well inside this, so it never
+/// flashes a diagnostic at a user who was not kept waiting.
+const STARTUP_QUIET_PERIOD: Duration = Duration::from_secs(8);
+
+/// How long a wait must run before the splash adds the reassurance that a slow
+/// start is expected after a restart.
+const STARTUP_LONG_WAIT: Duration = Duration::from_secs(60);
+
+/// The splash's opening line, and the one a fast launch shows for its whole
+/// life. Mirrored by `main.tsx`'s initial `setBootStatus`, which paints before
+/// the first status poll can answer.
+const STARTING_LABEL: &str = "Starting Lucidos…";
+
+/// Which part of [`launch`]'s start-and-navigate loop is currently running.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupPhase {
+    /// Installing / kickstarting the launchd service.
+    EnsuringService,
+    /// Service ensured; polling `/~/api/v1/health` for the gateway.
+    WaitingForGateway,
+}
+
+/// What [`launch`]'s thread is doing, for the pre-gateway boot splash to read.
+///
+/// The packaged window paints an inline splash on the bundled asset scheme and
+/// cannot reach any API until [`launch`] navigates it to the gateway, so this
+/// Tauri-IPC channel is the only thing it can ask. Before it existed the splash
+/// showed one static string for however long the wait ran, which is how a start
+/// that was recovering on its own read as a hang.
+///
+/// The sibling of the gateway's `boot_phase` / `boot_failure` narration for the
+/// WORKSPACE splash, one layer earlier: same idea, applied to the wait before
+/// the gateway answers at all.
+pub struct StartupStatus {
+    inner: std::sync::Mutex<StartupProgress>,
+}
+
+struct StartupProgress {
+    phase: StartupPhase,
+    /// When the whole start began, NOT when the current phase did: the splash
+    /// reports how long the user has been waiting, and that clock must not reset
+    /// every time the loop re-ensures the service.
+    began: Instant,
+    /// The last thing that went wrong, already written as a sentence so it can
+    /// be followed by another one. `None` on the ordinary path.
+    detail: Option<String>,
+}
+
+impl Default for StartupStatus {
+    fn default() -> Self {
+        Self {
+            inner: std::sync::Mutex::new(StartupProgress {
+                phase: StartupPhase::EnsuringService,
+                began: Instant::now(),
+                detail: None,
+            }),
+        }
+    }
+}
+
+impl StartupStatus {
+    /// Move to `phase`. Deliberately does NOT touch `detail`: a failure recorded
+    /// while ensuring the service has to survive into the wait that follows it,
+    /// which is the only stretch long enough for anyone to read it. Clearing on
+    /// every phase change instead made the failure text unreachable, since the
+    /// loop moves to `WaitingForGateway` on the line after it records one.
+    fn enter(&self, phase: StartupPhase) {
+        if let Ok(mut p) = self.inner.lock() {
+            p.phase = phase;
+        }
+    }
+
+    /// Record why the current cycle failed. Pass a sentence.
+    fn note_failure(&self, detail: impl Into<String>) {
+        if let Ok(mut p) = self.inner.lock() {
+            p.detail = Some(detail.into());
+        }
+    }
+
+    /// Drop any recorded failure, because the thing that failed just worked.
+    /// Tied to the outcome rather than to progress through the loop: the wait
+    /// after a successful ensure is an ordinary wait and should read as one.
+    fn clear_failure(&self) {
+        if let Ok(mut p) = self.inner.lock() {
+            p.detail = None;
+        }
+    }
+
+    /// The line to show on the splash right now.
+    pub fn label(&self) -> String {
+        match self.inner.lock() {
+            Ok(p) => startup_label(p.phase, p.began.elapsed(), p.detail.as_deref()),
+            // A poisoned lock says nothing useful about the start, and the
+            // splash must still say something.
+            Err(_) => STARTING_LABEL.to_string(),
+        }
+    }
+}
+
+/// The splash's line for a given phase, elapsed time and last failure. Pure, so
+/// the wording is pinned by tests rather than assembled in the poll loop.
+///
+/// Two rules shape it. A start under [`STARTUP_QUIET_PERIOD`] says exactly what
+/// it says today, so nothing changes for the overwhelming majority of launches.
+/// Past that, the text names what is being waited on and counts, because a
+/// number that moves is what distinguishes "working" from "wedged" to someone
+/// looking at a splash screen.
+fn startup_label(phase: StartupPhase, elapsed: Duration, detail: Option<&str>) -> String {
+    if elapsed < STARTUP_QUIET_PERIOD {
+        return STARTING_LABEL.to_string();
+    }
+    if let Some(detail) = detail {
+        return format!("{detail} Retrying…");
+    }
+    match phase {
+        StartupPhase::EnsuringService => "Starting the background service…".to_string(),
+        StartupPhase::WaitingForGateway if elapsed >= STARTUP_LONG_WAIT => format!(
+            "Waiting for the background service… ({}). It may still be starting up after a restart.",
+            humanize_wait(elapsed)
+        ),
+        StartupPhase::WaitingForGateway => {
+            format!("Waiting for the background service… ({})", humanize_wait(elapsed))
+        }
+    }
+}
+
+/// A wait as the splash spells it: `12s`, `1m 05s`. Seconds are zero-padded past
+/// the first minute so the line does not change width every tick.
+fn humanize_wait(elapsed: Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m {:02}s", secs / 60, secs % 60)
+    }
+}
+
 const GATEWAY_RESOURCE_NAME: &str = "lucidos-gateway";
 const ENGINE_RESOURCE_NAME: &str = "lucidos-engine";
 const FRONTEND_RESOURCE_NAME: &str = "frontend";
@@ -629,10 +769,22 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         // interrupts a slow-but-progressing start — then polls health for one
         // bounded cycle. `wait_for_health` sleeps between attempts, so this can't
         // busy-loop.
+        //
+        // Each step also tells `StartupStatus` where it is, which is the only
+        // thing the splash on the other side of the IPC bridge can read: waiting
+        // silently is what made a recovering start look like a hung one.
+        let status = handle.state::<StartupStatus>();
         loop {
-            if let Err(e) = ensure_service_installed_and_running(&app_data) {
-                eprintln!("[desktop] ensure service running failed: {e}");
+            status.enter(StartupPhase::EnsuringService);
+            match ensure_service_installed_and_running(&app_data) {
+                // Whatever went wrong last cycle is over: this wait is ordinary.
+                Ok(()) => status.clear_failure(),
+                Err(e) => {
+                    eprintln!("[desktop] ensure service running failed: {e}");
+                    status.note_failure(format!("Could not start the background service: {e}."));
+                }
             }
+            status.enter(StartupPhase::WaitingForGateway);
             if wait_for_health(port, HEALTH_ENSURE_CYCLE) {
                 break;
             }
@@ -667,6 +819,68 @@ fn wait_for_health(port: u16, timeout: Duration) -> bool {
     false
 }
 
+/// How a wait for the freshly-spawned gateway ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GatewayStart {
+    /// It answered `/~/api/v1/health`.
+    Healthy,
+    /// The child process is gone. Nothing will ever answer, so stop waiting.
+    ChildExited,
+    /// Still alive, still not answering, and out of time.
+    TimedOut,
+}
+
+/// Decide a single poll of the two conditions [`await_gateway_start`] watches.
+/// `None` means neither is decisive yet, so keep waiting.
+///
+/// **Health is checked first, and the order is load-bearing.** A gateway that
+/// answered and only then exited has done its job for this function: the
+/// supervise loop below is what notices the exit, and it reacts by shutting down
+/// for a launchd respawn, which is a different and correct thing from reporting
+/// that the boot failed.
+///
+/// Pure, so the ordering is pinned by a test rather than by reading the loop.
+fn gateway_start_poll(healthy: bool, exited: bool, out_of_time: bool) -> Option<GatewayStart> {
+    if healthy {
+        return Some(GatewayStart::Healthy);
+    }
+    if exited {
+        return Some(GatewayStart::ChildExited);
+    }
+    if out_of_time {
+        return Some(GatewayStart::TimedOut);
+    }
+    None
+}
+
+/// Wait for a just-spawned gateway to answer, giving up the moment its process
+/// is gone rather than serving out the whole deadline.
+///
+/// The deadline exists for a gateway that is slow but PROGRESSING (migrations
+/// and embedding warmup on a fresh workspace can take a while), and it still
+/// applies to one. What it must not do is govern a gateway that has already
+/// exited: a bind failure kills the process in under a second, and waiting the
+/// remaining two minutes on the corpse is time the packaged window spends on its
+/// startup splash for no reason at all, before launchd even gets the chance to
+/// respawn. Watching the child collapses that to the respawn throttle.
+fn await_gateway_start(port: u16, timeout: Duration, gateway: &mut Child) -> GatewayStart {
+    let deadline = Instant::now() + timeout;
+    loop {
+        // A failed `try_wait` means we can no longer tell whether the child is
+        // alive; treat that as gone rather than waiting out the deadline on a
+        // question we cannot answer.
+        let exited = !matches!(gateway.try_wait(), Ok(None));
+        if let Some(outcome) = gateway_start_poll(
+            http_ok(port, "/~/api/v1/health"),
+            exited,
+            Instant::now() >= deadline,
+        ) {
+            return outcome;
+        }
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
 // ── Service role: the launchd entry point ───────────────────────────────────
 
 /// Headless launchd entry point (`Lucidos --service`). Boots the standalone
@@ -676,6 +890,19 @@ fn wait_for_health(port: u16, timeout: Duration) -> bool {
 ///    gateway exited and launchd's `KeepAlive` should respawn us.
 ///  * non-zero — boot failed; launchd respawns after `ThrottleInterval`.
 pub fn run_service() -> i32 {
+    // FIRST, before anything else in the process. launchd hands us an
+    // environment the user's shell profile never touched, so the provider keys
+    // the engine discovers from env are absent and PATH is the bare
+    // `/usr/bin:/bin:/usr/sbin:/sbin`. Everything below this line inherits what
+    // we have here: the gateway, every workspace engine, every coding agent.
+    //
+    // Placed at the top rather than beside `spawn_gateway` because it sets
+    // process env, which is only sound while the process is single-threaded.
+    // `main` reaches here before any Tauri, AppKit or thread setup, and nothing
+    // above this statement changes that. See `shell_env` for the whole story.
+    #[cfg(target_os = "macos")]
+    crate::shell_env::hydrate_login_shell_env();
+
     install_stop_handlers();
 
     let app_data = match app_data_dir_from_env() {
@@ -701,10 +928,27 @@ pub fn run_service() -> i32 {
             return 1;
         }
     };
-    if !wait_for_health(port, ENGINE_HEALTH_TIMEOUT) {
-        eprintln!("[service] gateway did not become healthy on port {port}");
-        svc.shutdown(&resources, &app_data);
-        return 1;
+    match await_gateway_start(port, ENGINE_HEALTH_TIMEOUT, &mut svc.gateway) {
+        GatewayStart::Healthy => {}
+        GatewayStart::ChildExited => {
+            // Say WHICH of the two ways the start failed. The gateway logs its
+            // own reason (a held port, an address that does not exist yet) to
+            // the same file, immediately above this line, so naming the exit
+            // points the reader at it instead of at a timeout that never ran.
+            eprintln!(
+                "[service] the gateway exited before answering on port {port}; see its error above"
+            );
+            svc.shutdown(&resources, &app_data);
+            return 1;
+        }
+        GatewayStart::TimedOut => {
+            eprintln!(
+                "[service] gateway did not become healthy on port {port} within {}s",
+                ENGINE_HEALTH_TIMEOUT.as_secs()
+            );
+            svc.shutdown(&resources, &app_data);
+            return 1;
+        }
     }
     eprintln!("[service] gateway healthy on port {port}; supervising");
 
@@ -1727,6 +1971,193 @@ fn parse_unread_total(body: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Waiting for a freshly-spawned gateway ────────────────────────────────
+
+    #[test]
+    fn a_dead_gateway_ends_the_wait_immediately() {
+        // The reported stall: the gateway died on a bind failure in under a
+        // second and the service still waited out its full 120s deadline.
+        assert_eq!(
+            gateway_start_poll(false, true, false),
+            Some(GatewayStart::ChildExited)
+        );
+    }
+
+    #[test]
+    fn a_gateway_that_answered_is_healthy_even_if_it_has_since_exited() {
+        // Health is checked first on purpose. An exit after a healthy probe is
+        // the supervise loop's business (shut down, let launchd respawn), which
+        // is a different outcome from "this boot never came up".
+        assert_eq!(
+            gateway_start_poll(true, true, true),
+            Some(GatewayStart::Healthy)
+        );
+        assert_eq!(
+            gateway_start_poll(true, false, false),
+            Some(GatewayStart::Healthy)
+        );
+    }
+
+    #[test]
+    fn a_live_but_silent_gateway_keeps_its_deadline() {
+        // Slow-but-progressing is exactly what ENGINE_HEALTH_TIMEOUT is for
+        // (migrations + embedding warmup on a fresh workspace). Watching the
+        // child must not cut that short.
+        assert_eq!(gateway_start_poll(false, false, false), None);
+        assert_eq!(
+            gateway_start_poll(false, false, true),
+            Some(GatewayStart::TimedOut)
+        );
+    }
+
+    // ── What the startup splash says ─────────────────────────────────────────
+
+    #[test]
+    fn a_fast_start_says_exactly_what_it_always_said() {
+        // The overwhelming majority of launches resolve inside the quiet period,
+        // and none of them should gain a diagnostic they never had.
+        for phase in [
+            StartupPhase::EnsuringService,
+            StartupPhase::WaitingForGateway,
+        ] {
+            for elapsed in [
+                Duration::ZERO,
+                STARTUP_QUIET_PERIOD - Duration::from_millis(1),
+            ] {
+                assert_eq!(startup_label(phase, elapsed, None), STARTING_LABEL);
+            }
+        }
+        // Even a failure stays quiet while the start is still young: the loop
+        // re-ensures the service immediately, so a cycle that fails and recovers
+        // inside the quiet period never troubles the user with it.
+        assert_eq!(
+            startup_label(
+                StartupPhase::WaitingForGateway,
+                Duration::from_secs(1),
+                Some("Could not start the background service: nope.")
+            ),
+            STARTING_LABEL
+        );
+    }
+
+    #[test]
+    fn a_slow_start_names_what_it_is_waiting_for_and_counts() {
+        // The point of the whole change: a number that moves is what tells a
+        // user staring at a splash that it is working rather than wedged.
+        let at_12s = startup_label(
+            StartupPhase::WaitingForGateway,
+            Duration::from_secs(12),
+            None,
+        );
+        let at_13s = startup_label(
+            StartupPhase::WaitingForGateway,
+            Duration::from_secs(13),
+            None,
+        );
+        assert_eq!(at_12s, "Waiting for the background service… (12s)");
+        assert_ne!(at_12s, at_13s, "the line must change as the wait runs");
+        assert_eq!(
+            startup_label(StartupPhase::EnsuringService, Duration::from_secs(12), None),
+            "Starting the background service…"
+        );
+    }
+
+    #[test]
+    fn a_long_wait_says_a_restart_explains_it() {
+        let label = startup_label(
+            StartupPhase::WaitingForGateway,
+            Duration::from_secs(95),
+            None,
+        );
+        assert_eq!(
+            label,
+            "Waiting for the background service… (1m 35s). It may still be starting up after a \
+             restart."
+        );
+        // The boundary belongs to the long form, not the short one.
+        assert!(
+            startup_label(StartupPhase::WaitingForGateway, STARTUP_LONG_WAIT, None)
+                .contains("after a restart")
+        );
+        assert!(!startup_label(
+            StartupPhase::WaitingForGateway,
+            STARTUP_LONG_WAIT - Duration::from_secs(1),
+            None
+        )
+        .contains("after a restart"));
+    }
+
+    #[test]
+    fn a_recorded_failure_is_shown_with_the_promise_of_a_retry() {
+        // The loop genuinely does retry forever, so the line must not read as a
+        // dead end. Same distinction the gateway's BootFailure draws.
+        assert_eq!(
+            startup_label(
+                StartupPhase::WaitingForGateway,
+                Duration::from_secs(30),
+                Some("Could not start the background service: launchctl bootstrap failed.")
+            ),
+            "Could not start the background service: launchctl bootstrap failed. Retrying…"
+        );
+    }
+
+    #[test]
+    fn a_wait_is_spelled_without_the_line_changing_width_every_tick() {
+        assert_eq!(humanize_wait(Duration::from_secs(0)), "0s");
+        assert_eq!(humanize_wait(Duration::from_secs(59)), "59s");
+        assert_eq!(humanize_wait(Duration::from_secs(60)), "1m 00s");
+        assert_eq!(humanize_wait(Duration::from_secs(69)), "1m 09s");
+        assert_eq!(humanize_wait(Duration::from_secs(3599)), "59m 59s");
+        assert_eq!(humanize_wait(Duration::from_secs(3600)), "60m 00s");
+    }
+
+    /// Wind the start's clock back, so a test can ask what the splash would say
+    /// after `elapsed` without sleeping for it.
+    fn aged(status: &StartupStatus, elapsed: Duration) {
+        if let Ok(mut p) = status.inner.lock() {
+            p.began = Instant::now() - elapsed;
+        }
+    }
+
+    #[test]
+    fn the_status_starts_quiet() {
+        let status = StartupStatus::default();
+        assert_eq!(status.label(), STARTING_LABEL, "a fresh start is quiet");
+    }
+
+    #[test]
+    fn a_failure_recorded_while_ensuring_survives_into_the_wait() {
+        // The bug this pins: the loop records an ensure failure and moves to
+        // WaitingForGateway on the very next line, so a phase change that
+        // cleared the detail made the failure text unreachable. The wait is the
+        // only stretch long enough for anyone to read it.
+        let status = StartupStatus::default();
+        status.enter(StartupPhase::EnsuringService);
+        status.note_failure("Could not start the background service: nope.");
+        status.enter(StartupPhase::WaitingForGateway);
+        aged(&status, Duration::from_secs(20));
+
+        assert_eq!(
+            status.label(),
+            "Could not start the background service: nope. Retrying…"
+        );
+    }
+
+    #[test]
+    fn a_cycle_that_ensures_cleanly_drops_the_previous_complaint() {
+        // The other half: the detail's life is tied to the OUTCOME, not to
+        // progress through the loop, so a service that started on the retry
+        // leaves the splash reading as an ordinary wait.
+        let status = StartupStatus::default();
+        status.note_failure("Could not start the background service: nope.");
+        status.enter(StartupPhase::EnsuringService);
+        status.clear_failure();
+        status.enter(StartupPhase::WaitingForGateway);
+        aged(&status, Duration::from_secs(20));
+
+        assert_eq!(status.label(), "Waiting for the background service… (20s)");
+    }
 
     #[test]
     fn xml_escape_escapes_markup_chars() {

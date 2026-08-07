@@ -173,11 +173,18 @@
         };
         var fontKey = localStorage.getItem(wsKey('lucidos-font-family'));
         d.style.setProperty('--font-ui', FONTS[fontKey] || FONTS.monospace);
-        // Programming ligatures, only for fonts that ship them (Fira Code);
-        // every other font gets `normal` (CSS initial → unchanged). Mirrors
-        // FONT_FEATURES in preferences.ts and the same map in api/sdk_prefs.rs.
-        var FEATURES = { 'fira-code': '"liga" 1, "calt" 1' };
-        d.style.setProperty('font-feature-settings', FEATURES[fontKey] || 'normal');
+        // Programming ligatures: OFF for text, ON for code, and only for fonts
+        // that ship them (Fira Code). Every other font gets `normal` for both,
+        // leaving its rendering unchanged. Mirrors FONT_FEATURES in
+        // preferences.ts and the same map in api/sdk_prefs.rs; consumed by the
+        // two rules in styles/global/base.css. The off value MUST be the zeros,
+        // never `normal`: liga and calt are default-ON, so `normal` renders
+        // identically to `1` and Fira Code's calt still collapses a typed `...`
+        // into what reads as two dots. See preferences.ts for the full why.
+        var FEATURES = { 'fira-code': { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' } };
+        var feat = FEATURES[fontKey] || { text: 'normal', code: 'normal' };
+        d.style.setProperty('--font-features-text', feat.text);
+        d.style.setProperty('--font-features-code', feat.code);
         var scale = localStorage.getItem(wsKey('lucidos-ui-scale'));
         if (scale) {
           // Snap to the 12.5% grid (see UI_SCALE_STEP) so a pre-grid saved

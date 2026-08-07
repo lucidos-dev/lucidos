@@ -410,6 +410,12 @@ async fn sequential_apply_two_changes_succeeds() {
     )
     .await;
 
+    // Both applies below put files into the shared workspace working tree,
+    // which the command-checkpoint test snapshots whole; see
+    // `workspace_tree_lock`. Held across the pair, since the point here is that
+    // the SECOND apply follows the first on a clean tree.
+    let _tree = crate::support::workspace_tree_lock().read().await;
+
     // Apply change 1
     let url1 = format!("{}/api/v1/changes/{}/apply", base_url(), change1_id);
     let resp1 = client

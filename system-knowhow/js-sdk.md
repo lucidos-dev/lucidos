@@ -62,7 +62,7 @@ What each piece does — include only what you need:
 | Accents | `--accent`, `--accent-light`, `--accent-green`, `--accent-yellow`, `--accent-red` |
 | Focus | `--focus-ring` — a ready-made `box-shadow` value (a soft accent band) for focus indicators; the `.action-btn`/`.icon-btn` classes use it, and your own controls match the host with `:focus-visible { box-shadow: var(--focus-ring); }` |
 | Shadows | `--shadow-sm`, `--shadow-md`, `--shadow-lg` |
-| Layout (theme-independent) | `--font-ui`, `--font-mono`, `--transition`, `--user-ui-scale` — plus the spacing / radius / motion scales below |
+| Layout (theme-independent) | `--font-ui`, `--font-mono`, `--font-features-text`, `--font-features-code`, `--transition`, `--user-ui-scale`, plus the spacing / radius / motion scales below |
 
 The user's UI font is **`--font-ui`** — that's the canonical token, set live to the
 user's font choice. You rarely need to apply it yourself: `sdk-iframe.css` already
@@ -75,6 +75,32 @@ Only re-declare `font-family` when you deliberately override it, and then use
 `--font-family` and `--font` are tolerated **aliases** of `--font-ui` (so the
 intuitive guess still resolves to the user's font instead of silently dropping to a
 hardcoded fallback) — but `--font-ui` is the name to write.
+
+**`--font-features-text` and `--font-features-code` carry programming ligatures,
+and only code gets them.** When the user picked Fira Code they resolve to
+`"liga" 0, "calt" 0` and `"liga" 1, "calt" 1`; for every other font both are
+`normal`. `sdk-iframe.css` applies them for you, the text one on `html, input,
+textarea, select, button` and the code one on `code, pre, kbd, samp`, so a code
+block in your app ligatures `=>` and `!=` while your prose and your form fields
+render literally.
+
+Apply one yourself only on an element that shows code but is none of those tags:
+`font-feature-settings: var(--font-features-code, normal)`. Never put the CODE
+one on `:root`, `html` or `body`: `font-feature-settings` is inherited, so that
+reaches every character in your app, and Fira Code's `calt` re-spaces dot runs
+tightly enough that a typed `...` reads as two dots.
+
+Two things to know if you write your own rule, because both look fine in
+DevTools and neither shows up in the computed value:
+
+- **`normal` does not mean "ligatures off".** `liga` and `calt` are default-ON
+  features in CSS, so `normal` renders identically to `"liga" 1, "calt" 1`.
+  Use `var(--font-features-text, normal)` when you want them off, never a bare
+  `normal`, and never expect deleting a declaration to disable anything.
+- **Form controls do not inherit this property.** The UA stylesheet's `font`
+  shorthand resets it on `input` / `textarea` / `select` / `button`, which is why
+  they are named explicitly above. A custom control of your own needs the same
+  treatment.
 
 The spacing, radius, motion, icon, and type scales are theme-independent and have
 fixed values — **use the token, not a magic number, and never a `px` fallback
@@ -638,6 +664,18 @@ interface UpdateTrigger {
 interface ApiResult {
   success: boolean;
   error?: string;
+  /** Trigger create / update only: the engine's read-back on the cron it just
+   *  stored. Absent on an update that did not touch the schedule. */
+  cron_preview?: CronPreview;
+}
+
+interface CronPreview {
+  /** The next few fire times (RFC3339), merged across the whole expression
+   *  array. Empty when the trigger has no cron at all. */
+  next_runs: string[];
+  /** Non-fatal advice. A cron that can NEVER fire is a hard error instead, so
+   *  it arrives as `error` with `success: false`. */
+  warnings: string[];
 }
 
 // Result of an off-schedule run. `success: true` with
@@ -669,6 +707,14 @@ await lucidos.triggers.create({
 ```
 
 Each entry's `condition` only applies to its own `event_type` — the `from: 'partner'` filter on `MessageReceived` does NOT block `EmailReceived` from firing on its own filter.
+
+### Cron validation on create and update
+
+Within one cron expression the fields are **ANDed**; across the array they are **ORed**. So `0 0 9 1 * Mon` fires only when the 1st IS a Monday (roughly 1.7 times a year), not on the 1st and every Monday, which is two expressions. See `system-knowhow/triggers.md` § "Writing cron expressions" for the nth-weekday and last-weekday recipes.
+
+An expression that can **never** fire (`0 0 9 31 2 *`, Feb 31, and its relatives) is rejected: `success: false` with an `error` naming the offending fields. Do not retry it, and do not present it to the user as a transient failure; the expression itself is wrong.
+
+Every accepted create / update returns `cron_preview`. Show `next_runs` in your app's confirmation so the user sees what they actually scheduled, and surface each entry of `warnings` (currently the day-of-month/day-of-week AND footgun) rather than dropping it.
 
 Trigger groups are user-visible folders shown in the triggers panel. Pure organizational labels — they have no schedule, run no code, and don't coordinate firing. Apps that organize the triggers they create can pass `group_id` to `create` / `update`; the engine validates the id against the workspace's group registry and rejects unknown values. The SDK does not expose group CRUD today — group management lives behind the engine's HTTP and LLM-tool surfaces.
 
@@ -728,7 +774,7 @@ type Preferences = Record<string, string>;
 | Key | Values | Description |
 |-----|--------|-------------|
 | `theme` | `dark`, `light`, `system` | UI theme |
-| `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono`, `fira-code` | Font (`fira-code` also enables programming ligatures) |
+| `font-family` | `monospace`, `system`, `inter`, `jetbrains-mono`, `ibm-plex-mono`, `fira-code` | Font (`fira-code` also enables programming ligatures, on code and `pre` blocks only, via `--font-features-text` / `--font-features-code`) |
 | `ui-scale` | Number in 12.5% steps from 75 to 200 (`75`, `87.5`, `100`, `112.5`, `125`, `137.5`, `150`, `162.5`, `175`, `187.5`, `200`); or the legacy strings `small` / `medium` / `large` (= `100` / `112.5` / `125`). Off-grid numbers snap to the nearest valid step. | Scale |
 
 ## lucidos.notifications — Notification Center
@@ -1001,6 +1047,7 @@ lucidos.ui.startThread(opts?: { prompt?: string }): Promise<void>
 lucidos.ui.previewFile(params: FilePreviewParams): Promise<void>
 lucidos.ui.confirm(options: ConfirmOptions): Promise<boolean>
 lucidos.ui.toast(message: string, type?: ToastType, opts?: ToastOptions): void
+lucidos.ui.dismissToast(key: string): void
 lucidos.ui.prompt(options: PromptOptions): Promise<string | null>
 lucidos.ui.Select.create(opts: SelectCreateOptions): SelectInstance
 lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
@@ -1266,6 +1313,10 @@ interface ToastOptions {
    *  updates the existing toast (message/type/etc.) instead of stacking a new
    *  one — e.g. an 'Opening…' toast becoming 'Opened'. */
   key?: string;
+  /** true = show an indeterminate "work in progress" spinner in place of the
+   *  severity icon. Pair it with a `key`, so a later keyed toast can replace
+   *  the spinner with the outcome. Indeterminate only: no percentage. */
+  spinning?: boolean;
 }
 ```
 
@@ -1285,6 +1336,50 @@ lucidos.ui.toast('Working on it…', 'info', { durationMs: 2000 });
 lucidos.ui.toast('Opening from Drive…', 'info', { key: 'drive-open' });
 lucidos.ui.toast('Opened "Q3 deck"', 'success', { key: 'drive-open' });
 ```
+
+#### Long-running work: a spinner you can take back down
+
+`spinning: true` swaps the severity icon for a small indeterminate spinner, so a
+keyed toast can narrate work that has no honest percentage. Its counterpart is
+`lucidos.ui.dismissToast(key)`, which takes that toast back down. That covers the
+one case a keyed replacement can't express: work that finishes with nothing left
+to say.
+
+`dismissToast` is fire-and-forget like `toast`, and **a key matching nothing is a
+no-op**, never an error. Your app can't know whether the toast is still up (the
+user may have closed it, or its `durationMs` may have expired), so "already gone"
+is the normal case rather than a failure. It reaches toasts by key only, so a
+`toast()` raised without one can't be dismissed this way.
+
+Start the spinner on the user's action, and let the event that reports the work
+finished decide how it ends:
+
+```js
+document.querySelector('#reindex').addEventListener('click', async () => {
+  lucidos.ui.toast('Reindexing your notes…', 'info', {
+    key: 'reindex',
+    spinning: true,
+    dismissable: false,   // work is under way; there's nothing to cancel by closing
+  });
+  await lucidos.events.emit('ReindexRequested', {});
+});
+
+lucidos.sse.on('ReindexCompleted', (data) => {
+  if (data.changed === 0) {
+    lucidos.ui.dismissToast('reindex');   // nothing worth reporting, just clear it
+  } else {
+    lucidos.ui.toast(`Reindexed ${data.changed} notes`, 'success', { key: 'reindex' });
+  }
+});
+lucidos.sse.on('ReindexFailed', (data) => {
+  lucidos.ui.toast(`Reindex failed: ${data.error}`, 'error', { key: 'reindex' });
+});
+```
+
+Reusing one `key` across every arm is what makes the spinner *become* the outcome
+in place instead of stacking a second toast under it. Give a `spinning` toast an
+end condition on every path (a keyed replacement or a `dismissToast`), or the
+spinner sits there forever.
 
 ### Prompts
 

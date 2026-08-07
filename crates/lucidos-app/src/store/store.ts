@@ -7,6 +7,7 @@ import type {
   Loadable,
   Notification,
   CredentialInfo,
+  KnownOAuthProviders,
   OAuthAccountInfo,
   PinnedAppEntry,
   InstalledPlugin,
@@ -343,7 +344,27 @@ export const activeMenuItem = signal<MenuItem>(
 // --- Connection ---
 export const connectionStatus = signal<ConnectionStatus>('connecting');
 export const isConnected = computed(() => connectionStatus.value === 'connected');
+/** The engine's own name for this workspace: the last component of its
+ *  directory, which for a gateway-provisioned workspace IS its *workspace
+ *  address* (`docs/glossary.md`). This is the workspace's IDENTITY here: it is
+ *  stable across renames, unique across the machine, and thread-ref links
+ *  (`utils/threadRef.ts`) plus cross-workspace routing match on it. Do not swap
+ *  it for the display label. */
 export const workspaceName = signal<string>('');
+/** The display label the workspace gateway's registry holds for this workspace,
+ *  i.e. what the picker lists and what a rename edits. Empty until the control
+ *  listing resolves, and stays empty with no gateway in front of us. Renaming is
+ *  a registry write with no engine involvement, so the engine cannot report this
+ *  and the app has to ask the gateway (see `actions/workspace-label.ts`). */
+export const workspaceDisplayName = signal<string>('');
+/** What every "which workspace is this" surface shows: the user's own label when
+ *  we know it, else the engine's name. One derived value, so the header, the
+ *  System page and the Files source dropdown cannot disagree with the switcher
+ *  row sitting next to them (they did: the switcher reads the gateway listing,
+ *  so after a rename one screen carried two names for one workspace). */
+export const visibleWorkspaceName = computed(
+  () => workspaceDisplayName.value || workspaceName.value,
+);
 export const workspacePath = signal<string>('');
 export const engineStartedAt = signal<string | null>(null);
 export const lucidosRelease = signal<string | null>(null);
@@ -1501,6 +1522,25 @@ export const chatModels = signal<Loadable<ModelInfo[]>>({ status: 'not-loaded' }
 // --- OAuth Accounts ---
 export const oauthAccounts = signal<Loadable<OAuthAccountInfo[]>>({ status: 'not-loaded' });
 
+/** The *OAuth provider registry*, as the engine serves it.
+ *
+ *  Drives the quick-provider buttons and the Connect form's autofill, so a
+ *  provider added to `system-knowhow/oauth-providers.json` gets both with no
+ *  frontend change. An engine with no staged system-knowhow answers an empty
+ *  list, which renders no buttons and leaves the typed-name path working. */
+export const knownOAuthProviders = signal<Loadable<KnownOAuthProviders>>({ status: 'not-loaded' });
+
+/** What Settings → Accounts should arrive pre-filled with, set by a deep link.
+ *
+ *  Carries the SCOPES as well as the provider, because the caller knows what the
+ *  connection is FOR. Backup passes its upload scopes, so one authorization
+ *  covers sign-in and upload instead of leaving the user facing *Grant access*
+ *  back on the Backup page: a second trip through the provider's consent screen
+ *  for one intent.
+ *
+ *  Consumed once by `SettingsView` and cleared, like `settingsScrollTarget`. */
+export const oauthConnectPrefill = signal<{ provider: string; scopes?: string } | null>(null);
+
 // --- Triggers ---
 export const triggers = signal<Loadable<TriggerInfo[]>>({ status: 'not-loaded' });
 
@@ -1712,9 +1752,9 @@ export function showToast(message: string, type: ToastType = 'info', opts?: { ke
   // branch above deliberately does NOT touch `pane`, so an in-place update keeps
   // the toast where it first appeared.
   const pane = focusedPane.value === 'content' ? 'content' : 'thread';
-  // Prepend so the newest toast renders at the top of the column-stacked
-  // container and pushes existing ones down (the container is pinned to the
-  // top of the viewport, so array order is top→bottom).
+  // Prepend so the newest toast renders at the top of its pane's column-stacked
+  // stack and pushes that pane's existing toasts down (each column is pinned to
+  // the top of the viewport, so array order is top→bottom).
   toasts.value = [{ id, message, type, key, action, secondaryAction, onClick, spinning, progress, dismissable, noAutofocus, pane }, ...toasts.value];
   if (key) {
     scheduleAutoDismiss(key, autoDismissMs);
@@ -1851,7 +1891,7 @@ export const stepDetailModal = signal<StepDetailModalState>(null);
 
 // --- Command checkpoint diff modal ---
 // Set to a checkpoint ResponseEvent to show what that command changed; null =
-// closed. Opened by "View changes" on the checkpoint card, so the Undo beside
+// closed. Opened by the Diff button on the checkpoint card, so the Undo beside
 // it is not a blind button. A modal rather than an inline expansion because a
 // destructive command can touch a lot of files, and the transcript is not where
 // that belongs.

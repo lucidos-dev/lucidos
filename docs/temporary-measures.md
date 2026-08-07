@@ -442,6 +442,28 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   `docs/investigations/2026-08-02-cc-stream-idle-timeout.md`; the upstream reports
   are closed as duplicate / not planned, so there is nothing open to chase)
 
+### "list_files returns the whole tree unfiltered" line in `[CURRENT FILES]`
+
+- **Added:** 2026-08-07
+- **Lives in:** `build_file_list_section`
+  (`crates/lucidos-engine/src/engine/chat/process/workspace_payload.rs`), the
+  trailing advisory emitted whenever the block is partial.
+- **Impermanent because:** it warns the chat agent about a defect in a
+  neighbouring surface rather than describing its own. The `list_files` tool
+  (`engine/tools/files.rs`) returns `all_files.join("\n")` with no ignore filter
+  and no cap, so on a workspace with a vendored tree one call returns every
+  path, which is exactly what the prompt block was reshaped to stop paying for.
+  Warning the model is a mitigation; filtering the tool is the fix.
+- **Removal / resolution condition:** when `list_files` applies
+  `core::artifacts::is_vendored_path` (or otherwise bounds its result), reword
+  the line to drop the "returns the whole tree unfiltered" claim, which is
+  otherwise a false statement the prompt makes on every turn. Keeping a shorter
+  "use glob_files for a targeted lookup" pointer is fine. Verify by checking
+  that the `list_files` arm in `engine/tools/files.rs` filters, and that
+  `vendored_tree_is_excluded_and_real_files_survive` still asserts whatever the
+  line becomes.
+- **Status:** active
+
 ---
 
 ## 2. Model-tolerance measures
@@ -619,8 +641,9 @@ condition; fix the condition rather than acting on it.
 
 - **Added:** 2026-06-30
 - **Lives in:** `crates/lucidos-engine/src/engine/chat/process/system_prompt.rs`
-  (`REPEATED_ACTION_RULE` const + the generalized CRITICAL RULE #1 / VERIFICATION
-  lines it sits beside, spliced via the `__REPEATED_ACTION_RULE__` placeholder),
+  (`REPEATED_ACTION_RULE` const + the generalized CRITICAL RULE #1 it sits
+  beside, spliced via the `__REPEATED_ACTION_RULE__` placeholder; the separate
+  VERIFICATION line folded into that rule on 2026-08-07),
   with the colocated test `chat_prompt_forbids_faking_repeated_actions` in
   `crates/lucidos-engine/src/engine/chat/process_tests.rs`.
 - **Impermanent because (tolerates):** On a repeat request — the user says
@@ -640,7 +663,7 @@ condition; fix the condition rather than acting on it.
   to repeat a `send_notification` / `send_email` / `events emit` action; if every
   confirmation is backed by a matching `ToolCalled` in the SAME turn over a
   representative window, drop `REPEATED_ACTION_RULE` + its placeholder + the test,
-  and narrow CRITICAL RULE #1 / VERIFICATION back to file writes.
+  and narrow CRITICAL RULE #1 back to file writes.
 - **Status:** active
 
 ### "Narrating it does not do it" on an event-wait re-arm
@@ -650,17 +673,21 @@ condition; fix the condition rather than acting on it.
   sentence of the `WAIT_SPENT_NOTICE` const, "Narrating it does not do it: a turn
   that ends with no new call leaves nothing watching for this, whatever the
   sentence said") and `crates/lucidos-engine/src/llm/tools/misc.rs` (the
-  `await_event` description's "Saying you will re-arm is not re-arming; a turn
-  that ends with no new call leaves nothing watching for it"). Pinned by
-  `the_delivery_result_says_the_subscription_is_spent_and_re_arming_is_a_call`
+  `await_event` description's "Saying you will re-subscribe is not
+  re-subscribing", shortened from the fuller sentence by the 2026-08-07
+  schema-budget trim; the wake notice still carries the long form).
+  Pinned by `the_delivery_wake_says_the_subscription_is_spent_and_re_arming_is_a_call`
   in `engine/event_wait/mod_tests.rs` and
-  `await_event_description_splits_the_two_wakes_before_saying_do_not_register`
+  `await_event_description_says_a_wake_spends_the_subscription`
   in `llm/tools/tests.rs`.
 - **Impermanent because (tolerates):** The same "wrote the confirmation instead
   of calling the tool" mistake as the entry above, in the one place it is most
-  invited: `await_event` is a TERMINAL tool (`AwaitEventOutcome::Parked`, "the
-  turn must end here"), so the habit of writing the closing paragraph after the
-  last tool call puts prose exactly where the call had to go. Observed
+  invited. A re-arm is the LAST thing a wake turn does, so the habit of writing
+  the closing paragraph after the last tool call puts prose exactly where the
+  call had to go. (Until 2026-08-06 there was a second reason, since
+  `await_event` was a TERMINAL tool that ended the turn outright; ADR 0049 made
+  every wait detached, so it now returns like any other tool and the turn
+  carries on. The mistake outlived the shape that invited it.) Observed
   2026-08-06 in the *Notification of Agent Code Edits* thread: the thread woke
   on a delivery, reported the edit, closed with "Re-arming the watch now, so
   I'll keep reporting each edit as it happens" and ended the turn with no second
@@ -1030,8 +1057,10 @@ event that retires it.
 - **Added:** 2026-07-02 (registered by the /harden-project sweep — the alias
   landed 2026-05-25/27, commits 713e33b1d/976a4a516)
 - **Lives in:** `crates/lucidos-engine/src/llm/tools/threads.rs` (the `repo` param
-  schema, marked "DEPRECATED — use `folder` instead. Accepted for one release as
-  an alias"), `crates/lucidos-engine/src/engine/agentic_loop_special_tool.rs`
+  schema, marked "DEPRECATED, use `folder`. Passing both is an error"; the
+  "accepted for one release" sunset moved into this row on 2026-08-07, when the
+  schema-budget trim cut the param description back to its rule),
+  `crates/lucidos-engine/src/engine/agentic_loop_special_tool.rs`
   (the alias-resolution arm + the both-passed error, two sites), and
   `crates/lucidos-engine/src/engine/http/workspace_client.rs`
   (`CrossWorkspaceSpawn.repo`).

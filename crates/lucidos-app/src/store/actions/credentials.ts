@@ -15,6 +15,10 @@ import {
 import type { ApiResult } from '../../api/types';
 import type { UpdateCredentialBody } from '../../api/client/settings';
 import { landOnAccountsWithOverlay } from './menu';
+import {
+  cancelPendingOAuthConnect,
+  resumeOAuthConnectAfterCredentialSaved,
+} from './oauth';
 import { pushNavState } from './navigation';
 import { errorDetail } from '../../utils/errorDetail';
 
@@ -45,7 +49,50 @@ export function openCredentialRequest(request: CredentialRequest): void {
 }
 
 export function closeCredentialForm(): void {
+  // Dismissing the form abandons whatever Connect queued behind it. Without
+  // this, cancelling a registration and later saving an unrelated credential
+  // would open a browser for a provider the user walked away from.
+  cancelPendingOAuthConnect();
   closeInlineForm();
+}
+
+/** Save a credential the engine ASKED for, then continue whatever was blocked.
+ *
+ *  Two things the plain create path cannot do, and the reason this exists as its
+ *  own entry point rather than as flags on `submitNewCredential`:
+ *
+ *  1. **A repair updates, it never creates.** A request carrying
+ *     `existing_credential_id` targets a row that already exists (an OAuth
+ *     Client saved without the endpoints a flow needs). Creating would make a
+ *     second `oauth_client` for one provider, and a name plus an auth type is
+ *     the credential's identity, so that pair is a duplicate.
+ *  2. **The flow continues.** Saving used to close the form and stop, which is
+ *     what left a user who pressed Connect looking at the Accounts page with no
+ *     idea that pressing Connect again was the next step.
+ */
+export async function submitRequestedCredential(
+  request: CredentialRequest,
+  service: string,
+  baseUrl: string,
+  authType: AuthType,
+  authValue: string,
+  envVarName?: string,
+): Promise<boolean> {
+  const saved = request.existing_credential_id
+    ? await submitCredentialEdit(request.existing_credential_id, {
+        base_url: baseUrl,
+        auth_type: authType,
+        // An `oauth_client` is not sent through the proxy auth pipeline, so it
+        // has no meaningful auth header. The field is required by the update
+        // shape, so it carries the same default the create path stores.
+        auth_header: 'Authorization',
+        auth_value: authValue,
+        env_var_name: envVarName,
+      })
+    : await submitNewCredential(service, baseUrl, authType, authValue, envVarName);
+  if (!saved) return false;
+  await resumeOAuthConnectAfterCredentialSaved(service);
+  return true;
 }
 
 /** Shared success/error/reload handling for credential saves. */
@@ -59,7 +106,10 @@ async function runCredentialSave(
       showToast(data.error || failMsg, 'error');
       return false;
     }
-    closeCredentialForm();
+    // `closeInlineForm`, NOT `closeCredentialForm`: closing because the save
+    // SUCCEEDED must not abandon the authorization the save just unblocked.
+    // Only a user dismissing the form does that.
+    closeInlineForm();
     await loadCredentials();
     return true;
   } catch (error) {

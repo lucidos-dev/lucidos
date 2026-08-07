@@ -22,7 +22,10 @@ pub struct OAuthAccount {
     pub access_token: String,
     pub refresh_token: Option<String>,
     pub token_expiry: Option<DateTime<Utc>>,
+    /// What the provider GRANTED. See [`OAuthAccountInfo::desired_scopes`] for
+    /// the set that was asked for.
     pub scopes: String,
+    pub desired_scopes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -45,6 +48,7 @@ impl std::fmt::Debug for OAuthAccount {
             )
             .field("token_expiry", &self.token_expiry)
             .field("scopes", &self.scopes)
+            .field("desired_scopes", &self.desired_scopes)
             .field("created_at", &self.created_at)
             .field("updated_at", &self.updated_at)
             .finish()
@@ -58,7 +62,20 @@ pub struct OAuthAccountInfo {
     pub provider: String,
     pub email: Option<String>,
     pub display_name: Option<String>,
+    /// What the provider GRANTED.
     pub scopes: String,
+    /// What the account was ASKED for, accumulated across every authorization.
+    ///
+    /// This is what *Reconnect* re-requests. Re-requesting `scopes` instead
+    /// could only ever ask for the set the account already held, because
+    /// `prepare_oauth_flow` merges the request with the existing grant, so an
+    /// account a provider had narrowed could never recover the difference. That
+    /// is the button the engine's own Dropbox permission error sends the user
+    /// to.
+    ///
+    /// `None` for an account connected before the column existed. The caller
+    /// falls back to something never narrower than the granted set.
+    pub desired_scopes: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -171,6 +188,104 @@ pub fn oauth_client_request(provider: &str, overrides: &OAuthClientOverrides) ->
     request
 }
 
+impl OAuthClientOverrides {
+    /// Prefill from an *OAuth provider registry* row, so the credential modal
+    /// asks only for the Client ID.
+    ///
+    /// This is the whole of the registry's authority: it seeds a credential at
+    /// write time and never participates in a flow. `prepare_oauth_flow` still
+    /// reads endpoints back out of the stored credential, so a credential keeps
+    /// fully describing its own authorization.
+    ///
+    /// `scopes` comes from the caller, not the row, because the scope set is a
+    /// property of what the connection is FOR (a backup, a mailbox) rather than
+    /// of the provider.
+    pub fn from_registry(row: &crate::core::oauth_registry::OAuthProviderRow) -> Self {
+        Self {
+            base_url: Some(row.base_url.clone()),
+            auth_url: Some(row.auth_url.clone()),
+            token_url: Some(row.token_url.clone()),
+            userinfo_url: row.userinfo_url.clone(),
+            userinfo_method: row.userinfo_method.clone(),
+            authorize_params: row.authorize_params.clone(),
+            scopes: None,
+            redirect_uri: row.redirect_uri.clone(),
+        }
+    }
+}
+
+/// The credential fields [`prepare_oauth_flow`] hard-requires, in the order it
+/// reads them, so a caller can tell "this credential cannot drive a flow" from
+/// "this flow failed".
+const REQUIRED_FLOW_FIELDS: [&str; 3] = ["client_id", "auth_url", "token_url"];
+
+/// Which required fields a stored `oauth_client` secret is missing.
+///
+/// Empty means the credential can drive a flow. Anything else is the list the
+/// user is about to be shown, because reaching `prepare_oauth_flow` in this
+/// state produces a bare *"Missing auth_url in OAuth credentials"* toast with no
+/// way forward: the endpoint inputs carried no `required` attribute and the form
+/// only pair-validated them, so a credential saved with both blank was accepted
+/// and failed on the NEXT press of Connect, one screen away from the cause.
+///
+/// A secret that is not a JSON object counts as missing everything. There is no
+/// recoverable client id inside an unparseable blob, and reopening the form
+/// prefilled from the registry is a better answer than a toast about JSON.
+pub fn missing_flow_fields(auth_value: &str) -> Vec<&'static str> {
+    let parsed = serde_json::from_str::<serde_json::Value>(auth_value).ok();
+    let present = |key: &str| {
+        parsed
+            .as_ref()
+            .and_then(|v| v.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .is_some_and(|s| !s.is_empty())
+    };
+    REQUIRED_FLOW_FIELDS
+        .into_iter()
+        .filter(|key| !present(key))
+        .collect()
+}
+
+/// The credential request that REPAIRS an existing `oauth_client` rather than
+/// creating one.
+///
+/// Same modal, same registry prefill, two additions the create path has no use
+/// for: `existing_credential_id`, so the save updates the row instead of
+/// creating a second one for the same provider (a name plus an auth type is the
+/// credential's identity, and a duplicate pair is the 2026-08-05 incident), and
+/// `missing`, so the form can say which fields it reopened for. The stored
+/// `client_id` rides along in `defaults` because the user already supplied it
+/// and asking twice is how a repair starts feeling like a punishment.
+pub fn oauth_client_repair_request(
+    provider: &str,
+    overrides: &OAuthClientOverrides,
+    credential_id: Uuid,
+    client_id: Option<&str>,
+    missing: &[&str],
+) -> serde_json::Value {
+    let mut request = oauth_client_request(provider, overrides);
+    request["existing_credential_id"] = serde_json::json!(credential_id.to_string());
+    request["missing"] = serde_json::json!(missing);
+    request["prompt"] = serde_json::json!(format!(
+        "Finish the OAuth client registration for {provider}. Connecting needs {}.",
+        join_human(missing)
+    ));
+    if let Some(client_id) = client_id.map(str::trim).filter(|s| !s.is_empty()) {
+        request["defaults"]["client_id"] = serde_json::json!(client_id);
+    }
+    request
+}
+
+/// "a" / "a and b" / "a, b and c". Used only for the repair prompt.
+fn join_human(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Determine the provider name from an API URL.
 pub fn provider_for_url(url: &str) -> Option<&'static str> {
     if url.contains(".googleapis.com") || url.contains("google.com/") {
@@ -223,18 +338,20 @@ impl OAuthStore {
         refresh_token: Option<&str>,
         token_expiry: Option<DateTime<Utc>>,
         scopes: &str,
+        desired_scopes: &str,
     ) -> Result<Uuid, sqlx::Error> {
         let result = if email.is_some() {
             sqlx::query_scalar::<_, Uuid>(
                 r#"
-                INSERT INTO oauth_accounts (provider, email, display_name, access_token, refresh_token, token_expiry, scopes)
-                VALUES ($1, $2, $3, $4, $5, $6, $7)
+                INSERT INTO oauth_accounts (provider, email, display_name, access_token, refresh_token, token_expiry, scopes, desired_scopes)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
                 ON CONFLICT (provider, email) DO UPDATE SET
                     display_name = EXCLUDED.display_name,
                     access_token = EXCLUDED.access_token,
                     refresh_token = COALESCE(EXCLUDED.refresh_token, oauth_accounts.refresh_token),
                     token_expiry = EXCLUDED.token_expiry,
                     scopes = EXCLUDED.scopes,
+                    desired_scopes = EXCLUDED.desired_scopes,
                     updated_at = NOW()
                 RETURNING id
                 "#,
@@ -246,19 +363,21 @@ impl OAuthStore {
             .bind(refresh_token)
             .bind(token_expiry)
             .bind(scopes)
+            .bind(desired_scopes)
             .fetch_one(pool)
             .await?
         } else {
             sqlx::query_scalar::<_, Uuid>(
                 r#"
-                INSERT INTO oauth_accounts (provider, email, display_name, access_token, refresh_token, token_expiry, scopes)
-                VALUES ($1, NULL, $2, $3, $4, $5, $6)
+                INSERT INTO oauth_accounts (provider, email, display_name, access_token, refresh_token, token_expiry, scopes, desired_scopes)
+                VALUES ($1, NULL, $2, $3, $4, $5, $6, $7)
                 ON CONFLICT (provider) WHERE email IS NULL DO UPDATE SET
                     display_name = EXCLUDED.display_name,
                     access_token = EXCLUDED.access_token,
                     refresh_token = COALESCE(EXCLUDED.refresh_token, oauth_accounts.refresh_token),
                     token_expiry = EXCLUDED.token_expiry,
                     scopes = EXCLUDED.scopes,
+                    desired_scopes = EXCLUDED.desired_scopes,
                     updated_at = NOW()
                 RETURNING id
                 "#,
@@ -269,6 +388,7 @@ impl OAuthStore {
             .bind(refresh_token)
             .bind(token_expiry)
             .bind(scopes)
+            .bind(desired_scopes)
             .fetch_one(pool)
             .await?
         };
@@ -281,7 +401,7 @@ impl OAuthStore {
         sqlx::query_as::<_, OAuthAccount>(
             r#"
             SELECT id, provider, email, display_name, access_token,
-                   refresh_token, token_expiry, scopes,
+                   refresh_token, token_expiry, scopes, desired_scopes,
                    created_at, updated_at
             FROM oauth_accounts
             WHERE id = $1
@@ -313,7 +433,7 @@ impl OAuthStore {
         sqlx::query_as::<_, OAuthAccount>(
             r#"
             SELECT id, provider, email, display_name, access_token,
-                   refresh_token, token_expiry, scopes,
+                   refresh_token, token_expiry, scopes, desired_scopes,
                    created_at, updated_at
             FROM oauth_accounts
             WHERE provider = $1
@@ -363,7 +483,7 @@ impl OAuthStore {
     pub async fn list(pool: &PgPool) -> Result<Vec<OAuthAccountInfo>, sqlx::Error> {
         sqlx::query_as::<_, OAuthAccountInfo>(
             r#"
-            SELECT id, provider, email, display_name, scopes,
+            SELECT id, provider, email, display_name, scopes, desired_scopes,
                    created_at, updated_at
             FROM oauth_accounts
             ORDER BY provider ASC, created_at ASC
@@ -378,7 +498,7 @@ impl OAuthStore {
         sqlx::query_as::<_, OAuthAccount>(
             r#"
             SELECT id, provider, email, display_name, access_token,
-                   refresh_token, token_expiry, scopes,
+                   refresh_token, token_expiry, scopes, desired_scopes,
                    created_at, updated_at
             FROM oauth_accounts
             ORDER BY provider ASC, created_at ASC
@@ -421,6 +541,7 @@ impl OAuthStore {
         refresh_token: Option<&str>,
         token_expiry: Option<DateTime<Utc>>,
         scopes: &str,
+        desired_scopes: &str,
         actor: Option<MessageOrigin>,
     ) -> Result<Uuid, sqlx::Error> {
         let id = Self::upsert_row(
@@ -432,6 +553,7 @@ impl OAuthStore {
             refresh_token,
             token_expiry,
             scopes,
+            desired_scopes,
         )
         .await?;
         event_bus
@@ -567,7 +689,11 @@ fn callback_uri_for_host(host: &str) -> String {
 }
 
 /// The redirect URI advertised when a credential doesn't override it.
-fn default_redirect_uri() -> String {
+///
+/// Public because the Connect form offers it for copying into the provider's
+/// console: it has to be registered character for character, so the one place
+/// that knows it must be the one that states it.
+pub fn default_redirect_uri() -> String {
     callback_uri_for_host(DEFAULT_CALLBACK_HOST)
 }
 
@@ -1527,12 +1653,27 @@ const BRAND_MARK: &str = include_str!("../../../lucidos-app/public/favicon.svg")
 /// landing here in 2026-08-06 still had to ask whether the tab was ours or
 /// Dropbox's.
 ///
-/// So it now wears the surface the *workspace picker* wears (`styles/picker.css`
+/// So it wears the surface the *workspace picker* wears (`styles/picker.css`
 /// `.ws-picker`): the mark's own radial gradient scaled to fill the viewport,
-/// white on brand blue, the neutral `--font-sans` stack, and the mark itself
-/// above the heading. That is the repo's existing answer to "what does a
-/// standalone Lucidos screen look like", and being unmistakably ours is the
-/// whole job here.
+/// white on brand blue, and the neutral `--font-sans` stack. That is the repo's
+/// existing answer to "what does a standalone Lucidos screen look like", and
+/// being unmistakably ours is the whole job here.
+///
+/// It takes the picker's **arrangement** too, which the first pass did not. Four
+/// small elements centered both ways in a full viewport of blue read as a splash
+/// rather than a page, and the provider id was a bare trailing word that, in the
+/// reporting user's words, "needs to explain itself" (2026-08-06, the same
+/// install as the surface fix above). So the shell is top-anchored in a bounded
+/// left-aligned column (`.ws-picker`'s `align-items:flex-start` and its `4rem`
+/// top padding), the mark and a
+/// "Lucidos" wordmark sit together as a horizontal lockup the way
+/// `.ws-picker-brand` does, and the provider is a labelled key/value row under a
+/// hairline: *Authorized with · dropbox*. The label is state-specific, since a
+/// completed and a refused authorization say different things about that
+/// provider, and a blank provider drops the row entirely rather than ruling off
+/// an empty line. The id itself is rendered verbatim: they are `dropbox` and
+/// `ghealth`, and title-casing the second one produces "Ghealth", so the label
+/// carries the meaning instead.
 ///
 /// **It fetches nothing.** No stylesheet, script, font or image, which is why
 /// the CSS is inline and the mark is [`BRAND_MARK`] rather than an `<img>`. Two
@@ -1555,15 +1696,17 @@ const BRAND_MARK: &str = include_str!("../../../lucidos-app/public/favicon.svg")
 /// exchanged, so it cannot claim the account is connected or name it. "Finishing
 /// the connection" is the honest tense.
 fn callback_page(provider: &str, ok: bool) -> String {
-    let (heading, detail) = if ok {
+    let (heading, detail, provider_label) = if ok {
         (
             "Authorization complete",
             "Lucidos is finishing the connection. You can close this tab.",
+            "Authorized with",
         )
     } else {
         (
             "Authorization failed",
             "Nothing was connected. Return to Lucidos for the details.",
+            "Tried to connect",
         )
     };
     // `provider` is a bare identifier (`dropbox`, `ghealth`), but escape it
@@ -1577,28 +1720,44 @@ fn callback_page(provider: &str, ok: bool) -> String {
     } else {
         format!("Lucidos {provider}")
     };
+    // No value, no row: a flow whose provider name never reached this far would
+    // otherwise draw the hairline and the label over nothing.
+    let footer = if provider.is_empty() {
+        String::new()
+    } else {
+        format!("<dl><dt>{provider_label}</dt><dd>{provider}</dd></dl>")
+    };
     format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{title}</title><style>\
          :root{{color-scheme:dark}}\
-         body{{margin:0;min-height:100vh;display:flex;align-items:center;\
-         justify-content:center;padding:2rem 1rem;color:#fff;\
+         body{{margin:0;min-height:100vh;display:flex;align-items:flex-start;\
+         justify-content:center;padding:4rem 1.5rem 3rem;color:#fff;\
          font:1rem/1.5 system-ui,-apple-system,BlinkMacSystemFont,'Segoe UI',\
          Roboto,Helvetica,Arial,sans-serif;\
          background:radial-gradient(60% 50% at 80% 0%,rgba(150,200,255,.45),transparent 70%),\
          radial-gradient(130% 120% at 28% 12%,#4a97ee 0%,#1f6fce 50%,#0c52ad 100%);\
          background-attachment:fixed}}\
-         main{{max-width:26rem;text-align:center}}\
-         main svg{{width:3rem;height:3rem;display:block;margin:0 auto 1.5rem;\
+         main{{width:100%;max-width:30rem}}\
+         .brand{{display:flex;align-items:center;gap:.875rem;margin:0 0 2.5rem}}\
+         .brand svg{{flex:0 0 auto;width:3rem;height:3rem;display:block;\
          border-radius:.825rem;filter:drop-shadow(0 .45rem 1.05rem rgba(3,33,80,.55))}}\
-         h1{{font-size:1.25rem;font-weight:600;margin:0 0 .5rem}}\
-         p{{margin:0;color:rgba(255,255,255,.78)}}\
-         .who{{margin-top:1.25rem;font-size:.8125rem;color:rgba(255,255,255,.55)}}\
+         .brand span{{font-size:1.375rem;font-weight:600;line-height:1;\
+         letter-spacing:-.01em;color:rgba(255,255,255,.92)}}\
+         h1{{font-size:2rem;font-weight:700;line-height:1.2;\
+         letter-spacing:-.02em;margin:0 0 .625rem}}\
+         p{{margin:0;font-size:1.0625rem;color:rgba(255,255,255,.78);\
+         text-wrap:pretty}}\
+         dl{{display:flex;align-items:baseline;justify-content:space-between;\
+         gap:1rem;margin:2rem 0 0;padding-top:1rem;\
+         border-top:1px solid rgba(255,255,255,.18);font-size:.8125rem}}\
+         dt{{color:rgba(255,255,255,.55)}}\
+         dd{{margin:0;font-weight:500}}\
          </style></head><body><main>\
-         {BRAND_MARK}\
+         <div class=\"brand\">{BRAND_MARK}<span>Lucidos</span></div>\
          <h1>{heading}</h1><p>{detail}</p>\
-         <p class=\"who\">{provider}</p>\
+         {footer}\
          </main></body></html>"
     )
 }
@@ -1711,12 +1870,23 @@ pub async fn prepare_oauth_flow(
 ) -> Result<PreparedOAuthFlow, BoxError> {
     use crate::core::CredentialStore;
 
-    // Merge requested scopes with any existing scopes for this provider
+    // What this flow will ASK for: everything the account already holds, plus
+    // everything it has ever been asked for, plus what this caller wants. Never
+    // narrower than any of the three.
+    //
+    // The `desired` half is what makes *Reconnect* able to recover a scope the
+    // provider refused. Merging only against the GRANTED set (which is all this
+    // did before) meant a reconnect passing that same granted set computed
+    // `granted UNION granted`, so an account a provider had narrowed stayed
+    // narrow forever, and the engine's own Dropbox permission error pointed the
+    // user at exactly that button.
     let existing_account = OAuthStore::get_by_provider(pool, provider).await?;
-    let merged_scopes = if let Some(ref acct) = existing_account {
-        merge_scopes(&acct.scopes, scopes)
-    } else {
-        scopes.to_string()
+    let merged_scopes = match existing_account {
+        Some(ref acct) => {
+            let held = merge_scopes(&acct.scopes, acct.desired_scopes.as_deref().unwrap_or(""));
+            merge_scopes(&held, scopes)
+        }
+        None => scopes.to_string(),
     };
 
     // Look up client credentials
@@ -1857,9 +2027,15 @@ pub async fn prepare_oauth_flow(
             // Use actually granted scopes from the token response, fall back to what we requested
             let granted_scopes = token_resp.scope.as_deref().unwrap_or(&merged_scopes);
 
-            // Store account with granted scopes. `connect` announces
-            // OAuthAccountConnected from inside the write path, so every device
-            // reloads its Accounts list without waiting for a page refresh.
+            // Store account with granted scopes AND the set that was requested.
+            // Recording the request is what lets a later *Reconnect* ask for a
+            // scope this authorization did not get: the difference between these
+            // two arguments IS the shortfall, and before this it was computed,
+            // used to build one URL, and thrown away.
+            //
+            // `connect` announces OAuthAccountConnected from inside the write
+            // path, so every device reloads its Accounts list without waiting
+            // for a page refresh.
             OAuthStore::connect(
                 &pool,
                 &event_bus,
@@ -1870,6 +2046,7 @@ pub async fn prepare_oauth_flow(
                 token_resp.refresh_token.as_deref(),
                 token_expiry,
                 granted_scopes,
+                &merged_scopes,
                 initiator,
             )
             .await

@@ -1082,26 +1082,31 @@ fn test_untouched_context_reports_nothing_trimmed() {
     assert!(!outcome.any());
 }
 
-/// `estimate_tokens_from_chars` must be the exact inverse of the budget's
-/// chars/token assumption — otherwise the displayed "Context: N tokens"
-/// drifts from the trim budget and gives a false reading. If
+/// `budget_tokens_from_chars` must be the exact inverse of the budget's
+/// chars/token assumption. The trim log lines print the content and the
+/// budget side by side, so a drift here makes "over budget" unreadable: the
+/// same char budget would report as a token count that isn't the window. If
 /// `agent_context_char_budget(model)` yields B chars on a window of W
-/// tokens, then `estimate_tokens_from_chars(B)` must yield ≤ W (saturating
+/// tokens, then `budget_tokens_from_chars(B)` must yield ≤ W (saturating
 /// down by at most 1 from integer division).
+///
+/// Note this is deliberately NOT `estimate_tokens_from_chars`, which answers
+/// "how many tokens is this really" at a measured 2.5 chars/token and does
+/// not round-trip the budget. See both doc comments in `context.rs`.
 #[test]
-fn test_token_estimate_matches_budget_ratio() {
+fn test_budget_token_round_trip_matches_budget_ratio() {
     for model in ["claude-opus-4-7", "claude-opus-4-7[1m]", "gpt-5"] {
         let window = context_window_from_prefix(model);
         let usable = window - RESPONSE_TOKEN_RESERVE;
         let budget_chars = agent_context_char_budget(window);
-        let estimated_tokens = estimate_tokens_from_chars(budget_chars);
+        let budget_tokens = budget_tokens_from_chars(budget_chars);
         // Round-trip should land within 1 of usable (integer-division loss).
         assert!(
-            estimated_tokens <= usable && estimated_tokens + 1 >= usable,
+            budget_tokens <= usable && budget_tokens + 1 >= usable,
             "model {}: budget={} chars round-trips to {} tokens, expected ≈ {}",
             model,
             budget_chars,
-            estimated_tokens,
+            budget_tokens,
             usable,
         );
     }

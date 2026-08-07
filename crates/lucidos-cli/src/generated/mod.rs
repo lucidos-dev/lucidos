@@ -15,25 +15,25 @@
 use crate::http::{client, send_and_print};
 use crate::workspace::{BoxError, Workspace};
 
-/// Read and clear the notification inbox. Use 'list' to see what notifications have been sent (task errors, agent nudges, etc.), 'mark_read' to clear one by id, and 'mark_all_read' to clear the whole unread inbox. To SEND a notification, use the separate send_notification tool.
+/// Read and clear the notification inbox. SENDING is the separate send_notification tool.
 #[derive(clap::Subcommand)]
 pub enum NotificationsCmd {
-    /// List inbox notifications (unread by default, or all). Returns id/title/message/read/created_at.
+    /// Inbox notifications, unread by default: id, title, message, read, created_at.
     List {
-        /// Which notifications to return: 'unread' (default) or 'all'.
+        /// 'unread' (default) or 'all'.
         #[arg(long)]
         filter: Option<String>,
-        /// Maximum number of notifications to return (1-50, default 20).
+        /// 1-50, default 20.
         #[arg(long)]
         limit: Option<i64>,
     },
     /// Mark a single notification read by id.
     Read {
-        /// UUID of the notification to mark read (from the 'list' action).
+        /// UUID from the 'list' action.
         #[arg(long)]
         id: String,
     },
-    /// Mark every unread notification read (clears the inbox badge).
+    /// Mark every unread one read, clearing the inbox badge.
     ReadAll,
 }
 
@@ -70,24 +70,24 @@ pub fn dispatch_notifications(ws: &Workspace, cmd: NotificationsCmd) -> Result<(
     }
 }
 
-/// Read and change user preferences (Settings). 'get' lists every settable key with its current value, allowed values, default, and scope (global vs per-device); 'set' changes one key. Call 'get' before 'set' when unsure of a key or its allowed values. Device-scoped keys (theme, font, ui-scale, push) auto-apply to the calling device. This does NOT set secrets (use request_credential), add chat models (use manage_models), or change command-safety settings.
+/// Read and change user preferences (Settings). A device-scoped key (theme, font, ui-scale, push) applies to the calling device. NOT for secrets (request_credential), chat models (manage_models), or command-safety settings.
 #[derive(clap::Subcommand)]
 pub enum PreferencesCmd {
-    /// List the settable preferences with each one's current value, allowed values, default, and scope (global vs per-device).
+    /// Every settable key with its current value, allowed values, default and scope (global or per-device).
     Get {
-        /// Device id to read device-scoped overrides for; omit for the global view.
+        /// Read device-scoped overrides; omit for the global view.
         #[arg(long)]
         device_id: Option<String>,
     },
-    /// Change a single preference (theme, language, timezone, chat_model, …). Call 'get' first if unsure of the key or its allowed values.
+    /// Change one preference. Call 'get' first if unsure of the key or its allowed values.
     Set {
-        /// Preference key (e.g. 'theme', 'language', 'timezone', 'chat_model').
+        /// e.g. 'theme', 'language', 'timezone', 'chat_model'.
         #[arg(long)]
         key: String,
-        /// New value as a string ('true'/'false' for booleans, '125' for numbers, an allowed enum value).
+        /// A string: 'true'/'false', '125', or an allowed enum value.
         #[arg(long)]
         value: String,
-        /// Device id for a per-device key; omit for global keys.
+        /// For a per-device key; omit for global ones.
         #[arg(long)]
         device_id: Option<String>,
     },
@@ -127,10 +127,10 @@ pub fn dispatch_preferences(ws: &Workspace, cmd: PreferencesCmd) -> Result<(), B
     }
 }
 
-/// Create and manage triggers: scheduled (cron) and/or event-driven automations. 'create' a new trigger, 'list' existing ones, 'update' a trigger in place (prefer over delete+create, which keeps run history), 'delete', and 'pause'/'resume'. Use 'run' to fire an existing trigger once, right now, off-schedule. Cron times are in the user's local timezone (set it first). To organize triggers into panel folders, use the trigger_groups tool.
+/// Create and manage triggers: scheduled (cron) and event-driven automations. Panel folders are the trigger_groups tool.
 #[derive(clap::Subcommand)]
 pub enum TriggersCmd {
-    /// Create a NEW trigger (schedule-based via cron, event-based via on, or both). list/update existing workflows instead of recreating. Set timezone first.
+    /// Create a NEW trigger: cron, event-based `on`, or both. Update an existing one rather than recreating.
     Create {
         /// A short, descriptive name for the trigger.
         #[arg(long)]
@@ -138,31 +138,31 @@ pub enum TriggersCmd {
         /// JSON: { "type": "intent", "intent": "…" } or { "type": "script", "path": "name/run.py" }.
         #[arg(long)]
         run: String,
-        /// JSON array of 6-field cron strings in the user's local time, e.g. ["0 0 8 * * *"].
+        /// 6-field cron strings in the user's local time, e.g. ["0 0 8 * * *"].
         #[arg(long)]
         cron_expressions: Option<String>,
-        /// JSON array of event subscriptions, e.g. [{"event_type":"X","condition":{...}}].
+        /// Event subscriptions, e.g. [{"event_type":"X","condition":{...}}].
         #[arg(long)]
         on: Option<String>,
-        /// Owning app directory name (e.g. 'trigger-workflow'); deep-links notifications to that app.
+        /// Owning app directory name; deep-links notifications to that app.
         #[arg(long)]
         app_id: Option<String>,
-        /// When true, threads spawned by this trigger surface in REVIEW on completion instead of ARCHIVE.
+        /// Threads this trigger spawns surface in REVIEW on completion, not ARCHIVE.
         #[arg(long)]
         go_to_review: Option<bool>,
         /// Trigger-group id this trigger belongs to (organizational only).
         #[arg(long)]
         group_id: Option<String>,
-        /// JSON array of irreversible side-effect categories this trigger may perform unattended (e.g. ["email"]).
+        /// Irreversible side-effect categories this trigger may perform unattended, e.g. ["email"].
         #[arg(long)]
         side_effect_grant: Option<String>,
-        /// Stable kebab-case slug (directory segment for per-trigger knowhow); derived from name when omitted.
+        /// Kebab-case slug, the directory segment for per-trigger knowhow. Derived from name.
         #[arg(long)]
         slug: Option<String>,
     },
-    /// List all triggers with their names, schedules, event subscriptions, and what each runs.
+    /// All triggers with their names, schedules, subscriptions and what each runs.
     List,
-    /// Update an existing trigger's name/schedule/subscriptions/run config. Prefer over delete+create (keeps run history). Send the full replacement 'on' array.
+    /// Update name, schedule, subscriptions or run config in place. Prefer it over delete plus create, which loses run history. Send the full replacement 'on' array.
     Update {
         /// UUID of the trigger.
         #[arg(long)]
@@ -170,41 +170,41 @@ pub enum TriggersCmd {
         /// New name for the trigger.
         #[arg(long)]
         name: Option<String>,
-        /// JSON run config to change: { "type": "intent", "intent": "…" } or { "type": "script", "path": "…" }.
+        /// JSON run config: { "type": "intent", … } or { "type": "script", … }.
         #[arg(long)]
         run: Option<String>,
-        /// JSON array of 6-field cron strings in the user's local time, e.g. ["0 0 8 * * *"].
+        /// 6-field cron strings in the user's local time, e.g. ["0 0 8 * * *"].
         #[arg(long)]
         cron_expressions: Option<String>,
-        /// JSON array of event subscriptions, e.g. [{"event_type":"X","condition":{...}}].
+        /// Event subscriptions, e.g. [{"event_type":"X","condition":{...}}].
         #[arg(long)]
         on: Option<String>,
         /// Pause (true) or resume (false) the trigger.
         #[arg(long)]
         paused: Option<bool>,
-        /// Owning app directory name (e.g. 'trigger-workflow'); deep-links notifications to that app.
+        /// Owning app directory name; deep-links notifications to that app.
         #[arg(long)]
         app_id: Option<String>,
-        /// When true, threads spawned by this trigger surface in REVIEW on completion instead of ARCHIVE.
+        /// Threads this trigger spawns surface in REVIEW on completion, not ARCHIVE.
         #[arg(long)]
         go_to_review: Option<bool>,
         /// Trigger-group id this trigger belongs to (organizational only).
         #[arg(long)]
         group_id: Option<String>,
-        /// JSON array of irreversible side-effect categories this trigger may perform unattended (e.g. ["email"]).
+        /// Irreversible side-effect categories this trigger may perform unattended, e.g. ["email"].
         #[arg(long)]
         side_effect_grant: Option<String>,
-        /// Stable kebab-case slug (directory segment for per-trigger knowhow); derived from name when omitted.
+        /// Kebab-case slug, the directory segment for per-trigger knowhow. Derived from name.
         #[arg(long)]
         slug: Option<String>,
     },
-    /// Delete a trigger by id (orphans its run history — prefer update for tweaks).
+    /// Delete a trigger by id; it orphans the run history, so prefer update for tweaks.
     Delete {
         /// UUID of the trigger.
         #[arg(long)]
         id: String,
     },
-    /// Fire an existing trigger ONCE, right now, off-schedule ('run it now', 'fire it manually', an ad hoc run). The real thing: it records TriggerExecuted / last_run and runs under the trigger's own identity, side-effect grant and go_to_review, so never imitate it by copying run.intent into run_thread. Returns as soon as the run starts. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).
+    /// Fire an existing trigger ONCE, right now, off-schedule, under its own identity, side-effect grant and go_to_review, recording TriggerExecuted and last_run. Refused inside a trigger fire, on a paused trigger, and on an event-only trigger (emit its event instead).
     Run {
         /// UUID of the trigger.
         #[arg(long)]
@@ -367,12 +367,12 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
     }
 }
 
-/// Manage trigger groups — user-visible folders that organize triggers in the panel. Pure organizational label: groups don't fire or schedule anything. 'list' groups, 'create' / 'rename' / 'delete' a group, or 'reorder' them. Assign a trigger to a group via the triggers tool's group_id field.
+/// User-visible folders organizing triggers in the panel. Purely a label: a group fires and schedules nothing. Assign a trigger to one with the triggers tool's group_id.
 #[derive(clap::Subcommand)]
 pub enum TriggerGroupsCmd {
-    /// List trigger groups (id, name, order, member_count). Pure organizational folders.
+    /// Groups with id, name, order and member_count.
     List,
-    /// Create a trigger group (a named folder). Names are unique (case-insensitive).
+    /// Create a named folder. Names are unique, case-insensitively.
     Create {
         /// Group name (the section header shown in the triggers panel).
         #[arg(long)]
@@ -381,7 +381,7 @@ pub enum TriggerGroupsCmd {
         #[arg(long)]
         order: Option<i64>,
     },
-    /// Rename a trigger group. Fails if another group already uses the new name (case-insensitive).
+    /// Rename a group. Fails if another already uses the name, case-insensitively.
     Rename {
         /// UUID of the trigger group.
         #[arg(long)]
@@ -390,13 +390,13 @@ pub enum TriggerGroupsCmd {
         #[arg(long)]
         name: String,
     },
-    /// Atomic batch reorder of trigger groups — pass an array of { id, order } entries.
+    /// Atomic batch reorder: an array of { id, order } entries.
     Reorder {
         /// JSON array of { id, order } entries to reorder atomically.
         #[arg(long)]
         ordering: String,
     },
-    /// Delete a trigger group. Refuses (with member ids) when the group still has triggers — move them first.
+    /// Refused, with member ids, while the group still holds triggers: move them first.
     Delete {
         /// UUID of the trigger group.
         #[arg(long)]
@@ -458,18 +458,18 @@ pub fn dispatch_trigger_groups(ws: &Workspace, cmd: TriggerGroupsCmd) -> Result<
     }
 }
 
-/// Manage apps — 'list' all apps, 'get' one by id, 'update' an app's name/description, or 'delete' an app. (Creating an app is the separate create_app tool; editing app source is done in the app's coding-agent worktree.)
+/// Manage apps. Creating one is the separate create_app tool, and app source is edited in the app's coding-agent worktree.
 #[derive(clap::Subcommand)]
 pub enum AppsCmd {
-    /// List all apps in the workspace (id, name, description, icon).
+    /// All apps: id, name, description, icon.
     List,
-    /// Get one app's metadata by id.
+    /// One app's metadata by id.
     Get {
         /// App id (the folder name under data/apps/, e.g. 'habit-tracker').
         #[arg(long)]
         id: String,
     },
-    /// Update an app's name/description.
+    /// Update an app's name or description.
     Update {
         /// App id (the folder name under data/apps/, e.g. 'habit-tracker').
         #[arg(long)]
@@ -481,7 +481,7 @@ pub enum AppsCmd {
         #[arg(long)]
         description: Option<String>,
     },
-    /// Delete an app by id (plugin-installed apps must be removed via the plugin).
+    /// Delete an app by id; a plugin-installed one goes through the plugin.
     Delete {
         /// App id (the folder name under data/apps/, e.g. 'habit-tracker').
         #[arg(long)]
@@ -536,12 +536,12 @@ pub fn dispatch_apps(ws: &Workspace, cmd: AppsCmd) -> Result<(), BoxError> {
     }
 }
 
-/// Correct long-term memory. 'correct' searches by keyword and deletes only the entries that semantically match a wrong claim (optionally storing a correction); 'correct_by_id' removes exactly one entry by the [id: <uuid>] shown in the [Long-term Memory] block. Use 'correct_by_id' when the id is visible, 'correct' otherwise. (Reading memory is the `lucidos memory` CLI; the agent gets memory injected into its context.)
+/// Correct long-term memory. Prefer 'correct_by_id' when the [id: <uuid>] is visible. There is no read action: memory is injected into your context.
 #[derive(clap::Subcommand)]
 pub enum MemoryCmd {
-    /// Memory index stats (entry counts, sources). Read-only.
+    /// Index stats: entry counts and sources.
     Stats,
-    /// Paginated long-term-memory entries with their importance and source. Read-only.
+    /// Paginated entries with their importance and source.
     Entries {
         /// Max entries to return (default 50, capped at 200).
         #[arg(long)]
@@ -555,11 +555,11 @@ pub enum MemoryCmd {
         /// Sort order for the entries page.
         #[arg(long)]
         sort: Option<String>,
-        /// Comma-separated importance levels to include: low,medium,high,critical.
+        /// Importance levels to include: low,medium,high,critical.
         #[arg(long)]
         importance: Option<String>,
     },
-    /// Inspect one memory's source (the originating event or artifact) plus the entries derived from it. Read-only.
+    /// One memory's originating event or artifact, plus the entries derived from it.
     Source {
         /// Event UUID (required when source_type is 'event').
         #[arg(long)]
@@ -637,10 +637,10 @@ pub fn dispatch_memory(ws: &Workspace, cmd: MemoryCmd) -> Result<(), BoxError> {
     }
 }
 
-/// Inspect and tune the Thread Queue — the shared admission-control pool for background spawns AND user-initiated work. 'list' shows live entries + the active capacity policy (call it before relative changes like 'double capacity'); 'update_policy' changes caps in place (only provided fields change). Concurrency caps may be 0 to hold admission; keep max_concurrent_per_trigger at 1 unless one trigger should run fires concurrently.
+/// Inspect and tune the Thread Queue, the shared admission-control pool for background spawns AND user-initiated work. Call 'list' before a relative change like 'double capacity'. A concurrency cap may be 0 to hold admission; keep max_concurrent_per_trigger at 1 unless one trigger should run its fires concurrently.
 #[derive(clap::Subcommand)]
 pub enum ThreadQueueCmd {
-    /// List the live Thread Queue + active capacity policy ({ entries, policy }), including user-initiated occupants. Read-only — call before changing capacity so relative requests are computed from the live policy.
+    /// Live queue plus the active capacity policy ({ entries, policy }), user-initiated occupants included. Call it before changing capacity, so a relative request starts from the live numbers.
     List,
     /// Force-admit a queued entry now, ignoring every cap.
     RunNow {
@@ -681,21 +681,21 @@ pub fn dispatch_thread_queue(ws: &Workspace, cmd: ThreadQueueCmd) -> Result<(), 
     }
 }
 
-/// Manage non-secret environment variables injected into every subprocess Lucidos spawns (run_bash, run_python, scheduled scripts, coding agents). 'list' shows all name+value pairs, 'set' creates or replaces one (takes effect on the next subprocess — no restart), 'delete' removes one by name. These are NOT secret (they appear in logs/events) — for API keys, tokens, or passwords use request_credential instead.
+/// Non-secret environment variables injected into every subprocess Lucidos spawns, effective on the next one with no restart. They appear in logs and events, so use request_credential for an API key, token or password.
 #[derive(clap::Subcommand)]
 pub enum EnvVarsCmd {
-    /// List all user environment variables (name + value). These are injected into every subprocess Lucidos spawns.
+    /// Every variable with its value.
     List,
-    /// Create or replace a non-secret environment variable. Takes effect on the next subprocess — no restart.
+    /// Create or replace one.
     Set {
-        /// Variable name: uppercase letters, digits, underscores; not starting with a digit (e.g. GITHUB_TOKEN). Engine-owned names (CRED_*, OAUTH_*, PG*, PATH, internal LUCIDOS_*) are rejected.
+        /// Uppercase letters, digits and underscores, not starting with a digit. An engine-owned name (CRED_*, OAUTH_*, PG*, PATH, LUCIDOS_*) is rejected.
         #[arg(long)]
         name: String,
-        /// Variable value (plaintext, non-secret). For secrets use a credential instead.
+        /// Plaintext, non-secret. Use a credential for a secret.
         #[arg(long)]
         value: String,
     },
-    /// Remove an environment variable by name.
+    /// Remove one by name.
     Delete {
         /// Name of the variable to delete.
         #[arg(long)]
@@ -732,14 +732,14 @@ pub fn dispatch_env_vars(ws: &Workspace, cmd: EnvVarsCmd) -> Result<(), BoxError
     }
 }
 
-/// Manage the chat-model registry that powers the Lucidos Agent's model picker. Add a model the user wants available, enable/disable an existing one, or remove a user-added model. To switch the ACTIVE model instead, use set_preference(key='chat_model'). Builtin models can be disabled but not removed.
+/// The chat-model registry behind the Lucidos Agent's model picker. A builtin can be disabled but not removed. Switch the ACTIVE model with set_preference(key='chat_model').
 #[derive(clap::Subcommand)]
 pub enum ModelsCmd {
-    /// List all models in the registry (enabled + disabled, builtin + user).
+    /// Every model, enabled and disabled, builtin and user.
     List,
     /// Register a new model in the picker.
     Add {
-        /// Model id — the string sent in API requests (e.g. 'z-ai/glm-5.2', 'claude-opus-4-8@default'). Required for add/enable/disable/remove.
+        /// The string sent in API requests (e.g. 'z-ai/glm-5.2'). Required for add/enable/disable/remove.
         #[arg(long)]
         id: String,
         /// Human-friendly display name for 'add' (defaults to the id).
@@ -748,14 +748,14 @@ pub enum ModelsCmd {
         /// Backend that serves the model. Required for 'add'.
         #[arg(long)]
         provider: String,
-        /// Optional display order (lower sorts first; user models default to 1000).
+        /// Lower sorts first; user models default to 1000.
         #[arg(long)]
         sort_order: Option<i64>,
-        /// Context window in tokens (e.g. 1048576). Set it to the window the model actually serves. Omitting it falls back to guessing from the model id (claude-* → 200k unless the id ends in [1m], gpt-5* → 400k, anything else → 200k) — that guess has no rule for OpenRouter / Gemini / local ids, so they are treated as 200k however large they really are. Guesses err low on purpose: too low only trims context early, too high makes the provider reject the request.
+        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose: too low only trims context early, too high makes the provider reject the request.
         #[arg(long)]
         context_window: Option<i64>,
     },
-    /// Edit a model's label/provider/sort_order/enabled (CLI generic PUT).
+    /// Edit label, provider, sort_order or enabled.
     Update {
         /// Model id (the request string, e.g. 'z-ai/glm-5.2').
         #[arg(long)]
@@ -766,17 +766,17 @@ pub enum ModelsCmd {
         /// Backend that serves the model.
         #[arg(long)]
         provider: Option<String>,
-        /// Optional display order (lower sorts first; user models default to 1000).
+        /// Lower sorts first; user models default to 1000.
         #[arg(long)]
         sort_order: Option<i64>,
         /// Whether the model is enabled (shown in the picker).
         #[arg(long)]
         enabled: Option<bool>,
-        /// Context window in tokens (e.g. 1048576). Set it to the window the model actually serves. Omitting it falls back to guessing from the model id (claude-* → 200k unless the id ends in [1m], gpt-5* → 400k, anything else → 200k) — that guess has no rule for OpenRouter / Gemini / local ids, so they are treated as 200k however large they really are. Guesses err low on purpose: too low only trims context early, too high makes the provider reject the request.
+        /// Context window in tokens (e.g. 1048576), what the model actually serves. Omitting it guesses from the model id: 1M for an id carrying [1m], 400k for gpt-5*, 200k for everything else including OpenRouter, Gemini and local ids however large they are. The guess errs low on purpose: too low only trims context early, too high makes the provider reject the request.
         #[arg(long)]
         context_window: Option<i64>,
     },
-    /// Delete a user-added model (builtins can't be removed — disable instead).
+    /// Delete a user-added model; a builtin can only be disabled.
     Delete {
         /// Model id (the request string, e.g. 'z-ai/glm-5.2').
         #[arg(long)]

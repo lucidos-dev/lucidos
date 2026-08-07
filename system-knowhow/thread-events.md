@@ -1,11 +1,11 @@
 ---
 name: ThreadEvent Reference
-description: The full enumerated list of `ThreadEvent` variants the Lucidos engine emits: chat-side (MessageReceived, ResponseGenerated, …), coding-agent (CodingAgent*), thread lifecycle (ThreadStarted, ThreadArchived, …), changes (ChangeProposed, ChangeApplied, …), background bash, plugin / repo / merge-conflict, transient SSE-only request events (AppUiRefreshRequested, AppUiCaptureRequested, …). Documents each variant's payload, volume class, whether it's persisted, and whether a workspace trigger can subscribe to it via an `on:` entry (the scheduler uses a blocklist, so every persisted variant is triggerable except a small set of high-volume streaming / per-action ones). Load when the user asks "what events fire on a thread", "can I trigger on ResponseGenerated / ChangeApplied / TriggerCompleted / BackgroundBashCompleted", "list every ThreadEvent", "is X event persisted", "what payload does Y carry", or talks about the EventBus, event sourcing, SSE event stream, event-based triggers, projections, and especially before wiring an `on:` subscription to a high-volume variant. **Also the canonical answer to "can an app or the events tool query engine events?"** Yes, and § "One table, two enums" is the statement of the `ThreadEvent` vs `SystemEvent` vs `DomainEvent` split: two Rust enums over ONE `events` table, so `lucidos.events.query`, `lucidos events query`, `/api/v1/events/query` and the `events` LLM tool all return every kind. Read that section before claiming any event is unreachable from an app, or before answering "how does an app read a child thread's outcome". For the coding-agent deep-dive (UserQuestion vs permission distinction, CodingAgentIdled semantics, the no-`CodingAgentErrored` gap), see `system-knowhow/coding-agent-events.md`.
+description: Every `ThreadEvent` the engine emits, by family (chat, coding-agent, thread lifecycle, changes, background bash, plugin, repo, merge conflict, and the transient SSE-only request events), with each one's payload, volume class, persistence, and whether a trigger can subscribe. Load for "what events fire on a thread", "can I trigger on ResponseGenerated / ChangeApplied / BackgroundBashCompleted", "is X persisted", "what payload does Y carry", or whether an app can read engine events.
 ---
 
 # ThreadEvent Reference
 
-The complete enumerated list of `ThreadEvent` — the per-thread event family that flows through the EventBus into PostgreSQL, the SSE stream, and (for one curated entry) the trigger matcher. Source of truth: `crates/lucidos-engine/src/engine/thread_events.rs`. Variant names below are the **current** names; legacy aliases (e.g. `ClaudeCodeIdled`, `SessionRecovered`, `parent_thread`, `task_id` / `task_name`) exist as `#[serde(alias = ...)]` on the wire so old DB rows decode cleanly — write new code, new triggers, and new docs against the current name only.
+The complete enumerated list of `ThreadEvent`, the per-thread event family that flows through the EventBus into PostgreSQL, the SSE stream, and (for one curated entry) the trigger matcher. Source of truth: `crates/lucidos-engine/src/engine/thread_events/` (the enum itself is in `event.rs`). Variant names below are the **current** names; legacy aliases (e.g. `ClaudeCodeIdled`, `SessionRecovered`, `parent_thread`, `task_id` / `task_name`) exist as `#[serde(alias = ...)]` on the wire so old DB rows decode cleanly. Write new code, new triggers, and new docs against the current name only.
 
 For the coding-agent slice (`CodingAgent*` + the `UserQuestion*` / permission machinery) the deep-dive lives in `system-knowhow/coding-agent-events.md`. This file is the master enumeration; the coding-agent entries below summarize and link.
 
@@ -49,7 +49,7 @@ The blocklist contains exactly the per-token streaming variants — many fires p
 - `CodingAgentTextStreamed`
 - `CodingAgentThoughtStreamed`
 
-Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemorySearched`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable** — fire once per discrete action, scope with per-entry `condition:` filters (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`, `estimated_total_tokens: { $gt: 150000 }`).
+Per-action variants with high cardinality (`ToolCalled`, `ToolResult`, `CodingAgentToolCalled`, `CodingAgentToolResult`, `ContextCaptured`, `MemorySearched`, `ImageDescribed`, `UserPromptInjected`, `CodingAgentPromptSent`) are **triggerable**: they fire once per discrete action, scoped with per-entry `condition:` filters (e.g. `name: "Bash"`, `estimated_total_tokens: { $gt: 150000 }`). A condition reads TOP-LEVEL payload fields only, with operators `$eq` / `$ne` / `$lt` / `$lte` / `$gt` / `$gte` / `$in` and a bare value meaning `$eq`. There is no regex operator and no nested path, and an unsupported one never matches, so a filter on the command text inside `args` silently never fires.
 
 That means right now (each example below is one entry inside a trigger's `on` list, see `system-knowhow/triggers.md` for the full subscription shape):
 
@@ -66,15 +66,15 @@ The `Triggerable` column on every table below is the binary "would a trigger fir
 
 ### Triggerable is not the same question as awaitable
 
-There are now **two** kinds of event subscription, and they share a predicate language, a matcher (`EventSubscription::matches`) and a blocklist, but not their answer for every event:
+An *event subscription* comes in **two species**, and they share a predicate language, a matcher (`EventSubscription::matches`) and a blocklist, but not their answer for every event:
 
-- A **trigger** is a persistent reactive rule. It fires every time its `on:` matches, and each firing spawns a NEW thread. "React to every X."
-- A thread's **event wait** (`await_event`) is a one-shot subscription. The calling thread finishes its turn and idles, the first match re-opens THAT thread with the event as a new message, and the wait is consumed. "Continue when the next X happens."
+- A **trigger subscription** is one entry in a *trigger*'s `on:` list, a persistent reactive rule. Each match spawns a NEW thread and leaves the subscription armed for the next one. "React to every X."
+- A **thread subscription**, whose internal name is *event wait* (`await_event`), belongs to an existing thread. The calling thread finishes its turn and idles, the first match re-opens THAT thread with the event as a new message, and the subscription is spent. "Continue when the next X happens."
 
 Two questions pick between them, and the first one is the one that gets forgotten:
 
-1. **Where does the answer go?** A trigger reaches the user as a notification from its own thread; it cannot continue the conversation they are typing in. `await_event` parks the current turn and resumes it, so the report lands in the thread they are reading. "Tell me **here** when X happens" is `await_event`, even though the phrasing sounds like a standing rule.
-2. **How long must it last?** `await_event` is one-shot and you re-arm per event, with consecutive parks capped. A reaction that must outlive the conversation and fire indefinitely is a trigger.
+1. **Where does the answer go?** A trigger reaches the user as a notification from its own thread; it cannot continue the conversation they are typing in. `await_event` re-opens the subscribing thread with a new turn, so the report lands in the thread they are reading. "Tell me **here** when X happens" is `await_event`, even though the phrasing sounds like a standing rule.
+2. **How long must it last?** `await_event` is one-shot and you re-arm per event, with consecutive subscriptions capped. A reaction that must outlive the conversation and fire indefinitely is a trigger.
 
 Being blocked is not a precondition. `await_event` is a delivery mechanism as much as a waiting one: a turn that could have ended perfectly well still uses it when the user wants the next X reported into this conversation. And `await_event` is not a stream: if you need every X forever, that is a trigger.
 
@@ -249,10 +249,10 @@ the wait, and the dispatcher's live set is rebuilt from these rows at boot.
 
 | Event | When it fires | Volume | Persisted | Triggerable | Awaitable |
 |---|---|---|---|---|---|
-| `EventWaitStarted` | A thread registered a subscription. Emitted between the `ToolCalled` and that call's `ToolResult`, so the pair closes normally and the turn carries on. Carries `wait_id`, `tool_use_id`, `on: EventSubscription[]` (same shape as a trigger's `on:`), `reason` (the model's own words, shown to the user), `expires_at`, and `watermark` (the event `sequence` at registration, which the catch-up scan reads forward from). Writes NO status. | per-action (rare) | yes | yes | **no** |
+| `EventWaitStarted` | A thread registered a subscription. Emitted between the `ToolCalled` and that call's `ToolResult`, so the pair closes normally and the turn carries on. Carries `wait_id`, `tool_use_id`, `on: EventSubscription[]` (same shape as a trigger's `on:`), `reason` (the model's own words, shown to the user), `armed_at`, `expires_at`, and `watermark` (the event `sequence` at registration, which the catch-up scan reads forward from). `armed_at` is recorded rather than derived from `expires_at`, because the age is what `list_event_waits` reports and a derived one drifts; rows written before 2026-08-07 lack it and fall back to the event row's own `created`. Writes NO status. | per-action (rare) | yes | yes | **no** |
 | `EventWaitDelivered` | A matching event resolved the wait. Carries `wait_id`, the matched `event_id` / `event_type` / `payload` (self-contained, so replay never dangles), and `matched_index` (which `on:` entry fired). | per-action (rare) | yes | yes | **no** |
 | `EventWaitExpired` | The wait passed `expires_at`. **Wakes the thread** with an explanatory message rather than dropping it: a silently dropped wait is a permanently stalled thread, which is worse than the polling this replaces. Carries `wait_id`. | per-action (rare) | yes | yes | **no** |
-| `EventWaitCanceled` | The user ended the wait deliberately. `cause` is one of `user_stop` (the Stop waiting button), `thread_canceled`, `thread_archived`, `thread_discarded`. Note what is absent: an ordinary user message does NOT cancel, and does not disturb the subscription in any way. | per-action (rare) | yes | yes | **no** |
+| `EventWaitCanceled` | The subscription was stopped short of its own resolution. `cause` is one of `user_stop` (the **Stop waiting** button), `agent_stand_down` (the agent retired one of its own), `thread_archived`, `thread_discarded`. Note what is absent: neither an ordinary user message nor a thread-level **Stop** disturbs a subscription in any way. `thread_canceled` is a RETIRED cause, still read so pre-2026-08-07 rows replay, never emitted. Also carries `on` and `reason`, a copy of what was stopped, so the transcript entry is self-contained on replay the way a delivery is: a stop renders at its own place in the timeline and its `EventWaitStarted` is routinely outside the loaded window by then. Both are absent on pre-2026-08-07 rows. | per-action (rare) | yes | yes | **no** |
 
 ### A subscription does not hold the turn
 
@@ -263,13 +263,44 @@ Archive stays offered, and archiving cancels the subscription rather than
 stranding it. What surfaces a live subscription is the per-thread **subscription
 indicator**, not the thread status.
 
+#### It already happened: the registration result may hand you the answer
+
+A subscription watches **forward only**, so it can never fire for something that
+has already gone by. If the thing might be in the past, check state first as you
+would anyway; arming a wait for an event that already happened just idles until
+the timeout.
+
+What you do not have to worry about is the **race between that check and the
+call**. If a match landed in the few minutes just before it, registration finds
+it and names it in the `await_event` result, with its payload and how long ago
+it was.
+
+**That is a report, not a wake.** The subscription watches FORWARD from the
+moment it was armed, so it will never fire for anything the result names, and a
+turn that ends without acting on it ends with the thing unhandled. It is not
+delivered as a wake because only you can tell an event you missed from one you
+handled yourself earlier in the same turn. Act on it now, or decide out loud
+that you already did.
+
+Nothing suppresses that report except an event you were literally handed by an
+earlier wait (an `EventWaitDelivered`), so a re-arm right after a **delivery** is
+never told about the event that just woke it.
+
+Read that promise narrowly: it covers a delivery, not every wake. A
+*child-completion* wake is the other way an event re-opens a thread, and the
+fan-in writes no `EventWaitDelivered`, so if you re-arm on
+`ChildThreadCompleted` in a wake turn the report can name the very card that
+woke you. Recognise it by its `child_thread_id` and its age and carry on. Better
+still, do not subscribe to your own child at all: see the `ChildThreadCompleted`
+section below for why that wait buys nothing.
+
 #### Which wakes leave you still watching, and which do not
 
 | Wake | Subscription after it | What to do |
 |---|---|---|
 | **Delivery** (`EventWaitDelivered`) | **Spent.** The first match resolves the wait and consumes it. Any *other* live wait on the thread is untouched. | This one has stopped watching. To catch the next one, call `await_event` again *before the turn ends*. Saying you will re-subscribe is not re-subscribing: a turn that ends with no new call leaves nothing watching for it. |
 | **Expiry** (`EventWaitExpired`) | Gone. | Report what you were waiting for, rather than subscribing again to the same thing. |
-| **Cancel** (`EventWaitCanceled`) | Gone, by the user's choice. There is no wake at all: the thread is left exactly as it was. | Report back. Do not re-register unless they ask. |
+| **Stopped** (`EventWaitCanceled`) | Gone, because somebody stopped it: the **Stop waiting** button, an archive or discard, or you standing it down yourself. There is no wake at all, so the thread is left exactly as it was. | Report back. Do not re-register unless they ask. |
 
 Delivery is the one that bites. It is the only resolution that consumes the
 subscription *and* hands you a payload to act on, so it reads like the wait is
@@ -283,6 +314,11 @@ A **user message** is deliberately absent from that table, and its absence is
 the point: it resolves nothing, so every subscription survives it with its
 deadline intact and none of them needs re-registering. It used to *detach* a
 wait, which was the closest thing to a fourth row.
+
+A thread-level **Stop** is absent for the same reason, as of 2026-08-07. Stop
+ends the running turn; it does not touch a subscription, which was never holding
+that turn. It used to stop all of them, which meant pressing Stop on one turn
+silently killed unrelated watches armed hours earlier.
 
 
 **No `EventWait*` event writes a status**, and that absence is the rule rather
@@ -622,26 +658,28 @@ Both events also fire for `run_python_background`. The `command` field then carr
 {
   "type": "ContextCaptured",
   "data": {
-    "producer": "MainLlm",
+    "producer": "main_llm",
     "model": "claude-opus-4-7",
     "context_window": 200000,
     "sections": [
-      { "name": "system_prompt", "estimated_tokens": 12345, "characters": 49380 },
-      { "name": "memory", "estimated_tokens": 423, "characters": 1690 }
+      { "name": "System Instructions", "char_count": 49380, "role": "system" },
+      { "name": "Memory", "char_count": 1690, "role": "user", "group": "Memory & history" }
     ],
     "tools": ["bash", "read", "edit"],
-    "estimated_total_tokens": 28934,
-    "usage": { "input_tokens": 28310, "output_tokens": 0, "cache_read_input_tokens": 0, "cache_creation_input_tokens": 0 },
+    "estimated_total_tokens": 20428,
+    "usage": { "input_tokens": 19878, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0 },
     "trimmed": false
   }
 }
 ```
 
-`producer` is `ContextProducer` (e.g. `MainLlm`, `ClaudeCode`). `usage` is `None` pre-call and on providers that don't report it (OpenAI, Gemini); when present it carries the real provider-reported counts.
+`producer` is `ContextProducer`, serialized snake_case: `main_llm`, `claude_code`, `codex`. Match those exact values in a `condition:` filter, not the PascalCase Rust variant names, which never match. `usage` is `None` pre-call and on providers that don't report it (OpenAI, Gemini); when present it carries the real provider-reported counts.
 
 `context_window` is the model's window in tokens as the engine resolved it — the value declared on the model's *model registry* row, or, when that's unset, a guess from the model id (`[1m]`→1M, `claude-`→200k, `gpt-5`→400k, else 200k). A capture showing `200000` for a model you know is bigger means the row hasn't declared its *context window* yet, and the turn was budgeted against the smaller number.
 
-`estimated_total_tokens` covers the system prompt, the tool definitions, and the messages — the whole request, matching what the trim budget accounts for. It is an estimate at a fixed 1.5 chars/token, so compare it to `usage.input_tokens` (the real total prompt) rather than treating it as exact.
+`estimated_total_tokens` covers the system prompt, the tool definitions, and the messages: the whole request, matching what the trim budget accounts for. It is an estimate at a fixed 2.5 chars/token, measured across 12,069 captures against the real counts, so compare it to `usage.input_tokens` (the real total prompt) rather than treating it as exact. This is deliberately *not* the ratio the trim budget uses. The budget assumes a conservative 1.5 chars/token so it can never pack a prompt past the *context window*, while this number is read by a human and wants accuracy. It was 1.5 until 2026-08-07, which made every context readout run about 1.7x high. **A trigger condition on `estimated_total_tokens` written before that date wants re-scaling by 5/3**: the same prompt now reports about 0.6x what it used to, so a `{ $gt: 150000 }` threshold silently stops firing where it used to, rather than erroring.
+
+Each section carries `name`, `char_count` and `role` (`system` / `prior_message` / `user`), plus an optional `group` label and an optional `content` body (omitted when the `capture_context` preference is off). Note the field is `char_count`, not a token count: the sections carry no per-section token number, and their char counts sum to exactly the chars behind `estimated_total_tokens`. That is what lets the LLM Context Viewer show each section as a share of the capture's headline total (the measured `usage.input_tokens` when there is one, the estimate otherwise) instead of applying a ratio of its own, so the section rows always add up to the number at the top of the panel.
 
 `trimmed` means the LLM was given less than the assembled context. It covers **both** ways that happens: whole messages evicted (trim pass 2) and individual tool-result bodies replaced with `[content truncated — was N chars]` (passes 1 and 1.5). It previously reported only the eviction case, so turns whose tool results had been gutted showed as untrimmed.
 
@@ -727,6 +765,8 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 
 `status` is `success` / `failure` / `no_changes` / `canceled`. `summary` is truncated to 2000 chars. `pending_change_ids` is empty for chat children and for coding-agent children that ended without proposing anything.
 
+**The parent is woken BY this card, so it never has to wait for one.** The fan-in persists the card on the parent and re-opens that thread with the same status / summary / `pending_change_ids` an *event wait* would have delivered. That makes an `await_event` (or `lucidos await-event`) subscription on your own child's completion redundant: the engine stands the fan-in callback down when a live wait already covers the card, so it is one turn either way, but the subscription still spends part of the consecutive-subscription budget and arms a timeout that can fire while the child is still working. Awaiting a `ChildThreadCompleted` is right only for a completion that is not the awaiting thread's own child's, a grandchild's for instance, named with a `child_thread_id` condition.
+
 **One card per completed turn, not one per child.** A child can report more than once: a parent that sends a *child follow-up* revives or redirects the child, and that turn's own terminal produces a second `ChildThreadCompleted` for the same `child_thread_id`, on the same parent. A human clicking Continue on a coding-agent child does the same. So do not treat `child_thread_id` as a key; the events are a log of completed turns.
 
 **A steer is not a completion.** A `ResponseCanceled` whose cause is `superseded_by_followup` is the mid-turn redirect the engine arms when a follow-up lands on a live Codex turn: the caller steered, they did not abandon, and the child runs the redirected turn immediately afterwards. It fires no `ChildThreadCompleted` and no parent wake. The redirected turn's own terminal is the report.
@@ -791,12 +831,17 @@ Multiple events with the same `change_id` arrive for a branch (one per commit). 
 `origin.reason.kind` is `continuation_started` (legacy alias `session_recovered`).
 
 `reason` (optional) mirrors the originating `ContinuationRequested.reason` so the
-timeline can label the resume honestly. `user_clicked_continue` is a genuine
-resume after an engine restart (the user tapped "continue"); `auto_recovery_after_hang`
-fires for a hung subprocess OR a stray signal-kill where **nothing restarted**
-(e.g. another workspace's `cargo check` build-lock kill landing on this coding
-agent's process) — the UI labels that "Resumed after an interruption", not
-"Resumed after engine restart". Absent on legacy rows and the chat-rerun path.
+timeline can label the resume honestly, naming which interruption it recovered
+from. `user_clicked_continue` is a genuine resume after an engine restart (the
+user tapped "continue"). `auto_recovery_after_hang` fires for a hung subprocess
+OR a stray signal-kill where **nothing restarted** (e.g. another workspace's
+`cargo check` build-lock kill landing on this coding agent's process), and the UI
+labels it "Resumed after the session stopped responding".
+`auto_resume_after_api_error` is the engine picking a turn back up after a
+transient upstream failure the agent reported itself, labelled "Resumed after the
+model connection dropped". Neither of the two auto reasons claims "Resumed after
+engine restart", and the two are worded apart because both can fire on one thread
+minutes apart. Absent on legacy rows and the chat-rerun path.
 
 **The boundary confers no thread type.** `ContinuationStarted` is emitted on all
 three channels — `chat` and `trigger` from `emit_resume_anchor` (reached from
@@ -837,7 +882,7 @@ run:
 
 Three knobs:
 
-1. **Pick the right event.** Lifecycle / one-per-turn variants are usually what you want. Per-action variants (e.g. `ToolCalled`, `CodingAgentToolCalled`, `ContextCaptured`, `ImageDescribed`) fire many times per turn — always pair them with the entry's `condition:` filter so the trigger only matches the case you care about (e.g. `name: "Bash"`, `args.command: { $regex: "git push" }`, `estimated_total_tokens: { $gt: 150000 }`).
+1. **Pick the right event.** Lifecycle / one-per-turn variants are usually what you want. Per-action variants (e.g. `ToolCalled`, `CodingAgentToolCalled`, `ContextCaptured`, `ImageDescribed`) fire many times per turn, so always pair them with the entry's `condition:` filter so the trigger only matches the case you care about (e.g. `name: "Bash"`, `estimated_total_tokens: { $gt: 150000 }`). Top-level fields only, and no regex operator: see § "Volume classes".
 2. **Per-token streaming is off-limits.** `TextStreamed` / `ThoughtStreamed` / `CodingAgentTextStreamed` are blocked at the scheduler. Subscribing to one validates and persists, but the matcher never sees the event. If a workspace genuinely needs token-level reactivity, it has to consume the SSE stream directly — not from a trigger.
 3. **For workspace-defined signals**, `lucidos events emit` (or the `emit_event` LLM tool) writes a `SystemEvent::DomainEvent` that flows through the matcher unconditionally. Use this when you want a name that isn't part of the engine's own ThreadEvent enum (e.g. `OuraDataImported`, `BuildBroken`) — see `system-knowhow/lucidos-cli.md`.
 

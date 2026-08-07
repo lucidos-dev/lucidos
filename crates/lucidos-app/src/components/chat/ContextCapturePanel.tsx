@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useState } from 'preact/hooks';
 import type { ContextSection, ContextCapture, Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
-import { formatTokens, estimateTokens, contextPercent } from '../../utils/formatTokens';
+import { formatTokens, contextPercent } from '../../utils/formatTokens';
 import { groupSections, type RoleGroup, type InnerGroup } from './contextGrouping';
+import { sectionTokenScale, headlineTokens, type TokenScale } from './sectionTokens';
 import { fetchContextCapture, type ContextCapturePayload } from '../../api/threads';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { mergeContextCaptureSections, needsLazyFetch } from './loadStrippedSections';
@@ -18,7 +19,10 @@ function formatChars(n: number): string {
   return `${n}`;
 }
 
-function ContextSectionRow({ section }: { section: ContextSection }) {
+/** `tokens` is the scale from `sectionTokenScale`: a share of the capture's
+ *  headline total, threaded down from `ContextSectionsArea` so every row in
+ *  the tree divides the same measured (or same estimated) pie. */
+function ContextSectionRow({ section, tokens }: { section: ContextSection; tokens: TokenScale }) {
   const [open, setOpen] = useState(false);
   return (
     <div class="context-section" data-role="section-row">
@@ -26,7 +30,7 @@ function ContextSectionRow({ section }: { section: ContextSection }) {
         <span>{open ? '▼' : '▶'}</span>
         <span class="context-section-name">{section.name}</span>
         <span class="context-section-chars">
-          {formatChars(section.char_count)} chars · ≈{formatTokens(estimateTokens(section.char_count))} tokens
+          {formatChars(section.char_count)} chars · ≈{formatTokens(tokens(section.char_count))} tokens
         </span>
       </button>
       {open && section.content !== undefined && (
@@ -41,7 +45,7 @@ function ContextSectionRow({ section }: { section: ContextSection }) {
   );
 }
 
-function ContextInnerGroup({ group }: { group: InnerGroup }) {
+function ContextInnerGroup({ group, tokens }: { group: InnerGroup; tokens: TokenScale }) {
   const [open, setOpen] = useState(true);
   const totalChars = group.sections.reduce((a, s) => a + s.char_count, 0);
   return (
@@ -50,15 +54,15 @@ function ContextInnerGroup({ group }: { group: InnerGroup }) {
         <span>{open ? '▾' : '▸'}</span>
         <span class="context-inner-label">{group.name}</span>
         <span class="context-inner-chars">
-          {formatChars(totalChars)} · ≈{formatTokens(estimateTokens(totalChars))}
+          {formatChars(totalChars)} · ≈{formatTokens(tokens(totalChars))}
         </span>
       </button>
-      {open && group.sections.map(s => <ContextSectionRow key={s.name} section={s} />)}
+      {open && group.sections.map(s => <ContextSectionRow key={s.name} section={s} tokens={tokens} />)}
     </div>
   );
 }
 
-function ContextRoleGroup({ role }: { role: RoleGroup }) {
+function ContextRoleGroup({ role, tokens }: { role: RoleGroup; tokens: TokenScale }) {
   const [open, setOpen] = useState(true);
   const totalChars = role.innerGroups
     .flatMap(ig => ig.sections)
@@ -69,13 +73,13 @@ function ContextRoleGroup({ role }: { role: RoleGroup }) {
         <span>{open ? '▼' : '▶'}</span>
         <span class="context-role-label">{role.label}</span>
         <span class="context-role-chars">
-          {formatChars(totalChars)} chars · ≈{formatTokens(estimateTokens(totalChars))} tokens
+          {formatChars(totalChars)} chars · ≈{formatTokens(tokens(totalChars))} tokens
         </span>
       </button>
       {open && role.innerGroups.map(ig => (
         ig.name
-          ? <ContextInnerGroup key={ig.name} group={ig} />
-          : ig.sections.map(s => <ContextSectionRow key={s.name} section={s} />)
+          ? <ContextInnerGroup key={ig.name} group={ig} tokens={tokens} />
+          : ig.sections.map(s => <ContextSectionRow key={s.name} section={s} tokens={tokens} />)
       ))}
     </div>
   );
@@ -143,6 +147,10 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
     return <div class="context-sections-loading" data-role="context-sections-loading">Loading sections…</div>;
   }
   const hydrated = mergeContextCaptureSections(snap, loadable.data);
+  // Built from the HYDRATED capture, never from `snap`: a stripped snapshot
+  // carries no sections, so a scale derived before the lazy fetch would divide
+  // by zero and flatten every row to 0 tokens.
+  const tokens = sectionTokenScale(hydrated);
   return (
     <>
       <div class="step-detail-context-meta">
@@ -153,7 +161,7 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
       </div>
       <div class="context-sections">
         {groupSections(hydrated.sections).map(role => (
-          <ContextRoleGroup key={role.role} role={role} />
+          <ContextRoleGroup key={role.role} role={role} tokens={tokens} />
         ))}
       </div>
     </>
@@ -162,7 +170,9 @@ function ContextSectionsArea({ snap }: { snap: ContextCapture }) {
 
 /** Budget bar + section list + (when usage is present) cache breakdown. */
 export function ContextCapturePanel({ snap }: { snap: ContextCapture }) {
-  const used = snap.usage?.input_tokens ?? snap.estimated_total_tokens;
+  // Same function `sectionTokenScale` divides up, so the tree below cannot
+  // disagree with this bar. Do not inline the expression here.
+  const used = headlineTokens(snap);
   const pct = contextPercent(used, snap.context_window);
   const cacheRead = snap.usage?.cache_read_tokens ?? 0;
   const cacheWrite = snap.usage?.cache_creation_tokens ?? 0;

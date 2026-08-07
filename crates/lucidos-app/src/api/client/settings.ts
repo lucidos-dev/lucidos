@@ -1,6 +1,12 @@
 import { API, json, text } from './_core';
 import { lucidos } from '@lucidos/sdk';
-import type { AuthType, EmailAccountInfo, Notification, OAuthAccountInfo } from '../../store/types';
+import type {
+  AuthType,
+  EmailAccountInfo,
+  KnownOAuthProviders,
+  Notification,
+  OAuthAccountInfo,
+} from '../../store/types';
 import type { AgentBinariesResponse, ApiResult, CredentialsListResponse, DeviceInfo, EmbeddingModelStatus, EnvVarsListResponse, MemoryEntriesResponse, MemorySourceResponse, MemoryStatsResponse, NetworkConfigResponse, NotificationsResponse } from '../types';
 
 // --- Notifications (SDK delegation) ---
@@ -156,6 +162,15 @@ export function getEmailAccount(name: string): Promise<EmailAccountInfo> {
 // --- OAuth Accounts ---
 export function listOAuthAccounts(): Promise<{ accounts: OAuthAccountInfo[] }> {
   return json(`${API}/oauth/accounts`);
+}
+
+/** The *OAuth provider registry* plus the redirect URI a flow will send.
+ *
+ *  Non-secret provider metadata, so it needs no gating. An engine with no
+ *  staged system-knowhow answers an empty `providers` list rather than failing,
+ *  and the Accounts page falls back to its typed-name path. */
+export function listKnownOAuthProviders(): Promise<KnownOAuthProviders> {
+  return json(`${API}/oauth/known-providers`);
 }
 
 export function deleteOAuthAccountApi(id: string): Promise<ApiResult> {

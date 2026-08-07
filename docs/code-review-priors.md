@@ -412,6 +412,42 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-engine/src/engine/mod.rs` `in_flight_request_event_id`,
   `record_request_event_id`.)
 
+- **The cron never-fires guard SHOULD reject a schedule whose next match is past
+  the crate's year-2100 horizon.** `validate_cron_expressions`
+  (`engine/tools/scheduler.rs`) rejects an expression when
+  `Schedule::upcoming(tz).next()` is `None`, and a reviewer reasonably objects
+  that `cron`'s `Years` unit stops at 2100, so near that boundary the iterator
+  exhausts for schedules that are calendar-satisfiable (e.g. `0 0 9 29 2 *`
+  queried after Feb 2096, since 2100 is not a leap year) and the guard calls them
+  impossible. The objection is factually right about the horizon and wrong about
+  the consequence: **the scheduler consults the same oracle**. `run_task_loop`
+  (`scheduler/task_runner.rs`) calls `next_occurrence_multi` each pass and returns
+  `Ok("no more occurrences")` on `None`, and `TriggerConfig::next_run` reports
+  nothing upcoming. So a horizon-blocked trigger genuinely does not fire under
+  this engine, and accepting it would recreate precisely the silent non-firing
+  the guard exists to eliminate. Rejecting keeps guard and runtime in agreement,
+  which is the property that matters; the fallback diagnosis names the horizon
+  (`CRON_SEARCH_HORIZON_YEAR`) so the message is not a dead end. Re-flag only if
+  the runner stops using `upcoming()` (e.g. gains its own unbounded search), or
+  if the crate's year bound is lifted, at which point the two move together
+  anyway. (Raised by a Codex review on 2026-08-07.)
+
+- **A `data/`-relative path helper that splits on `/` alone is NOT a Windows
+  bug, because there is no Windows build.** Reviews flag any path predicate or
+  splitter that assumes a forward slash (`is_vendored_path` in
+  `core/artifacts.rs` is the current example) on the theory that
+  `Path::to_string_lossy` would yield `\` separators on Windows and the check
+  would silently pass everything. Lucidos ships two shapes, the macOS
+  `.app`/`.dmg` and the headless tarball for macOS + Linux; `install.sh`
+  refuses any OS other than Darwin or Linux and no release carries a `.msi`
+  (`CLAUDE.md` § One-Click Install). Every producer of these strings is
+  `list_searchable_data_files`, which builds them as
+  `format!("{prefix}/{rel}")` on a Unix host. A stray `\`-normalizing call
+  elsewhere (`knowhow::id_from_path`) is historical, not evidence of support.
+  Re-flag only if a Windows target lands, at which point the fix is one
+  normalization at the walk, not per-predicate. (`core/artifacts.rs`,
+  `engine/chat/process/workspace_payload.rs`.)
+
 ## Frontend
 
 - **`sendCompose`'s catch cannot be reached by a failed chat POST, so a reviewer
@@ -1078,6 +1114,24 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-app/src/desktop.rs` `ensure_login_agent_installed`,
   `login_launch_script`.)
 
+- **An OAuth flow recorded with `provider: null` deliberately matches any
+  completion.** `handleOAuthAccountConnected`
+  (`store/actions/oauth.ts`) fronts the window only when `oauthAuthFlow` names
+  the provider the event carries, OR when it names no provider at all, and that
+  second arm reads like a hole in the check. It is the only thing the agent path
+  can say: the engine's `NavigationRequested` for an authorization
+  (`engine/tools/credentials.rs`) carries `purpose: "oauth"` and a URL, no
+  provider, so the page opening it does not know which provider it is
+  authorizing. Plumbing one through would not close the gap either, because the
+  navigate is scoped to the focused thread and two windows viewing that thread
+  would record the SAME provider. The distinguisher would have to be per-window,
+  which the event has no notion of. The residual is bounded: a stale marker from
+  an abandoned agent-started flow fronts its own window once, in the same
+  workspace, right after the user's own OAuth action, and never creates or
+  unhides a window. Re-flag only if the navigate payload gains a per-window
+  identity to key on. (`store/actions/oauth.ts`,
+  `crates/lucidos-engine/src/engine/tools/credentials.rs`.)
+
 ## Scripts (bash)
 
 - **`record_instance_port`'s `2>/dev/null || true` is deliberate, even though
@@ -1685,6 +1739,25 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-app/src/store/thread-events/exchange-render.ts`,
   `store/event-rendering.ts` `getEventToggleState`.)
 
+- **The event-wait routes bind the caller's thread only when the caller HAS
+  one.** `refuse_event_waits_for_another_thread` refuses a request whose
+  thread-bound origin token names a different thread than the path, and lets an
+  UNTOKENED request through. Reviews read the second half as the check being
+  incomplete: any local process could then list or stop any thread's
+  subscriptions. The asymmetry is deliberate and is the narrower of two
+  choices. The realistic actor is an agent, and an agent is by construction a
+  Lucidos-spawned subprocess carrying a token it cannot re-point, so the check
+  covers exactly the caller whose isolation the tools promise. An untokened
+  caller is the ordinary local API surface that every sibling
+  `/threads/:id/...` route already trusts (`continue`, `answer-question`,
+  `archive`, and the register route itself), and archiving a thread already
+  stops all of its subscriptions, so refusing here would move a trust boundary
+  without closing the capability. Widening it is a cross-cutting decision about
+  the whole local API, not a property of these three routes: re-flag only with
+  that decision made, or if an agent path is found that reaches them without a
+  token.
+  (`crates/lucidos-engine/src/api/threads/actions.rs`, ADR 0052.)
+
 ## Settled architecture questions
 
 - **No shared turn-lifecycle orchestrator across the agent-session loop and
@@ -1692,3 +1765,14 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`lifecycle.rs` pure decision functions + the typed terminal helpers).
 - **External-repo coding-agent threads stay out of the change/dot/blocking
   machinery** — ADR 0001.
+
+- **A rule cut from a tool schema is not a rule lost when the static system
+  prompt states it** (2026-08-07, tool-schema budget trim). The trim's whole
+  method is that where the prompt and a schema both carry a policy, the schema
+  keeps a pointer or nothing and the prompt keeps the rule, so a reviewer
+  reading only the diff sees deletions that look like dropped rules. The
+  plugins "do NOT claim it succeeded" instruction was flagged this way and is
+  in `system_prompt.rs`'s PLUGINS section verbatim. Before flagging a removed
+  instruction, grep `system_prompt.rs`, `process_helpers.rs` and the
+  `system-knowhow/*.md` body the schema now names. Re-flagging needs evidence
+  that NO surface carries it, not that the schema no longer does.

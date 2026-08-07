@@ -519,8 +519,8 @@ const PY_ERROR_BYTE_BUDGET: usize = 4096;
 /// the first and last `File "..."` frames (with the indented code line
 /// below each), and the final `ExceptionClass: message` line.
 ///
-/// Why this exists: the personal-workspace chat agent observed in
-/// `dev` thread `9d44e81c…` returned 19 errors in 500 events, most of
+/// Why this exists: a live chat agent, observed in
+/// `dev` thread `9d44e81c…`, returned 19 errors in 500 events, most of
 /// them ~30-line `ModuleNotFoundError` tracebacks dominated by
 /// interpreter / importer frames the LLM doesn't act on. Trimming the
 /// middle here cuts each error's context cost without dropping the

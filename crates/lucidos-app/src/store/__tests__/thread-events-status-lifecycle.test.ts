@@ -676,7 +676,7 @@ describe('synthesizeContextCapture — legacy event projection', () => {
     const result = synthesizeContextCapture({
       thinking: { text: 'Context: 36510 tokens, 1 messages', context_tokens: 36510, context_messages: 1 },
       tokensMeasured: { input_tokens: 23500 },
-      assembled: { sections: [{ name: 'System', content: 'sys', char_count: 3 }], tools: ['read_file'], model: 'claude-opus-4-7', total_chars: 3 },
+      assembled: { sections: [{ name: 'System', content: 'sys', char_count: 3 }], tools: ['read_file'], model: 'claude-opus-4-7' },
     });
     expect(result.producer).toBe('main_llm');
     expect(result.model).toBe('claude-opus-4-7');
@@ -692,12 +692,31 @@ describe('synthesizeContextCapture — legacy event projection', () => {
   it('synthesizeContextCapture survives missing tokensMeasured', () => {
     const result = synthesizeContextCapture({
       thinking: { text: 'Context: 1000 tokens, 2 messages', context_tokens: 1000 },
-      assembled: { sections: [], tools: [], model: 'claude-sonnet-4-6', total_chars: 0 },
+      assembled: { sections: [], tools: [], model: 'claude-sonnet-4-6' },
     });
     expect(result.usage).toBeUndefined();
     expect(result.estimated_total_tokens).toBe(1000);
     expect(result.model).toBe('claude-sonnet-4-6');
     expect(result.legacy).toBe(true);
+  });
+
+  // A ContextAssembled with no Thinking token count reports NO token total,
+  // never the assembled `total_chars`. That arm existed until 2026-08-07 and
+  // put a character count in a token field: about 2.5x the truth, presented
+  // as authoritative. The Context Viewer scales its section rows against this
+  // headline, so the lie propagated to every row in the tree. Zero is the
+  // honest answer, and the sections keep their real `char_count`s.
+  it('synthesizeContextCapture reports no tokens rather than a char count', () => {
+    const result = synthesizeContextCapture({
+      assembled: {
+        sections: [{ name: 'System', char_count: 147_800 }],
+        tools: [],
+        model: 'claude-opus-4-7',
+      },
+    });
+    expect(result.estimated_total_tokens).toBe(0);
+    expect(result.usage).toBeUndefined();
+    expect(result.sections[0].char_count).toBe(147_800);
   });
 
   // Even-older rows where only Thinking ever fired (capture_context off).

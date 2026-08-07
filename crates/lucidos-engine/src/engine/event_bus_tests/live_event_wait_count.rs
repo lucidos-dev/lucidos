@@ -43,6 +43,7 @@ async fn emit_wait_started(bus: &EventBus, thread_id: Uuid, wait_id: Uuid) {
                 condition: None,
             }],
             reason: "waiting for the release change".into(),
+            armed_at: Utc::now(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
             watermark: 0,
         },
@@ -158,6 +159,8 @@ async fn cancel_clears_the_count() {
         event: ThreadEvent::EventWaitCanceled {
             wait_id,
             cause: EventWaitCancelCause::UserStop,
+            on: vec![],
+            reason: String::new(),
         },
         meta: EventMeta::NONE,
     })

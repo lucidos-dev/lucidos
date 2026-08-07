@@ -629,8 +629,38 @@ pub struct UpdateModelRequest {
     pub context_window: Option<Option<i32>>,
 }
 
-/// Generic success/error response used by credential, preference, and trigger endpoints.
+/// The engine's read-back on a trigger's cron after a create or update: the fire
+/// times it computed, plus any non-fatal advice. Set only by the trigger write
+/// endpoints. A schedule that can never fire is a hard error instead, so a
+/// preview with an empty `next_runs` means the trigger has no cron at all.
 #[derive(Serialize)]
+pub struct CronPreview {
+    /// The next few upcoming fire times (RFC3339, in the trigger's timezone),
+    /// merged across the whole expression array under OR semantics.
+    pub next_runs: Vec<String>,
+    /// Non-fatal warnings, e.g. the day-of-month/day-of-week AND footgun.
+    pub warnings: Vec<String>,
+}
+
+impl CronPreview {
+    /// Project the engine's validation result onto the wire shape. Lives here
+    /// rather than on `ValidatedCron` so the scheduler stays unaware of the HTTP
+    /// layer.
+    pub(crate) fn from_validated(
+        validated: &crate::engine::tools::scheduler::ValidatedCron,
+    ) -> Self {
+        Self {
+            next_runs: validated.next_runs_rfc3339(),
+            warnings: validated.warnings.clone(),
+        }
+    }
+}
+
+/// Generic success/error response used by credential, preference, and trigger endpoints.
+///
+/// `Default` is what the constructors below build on, so a new optional field
+/// costs one line here instead of an edit to every one of them.
+#[derive(Serialize, Default)]
 pub struct ApiResult {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -641,45 +671,74 @@ pub struct ApiResult {
     /// When set, the frontend should open this URL for OAuth authorization.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_url: Option<String>,
+    /// When set, the next fire times and cron warnings for the trigger this call
+    /// just wrote. Trigger create / update only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cron_preview: Option<CronPreview>,
 }
 
 impl ApiResult {
     fn ok() -> Json<Self> {
         Json(Self {
             success: true,
-            error: None,
-            credential_request: None,
-            auth_url: None,
+            ..Default::default()
+        })
+    }
+    /// Success, carrying the cron read-back the caller should surface.
+    fn ok_with_cron_preview(preview: CronPreview) -> Json<Self> {
+        Json(Self {
+            success: true,
+            cron_preview: Some(preview),
+            ..Default::default()
         })
     }
     fn err(msg: impl Into<String>) -> Json<Self> {
         Json(Self {
-            success: false,
             error: Some(msg.into()),
-            credential_request: None,
-            auth_url: None,
+            ..Default::default()
         })
     }
     fn with_auth_url(url: String) -> Json<Self> {
         Json(Self {
             success: true,
-            error: None,
-            credential_request: None,
             auth_url: Some(url),
+            ..Default::default()
         })
     }
-    fn needs_credentials(provider: &str) -> Json<Self> {
+    /// No OAuth client registered yet: hand the modal a request, prefilled from
+    /// the *OAuth provider registry* when the provider is a known one.
+    ///
+    /// `overrides` used to be `OAuthClientOverrides::default()` unconditionally,
+    /// which is what made the Settings Connect button strictly worse than asking
+    /// the *Lucidos Agent*: the agent looked the endpoints up in knowhow and
+    /// passed them, while this path emitted no `defaults` block at all and left
+    /// the user to type a provider's authorization and token URLs by hand.
+    fn needs_credentials(
+        provider: &str,
+        overrides: &crate::core::oauth::OAuthClientOverrides,
+    ) -> Json<Self> {
         Json(Self {
-            success: false,
             error: Some(format!(
                 "OAuth client credentials required for {}",
                 provider
             )),
             credential_request: Some(crate::core::oauth::oauth_client_request(
-                provider,
-                &crate::core::oauth::OAuthClientOverrides::default(),
+                provider, overrides,
             )),
-            auth_url: None,
+            ..Default::default()
+        })
+    }
+
+    /// An OAuth client exists but cannot drive a flow. Same modal, targeted at
+    /// the existing row so the save repairs it instead of creating a duplicate.
+    fn needs_credential_repair(provider: &str, request: serde_json::Value) -> Json<Self> {
+        Json(Self {
+            error: Some(format!(
+                "The OAuth client registration for {} is incomplete",
+                provider
+            )),
+            credential_request: Some(request),
+            ..Default::default()
         })
     }
 }

@@ -1,7 +1,7 @@
 import { useRef, useEffect, useState, useMemo } from 'preact/hooks';
 import { Overlay } from '../shared/Overlay';
 import { signal, useSignalEffect } from '@preact/signals';
-import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, isMidTurn, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive } from '../../store/store';
+import { pendingChatMessage, showToast, openImagePopupFromGroup, focusedThreadId, threadMap, panelUrl, panelTitle, cancelingThreadIds, answeringThreadIds, clearThreadAnswering, effectiveThreadStatus, currentApp, wipPreviewThreadId, promptSendCollapsing, composeViewActive } from '../../store/store';
 import { resolveCodingAgent } from '../../store/composeSelections';
 import { sendMessage, handleCancelExchange } from '../../store/actions/chat';
 import { currentChatContext, type ChatContext } from '../../store/actions/chatContext';
@@ -29,7 +29,7 @@ import { LucidosControlMenu } from './LucidosControlMenu';
 import { EventWaitIndicator } from './EventWaitPanel';
 import { TodoListIndicator } from './TodoListPanel';
 import { getBannerSlots, getWaitingState, getStandaloneCcDiffButton, type BannerState } from './WaitingBanner';
-import { composeHasContent, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
+import { composeHasContent, computeMorphMode, computeAnswerActionMode, computePromptEscapeAction, dispatchSend, computeSubmitMultiCount, findLatestPendingQuestion, promptPlaceholder, shouldClearCanceling, shouldClearSubmitting, submittingThreadIds, canceledQuestionByThread, setCanceledQuestion, canceledWhileAwaitingByThread, setCanceledWhileAwaiting, queuedUploadSends, queueUploadSend, takeQueuedUploadSend, clearQueuedUploadSend, clearSubmittingThread, armCancelSettle, isCancelSettling, type UploadSendIntent } from './prompt-input-helpers';
 import { SplitButton } from '../shared/SplitButton';
 export * from './prompt-input-helpers';
 import { useFitsInOneRow } from '../../hooks/useFitsInOneRow';
@@ -137,7 +137,7 @@ function CameraCapture() {
     <Overlay open onClose={close} overlayClass="camera-overlay" panelClass="camera-container" panelRole="dialog">
       <video ref={videoRef} autoPlay playsInline muted class="camera-video" />
       <div class="camera-controls">
-        <button class="camera-capture-btn" onClick={capture} data-tooltip="Take photo">
+        <button class="camera-capture-btn" onClick={capture} aria-label="Take photo" data-tooltip="Take photo">
           <CaptureIcon />
         </button>
         <button class="action-btn action-btn-danger" onClick={close}>Cancel</button>
@@ -685,23 +685,26 @@ export function PromptInput() {
     // threadMap). Including it would cause an extra no-op run after each clear.
   }, [focusedThreadId.value, threadMap.value]);
 
-  // Mirror effect for the optimistic submitting flag: clear it once the
-  // thread reaches a cancellable status. From that point on, the real
-  // waitingState='canceling' drives the same morph button — the optimistic
-  // flag has done its job (covered the click → SSE gap).
+  // Mirror effect for the optimistic submitting flag. It covered the click →
+  // SSE gap; release it the moment either the real status takes over OR
+  // nothing is in flight behind it, so a Stop is never offered on a thread
+  // with no turn to stop. See `shouldClearSubmitting` for both arms.
   useEffect(() => {
     const focused = focusedThreadId.value;
     if (!focused || !submittingThreadIds.value.has(focused)) return;
     const thread = threadMap.value.get(focused);
     if (!thread) return;
-    if (isMidTurn(effectiveThreadStatus(thread))) {
+    if (shouldClearSubmitting(
+      effectiveThreadStatus(thread),
+      queuedUploadSends.value.has(focused),
+    )) {
       const next = new Set(submittingThreadIds.value);
       next.delete(focused);
       submittingThreadIds.value = next;
     }
     // See cancelingThreadIds effect above for why submittingThreadIds.value
     // is intentionally omitted from deps.
-  }, [focusedThreadId.value, threadMap.value]);
+  }, [focusedThreadId.value, threadMap.value, queuedUploadSends.value]);
 
   // Release the optimistic answering flag once the real projection status
   // leaves `waiting_for_user_answer` — the agent's resume is confirmed (status

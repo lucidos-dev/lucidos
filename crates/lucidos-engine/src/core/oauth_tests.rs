@@ -59,6 +59,7 @@ fn make_account(
         provider: provider.to_string(),
         email: Some("test@example.com".to_string()),
         display_name: None,
+        desired_scopes: None,
         access_token: access_token.to_string(),
         refresh_token: refresh_token.map(|s| s.to_string()),
         token_expiry,
@@ -148,6 +149,7 @@ fn make_env_account(provider: &str, email: Option<&str>, token: &str) -> OAuthAc
         refresh_token: None,
         token_expiry: None,
         scopes: String::new(),
+        desired_scopes: None,
         created_at: Utc::now(),
         updated_at: Utc::now(),
     }
@@ -365,6 +367,7 @@ async fn connect_announces_and_a_token_refresh_does_not() {
         Some("refresh"),
         None,
         "openid email",
+        "openid email",
         None,
     )
     .await
@@ -382,6 +385,7 @@ async fn connect_announces_and_a_token_refresh_does_not() {
         "access2",
         Some("refresh"),
         None,
+        "openid email https://www.googleapis.com/auth/drive",
         "openid email https://www.googleapis.com/auth/drive",
         None,
     )
@@ -1630,12 +1634,72 @@ fn callback_page_wears_the_brand_surface() {
 }
 
 /// A blank provider (a flow whose name never made it this far) must not render
-/// an empty `<title>` or a stray label.
+/// an empty `<title>`, a stray label, or a hairline ruling off nothing.
 #[test]
 fn callback_page_tolerates_a_blank_provider() {
     let page = callback_page("", true);
     assert!(page.contains("<title>Lucidos</title>"), "{page}");
     assert!(page.contains("Authorization complete"), "{page}");
+    assert!(!page.contains("<dl>"), "no value, no row: {page}");
+    assert!(!page.contains("Authorized with"), "{page}");
+}
+
+/// The provider id never appears on its own. It used to be a bare trailing word
+/// under the copy (`dropbox`), which a user reading the page could not place at
+/// all, so it is now the value of a labelled row and the label says what the
+/// authorization did with it.
+#[test]
+fn callback_page_labels_the_provider_it_names() {
+    let ok = callback_page("dropbox", true);
+    assert!(
+        ok.contains("<dt>Authorized with</dt><dd>dropbox</dd>"),
+        "{ok}"
+    );
+    let failed = callback_page("dropbox", false);
+    assert!(
+        failed.contains("<dt>Tried to connect</dt><dd>dropbox</dd>"),
+        "{failed}"
+    );
+    // The label wraps the ESCAPED value, so the row can never open a tag either.
+    let hostile = callback_page("<script>alert(1)</script>", true);
+    assert!(
+        hostile.contains("<dd>&lt;script&gt;alert(1)&lt;/script&gt;</dd>"),
+        "{hostile}"
+    );
+}
+
+/// The shell is a top-anchored, left-aligned column, not a block floating dead
+/// center in a viewport of blue ("elements good, layout sucks", 2026-08-06). The
+/// values are the workspace picker's (`styles/picker.css` `.ws-picker`).
+///
+/// Asserted against the `body` rule specifically rather than the whole page,
+/// because the brand lockup legitimately centers its own two children.
+#[test]
+fn callback_page_shell_is_top_anchored_and_left_aligned() {
+    let page = callback_page("dropbox", true);
+    let body = css_rule(&page, "body{");
+    assert!(body.contains("align-items:flex-start"), "{body}");
+    assert!(!body.contains("align-items:center"), "{body}");
+    assert!(body.contains("padding:4rem"), "{body}");
+    let main = css_rule(&page, "main{");
+    assert!(!main.contains("text-align:center"), "{main}");
+    // The lockup reads left to right, the way `.ws-picker-brand` does.
+    assert!(page.contains("<div class=\"brand\">"), "{page}");
+    assert!(page.contains("<span>Lucidos</span>"), "{page}");
+}
+
+/// The declarations of one rule of the callback page's inline stylesheet, so a
+/// layout assertion can name the element it is about.
+fn css_rule<'a>(page: &'a str, selector: &str) -> &'a str {
+    let start = page
+        .find(selector)
+        .unwrap_or_else(|| panic!("no `{selector}` rule in the page: {page}"));
+    let open = start + selector.len();
+    let close = page[open..]
+        .find('}')
+        .unwrap_or_else(|| panic!("unterminated `{selector}` rule: {page}"))
+        + open;
+    &page[open..close]
 }
 
 // ---------------------------------------------------------------------------
@@ -1898,4 +1962,262 @@ fn oauth_client_request_carries_the_authorize_params() {
 fn client_provider_name_does_not_strip_a_prefix_with_nothing_after_it() {
     assert_eq!(client_provider_name("oauth:"), "oauth:");
     assert_eq!(client_provider_name("  OAuth:  "), "oauth:");
+}
+
+// ─── The registry bridge and the repair request ────────────────────────────
+//
+// The registry prefills a credential at WRITE time and never participates in a
+// flow. These pin the boundary between "seeded a credential" and "drove an
+// authorization", which is what keeps a credential the single description of
+// its own flow.
+
+use crate::core::oauth_registry::OAuthProviderRow;
+
+fn row(userinfo_method: Option<&str>) -> OAuthProviderRow {
+    OAuthProviderRow {
+        id: "acme".to_string(),
+        label: "Acme".to_string(),
+        base_url: "https://api.acme.test".to_string(),
+        auth_url: "https://acme.test/authorize".to_string(),
+        token_url: "https://api.acme.test/token".to_string(),
+        userinfo_url: Some("https://api.acme.test/me".to_string()),
+        userinfo_method: userinfo_method.map(str::to_string),
+        authorize_params: None,
+        redirect_uri: None,
+        client_type: Some("public".to_string()),
+        console_label: None,
+        console_url: None,
+        setup_hint: None,
+        permissions_hint: None,
+    }
+}
+
+#[test]
+fn from_registry_carries_every_endpoint_but_never_the_scopes() {
+    // Scopes are a property of what the connection is FOR, not of the provider,
+    // so the row must not supply them: the caller passing backup scopes and the
+    // caller passing a bare sign-in both go through here.
+    let overrides = OAuthClientOverrides::from_registry(&row(Some("POST")));
+    assert_eq!(
+        overrides.auth_url.as_deref(),
+        Some("https://acme.test/authorize")
+    );
+    assert_eq!(
+        overrides.token_url.as_deref(),
+        Some("https://api.acme.test/token")
+    );
+    assert_eq!(
+        overrides.userinfo_url.as_deref(),
+        Some("https://api.acme.test/me")
+    );
+    assert_eq!(overrides.userinfo_method.as_deref(), Some("POST"));
+    assert_eq!(overrides.base_url.as_deref(), Some("https://api.acme.test"));
+    assert_eq!(overrides.scopes, None);
+}
+
+#[test]
+fn a_registry_prefilled_request_asks_only_for_the_client_id() {
+    // The whole point of the registry: every endpoint arrives in `defaults`, so
+    // the modal's endpoint section is prefilled and collapsed rather than blank
+    // and titled "(required)".
+    let req = oauth_client_request("acme", &OAuthClientOverrides::from_registry(&row(None)));
+    assert_eq!(req["base_url"], "https://api.acme.test");
+    assert_eq!(req["defaults"]["auth_url"], "https://acme.test/authorize");
+    assert_eq!(req["defaults"]["token_url"], "https://api.acme.test/token");
+    // Absent on the row means absent in the request, never present-as-null: the
+    // modal reads a missing key as "not prefilled".
+    assert!(
+        req["defaults"].get("userinfo_method").is_none(),
+        "an unset userinfo_method must not reach the modal: {req}"
+    );
+}
+
+// ─── missing_flow_fields ───────────────────────────────────────────────────
+
+#[test]
+fn a_complete_client_is_missing_nothing() {
+    let complete =
+        r#"{"client_id":"abc","auth_url":"https://a.test/x","token_url":"https://a.test/t"}"#;
+    assert!(missing_flow_fields(complete).is_empty());
+}
+
+#[test]
+fn the_endpointless_client_reports_both_urls() {
+    // Exactly the credential the old form let a user save: a client id and
+    // nothing else. It reached `prepare_oauth_flow` and died there with
+    // "Missing auth_url in OAuth credentials", one screen from the cause.
+    assert_eq!(
+        missing_flow_fields(r#"{"client_id":"abc"}"#),
+        vec!["auth_url", "token_url"]
+    );
+}
+
+#[test]
+fn a_blank_or_whitespace_value_counts_as_missing() {
+    // `prepare_oauth_flow` trims and rejects an empty client_id, so a credential
+    // holding one cannot drive a flow either. Reporting it as present would send
+    // the user back to the same dead end.
+    assert_eq!(
+        missing_flow_fields(
+            r#"{"client_id":"  ","auth_url":"https://a.test/x","token_url":"https://a.test/t"}"#
+        ),
+        vec!["client_id"]
+    );
+}
+
+#[test]
+fn an_unparseable_secret_counts_as_missing_everything() {
+    // There is no recoverable client id inside a blob that is not JSON, so
+    // reopening the form prefilled beats a toast about JSON.
+    assert_eq!(
+        missing_flow_fields("not json at all"),
+        vec!["client_id", "auth_url", "token_url"]
+    );
+}
+
+// ─── oauth_client_repair_request ───────────────────────────────────────────
+
+#[test]
+fn a_repair_request_targets_the_existing_row_and_keeps_the_client_id() {
+    // Both are what stop a repair from creating a SECOND oauth_client for one
+    // provider: the id routes the save to an update, and the retained client id
+    // means the user is not asked again for a value they already gave.
+    let id = uuid::Uuid::new_v4();
+    let req = oauth_client_repair_request(
+        "acme",
+        &OAuthClientOverrides::from_registry(&row(None)),
+        id,
+        Some("abc"),
+        &["auth_url", "token_url"],
+    );
+    assert_eq!(req["existing_credential_id"], id.to_string());
+    assert_eq!(req["defaults"]["client_id"], "abc");
+    assert_eq!(req["defaults"]["auth_url"], "https://acme.test/authorize");
+    assert_eq!(req["missing"][0], "auth_url");
+    assert_eq!(req["missing"][1], "token_url");
+}
+
+#[test]
+fn a_repair_prompt_names_what_is_missing() {
+    let req = oauth_client_repair_request(
+        "acme",
+        &OAuthClientOverrides::default(),
+        uuid::Uuid::new_v4(),
+        None,
+        &["auth_url", "token_url"],
+    );
+    let prompt = req["prompt"].as_str().unwrap();
+    assert!(
+        prompt.contains("auth_url and token_url"),
+        "the prompt must name the fields, got: {prompt}"
+    );
+}
+
+#[test]
+fn a_repair_request_with_no_registry_row_still_carries_its_target() {
+    // An unknown provider has no defaults to seed, but the repair must still
+    // update rather than duplicate. This is the case where indexing into an
+    // absent `defaults` block would be easy to get wrong.
+    let id = uuid::Uuid::new_v4();
+    let req = oauth_client_repair_request(
+        "unknown-thing",
+        &OAuthClientOverrides::default(),
+        id,
+        Some("abc"),
+        &["auth_url"],
+    );
+    assert_eq!(req["existing_credential_id"], id.to_string());
+    assert_eq!(req["defaults"]["client_id"], "abc");
+}
+
+// ─── desired_scopes: Reconnect must be able to widen ───────────────────────
+//
+// `scopes` records what the provider GRANTED. Reconnect used to re-request it,
+// and `prepare_oauth_flow` merges a request with the existing grant, so the
+// merge computed `granted UNION granted`: a no-op. An account a provider had
+// narrowed could never recover the difference, which is exactly what the
+// engine's Dropbox permission error tells the user to do with that button.
+
+#[tokio::test]
+async fn connect_records_what_was_asked_for_beside_what_was_granted() {
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    crate::test_support::seed_oauth_account_with_desired(
+        &pool,
+        "acme",
+        Some("user@example.com"),
+        None,
+        "access",
+        None,
+        None,
+        "read",
+        "read write",
+    )
+    .await
+    .unwrap();
+
+    let account = OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .expect("seeded account");
+    assert_eq!(account.scopes, "read");
+    assert_eq!(account.desired_scopes.as_deref(), Some("read write"));
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db).await;
+}
+
+#[test]
+fn a_refused_scope_survives_into_the_next_request() {
+    // The accumulation `prepare_oauth_flow` performs, in the shape that matters:
+    // asked for two, granted one, and the next flow must still ask for two.
+    let granted = "read";
+    let desired = "read write";
+    let held = merge_scopes(granted, desired);
+    assert_eq!(merge_scopes(&held, desired), "read write");
+}
+
+#[test]
+fn accumulating_never_drops_a_scope_the_caller_did_not_mention() {
+    // A reconnect asking only for what one page needs must not narrow an account
+    // another page widened. Union, never replace.
+    let held = merge_scopes("read", "read write");
+    assert_eq!(merge_scopes(&held, "admin"), "read write admin");
+}
+
+#[tokio::test]
+async fn a_legacy_account_with_no_desired_set_is_never_narrowed() {
+    // Every account connected before the column existed reads NULL. The merge
+    // has to treat that as "nothing extra", not as an empty set that replaces
+    // the grant.
+    let (pool, db) = crate::test_support::setup_test_db().await;
+    crate::test_support::seed_oauth_account(
+        &pool,
+        "acme",
+        Some("user@example.com"),
+        None,
+        "access",
+        None,
+        None,
+        "read write",
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE oauth_accounts SET desired_scopes = NULL WHERE provider = 'acme'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let account = OAuthStore::get_by_provider(&pool, "acme")
+        .await
+        .unwrap()
+        .expect("seeded account");
+    assert_eq!(account.desired_scopes, None);
+    let held = merge_scopes(
+        &account.scopes,
+        account.desired_scopes.as_deref().unwrap_or(""),
+    );
+    assert_eq!(held, "read write");
+
+    pool.close().await;
+    crate::test_support::teardown_test_db(&db).await;
 }

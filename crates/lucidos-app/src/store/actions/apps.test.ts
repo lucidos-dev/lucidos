@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
-import { panelOverlay, currentApp, appsList, inputMode, appRefreshKey, splitRatio, toasts, wipPreviewThreadId, threadMap, focusedThreadId, threadsLoaded } from '../store';
+import { panelOverlay, currentApp, appsList, appPseudoFullscreen, inputMode, appRefreshKey, splitRatio, toasts, wipPreviewThreadId, threadMap, focusedThreadId, threadsLoaded } from '../store';
 import type { App } from '../types';
 import { makeOptimisticThreadState } from '../thread-events';
 // Importing the wipPreview module installs the auto-revert effect that
@@ -369,5 +369,59 @@ describe('openApp expands the content pane on desktop', () => {
     openApp(notesApp);
 
     expect(splitRatio.value).toBe(0.7);
+  });
+});
+
+describe('exitAppFullscreen', () => {
+  // The `document` stub in test-setup.ts is a plain object, so the fullscreen
+  // surface is whatever a test puts on it. Restore per test.
+  const doc = document as unknown as Record<string, unknown>;
+
+  beforeEach(() => {
+    appPseudoFullscreen.value = false;
+    delete doc.fullscreenElement;
+    delete doc.webkitFullscreenElement;
+    delete doc.exitFullscreen;
+    delete doc.webkitExitFullscreen;
+  });
+
+  afterEach(() => {
+    appPseudoFullscreen.value = false;
+    delete doc.fullscreenElement;
+    delete doc.webkitFullscreenElement;
+    delete doc.exitFullscreen;
+    delete doc.webkitExitFullscreen;
+  });
+
+  it('reports nothing to leave when no app panel is fullscreen', async () => {
+    const { exitAppFullscreen } = await import('./apps');
+    expect(exitAppFullscreen()).toBe(false);
+  });
+
+  it('ends the CSS pseudo-fullscreen fallback', async () => {
+    appPseudoFullscreen.value = true;
+    const { exitAppFullscreen } = await import('./apps');
+    expect(exitAppFullscreen()).toBe(true);
+    expect(appPseudoFullscreen.value).toBe(false);
+  });
+
+  it('exits native fullscreen through the unprefixed API', async () => {
+    doc.fullscreenElement = {};
+    const exit = vi.fn().mockResolvedValue(undefined);
+    doc.exitFullscreen = exit;
+    const { exitAppFullscreen } = await import('./apps');
+    expect(exitAppFullscreen()).toBe(true);
+    expect(exit).toHaveBeenCalledTimes(1);
+  });
+
+  it('exits native fullscreen through the webkit spelling, which returns void not a promise', async () => {
+    // A bare `.then` on the prefixed call throws a TypeError synchronously, so
+    // the void return is the case worth pinning.
+    doc.webkitFullscreenElement = {};
+    const exit = vi.fn();
+    doc.webkitExitFullscreen = exit;
+    const { exitAppFullscreen } = await import('./apps');
+    expect(exitAppFullscreen()).toBe(true);
+    expect(exit).toHaveBeenCalledTimes(1);
   });
 });

@@ -584,21 +584,34 @@ export function BackupSection() {
         // but now with a way out of it. This was static prose naming a path,
         // which left the user to walk it themselves; the button lands them on
         // the Connected accounts section directly.
-        <div class="backup-blocked-row">
+        <div class="backup-blocked-state">
           <span>No {providerInfo.name} account connected, so backups cannot upload.</span>
-          <button class="action-btn action-btn-confirm" onClick={openConnectedAccountsSettings}>
+          {/* The deep-link carries the provider AND the scopes an upload needs,
+              so the one consent screen covers signing in and granting access.
+              Handing over only the provider left the user back here facing
+              *Grant access*: a second trip through the same screen for what
+              they asked for once. */}
+          <button
+            class="action-btn action-btn-confirm"
+            onClick={() =>
+              openConnectedAccountsSettings(
+                oauthProviderFor(providerInfo.id),
+                PROVIDER_SCOPES[providerInfo.id],
+              )
+            }
+          >
             Connect {providerInfo.name}
           </button>
         </div>
       )}
 
       {providerInfo && providerInfo.connected && !providerInfo.ready && (
-        // The other blocked state, and deliberately the same row: an account
+        // The other blocked state, and deliberately the same layout: an account
         // exists, so the fix is a re-authorization rather than a connection.
         // The line names the permissions the grant is short whenever the engine
         // reports them, because a bare refusal sentence reads identically after
         // a completed authorization and before one.
-        <div class="backup-blocked-row">
+        <div class="backup-blocked-state">
           <span>{backupAccessLine(providerInfo.name, providerInfo.missing_scopes)}</span>
           <button
             class="action-btn action-btn-confirm"

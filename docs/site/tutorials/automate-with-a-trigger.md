@@ -16,7 +16,7 @@ wrong, and how to keep it from becoming notification noise.
 |---|---|
 | "Every morning, send me…" | Trigger (schedule) |
 | "Notify me when my package ships" | Trigger (event) — something has to emit that event |
-| "When either X or Y happens, do Z" | **One** trigger with two event subscriptions, not two triggers |
+| "When either X or Y happens, do Z" | **One** trigger with two trigger subscriptions, not two triggers |
 | "Check this once and tell me" | Just do it now — no trigger |
 
 If you only want it to happen once, don't create a trigger. A one-off ("remind me at
@@ -113,7 +113,7 @@ knowhow file *first*, then creates the trigger.
 ## Going deeper
 
 - **Triggers** (`system-knowhow/triggers.md`): cron vs. event in
-  depth, multi-event subscriptions, conditions, script triggers, one-shots, and
+  depth, multiple subscriptions per trigger, conditions, script triggers, one-shots, and
   notification routing.
 - **Concepts → Intent, knowhow, and scripts** ([here](../concepts.md#intent-knowhow-and-scripts)) — the
   intent/knowhow split this tutorial leans on.

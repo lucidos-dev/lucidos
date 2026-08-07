@@ -432,9 +432,10 @@ async fn user_actor_resolved_unknown_device_id_falls_back_to_short_label() {
 
 /// Helper: install a known secret for the duration of the test.
 /// `init_agent_origin_secret` is idempotent (`OnceLock::set`), so the
-/// first test to run wins for the whole process. Tests that need to
-/// assert the no-secret-installed path use the bare `subprocess_origin`
-/// without going through this helper.
+/// first test to run wins for the whole process. That is also why there is no
+/// test for the no-secret-installed path: the suite shares one process, so
+/// whether the secret is set by the time such a test ran would depend on test
+/// ordering. Every test here installs it first.
 fn install_test_secret() {
     init_agent_origin_secret("subprocess-test-secret".to_string());
 }

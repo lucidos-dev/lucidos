@@ -463,7 +463,7 @@ describe('chat follow-up while parent loop still running', () => {
     expect(followupStatus).toBe('done');
   });
 
-  // Verbatim production payload from personal workspace thread
+  // Verbatim production payload from thread
   // a81d6adc-6647-4cf4-9589-edb58eb57571 (2026-05-05). Same MR1 → many tools →
   // MR2 mid-flight → tools → UPI → tools → ResponseGenerated shape, but using
   // the actual UUIDs and timestamps so a regression that only hits a specific

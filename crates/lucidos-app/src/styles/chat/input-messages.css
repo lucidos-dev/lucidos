@@ -608,6 +608,16 @@
     overflow: hidden;
 }
 
+/* The transcript's own scroll indicator is MOBILE ONLY (styles/mobile.css gives
+   it its geometry and turns it on). On desktop `.thread-content-wrap` sits below
+   the header in normal flow, so the native scrollbar is already aligned with the
+   content and there is nothing to replace. Hidden by default rather than
+   conditionally rendered, matching `.mobile-swipe-wrapper`, so the mobile rules
+   are the only place the element's layout is described. */
+.thread-scroll-indicator {
+    display: none;
+}
+
 .thread-content {
     display: none;
     min-height: 3.75rem;
@@ -1090,6 +1100,9 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     border: none;
     cursor: pointer;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     font-size: var(--font-size-xs);
     color: var(--text-muted);
     padding: 0;
@@ -1128,6 +1141,9 @@ html[data-theme="dark"] .thread-status-question-badge::after {
     border-radius: 0.25rem;
     color: inherit;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     transition: background var(--duration-fast);
     text-align: left;
 }

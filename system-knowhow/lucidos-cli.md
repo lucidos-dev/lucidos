@@ -1,6 +1,6 @@
 ---
 name: Lucidos CLI (`lucidos`)
-description: Shell command available on PATH for any subprocess Lucidos spawns (Python, bash, Claude Code, Codex). It writes files under `data/`, emits and queries domain events, subscribes the calling thread to an event instead of polling (`lucidos await-event`), lists thread summaries (`lucidos threads list/count`), spawns threads (`lucidos spawn-thread`, including Codex via `--codex` / `--coding-agent codex` and app coding-agent threads via `--folder data/apps/<id>`), lists and applies pending changes (`lucidos changes list` / `lucidos changes apply <id>`), reads system-knowhow on demand (`lucidos knowhow list` / `lucidos knowhow read <id>`, which is how an app coding-agent thread fetches app-building guides), and calls external APIs through the engine proxy so credentials never appear in script source, args, env vars, or logs. Prefer this over hand-rolling HTTP calls back to the engine and over `curl -H "Authorization: Bearer $CRED_..."`.
+description: The `lucidos` shell command, on PATH in every subprocess Lucidos spawns (Python, bash, Claude Code, Codex): write files under data/, emit and query domain events, await an event instead of polling (and read or stop those subscriptions with `event-waits list` / `cancel`), list and spawn threads, list and apply pending changes, read system-knowhow, and call an external API through the engine proxy so credentials never reach script source, args, env or logs. Prefer it over hand-rolled HTTP back to the engine.
 ---
 
 # `lucidos` CLI
@@ -12,6 +12,7 @@ A shell command (`lucidos`) available on the `PATH` of every subprocess Lucidos 
 - list or count *thread summaries* in the workspace — useful for "is anything still running?" gates in triggers
 - spawn a new *thread* — a chat thread, or a *coding-agent thread* on a repo or an app folder (`--cc` for Claude Code, `--codex` / `--coding-agent codex` for Codex, `--folder data/apps/<id>` for app worktrees) — `lucidos spawn-thread`
 - subscribe the calling thread to an event instead of polling for it, and finish, letting the engine re-open the thread when the event lands: `lucidos await-event`
+- read what this thread is currently subscribed to, and stop watching: `lucidos event-waits list` / `lucidos event-waits cancel`
 - list pending / applied *changes* (`lucidos changes list`) and apply a pending one (the coding-agent-proposed branch waiting on the Apply button) — `lucidos changes apply <id>`
 - read engine-shipped system-knowhow (and user knowhow) — `lucidos knowhow list` / `lucidos knowhow read <id>` — the way an *app coding-agent thread* (whose worktree can't see `system-knowhow/`) pulls app-building guides on demand
 - call an external API that's configured in `data/config/apis.json` (auth header injected by the engine — credential never appears in the script)
@@ -368,15 +369,37 @@ the session*. Sitting in a sleep-and-recheck loop afterwards is the thing this
 replaces, and polling for the event as well is strictly worse than either.
 
 Reach for it whenever the thing you are waiting on is something the engine
-emits: another thread finishing (`ChildThreadCompleted`), a change appearing
-(`ChangeProposed`), a trigger firing (`TriggerExecuted`), a workspace domain
-event your own scripts emit. It is **not** for external state with no Lucidos
-event (a third-party API you can only re-query, a file another process may
-write): nothing would ever wake you, so poll for those.
+emits: a change appearing (`ChangeProposed`), a trigger firing
+(`TriggerExecuted`), a workspace domain event your own scripts emit. It is
+**not** for external state with no Lucidos event (a third-party API you can only
+re-query, a file another process may write): nothing would ever wake you, so
+poll for those.
+
+**And never subscribe to your own child's completion.** A thread spawned with
+`lucidos spawn-thread --relation child` already wakes this one: when it finishes, the
+engine emits `ChildThreadCompleted` here and re-opens this thread with the
+child's status, summary and `pending_change_ids`, which is everything a
+subscription would have handed you. So a wait on it buys nothing, and it costs
+two things: one of the consecutive subscriptions the loop cap below allows, and
+a second clock, since
+a child that outlives `--timeout-secs` wakes this thread with a pointless expiry
+and then wakes it again when it actually finishes. Await a `ChildThreadCompleted`
+only for a completion that is **not** your own child's, a grandchild's for
+instance, named with `--condition '{"child_thread_id": "<uuid>"}'`.
 
 A **rendezvous, not a stream**. The first match resolves the subscription and
 consumes it. "Continue when the next X happens" is this; "react to every X,
 forever" is a *trigger*.
+
+**It watches forward only, so still check whether it already happened.** A
+subscription cannot fire for an event that has already gone by, so if the thing
+might be in the past, look at state first as you would anyway. What you do not
+have to worry about is the race between that check and this command: if a match
+landed in the few minutes just before it, the response names it, with its age.
+Read that part rather than skimming to the `"status":"subscribed"`, and act on
+it before you finish, because nothing will wake you for it. It is a report and
+not a wake because only you can tell an event you missed from one you handled
+yourself a few minutes ago.
 
 - `--on` names the event type, PascalCase past tense. Repeat it to watch
   several: any one of them wakes the thread.
@@ -400,15 +423,70 @@ wake you twice for one event), and 10 subscriptions in a row with no message
 from the user is the loop cap.
 
 ```bash
-# Wait for a coding-agent sidequest to finish, then stop. The engine re-opens
-# this thread with the completion when it lands.
-$ lucidos await-event --on ChildThreadCompleted --timeout-secs 3600 \
-    --reason "waiting for the e2e sidequest to finish"
+# Wait for a domain event the workspace's own scripts emit, then stop. The
+# engine re-opens this thread with the payload when it lands.
+$ lucidos await-event --on E2ETestsPassed --timeout-secs 3600 \
+    --reason "waiting for tonight's e2e run to report"
 
 # Narrow it: only a change that actually touched files.
 $ lucidos await-event --on ChangeProposed --condition '{"file_count": {"$gt": 0}}' \
     --timeout-secs 1800 --reason "waiting for the refactor to propose its change"
 ```
+
+### `lucidos event-waits list` / `lucidos event-waits cancel [--wait-id <ID>] [--all]`
+
+Read and stop the **calling thread's** own subscriptions, the ones
+`lucidos await-event` armed. The coding-agent counterparts of the chat agent's
+`list_event_waits` and `cancel_event_wait` tools, on the same code underneath,
+so both agents get the same report and the same refusals. Like `await-event`,
+both take the thread from `$LUCIDOS_THREAD_ID` and have no thread flag, so
+neither can reach another thread's subscriptions.
+
+**`list` is how you answer "am I still watching for that?", and you cannot
+answer it any other way.** Nothing tells you when a subscription ends. A
+delivery wakes you, but a timeout or a user pressing **Stop waiting** lands
+while your session is not running, and a subscription is *spent* the moment it
+fires. Answering from memory is a guess: on 2026-08-06 a thread told its user
+twice that a watch was armed when it had been dead for two hours. Run it before
+saying you are still watching, before re-subscribing to something you may
+already be watching (a duplicate is refused), and to get the id `cancel` takes.
+
+Each entry carries the subscription's id, the events and conditions it watches,
+the `--reason` it was armed with, when it was armed, and when it times out, with
+both ages spelled out:
+
+```bash
+$ lucidos event-waits list
+{"count":1,"event_waits":[{"wait_id":"3f2b…","subscription":"ChangeProposed",
+  "reason":"waiting for the refactor to propose its change",
+  "armed_at":"2026-08-07T09:14:22Z","armed_ago":"7m",
+  "expires_at":"2026-08-07T09:44:22Z","expires_in":"22m"}]}
+```
+
+**`cancel` is how you stop watching.** A subscription you leave live wakes this
+thread later whatever you told the user, so when they say to stop, drop it, or
+never mind, run this rather than promising. Use it too when the thing turns out
+to have already happened, or when a new subscription supersedes an old one.
+
+Pass exactly one of `--wait-id <ID>` (from `list`) or `--all`. Neither is
+defaulted: a bare call would have to guess between stopping one and stopping
+every one, and both guesses are wrong. Stopping is silent, so nothing interrupts
+you: the subscription simply ends, the user sees it leave the subscription
+indicator, and the transcript records what was stopped.
+
+```bash
+# The user changed their mind about one of several watches.
+$ lucidos event-waits cancel --wait-id 3f2b1c04-...
+{"status":"stopped","message":"Stopped watching for ChangeProposed. It will not wake this thread."}
+
+# Stand everything down.
+$ lucidos event-waits cancel --all
+```
+
+Refusals arrive as a `400` carrying the reason: both flags or neither, and a
+`--wait-id` that is not live on this thread (already fired, timed out, already
+stopped, or belonging to another thread, which are indistinguishable and equally
+mean "not yours to stop").
 
 ### `lucidos notify --title <T> --message <M> [--app-id <APP>] [--tap <T>] [--thread-id <UUID>] [--event-id <UUID>]`
 
@@ -529,6 +607,15 @@ $ lucidos triggers delete --id <uuid>
 # Fire an existing trigger once, right now, outside its schedule
 $ lucidos triggers run --id <uuid>
 ```
+
+`--cron-expressions` entries are validated on `create` and `update`. Within one
+expression the fields are ANDed and across the array they are ORed, so
+`0 0 9 1 * Mon` is the 1st only when it is a Monday. An expression that can
+**never** fire (`0 0 9 31 2 *`, Feb 31) is refused with an error naming the
+offending fields, and a successful write returns a `cron_preview` object
+carrying `next_runs` (the next few fire times) plus any `warnings`. Read the
+preview back rather than assuming the schedule means what you intended;
+`system-knowhow/triggers.md` § "Writing cron expressions" has the recipes.
 
 `create`/`update` accept `--name`, `--run`, `--cron-expressions`, `--on`,
 `--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`, `--slug`;

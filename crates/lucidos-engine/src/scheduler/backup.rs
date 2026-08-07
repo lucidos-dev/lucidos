@@ -85,13 +85,27 @@ pub(crate) async fn run_backup(
                     "[Backup] BackupCompleted",
                 )
                 .await;
-            let keep = backup::get_retention_count(pool).await;
-            // Scope pruning to THIS workspace's archives so a shared cloud
-            // backup folder (multiple workspaces, one account) never has one
-            // workspace evict another's backups.
-            let workspace_name = backup::workspace_archive_name(workspace);
-            if let Err(e) = backup::prune_old_backups(provider, workspace_name, keep).await {
-                log!("[Backup] Pruning failed (non-fatal): {}", e);
+            // A retention count we could not READ must not authorize deleting
+            // anything: the old default-on-error pruned down to 5 on a pool
+            // timeout, discarding up to 45 archives of a workspace configured
+            // for 50. Skipping costs one un-pruned run, which the next
+            // successful backup cleans up.
+            match backup::get_retention_count(pool).await {
+                Ok(keep) => {
+                    // Scope pruning to THIS workspace's archives so a shared
+                    // cloud backup folder (multiple workspaces, one account)
+                    // never has one workspace evict another's backups.
+                    let workspace_name = backup::workspace_archive_name(workspace);
+                    if let Err(e) = backup::prune_old_backups(provider, workspace_name, keep).await
+                    {
+                        log!("[Backup] Pruning failed (non-fatal): {}", e);
+                    }
+                }
+                Err(e) => log!(
+                    "[Backup] Could not read the retention count ({}); skipping pruning this run rather than defaulting to {}",
+                    e,
+                    backup::DEFAULT_BACKUP_RETENTION
+                ),
             }
         }
         Err(e) => {

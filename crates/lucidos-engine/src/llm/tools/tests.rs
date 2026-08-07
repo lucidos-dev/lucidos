@@ -834,6 +834,49 @@ fn await_event_description_says_a_wake_spends_the_subscription() {
     );
 }
 
+/// The arming lookback is only useful if the model knows to read it. It is a
+/// REPORT, not a wake: the subscription watches forward, so a match named in
+/// the result will never arrive as a turn, and a model that skims to
+/// "Subscribed" ends the turn with the thing unhandled. That is precisely the
+/// 2026-08-06 failure, one layer up.
+///
+/// **The scope of the promise is load-bearing and is asserted here.** The
+/// lookback covers a few minutes, so telling the model it need not check at all
+/// would be a bigger bug than the one being fixed: it would arm a forward-only
+/// wait for something that happened an hour ago, which can never fire and idles
+/// to the timeout. The text must close the check-to-arm RACE without excusing
+/// the check.
+#[test]
+fn await_event_description_says_an_already_happened_match_is_reported_not_delivered() {
+    let tools = get_default_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::AWAIT_EVENT)
+        .expect("await_event must be registered in get_default_tools()");
+    let d = &tool.description;
+
+    assert!(
+        d.contains("still check state before subscribing"),
+        "a forward-only watch cannot cover the past, so the check survives:\n{d}"
+    );
+    assert!(
+        d.contains("race between that check and this call"),
+        "the race is the only thing the lookback excuses:\n{d}"
+    );
+    assert!(
+        !d.contains("do not have to check first"),
+        "an unscoped 'no need to check' arms waits that can never fire:\n{d}"
+    );
+    assert!(
+        d.contains("WATCHES FORWARD ONLY"),
+        "why a reported match will never wake it:\n{d}"
+    );
+    assert!(
+        d.contains("report, not a wake"),
+        "the model owes the report an action inside this turn:\n{d}"
+    );
+}
+
 /// The description promises a bound because there is one. A model that offers
 /// to watch "forever" in a chat thread is wrong twice: the cap refuses the next
 /// call, and an unbounded standing rule is a trigger's job.
@@ -853,5 +896,39 @@ fn await_event_description_names_the_real_subscription_cap() {
          restated as a literal that drifts from the refusal the model actually \
          hits:\n{}",
         tool.description
+    );
+}
+
+/// A direct child already re-opens its parent when it finishes (ADR 0011), so a
+/// wait on its `ChildThreadCompleted` is redundant: the engine stands the fan-in
+/// callback down when a live wait covers the card, and what is left is a spent
+/// subscription slot plus a timeout that can fire while the child still works.
+/// The use-list used to say "a thread finishing" with no carve-out, which is the
+/// nearest matching instruction for exactly this case, and on 2026-08-06 a live
+/// thread duly subscribed to its own coding-agent child. So the assertion is
+/// that the exclusion is stated AND that the use-list no longer invites it.
+#[test]
+fn await_event_description_carves_out_the_threads_own_child() {
+    let tools = get_default_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::AWAIT_EVENT)
+        .expect("await_event must be registered in get_default_tools()");
+    let d = &tool.description;
+
+    assert!(
+        d.contains("NOT FOR A THREAD YOU SPAWNED AS A CHILD OF THIS ONE"),
+        "the redundant case has to be excluded by name, or the fan-in is \
+         invisible to the model:\n{d}"
+    );
+    assert!(
+        d.contains("a thread you did not spawn finishing"),
+        "the use-list must scope its thread case to a thread the caller did not \
+         spawn, or it invites the very call the paragraph below forbids:\n{d}"
+    );
+    assert!(
+        d.contains("child_thread_id"),
+        "the legitimate case (a completion that is not your own child's) has to \
+         name how to target it, or the exclusion reads as a blanket ban:\n{d}"
     );
 }

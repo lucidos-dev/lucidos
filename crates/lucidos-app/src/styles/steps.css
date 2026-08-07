@@ -71,6 +71,9 @@
     padding: 0;
     margin: 0;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     color: inherit;
     text-align: left;
     cursor: pointer;
@@ -209,6 +212,9 @@
     border: none;
     padding: 0;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     text-align: left;
     margin-left: 0.25rem;
     color: var(--text-muted);
@@ -476,13 +482,6 @@
     overflow-y: auto;
 }
 
-.step-detail-empty {
-    color: var(--text-muted);
-    font-size: var(--font-size-lg);
-    text-align: center;
-    padding: 1.5rem 0;
-}
-
 .step-detail-context {
     display: flex;
     flex-direction: column;
@@ -557,10 +556,15 @@
    box earns its weight only for an inline AFFORDANCE (checkpoint carries an
    Undo button). The event-wait record used to share it and no longer does: it
    was a full-width panel for one action the agent took, so it became an
-   ordinary step line instead (see `.inline-step-static`). */
+   ordinary step line instead (see `.inline-step-static`).
+
+   Corners, not a centred row: the icon rides the summary's FIRST line and the
+   actions sit on the LAST, so a card whose summary wraps to several lines still
+   reads top-down (what happened, then what you can do about it) instead of
+   floating both ends against the middle of the paragraph. */
 .step-note-card {
     display: flex;
-    align-items: center;
+    align-items: flex-start;
     gap: 0.625rem;
     margin: 0.375rem 0;
     padding: 0.5rem 0.75rem;
@@ -574,6 +578,11 @@
     flex: 0 0 auto;
     color: var(--text-muted);
     font-size: var(--font-size-xl);
+    /* The glyph is a step larger than the summary beside it, so its own line
+       box would sit it below the first line once the card is top-aligned.
+       Shrink the box back to roughly one summary line so the two share a
+       centre line. */
+    line-height: 1.2;
 }
 
 .step-note-body {
@@ -607,16 +616,24 @@
 }
 
 .checkpoint-reverted {
-    flex: 0 0 auto;
     color: var(--text-muted);
     font-size: var(--font-size-sm);
 }
 
-/* The door to the checkpoint's diff. Sits between the body and Undo, and must
-   not be squeezed by a long command: the body is the only flex child that
-   gives. */
-[data-role="checkpoint-diff"] {
+/* Diff (the door to the checkpoint's change) beside Undo. Bottom-aligned
+   because `.checkpoint-scope` on the card's last line is Undo's caption,
+   spelling out what the button is about to do, so the two belong on one line.
+   A group rather than two bottom-aligned siblings, because the reverted marker
+   that replaces Undo is bare text where the other two are padded buttons:
+   aligning the three boxes' bottoms individually would leave their baselines a
+   few pixels apart. Never squeezed by a long command: the body is the only flex
+   child that gives. */
+.checkpoint-actions {
     flex: 0 0 auto;
+    align-self: flex-end;
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
 }
 
 /* The diff can be long, so the panel takes the room a step detail does and
@@ -645,5 +662,8 @@
     border: none;
     padding: 0;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     cursor: pointer;
 }

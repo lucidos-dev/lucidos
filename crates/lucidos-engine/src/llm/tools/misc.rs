@@ -71,51 +71,51 @@ const NAVIGABLE_SETTINGS_VIEWS: &[&str] = &[
 pub fn get_navigate_ui_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::NAVIGATE_UI.to_string(),
-        description: "Navigate the Lucidos UI to a specific panel, app, file, thread, or form. Use this when the user asks to open, show, or go to something in the interface — e.g. \"open settings\", \"show me the habit tracker\", \"go to triggers\", \"open my budget file\", \"go to that thread\".".to_string(),
+        description: "Navigate the Lucidos UI to a panel, app, file, thread, or creation form, when the user asks to open, show, or go to something.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "target": {
                     "type": "string",
                     "enum": NAVIGATE_TARGETS,
-                    "description": "Navigation target. Use 'files', 'apps', 'app-store', 'triggers', 'thread-queue', 'changes', 'notifications', 'settings' for panels. 'app-store' opens the Plugins panel, where users browse and install apps and other plugins from marketplaces (they uncheck the panel's 'Installed only' filter to see installable ones; refer to it as the 'Plugins panel', never the retired 'App Store' or 'Store'). Use 'app' to open an app by ID. Use 'file' to preview a file. Use 'trigger' to focus a trigger by ID. Use 'thread' to focus a thread by ID. Use 'new-app', 'new-trigger', or 'new-chat' to open the creation form. Use 'url' to open a URL on the user's device, in whichever browser they have configured (the in-app panel, their system browser, or a new tab). For a Settings sub-section, use target 'settings' with the 'settings_view' arg."
+                    "description": "Most values are a panel needing nothing else; 'app-store' is the Plugins panel, whose 'Installed only' filter is on by default. Companion args: 'app' takes app_id, 'file' file_path, 'trigger' and 'thread' id, 'settings' settings_view. 'url' opens the browser the user configured."
                 },
                 "settings_view": {
                     "type": "string",
                     "enum": NAVIGABLE_SETTINGS_VIEWS,
-                    "description": "Which Settings sub-section to open. Only used when target is 'settings'. 'models' = chat/image/background model settings (use this for questions about the current model), 'permissions' = command guard + allowlists, 'coding-agents' = claude/codex binary paths + registered repositories, 'accounts' = credentials + OAuth, 'locale' = language + timezone, 'marketplaces', 'access' = reaching this engine from another device (connect URLs, Tailscale, network bind), 'devices', 'appearance' = theme/font/scale + where links open, 'keyboard-shortcuts'. Under Settings → System: 'system', 'backup', 'memory', 'disk-usage', 'environment-variables', 'thread-queue', 'debugging'. Omit to land on the Settings home list."
+                    "description": "Only with target 'settings'; omitting it lands on the Settings home list. The non-obvious ones: 'models' also holds the current chat model, 'permissions' the command guard and allowlists, 'coding-agents' binary paths and repositories, 'accounts' credentials and OAuth, 'access' reaching this engine from another device, 'appearance' theme, font and scale."
                 },
                 "app_id": {
                     "type": "string",
-                    "description": "App ID to open. Required when target is 'app'."
+                    "description": "Required when target is 'app'."
                 },
                 "file_path": {
                     "type": "string",
-                    "description": "File path to preview, including the directory prefix (e.g. 'artifacts/research/notes.md', 'knowhow/domain/guide.md'). Required when target is 'file'. A file in a registered repository clone uses the encoded form 'repo:<repoId>:file:<repo-relative path>' instead, which reads the clone's current HEAD; to read it at a particular revision, name that revision in the mode segment: 'repo:<repoId>:file#<ref>:<repo-relative path>', where <ref> is a branch, tag or sha. Every segment must be non-empty."
+                    "description": "Required for 'file'. Path with its directory prefix (e.g. 'artifacts/notes.md'). A file in a registered repository clone takes 'repo:<repoId>:file:<path>' at the clone's HEAD, or 'repo:<repoId>:file#<ref>:<path>' for a branch, tag or sha."
                 },
                 "line": {
                     "type": "integer",
-                    "description": "Line to open the file at, 1-based. The preview scrolls it into view and highlights it, the same as clicking the line number. Only used when target is 'file'. Use it whenever you cite a specific line, so the reader lands on it instead of the top of the file. A file that renders (markdown, CSV, SVG) switches to its source view so the line is visible."
+                    "description": "1-based line to open at; 'file' only. The preview scrolls to it and switches a rendered file to source view. Pass it whenever you cite a line."
                 },
                 "line_end": {
                     "type": "integer",
-                    "description": "Last line of the highlighted range, 1-based and inclusive. Omit to highlight the single line given by 'line'. Only used when target is 'file'."
+                    "description": "Last line of the highlighted range, 1-based inclusive. Omit to highlight only 'line'. 'file' only."
                 },
                 "id": {
                     "type": "string",
-                    "description": "ID of the entity to navigate to. Required when target is 'thread' or 'trigger'."
+                    "description": "Required when target is 'thread' or 'trigger'."
                 },
                 "url": {
                     "type": "string",
-                    "description": "URL to open in the internal browser panel. Required when target is 'url'."
+                    "description": "Required when target is 'url'."
                 },
                 "event_id": {
                     "type": "string",
-                    "description": "Specific event UUID inside thread to scroll-to-and-pulse on land. Only used when target is 'thread'."
+                    "description": "Event uuid inside the thread to scroll to and pulse on land. 'thread' only."
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Pre-populated draft text for the new chat compose box. Only used when target is 'new-chat'."
+                    "description": "Draft text for the compose box. 'new-chat' only."
                 }
             },
             "required": ["target"]
@@ -132,31 +132,31 @@ pub(super) fn git_clone_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::GIT_CLONE.to_string(),
-            description: "Clone a git repository. Per system-knowhow/best-practices rule 8, the agent must explicitly choose where the clone lands — there is no default. Two valid destination roots: '.lucidos/tmp/<name>/' for research / inspect / extract-then-discard work (ephemeral, gitignored, won't bloat artifact count); 'data/artifacts/imported/<name>/' for persistent, git-tracked dependencies the user wants to keep. Refuses to write to artifacts/imported/ if the resulting clone exceeds 500 files or 100 MB — extract only what the app needs, or move the dataset to ~/.lucidos/data/<name>/.".to_string(),
+            description: "Clone a git repository. You must choose where it lands, there is no default: '.lucidos/tmp/<name>/' for inspect-then-discard work (ephemeral, gitignored), 'data/artifacts/imported/<name>/' for a persistent git-tracked dependency, which needs the user ASKED first. Over 500 files or 100 MB is refused for artifacts/imported/: extract only what the app needs, or move the dataset to ~/.lucidos/data/<name>/ (system-knowhow/best-practices rule 8).".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "url": {
                         "type": "string",
-                        "description": "Git repository URL (https://github.com/owner/repo or git@github.com:owner/repo)"
+                        "description": "Repository URL, https or ssh form."
                     },
                     "branch": {
                         "type": "string",
-                        "description": "Branch to clone (optional, defaults to default branch)"
+                        "description": "Branch to clone (defaults to the default branch)."
                     },
                     "destination": {
                         "type": "string",
-                        "description": "REQUIRED. Must start with one of two prefixes: '.lucidos/tmp/<name>/' (ephemeral, gitignored — the default per rule 8 for research / inspect / extract-then-discard work) or 'data/artifacts/imported/<name>/' (persistent, git-tracked — only when the user has confirmed they want the full repo in the workspace). Bare names without a prefix are rejected to prevent silently bloating data/artifacts/."
+                        "description": "REQUIRED: one of the two prefixes above. A bare name is rejected, so data/artifacts/ cannot bloat silently."
                     },
                     "include_patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Glob patterns for files to include (optional, e.g., ['*.py', 'src/**/*.rs'])"
+                        "description": "Globs to include, e.g. ['*.py', 'src/**/*.rs']."
                     },
                     "exclude_patterns": {
                         "type": "array",
                         "items": { "type": "string" },
-                        "description": "Glob patterns for files to exclude (optional, e.g., ['*.lock', 'node_modules/**'])"
+                        "description": "Globs to exclude, e.g. ['node_modules/**']."
                     }
                 },
                 "required": ["url", "destination"]
@@ -173,7 +173,7 @@ pub(super) fn git_clone_tools() -> Vec<ToolDefinition> {
 pub(super) fn backup_status_tools() -> Vec<ToolDefinition> {
     vec![ToolDefinition {
         name: tn::GET_BACKUP_STATUS.to_string(),
-        description: "Read the workspace's backup status: the schedule (in the user's timezone) and next scheduled run, the provider and retention, the last run (with duration), recent run history (start/finish/size for each), and whether backups are stale. Read-only — makes no changes. Use it to answer 'when's my next/last backup?', 'how big/long are my backups?', or to check before changing the schedule. The schedule/provider/retention are CHANGED with set_preference (keys backup_schedule, backup_provider, backup_retention); restore is done from the workspace picker.".to_string(),
+        description: "Read the workspace's backup status: schedule (user's timezone) and next run, provider and retention, the last run and its duration, recent history, and whether backups are stale. Read-only: change the schedule, provider and retention with set_preference (backup_schedule, backup_provider, backup_retention), and restore from the workspace picker.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {}
@@ -185,59 +185,59 @@ pub(super) fn request_credential_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::REQUEST_CREDENTIAL.to_string(),
-            description: "Request API credentials from the user via a secure modal dialog. NEVER accept credentials pasted in chat — always use this tool. The user enters the credential in a popup (not in chat), keeping it secure and out of the event log. Call this for ONE credential at a time and wait for it to resolve before requesting the next — issuing multiple credential requests in parallel stacks modals and forces the user to history-navigate between them.".to_string(),
+            description: "Request an API credential through a secure modal, so the user types it into a popup rather than into the conversation and the event log. ONE at a time: wait for each to resolve before requesting the next.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "service_name": {
                         "type": "string",
-                        "description": "Name of the service (e.g., 'oura', 'github', 'notion'). For auth_type 'oauth_client' the credential is ALWAYS stored as 'oauth:<provider>' whatever you pass here (that is the only name the OAuth flow reads), so refer to it that way afterwards and never imply a second plain '<provider>' entry should exist."
+                        "description": "Name of the service (e.g. 'oura'). For 'oauth_client' pass the BARE provider name: the auth type is what marks the row as an app registration."
                     },
                     "prompt": {
                         "type": "string",
-                        "description": "Instructions shown in the modal. Include where to find the credential (e.g., 'Go to cloud.ouraring.com → Personal Access Tokens → Create. Paste the token below.')"
+                        "description": "Instructions shown in the modal, including where to find it."
                     },
                     "base_url": {
                         "type": "string",
-                        "description": "Base URL for the API (e.g., 'https://api.ouraring.com')"
+                        "description": "Base URL for the API."
                     },
                     "auth_type": {
                         "type": "string",
                         "enum": ["api_key", "bearer", "basic", "password", "oauth_client"],
-                        "description": "Type of authentication. Use 'password' for username+password (injected as Basic auth), 'oauth_client' for OAuth client_id (+ client_secret for a confidential client). PREFER connect_oauth_account over calling this with 'oauth_client': that tool opens the same modal itself when no client exists and then runs the authorization, so it is one call instead of two and cannot land the client under the wrong name. If you do use this, first load_knowhow('system-knowhow/oauth-providers') and pass auth_url/token_url/userinfo_url (+ optional scopes/redirect_uri) so the modal pre-fills them and the user only enters client_id+client_secret. The client secret is OPTIONAL: leaving it blank makes Lucidos a public client that authenticates with PKCE instead, which is the right shape when the provider's app registration is a desktop/native app. Omit the endpoint args only for a provider not yet in that knowhow (then the user types the URLs by hand once). Default: api_key"
+                        "description": "Default api_key. 'password' is username plus password, injected as Basic auth. PREFER connect_oauth_account over 'oauth_client': it opens this same modal itself and then authorizes, one call instead of two. For 'oauth_client', load_knowhow('system-knowhow/oauth-providers') first and pass its endpoints below."
                     },
                     "auth_url": {
                         "type": "string",
-                        "description": "oauth_client only. OAuth authorization endpoint looked up in the oauth-providers knowhow. Pre-fills the modal so the user doesn't type it."
+                        "description": "oauth_client only, from the oauth-providers knowhow."
                     },
                     "token_url": {
                         "type": "string",
-                        "description": "oauth_client only. OAuth token endpoint from the oauth-providers knowhow. Pre-fills the modal."
+                        "description": "oauth_client only, from that knowhow."
                     },
                     "userinfo_url": {
                         "type": "string",
-                        "description": "oauth_client only, optional. OAuth userinfo endpoint from the oauth-providers knowhow."
+                        "description": "oauth_client only. Without one the account reports no email."
                     },
                     "userinfo_method": {
                         "type": "string",
                         "enum": ["GET", "POST"],
-                        "description": "oauth_client only, optional. HTTP method for userinfo_url. Omit for the OIDC default GET; pass 'POST' only when the knowhow's row says so (Dropbox's users/get_current_account is POST-only). Wrong value costs only the connected account's name/email, never the connection."
+                        "description": "oauth_client only. GET unless the knowhow's row says POST."
                     },
                     "authorize_params": {
                         "type": "string",
-                        "description": "oauth_client only, optional. Extra authorization-URL parameters in key=value&key=value form, copied verbatim from the knowhow row's authorize_params column. This is where a provider spells 'issue a refresh token' its own way (Dropbox needs token_access_type=offline, without which its token expires in hours and cannot be renewed). Omit to send Google's 'access_type=offline&prompt=consent', which is the default and what every existing connection uses."
+                        "description": "oauth_client only. Extra authorization-URL parameters from the knowhow row. Omit for the default."
                     },
                     "scopes": {
                         "type": "string",
-                        "description": "oauth_client only, optional. Default OAuth scopes (space-separated) to pre-fill the modal's scopes field."
+                        "description": "oauth_client only. Space-separated scopes, to pre-fill the modal."
                     },
                     "redirect_uri": {
                         "type": "string",
-                        "description": "oauth_client only, optional. Loopback callback URI the user must register with the provider. Omit for the default 'http://127.0.0.1:14981/oauth/callback'. Only pass one when the oauth-providers knowhow says this provider needs a different host form (e.g. 'http://localhost:14981/oauth/callback'). Must be one of: http://127.0.0.1:14981/oauth/callback, http://localhost:14981/oauth/callback, http://[::1]:14981/oauth/callback."
+                        "description": "oauth_client only. Omit for the default loopback URI; the knowhow lists the three accepted forms."
                     },
                     "env_var_name": {
                         "type": "string",
-                        "description": "Optional. Custom environment variable name to ALSO inject the secret under, in addition to the default CRED_<NAME> (e.g. 'APPLE_PASSWORD' when a script or tool expects that exact name). Pre-fills the modal's 'Env var name' field; the user can edit or clear it. Must match [A-Z_][A-Z0-9_]* and must not be an engine-owned name (CRED_*, OAUTH_*, PG*, PATH, LUCIDOS_*). Single-value auth types only — ignored for 'password' (which splits into _USERNAME/_PASSWORD)."
+                        "description": "Optional extra env var name for the secret, alongside the default CRED_<NAME>. Must match [A-Z_][A-Z0-9_]* and not clobber an engine-owned name. Single-value auth types only."
                     }
                 },
                 "required": ["service_name", "prompt", "base_url", "auth_type"]
@@ -250,46 +250,46 @@ pub(super) fn connect_oauth_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::CONNECT_OAUTH_ACCOUNT.to_string(),
-            description: "Connect an OAuth account so Lucidos can make authenticated API requests on the user's behalf. Works for any OAuth 2.0 provider. Opens the user's browser for authorization. If client credentials for the provider aren't configured yet, this first opens the credential modal — load_knowhow('system-knowhow/oauth-providers') and pass auth_url/token_url/userinfo_url so they pre-fill (e.g. a health-only Google connection named 'ghealth' uses Google's endpoints under a distinct name). For an already-configured provider, just pass provider + scopes.".to_string(),
+            description: "Connect an OAuth account so Lucidos can call an API on the user's behalf. Any OAuth 2.0 provider, ONE call for the whole flow: with no client credentials yet it opens the credential modal itself, then authorizes. The page opens on the USER'S DEVICE in whichever browser they configured, so tell them to complete it there; tokens are stored automatically. Provider and scopes alone suffice for a provider the registry knows, otherwise load_knowhow('system-knowhow/oauth-providers').".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "provider": {
                         "type": "string",
-                        "description": "Provider name (e.g., 'google', 'microsoft', 'github'). Use a distinct name for a dedicated connection (e.g. 'ghealth' for a health-only Google connection that must not carry other scopes)."
+                        "description": "Provider name (e.g. 'google'). Use a distinct name for a dedicated connection that must not carry other scopes, e.g. 'ghealth' on Google's endpoints."
                     },
                     "scopes": {
                         "type": "string",
-                        "description": "Space-separated OAuth scopes to request (e.g., 'https://www.googleapis.com/auth/spreadsheets https://www.googleapis.com/auth/drive.readonly')"
+                        "description": "Space-separated scopes to request."
                     },
                     "auth_url": {
                         "type": "string",
-                        "description": "Optional. OAuth authorization endpoint from the oauth-providers knowhow — used only when the credential modal opens (no client credentials yet) to pre-fill the endpoints."
+                        "description": "Optional, from the oauth-providers knowhow; pre-fills the modal."
                     },
                     "token_url": {
                         "type": "string",
-                        "description": "Optional. OAuth token endpoint from the oauth-providers knowhow — pre-fills the credential modal when it opens."
+                        "description": "Optional, from that knowhow."
                     },
                     "userinfo_url": {
                         "type": "string",
-                        "description": "Optional. OAuth userinfo endpoint from the oauth-providers knowhow; pre-fills the credential modal when it opens. Without one the connected account reports no email, so pass it whenever the knowhow has it."
+                        "description": "Optional. Without one the account reports no email."
                     },
                     "userinfo_method": {
                         "type": "string",
                         "enum": ["GET", "POST"],
-                        "description": "Optional. HTTP method for userinfo_url. Omit for the OIDC default GET; pass 'POST' only when the knowhow's row says so (Dropbox's users/get_current_account is POST-only)."
+                        "description": "Optional. GET unless the row says POST."
                     },
                     "authorize_params": {
                         "type": "string",
-                        "description": "Optional. Extra authorization-URL parameters in key=value&key=value form, from the knowhow row's authorize_params column; pre-fills the credential modal when it opens. This is how a provider asks for a refresh token in its own spelling (Dropbox: token_access_type=offline). Omit for the default 'access_type=offline&prompt=consent'."
+                        "description": "Optional extra authorization-URL parameters, key=value&key=value, from the knowhow row."
                     },
                     "base_url": {
                         "type": "string",
-                        "description": "Optional. API base URL to pre-fill in the credential modal when it opens (e.g. 'https://healthcare.googleapis.com')."
+                        "description": "Optional API base URL, to pre-fill the modal."
                     },
                     "redirect_uri": {
                         "type": "string",
-                        "description": "Optional. Loopback callback URI the user registers with the provider — pre-fills the credential modal when it opens. Omit for the default 'http://127.0.0.1:14981/oauth/callback'. Pass 'http://localhost:14981/oauth/callback' only when the oauth-providers knowhow says this provider needs the name form instead of the IP."
+                        "description": "Optional. Omit for the default loopback URI; the knowhow names the other two forms and when to use them."
                     }
                 },
                 "required": ["provider", "scopes"]
@@ -302,17 +302,17 @@ pub(super) fn execute_intent_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::EXECUTE_INTENT.to_string(),
-            description: "Execute a stored intent — a description of what the user wants, paired with know-how for how to achieve it. The intent's instructions and relevant know-how are loaded automatically. Internal tool calls happen inside the execution — only the final result is returned. Use this when the user's request matches an available intent.".to_string(),
+            description: "Execute a stored intent: what the user wants, paired with the knowhow for achieving it, both loaded automatically. It runs its own tool calls internally and returns only the final result.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "intent_id": {
                         "type": "string",
-                        "description": "Intent ID (e.g., 'job-search/find-jobs', 'home-control/run-control-loop')"
+                        "description": "Intent id, e.g. 'job-search/find-jobs'."
                     },
                     "task": {
                         "type": "string",
-                        "description": "What to do (e.g., 'Make the title black', 'Log today\\'s sleep data')"
+                        "description": "What to do, e.g. 'Log today's sleep data'."
                     }
                 },
                 "required": ["intent_id"]
@@ -325,7 +325,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::ASK_USER_QUESTION.to_string(),
-            description: "Ask the user a multiple-choice question and wait for their pick. The Lucidos UI renders each question as a card with the options as clickable buttons, so the user can answer with a tap instead of typing. Use whenever the answer is a yes/no decision, a pick from 2–4 named choices, or a confirmation step before doing something significant, anywhere a button would beat a typed reply. Single-question is the common case; pass up to 4 questions in one call only when they are a tight batch the user should answer in sequence (each question renders one card at a time). Every question object MUST carry a non-empty `question` (the full question text the user reads on the card); the short `header` chip-label is NEVER a substitute, and the engine rejects (and forces you to re-ask) any call that leaves `question` empty, so fill it the first time. NEVER add an \"Other\" / \"Something else\" / \"Let me type it\" option: Lucidos has no text-entry option, so tapping one just sends you that label back as the user's answer, which is a dead end. Both escapes are on every card without you: the user can type any reply in the prompt textarea (it arrives as their answer to this question), and Cancel dismisses the question so they can steer you elsewhere. An option carrying a decision you can act on is different and still welcome (\"None of these\", \"Neither, ask me later\", \"Cancel the deploy\"); what is banned is an option whose only meaning is \"I will type it instead\". Returns a JSON object mapping each question text to the chosen option label (or the user's typed text when they answer freeform). NEVER ask a question purely to get resumed. A one-option card whose only job is to wake you back up makes the human your scheduler: it lights the needs-attention badge, pushes a notification, and blocks Apply, all for something the engine already knows. If you are waiting for something that happens in Lucidos, `await_event` is the tool; if you are waiting on the output of a process you started, `bash_output(task_id, wait_secs=N)` is. Ask only when you genuinely need the person to decide.".to_string(),
+            description: "Ask the user a multiple-choice question and wait for their pick. Each renders as a card of clickable buttons, one at a time; pass up to 4 only for a tight batch answered in sequence. Returns a JSON object mapping each question text to the chosen label, or to the user's typed text when they answer freeform.\n\nNEVER add an \"Other\" / \"Something else\" / \"Let me type it\" option. Lucidos has no text-entry option, so tapping one just hands that label back as the answer, a dead end. Both escapes are on every card without you: the user can type any reply in the prompt textarea and it arrives as their answer to this question, and Cancel dismisses the question so they can steer you elsewhere. An option carrying a decision you can act on is different and still welcome (\"None of these\", \"Cancel the deploy\").\n\nNever ask purely to get resumed while something you could subscribe to is pending: a card makes the human your scheduler and blocks Apply until they tap.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
@@ -333,33 +333,33 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                         "type": "array",
                         "minItems": 1,
                         "maxItems": 4,
-                        "description": "1–4 questions to ask. Rendered one card at a time; the user answers them in order. The combined answers map comes back as the tool result.",
+                        "description": "1 to 4 questions, one card at a time, answered in order.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "question": {
                                     "type": "string",
-                                    "description": "REQUIRED. The full question shown to the user (in the user's language). Always provide the complete question here — never leave it empty or put the question only in `header`. The engine rejects calls whose `question` is missing and makes you re-ask."
+                                    "description": "REQUIRED, in the user's language. Never empty and never only in `header`: the engine rejects that and makes you re-ask."
                                 },
                                 "header": {
                                     "type": "string",
-                                    "description": "Optional short chip-label (≤12 chars) summarising the question (e.g. \"Approach\", \"Confirm\"). Supplementary only — NOT a replacement for `question`."
+                                    "description": "Optional chip-label, 12 characters or fewer. Never a replacement for `question`."
                                 },
                                 "options": {
                                     "type": "array",
                                     "minItems": 2,
                                     "maxItems": 4,
-                                    "description": "2–4 choices rendered as buttons. Pick distinct, mutually-exclusive labels unless `multiSelect` is true.",
+                                    "description": "2 to 4 buttons, mutually exclusive unless `multiSelect`.",
                                     "items": {
                                         "type": "object",
                                         "properties": {
                                             "label": {
                                                 "type": "string",
-                                                "description": "Button text the user clicks. 1–5 words; in the user's language."
+                                                "description": "Button text, 1 to 5 words, in the user's language."
                                             },
                                             "description": {
                                                 "type": "string",
-                                                "description": "Optional one-line explanation rendered under the button label — useful when the trade-offs aren't obvious from the label alone."
+                                                "description": "Optional one-line explanation under the label."
                                             }
                                         },
                                         "required": ["label"]
@@ -367,7 +367,7 @@ pub(super) fn ask_user_question_tools() -> Vec<ToolDefinition> {
                                 },
                                 "multiSelect": {
                                     "type": "boolean",
-                                    "description": "When true, the user can pick multiple options before submitting. Default false."
+                                    "description": "When true the user can pick several before submitting. Default false."
                                 }
                             },
                             "required": ["question", "options"]
@@ -391,24 +391,24 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::AWAIT_EVENT.to_string(),
-            description: format!("Subscribe to something happening in Lucidos, instead of checking over and over. This call returns IMMEDIATELY and blocks nothing: finish your turn and end your response normally, and the engine re-opens this thread with a NEW turn the moment a matching event arrives. If nothing matches before `timeout_secs`, you are woken with a timeout instead. A subscription always resolves; it never strands you.\n\nYou are not blocked while subscribed. The thread is simply idle and watching, so say what you are waiting for and stop, exactly as you would at the end of any turn. Do NOT keep the turn alive waiting, and do NOT poll to see whether it fired.\n\nUse this INSTEAD of a polling loop whenever you are waiting on Lucidos state: a thread finishing, a change being proposed, a trigger firing, an app or workspace emitting a domain event. A `run_bash_background` / `run_python` sleep-and-recheck loop for any of those is strictly worse: it burns a full LLM call per poll, samples on an interval so it can miss or tear a transition, and dies on restart. This does not. The subscription is persisted, so it survives an engine restart and still wakes you.\n\nTWO QUESTIONS PICK BETWEEN THIS AND A TRIGGER, AND YOU NEED BOTH. First, WHERE DOES THE ANSWER GO? A trigger runs in its own thread and reaches the user as a notification; it cannot continue THIS conversation. This tool re-opens the very thread they are reading. So \"tell me HERE when X happens\", \"let me know in this chat\", or a request typed into a thread they are clearly waiting in, is this tool, even though the words sound like a standing rule. Second, HOW LONG? A RENDEZVOUS, NOT A STREAM: the first matching event resolves the subscription and consumes it. \"Continue when the next X happens\" is this tool; \"react to every X, forever\", outliving the conversation, is a trigger (`triggers` tool). Both answers can be right at once, so lead with the one that matches where they asked to be told, and offer the other: report here now with this tool, and a trigger if they want it to keep running after this thread is done.\n\nNOT for external state with no Lucidos event (a third-party API you can only re-query, a file another process might write). There is no event to wake you, so poll for those.\n\nWhen you are woken, the event arrives as a new message on this same thread and you carry on with the whole conversation behind you. THE SUBSCRIPTION IS SPENT once it wakes you, however it woke you, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing; a turn that ends with no new call leaves nothing watching. A message from the user meanwhile changes nothing: it runs an ordinary turn and every subscription you hold survives it untouched, so do not register those again.\n\nA re-armed watch is bounded, so do not promise the user \"forever\". After {} subscriptions in a row with no message from them, the next call is refused and you have to report back. Offer to keep watching and check in; a rule that must outlive the conversation is a trigger.", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
+            description: format!("Subscribe to Lucidos state instead of checking over and over: a thread you did not spawn finishing, a change proposed, a trigger firing, a domain event. Returns immediately and blocks nothing; the engine re-opens this thread with a NEW turn when a match arrives, or on `timeout_secs`.\n\nIT WATCHES FORWARD ONLY, so if the thing might already be in the past, still check state before subscribing; a wait armed for one already gone by idles to the timeout. What you do NOT have to worry about is the race between that check and this call: a match from the few minutes just before it is named in the result with its age. READ THAT PART and act on it in THIS turn, because it is a report, not a wake.\n\nAND NOT FOR A THREAD YOU SPAWNED AS A CHILD OF THIS ONE, which already re-opens this thread with its result. Await `ChildThreadCompleted` only for a completion that is not your own child's, named with a `child_thread_id` condition.\n\nTHE SUBSCRIPTION IS SPENT once it wakes you, so if you want the next one too, call this again before that turn ends. Saying you will re-subscribe is not re-subscribing. A user message is different: every subscription survives it untouched, so do not register those again.\n\nAfter {} subscriptions in a row with no message from the user the next call is refused, so never promise to watch \"forever\".", crate::engine::event_wait::MAX_CONSECUTIVE_SUBSCRIPTIONS),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "on": {
                         "type": "array",
                         "minItems": 1,
-                        "description": "What to wake on. Any entry matching wakes you (OR), and the result names which one fired. Same event names and same `condition` language as a trigger's `on_event`.",
+                        "description": "Any entry matching wakes you, and the result names which fired. Same shape as a trigger's `on_event`.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "event_type": {
                                     "type": "string",
-                                    "description": "Event name, PascalCase past tense. A Lucidos thread event (`ChangeProposed`, `ResponseGenerated`, `CodingAgentIdled`, `ChildThreadCompleted`, `TriggerExecuted`, and so on) or a domain event this workspace emits with `emit_event` (`ReleasePublished`, ...). Per-token streaming events (`TextStreamed`, `ThoughtStreamed`, and the coding-agent twins) and the `EventWait*` family are refused: the first never reaches a subscriber, the second would satisfy itself."
+                                    "description": "PascalCase past tense: a thread event (`ChangeProposed`, `CodingAgentIdled`, `ChildThreadCompleted`, …) or a domain event this workspace emits. Streaming events and the `EventWait*` family are refused."
                                 },
                                 "condition": {
                                     "type": "object",
-                                    "description": "Optional payload filter, scoped to THIS entry. Field-to-value for equality, or an operator object: `{\"$eq\":v}`, `{\"$ne\":v}`, `{\"$lt\":n}`, `{\"$lte\":n}`, `{\"$gt\":n}`, `{\"$gte\":n}`, `{\"$in\":[…]}`. Filter on the event's OWN payload fields, which are the ones you see in `query_events` output: e.g. `{\"child_thread_id\": \"<uuid>\"}` on `ChildThreadCompleted`, or `{\"file_count\": {\"$gt\": 0}}` on `ChangeProposed`. The thread an event belongs to is NOT a payload field, so you cannot filter on it."
+                                    "description": "Optional filter on THIS entry. A value for equality, or an operator object (`$eq`, `$ne`, `$lt`, `$lte`, `$gt`, `$gte`, `$in`). Only the event's OWN payload fields, e.g. `{\"child_thread_id\": \"<uuid>\"}`; the thread it belongs to is not one."
                                 }
                             },
                             "required": ["event_type"]
@@ -418,14 +418,52 @@ pub(super) fn await_event_tools() -> Vec<ToolDefinition> {
                         "type": "integer",
                         "minimum": 1,
                         "maximum": 86400,
-                        "description": "REQUIRED. How long to wait before giving up, in seconds (max 86400 = 24h). There is no unbounded wait. Pick a real upper bound for the thing you are waiting on and add margin: waking early with a timeout costs one turn, waking too late costs the user the whole wait."
+                        "description": "REQUIRED. Seconds before giving up, max 86400; there is no unbounded wait. Add margin: waking early costs one turn, waking late costs the whole wait."
                     },
                     "reason": {
                         "type": "string",
-                        "description": "REQUIRED. One short line, in the user's language, saying what you are waiting for and why (\"waiting for the release build to finish\"). The user reads this in the subscription indicator, and it is how they tell a sleeping thread from a stalled one."
+                        "description": "REQUIRED. One short line in the user's language saying what you await; it shows in the subscription indicator."
                     }
                 },
                 "required": ["on", "timeout_secs", "reason"]
+            }),
+        },
+    ]
+}
+
+/// The other two verbs on a thread's own subscriptions: read them, and stand
+/// them down. Siblings of `await_event`, which arms them.
+///
+/// Both are scoped to the calling thread and take no thread id, so an agent
+/// cannot read or end another thread's subscriptions. See
+/// `engine::event_wait::agent_surface` for why each exists.
+pub(super) fn event_wait_agent_tools() -> Vec<ToolDefinition> {
+    vec![
+        ToolDefinition {
+            name: tn::LIST_EVENT_WAITS.to_string(),
+            description: "What THIS thread is subscribed to right now: each subscription's id, what it watches, your reason, when you armed it, and when it times out. CALL IT BEFORE TELLING THE USER WHETHER YOU ARE STILL WATCHING, because a spend, a timeout and a user pressing Stop waiting all land while you are not running, so memory is a guess that has been wrong by two hours. It is also where the `wait_id` comes from.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {},
+                "required": []
+            }),
+        },
+        ToolDefinition {
+            name: tn::CANCEL_EVENT_WAIT.to_string(),
+            description: "Stand down a subscription this thread armed with `await_event`: one by `wait_id`, or all with `all: true`. THIS IS HOW YOU STOP WATCHING, and one you leave live wakes this thread later whatever you told the user. Stopping is silent, so carry straight on in this turn. Pass exactly one argument.".to_string(),
+            parameters: json!({
+                "type": "object",
+                "properties": {
+                    "wait_id": {
+                        "type": "string",
+                        "description": "The subscription to stop, from `list_event_waits`. Omit when passing `all`."
+                    },
+                    "all": {
+                        "type": "boolean",
+                        "description": "Stop every live subscription on this thread. Prefer a `wait_id` when one of several is meant."
+                    }
+                },
+                "required": []
             }),
         },
     ]
@@ -435,19 +473,19 @@ pub(super) fn todo_write_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::TODO_WRITE.to_string(),
-            description: "Maintain your current todo list — a per-thread, user-visible list of items you're working through during a response. Use proactively on multi-step tasks (≥3 steps) so the user can watch your plan in real time. Replace-whole-list: every call carries the ENTIRE new list and discards the previous one. The empty list clears the panel.\n\nWorkflow: (1) Call once at the start with all items `pending`. (2) Before starting an item, re-call with that item flipped to `in_progress` — at most ONE item may be `in_progress` at a time. (3) After finishing, re-call with it `completed`. Always pass the whole list, including unchanged items.\n\nField guidance: `content` is the imperative form (\"Run tests\"). `active_form` is the present-continuous form (\"Running tests\") shown to the user only while the item is `in_progress`. Skip the tool entirely for trivial single-step requests.\n\nMax 50 items per call.\n\nIMPORTANT — abandonment: if you end your response with any item still `pending` or `in_progress`, the engine flips those items to `abandoned` so the user sees you walked away from them. To avoid that, either finish each item (mark `completed`) or call this tool with `[]` to drop the list explicitly. You cannot set `abandoned` yourself — it is engine-only.".to_string(),
+            description: "Maintain your todo list: a per-thread, user-visible list of items you are working through during a response, rendered in the prompt bar. Replace-whole-list, so every call carries the ENTIRE new list; `[]` clears it. Max 50 items, at most ONE `in_progress`. ABANDONMENT: any item still `pending` or `in_progress` when your response ends is flipped to `abandoned`, so the user sees you walked away from it.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "todos": {
                         "type": "array",
-                        "description": "The whole new todo list. Pass `[]` to clear.",
+                        "description": "The whole new list. `[]` clears.",
                         "items": {
                             "type": "object",
                             "properties": {
                                 "content": {
                                     "type": "string",
-                                    "description": "Imperative form, what the item is (\"Run tests\")."
+                                    "description": "Imperative form (\"Run tests\")."
                                 },
                                 "active_form": {
                                     "type": "string",
@@ -456,7 +494,7 @@ pub(super) fn todo_write_tools() -> Vec<ToolDefinition> {
                                 "status": {
                                     "type": "string",
                                     "enum": ["pending", "in_progress", "completed"],
-                                    "description": "At most ONE item may be `in_progress` at a time. (`abandoned` is engine-only — set automatically when you end a response with non-completed items.)"
+                                    "description": "At most ONE item may be `in_progress`."
                                 }
                             },
                             "required": ["content", "active_form", "status"]

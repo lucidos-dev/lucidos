@@ -32,7 +32,8 @@ use axum::http::{header, HeaderValue, Method, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use axum::Router;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -230,6 +231,12 @@ struct GatewayInner {
     /// Single-slot state of the picker's restore-from-backup flow (see
     /// [`RestoreStatus`]). Polled via the control API; never persisted.
     restore: RwLock<RestoreStatus>,
+    /// Configured bind addresses this process wants but does not hold yet (see
+    /// [`net_config::bind_plan`] and [`serve_optional_address`]). Normally empty.
+    /// Non-empty means the gateway is serving loopback while it waits for an
+    /// interface to appear, which is a REACHABILITY degradation and nothing else,
+    /// so it is reported in `/~/api/v1/health` rather than left to the log.
+    pending_binds: RwLock<BTreeSet<SocketAddr>>,
     /// Path of the binary this process was launched from (`current_exe`), used by
     /// the reload control to re-exec onto the rebuilt binary and to stat for the
     /// "new gateway available" check.
@@ -812,12 +819,28 @@ impl GatewayState {
     /// push) for a workspace whose engine is up. The picker toggle turns it off
     /// per workspace. This is the sole creation path: there is no auto-created
     /// bootstrap `default`, and first run shows the picker.
-    pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceStatus, BoxError> {
+    ///
+    /// Refuses a display name another workspace already carries: two rows the
+    /// user cannot tell apart is not a state worth creating (see
+    /// [`Registry::find_by_display_name`]). The *address* may still be taken
+    /// while the name is free, and that one is suffixed rather than refused, so
+    /// the picker states the resulting address before the click.
+    pub async fn create_workspace(&self, name: &str) -> Result<WorkspaceStatus, ApiError> {
         let ws = {
             let mut reg = self.inner.registry.lock().unwrap();
+            if let Some(existing) = reg.find_by_display_name(name, None) {
+                return Err(ApiError::conflict(name_taken_message(&existing.name)));
+            }
+            // A restore in flight has reserved its name for minutes without a
+            // registry entry to show for it: see `restore_reserved_name`.
+            if names_match(&self.restore_reserved_name(), name) {
+                return Err(ApiError::conflict(name_being_restored_message(name)));
+            }
             let base = registry::slugify(name);
             let id = registry::unique_slug(&base, &|s| reg.contains(s));
-            let port = reg.allocate_port()?;
+            let port = reg
+                .allocate_port()
+                .map_err(|e| ApiError::internal(e.to_string()))?;
             let ws = Workspace {
                 id: id.clone(),
                 name: name.to_string(),
@@ -826,8 +849,10 @@ impl GatewayState {
                 database_url: None,
                 autostart: true,
             };
-            reg.add(ws.clone())?;
-            reg.save(&self.inner.registry_path)?;
+            reg.add(ws.clone())
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+            reg.save(&self.inner.registry_path)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
             ws
         };
 
@@ -876,6 +901,24 @@ impl GatewayState {
         Ok(())
     }
 
+    /// The display name an in-flight restore has reserved, if any.
+    ///
+    /// A restore holds its name from the moment it is accepted until its
+    /// registry entry is committed, which is minutes later: the archive has to
+    /// be decrypted, unpacked and `pg_restore`d first. For that whole window the
+    /// name exists nowhere in the registry, so create and rename have to consult
+    /// this as well or they would hand out a name the restore is about to
+    /// commit, and `Registry::add` (id-only) would not catch it.
+    ///
+    /// Callers hold the registry lock across this read, which is what makes the
+    /// pair atomic. Lock order is always registry then restore.
+    fn restore_reserved_name(&self) -> Option<String> {
+        match self.inner.restore.read().ok().as_deref() {
+            Some(RestoreStatus::Running { name, .. }) => Some(name.clone()),
+            _ => None,
+        }
+    }
+
     /// Update the `phase` of an in-flight restore (no-op if not Running).
     fn set_restore_phase(&self, phase: &str) {
         if let Ok(mut st) = self.inner.restore.write() {
@@ -919,21 +962,57 @@ impl GatewayState {
                 )
             })?;
 
-        // Reserve id + port under the registry lock. On a slug collision, reject
-        // so the picker asks for a different name (NOT a silent `-2` suffix).
+        // Validate the name, reserve the id + port, and CLAIM THE RESTORE SLOT,
+        // all while holding the registry lock.
+        //
+        // The slot claim belongs inside this critical section, not after it,
+        // because the registry entry is committed only minutes later (after the
+        // archive is unpacked and pg_restore'd). Between this check and that
+        // commit the name is not in the registry yet, so nothing but the claim
+        // itself is holding it: a rename could take the name meanwhile and
+        // `Registry::add` would happily commit the duplicate, since it only
+        // checks ids. The claim IS the reservation, and `create_workspace` /
+        // `rename_workspace` consult it (see `restore_reserved_name`).
+        //
+        // Lock order is registry then restore, everywhere, so the two can never
+        // deadlock against each other.
         let (id, port) = {
             let reg = self.inner.registry.lock().unwrap();
-            let slug = registry::slugify(&name);
-            if reg.contains(&slug) {
+            let mut st = self.inner.restore.write().map_err(|_| {
                 let _ = std::fs::remove_file(&archive_tmp);
-                return Err(ApiError::conflict(format!(
-                    "A workspace named \"{name}\" already exists — choose a different name."
+                ApiError::internal("restore state poisoned")
+            })?;
+            // Check-and-set the single slot: two near-simultaneous restores must
+            // not both pass (the control handler's pre-check is a best-effort
+            // fast-fail; this is the authoritative gate).
+            if matches!(*st, RestoreStatus::Running { .. }) {
+                let _ = std::fs::remove_file(&archive_tmp);
+                return Err(ApiError::conflict("A restore is already in progress"));
+            }
+            // The name first, then the address it derives: a duplicate NAME is
+            // the one the user can see, so say that rather than talking about an
+            // address when both are taken.
+            if let Some(existing) = reg.find_by_display_name(&name, None) {
+                let _ = std::fs::remove_file(&archive_tmp);
+                return Err(ApiError::conflict(name_taken_message(&existing.name)));
+            }
+            let slug = registry::slugify(&name);
+            if let Some(existing) = reg.get(&slug) {
+                let _ = std::fs::remove_file(&archive_tmp);
+                return Err(ApiError::conflict(address_taken_message(
+                    &slug,
+                    &existing.name,
                 )));
             }
             let port = reg.allocate_port().map_err(|e| {
                 let _ = std::fs::remove_file(&archive_tmp);
                 ApiError::internal(e.to_string())
             })?;
+            *st = RestoreStatus::Running {
+                id: slug.clone(),
+                name: name.clone(),
+                phase: "starting".to_string(),
+            };
             (slug, port)
         };
 
@@ -945,26 +1024,6 @@ impl GatewayState {
             database_url: None,
             autostart: false,
         };
-
-        // Atomically claim the single restore slot: check-and-set under ONE write
-        // lock so two near-simultaneous restores can't both pass (the control
-        // handler's pre-check is a best-effort fast-fail; this is the
-        // authoritative gate, mirroring the engine's old `try_start`).
-        {
-            let mut st = self.inner.restore.write().map_err(|_| {
-                let _ = std::fs::remove_file(&archive_tmp);
-                ApiError::internal("restore state poisoned")
-            })?;
-            if matches!(*st, RestoreStatus::Running { .. }) {
-                let _ = std::fs::remove_file(&archive_tmp);
-                return Err(ApiError::conflict("A restore is already in progress"));
-            }
-            *st = RestoreStatus::Running {
-                id: id.clone(),
-                name: name.clone(),
-                phase: "starting".to_string(),
-            };
-        }
         let me = self.clone();
         let (id_done, name_done) = (id.clone(), name.clone());
         tokio::spawn(async move {
@@ -1189,14 +1248,26 @@ impl GatewayState {
 
     /// Rename = edit the display name only (registry + runtime). No dir move, DB
     /// reconnect, or port change.
-    pub async fn rename_workspace(&self, id: &str, name: &str) -> Result<(), BoxError> {
+    ///
+    /// Refuses a name another workspace already carries, so a rename cannot
+    /// produce the pair of identical-looking rows that create and restore now
+    /// refuse to create. Renaming a workspace to what it is already called (or a
+    /// case edit of it) is not a collision with itself.
+    pub async fn rename_workspace(&self, id: &str, name: &str) -> Result<(), ApiError> {
         {
             let mut reg = self.inner.registry.lock().unwrap();
+            if let Some(existing) = reg.find_by_display_name(name, Some(id)) {
+                return Err(ApiError::conflict(name_taken_message(&existing.name)));
+            }
+            if names_match(&self.restore_reserved_name(), name) {
+                return Err(ApiError::conflict(name_being_restored_message(name)));
+            }
             let ws = reg
                 .get_mut(id)
-                .ok_or_else(|| format!("workspace '{id}' not found"))?;
+                .ok_or_else(|| ApiError::bad_request(format!("workspace '{id}' not found")))?;
             ws.name = name.to_string();
-            reg.save(&self.inner.registry_path)?;
+            reg.save(&self.inner.registry_path)
+                .map_err(|e| ApiError::internal(e.to_string()))?;
         }
         // Clone the Arc out and drop the map lock before locking the stack —
         // the supervisor holds stack→map, so map→stack here would deadlock (see
@@ -2040,6 +2111,7 @@ pub async fn run() -> Result<(), BoxError> {
             boot_phases: RwLock::new(HashMap::new()),
             boot_failures: RwLock::new(HashMap::new()),
             restore: RwLock::new(RestoreStatus::default()),
+            pending_binds: RwLock::new(BTreeSet::new()),
             exe_path: std::env::current_exe().ok(),
             update_check: Mutex::new(UpdateCheck::default()),
         }),
@@ -2083,7 +2155,7 @@ async fn serve(
             header::CACHE_CONTROL,
             HeaderValue::from_static("no-cache"),
         ))
-        .with_state(state);
+        .with_state(state.clone());
     let router = if permissive_cors_enabled() {
         crate::log!("[Gateway] permissive CORS enabled by LUCIDOS_PERMISSIVE_CORS");
         router.layer(CorsLayer::permissive())
@@ -2091,38 +2163,182 @@ async fn serve(
         router
     };
 
-    // Every address to listen on. A specific `Address` ALSO binds loopback (see
-    // `net_config::bind_socket_addrs`) so the dev launch scripts' control POSTs
-    // and each spawned engine's Apply-restart callback — both over `127.0.0.1` —
-    // keep reaching the gateway. `addr` (the primary) is only for the log.
-    let addrs = net_config::bind_socket_addrs(&bind_choice, port);
-    let addr = addrs[0];
+    // Every address to listen on, split by what a bind failure MEANS. A specific
+    // `Address` ALSO binds loopback (see `net_config::bind_socket_addrs`) so the
+    // dev launch scripts' control POSTs and each spawned engine's Apply-restart
+    // callback, both over `127.0.0.1`, keep reaching the gateway; `bind_plan`
+    // then makes loopback the REQUIRED half and the configured address the
+    // retryable one, because at boot that address may not exist yet.
+    let plan = net_config::bind_plan(&bind_choice, port);
     let handle = axum_server::Handle::new();
     install_shutdown(handle.clone());
 
     let tls_cert = std::env::var("LUCIDOS_TLS_CERT").ok();
     let tls_key = std::env::var("LUCIDOS_TLS_KEY").ok();
-    // Serve every resolved address concurrently under the one shared shutdown
-    // `Handle`; a bind failure on any address fails fast.
-    if let (Some(cert), Some(key)) = (tls_cert, tls_key) {
-        let cfg = axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?;
-        crate::log!("[Gateway] listening on https://{} (TLS)", addr);
-        futures::future::try_join_all(addrs.into_iter().map(|a| {
-            axum_server::bind_rustls(a, cfg.clone())
-                .handle(handle.clone())
-                .serve(router.clone().into_make_service())
-        }))
-        .await?;
-    } else {
-        crate::log!("[Gateway] listening on http://{}", addr);
-        futures::future::try_join_all(addrs.into_iter().map(|a| {
-            axum_server::bind(a)
-                .handle(handle.clone())
-                .serve(router.clone().into_make_service())
-        }))
-        .await?;
+    let tls = match (tls_cert, tls_key) {
+        (Some(cert), Some(key)) => {
+            Some(axum_server::tls_rustls::RustlsConfig::from_pem_file(&cert, &key).await?)
+        }
+        _ => None,
+    };
+
+    // The required addresses, bound BEFORE anything is served so a failure is
+    // still fatal and still reported as one. `?` on the bind is what keeps
+    // `loopback` / `all` behaving exactly as they always have.
+    let mut serving = Vec::with_capacity(plan.required.len());
+    for addr in plan.required {
+        let listener = bind_and_log(addr, tls.is_some())?;
+        serving.push(serve_listener(
+            listener,
+            router.clone(),
+            handle.clone(),
+            tls.clone(),
+        ));
     }
+
+    // The optional ones, each retried in its own task until the address exists.
+    // Recorded as pending first so `/~/api/v1/health` is honest from the very
+    // first request, rather than only after the first failed attempt.
+    if !plan.optional.is_empty() {
+        if let Ok(mut pending) = state.inner.pending_binds.write() {
+            pending.extend(plan.optional.iter().copied());
+        }
+        for addr in plan.optional {
+            tokio::spawn(serve_optional_address(
+                addr,
+                router.clone(),
+                handle.clone(),
+                tls.clone(),
+                state.clone(),
+            ));
+        }
+    }
+
+    // Serve the required addresses concurrently under the one shared shutdown
+    // `Handle`. Reaching here means every one of them is already bound, so this
+    // only ends on shutdown or on a listener genuinely failing mid-flight.
+    futures::future::try_join_all(serving).await?;
     Ok(())
+}
+
+/// Bind one address and announce it, in that order.
+///
+/// The order is the point. The announcement used to be printed before the bind
+/// was attempted, so a gateway that died on `EADDRNOTAVAIL` left a log claiming
+/// it was listening on the address it had just failed to acquire, which is the
+/// opposite of what the reader needs at that moment.
+fn bind_and_log(addr: SocketAddr, tls: bool) -> std::io::Result<std::net::TcpListener> {
+    let listener = std::net::TcpListener::bind(addr)?;
+    if tls {
+        crate::log!("[Gateway] listening on https://{addr} (TLS)");
+    } else {
+        crate::log!("[Gateway] listening on http://{addr}");
+    }
+    Ok(listener)
+}
+
+/// Serve an already-bound listener, with or without TLS. Boxed because the two
+/// arms are different `axum_server` acceptor types and the caller keeps them in
+/// one collection.
+fn serve_listener(
+    listener: std::net::TcpListener,
+    router: Router,
+    handle: axum_server::Handle,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>> {
+    match tls {
+        Some(cfg) => Box::pin(
+            axum_server::from_tcp_rustls(listener, cfg)
+                .handle(handle)
+                .serve(router.into_make_service()),
+        ),
+        None => Box::pin(
+            axum_server::from_tcp(listener)
+                .handle(handle)
+                .serve(router.into_make_service()),
+        ),
+    }
+}
+
+/// First re-attempt delay for an optional bind, and the ceiling the backoff
+/// doubles up to. A tailnet interface takes seconds to appear after login, so
+/// the first retries are quick; the ceiling keeps a machine that never joins
+/// from spinning.
+const OPTIONAL_BIND_RETRY_START: Duration = Duration::from_secs(1);
+const OPTIONAL_BIND_RETRY_MAX: Duration = Duration::from_secs(30);
+
+/// Backoff schedule for an optional bind: double, capped. Pure so the schedule
+/// is pinned by a test rather than by reading the loop.
+fn next_bind_retry_delay(current: Duration) -> Duration {
+    std::cmp::min(current * 2, OPTIONAL_BIND_RETRY_MAX)
+}
+
+/// Hold one optional address for the life of the process: bind it when it
+/// exists, serve it, and go back to waiting if it goes away.
+///
+/// This is what makes a configured tailnet or LAN address non-fatal. At boot,
+/// launchd starts the service before `tailscaled` has assigned the machine's
+/// `100.x` address, so binding it fails with `EADDRNOTAVAIL`. Retrying here
+/// means the listener simply appears a few seconds later, with no restart and
+/// nothing for the user to do, while loopback has been serving the whole time.
+///
+/// Logging is one line per state change rather than one per attempt: the first
+/// failure states the reason AND the retry cadence, so the silence that follows
+/// is readable as "still retrying on that schedule" instead of as a process that
+/// gave up. A machine that never joins its tailnet would otherwise write a line
+/// every 30s forever into a log that is already tens of megabytes.
+async fn serve_optional_address(
+    addr: SocketAddr,
+    router: Router,
+    handle: axum_server::Handle,
+    tls: Option<axum_server::tls_rustls::RustlsConfig>,
+    state: GatewayState,
+) {
+    let mut delay = OPTIONAL_BIND_RETRY_START;
+    let mut reported: Option<std::io::ErrorKind> = None;
+    loop {
+        match bind_and_log(addr, tls.is_some()) {
+            Ok(listener) => {
+                if let Ok(mut pending) = state.inner.pending_binds.write() {
+                    pending.remove(&addr);
+                }
+                reported = None;
+                // `Ok` here is the shutdown handle firing, which means the whole
+                // process is going down and this address is nobody's problem any
+                // more. An `Err` is the listener itself failing (the interface
+                // went away under us), so fall back through to re-binding.
+                match serve_listener(listener, router.clone(), handle.clone(), tls.clone()).await {
+                    Ok(()) => return,
+                    Err(e) => {
+                        crate::log!("[Gateway] stopped listening on {addr} ({e}); re-binding");
+                        if let Ok(mut pending) = state.inner.pending_binds.write() {
+                            pending.insert(addr);
+                        }
+                    }
+                }
+                // Backoff is NOT reset by a successful bind, only by a serve that
+                // ran to shutdown (which returns above). An address that binds
+                // and then immediately fails to serve would otherwise re-bind,
+                // re-log and re-fail with no delay at all, spinning a core and
+                // filling the log; keeping the schedule means a flapping
+                // interface backs off exactly like an absent one.
+                tokio::time::sleep(delay).await;
+                delay = next_bind_retry_delay(delay);
+            }
+            Err(e) => {
+                if reported != Some(e.kind()) {
+                    reported = Some(e.kind());
+                    crate::log!(
+                        "[Gateway] cannot bind {addr} yet ({e}); serving loopback meanwhile and \
+                         retrying every {}s at most until it appears",
+                        OPTIONAL_BIND_RETRY_MAX.as_secs()
+                    );
+                }
+                tokio::time::sleep(delay).await;
+                delay = next_bind_retry_delay(delay);
+            }
+        }
+    }
 }
 
 fn permissive_cors_enabled() -> bool {
@@ -2134,13 +2350,26 @@ fn permissive_cors_enabled_value(value: Option<&str>) -> bool {
 }
 
 /// Gateway-own health (`/~/api/v1/health`). The launcher polls this.
+///
+/// `status` stays `ok` while an address is pending: the gateway IS serving, and
+/// the launcher's poll must not be held back by a tailnet that has not come up
+/// (that coupling is what stalled the packaged start for two minutes). The
+/// degraded reachability is reported alongside, in `pending_binds`, so it is
+/// inspectable without reading the log. Normally an empty array.
 async fn gateway_health(State(state): State<GatewayState>) -> axum::Json<serde_json::Value> {
     let count = state.inner.routes.read().map(|r| r.len()).unwrap_or(0);
+    let pending: Vec<String> = state
+        .inner
+        .pending_binds
+        .read()
+        .map(|p| p.iter().map(|a| a.to_string()).collect())
+        .unwrap_or_default();
     axum::Json(serde_json::json!({
         "status": "ok",
         "role": "gateway",
         "release": crate::LUCIDOS_RELEASE,
         "workspaces": count,
+        "pending_binds": pending,
     }))
 }
 
@@ -2268,6 +2497,54 @@ async fn fallback(State(state): State<GatewayState>, req: axum::extract::Request
             (StatusCode::NOT_FOUND, format!("unknown workspace '{slug}'")).into_response()
         }
     }
+}
+
+/// The refusal when a create / rename / restore asks for a display name another
+/// workspace already carries.
+///
+/// One sentence for all three surfaces, because it is one rule. It quotes the
+/// existing workspace's name as stored rather than what the user typed: the
+/// match is case- and space-insensitive, so "PersonAAA" must come back as the
+/// "personaaa" they can actually see in the list.
+fn name_taken_message(existing_name: &str) -> String {
+    format!("You already have a workspace called \"{existing_name}\". Choose a different name.")
+}
+
+/// Do these two display names count as the same one? Trimmed and
+/// case-insensitive, matching [`Registry::find_by_display_name`], so the
+/// in-flight-restore reservation is compared exactly the way a registered name
+/// is. `None` (no restore running) never matches.
+fn names_match(reserved: &Option<String>, name: &str) -> bool {
+    reserved
+        .as_deref()
+        .is_some_and(|r| r.trim().to_lowercase() == name.trim().to_lowercase())
+}
+
+/// The refusal when the name is not in the registry yet but a running restore is
+/// about to commit it. Distinct wording from [`name_taken_message`] because
+/// there is no workspace to point at yet, and because waiting is a real option.
+fn name_being_restored_message(name: &str) -> String {
+    format!(
+        "A restore in progress is already creating a workspace called \"{name}\". \
+         Choose a different name, or wait for it to finish."
+    )
+}
+
+/// The refusal when a restore asks for an address another workspace already
+/// holds.
+///
+/// It names the workspace **as the picker lists it** and states the address they
+/// collide on, because those are two different strings the moment anyone renames
+/// anything: the address is frozen at create time and a rename edits only the
+/// display name. The old wording ("a workspace named X already exists") asserted
+/// the existence of a name that, after a rename, no row on screen has, which is
+/// unanswerable for the user. Mirrors what the picker predicts client-side, so
+/// the pre-check and this authoritative check can't tell different stories.
+fn address_taken_message(slug: &str, existing_name: &str) -> String {
+    format!(
+        "The address /{slug}/ is already taken by \"{existing_name}\". \
+         Choose a different name, or delete that workspace first."
+    )
 }
 
 /// Should [`GatewayState::boot_all`] bring this workspace up?
@@ -2557,6 +2834,40 @@ fn raise_fd_limit() {
 mod tests {
     use super::*;
 
+    // ── Retrying an optional bind ────────────────────────────────────────────
+
+    #[test]
+    fn the_optional_bind_backoff_doubles_and_caps() {
+        let mut delay = OPTIONAL_BIND_RETRY_START;
+        let mut seen = vec![delay];
+        for _ in 0..12 {
+            let next = next_bind_retry_delay(delay);
+            assert!(
+                next >= delay,
+                "backoff must never shrink: {next:?} < {delay:?}"
+            );
+            assert!(
+                next <= OPTIONAL_BIND_RETRY_MAX,
+                "backoff must stay under the ceiling: {next:?}"
+            );
+            delay = next;
+            seen.push(delay);
+        }
+        assert_eq!(
+            delay, OPTIONAL_BIND_RETRY_MAX,
+            "backoff must actually reach the ceiling, not creep toward it"
+        );
+        assert_eq!(seen[1], Duration::from_secs(2), "first re-attempt doubles");
+    }
+
+    #[test]
+    fn the_first_optional_bind_retry_is_prompt() {
+        // A tailnet interface appears seconds after login, so the schedule has to
+        // start well below its ceiling or the common case waits for nothing.
+        assert!(OPTIONAL_BIND_RETRY_START < OPTIONAL_BIND_RETRY_MAX);
+        assert!(OPTIONAL_BIND_RETRY_START <= Duration::from_secs(1));
+    }
+
     // ── What boot_all brings up ──────────────────────────────────────────────
 
     fn workspace(id: &str, autostart: bool) -> Workspace {
@@ -2587,6 +2898,62 @@ mod tests {
             "a surviving engine is re-adopted whatever the flag says",
         );
         assert!(should_bring_up(&workspace("always", true), false, &empty));
+    }
+
+    // ── Refusing a restore whose address is taken ────────────────────────────
+
+    /// The reported case: a workspace created as "personal" and later renamed to
+    /// "personaal" still holds `/personal/`. Restoring a "personal" backup was
+    /// refused with `a workspace named "personal" already exists`, naming a
+    /// workspace the picker does not list.
+    #[test]
+    fn the_refusal_names_the_workspace_the_user_can_see() {
+        let msg = address_taken_message("personal", "personaal");
+        assert!(msg.contains("personaal"), "{msg}");
+        assert!(msg.contains("/personal/"), "{msg}");
+        assert!(
+            !msg.contains("named \"personal\""),
+            "must not claim a name no workspace has: {msg}",
+        );
+    }
+
+    // A restore holds its name for minutes with nothing in the registry to show
+    // for it, so create / rename consult the running slot as well. Without that,
+    // a rename during a restore lands a duplicate at commit time, because
+    // `Registry::add` only checks ids.
+    #[test]
+    fn an_in_flight_restore_reserves_its_name_the_same_way_the_registry_does() {
+        let reserved = Some("Personal Notes".to_string());
+        for probe in ["Personal Notes", "personal notes", "  PERSONAL NOTES  "] {
+            assert!(names_match(&reserved, probe), "probe {probe:?}");
+        }
+        assert!(!names_match(&reserved, "something else"));
+        // No restore running reserves nothing.
+        assert!(!names_match(&None, "Personal Notes"));
+    }
+
+    #[test]
+    fn the_restore_reservation_refusal_offers_waiting_as_the_other_way_out() {
+        let msg = name_being_restored_message("personal");
+        assert!(msg.contains("\"personal\""), "{msg}");
+        assert!(msg.contains("restore in progress"), "{msg}");
+        assert!(msg.contains("wait"), "{msg}");
+    }
+
+    #[test]
+    fn the_duplicate_name_refusal_quotes_the_name_as_stored() {
+        // The match is case- and space-insensitive, so typing "PersonAAA" must
+        // be answered with the "personaaa" the picker actually lists.
+        let msg = name_taken_message("personaaa");
+        assert!(msg.contains("\"personaaa\""), "{msg}");
+        assert!(msg.contains("different name"), "{msg}");
+    }
+
+    #[test]
+    fn the_refusal_states_both_ways_out() {
+        let msg = address_taken_message("work", "work");
+        assert!(msg.contains("different name"), "{msg}");
+        assert!(msg.contains("delete"), "{msg}");
     }
 
     // The other half of the contract: Stop must stick. A workspace the user

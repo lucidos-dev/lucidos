@@ -175,30 +175,55 @@ impl AbortCause {
     }
 }
 
-/// Why an `EventWaitCanceled` was emitted. Every arm is the user ending the
-/// wait deliberately.
+/// Why an `EventWaitCanceled` was emitted: how a *thread subscription* was
+/// stopped short of its own resolution.
 ///
-/// What is deliberately absent is an ordinary user message. Typing into a
-/// parked thread *detaches* the wait (the engine closes the dangling
-/// `await_event` call so the turn can run) and leaves the subscription live,
-/// so asking a parked thread "how's it going?" cannot silently discard a
-/// forty-minute wait. Cancelling on any `MessageReceived` was the original
+/// Every live arm is somebody deciding to stop it, and each one is announced.
+/// The **Stop waiting** button is the user ending one directly, archive and
+/// discard end the thread that holds it (and the archive asks first, naming
+/// what it would stop), and a stand-down is the agent retiring a watch it armed
+/// after the user told it to. A timeout is not here at all: that is
+/// `EventWaitExpired`, which wakes the thread rather than stopping it.
+///
+/// Two things are deliberately absent.
+///
+/// An **ordinary user message** does not stop a subscription. Typing into a
+/// subscribed thread runs a normal turn and leaves every subscription exactly
+/// as it was, so asking "how's it going?" cannot silently throw away a
+/// forty-minute watch. Cancelling on any `MessageReceived` was the original
 /// design and was rejected for exactly that.
+///
+/// A **thread-level Stop** does not either, as of 2026-08-07. See
+/// [`Self::ThreadCanceled`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EventWaitCancelCause {
-    /// The **Stop waiting** button on the wait itself, in the subscription
-    /// indicator or the thread card.
+    /// The **Stop waiting** button on the subscription itself, in the
+    /// subscription indicator.
     UserStop,
-    /// A thread-level Stop / Cancel. The user stopped the whole thread, so its
-    /// subscriptions go with it.
-    ThreadCanceled,
-    /// The thread was archived. Archive is a legitimate way to end a wait, and
-    /// leaving one live behind the archive curtain would wake a thread the user
-    /// considers closed.
+    /// The agent stood a subscription of its own down, through
+    /// `cancel_event_wait` / `lucidos event-waits cancel`. Its own arm so the
+    /// event log can tell "the user told it to stand down" from a person
+    /// pressing a button, from an archive, and from a timeout.
+    AgentStandDown,
+    /// The thread was archived. Archive is a legitimate way to stop a
+    /// subscription, and leaving one live behind the archive curtain would wake
+    /// a thread the user considers closed. The confirm in `handleArchiveThread`
+    /// names every subscription the cascade would stop before it happens.
     ThreadArchived,
     /// The thread was discarded.
     ThreadDiscarded,
+    /// **Retired, and still read.** A thread-level Stop used to stop every
+    /// subscription on the thread; it no longer does, and nothing emits this.
+    /// It stays in the enum, and stays deserializable, because rows written
+    /// before 2026-08-07 carry it and events are append-only: dropping the arm
+    /// would replay them as [`Self::Unknown`] and lose why they ended.
+    ///
+    /// A Stop is turn-scoped. Cancelling unrelated subscriptions from it killed
+    /// a watch armed two hours earlier with nothing anywhere saying so, and a
+    /// subscription has not held a turn since ADR 0049, so it was never part of
+    /// what a Stop owns. Do not re-add the emit; see `api::chat::cancel_chat`.
+    ThreadCanceled,
     /// Legacy or unrecognized cause, so old DB rows replay cleanly. Never emit
     /// fresh.
     #[serde(other)]

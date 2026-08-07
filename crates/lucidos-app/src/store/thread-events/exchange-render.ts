@@ -3,11 +3,11 @@ import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../ev
 import { AWAIT_EVENT_TOOL, describeWaitSubscription } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
-import { isSwitchTeardownAbort } from './thread-event-types';
+import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isSwitchTeardownAbort } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
-import type { ActorMode, EventSubscription, SequencedEvent, ThreadEvent } from './thread-event-types';
+import type { ActorMode, EventSubscription, EventWaitCancelCause, SequencedEvent, ThreadEvent } from './thread-event-types';
 
 /** The two projections' step shapes, as far as the resolvers care. */
 type StepLike = { outcome: StepOutcome; description?: string; tool_name?: string };
@@ -129,7 +129,11 @@ function nameThinkingStep(
 export interface LegacyContextEvents {
   thinking?: { text?: string; context_tokens?: number; context_messages?: number; trimmed?: boolean };
   tokensMeasured?: { input_tokens?: number };
-  assembled?: { sections?: ContextSection[]; tools?: string[]; model?: string; total_chars?: number };
+  /** `total_chars` is deliberately absent: it is a CHARACTER count, and the
+   *  only thing it was ever used for was standing in for a token total, which
+   *  is a different unit. See `synthesizeContextCapture`. The per-section
+   *  `char_count`s carry the same information honestly. */
+  assembled?: { sections?: ContextSection[]; tools?: string[]; model?: string };
 }
 
 /** Default context_window for legacy rows: 200k. Pre-ContextCaptured
@@ -152,7 +156,15 @@ export function synthesizeContextCapture(legacy: LegacyContextEvents): ContextCa
     context_window: LEGACY_CONTEXT_WINDOW,
     sections: legacy.assembled?.sections ?? [],
     tools: legacy.assembled?.tools ?? [],
-    estimated_total_tokens: legacy.thinking?.context_tokens ?? legacy.assembled?.total_chars ?? 0,
+    // NOT `?? legacy.assembled?.total_chars`: that arm put a CHARACTER count
+    // into a token field, roughly 2.5x the truth, and the panel presented it
+    // as a token total with no hint it was a different unit. `frontend.md`'s
+    // "No Silent Defaults" is exactly this: fall back to unknown, not to a
+    // plausible value. `ContextCapturePanel` renders a zero headline as no
+    // token figure at all while still showing every section's real char
+    // count, so the one signal we genuinely have survives and the one we
+    // don't have is absent instead of invented.
+    estimated_total_tokens: legacy.thinking?.context_tokens ?? 0,
     usage,
     trimmed: legacy.thinking?.trimmed ?? false,
     legacy: true,
@@ -418,6 +430,28 @@ function resolveLastPendingResponseStep(
   return null;
 }
 
+/** Does this text chunk merely repeat what the turn's failure card already
+ *  says? An agent that loses its upstream connection reports the error twice:
+ *  it streams `API Error: …` as ordinary assistant text before exiting, and the
+ *  engine records the same string as the turn's `ResponseFailed`. Drawing both
+ *  put one identical sentence on screen as a paragraph and again in the red card
+ *  right beneath it (reported 2026-08-07).
+ *
+ *  The card is the copy that stays: it carries the `ResponseFailed`'s own event
+ *  id, which is what makes a notification deep-link resolve to the failure (see
+ *  `ExchangeError.eventId`), and `ChatExchange` renders it as a SIBLING of the
+ *  response panel, so dropping the paragraph can never hide the error.
+ *
+ *  Matched per chunk, before `mergeAdjacentTextEvents`: an agent emits the error
+ *  as its own chunk, and merging would glue it onto whatever prose preceded it,
+ *  leaving nothing that compares equal. Exact (trimmed) equality only, so prose
+ *  that merely mentions the failure is the agent talking about it and stays. */
+function failureEchoPredicate(exchange: Exchange): (text: string | undefined) => boolean {
+  const failure = exchangeError(exchange)?.message.trim();
+  if (!failure) return () => false;
+  return text => (text ?? '').trim() === failure;
+}
+
 /** Build ResponseEvent[] from exchange events (interleaved text + steps for rendering).
  *  @param _isLast — kept for caller compatibility; no longer drives spinner resolution
  *  on its own. See `threadIdle`.
@@ -429,6 +463,7 @@ function resolveLastPendingResponseStep(
 export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threadIdle = false): ResponseEvent[] {
   const events: ResponseEvent[] = [];
   const hasCCContent = exchangeHasCCContent(exchange);
+  const isFailureEcho = failureEchoPredicate(exchange);
   let terminal: TerminalKind = null;
   // Set when the exchange completed via a text-less ResponseGenerated — a
   // benign empty completion (the model ended its turn cleanly with no text).
@@ -576,7 +611,7 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         // Mirror of exchangeSteps: only VISIBLE text ends the thinking pass.
         const text = (event as { text: string }).text;
         if (hasVisibleText(text)) resolveLastPendingResponseStep(events, isThinking);
-        events.push({ type: 'text', md: text });
+        if (!isFailureEcho(text)) events.push({ type: 'text', md: text });
         break;
       }
       case 'SessionStarted':
@@ -644,7 +679,7 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
       case 'CodingAgentTextStreamed': {
         const text = (event as { text: string }).text;
         if (hasVisibleText(text)) resolveLastPendingResponseStep(events, isThinking);
-        events.push({ type: 'text', md: text });
+        if (!isFailureEcho(text)) events.push({ type: 'text', md: text });
         terminal = null; // CC resumed, not finished yet
         break;
       }
@@ -715,13 +750,24 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
       case 'EventWaitExpired':
       case 'EventWaitCanceled': {
         // Flip the card this resolves, matched by wait_id. A resolution can
-        // arrive in a LATER exchange than its park (a detached wait outlives
-        // the turn that registered it), in which case there is no card here to
-        // flip and the resolution renders through its own wake instead.
+        // arrive in a LATER exchange than the row that armed it, since a
+        // subscription outlives its turn, in which case there is nothing here
+        // to flip.
+        //
+        // A delivery and an expiry both wake the thread, so each already reads
+        // as its own turn further down and needs nothing more. A STOP is the
+        // one resolution with no wake, so when its row is not here it gets one
+        // of its own, at this position: that is the difference between the user
+        // seeing what was stopped at the moment it was stopped and seeing
+        // nothing at all. Exactly one row either way, so an arm-then-stop
+        // inside one exchange does not double up.
         const e = event as {
           wait_id: string;
           event_type?: string;
           event_id?: string;
+          on?: EventSubscription[];
+          reason?: string;
+          cause?: EventWaitCancelCause;
         };
         const state =
           event.type === 'EventWaitDelivered'
@@ -729,6 +775,7 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
             : event.type === 'EventWaitExpired'
               ? 'timed_out'
               : 'canceled';
+        let flipped = false;
         for (const prior of events) {
           if (prior.type === 'event_wait' && prior.wait_id === e.wait_id) {
             prior.state = state;
@@ -736,8 +783,26 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
               prior.matched_event_type = e.event_type;
               prior.matched_event_id = e.event_id;
             }
+            if (state === 'canceled') prior.cause = e.cause;
+            flipped = true;
             break;
           }
+        }
+        if (!flipped && state === 'canceled') {
+          events.push({
+            type: 'event_wait',
+            wait_id: e.wait_id,
+            // Self-contained on the event since 2026-08-07. An older row
+            // carries neither, and the row then names no subscription rather
+            // than inventing one.
+            subscription: e.on ? describeWaitSubscription(e.on) : '',
+            reason: e.reason ?? '',
+            // The deadline died with the subscription, so there is nothing to
+            // count down to. The row renders its note, not a countdown.
+            expires_at: '',
+            state: 'canceled',
+            cause: e.cause,
+          });
         }
         break;
       }
@@ -1066,7 +1131,9 @@ export function abortPromisesAutoResume(ev: ThreadEvent): boolean {
  *    there re-runs completed work, which on 2026-08-06 meant offering to redo a
  *    turn that had applied a change and spawned a sub-thread two minutes
  *    earlier (real thread ebc787a4). The scan does not stop at such a boundary:
- *    an OLDER unresolved abort above it is still legitimately continuable. */
+ *    an OLDER unresolved abort above it is still legitimately continuable. The
+ *    recovery marker is the one terminal that does NOT resolve a boundary, see
+ *    `abortBoundaryResolved`. */
 export function continuableAbortIndex(exchanges: Exchange[]): number | null {
   for (let i = exchanges.length - 1; i >= 0; i--) {
     const ev = exchanges[i].userEvent;
@@ -1082,9 +1149,27 @@ export function continuableAbortIndex(exchanges: Exchange[]): number | null {
 }
 
 /** Did a turn run under this abort boundary and finish? Any terminal among its
- *  steps says yes, whatever ended it. */
+ *  steps says yes, whatever ended it, with exactly one exception.
+ *
+ *  Crash recovery emits its boundary and its own marker as a pair: a
+ *  `recovery_after_restart` abort, then a synthetic
+ *  `CodingAgentIdled { reason: engine_restart_interrupt }` whose whole purpose
+ *  is to say "this session was interrupted, offer Continue"
+ *  (`agent_recovery/recovery.rs`). `CodingAgentIdled` does not start an
+ *  exchange, so that marker folds into the abort as a step and looked exactly
+ *  like a finished turn. Reading the engine's offer as its own refusal withheld
+ *  Continue from every coding-agent thread a restart touched, which on
+ *  2026-08-07 was all of them at once. A turn that genuinely ran under the
+ *  boundary and idled carries no reason, so it still resolves. */
 function abortBoundaryResolved(exchange: Exchange): boolean {
-  return exchange.steps.some(s => TERMINAL_EVENT_TYPES.has(s.event.type));
+  return exchange.steps.some(({ event }) =>
+    TERMINAL_EVENT_TYPES.has(event.type) && !isRecoveryInterruptMarker(event));
+}
+
+/** The synthetic idle crash recovery stamps under its own abort boundary. */
+function isRecoveryInterruptMarker(event: ThreadEvent): boolean {
+  return event.type === 'CodingAgentIdled'
+    && event.reason === IDLE_ENGINE_RESTART_INTERRUPT_REASON;
 }
 
 const TERMINAL_EVENT_TYPES: ReadonlySet<string> = new Set([

@@ -3,7 +3,7 @@
 import './utils/workspaceStorage.install';
 import { render } from 'preact';
 import { App } from './App';
-import { WorkspacePicker } from './components/picker/WorkspacePicker';
+import { lazyComponent } from './utils/lazyComponent';
 import { IS_PICKER, WORKSPACE_ID, baseContextIsValid } from './utils/basePath';
 import { rememberLastWorkspace } from './utils/lastWorkspace';
 import { updateAvailable } from './store/store';
@@ -15,6 +15,7 @@ import { isTouchDevice } from './utils/viewport';
 import { isIOSPwa, isTauri, isTauriPreGatewayEntry } from './utils/platform';
 import { invoke } from './utils/tauri';
 import { setBootStatus } from './utils/bootSplash';
+import { startStartupStatusPolling } from './utils/startupStatus';
 import { reconcileDesktopDeviceId } from './store/actions/devices';
 import { openAppById } from './store/actions/apps';
 import { startPerfProbe } from './utils/perfProbe';
@@ -35,10 +36,32 @@ import './store/effects';
 import './store/actions/wipPreview';
 
 // The inline pre-hydration watchdog owns the failure case where this module
-// graph never evaluates (for example, a stale hashed entry bundle). Reaching
-// this line proves the graph is live; hand normal readiness/dismissal back to
-// the application and clear the watchdog's guarded retry state.
-(window as Window & { __lucidosBootLoaded?: () => void }).__lucidosBootLoaded?.();
+// graph never evaluates (for example, a stale hashed entry bundle). Handing over
+// tells it the graph is live: it clears the 15s stall timer AND the entry-script
+// error listener, so from that call on, a boot that dies is the application's to
+// recover. Also clears the watchdog's guarded retry state.
+function handOverBootOwnership(): void {
+  (window as Window & { __lucidosBootLoaded?: () => void }).__lucidosBootLoaded?.();
+}
+
+// The app path hands over here, because reaching this line really does mean its
+// whole root is in memory. The PICKER path does NOT: its root arrives in a
+// second chunk (see WorkspacePicker below), so handing over here would disarm
+// the watchdog while the thing it guards is still in flight. That matters
+// because the watchdog is the ONLY recovery a picker document has: the gateway
+// escape link is deliberately offered to direct-port documents alone (see
+// revealGatewayEscape in index.html), leaving the picker with the inline
+// retry-once + tap-to-retry, which is also the only way back for an iOS PWA
+// with no reload button. `lazyComponent`'s own stale-chunk reload does not
+// substitute for it: it stands down whenever sessionStorage is unavailable or
+// it already reloaded in the last 30s, and its fallback toast cannot render on
+// a document whose only component is the chunk that failed. So the picker hands
+// over once its chunk resolves, and a chunk that never arrives falls back to
+// exactly the recovery a static import used to get. The two paths cannot both
+// fire: `isTauriPreGatewayEntry()` (the one boot() path that renders nothing)
+// is false whenever IS_PICKER is true, since the picker context is a
+// gateway-stamped `<base href="/~/">` and the pre-gateway shell has no base.
+if (!IS_PICKER) handOverBootOwnership();
 
 if (isTouchDevice()) {
   document.body.classList.add('is-touch');
@@ -100,6 +123,26 @@ publishScrollbarGutter();
 // gone because they now carry different base hrefs.
 const appRoot = document.getElementById('app')!;
 
+// The picker and the app are MUTUALLY EXCLUSIVE render roots (see the render
+// call in `boot()`), so shipping the picker inside the eager entry chunk sent
+// every workspace document ~43 kB it could never mount. Code-split it: the app
+// path stops paying for it entirely, and the picker path fetches it while the
+// inline boot splash is still covering the screen. `lazyComponent` renders null
+// until the chunk lands, so the splash simply stays up one round trip longer,
+// and its stale-chunk arm (reload to the new build) already covers the failure
+// a hashed-URL 404 would otherwise strand the picker on. `<App/>` deliberately
+// stays static: it IS the eager graph (main.tsx pulls the store, the effects
+// and the actions in on its own), so splitting it would move bytes into a
+// second chunk without removing any from the critical path.
+const WorkspacePicker = lazyComponent(() =>
+  import('./components/picker/WorkspacePicker').then((m) => {
+    // The picker's root is here now, so this is where the picker path proves
+    // its graph is live. See handOverBootOwnership above for why it waits.
+    handOverBootOwnership();
+    return m.WorkspacePicker;
+  }),
+);
+
 // Defensive recovery (boot-recovery plan): a workspace bundle that loaded in a
 // malformed base-path context can't build valid URLs from it — every fetch + SW
 // registration throws WebKit's "string did not match the expected pattern" and
@@ -133,6 +176,9 @@ function recoverFromBrokenContext(): boolean {
  *  would, so the WKWebView crash watchdog (lib.rs) doesn't reload the splash every
  *  ~60s while we wait. */
 function stayOnStartingSplash(): void {
+  // The opening line, painted now rather than a poll-tick from now. Matches
+  // `desktop::STARTING_LABEL`, which is also what the first poll answers, so a
+  // fast start never sees the text change at all.
   setBootStatus('Starting Lucidos…');
   // As in useStartup: the `catch` is a local no-op, and `invoke` reports bridge
   // failures to the engine log on its own (utils/ipcHealth). Note this splash
@@ -141,6 +187,14 @@ function stayOnStartingSplash(): void {
   // working after desktop::launch navigates to the (remote) gateway origin.
   invoke('heartbeat').catch(() => {});
   window.setInterval(() => { invoke('heartbeat').catch(() => {}); }, 15_000);
+  // Separate from the heartbeat and deliberately faster: the heartbeat's job is
+  // to keep the crash watchdog quiet, and slowing this to its cadence would make
+  // the elapsed counter jump in 15s steps. See utils/startupStatus.
+  startStartupStatusPolling({
+    invoke,
+    setStatus: setBootStatus,
+    setInterval: (fn, ms) => window.setInterval(fn, ms),
+  });
 }
 
 async function boot() {

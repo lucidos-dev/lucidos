@@ -23,6 +23,9 @@ mod history;
 mod run;
 mod system_prompt;
 mod titles;
+// `pub(super)` so the per-trigger knowhow listing in `chat::process_helpers`
+// can share this module's routing-description ceiling.
+pub(super) mod workspace_payload;
 
 // Re-exported only for the colocated `process_tests` module, which reaches
 // these via `super::`. Non-test code imports them from the child modules

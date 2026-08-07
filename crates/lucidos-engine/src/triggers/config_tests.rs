@@ -929,15 +929,15 @@ fn apply_update_absent_group_id_leaves_unchanged() {
 }
 
 #[test]
-fn next_run_returns_none_when_paused() {
+fn next_runs_returns_nothing_when_paused() {
     let payload = json!({
         "trigger_id": "t1", "name": "T", "schedule": ["0 0 8 * * *"], "timezone": "UTC",
         "run": { "type": "intent", "text": "x", "knowhow": [] }
     });
     let mut config = TriggerConfig::from_created_payload(&payload).unwrap();
-    assert!(config.next_run().is_some());
+    assert!(!config.next_runs(1).is_empty());
     config.paused = true;
-    assert!(config.next_run().is_none());
+    assert!(config.next_runs(1).is_empty());
 }
 
 // --- Side-effect grant (ADR 0002, Phase 5) ---
@@ -1005,4 +1005,98 @@ fn apply_update_replaces_and_clears_side_effect_grant() {
     // Empty array clears it.
     config.apply_update(&json!({ "trigger_id": "t1", "side_effect_grant": [] }));
     assert!(config.side_effect_grant.is_empty());
+}
+
+// -- schedule_error / next_runs --
+
+/// Build a schedule-only config from a `TriggerCreated` payload.
+fn scheduled(schedule: serde_json::Value, paused: bool) -> TriggerConfig {
+    let mut config = TriggerConfig::from_created_payload(&json!({
+        "trigger_id": "t1",
+        "name": "T",
+        "schedule": schedule,
+        "timezone": "Europe/Oslo",
+        "run": { "type": "intent", "intent": "do the thing" },
+    }))
+    .unwrap();
+    config.paused = paused;
+    config
+}
+
+#[test]
+fn schedule_error_names_the_impossible_date() {
+    let problem = scheduled(json!(["0 0 9 31 2 *"]), false)
+        .schedule_error()
+        .expect("Feb 31 can never fire");
+    assert!(problem.contains("0 0 9 31 2 *"), "got: {problem}");
+    assert!(
+        problem.contains("day-of-month 31 never occurs in month 2 (February)"),
+        "got: {problem}"
+    );
+}
+
+#[test]
+fn schedule_error_ignores_paused() {
+    // A paused trigger with a dead schedule is exactly as misconfigured as an
+    // active one: resuming it would still do nothing.
+    assert!(scheduled(json!(["0 0 9 31 2 *"]), true)
+        .schedule_error()
+        .is_some());
+}
+
+#[test]
+fn schedule_error_is_none_when_any_expression_can_fire() {
+    // One live expression means the trigger genuinely fires, so the row must not
+    // wear an error chip because a sibling entry is dead.
+    assert_eq!(
+        scheduled(json!(["0 0 9 31 2 *", "0 0 8 * * *"]), false).schedule_error(),
+        None
+    );
+}
+
+#[test]
+fn schedule_error_is_none_for_healthy_and_event_only_triggers() {
+    assert_eq!(
+        scheduled(json!(["0 0 8 * * *"]), false).schedule_error(),
+        None
+    );
+    // No cron at all: nothing to be wrong about.
+    assert_eq!(scheduled(json!([]), false).schedule_error(), None);
+}
+
+#[test]
+fn schedule_error_reports_an_unparseable_expression() {
+    let problem = scheduled(json!(["0 0 99 * * *"]), false)
+        .schedule_error()
+        .expect("an unparseable expression is also a dead schedule");
+    assert!(
+        problem.contains("not a valid cron expression"),
+        "got: {problem}"
+    );
+}
+
+#[test]
+fn next_runs_merges_the_whole_schedule_in_order() {
+    // OR semantics across the array, so the 8am and 8pm streams interleave
+    // rather than the first expression owning all three slots.
+    let config = scheduled(json!(["0 0 8 * * *", "0 0 20 * * *"]), false);
+    let runs = config.next_runs(3);
+    assert_eq!(runs.len(), 3);
+    assert!(runs.windows(2).all(|w| w[0] < w[1]), "got: {runs:?}");
+    let hours: std::collections::BTreeSet<u32> = runs.iter().map(chrono::Timelike::hour).collect();
+    assert_eq!(
+        hours.len(),
+        2,
+        "both expressions must be represented: {runs:?}"
+    );
+}
+
+#[test]
+fn next_runs_is_empty_when_paused_or_dead() {
+    assert!(scheduled(json!(["0 0 8 * * *"]), true)
+        .next_runs(3)
+        .is_empty());
+    assert!(scheduled(json!(["0 0 9 31 2 *"]), false)
+        .next_runs(3)
+        .is_empty());
 }

@@ -131,7 +131,11 @@ impl LucidosEngine {
                 ))
             }
         };
-        let retention = backup::get_retention_count(pool).await;
+        // Display only, so the default is the right answer on an unreadable
+        // row; the prune caller in `scheduler::backup` skips instead.
+        let retention = backup::get_retention_count(pool)
+            .await
+            .unwrap_or(backup::DEFAULT_BACKUP_RETENTION);
         let tz: chrono_tz::Tz = self.user_timezone().await.parse().unwrap_or(chrono_tz::UTC);
 
         // Resolve the provider's account state before rendering. Reported

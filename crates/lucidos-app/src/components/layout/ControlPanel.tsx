@@ -13,6 +13,7 @@ import { CheckIcon, ReloadIcon } from '../shared/icons';
 import { fetchWorkspaces } from '../../api/client';
 import type { WorkspaceInfo } from '../../api/client';
 import { listWorkspaces, openWorkspace, type WorkspaceStatus } from '../../api/client/control';
+import { adoptWorkspaceDisplayName } from '../../store/actions/workspace-label';
 import { WORKSPACE_ID, gatewayPickerHref } from '../../utils/basePath';
 import type { Loadable } from '../../store/types';
 import { toFailed } from '../../store/types';
@@ -457,7 +458,12 @@ export function ControlPanel({ layout }: { layout: 'desktop' | 'mobile' }) {
     if (!effectiveOpen) return;
     setGatewayWs({ status: 'loading' });
     listWorkspaces()
-      .then(list => setGatewayWs({ status: 'loaded', data: list }))
+      .then(list => {
+        setGatewayWs({ status: 'loaded', data: list });
+        // Same listing the rows render, so a rename made in the picker while
+        // this tab was open reaches the header on the next open of this panel.
+        adoptWorkspaceDisplayName(list);
+      })
       .catch(() => {
         setGatewayWs({ status: 'failed', error: 'no gateway' });
         if (!connected) {

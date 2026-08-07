@@ -1624,26 +1624,21 @@ pub(super) async fn cancel_chat(
     } else {
         false
     };
-    // Stop ends this thread's event waits too (S6b lists a thread-level Stop
-    // as one of the four cancel causes). Done here rather than off the bus,
-    // unlike archive and discard: a PARKED thread has no running turn, so Stop
-    // emits nothing for a bus subscriber to observe, and the wait would outlive
-    // the Stop that was meant to end it. Counts toward `canceled` because it IS
-    // a status-changing event the client will receive.
-    let waits_canceled = match thread_id {
-        Some(uuid) => {
-            state
-                .engine
-                .cancel_event_waits_for_thread(
-                    uuid,
-                    crate::engine::thread_events::EventWaitCancelCause::ThreadCanceled,
-                    actor.clone(),
-                )
-                .await
-                > 0
-        }
-        None => false,
-    };
+    // Stop ends the TURN, and nothing else. It deliberately leaves this
+    // thread's event subscriptions alone.
+    //
+    // It used to cancel every one of them, which is what made a Stop on one
+    // running turn silently kill unrelated long-running subscriptions on the
+    // same thread: no toast, no transcript line, and the indicator row just
+    // gone. A subscription has not held a turn since ADR 0049, so it is not
+    // part of what a turn-scoped Stop owns, and the coupling had outlived the
+    // parked shape that justified it. The ways to end one are the **Stop
+    // waiting** button (per subscription), archive and discard (off the bus,
+    // and the archive asks first), and the agent standing itself down.
+    //
+    // `EventWaitCancelCause::ThreadCanceled` is kept and still deserializes,
+    // because rows written before this carry it; see its doc comment.
+    //
     // `canceled = false` means the server had nothing live to cancel — the
     // client's optimistic "canceling" state is stale and it must re-sync.
     let canceled = match thread_id {
@@ -1675,7 +1670,7 @@ pub(super) async fn cancel_chat(
         None => state.engine.cancel_all_threads(actor),
     };
     Ok(Json(super::CancelResponse {
-        canceled: question_resolved || waits_canceled || canceled,
+        canceled: question_resolved || canceled,
     }))
 }
 

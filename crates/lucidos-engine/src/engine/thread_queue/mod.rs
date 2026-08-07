@@ -137,6 +137,18 @@ struct QueueState {
     user_active: HashMap<Uuid, UserSlot>,
     /// User-initiated responses waiting for a slot (priority line, FIFO).
     user_queued: VecDeque<UserWaiter>,
+    /// `thread_id` to the `user_active` key its slot was filed under before
+    /// [`ThreadQueue::reconcile_user_slot`] removed it on a park/idle.
+    ///
+    /// This is what lets the resume RE-file the slot under its ORIGINAL key.
+    /// [`UserSlotGuard`]'s backstop matches the gate's `entry_id`, so a resume
+    /// that minted a fresh `Uuid` put the slot permanently out of the guard's
+    /// reach: pair that with a settle missed on broadcast lag and the slot was
+    /// leaked for the life of the process, and enough leaks block every chat
+    /// POST on the pool. Keyed by thread because that is what reconcile has in
+    /// hand, and bounded by it: one parked key per thread, cleared when the
+    /// slot is re-filed or the guard drops.
+    parked_user_slots: HashMap<Uuid, Uuid>,
     /// Per-trigger notification cooldowns (allowed-ephemeral — a restart
     /// resetting the cooldown at worst re-notifies once).
     backlog_notified: HashMap<String, Instant>,
@@ -202,6 +214,12 @@ pub struct SubmitOutcome {
 pub struct UserSlotGuard {
     queue: Arc<ThreadQueue>,
     entry_id: Uuid,
+    /// The thread the gate reserved for. Carried ONLY so the drop can clear
+    /// this thread's `parked_user_slots` key when the task ends while its
+    /// thread is parked. Releasing the slot itself stays keyed by `entry_id`;
+    /// see [`ThreadQueue::release_user_slot`] for why a by-thread release would
+    /// be wrong.
+    thread_id: Option<Uuid>,
 }
 
 impl Drop for UserSlotGuard {
@@ -211,8 +229,9 @@ impl Drop for UserSlotGuard {
         // missed release at shutdown is harmless (it dies with the process).
         let queue = self.queue.clone();
         let entry_id = self.entry_id;
+        let thread_id = self.thread_id;
         tokio::spawn(async move {
-            queue.release_user_slot(entry_id).await;
+            queue.release_user_slot(entry_id, thread_id).await;
         });
     }
 }
@@ -367,6 +386,7 @@ impl ThreadQueue {
                 active: HashMap::new(),
                 user_active: HashMap::new(),
                 user_queued: VecDeque::new(),
+                parked_user_slots: HashMap::new(),
                 backlog_notified: HashMap::new(),
                 global_notified: None,
             }),
@@ -1016,6 +1036,7 @@ impl ThreadQueue {
         UserSlotGuard {
             queue: self.clone(),
             entry_id,
+            thread_id,
         }
     }
 
@@ -1027,9 +1048,31 @@ impl ThreadQueue {
     /// thread, or broadcast lag), or to clear a still-**queued** waiter whose
     /// task gave up before admission. Refreshes the panel and drains so the
     /// freed slot admits waiting work.
-    async fn release_user_slot(self: &Arc<Self>, entry_id: Uuid) {
+    ///
+    /// **It stays keyed by `entry_id` alone, and `parked_user_slots` is what
+    /// makes that sufficient.** `reconcile_user_slot` removes a parked thread's
+    /// slot and re-files it on resume; when it minted a fresh `Uuid` there, the
+    /// guard's `entry_id` matched nothing afterwards and this backstop could
+    /// never fire. Pair that with a settle missed on broadcast lag (the
+    /// subscriber skips reconcile for dropped events) and the slot leaked for
+    /// the life of the process, and enough leaks block every chat POST on the
+    /// pool. The resume now re-files under the parked key, so identity survives
+    /// the round trip and no by-thread fallback is needed. A fallback would be
+    /// worse than the leak it fixed: it releases whatever slot currently holds
+    /// the thread, which after a second gate for the same thread is the NEWER
+    /// request's slot, admitting queued work above the configured pool limit
+    /// with no status transition guaranteed to put it back.
+    ///
+    /// `thread_id` is taken only to drop this thread's parked key, so a guard
+    /// dropped while its thread is parked leaves nothing behind in the map.
+    async fn release_user_slot(self: &Arc<Self>, entry_id: Uuid, thread_id: Option<Uuid>) {
         let removed = {
             let mut state = self.state.lock().await;
+            if let Some(tid) = thread_id {
+                if state.parked_user_slots.get(&tid) == Some(&entry_id) {
+                    state.parked_user_slots.remove(&tid);
+                }
+            }
             if state.user_active.remove(&entry_id).is_some() {
                 true
             } else {
@@ -1174,8 +1217,18 @@ impl ThreadQueue {
                         .as_ref()
                         .map(|(_, _, s)| truncate_summary(s.trim()))
                         .unwrap_or_default();
+                    // Re-file under the key this thread's slot was parked at, so
+                    // the gate's `UserSlotGuard` can still release it. A fresh
+                    // `Uuid` here put the slot permanently out of the guard's
+                    // reach; see `parked_user_slots`. No parked key means this
+                    // resume has no live guard behind it, so a fresh one is
+                    // right and the reconcile removal below owns the slot.
+                    let entry_id = state
+                        .parked_user_slots
+                        .remove(&thread_id)
+                        .unwrap_or_else(Uuid::new_v4);
                     state.user_active.insert(
-                        Uuid::new_v4(),
+                        entry_id,
                         UserSlot {
                             thread_id: Some(thread_id),
                             summary,
@@ -1185,6 +1238,14 @@ impl ThreadQueue {
                     (true, false)
                 }
                 (false, true) => {
+                    if let Some(key) = state
+                        .user_active
+                        .iter()
+                        .find(|(_, s)| s.thread_id == Some(thread_id))
+                        .map(|(k, _)| *k)
+                    {
+                        state.parked_user_slots.insert(thread_id, key);
+                    }
                     state
                         .user_active
                         .retain(|_, s| s.thread_id != Some(thread_id));

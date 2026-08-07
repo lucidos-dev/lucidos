@@ -1,5 +1,41 @@
 # Changelog
 
+## v0.24.0 — 2026-08-07
+
+### Added
+
+- **The Triggers panel shows when each trigger fires next.** A row lists its upcoming run times, and a trigger whose schedule cannot be evaluated shows an errored state instead of a blank.
+- **A cron expression that can never fire is rejected when you save it.** The offending field is marked in the trigger editor and keeps its red border while you are editing it.
+- **The agent can list and stand down its own event subscriptions.** `list_event_waits` reports what a thread is watching, when it was armed and when it times out; `cancel_event_wait` stops one or all of them. Both are on the `lucidos` CLI as `event-waits list` and `event-waits cancel`.
+- **A stopped subscription leaves a line in the transcript where it stopped**, so a thread that was watching for something shows where the watch ended.
+- **Archiving a thread that still has live subscriptions asks first**, and says how many it will stop.
+- **Connect an OAuth account in one pass.** The engine serves a provider registry, so the Connect form arrives prefilled with a known provider's endpoints, Reconnect widens an existing connection's scopes, and the form says when a provider requires the client secret. A refused connection shows what the provider sent back.
+- **An account records the scope set it was asked for**, alongside the scopes actually granted.
+- **The desktop app's startup splash says what it is waiting for.** It polls the engine's startup status while the gateway comes up, instead of showing a blank window.
+- **A scroll indicator on the mobile transcript.** It tracks position through the windowed transcript, sizes its thumb to the visible fraction, and fades out when scrolling stops.
+- **An app can show a spinning toast and dismiss it by key.** `lucidos.ui.toast` takes a spinning type and a stable `key`, and a later toast with the same key replaces the one on screen.
+
+### Changed
+
+- **The always-loaded chat context is substantially smaller.** Tool schemas, the static prompt body and the per-workspace payload were each trimmed and given a budget that tests hold them to. The workspace file listing now excludes vendored and build directories, lists breadth first, and caps knowhow and app descriptions.
+- **A collapsed run of hidden steps is marked with a faded tick** across the width of the transcript column, in place of a gap.
+- **The checkpoint card groups its actions**, and View changes is a Diff button.
+- **The Schedule Add button sits inside the cron field frame** in the trigger editor.
+- **The workspace picker refuses a duplicate workspace name** on create, rename and restore, and shows the name you gave a workspace from inside that workspace.
+
+### Fixed
+
+- **A data write issued while a change is being applied succeeds.** The write waits out a git index another writer is holding, then commits.
+- **Continue works after a crash**, and the transcript no longer repeats the interrupted turn.
+- **Stop ends the current turn and leaves the thread's event subscriptions running.** The button also releases once no turn is in flight, instead of staying stuck.
+- **The scheduler emits one terminator event per trigger fire**, not two.
+- **The gateway keeps serving loopback when a configured bind address is not up yet**, and the desktop app stops waiting on a gateway that has already died.
+- **Fira Code's ligatures stay off prose**, including the composer, so a typed `...` renders as three dots on all of it.
+- **Each pane has its own toast stack**, so a toast raised in one no longer appears in the other. The toast list also wakes on a layout flip rather than on every drag frame.
+- **A new-chat navigation keeps the open app.** The app stays fullscreen where it was, and stays put when the navigation lands on a split layout.
+- **Credential repair works against the stored credential**, the base URL sticks when you edit it, and the endpoint pair rule applies to edits as well as to new entries.
+- **The workspace picker keeps both entry points visible** and says why Restore is blocked when it is.
+- **The brand badge's superscript lift stays inside its clipping box**, on mobile and desktop.
 ## v0.23.1 — 2026-08-06
 
 ### Changed

@@ -1,11 +1,14 @@
 /** Pure part of the toast-stack reflow (FLIP) animation.
  *
- *  A new toast is prepended to the column-stacked, top-pinned container
- *  (`showToast` in store.ts), so every surviving toast is instantly re-laid-out
- *  downward by the new toast's height + gap. Left alone that reflow is an abrupt
- *  jump. The Toast component captures each surviving toast's OLD top before the
- *  commit and its NEW top after, then plays the delta back to zero — so the
- *  survivors glide to their new positions instead of snapping.
+ *  A new toast is prepended to the toast list (`showToast` in store.ts) and
+ *  lands at the top of its pane's column-stacked, top-pinned stack
+ *  (`toastColumns.ts`), so every surviving toast IN THAT COLUMN is instantly
+ *  re-laid-out downward by the new toast's height + gap. Left alone that reflow
+ *  is an abrupt jump. The Toast component captures each surviving toast's OLD
+ *  top before the commit and its NEW top after, then plays the delta back to
+ *  zero, so the survivors glide to their new positions instead of snapping.
+ *  The other pane's column does not move, so its toasts yield a zero delta and
+ *  are skipped by the threshold below.
  *
  *  This helper is the DOM-free core: given the previous render's ids, the
  *  captured old tops, and the current tops, it returns the per-toast shift to

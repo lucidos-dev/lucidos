@@ -26,6 +26,18 @@ pub struct TriggerInfo {
     pub last_run_status: Option<TriggerRunStatus>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub next_run: Option<String>,
+    /// The next few upcoming fire times (RFC3339, UTC), merged across every cron
+    /// expression. `next_run` is its first entry; the panel shows the rest so a
+    /// wrong schedule is visible before it costs anything (a "monthly" trigger
+    /// listing three dates a year apart gives itself away).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub next_runs: Vec<String>,
+    /// Set when the trigger's cron schedule can never fire, e.g. `0 0 9 31 2 *`.
+    /// Renders as an error on the row instead of the "No more runs" chip a spent
+    /// one-shot gets. Only reachable for triggers stored before the create /
+    /// update guard existed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schedule_error: Option<String>,
     pub run: serde_json::Value,
     /// Event subscriptions. Empty for schedule-only triggers; each entry pairs
     /// an event type with an optional per-entry payload filter.
@@ -65,6 +77,9 @@ impl TriggerInfo {
             );
             serde_json::Value::Null
         });
+        // One pass over the schedule feeds both fields: `next_run` is just the
+        // head of the preview, so the two can never disagree.
+        let next_runs = config.next_runs(crate::engine::tools::scheduler::CRON_PREVIEW_COUNT);
         Self {
             id: config.id.clone(),
             name: config.name.clone(),
@@ -74,7 +89,9 @@ impl TriggerInfo {
             paused: config.paused,
             last_run: config.last_run.map(|t| t.to_rfc3339()),
             last_run_status: config.last_run_status,
-            next_run: config.next_run().map(|t| t.to_rfc3339()),
+            next_run: next_runs.first().map(|t| t.to_rfc3339()),
+            next_runs: next_runs.iter().map(|t| t.to_rfc3339()).collect(),
+            schedule_error: config.schedule_error(),
             run,
             on: config.on.clone(),
             // Surface the resolved (explicit-or-derived) app id so the frontend
@@ -305,25 +322,28 @@ pub(super) async fn create_trigger(
         return ApiResult::err("At least one cron expression or an event subscription is required");
     }
 
-    // Validate cron expressions if provided
-    for expr in &request.cron_expressions {
-        let expr = expr.trim();
-        if crate::engine::tools::scheduler::parse_standard_cron(expr).is_err() {
-            return ApiResult::err(format!("Invalid cron expression: '{}'", expr));
-        }
-    }
-    let cron_expressions: Vec<String> = request
-        .cron_expressions
-        .iter()
-        .map(|s| s.trim().to_string())
-        .collect();
-
-    // Read timezone from preferences (default to UTC)
+    // Read timezone from preferences (default to UTC) before validating cron: the
+    // guard reports its next-run preview in the trigger's own timezone.
     let timezone = PreferenceStore::get(&state.pool, "timezone")
         .await
         .ok()
         .flatten()
         .unwrap_or_else(|| "UTC".to_string());
+
+    // Validate cron expressions if provided. This rejects a schedule that can
+    // never fire (Feb 31 and friends), not just a malformed one.
+    let validated = match crate::engine::tools::scheduler::validate_cron_expressions(
+        request
+            .cron_expressions
+            .iter()
+            .map(|s| s.trim().to_string())
+            .collect(),
+        crate::engine::tools::scheduler::cron_tz_or_utc(&timezone, "POST /triggers"),
+    ) {
+        Ok(v) => v,
+        Err(e) => return ApiResult::err(e),
+    };
+    let cron_expressions = validated.expressions.clone();
 
     let run_value = match serde_json::to_value(&run) {
         Ok(v) => v,
@@ -397,7 +417,7 @@ pub(super) async fn create_trigger(
         )
         .await;
 
-    ApiResult::ok()
+    ApiResult::ok_with_cron_preview(CronPreview::from_validated(&validated))
 }
 
 /// Update an existing trigger
@@ -415,15 +435,19 @@ pub(super) async fn update_trigger(
         None => return ApiResult::err(format!("Trigger '{}' not found", task_id)),
     };
 
-    // Validate cron expressions if provided
-    if let Some(ref exprs) = request.cron_expressions {
-        for expr in exprs {
-            let expr = expr.trim();
-            if crate::engine::tools::scheduler::parse_standard_cron(expr).is_err() {
-                return ApiResult::err(format!("Invalid cron expression: '{}'", expr));
-            }
-        }
-    }
+    // Validate cron expressions if provided, against the trigger's own timezone
+    // (an update cannot change it). This rejects a schedule that can never fire
+    // (Feb 31 and friends), not just a malformed one.
+    let validated = match request.cron_expressions {
+        Some(ref exprs) => match crate::engine::tools::scheduler::validate_cron_expressions(
+            exprs.iter().map(|s| s.trim().to_string()).collect(),
+            crate::engine::tools::scheduler::cron_tz_or_utc(&existing.timezone, "PUT /triggers"),
+        ) {
+            Ok(v) => Some(v),
+            Err(e) => return ApiResult::err(e),
+        },
+        None => None,
+    };
 
     // Validate run field if changing
     if let Some(ref run_val) = request.run {
@@ -446,9 +470,8 @@ pub(super) async fn update_trigger(
     if let Some(ref n) = request.name {
         update_payload["name"] = serde_json::json!(n.trim());
     }
-    if let Some(ref exprs) = request.cron_expressions {
-        let updated_crons: Vec<String> = exprs.iter().map(|s| s.trim().to_string()).collect();
-        update_payload["schedule"] = serde_json::json!(updated_crons);
+    if let Some(ref v) = validated {
+        update_payload["schedule"] = serde_json::json!(v.expressions);
     }
     if let Some(ref run_val) = request.run {
         if let Ok(run) = serde_json::from_value::<TriggerRun>(run_val.clone()) {
@@ -521,9 +544,9 @@ pub(super) async fn update_trigger(
     }
 
     // Ensure trigger still has at least one firing mechanism after update
-    let updated_crons = request
-        .cron_expressions
+    let updated_crons = validated
         .as_ref()
+        .map(|v| &v.expressions)
         .unwrap_or(&existing.schedule);
     let updated_on = normalized_on.as_ref().unwrap_or(&existing.on);
     if updated_crons.is_empty() && updated_on.is_empty() {
@@ -548,7 +571,12 @@ pub(super) async fn update_trigger(
         )
         .await;
 
-    ApiResult::ok()
+    // Only an update that actually rewrote the schedule has a preview to report;
+    // one that only renamed the trigger says nothing about its cron.
+    match validated {
+        Some(ref v) => ApiResult::ok_with_cron_preview(CronPreview::from_validated(v)),
+        None => ApiResult::ok(),
+    }
 }
 
 /// Delete a trigger

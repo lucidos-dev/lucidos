@@ -144,20 +144,25 @@ export async function dismissNativeNotification(opts: {
 }
 
 /**
- * Bring the native main window to the front (Rust `focus_main_window`): leave
- * menu-bar-only, unminimize, show, focus, activate frontmost. The same reshow the
- * tray's "Open Lucidos" and a notification tap perform.
+ * Bring the CALLING page's own native window to the front (Rust
+ * `focus_calling_window`): leave menu-bar-only, unminimize, show, focus,
+ * activate frontmost.
  *
  * For the one flow that finishes OUTSIDE the app: an OAuth authorization the
  * user completes in a browser, after which they'd otherwise be left on the
- * callback tab with Lucidos behind it. Not a general "focus me" the page may
- * call freely. A window that fronts itself on a background event is a nuisance,
- * so keep callers to "this device started it, the user clicked seconds ago,
- * fires once". Best-effort: errors are swallowed (there is no window to front on
- * a failed IPC, and the connection itself already succeeded). Only call when
+ * callback tab with Lucidos behind it.
+ *
+ * The window it fronts is the calling page's, never `main`. The command used to
+ * be `focus_main_window` and reshowed `main` specifically (creating one if it
+ * was gone), which raised the wrong window whenever the flow was finished from a
+ * New Window or a second workspace. Not a general "focus me" the page may call
+ * freely: a window that fronts itself on a background event is a nuisance, so
+ * keep callers to "this page started it, the user clicked seconds ago, fires
+ * once". Best-effort: errors are swallowed (there is no window to front on a
+ * failed IPC, and the connection itself already succeeded). Only call when
  * isTauri() is true. */
-export function focusMainWindow(): void {
-  invoke('focus_main_window').catch(() => {});
+export function focusCallingWindow(): void {
+  invoke('focus_calling_window').catch(() => {});
 }
 
 /**

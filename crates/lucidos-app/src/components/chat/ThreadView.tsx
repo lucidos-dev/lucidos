@@ -16,6 +16,7 @@ import { computeExchanges, hasContentEvents } from '../../store/thread-events';
 import { awayFromBottom, notAtTop, scrollToBottom, scrollToBottomAnimated, scrollToTop, scrolledUp, hasPendingEventScroll, deepLinkRenderAll } from './scrollState';
 import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll } from './threadWindow';
 import { useScrollMemory, hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
+import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
 import { forceIOSRepaint, forceIOSRepaintBurst, createRepaintThrottle } from '../../utils/iosRepaint';
@@ -408,6 +409,24 @@ export function ThreadView() {
     const areaRef = useRef<HTMLDivElement>(null);
     const isUp = awayFromBottom.value;
     const isNotAtTop = notAtTop.value;
+
+    // The mobile transcript draws its own scroll indicator, because the native
+    // overlay one spans a box that starts behind the fixed header (see
+    // components/chat/scrollIndicator.ts). No-op on desktop.
+    //
+    // The two elements are held in STATE via callback refs, not in refs: this
+    // component renders a loading branch before the transcript branch, so the
+    // indicator mounts after the first effect pass, and a ref filling in would
+    // never re-run the hook's effect (stable object, unchanged dependency).
+    const [indicatorTrack, setIndicatorTrack] = useState<HTMLDivElement | null>(null);
+    const [indicatorThumb, setIndicatorThumb] = useState<HTMLDivElement | null>(null);
+    useThreadScrollIndicator({
+        scrollerRef: areaRef,
+        track: indicatorTrack,
+        thumb: indicatorThumb,
+        renderFromIndex,
+        totalExchanges: exchanges.length,
+    });
 
     // Re-publish --scrollbar-gutter-width now that a real transcript exists to
     // measure. The boot publish (main.tsx) ran before any of this was mounted and
@@ -840,7 +859,11 @@ export function ThreadView() {
                     <ThreadOverflowMenu threadId={threadId} title={threadTitle} />
                 </span>
             </div>
-            <div class="thread-content-wrap">
+            {/* `has-scroll-indicator` is what licenses mobile.css to suppress the
+                native overlay indicator on this scroller: the suppression is
+                scoped to a wrap that actually carries a replacement, so a
+                transcript can never end up with no scroll feedback at all. */}
+            <div class="thread-content-wrap has-scroll-indicator">
                 {/* tabindex makes the transcript a keyboard-focusable scroll
                     region: once focused (via Tab or the ⌘↑/⌘↓ turn shortcuts) the
                     native Arrow/PageUp/PageDown/Home/End/Space keys scroll it. */}
@@ -854,6 +877,12 @@ export function ThreadView() {
                     )}
                 </div>
                 <ThreadSkeletonOverlay show={showThreadSkeleton} />
+                {/* Presentational only (aria-hidden): the transcript is already a
+                    labelled scroll region and a screen reader announces position
+                    from that, not from a decorative bar. */}
+                <div class="thread-scroll-indicator" ref={setIndicatorTrack} aria-hidden="true">
+                    <div class="thread-scroll-thumb" ref={setIndicatorThumb} />
+                </div>
                 <ScrollControls
                     showUp={isNotAtTop}
                     showDown={isUp}

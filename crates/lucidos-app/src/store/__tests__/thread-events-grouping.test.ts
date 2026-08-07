@@ -700,6 +700,39 @@ describe('continuableAbortIndex', () => {
     const exchanges = groupIntoExchanges(events);
     expect(continuableAbortIndex(exchanges)).toBe(1);
   });
+
+  // Crash recovery emits the boundary and its OWN marker together: a
+  // `recovery_after_restart` abort immediately followed by the synthetic
+  // `CodingAgentIdled { reason: engine_restart_interrupt }` whose entire purpose
+  // is to say "this was interrupted, offer Continue"
+  // (`agent_recovery/recovery.rs`). `CodingAgentIdled` is not an exchange-start
+  // type, so it folds into the abort as a step, and the resolved-boundary check
+  // read the engine's own offer as a turn that had run and finished. Every
+  // coding-agent thread a restart touched came back unresumable (reported
+  // 2026-08-07, across a whole workspace at once).
+  it('offers Continue on the recovery pair, whose idle IS the interruption marker', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: { kind: 'system' } }],
+      [3, { type: 'CodingAgentIdled', reason: 'engine_restart_interrupt' }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(continuableAbortIndex(exchanges)).toBe(1);
+  });
+
+  // The other direction, and the reason the carve-out is keyed on the reason
+  // rather than on the event type: a coding-agent turn that genuinely ran under
+  // the boundary and finished still resolves it.
+  it('returns null when a real coding-agent turn under the abort went idle', () => {
+    const events = new Map<number, ThreadEvent>([
+      [1, { type: 'MessageReceived', text: 'one' }],
+      [2, { type: 'ResponseAborted', cause: 'recovery_after_restart', actor: { kind: 'system' } }],
+      [3, { type: 'CodingAgentTextStreamed', text: 'carrying on' }],
+      [4, { type: 'CodingAgentIdled' }],
+    ]);
+    const exchanges = groupIntoExchanges(events);
+    expect(continuableAbortIndex(exchanges)).toBeNull();
+  });
 });
 
 describe('abortPromisesAutoResume', () => {

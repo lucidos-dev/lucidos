@@ -113,7 +113,7 @@ test.describe('Command checkpoint card', () => {
     await expect(card.locator('.checkpoint-scope')).toHaveCount(0);
   });
 
-  test('View changes opens the diff, and explains a reclaimed snapshot pair', async ({ page }) => {
+  test('Diff opens the change, and explains a reclaimed snapshot pair', async ({ page }) => {
     const { threadId } = seed();
     await openThread(page, threadId);
 

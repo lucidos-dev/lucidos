@@ -16,16 +16,31 @@
 #
 # Reclaiming a stale lock is ORPHAN-SAFE, not blind. A "stale" lock is one whose
 # owner PID is dead — but an INTERRUPTED run (killed before its EXIT trap could
-# tear down) leaves orphaned e2e processes alive: Playwright/WebKit browser
-# children and the e2e-test workspace engine, still holding their RSS. The
+# tear down) leaves orphaned e2e processes alive, still holding their RSS. The
 # nightly orchestrator re-spawned the full e2e suite THREE times on 2026-06-21,
 # and each re-spawn reclaimed the "free" stale lock and stacked a fresh set of
 # browsers on top of the orphans → 23.5 GB compressed + 14 GB swap, the machine
 # pinned in critical memory pressure for 4+ hours.
 #
-# So before reclaiming a stale lock we SWEEP the prior run's orphans
-# (deliberately, logged), then re-scan; we reclaim only once they are gone. If
-# the sweep can't clear them we REFUSE rather than stack. The four states:
+# THREE KINDS of orphan, because a run leaks three kinds of process:
+#   browser: Playwright's browser children, matched by the browsers-cache path.
+#   engine:  the e2e-test workspace's own engine, keyed on its pidfile.
+#   agent:   the CODING-AGENT subprocesses the suite's own tests spawn (Claude
+#            Code / Codex, and the `lucidos mcp-permission-server` each one
+#            runs). The engine starts them with their cwd inside a worktree
+#            under the e2e workspace; when it dies they are re-parented to init
+#            and keep running. Four survived 55 minutes on 2026-08-07, the
+#            single largest contributor to a memory exhaustion that froze the
+#            host, and nothing here looked for them: the sweep knew only about
+#            browsers and the engine.
+#
+# The sweep runs at two moments, and it needs both:
+#   - at TEARDOWN of every run that stops its workspace (`sweep_e2e_orphans`),
+#     so a run cleans up after itself instead of banking on the next one; and
+#   - before RECLAIMING a stale lock, the only backstop left when a run is
+#     killed hard enough that its EXIT trap never fires.
+# Reclaim re-scans after sweeping and takes the lock only once they are gone; if
+# the sweep cannot clear them it REFUSES rather than stack. The four states:
 #   1. no lock file           → acquire
 #   2. live-PID lock          → hard-fail (another run is live)
 #   3. stale lock, no orphans → reclaim (as before)
@@ -79,7 +94,81 @@ _e2e_orphan_browser_tokens() {
     printf '%s\n' "$base/webkit" "$base/chromium" "$base/firefox"
 }
 
-# Emit "KIND PID" for every LIVE orphan of a prior e2e run. KIND ∈ browser|engine.
+# argv[0] basenames worth asking the kernel about for the `agent` kind. This
+# list NARROWS the candidate set only; the cwd check below is what decides, so
+# adding a name here can never by itself make something a kill candidate.
+# `lucidos` is the engine-bundled CLI that Claude Code runs as its MCP
+# permission server. `lucidos-engine` is deliberately absent: the engine has its
+# own pidfile-keyed kind, and listing it here would double-report it.
+_e2e_orphan_agent_basenames() {
+    printf '%s\n' claude codex node lucidos
+}
+
+# A pid's current working directory, or empty when it cannot be read.
+#
+# This is a KERNEL FACT, which is the whole reason the `agent` kind keys on it.
+# argv[0] cannot separate an e2e coding-agent subprocess from the user's own
+# session (both are `.../bin/claude`), and the rest of the command line is
+# actively unsafe to match: a Claude Code process carries the engine's thread
+# history inside a ~22 KB `--append-system-prompt`, so a session that merely
+# DISCUSSES the e2e workspace's paths contains them verbatim (the session that
+# designed this sweep did). That is not hypothetical: the sibling matcher in
+# webkit_reaper.sh SIGKILLed two real sessions on 2026-08-03 for quoting a path.
+# No prompt text can forge a cwd.
+#
+# Test seam: overridden by the test to feed synthetic paths.
+_e2e_proc_cwd() {
+    local pid="$1"
+    if [ -r "/proc/$pid/cwd" ]; then
+        readlink "/proc/$pid/cwd" 2>/dev/null
+        return 0
+    fi
+    lsof -a -d cwd -p "$pid" -Fn 2>/dev/null | sed -n 's/^n//p' | head -1
+}
+
+# The e2e workspace dir with symlinks resolved, so a prefix test can match the
+# real paths `lsof` reports. Falls back to the unresolved form if it is gone.
+_e2e_resolved_workspace_dir() {
+    local ws
+    ws="$(_e2e_workspace_dir)"
+    (cd "$ws" 2>/dev/null && pwd -P) || printf '%s' "$ws"
+}
+
+# Is $1 the directory $2, or anything beneath it? Prefix test on whole path
+# components, so a sibling like `<ws>-old` can never match `<ws>`.
+#
+# Trailing slashes are stripped from the root first. `_e2e_workspace_dir` hands
+# back $E2E_WORKSPACE verbatim, so an operator who exported it with one would
+# otherwise make `<root>/*` read `<root>//*`, which matches nothing: the scan
+# would go silently blind, the same class of disarming as the whitespace
+# browsers path that `_e2e_list_orphans` warns about.
+_e2e_path_under() {
+    local path="$1" root="$2"
+    while [ "${root%/}" != "$root" ] && [ -n "${root%/}" ]; do root="${root%/}"; done
+    [ -n "$path" ] && [ -n "$root" ] || return 1
+    case "$path" in
+        "$root" | "$root"/*) return 0 ;;
+    esac
+    return 1
+}
+
+# Is $1 an ancestor of this shell? Never signal one (ADR 0025): a sweep that can
+# reach its own caller kills the run that is trying to clean up. The cwd gate
+# already excludes our own session, so this is defence in depth, and it is the
+# same posture `is_protected_host_pid` takes in ports.sh. Bounded walk so a
+# malformed ppid chain cannot spin.
+_e2e_is_ancestor_of_self() {
+    local target="$1" p=$$ hops=0
+    while [ "$p" -gt 1 ] && [ "$hops" -lt 64 ]; do
+        [ "$p" = "$target" ] && return 0
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+        case "$p" in ''|*[!0-9]*) return 1 ;; esac
+        hops=$((hops + 1))
+    done
+    return 1
+}
+
+# Emit "KIND PID" for every LIVE orphan of a prior e2e run. KIND ∈ browser|engine|agent.
 # Browser children are matched by the cache-path substring; the engine is keyed on
 # the e2e-test workspace's OWN engine.pid (so we never touch another workspace's
 # engine). PID≤1 and our own shell are always skipped. Test seam: overridden by
@@ -139,6 +228,43 @@ $tokens
 EOF
     done
 
+    # Coding-agent subprocesses the suite's own tests spawned. Two-stage on
+    # purpose: argv[0]'s basename narrows the candidates (so we ask the kernel
+    # about a handful of pids, not 500), and the CWD decides. See `_e2e_proc_cwd`
+    # for why nothing else in the command line may be trusted here.
+    #
+    # No ppid==1 gate. Both callers hold the lock, so nothing else is legitimately
+    # driving this workspace: at teardown the engine has already been stopped, and
+    # on the reclaim path the owning run is dead. Requiring re-parenting would
+    # also miss an agent whose parent is another leaked agent.
+    # Both forms of the workspace root, because the two sides of the comparison
+    # are resolved differently: `lsof` reports a cwd with symlinks already
+    # resolved, while $E2E_WORKSPACE may be written through one (macOS `/var` is
+    # a symlink to `/private/var`, which is where a temp-dir workspace lives).
+    # Matching either root means a symlinked path can't silently disarm the scan.
+    local ws_raw ws_real agent_names argv0 cwd name
+    ws_raw="$(_e2e_workspace_dir)"
+    ws_real="$(_e2e_resolved_workspace_dir)"
+    agent_names="$(_e2e_orphan_agent_basenames)"
+    _e2e_orphan_ps | while read -r pid command; do
+        case "$pid" in ''|*[!0-9]*) continue ;; esac
+        [ "$pid" -le 1 ] && continue
+        [ "$pid" = "$self" ] && continue
+        argv0="${command%% *}"
+        local matched=""
+        while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            [ "${argv0##*/}" = "$name" ] && { matched=1; break; }
+        done <<EOF
+$agent_names
+EOF
+        [ -n "$matched" ] || continue
+        cwd="$(_e2e_proc_cwd "$pid")"
+        _e2e_path_under "$cwd" "$ws_real" || _e2e_path_under "$cwd" "$ws_raw" || continue
+        _e2e_is_ancestor_of_self "$pid" && continue
+        echo "agent $pid"
+    done
+
     # e2e-test workspace engine — keyed on its dedicated pidfile, liveness-gated.
     local engine_pid
     engine_pid="$(cat "$(_e2e_workspace_dir)/.lucidos/engine.pid" 2>/dev/null)"
@@ -162,6 +288,7 @@ EOF
 # no-op to exercise the refuse-on-survive path.
 _e2e_reap_orphans() {
     local kind pid
+    local agents=""
     while read -r kind pid; do
         [ -z "$pid" ] && continue
         case "$kind" in
@@ -173,8 +300,50 @@ _e2e_reap_orphans() {
                 kill -USR1 "$pid" 2>/dev/null \
                     && echo "[e2e-lock] signaled orphan engine pid=$pid to stop (SIGUSR1)" >&2
                 ;;
+            agent)
+                # SIGTERM first: a coding agent owns a git worktree and a child
+                # MCP server, and its own handler unwinds both far more tidily
+                # than we can. Escalated below rather than trusted, because one
+                # that ignores it keeps ~150 MB and a node runtime for the life
+                # of the host, which is the pile-up being prevented.
+                kill -TERM "$pid" 2>/dev/null \
+                    && echo "[e2e-lock] asked orphan agent pid=$pid to stop (SIGTERM)" >&2
+                agents="$agents $pid"
+                ;;
         esac
     done
+    if [ -n "$agents" ]; then
+        sleep "${E2E_ORPHAN_AGENT_GRACE_S:-2}"
+        for pid in $agents; do
+            kill -0 "$pid" 2>/dev/null || continue
+            kill -KILL "$pid" 2>/dev/null \
+                && echo "[e2e-lock] orphan agent pid=$pid ignored SIGTERM, killed" >&2
+        done
+    fi
+}
+
+# ── sweep_e2e_orphans ───────────────────────────────────────────────────
+# Reap whatever this run left behind. Called from the teardown chain AFTER the
+# workspace is stopped, so the agents the tests spawned have already lost their
+# parent and nothing legitimate is still driving the workspace.
+#
+# This is the half that makes cleanup UNCONDITIONAL. The reclaim path above only
+# ever runs when the NEXT run finds a stale lock, so a run that finished cleanly,
+# or one whose successor never came, left its agents alive indefinitely: that is
+# exactly how four of them reached 55 minutes on 2026-08-07.
+#
+# Never fails the caller and never blocks it for long: teardown must not turn a
+# green run red, and an orphan that survives is still caught by the reclaim path.
+sweep_e2e_orphans() {
+    local orphans
+    orphans="$(_e2e_list_orphans 2>/dev/null)" || return 0
+    [ -n "$orphans" ] || return 0
+    echo "[e2e-lock] teardown: sweeping processes this run left behind:" >&2
+    printf '%s\n' "$orphans" | sed 's/^/[e2e-lock]   orphan: /' >&2
+    _e2e_reap_orphans <<EOF
+$orphans
+EOF
+    return 0
 }
 
 # Atomic create-or-fail using noclobber. Returns 0 on success, non-zero if file exists.
@@ -233,7 +402,8 @@ acquire_e2e_lock() {
 $orphans
 EOF
             # Poll until the sweep clears them. Browser SIGKILL is near-instant;
-            # the engine's SIGUSR1 graceful shutdown can take up to its ~10s budget.
+            # an agent gets a SIGTERM grace before its SIGKILL; the engine's
+            # SIGUSR1 graceful shutdown can take up to its ~10s budget.
             local timeout_s="${E2E_ORPHAN_REAP_TIMEOUT_S:-15}"
             case "$timeout_s" in ''|*[!0-9]*) timeout_s=15 ;; esac
             local deadline=$(( $(date +%s) + timeout_s ))
@@ -257,7 +427,7 @@ EOF
                 echo "Clean up the listed PIDs, then re-run. The e2e-test workspace can be" >&2
                 echo "stopped with:" >&2
                 echo "  ${_E2E_LOCK_LIB_DIR%/lib}/stop.sh -w \"$ws\"" >&2
-                echo "and any leftover Playwright browser PIDs with: kill -KILL <pid>" >&2
+                echo "and any leftover browser or coding-agent PIDs with: kill -KILL <pid>" >&2
                 echo "" >&2
                 echo "Lock file: $lock_file" >&2
                 return 1

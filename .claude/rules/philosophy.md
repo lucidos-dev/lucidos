@@ -9,10 +9,11 @@ Vision, mission, reasoning and worked cases:
 
 ## When this applies
 
-Only to proposals that add a **surface** (a new place the user meets Lucidos) or
-an **integration** (a new relationship with somebody else's product). It has
-nothing useful to say about concurrency, build determinism, recovery or schema
-work. Do not apply it there.
+**The test** below applies only to proposals that add a **surface** (a new place
+the user meets Lucidos) or an **integration** (a new relationship with somebody
+else's product). It has nothing useful to say about concurrency, build
+determinism, recovery or schema work. Do not apply it there. **Rule 3 is wider**
+and applies to any choice of client technology, protocol or format.
 
 ## The test
 
@@ -39,7 +40,7 @@ all deliberate, because that is where people are. The clause that makes it
 survivable is that **we own the fallback** (the headless tarball against the
 DMG). Do not cite this page against a ramp.
 
-## The two rules that catch most mistakes
+## The three rules that catch most mistakes
 
 1. **Own the surface, rent the model.** A model dependency sits behind our own
    registry and speaks our interface. A *surface* dependency (a chat platform,
@@ -47,6 +48,10 @@ DMG). Do not cite this page against a ramp.
    first freely. Take the second as a ramp, and only where we own the fallback.
 2. **Prompt-first, never prompt-only.** Anything doable in an app must be doable
    through the prompt. The reverse is not required.
+3. **Open standards, or no dependency.** Clients are one HTML/CSS/JS build (a
+   PWA, and the same build in the OS webview); apps are plain HTML/CSS/JS
+   against the SDK, no build step. No Swift/Kotlin/C#, and no private wire
+   protocol where a standard exists. Client-side native code only as a shim.
 
 ## Already settled
 
@@ -64,7 +69,8 @@ mechanism it loses on structural grounds in ADR 0048, as an OS handoff it is
 open).
 
 **The test is silent on anything pointing at our own client.** Argue those on
-cost and mechanics. Do not cite the philosophy to win them.
+cost and mechanics. Do not cite the philosophy to win them. Rule 3 is the one
+exception: it judges what a client is built out of, wherever it points.
 
 ## Writing a claim into the doc
 

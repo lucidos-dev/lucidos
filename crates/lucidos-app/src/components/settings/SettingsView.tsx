@@ -1,11 +1,24 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
-import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories } from '../../store/store';
+import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
 import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
 import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
-import { loadOAuthAccounts, disconnectOAuthAccount, grantOAuthScope } from '../../store/actions/oauth';
+import {
+  loadOAuthAccounts,
+  loadKnownOAuthProviders,
+  disconnectOAuthAccount,
+  grantOAuthScope,
+} from '../../store/actions/oauth';
+import {
+  connectScopes,
+  missingScopes,
+  prefillLabel,
+  providerToSend,
+  reconnectScopes,
+} from './oauthConnectForm';
+import { handleNavigationRequest } from '../../store/actions/navigation-request';
 import { initPushSubscription } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { availableReasoningLevels } from '../../store/models';
@@ -443,12 +456,39 @@ function VertexProviderSettings() {
   );
 }
 
+/** Hand the connection to the agent, which reads the same *OAuth provider
+ *  registry* and can walk the user through the provider's app console: the one
+ *  step this page cannot do for them, since the Client ID only exists once an
+ *  app is registered there.
+ *
+ *  Routed through `handleNavigationRequest` rather than poking compose directly,
+ *  so it clears the settings overlay, allocates a fresh draft and focuses the
+ *  prompt exactly like every other new-chat entry point. */
+function askLucidosToConnectAccount(): void {
+  handleNavigationRequest({
+    target: 'new-chat',
+    prompt:
+      'Help me connect an account: register the app with the provider, '
+      + 'enter the client ID, and sign in.',
+  });
+}
+
 export function SettingsView() {
   const loadable = devices.value;
   const showLoading = useDelayedLoading(loadable);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [oauthProvider, setOauthProvider] = useState('');
   const [oauthConnecting, setOauthConnecting] = useState(false);
+  /** The scopes a deep link said this connection is for, or null for a bare
+   *  sign-in. Cleared once used, or when the user picks a different provider:
+   *  Backup's upload scopes mean nothing for the provider they typed instead. */
+  const [oauthPurpose, setOauthPurpose] = useState<string | null>(null);
+  // A failed or absent registry is not an error state on this page: it means no
+  // quick buttons and no autofill, and the typed-name path still connects. So
+  // it degrades to an empty list rather than a `LoadableError`.
+  const registryLoadable = knownOAuthProviders.value;
+  const registryProviders =
+    registryLoadable.status === 'loaded' ? registryLoadable.data.providers : [];
   // Access preferences.value to subscribe to signal updates, then use typed accessors
   preferences.value;
   const uiScale = currentUiScale();
@@ -514,6 +554,28 @@ export function SettingsView() {
     settingsScrollTarget.value = null;
   }, [settingsScrollTarget.value, settingsSubview.value]);
 
+  // The *OAuth provider registry* backs both the quick buttons and the Connect
+  // form's autofill, so it is fetched once when Accounts is first shown rather
+  // than per press.
+  useEffect(() => {
+    if (settingsSubview.value !== 'accounts') return;
+    if (knownOAuthProviders.value.status !== 'not-loaded') return;
+    void loadKnownOAuthProviders();
+  }, [settingsSubview.value, knownOAuthProviders.value.status]);
+
+  // Arriving from a deep link (Backup's Connect button) with the provider and
+  // what the connection is for. Consumed once and cleared, like
+  // `settingsScrollTarget`. Waits for the registry so a known provider's field
+  // shows its label rather than its bare id.
+  useEffect(() => {
+    const prefill = oauthConnectPrefill.value;
+    if (!prefill || settingsSubview.value !== 'accounts') return;
+    if (knownOAuthProviders.value.status === 'loading') return;
+    setOauthProvider(prefillLabel(registryProviders, prefill.provider));
+    setOauthPurpose(prefill.scopes ?? null);
+    oauthConnectPrefill.value = null;
+  }, [oauthConnectPrefill.value, settingsSubview.value, knownOAuthProviders.value.status]);
+
   function credentialsSection() {
     const credLoadable = credentials.value;
     if (credLoadable.status === 'failed') {
@@ -524,8 +586,12 @@ export function SettingsView() {
     }
     return (
       <div class="list-rows">
+        {/* Keyed by `id`, never `service_name`: a name stopped identifying a row
+            when `auth_type` became the discriminator, so an `oauth_client` app
+            registration and an API key for the same provider share a name and
+            would collide into one key. */}
         {credLoadable.data.map((cred) => (
-          <CredentialItem key={cred.service_name} credential={cred} />
+          <CredentialItem key={cred.id} credential={cred} />
         ))}
         <div class="list-row-add-card" onClick={openAddCredential}>
           <div class="list-row-add-icon">+</div>
@@ -536,12 +602,20 @@ export function SettingsView() {
   }
 
   async function handleConnectProvider() {
-    const provider = oauthProvider.trim().toLowerCase();
+    if (!oauthProvider.trim()) return;
+    // The id, not the text in the field: a quick button puts "Dropbox" there and
+    // the credential's service name is `dropbox`, so sending the label would
+    // open a second connection under a name differing only in case.
+    const provider = providerToSend(registryProviders, oauthProvider);
     if (!provider) return;
     setOauthConnecting(true);
     try {
-      await grantOAuthScope(provider, 'openid email profile');
+      // `oauthPurpose` is what a deep link said this connection is FOR. Requesting
+      // it here is what makes one consent screen enough when the user arrived
+      // from Backup.
+      await grantOAuthScope(provider, connectScopes(oauthPurpose));
       setOauthProvider('');
+      setOauthPurpose(null);
     } finally {
       setOauthConnecting(false);
     }
@@ -564,6 +638,12 @@ export function SettingsView() {
           // an empty span is still a flex item, and .list-row-details' 0.75rem
           // gap would render it as a trailing hole after the email.
           const scopeLabel = account.scopes ? formatScopes(account.scopes) : '';
+          // Asked for but not granted: a provider refusing part of a request is
+          // a real state, and before the account recorded what it asked for
+          // there was nothing to compare, so it looked exactly like an account
+          // nobody had asked. Reconnect is the fix, and it is the button beside
+          // this line.
+          const shortfall = missingScopes(account);
           return (
           <div class="list-row oauth-account-row" key={account.id}>
             <div class="list-row-info">
@@ -576,6 +656,14 @@ export function SettingsView() {
                 <span>{account.email || 'No email'}</span>
                 {scopeLabel && <span>{scopeLabel}</span>}
               </div>
+              {shortfall.length > 0 && (
+                <div class="oauth-account-shortfall">
+                  Missing {shortfall.join(', ')}. The provider refused{' '}
+                  {shortfall.length === 1 ? 'it' : 'them'}: enable{' '}
+                  {shortfall.length === 1 ? 'it' : 'them'} for your app with the provider,
+                  then Reconnect.
+                </div>
+              )}
               <div class="list-row-date">
                 <span data-tooltip={formatDateTime(new Date(account.created_at))}>
                   Connected {formatShortDateWithYear(new Date(account.created_at))}
@@ -583,9 +671,14 @@ export function SettingsView() {
               </div>
             </div>
             <div class="list-row-actions">
+              {/* The DESIRED set, not the granted one. Re-requesting what the
+                  account already holds made the engine's merge compute
+                  `granted UNION granted`, so this button could never recover a
+                  scope a provider had refused, which is the one thing the
+                  engine's own permission errors send the user here to do. */}
               <button
                 class="action-btn"
-                onClick={() => void grantOAuthScope(account.provider, account.scopes)}
+                onClick={() => void grantOAuthScope(account.provider, reconnectScopes(account))}
               >Reconnect</button>
               <button
                 class="action-btn action-btn-danger"
@@ -596,14 +689,24 @@ export function SettingsView() {
           );
         })}
         <div class="list-row oauth-connect-row">
+          {/* One button per known provider, straight from the registry. This was
+              a hardcoded `['Google', 'Microsoft', 'GitHub']` array, which is why
+              Dropbox had no button despite the engine knowing its endpoints all
+              along. Adding a provider to the JSON now adds its button. */}
           <div class="oauth-quick-providers">
-            {['Google', 'Microsoft', 'GitHub'].map(name => (
+            {registryProviders.map(p => (
               <button
-                key={name}
-                class={`oauth-quick-btn${oauthProvider.toLowerCase() === name.toLowerCase() ? ' active' : ''}`}
+                key={p.id}
+                class={`oauth-quick-btn${oauthProvider.toLowerCase() === p.label.toLowerCase() ? ' active' : ''}`}
                 disabled={oauthConnecting}
-                onClick={() => setOauthProvider(prev => prev.toLowerCase() === name.toLowerCase() ? '' : name)}
-              >{name}</button>
+                onClick={() => {
+                  // Switching provider drops any purpose a deep link supplied:
+                  // Backup's upload scopes mean nothing for a different service.
+                  setOauthPurpose(null);
+                  setOauthProvider(prev =>
+                    prev.toLowerCase() === p.label.toLowerCase() ? '' : p.label);
+                }}
+              >{p.label}</button>
             ))}
           </div>
           <div class="oauth-connect-controls">
@@ -622,6 +725,17 @@ export function SettingsView() {
               onClick={handleConnectProvider}
             >{oauthConnecting ? 'Connecting...' : 'Connect'}</button>
           </div>
+          {/* Connecting a provider needs a Client ID out of that provider's own
+              app console, with the redirect URI registered byte for byte. The
+              form says which console and shows the URI, but the agent can walk
+              someone through the console itself, which no static form can. */}
+          <p class="form-hint oauth-connect-hint">
+            Connecting needs an app registration with the provider.{' '}
+            <button class="accent-link" onClick={askLucidosToConnectAccount}>
+              Ask Lucidos to do it
+            </button>{' '}
+            if you would rather be walked through it.
+          </p>
         </div>
       </div>
     );

@@ -104,14 +104,14 @@ describe('EventWaitStep', () => {
     expect(findByClass(step(wait_()), 'running-shimmer')).toBeNull();
   });
 
-  /** A resolved wait keeps the same subject line and changes only its outcome
-   *  and its trailing note, so the eye reads one row rather than four phrasings.
-   *  Timeout and cancel share the muted `unfinished` treatment (nothing failed,
-   *  the wait just stopped), so the note is what has to tell them apart. */
+  /** A wait that resolved on its own keeps the same subject line and changes
+   *  only its outcome and its trailing note, so the eye reads one row rather
+   *  than several phrasings. Timeout shares the muted `unfinished` treatment
+   *  with a stop (nothing failed, the watch just ended without its event), so
+   *  the note is what tells them apart. */
   it.each([
     ['woke', 'success', 'ChangeProposed'],
     ['timed_out', 'unfinished', 'timed out'],
-    ['canceled', 'unfinished', 'canceled'],
   ] as const)('renders the %s state as an %s step', (state, className, note) => {
     const tree = step(
       wait_({ state, matched_event_type: state === 'woke' ? 'ChangeProposed' : undefined }),
@@ -121,6 +121,45 @@ describe('EventWaitStep', () => {
     expect(String(el?.props.class)).toContain(className);
     expect(vnodeText(tree)).toContain('Set up an event wait:');
     expect(vnodeText(tree)).toContain(note);
+  });
+
+  /** A STOP is a different action at a different moment, so it says so. When
+   *  the subscription was armed in an earlier turn, this row IS the stop and
+   *  sits where the stop happened; "Set up an event wait" there would name the
+   *  wrong event entirely.
+   *
+   *  The word is "stopped", never "discarded": *discarded* already means
+   *  throwing a thing away in Lucidos, and one of the causes literally IS a
+   *  discarded thread. */
+  it('reads a stop as a stop, not as an arming', () => {
+    const tree = step(wait_({ state: 'canceled', cause: 'user_stop' }));
+    const el = findByRole(tree, 'event-wait-step');
+    expect(el?.props['data-state']).toBe('canceled');
+    expect(String(el?.props.class)).toContain('unfinished');
+    expect(vnodeText(tree)).toContain('Stopped waiting: the release build to finish');
+    expect(vnodeText(tree)).not.toContain('Set up an event wait');
+    expect(vnodeText(tree)).not.toContain('discard');
+  });
+
+  /** Every cause reads as what the person actually did, so a stand-down the
+   *  agent performed is not reported as the user pressing a button. */
+  it.each([
+    ['user_stop', 'stopped from the panel'],
+    ['agent_stand_down', 'stood down'],
+    ['thread_archived', 'stopped by archiving'],
+    ['thread_discarded', 'stopped by discarding the thread'],
+    ['thread_canceled', 'stopped by a thread Stop'],
+  ] as const)('names %s as "%s"', (cause, note) => {
+    expect(vnodeText(step(wait_({ state: 'canceled', cause })))).toContain(note);
+  });
+
+  /** A pre-2026-08-07 `EventWaitCanceled` carries neither a cause nor what it
+   *  stopped. It still has to render, and it says the one thing it knows rather
+   *  than an empty "Set up an event wait: ". */
+  it('renders a legacy stop that knows neither cause nor subscription', () => {
+    const tree = step(wait_({ state: 'canceled', reason: '', subscription: '', cause: undefined }));
+    expect(vnodeText(tree)).toContain('Stopped waiting for an event');
+    expect(vnodeText(tree)).toContain('stopped');
   });
 
   it('offers a jump to the matched event only when one was recorded', () => {

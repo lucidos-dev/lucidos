@@ -195,8 +195,9 @@ export function executorExtras(
       if (typeof event.context_tokens === 'number') contextTokens = event.context_tokens;
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;
     } else if (event.type === 'ContextCaptured') {
-      // Prefer real input_tokens; fall back to the conservative chars*2/3
-      // estimate (see `estimate_tokens_from_chars` in the engine).
+      // Prefer real input_tokens; fall back to the engine's chars*2/5
+      // estimate (see `estimate_tokens_from_chars` in the engine, which is
+      // measured at 2.5 chars/token, NOT the trim budget's conservative 1.5).
       const tokens = event.usage?.input_tokens ?? event.estimated_total_tokens;
       if (typeof tokens === 'number') contextTokens = tokens;
       if (typeof event.trimmed === 'boolean') contextTrimmed = event.trimmed;

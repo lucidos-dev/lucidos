@@ -249,6 +249,9 @@ html:not([data-theme="light"]) .action-btn-confirm {
     padding: 0;
     margin: 0;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     text-align: left;
     color: var(--accent);
     cursor: pointer;

@@ -401,6 +401,12 @@ async fn a_command_destroying_only_ignored_content_leaves_no_undo_card() {
     std::fs::create_dir_all(&scratch).expect("create scratch dir");
     std::fs::write(scratch.join("f.txt"), "scratch").expect("write scratch file");
 
+    // The checkpoint pair images the WHOLE working tree, so anything another
+    // test lands there between the two snapshots is read as this command's own
+    // effect and produces the card this test proves absent. Hold the tree still
+    // for the guarded turn; see `workspace_tree_lock`.
+    let _tree_quiet = crate::support::workspace_tree_lock().write().await;
+
     let refs_before = checkpoint_ref_count();
     let marker = crate::support::unique_marker("api-command-guard");
     let code = format!("import shutil; shutil.rmtree('{scratch_rel}')");

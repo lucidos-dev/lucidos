@@ -156,9 +156,27 @@ describe('describeContinuationReason', () => {
   });
 
   // The turn header keys off the same reason and must agree with the popover.
-  it('labels the api-error resume an interruption in the turn header too', () => {
+  // It also has to SAY which interruption: both auto-resume reasons shared one
+  // "Resumed after an interruption" label, so a thread that dropped its
+  // connection and was then killed by the hang watchdog showed two identical
+  // rows with no way to tell them apart or to know they had different causes
+  // (reported 2026-08-07). Neither may claim a restart, which is what the
+  // shared label was protecting and what these keep.
+  it('names which interruption the api-error resume recovered from', () => {
+    const label = continuationStartedSummary(CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON, undefined);
+    expect(label).toMatch(/connection/i);
+    expect(label).not.toMatch(/restart/i);
+  });
+
+  it('names which interruption the hang recovery recovered from', () => {
+    const label = continuationStartedSummary(CONTINUATION_AUTO_RECOVERY_REASON, undefined);
+    expect(label).toMatch(/stopped responding/i);
+    expect(label).not.toMatch(/restart/i);
+  });
+
+  it('gives the two auto-resume reasons distinguishable labels', () => {
     expect(continuationStartedSummary(CONTINUATION_AUTO_RESUME_AFTER_API_ERROR_REASON, undefined))
-      .toBe('Resumed after an interruption');
+      .not.toBe(continuationStartedSummary(CONTINUATION_AUTO_RECOVERY_REASON, undefined));
   });
 
   it('returns null for an unrecorded or unrecognized reason rather than inventing one', () => {

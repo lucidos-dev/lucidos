@@ -1,6 +1,6 @@
 ---
 name: Remote Access & HTTPS
-description: Use when the user wants to reach Lucidos from a phone, tablet, or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "Serve is not enabled on your tailnet", "reverse proxy". Covers the Settings > Access page and what each of its controls does, the Expose run and the tailnet approval it can wait on, finding which gateway is listening on which port, the three routes to HTTPS (tailscale serve, mkcert, plain HTTP over the tunnel), and the per-device certificate trust steps.
+description: Use when the user wants to reach Lucidos from a phone, tablet or another machine: "access from my phone", "remote access", "Mobile Access", "Expose", "Tailscale", "HTTPS", "not secure warning", "add to home screen", "certificate", "mkcert", "tailscale serve", "reverse proxy". Covers the Settings, Access page and its controls, the Expose run and the tailnet approval it can wait on, which gateway listens on which port, the three routes to HTTPS, and per-device certificate trust.
 ---
 
 # Remote Access & HTTPS
@@ -569,6 +569,23 @@ bound beyond loopback. `tailscale serve` does not, since it proxies locally.
 
 Binding to the tailnet IP specifically (`100.x.y.z`) is the middle ground: the
 tailnet reaches it, the coffee-shop LAN does not.
+
+**A configured IP that is not up yet does not hold the start back.** An `<IP>`
+bind is always accompanied by loopback, and only the loopback half is required:
+the gateway serves on it immediately and retries the configured address in the
+background until the interface appears, then starts listening on it too, with no
+restart. This matters at boot, where launchd starts the service before
+`tailscaled` has assigned the machine's `100.x` address, so binding it fails with
+`Can't assign requested address`. Until 2026-08-07 that failure was fatal to the
+whole gateway, and the desktop window sat on its startup splash for two minutes
+waiting for a process that had already exited.
+
+So a `100.x` URL can be briefly unreachable just after a restart while the local
+one already works. `GET /~/api/v1/health` reports any address still being waited
+on as `pending_binds`; an empty array means everything configured is bound.
+`loopback` and `all` are unaffected: their single address is required, and
+failing to bind it is still a hard error (that failure means the port is held,
+not that an interface is missing).
 
 ## Operational notes
 

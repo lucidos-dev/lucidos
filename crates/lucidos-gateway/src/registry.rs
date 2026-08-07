@@ -184,6 +184,29 @@ impl Registry {
         self.workspaces.iter().any(|w| w.id == id)
     }
 
+    /// The workspace already carrying this display name, ignoring surrounding
+    /// space and letter case, skipping `except_id` (so renaming a workspace to
+    /// what it is already called is not a collision with itself).
+    ///
+    /// The display name is what a user picks a workspace BY, so two rows reading
+    /// the same thing simply cannot be told apart in the picker: what
+    /// distinguishes them is the address, and the address is the thing the user
+    /// never sees. Create / rename / restore therefore refuse a duplicate rather
+    /// than produce one. Case-insensitive because "Work" and "work" are no more
+    /// distinguishable in a list than two identical strings, and they slug to the
+    /// same address anyway.
+    ///
+    /// A WRITE-time rule only. Duplicates were legal until now, so a registry
+    /// holding some keeps working: the picker shows those rows' addresses so they
+    /// stay tellable apart until the user renames one. Nothing is renamed for
+    /// them.
+    pub fn find_by_display_name(&self, name: &str, except_id: Option<&str>) -> Option<&Workspace> {
+        let wanted = name.trim().to_lowercase();
+        self.workspaces
+            .iter()
+            .find(|w| Some(w.id.as_str()) != except_id && w.name.trim().to_lowercase() == wanted)
+    }
+
     /// Add a workspace. Errors if the id already exists.
     pub fn add(&mut self, ws: Workspace) -> Result<(), BoxError> {
         if self.contains(&ws.id) {
@@ -557,6 +580,57 @@ mod tests {
         assert_eq!(loaded.version, REGISTRY_VERSION);
         assert!(loaded.get("myws").unwrap().autostart);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── Display names are unique ─────────────────────────────────────────────
+
+    fn two_workspaces() -> Registry {
+        let mut reg = Registry::default();
+        for (id, name) in [("personal", "personaaa"), ("personaaa", "personaaa2")] {
+            reg.add(Workspace {
+                id: id.into(),
+                name: name.into(),
+                dir: format!("workspaces/{id}"),
+                port: 5000,
+                database_url: None,
+                autostart: false,
+            })
+            .unwrap();
+        }
+        reg
+    }
+
+    #[test]
+    fn a_taken_display_name_is_found_whatever_its_case_or_padding() {
+        // The reported picker screenshot: two rows both reading "personaaa",
+        // one at /personal/ and one at /personaaa/. Nothing may create that.
+        let reg = two_workspaces();
+        for probe in ["personaaa", "PersonAAA", "  personaaa  "] {
+            assert_eq!(
+                reg.find_by_display_name(probe, None).map(|w| w.id.as_str()),
+                Some("personal"),
+                "probe {probe:?}",
+            );
+        }
+        assert!(reg.find_by_display_name("something else", None).is_none());
+    }
+
+    #[test]
+    fn a_workspace_never_collides_with_itself_on_rename() {
+        // Re-saving the same name (or a case edit of it) must not be refused.
+        let reg = two_workspaces();
+        assert!(reg
+            .find_by_display_name("personaaa", Some("personal"))
+            .is_none());
+        assert!(reg
+            .find_by_display_name("PERSONAAA", Some("personal"))
+            .is_none());
+        // But taking the OTHER workspace's name still collides.
+        assert_eq!(
+            reg.find_by_display_name("personaaa2", Some("personal"))
+                .map(|w| w.id.as_str()),
+            Some("personaaa"),
+        );
     }
 
     #[test]

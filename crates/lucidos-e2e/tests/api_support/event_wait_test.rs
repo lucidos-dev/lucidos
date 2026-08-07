@@ -22,6 +22,11 @@
 //! * an unrelated event resolving nothing, then Stop waiting cancelling
 //! * the HTTP registration route, the one a coding agent reaches through
 //!   `lucidos await-event`
+//! * a thread-level **Stop** ending the turn and leaving every subscription
+//!   watching, which is what a Stop used to silently destroy
+//! * the agent's own two verbs over the routes `lucidos event-waits list` /
+//!   `cancel` call: the read, the refusals, and a stand-down that records its
+//!   own cause
 
 use crate::support::{
     base_url, db_url, http_client, poll_thread_summary_by_marker, unique_marker, user_client,
@@ -404,4 +409,312 @@ async fn a_wait_can_be_registered_over_http() {
     emit_domain_event(&event_type, "waking the HTTP-registered wait").await;
     await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
     await_event_row(&pool, thread_id, "UserPromptInjected", 25).await;
+}
+
+/// The **arming lookback** over the real route: the event lands BEFORE the
+/// subscription exists, so nothing will ever wake the thread for it, and the
+/// registration response is the only place the caller can learn about it.
+///
+/// This is the 2026-08-06 failure end to end. A chat thread checked the change
+/// list, worked for 84 seconds, then armed a wait 26 seconds after the
+/// `ChangeProposed` it wanted had already landed. The wait was armed, the
+/// response said "subscribed", and the change was never applied.
+///
+/// Registered over HTTP because that path is the one no unit test covers: the
+/// coding-agent route composes the same text through the same
+/// `register_event_wait`, and a report that never reached the JSON body would
+/// look exactly like a report that was never generated.
+#[tokio::test]
+async fn a_registration_reports_a_match_that_landed_before_it() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+    let event_type = format!("E2eLookback{}", Uuid::new_v4().simple());
+
+    let marker = unique_marker("api-event-wait-lookback");
+    let resp = user_client()
+        .await
+        .post(format!("{}/api/v1/chat/stream", base_url()))
+        .json(&serde_json::json!({ "message": marker, "mode": "human" }))
+        .send()
+        .await
+        .expect("chat request failed");
+    assert_eq!(resp.status(), 200);
+    let thread_id = poll_thread_summary_by_marker(&pool, &marker, 20)
+        .await
+        .thread_id;
+    await_event_row(&pool, thread_id, "ResponseGenerated", 25).await;
+
+    // The event happens first. This is the whole point: it is below the
+    // watermark the registration is about to record.
+    emit_domain_event(&event_type, "landed while the caller was still working").await;
+
+    let resp = http_client()
+        .post(format!(
+            "{}/api/v1/threads/{}/event-waits",
+            base_url(),
+            thread_id
+        ))
+        .json(&serde_json::json!({
+            "on": [{ "event_type": event_type }],
+            "timeout_secs": 300,
+            "reason": "e2e: subscribing to something that already happened",
+        }))
+        .send()
+        .await
+        .expect("register request failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    let message = body["message"].as_str().unwrap_or_default();
+
+    assert!(
+        message.contains("ALREADY HAPPENED"),
+        "the caller must be told, or it finishes with the thing unhandled: {message}"
+    );
+    assert!(
+        message.contains(&event_type),
+        "the report names the event: {message}"
+    );
+    assert!(
+        message.contains("will NOT wake you"),
+        "a forward-only watch is the trap, and it has to be stated: {message}"
+    );
+    assert!(
+        message.contains("Nothing is blocking"),
+        "the wait is still armed and the caller may still finish: {message}"
+    );
+
+    // A report is not a delivery. The wait is live, unconsumed, and the thread
+    // is idle rather than mid-wake.
+    await_event_row(&pool, thread_id, "EventWaitStarted", 10).await;
+    assert_eq!(
+        count_events(&pool, thread_id, "EventWaitDelivered").await,
+        0,
+        "the lookback reports; only a forward match delivers"
+    );
+    assert_eq!(thread_status(&pool, thread_id).await, "idle");
+
+    // And the subscription really is still watching: the NEXT one wakes it.
+    emit_domain_event(&event_type, "the one the subscription is for").await;
+    await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
+}
+
+/// **Stop cancels the turn only.** The regression that this whole change is
+/// about: a Stop on a running turn used to cancel every subscription on the
+/// thread. A watch armed at 00:08 died at 02:07 because the user stopped an
+/// unrelated turn, with no toast, no transcript line, and the indicator row
+/// simply gone.
+///
+/// Driven end to end rather than as a unit test because the coupling lived in
+/// the HTTP handler, and because the half that matters is what happens AFTER:
+/// the subscription must still be armed, and must still wake the thread.
+#[tokio::test]
+async fn stopping_a_turn_leaves_the_thread_s_subscriptions_watching() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+    let event_type = format!("E2eStopKeepsWatch{}", Uuid::new_v4().simple());
+    let thread_id = subscribe_a_thread(&pool, &event_type, "api-event-wait-stop").await;
+
+    // Stop with nothing running. The server has no turn to end, so it honestly
+    // reports it did nothing, and the subscription is untouched. Before the
+    // fix this cancelled the wait AND reported `canceled: true` for it.
+    let resp = http_client()
+        .post(format!(
+            "{}/api/v1/chat/cancel?thread_id={}",
+            base_url(),
+            thread_id
+        ))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    assert_eq!(
+        body["canceled"], false,
+        "an idle thread has no turn to stop, and a subscription is not one: {body:?}"
+    );
+
+    // Now the reported shape: a Stop aimed at a turn that is actually running.
+    // Whether it lands mid-turn is a genuine race here (the mock's reply on a
+    // thread that already subscribed is one short line), and the assertions
+    // below are deliberately true on both sides of it: the Stop either ends the
+    // turn or arrives just after it ended, and neither may touch a
+    // subscription. The pre-fix code cancelled on every `/chat/cancel`
+    // regardless, which is exactly why both sides of the race catch it.
+    let resp = user_client()
+        .await
+        .post(format!("{}/api/v1/chat/stream", base_url()))
+        .json(&serde_json::json!({
+            "message": "keep talking while I stop you",
+            "mode": "human",
+            "thread_id": thread_id.to_string(),
+        }))
+        .send()
+        .await
+        .expect("follow-up request failed");
+    assert_eq!(resp.status(), 200);
+
+    let resp = http_client()
+        .post(format!(
+            "{}/api/v1/chat/cancel?thread_id={}",
+            base_url(),
+            thread_id
+        ))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Let the turn reach whichever terminator it was going to reach.
+    await_event_count(&pool, thread_id, "ResponseGenerated", 1, 25).await;
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    assert_eq!(
+        count_events(&pool, thread_id, "EventWaitCanceled").await,
+        0,
+        "Stop ends the turn; the subscription was never holding it"
+    );
+
+    // The proof that the subscription is not merely un-cancelled but still
+    // ARMED: the event still wakes the thread.
+    emit_domain_event(&event_type, "arriving after the Stop").await;
+    let delivered = await_event_row(&pool, thread_id, "EventWaitDelivered", 25).await;
+    assert_eq!(delivered["event_type"], event_type.as_str());
+}
+
+/// The agent's own surface: read this thread's subscriptions, then stand one
+/// down. Both routes are what `lucidos event-waits list` / `cancel` call, and
+/// the chat agent's `list_event_waits` / `cancel_event_wait` tools reach the
+/// same code in process.
+///
+/// The reported failure is the read half: on 2026-08-06 a thread told the user
+/// twice that a watch was armed when it had been dead for two hours, because
+/// the only way it could answer was to diff four event types by eye across the
+/// whole store.
+#[tokio::test]
+async fn an_agent_can_read_and_stand_down_its_own_subscriptions() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+    let event_type = format!("E2eAgentSurface{}", Uuid::new_v4().simple());
+    let thread_id = subscribe_a_thread(&pool, &event_type, "api-event-wait-agent").await;
+    let list_url = format!("{}/api/v1/threads/{}/event-waits", base_url(), thread_id);
+
+    let resp = http_client()
+        .get(&list_url)
+        .send()
+        .await
+        .expect("list request failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    assert_eq!(body["count"], 1);
+    let entry = &body["event_waits"][0];
+    // Everything the agent was asked for and could not answer.
+    assert_eq!(entry["on"][0]["event_type"], event_type.as_str());
+    assert_eq!(entry["subscription"], event_type.as_str());
+    assert!(
+        entry["reason"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&event_type),
+        "the reason the subscription was armed with: {entry}"
+    );
+    assert!(entry["wait_id"].is_string(), "{entry}");
+    assert!(entry["armed_at"].is_string(), "{entry}");
+    assert!(entry["expires_at"].is_string(), "{entry}");
+    // Ages spelled out beside the timestamps: a fresh subscription is seconds
+    // old, not the whole timeout.
+    assert!(
+        entry["armed_ago"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with('s'),
+        "armed seconds ago, not hours: {entry}"
+    );
+    let wait_id = entry["wait_id"].as_str().expect("wait_id").to_string();
+
+    let cancel_url = format!(
+        "{}/api/v1/threads/{}/event-waits/cancel",
+        base_url(),
+        thread_id
+    );
+
+    // Both arguments, and neither, are refused rather than defaulted: a bare
+    // call must not stop everything, and a no-op must not report success.
+    for body in [
+        serde_json::json!({}),
+        serde_json::json!({ "wait_id": wait_id, "all": true }),
+    ] {
+        let resp = http_client()
+            .post(&cancel_url)
+            .json(&body)
+            .send()
+            .await
+            .expect("cancel request failed");
+        assert_eq!(resp.status(), 400, "ambiguous cancel must be refused");
+    }
+
+    // A `wait_id` that is not live on THIS thread is refused, not obeyed. Both
+    // verbs are scoped to the calling thread and take no thread argument, so
+    // this is the only shape a cross-thread attempt can take.
+    let resp = http_client()
+        .post(&cancel_url)
+        .json(&serde_json::json!({ "wait_id": Uuid::new_v4() }))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status(), 400);
+    assert_eq!(
+        count_events(&pool, thread_id, "EventWaitCanceled").await,
+        0,
+        "a refused cancel stops nothing"
+    );
+
+    // The real stand-down.
+    let resp = http_client()
+        .post(&cancel_url)
+        .json(&serde_json::json!({ "wait_id": wait_id }))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    assert_eq!(body["status"], "stopped");
+    assert!(
+        body["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&event_type),
+        "the result names what it stopped: {body:?}"
+    );
+
+    // Its own cause, so an agent stand-down is distinguishable in the event log
+    // from a user pressing Stop waiting, from an archive, and from a timeout.
+    let canceled = await_event_row(&pool, thread_id, "EventWaitCanceled", 10).await;
+    assert_eq!(canceled["cause"], "agent_stand_down");
+    // Self-contained, so the transcript entry can name what was stopped even
+    // when the registration is outside the loaded window.
+    assert_eq!(canceled["on"][0]["event_type"], event_type.as_str());
+    assert!(canceled["reason"]
+        .as_str()
+        .unwrap_or_default()
+        .contains(&event_type));
+
+    // Nothing is watching any more, and the read says so in those words.
+    let resp = http_client()
+        .get(&list_url)
+        .send()
+        .await
+        .expect("list request failed");
+    let body: serde_json::Value = resp.json().await.expect("JSON body");
+    assert_eq!(body["count"], 0);
+
+    // And it really is stood down: the event no longer wakes the thread.
+    emit_domain_event(&event_type, "arriving after the stand-down").await;
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    assert_eq!(
+        count_events(&pool, thread_id, "EventWaitDelivered").await,
+        0,
+        "a stopped subscription does not fire"
+    );
 }

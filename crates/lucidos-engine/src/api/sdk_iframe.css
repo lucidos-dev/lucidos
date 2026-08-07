@@ -151,6 +151,35 @@ body {
     text-rendering: optimizeLegibility;
 }
 
+/* Programming ligatures belong to CODE, never to prose. sdk-prefs.js
+   (api/sdk_prefs.rs) and applyPreferences (packages/lucidos-sdk/src/ui.ts)
+   publish two values on <html>: --font-features-text and --font-features-code.
+   For Fira Code they are '"liga" 0, "calt" 0' and '"liga" 1, "calt" 1'; for
+   every other font both are `normal`. These two rules are their ONLY consumers
+   in an app iframe, mirroring the host's rules in styles/global/base.css.
+
+   Fira Code's `calt` re-spaces dot runs, so a typed `...` reads as two dots
+   (tonsky/FiraCode#1561, open upstream, no way to disable a single sequence).
+   Two traps, both established by pixel comparison rather than by reading the
+   computed value, which shows neither: `normal` is NOT off (liga and calt are
+   default-ON, so `normal` renders identically to `1`), and form controls do not
+   inherit this property (the UA `font` shorthand resets it), so they are named
+   explicitly. See preferences.ts in the host for the full write-up. */
+html,
+input,
+textarea,
+select,
+button {
+    font-feature-settings: var(--font-features-text, normal);
+}
+
+code,
+pre,
+kbd,
+samp {
+    font-feature-settings: var(--font-features-code, normal);
+}
+
 a {
     color: var(--accent);
     text-decoration: none;

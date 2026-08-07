@@ -14,13 +14,13 @@ use serde_json::json;
 pub fn get_view_image_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::VIEW_IMAGE.to_string(),
-        description: "Load an image posted earlier in this thread back into your vision so you can actually SEE its pixels again. Use this whenever the user refers to an image you can no longer see — older images drop out of your view after a few messages, leaving only a text note like '[attached image (thread:2) — image not included]'. Call view_image to bring it back, then describe/answer from what you see. This is for re-viewing conversation images; use read_file for image files saved under data/artifacts/.".to_string(),
+        description: "Load an image posted earlier in this thread back into your vision so you can SEE its pixels again. Older images drop out of view after a few messages, leaving only a text note, so call this whenever the user refers to one you can no longer see, then answer from what you see. For an image file under data/artifacts/, use read_file.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "image": {
                     "type": "string",
-                    "description": "Thread image reference: 'thread:N' where N is the 1-based sequential index shown in the conversation history (same numbering as generate_image's input_images and save_thread_image)."
+                    "description": "Thread image reference 'thread:N', 1-based as shown in the conversation history."
                 }
             },
             "required": ["image"]
@@ -32,17 +32,17 @@ pub fn get_view_image_tool() -> ToolDefinition {
 pub fn get_save_thread_image_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::SAVE_THREAD_IMAGE.to_string(),
-        description: "Save an image from the conversation history to an artifact file. Use this when the user wants to keep an image they pasted or that was generated earlier. The image is committed to git automatically.".to_string(),
+        description: "Save a conversation image to an artifact file, committed to git, when the user wants to keep one.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "image": {
                     "type": "string",
-                    "description": "Thread image reference: 'thread:N' where N is the 1-based sequential index of images in the conversation (same numbering as generate_image's input_images)."
+                    "description": "Thread image reference 'thread:N', 1-based across the conversation."
                 },
                 "path": {
                     "type": "string",
-                    "description": "Destination path relative to data/artifacts/ (e.g., 'projects/reports/photo.jpg'). The image is committed to git."
+                    "description": "Destination relative to data/artifacts/ (e.g. 'projects/reports/photo.jpg'). Committed to git."
                 }
             },
             "required": ["image", "path"]
@@ -54,34 +54,33 @@ pub fn get_save_thread_image_tool() -> ToolDefinition {
 pub fn get_image_generation_tool() -> ToolDefinition {
     ToolDefinition {
         name: tn::GENERATE_IMAGE.to_string(),
-        description: "SYNTHESIZES a new image, or edits an existing image. Returns image bytes — never text. \
-            This is NOT a vision/analysis tool: do NOT call it to 'describe', 'analyze', 'summarize', \
-            'transcribe', or 'tell me what's in' an image. To describe an image already in the conversation, \
-            just describe it directly in your reply — you can see recent ones natively; for an older image \
-            you can no longer see, call view_image('thread:N') first, then describe it. \
-            Provide `prompt` describing the desired output image. To edit an existing image, also pass \
-            `input_images`. The current image provider may only support one input image — if you provide \
-            multiple and it's not supported, the call fails with an error asking the user to pick one.".to_string(),
+        description: "SYNTHESIZES a new image, or edits an existing one. Returns image bytes, never text. \
+            NOT a vision or analysis tool: never call it to describe, analyze, summarize or transcribe an \
+            image. You can see recent conversation images natively, so describe them directly in your reply; \
+            for an older one, call view_image('thread:N') first. \
+            `prompt` describes the output image; add `input_images` to edit an existing one. The current \
+            provider may accept only one input image, and passing more then fails with an error asking the \
+            user to pick.".to_string(),
         parameters: json!({
             "type": "object",
             "properties": {
                 "prompt": {
                     "type": "string",
-                    "description": "Describes the image to be synthesized (or how to edit input_images). Must describe a desired output picture, NOT instructions like 'describe this image' — that wastes a generation call and returns a meaningless image."
+                    "description": "The image to synthesize, or how to edit input_images. Must describe a desired output picture, never an instruction like 'describe this image'."
                 },
                 "input_images": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional image references to edit. Each entry is either 'thread:N' (Nth image in the conversation, 1-based) or an artifact path (e.g., 'artifacts/photo.png'). Omit for text-to-image generation."
+                    "description": "Images to edit, each 'thread:N' (1-based) or an artifact path. Omit for text-to-image."
                 },
                 "size": {
                     "type": "string",
                     "enum": ["square", "landscape", "portrait", "auto"],
-                    "description": "Output image dimensions. Default: 'auto'."
+                    "description": "Output dimensions. Default 'auto'."
                 },
                 "save_as_artifact": {
                     "type": "string",
-                    "description": "Optional path relative to data/artifacts/ to save the generated image (e.g., 'generated/logo.png'). Image is git-committed."
+                    "description": "Optional path relative to data/artifacts/ to save it (e.g. 'generated/logo.png'). Git-committed."
                 }
             },
             "required": ["prompt"]

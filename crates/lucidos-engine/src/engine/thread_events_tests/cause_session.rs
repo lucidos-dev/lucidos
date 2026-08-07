@@ -242,3 +242,80 @@ fn paused_verdict_is_exactly_a_promised_auto_resume() {
         }
     }
 }
+
+/// Every emitted `EventWaitCancelCause` round-trips, and the two arms that are
+/// only ever READ still deserialize.
+///
+/// `thread_canceled` is the load-bearing one. A thread-level Stop stopped
+/// producing it on 2026-08-07, but events are append-only, so every row written
+/// before that still carries the string. Dropping the arm would replay them
+/// through `#[serde(other)]` as `Unknown` and lose why those subscriptions
+/// ended.
+#[test]
+fn event_wait_cancel_causes_round_trip_including_the_retired_one() {
+    for (cause, wire) in [
+        (EventWaitCancelCause::UserStop, "user_stop"),
+        (EventWaitCancelCause::AgentStandDown, "agent_stand_down"),
+        (EventWaitCancelCause::ThreadArchived, "thread_archived"),
+        (EventWaitCancelCause::ThreadDiscarded, "thread_discarded"),
+        (EventWaitCancelCause::ThreadCanceled, "thread_canceled"),
+    ] {
+        let event = ThreadEvent::EventWaitCanceled {
+            wait_id: uuid::Uuid::new_v4(),
+            cause,
+            on: vec![],
+            reason: String::new(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            json["cause"], wire,
+            "{cause:?} must stay on the wire as {wire:?}"
+        );
+        match serde_json::from_value::<ThreadEvent>(json).unwrap() {
+            ThreadEvent::EventWaitCanceled { cause: back, .. } => assert_eq!(back, cause),
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    // An unrecognized cause from a future or older build replays rather than
+    // failing the whole read.
+    let unknown: ThreadEvent = serde_json::from_str(
+        r#"{"type":"EventWaitCanceled","wait_id":"00000000-0000-0000-0000-000000000001","cause":"who_knows"}"#,
+    )
+    .unwrap();
+    match unknown {
+        ThreadEvent::EventWaitCanceled { cause, .. } => {
+            assert_eq!(cause, EventWaitCancelCause::Unknown)
+        }
+        _ => panic!("wrong variant"),
+    }
+}
+
+/// **Stop cancels the turn only.** The tripwire for the incident that removed
+/// the coupling: a Stop on one running turn used to cancel every subscription
+/// on the thread, so a watch armed at 00:08 died at 02:07 with no toast, no
+/// transcript line, and the indicator row simply gone.
+///
+/// A source scan rather than a behavioural assertion because what must stay
+/// true is an ABSENCE at one site, and `cancel_chat` is where the call was. The
+/// behaviour itself is covered end to end by the `event_wait_test` e2e case
+/// that stops a turn and asserts the subscription still wakes.
+#[test]
+fn stopping_a_turn_never_reaches_the_thread_s_subscriptions() {
+    const CANCEL_CHAT_SRC: &str = include_str!("../../api/chat.rs");
+    let body = CANCEL_CHAT_SRC
+        .split_once("pub(super) async fn cancel_chat(")
+        .expect("cancel_chat still lives in api/chat.rs")
+        .1;
+    // Comments in the body legitimately NAME both, explaining why neither is
+    // called, so the scan looks for the call and the construction rather than
+    // the words.
+    assert!(
+        !body.contains("cancel_event_waits_for_thread("),
+        "cancel_chat must not cancel the thread's subscriptions: Stop ends the turn"
+    );
+    assert!(
+        !body.contains("EventWaitCancelCause::ThreadCanceled,"),
+        "ThreadCanceled is retired: it is read from old rows, never emitted"
+    );
+}

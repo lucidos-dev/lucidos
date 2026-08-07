@@ -1,4 +1,5 @@
 import { errorDetail } from '../utils/errorDetail';
+import type { EventWaitCancelCause } from './thread-events/thread-event-types';
 
 // --- Async data loading ---
 // Every piece of async data must be in one of these states.
@@ -223,7 +224,7 @@ export type ResponseEvent =
   | {
       /** The command guard bracketed a ReversibleDanger command with a
        *  snapshot pair (ADR 0002, Phase 4). Renders inline with a one-click
-       *  Undo and a View changes button; `reverted` flips true once the paired
+       *  Undo and a Diff button; `reverted` flips true once the paired
        *  CommandCheckpointReverted event lands in this exchange.
        *
        *  `restores` (files Undo puts back) and `removes` (files it deletes,
@@ -246,18 +247,30 @@ export type ResponseEvent =
        *  the wake's steps continue below this card.
        *
        *  `state` is flipped in place by whichever resolution lands later in the
-       *  exchange, matched by `wait_id`. Same shape as the checkpoint card. */
+       *  SAME exchange, matched by `wait_id`. Same shape as the checkpoint card.
+       *
+       *  A **stop** also creates one of these on its own, at its own place in
+       *  the transcript, when the row it would have flipped is not in this
+       *  exchange. See `exchange-render`: a subscription routinely outlives the
+       *  turn that armed it by hours, and a stop is the one resolution with no
+       *  wake, so without that row it left no mark anywhere near where the user
+       *  was reading. */
       type: 'event_wait';
       wait_id: string;
       /** Rendered subscription line, already collapsed to prose. */
       subscription: string;
       reason: string;
+      /** Empty on a stop row built from a pre-2026-08-07 `EventWaitCanceled`,
+       *  which carries no deadline of its own. */
       expires_at: string;
       state: 'waiting' | 'woke' | 'timed_out' | 'canceled';
       /** Set on `woke`: the event that matched, for the card's summary line and
        *  its deep link into the source event. */
       matched_event_type?: string;
       matched_event_id?: string;
+      /** Set on `canceled`: how it was stopped, which is what the row's note
+       *  says. Absent on a pre-2026-08-07 row. */
+      cause?: EventWaitCancelCause;
     }
   | {
       /** The model ended its turn cleanly but produced no text (a benign empty
@@ -335,6 +348,14 @@ export interface TriggerInfo {
    *  `last_run` timestamp only). Surfaced as an OK/failed chip on the row. */
   last_run_status?: 'ok' | 'failed';
   next_run?: string;
+  /** The next few upcoming fire times (RFC3339), merged across every cron
+   *  expression. `next_run` is its first entry. Engine omits the field when
+   *  empty, so readers must tolerate absence. */
+  next_runs?: string[];
+  /** Set when the trigger's cron can never fire, e.g. `0 0 9 31 2 *` (Feb 31).
+   *  Distinct from "No more runs", which a spent one-shot legitimately earns.
+   *  Only reachable for triggers stored before the engine guard existed. */
+  schedule_error?: string;
   run: TriggerRun;
   /** Event subscriptions. Engine omits the field when there are none, so
    *  readers must tolerate absence. */
@@ -412,8 +433,14 @@ export interface ThreadQueueResponse {
 }
 
 /** An active (non-paused) trigger has no more runs when it has no next_run and no event subscriptions.
- *  Paused triggers are "Paused", not "No more runs". */
+ *  Paused triggers are "Paused", not "No more runs".
+ *
+ *  A trigger whose cron can NEVER fire is excluded: it gets the schedule-error
+ *  chip instead. Both states have no `next_run`, but they mean opposite things
+ *  to the user. "No more runs" is a one-shot that did its job; a schedule error
+ *  is a trigger that never worked and needs fixing. */
 export function hasNoMoreRuns(trigger: TriggerInfo): boolean {
+  if (trigger.schedule_error) return false;
   return !trigger.paused && !trigger.next_run && !(trigger.on && trigger.on.length > 0);
 }
 
@@ -479,9 +506,55 @@ export interface OAuthAccountInfo {
   provider: string;
   email: string | null;
   display_name: string | null;
+  /** What the provider GRANTED. */
   scopes: string;
+  /** What the account was ASKED for, accumulated across every authorization.
+   *
+   *  This is what *Reconnect* must re-request. Re-requesting `scopes` could only
+   *  ever ask for the set the account already held, because the engine merges a
+   *  request with the existing grant, so an account a provider had narrowed
+   *  could never recover the difference. That is the button the engine's own
+   *  Dropbox permission error sends the user to.
+   *
+   *  Absent for an account connected before the column existed, and absent
+   *  entirely on an engine older than this field, which is the window between
+   *  the new bundle being served and the engine restart landing. Callers fall
+   *  back to `scopes`, which is never narrower than today's behavior. */
+  desired_scopes?: string | null;
   created_at: string;
   updated_at: string;
+}
+
+/** One row of the *OAuth provider registry*: a provider Lucidos knows the OAuth
+ *  endpoints for, served from `system-knowhow/oauth-providers.json`.
+ *
+ *  Drives the quick-provider buttons on Settings → Accounts and the Connect
+ *  form's autofill, so adding a provider to the JSON adds its button and its
+ *  prefill with no frontend change. */
+export interface KnownOAuthProvider {
+  id: string;
+  label: string;
+  base_url: string;
+  auth_url: string;
+  token_url: string;
+  userinfo_url?: string;
+  userinfo_method?: string;
+  authorize_params?: string;
+  redirect_uri?: string;
+  /** `'public'` (leave the client secret blank, PKCE) or `'confidential'`. */
+  client_type?: string;
+  console_label?: string;
+  console_url?: string;
+  setup_hint?: string;
+  permissions_hint?: string;
+}
+
+/** The registry plus the exact redirect URI a flow will send, which the form
+ *  offers for copying: it has to be registered with the provider character for
+ *  character, so the engine states it rather than the frontend rebuilding it. */
+export interface KnownOAuthProviders {
+  providers: KnownOAuthProvider[];
+  default_redirect_uri: string;
 }
 
 // An app definition — the app IS the UI component (flat structure)
@@ -599,8 +672,10 @@ export interface ToastItem {
    *  focused when the toast first appeared (drawer counts as 'thread'). It never
    *  changes afterwards — a later focus switch must not make the toast jump
    *  panes. Set once in `showToast`; a keyed in-place update keeps the original.
-   *  Drives `data-toast-pane` in Toast.tsx (desktop CSS only; ignored on mobile,
-   *  where one pane fills the screen). */
+   *  Selects which `.toast-column` the toast is rendered into (`toastColumns.ts`),
+   *  so it stacks with its own pane's toasts and never displaces the other
+   *  pane's. Ignored while only one pane is on screen: mobile, and a collapsed
+   *  split, both merge every toast into one column. */
   pane?: 'thread' | 'content';
 }
 
@@ -635,6 +710,18 @@ export interface CredentialRequest {
    *  this exact name (in addition to the default `CRED_<NAME>`). The user can
    *  edit or clear it before saving. */
   env_var_name?: string;
+  /** Set when this request REPAIRS an existing `oauth_client` rather than
+   *  creating one: the credential's id, so the save updates that row.
+   *
+   *  Without it the save would `POST /credentials` and try to create a second
+   *  OAuth Client for the same provider. A credential is identified by its name
+   *  together with its auth type, so that pair is a duplicate, which is the
+   *  2026-08-05 incident. */
+  existing_credential_id?: string;
+  /** On a repair, the required fields the stored credential was missing
+   *  (`client_id` / `auth_url` / `token_url`). Rendered so the form says why it
+   *  reopened rather than looking like a form the user already filled in. */
+  missing?: string[];
 }
 
 export interface PluginMarketplace {

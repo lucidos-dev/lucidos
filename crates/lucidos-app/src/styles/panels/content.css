@@ -45,6 +45,9 @@
     background: none;
     color: inherit;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     text-align: left;
     cursor: pointer;
     /* Animate background-color only, never opacity: fading a text-bearing row's
@@ -870,6 +873,9 @@
     border: none;
     color: inherit;
     font: inherit;
+    /* `font` resets font-feature-settings to initial; keep inheriting it
+       so a Fira Code user does not get ligatures back here. */
+    font-feature-settings: inherit;
     text-align: left;
     cursor: pointer;
     transition: background-color var(--duration-fast);

@@ -425,7 +425,28 @@ pub async fn forward_request(
             let status =
                 StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
             let resp_headers = resp.headers().clone();
-            let resp_body = resp.bytes().await.unwrap_or_default();
+            // A body read that fails mid-stream (connection dropped, the
+            // client's 30s timeout expiring during the body) must NOT be
+            // reported as the upstream's own status with an empty body: the
+            // calling app would read a 200 with no data as a successful empty
+            // result. Surface it as the gateway error it is. Same URL-stripping
+            // as the send-failure arm below, for the same credential reason.
+            let resp_body = match resp.bytes().await {
+                Ok(b) => b,
+                Err(e) => {
+                    let safe_e = e.without_url();
+                    log!(
+                        "[Proxy] reading upstream body from {} failed: {}",
+                        log_url,
+                        safe_e
+                    );
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        format!("upstream body read failed: {}", safe_e),
+                    )
+                        .into_response();
+                }
+            };
             let mut response = Response::builder().status(status);
             for (name, value) in &resp_headers {
                 if !should_strip_response_header(name.as_str()) {

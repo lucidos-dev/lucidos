@@ -1,41 +1,51 @@
 ---
 name: OAuth Providers Registry
-description: The registry of OAuth 2.0 provider endpoints (auth_url / token_url / userinfo_url + its userinfo_method, the authorize_params a provider needs to issue a refresh token, default base URL, typical scopes) the agent consults when collecting OAuth client credentials. Also states that an oauth_client credential is named for the provider alone, with auth_type as the thing that marks it (the legacy oauth:<provider> prefix is stripped on write), and that connect_oauth_account is the one call for the whole flow, rather than a hand-rolled request_credential first. Load this BEFORE calling request_credential (auth_type oauth_client) or connect_oauth_account so you can pass the endpoints and the credential modal pre-fills them instead of forcing the user to type Google's / Microsoft's own URLs by hand. Covers the alias rule for dedicated connections (e.g. a health-only Google connection named "ghealth" reuses Google's endpoints), the loopback redirect URI and when to override its host form, the confidential-vs-public client rule (a blank client secret means PKCE), Microsoft Entra's redirect-URI platform buckets and the AADSTS90023 / AADSTS50011 symptoms they cause, the Dropbox App Console rule that its Permissions tab caps what may be requested and that enabling a scope never upgrades a token or grant that already exists (reconnect), the Dropbox scope set a backup needs, the one-authorization-at-a-time rule (the callback port is fixed, so starting a flow cancels an abandoned one and a surviving clash means another workspace holds the port), the per-flow state parameter that is generated for you and refused in authorize_params, and how to add a new provider (edit this file, no engine change). Maintain this file: when you discover a provider's endpoints via web_search, add a row here.
+description: The rules around OAuth 2.0 providers, beside the endpoint rows in the sibling oauth-providers.json. The engine reads that file, so for a known provider connect_oauth_account needs only the provider name and scopes. Covers: connect_oauth_account is one call for the whole flow, an oauth_client credential takes the bare provider name, the loopback redirect URI and when to override its host form, confidential vs public client (a blank secret means PKCE), Microsoft Entra's AADSTS errors, and the per-provider quirks a row cannot express. Load BEFORE collecting an OAuth credential for a provider the registry does not know, or when a connection fails; add a new provider as a row in the JSON.
 ---
 
 # OAuth providers registry
 
-This file is the **single registry** of known OAuth 2.0 provider endpoints. The
-engine no longer hardcodes any provider — it reads nothing from this file
-directly. **You** (the agent) read it, and you keep it up to date.
+The **rows** live in the sibling data file
+[`oauth-providers.json`](oauth-providers.json). **This file is the prose that
+goes with them**, and deliberately restates no row.
+
+The engine reads the JSON (`core/oauth_registry.rs`) to prefill the Connect form
+on **Settings → Accounts** and to fill in any endpoint you did not pass to
+`connect_oauth_account`. It still hardcodes no provider: adding one is a data
+edit. You read the same rows, and you keep them up to date.
 
 ## How it's used
 
 When a service needs OAuth client credentials:
 
-1. **Load this file** and find the provider's endpoints.
-2. Call **`connect_oauth_account`** with the provider name, the scopes, and
-   **`auth_url`, `token_url`, `userinfo_url`, `userinfo_method` /
-   `authorize_params` where the row gives one, and optional `redirect_uri`** from
-   the row below. That one tool covers the whole flow: with no client credentials
-   yet it opens the credential modal itself (pre-filled from those args, so the
-   user enters only `client_id`, plus `client_secret` for a confidential/web
-   client), and once the client is saved the same call runs the authorization.
+1. Call **`connect_oauth_account`** with the provider name and the scopes. For a
+   provider in [`oauth-providers.json`](oauth-providers.json) that is all it
+   needs: **the engine fills the endpoints in from the row itself.** That one
+   tool covers the whole flow: with no client credentials yet it opens the
+   credential modal (prefilled, so the user enters only `client_id`, plus
+   `client_secret` for a confidential/web client), and once the client is saved
+   the same call runs the authorization.
    **Do not hand-roll a `request_credential(auth_type: "oauth_client")` call
    first.** It is a second modal for the same value, and that extra step is what
    produced a duplicate credential on 2026-08-05.
+2. For a provider the registry does **not** know, pass the endpoints yourself:
+   `auth_url`, `token_url`, `userinfo_url`, and `userinfo_method` /
+   `authorize_params` / `redirect_uri` where the provider needs one. Anything you
+   pass wins over the registry, so this is also how a *derived provider* name
+   (see the alias rule below) runs on a known provider's endpoints.
 3. The values are stored in the credential's JSON
    (`{client_id, client_secret?, auth_url, token_url, userinfo_url,
    userinfo_method?, authorize_params?, scopes, redirect_uri?}`), which is the
-   **per-credential source of truth** for endpoints. Token refresh and re-authorization read them
-   back from there.
-   `client_secret` and `redirect_uri` are optional — see the two sections below
+   **per-credential source of truth** for endpoints. Token refresh and
+   re-authorization read them back from there, and the registry is not consulted
+   again: a credential fully describes its own flow.
+   `client_secret` and `redirect_uri` are optional, see the two sections below
    for what their absence means.
 
-If you omit the endpoint args, the modal treats it as a custom provider and
-makes the user type the URLs in by hand — only do that for a provider you
-genuinely can't find. **Better: find it via `web_search` and add a row here** so
-the next connection is one step.
+A provider that is in neither the registry nor your args leaves the user typing
+URLs in by hand, so only do that for one you genuinely cannot find. **Better:
+find it via `web_search` and add a row to the JSON** so the next connection, for
+you and for the Connect button alike, is one step.
 
 ### The credential is named for the provider, and typed `oauth_client`
 
@@ -115,36 +125,46 @@ token that also holds calendar / drive / docs / fitness scopes. The fix is a
 **dedicated connection under a distinct provider name** that requests only the
 narrow scopes — but it still uses the **base provider's endpoints**.
 
-Resolve a derived name to its base provider's endpoints:
-
-- `ghealth`, `google-health`, `google-*` → use the **google** row.
-- `ms-*`, `microsoft-*`, `outlook`, `azure` → use the **microsoft** row.
-- Otherwise match the longest provider key that the name starts with / contains;
-  fall back to asking the user which base provider it is.
-
-Connect it under the distinct name so its token is stored separately:
+A derived name is **not** in the registry and must not be added to it: aliases
+are ad hoc, one per user need. So the engine cannot resolve one for you, and
+deliberately does not try to guess a base provider from the spelling. Read the
+base provider's row out of [`oauth-providers.json`](oauth-providers.json) and
+pass its endpoints explicitly, under the distinct name, so the token is stored
+separately:
 
 ```
 connect_oauth_account(
-  provider="ghealth",
-  scopes="https://www.googleapis.com/auth/cloud-healthcare",
-  auth_url="https://accounts.google.com/o/oauth2/v2/auth",
-  token_url="https://oauth2.googleapis.com/token",
-  userinfo_url="https://www.googleapis.com/oauth2/v2/userinfo",
-  base_url="https://healthcare.googleapis.com")
+  provider="<derived-name>",
+  scopes="<the narrow scopes only>",
+  auth_url="<base provider's auth_url>",
+  token_url="<base provider's token_url>",
+  userinfo_url="<base provider's userinfo_url>",
+  base_url="<the narrow API's own base URL>")
 ```
+
+Match a derived name to its base by asking what the connection is for, or by
+asking the user outright. The Connect button on **Settings → Accounts** does the
+same thing: type a name the registry does not know and it asks which known
+provider the connection runs on, then prefills from that provider's row.
 
 ## Known providers
 
-| Provider | auth_url | token_url | userinfo_url | userinfo_method | authorize_params | base_url |
-|---|---|---|---|---|---|---|
-| `google` | `https://accounts.google.com/o/oauth2/v2/auth` | `https://oauth2.googleapis.com/token` | `https://www.googleapis.com/oauth2/v2/userinfo` | GET | _(default)_ | `https://www.googleapis.com` |
-| `microsoft` | `https://login.microsoftonline.com/common/oauth2/v2.0/authorize` | `https://login.microsoftonline.com/common/oauth2/v2.0/token` | `https://graph.microsoft.com/v1.0/me` | GET | _(default)_ | `https://graph.microsoft.com` |
-| `github` | `https://github.com/login/oauth/authorize` | `https://github.com/login/oauth/access_token` | `https://api.github.com/user` | GET | _(default)_ | `https://api.github.com` |
-| `dropbox` | `https://www.dropbox.com/oauth2/authorize` | `https://api.dropboxapi.com/oauth2/token` | `https://api.dropboxapi.com/2/users/get_current_account` | **POST** | **`token_access_type=offline`** | `https://api.dropboxapi.com` |
-| `spotify` | `https://accounts.spotify.com/authorize` | `https://accounts.spotify.com/api/token` | `https://api.spotify.com/v1/me` | GET | _(default)_ | `https://api.spotify.com` |
+**The rows live in [`oauth-providers.json`](oauth-providers.json), beside this
+file.** Read it for a provider's `auth_url`, `token_url`, `userinfo_url`,
+`userinfo_method`, `authorize_params`, `base_url`, and its console fields
+(`console_url`, `client_type`, `setup_hint`, `permissions_hint`).
 
-### The `userinfo_method` column
+They are a data file rather than a table here because the engine serves them: the
+Connect form on **Settings → Accounts** reads the same rows to prefill a
+provider's whole app registration, so a user connecting a known provider enters
+only a Client ID. This file deliberately does **not** restate a single row, and
+`the_knowhow_markdown_restates_no_registry_row` fails the build if one comes
+back. Two copies of an endpoint are two things that can disagree.
+
+Everything below is the prose that goes with those rows: what the optional
+columns mean, and the per-provider quirks that are not expressible as a value.
+
+### The `userinfo_method` field
 
 `userinfo_url` is what makes a *connected account* show **whose** account it is.
 Omit it and the account lists as "No email" and the connect tool reports it as
@@ -152,7 +172,7 @@ unnamed, which is exactly what happened to Dropbox before its endpoint was
 recorded here.
 
 Almost every provider serves userinfo over **GET**, which is the default: pass
-`userinfo_method` only for the exceptions, and only when the row above says so.
+`userinfo_method` only for the exceptions, and only when the provider's row says so.
 Dropbox is one: `users/get_current_account` is POST-only (Lucidos sends POST
 with no body and no `Content-Type`, the shape Dropbox accepts). Note also that
 Dropbox nests the display name as `name.display_name` rather than a flat `name`;
@@ -173,7 +193,7 @@ nothing works the next morning. That is what happened to Dropbox backups until
 
 The default, sent whenever this column says _(default)_ and whenever the field
 is left blank, is Google's: `access_type=offline&prompt=consent`. Pass an
-explicit value only where the table above gives one, and pass it **verbatim**:
+explicit value only where the provider's row gives one, and pass it **verbatim**:
 an explicit value REPLACES the default rather than adding to it, so what the
 table says is exactly what Lucidos sends.
 
@@ -318,7 +338,8 @@ Adding a known provider is a **knowhow edit, not an engine change**:
 
 1. `web_search` for the provider's OAuth 2.0 authorization + token endpoints
    (and userinfo endpoint if it has one).
-2. Add a row to the table above with its `base_url`.
+2. Add a row to `oauth-providers.json` with its `base_url` and, so the Connect
+   button can help too, its `console_url`, `client_type` and `setup_hint`.
 3. Note any scope quirks under "Notes on scopes".
 
 That's it — the next `request_credential` / `connect_oauth_account` for that

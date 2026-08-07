@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { panelOverlay, focusedThreadId, toasts } from '../store';
+import type { App } from '../types';
 
 // Mock all side-effect imports that handleNavigationRequest calls
 const switchMenuItem = vi.fn();
@@ -8,8 +9,10 @@ const setActiveMenu = vi.fn();
 vi.mock('./menu', () => ({ switchMenuItem, openSettingsSubview, setActiveMenu }));
 
 const openAppById = vi.fn();
+const exitAppFullscreen = vi.fn(() => false);
 vi.mock('./apps', () => ({
   openAppById,
+  exitAppFullscreen,
   refreshAppUI: vi.fn(),
   captureAppUI: vi.fn(),
   openCredentialRequest: vi.fn(),
@@ -39,6 +42,15 @@ vi.mock('./navigation', () => ({ pushNavState, replaceNavState: vi.fn() }));
 const revealContentPane = vi.fn();
 const navigateToPane = vi.fn();
 vi.mock('./pane', () => ({ revealContentPane, navigateToPane }));
+
+// The layout predicate the `new-chat` branch gates its overlay clear on: the
+// same one revealContentPane()/revealThreadPane() branch on. jsdom's viewport
+// is desktop, but reading it would make the split-layout case pass for the
+// wrong reason, so drive it explicitly per test. vi.hoisted because `../store`
+// is imported statically above, and a factory that runs during that phase
+// would hit the TDZ on a plain const (see `./devices` below).
+const { isMobile } = vi.hoisted(() => ({ isMobile: vi.fn(() => false) }));
+vi.mock('../../utils/viewport', () => ({ isMobile }));
 
 const unfocusThread = vi.fn();
 const focusThread = vi.fn();
@@ -80,6 +92,9 @@ describe('handleNavigationRequest', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     panelOverlay.value = null;
+    // Split layout by default (clearAllMocks keeps a mockReturnValue, so a
+    // single-pane test can't leak its layout into the next one).
+    isMobile.mockReturnValue(false);
   });
 
   it('navigates to trigger details when target is "trigger" with id (delegates to navigateToTrigger, no stale-cache pre-check)', () => {
@@ -169,10 +184,12 @@ describe('handleNavigationRequest', () => {
     expect(revealContentPane).toHaveBeenCalledTimes(1);
   });
 
-  it('opens fresh compose for new-chat target (no prefill)', async () => {
+  it('opens fresh compose for new-chat target on a single pane, clearing the overlay (no prefill)', async () => {
+    isMobile.mockReturnValue(true);
     panelOverlay.value = { type: 'file-preview', path: 'notes.md' };
     handleNavigationRequest({ target: 'new-chat' });
-    // Closes any open overlay so the chat panel is visible.
+    // Single-pane layout: the content pane's overlay really is covering the
+    // conversation, so it has to close for the compose view to be reachable.
     expect(panelOverlay.value).toBeNull();
     // Drops focus first so ensureFocusedComposeThread allocates a fresh id
     // (it returns the existing id otherwise).
@@ -180,7 +197,37 @@ describe('handleNavigationRequest', () => {
     expect(ensureFocusedComposeThread).toHaveBeenCalledTimes(1);
     // No prompt → no draft prefill, just a blank compose.
     expect(updateCompose).not.toHaveBeenCalled();
+    // Dropping the overlay unmounts a fullscreen app panel, so nothing here
+    // has to leave fullscreen by hand.
+    expect(exitAppFullscreen).not.toHaveBeenCalled();
     // Focus runs in rAF so the chat panel can mount before we query its DOM.
+    await new Promise(resolve => requestAnimationFrame(resolve));
+    expect(focusPromptNow).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps the open app on a split layout, where the conversation has its own pane', async () => {
+    // The reported regression: an app UI button calling lucidos.ui.startThread
+    // opened the fresh chat AND closed the app the user was working in, because
+    // the branch cleared panelOverlay unconditionally. On the split layout the
+    // thread pane and the content pane are side by side, so the conversation was
+    // never hidden and the clear only cost the user their app (ContentPane's
+    // `{!overlay && …}` fallback then renders activeMenuItem, i.e. Files).
+    const overlay = { type: 'app-ui' as const, app: { id: 'demo-director', name: 'Demo Director' } as App };
+    panelOverlay.value = overlay;
+    handleNavigationRequest({ target: 'new-chat', prompt: 'Refresh the list' });
+    expect(panelOverlay.value).toBe(overlay);
+    // A fullscreen app panel is the one case where the content pane IS the whole
+    // viewport, so the split leaves fullscreen instead of closing the app.
+    expect(exitAppFullscreen).toHaveBeenCalledTimes(1);
+    // Nothing pulls the content pane either: this navigation lands on a thread.
+    expect(revealContentPane).not.toHaveBeenCalled();
+    // The thread pane is revealed through unfocusThread, which calls
+    // revealThreadPane() unless the caller opts out with { revealPane: false }
+    // (mobile swipes to the thread pane; desktop re-activates the Threads pane
+    // group and re-expands a collapsed split). Pinned as a no-argument call so
+    // the branch can't quietly acquire that opt-out.
+    expect(unfocusThread).toHaveBeenCalledWith();
+    expect(updateCompose).toHaveBeenCalledWith('new-thread-id', { text: 'Refresh the list' });
     await new Promise(resolve => requestAnimationFrame(resolve));
     expect(focusPromptNow).toHaveBeenCalledTimes(1);
   });

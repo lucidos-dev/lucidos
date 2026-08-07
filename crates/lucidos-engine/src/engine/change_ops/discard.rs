@@ -142,21 +142,34 @@ impl LucidosEngine {
             return Err(format!("Change is already {}", change.status).into());
         }
 
-        // Mark as discarded FIRST, before touching git — event is the source of truth
+        // Mark as discarded FIRST, before touching git: the event is the source
+        // of truth. The emit is AWAITED for its result rather than
+        // fire-and-forget, because everything below this line is destructive
+        // (`git reset --hard main`, `git clean -fd`, `git branch -f <branch>
+        // main`). A dropped emit used to destroy the branch's commits and every
+        // untracked file while the projection still read `pending` and the
+        // caller was told the discard succeeded. Failing here instead leaves the
+        // change pending and the work intact, which is the recoverable
+        // direction.
         self.event_bus
-            .emit_or_log(
-                crate::engine::event_bus::BusEvent::Thread {
-                    thread_id: change.thread_id.unwrap_or(change_id),
-                    event: crate::engine::thread_events::ThreadEvent::ChangeDiscarded {
-                        change_id: change_id.to_string(),
-                        actor,
-                        path: String::new(),
-                    },
-                    meta: crate::engine::thread_events::EventMeta::NONE,
+            .emit(crate::engine::event_bus::BusEvent::Thread {
+                thread_id: change.thread_id.unwrap_or(change_id),
+                event: crate::engine::thread_events::ThreadEvent::ChangeDiscarded {
+                    change_id: change_id.to_string(),
+                    actor,
+                    path: String::new(),
                 },
-                "[Changes] ChangeDiscarded",
-            )
-            .await;
+                meta: crate::engine::thread_events::EventMeta::NONE,
+            })
+            .await
+            .map_err(|e| {
+                log!(
+                    "[Changes] ChangeDiscarded emit failed for {}: {}. Leaving the branch intact.",
+                    change_id,
+                    e
+                );
+                format!("could not record the discard of change {change_id}: {e}")
+            })?;
 
         // Feed the Apply-All driver: if this discarded change is a live batch
         // member, mark it terminal so the batch advances instead of stalling.

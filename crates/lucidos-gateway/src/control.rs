@@ -262,10 +262,9 @@ async fn create(
     }
     // Picker "+ New": auto-start off by default — the user opens it now; whether
     // it auto-starts on a future gateway boot is their per-workspace toggle.
-    let status = state
-        .create_workspace(name)
-        .await
-        .map_err(|e| ApiError::internal(e.to_string()))?;
+    // The gateway returns a typed error: a duplicate display name is a 409 the
+    // user can act on, not a 500.
+    let status = state.create_workspace(name).await?;
     Ok(Json(json!({ "workspace": status })))
 }
 
@@ -481,10 +480,7 @@ async fn rename(
     if name.is_empty() {
         return Err(ApiError::bad_request("workspace name must not be empty"));
     }
-    state
-        .rename_workspace(&id, name)
-        .await
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    state.rename_workspace(&id, name).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

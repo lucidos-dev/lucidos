@@ -8,17 +8,17 @@ pub(super) fn fetch_news_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::FETCH_NEWS.to_string(),
-            description: "Fetch recent news articles on a topic. Uses GDELT global news database which covers news in all languages worldwide. Automatically prioritizes sources from user's country based on their timezone.".to_string(),
+            description: "Fetch recent news articles on a topic from the GDELT global news database, all languages. Sources from the user's own country, derived from their timezone, are prioritized automatically.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "topic": {
                         "type": "string",
-                        "description": "The news topic or search query (e.g., 'Trump', 'climate', 'sports', 'AI')"
+                        "description": "The news topic or search query."
                     },
                     "max_articles": {
                         "type": "integer",
-                        "description": "Maximum number of articles to return (default: 5)"
+                        "description": "Max articles to return (default 5)."
                     }
                 },
                 "required": ["topic"]
@@ -31,17 +31,17 @@ pub(super) fn web_search_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::WEB_SEARCH.to_string(),
-            description: "Search the web for information. Use this when you need to look up facts, verify information, or find current data you're unsure about. Search once or twice max — if you found the answer, STOP searching.".to_string(),
+            description: "Search the web to look up a fact, verify something, or find current data you are unsure of. Twice at most: once you have the answer, STOP searching.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "The search query (e.g., 'python list comprehension', 'best pizza recipe')"
+                        "description": "The search query."
                     },
                     "max_results": {
                         "type": "integer",
-                        "description": "Maximum number of results to return (default: 5)"
+                        "description": "Max results to return (default 5)."
                     }
                 },
                 "required": ["query"]

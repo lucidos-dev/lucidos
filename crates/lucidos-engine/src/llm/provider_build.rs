@@ -16,10 +16,10 @@ use crate::llm::web_search::{
     WebSearchProvider,
 };
 use crate::llm::{
-    resolve_bearer_key, resolve_openai_api_key, select_provider, AnthropicAuth, AnthropicProvider,
-    LlmProvider, OpenAiKeySource, OpenAiProvider, ProviderSelection, ProviderSelectionInputs,
-    RoutingProvider, UnconfiguredProvider, VertexProvider, OPENAI_DEFAULT_BASE_URL,
-    OPENROUTER_BASE_URL,
+    resolve_anthropic_auth, resolve_bearer_key, resolve_openai_api_key, select_provider,
+    AnthropicAuth, AnthropicAuthSource, AnthropicProvider, LlmProvider, OpenAiKeySource,
+    OpenAiProvider, ProviderSelection, ProviderSelectionInputs, RoutingProvider,
+    UnconfiguredProvider, VertexProvider, OPENAI_DEFAULT_BASE_URL, OPENROUTER_BASE_URL,
 };
 use sqlx::PgPool;
 use std::sync::Arc;
@@ -102,72 +102,62 @@ struct DirectProviders {
 }
 
 /// Resolve the direct (OpenAI-wire + Anthropic) providers from credentials +
-/// env. `pool == None` means the DB is unavailable (a degraded boot) — the env
-/// fallbacks (`OPENAI_API_KEY`, `LUCIDOS_OPENROUTER_API_KEY`,
-/// `LUCIDOS_LOCAL_*`) and the Codex-detected OpenAI key still apply, but stored
-/// credentials and the `local_base_url` preference can't be read (so no direct
-/// Anthropic). Every field degrades to `None` / an omitted backend on any
-/// read/build error so the engine still comes up on its other providers.
+/// env. `pool == None` means the DB is unavailable (a degraded boot): the env
+/// fallbacks (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`,
+/// `LUCIDOS_OPENROUTER_API_KEY`, `LUCIDOS_LOCAL_*`) and the Codex-detected
+/// OpenAI key all still apply, but stored credentials and the `local_base_url`
+/// preference can't be read. Every field degrades to `None` / an omitted backend
+/// on any read/build error so the engine still comes up on its other providers.
 async fn resolve_direct_providers(
     pool: Option<&PgPool>,
     default_model: &str,
     registry: &crate::llm::model_registry::ModelRegistry,
     openai_env_key: Option<String>,
     openai_codex_key: Option<String>,
+    anthropic_env_key: Option<String>,
 ) -> DirectProviders {
     let Some(pool) = pool else {
         // No DB access, but the env-var + Codex fallbacks must still work.
         let openai_key = resolve_openai_api_key(None, openai_env_key, openai_codex_key);
         let openai = build_openai_provider(openai_key.clone(), default_model);
+        let anthropic_auth = resolve_anthropic_auth(None, anthropic_env_key);
+        let anthropic = build_anthropic_provider(anthropic_auth.clone(), default_model);
         let openrouter = build_openrouter_provider(
             None,
             std::env::var("LUCIDOS_OPENROUTER_API_KEY").ok(),
             default_model,
         );
         let local = build_local_provider(None, None, default_model);
+        // Same chain order as the DB-up path below: Anthropic, then OpenAI.
+        let mut search_backends: Vec<Arc<dyn WebSearchProvider>> =
+            anthropic_search_backend(anthropic_auth, registry, default_model)
+                .into_iter()
+                .collect();
+        search_backends.extend(openai_search_backend(openai_key, registry, default_model));
         return DirectProviders {
             openai,
-            anthropic: None,
+            anthropic,
             openrouter,
             local,
-            search_backends: openai_search_backend(openai_key, registry, default_model)
-                .into_iter()
-                .collect(),
+            search_backends,
         };
     };
 
-    // Held past provider construction so the Anthropic search backend can be
-    // built from the same auth (`AnthropicProvider` keeps its copy private).
-    let anthropic_auth = match CredentialStore::get(pool, "anthropic").await {
-        Ok(Some(cred)) => match cred.auth_type {
-            AuthType::ApiKey => Some(AnthropicAuth::ApiKey(cred.auth_value)),
-            AuthType::Bearer => Some(AnthropicAuth::OAuthBearer(cred.auth_value)),
-            other => {
-                crate::log!(
-                    "[Startup] Anthropic credential auth_type {} unsupported (expected api_key or bearer) — direct Anthropic disabled",
-                    other
-                );
-                None
-            }
-        },
+    // Anthropic: a stored `anthropic` credential wins; otherwise the env
+    // fallback. Resolved once and held past provider construction so the search
+    // backend is built from the same auth (`AnthropicProvider` keeps its copy
+    // private), which is also what stops the two disagreeing about which source
+    // won.
+    let anthropic_credential = match CredentialStore::get(pool, "anthropic").await {
+        Ok(Some(cred)) => Some((cred.auth_type, cred.auth_value)),
         Ok(None) => None,
         Err(e) => {
             crate::log!("[Startup] Failed to read Anthropic credential: {}", e);
             None
         }
     };
-    let anthropic = anthropic_auth.clone().and_then(|a| {
-        match AnthropicProvider::new(a, default_model.to_string()) {
-            Ok(p) => {
-                crate::log!("[Startup] Direct Anthropic provider configured");
-                Some(p)
-            }
-            Err(e) => {
-                crate::log!("[Startup] Failed to build Anthropic provider: {}", e);
-                None
-            }
-        }
-    });
+    let anthropic_auth = resolve_anthropic_auth(anthropic_credential, anthropic_env_key);
+    let anthropic = build_anthropic_provider(anthropic_auth.clone(), default_model);
 
     // OpenAI: a stored `openai` credential wins; otherwise the env fallback.
     let openai_credential = match CredentialStore::get(pool, "openai").await {
@@ -220,19 +210,10 @@ async fn resolve_direct_providers(
     // Chain order: Anthropic before OpenAI, because Anthropic's server tool has
     // no per-call fee while OpenAI's Responses web search bills per call on top
     // of the tokens the results consume.
-    let mut search_backends: Vec<Arc<dyn WebSearchProvider>> = Vec::new();
-    if let Some(auth) = anthropic_auth {
-        let model = search_model_for(
-            registry,
-            crate::llm::ProviderKind::Anthropic,
-            default_model,
-            ANTHROPIC_FALLBACK_SEARCH_MODEL,
-        );
-        match AnthropicServerToolSearch::new(auth, model) {
-            Ok(b) => search_backends.push(Arc::new(b)),
-            Err(e) => crate::log!("[Startup] Failed to build Anthropic search backend: {}", e),
-        }
-    }
+    let mut search_backends: Vec<Arc<dyn WebSearchProvider>> =
+        anthropic_search_backend(anthropic_auth, registry, default_model)
+            .into_iter()
+            .collect();
     search_backends.extend(openai_search_backend(openai_key, registry, default_model));
 
     DirectProviders {
@@ -271,6 +252,30 @@ fn search_model_for(
         chat_model.to_string()
     } else {
         fallback.to_string()
+    }
+}
+
+/// The Anthropic search backend for resolved auth, or `None` when Anthropic is
+/// not configured. Shared by the DB-up and DB-down paths so both honor the
+/// `ANTHROPIC_API_KEY` fallback identically.
+fn anthropic_search_backend(
+    resolved_auth: Option<(AnthropicAuth, AnthropicAuthSource)>,
+    registry: &crate::llm::model_registry::ModelRegistry,
+    default_model: &str,
+) -> Option<Arc<dyn WebSearchProvider>> {
+    let (auth, _source) = resolved_auth?;
+    let model = search_model_for(
+        registry,
+        crate::llm::ProviderKind::Anthropic,
+        default_model,
+        ANTHROPIC_FALLBACK_SEARCH_MODEL,
+    );
+    match AnthropicServerToolSearch::new(auth, model) {
+        Ok(b) => Some(Arc::new(b) as Arc<dyn WebSearchProvider>),
+        Err(e) => {
+            crate::log!("[Startup] Failed to build Anthropic search backend: {}", e);
+            None
+        }
     }
 }
 
@@ -352,6 +357,10 @@ pub async fn build_active_provider(
     // (apikey login), the parallel of Vertex reading the gcloud ADC file. Read
     // fresh each build (boot + credential-subscriber hot-swap); never persisted.
     let openai_codex_key = crate::llm::openai::codex_detect::load();
+    // The Anthropic env fallback, below a stored `anthropic` credential. Read
+    // here (not inside the resolver) so the precedence stays pure over its
+    // inputs and unit-testable without touching process env.
+    let anthropic_env_key = std::env::var("ANTHROPIC_API_KEY").ok();
     let DirectProviders {
         openai,
         anthropic,
@@ -364,6 +373,7 @@ pub async fn build_active_provider(
         &ctx.model_registry,
         openai_env_key,
         openai_codex_key,
+        anthropic_env_key,
     )
     .await;
 
@@ -450,6 +460,33 @@ pub async fn build_active_provider(
         web_search,
         selection,
     })
+}
+
+/// Build the direct-Anthropic provider from already-resolved auth, logging
+/// which source it came from (the source name, never the secret) and degrading
+/// to `None` (rather than aborting) if the reqwest client can't be built.
+///
+/// Takes the resolved auth rather than resolving it, so the caller can hand the
+/// same auth to [`anthropic_search_backend`]: resolving twice would risk the
+/// provider and the search backend disagreeing about which source won.
+fn build_anthropic_provider(
+    resolved_auth: Option<(AnthropicAuth, AnthropicAuthSource)>,
+    default_model: &str,
+) -> Option<AnthropicProvider> {
+    let (auth, source) = resolved_auth?;
+    match AnthropicProvider::new(auth, default_model.to_string()) {
+        Ok(p) => {
+            crate::log!(
+                "[Startup] Direct Anthropic provider configured (auth from {})",
+                source
+            );
+            Some(p)
+        }
+        Err(e) => {
+            crate::log!("[Startup] Failed to build Anthropic provider: {}", e);
+            None
+        }
+    }
 }
 
 /// Build the direct-OpenAI provider from an already-resolved key, logging where
@@ -599,18 +636,21 @@ mod tests {
     }
 
     /// Whether an ambient provider source could pre-configure a provider in this
-    /// process: the OpenAI / OpenRouter / local env fallbacks, OR a Codex CLI
-    /// `apikey` login on disk (`${CODEX_HOME:-~/.codex}/auth.json`), which the
-    /// OpenAI builder now honors as its lowest-precedence fallback. On a dev
-    /// shell or CI runner that has any of these, the "no provider configured"
-    /// assertions below are not meaningful — the `anthropic`-credential
-    /// transition (env- and file-independent) still is. (Anthropic has no env
-    /// fallback in `resolve_direct_providers`.) The Codex source must be included
-    /// here, not just the env vars: a developer logged into Codex would otherwise
-    /// see `build_active_provider` return `Real` while this gate reported false,
-    /// breaking the `Unconfigured`/`FailFast` assertions.
+    /// process: the Anthropic / OpenAI / OpenRouter / local env fallbacks, OR a
+    /// Codex CLI `apikey` login on disk (`${CODEX_HOME:-~/.codex}/auth.json`),
+    /// which the OpenAI builder honors as its lowest-precedence fallback. On a
+    /// dev shell or CI runner that has any of these, the "no provider
+    /// configured" assertions below are not meaningful; seeding an `anthropic`
+    /// credential still selects `Real` either way, so that half of each test
+    /// runs unconditionally.
+    ///
+    /// Every non-credential source belongs here, not just the obvious env vars.
+    /// A developer logged into Codex, or one exporting `ANTHROPIC_API_KEY`,
+    /// would otherwise see `build_active_provider` return `Real` while this gate
+    /// reported false, breaking the `Unconfigured`/`FailFast` assertions.
     fn ambient_provider_env() -> bool {
-        std::env::var("OPENAI_API_KEY").is_ok()
+        std::env::var("ANTHROPIC_API_KEY").is_ok()
+            || std::env::var("OPENAI_API_KEY").is_ok()
             || std::env::var("LUCIDOS_OPENROUTER_API_KEY").is_ok()
             || std::env::var("LUCIDOS_LOCAL_BASE_URL").is_ok()
             || std::env::var("LUCIDOS_LOCAL_API_KEY").is_ok()
@@ -695,6 +735,91 @@ mod tests {
         }
 
         teardown_test_db(&db).await;
+    }
+
+    /// The ids of the resolved search backends, in chain order.
+    fn backend_ids(providers: &DirectProviders) -> Vec<&'static str> {
+        providers.search_backends.iter().map(|b| b.id()).collect()
+    }
+
+    /// `ANTHROPIC_API_KEY` alone (no stored credential) configures the direct
+    /// Anthropic provider AND its search backend. The search half is the one
+    /// that silently goes missing: the auth is deliberately held past provider
+    /// construction so both are built from it, and an env path that reached only
+    /// the provider would give an env-configured user chat with no Anthropic
+    /// search backend.
+    ///
+    /// The env value is passed as an argument, never exported, so this cannot
+    /// race the rest of the binary.
+    #[tokio::test]
+    async fn anthropic_env_key_alone_builds_the_provider_and_its_search_backend() {
+        let (pool, db) = setup_test_db().await;
+        let registry = crate::llm::model_registry::empty();
+        let resolved = resolve_direct_providers(
+            Some(&pool),
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            Some("sk-ant-env".to_string()),
+        )
+        .await;
+        assert!(
+            resolved.anthropic.is_some(),
+            "ANTHROPIC_API_KEY must configure the direct Anthropic provider"
+        );
+        assert!(
+            backend_ids(&resolved).contains(&"anthropic-server-tool"),
+            "the same env-resolved auth must reach the search backend: {:?}",
+            backend_ids(&resolved)
+        );
+        teardown_test_db(&db).await;
+    }
+
+    /// The degraded (DB-down) boot honors the env fallback too, exactly as the
+    /// OpenAI env + Codex fallbacks already do there. Before this, that path
+    /// hardcoded `anthropic: None`, so a DB outage silently dropped Anthropic
+    /// even for a user whose key was in the environment all along.
+    ///
+    /// Needs no database (`pool == None`) and no process env: both key sources
+    /// are arguments, which makes the with/without pair deterministic.
+    #[tokio::test]
+    async fn db_down_boot_honors_the_anthropic_env_key() {
+        let registry = crate::llm::model_registry::empty();
+
+        let without = resolve_direct_providers(
+            None,
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            None,
+        )
+        .await;
+        assert!(
+            without.anthropic.is_none(),
+            "no credential and no env key means no Anthropic, even degraded"
+        );
+        assert!(!backend_ids(&without).contains(&"anthropic-server-tool"));
+
+        let with = resolve_direct_providers(
+            None,
+            crate::core::DEFAULT_CHAT_MODEL,
+            &registry,
+            None,
+            None,
+            Some("sk-ant-env".to_string()),
+        )
+        .await;
+        assert!(
+            with.anthropic.is_some(),
+            "the env fallback must survive a DB-down boot"
+        );
+        assert_eq!(
+            backend_ids(&with),
+            vec!["anthropic-server-tool"],
+            "and must carry its search backend with it"
+        );
     }
 
     /// With the gate OFF and nothing configured, the rebuild reports `FailFast`
@@ -898,8 +1023,9 @@ mod tests {
     #[tokio::test]
     async fn local_only_workspace_gets_an_empty_chain() {
         if ambient_provider_env() {
-            // A developer machine with OPENAI_API_KEY / a Codex login would add
-            // a real backend and make this assertion meaningless.
+            // A developer machine with ANTHROPIC_API_KEY / OPENAI_API_KEY / a
+            // Codex login would add a real backend and make this assertion
+            // meaningless.
             return;
         }
         let (pool, db) = setup_test_db().await;

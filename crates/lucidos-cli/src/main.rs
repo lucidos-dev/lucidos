@@ -26,6 +26,7 @@ mod changes;
 mod coding_agent_diff_hook;
 mod data;
 mod data_store;
+mod event_waits;
 mod events;
 /// Manifest-generated subcommands (one per `cli = true` capability domain).
 /// AUTO-GENERATED content; wire each enum below. See
@@ -85,15 +86,35 @@ enum Command {
     /// passed. Nothing is blocked while you are subscribed, and you must not
     /// sit in a sleep-and-recheck loop waiting for it.
     ///
-    /// Use it for anything the engine emits: another thread finishing
-    /// (`ChildThreadCompleted`), a change appearing (`ChangeProposed`), a
-    /// trigger firing, a workspace domain event. NOT for external state with no
-    /// Lucidos event, which has nothing to wake you.
+    /// Use it for anything the engine emits: a change appearing
+    /// (`ChangeProposed`), a trigger firing, a workspace domain event. NOT for
+    /// external state with no Lucidos event, which has nothing to wake you, and
+    /// NOT for a thread you spawned as your own child: that one already wakes
+    /// this thread with its result when it finishes, so a wait on its
+    /// `ChildThreadCompleted` buys nothing. Await a completion only for a thread
+    /// that is not your own child, named with a `child_thread_id` condition.
     ///
     /// A rendezvous, not a stream: the first match consumes it. For a standing
     /// rule that fires every time, create a trigger instead.
     #[command(name = "await-event")]
     AwaitEvent(AwaitEventArgs),
+    /// Read or stop this thread's own event subscriptions, the ones
+    /// `await-event` armed.
+    ///
+    /// `list` is how you answer "am I still watching for that?". You cannot
+    /// know otherwise, because a subscription is spent the moment it fires, can
+    /// time out, and can be stopped by the user, none of which is announced to
+    /// a session that is not running. `cancel` is how you stand one down when
+    /// the user says to stop; without it a subscription is unrevokable and
+    /// wakes this thread later whatever you told them.
+    ///
+    /// Both act on `$LUCIDOS_THREAD_ID` and take no thread argument, so neither
+    /// can reach another thread's subscriptions.
+    #[command(name = "event-waits")]
+    EventWaits {
+        #[command(subcommand)]
+        action: EventWaitsCmd,
+    },
     /// Record/query hardening state. Invoked by `/harden` Phase 5.
     Hardened {
         #[command(subcommand)]
@@ -411,6 +432,31 @@ enum ThreadsCmd {
         /// reads you only when that call returns.
         #[arg(long)]
         urgent: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum EventWaitsCmd {
+    /// List what this thread is subscribed to right now: each subscription's
+    /// id, the events and conditions it watches, the reason it was armed with,
+    /// how long ago that was, and how long is left.
+    ///
+    /// Call it before telling the user whether you are still watching for
+    /// something, and to get the id `cancel` takes.
+    List,
+    /// Stop watching. Pass `--wait-id <id>` for one subscription or `--all` for
+    /// every one on this thread; exactly one of the two.
+    ///
+    /// There is no wake, so nothing interrupts you: the subscription simply
+    /// stops, the user sees it leave the subscription indicator, and the
+    /// transcript records what was stopped.
+    Cancel {
+        /// The subscription to stop, from `event-waits list`.
+        #[arg(long = "wait-id")]
+        wait_id: Option<String>,
+        /// Stop every live subscription on this thread.
+        #[arg(long)]
+        all: bool,
     },
 }
 
@@ -932,6 +978,16 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     reason: &args.reason,
                 },
             )?;
+            Ok(0)
+        }
+        Command::EventWaits { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                EventWaitsCmd::List => event_waits::cmd_event_waits_list(&ws)?,
+                EventWaitsCmd::Cancel { wait_id, all } => {
+                    event_waits::cmd_event_waits_cancel(&ws, wait_id.as_deref(), all)?
+                }
+            }
             Ok(0)
         }
         Command::Notify(args) => {

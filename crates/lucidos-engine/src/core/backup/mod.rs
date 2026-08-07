@@ -49,15 +49,25 @@ pub fn is_schedule_active(value: &str) -> bool {
     !value.is_empty() && value != "off"
 }
 
-/// Read the backup retention count from preferences, falling back to the default.
-pub async fn get_retention_count(pool: &PgPool) -> usize {
+/// Read the backup retention count from preferences. A missing or unparseable
+/// row is the default; a FAILED read is an `Err`.
+///
+/// The split matters because one caller acts destructively on the answer. This
+/// used to be `.ok().flatten()…unwrap_or(DEFAULT_BACKUP_RETENTION)`, so a
+/// transient `sqlx` failure (a pool timeout under load is the realistic one)
+/// read as "keep 5" and `scheduler::backup` fed that straight into
+/// [`prune_old_backups`], deleting every archive beyond the fifth. A workspace
+/// configured for the catalog maximum of 50 lost up to 45 backups on one blip,
+/// immediately after a SUCCESSFUL upload. That is the case
+/// `.claude/rules/rust.md` names outright: an unknown must never authorize
+/// deleting. The two display callers still want the default on an unknown, and
+/// say so at their own call sites; the prune caller skips the prune.
+pub async fn get_retention_count(pool: &PgPool) -> Result<usize, BoxError> {
     use crate::core::PreferenceStore;
-    PreferenceStore::get(pool, PREF_BACKUP_RETENTION)
-        .await
-        .ok()
-        .flatten()
+    Ok(PreferenceStore::get(pool, PREF_BACKUP_RETENTION)
+        .await?
         .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(DEFAULT_BACKUP_RETENTION)
+        .unwrap_or(DEFAULT_BACKUP_RETENTION))
 }
 
 /// Static registry of all backup providers: (id, name, oauth_provider, required_scopes, constructor).

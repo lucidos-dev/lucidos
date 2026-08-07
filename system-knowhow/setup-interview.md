@@ -1,6 +1,6 @@
 ---
 name: Setup Interview
-description: Use when the user wants Lucidos set up around their own life rather than a single answer, and when they ask what they should use it for at all. Phrases like "help me get the most out of Lucidos", "set me up", "build me a starting kit", "what should I use Lucidos for", "help me get started", "figure out what to build for me", "make my life better", "help me with my training", "coach me", or a returning user asking to run setup again. Covers what mix of their life to interview about (work is one option, not the assumption), the question ladder, when a card should be multi-select, mapping answers to a concrete kit instead of a default one, confirming before building, building it for real in this session, and persisting what was learned.
+description: Use when the user wants Lucidos set up around their own life rather than a single answer, or asks what to use it for at all: "help me get the most out of Lucidos", "set me up", "build me a starting kit", "what should I use Lucidos for", "help me get started", "figure out what to build for me", "make my life better", "help me with my training", "coach me", or a returning user running setup again. Covers which parts of their life to interview about (work is one option, not the assumption), the question ladder, mapping answers to a concrete kit, confirming before building, and what to persist.
 ---
 
 # Setup Interview

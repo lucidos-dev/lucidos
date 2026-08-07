@@ -64,23 +64,7 @@ impl LucidosEngine {
             String::new()
         } else {
             let all_files = self.artifact_manager.list_artifacts().unwrap_or_default();
-
-            if !all_files.is_empty() {
-                let file_list = all_files
-                    .iter()
-                    .take(100)
-                    .cloned()
-                    .collect::<Vec<_>>()
-                    .join("\n  ");
-                let suffix = if all_files.len() > 100 {
-                    format!("\n  ... and {} more", all_files.len() - 100)
-                } else {
-                    String::new()
-                };
-                format!("[CURRENT FILES]\n  {}{}\n[END FILES]", file_list, suffix)
-            } else {
-                String::new()
-            }
+            super::workspace_payload::build_file_list_section(&all_files)
         }; // end file_list_context if/else
 
         // Include user profile content so LLM doesn't need to read it

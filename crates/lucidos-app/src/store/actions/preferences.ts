@@ -39,14 +39,44 @@ const GOOGLE_FONT_URLS: Partial<Record<FontFamily, string>> = {
   'fira-code': 'https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap',
 };
 
-// Programming ligatures, enabled ONLY for fonts that ship them and that the
-// user explicitly picked for them (Fira Code's signature feature: => != === ).
-// Every other font sets `normal` (the CSS initial), so their rendering is
-// unchanged. `font-feature-settings` is inherited, so setting it on <html>
-// cascades to all text — mirrored in the FOUC scripts (index.html,
-// api/sdk_prefs.rs) and the SDK (packages/lucidos-sdk/src/ui.ts).
-const FONT_FEATURES: Partial<Record<FontFamily, string>> = {
-  'fira-code': '"liga" 1, "calt" 1',
+// Programming ligatures belong to CODE, never to prose. Fira Code's `calt`
+// deliberately re-spaces dot runs (`..` and `...` are separate contextual rules
+// so the font can tighten range operators), so a typed `...` comes out kerned
+// tight enough to read as two dots: tonsky/FiraCode#1561, open upstream with no
+// per-sequence switch. `...` is ordinary prose punctuation and Lucidos is
+// chat-first, so the feature is turned OFF for text and back ON for code.
+//
+// Two values per font, published as custom properties and consumed by CSS
+// (`html, input, textarea, select, button` for the text one; `code, pre, kbd,
+// samp, .diff-line-content` for the code one) in styles/global/base.css and its
+// mirror in the engine-served api/sdk_iframe.css. Mirrored in the FOUC scripts
+// (index.html, api/sdk_prefs.rs) and the SDK (packages/lucidos-sdk/src/ui.ts).
+//
+// Two things about this are counter-intuitive, and getting either wrong makes
+// the change a silent no-op. Both were established by pixel comparison in
+// headless Chromium, because the computed property value does not show either:
+//
+//  1. **`normal` does NOT mean "ligatures off".** `liga` and `calt` are
+//     default-ON features in CSS, so `normal` means "the font's defaults",
+//     which for Fira Code is ligatures on. Rendering `...` under `normal` is
+//     byte-identical to rendering it under `"liga" 1, "calt" 1`. Turning the
+//     feature off REQUIRES writing the zeros. Never spell the off value
+//     `normal`, and never think that dropping the declaration disables it.
+//  2. **A <textarea> does not inherit `font-feature-settings`.** The UA
+//     stylesheet applies the `font` shorthand to form controls, and that
+//     shorthand resets this property to its initial value. So the text rule has
+//     to name the controls explicitly; inheriting from <html> reaches prose but
+//     stops at the composer, which is the surface the bug was reported against.
+//     Same reason the app already sets `font-family` on inputs by hand.
+//
+// Every non-Fira font resolves BOTH to `normal`, leaving its rendering exactly
+// as it is today. That matters beyond minimal blast radius: an unconditional
+// `"liga" 0` would also kill the `fi`/`fl` ligatures a proportional text font
+// like Inter legitimately wants.
+type FontFeaturePair = { text: string; code: string };
+const FONT_FEATURES_DEFAULT: FontFeaturePair = { text: 'normal', code: 'normal' };
+const FONT_FEATURES: Partial<Record<FontFamily, FontFeaturePair>> = {
+  'fira-code': { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' },
 };
 
 const loadedFonts = new Set<string>();
@@ -396,10 +426,9 @@ export function applyFontFamily(font: FontFamily): void {
   localStorage.setItem('lucidos-font-family', font);
   const value = FONT_FAMILY_VALUES[font] || FONT_FAMILY_VALUES.monospace;
   document.documentElement.style.setProperty('--font-ui', value);
-  document.documentElement.style.setProperty(
-    'font-feature-settings',
-    FONT_FEATURES[font] || 'normal',
-  );
+  const features = FONT_FEATURES[font] || FONT_FEATURES_DEFAULT;
+  document.documentElement.style.setProperty('--font-features-text', features.text);
+  document.documentElement.style.setProperty('--font-features-code', features.code);
 }
 
 export function currentFontFamily(): FontFamily {

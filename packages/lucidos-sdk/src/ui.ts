@@ -28,12 +28,24 @@ const GOOGLE_FONT_URLS: Record<string, string> = {
   'fira-code': 'https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600;700&display=swap',
 };
 
-// Programming ligatures, gated to fonts that ship them (Fira Code); every other
-// font resolves to `normal` (CSS initial → unchanged). Mirrors FONT_FEATURES in
-// the host shell (crates/lucidos-app/src/store/actions/preferences.ts) and the
-// FOUC scripts (index.html, crates/lucidos-engine/src/api/sdk_prefs.rs).
-const FONT_FEATURES: Record<string, string> = {
-  'fira-code': '"liga" 1, "calt" 1',
+// Programming ligatures: OFF for text, ON for code, gated to fonts that ship
+// them (Fira Code). Every other font resolves BOTH to `normal`, leaving its
+// rendering unchanged. Mirrors FONT_FEATURES in the host shell
+// (crates/lucidos-app/src/store/actions/preferences.ts) and the FOUC scripts
+// (index.html, crates/lucidos-engine/src/api/sdk_prefs.rs). The engine-served
+// api/sdk_iframe.css is the only consumer: `html, input, textarea, select,
+// button` take the text value, `code, pre, kbd, samp` the code one.
+//
+// The off value is the ZEROS, never `normal`: `liga` and `calt` are default-ON
+// in CSS, so `normal` means "the font's defaults" and renders identically to
+// `1`, leaving Fira Code's `calt` free to re-space a typed `...` into what reads
+// as two dots (tonsky/FiraCode#1561). Form controls are named explicitly
+// because the UA stylesheet's `font` shorthand resets this property on them, so
+// a `<textarea>` never inherits it. See preferences.ts for the full why.
+type FontFeaturePair = { text: string; code: string };
+const FONT_FEATURES_DEFAULT: FontFeaturePair = { text: 'normal', code: 'normal' };
+const FONT_FEATURES: Record<string, FontFeaturePair> = {
+  'fira-code': { text: '"liga" 0, "calt" 0', code: '"liga" 1, "calt" 1' },
 };
 
 const loadedFonts = new Set<string>();
@@ -129,6 +141,12 @@ export interface ToastOptions {
    *  updates the existing toast (message/type/etc.) instead of stacking a new
    *  one — e.g. an 'Opening…' toast becoming 'Opened'. */
   key?: string;
+  /** true = show an indeterminate "work in progress" spinner in place of the
+   *  severity icon. Pair it with a `key` so a later keyed toast replaces the
+   *  spinning one with the outcome (or call `dismissToast(key)` when the work
+   *  finishes with nothing to say). Indeterminate only: there is no app-facing
+   *  percentage. */
+  spinning?: boolean;
 }
 
 export interface PromptOptions {
@@ -324,10 +342,9 @@ export const ui = {
     }
     const fontValue = FONT_FAMILIES[fontKey] || FONT_FAMILIES['monospace'];
     document.documentElement.style.setProperty('--font-ui', fontValue);
-    document.documentElement.style.setProperty(
-      'font-feature-settings',
-      FONT_FEATURES[fontKey] || 'normal',
-    );
+    const features = FONT_FEATURES[fontKey] || FONT_FEATURES_DEFAULT;
+    document.documentElement.style.setProperty('--font-features-text', features.text);
+    document.documentElement.style.setProperty('--font-features-code', features.code);
 
     // Mirrors clampUiScale in preferences.ts — keep (75, 200, 12.5) in sync.
     // Fall back to the `lucidos-ui-scale` localStorage value sdk-prefs.js read
@@ -496,9 +513,10 @@ export const ui = {
    * themed by the user's preferences). Fire-and-forget — there is no result.
    *
    * Only the serializable subset of the host toast is exposed: `message`, the
-   * `type` severity, and `opts` (`durationMs`, `dismissable`, `key`). The host's
-   * action-button callbacks can't cross the postMessage boundary, so they're
-   * intentionally not available here. An unknown `type` degrades to `info`.
+   * `type` severity, and `opts` (`durationMs`, `dismissable`, `key`,
+   * `spinning`). The host's action-button callbacks can't cross the postMessage
+   * boundary, so they're intentionally not available here. An unknown `type`
+   * degrades to `info`.
    */
   toast(message: string, type: ToastType = 'info', opts?: ToastOptions): void {
     if (typeof message !== 'string' || message.length === 0) {
@@ -511,6 +529,7 @@ export const ui = {
       durationMs: opts && typeof opts.durationMs === 'number' ? opts.durationMs : undefined,
       dismissable: opts && typeof opts.dismissable === 'boolean' ? opts.dismissable : undefined,
       key: opts && typeof opts.key === 'string' && opts.key.length > 0 ? opts.key : undefined,
+      spinning: opts && typeof opts.spinning === 'boolean' ? opts.spinning : undefined,
     };
     // No host parent (SDK loaded in a top-level window) — surface via console so
     // a standalone testing context still sees the feedback instead of silence.
@@ -522,6 +541,30 @@ export const ui = {
       return;
     }
     window.parent.postMessage({ type: 'lucidos:ui:toast', payload }, '*');
+  },
+
+  /**
+   * Take down a toast your app raised with `toast(…, { key })`. Fire-and-forget,
+   * like `toast` itself. Use it for the case a keyed replacement can't express:
+   * work that finishes with nothing left to say, e.g. a `spinning` "Syncing…"
+   * toast that should just disappear when the SSE event lands.
+   *
+   * A key matching nothing is a silent no-op. Your app cannot know whether the
+   * toast is still up (the user may have closed it, or its duration may have
+   * expired), so "already gone" is the normal case, not an error.
+   */
+  dismissToast(key: string): void {
+    if (typeof key !== 'string' || key.length === 0) {
+      throw new TypeError('lucidos.ui.dismissToast: key must be a non-empty string');
+    }
+    // No host parent (SDK loaded in a top-level window): mirror the console
+    // fallback in `toast()` so a standalone testing context sees both halves of
+    // the exchange instead of a toast line with no matching dismissal.
+    if (window.parent === window) {
+      console.log(`[lucidos.ui.dismissToast] ${key}`);
+      return;
+    }
+    window.parent.postMessage({ type: 'lucidos:ui:dismissToast', payload: { key } }, '*');
   },
 
   /**

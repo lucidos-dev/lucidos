@@ -179,11 +179,23 @@ export interface ModelsListResponse {
 }
 
 /** Generic success/error response used by credential, preference, and trigger endpoints. */
+/** The engine's read-back on a trigger's cron after a create or update. Present
+ *  only on the trigger write endpoints. */
+export interface CronPreview {
+  /** The next few upcoming fire times (RFC3339), merged across the whole
+   *  expression array. */
+  next_runs: string[];
+  /** Non-fatal warnings, e.g. the day-of-month/day-of-week AND footgun. A cron
+   *  that can never fire is a hard error instead, so it arrives as `error`. */
+  warnings: string[];
+}
+
 export interface ApiResult {
   success: boolean;
   error?: string;
   credential_request?: { service: string; prompt: string; base_url: string; auth_type: AuthType };
   auth_url?: string;
+  cron_preview?: CronPreview;
 }
 
 export interface UploadResponse {

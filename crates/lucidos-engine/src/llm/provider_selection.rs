@@ -15,7 +15,7 @@ pub struct ProviderSelectionInputs {
     pub has_vertex: bool,
     /// A direct OpenAI provider is configured (stored credential or env key).
     pub has_openai: bool,
-    /// A direct Anthropic provider is configured.
+    /// A direct Anthropic provider is configured (stored credential or env key).
     pub has_anthropic: bool,
     /// An OpenRouter provider is configured.
     pub has_openrouter: bool,

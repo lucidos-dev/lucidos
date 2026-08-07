@@ -63,7 +63,11 @@ static WORKSPACE_INDEX_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Ensure the e2e workspace has an app folder named `app_id` with at least
 /// one file committed on `main`. Idempotent: skips when the folder already
 /// exists. The folder lives under `<ws>/data/apps/<app_id>/`.
-fn ensure_app_committed(app_id: &str, marker: &str) -> PathBuf {
+/// Async only so it can take the shared-tree read guard: the manifest and
+/// index it creates appear in the working tree, which a command checkpoint
+/// images whole (see `workspace_tree_lock`).
+async fn ensure_app_committed(app_id: &str, marker: &str) -> PathBuf {
+    let _tree = crate::support::workspace_tree_lock().read().await;
     let ws = workspace_path();
     let app_dir = ws.join("data/apps").join(app_id);
     if !app_dir.exists() {
@@ -251,7 +255,7 @@ async fn app_coding_agent_lifecycle() {
 
     let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
     let app_id = format!("e2e-app-{}", suffix);
-    let app_dir = ensure_app_committed(&app_id, &suffix);
+    let app_dir = ensure_app_committed(&app_id, &suffix).await;
 
     let thread_id = Uuid::new_v4();
     let change_id = Uuid::new_v4();
@@ -307,7 +311,11 @@ async fn app_coding_agent_lifecycle() {
     .await;
 
     let apply_url = format!("{}/api/v1/changes/{}/apply", base_url(), change_id);
+    // Puts a file into the shared workspace working tree; see
+    // `workspace_tree_lock`.
+    let tree = crate::support::workspace_tree_lock().read().await;
     let resp = client.post(&apply_url).send().await.expect("apply");
+    drop(tree);
     let status = resp.status().as_u16();
     let body: serde_json::Value = resp.json().await.expect("apply JSON");
     assert_eq!(status, 200, "apply should succeed: {:?}", body);
@@ -384,7 +392,7 @@ async fn app_coding_agent_concurrent_apply() {
 
     let suffix = Uuid::new_v4().as_simple().to_string()[..8].to_string();
     let app_id = format!("e2e-app-conc-{}", suffix);
-    let app_dir = ensure_app_committed(&app_id, &suffix);
+    let app_dir = ensure_app_committed(&app_id, &suffix).await;
 
     // Two threads, two worktrees, two branches — each edits a different file
     // so the rebase is trivially clean (the test's job is to prove
@@ -416,6 +424,12 @@ async fn app_coding_agent_concurrent_apply() {
 
     let url_a = format!("{}/api/v1/changes/{}/apply", base_url(), cid_a);
     let url_b = format!("{}/api/v1/changes/{}/apply", base_url(), cid_b);
+
+    // These two merges put files into the shared workspace working tree, which
+    // the command-checkpoint test snapshots whole; see `workspace_tree_lock`.
+    // A read guard, so the two applies below still overlap each other, which is
+    // the entire point of this test.
+    let _tree = crate::support::workspace_tree_lock().read().await;
 
     // Fire concurrently. MERGE_MUTEX inside change_ops serialises the actual
     // ff-merge, but both requests are alive in the engine at the same time.

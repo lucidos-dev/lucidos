@@ -10,6 +10,7 @@ import {
 } from '../store';
 import { toFailed, setLoadingIfFresh } from '../types';
 import type { EventSubscription, SideEffectCategory, TriggerRun } from '../types';
+import type { ApiResult } from '../../api/types';
 import {
   listTriggers,
   listHistoricalTriggers,
@@ -142,6 +143,17 @@ interface SubmitTriggerParams {
   sideEffectGrant: SideEffectCategory[];
 }
 
+/** Surface the engine's non-fatal cron advice after a successful save.
+ *
+ *  Warnings only: a schedule that can never fire is rejected outright and
+ *  arrives as `error`. The next-run preview needs no toast, since the reload
+ *  below renders it on the trigger's own row. */
+function surfaceCronWarnings(result: ApiResult): void {
+  for (const warning of result.cron_preview?.warnings ?? []) {
+    showToast(warning, 'warning');
+  }
+}
+
 export async function submitTrigger(params: SubmitTriggerParams): Promise<boolean> {
   const { name, run, cronExpressions, triggerId, on, showEvent, goToReview, groupId, sideEffectGrant } = params;
   if (!name.trim()) {
@@ -177,6 +189,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         showToast(data.error || 'Failed to update trigger', 'error');
         return false;
       }
+      surfaceCronWarnings(data);
     } else {
       const data = await createTrigger({
         name: name.trim(),
@@ -195,6 +208,7 @@ export async function submitTrigger(params: SubmitTriggerParams): Promise<boolea
         showToast(data.error || 'Failed to create trigger', 'error');
         return false;
       }
+      surfaceCronWarnings(data);
     }
 
     closeTriggerForm();

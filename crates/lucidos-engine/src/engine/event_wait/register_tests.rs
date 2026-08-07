@@ -147,6 +147,152 @@ fn describe_subscriptions_reads_as_the_or_it_is() {
     assert!(text.contains("where"), "{text}");
 }
 
+// ── what the arming lookback suppresses ─────────────────────────────
+
+/// The one sound suppression: an event this thread was literally handed by an
+/// earlier wait. Nothing else is evidence the thread has seen it.
+#[tokio::test]
+async fn a_delivered_event_is_excluded_from_the_lookback() {
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{EventMeta, ThreadEvent};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = uuid::Uuid::new_v4();
+    let since = chrono::Utc::now() - chrono::Duration::minutes(3);
+
+    assert!(
+        delivered_event_ids(&pool, thread_id, since)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a thread handed nothing excludes nothing"
+    );
+
+    let handed = uuid::Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::EventWaitDelivered {
+            wait_id: uuid::Uuid::new_v4(),
+            event_id: handed,
+            event_type: "ChangeProposed".into(),
+            payload: json!({}),
+            matched_index: 0,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let excluded = delivered_event_ids(&pool, thread_id, since).await.unwrap();
+    assert!(
+        excluded.contains(&handed),
+        "the delivery names the exact event the thread saw"
+    );
+    assert_eq!(excluded.len(), 1, "and only that one");
+
+    // Another thread's deliveries are none of this thread's business.
+    assert!(
+        delivered_event_ids(&pool, uuid::Uuid::new_v4(), since)
+            .await
+            .unwrap()
+            .is_empty(),
+        "the exclusion is per-thread"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// **Nothing coarser than a delivery may suppress a report.** Two rounds of
+/// review killed a sequence floor here, each time because it hid an event
+/// nobody had told the thread about: first a floor at the last `EventWait*` of
+/// any kind (an unrelated `ChildThreadCompleted` delivery hid a missed
+/// `ChangeProposed`), then a floor on shared event *type* (a `ChangeProposed`
+/// wait conditioned on one repo hid a `ChangeProposed` for another).
+///
+/// This pins the shape that makes both impossible: registrations, expiries and
+/// cancels contribute NOTHING to the exclusion set, whatever they were about,
+/// and a delivery contributes exactly one event id rather than a cutoff.
+#[tokio::test]
+async fn only_a_delivery_suppresses_and_only_the_event_it_named() {
+    use crate::engine::event_bus::{BusEvent, EventBus};
+    use crate::engine::thread_events::{EventMeta, ThreadEvent};
+    use crate::test_support::{setup_test_db, teardown_test_db};
+
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let thread_id = uuid::Uuid::new_v4();
+    let since = chrono::Utc::now() - chrono::Duration::minutes(3);
+    let wait_id = uuid::Uuid::new_v4();
+
+    // A whole wait lifecycle that hands the thread no event.
+    for event in [
+        ThreadEvent::EventWaitStarted {
+            wait_id,
+            tool_use_id: "toolu_x".into(),
+            on: vec![crate::core::event_subscription::EventSubscription {
+                event_type: "ChangeProposed".into(),
+                condition: None,
+            }],
+            reason: "waiting".into(),
+            armed_at: chrono::Utc::now(),
+            expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
+            watermark: 0,
+        },
+        ThreadEvent::EventWaitExpired { wait_id },
+    ] {
+        bus.emit(BusEvent::Thread {
+            thread_id,
+            event,
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+
+    assert!(
+        delivered_event_ids(&pool, thread_id, since)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a registration and an expiry handed the thread nothing, so they \
+         suppress nothing: a floor here is what hid the missed event twice"
+    );
+
+    // A delivery of a DIFFERENT event does not suppress an unrelated one.
+    let other = uuid::Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id,
+        event: ThreadEvent::EventWaitDelivered {
+            wait_id,
+            event_id: other,
+            event_type: "ChildThreadCompleted".into(),
+            payload: json!({}),
+            matched_index: 0,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let excluded = delivered_event_ids(&pool, thread_id, since).await.unwrap();
+    assert_eq!(
+        excluded.len(),
+        1,
+        "one delivery excludes one event, not a span of the timeline"
+    );
+    assert!(excluded.contains(&other));
+    assert!(
+        !excluded.contains(&uuid::Uuid::new_v4()),
+        "and says nothing about any event it did not name"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
 // ── the whole-argument shape ─────────────────────────────────────────
 
 /// `reason` is what the user reads in the indicator, and it is the difference

@@ -20,3 +20,15 @@ export function slugifyWorkspaceName(name: string): string {
   out = out.replace(/-+$/, '');
   return out || 'workspace';
 }
+
+/** Make `base` unique against `taken` by appending `-2`, `-3`, … the way the
+ *  gateway does when it creates a workspace. Mirrors `registry::unique_slug`, so
+ *  the create form can state the address a colliding name will actually get
+ *  instead of letting the suffix appear out of nowhere. */
+export function uniqueWorkspaceSlug(base: string, taken: readonly string[]): string {
+  if (!taken.includes(base)) return base;
+  for (let n = 2; ; n++) {
+    const candidate = `${base}-${n}`;
+    if (!taken.includes(candidate)) return candidate;
+  }
+}

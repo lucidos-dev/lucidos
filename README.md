@@ -276,6 +276,7 @@ Env var beats `lucidos.toml`. Both still collision-walk forward if the chosen ba
 | `VERTEX_PROJECT_ID` | (none) | GCP project (for `claude-*`/`gemini-*`) |
 | `VERTEX_REGION` | `europe-west1` | Vertex AI region |
 | `OPENAI_API_KEY` | (none) | OpenAI key (for `gpt-*` models). Fallback below a stored `openai` credential; if unset too, the engine auto-detects a key from the Codex CLI's `${CODEX_HOME:-~/.codex}/auth.json` (`apikey` login only). |
+| `ANTHROPIC_API_KEY` | (none) | Anthropic key (for direct `claude-*` models). Fallback below a stored `anthropic` credential. Always used as an API key, never as a subscription OAuth token. |
 
 **Per-workspace environment variables:** beyond the global `.env` the engine loads at startup, each workspace can define its own non-secret environment variables in **Settings → System → Environment variables** (DB-backed). The engine injects them as real env vars into every subprocess it spawns (`run_bash`, `run_python`, scheduled scripts, triggers, and coding-agent sessions) alongside `CRED_*`/`OAUTH_*`. Use them for per-workspace identity (e.g. `GH_CONFIG_DIR` / `GIT_SSH_COMMAND` so `gh` / `git push` authenticate as the right account). Changes take effect on the next subprocess, no restart. They are non-secret (real secrets belong in credentials). The legacy `<workspace>/data/.env` file is migrated into this store on startup and removed.
 <!--devsetup-end-->

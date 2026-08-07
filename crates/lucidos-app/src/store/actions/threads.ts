@@ -1,6 +1,8 @@
 import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, bootstrappingThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
 import { revealThreadPane } from './pane';
 import type { ThreadSection, ThreadState } from '../thread-events';
+import { describeWaitSubscription } from '../thread-events';
+import type { ConfirmDetailGroup, ConfirmDetails } from '../types';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { computeFamilyGraph, filterByTopThread, orderedCurrentForReview, attentionThreads, reviewThreads, runningThreads, draftThreads } from '../../components/drawer/family-graph';
 import type { FamilyGraph } from '../../components/drawer/family-graph';
@@ -425,6 +427,73 @@ function collectArchiveCascade(rootId: string): Set<string> {
   return seen;
 }
 
+/** What archiving this cascade would stop, for the confirm to name.
+ *
+ *  Archiving cancels every live *thread subscription* in the cascade, which is
+ *  correct and stays: leaving one live behind the archive curtain would wake a
+ *  thread the user considers closed. The bug was that it happened in silence,
+ *  so an ordinary unsaved thread with three live subscriptions archived on the
+ *  first tap and the event-wait dispatcher cancelled all three.
+ *
+ *  **Two sources, because neither alone is right.** `meta.liveEventWaits` is
+ *  folded from a thread's LOADED events, so it names every subscription on the
+ *  thread the user is looking at and knows nothing about a sub-thread whose
+ *  events were never fetched. `meta.liveEventWaitCount` is the projected column
+ *  and is right for every row in the map. So the named ones come from the list
+ *  and the rest are counted from the column, rather than the dialog waiting on
+ *  a fetch before it can open. The thread being archived is always fully named,
+ *  which is the case that matters.
+ *
+ *  Returns `null` when the cascade holds none, which is what keeps an ordinary
+ *  archive a single tap.
+ *
+ *  Exported for its own tests: the naming and the remainder line are worth
+ *  pinning without driving a whole archive. */
+export function subscriptionsStoppedByArchive(
+  cascade: Set<string>,
+  rootId: string,
+): { message: string; details: ConfirmDetails } | null {
+  const groups: ConfirmDetailGroup[] = [];
+  let named = 0;
+  let unnamed = 0;
+  for (const id of cascade) {
+    const t = threadMap.value.get(id);
+    if (t === undefined || t.meta.liveEventWaitCount === 0) continue;
+    const waits = t.meta.liveEventWaits;
+    if (waits.length > 0) {
+      named += waits.length;
+      groups.push({
+        header: id === rootId ? 'This thread' : t.meta.title || 'Sub-thread',
+        items: waits.map((w) => `${w.reason} (${describeWaitSubscription(w.on)})`),
+      });
+    }
+    // The shortfall is counted whether the thread named NONE of its
+    // subscriptions or only some. A thread's events load in a window, so one
+    // holding two subscriptions can have the newer `EventWaitStarted` in the
+    // window and the older one outside it: counting only the all-or-nothing
+    // case would name one, drop the other, and under-report the total in the
+    // one dialog whose whole job is not to.
+    unnamed += Math.max(0, t.meta.liveEventWaitCount - waits.length);
+  }
+  const count = named + unnamed;
+  if (count === 0) return null;
+  // A count-only group: the dialog renders a header with no list, which is the
+  // honest shape for subscriptions we can count but not name.
+  if (unnamed > 0) {
+    groups.push({
+      header: `${unnamed} more on sub-threads`,
+      items: [],
+    });
+  }
+  return {
+    message:
+      count === 1
+        ? 'Archiving stops what this thread is waiting for. It will not fire.'
+        : `Archiving stops ${count} subscriptions. They will not fire.`,
+    details: { groups },
+  };
+}
+
 /** Clear a thread's unsent reply draft — local signal plus the server compose
  *  row. Snapshots the draft so a failed PUT restores it: local and server must
  *  not diverge, or the discarded draft silently reappears on the next load.
@@ -493,6 +562,21 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     // neither → Cancel/Escape/outside-click: abort the archive.
     if (!keep && !discardChosen) return;
     discardDrafts = discardChosen;
+  }
+
+  // Archiving cancels every live thread subscription in the same cascade, so
+  // say which ones before it happens. Unlike the draft confirm there is no
+  // third outcome to offer: keeping a subscription alive behind the archive
+  // curtain is not on the table, so this is Cancel (abort) versus Archive
+  // (proceed), and a cascade holding none never asks at all.
+  const stopping = subscriptionsStoppedByArchive(cascade, threadId);
+  if (stopping) {
+    const proceed = await showConfirm(stopping.message, 'Archive', {
+      variant: 'default',
+      cancelLabel: 'Cancel',
+      details: stopping.details,
+    });
+    if (!proceed) return;
   }
 
   // Pin to bottom and show header before banner re-renders

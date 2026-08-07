@@ -8,7 +8,7 @@ import { checkpointDiffModal, contextViewer, findChangeById, lazyChanges, openIm
 import { LUCIDOS_AGENT_LABEL, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
-import type { Exchange } from '../../store/thread-events';
+import type { EventWaitCancelCause, Exchange } from '../../store/thread-events';
 import type { Loadable, ResponseEvent, StepOutcome } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
@@ -577,7 +577,29 @@ const EVENT_WAIT_STEP_STATE: Record<EventWaitState, { outcome: StepOutcome; note
   waiting: { outcome: 'success' },
   woke: { outcome: 'success' },
   timed_out: { outcome: 'unfinished', note: 'timed out' },
-  canceled: { outcome: 'unfinished', note: 'canceled' },
+  canceled: { outcome: 'unfinished', note: 'stopped' },
+};
+
+/** Who stopped a subscription, in the words of whatever they pressed.
+ *
+ *  The word is **stopped**, never "discarded": *discarded* already means
+ *  throwing a thing away in Lucidos (a discarded thread, change or draft), and
+ *  one of these causes literally IS a discarded thread, so reusing it here
+ *  would collide. "Stop waiting" is what the button says, so a stop is what
+ *  this reads as. (The `canceled` identifiers underneath keep their names: they
+ *  are on disk in persisted rows.)
+ *
+ *  A pre-2026-08-07 row carries no cause and falls back to the bare note, which
+ *  says it stopped without claiming to know how. */
+const EVENT_WAIT_STOP_NOTE: Record<EventWaitCancelCause, string> = {
+  user_stop: 'stopped from the panel',
+  agent_stand_down: 'stood down',
+  thread_archived: 'stopped by archiving',
+  thread_discarded: 'stopped by discarding the thread',
+  // Retired: a thread-level Stop no longer stops a subscription. Only old rows
+  // carry it, and they still have to render.
+  thread_canceled: 'stopped by a thread Stop',
+  unknown: 'stopped',
 };
 
 /** An event wait, as one line in the step list (ADR 0047, amended 2026-08-06).
@@ -636,6 +658,20 @@ export function eventWaitStepBody({
   const { outcome, note } = EVENT_WAIT_STEP_STATE[event.state];
   const { icon, className } = stepStatus(outcome);
   const matched = event.matched_event_id;
+  // A row with no reason is a STOP that landed in a later exchange than the one
+  // that armed the subscription, built from an `EventWaitCanceled` written
+  // before it carried what it stopped. It has nothing to name, so it says the
+  // one thing it does know rather than an empty "Set up an event wait: ".
+  const description =
+    event.state === 'canceled' && !event.reason
+      ? 'Stopped waiting for an event'
+      : `${event.state === 'canceled' ? 'Stopped waiting' : 'Set up an event wait'}: ${event.reason}`;
+  const detail =
+    event.state === 'woke' && event.matched_event_type
+      ? event.matched_event_type
+      : event.state === 'canceled'
+        ? (event.cause ? EVENT_WAIT_STOP_NOTE[event.cause] : note)
+        : note ?? event.subscription;
   return (
     <div
       class={`inline-step inline-step-static ${className}`}
@@ -652,15 +688,15 @@ export function eventWaitStepBody({
           A colon rather than "for", because `reason` is the model's own words
           and it reaches for a gerund as often as a noun phrase: "…an event wait
           for Watching for the next code edit" is what the preposition produced
-          on a real thread. The colon reads as an introduction either way. */}
-      <span class="step-description">
-        Set up an event wait: {event.reason}
-      </span>
-      <span class="step-detail">
-        {event.state === 'woke' && event.matched_event_type
-          ? event.matched_event_type
-          : note ?? event.subscription}
-      </span>
+          on a real thread. The colon reads as an introduction either way.
+
+          A stopped row says "Stopped waiting" instead, because it is a
+          different action at a different moment: when the subscription was
+          armed in an earlier turn, this row IS the stop, sitting where the stop
+          happened, and "Set up an event wait" there would name the wrong
+          event entirely. */}
+      <span class="step-description">{description}</span>
+      <span class="step-detail">{detail}</span>
       {event.state === 'woke' && matched ? (
         // The matched event usually lives somewhere ELSE: the headline cases are
         // a `CodingAgentIdled` or a `ChangeProposed` from the coding-agent thread
@@ -698,10 +734,12 @@ export function checkpointUndoScope(restores: number, removes: number): string |
 /** The command-guard checkpoint card (ADR 0002, Phase 4): an inline affordance
  *  for an in-workspace destructive command, with a one-click Undo that restores
  *  the workspace from the snapshot taken before it and removes the files it
- *  created. "View changes" opens the diff between those two snapshots, so the
- *  Undo beside it is not a blind button. Once reverted (live via the paired
- *  `CommandCheckpointReverted` event, or on reload), Undo is replaced with a
- *  reverted marker, while the diff stays available. */
+ *  created. Diff opens the change between those two snapshots, so the Undo
+ *  beside it is not a blind button, and it is the same `.action-btn` Diff the
+ *  changes list and the change banners carry rather than a one-off link. Once
+ *  reverted (live via the paired `CommandCheckpointReverted` event, or on
+ *  reload), Undo is replaced with a reverted marker, while the diff stays
+ *  available. */
 export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type: 'checkpoint' }> }) {
   const pending = useSignal(false);
   const onUndo = async () => {
@@ -726,27 +764,29 @@ export function CheckpointCard({ event }: { event: Extract<ResponseEvent, { type
         <code class="step-note-detail">{event.command}</code>
         {scope && <div class="checkpoint-scope">{scope}</div>}
       </div>
-      <button
-        type="button"
-        class="accent-link"
-        data-role="checkpoint-diff"
-        onClick={() => { checkpointDiffModal.value = event; }}
-      >
-        View changes
-      </button>
-      {event.reverted ? (
-        <span class="checkpoint-reverted">Reverted ✓</span>
-      ) : (
+      <div class="checkpoint-actions">
         <button
           type="button"
-          class="action-btn action-btn-danger"
-          data-role="checkpoint-undo"
-          disabled={pending.value}
-          onClick={onUndo}
+          class="action-btn"
+          data-role="checkpoint-diff"
+          onClick={() => { checkpointDiffModal.value = event; }}
         >
-          {pending.value ? 'Undoing…' : 'Undo'}
+          Diff
         </button>
-      )}
+        {event.reverted ? (
+          <span class="checkpoint-reverted">Reverted ✓</span>
+        ) : (
+          <button
+            type="button"
+            class="action-btn action-btn-danger"
+            data-role="checkpoint-undo"
+            disabled={pending.value}
+            onClick={onUndo}
+          >
+            {pending.value ? 'Undoing…' : 'Undo'}
+          </button>
+        )}
+      </div>
     </div>
   );
 }

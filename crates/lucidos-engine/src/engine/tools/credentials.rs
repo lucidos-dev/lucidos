@@ -1,5 +1,6 @@
 use super::super::LucidosEngine;
 use crate::core::oauth;
+use crate::core::oauth_registry;
 use crate::core::CredentialStore;
 
 /// Sentinel prefix on a tool result that the agentic loop strips off and
@@ -204,15 +205,31 @@ impl LucidosEngine {
                             .filter(|s| !s.is_empty())
                             .map(str::to_string)
                     };
+                    //
+                    // Anything the agent did NOT pass falls back to the *OAuth
+                    // provider registry* row, which is the same data it would
+                    // have read out of the knowhow. Passing wins, so a derived
+                    // name carrying the base provider's URLs behaves exactly as
+                    // before; the fallback only rescues the case where the agent
+                    // skipped the lookup, which used to drop the user into a
+                    // blank endpoint form.
+                    let row = oauth_registry::find_provider(
+                        self.system_knowhow_dir(),
+                        &oauth::client_provider_name(&provider),
+                    );
+                    let from_row = row
+                        .as_ref()
+                        .map(oauth::OAuthClientOverrides::from_registry)
+                        .unwrap_or_default();
                     let overrides = oauth::OAuthClientOverrides {
-                        base_url: str_arg("base_url"),
-                        auth_url: str_arg("auth_url"),
-                        token_url: str_arg("token_url"),
-                        userinfo_url: str_arg("userinfo_url"),
-                        userinfo_method: str_arg("userinfo_method"),
-                        authorize_params: str_arg("authorize_params"),
+                        base_url: str_arg("base_url").or(from_row.base_url),
+                        auth_url: str_arg("auth_url").or(from_row.auth_url),
+                        token_url: str_arg("token_url").or(from_row.token_url),
+                        userinfo_url: str_arg("userinfo_url").or(from_row.userinfo_url),
+                        userinfo_method: str_arg("userinfo_method").or(from_row.userinfo_method),
+                        authorize_params: str_arg("authorize_params").or(from_row.authorize_params),
                         scopes: Some(scopes.to_string()),
-                        redirect_uri: str_arg("redirect_uri"),
+                        redirect_uri: str_arg("redirect_uri").or(from_row.redirect_uri),
                     };
                     return Ok(credential_request_envelope(oauth::oauth_client_request(
                         &provider, &overrides,
@@ -226,7 +243,7 @@ impl LucidosEngine {
                 // `purpose: "oauth"` is what lets the client close the in-app
                 // browser panel again once the flow lands, instead of leaving
                 // the user on a dead callback page inside the app. See
-                // `oauthAuthPanelUrl` in store/actions/oauth.ts.
+                // `oauthAuthFlow` in store/actions/oauth.ts.
                 let open_auth_url = async |auth_url: &str| {
                     self.request_navigation(
                         &serde_json::json!({

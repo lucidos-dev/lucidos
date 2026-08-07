@@ -84,6 +84,67 @@ pub fn backup_key_lock() -> &'static tokio::sync::Mutex<()> {
     &LOCK
 }
 
+/// Serializes every test that temporarily widens the engine's thread-queue
+/// capacity policy to guarantee itself an admission slot.
+///
+/// The policy is a single shared setting, and the widen is a read-modify-write:
+/// each test reads the current policy, raises the limits it needs, fires, then
+/// PUTs the value it read back. Two of those overlapping is not a slower test,
+/// it is a leak. The second reader saves the FIRST one's widened policy as "the
+/// original", and restores that after the first has already put the real one
+/// back, so the whole rest of the suite runs on 512 concurrent slots and every
+/// admission-refusal assertion silently stops testing anything.
+///
+/// Lives here rather than in either test file because a lock only one side
+/// takes is not a lock.
+pub fn capacity_policy_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+    &LOCK
+}
+
+/// Holds the e2e workspace's working tree still for the one test that asserts
+/// on a snapshot of the whole tree.
+///
+/// A command checkpoint is a pair of images of the ENTIRE working tree, taken
+/// either side of a guarded command, and
+/// `command_safety_test::a_command_destroying_only_ignored_content_leaves_no_undo_card`
+/// asserts the pair comes out empty. Its own command only destroys a gitignored
+/// path, so it contributes nothing, but the pair also captures whatever ELSE
+/// lands in the tree between the two snapshots. The apply tests merge files
+/// into `data/apps/` there, and on 2026-08-07 both full-suite runs caught
+/// `style-a.css` + `style-b.css` from `app_coding_agent_concurrent_apply` in the
+/// window: the guard read them as the command's own effects and emitted exactly
+/// the card the test exists to prove absent.
+///
+/// Read/write rather than a plain mutex, so the tree writers keep running
+/// concurrently with EACH OTHER (`app_coding_agent_concurrent_apply` is about
+/// two applies overlapping, so serializing those would gut it) and only the
+/// snapshot window is exclusive. Writers take `read()`, the snapshot takes
+/// `write()`.
+///
+/// **Every writer has to take it, so this is an obligation on new tests too.**
+/// A lock the checkpoint test holds against only SOME writers still lets the
+/// rest recreate the card. The writers today are the three apply tests, the two
+/// trigger tests (their script files appearing and being removed), the
+/// file-edit tests, the CLI data-write test, and the app-seeding helper. If you
+/// add a test that creates, edits or deletes a non-ignored file under the e2e
+/// workspace, take a `read()` guard across that mutation. Writes under
+/// `.lucidos/` and `data/blobs/` need nothing: the workspace gitignores both, so
+/// no snapshot ever sees them.
+///
+/// Only the moment a file APPEARS or DISAPPEARS needs the guard. A file present
+/// across both images cancels out of the diff, so committing it later, or
+/// reading it, is free.
+///
+/// Lives here rather than in either test file because a lock only one side
+/// takes is not a lock.
+pub fn workspace_tree_lock() -> &'static tokio::sync::RwLock<()> {
+    static LOCK: std::sync::LazyLock<tokio::sync::RwLock<()>> =
+        std::sync::LazyLock::new(|| tokio::sync::RwLock::new(()));
+    &LOCK
+}
+
 pub fn workspace_path() -> PathBuf {
     if let Ok(ws) = std::env::var("E2E_WORKSPACE") {
         PathBuf::from(ws)

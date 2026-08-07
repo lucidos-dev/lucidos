@@ -10,6 +10,31 @@ fn sub(event_type: &str, condition: Option<Value>) -> EventSubscription {
     }
 }
 
+/// An [`ArmingLookback`] built from `(event_type, payload, seconds ago)`, for
+/// the text tests, which care about the wording rather than the query.
+fn lookback_of(items: &[(&str, Value, i64)]) -> ArmingLookback {
+    ArmingLookback {
+        matches: items
+            .iter()
+            .map(|(event_type, payload, ago)| LookbackMatch {
+                event_type: (*event_type).to_string(),
+                payload: payload.clone(),
+                created: Utc::now() - chrono::Duration::seconds(*ago),
+            })
+            .collect(),
+        more: false,
+    }
+}
+
+/// The store's high-water sequence, which is what a registration records as its
+/// watermark.
+async fn max_sequence(pool: &sqlx::PgPool) -> i64 {
+    sqlx::query_scalar("SELECT COALESCE(MAX(sequence), 0) FROM events")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
 fn wait_with(thread_id: Uuid, on: Vec<EventSubscription>, watermark: i64) -> LiveWait {
     LiveWait {
         wait_id: Uuid::new_v4(),
@@ -17,6 +42,7 @@ fn wait_with(thread_id: Uuid, on: Vec<EventSubscription>, watermark: i64) -> Liv
         tool_use_id: "toolu_park".into(),
         on,
         reason: "waiting for a change".into(),
+        armed_at: Utc::now(),
         expires_at: Utc::now() + chrono::Duration::hours(1),
         watermark,
     }
@@ -128,6 +154,7 @@ fn the_event_wait_family_never_reaches_the_wait_matcher() {
         tool_use_id: "toolu".into(),
         on: vec![sub("ChangeProposed", None)],
         reason: "r".into(),
+        armed_at: Utc::now(),
         expires_at: Utc::now(),
         watermark: 0,
     };
@@ -203,11 +230,11 @@ fn the_expiry_wake_says_it_timed_out_and_discourages_re_subscribing() {
 /// and stalls the turn waiting for something that arrives as a new turn.
 #[test]
 fn the_registration_result_says_nothing_is_blocking() {
-    let engine_side = super::register::registered_tool_result_text(&wait_with(
-        Uuid::new_v4(),
-        vec![sub("ChangeProposed", None)],
-        0,
-    ));
+    let engine_side = super::register::registered_tool_result_text(
+        &wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0),
+        None,
+        Utc::now(),
+    );
     assert!(engine_side.contains("ChangeProposed"), "{engine_side}");
     assert!(
         engine_side.contains("Nothing is blocking"),
@@ -265,8 +292,17 @@ fn every_subscription_text_says_where_the_subscription_stands() {
     let shapes: Vec<(&str, String, &str)> = vec![
         (
             "registration",
-            super::register::registered_tool_result_text(&w),
+            super::register::registered_tool_result_text(&w, None, Utc::now()),
             "Nothing is blocking",
+        ),
+        (
+            "registration with an arming lookback",
+            super::register::registered_tool_result_text(
+                &w,
+                Some(&lookback_of(&[("ChangeProposed", payload.clone(), 26)])),
+                Utc::now(),
+            ),
+            "will NOT wake you",
         ),
         (
             "delivery",
@@ -372,6 +408,7 @@ async fn emit_subscribe(bus: &EventBus, thread_id: Uuid, on: Vec<EventSubscripti
             tool_use_id: format!("toolu_{}", wait_id.simple()),
             on,
             reason: "waiting for a change".into(),
+            armed_at: Utc::now(),
             expires_at: Utc::now() + chrono::Duration::hours(1),
             watermark: 0,
         },
@@ -399,6 +436,8 @@ async fn rebuild_recovers_a_live_wait_and_skips_resolved_ones() {
         event: ThreadEvent::EventWaitCanceled {
             wait_id: done_id,
             cause: crate::engine::thread_events::EventWaitCancelCause::UserStop,
+            on: vec![],
+            reason: String::new(),
         },
         meta: EventMeta::NONE,
     })
@@ -414,6 +453,79 @@ async fn rebuild_recovers_a_live_wait_and_skips_resolved_ones() {
     assert_eq!(recovered.on.len(), 1);
     assert_eq!(recovered.on[0].event_type, "ChangeProposed");
     assert_eq!(recovered.reason, "waiting for a change");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A subscription's `armed_at` survives the rebuild, and a row written before
+/// the field existed falls back to the event's own `created`.
+///
+/// The fallback is what makes `list_event_waits` honest about a subscription
+/// armed before 2026-08-07: the alternative, `expires_at` minus the timeout,
+/// would report a wait armed three minutes ago as armed a whole day ago,
+/// which is precisely the wrong answer to the question the tool exists for.
+#[tokio::test]
+async fn rebuild_keeps_armed_at_and_falls_back_to_the_row_for_a_legacy_payload() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    let armed_at = Utc::now() - chrono::Duration::minutes(7);
+    let recorded_thread = Uuid::new_v4();
+    let recorded_id = Uuid::new_v4();
+    bus.emit(BusEvent::Thread {
+        thread_id: recorded_thread,
+        event: ThreadEvent::EventWaitStarted {
+            wait_id: recorded_id,
+            tool_use_id: "toolu_armed".into(),
+            on: vec![sub("ChangeProposed", None)],
+            reason: "waiting for a change".into(),
+            armed_at,
+            expires_at: Utc::now() + chrono::Duration::hours(1),
+            watermark: 0,
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    // A pre-2026-08-07 row: the same event with the field stripped from its
+    // persisted payload, which is exactly what is on disk for a subscription
+    // armed before the field existed.
+    let legacy_thread = Uuid::new_v4();
+    let legacy_id = emit_subscribe(&bus, legacy_thread, vec![sub("ChangeProposed", None)]).await;
+    sqlx::query(
+        "UPDATE events SET payload = payload - 'armed_at' \
+         WHERE aggregate = 'thread' AND aggregate_id = $1 AND event_type = 'EventWaitStarted'",
+    )
+    .bind(legacy_thread.to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let legacy_created: DateTime<Utc> = sqlx::query_scalar(
+        "SELECT created FROM events WHERE aggregate = 'thread' AND aggregate_id = $1 \
+         AND event_type = 'EventWaitStarted'",
+    )
+    .bind(legacy_thread.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    let waits = LiveWaits::new();
+    rebuild_live_waits(&pool, &waits).await.unwrap();
+
+    let recorded = waits.take(recorded_id).await.expect("recorded wait");
+    assert_eq!(
+        recorded.armed_at.timestamp_millis(),
+        armed_at.timestamp_millis(),
+        "a recorded arming time comes back as itself"
+    );
+    let legacy = waits.take(legacy_id).await.expect("legacy wait");
+    assert_eq!(
+        legacy.armed_at.timestamp_millis(),
+        legacy_created.timestamp_millis(),
+        "with no field, the row's own `created` is the arming time"
+    );
 
     pool.close().await;
     teardown_test_db(&db_name).await;
@@ -436,6 +548,7 @@ async fn rebuild_re_arms_a_wait_that_expired_while_the_engine_was_down() {
             tool_use_id: "toolu_stale".into(),
             on: vec![sub("ChangeProposed", None)],
             reason: "waiting across a restart".into(),
+            armed_at: Utc::now(),
             expires_at: Utc::now() - chrono::Duration::hours(2),
             watermark: 0,
         },
@@ -560,6 +673,516 @@ async fn catch_up_on_an_empty_subscription_list_queries_nothing() {
         .await
         .unwrap()
         .is_none());
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+// ── the arming lookback ─────────────────────────────────────────────
+
+/// The report is the only part of a registration result the model has to act on
+/// within the turn, so it leads, and it says the trap out loud. The 2026-08-06
+/// failure was a thread that had every fact it needed except this one: the
+/// subscription it had just armed was never going to wake it for the change
+/// that had landed 26 seconds earlier.
+#[test]
+fn the_arming_lookback_leads_the_result_and_names_the_trap() {
+    let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
+    let text = super::register::registered_tool_result_text(
+        &w,
+        Some(&lookback_of(&[(
+            "ChangeProposed",
+            json!({"file_count": 11}),
+            26,
+        )])),
+        Utc::now(),
+    );
+
+    let report_at = text
+        .find("ALREADY HAPPENED")
+        .expect("the report is present");
+    let subscribed_at = text.find("Subscribed to").expect("still confirms the wait");
+    assert!(
+        report_at < subscribed_at,
+        "the actionable half leads:\n{text}"
+    );
+    assert!(
+        text.contains("will NOT wake you"),
+        "a forward-only watch is the trap, and it has to be stated: {text}"
+    );
+    assert!(
+        text.contains("in this turn"),
+        "acting on it later is not an option the model has: {text}"
+    );
+    assert!(
+        text.contains("26s ago"),
+        "the age is the whole basis: {text}"
+    );
+    assert!(
+        text.contains("\"file_count\": 11"),
+        "carries the payload: {text}"
+    );
+}
+
+/// No lookback means the result is byte-for-byte what it always was. A note
+/// saying "nothing already happened" would be noise on every ordinary
+/// subscription.
+#[test]
+fn an_empty_lookback_leaves_the_registration_result_untouched() {
+    let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
+    let plain = super::register::registered_tool_result_text(&w, None, Utc::now());
+    let empty = super::register::registered_tool_result_text(
+        &w,
+        Some(&ArmingLookback::default()),
+        Utc::now(),
+    );
+    assert_eq!(plain, empty);
+    assert!(!plain.contains("ALREADY HAPPENED"), "{plain}");
+}
+
+/// Ages are rendered at the granularity the window makes meaningful. Anything
+/// coarser would print every match as the same thing, and the age is how the
+/// model tells a miss from its own work a moment ago.
+#[test]
+fn the_report_renders_an_age_the_model_can_act_on() {
+    let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
+    let text = super::register::registered_tool_result_text(
+        &w,
+        Some(&lookback_of(&[
+            ("ChangeProposed", json!({}), 5),
+            ("ChangeProposed", json!({}), 134),
+        ])),
+        Utc::now(),
+    );
+    assert!(text.contains("5s ago"), "{text}");
+    assert!(text.contains("2m 14s ago"), "{text}");
+}
+
+/// The notice rides on a call made only to REGISTER, so a fat payload must not
+/// turn a two-sentence tool result into tens of KB. The cut keeps the identity
+/// and the age, which is what the notice tells the model to act on.
+#[test]
+fn a_fat_payload_is_truncated_but_still_identifies_its_event() {
+    let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
+    let huge = json!({ "files": vec!["crates/some/long/path.rs"; 500] });
+    let text = super::register::registered_tool_result_text(
+        &w,
+        Some(&lookback_of(&[("ChangeProposed", huge, 12)])),
+        Utc::now(),
+    );
+
+    assert!(
+        text.contains("payload truncated"),
+        "the cut says it happened: {text}"
+    );
+    assert!(
+        text.len() < 4_000,
+        "a registration result must stay small, was {} bytes",
+        text.len()
+    );
+    assert!(text.contains("ChangeProposed"), "identity survives: {text}");
+    assert!(text.contains("12s ago"), "age survives: {text}");
+    assert!(
+        text.contains("Nothing is blocking"),
+        "and the cut never eats the rest of the result: {text}"
+    );
+}
+
+/// Multi-byte text must not be sliced mid-character, per `.claude/rules/rust.md`.
+/// A payload is arbitrary workspace text, so this is reachable, and the failure
+/// mode is a panic on a live registration rather than a bad string.
+#[test]
+fn truncating_a_payload_never_splits_a_character() {
+    let w = wait_with(Uuid::new_v4(), vec![sub("ChangeProposed", None)], 0);
+    // Every char is 4 bytes, so a naive byte cut lands inside one.
+    let emoji = json!({ "note": "🎉".repeat(2_000) });
+    let text = super::register::registered_tool_result_text(
+        &w,
+        Some(&lookback_of(&[("ChangeProposed", emoji, 1)])),
+        Utc::now(),
+    );
+    assert!(text.contains("payload truncated"), "{text}");
+    assert!(text.is_char_boundary(text.len()));
+}
+
+/// A busy window points at the fix rather than dumping payloads: too many
+/// matches means the subscription is too broad, and the tool has a `condition`
+/// and a trigger to offer.
+#[test]
+fn a_truncated_report_says_so_and_says_what_to_do() {
+    let w = wait_with(Uuid::new_v4(), vec![sub("ToolCalled", None)], 0);
+    let mut found = lookback_of(&[("ToolCalled", json!({"name": "run_bash"}), 3)]);
+    found.more = true;
+    let text = super::register::registered_tool_result_text(&w, Some(&found), Utc::now());
+    assert!(text.contains("More matched than are shown"), "{text}");
+    assert!(text.contains("condition"), "{text}");
+    assert!(text.contains("trigger"), "{text}");
+}
+
+/// The whole point, and the 2026-08-06 failure in miniature: the event landed
+/// while the model was still working towards the `await_event` call, so it is
+/// BELOW the watermark and the forward scan can never see it. The lookback
+/// does.
+#[tokio::test]
+async fn the_lookback_finds_a_match_that_landed_before_the_wait_was_armed() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    bus.emit(BusEvent::Thread {
+        thread_id: Uuid::new_v4(),
+        event: ThreadEvent::ThreadArchived,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    let watermark = max_sequence(&pool).await;
+
+    let found = arming_lookback_matches(
+        &pool,
+        &[sub("ThreadArchived", None)],
+        watermark,
+        Utc::now() - chrono::Duration::minutes(3),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(found.matches.len(), 1, "the match is below the watermark");
+    assert_eq!(found.matches[0].event_type, "ThreadArchived");
+    assert!(!found.more);
+
+    // Same wait, same window: the FORWARD scan still sees nothing, which is the
+    // property that made this invisible in the first place.
+    let wait = wait_with(Uuid::new_v4(), vec![sub("ThreadArchived", None)], watermark);
+    assert!(
+        catch_up_from_watermark(&pool, &wait)
+            .await
+            .unwrap()
+            .is_none(),
+        "the lookback is additive: it must not change what the forward scan sees"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The window is short on purpose. An event older than it is the archaeology
+/// case: the model decided to subscribe mid-turn, and work it did an hour ago
+/// is not a missed rendezvous.
+#[tokio::test]
+async fn the_lookback_ignores_a_match_older_than_the_window() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+
+    bus.emit(BusEvent::Thread {
+        thread_id: Uuid::new_v4(),
+        event: ThreadEvent::ThreadArchived,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    let watermark = max_sequence(&pool).await;
+    // Back-date the row rather than sleeping: the boundary is `created`, and a
+    // test that waits out a real window is a test nobody runs.
+    sqlx::query("UPDATE events SET created = now() - interval '1 hour'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let found = arming_lookback_matches(
+        &pool,
+        &[sub("ThreadArchived", None)],
+        watermark,
+        Utc::now() - chrono::Duration::minutes(3),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert!(found.is_empty(), "older than the window: {found:?}");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The one suppression: an event this thread was already handed is not
+/// re-reported. Everything else in the window is, even if some other wait
+/// existed at the time, because only a delivery proves the thread saw it.
+#[tokio::test]
+async fn the_lookback_skips_an_event_the_thread_was_already_handed() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let other = Uuid::new_v4();
+
+    let mut ids = Vec::new();
+    for _ in 0..2 {
+        let emitted = bus
+            .emit(BusEvent::Thread {
+                thread_id: other,
+                event: ThreadEvent::ThreadArchived,
+                meta: EventMeta::NONE,
+            })
+            .await
+            .unwrap()
+            .expect("persisted");
+        ids.push(emitted.event_id);
+    }
+    let watermark = max_sequence(&pool).await;
+    let since = Utc::now() - chrono::Duration::minutes(3);
+
+    let handed: std::collections::HashSet<Uuid> = [ids[0]].into_iter().collect();
+    let found = arming_lookback_matches(
+        &pool,
+        &[sub("ThreadArchived", None)],
+        watermark,
+        since,
+        &handed,
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.matches.len(), 1, "the handed one is dropped");
+
+    let nothing_handed = arming_lookback_matches(
+        &pool,
+        &[sub("ThreadArchived", None)],
+        watermark,
+        since,
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        nothing_handed.matches.len(),
+        2,
+        "decoy: both are inside the window, so the exclusion is what dropped one"
+    );
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Newest first, capped, and `more` set rather than a total. A busy window must
+/// not turn one tool result into a wall of payloads, and counting the rest
+/// would mean reading the whole window.
+#[tokio::test]
+async fn the_lookback_reports_the_newest_matches_up_to_the_limit() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let other = Uuid::new_v4();
+
+    for name in ["a", "b", "c", "d", "e"] {
+        bus.emit(BusEvent::Thread {
+            thread_id: other,
+            event: ThreadEvent::ToolCalled {
+                name: name.into(),
+                args: json!({}),
+                description: String::new(),
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+    let watermark = max_sequence(&pool).await;
+
+    let found = arming_lookback_matches(
+        &pool,
+        &[sub("ToolCalled", None)],
+        watermark,
+        Utc::now() - chrono::Duration::minutes(3),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(found.matches.len(), 3);
+    assert!(found.more, "two more exist and the report says so");
+    let names: Vec<&str> = found
+        .matches
+        .iter()
+        .map(|m| m.payload["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, vec!["e", "d", "c"], "newest first");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The condition is applied here exactly as the forward scan applies it, so a
+/// filter that narrows a wake also narrows the report.
+#[tokio::test]
+async fn the_lookback_applies_the_condition_not_just_the_event_name() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let other = Uuid::new_v4();
+
+    for name in ["run_bash", "run_python"] {
+        bus.emit(BusEvent::Thread {
+            thread_id: other,
+            event: ThreadEvent::ToolCalled {
+                name: name.into(),
+                args: json!({}),
+                description: String::new(),
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+    let watermark = max_sequence(&pool).await;
+
+    let found = arming_lookback_matches(
+        &pool,
+        &[sub("ToolCalled", Some(json!({"name": "run_bash"})))],
+        watermark,
+        Utc::now() - chrono::Duration::minutes(3),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.matches.len(), 1);
+    assert_eq!(found.matches[0].payload["name"], "run_bash");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// Nothing above the watermark leaks into the report. That half of the timeline
+/// belongs to the forward scan, and reporting it here would double up with the
+/// wake it is about to produce.
+#[tokio::test]
+async fn the_lookback_stops_at_the_watermark() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let other = Uuid::new_v4();
+
+    let watermark = max_sequence(&pool).await;
+    bus.emit(BusEvent::Thread {
+        thread_id: other,
+        event: ThreadEvent::ThreadArchived,
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+
+    let found = arming_lookback_matches(
+        &pool,
+        &[sub("ThreadArchived", None)],
+        watermark,
+        Utc::now() - chrono::Duration::minutes(3),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert!(found.is_empty(), "after the watermark is the wake's job");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The scan is bounded in PAGES, not only per page. The condition is evaluated
+/// in Rust, so the row `LIMIT` bounds one round trip but not their number: a
+/// high-cardinality type with a condition that matches nothing would otherwise
+/// page through the whole window while `await_event` waits on it.
+///
+/// Seeded past the budget (`ARMING_LOOKBACK_MAX_PAGES * CATCH_UP_PAGE`) with a
+/// condition nothing satisfies, so an unbudgeted loop reads every row. The
+/// assertion is on the row count the loop can have touched, since the return
+/// value is empty either way.
+#[tokio::test]
+async fn the_lookback_gives_up_rather_than_paging_a_busy_window() {
+    let (pool, db_name) = setup_test_db().await;
+    let (bus, _rx) = EventBus::new(pool.clone());
+    let other = Uuid::new_v4();
+
+    let seeded = ARMING_LOOKBACK_MAX_PAGES * (CATCH_UP_PAGE as usize) + 50;
+    for i in 0..seeded {
+        bus.emit(BusEvent::Thread {
+            thread_id: other,
+            event: ThreadEvent::ToolCalled {
+                name: format!("noise_{i}"),
+                args: json!({}),
+                description: String::new(),
+            },
+            meta: EventMeta::NONE,
+        })
+        .await
+        .unwrap();
+    }
+    let watermark = max_sequence(&pool).await;
+
+    let found = arming_lookback_matches(
+        &pool,
+        // Matches none of the seeded rows, so nothing short-circuits the scan.
+        &[sub(
+            "ToolCalled",
+            Some(json!({"name": "nothing_matches_this"})),
+        )],
+        watermark,
+        Utc::now() - chrono::Duration::minutes(3),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert!(found.is_empty(), "the condition matches nothing: {found:?}");
+
+    // The budget is what stopped it. Without one the loop would have to reach
+    // the oldest seeded row; with one it cannot see past its page allowance.
+    let unreachable = seeded - ARMING_LOOKBACK_MAX_PAGES * (CATCH_UP_PAGE as usize);
+    assert!(
+        unreachable > 0,
+        "the fixture must exceed the budget or this asserts nothing"
+    );
+
+    // A match inside the budget is still found, so the cap did not simply
+    // break the scan.
+    bus.emit(BusEvent::Thread {
+        thread_id: other,
+        event: ThreadEvent::ToolCalled {
+            name: "findable".into(),
+            args: json!({}),
+            description: String::new(),
+        },
+        meta: EventMeta::NONE,
+    })
+    .await
+    .unwrap();
+    let near = arming_lookback_matches(
+        &pool,
+        &[sub("ToolCalled", Some(json!({"name": "findable"})))],
+        max_sequence(&pool).await,
+        Utc::now() - chrono::Duration::minutes(3),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert_eq!(near.matches.len(), 1, "the newest match is still reported");
+
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+#[tokio::test]
+async fn the_lookback_on_an_empty_subscription_list_queries_nothing() {
+    let (pool, db_name) = setup_test_db().await;
+    let found = arming_lookback_matches(
+        &pool,
+        &[],
+        i64::MAX,
+        Utc::now(),
+        &std::collections::HashSet::new(),
+        3,
+    )
+    .await
+    .unwrap();
+    assert!(found.is_empty());
     pool.close().await;
     teardown_test_db(&db_name).await;
 }
@@ -748,6 +1371,8 @@ async fn no_event_wait_resolution_touches_the_status() {
         ThreadEvent::EventWaitCanceled {
             wait_id,
             cause: crate::engine::thread_events::EventWaitCancelCause::UserStop,
+            on: vec![],
+            reason: String::new(),
         },
     ] {
         let label = event.event_type();

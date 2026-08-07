@@ -9,27 +9,27 @@ pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::READ_FILE.to_string(),
-            description: "Read the contents of a file in the workspace, under data/ or under the ephemeral .lucidos/tmp/ scratch tree. Supports text files and images (.png, .jpg, .jpeg, .gif, .webp: displayed visually). SVGs are returned as text. Large images (e.g. iPhone photos) are automatically downsampled to fit the model; only files over 25 MB are rejected. Text files >50KB are returned in chunks: the response ends with the exact `offset=` to pass on the next call to continue reading. Don't re-read content you've already seen.\n\nReads inside .zip and .lucidos-plugin archives transparently: point `path` past the archive segment, e.g. `artifacts/plugins/foo.lucidos-plugin/apps/x/index.html`. To inspect a small section of a long file use `start_line` + `line_count` instead of pulling the whole thing or shelling out to run_python.".to_string(),
+            description: "Read a file under data/ or the ephemeral .lucidos/tmp/ scratch tree. Text and images both work; an SVG comes back as text, a large image is downsampled, and only files over 25 MB are rejected. Text over 50KB comes back in chunks ending with the exact `offset=` for the next call, and `start_line` plus `line_count` reads part of a long file. Reads inside .zip and .lucidos-plugin archives: point `path` past the archive segment.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/index.html), or a scratch path under .lucidos/tmp/ (e.g. .lucidos/tmp/oura_data.json, exactly what http_request's temp_path and git_clone's tmp destination report back). May traverse a .zip or .lucidos-plugin segment to read an entry inside the archive (e.g. artifacts/plugins/foo.lucidos-plugin/apps/x/index.html)."
+                        "description": "Relative path under data/ (e.g. artifacts/notes.md), or a scratch path under .lucidos/tmp/ exactly as http_request and git_clone report it back. May traverse a .zip or .lucidos-plugin segment to read an entry inside."
                     },
                     "offset": {
                         "type": "integer",
-                        "description": "Byte offset to start reading from (default 0). Use the `offset=` value from the previous truncated response to read the next chunk. Text files only. Ignored when `start_line` is set."
+                        "description": "Byte offset to start from (default 0), from the previous truncated response. Text only, ignored when `start_line` is set."
                     },
                     "start_line": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "1-based line to start reading from. Combine with `line_count` to read a specific range without pulling the whole file. Text files only."
+                        "description": "1-based line to start from. With `line_count`, reads a range. Text only."
                     },
                     "line_count": {
                         "type": "integer",
                         "minimum": 1,
-                        "description": "Number of lines to read starting from `start_line` (default: read to end). Use small values (e.g. 5–50) when you only need to inspect a known location."
+                        "description": "Lines to read from `start_line` (default: to the end)."
                     }
                 },
                 "required": ["path"]
@@ -37,21 +37,21 @@ pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::WRITE_FILE.to_string(),
-            description: "Create or update a file in the workspace. For NEW files or FULL rewrites only. NEVER use when edit_file can do the job, because rewriting introduces subtle regressions. Writes under data/ only: this tool git-commits everything it writes, so it refuses the gitignored .lucidos/tmp/ scratch tree. Create scratch with run_python instead (its cwd is the workspace root).".to_string(),
+            description: "Create or update a file. For NEW files and FULL rewrites only: NEVER use it where edit_file would do, since rewriting introduces subtle regressions. Under data/ only, because it git-commits what it writes and so refuses the gitignored .lucidos/tmp/ scratch tree; create scratch with run_python.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/knowhow/api-reference.md, knowhow/domain.md). For knowhow/ paths, if the file already exists in shared (~/.lucidos/knowhow/) but not locally, the write updates the shared copy."
+                        "description": "Relative path under data/ (e.g. artifacts/notes.md, apps/my-app/knowhow/api-reference.md). A knowhow/ path that exists in shared (~/.lucidos/knowhow/) but not locally updates the shared copy."
                     },
                     "content": {
                         "type": "string",
-                        "description": "Content to write to the file"
+                        "description": "Content to write."
                     },
                     "message": {
                         "type": "string",
-                        "description": "Semantic commit message describing the intent (e.g., 'Add dark theme styles', 'Create job listing card layout')"
+                        "description": "Semantic commit message describing the intent."
                     }
                 },
                 "required": ["path", "content"]
@@ -59,40 +59,36 @@ pub(super) fn read_write_edit_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::EDIT_FILE.to_string(),
-            description: "Make a targeted edit to an existing file. Two modes:\n\
-                1. Text mode: old_string + new_string — search-and-replace for text files\n\
-                2. JSON mode: json_path + new_value — surgical edit at a specific path for JSON files (.json, .slides, etc.)\n\
-                JSON mode handles parsing, navigation, and re-serialization automatically. Use it for .slides and other JSON files to avoid escape and matching issues.\n\
-                Edits files under data/ only; the gitignored .lucidos/tmp/ scratch tree is readable but not editable here (use run_python).".to_string(),
+            description: "Targeted edit to an existing file, in one of two modes. Text mode is old_string plus new_string. JSON mode is json_path plus new_value, which handles parsing and re-serialization for a .json or .slides file, avoiding escaping and matching issues; prefer it there. Under data/ only: .lucidos/tmp/ is readable but not editable here, so use run_python.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g., artifacts/notes.md, artifacts/deck.slides, apps/my-app/knowhow/api-reference.md, knowhow/domain.md). For knowhow/ paths, if the file already exists in shared (~/.lucidos/knowhow/) but not locally, the edit updates the shared copy."
+                        "description": "Relative path under data/ (e.g. artifacts/notes.md, apps/my-app/knowhow/api-reference.md). A knowhow/ path that exists in shared (~/.lucidos/knowhow/) but not locally updates the shared copy."
                     },
                     "old_string": {
                         "type": "string",
-                        "description": "Text mode: the exact text to find in the file"
+                        "description": "Text mode: the exact text to find."
                     },
                     "new_string": {
                         "type": "string",
-                        "description": "Text mode: the text to replace it with (must be different from old_string)"
+                        "description": "Text mode: the replacement, different from old_string."
                     },
                     "replace_all": {
                         "type": "boolean",
-                        "description": "Text mode: replace all occurrences instead of just the first (default: false)"
+                        "description": "Text mode: replace all occurrences, not just the first (default false)."
                     },
                     "json_path": {
                         "type": "string",
-                        "description": "JSON mode: path to the target value. Supports dot notation (`metadata.author.name`), array indices (`sections[1]`), quoted keys for non-identifier chars like dates or slugs (`dailyLog[\"2026-05-04\"]` or `dailyLog['2026-05-04']`), the JSONPath root marker (`$.streak`), and raw JSON Pointers (`/sections/1/title`). Mix freely — e.g. `habits[0].dailyLog[\"2026-05-04\"]`."
+                        "description": "JSON mode: path to the target value. Dot notation, array indices (`sections[1]`), quoted keys (`dailyLog[\"2026-05-04\"]`), the JSONPath root (`$.streak`) and JSON Pointers (`/sections/1/title`) all work and mix freely."
                     },
                     "new_value": {
-                        "description": "JSON mode: the replacement value — can be any JSON type (string, number, object, array, boolean, null)"
+                        "description": "JSON mode: the replacement value, any JSON type."
                     },
                     "message": {
                         "type": "string",
-                        "description": "Semantic commit message describing the intent (e.g., 'Fix filter button spacing', 'Update slide 3 title')"
+                        "description": "Semantic commit message describing the intent."
                     }
                 },
                 "required": ["path"]
@@ -105,7 +101,7 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::LIST_FILES.to_string(),
-            description: "List all files in the workspace (artifacts and App UIs). Call ONCE at start if needed, then use the results.".to_string(),
+            description: "List all files in the workspace (artifacts and app UIs). Call ONCE if needed, then use the results.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {},
@@ -114,17 +110,17 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::GLOB_FILES.to_string(),
-            description: "Find files in the workspace matching a glob pattern. Patterns are relative to data/ — use the same paths you'd see in list_files (e.g. 'apps/**/index.html', 'artifacts/*.md', '**/*.csv'). Searches artifacts/, apps/, knowhow/, triggers/. Prefer this over run_bash with find/ls.".to_string(),
+            description: "Find files by glob across artifacts/, apps/, knowhow/ and triggers/, relative to data/ (e.g. 'apps/**/index.html').".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Glob pattern relative to data/. Examples: 'apps/**/index.html', 'artifacts/*.md', '**/*.csv'."
+                        "description": "Glob pattern relative to data/."
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Max paths to return (default 200, max 1000). Returned paths are sorted; `truncated: true` in the result indicates the cap was hit."
+                        "description": "Max paths to return (default 200, max 1000). Sorted; `truncated: true` means the cap was hit."
                     }
                 },
                 "required": ["pattern"]
@@ -132,17 +128,17 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::GREP_FILES.to_string(),
-            description: "Search file contents using a regex (Rust regex crate syntax). Searches artifacts/, apps/, knowhow/, triggers/. Skips binary files. Prefer this over run_bash with rg/grep — it's structured and respects workspace ignore rules. Lines longer than 300 chars are truncated with `…` (PDF text dumps and unwrapped JSON commonly trip this), and the total returned text is capped at ~50 KB — narrow with `path_glob` if you hit `truncated: true` and need more detail.".to_string(),
+            description: "Regex-search file contents (Rust regex crate syntax) across artifacts/, apps/, knowhow/ and triggers/, skipping binaries and respecting workspace ignore rules. A line over 300 chars is truncated and the total capped at ~50 KB; narrow with `path_glob` when you hit `truncated: true`.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "pattern": {
                         "type": "string",
-                        "description": "Regex pattern (Rust regex crate syntax). Case-sensitive by default."
+                        "description": "Regex, Rust regex crate syntax. Case-sensitive by default."
                     },
                     "path_glob": {
                         "type": "string",
-                        "description": "Optional glob to restrict which files are searched (e.g. 'apps/**/*.html', 'artifacts/*.md'). Defaults to all files under data/."
+                        "description": "Optional glob restricting which files are searched (e.g. 'apps/**/*.html'). Defaults to all files under data/."
                     },
                     "case_insensitive": {
                         "type": "boolean",
@@ -150,11 +146,11 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
                     },
                     "max_matches": {
                         "type": "integer",
-                        "description": "Total match cap across all files (default 100, max 500). `truncated: true` in the result indicates the cap was hit."
+                        "description": "Total match cap (default 100, max 500). `truncated: true` means the cap was hit."
                     },
                     "context_lines": {
                         "type": "integer",
-                        "description": "Lines of context to return before/after each match (default 0, max 5)."
+                        "description": "Lines of context before and after each match (default 0, max 5)."
                     }
                 },
                 "required": ["pattern"]
@@ -162,21 +158,21 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::COPY_FILE.to_string(),
-            description: "Copy a file within the workspace. Use this instead of read_file + write_file when you need to duplicate or move content: it handles the copy server-side without passing content through the conversation. This is how you promote a file out of ephemeral scratch, e.g. after git_clone lands a repo under .lucidos/tmp/<name>/, copy the few files you actually need into artifacts/imported/<name>/.".to_string(),
+            description: "Copy a file server-side, without passing its content through the conversation. Use it instead of read_file plus write_file, and to promote a file out of scratch into artifacts/imported/<name>/ after a git_clone.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "description": "Source path under data/ (e.g., artifacts/imported/report.txt) or under .lucidos/tmp/ (e.g., .lucidos/tmp/some-repo/README.md)"
+                        "description": "Source path under data/ or under .lucidos/tmp/."
                     },
                     "destination": {
                         "type": "string",
-                        "description": "Destination path under data/ (e.g., artifacts/projects/report.txt). Must be under data/: the copy is git-committed, so .lucidos/tmp/ is not a valid destination."
+                        "description": "Destination path under data/. Git-committed, so .lucidos/tmp/ is not valid."
                     },
                     "message": {
                         "type": "string",
-                        "description": "Semantic commit message (e.g., 'Copy report to projects folder')"
+                        "description": "Semantic commit message."
                     }
                 },
                 "required": ["source", "destination"]
@@ -184,17 +180,17 @@ pub(super) fn search_tools() -> Vec<ToolDefinition> {
         },
         ToolDefinition {
             name: tn::DELETE_FILE.to_string(),
-            description: "Delete a file from the workspace (recoverable from git history). Refuses plugin-owned paths; the error tells you the owning plugin id — call uninstall_plugin with that id instead so the user sees a confirm panel before deletion.".to_string(),
+            description: "Delete a file (recoverable from git history). Refuses a plugin-owned path and names the owning plugin id; use the plugins tool's uninstall action with that id instead, so the user sees a confirm panel first.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "path": {
                         "type": "string",
-                        "description": "Relative path under data/ (e.g., artifacts/notes.md, apps/my-app/ui/main/old.js). Deletes tracked files only; remove .lucidos/tmp/ scratch with run_bash."
+                        "description": "Relative path under data/. Tracked files only; remove .lucidos/tmp/ scratch with run_bash."
                     },
                     "message": {
                         "type": "string",
-                        "description": "Semantic commit message describing why (e.g., 'Remove unused utility module')"
+                        "description": "Semantic commit message."
                     }
                 },
                 "required": ["path"]
@@ -207,17 +203,17 @@ pub(super) fn import_file_tools() -> Vec<ToolDefinition> {
     vec![
         ToolDefinition {
             name: tn::IMPORT_FILE.to_string(),
-            description: "Import a file from the local filesystem into the artifacts directory. The file will be copied, committed to git, and indexed for search. Refuses files larger than 100 MB — for bulk reference data, move the file to ~/.lucidos/data/<name>/ and pin the absolute path in the relevant app's knowhow (see system-knowhow/best-practices rule 8).".to_string(),
+            description: "Import a file from the local filesystem into artifacts/, committed to git and indexed for search. Refuses over 100 MB: move bulk reference data to ~/.lucidos/data/<name>/ and pin the absolute path in the relevant app's knowhow.".to_string(),
             parameters: json!({
                 "type": "object",
                 "properties": {
                     "source_path": {
                         "type": "string",
-                        "description": "Absolute path to the source file on the local filesystem"
+                        "description": "Absolute path to the source file."
                     },
                     "destination": {
                         "type": "string",
-                        "description": "Relative path in artifacts/imported/ (optional, defaults to original filename)"
+                        "description": "Relative path in artifacts/imported/ (defaults to the original filename)."
                     }
                 },
                 "required": ["source_path"]

@@ -108,9 +108,9 @@ impl LucidosEngine {
     /// archive curtain would wake a thread the user considers closed.
     ///
     /// The other two causes are not derivable from an event and stay at their
-    /// call sites: **Stop waiting** targets one wait, and a thread Stop on an
-    /// idle-but-subscribed thread emits nothing at all to observe (there is no
-    /// running turn to cancel), so `cancel_chat` calls the cancel directly.
+    /// call sites, both of them explicit requests rather than consequences:
+    /// **Stop waiting** targets one subscription, and an agent stand-down
+    /// targets one or all of the calling thread's own.
     async fn cancel_waits_ended_by(&self, emitted: &EmittedEvent) {
         let BusEvent::Thread {
             thread_id, event, ..
@@ -648,11 +648,14 @@ impl LucidosEngine {
 
     /// Cancel every live wait on a thread. Returns how many were canceled.
     ///
-    /// The four causes in [`EventWaitCancelCause`] are all "the user ended it":
-    /// the **Stop waiting** button, a thread Stop/Cancel, archive and discard. A
-    /// user *message* is deliberately not among them (S6b): typing into a
-    /// subscribed thread runs an ordinary turn and leaves every subscription
-    /// exactly as it was, because none of them holds the turn to begin with.
+    /// Two callers, and they are the two ways EVERY subscription on a thread
+    /// ends at once: [`Self::cancel_waits_ended_by`] when the thread itself
+    /// ends (archive or discard), and the agent standing all of its own down.
+    /// A thread-level **Stop** is deliberately not one of them: it ends the
+    /// turn and nothing else (see `api::chat::cancel_chat`). Neither is a user
+    /// *message*: typing into a subscribed thread runs an ordinary turn and
+    /// leaves every subscription exactly as it was, because none of them holds
+    /// the turn to begin with.
     pub async fn cancel_event_waits_for_thread(
         &self,
         thread_id: Uuid,

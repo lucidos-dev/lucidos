@@ -675,6 +675,28 @@ pub(super) async fn delete_oauth_account(
     }
 }
 
+/// The *OAuth provider registry*: every provider whose endpoints Lucidos knows.
+///
+/// Drives two things on Settings > Accounts that were hardcoded or absent
+/// before: the quick-provider buttons (previously a literal three-name array in
+/// the frontend, which is why Dropbox had no button despite being fully
+/// supported), and the Connect form's autofill. Nothing here is a secret, so the
+/// rows are served verbatim; an unavailable registry answers an empty list and
+/// the page falls back to its manual path.
+pub(super) async fn list_known_oauth_providers(
+    State(state): State<AppState>,
+) -> Json<serde_json::Value> {
+    let providers = crate::core::oauth_registry::load_providers(state.engine.system_knowhow_dir());
+    Json(serde_json::json!({
+        "providers": providers,
+        // The exact loopback URI the flow will send, so the form can offer it
+        // for copying into the provider's console. It has to be registered
+        // character for character, and it is the engine's to state: only the
+        // host form is configurable, never the port or path.
+        "default_redirect_uri": crate::core::oauth::default_redirect_uri(),
+    }))
+}
+
 /// Start an OAuth flow: prepares the authorization URL and spawns a background
 /// listener for the callback. Returns `{ auth_url }` for the frontend to open.
 pub(super) async fn reauthorize_oauth(
@@ -691,12 +713,42 @@ pub(super) async fn reauthorize_oauth(
         _ => return ApiResult::err("scopes is required"),
     };
 
-    // Check if client credentials exist before starting the OAuth flow
+    // The OAuth client has to exist AND be able to drive a flow before the
+    // authorization starts. Both shortfalls resolve to the same answer: hand the
+    // modal a credential request prefilled from the registry. Reaching
+    // `prepare_oauth_flow` without them produces a bare "Missing auth_url in
+    // OAuth credentials" toast one screen away from anything the user can act
+    // on.
     let cred_service = crate::core::oauth::client_provider_name(&provider);
+    let registry_row = crate::core::oauth_registry::find_provider(
+        state.engine.system_knowhow_dir(),
+        &cred_service,
+    );
+    let overrides = registry_row
+        .as_ref()
+        .map(crate::core::oauth::OAuthClientOverrides::from_registry)
+        .unwrap_or_default();
     match CredentialStore::get_oauth_client(&state.pool, &cred_service).await {
-        Ok(None) => return ApiResult::needs_credentials(&provider),
+        Ok(None) => return ApiResult::needs_credentials(&provider, &overrides),
         Err(e) => return ApiResult::err(format!("Failed to check credentials: {}", e)),
-        Ok(Some(_)) => {}
+        Ok(Some(cred)) => {
+            let missing = crate::core::oauth::missing_flow_fields(&cred.auth_value);
+            if !missing.is_empty() {
+                let client_id = serde_json::from_str::<serde_json::Value>(&cred.auth_value)
+                    .ok()
+                    .and_then(|v| v["client_id"].as_str().map(str::to_string));
+                return ApiResult::needs_credential_repair(
+                    &provider,
+                    crate::core::oauth::oauth_client_repair_request(
+                        &provider,
+                        &overrides,
+                        cred.id,
+                        client_id.as_deref(),
+                        &missing,
+                    ),
+                );
+            }
+        }
     }
 
     // The device clicking Connect is the one to bring back to the front when the
@@ -1349,6 +1401,7 @@ pub(super) fn router() -> Router<AppState> {
             "/oauth/accounts",
             get(list_oauth_accounts).delete(delete_oauth_account),
         )
+        .route("/oauth/known-providers", get(list_known_oauth_providers))
         .route("/oauth/reauthorize", post(reauthorize_oauth))
         .route("/oauth/complete", post(complete_oauth))
         // Short-lived OAuth access-token for in-browser SDKs (e.g. Spotify

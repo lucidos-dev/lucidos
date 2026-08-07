@@ -191,16 +191,28 @@
 }
 
 
-/* Instructions callout — raised neutral surface only; no left accent bar (see
-   .claude/rules/frontend.md — left-accent stripes on callouts are forbidden). */
+/* The credential form's four prose blocks all sit at --font-size-sm, the same
+   step as the form's own labels and as the settings prose around them
+   (.settings-section-desc, .settings-row-note, .system-notice).
+
+   They were each an `em` fraction (0.9em / 0.85em), and nothing between them and
+   the root sets a font-size, so 0.9em resolved against the root itself: 14.4px
+   at 100% UI scale, larger than every label, input and hint on the same form,
+   and larger even than --font-size-lg. An `em` is only worth having when it is
+   relative to something deliberate; here it tracked the browser default and read
+   as oversized at every scale. Same trap the .email-confirm-meta comment above
+   records. */
+
+/* Instructions callout: raised neutral surface only, no left accent bar (see
+   .claude/rules/frontend.md, left-accent stripes on callouts are forbidden). */
 .credential-instructions {
     margin: 0 0 0.75rem 0;
     padding: 0.625rem 0.875rem;
     background: var(--bg-tertiary);
     border-radius: 0.25rem;
     color: var(--text-secondary);
-    font-size: 0.9em;
-    /* Engine emits multi-line prompts (numbered steps) — preserve newlines. */
+    font-size: var(--font-size-sm);
+    /* Engine emits multi-line prompts (numbered steps), so preserve newlines. */
     white-space: pre-wrap;
 }
 
@@ -215,13 +227,63 @@
 .credential-oauth-endpoints > summary {
     cursor: pointer;
     color: var(--text-secondary);
-    font-size: 0.85em;
+    font-size: var(--font-size-sm);
     padding: 0.25rem 0;
     user-select: none;
 }
 
 .credential-oauth-endpoints[open] > summary {
     margin-bottom: 0.5rem;
+}
+
+/* Why the form reopened on a repair: which required fields the saved OAuth
+   Client was missing. Warning-toned because the registration is broken until
+   it is filled in, but not an error: the fix is right here. */
+.credential-repair-notice {
+    margin: 0 0 0.75rem 0;
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    color: var(--accent-yellow);
+    font-size: var(--font-size-sm);
+}
+
+/* Where to get the Client ID: the provider's own app console, which is the one
+   step this form cannot perform. Every value comes from the OAuth provider
+   registry. */
+.credential-console-help {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    margin-bottom: 0.75rem;
+    padding: 0.625rem 0.875rem;
+    background: var(--bg-tertiary);
+    border-radius: 0.25rem;
+    color: var(--text-secondary);
+    font-size: var(--font-size-sm);
+}
+
+.credential-console-help p {
+    margin: 0;
+}
+
+/* The URI must be registered with the provider character for character, so it
+   gets its own row with a copy button rather than living inside a sentence. */
+.credential-redirect-uri {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
+.credential-redirect-uri code {
+    flex: 1;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    padding: 0.25rem 0.5rem;
+    background: var(--bg-primary);
+    border-radius: 0.25rem;
+    color: var(--text-primary);
 }
 
 /* ===== Plugin install panel ===== */

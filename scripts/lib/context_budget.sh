@@ -47,7 +47,7 @@
 # says what became worth paying for on every request. Set to the measured total
 # at the time of writing, so the gate starts exactly where the tree does.
 # shellcheck disable=SC2034 # read by scripts/check-context-budget.sh, which sources this file
-CONTEXT_BUDGET_CEILING=47602
+CONTEXT_BUDGET_CEILING=48113
 
 # Every file that is allowed to be resident, relative to the repo root. An
 # unscoped rule not on this list fails the membership arm even when the total is

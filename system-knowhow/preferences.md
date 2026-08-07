@@ -1,6 +1,6 @@
 ---
 name: Preferences
-description: The user preferences (Settings) the Lucidos Agent can read and change with get_preferences / set_preference — theme, language, timezone, push, the welcome message, chat model, reasoning effort, UI scale, font, and more. Covers the catalog of settable keys with their allowed values, defaults, and global-vs-device scope; how a write propagates (the persisted PreferencesChanged / LanguageSet / TimezoneSet events that open pages live-apply); the device-scope override trap; and which Settings live in OTHER stores (models via manage_models, secrets via request_credential, the command guard which is human-only). Load when the user asks to change a setting, toggle dark mode, show/hide the welcome message, set their language/timezone, or switch chat model.
+description: The preferences (Settings) the Lucidos Agent reads and changes with get_preferences / set_preference: theme, language, timezone, push, welcome message, chat model, reasoning effort, UI scale, font and more. Covers the settable keys with their allowed values, defaults and global-vs-device scope, how a write propagates, the device-scope override trap, and which Settings live in other stores.
 ---
 
 # Preferences (Settings the agent can change)
@@ -89,7 +89,7 @@ globally does nothing on a device that has its own `theme=light` override. Use
 | `backup_retention` | global | number 1–50 | `5` | How many recent backups to keep; older ones are pruned after each successful backup. |
 | `backup_reminder_dismissed` | global | empty \| an RFC 3339 instant \| `forever` | (unset) | Dismissal state of the app-shell banner shown while backup is off (no active `backup_schedule` with a `backup_provider`). Unset/empty = never dismissed, banner shows. An RFC 3339 instant = dismissed then, hidden for 30 days from it. `forever` = dismissed a second time, hidden for good. Set it to empty to bring the reminder back. The banner only ever shows while backup is off, so enabling a schedule hides it whatever this says. |
 | `theme` | device | `light` \| `dark` \| `system` | `dark` | Color theme for the calling device. |
-| `font-family` | device | `monospace` \| `system` \| `inter` \| `jetbrains-mono` \| `ibm-plex-mono` \| `fira-code` | `monospace` | UI font for the calling device. `fira-code` also enables programming ligatures. |
+| `font-family` | device | `monospace` \| `system` \| `inter` \| `jetbrains-mono` \| `ibm-plex-mono` \| `fira-code` | `monospace` | UI font for the calling device. `fira-code` also enables programming ligatures, on code surfaces only (code blocks, inline code, diffs, file previews); prose and the prompt render literally, because Fira Code's contextual alternates re-space a typed `...` into what reads as two dots. |
 | `ui-scale` | device | number 75–200 | `100` | UI scale percent for the calling device (snaps to 12.5 steps). |
 | `push_notifications` | device | `enabled` \| `declined` | (unset) | Push notifications for the calling device. `enabled` triggers the OS/browser permission prompt. |
 

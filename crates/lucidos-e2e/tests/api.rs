@@ -116,6 +116,9 @@ mod notifications_presence_test;
 #[path = "api_support/credentials_test.rs"]
 mod credentials_test;
 
+#[path = "api_support/oauth_connect_test.rs"]
+mod oauth_connect_test;
+
 #[path = "api_support/models_test.rs"]
 mod models_test;
 

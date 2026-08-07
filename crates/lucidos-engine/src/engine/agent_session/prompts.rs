@@ -468,9 +468,12 @@ const CODEX_CLI_RULE: &str = "\n\n\
     this thread to a Lucidos event, then FINISH your session. It returns immediately and \
     blocks nothing. The engine re-opens this thread with a follow-up message when the event \
     lands, or tells you the deadline passed. Use it instead of a sleep-and-recheck loop \
-    whenever you are waiting on something the engine emits (a spawned thread finishing, a \
-    change appearing, a trigger firing). Do NOT poll for it afterwards, and do NOT keep the \
-    session alive waiting.";
+    whenever you are waiting on something the engine emits (a change appearing, a trigger \
+    firing). NOT for a child you spawned: its completion already re-opens this thread. \
+    Do NOT poll for it afterwards, and do NOT keep the session alive waiting.\n\
+    - `lucidos event-waits list` / `... cancel [--wait-id <id>|--all]`: read or stop this \
+    thread's subscriptions. Nothing tells you when one ends, so `list` before claiming you \
+    are still watching; `cancel` when they say stop, since saying it does not stop it.";
 
 /// Codex-only slash-command mapping appended by [`append_backend_rules`]
 /// alongside [`CODEX_CLI_RULE`]. Lucidos prompts name Claude Code slash
@@ -1450,19 +1453,19 @@ mod tests {
     /// table reads the same as every other public surface naming a backend.
     const PROMPT_FLAVOR_CEILINGS: &[(&str, &str, usize)] = &[
         ("worktree", "claude-code", 21420),
-        ("worktree", "codex", 19826),
+        ("worktree", "codex", 20128),
         ("external_repo", "claude-code", 14345),
-        ("external_repo", "codex", 12751),
+        ("external_repo", "codex", 13053),
         ("recovery", "claude-code", 20015),
-        ("recovery", "codex", 18421),
+        ("recovery", "codex", 18723),
         ("external_repo_recovery", "claude-code", 14221),
-        ("external_repo_recovery", "codex", 12627),
+        ("external_repo_recovery", "codex", 12929),
         ("app_worktree", "claude-code", 17555),
-        ("app_worktree", "codex", 15961),
+        ("app_worktree", "codex", 16263),
         ("app_worktree_recovery", "claude-code", 16119),
-        ("app_worktree_recovery", "codex", 14525),
+        ("app_worktree_recovery", "codex", 14827),
         ("conflict_resolution", "claude-code", 5343),
-        ("conflict_resolution", "codex", 6275),
+        ("conflict_resolution", "codex", 6577),
     ];
 
     /// Both backends, paired with the label used in `PROMPT_FLAVOR_CEILINGS`.
