@@ -377,15 +377,25 @@ fn backup_failure_body(
 /// cause-alternating failure notify on every single run.
 pub(crate) async fn notify_backup_failure(engine: &SharedEngine, provider_id: &str, error: &str) {
     let pool = engine.pool();
-    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(BACKUP_FAILURE_DEDUP_MINUTES);
+    // The window is resolved by the database (ADR 0053): `notifications.created_at`
+    // is stamped by Postgres, so an engine-computed cutoff would compare the host
+    // clock against the database clock. A container clock ahead of the host would
+    // suppress a failure the user needs to see.
     let recent: bool = sqlx::query_scalar(
-        "SELECT EXISTS (SELECT 1 FROM notifications WHERE title = $1 AND created_at > $2)",
+        "SELECT EXISTS (SELECT 1 FROM notifications \
+         WHERE title = $1 AND created_at > now() - make_interval(secs => $2))",
     )
     .bind(BACKUP_FAILURE_TITLE)
-    .bind(cutoff)
+    .bind((BACKUP_FAILURE_DEDUP_MINUTES * 60) as f64)
     .fetch_one(pool)
     .await
-    .unwrap_or(false);
+    .unwrap_or_else(|e| {
+        // A dedup lookup that could not run is UNKNOWN, not "already notified":
+        // fall through to notifying, so a DB hiccup costs a duplicate banner
+        // rather than the backup failure report itself.
+        log!("[Backup] Failure-notification dedup lookup failed: {}", e);
+        false
+    });
 
     if recent {
         return;

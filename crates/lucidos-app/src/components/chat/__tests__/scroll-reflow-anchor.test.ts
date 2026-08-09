@@ -31,7 +31,6 @@ import {
   notAtTop,
   scrollToEventAndPulse,
   scrolledFromTop,
-  scrolledUp,
 } from '../scrollState';
 
 /** Enough DOM for `scrollToEventAndPulse` to arm a deep-link claim and then wait
@@ -108,7 +107,6 @@ function makeTranscript(opts: { turns: number[]; width: number; clientHeight: nu
 const SIX_TURNS = { turns: [600, 600, 600, 600, 600, 600], width: 800, clientHeight: 600 };
 
 beforeEach(() => {
-  scrolledUp.value = false;
   awayFromBottom.value = false;
   notAtTop.value = false;
   scrolledFromTop.value = false;
@@ -122,7 +120,6 @@ describe('transcript reflow anchoring across a pane-width change', () => {
     // Park mid-history with turn 3's top 100px above the viewport top.
     el.scrollTop = 1900;
     onScroll();
-    expect(scrolledUp.value).toBe(true);
     onResize(); // layout settles: the anchor snapshot is taken here
     expect(el.turnTop(3)).toBe(-100);
 
@@ -155,24 +152,31 @@ describe('transcript reflow anchoring across a pane-width change', () => {
     expect(el.scrollTop).toBe(1000);
   });
 
-  it('keeps a bottom-riding reader on the bottom instead of anchoring', () => {
+  it('anchors a reader sitting at the bottom too, rather than re-pinning them', () => {
+    // The correction used to branch here: a reader within 80px of the bottom was
+    // put back ON the new bottom (6600) instead of held on their content. That
+    // is a bottom-pin wearing anchor preservation's clothes, and it fired on
+    // someone who had deliberately scrolled 79px up. Everyone gets the anchor,
+    // so the last turn's top stays exactly where the reader had it and the
+    // chevron comes up for the content that the re-wrap pushed below the fold.
     const el = makeTranscript(SIX_TURNS);
     const { onScroll, onResize } = makeScrollObservers(el);
 
     el.scrollTop = 3000; // the bottom (3600 of content, 600 of viewport)
     onScroll();
-    expect(scrolledUp.value).toBe(false);
+    expect(awayFromBottom.value).toBe(false);
     onResize();
+    expect(el.turnTop(5)).toBe(0); // the last turn starts at the viewport top
 
     el.setWidth(400);
     onResize();
 
-    expect(el.scrollTop).toBe(6600); // the new bottom, not the old offset
-    expect(scrolledUp.value).toBe(false);
-    expect(awayFromBottom.value).toBe(false);
+    expect(el.turnTop(5)).toBe(0); // still on it, not dragged to the new bottom
+    expect(el.scrollTop).toBe(6000);
+    expect(awayFromBottom.value).toBe(true); // the re-wrap put content below them
   });
 
-  it('defers to an in-flight deep-link instead of force-pinning to the bottom', () => {
+  it('holds the anchor while a deep-link is resolving', () => {
     const restoreDom = installDeepLinkStubs();
     vi.useFakeTimers();
     try {
@@ -183,9 +187,8 @@ describe('transcript reflow anchoring across a pane-width change', () => {
       onScroll();
       onResize();
 
-      // A deep-link that has not resolved yet leaves scrolledUp false while the
-      // thread loads, so the force-pin branch is the one that would run.
-      scrolledUp.value = false;
+      // A deep-link owns the viewport for the whole resolve window, and the
+      // anchor correction must not fight the landing it is about to make.
       scrollToEventAndPulse('never-renders');
       expect(hasPendingEventScroll()).toBe(true);
 
@@ -197,7 +200,7 @@ describe('transcript reflow anchoring across a pane-width change', () => {
       expect(el.turnTop(3)).toBe(-100);    // held on the anchor instead
     } finally {
       // Drop the claim before running the deadline out, so its give-up branch
-      // sees a superseded claim and returns without starting a bottom-pin loop.
+      // sees a superseded claim and reports nothing.
       clearPendingEventScroll();
       vi.runOnlyPendingTimers();
       vi.useRealTimers();
@@ -249,12 +252,11 @@ describe('transcript reflow anchoring across a pane-width change', () => {
     onResize();
 
     // A token lands: the last turn grows, the width is untouched. The reader
-    // stays exactly where they are, and the chevron escalates as before.
+    // stays exactly where they are, and the chevron comes up.
     el.growLastTurn(400);
     onResize();
 
     expect(el.scrollTop).toBe(1900);
-    expect(scrolledUp.value).toBe(true);
     expect(awayFromBottom.value).toBe(true);
   });
 

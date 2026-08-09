@@ -3,7 +3,7 @@ import { panelOverlay, wipPreviewThreadId, threadMap, activeMenuItem, settingsSu
 import type { App } from '../../../store/types';
 import { MENU_ITEMS } from '../../../store/types';
 import { makeOptimisticThreadState, PENDING_TITLE_PLACEHOLDER } from '../../../store/thread-events';
-import { CHANNEL_OPTIONS, getContentTitle, navEntryTitle } from '../headerHelpers';
+import { CHANNEL_OPTIONS, getContentTitle, getContentTitleShort, navEntryTitle } from '../headerHelpers';
 
 vi.mock('../../../api/client', () => ({
   listAppsApi: vi.fn().mockResolvedValue([]),
@@ -183,6 +183,75 @@ describe('getContentTitle — menu labels', () => {
   it('apps renders its canonical "Apps" title (the Store moved out to the Plugins panel)', () => {
     activeMenuItem.value = 'apps';
     expect(getContentTitle()).toBe('Apps');
+  });
+});
+
+describe('getContentTitleShort: the header bar’s form of the title', () => {
+  beforeEach(() => {
+    panelOverlay.value = null;
+    wipPreviewThreadId.value = null;
+    threadMap.value = new Map();
+    settingsSubview.value = 'main';
+    activeMenuItem.value = 'apps';
+  });
+
+  it('renders a Settings category’s authored shorthand', () => {
+    activeMenuItem.value = 'settings';
+    settingsSubview.value = 'appearance';
+    expect(getContentTitleShort()).toBe('Appearance');
+    // The full name stays available for the tap-tooltip beside it.
+    expect(getContentTitle()).toBe('Appearance & Behavior');
+  });
+
+  it('falls back to the full label for a category with no shorthand', () => {
+    activeMenuItem.value = 'settings';
+    settingsSubview.value = 'thread-queue';
+    expect(getContentTitleShort()).toBe('Thread Queue');
+  });
+
+  it('leaves every other destination exactly as the full title has it', () => {
+    // A name we did not author cannot have a shorthand, so the two forms must
+    // not drift: a branch added to one and missed in the other would render an
+    // empty header bar.
+    settingsSubview.value = 'main';
+    for (const item of MENU_ITEMS) {
+      activeMenuItem.value = item;
+      expect(getContentTitleShort(), `menu item "${item}"`).toBe(getContentTitle());
+    }
+
+    activeMenuItem.value = 'apps';
+    panelOverlay.value = { type: 'app-ui', app: fakeApp };
+    expect(getContentTitleShort()).toBe('Habit Tracker');
+
+    panelOverlay.value = { type: 'file-preview', path: 'artifacts/research/notes.md' };
+    expect(getContentTitleShort()).toBe('notes.md');
+  });
+
+  /** The rule the three cases below share: a title WE author says the
+   *  destination's KIND in the bar, and the detail naming the instance lives in
+   *  the full form, which the tap-tooltip and the history menu render. */
+  it('says the kind of thing a notification is, not which one', () => {
+    activeMenuItem.value = 'notifications';
+    panelOverlay.value = {
+      type: 'notification-detail',
+      notification: {
+        id: 'n1',
+        title: 'Lucidos is asking',
+        message: 'All good',
+        read: false,
+        created_at: new Date('2026-06-26T10:00:00Z').toISOString(),
+      },
+    };
+    expect(getContentTitleShort()).toBe('Notification');
+    expect(getContentTitle()).toBe('Notification - Lucidos is asking');
+  });
+
+  it('names the app previewing work in progress, not the thread doing the work', () => {
+    seedThread('thread-1', 'Fix the streak counter');
+    panelOverlay.value = { type: 'app-ui', app: fakeApp };
+    wipPreviewThreadId.value = 'thread-1';
+    expect(getContentTitleShort()).toBe('Habit Tracker (WIP)');
+    expect(getContentTitle()).toBe('Habit Tracker (WIP by Fix the streak counter)');
   });
 });
 

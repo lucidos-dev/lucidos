@@ -96,12 +96,19 @@ struct PanelContentChannel(Mutex<Option<std::sync::mpsc::Sender<(String, String)
 /// Tracks the label of the currently active panel webview.
 struct PanelWebview(Mutex<Option<String>>);
 
-/// Sender that wakes the dock-badge loop (`desktop::launch`) for an immediate
-/// recompute. The frontend's `nudge_dock_badge` command sends on it when a
-/// notification SSE arrives, so the macOS dock badge updates the instant a
-/// notification is read (in-app or from another device) instead of on the next
-/// poll tick. The receiver lives in the badge thread (macOS, packaged); a send
-/// is a harmless no-op when there's no consumer (dev / non-macOS).
+/// Sender that wakes the unread-indicator loop (`desktop::launch`) for an
+/// immediate recompute. The frontend's `nudge_dock_badge` command sends on it when
+/// a notification SSE arrives, so the menu-bar tray title (and the dock badge, when
+/// a window is open) updates the instant a notification is read (in-app or from
+/// another device) instead of on the next poll tick. The receiver lives in that
+/// loop's thread (macOS, packaged); a send is a harmless no-op when there's no
+/// consumer (dev / non-macOS).
+///
+/// The `dock badge` in this name and in `nudge_dock_badge` predates the tray
+/// surface, and is kept because the command name is a wire contract with the
+/// frontend: it is spelled in `permissions/app-ipc.json`, in the generated
+/// `gen/schemas/acl-manifests.json`, and in `utils/tauri.ts`. What it nudges is
+/// the unread indicator as a whole.
 struct DockBadgeNudge(Mutex<std::sync::mpsc::Sender<()>>);
 
 /// Tracks the JS heartbeat for WKWebView crash recovery. WKWebView's content
@@ -296,11 +303,22 @@ const TITLE_BAR_DEFAULT_COLOR: &str = "#15549e";
 /// content below keeps its position. Empty on every other platform and the web
 /// build, where there is no native title bar: `--titlebar-inset` stays unset
 /// (0px) and the strip collapses to nothing.
+///
+/// It also stamps `data-titlebar-overlay`, which is the same fact as a SELECTOR
+/// rather than a length. Two things need it, and neither can be expressed with
+/// the var alone. The header's leading control steps right by
+/// `--titlebar-lights-reserve`, a flat 80px clearing the traffic lights, with no
+/// `--titlebar-inset` term in it to collapse to nothing off this build: keyed on
+/// the var, a web header would be indented by the width of lights it does not
+/// have. And the header is SHORTENED by the band here, so the two desktop builds
+/// show one bar; that subtraction is only correct where a band exists. See the
+/// `[data-titlebar-overlay]` block in `styles/panels/shell.css`.
 fn titlebar_inset_script() -> &'static str {
     #[cfg(target_os = "macos")]
     {
-        "if(document.documentElement)\
-         document.documentElement.style.setProperty('--titlebar-inset','28px');"
+        "if(document.documentElement){\
+         document.documentElement.style.setProperty('--titlebar-inset','28px');\
+         document.documentElement.setAttribute('data-titlebar-overlay','');}"
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1118,13 +1136,14 @@ fn dismiss_native_notification(id: Option<String>) {
     notifications::dismiss(id);
 }
 
-/// Wake the dock-badge loop for an immediate recompute. The frontend calls this
-/// (under `isTauri()`) from its notification SSE handler so the macOS dock badge
-/// updates the instant a notification is read — in-app or from another device —
+/// Wake the unread-indicator loop for an immediate recompute. The frontend calls
+/// this (under `isTauri()`) from its notification SSE handler so the macOS count
+/// updates the instant a notification is read, in-app or from another device,
 /// instead of waiting for the periodic poll. Best-effort: a send failure (no
-/// receiver in dev / non-macOS, where there is no dock tile) is ignored. The
-/// recompute itself reads the gateway's fresh `unread-total` aggregate. See
-/// `desktop::launch` and `system-knowhow/notifications.md` § App-icon badge.
+/// receiver in dev / non-macOS, where there is neither a tray nor a dock tile) is
+/// ignored. The recompute itself reads the gateway's fresh `unread-total`
+/// aggregate. See `desktop::launch` and `system-knowhow/notifications.md`
+/// § App-icon badge.
 #[tauri::command]
 fn nudge_dock_badge(state: tauri::State<'_, DockBadgeNudge>) {
     let _ = state.0.lock().unwrap().send(());
@@ -1185,15 +1204,16 @@ fn emit_window_active(app: &tauri::AppHandle, label: &str, active: bool) {
 /// True while the packaged macOS client is running menu-bar-only: it has no
 /// visible app window, so it uses the `Accessory` activation policy and is absent
 /// from the Dock and the Cmd+Tab app switcher, living only in the menu-bar tray.
-/// Flipped by [`set_menu_bar_only`]; read by [`apply_unread_indicator`] to pick
-/// which surface shows the unread count. Starts `false`, so an ordinary launch
-/// is a normal `Regular` Dock app; a login start flips it in `setup` (see
+/// Flipped by [`set_menu_bar_only`]; read by [`apply_unread_indicator`] to tell
+/// whether there is a Dock tile to badge with the unread count (the menu-bar tray
+/// carries the count either way). Starts `false`, so an ordinary launch is a normal
+/// `Regular` Dock app; a login start flips it in `setup` (see
 /// [`should_show_window_at_startup`]) instead of ever showing a window.
 static MENU_BAR_ONLY: AtomicBool = AtomicBool::new(false);
 
 /// The most recent aggregate unread total, so a `Regular`↔`Accessory` transition
-/// can re-route the SAME count to the surface that now exists (Dock badge vs tray
-/// title) without waiting for the next badge-loop poll. Written by
+/// can re-apply the SAME count to the Dock tile that just appeared or vanished,
+/// without waiting for the next badge-loop poll. Written by
 /// [`apply_unread_indicator`].
 static LAST_UNREAD: AtomicU64 = AtomicU64::new(0);
 
@@ -1222,45 +1242,60 @@ fn should_show_window_at_startup(args: &[std::ffi::OsString], is_dev: bool) -> b
             .any(|a| a == std::ffi::OsStr::new(desktop::LOGIN_FLAG))
 }
 
-/// Pure: which surface shows the unread `count` for the current activation state,
-/// as `(dock_badge_label, tray_title_label)`. `Regular` → the Dock badge; menu-bar
-/// only → the tray-icon title (there is no Dock tile then). `0` clears both; a
-/// count over 99 collapses to "99+". Unit-testable without AppKit.
-fn unread_targets(menu_bar_only: bool, count: u64) -> (Option<String>, Option<String>) {
+/// Pure: which surfaces show the unread `count`, as `(dock_badge_label,
+/// tray_title)`. The menu-bar tray-icon title ALWAYS carries the count, so
+/// the menu bar is a constant read on how much is waiting whether or not a window
+/// is open. The Dock badge carries it as well while the client is a normal
+/// `Regular` Dock app, and stays `None` while menu-bar-only, where the app has no
+/// Dock tile to badge. `0` clears both; a count over 99 collapses to "99+" on both.
+/// Unit-testable without AppKit.
+///
+/// **The two halves clear differently, which is why their types differ.** The Dock
+/// badge is an `Option`, because AppKit's `setBadgeLabel(None)` is what removes the
+/// badge bubble. The tray title is a plain `String` whose EMPTY value means "no
+/// count": `tray-icon`'s macOS `set_title` ignores a `None` outright (its
+/// `set_title_inner` only calls `setTitle:` inside `if let Some(..)`), so a cleared
+/// title has to be written as an empty string or the menu bar keeps showing the
+/// last number it was ever given. Modelling the tray side as an `Option` is
+/// therefore not a smaller version of the same thing, it is the bug: the count went
+/// to zero, the bell and the Dock tile cleared, and the menu bar sat at 8.
+fn unread_targets(menu_bar_only: bool, count: u64) -> (Option<String>, String) {
     if count == 0 {
-        return (None, None);
+        return (None, String::new());
     }
     let label = if count > 99 {
         "99+".to_string()
     } else {
         count.to_string()
     };
-    if menu_bar_only {
-        (None, Some(label))
+    let dock = if menu_bar_only {
+        None
     } else {
-        (Some(label), None)
-    }
+        Some(label.clone())
+    };
+    (dock, label)
 }
 
-/// Route the aggregate unread `count` to the correct surface for the current
-/// activation state: the Dock badge while a window is open (`Regular`), the
-/// menu-bar tray-icon title while menu-bar-only (`Accessory`). Stores `count` in
-/// [`LAST_UNREAD`] so a later activation transition can re-route it. Called from
-/// the desktop badge loop (marshalled to the main thread) and from
+/// Show the aggregate unread `count` on every surface that exists right now: the
+/// menu-bar tray-icon title always, plus the Dock badge while a window is open
+/// (`Regular`). A menu-bar-only client (`Accessory`) has no Dock tile, so only the
+/// tray is written there. Stores `count` in [`LAST_UNREAD`] so a later activation
+/// transition can re-apply it to the Dock tile that just appeared or vanished.
+/// Called from the desktop badge loop (marshalled to the main thread) and from
 /// [`set_menu_bar_only`].
 pub(crate) fn apply_unread_indicator(app: &tauri::AppHandle, count: u64) {
     LAST_UNREAD.store(count, std::sync::atomic::Ordering::SeqCst);
     let menu_bar_only = MENU_BAR_ONLY.load(std::sync::atomic::Ordering::SeqCst);
     let (dock, tray) = unread_targets(menu_bar_only, count);
     notifications::set_dock_badge(dock);
-    notifications::set_tray_title(app, tray);
+    notifications::set_tray_title(app, &tray);
 }
 
 /// Switch the client between menu-bar-only (`Accessory`: gone from the Dock +
 /// Cmd+Tab) and normal (`Regular`: Dock + Cmd+Tab). On macOS this sets the
 /// NSApplication activation policy; on other platforms only the flag moves (the
-/// badge/tray writes are no-ops there). Then re-routes the unread indicator to the
-/// surface that now exists. See
+/// badge/tray writes are no-ops there). Then re-applies the unread indicator, so
+/// the Dock tile that just appeared or vanished agrees with the tray. See
 /// `docs/plans/2026-07-01-macos-client-menu-bar-only-on-window-close.md`.
 fn set_menu_bar_only(app: &tauri::AppHandle, menu_bar_only: bool) {
     #[cfg(target_os = "macos")]
@@ -1854,6 +1889,37 @@ mod tests {
         assert!(!is_app_window(""));
     }
 
+    /// The injected script carries TWO facts the desktop header depends on, and
+    /// it is a string literal nothing else parses: a typo in it fails silently
+    /// in the webview, where the only symptom is a header that quietly lays out
+    /// like the web build. The attribute half is the one at risk, being the
+    /// newer of the two and the gate every `[data-titlebar-overlay]` rule in
+    /// `styles/panels/shell.css` hangs off.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn the_titlebar_script_sets_both_the_inset_and_the_overlay_marker() {
+        let script = titlebar_inset_script();
+        assert!(script.contains("--titlebar-inset"), "{script}");
+        assert!(script.contains("28px"), "{script}");
+        assert!(script.contains("data-titlebar-overlay"), "{script}");
+        // Both statements live inside the one `if(document.documentElement)`
+        // guard, so the braces have to balance or the second never runs.
+        assert_eq!(
+            script.matches('{').count(),
+            script.matches('}').count(),
+            "unbalanced braces: {script}"
+        );
+    }
+
+    /// Off macOS there is no native title bar, so the script must stay empty:
+    /// stamping the marker anywhere else would move the Linux and Windows
+    /// header's leading control into a band that does not exist.
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn the_titlebar_script_is_empty_off_macos() {
+        assert_eq!(titlebar_inset_script(), "");
+    }
+
     #[test]
     fn should_be_menu_bar_only_iff_no_windows_visible() {
         // No visible app window → drop to the menu-bar tray (Accessory).
@@ -1906,19 +1972,51 @@ mod tests {
     }
 
     #[test]
-    fn unread_targets_routes_by_activation_state() {
-        // Regular (a window is open): count on the Dock badge, nothing on the tray.
-        assert_eq!(unread_targets(false, 5), (Some("5".into()), None));
-        // Menu-bar only (Accessory): count on the tray title, no Dock tile.
-        assert_eq!(unread_targets(true, 5), (None, Some("5".into())));
-        // Zero clears both surfaces regardless of state.
-        assert_eq!(unread_targets(false, 0), (None, None));
-        assert_eq!(unread_targets(true, 0), (None, None));
-        // Over 99 collapses to "99+" on whichever surface is active.
-        assert_eq!(unread_targets(false, 150), (Some("99+".into()), None));
-        assert_eq!(unread_targets(true, 100), (None, Some("99+".into())));
-        // Boundary: exactly 99 is shown as-is.
-        assert_eq!(unread_targets(false, 99), (Some("99".into()), None));
+    fn unread_targets_always_titles_the_tray_and_badges_the_dock_only_under_regular() {
+        // Regular (a window is open): the count is on BOTH the Dock badge and the
+        // menu-bar tray title. The menu bar carrying it at all times is the point.
+        assert_eq!(
+            unread_targets(false, 5),
+            (Some("5".into()), "5".to_string())
+        );
+        // Menu-bar only (Accessory): tray title only, because there is no Dock tile.
+        assert_eq!(unread_targets(true, 5), (None, "5".to_string()));
+        // Over 99 collapses to "99+" on every surface that shows it.
+        assert_eq!(
+            unread_targets(false, 100),
+            (Some("99+".into()), "99+".to_string())
+        );
+        assert_eq!(
+            unread_targets(false, 150),
+            (Some("99+".into()), "99+".to_string())
+        );
+        assert_eq!(unread_targets(true, 100), (None, "99+".to_string()));
+        // Boundary: exactly 99 is shown as-is, on both surfaces.
+        assert_eq!(
+            unread_targets(false, 99),
+            (Some("99".into()), "99".to_string())
+        );
+        assert_eq!(unread_targets(true, 99), (None, "99".to_string()));
+    }
+
+    #[test]
+    fn a_cleared_tray_title_is_an_empty_string_the_tray_will_actually_write() {
+        // The reported bug: the bell read 0 and the Dock tile was blank while the
+        // menu bar still showed 8. Zero has to reach `set_tray_title` as a value it
+        // WRITES, because `tray-icon`'s macOS backend drops a `None` on the floor
+        // and leaves the last count on screen (see `notifications::set_tray_title`).
+        // An empty string takes the same path a real count does, so the item blanks.
+        for menu_bar_only in [false, true] {
+            let (dock, tray) = unread_targets(menu_bar_only, 0);
+            assert_eq!(dock, None, "the Dock badge clears with None, which works");
+            assert_eq!(
+                tray, "",
+                "the tray clears by being WRITTEN empty, not skipped"
+            );
+        }
+        // And the non-zero case must not be empty, or clearing would be
+        // indistinguishable from showing a count.
+        assert_ne!(unread_targets(false, 1).1, "");
     }
 
     #[test]

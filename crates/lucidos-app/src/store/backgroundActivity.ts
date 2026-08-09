@@ -21,7 +21,7 @@
  *
  * Everything here is a PURE function of explicit arguments, with the signal
  * reads left to the callsite (the `currentWorkspaceRefreshState` precedent in
- * ControlPanel.tsx), so the derivation and the toast copy are unit-testable
+ * WorkspaceMenuRows.tsx), so the derivation and the toast copy are unit-testable
  * without a render. Actions are carried as DESCRIPTORS rather than callbacks for
  * the same reason: a closure in here would be the end of that.
  */

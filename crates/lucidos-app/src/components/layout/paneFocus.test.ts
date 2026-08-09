@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   trapTargetIndex, paneTabTarget,
   shouldReconcilePaneFocus, PANE_FOCUS_REGION,
-  isContentPaneIframeFocus,
+  isContentPaneIframeFocus, navigationFocusTarget,
 } from './paneFocus';
 
 // A click inside any content-pane iframe (app, preview, PDF plugin, cross-origin
@@ -138,6 +138,35 @@ describe('shouldReconcilePaneFocus', () => {
       { mobile: false, overlayOpen: false, focusInsidePane: true },
     ];
     for (const c of combos) expect(shouldReconcilePaneFocus(c)).toBe(false);
+  });
+});
+
+// Which focusable a navigation landing on a settings row hands focus to. A row
+// whose label carries an explainer puts the info icon BEFORE the control in DOM
+// order, so "the first focusable" is the icon and Enter opens a dialog instead
+// of operating the setting the user searched for.
+describe('navigationFocusTarget', () => {
+  const fake = (cls: string) => ({ cls, classList: { contains: (c: string) => c === cls } });
+
+  it('skips the explainer icon and lands on the row control behind it', () => {
+    const [icon, control] = [fake('explainer-btn'), fake('settings-option')];
+    expect(navigationFocusTarget([icon, control])).toBe(control);
+  });
+
+  it('takes the first control when the row has no explainer', () => {
+    const [first, second] = [fake('settings-option'), fake('action-btn')];
+    expect(navigationFocusTarget([first, second])).toBe(first);
+  });
+
+  it('falls back to the explainer when it is the only focusable', () => {
+    // A section title whose sole focusable IS its icon (Repositories, Connect
+    // URLs) should still take focus rather than leaving the landing unfocused.
+    const icon = fake('explainer-btn');
+    expect(navigationFocusTarget([icon])).toBe(icon);
+  });
+
+  it('is undefined for a container with nothing focusable', () => {
+    expect(navigationFocusTarget([])).toBeUndefined();
   });
 });
 

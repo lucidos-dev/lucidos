@@ -287,9 +287,10 @@ pub(super) async fn claude_code_interrupt(
 }
 
 /// Response of `GET /api/v1/coding-agents/binaries` — effective CLI binary
-/// resolution per coding agent, for the Settings → Coding Agents surface.
-/// Live detection (see `runtime::detect_agent_binary`); the override itself is
-/// the `coding_agent_*_path` preference written via `PUT /api/v1/preferences`.
+/// resolution per coding agent, plus each resolved binary's self-reported
+/// version, for the Settings → Coding Agents surface. Live detection (see
+/// `runtime::detect_agent_binary_with_version`); the override itself is the
+/// `coding_agent_*_path` preference written via `PUT /api/v1/preferences`.
 #[derive(Serialize)]
 pub(super) struct AgentBinariesResponse {
     claude_code: crate::runtime::AgentBinaryStatus,
@@ -315,16 +316,19 @@ pub(super) async fn coding_agent_binaries(
     };
     let claude_override = read_override(crate::core::PREF_CODING_AGENT_CLAUDE_PATH).await?;
     let codex_override = read_override(crate::core::PREF_CODING_AGENT_CODEX_PATH).await?;
-    Ok(Json(AgentBinariesResponse {
-        claude_code: crate::runtime::detect_agent_binary(
+    // Concurrently: each agent's detection now runs `<binary> --version`, so
+    // sequencing them would make the section pay both probes back to back.
+    let (claude_code, codex) = tokio::join!(
+        crate::runtime::detect_agent_binary_with_version(
             crate::runtime::CodingAgent::ClaudeCode,
             claude_override.as_deref(),
         ),
-        codex: crate::runtime::detect_agent_binary(
+        crate::runtime::detect_agent_binary_with_version(
             crate::runtime::CodingAgent::Codex,
             codex_override.as_deref(),
         ),
-    }))
+    );
+    Ok(Json(AgentBinariesResponse { claude_code, codex }))
 }
 
 /// Routes for the `/claude-code/*` surface.

@@ -14,13 +14,22 @@ const ENV_SOURCE_THREAD_ID: &str = "LUCIDOS_THREAD_ID";
 const ENV_EVENT_ID: &str = "LUCIDOS_EVENT_ID";
 
 pub(crate) struct ListFilters<'a> {
-    /// `Some(true)` → only `running` / `waiting_for_user_answer` (agentic loop
-    /// mid-flow). `Some(false)` → invert. `None` → no filter.
+    /// `Some(true)` selects the UNION of `running` and
+    /// `waiting_for_user_answer`, `Some(false)` inverts it, `None` filters
+    /// nothing. For "is the workspace busy?" callers want `status` with
+    /// `running` alone: a thread awaiting a user answer is blocked on the
+    /// human, not working.
     pub active: Option<bool>,
+    /// Exactly these statuses, from repeated `--status` flags and/or
+    /// comma-separated values. Empty means no status narrowing. Clap already
+    /// refuses this together with `active`; the engine validates the values and
+    /// is the single place that owns the wording for a bad one.
+    pub status: &'a [String],
     /// Comma-separated source list (`chat`, `trigger`, `coding-agent`).
     /// Legacy `claude_code` is also accepted by the engine.
     pub source: Option<&'a str>,
-    /// Server clamps to 1..=1000 (default 100).
+    /// Server clamps to 1..=1000 (default 100). `None` on the `count` path,
+    /// which has no page to size.
     pub limit: Option<u32>,
     /// Restrict to the direct children of this thread. Same name as the
     /// `parent` query param and as the `my_children` filter the LLM tool
@@ -60,32 +69,30 @@ pub(crate) fn resolve_parent_filter(
 
 pub(crate) fn cmd_list(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), BoxError> {
     let url = format!("{}/api/v1/threads/list", ws.base_url());
+    send_filtered("GET", &url, &filters)
+}
+
+/// Same filters as `cmd_list`, against the count endpoint. `limit` is carried
+/// in the shared `ListFilters` and left `None` here, mirroring how the store
+/// and HTTP layers reuse one filter struct for both queries.
+pub(crate) fn cmd_count(ws: &Workspace, filters: ListFilters<'_>) -> Result<(), BoxError> {
+    let url = format!("{}/api/v1/threads/count", ws.base_url());
+    send_filtered("GET", &url, &filters)
+}
+
+fn send_filtered(method: &str, url: &str, filters: &ListFilters<'_>) -> Result<(), BoxError> {
     let params = build_query_params(
         filters.active,
+        filters.status,
         filters.source,
         filters.limit,
         filters.parent.as_deref(),
     );
-    let mut req = http_client()?.get(&url);
+    let mut req = http_client()?.get(url);
     if !params.is_empty() {
         req = req.query(&params);
     }
-    send_and_print("GET", &url, req)
-}
-
-pub(crate) fn cmd_count(
-    ws: &Workspace,
-    active: Option<bool>,
-    source: Option<&str>,
-    parent: Option<&str>,
-) -> Result<(), BoxError> {
-    let url = format!("{}/api/v1/threads/count", ws.base_url());
-    let params = build_query_params(active, source, None, parent);
-    let mut req = http_client()?.get(&url);
-    if !params.is_empty() {
-        req = req.query(&params);
-    }
-    send_and_print("GET", &url, req)
+    send_and_print(method, url, req)
 }
 
 /// `lucidos threads follow-up`: send a message to one of the calling thread's
@@ -155,6 +162,7 @@ pub(crate) fn source_thread_id_from_env() -> Option<String> {
 
 fn build_query_params(
     active: Option<bool>,
+    status: &[String],
     source: Option<&str>,
     limit: Option<u32>,
     parent: Option<&str>,
@@ -162,6 +170,12 @@ fn build_query_params(
     let mut params: Vec<(&'static str, String)> = Vec::new();
     if let Some(a) = active {
         params.push(("active", a.to_string()));
+    }
+    // Repeated `--status a --status b` and `--status a,b` are the same
+    // request: both arrive as one comma-separated param. The engine owns
+    // validation, so a bad value produces one wording rather than two.
+    if !status.is_empty() {
+        params.push(("status", status.join(",")));
     }
     if let Some(s) = source {
         let trimmed = s.trim();
@@ -185,64 +199,131 @@ fn build_query_params(
 mod tests {
     use super::*;
 
+    /// No status flags, so the status axis contributes nothing.
+    const NO_STATUS: &[String] = &[];
+
+    fn statuses(values: &[&str]) -> Vec<String> {
+        values.iter().map(|v| v.to_string()).collect()
+    }
+
     #[test]
     fn list_includes_active_flag_when_set() {
-        let params = build_query_params(Some(true), None, None, None);
+        let params = build_query_params(Some(true), NO_STATUS, None, None, None);
         assert_eq!(params, vec![("active", "true".to_string())]);
     }
 
     #[test]
     fn list_includes_active_false_when_explicitly_inverted() {
-        let params = build_query_params(Some(false), None, None, None);
+        let params = build_query_params(Some(false), NO_STATUS, None, None, None);
         assert_eq!(params, vec![("active", "false".to_string())]);
     }
 
     #[test]
+    fn list_includes_status_when_set() {
+        let params = build_query_params(None, &statuses(&["running"]), None, None, None);
+        assert_eq!(params, vec![("status", "running".to_string())]);
+    }
+
+    /// Repeated flags and one comma-separated flag are the same request, so
+    /// neither form is a second thing the engine has to know about.
+    #[test]
+    fn repeated_and_comma_separated_status_flags_produce_one_param() {
+        let repeated = build_query_params(
+            None,
+            &statuses(&["running", "waiting_for_user_answer"]),
+            None,
+            None,
+            None,
+        );
+        let joined = build_query_params(
+            None,
+            &statuses(&["running,waiting_for_user_answer"]),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(repeated, joined);
+        assert_eq!(
+            repeated,
+            vec![("status", "running,waiting_for_user_answer".to_string())]
+        );
+    }
+
+    #[test]
     fn list_includes_source_when_non_empty() {
-        let params = build_query_params(None, Some("chat,trigger"), None, None);
+        let params = build_query_params(None, NO_STATUS, Some("chat,trigger"), None, None);
         assert_eq!(params, vec![("source", "chat,trigger".to_string())]);
     }
 
     #[test]
     fn list_omits_blank_source() {
-        let params = build_query_params(None, Some("   "), None, None);
+        let params = build_query_params(None, NO_STATUS, Some("   "), None, None);
         assert!(params.is_empty());
     }
 
     #[test]
     fn list_includes_limit_when_set() {
-        let params = build_query_params(None, None, Some(50), None);
+        let params = build_query_params(None, NO_STATUS, None, Some(50), None);
         assert_eq!(params, vec![("limit", "50".to_string())]);
     }
 
     #[test]
     fn list_returns_no_params_when_all_unset() {
-        let params = build_query_params(None, None, None, None);
+        let params = build_query_params(None, NO_STATUS, None, None, None);
         assert!(params.is_empty());
     }
 
     #[test]
     fn list_includes_parent_when_set() {
         let parent = "11111111-1111-1111-1111-111111111111";
-        let params = build_query_params(None, None, None, Some(parent));
+        let params = build_query_params(None, NO_STATUS, None, None, Some(parent));
         assert_eq!(params, vec![("parent", parent.to_string())]);
     }
 
     #[test]
     fn list_omits_blank_parent() {
-        let params = build_query_params(None, None, None, Some("  "));
+        let params = build_query_params(None, NO_STATUS, None, None, Some("  "));
         assert!(params.is_empty());
     }
 
     #[test]
     fn list_composes_every_filter() {
         let parent = "22222222-2222-2222-2222-222222222222";
-        let params = build_query_params(Some(true), Some("trigger"), Some(10), Some(parent));
+        let params = build_query_params(
+            Some(true),
+            NO_STATUS,
+            Some("trigger"),
+            Some(10),
+            Some(parent),
+        );
         assert_eq!(
             params,
             vec![
                 ("active", "true".to_string()),
                 ("source", "trigger".to_string()),
+                ("limit", "10".to_string()),
+                ("parent", parent.to_string()),
+            ]
+        );
+    }
+
+    /// The status axis composes with the others exactly as `active` does. Clap
+    /// refuses `--active --status`, so the two never both appear here.
+    #[test]
+    fn status_composes_with_the_other_filters() {
+        let parent = "99999999-9999-9999-9999-999999999999";
+        let params = build_query_params(
+            None,
+            &statuses(&["running"]),
+            Some("coding-agent"),
+            Some(10),
+            Some(parent),
+        );
+        assert_eq!(
+            params,
+            vec![
+                ("status", "running".to_string()),
+                ("source", "coding-agent".to_string()),
                 ("limit", "10".to_string()),
                 ("parent", parent.to_string()),
             ]

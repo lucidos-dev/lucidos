@@ -43,6 +43,14 @@ export interface Trigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omitted when empty (= no grant). */
   side_effect_grant?: SideEffectCategory[];
+  /** Chat model this trigger's intent fires on. Omitted when the trigger uses
+   *  the account default (Settings → Models → Chat & triggers). Intent
+   *  triggers only: a script trigger runs no LLM. */
+  model?: string;
+  /** Thinking budget for this trigger's intent fires, one of
+   *  `none|low|medium|high|xhigh|max`. Omitted when the trigger uses the
+   *  account default. */
+  reasoning_effort?: string;
 }
 
 export interface CreateTrigger {
@@ -56,6 +64,13 @@ export interface CreateTrigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
+  /** Chat model this trigger's intent fires on. Omit / null = the account
+   *  default. Not validated against the model registry, so a wrong id fails at
+   *  fire time rather than at save time. */
+  model?: string | null;
+  /** Thinking budget for this trigger's intent fires. Omit / null = the account
+   *  default. Must be one of `none|low|medium|high|xhigh|max`. */
+  reasoning_effort?: string | null;
 }
 
 export interface UpdateTrigger {
@@ -72,6 +87,12 @@ export interface UpdateTrigger {
   /** Full replacement for the side-effect grant. Send the complete new set;
    *  pass `[]` to clear all grants. */
   side_effect_grant?: SideEffectCategory[];
+  /** Pin the trigger's intent to a chat model (string) or clear it back to the
+   *  account default (null). Absent leaves it unchanged. */
+  model?: string | null;
+  /** Pin the trigger's thinking budget (`none|low|medium|high|xhigh|max`) or
+   *  clear it back to the account default (null). Absent leaves it unchanged. */
+  reasoning_effort?: string | null;
 }
 
 export interface ApiResult {

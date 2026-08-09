@@ -148,8 +148,8 @@ function restartProgressMessage(newVersion: boolean): string {
 export async function initiateEngineRestart(): Promise<void> {
   // Single version surface: the switch replaces the poll-driven "New version
   // available → Switch to new version" toast with the progress toast below.
-  // Remove it here (the canonical switch entry point) so every path — the toast's
-  // own button, the control-panel reload glyph, the SystemPage dialog — collapses
+  // Remove it here (the canonical switch entry point) so every path (the toast's
+  // own button, the menu's Refresh row, the SystemPage dialog) collapses
   // to one toast instead of stacking "Starting new version…" on top of the
   // still-visible "New version available." toast. Use removeToast (structural),
   // NOT dismissToast: clicking Switch is ACTING on the prompt, not deferring it,
@@ -260,12 +260,12 @@ function isEngineOutdated(): boolean {
 }
 
 /** Persist (or clear) the restart-pending state driven by `restartRequired` so
- *  the control-panel badge and the restart confirm dialog (SystemPage) survive a
+ *  the brand badge and the restart confirm dialog (SystemPage) survive a
  *  page reload.
  *
  *  It does NOT show a pre-switch toast, and (in dev) does NOT light the
  *  "New version available" badge at Apply time. That whole engine surface — the
- *  poll-driven engine-new-version toast (engine-update.ts) AND the control-panel
+ *  poll-driven engine-new-version toast (engine-update.ts) AND the brand
  *  badge / reload-glyph highlight (`engineNewVersionReady()` in store.ts)
  *  — fires only once the background rebuild is actually `ready`, so nothing can
  *  claim "available" before the build finishes. `restartRequired` here still
@@ -316,7 +316,7 @@ function restoreRestartGroupsFromStorage(): void {
  *      reconnect. This takes precedence — re-showing the pre-restart warning here
  *      would nag the user to start a restart already underway.
  *   2. A restart is merely PENDING (`RESTART_LS_KEY`). Restore `restartRequired`
- *      + the restart groups so the control-panel badge and restart confirm dialog
+ *      + the restart groups so the brand badge and restart confirm dialog
  *      reappear. No toast — the engine "New version available" toast is owned by
  *      the poll (engine-update.ts) once the rebuild is `ready`. */
 export function restoreRestartToast(): void {

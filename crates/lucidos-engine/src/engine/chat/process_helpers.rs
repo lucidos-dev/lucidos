@@ -89,6 +89,8 @@ pub(super) fn build_trigger_started_event(
     invocation: &TriggerInvocation,
     user_message: &str,
     go_to_review: bool,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
 ) -> (ThreadEvent, EventMeta) {
     use crate::engine::thread_events::EngineReason;
     (
@@ -104,6 +106,11 @@ pub(super) fn build_trigger_started_event(
                 trigger_name: Some(trigger_name.to_string()),
             })),
             go_to_review,
+            // The RESOLVED pair, not the trigger's raw pin: an unpinned trigger
+            // records the account model it actually ran on, so the thread's
+            // model memory is honest either way.
+            model: model.map(str::to_string),
+            reasoning_effort: reasoning_effort.map(str::to_string),
         },
         EventMeta {
             channel: Some(EventChannel::Trigger),

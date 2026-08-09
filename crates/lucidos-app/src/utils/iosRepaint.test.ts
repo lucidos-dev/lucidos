@@ -240,12 +240,11 @@ describe('forceIOSRepaint', () => {
     expect(el.offsetReads).toBeGreaterThanOrEqual(1);
   });
 
-  it('yields the restore to a concurrent scroll write (never clobbers useScrollMemory / autoscroll)', () => {
-    // The open-path race: useScrollMemory restores a scrolled-up thread to its
-    // saved position (or useAutoScroll pins to a new bottom during streaming)
-    // BETWEEN the nudge and its restore. The restore must yield — only undo OUR
-    // nudge if scrollTop is still the value we left — so it can't snap the user
-    // back to a stale position.
+  it('yields the restore to a concurrent scroll write (never clobbers useScrollMemory / the chevron)', () => {
+    // The open-path race: useScrollMemory restores a thread to its saved
+    // position, or the reader taps the down chevron, BETWEEN the nudge and its
+    // restore. The restore must yield, only undoing OUR nudge if scrollTop is
+    // still the value we left, so it can't snap them back to a stale position.
     const el = fakeEl('', { scrollTop: 500, scrollHeight: 2000, clientHeight: 800 });
     forceIOSRepaint(el);
     flushFrame(); // frame 1: nudge to 499
@@ -256,16 +255,15 @@ describe('forceIOSRepaint', () => {
   });
 
   it('nudges from the LIVE position, not a stale call-time baseline (streaming growth)', () => {
-    // The auto-tail regression: on iOS the streaming-repaint throttle calls
-    // forceIOSRepaint while at the bottom, but content grows (and useAutoScroll
-    // re-pins to the NEW bottom) between the call and the rAF nudge. A call-time
-    // baseline would nudge to (oldBottom - 1) — now far above the grown bottom —
-    // which scrollState.onScroll reads as scrolled-up and latches scrolledUp=true,
-    // permanently parking auto-scroll. The nudge must be ±1 from the CURRENT
-    // position so it stays inside the 80px / 2px slack and never trips it.
+    // On iOS the streaming-repaint throttle calls forceIOSRepaint while the
+    // reader is at the bottom, and they can move between the call and the rAF
+    // nudge (a chevron tap landing them on the grown bottom). A call-time
+    // baseline would then write (oldBottom - 1), dragging them back up by
+    // however far they got. The nudge must be ±1 from the CURRENT position so
+    // it stays inside the 2px chevron slack and moves nobody.
     const el = fakeEl('', { scrollTop: 1200, scrollHeight: 2000, clientHeight: 800 }); // at bottom (2000-800)
     forceIOSRepaint(el); // call-time baseline would capture 1200
-    // Streaming grows the transcript; useAutoScroll pins to the new bottom:
+    // Streaming grows the transcript and the reader chevrons to the new bottom:
     el.scrollHeight = 3000;
     el.scrollTop = 2200; // new bottom (3000-800)
     flushFrame(); // frame 1: nudge — must be ±1 from the LIVE 2200, not the stale 1200

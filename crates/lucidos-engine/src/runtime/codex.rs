@@ -580,7 +580,9 @@ pub const CODEX_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos__ask_user_question"
 ///
 /// - `enabled_tools` hides the CC-only `approve` permission tool — without it
 ///   Codex would advertise `mcp__lucidos__approve` to the model as an
-///   ordinary callable tool.
+///   ordinary callable tool. The mirror-image filter for CC lives inside the
+///   server instead (`--permission-only`, see `permission_mcp_config_json`),
+///   because CC has no `enabled_tools` equivalent for a server it spawns.
 /// - `tools.ask_user_question.approval_mode = "approve"` trusts that ONE MCP
 ///   tool so non-interactive Codex sessions don't auto-cancel it as an
 ///   unapproved MCP call before the Lucidos QuestionCard endpoint can run.

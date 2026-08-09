@@ -44,6 +44,96 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# ── neutralize the lucidos CLI ──────────────────────────────────────────
+# A recording stub shadows the real CLI for the WHOLE file, so even a regression
+# in the emit guard cannot reach a live engine: the worst it could do is append a
+# line here. Same posture as the ps and cwd seams below, and as the `kill` shim
+# in ports_test.sh (ADR 0025).
+#
+# One line per call, tab separated. No argument the lock library passes can
+# contain a tab or a newline: `_e2e_json_escape` strips control characters from
+# every interpolated value, and the summary is the library's own text. The
+# trailing field records whether the lock file existed AT CALL TIME, which is how
+# the ordering invariant (announce a release only once the file is gone) is
+# asserted rather than assumed.
+STUB_DIR="$TMPROOT/stub"
+mkdir -p "$STUB_DIR"
+CAPTURE="$TMPROOT/lucidos-calls.txt"
+: > "$CAPTURE"
+export CAPTURE
+EMIT_LOCK="$E2E_WORKSPACE/.lucidos/e2e.lock"
+STUB_WATCH_LOCK="$EMIT_LOCK"
+export STUB_WATCH_LOCK
+cat > "$STUB_DIR/lucidos" <<'STUB'
+#!/bin/bash
+# Delay ONE event type before it records, which is what makes the ordering test
+# deterministic instead of a coin flip: argv is `events emit <Type> ...`, so $3
+# names the event.
+if [ "${3:-}" = "${STUB_PREDELAY_EVENT:-}" ] && [ -n "${STUB_PREDELAY_S:-}" ]; then
+    sleep "$STUB_PREDELAY_S"
+fi
+{
+    printf '%s\t' "$@"
+    if [ -e "${STUB_WATCH_LOCK:-/nonexistent}" ]; then
+        printf 'LOCKFILE_PRESENT'
+    else
+        printf 'LOCKFILE_ABSENT'
+    fi
+    printf '\n'
+} >> "$CAPTURE"
+# Stand in for a wedged engine. Recorded BEFORE sleeping, so the hang test can
+# still assert the call was made.
+[ -n "${STUB_SLEEP_S:-}" ] && sleep "$STUB_SLEEP_S"
+exit "${STUB_EXIT:-0}"
+STUB
+chmod +x "$STUB_DIR/lucidos"
+PATH="$STUB_DIR:$PATH"
+export PATH
+
+# The stub's knobs, and the library's emit bound, are EXPORTED ONCE here with
+# their inert defaults so each case can set them with a plain assignment inside
+# its subshell. Exporting them in the subshells instead is what shellcheck's
+# SC2030/SC2031 complain about, correctly in general (a value set in one subshell
+# is invisible to the next) even though each case here wants exactly that.
+# Declared empty: the stub reads `${STUB_SLEEP_S:-}` / `${STUB_EXIT:-0}` and the
+# library `${E2E_LOCK_EMIT_TIMEOUT_S:-5}`, so empty is the default in all three.
+export STUB_SLEEP_S=""
+export STUB_EXIT=""
+export E2E_LOCK_EMIT_TIMEOUT_S=""
+export STUB_PREDELAY_EVENT=""
+export STUB_PREDELAY_S=""
+
+TAB="$(printf '\t')"
+
+# The first recorded call for an event type, and its two interesting fields.
+emit_call() { grep "^events${TAB}emit${TAB}$1${TAB}" "$CAPTURE" | head -1; }
+emit_payload() { emit_call "$1" | awk -F'\t' '{ print $(NF - 1) }'; }
+emit_marker() { emit_call "$1" | awk -F'\t' '{ print $NF }'; }
+
+# Wait for an event to be recorded, bounded. Needed only by the cases that
+# deliberately do NOT wait for the announcement acquire_e2e_lock backgrounds:
+# once their subshell exits, that child is re-parented and the test shell can no
+# longer `wait` for it, so its write would otherwise land in $CAPTURE after the
+# NEXT case has truncated it and be read as that case's event.
+drain_emit() {
+    local event="$1" waited=0
+    while [ -z "$(emit_call "$event")" ] && [ "$waited" -lt 50 ]; do
+        sleep 0.1
+        waited=$((waited + 1))
+    done
+}
+
+# Start an emit case from a known state. The emit cases run with
+# $E2E_LOCK_DIR_OVERRIDE unset (that variable IS the guard), so their lock lands
+# at <E2E_WORKSPACE>/.lucidos/e2e.lock instead, which this file already pins to
+# the sandbox.
+reset_emit_sandbox() {
+    rm -f "$EMIT_LOCK" "$E2E_WORKSPACE/.lucidos/engine.pid"
+    E2E_LOCK_OWNED=""
+    SYNTHETIC_PS=""
+    : > "$CAPTURE"
+}
+
 source "$PROJECT_DIR/scripts/lib/e2e_lock.sh"
 
 # ── neutralize the real process scan ────────────────────────────────────
@@ -544,6 +634,478 @@ else
 fi
 assert_eq "1" "$([ -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" ] && echo 1 || echo 0)" "held lock preserved"
 rm -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+
+# ── 10-18. The lock announces itself (the E2ELock* domain events) ────────
+# A hold now emits E2ELockAcquired when it starts and E2ELockReleased when it
+# ends, so a run that LOST the lock can subscribe with `lucidos await-event` and
+# end its turn instead of busy-waiting (2026-08-09: two losers hand-rolled sleep
+# loops, one of them a 40 minute foreground tool call).
+#
+# Everything below is about the emit being invisible when it fails. An e2e run
+# must never go red, and an EXIT trap must never stall, because the engine was
+# briefly unreachable.
+
+echo ""
+echo "Test 10: the emit guard keeps this suite off the developer's live workspace"
+# $E2E_LOCK_DIR_OVERRIDE is what suppresses the emit, and this file exports it
+# for the whole run. Without the guard, every test above would POST E2ELock*
+# events into whichever workspace the developer is sitting in.
+: > "$CAPTURE"
+reset_lock_dir
+acquire_e2e_lock e2e-browser >/dev/null 2>&1
+release_e2e_lock
+if [ -s "$CAPTURE" ]; then
+    fail "a guarded acquire/release called lucidos: $(cat "$CAPTURE")"
+else
+    pass "no emit while E2E_LOCK_DIR_OVERRIDE is set"
+fi
+
+echo ""
+echo "Test 11: acquire and release announce themselves"
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    # acquire_e2e_lock backgrounds its announcement (it is holding the lock with
+    # no teardown armed), so reap it before the parent reads $CAPTURE. `wait`
+    # with no args is exact: this subshell has no other children.
+    wait
+    release_e2e_lock
+)
+acq="$(emit_payload E2ELockAcquired)"
+rel="$(emit_payload E2ELockReleased)"
+case "$acq" in
+    *'"script":"e2e-browser"'*'"reclaimed":false'*) pass "acquire emits E2ELockAcquired for a free lock" ;;
+    *) fail "wrong or missing E2ELockAcquired payload: $acq" ;;
+esac
+case "$rel" in
+    *'"script":"e2e-browser"'*'"outcome":"released"'*) pass "release emits E2ELockReleased naming the script" ;;
+    *) fail "wrong or missing E2ELockReleased payload: $rel" ;;
+esac
+case "$rel" in
+    *'"thread_id":"'*'"worktree":"'*) pass "payload carries the thread id and worktree a waiter filters on" ;;
+    *) fail "release payload lacks thread_id/worktree: $rel" ;;
+esac
+if printf '%s' "$rel" | grep -q '"held_secs":[0-9]'; then
+    pass "release payload carries how long the lock was held"
+else
+    fail "release payload has no numeric held_secs: $rel"
+fi
+# The ordering invariant. A waiter woken by the release retries immediately, so
+# waking one while the lock file is still there would spend one of its ten
+# consecutive subscriptions on nothing.
+if [ "$(emit_marker E2ELockReleased)" = "LOCKFILE_ABSENT" ]; then
+    pass "the release is announced only after the lock file is gone"
+else
+    fail "E2ELockReleased fired while the lock file was still present"
+fi
+if [ "$(emit_marker E2ELockAcquired)" = "LOCKFILE_PRESENT" ]; then
+    pass "the acquire is announced only after the lock file is written"
+else
+    fail "E2ELockAcquired fired before the lock file existed"
+fi
+
+echo ""
+echo "Test 12: reclaiming a dead owner's lock announces THAT hold ending"
+# A waiter is blocked on the hold, not on the process, and a hold whose owner
+# died is over just as finally. Nothing else would ever announce it: the dead
+# owner's EXIT trap never ran.
+reset_emit_sandbox
+cat > "$EMIT_LOCK" <<EOF
+PID=999999
+THREAD_ID=ghost
+WORKTREE=/tmp/ghost
+STARTED=2020-01-01T00:00:00Z
+SCRIPT=e2e-api
+EOF
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait          # both reclaim announcements are backgrounded
+)
+rel="$(emit_payload E2ELockReleased)"
+case "$rel" in
+    *'"outcome":"reclaimed"'*) pass "reclaim emits E2ELockReleased with outcome=reclaimed" ;;
+    *) fail "reclaim did not announce the release: $rel" ;;
+esac
+case "$rel" in
+    *'"script":"e2e-api"'*'"thread_id":"ghost"'*) pass "the payload describes the DEAD owner, not the reclaimer" ;;
+    *) fail "reclaim payload describes the wrong hold: $rel" ;;
+esac
+# This fixture predates STARTED_EPOCH, exactly like every lock file written
+# before it existed. The field must be omitted rather than emitted empty, which
+# would be invalid JSON and would lose the whole event.
+if printf '%s' "$rel" | grep -q 'held_secs'; then
+    fail "a lock file with no STARTED_EPOCH still emitted held_secs: $rel"
+else
+    pass "no STARTED_EPOCH means held_secs is omitted, not emitted empty"
+fi
+case "$(emit_payload E2ELockAcquired)" in
+    *'"reclaimed":true'*) pass "the reclaimer's own acquire is flagged reclaimed" ;;
+    *) fail "reclaim acquire not flagged: $(emit_payload E2ELockAcquired)" ;;
+esac
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 13: an emit that FAILS never reds the run or strands the lock"
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    STUB_EXIT=1
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1 || exit 90
+    release_e2e_lock || exit 91
+)
+rc="$?"
+assert_eq "0" "$rc" "acquire + release stay rc 0 when the emit exits non-zero"
+assert_eq "0" "$([ -f "$EMIT_LOCK" ] && echo 1 || echo 0)" "the lock is still released when the emit fails"
+drain_emit E2ELockAcquired
+
+echo ""
+echo "Test 14: an emit that HANGS is abandoned, not waited out"
+# release_e2e_lock runs inside an EXIT trap. The CLI's own reqwest default is
+# 30s, and a `lucidos` wedged before its HTTP client exists is not covered by it
+# at all, so the bound has to live here.
+reset_emit_sandbox
+started="$(date +%s)"
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    # Far past the 1s bound, but short enough that the two `sleep`s the killed
+    # stubs leave re-parented do not outlive the suite by much.
+    STUB_SLEEP_S=8
+    E2E_LOCK_EMIT_TIMEOUT_S=1
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    release_e2e_lock
+) 2> "$OUT_DIR"/test-14.err
+rc="$?"
+elapsed=$(( $(date +%s) - started ))
+assert_eq "0" "$rc" "a hanging emit still returns 0"
+if [ "$elapsed" -lt 10 ]; then
+    pass "the hanging release emit cost ${elapsed}s, not 8 (bounded at 1s)"
+else
+    fail "teardown stalled ${elapsed}s on a hanging emit"
+fi
+assert_eq "0" "$([ -f "$EMIT_LOCK" ] && echo 1 || echo 0)" "the lock is still released past a hanging emit"
+if grep -q "emit exceeded 1s and was abandoned" "$OUT_DIR"/test-14.err; then
+    pass "the abandonment is logged, never silent"
+else
+    fail "a hanging emit was abandoned silently (stderr: $(cat "$OUT_DIR"/test-14.err))"
+fi
+drain_emit E2ELockAcquired
+
+echo ""
+echo "Test 14b: acquire does not block on its own announcement"
+# acquire_e2e_lock returns having TAKEN the lock, and both entry points install
+# their teardown only afterwards (scripts/e2e.sh, setup_e2e_session), so anything
+# it blocks on widens the window in which an interrupt leaves a stale lock nobody
+# releases and no waiter hears about. A wedged engine would have made that window
+# 10s on the reclaim path, which announces twice. Hence the backgrounding, and
+# hence this test: the release emit may block (its trap holds no lock), the
+# acquire emit may not.
+reset_emit_sandbox
+started="$(date +%s)"
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    STUB_SLEEP_S=8
+    E2E_LOCK_EMIT_TIMEOUT_S=5
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    # Deliberately no `wait` here: the whole point is that the caller gets on
+    # with arming its teardown instead of waiting for a decorative event.
+) 2>/dev/null
+elapsed=$(( $(date +%s) - started ))
+if [ "$elapsed" -lt 3 ]; then
+    pass "acquire returned in ${elapsed}s with the emit wedged (stale-lock window not widened)"
+else
+    fail "acquire blocked ${elapsed}s on its announcement, widening the stale-lock window"
+fi
+# It still has to HAPPEN, just not on the caller's clock. Draining it here also
+# keeps its write out of the next case's capture (see drain_emit).
+drain_emit E2ELockAcquired
+if [ -n "$(emit_call E2ELockAcquired)" ]; then
+    pass "the announcement still landed, just off the critical path"
+else
+    fail "backgrounding lost the announcement entirely"
+fi
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 14c: a short run cannot persist Released before Acquired"
+# The acquire announcement is backgrounded and the release one is not, so a run
+# that ends quickly could otherwise land them out of order and show a lock that
+# was released and then taken and never given back. A waiter does not care (it
+# watches only for a release), but a timeline that lies is the whole reason the
+# acquire event exists. Deterministic, not hopeful: the stub delays ONLY
+# E2ELockAcquired, so without the ordering the release always wins.
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    STUB_PREDELAY_EVENT=E2ELockAcquired
+    STUB_PREDELAY_S=1
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    release_e2e_lock          # no `wait`: release itself must do the ordering
+)
+order="$(awk -F'\t' '{ print $3 }' "$CAPTURE" | tr '\n' ' ')"
+case "$order" in
+    "E2ELockAcquired E2ELockReleased "*)
+        pass "acquired then released, in that order ($order)" ;;
+    *)
+        fail "lock events persisted out of order: $order" ;;
+esac
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 15: no lucidos on PATH is a clean no-op"
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    PATH="/usr/bin:/bin"
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1 || exit 90
+    release_e2e_lock || exit 91
+) > "$OUT_DIR"/test-15.out 2>&1
+rc="$?"
+assert_eq "0" "$rc" "acquire + release stay rc 0 with no lucidos CLI"
+assert_eq "0" "$([ -f "$EMIT_LOCK" ] && echo 1 || echo 0)" "the lock is still released with no lucidos CLI"
+if [ -s "$OUT_DIR"/test-15.out ]; then
+    fail "a missing CLI produced noise: $(cat "$OUT_DIR"/test-15.out)"
+else
+    pass "a missing CLI is silent (a manual run outside a workspace is normal)"
+fi
+
+echo ""
+echo "Test 16: the payload survives a worktree path full of JSON metacharacters"
+# WORKTREE is `$PWD` at acquire time, so it is arbitrary. release_events.sh gets
+# away with embedding raw literals because its values are fixed step ids and
+# N.N.N versions; that is not true here, and an unescaped quote would lose the
+# whole event to a parse error at the engine.
+reset_emit_sandbox
+WEIRD_DIR="$TMPROOT/"'q"uote and\back'
+mkdir -p "$WEIRD_DIR"
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    cd "$WEIRD_DIR" || exit 90
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait
+    release_e2e_lock
+)
+rel="$(emit_payload E2ELockReleased)"
+if printf '%s' "$rel" | python3 -c 'import json,sys; json.load(sys.stdin)' 2>/dev/null; then
+    pass "a worktree with a quote and a backslash still yields parseable JSON"
+else
+    fail "payload is not valid JSON: $rel"
+fi
+if printf '%s' "$rel" | python3 -c \
+    'import json,sys; d=json.load(sys.stdin); sys.exit(0 if d["worktree"].endswith("q\"uote and\\back") else 1)' \
+    2>/dev/null; then
+    pass "the escaped path round-trips to the real directory name"
+else
+    fail "the worktree did not round-trip: $rel"
+fi
+
+echo ""
+echo "Test 17: the refusal teaches the subscribe path, not a sleep loop"
+# An agent that never loaded the e2e-lock-wait skill has only this text to go on,
+# and on 2026-08-09 two of them read the old wording and wrote retry loops.
+reset_lock_dir
+acquire_e2e_lock e2e-browser >/dev/null 2>&1
+acquire_e2e_lock e2e-api > "$OUT_DIR"/test-17.out 2>&1
+if grep -q "await-event --on E2ELockReleased" "$OUT_DIR"/test-17.out; then
+    pass "the refusal spells out the await-event command"
+else
+    fail "the refusal does not name await-event"
+    echo "  ---"; cat "$OUT_DIR"/test-17.out; echo "  ---"
+fi
+if grep -qi "do NOT sleep, poll, or write a retry loop" "$OUT_DIR"/test-17.out; then
+    pass "the refusal names the anti-pattern it is replacing"
+else
+    fail "the refusal does not warn against polling"
+fi
+if grep -q "e2e-lock-wait" "$OUT_DIR"/test-17.out; then
+    pass "the refusal points at the skill carrying the full rules"
+else
+    fail "the refusal does not point at the skill"
+fi
+release_e2e_lock
+
+echo ""
+echo "Test 18: the refusal warns when the holder's release cannot reach us"
+# The lock is shared across every workspace on the machine, but an emit lands in
+# the emitting subprocess's own $LUCIDOS_WORKSPACE. A waiter that subscribes to a
+# holder in another workspace waits out its whole timeout, so say so up front.
+reset_lock_dir
+mkdir -p "$TMPROOT/ws-a" "$TMPROOT/ws-b"
+cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
+PID=$$
+THREAD_ID=other
+WORKTREE=$TMPROOT/ws-b/.lucidos/worktrees/thread-x
+STARTED=2020-01-01T00:00:00Z
+STARTED_EPOCH=1577836800
+SCRIPT=e2e-browser
+EOF
+( LUCIDOS_WORKSPACE="$TMPROOT/ws-a"; acquire_e2e_lock e2e-api ) > "$OUT_DIR"/test-18a.out 2>&1
+if grep -q "not reach this thread" "$OUT_DIR"/test-18a.out; then
+    pass "a holder in another workspace is called out in the refusal"
+else
+    fail "no cross-workspace note for a holder elsewhere"
+    echo "  ---"; cat "$OUT_DIR"/test-18a.out; echo "  ---"
+fi
+cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
+PID=$$
+THREAD_ID=other
+WORKTREE=$TMPROOT/ws-a/.lucidos/worktrees/thread-x
+STARTED=2020-01-01T00:00:00Z
+STARTED_EPOCH=1577836800
+SCRIPT=e2e-browser
+EOF
+( LUCIDOS_WORKSPACE="$TMPROOT/ws-a"; acquire_e2e_lock e2e-api ) > "$OUT_DIR"/test-18b.out 2>&1
+if grep -q "not reach this thread" "$OUT_DIR"/test-18b.out; then
+    fail "a same-workspace holder was wrongly reported as unreachable"
+else
+    pass "a holder in THIS workspace gets no note (its release does wake us)"
+fi
+# Cannot tell is not the same as another workspace: a manual terminal run has no
+# $LUCIDOS_WORKSPACE, and guessing there would warn every such run for nothing.
+( unset LUCIDOS_WORKSPACE; acquire_e2e_lock e2e-api ) > "$OUT_DIR"/test-18c.out 2>&1
+if grep -q "not reach this thread" "$OUT_DIR"/test-18c.out; then
+    fail "warned about the workspace gap with no LUCIDOS_WORKSPACE to compare against"
+else
+    pass "no workspace to compare against means no claim either way"
+fi
+rm -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+
+echo ""
+echo "Test 18b: a removal that FAILS is not announced as a release"
+# `rm -f` is silent about a missing file but not about a permission or
+# filesystem error. Announcing through one wakes every waiter onto a lock that is
+# still held: each retries, is refused, and spends one of its ten consecutive
+# subscriptions on a release that never happened. `rm` is shadowed for the
+# subshell, the same seam style as test 5's stubbed reaper.
+reset_emit_sandbox
+(
+    unset E2E_LOCK_DIR_OVERRIDE
+    E2E_LOCK_OWNED=""
+    acquire_e2e_lock e2e-browser >/dev/null 2>&1
+    wait                                 # let the backgrounded acquire emit land
+    : > "$CAPTURE"                       # then drop it
+    rm() { return 1; }
+    release_e2e_lock
+) 2> "$OUT_DIR"/test-18d.err
+assert_eq "0" "$?" "a failed removal still returns 0 (never reds a run)"
+assert_eq "1" "$([ -f "$EMIT_LOCK" ] && echo 1 || echo 0)" "the lock file is still there, as the failure implies"
+if [ -n "$(emit_call E2ELockReleased)" ]; then
+    fail "announced a release the removal never performed: $(emit_call E2ELockReleased)"
+else
+    pass "no E2ELockReleased when the lock was not actually released"
+fi
+if grep -q "STILL HELD" "$OUT_DIR"/test-18d.err; then
+    pass "the failure is reported loudly instead of passing for a release"
+else
+    fail "a failed removal was silent (stderr: $(cat "$OUT_DIR"/test-18d.err))"
+fi
+rm -f "$EMIT_LOCK"
+
+echo ""
+echo "Test 19: release skips a lock another run has taken over, but not a broken one"
+# "Only removes the lock if we own it" used to mean only that this shell had set
+# E2E_LOCK_OWNED. A run whose pid another process could not reach with `kill -0`
+# (a different user on the host) has its lock legitimately reclaimed, and this
+# function would then delete the new owner's file on the way out.
+reset_lock_dir
+cat > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" <<EOF
+PID=999999
+THREAD_ID=someone-else
+WORKTREE=/tmp/someone-else
+STARTED=2020-01-01T00:00:00Z
+STARTED_EPOCH=1577836800
+SCRIPT=e2e-api
+EOF
+E2E_LOCK_OWNED="$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+release_e2e_lock 2> "$OUT_DIR"/test-19.err
+assert_eq "1" "$([ -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" ] && echo 1 || echo 0)" "a lock now held by another PID is left alone"
+if grep -q "held by PID 999999 now, not us" "$OUT_DIR"/test-19.err; then
+    pass "the skip is announced, never silent"
+else
+    fail "release skipped silently (stderr: $(cat "$OUT_DIR"/test-19.err))"
+fi
+# The other direction matters more: a lock file we cannot read a pid out of must
+# still be removed. Leaving it would wedge every future run behind a refusal
+# whose stale-owner branch needs a pid it will never find.
+reset_lock_dir
+printf 'SCRIPT=e2e-api\n' > "$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+E2E_LOCK_OWNED="$E2E_LOCK_DIR_OVERRIDE/e2e.lock"
+release_e2e_lock 2>/dev/null
+assert_eq "0" "$([ -f "$E2E_LOCK_DIR_OVERRIDE/e2e.lock" ] && echo 1 || echo 0)" "a lock with no readable PID is still removed (no wedge)"
+
+echo ""
+echo "Test 19b: a lock file with no trailing newline keeps its last field"
+# `while read` returns non-zero on a final line with no newline, having already
+# filled the variables, so the plain form drops it. SCRIPT is written last, so
+# the lost field is the one the refusal names.
+printf 'PID=123\nWORKTREE=/tmp/w\nSCRIPT=e2e-api' > "$TMPROOT/lock-no-newline"
+_e2e_read_lock_file "$TMPROOT/lock-no-newline"
+assert_eq "123" "$_E2E_LK_PID" "an unterminated lock file still yields earlier fields"
+assert_eq "e2e-api" "$_E2E_LK_SCRIPT" "and still yields the LAST field"
+rm -f "$TMPROOT/lock-no-newline"
+
+echo ""
+echo "Test 20: a malformed STARTED_EPOCH degrades quietly"
+# `_e2e_lock_held_secs` is read through a command substitution inside an EXIT
+# trap under `set -e`, so it must exit 0 whatever it is handed, and it must not
+# leak bash's "integer expression expected" over a lock file it has already
+# given up on.
+for bad in "" "not-a-number" "99999999999999999999999" "-5"; do
+    out="$(_e2e_lock_held_secs "$bad" 2>"$OUT_DIR"/test-20.err)"
+    rc=$?
+    assert_eq "0" "$rc" "held_secs exits 0 for STARTED_EPOCH='$bad'"
+    assert_eq "" "$out" "held_secs is empty for STARTED_EPOCH='$bad'"
+    if [ -s "$OUT_DIR"/test-20.err ]; then
+        fail "held_secs leaked to stderr for '$bad': $(cat "$OUT_DIR"/test-20.err)"
+    else
+        pass "held_secs is silent for STARTED_EPOCH='$bad'"
+    fi
+done
+out="$(_e2e_lock_held_secs "$(( $(date +%s) - 42 ))")"
+assert_eq "42" "$out" "held_secs still measures a well-formed epoch"
+
+echo ""
+echo "Test 21: a failed lock-file read does not abort the EXIT trap under \`set -e\`"
+# release_e2e_lock runs from an EXIT trap in every entry script, all of which set
+# -e, and it reads the lock file with a bare call. A bare call to a function that
+# returns non-zero takes `set -e` with it, so a read failing there truncates the
+# rest of teardown rather than reporting anything.
+#
+# The window is real but not reproducible by timing (the file has to vanish
+# between the `-f` test and the read), so the read is stubbed to fail, exactly as
+# test 5 stubs the reaper. The stub clears the fields first, mirroring the real
+# one, so the case does not lean on whatever the previous test left behind.
+#
+# The subshell is a BARE statement, deliberately. Wrapping it in `if ( ... );
+# then` reads naturally and is inert: bash suppresses errexit for everything in
+# an `if` condition, subshells and the functions they call included, so the
+# earlier shape passed identically with and without the fix. The same rule is why
+# `acquire_e2e_lock` needs no test here: both entry points invoke it as
+# `acquire_e2e_lock <label> || exit 1`, and a `||` list suppresses errexit inside
+# the function too.
+rm -f "$OUT_DIR"/test-21.marker
+reset_lock_dir
+acquire_e2e_lock e2e-browser >/dev/null 2>&1
+( set -e
+  _e2e_read_lock_file() {
+      _E2E_LK_PID=""; _E2E_LK_THREAD=""; _E2E_LK_WORKTREE=""
+      _E2E_LK_STARTED=""; _E2E_LK_STARTED_EPOCH=""; _E2E_LK_SCRIPT=""
+      return 1
+  }
+  release_e2e_lock >/dev/null 2>&1
+  echo reached > "$OUT_DIR"/test-21.marker )
+assert_eq "0" "$?" "release_e2e_lock returns to its caller when the read fails"
+assert_eq "reached" "$(cat "$OUT_DIR"/test-21.marker 2>/dev/null)" "the teardown step after release still ran"
+release_e2e_lock >/dev/null 2>&1
 
 # ── Summary ──────────────────────────────────────────────────────────────
 echo ""

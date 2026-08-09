@@ -1,4 +1,5 @@
-import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, bootstrappingThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, drawerView, threadSearchQuery, threadSearchResults } from '../store';
+import { showToast, showConfirm, threadMap, archivingThreadIds, applyingNowThreadIds, discardingCCThreadIds, revealOnFocus, resetCodingAgentPendingPreferences, setFocusedThread, focusedThreadId, bootstrappingThreadId, drawerView, threadSearchQuery, threadSearchResults } from '../store';
+import { appliedThreadFilter } from '../appliedThreadFilter';
 import { revealThreadPane } from './pane';
 import type { ThreadSection, ThreadState } from '../thread-events';
 import { describeWaitSubscription } from '../thread-events';
@@ -10,9 +11,8 @@ import { saveThread, unsaveThread, archiveThread } from '../../api/threads';
 import { ApiError, putComposeOnThread } from '../../api/client';
 import { loadThreadEvents, ensureThreadByIdInMap, refreshStaleThreadEvents, sectionMutatedAt } from './thread-loading';
 import { clearDraft, draftPresentThreadIds, getDraft, setDraft, type ComposeDraft } from '../composeDrafts';
-import { scrollToBottom, scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll } from '../../components/chat/scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, clearPendingEventScroll, stopFollowingBottom } from '../../components/chat/scrollState';
 import { pushThreadNavState } from './thread-navigation';
-import { hasSavedScroll, threadScrollKey } from '../../hooks/useScrollMemory';
 import { errorDetail } from '../../utils/errorDetail';
 
 // ---------------------------------------------------------------------------
@@ -45,14 +45,13 @@ export interface FocusThreadOptions {
 }
 
 export function focusThread(threadId: string, options?: FocusThreadOptions): void {
+  const wasFocused = focusedThreadId.value === threadId;
   setFocusedThread(threadId);
   resetCodingAgentPendingPreferences();
-  // Scroll to bottom and suppress ResizeObserver so content rendering
-  // doesn't set scrolledUp=true before useAutoScroll can scroll down.
-  // Skip when the target has a saved scroll — the 500ms pinning loop
-  // would override useScrollMemory's restore.
-  // Skip too when a deep-link target (event or change) is provided — the
-  // matching scrollTo*AndPulse owns the scroll target in that case.
+  // Focusing a thread does NOT position its transcript. `useScrollMemory` owns
+  // that: a saved position is restored, and a thread with none opens at the top
+  // of what is rendered (see ThreadView's `resetOnEmpty`). A deep-link target
+  // (event or change) overrides both, via the matching scrollTo*AndPulse below.
   const targetEventId = options?.targetEventId ?? null;
   // targetEventId wins when both are set (notification deep-link is more
   // specific than a Changes-row landing on the originating turn).
@@ -62,7 +61,26 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // claim from a prior focus, so its suppression can't leak onto this thread's
   // load. A deep-link focus re-claims below via scrollTo*AndPulse.
   if (!hasTarget) clearPendingEventScroll();
-  if (!hasTarget && !hasSavedScroll(threadScrollKey(threadId))) scrollToBottom();
+  // A standing follow belongs to the thread it was armed in. Opening a DIFFERENT
+  // thread is not asking to ride its live edge, and the position this one
+  // restores to may BE its bottom, which writes no scroll for the reader-moved
+  // disarm to notice. Retire it here instead.
+  //
+  // This costs the thread being LEFT nothing: its request was recorded as the
+  // live-edge form of its reading position while it was on screen, and only the
+  // ARM is broadcast to the recording side, so a retire writes nothing (see
+  // `onFollowArmed`). Re-entry resumes it.
+  //
+  // Re-focusing the thread the reader is ALREADY in is not an open at all, so it
+  // retires nothing: there is no incoming thread to protect, the reader asked for
+  // nothing, and `useScrollMemory` does not re-run on an unchanged key, so a
+  // retire here would silently end a follow with nothing left to resume it.
+  //
+  // The one caller that reaches here with the focus ALREADY moved is
+  // `focusThreadOrBootstrapResult`'s miss path, which focuses optimistically
+  // before its fetch. It retires at that optimistic focus instead, which is the
+  // moment its navigation actually leaves a thread.
+  if (!wasFocused) stopFollowingBottom();
   // notAtTop is NOT reset here — syncNotAtTop() in the scroll listener owns
   // it exclusively. Manual resets cause the chevron to vanish when no scroll
   // event fires (e.g. re-focusing the same thread where scrollTop is unchanged).
@@ -88,13 +106,12 @@ export function focusThread(threadId: string, options?: FocusThreadOptions): voi
   // A deep-link whose target never renders (the event isn't in this thread, it
   // renders nothing, or the thread was still loading when the resolve deadline
   // closed) used to end in silence, so the notification tap just looked broken.
-  // scrollState handles the recovery scroll and calls back here for the words:
-  // it stays free of the `store` import that `showToast` would drag in.
+  // scrollState calls back here for the words: it stays free of the `store`
+  // import that `showToast` would drag in.
   //
   // The message deliberately does NOT claim where the user was taken, because
-  // the recovery scroll is conditional (it stands down for a user who scrolled
-  // away during the wait) while the message is not. It does not name the SOURCE
-  // either: a notification tap is no longer the only way in, since the event-wait
+  // they are not taken anywhere: the transcript stays exactly where it was, and
+  // the toast is the whole recovery. It does not name the SOURCE either: a notification tap is no longer the only way in, since the event-wait
   // card's "show it" (`showEventWhereItLives`) lands here too, and telling that
   // user about a notification they never received would be a plain lie.
   if (targetEventId) {
@@ -156,6 +173,13 @@ export async function focusThreadOrBootstrapResult(
   const previousFocus = focusedThreadId.value;
   bootstrappingThreadId.value = threadId;
   setFocusedThread(threadId);
+  // This optimistic focus IS the navigation away from the previous thread, so
+  // the standing follow retires HERE. The `focusThread` at the end cannot do it:
+  // by then this thread is already the focused one, so its same-thread gate
+  // reads "nothing was left" and would keep the PREVIOUS thread's follow armed
+  // over the one being opened, which would then ride a live edge nobody asked
+  // for and record that borrowed request as its own reading position.
+  if (previousFocus !== threadId) stopFollowingBottom();
   // Same opt-out as the hit path above, so `revealPane: false` means the same
   // thing whichever branch a caller lands on.
   if (options?.revealPane !== false) revealThreadPane();
@@ -239,6 +263,12 @@ export function unfocusThread(opts?: { revealPane?: boolean }): void {
   setFocusedThread(null);
   revealOnFocus.value = false;
   resetCodingAgentPendingPreferences();
+  // Same rule as `focusThread`'s retire, for the surface it forgot: the compose
+  // view has its own scroll container and registers itself as the active one
+  // (`CreateThreadView`'s `useScrollObservers`), so a follow armed in a thread
+  // would ride the compose view's growth instead. Nothing is lost by retiring,
+  // since the thread's own request is recorded under its reading position.
+  stopFollowingBottom();
   if (opts?.revealPane !== false) revealThreadPane();
 }
 
@@ -340,10 +370,10 @@ export async function handleUnsaveThread(threadId: string): Promise<void> {
 function visibleThreadsAndGraph(): { visible: ThreadState[]; graph: FamilyGraph } {
   const all = Array.from(threadMap.value.values());
   const graph = computeFamilyGraph(all);
-  const filter = threadChannelFilter.value;
-  const triggerSelection = selectedTriggerIds.value;
-  const repoSelection = selectedRepoIds.value;
-  const appSelection = selectedAppIds.value;
+  // The *applied* selection, which is what the drawer is showing: while the
+  // thread filter panel is up it holds still, and the row the focus lands on
+  // has to be one the user can actually click (see `appliedThreadFilter`).
+  const { channels: filter, triggerIds: triggerSelection, repoIds: repoSelection, appIds: appSelection } = appliedThreadFilter.value;
   // A trigger/repo/app sub-selection flips the gate to any-member matching,
   // mirroring the drawer so a coding-agent thread in the selected repo/app surfaces with
   // its family even when the root's channel is filtered out.
@@ -578,9 +608,6 @@ export async function handleArchiveThread(threadId: string): Promise<void> {
     });
     if (!proceed) return;
   }
-
-  // Pin to bottom and show header before banner re-renders
-  scrollToBottom();
 
   // Clear stale apply state — applying and archiving are mutually exclusive.
   // If the user is archiving, any in-progress or stale apply is abandoned.

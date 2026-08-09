@@ -552,3 +552,220 @@ async fn list_rejects_a_malformed_parent() {
         "a malformed parent id must be rejected, not ignored"
     );
 }
+
+/// The reason the `status` filter exists. `active=true` is the union of
+/// `running` and `waiting_for_user_answer`, so an idle detector gated on it
+/// stays silent for as long as anybody is parked on an unanswered question. On
+/// 2026-08-07 that hid four pending changes for three hours. `status=running`
+/// is the same question asked precisely, and it must not pick up the parked
+/// thread.
+#[tokio::test]
+async fn status_running_excludes_a_thread_parked_on_a_question() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let marker = unique_marker("api-threads-status-running");
+
+    seed_summary_row(
+        &pool,
+        &format!("{marker}-running"),
+        "chat",
+        ThreadStatus::Running,
+    )
+    .await;
+    seed_summary_row(
+        &pool,
+        &format!("{marker}-wait-user"),
+        "claude_code",
+        ThreadStatus::WaitingForUserAnswer,
+    )
+    .await;
+
+    let url = format!(
+        "{}/api/v1/threads/list?status=running&limit=1000",
+        base_url()
+    );
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("status=running request")
+        .json()
+        .await
+        .expect("invalid JSON");
+
+    let titles: Vec<&str> = rows_with_title_prefix(&body, &marker)
+        .iter()
+        .filter_map(|r| r["title"].as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        [format!("{marker}-running").as_str()],
+        "status=running must return the working thread and ONLY it: a thread \
+         awaiting a user answer is blocked on the human, not working"
+    );
+}
+
+/// The other direction of the same split: "is anything waiting on me?" must
+/// not count the thread that is busy working.
+#[tokio::test]
+async fn status_waiting_for_user_answer_excludes_a_running_thread() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let marker = unique_marker("api-threads-status-awaiting");
+
+    seed_summary_row(
+        &pool,
+        &format!("{marker}-running"),
+        "chat",
+        ThreadStatus::Running,
+    )
+    .await;
+    seed_summary_row(
+        &pool,
+        &format!("{marker}-wait-user"),
+        "claude_code",
+        ThreadStatus::WaitingForUserAnswer,
+    )
+    .await;
+
+    let url = format!(
+        "{}/api/v1/threads/list?status=waiting_for_user_answer&limit=1000",
+        base_url()
+    );
+    let body: serde_json::Value = client
+        .get(&url)
+        .send()
+        .await
+        .expect("status=waiting_for_user_answer request")
+        .json()
+        .await
+        .expect("invalid JSON");
+
+    let titles: Vec<&str> = rows_with_title_prefix(&body, &marker)
+        .iter()
+        .filter_map(|r| r["title"].as_str())
+        .collect();
+    assert_eq!(
+        titles,
+        [format!("{marker}-wait-user").as_str()],
+        "status=waiting_for_user_answer must exclude the running thread"
+    );
+}
+
+/// A list can be filtered client-side; a count cannot. `count` is the surface
+/// an idle detector actually calls, so it has to honour `status` too.
+#[tokio::test]
+async fn count_honours_the_status_filter() {
+    let client = http_client();
+    let pool = sqlx::PgPool::connect(&db_url()).await.expect("connect db");
+    let marker = unique_marker("api-threads-count-status");
+
+    let parent = seed_summary_row(
+        &pool,
+        &format!("{marker}-parent"),
+        "chat",
+        ThreadStatus::Idle,
+    )
+    .await;
+    seed_child_row(
+        &pool,
+        &format!("{marker}-child-running"),
+        parent,
+        ThreadStatus::Running,
+    )
+    .await;
+    for i in 0..2 {
+        seed_child_row(
+            &pool,
+            &format!("{marker}-child-parked-{i}"),
+            parent,
+            ThreadStatus::WaitingForUserAnswer,
+        )
+        .await;
+    }
+
+    // Scoped to one parent so parallel tests' rows cannot move the number.
+    let count = |status: &str| {
+        let url = format!(
+            "{}/api/v1/threads/count?parent={parent}&status={status}",
+            base_url()
+        );
+        let client = client.clone();
+        async move {
+            let body: serde_json::Value = client
+                .get(&url)
+                .send()
+                .await
+                .expect("count request")
+                .json()
+                .await
+                .expect("invalid JSON");
+            body["count"].as_i64().expect("count is an integer")
+        }
+    };
+
+    assert_eq!(count("running").await, 1, "one child is actually working");
+    assert_eq!(
+        count("waiting_for_user_answer").await,
+        2,
+        "two children are parked on a question"
+    );
+    assert_eq!(
+        count("running,waiting_for_user_answer").await,
+        3,
+        "naming both statuses is the union, and agrees with active=true"
+    );
+
+    let active_url = format!(
+        "{}/api/v1/threads/count?parent={parent}&active=true",
+        base_url()
+    );
+    let active_body: serde_json::Value = client
+        .get(&active_url)
+        .send()
+        .await
+        .expect("active count request")
+        .json()
+        .await
+        .expect("invalid JSON");
+    assert_eq!(
+        active_body["count"].as_i64(),
+        Some(3),
+        "active=true is unchanged: it still returns the union of both states"
+    );
+}
+
+/// Two answers to one question. Silently intersecting them would make
+/// `active=true&status=idle` an empty result that reads as "nothing matched".
+#[tokio::test]
+async fn active_and_status_together_is_rejected() {
+    let client = http_client();
+    for path in ["list", "count"] {
+        let url = format!(
+            "{}/api/v1/threads/{path}?active=true&status=running",
+            base_url()
+        );
+        let response = client.get(&url).send().await.expect("conflict request");
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "{path} must refuse active and status together, not intersect them"
+        );
+    }
+}
+
+/// A typo that silently returned zero rows would read as "the workspace is
+/// quiet", which is the failure this filter exists to prevent.
+#[tokio::test]
+async fn an_unknown_status_is_rejected_rather_than_matching_nothing() {
+    let client = http_client();
+    for raw in ["runnign", ""] {
+        let url = format!("{}/api/v1/threads/list?status={raw}", base_url());
+        let response = client.get(&url).send().await.expect("bad status request");
+        assert_eq!(
+            response.status().as_u16(),
+            400,
+            "status={raw:?} must be refused, not read as an empty or absent filter"
+        );
+    }
+}

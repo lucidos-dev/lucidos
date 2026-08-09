@@ -172,6 +172,8 @@ fn trigger_started_can_carry_scheduler_origin() {
             },
         }),
         go_to_review: false,
+        model: None,
+        reasoning_effort: None,
     };
     let json = serde_json::to_value(&event).unwrap();
     assert_eq!(json["type"], "TriggerStarted");

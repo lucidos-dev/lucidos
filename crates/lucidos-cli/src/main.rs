@@ -28,6 +28,7 @@ mod data;
 mod data_store;
 mod event_waits;
 mod events;
+mod frontend_preview;
 /// Manifest-generated subcommands (one per `cli = true` capability domain).
 /// AUTO-GENERATED content; wire each enum below. See
 /// `crates/lucidos-engine/src/capability_manifest/`.
@@ -132,11 +133,28 @@ enum Command {
         #[command(subcommand)]
         action: PlannedCmd,
     },
-    /// MCP stdio server invoked by Claude Code as `--permission-prompt-tool`.
-    /// Forwards each permission request to the parent engine and blocks on the
-    /// user's decision. Hidden from `--help`; not meant for direct invocation.
+    /// Start, stop, or inspect the frontend preview: a Vite dev server the
+    /// engine supervises inside a coding-agent worktree, on its own port, so a
+    /// TypeScript or CSS change is visible in the real app BEFORE Apply. The
+    /// engine owns the process because one a coding agent starts itself dies
+    /// with its turn. Development only, and refused on a packaged install.
+    #[command(name = "frontend-preview")]
+    FrontendPreview {
+        #[command(subcommand)]
+        action: FrontendPreviewCmd,
+    },
+    /// MCP stdio server invoked by Claude Code as `--permission-prompt-tool`,
+    /// and by Codex as its `ask_user_question` provider. Forwards each request
+    /// to the parent engine and blocks on the user's decision. Hidden from
+    /// `--help`; not meant for direct invocation.
     #[command(name = "mcp-permission-server", hide = true)]
-    McpPermissionServer,
+    McpPermissionServer {
+        /// Advertise only the `approve` permission tool, hiding
+        /// `ask_user_question`. Passed by Claude Code, which has its own
+        /// `AskUserQuestion` tool: see `mcp_permission_server::ToolSet`.
+        #[arg(long)]
+        permission_only: bool,
+    },
     /// PreToolUse hook subcommand invoked by Claude Code via .lucidos/cc-settings.json
     /// when the AskUserQuestion tool fires. Reads the hook payload from stdin,
     /// long-polls the parent engine for the user's answer, prints the protocol-required
@@ -360,14 +378,18 @@ enum ChangesCmd {
 enum ThreadsCmd {
     /// List thread summaries as JSON. Newest-first.
     ///
-    /// `--active` restricts to threads where the agentic loop is mid-flow
-    /// (`status` of `running` or `waiting_for_user_answer`). Status
-    /// `waiting` is *not* active — it means the coding agent has stopped and proposed
-    /// changes the user must act on; the loop has paused.
+    /// `--active` is the UNION of `running` and `waiting_for_user_answer`. For
+    /// "is the workspace busy?", use `--status running`: a thread awaiting a
+    /// user answer is blocked on the human, not working. Status `waiting` is in
+    /// neither, and means the coding agent has stopped and proposed changes the
+    /// user must act on.
     List {
-        /// Restrict to active threads only.
+        /// Restrict to the active union: `running` OR `waiting_for_user_answer`. For "is the workspace busy?" use `--status running` instead, since a thread awaiting a user answer is blocked on the human, not working.
         #[arg(long)]
         active: bool,
+        /// Restrict to exactly these statuses (repeatable, or comma-separated): idle, running, waiting, waiting_for_user_answer, paused, failed. The precise form of `--active`, and mutually exclusive with it.
+        #[arg(long, conflicts_with = "active")]
+        status: Vec<String>,
         /// Comma-separated source filter (`chat`, `trigger`, `coding-agent`; legacy `claude_code` also accepted).
         #[arg(long)]
         source: Option<String>,
@@ -385,10 +407,17 @@ enum ThreadsCmd {
     },
     /// Count thread summaries matching the same filters as `list`.
     /// Outputs `{ "count": N }`.
+    ///
+    /// `--active` is the UNION of `running` and `waiting_for_user_answer`, so a
+    /// nonzero count does NOT mean work is in flight. An idle detector asking
+    /// "is the workspace quiet?" wants `--status running`.
     Count {
-        /// Restrict to active threads only.
+        /// Restrict to the active union: `running` OR `waiting_for_user_answer`. For "is the workspace busy?" use `--status running` instead, since a thread awaiting a user answer is blocked on the human, not working.
         #[arg(long)]
         active: bool,
+        /// Restrict to exactly these statuses (repeatable, or comma-separated): idle, running, waiting, waiting_for_user_answer, paused, failed. The precise form of `--active`, and mutually exclusive with it.
+        #[arg(long, conflicts_with = "active")]
+        status: Vec<String>,
         /// Comma-separated source filter (`chat`, `trigger`, `coding-agent`; legacy `claude_code` also accepted).
         #[arg(long)]
         source: Option<String>,
@@ -683,6 +712,23 @@ enum HardenedCmd {
 }
 
 #[derive(Subcommand)]
+enum FrontendPreviewCmd {
+    /// Start (or move) the frontend preview onto a thread's worktree. Replaces
+    /// any running preview: there is one slot per workspace. Prints the URL to
+    /// open, built from the host this command reached the engine on.
+    Start {
+        /// Thread whose coding-agent worktree to serve. Defaults to
+        /// `$LUCIDOS_THREAD_ID`, which every coding-agent subprocess carries.
+        #[arg(long)]
+        thread_id: Option<String>,
+    },
+    /// Stop the running frontend preview, if any.
+    Stop,
+    /// Print what the frontend preview is currently serving, if anything.
+    Status,
+}
+
+#[derive(Subcommand)]
 enum PlannedCmd {
     /// Record a Planned marker for the current branch (in $PWD). Pass exactly
     /// one of `--plan <docs/plans/file>` (a real implementation plan was
@@ -916,8 +962,23 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             }
             Ok(0)
         }
-        Command::McpPermissionServer => {
-            mcp_permission_server::run()?;
+        Command::FrontendPreview { action } => {
+            let ws = resolve_from_env()?;
+            match action {
+                FrontendPreviewCmd::Start { thread_id } => {
+                    frontend_preview::cmd_start(&ws, thread_id.as_deref())?
+                }
+                FrontendPreviewCmd::Stop => frontend_preview::cmd_stop(&ws)?,
+                FrontendPreviewCmd::Status => frontend_preview::cmd_status(&ws)?,
+            }
+            Ok(0)
+        }
+        Command::McpPermissionServer { permission_only } => {
+            mcp_permission_server::run(if permission_only {
+                mcp_permission_server::ToolSet::PermissionOnly
+            } else {
+                mcp_permission_server::ToolSet::All
+            })?;
             Ok(0)
         }
         Command::AskUserQuestionHook => {
@@ -1010,6 +1071,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
             match action {
                 ThreadsCmd::List {
                     active,
+                    status,
                     source,
                     limit,
                     parent,
@@ -1018,6 +1080,7 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                     &ws,
                     threads::ListFilters {
                         active: if active { Some(true) } else { None },
+                        status: &status,
                         source: source.as_deref(),
                         limit,
                         parent: threads::resolve_parent_filter(
@@ -1029,22 +1092,26 @@ fn run(cli: Cli) -> Result<u8, workspace::BoxError> {
                 )?,
                 ThreadsCmd::Count {
                     active,
+                    status,
                     source,
                     parent,
                     my_children,
-                } => {
-                    let parent = threads::resolve_parent_filter(
-                        parent,
-                        my_children,
-                        threads::source_thread_id_from_env(),
-                    )?;
-                    threads::cmd_count(
-                        &ws,
-                        if active { Some(true) } else { None },
-                        source.as_deref(),
-                        parent.as_deref(),
-                    )?
-                }
+                } => threads::cmd_count(
+                    &ws,
+                    threads::ListFilters {
+                        active: if active { Some(true) } else { None },
+                        status: &status,
+                        source: source.as_deref(),
+                        // `count` takes no --limit: a COUNT(*) has no page to
+                        // size. Same reuse the store and HTTP layers make.
+                        limit: None,
+                        parent: threads::resolve_parent_filter(
+                            parent,
+                            my_children,
+                            threads::source_thread_id_from_env(),
+                        )?,
+                    },
+                )?,
                 ThreadsCmd::FollowUp {
                     thread,
                     message,
@@ -1166,6 +1233,71 @@ mod tests {
                 "{forbidden} must not exist on follow-up: the caller is authenticated, not stated"
             );
         }
+    }
+
+    /// `--status` is the precise form of `--active`, and both `list` and
+    /// `count` carry it: an idle detector calls `count`, which is the surface
+    /// the union misled on 2026-08-07.
+    #[test]
+    fn threads_list_and_count_both_offer_the_status_filter() {
+        for path in [["threads", "list"], ["threads", "count"]] {
+            let flags = subcommand_flags(&path);
+            assert!(
+                flags.contains(&"--status".to_string()),
+                "{path:?} must expose --status: {flags:?}"
+            );
+            assert!(
+                flags.contains(&"--active".to_string()),
+                "{path:?} keeps --active unchanged for existing callers: {flags:?}"
+            );
+        }
+    }
+
+    /// Two answers to one question. Left to compose, `--active --status idle`
+    /// would return nothing and read as "the workspace is quiet".
+    #[test]
+    fn active_and_status_cannot_be_combined() {
+        for path in [["threads", "list"], ["threads", "count"]] {
+            let argv = [
+                "lucidos", "threads", path[1], "--active", "--status", "running",
+            ];
+            let err = Cli::command()
+                .try_get_matches_from(argv)
+                .expect_err("--active with --status must be refused, not intersected");
+            let rendered = err.to_string();
+            assert!(
+                rendered.contains("--active") && rendered.contains("--status"),
+                "the refusal must name both flags: {rendered}"
+            );
+        }
+    }
+
+    /// Both spellings of one filter reach the engine, so a caller who follows
+    /// the repo's kebab-case convention is not punished for it.
+    #[test]
+    fn status_accepts_repeats_and_comma_separated_values() {
+        let matches = Cli::command()
+            .try_get_matches_from([
+                "lucidos",
+                "threads",
+                "count",
+                "--status",
+                "running",
+                "--status",
+                "failed,paused",
+            ])
+            .expect("--status is repeatable");
+        let values: Vec<&String> = matches
+            .subcommand_matches("threads")
+            .and_then(|m| m.subcommand_matches("count"))
+            .expect("threads count")
+            .get_many::<String>("status")
+            .expect("status values")
+            .collect();
+        assert_eq!(
+            values,
+            [&"running".to_string(), &"failed,paused".to_string()]
+        );
     }
 
     /// The child-listing filter is spelled the same at every layer: `parent`

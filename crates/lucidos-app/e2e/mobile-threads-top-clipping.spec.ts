@@ -1,6 +1,16 @@
 /**
- * Regression test: the top of the mobile threads list must not be clipped
- * by the fixed mobile header on iOS PWA.
+ * Regression tests: nothing the mobile threads pane shows at its top may be
+ * clipped by the fixed mobile header. Two views live in that pane and each is
+ * its own scroll container, so each has to reserve the header height itself:
+ * the thread list, and the filter panel that covers it.
+ *
+ * Test 1 (the list) is about the header's MEASURED height going stale on iOS
+ * PWA; test 2 (the filter panel) is about a scroll container missing the
+ * spacer entirely. Same visible symptom, different halves of the mechanism.
+ * The rest of this block is test 1; test 2 carries its own note at its site.
+ *
+ * TEST 1. The top of the mobile threads list must not be clipped by the fixed
+ * mobile header on iOS PWA.
  *
  * The header is `position: fixed` and sits above the swipe panes. The
  * threads pane's scroll container (`.thread-drawer-list`) uses a `::before`
@@ -27,11 +37,11 @@
  * changed) the observer must catch.
  */
 import { test, expect } from './fixtures';
-import { assertHealthy, ensureMobileView, navigateToApp, sendMessage, uniqueMessage, waitForResponse } from './helpers';
+import { assertHealthy, clickVisibleElement, ensureMobileView, navigateToApp, sendMessage, uniqueMessage, waitForResponse, waitForVisibleElement } from './helpers';
 
 const SIMULATED_SAFE_AREA_TOP_PX = 59; // iPhone 14 Pro dynamic-island inset
 
-test.describe('Mobile threads list — top row not clipped under header', () => {
+test.describe('Mobile threads pane: top content not clipped under header', () => {
   test.use({ viewport: { width: 375, height: 812 } });
 
   test.beforeEach(async ({ page }) => {
@@ -124,6 +134,67 @@ test.describe('Mobile threads list — top row not clipped under header', () => 
       `--mobile-header-height=${cssVar} (${cssVarPx}px). ` +
       `Either useHideOnScroll's ResizeObserver missed the padding change ` +
       `(needs box: 'border-box') or the CSS fallback is too short.`,
+    ).toBeGreaterThanOrEqual(headerBottom - 1);
+  });
+
+  /**
+   * The filter panel COVERS the thread list inside the same pane and scrolls
+   * on its own (`.thread-filter-panel`, position:absolute inset:0 over
+   * `.thread-drawer-list`). So it inherits nothing from the list's header
+   * spacer and needs its own, which it shipped without: the panel's first
+   * Status rows rendered behind the fixed header.
+   *
+   * No safe-area simulation here. This half fails with the header at its
+   * ordinary height, because the pane starts at the viewport top and a panel
+   * with no spacer starts there with it.
+   */
+  test('filter panel Status rows start below the header', async ({ page }) => {
+    await navigateToApp(page);
+    await ensureMobileView(page, 'threads');
+
+    // Wait for the button to be laid out before clicking it. `ensureMobileView`
+    // resolves as soon as the header's data-mobile-view flips, which is what
+    // makes the threads row displayable, not what proves it has been measured.
+    // Without the wait a loaded run can catch a zero-rect button and fail on
+    // "button not visible" instead of on the geometry this test guards.
+    await waitForVisibleElement(page, 'button[aria-label="Filter threads"]', 10_000);
+    const opened = await clickVisibleElement(page, 'button[aria-label="Filter threads"]');
+    expect(opened, 'Filter threads button not visible in the mobile threads header').toBe(true);
+
+    await page.waitForFunction(() => {
+      const row = document.querySelector('.mobile-swipe-pane .thread-filter-panel .drawer-view-option');
+      return !!row && row.getBoundingClientRect().height > 0;
+    }, undefined, { timeout: 10_000 });
+
+    const result = await page.evaluate(() => {
+      const header = document.querySelector('.app-header');
+      const panel = document.querySelector('.mobile-swipe-pane .thread-filter-panel');
+      const firstRow = document.querySelector('.mobile-swipe-pane .thread-filter-panel .drawer-view-option');
+      if (!header || !panel || !firstRow) return { error: 'missing header, panel or row' };
+      return {
+        headerBottom: header.getBoundingClientRect().bottom,
+        panelScrollTop: (panel as HTMLElement).scrollTop,
+        rowTop: firstRow.getBoundingClientRect().top,
+        rowLabel: (firstRow.textContent ?? '').trim(),
+      };
+    });
+
+    expect(result).not.toHaveProperty('error');
+    const { headerBottom, panelScrollTop, rowTop, rowLabel } = result as {
+      headerBottom: number; panelScrollTop: number; rowTop: number; rowLabel: string;
+    };
+
+    // Sanity: the panel is at its top, so the row's position is its resting
+    // one and not the product of a scroll.
+    expect(panelScrollTop).toBe(0);
+
+    // 1px subpixel tolerance, as in the list test above.
+    expect(
+      rowTop,
+      `first Status row ("${rowLabel}") top (${rowTop}) is above header bottom ` +
+      `(${headerBottom}), so the row is hidden under the fixed header. The panel ` +
+      `is a scroll container of its own and must carry the ::before header ` +
+      `spacer (mobile.css, the .mobile-swipe-pane …::before group).`,
     ).toBeGreaterThanOrEqual(headerBottom - 1);
   });
 });

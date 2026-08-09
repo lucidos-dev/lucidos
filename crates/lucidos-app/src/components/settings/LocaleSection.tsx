@@ -6,6 +6,7 @@ import {
   currentTimezone,
   setTimezone,
 } from '../../store/actions/preferences';
+import { Explainer } from '../shared/Explainer';
 
 /** Common languages offered up-front; the field is freeText, so any other
  *  language name can still be typed. The value stored is the plain name the
@@ -79,7 +80,18 @@ export function LocaleSection() {
     <div class="settings-section">
       <div class="settings-section-title">Locale</div>
       <div class="settings-row" data-search-anchor="locale:language">
-        <span class="settings-row-label">Language</span>
+        <span class="settings-row-label">
+          Language
+          <Explainer title="Language">
+            <p>
+              For best results, English is recommended: models are strongest in it.
+            </p>
+            <p>
+              You can still write in any language; replies come in the language set
+              here, or match yours when left on Auto.
+            </p>
+          </Explainer>
+        </span>
         <Dropdown
           options={languageOptions}
           value={language}
@@ -87,11 +99,6 @@ export function LocaleSection() {
           freeText
           placeholder="Auto (from conversation)"
         />
-      </div>
-      <div class="settings-row-note">
-        For best results, English is recommended — models are strongest in it. You
-        can still write in any language; replies come in the language set here, or
-        match yours when left on Auto.
       </div>
       <div class="settings-row" data-search-anchor="locale:timezone">
         <span class="settings-row-label">Timezone</span>

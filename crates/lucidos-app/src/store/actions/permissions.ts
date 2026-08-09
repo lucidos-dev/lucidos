@@ -1,26 +1,19 @@
 import { postCommandConsent, postMcpConsent, postMcpPermissionConsent } from '../../api/client';
 import type { PersistScope } from '../thread-events';
-import { scrollToBottom } from '../../components/chat/scrollState';
 
-/** Resolve an inline permission card and force the transcript to the bottom.
+/* Resolving an in-thread permission card posts the consent and nothing else.
  *
- *  Forcing the scroll (not the conditional `preserveAtBottom`) means that even
- *  when the user scrolled up to read history while the card was pending,
- *  resolving it re-activates auto-scroll so the agent's resumed stream tails the
- *  bottom — the same contract `answerThreadQuestion` gives the question card.
+ * All three used to route through a `resolveAndPin` helper that forced the
+ * transcript to the bottom first, on the reasoning that resolving a card
+ * resumes the agent's stream and the reader would want to tail it. That is the
+ * app deciding where the reader looks, so it is gone (see the header of
+ * `components/chat/scrollState.ts`): the resumed stream grows below them, and
+ * the down chevron is how they follow it. With the scroll removed the helper
+ * was a bare call-through, so each card calls its own endpoint directly.
  *
- *  Throws on a failed POST; the card's optimistic `decide` rolls back its
- *  pending state and toasts. Used by all three in-thread permission cards
- *  (coding-agent, command guard, chat MCP). */
-async function resolveAndPin(
-  consent: (id: string, allowed: boolean, persist?: PersistScope) => Promise<void>,
-  requestId: string,
-  allowed: boolean,
-  persist?: PersistScope,
-): Promise<void> {
-  scrollToBottom();
-  await consent(requestId, allowed, persist);
-}
+ * Each throws on a failed POST; the card's optimistic `decide` rolls back its
+ * pending state and toasts.
+ */
 
 /** Resolve a coding-agent permission card (CC's MCP prompt / Codex's app-server
  *  approval bridge). */
@@ -29,7 +22,7 @@ export function resolveCodingAgentPermission(
   allowed: boolean,
   persist?: PersistScope,
 ): Promise<void> {
-  return resolveAndPin(postMcpConsent, requestId, allowed, persist);
+  return postMcpConsent(requestId, allowed, persist);
 }
 
 /** Resolve a chat command-guard permission card (ADR 0002). */
@@ -38,7 +31,7 @@ export function resolveCommandPermission(
   allowed: boolean,
   persist?: PersistScope,
 ): Promise<void> {
-  return resolveAndPin(postCommandConsent, requestId, allowed, persist);
+  return postCommandConsent(requestId, allowed, persist);
 }
 
 /** Resolve a chat MCP permission card (MCP server tool call). */
@@ -47,5 +40,5 @@ export function resolveMcpPermission(
   allowed: boolean,
   persist?: PersistScope,
 ): Promise<void> {
-  return resolveAndPin(postMcpPermissionConsent, requestId, allowed, persist);
+  return postMcpPermissionConsent(requestId, allowed, persist);
 }

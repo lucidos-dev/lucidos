@@ -1058,7 +1058,19 @@ pub(crate) async fn reload_backup_schedule(
 ) {
     use crate::core::backup::{is_schedule_active, PREF_BACKUP_PROVIDER, PREF_BACKUP_SCHEDULE};
 
-    let cron = match PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE).await {
+    let read_schedule = PreferenceStore::get(pool, PREF_BACKUP_SCHEDULE).await;
+    if let Err(e) = &read_schedule {
+        // A preference read that could not run is UNKNOWN, not "the user turned
+        // backups off". It still falls through to the disabled branch below, so
+        // say so loudly: otherwise a DB hiccup ends scheduled backups in silence.
+        log!(
+            "[Scheduler] Could not read {}, treating the backup schedule as \
+             disabled for this reload: {}",
+            PREF_BACKUP_SCHEDULE,
+            e
+        );
+    }
+    let cron = match read_schedule {
         Ok(Some(c)) if is_schedule_active(&c) => c,
         _ => {
             // Disabled or unset — ensure no stale job lingers.
@@ -1068,7 +1080,16 @@ pub(crate) async fn reload_backup_schedule(
             return;
         }
     };
-    let provider = match PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await {
+    let read_provider = PreferenceStore::get(pool, PREF_BACKUP_PROVIDER).await;
+    if let Err(e) = &read_provider {
+        log!(
+            "[Scheduler] Could not read {}, so the backup job stays unregistered \
+             for this reload: {}",
+            PREF_BACKUP_PROVIDER,
+            e
+        );
+    }
+    let provider = match read_provider {
         Ok(Some(p)) if !p.is_empty() => p,
         // Schedule is active but there is no provider to upload to — drop any
         // previously-registered job rather than leave a stale one that fires

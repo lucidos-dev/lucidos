@@ -60,6 +60,8 @@ async fn initiator_system_trigger() {
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
             go_to_review: false,
+            model: None,
+            reasoning_effort: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -99,6 +101,8 @@ async fn initiator_inherited_system_to_cc_child() {
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
             go_to_review: false,
+            model: None,
+            reasoning_effort: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -282,6 +286,8 @@ async fn initiator_preserved_on_session_started_upsert() {
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
             go_to_review: false,
+            model: None,
+            reasoning_effort: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

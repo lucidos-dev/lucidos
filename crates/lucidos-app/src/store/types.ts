@@ -241,20 +241,28 @@ export type ResponseEvent =
     }
   | {
       /** The thread subscribed to an *event wait* (`await_event`, ADR 0047). A
-       *  step-level card, deliberately NOT an exchange divider: an attached
+       *  step-level row, deliberately NOT an exchange divider: an attached
        *  delivery resumes the SAME exchange, which is the whole point of the
        *  design, so `EventWaitStarted` stays out of `EXCHANGE_START_TYPES` and
-       *  the wake's steps continue below this card.
+       *  the wake's steps continue below this row.
        *
-       *  `state` is flipped in place by whichever resolution lands later in the
-       *  SAME exchange, matched by `wait_id`. Same shape as the checkpoint card.
+       *  Rendered ungated, unlike a `'step'`: it is a marker rather than step
+       *  mechanics (see `isStepMechanics`). Hiding it behind the default-off
+       *  "Show steps" toggle left a parked thread with no evidence anywhere that
+       *  it had parked, since the clock indicator holds only the LIVE half and
+       *  drops a wait the moment it resolves.
        *
-       *  A **stop** also creates one of these on its own, at its own place in
-       *  the transcript, when the row it would have flipped is not in this
-       *  exchange. See `exchange-render`: a subscription routinely outlives the
-       *  turn that armed it by hours, and a stop is the one resolution with no
-       *  wake, so without that row it left no mark anywhere near where the user
-       *  was reading. */
+       *  `state` is flipped in place by a delivery or an expiry landing in the
+       *  SAME exchange, matched by `wait_id`. Those keep the subject line and
+       *  add the outcome, so the row still says what it says.
+       *
+       *  A **stop** never flips it, and instead renders at the moment it
+       *  happened: as its own turn when the user pressed Stop waiting (the
+       *  `EventWaitCanceled` is then the exchange's `userEvent`, not a row), and
+       *  as a `canceled` row of its own for every other cause. A subscription
+       *  routinely outlives the turn that armed it by hours, so relabelling that
+       *  turn's row was reporting the stop in the wrong place and losing when the
+       *  watch started. */
       type: 'event_wait';
       wait_id: string;
       /** Rendered subscription line, already collapsed to prose. */
@@ -375,6 +383,14 @@ export interface TriggerInfo {
    *  this trigger. Absent for user-created triggers. Drives the "from <plugin>"
    *  chip in the triggers panel. */
   plugin_id?: string;
+  /** The *trigger model*: the chat model this trigger's intent fires on. Engine
+   *  omits the field when the trigger is on the account default (Settings →
+   *  Models → Chat & triggers), so absent means Default. Intent triggers only:
+   *  a script trigger runs no LLM. */
+  model?: string;
+  /** Thinking budget for this trigger's intent fires. Absent = the account
+   *  default, same as `model`. */
+  reasoning_effort?: string;
 }
 
 /** A user-visible folder that organizes triggers in the panel. Pure label —

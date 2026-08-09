@@ -169,6 +169,8 @@ async fn trigger_completed_sets_has_response_true() {
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
             go_to_review: false,
+            model: None,
+            reasoning_effort: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

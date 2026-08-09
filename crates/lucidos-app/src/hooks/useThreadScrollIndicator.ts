@@ -5,7 +5,7 @@ import {
   counterScaledRadiusPx,
   nextIndicatorVisibility,
 } from '../components/chat/scrollIndicator';
-import { getResizeMode } from '../components/chat/scrollState';
+import { isNavigationScroll } from '../components/chat/scrollState';
 import { isRepaintNudging } from '../utils/iosRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
 import { viewportIsMobile } from '../utils/viewport';
@@ -159,7 +159,7 @@ export function useThreadScrollIndicator(opts: {
     function onScroll() {
       const next = nextIndicatorVisibility(shown, {
         userScrolling: isUserScrolling(),
-        programmaticScroll: getResizeMode() === 'scroll',
+        programmaticScroll: isNavigationScroll(scroller),
         repaintNudge: isRepaintNudging(),
       });
       shown = next.shown;

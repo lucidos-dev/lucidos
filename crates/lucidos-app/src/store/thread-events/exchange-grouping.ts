@@ -1,6 +1,7 @@
 import { EVENT_CLASSIFICATION } from '../../generated/thread-lifecycle';
 import { eventWaitProjection } from './event-waits';
 import { findQuestionAnswer, modeToInitiator } from './exchange';
+import { isUserStoppedWait } from './thread-event-types';
 import { applyAggregateToMeta, updatesLastActivity } from './thread-meta';
 import type { Exchange } from './exchange';
 import type { MessageOrigin, SequencedEvent, StoredEvent, ThreadEvent, TransientEvent } from './thread-event-types';
@@ -112,7 +113,10 @@ function filterRemovedQueuedExchanges(
  *  (UserQuestionAsked, CodingAgentPermissionRequest, CredentialRequested,
  *  McpConsentRequested) — each agent pause is its own auditable boundary with
  *  an actor, not a step inside the prior agent response — and ChildThreadCompleted
- *  where a sidequest result lands in the parent as a rich card. */
+ *  where a sidequest result lands in the parent as a rich card.
+ *
+ *  One boundary is decided by the EVENT rather than by its type and so is not
+ *  in this set: see `isExchangeStartEvent`. */
 const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'MessageReceived',
   'TriggerStarted',
@@ -135,8 +139,21 @@ const EXCHANGE_START_TYPES: ReadonlySet<string> = new Set([
   'ChildThreadCompleted',
 ]);
 
-export function isExchangeStartEvent(type: string): boolean {
-  return EXCHANGE_START_TYPES.has(type);
+/** Whether this event opens a new exchange. Takes the EVENT, not its type,
+ *  because one boundary cannot be decided from the type alone.
+ *
+ *  `EventWaitCanceled` is a step for every cause but one. A **user stop** is a
+ *  person doing something to the thread at a moment, and it is the one
+ *  resolution with no wake, so nothing else in the transcript reports it: left
+ *  as a step it either landed inside whatever turn happened to be current or,
+ *  worse, rewrote the arming row hours above where the user was reading, which
+ *  is what it did until 2026-08-07. As a boundary it reads like the Stop and
+ *  Restart turns it belongs with, iconless with the device in its origin
+ *  popover. Nothing resumes out of it, so no seamless-resume invariant is at
+ *  stake (which is exactly why the park itself is still never a boundary). */
+export function isExchangeStartEvent(event: { type: string; cause?: string }): boolean {
+  if (event.type === 'EventWaitCanceled') return isUserStoppedWait(event);
+  return EXCHANGE_START_TYPES.has(event.type);
 }
 
 /** True when `exchange` is a divider still PARKED awaiting a user action — its
@@ -930,11 +947,36 @@ function foldEvent(
         const absorbedReqId = requestEventIdOf(event);
         if (absorbedReqId) reqIdRedirect.set(absorbedReqId, absorbTarget);
       }
-    } else if (isExchangeStartEvent(event.type) && !isLegacySupersededAbort) {
+    } else if (isExchangeStartEvent(event) && !isLegacySupersededAbort) {
       const previousCurrent = current;
       current = { userEvent: event, userSeq: seq, steps: [] };
       exchanges.push(current);
       touched?.add(current);
+      // **The user's Stop-waiting boundary takes no ownership of the turn.**
+      //
+      // Every other boundary here either ends the turn or takes it over, so
+      // becoming `current` is right for them. A stop is neither: a subscription
+      // does not hold its thread's turn (ADR 0049) and the Stop waiting button
+      // has no idle guard, so the user can press it while an unrelated turn is
+      // mid-flight, and that turn keeps running afterwards.
+      //
+      // Whatever routes CHRONOLOGICALLY must therefore keep landing in the turn
+      // that produced it: every coding-agent event (they are deliberately out of
+      // `REQUEST_ID_ROUTED_TYPES`), and on a chat thread a `TodoListWritten` or a
+      // background-bash pair. Folded into this boundary instead they would draw
+      // nothing at all, because the stop panel renders no response body, and the
+      // running turn's pending `Thinking` marker would shimmer forever with
+      // nothing left to resolve it. That is the shape the abort-boundary and
+      // change-banner exceptions elsewhere in this file exist for, reached from
+      // the other side.
+      //
+      // Restoring `current` is the whole handling it needs, and is why it is
+      // also absent from `advancesRedirect` below: it continues nothing, so
+      // there is no continuation to redirect and no handoff to record.
+      if (isUserStoppedWait(event)) {
+        current = previousCurrent;
+        return;
+      }
       // Register divider exchanges so their resolution can route back here by
       // id even if a boundary intervenes before the answer lands.
       if (event.type === 'UserQuestionAsked' && event.tool_use_id) {

@@ -5,10 +5,10 @@ import {
   selectedAppIds,
   setSelectedAppIds,
   filterFacets,
-  includeDeletedFilterOptions,
 } from './store';
 import { appIdFromFolder } from '../utils/appIdFromFolder';
 import { loadedOr } from './types';
+import { visibleFilterOptions } from './deletedFilterOptions';
 
 export type AppFilterOption = {
   id: string;
@@ -29,7 +29,7 @@ export type AppFilterOption = {
  *  filter restored from localStorage stays clearable. The `appsList` registry
  *  supplies live-vs-`(deleted)` labels. Returns [] until `appsList` loads —
  *  without it every app would mis-label as "(deleted)". */
-export const appFilterOptions = computed<AppFilterOption[]>(() => {
+export const appFilterOptionsAll = computed<AppFilterOption[]>(() => {
   if (appsList.value.status !== 'loaded') return [];
   const liveById = new Map(appsList.value.data.map(a => [a.id, a]));
   const result: AppFilterOption[] = [];
@@ -57,22 +57,14 @@ export const appFilterOptions = computed<AppFilterOption[]>(() => {
   }
   for (const id of selectedAppIds.value) push(id);
 
-  // Deleted entries are hidden unless the user opts in — but a *selected*
-  // deleted entry always stays visible so the filter remains clearable.
-  const includeDeleted = includeDeletedFilterOptions.value;
-  const selected = selectedAppIds.value;
-  return result
-    .filter(o => includeDeleted || !o.deleted || selected.has(o.id))
-    .sort((a, b) => {
-      if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
-      if (a.deleted) {
-        const aTime = a.lastActivity ?? '';
-        const bTime = b.lastActivity ?? '';
-        if (aTime !== bTime) return bTime.localeCompare(aTime);
-      }
-      return a.label.localeCompare(b.label);
-    });
+  return result;
 });
+
+/** The visible slice: unselected deleted entries dropped unless the user opts in
+ *  (`visibleFilterOptions`), which is also what `deletedOptionsHidden` reports
+ *  on. */
+export const appFilterOptions = computed<AppFilterOption[]>(() =>
+  visibleFilterOptions(appFilterOptionsAll.value, selectedAppIds.value));
 
 export function toggleAppId(id: string): void {
   const next = new Set(selectedAppIds.value);

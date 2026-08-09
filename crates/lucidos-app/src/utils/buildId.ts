@@ -14,3 +14,9 @@
 export function isUnstampedBuildId(id: string): boolean {
   return id.startsWith('__');
 }
+
+/** Display form of a build id: the un-stamped placeholder reads "dev" rather
+ *  than showing the literal `__LUCIDOS_BUILD_ID__` to a user. */
+export function formatBuildId(id: string): string {
+  return isUnstampedBuildId(id) ? 'dev' : id;
+}

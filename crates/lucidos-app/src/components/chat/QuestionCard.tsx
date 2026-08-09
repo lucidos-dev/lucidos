@@ -4,8 +4,8 @@ import { showToast } from '../../store/store';
 import { answerThreadQuestion } from '../../store/actions/chat-claude-code';
 import { createTapGate } from '../../utils/tapGesture';
 import { renderMarkdownInline, renderMarkdownInlineWithLinks } from '../../utils/renderMarkdown';
-import { preserveAtBottom } from './scrollState';
 import { CHOICE_CARD_ROLE, handleChoiceCardKeyDown, seedChoiceCardFocus } from './choiceCardNav';
+import { followAnsweredQuestion } from './scrollState';
 
 export type ResolvedAnswer =
   | { kind: 'Selected'; option_id: string }
@@ -162,7 +162,7 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
   const liftedPending = pendingAnswerByToolUse.value.get(toolUseId);
   const effective = resolved ?? liftedPending ?? localPending.value ?? undefined;
   if (effective) {
-    return <AnsweredBody question={question} options={options} multiSelect={multiSelect} resolved={effective} />;
+    return <AnsweredBody toolUseId={toolUseId} question={question} options={options} multiSelect={multiSelect} resolved={effective} />;
   }
   if (terminated) {
     return <TerminatedQuestionBody question={question} options={options} multiSelect={multiSelect} />;
@@ -187,6 +187,11 @@ export function QuestionBody({ threadId, toolUseId, question, options, multiSele
 
   const onPick = async (optionId: string) => {
     localPending.value = { kind: 'Selected', option_id: optionId };
+    // Answering is a send: take the reader to what they just answered and keep
+    // them at the live edge while the agent resumes underneath it. Before the
+    // await, because the scroll is the composer's-tap half of the action and
+    // must not wait on the round trip. See `followAnsweredQuestion`.
+    followAnsweredQuestion(toolUseId);
     const ok = await answerThreadQuestion(threadId, toolUseId, { kind: 'Selected', option_id: optionId });
     if (!ok) {
       localPending.value = null;
@@ -277,7 +282,6 @@ function OptionButton({
       onPointerCancel={() => gate.cancel()}
       onClick={() => {
         if (!gate.isTap()) return;
-        preserveAtBottom();
         onActivate(option.id);
       }}
       aria-label={`${isToggle ? 'Toggle' : 'Answer'}: ${option.label}`}
@@ -290,13 +294,24 @@ function OptionButton({
 /** Resolved-state rendering: options dim, the picked one is highlighted; the
  *  Custom-answer block surfaces freetext (FreeText answers, or the freetext
  *  typed alongside a MultiSelected); Canceled renders a disabled Cancel button
- *  styled like the picked permission affordance. Exported for unit tests. */
+ *  styled like the picked permission affordance. Exported for unit tests.
+ *
+ *  Carries `data-tool-use-id` like the live body it replaces, so the answer's
+ *  landing glide (`questionCardTurn` in scrollState) finds the card whether or
+ *  not this swap has already happened. The two submit sites resolve it
+ *  synchronously, before the render, so today they see the live body; depending
+ *  on that ordering to make the id unnecessary here would be one Preact
+ *  scheduling change away from silently losing the glide. The TERMINATED body
+ *  carries no id on purpose: a dead question is one nobody can answer, so nothing
+ *  ever looks it up. */
 export function AnsweredBody({
+  toolUseId,
   question,
   options,
   multiSelect,
   resolved,
 }: {
+  toolUseId: string;
   question: string;
   options: QuestionBodyProps['options'];
   multiSelect: boolean | undefined;
@@ -310,7 +325,7 @@ export function AnsweredBody({
     : resolved.kind === 'MultiSelected' ? resolved.text
     : undefined;
   return (
-    <div class="question-body question-body-answered">
+    <div class="question-body question-body-answered" data-tool-use-id={toolUseId}>
       <QuestionText question={question} />
       {options.length > 0 && (
         <div class="question-options">

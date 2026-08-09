@@ -33,6 +33,8 @@ fn config(slug: &str, run: TriggerRun) -> TriggerConfig {
         group_id: None,
         side_effect_grant: vec![],
         plugin_id: None,
+        model: None,
+        reasoning_effort: None,
     }
 }
 
@@ -73,6 +75,48 @@ fn roundtrips_an_event_trigger_with_condition_and_grant() {
     assert_eq!(parsed.on.len(), 1);
     assert_eq!(parsed.on[0].event_type, "SleepImported");
     assert!(parsed.on[0].condition.is_some());
+}
+
+/// `model` / `reasoning_effort` are scalars, so they must serialise ABOVE the
+/// `on` array-of-tables and the `run` table. Emitted after either, the `toml`
+/// crate rejects the whole document and the projection silently stops being
+/// written (see the ordering note at the top of `definition.rs`).
+#[test]
+fn roundtrips_a_trigger_pinned_to_a_model_and_effort() {
+    let mut c = config(
+        "cheap-digest",
+        TriggerRun::Intent {
+            intent: "Summarize today".to_string(),
+        },
+    );
+    c.model = Some("gemini-3.5-flash".to_string());
+    c.reasoning_effort = Some("low".to_string());
+    c.on = vec![EventSubscription {
+        event_type: "DayEnded".to_string(),
+        condition: None,
+    }];
+
+    let def = TriggerDefinition::from_config(&c);
+    let toml = def.to_toml().expect("serialize a model-pinned trigger");
+    let parsed = TriggerDefinition::from_toml(&toml).expect("parse a model-pinned trigger");
+    assert_eq!(parsed, def);
+    assert_eq!(parsed.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(parsed.reasoning_effort.as_deref(), Some("low"));
+}
+
+/// A trigger on the account default writes no model keys at all, so an existing
+/// workspace's projected files are byte-identical after this change.
+#[test]
+fn default_model_is_omitted_from_the_projection() {
+    let c = config(
+        "plain",
+        TriggerRun::Intent {
+            intent: "hi".to_string(),
+        },
+    );
+    let toml = TriggerDefinition::from_config(&c).to_toml().unwrap();
+    assert!(!toml.contains("model"));
+    assert!(!toml.contains("reasoning_effort"));
 }
 
 #[test]

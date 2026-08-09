@@ -244,6 +244,11 @@ async fn execute_llm_task(
         invocation,
         config.go_to_review,
         config.side_effect_grant.clone(),
+        // `None` on either means this trigger is on the account chat default
+        // for that field, which is what every trigger did before the per-trigger
+        // model existed.
+        config.model.as_deref(),
+        config.reasoning_effort.as_deref(),
         external_cancel,
     );
     let result = ACTIVE_TRIGGER_ID
@@ -436,25 +441,131 @@ fn build_event_env(
 }
 
 /// Check if an error notification for this task already exists within the dedup window.
+///
+/// The window is resolved by the database (ADR 0053): `notifications.created_at`
+/// is stamped by Postgres, so an engine-computed cutoff puts the host clock and
+/// the database clock on opposite sides of one `>`. A container clock running
+/// ahead of the host would push every real row outside the window and spam the
+/// user with duplicates; one running behind would over-dedup and swallow a
+/// failure they need to see.
+///
+/// The question is asked as `SELECT EXISTS (...)`, the shape every other
+/// existence check in the tree uses (its own sibling
+/// `backup::notify_backup_failure` included). The previous
+/// `SELECT 1 ... -> Option<(i64,)>` could not decode at all: an unadorned `1` is
+/// an `int4` column and sqlx's `i64` declares `INT8` with strict type
+/// compatibility, so every call returned a column-decode `Err` and the old
+/// `matches!(result, Ok(Some(_)))` read that as "nothing recent". The dedup
+/// window, and the index added for it
+/// (`20260310190000_notification_task_id_index.sql`), were dead.
 async fn has_recent_error_notification(pool: &PgPool, task_id: uuid::Uuid) -> bool {
-    let cutoff = chrono::Utc::now() - chrono::Duration::minutes(ERROR_DEDUP_MINUTES);
     let pattern = format!("%{}", ERROR_TITLE_SUFFIX);
-    let result: Result<Option<(i64,)>, _> = sqlx::query_as(
-        "SELECT 1 FROM notifications WHERE task_id = $1 AND created_at > $2 AND title LIKE $3 LIMIT 1"
+    let result: Result<bool, _> = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM notifications \
+         WHERE task_id = $1 \
+           AND created_at > now() - make_interval(secs => $2) \
+           AND title LIKE $3)",
     )
     .bind(task_id)
-    .bind(cutoff)
+    .bind((ERROR_DEDUP_MINUTES * 60) as f64)
     .bind(&pattern)
-    .fetch_optional(pool)
+    .fetch_one(pool)
     .await;
 
-    matches!(result, Ok(Some(_)))
+    match result {
+        Ok(hit) => hit,
+        Err(e) => {
+            // A dedup lookup that could not run is UNKNOWN, not "already
+            // notified": fall through to notifying, so a DB hiccup costs a
+            // duplicate banner rather than the failure report itself.
+            log!(
+                "[Scheduler] Error-notification dedup lookup failed for task {}: {}",
+                task_id,
+                e
+            );
+            false
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Regression for a dedup that never once fired. `has_recent_error_notification`
+    /// asked `SELECT 1 ... -> Option<(i64,)>`; an unadorned `1` is `int4` and sqlx's
+    /// `i64` declares `INT8` with strict type compatibility, so every call returned a
+    /// column-decode `Err` that the old `matches!(result, Ok(Some(_)))` read as
+    /// "nothing recent". The bug was invisible precisely because there was no test:
+    /// the function is only ever consulted to SUPPRESS a notification, so failing
+    /// closed looks exactly like a workspace that had no recent failure.
+    ///
+    /// This pins both halves of the fix: the `EXISTS -> bool` decode actually
+    /// round-trips, and the window is resolved by the DATABASE clock
+    /// (`now() - make_interval(secs => $2)`, ADR 0053) rather than an engine-computed
+    /// cutoff, so a row inside the window is seen and one outside it is not.
+    #[tokio::test]
+    async fn recent_error_notification_dedup_sees_a_row_inside_the_window_only() {
+        let (pool, db) = crate::test_support::setup_test_db().await;
+
+        let insert = |task_id: uuid::Uuid, title: String, age_secs: i64| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    "INSERT INTO notifications (id, task_id, title, message, created_at) \
+                     VALUES ($1, $2, $3, 'msg', now() - make_interval(secs => $4))",
+                )
+                .bind(uuid::Uuid::new_v4())
+                .bind(task_id)
+                .bind(title)
+                .bind(age_secs as f64)
+                .execute(&pool)
+                .await
+                .expect("insert notification");
+            }
+        };
+
+        // No rows at all: nothing recent.
+        let fresh_task = uuid::Uuid::new_v4();
+        assert!(
+            !has_recent_error_notification(&pool, fresh_task).await,
+            "a task with no notifications must not read as recently notified"
+        );
+
+        // A matching row one minute old is INSIDE the 30-minute window. Before the
+        // fix this returned false, which is the whole bug.
+        let inside = uuid::Uuid::new_v4();
+        insert(inside, format!("Nightly sync{}", ERROR_TITLE_SUFFIX), 60).await;
+        assert!(
+            has_recent_error_notification(&pool, inside).await,
+            "a matching error notification inside the dedup window must suppress"
+        );
+
+        // The same row one minute PAST the window must not suppress.
+        let outside = uuid::Uuid::new_v4();
+        insert(
+            outside,
+            format!("Nightly sync{}", ERROR_TITLE_SUFFIX),
+            ERROR_DEDUP_MINUTES * 60 + 60,
+        )
+        .await;
+        assert!(
+            !has_recent_error_notification(&pool, outside).await,
+            "a matching notification older than the window must not suppress"
+        );
+
+        // A recent notification that is not an ERROR one is not a dedup hit: the
+        // `title LIKE '% failed'` half has to keep doing work.
+        let other = uuid::Uuid::new_v4();
+        insert(other, "Nightly sync succeeded".to_string(), 60).await;
+        assert!(
+            !has_recent_error_notification(&pool, other).await,
+            "a non-error notification must not suppress the error report"
+        );
+
+        crate::test_support::teardown_test_db(&db).await;
+    }
 
     /// Source-scan tripwire, in the repo's existing idiom (see
     /// `engine::trigger_writes::only_the_chokepoint_constructs_a_trigger_lifecycle_event`).

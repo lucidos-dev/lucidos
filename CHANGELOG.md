@@ -1,5 +1,47 @@
 # Changelog
 
+## v0.25.0 — 2026-08-09
+
+### Added
+
+- **Frontend preview for a coding-agent worktree.** The engine supervises a Vite dev server rooted in the worktree a coding-agent session is editing, so its frontend is reachable on its own origin while the session runs. A Frontend preview section in the coding-agent menu carries the URL for the device you are on, and `lucidos frontend-preview` drives the same thing from a script.
+- **A trigger picks its own model and reasoning effort.** Set both on the trigger form, and every intent fire runs on them. The fire's model and effort are recorded on `TriggerStarted`, and the trigger row shows the model as a chip.
+- **A thread status filter, so running is askable apart from active.** `--status` on the CLI, a `status` query parameter, an SDK option and an agent tool argument all name exactly the statuses to keep. `--active` keeps its existing union of running and waiting.
+- **Settings shows each coding agent's installed CLI version.** The Binaries section probes `claude` and `codex` live alongside path detection, so an upgrade or a self-update shows up without a restart.
+- **A live style remote.** CSS custom property overrides travel over the preference channel and repaint every open client instantly, so the design tokens can be retuned from a phone while the app is running.
+- **A push switch for the device in your hand, under Settings > Appearance & Behavior.** Turning push on there offers to turn it off on your other devices.
+- **An info icon that opens an explainer.** Prose that used to sit permanently in the layout is behind a shared icon beside the control it describes, on settings rows, trigger forms and credential forms.
+- **The macOS menu bar always carries the unread count**, whether or not a window is open. The Dock badge is unchanged.
+- **The Lucidos menu says when a new version is waiting**, as a New version pill on the Restart row. Refresh and Restart are separate rows, and Restart asks first.
+
+### Changed
+
+- **The transcript never scrolls itself to the bottom.** The reading position belongs to the reader, and the app moves it only when you ask: the chevrons, turn stepping, a deep link, or returning to where you left. Pressing the down chevron or sending a message arms a standing follow that rides the live edge until you scroll away, and it survives leaving the thread and backgrounding the app.
+- **Answering a question card moves the transcript the same way sending a message does**, whichever of the three ways you answer.
+- **Stopping a wait is your own turn in the transcript**, at the point you pressed it, naming what was stopped.
+- **The desktop header is one 48px bar** with the Lucidos mark centred on it, the leading control up beside the traffic lights, and the navigation chevrons bracketing the pane they move. A row folds its actions into a menu when the pane runs out of room.
+- **The Lucidos menu is a centred modal** that opens with what you are running, and it now holds the workspace switcher and a Setup guide row.
+- **The mobile header centres on the Lucidos mark**, with the brand light and the menu in one control, and it reserves the keyboard's band so the composer and header stop moving.
+- **The thread filter opens as a panel in the drawer pane**, closed by an X on its own toggle. All statuses sits at the foot of the Status list, thread types narrow it rather than replacing it, and the row says "(filtered)" only when a setting is actually holding threads back.
+- **Pane dividers clamp at the pane minimums during a drag** instead of correcting after release, and a drag can no longer collapse a pane.
+- **A settings row holding a free-text field puts its label on its own line**, with the field full width beneath it.
+
+### Fixed
+
+- **The gateway no longer leaves defunct engine processes behind** after reloading itself.
+- **The gateway talks to an engine over the scheme that engine actually serves**, so a TLS certificate without a key no longer produces "error sending request for url".
+- **Two command-guard bypasses that auto-allowed writes outside the workspace are closed**: an output file passed to a read-only tool without a redirect, and `git diff --output=`.
+- **A synchronous `run_python` is held to its promised 300 second ceiling**, and the child is killed when it expires.
+- **A long toast no longer swallows the phone viewport.**
+- **Claude Code is offered the question tool it can actually reach over MCP**, instead of the Codex one.
+- **The search modal's category tabs pan instead of collapsing**, keep a clipped tab in view, and resync when the modal is reopened.
+- **The thread drawer refetches when the filter changed while the list was not mounted**, and pagination re-arms from the store when a filter applies.
+- **A merge-conflict toast lands on the turn where the conflict happened.**
+- **A `.htm` artifact previews and edits like a `.html` one.**
+- **A jump from a notification or a link lands on the settings control itself**, not on its info icon.
+- **A promoted coding draft keeps the destination chip it was showing** instead of losing it at send.
+- **The todo indicator in the composer uses one checklist glyph** across its three states.
+- **nanoid updated to 3.3.18** (GHSA-2v37-7h3g-55p8).
 ## v0.24.1 — 2026-08-07
 
 ### Changed

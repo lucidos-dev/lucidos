@@ -60,10 +60,16 @@ export function clearThreadModelOverride(threadId: string | null | undefined): v
   threadModelSelections.value = map;
 }
 
-/** The `field` value from the thread's most recent `MessageReceived` that carried
+/** The `field` value from the thread's most recent starter event that carried
  *  it. Mirrors the backend's newest-by-sequence lookup so the menu displays what
  *  the next send will actually use. Synthetic failed-send rows carry no model, so
- *  the field filter skips them. */
+ *  the field filter skips them.
+ *
+ *  Both starter kinds count, mirroring the backend's
+ *  `IN ('MessageReceived', 'TriggerStarted')`: a chat turn starts with
+ *  `MessageReceived`, while a trigger fire starts with `TriggerStarted` and
+ *  emits no `MessageReceived` at all. Reading only the former would show the
+ *  account model on a trigger thread however the trigger was pinned. */
 function lastThreadMessageField(
   threadId: string | null | undefined,
   field: 'model' | 'reasoning_effort',
@@ -74,7 +80,7 @@ function lastThreadMessageField(
   let bestSeq = -Infinity;
   let bestValue: string | undefined;
   for (const [seq, event] of thread.events) {
-    if (event.type !== 'MessageReceived') continue;
+    if (event.type !== 'MessageReceived' && event.type !== 'TriggerStarted') continue;
     const value = event[field];
     if (typeof value !== 'string' || value === '') continue;
     if (seq > bestSeq) {

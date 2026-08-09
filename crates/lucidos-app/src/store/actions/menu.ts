@@ -28,7 +28,8 @@ import { pushNavState } from './navigation';
  *
  *  Pure plumbing — does NOT manage panes. The user-intent callers
  *  (`switchMenuItem`, `openSettingsSubview`, `landOnAccountsWithOverlay`,
- *  the `thread-sync.ts` new-app / new-trigger branches) own the
+ *  `navigateToTrigger` in `triggers.ts`, and the new-app / new-trigger
+ *  branches of `handleNavigationRequest` in `navigation-request.ts`) own the
  *  `revealContentPane()` call themselves. Earlier this function carried its
  *  own conditional `navigateToPane('content')` gated on `item !== prev &&
  *  mobileView === 'thread'`; that gate silently dropped the swipe when the

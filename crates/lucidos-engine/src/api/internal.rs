@@ -19,12 +19,18 @@ struct PermissionPromptResponse {
 }
 
 /// Tools the engine handles before CC's permission gate can render a card.
-/// `AskUserQuestion` is intercepted in `agent_session::run_session` (kills
-/// CC, renders a `QuestionCard`); routing it through the permission tool
+/// A question tool is intercepted in `agent_session::run_session` (which
+/// renders a `QuestionCard` from the `UserQuestionAsked` this module's
+/// `ask_user_question` handler emits); routing it through the permission tool
 /// would surface a redundant "Allow?" card stacked on top of the question
 /// itself. Auto-approve at this gate so the user only sees the question.
+///
+/// The names come from [`crate::runtime::is_user_question_tool`], shared with
+/// the tool-call suppression in `run_session` so the two gates cannot know
+/// different sets. They did, and CC reaching the question tool over MCP fell
+/// through both: see that function.
 fn should_auto_allow(tool_name: &str) -> bool {
-    matches!(tool_name, "AskUserQuestion")
+    crate::runtime::is_user_question_tool(tool_name)
 }
 
 /// POST /api/v1/internal/permission-prompt — invoked by the lucidos-cli
@@ -810,25 +816,45 @@ mod tests {
     use super::*;
 
     #[test]
-    fn askuserquestion_is_auto_allowed_to_avoid_redundant_card() {
-        // The engine intercepts AskUserQuestion in run_session and renders
-        // the QuestionCard directly; routing it through the permission gate
-        // would stack a redundant "Allow?" card on top of the question.
-        assert!(
-            should_auto_allow("AskUserQuestion"),
-            "AskUserQuestion must short-circuit the permission gate"
-        );
+    fn every_question_tool_is_auto_allowed_to_avoid_redundant_card() {
+        // The engine intercepts a question tool in run_session and renders the
+        // QuestionCard directly; routing it through the permission gate would
+        // stack a redundant "Allow?" card on top of the question.
+        //
+        // BOTH names CC can reach, not just its native one. The MCP tool is
+        // advertised to CC by the very permission server this endpoint serves,
+        // so a question raised through it used to ask the user for permission
+        // to ask them a question.
+        for tool in [
+            crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL,
+            crate::runtime::CC_MCP_ASK_USER_QUESTION_TOOL,
+        ] {
+            assert!(
+                should_auto_allow(tool),
+                "{tool} must short-circuit the permission gate"
+            );
+        }
     }
 
     #[test]
     fn other_tools_are_not_auto_allowed() {
-        // Bash, Edit, Write, etc. must continue to render permission cards
-        // so the user can deny them. Only AskUserQuestion is special.
-        for tool in ["Edit", "Bash", "Write", "Read", "Glob", "Grep", "Skill"] {
+        // Bash, Edit, Write, etc. must continue to render permission cards so
+        // the user can deny them. `approve` is the sharpest case: it is the
+        // OTHER tool on the same MCP server, and auto-allowing by server rather
+        // than by tool would nullify the permission gate entirely.
+        for tool in [
+            "Edit",
+            "Bash",
+            "Write",
+            "Read",
+            "Glob",
+            "Grep",
+            "Skill",
+            crate::runtime::CC_PERMISSION_PROMPT_TOOL,
+        ] {
             assert!(
                 !should_auto_allow(tool),
-                "{} must NOT short-circuit the permission gate",
-                tool
+                "{tool} must NOT short-circuit the permission gate"
             );
         }
     }

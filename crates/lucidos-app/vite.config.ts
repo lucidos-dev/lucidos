@@ -4,8 +4,15 @@ import preact from '@preact/preset-vite';
 import { resolve } from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import { frontendPreviewProxy, PREVIEW_API_ORIGIN_ENV } from './vite/frontendPreviewProxy';
 
 const VITE_PORT = parseInt(process.env.VITE_PORT || '5173');
+
+// The frontend preview (engine/frontend_preview.rs) runs THIS dev server from a
+// coding-agent worktree on its own port, and forwards the engine-owned prefixes
+// back to the engine so the page is same-origin with its own API. `undefined`
+// for every other invocation, including a manual `npm run dev`.
+const previewProxy = frontendPreviewProxy(process.env[PREVIEW_API_ORIGIN_ENV]);
 
 // Resolve TLS cert/key: local .certs/ first, then LUCIDOS_TLS_CERT/KEY env vars
 // (needed in worktrees where .certs/ is gitignored — mirrors detect_tls() in workspace.sh).
@@ -335,10 +342,14 @@ export default defineConfig({
         key: fs.readFileSync(keyFile!),
       },
     }),
-    // The `server` block is only used by a manual `vite serve` (`npm run dev`).
-    // It is NOT part of the dev harness anymore (ADR 0014): web-dev / tauri-dev /
-    // e2e all build dist/ and the engine serves it directly via LUCIDOS_STATIC_DIR
-    // — there is no engine→Vite proxy. Kept for standalone frontend iteration.
+    ...(previewProxy && { proxy: previewProxy }),
+    // The `server` block is used by a manual `vite serve` (`npm run dev`) and by
+    // the frontend preview, which is the engine running this same dev server from
+    // a coding-agent worktree (engine/frontend_preview.rs). It is still NOT part
+    // of the dev harness (ADR 0014): web-dev / tauri-dev / e2e all build dist/
+    // and the engine serves it directly via LUCIDOS_STATIC_DIR, with no
+    // engine-to-Vite proxy in the workspace's own serving path. The preview is a
+    // separate origin the user opens deliberately, never that path (ADR 0055).
   },
   // `vite preview` (used by web-dev.sh --built to serve the built dist/) reads
   // `preview.*`, NOT `server.*` — mirror host/port/strictPort and TLS here so the

@@ -4,6 +4,7 @@ import { isPerfEnabled, setPerfEnabled } from '../../utils/perfQueue';
 import { animationSpeed, enginePackaged, speedMultiplier } from '../../store/store';
 import { confirmAndRestartEngine } from '../../store/actions/chat-changes';
 import { restartControlHome } from './restartControl';
+import { Explainer } from '../shared/Explainer';
 
 /** Settings → System → Debugging: developer/diagnostic toggles, off by default.
  *
@@ -31,13 +32,18 @@ import { restartControlHome } from './restartControl';
  *    Both routes go through `confirmAndRestartEngine`, the single
  *    confirm-then-restart entry point.
  *
- *    The note deliberately does NOT name a mechanism, because the packaged
+ *    Its explainer deliberately does NOT name a mechanism, because the packaged
  *    restart has two shapes: the desktop app drives `restart_service`
  *    (`launchctl kickstart -k` on the LaunchAgent, taking the gateway and every
  *    workspace engine it spawned down with it), while a browser/PWA client POSTs
  *    /restart, which the engine forwards to the gateway control API to respawn
  *    just this workspace's stack. The blast radius is what the user needs, so
- *    that is what the note states. */
+ *    that is what the explainer states.
+ *
+ *  Every row's prose is behind an *explainer* (`components/shared/Explainer.tsx`)
+ *  rather than sitting under the row as a `.settings-row-note`: this page is
+ *  four toggles and was three quarters grey paragraph. Nothing here is
+ *  state-dependent or a next action, so all four moved. */
 export function DebuggingSection() {
   // Lazy initializer: read localStorage once on mount, not on every render. The
   // panel remounts each time it's opened, so this reflects the current flag.
@@ -47,7 +53,20 @@ export function DebuggingSection() {
     <div class="settings-section">
       <div class="settings-section-title">Debugging</div>
       <div class="settings-row" data-search-anchor="debugging:capture-context">
-        <span class="settings-row-label">Capture context per step</span>
+        <span class="settings-row-label">
+          Capture context per step
+          <Explainer title="Capture context per step">
+            <p>
+              Stores the text of each prompt section (system prompt, conversation,
+              tools, memory, …) sent to the model on every step, so you can inspect what
+              went into the context in a step's snapshot viewer.
+            </p>
+            <p>
+              Off by default: it enlarges the event log. While off, the snapshot still
+              shows each section's name and size, just not its contents.
+            </p>
+          </Explainer>
+        </span>
         <label class="toggle-switch">
           <input
             type="checkbox"
@@ -57,15 +76,20 @@ export function DebuggingSection() {
           <span class="toggle-slider" />
         </label>
       </div>
-      <div class="settings-row-note">
-        Stores the text of each prompt section (system prompt, conversation,
-        tools, memory, …) sent to the model on every step, so you can inspect what
-        went into the context in a step's snapshot viewer. Off by default — it
-        enlarges the event log; while off, the snapshot still shows each section's
-        name and size, just not its contents.
-      </div>
       <div class="settings-row" data-search-anchor="debugging:perf">
-        <span class="settings-row-label">Perf instrumentation</span>
+        <span class="settings-row-label">
+          Perf instrumentation
+          <Explainer title="Perf instrumentation">
+            <p>
+              Logs thread-open / render / linkify timings to the engine log
+              (<code>[Client/perf]</code> lines) for diagnosing lag.
+            </p>
+            <p>
+              Per-device and off by default: turn it on only while measuring. Takes
+              effect immediately, no reload.
+            </p>
+          </Explainer>
+        </span>
         <label class="toggle-switch">
           <input
             type="checkbox"
@@ -79,14 +103,17 @@ export function DebuggingSection() {
           <span class="toggle-slider" />
         </label>
       </div>
-      <div class="settings-row-note">
-        Logs thread-open / render / linkify timings to the engine log
-        (<code>[Client/perf]</code> lines) for diagnosing lag. Per-device and off
-        by default — turn it on only while measuring. Takes effect immediately, no
-        reload.
-      </div>
       <div class="settings-row" data-search-anchor="debugging:animation-speed">
-        <span class="settings-row-label">Animation speed</span>
+        <span class="settings-row-label">
+          Animation speed
+          <Explainer title="Animation speed">
+            <p>
+              Scales the duration of every UI transition (1.0x = normal). Slowing
+              animations down makes transition glitches easier to inspect.
+            </p>
+            <p>Per-device, persisted locally, takes effect immediately.</p>
+          </Explainer>
+        </span>
         <div class="settings-row-options" style="gap: 0.5rem; align-items: center">
           <input
             type="range"
@@ -102,28 +129,27 @@ export function DebuggingSection() {
           <span class="settings-row-label" style="min-width: 2.5rem; text-align: right">{speedMultiplier.value.toFixed(1)}x</span>
         </div>
       </div>
-      <div class="settings-row-note">
-        Scales the duration of every UI transition (1.0x = normal). Slowing
-        animations down makes transition glitches easier to inspect. Per-device,
-        persisted locally, takes effect immediately.
-      </div>
       {restartControlHome(enginePackaged.value) === 'debugging' && (
-        <>
-          <div class="settings-row" data-search-anchor="debugging:restart-engine">
-            <span class="settings-row-label">Restart engine</span>
-            <button class="action-btn" onClick={() => { void confirmAndRestartEngine(); }}>
-              Restart Engine
-            </button>
-          </div>
-          <div class="settings-row-note">
-            Stops this workspace's engine and starts it again. In the desktop app
-            it restarts the whole background service, so every workspace it runs
-            goes down and comes back with it. Nothing is rebuilt: this install
-            ships its binary, so a restart is a recovery action for an
-            unresponsive engine, not how you pick up a new version. Use Check for
-            Updates under Overview for that.
-          </div>
-        </>
+        <div class="settings-row" data-search-anchor="debugging:restart-engine">
+          <span class="settings-row-label">
+            Restart engine
+            <Explainer title="Restart engine">
+              <p>
+                Stops this workspace's engine and starts it again. In the desktop app
+                it restarts the whole background service, so every workspace it runs
+                goes down and comes back with it.
+              </p>
+              <p>
+                Nothing is rebuilt: this install ships its binary, so a restart is a
+                recovery action for an unresponsive engine, not how you pick up a new
+                version. Use Check for Updates under Overview for that.
+              </p>
+            </Explainer>
+          </span>
+          <button class="action-btn" onClick={() => { void confirmAndRestartEngine(); }}>
+            Restart Engine
+          </button>
+        </div>
       )}
     </div>
   );

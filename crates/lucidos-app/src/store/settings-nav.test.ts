@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, migrateSettingsSubview } from './store';
+import { SETTINGS_NAV_ITEMS, SETTINGS_SYSTEM_SUBPANEL_ITEMS, settingsSubviewLabel, settingsSubviewShortLabel, migrateSettingsSubview } from './store';
 
 describe('settings navigation', () => {
   it('keeps System last in the Workspace group and owns Thread Queue, Backup, Memory, Disk Usage, Environment Variables, and Debugging as subpanels', () => {
@@ -42,10 +42,13 @@ describe('settings navigation', () => {
 
   it('labels every home row in Title Case', () => {
     // Peers used to disagree ("Network access" beside "Disk Usage"). Nav labels
-    // are Title Case; section titles INSIDE a page are sentence case.
-    for (const { label } of SETTINGS_NAV_ITEMS) {
-      for (const word of label.split(' ')) {
-        expect(word[0], `"${label}" is not Title Case`).toBe(word[0].toUpperCase());
+    // are Title Case; section titles INSIDE a page are sentence case. A
+    // shorthand is a label too, so it follows the same casing.
+    for (const { label, short } of SETTINGS_NAV_ITEMS) {
+      for (const name of short ? [label, short] : [label]) {
+        for (const word of name.split(' ')) {
+          expect(word[0], `"${name}" is not Title Case`).toBe(word[0].toUpperCase());
+        }
       }
     }
   });
@@ -64,6 +67,61 @@ describe('settings navigation', () => {
     expect(keys).toContain('appearance');
     expect(keys).toContain('coding-agents');
     expect(keys).toContain('locale');
+  });
+});
+
+describe('the header bar’s short category names', () => {
+  // The bar is the narrowest surface a category name is ever shown on. On a
+  // phone the title is the one shrinkable member of a fixed-width cluster
+  // between the two nav chevrons (`.header-title-cluster`,
+  // styles/header-mark.css), which leaves roughly this many characters at 100%
+  // UI scale and fewer above it. Past that the name ellipsises, and an ellipsis
+  // on a name WE chose is a name we should have written shorter: shrinking the
+  // font instead would make the bar's type jitter from screen to screen, which
+  // is what both the iOS and Material top-bar conventions warn against.
+  const HEADER_TITLE_MAX_CHARS = 12;
+  const allItems = [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS];
+
+  it('every category fits the bar without an ellipsis', () => {
+    for (const { key, label } of allItems) {
+      const shown = settingsSubviewShortLabel(key)!;
+      expect(
+        shown.length,
+        `"${label}" renders as "${shown}" in the header, which is too long: give it a shorter \`short\``,
+      ).toBeLessThanOrEqual(HEADER_TITLE_MAX_CHARS);
+    }
+  });
+
+  it('a shorthand exists only where it earns its keep', () => {
+    // A `short` equal to or longer than the label is dead weight that makes the
+    // bar and the Settings list disagree for nothing.
+    for (const { label, short } of allItems) {
+      if (short === undefined) continue;
+      expect(short.length, `"${label}" has a \`short\` that is not shorter`).toBeLessThan(label.length);
+      expect(short.trim(), `"${label}" has an empty \`short\``).not.toBe('');
+    }
+  });
+
+  it('falls back to the full label where no shorthand is authored', () => {
+    expect(settingsSubviewShortLabel('models')).toBe('Models');
+    expect(settingsSubviewShortLabel('thread-queue')).toBe('Thread Queue');
+  });
+
+  it('shortens the four names that do not fit, without renaming the category', () => {
+    // The full name is what the Settings list, Search Everywhere, the
+    // back/forward history menu and the title's tap-tooltip keep showing.
+    expect(settingsSubviewShortLabel('appearance')).toBe('Appearance');
+    expect(settingsSubviewLabel('appearance')).toBe('Appearance & Behavior');
+    expect(settingsSubviewShortLabel('keyboard-shortcuts')).toBe('Shortcuts');
+    expect(settingsSubviewLabel('keyboard-shortcuts')).toBe('Keyboard Shortcuts');
+    expect(settingsSubviewShortLabel('environment-variables')).toBe('Env Vars');
+    expect(settingsSubviewLabel('environment-variables')).toBe('Environment Variables');
+    expect(settingsSubviewShortLabel('coding-agents')).toBe('Agents');
+    expect(settingsSubviewLabel('coding-agents')).toBe('Coding Agents');
+  });
+
+  it('reports nothing for a key that is not a category', () => {
+    expect(settingsSubviewShortLabel('links' as never)).toBeUndefined();
   });
 });
 

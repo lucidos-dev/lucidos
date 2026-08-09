@@ -11,7 +11,7 @@ use uuid::Uuid;
 /// with one that lacks a recognized prefix. Per best-practices rule 8, the
 /// agent must pick a route explicitly — there is no default and no fallback.
 /// Lives next to the route enum so the wire message can't drift from the
-/// tool description in `llm/tools.rs`.
+/// tool description in `llm/tools/misc.rs`.
 const GIT_CLONE_DESTINATION_REQUIRED: &str =
     "Error: destination is required and must start with one of two prefixes — \
      '.lucidos/tmp/<name>/' (ephemeral, gitignored, the default per best-practices \
@@ -29,6 +29,134 @@ const GIT_CLONE_DESTINATION_REQUIRED: &str =
 enum GitCloneRoute {
     Artifacts(String),
     Tmp(String),
+}
+
+// Inner recursive helper: every parameter is per-recursion-frame state
+// (filters + four mutable counters); flattening into a struct would just
+// wrap the same set without simplifying the call sites below.
+#[allow(clippy::too_many_arguments)]
+fn walk_dir(
+    dir: &Path,
+    base: &Path,
+    dest_base: &str,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    default_excludes: &[&str],
+    collected_files: &mut Vec<(String, String)>,
+    imported_files: &mut Vec<String>,
+    imported_count: &mut usize,
+    skipped_count: &mut usize,
+    total_bytes: &mut u64,
+) -> Result<(), String> {
+    // Bail mid-walk once the bulk threshold trips so a 1 GB clone
+    // doesn't read 1 GB of UTF-8 into memory before the outer site
+    // refuses. The outer site re-checks the same predicate.
+    if *imported_count > MAX_BULK_FILE_COUNT || *total_bytes > MAX_BULK_BYTES {
+        return Ok(());
+    }
+
+    let entries = std::fs::read_dir(dir).map_err(|e| format!("Failed to read dir: {}", e))?;
+
+    for entry in entries.filter_map(|e| e.ok()) {
+        if *imported_count > MAX_BULK_FILE_COUNT || *total_bytes > MAX_BULK_BYTES {
+            return Ok(());
+        }
+        let path = entry.path();
+        let relative = path.strip_prefix(base).unwrap_or(&path);
+        let relative_str = relative.to_string_lossy();
+
+        let is_default_excluded = default_excludes.iter().any(|pattern| {
+            if pattern.contains("**") {
+                let prefix = pattern.trim_end_matches("/**");
+                relative_str.starts_with(prefix)
+            } else if pattern.starts_with("*.") {
+                let ext = pattern.trim_start_matches("*.");
+                path.extension().is_some_and(|e| e.to_string_lossy() == ext)
+            } else {
+                relative_str == *pattern || relative_str.starts_with(&format!("{}/", pattern))
+            }
+        });
+
+        if is_default_excluded {
+            *skipped_count += 1;
+            continue;
+        }
+
+        let is_excluded = !exclude_patterns.is_empty()
+            && exclude_patterns
+                .iter()
+                .any(|pattern| glob::Pattern::new(pattern).is_ok_and(|p| p.matches(&relative_str)));
+
+        if is_excluded {
+            *skipped_count += 1;
+            continue;
+        }
+
+        let is_included = include_patterns.is_empty()
+            || include_patterns
+                .iter()
+                .any(|pattern| glob::Pattern::new(pattern).is_ok_and(|p| p.matches(&relative_str)));
+
+        // FILES only. `include_patterns` selects files to import,
+        // and a directory essentially never matches a file glob
+        // (`glob::Pattern::new("src/**/*.rs").matches("src")` is
+        // false, and so is `"*.py"` against `src`). Pruning a
+        // directory here would skip the recursion below, so any
+        // non-empty `include_patterns` imported only top-level
+        // matches: the tool schema's own example
+        // `['*.py', 'src/**/*.rs']` imported nothing at all.
+        // Subtree pruning is `exclude_patterns`' job, above.
+        if !path.is_dir() && !is_included {
+            *skipped_count += 1;
+            continue;
+        }
+
+        if path.is_dir() {
+            walk_dir(
+                &path,
+                base,
+                dest_base,
+                include_patterns,
+                exclude_patterns,
+                default_excludes,
+                collected_files,
+                imported_files,
+                imported_count,
+                skipped_count,
+                total_bytes,
+            )?;
+        } else if path.is_file() {
+            let extension = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_lowercase();
+            let is_binary = crate::core::is_binary_extension(&extension);
+
+            let dest_path = format!("{}/{}", dest_base, relative_str);
+
+            if is_binary {
+                // Binary files aren't imported here: write_batch_and_commit
+                // is text-only and committing arbitrary binaries by default
+                // would bloat the repo.
+                *skipped_count += 1;
+            } else {
+                match std::fs::read_to_string(&path) {
+                    Ok(content) => {
+                        *total_bytes += content.len() as u64;
+                        collected_files.push((dest_path, content));
+                        imported_files.push(relative_str.to_string());
+                        *imported_count += 1;
+                    }
+                    Err(_) => {
+                        // Not valid UTF-8, same reason as binary above.
+                        *skipped_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 impl LucidosEngine {
@@ -361,127 +489,6 @@ impl LucidosEngine {
                 let mut imported_files: Vec<String> = Vec::new();
                 let dest_base = format!("imported/{}", dest_subdir);
 
-                // Inner recursive helper: every parameter is per-recursion-frame state
-                // (filters + four mutable counters); flattening into a struct would just
-                // wrap the same set without simplifying the call sites below.
-                #[allow(clippy::too_many_arguments)]
-                fn walk_dir(
-                    dir: &Path,
-                    base: &Path,
-                    dest_base: &str,
-                    include_patterns: &[String],
-                    exclude_patterns: &[String],
-                    default_excludes: &[&str],
-                    collected_files: &mut Vec<(String, String)>,
-                    imported_files: &mut Vec<String>,
-                    imported_count: &mut usize,
-                    skipped_count: &mut usize,
-                    total_bytes: &mut u64,
-                ) -> Result<(), String> {
-                    // Bail mid-walk once the bulk threshold trips so a 1 GB clone
-                    // doesn't read 1 GB of UTF-8 into memory before the outer site
-                    // refuses. The outer site re-checks the same predicate.
-                    if *imported_count > MAX_BULK_FILE_COUNT || *total_bytes > MAX_BULK_BYTES {
-                        return Ok(());
-                    }
-
-                    let entries =
-                        std::fs::read_dir(dir).map_err(|e| format!("Failed to read dir: {}", e))?;
-
-                    for entry in entries.filter_map(|e| e.ok()) {
-                        if *imported_count > MAX_BULK_FILE_COUNT || *total_bytes > MAX_BULK_BYTES {
-                            return Ok(());
-                        }
-                        let path = entry.path();
-                        let relative = path.strip_prefix(base).unwrap_or(&path);
-                        let relative_str = relative.to_string_lossy();
-
-                        let is_default_excluded = default_excludes.iter().any(|pattern| {
-                            if pattern.contains("**") {
-                                let prefix = pattern.trim_end_matches("/**");
-                                relative_str.starts_with(prefix)
-                            } else if pattern.starts_with("*.") {
-                                let ext = pattern.trim_start_matches("*.");
-                                path.extension().is_some_and(|e| e.to_string_lossy() == ext)
-                            } else {
-                                relative_str == *pattern
-                                    || relative_str.starts_with(&format!("{}/", pattern))
-                            }
-                        });
-
-                        if is_default_excluded {
-                            *skipped_count += 1;
-                            continue;
-                        }
-
-                        let is_excluded = !exclude_patterns.is_empty()
-                            && exclude_patterns.iter().any(|pattern| {
-                                glob::Pattern::new(pattern).is_ok_and(|p| p.matches(&relative_str))
-                            });
-
-                        if is_excluded {
-                            *skipped_count += 1;
-                            continue;
-                        }
-
-                        let is_included = include_patterns.is_empty()
-                            || include_patterns.iter().any(|pattern| {
-                                glob::Pattern::new(pattern).is_ok_and(|p| p.matches(&relative_str))
-                            });
-
-                        if !is_included {
-                            *skipped_count += 1;
-                            continue;
-                        }
-
-                        if path.is_dir() {
-                            walk_dir(
-                                &path,
-                                base,
-                                dest_base,
-                                include_patterns,
-                                exclude_patterns,
-                                default_excludes,
-                                collected_files,
-                                imported_files,
-                                imported_count,
-                                skipped_count,
-                                total_bytes,
-                            )?;
-                        } else if path.is_file() {
-                            let extension = path
-                                .extension()
-                                .and_then(|e| e.to_str())
-                                .unwrap_or("")
-                                .to_lowercase();
-                            let is_binary = crate::core::is_binary_extension(&extension);
-
-                            let dest_path = format!("{}/{}", dest_base, relative_str);
-
-                            if is_binary {
-                                // Binary files aren't imported here — write_batch_and_commit
-                                // is text-only and committing arbitrary binaries by default
-                                // would bloat the repo.
-                                *skipped_count += 1;
-                            } else {
-                                match std::fs::read_to_string(&path) {
-                                    Ok(content) => {
-                                        *total_bytes += content.len() as u64;
-                                        collected_files.push((dest_path, content));
-                                        imported_files.push(relative_str.to_string());
-                                        *imported_count += 1;
-                                    }
-                                    Err(_) => {
-                                        // Not valid UTF-8 — same reason as binary above.
-                                        *skipped_count += 1;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Ok(())
-                }
-
                 let mut collected_files: Vec<(String, String)> = Vec::new();
                 let mut total_bytes: u64 = 0;
                 if let Err(e) = walk_dir(
@@ -639,5 +646,94 @@ impl LucidosEngine {
             &commit_sha[..commit_sha.floor_char_boundary(7)]
         );
         Ok((msg, commit_sha, dest_relative))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `walk_dir` was a nested `fn` inside `git_clone`'s match arm, which is why
+    /// the bug below shipped untested. It is lifted to module level (a pure move,
+    /// it captured nothing) so the recursion can be exercised directly.
+    #[allow(clippy::too_many_arguments)]
+    fn walk(root: &Path, include: &[String], exclude: &[String]) -> (Vec<String>, usize) {
+        let mut collected = Vec::new();
+        let mut imported_files = Vec::new();
+        let (mut imported, mut skipped, mut bytes) = (0usize, 0usize, 0u64);
+        walk_dir(
+            root,
+            root,
+            "imported/x",
+            include,
+            exclude,
+            &[],
+            &mut collected,
+            &mut imported_files,
+            &mut imported,
+            &mut skipped,
+            &mut bytes,
+        )
+        .expect("walk");
+        imported_files.sort();
+        (imported_files, skipped)
+    }
+
+    fn tree() -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(d.path().join("src/deep")).unwrap();
+        std::fs::create_dir_all(d.path().join("vendor")).unwrap();
+        std::fs::write(d.path().join("top.py"), "print(1)").unwrap();
+        std::fs::write(d.path().join("src/a.rs"), "fn a() {}").unwrap();
+        std::fs::write(d.path().join("src/deep/b.rs"), "fn b() {}").unwrap();
+        std::fs::write(d.path().join("vendor/v.rs"), "fn v() {}").unwrap();
+        d
+    }
+
+    /// Regression: `include_patterns` was matched against DIRECTORY entries and a
+    /// non-match `continue`d BEFORE the `path.is_dir()` recursion, so a non-empty
+    /// include list pruned whole subtrees. `Pattern::new("src/**/*.rs")` does not
+    /// match the bare directory `src`, so the tool schema's own example
+    /// `['*.py', 'src/**/*.rs']` reached only TOP-LEVEL matches: on the tree
+    /// below it returned `["top.py"]` and lost both nested `.rs` files, and on a
+    /// repo whose every match is nested (the ordinary shape for that example) it
+    /// imported nothing at all.
+    #[test]
+    fn include_patterns_select_files_without_pruning_the_directories_holding_them() {
+        let d = tree();
+        let include = vec!["*.py".to_string(), "src/**/*.rs".to_string()];
+        let (files, _) = walk(d.path(), &include, &[]);
+        assert_eq!(
+            files,
+            vec![
+                "src/a.rs".to_string(),
+                "src/deep/b.rs".to_string(),
+                "top.py".to_string()
+            ],
+            "an include list must reach files nested under directories that match no file glob"
+        );
+    }
+
+    /// The other half of the contract: pruning a subtree is `exclude_patterns`'
+    /// job, and lifting the directory check out of the include gate must not have
+    /// disturbed it.
+    #[test]
+    fn exclude_patterns_still_prune_a_subtree() {
+        let d = tree();
+        let (files, _) = walk(d.path(), &[], &["vendor/**".to_string()]);
+        assert!(
+            !files.iter().any(|f| f.starts_with("vendor/")),
+            "got {files:?}"
+        );
+        assert!(files.contains(&"src/a.rs".to_string()), "got {files:?}");
+    }
+
+    /// An empty include list imports everything, the pre-existing behaviour that
+    /// masked the bug (the buggy gate was a no-op when `is_included` was always true).
+    #[test]
+    fn an_empty_include_list_imports_the_whole_tree() {
+        let d = tree();
+        let (files, _) = walk(d.path(), &[], &[]);
+        assert_eq!(files.len(), 4, "got {files:?}");
     }
 }

@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from 'preact/hooks';
 import { currentModel, reasoningEffort, preferences, showToast, showConfirm, oauthAccounts, credentials, chatModels, settingsSubview, settingsScrollTarget, SETTINGS_NAV_ITEMS, repositories, knownOAuthProviders, oauthConnectPrefill } from '../../store/store';
-import { devices, getDeviceId, loadDevices, updateDeviceName, toggleDevicePush, removeDevice } from '../../store/actions/devices';
-import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
+import { devices, getDeviceId, loadDevices, updateDeviceName, removeDevice } from '../../store/actions/devices';
+import { setImageModel, setBackgroundModel, setTheme, setFontFamily, setCurrentModel, setReasoningEffort, currentTheme, currentFontFamily, currentUiScale, currentImageModel, currentBackgroundModel, currentVertexRegion, setVertexRegion, currentCommandGuard, setCommandGuard, currentCommandGuardJudge, setCommandGuardJudge, currentMobileHeaderSticky, setMobileHeaderSticky, currentInAppBrowser, setInAppBrowser, currentExternalLinkTarget, setExternalLinkTarget, externalLinkTargetConfigurable, currentMaxToolCalls, setMaxToolCalls, estimateTurnDuration, MAX_TOOL_CALLS_MIN, MAX_TOOL_CALLS_REPRESENTABLE, currentStyleOverrides, clearStyleOverrides, type ExternalLinkTarget, type Theme, type FontFamily } from '../../store/actions/preferences';
 import { openScaleModal } from '../shared/scaleModalState';
 import { applyNavFocus } from '../shared/focusMarker';
 import { formatDateTime, formatShortDateWithYear } from '../../utils/formatTime';
@@ -23,7 +23,7 @@ import {
   reauthorizationHint,
 } from '../credentials/providerConsoleHint';
 import { handleNavigationRequest } from '../../store/actions/navigation-request';
-import { initPushSubscription } from '../../store/actions/push';
+import { setDevicePushEnabled } from '../../store/actions/push';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { availableReasoningLevels } from '../../store/models';
 import { chatModelOptions, loadChatModels } from '../../store/actions/models';
@@ -33,6 +33,7 @@ import { OpenAiProviderSettings } from './OpenAiProviderSettings';
 import { OpenRouterProviderSettings } from './OpenRouterProviderSettings';
 import { LocalProviderSettings } from './LocalProviderSettings';
 import { Dropdown } from '../shared/Dropdown';
+import { Explainer } from '../shared/Explainer';
 import { AllowlistEditor } from './AllowlistEditor';
 import { getCcAllowedTools, putCcAllowedTools, getAgentAllowedCommands, putAgentAllowedCommands } from '../../api/client';
 import { KeyboardShortcutsSection } from './KeyboardShortcutsSection';
@@ -42,7 +43,7 @@ import { NetworkAccessPage } from './NetworkAccessPage';
 import { LocaleSection } from './LocaleSection';
 import { CodingAgentBinariesSection } from './CodingAgentBinariesSection';
 import { SystemPage } from './SystemPage';
-import { isTauri } from '../../utils/platform';
+import { isTauri, describeDeviceUserAgent } from '../../utils/platform';
 import { viewportIsMobile } from '../../utils/viewport';
 import { ChevronRightIcon } from '../shared/icons';
 import { CredentialItem } from '../credentials/CredentialItem';
@@ -175,21 +176,6 @@ const BACKGROUND_MODELS = [
   { value: 'gpt-5.4-mini', label: 'GPT-5.4 mini' },
 ];
 
-function parseUserAgent(ua: string | null): string {
-  if (!ua) return 'Unknown device';
-  const browser = ua.match(/(?:Chrome|Firefox|Safari|Edge|Opera)\/[\d.]+/)?.[0]
-    || ua.match(/(?:Chrome|Firefox|Safari|Edge|Opera)/)?.[0]
-    || 'Unknown browser';
-  const os = ua.includes('iPhone') ? 'iOS'
-    : ua.includes('iPad') ? 'iPadOS'
-    : ua.includes('Mac') ? 'macOS'
-    : ua.includes('Android') ? 'Android'
-    : ua.includes('Windows') ? 'Windows'
-    : ua.includes('Linux') ? 'Linux'
-    : 'Unknown OS';
-  return `${browser} on ${os}`;
-}
-
 /** Self-skeletonizing device row: rendered with no props inside a
  *  SkeletonProvider (`<DeviceRow />`) it draws itself as a loading placeholder
  *  via the Sk* leaves; with real props it renders normally. The `editing` state
@@ -238,16 +224,6 @@ function DeviceRow({ device, editingId, setEditingId }: {
   // push remotely (and Remove) stays allowed.
   const enableBlocked = !sk && !isCurrent && !device?.push_enabled;
 
-  async function handleTogglePush() {
-    if (!device) return;
-    const newEnabled = !device.push_enabled;
-    if (newEnabled) {
-      const ok = await initPushSubscription();
-      if (!ok) return;
-    }
-    await toggleDevicePush(device.id, newEnabled);
-  }
-
   return (
     <div class={`list-row ${isCurrent ? 'device-current' : ''}`}>
       <div class="list-row-info">
@@ -276,7 +252,7 @@ function DeviceRow({ device, editingId, setEditingId }: {
             No manual middle-dot glue: it would be its own anonymous flex item
             and pick the gap up on both sides (see the oauth row's note below). */}
         <SkText class="list-row-details" as="div" w="14rem">
-          <span>{parseUserAgent(device?.user_agent ?? null)}</span>
+          <span>{describeDeviceUserAgent(device?.user_agent)}</span>
           {device && (
             <span data-tooltip={formatDateTime(new Date(device.last_seen_at))}>
               {formatTimeAgo(new Date(device.last_seen_at))}
@@ -295,7 +271,9 @@ function DeviceRow({ device, editingId, setEditingId }: {
               type="checkbox"
               checked={device?.push_enabled}
               disabled={enableBlocked}
-              onChange={handleTogglePush}
+              onChange={() => {
+                if (device) void setDevicePushEnabled(device.id, !device.push_enabled);
+              }}
             />
             <span class="toggle-slider" />
           </label>
@@ -438,6 +416,17 @@ function VertexProviderSettings() {
       <div class="settings-row">
         <span class="settings-row-label" data-search-anchor="models:vertex-ai">
           Vertex AI
+          <Explainer title="Vertex AI">
+            <p>
+              Serves the Claude models (Opus / Sonnet / Haiku) on the{' '}
+              <strong>vertex</strong> provider via Google Cloud.
+            </p>
+            <p>
+              No key to enter: it uses your <strong>gcloud</strong> Application Default
+              Credentials (<code>gcloud auth application-default login</code>). The region
+              below is the only setting.
+            </p>
+          </Explainer>
         </span>
       </div>
       <div class="settings-row" data-search-anchor="models:region">
@@ -449,12 +438,6 @@ function VertexProviderSettings() {
           placeholder="e.g. europe-west1"
           onChange={setVertexRegion}
         />
-      </div>
-      <div class="settings-row-note">
-        Serves the Claude models (Opus / Sonnet / Haiku) on the <strong>vertex</strong> provider
-        via Google Cloud. No key to enter — it uses your <strong>gcloud</strong> Application Default
-        Credentials (<code>gcloud auth application-default login</code>); the region above is the
-        only setting.
       </div>
     </>
   );
@@ -496,6 +479,7 @@ export function SettingsView() {
   // Access preferences.value to subscribe to signal updates, then use typed accessors
   preferences.value;
   const uiScale = currentUiScale();
+  const styleOverrideCount = Object.keys(currentStyleOverrides()).length;
   const imageModel = currentImageModel();
 
   useEffect(() => {
@@ -768,25 +752,34 @@ export function SettingsView() {
             an entry in each (2026-08-05). Credentials is the secret store;
             Connected accounts is the sign-in list. */}
         <div class="settings-section accounts-section">
-          <div class="settings-section-title" data-search-anchor="accounts:connected">Connected accounts</div>
-          <p class="settings-section-desc">
-            Services you have signed in to, so Lucidos can act on your behalf. Signing in
-            happens here, in your browser, and Lucidos keeps the resulting access.
-          </p>
+          <div class="settings-section-title" data-search-anchor="accounts:connected">
+            Connected accounts
+            <Explainer title="Connected accounts">
+              <p>Services you have signed in to, so Lucidos can act on your behalf.</p>
+              <p>
+                Signing in happens here, in your browser, and Lucidos keeps the
+                resulting access.
+              </p>
+            </Explainer>
+          </div>
           {oauthSection()}
         </div>
         <div class="settings-section accounts-section">
-          <div class="settings-section-title" data-search-anchor="accounts:credentials">Credentials</div>
-          {/* Deliberately does NOT spell out the `oauth:<provider>` service
-              name. That name is the storage key, and the row title drops the
-              prefix on purpose (see `credentialRowLabel`), so naming it here
-              sent the user looking for a string that appears nowhere on the
-              screen. The row explains itself instead: provider title, type
-              badge, and a note saying which account it belongs to. */}
-          <p class="settings-section-desc">
-            Secrets Lucidos stores for you: API keys, tokens and passwords, and the
-            OAuth app registrations behind the accounts above.
-          </p>
+          <div class="settings-section-title" data-search-anchor="accounts:credentials">
+            Credentials
+            {/* Deliberately does NOT spell out the `oauth:<provider>` service
+                name. That name is the storage key, and the row title drops the
+                prefix on purpose (see `credentialRowLabel`), so naming it here
+                sent the user looking for a string that appears nowhere on the
+                screen. The row explains itself instead: provider title, type
+                badge, and a note saying which account it belongs to. */}
+            <Explainer title="Credentials">
+              <p>
+                Secrets Lucidos stores for you: API keys, tokens and passwords, and the
+                OAuth app registrations behind the accounts above.
+              </p>
+            </Explainer>
+          </div>
           {credentialsSection()}
         </div>
       </>
@@ -877,8 +870,12 @@ export function SettingsView() {
 
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="coding-agents:repositories">Repositories</div>
-        <p class="settings-section-desc">Register local git repositories for Claude Code sessions.</p>
+        <div class="settings-section-title" data-search-anchor="coding-agents:repositories">
+          Repositories
+          <Explainer title="Repositories">
+            <p>Register local git repositories for Claude Code sessions.</p>
+          </Explainer>
+        </div>
         <div class="list-rows">{rows}</div>
       </div>
     );
@@ -1037,7 +1034,19 @@ export function SettingsView() {
     return (
       <>
         <div class="settings-section">
-          <div class="settings-section-title" data-search-anchor="models:chat">Chat &amp; triggers</div>
+          <div class="settings-section-title" data-search-anchor="models:chat">
+            Chat &amp; triggers
+            <Explainer title="Chat &amp; triggers">
+              <p>
+                The model and reasoning here are the defaults for new chat threads
+                and for every trigger.
+              </p>
+              <p>
+                A trigger can pin its own instead, on its edit form in the Triggers
+                panel.
+              </p>
+            </Explainer>
+          </div>
           <div class="settings-row">
             <span class="settings-row-label">Model</span>
             <Dropdown
@@ -1055,7 +1064,24 @@ export function SettingsView() {
             />
           </div>
           <div class="settings-row" data-search-anchor="models:max-tool-calls">
-            <span class="settings-row-label">Max tool calls</span>
+            <span class="settings-row-label">
+              Max tool calls
+              <Explainer title="Max tool calls">
+                <p>
+                  How many tool calls the agent may make in a single turn before the
+                  engine stops it. Applies to chat and triggers alike.
+                </p>
+                <p>
+                  Hitting the limit is not an error: the turn ends with a message you
+                  can continue from by sending anything.
+                </p>
+                <p>
+                  There's no maximum, but the cap is what bounds a runaway turn, and
+                  it's roughly how long one can run. Cost grows faster than time,
+                  because every step resends the conversation.
+                </p>
+              </Explainer>
+            </span>
             <Dropdown
               options={MAX_TOOL_CALLS_OPTIONS}
               value={String(maxToolCalls)}
@@ -1064,15 +1090,13 @@ export function SettingsView() {
               onChange={handleMaxToolCallsChange}
             />
           </div>
+          {/* Stays at rest while the rest of the note moved behind the
+              explainer: it is COMPUTED from the value in the field above, and a
+              dialog cannot show a figure the user is reading off the control it
+              describes. */}
           <div class="settings-row-note">
-            How many tool calls the agent may make in a single turn before the
-            engine stops it. Hitting the limit is not an error: the turn ends
-            with a message you can continue from by sending anything. There's no
-            maximum, but the cap is what bounds a runaway turn, and it's roughly
-            how long one can run. {maxToolCalls.toLocaleString()} allows up to
-            about {estimateTurnDuration(maxToolCalls)} of work, and cost grows
-            faster than time because every step resends the conversation.
-            Applies to chat and triggers alike.
+            {maxToolCalls.toLocaleString()} allows up to about{' '}
+            {estimateTurnDuration(maxToolCalls)} of work.
           </div>
         </div>
         <div class="settings-section">
@@ -1171,6 +1195,30 @@ export function SettingsView() {
             </button>
           </div>
         </div>
+        {/* The live style remote's undo. A custom property override is applied
+            to <html> the moment it is written, so a bad value (a background
+            that matches the text, a zero font size) is one slider away, and the
+            way out must not depend on the tuned UI being legible. Two routes,
+            deliberately: this row, and the `?style-reset` URL parameter, which
+            clears the map before first paint and so works even when this row
+            cannot be read. The row renders only while overrides exist, so it
+            costs nothing to a user who has never opened the remote. */}
+        {styleOverrideCount > 0 && (
+          <div class="settings-section">
+            <div class="settings-section-title" data-search-anchor="appearance:style-overrides">Style overrides</div>
+            <div class="settings-row" data-search-anchor="appearance:style-overrides-clear">
+              <span class="settings-row-label">
+                {styleOverrideCount} {styleOverrideCount === 1 ? 'value' : 'values'} tuned by the style remote
+              </span>
+              <button
+                class="action-btn action-btn-danger"
+                onClick={() => void clearStyleOverrides()}
+              >
+                Clear all
+              </button>
+            </div>
+          </div>
+        )}
         {/* The mobile header (and its hide-on-scroll behavior) only exists at the
             ≤768px breakpoint, so this toggle does nothing observable on desktop.
             Gate the whole section on the reactive viewport signal: it appears /
@@ -1193,8 +1241,80 @@ export function SettingsView() {
             </div>
           </div>
         )}
+        {notificationsSection()}
         {linksSection()}
       </>
+    );
+  }
+
+  /** Notifications: the push switch for THIS device, the same one the device's
+   *  own row in Settings → Devices carries. Duplicated here on purpose. Push is
+   *  per device, and the switch someone reaches for is the one governing the
+   *  device in their hand, which is behaviour of this client rather than a fact
+   *  about the fleet; Devices stays the place to see and manage the others.
+   *  Both rows call `setDevicePushEnabled`, so they cannot disagree. */
+  function notificationsSection() {
+    const currentId = getDeviceId();
+    const current = loadable.status === 'loaded'
+      ? loadable.data.find((d) => d.id === currentId)
+      : undefined;
+    // Loaded, but this device is not in the list: registration failed earlier
+    // this page load (`registerCurrentDevice` swallows its own errors as
+    // telemetry). Say so, rather than leaving a toggle that can never settle.
+    const unregistered = loadable.status === 'loaded' && current === undefined;
+    return (
+      <div class="settings-section">
+        <div class="settings-section-title" data-search-anchor="appearance:notifications">
+          Notifications
+        </div>
+        {loadable.status === 'failed' ? (
+          <LoadableError noun="devices" error={loadable.error} />
+        ) : (
+          <>
+            <div class="settings-row" data-search-anchor="appearance:push-notifications">
+              <span class="settings-row-label">
+                Push notifications
+                {/* The Devices link is why this takes the function form: it
+                    navigates, and the dialog has to go with it or it is left
+                    floating over the page it just opened. */}
+                <Explainer title="Push notifications">
+                  {(close) => (
+                    <>
+                      <p>
+                        Whether this device gets a notification outside Lucidos when
+                        something needs you.
+                      </p>
+                      <p>
+                        Every device has its own switch, and the rest live under{' '}
+                        <button
+                          class="accent-link"
+                          onClick={() => {
+                            close();
+                            openSettingsSubview('devices');
+                          }}
+                        >
+                          Devices
+                        </button>.
+                      </p>
+                    </>
+                  )}
+                </Explainer>
+              </span>
+              <LoadableToggle
+                loaded={current !== undefined}
+                checked={current?.push_enabled ?? false}
+                onChange={(c) => void setDevicePushEnabled(currentId, c)}
+              />
+            </div>
+            {unregistered && (
+              <div class="settings-row-note">
+                This device has not registered with the engine yet, so there is nothing
+                to switch on. Reload the page to try again.
+              </div>
+            )}
+          </>
+        )}
+      </div>
     );
   }
 
@@ -1224,49 +1344,58 @@ export function SettingsView() {
       <div class="settings-section">
         <div class="settings-section-title" data-search-anchor="appearance:links">Links</div>
         {showExternalTarget && (
-          <>
-            <p class="settings-section-desc">
-              Where a link to another site goes when you tap it. Installed on the
-              home screen, iOS would otherwise trap every link in an in-app view with
-              no address bar and no shared Safari session. iOS gives web apps no way
-              to reach your default-browser setting directly, so "Ask" is the option
-              that lets iOS itself offer every browser you have installed.
-            </p>
-            {/* The per-link override is iOS's OWN long-press menu, not something we
-                render: suppressing it to draw our own would cost Copy Link, Share
-                and Add to Reading List alongside Open in Safari. Naming it here is
-                the documented way to make it discoverable. */}
-            <p class="settings-section-desc">
-              For a one-off, long-press any link instead: iOS offers Open in Safari,
-              Copy and Share without changing this setting.
-            </p>
-            <div class="settings-row" data-search-anchor="appearance:external-link-target">
-              <span class="settings-row-label">Open links in</span>
-              <Dropdown
-                options={EXTERNAL_LINK_TARGET_OPTIONS}
-                value={currentExternalLinkTarget()}
-                onChange={(v) => void setExternalLinkTarget(v as ExternalLinkTarget)}
-              />
-            </div>
-          </>
+          <div class="settings-row" data-search-anchor="appearance:external-link-target">
+            <span class="settings-row-label">
+              Open links in
+              <Explainer title="Open links in">
+                <p>
+                  Where a link to another site goes when you tap it. Installed on the
+                  home screen, iOS would otherwise trap every link in an in-app view
+                  with no address bar and no shared Safari session.
+                </p>
+                <p>
+                  iOS gives web apps no way to reach your default-browser setting
+                  directly, so "Ask" is the option that lets iOS itself offer every
+                  browser you have installed.
+                </p>
+                {/* The per-link override is iOS's OWN long-press menu, not something
+                    we render: suppressing it to draw our own would cost Copy Link,
+                    Share and Add to Reading List alongside Open in Safari. Naming it
+                    here is the documented way to make it discoverable. */}
+                <p>
+                  For a one-off, long-press any link instead: iOS offers Open in
+                  Safari, Copy and Share without changing this setting.
+                </p>
+              </Explainer>
+            </span>
+            <Dropdown
+              options={EXTERNAL_LINK_TARGET_OPTIONS}
+              value={currentExternalLinkTarget()}
+              onChange={(v) => void setExternalLinkTarget(v as ExternalLinkTarget)}
+            />
+          </div>
         )}
         {showInAppBrowser && (
-          <>
-            <p class="settings-section-desc">
-              Open links inside the app in a built-in browser pane instead of your
-              system browser, and add a Browser entry to the menu drawer.
-              Experimental: the in-app browser has rough edges, so it's off by
-              default.
-            </p>
-            <div class="settings-row" data-search-anchor="appearance:in-app-browser">
-              <span class="settings-row-label">Open links in the in-app browser</span>
-              <LoadableToggle
-                loaded={loaded}
-                checked={currentInAppBrowser()}
-                onChange={(c) => void setInAppBrowser(c)}
-              />
-            </div>
-          </>
+          <div class="settings-row" data-search-anchor="appearance:in-app-browser">
+            <span class="settings-row-label">
+              Open links in the in-app browser
+              <Explainer title="Open links in the in-app browser">
+                <p>
+                  Open links inside the app in a built-in browser pane instead of
+                  your system browser, and add a Browser entry to the menu drawer.
+                </p>
+                <p>
+                  Experimental: the in-app browser has rough edges, so it's off by
+                  default.
+                </p>
+              </Explainer>
+            </span>
+            <LoadableToggle
+              loaded={loaded}
+              checked={currentInAppBrowser()}
+              onChange={(c) => void setInAppBrowser(c)}
+            />
+          </div>
         )}
       </div>
     );

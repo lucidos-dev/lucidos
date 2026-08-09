@@ -30,7 +30,7 @@ which is the same failure `.claude/rules/system-knowhow.md` gates elsewhere.
 |---|---|---|
 | Color | `--bg-{primary,secondary,tertiary}`, `--border-color`, `--text-{primary,secondary,muted,on-accent}`, `--accent`, `--accent-{green,yellow,red}` | Never hardcode a color. The one exception is `#fff` / `rgba(255,255,255,*)` on a translucent overlay over image content. |
 | Type scale | `--font-size-{3xs,2xs,xs,sm,md,lg,xl,2xl,3xl,display}` | `font-size` takes a token, never a raw `rem`. `em`, percentages, `inherit` and `var(--user-ui-scale)` stay literal on purpose, as does a value deliberately pinned to a computed-px threshold, which must carry a comment saying why. |
-| Z-index | `--z-{dropdown,sticky,drawer,control-panel,app-fullscreen,modal,toast,tooltip}` | Raw values 1 to 10 are fine inside a component's own stacking context. Anything higher must use a token. |
+| Z-index | `--z-{float,dropdown,sticky,drawer,control-panel,app-fullscreen,modal,toast,tooltip}` | Raw values 1 to 10 are fine inside a component's own stacking context. Anything higher must use a token. `--z-float` (20) is the lowest step, for a popover anchored inside its own pane. |
 | Duration | `--duration-{fast,normal,slow,emphasis}` | `emphasis` is for a deliberate state-change cue the user must register; reach for `normal` or `slow` first. |
 | Icon size | `--icon-size-{sm,md,lg}` | Do not set inline `width`/`height` on an SVG inside `.icon-btn`; the class sizes it. |
 | Shadow | `--shadow-{sm,md,lg}` | Never hardcode a `box-shadow`. |

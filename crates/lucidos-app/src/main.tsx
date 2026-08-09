@@ -18,11 +18,13 @@ import { invoke } from './utils/tauri';
 import { setBootStatus } from './utils/bootSplash';
 import { startStartupStatusPolling } from './utils/startupStatus';
 import { reconcileDesktopDeviceId } from './store/actions/devices';
+import { adoptDeviceIdFromUrl } from './utils/deviceIdSeed';
 import { openAppById } from './store/actions/apps';
 import { startPerfProbe } from './utils/perfProbe';
 import './styles/global.css';
 import './styles/picker.css';
 import './styles/header.css';
+import './styles/header-mark.css';
 import './styles/panels.css';
 import './styles/chat.css';
 import './styles/steps.css';
@@ -204,6 +206,12 @@ function stayOnStartingSplash(): void {
 }
 
 async function boot() {
+  // Frontend preview only (a dev-server bundle): adopt the `?device-id=` the
+  // preview link carried, BEFORE the first API call or preference read, so the
+  // preview resolves the same device-scoped preferences as the app the user came
+  // from instead of registering as a new device. A no-op everywhere else.
+  adoptDeviceIdFromUrl();
+
   // Packaged desktop shell before it has navigated to the gateway: stay on the
   // boot splash instead of booting a broken `<App/>` against the asset scheme
   // (see stayOnStartingSplash). There is no workspace context here, so the

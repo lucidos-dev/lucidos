@@ -184,6 +184,39 @@
     padding-top: 0.375rem;
 }
 
+/* A row whose control is a FREE-TEXT FIELD stacks: label on its own line, field
+   full width underneath. Side by side is right for a toggle, a chip row or a
+   dropdown (short control, short label), and wrong for a text field, which wants
+   the whole row to show what was typed. Squeezed into the leftover half of a
+   phone-width pane, the field truncates a pasted key or URL while the label wraps
+   into a two-line stack beside it ("API key (optional)" under Providers).
+
+   Matched on the FIELD rather than a per-callsite modifier class, so every
+   provider form and the add-model form get it and a new field can't forget to opt
+   in. `:has()` takes the specificity of its argument, making this (0,2,0): equal
+   to .settings-row.nav-focus-stuck above, which sets only padding/margin, so the
+   two never contend. The child rules are (0,3,0) and outrank the base
+   .settings-row-label / .settings-text-input declarations whatever the order. */
+.settings-row:has(> .settings-text-input) {
+    flex-direction: column;
+    align-items: stretch;
+    gap: var(--space-xs);
+}
+
+/* The base label's padding-top optically centers it against a control sitting to
+   its right. Stacked there is nothing to center against, and it just opens a gap
+   above the label. */
+.settings-row:has(> .settings-text-input) > .settings-row-label {
+    padding-top: 0;
+}
+
+/* min-width is what the field defends when it shares the row; stacked it has the
+   full width, so release it or the 14rem floor overflows a narrow pane. */
+.settings-row:has(> .settings-text-input) > .settings-text-input {
+    min-width: 0;
+    width: 100%;
+}
+
 /* A sub-setting nested under the row above it (e.g. the command-guard judge
    controls under the master "Command guard" toggle). Indented so the hierarchy
    reads at a glance. */

@@ -17,7 +17,8 @@
  * focused-textarea guards.
  */
 
-import { threadMap, focusedThreadId, inputMode, showToast, removeToast, showConfirm, setFocusedThread, selectedScope, type Scope } from '../store';
+import { threadMap, focusedThreadId, inputMode, showToast, removeToast, showConfirm, setFocusedThread, selectedScope, repositories, type Scope } from '../store';
+import { loadedOr } from '../types';
 import { generateUuid } from '../../utils/uuid';
 import {
   getComposeSelectionOverride,
@@ -34,7 +35,7 @@ import {
   resolveCcReasoningEffort,
   type ComposeSelectionOverride,
 } from '../composeSelections';
-import type { ComposeDestination } from '../composeDestination';
+import { scopeRepoName, type ComposeDestination } from '../composeDestination';
 import { makeOptimisticThreadState, type StoredEvent, type ThreadMeta } from '../thread-events';
 import { clearDraft, composeDrafts, draftIsEmpty, getDraft, patchDraft, setDraft, type ComposeDraft } from '../composeDrafts';
 import { API, ApiError, ensureThreadStarted, putComposeOnThread, deleteThread, isTransientFetchError, type ComposePutResult } from '../../api/client';
@@ -888,9 +889,8 @@ export function ensureFocusedComposeThread(): string {
   // fields stay unset and resolve to their account defaults. The seeded selection
   // is persisted by the first keystroke's compose PUT (pushNow includes it).
   seedComposeSelection(id, { scope: selectedScope.value, ...takePendingComposeSelection() });
-  // Inlined instead of focusThread() — focusThread also fires scrollToBottom,
-  // loadThreadEvents, and (on mobile) navigateToPane, none of which the
-  // draft path wants.
+  // Inlined instead of focusThread(): that also fires loadThreadEvents and
+  // (on mobile) navigateToPane, neither of which the draft path wants.
   pushThreadNavState({ type: 'thread', id });
   const startPromise = startComposeIfNeeded(id, currentComposeMode());
   pendingThreadStarts.set(id, startPromise);
@@ -1149,10 +1149,20 @@ export async function sendCompose(
     : undefined;
   const boundChannel: ThreadMeta['channel'] = opts.useCodingAgent ? 'claude_code' : 'chat';
   const boundCodingAgent = opts.useCodingAgent ? resolveCodingAgent(threadId) : undefined;
+  // The destination's NAME is part of the binding, not just its ids. The drawer
+  // row chips `meta.repoName` once the thread is started, and the engine only
+  // reports it (as `cc_repo_name`) a round trip later, so a promotion that bound
+  // the ids alone made the chip the draft row was already showing vanish and
+  // reappear. `scopeRepoName` is the same resolution the draft row used, so the
+  // two frames agree; the engine's answer overwrites it when it lands.
+  const boundRepoName = opts.useCodingAgent
+    ? scopeRepoName(scope, loadedOr(repositories.value, []))
+    : undefined;
   mutateThreadMeta(threadId, {
     state: 'active',
     channel: boundChannel,
     repoId: boundRepoId,
+    repoName: boundRepoName,
     codingAgentKind: boundCodingAgentKind,
     codingAgentFolder: boundCodingAgentFolder,
     codingAgent: boundCodingAgent,

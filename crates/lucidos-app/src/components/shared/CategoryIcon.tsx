@@ -2,7 +2,7 @@
  * Content-pane category icon — the small glyph that labels a destination by
  * what KIND of content it is (a thread, file, app, trigger, settings page,
  * change, …). Single source of truth shared by Search Everywhere's result rows
- * and the content-pane back/forward history menu (PanelNav), so the same
+ * and the content-pane back/forward history menu (ContentNav), so the same
  * category is marked the same way wherever it appears.
  *
  * Rendered as inline SVG (rather than pulled from icons.tsx) so the set stays

@@ -90,7 +90,7 @@ describe('claimSeedForCard', () => {
 });
 
 describe('shouldSeedChoiceFocus', () => {
-  const idle = { hoverPointer: true, promptHasText: false, activeIsIdle: true, scrolledUp: false };
+  const idle = { hoverPointer: true, promptHasText: false, activeIsIdle: true };
 
   it('seeds when the user is idle at the bottom of the transcript on desktop', () => {
     expect(shouldSeedChoiceFocus(idle)).toBe(true);
@@ -117,9 +117,15 @@ describe('shouldSeedChoiceFocus', () => {
     expect(shouldSeedChoiceFocus({ ...idle, activeIsIdle: false })).toBe(false);
   });
 
-  it('never seeds while the transcript is scrolled up', () => {
-    // The card is off-screen, so a focused choice would be an invisible Enter
-    // target and the arrows would hijack the keys they are reading history with.
-    expect(shouldSeedChoiceFocus({ ...idle, scrolledUp: true })).toBe(false);
+  it('asks nothing about the transcript position', () => {
+    // There used to be a fourth clause here, a position SIGNAL standing for
+    // "the reader has chosen to read history". It went with the bottom-pin that
+    // maintained it, and it is deliberately NOT carried over to
+    // `awayFromBottom`: nothing scrolls to a card now, so the card's own
+    // arrival puts the reader off the bottom and every card in a scrollable
+    // thread would decline its one chance at focus (`claimSeedForCard` latches
+    // the id on arrival). `seedChoiceCardFocus` asks `isElementOnScreen` about
+    // the CHOICE instead, which is the question that actually matters.
+    expect(Object.keys(idle)).toEqual(['hoverPointer', 'promptHasText', 'activeIsIdle']);
   });
 });

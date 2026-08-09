@@ -64,7 +64,7 @@ describe('SideBySideDiff renders both columns through LineNumberedCode', () => {
   };
 
   // Hookless at its own level, so it can be invoked directly and its vnode tree
-  // walked (the same approach as ThreadFilterDropdown.test.tsx).
+  // walked (the same approach as ThreadFilterPanel.test.tsx).
   const root = SideBySideDiff({ file }) as VNode<{ children: VNode<Record<string, unknown>>[] }>;
   const sides = root.props.children;
 

@@ -140,12 +140,15 @@ export interface NetworkConfigResponse {
  *  `coding_agent_*_path` preference, `detected` = probe-list hit, `path` =
  *  bare PATH lookup, `not-found` = nothing resolves. `valid` is false when a
  *  set override doesn't point at an executable (a spawn would fail with
- *  `error`). */
+ *  `error`). `version` is the binary's own `--version`, parsed to the bare
+ *  token (`2.1.224`); absent when nothing resolves or the probe found no
+ *  recognizable version, so it is never a placeholder. */
 export interface AgentBinaryStatus {
   path: string | null;
   source: 'override' | 'detected' | 'path' | 'not-found';
   valid: boolean;
   error?: string;
+  version?: string;
 }
 
 /** GET /api/v1/coding-agents/binaries — per-agent binary resolution for

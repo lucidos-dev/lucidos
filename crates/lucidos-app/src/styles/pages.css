@@ -982,3 +982,26 @@
     outline: 0.125rem solid transparent;
     box-shadow: var(--focus-ring);
 }
+
+/* Same as the thread-filter row: this label is a flex line with its own `gap`,
+   which already separates the explainer from the text, so drop the icon's base
+   `margin-left` rather than stacking the two. */
+.form-group label.form-checkbox-row > .explainer-btn {
+    margin-left: 0;
+}
+
+/* A field label with its explainer beside it (<FieldLabel>). The button sits
+   OUTSIDE the <label> on purpose: a <button> is a labelable element, so inside a
+   label whose control is a sibling it would become that label's control and a
+   click on the label text would open the dialog. See Explainer.tsx.
+   The row takes over the label's bottom margin so the field spacing is
+   unchanged from a bare `.form-group label`. */
+.form-label-row {
+    display: flex;
+    align-items: center;
+    margin-bottom: 0.375rem;
+}
+
+.form-label-row > label {
+    margin-bottom: 0;
+}

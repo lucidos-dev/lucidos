@@ -392,7 +392,11 @@ pub(super) fn trim_context_if_needed(
         len
     };
 
-    // Pass 1: truncate large values in old messages (skip message[0] and recent)
+    // Pass 1: truncate large values in old messages, skipping message[0].
+    // The recent tail is spared only once there are MORE than
+    // PRESERVE_RECENT_MESSAGES messages: at or below that, `preserve_start ==
+    // len`, so this pass covers every message including the last one that
+    // pass 1.5 below goes out of its way to protect.
     for message in &mut messages[1..preserve_start] {
         if let MessageContent::Blocks(blocks) = &mut message.content {
             for block in blocks.iter_mut() {

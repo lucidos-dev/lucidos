@@ -78,15 +78,18 @@ report that distinctly.
 
 ## Documented #[ignore] exceptions
 
-Expect **`5 ignored` in the lib run and `1 ignored` in the doctest run**
-— and nothing else. Any other ignored test is a real skip and must be
-fixed. (`crates/lucidos-engine/tests/` — the integration binaries — has
-no `#[ignore]` at all.)
+Expect **`7 ignored` in the lib run and `1 ignored` in the doctest run**,
+and nothing else. Any other ignored test is a real skip and must be
+fixed. (`crates/lucidos-engine/tests/`, the integration binaries, has
+no `#[ignore]` at all.) The seven are two different things: **five
+codegen writers** and **two diagnostic printers**.
 
-**The 5 lib-level ones are all codegen writers**, and every one of them
-is paired with a *non-ignored* staleness guard that fails `cargo test`
-when the generated file on disk no longer matches what the writer would
-produce. That pairing is the whole reason the `#[ignore]` is legitimate:
+### The five codegen writers
+
+Every one of them is paired with a *non-ignored* staleness guard that
+fails `cargo test` when the generated file on disk no longer matches
+what the writer would produce. That pairing is the whole reason the
+`#[ignore]` is legitimate:
 the writer is `#[ignore]`d because *running* it rewrites a checked-in
 source file (a test must not mutate the tree), while the guard means a
 stale artifact still reds the suite. Rust stays the source of truth; the
@@ -107,6 +110,27 @@ When a guard fails it prints the exact regeneration command; run that,
 then re-run the suite. `cargo test -p lucidos-engine --lib -- --ignored --list`
 prints the live list if you need to re-check the set.
 
+### The two diagnostic printers
+
+Both live in `engine::chat::process::system_prompt::tests` and arrived
+with the 2026-08-07 prompt-budget trim. Neither asserts anything, so
+neither has a pass/fail to skip: they are on-demand dumps, shaped as
+tests only because `cargo test` is how you run a thing in a Rust crate.
+The `#[ignore]` keeps their output out of every ordinary suite run.
+
+| `#[ignore]` printer | What asserts over the same data |
+|---|---|
+| `print_full_tool_schema_ranking` | `no_single_tool_schema_dominates_the_always_loaded_budget` (per-tool ceiling) and `always_loaded_context_stays_under_budget` (total budget) |
+| `print_frozen_tool_contract` | nothing automated: it exists for a manual before/after diff across a prose-only trim |
+
+So `print_frozen_tool_contract` is the one entry that does not satisfy
+clause (a) below. It stays as-is because un-ignoring it would add a
+multi-thousand-character dump to every suite run while still asserting
+nothing, which buys no coverage. Giving it a real guard means checking
+in a frozen contract fixture and failing the suite on every deliberate
+schema change; that is a policy call for the maintainer, not something
+to decide from inside a test run.
+
 **The 1 doctest** is a ```` ```ignore ```` fenced example in
 `crates/lucidos-engine/src/engine/event_bus/mod.rs` — illustrative usage,
 not a compilable snippet. It is the crate's only doctest, so the doc run
@@ -116,7 +140,17 @@ If a future change introduces a *new* `#[ignore]`, it must come with
 either (a) a sibling non-ignored verification test, or (b) a script
 under `./scripts/` that runs it as part of the nightly pipeline.
 Otherwise, fix the underlying issue or report it as an unfixable
-failure.
+failure. A pure diagnostic is the third shape, and its bar is that it
+stays pure: the moment it grows an assertion, it is a real test being
+skipped and clause (a) applies.
+
+Whichever shape it is, **add it to the inventory above in the same
+change and bump the expected count**. A stale count is exactly how a
+real skip hides: the next run sees a mismatch it cannot attribute, and
+either re-derives this entire analysis from scratch or waves it
+through. That is not hypothetical, it is what happened here. The two
+printers went undocumented for a day and the next run had to go read
+their source to find out whether the suite had been quietly holed.
 
 ## Out of scope
 

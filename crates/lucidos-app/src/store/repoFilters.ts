@@ -8,12 +8,12 @@ import {
   setSelectedAppIds,
   threadChannelFilter,
   filterFacets,
-  includeDeletedFilterOptions,
   CODING_AGENT_CHANNEL,
 } from './store';
 import { toggleChannel } from './triggerFilters';
 import { appFilterOptions } from './appFilters';
 import { loadedOr } from './types';
+import { visibleFilterOptions } from './deletedFilterOptions';
 
 export type RepoFilterOption = {
   id: string;
@@ -38,7 +38,7 @@ export type RepoFilterOption = {
  *  recorded. A repo registered solely for file browsing, with no coding-agent
  *  session, does not clutter the filter. Returns [] until the registry loads —
  *  without it every repo would mis-label as "(deleted)". */
-export const repoFilterOptions = computed<RepoFilterOption[]>(() => {
+export const repoFilterOptionsAll = computed<RepoFilterOption[]>(() => {
   if (repositories.value.status !== 'loaded') return [];
   const liveById = new Map(repositories.value.data.map(r => [r.id, r]));
   const result: RepoFilterOption[] = [];
@@ -69,22 +69,14 @@ export const repoFilterOptions = computed<RepoFilterOption[]>(() => {
   }
   for (const id of selectedRepoIds.value) push(id);
 
-  // Deleted entries are hidden unless the user opts in — but a *selected*
-  // deleted entry always stays visible so the filter remains clearable.
-  const includeDeleted = includeDeletedFilterOptions.value;
-  const selected = selectedRepoIds.value;
-  return result
-    .filter(o => includeDeleted || !o.deleted || selected.has(o.id))
-    .sort((a, b) => {
-      if (a.deleted !== b.deleted) return a.deleted ? 1 : -1;
-      if (a.deleted) {
-        const aTime = a.lastActivity ?? '';
-        const bTime = b.lastActivity ?? '';
-        if (aTime !== bTime) return bTime.localeCompare(aTime);
-      }
-      return a.label.localeCompare(b.label);
-    });
+  return result;
 });
+
+/** The visible slice: unselected deleted entries dropped unless the user opts in
+ *  (`visibleFilterOptions`), which is also what `deletedOptionsHidden` reports
+ *  on. */
+export const repoFilterOptions = computed<RepoFilterOption[]>(() =>
+  visibleFilterOptions(repoFilterOptionsAll.value, selectedRepoIds.value));
 
 export function toggleRepoId(id: string): void {
   const next = new Set(selectedRepoIds.value);

@@ -55,6 +55,23 @@ describe('optimistic bootstrap focus survives ThreadView stale-pointer cleanup',
     expect(miss).toContain('revealThreadPane()');
   });
 
+  it('the bootstrap retires the standing follow at its OWN focus, not at the focusThread it ends with', () => {
+    // The third thing that has to happen before the await, and the one the
+    // optimistic focus quietly breaks. `focusThread` retires the follow only
+    // when it is actually opening a different thread, and by the time this
+    // function calls it the optimistic focus has ALREADY moved: that call reads
+    // "same thread, nothing was left" and keeps the previous thread's follow
+    // armed over the one being opened, which then rides a live edge nobody
+    // asked for and records that borrowed request as its own reading position.
+    // So the retire belongs at the optimistic focus, which is where this
+    // navigation really leaves a thread.
+    const miss = threads.slice(
+      threads.indexOf('export async function focusThreadOrBootstrapResult'),
+      threads.indexOf('await ensureThreadByIdInMap'),
+    );
+    expect(miss).toContain('stopFollowingBottom()');
+  });
+
   it('every non-focused exit from the bootstrap releases the flag', () => {
     // A leaked flag would exempt a genuinely stale pointer from cleanup forever.
     expect(threads).toMatch(/catch \(error\) \{\s*releaseBootstrap\(threadId, previousFocus\);/);

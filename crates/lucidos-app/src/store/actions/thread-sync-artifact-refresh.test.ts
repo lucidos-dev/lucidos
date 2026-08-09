@@ -30,14 +30,14 @@ vi.mock('../../api/client', () => ({ API_BASE: '', API: '/api/v1', postMcpConsen
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
 vi.mock('./chat-changes', () => ({ syncRestartToast: vi.fn(), addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
-vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
+vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 // `./devices` is pulled in during the static import phase (via `../store`), so
 // the mock fn must be vi.hoisted.
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
 vi.mock('./devices', () => ({
-  getDeviceId, toggleDevicePush: vi.fn(), pendingDeviceRegistration: vi.fn(),
+  getDeviceId, pendingDeviceRegistration: vi.fn(),
 }));
-vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
+vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./repositories', () => ({
   refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false),
 }));

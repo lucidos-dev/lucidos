@@ -4,6 +4,7 @@ import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
+import { Explainer } from '../shared/Explainer';
 import {
   addPluginMarketplaceAction,
   loadPluginCatalog,
@@ -72,12 +73,16 @@ export function MarketplacesSection() {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title">Marketplaces</div>
-      <p class="settings-section-desc">
-        Git repositories the Store scans for installable plugins. The engine
-        re-checks them periodically and notifies you when an installed plugin
-        has an update.
-      </p>
+      <div class="settings-section-title">
+        Marketplaces
+        <Explainer title="Marketplaces">
+          <p>Git repositories the Store scans for installable plugins.</p>
+          <p>
+            The engine re-checks them periodically and notifies you when an installed
+            plugin has an update.
+          </p>
+        </Explainer>
+      </div>
 
       <form class="app-store-marketplace-form" onSubmit={addMarketplace}>
         <input

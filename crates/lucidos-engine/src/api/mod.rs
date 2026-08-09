@@ -14,6 +14,7 @@ mod data_api;
 pub(crate) mod diff;
 mod disk_usage;
 pub(crate) mod error;
+mod frontend_preview;
 pub(crate) mod frontend_snapshot;
 pub(crate) mod hex;
 mod history;
@@ -1077,7 +1078,8 @@ pub fn create_router(
     // consumes `state` directly.
     let app_ui_state = state.clone();
 
-    // ALL routes live under `/api/v1/` — see CLAUDE.md "API URL Conventions".
+    // ALL routes live under `/api/v1/`: see `.claude/rules/rust.md`
+    // § API URL Conventions.
     // Convention: query params for identifiers, path segments only for file paths.
     //
     // Route registration lives with the domain module that owns each URL
@@ -1114,6 +1116,7 @@ pub fn create_router(
         .merge(internal::router())
         .merge(backup::router())
         .merge(disk_usage::router())
+        .merge(frontend_preview::router())
         .merge(search::router())
         .merge(repositories::router())
         .merge(sdk::router())

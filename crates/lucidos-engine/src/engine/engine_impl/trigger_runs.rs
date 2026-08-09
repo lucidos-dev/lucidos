@@ -287,6 +287,8 @@ mod tests {
             group_id: None,
             side_effect_grant: vec![],
             plugin_id: None,
+            model: None,
+            reasoning_effort: None,
         }
     }
 

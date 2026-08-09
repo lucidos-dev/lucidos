@@ -295,9 +295,9 @@ mod imp {
     /// (`crate::apply_unread_indicator`) formats the AGGREGATE unread total across
     /// running workspaces (the Tauri window fronts the gateway, so its app icon
     /// represents all workspaces) — including the `0`→clear and `>99`→"99+" rules —
-    /// and routes it here only while the client is a normal `Regular` Dock app; a
-    /// menu-bar-only client has no Dock tile and shows the count via
-    /// [`set_tray_title`] instead.
+    /// and sends it here only while the client is a normal `Regular` Dock app; a
+    /// menu-bar-only client has no Dock tile, so it gets `None`. The same count
+    /// goes to [`set_tray_title`] either way, so the menu bar always shows it.
     ///
     /// MUST be called on the main thread — `MainThreadMarker::new()` returns
     /// `None` off it and we bail (the desktop poll marshals here via
@@ -316,15 +316,27 @@ mod imp {
         }
     }
 
-    /// Set (or clear, with `None`) the menu-bar tray icon's title text. Used to show
-    /// the unread count next to the icon while the client is menu-bar-only, where
-    /// there is no Dock tile to badge (`crate::apply_unread_indicator` routes the
-    /// count here vs [`set_dock_badge`] based on the activation policy). Looks up
-    /// the tray by the id it was built with (`lucidos-tray`). Best-effort: a missing
-    /// tray / failure is logged, not fatal.
-    pub fn set_tray_title(app: &AppHandle, title: Option<String>) {
+    /// Set the menu-bar tray icon's title text, clearing it with `""`. This is
+    /// where the unread count lives at ALL times: `crate::apply_unread_indicator`
+    /// sends it here on every recompute, whatever the activation policy, so the
+    /// menu bar is a constant read on how much is waiting. While a window is open
+    /// the same count is on the Dock badge too ([`set_dock_badge`]); menu-bar-only
+    /// has no Dock tile, so the tray is then the only surface. Looks up the tray by
+    /// the id it was built with (`lucidos-tray`). Best-effort: a missing tray /
+    /// failure is logged, not fatal.
+    ///
+    /// **`Some(title)` always, never `None`, and that is load-bearing.**
+    /// `tray-icon`'s macOS backend clears nothing on `None`: `set_title_inner`
+    /// wraps its `setTitle:` call in `if let Some(..)` and falls off the end
+    /// otherwise, so the status item keeps whatever text it last received while
+    /// the crate's own cached `attrs.title` records the clear. An empty string
+    /// goes down the same path every real count does, blanking the button and
+    /// letting `update_dimensions` shrink the item back to icon width. Passing
+    /// `None` here is what froze the menu bar at a stale unread count while the
+    /// bell and the Dock tile both read zero.
+    pub fn set_tray_title(app: &AppHandle, title: &str) {
         if let Some(tray) = app.tray_by_id("lucidos-tray") {
-            if let Err(e) = tray.set_title(title.as_deref()) {
+            if let Err(e) = tray.set_title(Some(title)) {
                 eprintln!("[Tauri] Failed to set tray title: {e}");
             }
         }
@@ -383,10 +395,10 @@ pub fn dismiss(_id: Option<String>) {}
 #[cfg(not(target_os = "macos"))]
 pub fn set_dock_badge(_label: Option<String>) {}
 
-/// No tray-title unread count off macOS — the menu-bar-only activation model is a
-/// macOS concept; a no-op so `crate::apply_unread_indicator` stays platform-agnostic.
+/// No tray-title unread count off macOS: the menu-bar status item is a macOS
+/// concept. A no-op so `crate::apply_unread_indicator` stays platform-agnostic.
 #[cfg(not(target_os = "macos"))]
-pub fn set_tray_title(_app: &tauri::AppHandle, _title: Option<String>) {}
+pub fn set_tray_title(_app: &tauri::AppHandle, _title: &str) {}
 
 /// No native tap stash off macOS (no native notification path here); always
 /// empty so the Tauri command stays platform-agnostic.

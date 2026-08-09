@@ -7,6 +7,7 @@ import {
   DEFAULT_LOCAL_BASE_URL,
 } from '../../store/actions/preferences';
 import { findProviderCredential } from './providerCredential';
+import { Explainer } from '../shared/Explainer';
 
 const LOCAL_SERVICE = 'local';
 
@@ -67,6 +68,22 @@ export function LocalProviderSettings() {
       <div class="settings-row">
         <span class="settings-row-label">
           Local (OpenAI-compatible)
+          <Explainer title="Local (OpenAI-compatible)">
+            <p>
+              Serves models on the <strong>local</strong> provider via any
+              OpenAI-compatible server: Ollama (default{' '}
+              <strong>{DEFAULT_LOCAL_BASE_URL}</strong>), LM Studio, vLLM, llama.cpp.
+            </p>
+            <p>
+              Add your local models in <strong>Manage Models</strong> with the{' '}
+              <strong>local</strong> provider, using the model id the server exposes
+              (e.g. <code>llama3.1</code>).
+            </p>
+            <p>
+              Also settable via the <strong>LUCIDOS_LOCAL_BASE_URL</strong> /{' '}
+              <strong>LUCIDOS_LOCAL_API_KEY</strong> launch env vars.
+            </p>
+          </Explainer>
           {/* `.list-row-details` is `display: flex`, so this span is a block box
               inside the label's line and renders UNDER it. A manual "·" glue
               would therefore be stranded at the start of that new line, the
@@ -121,13 +138,6 @@ export function LocalProviderSettings() {
         >
           {existing ? 'Update key' : 'Save key'}
         </button>
-      </div>
-      <div class="settings-row-note">
-        Serves models on the <strong>local</strong> provider via any OpenAI-compatible server — Ollama
-        (default <strong>{DEFAULT_LOCAL_BASE_URL}</strong>), LM Studio, vLLM, llama.cpp. Add your local
-        models in <strong>Manage Models</strong> with the <strong>local</strong> provider, using the
-        model id the server exposes (e.g. <code>llama3.1</code>). Also settable via the
-        <strong> LUCIDOS_LOCAL_BASE_URL</strong> / <strong>LUCIDOS_LOCAL_API_KEY</strong> launch env vars.
       </div>
     </>
   );

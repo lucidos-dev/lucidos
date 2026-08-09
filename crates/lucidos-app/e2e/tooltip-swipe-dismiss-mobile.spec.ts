@@ -85,10 +85,20 @@ test.describe('Mobile tooltip dismiss on swipe', () => {
 
     const title = page.locator('.mobile-content-title:visible').first();
     await expect(title).toBeVisible();
-    // The title must actually be truncated, else the tooltip is suppressed as
-    // redundant and there's nothing to dismiss.
-    const truncated = await title.evaluate((el) => el.scrollWidth > el.clientWidth);
-    expect(truncated, 'content title should be ellipsis-truncated at mobile width').toBeTruthy();
+    // The tooltip must have something to add, else it is suppressed as
+    // redundant and there is nothing to dismiss. Asserted with the app's own
+    // rule (`isRedundantTooltip`), not with truncation alone: the bar now
+    // renders the SHORT form of a title we author, so this header reads
+    // "Notification" and fits, while the tooltip still carries the
+    // notification's own long title. Ellipsis is one way to earn a tooltip,
+    // and since `getContentTitleShort` it is no longer the only one.
+    const revealable = await title.evaluate((el) => {
+      const tip = (el.getAttribute('data-tooltip') ?? '').trim().toLowerCase();
+      const visible = (el.textContent ?? '').trim().toLowerCase();
+      const truncated = el.scrollWidth > el.clientWidth;
+      return !!tip && (truncated || tip !== visible);
+    });
+    expect(revealable, 'content title must have a tooltip that says more than the bar does').toBeTruthy();
 
     // Tap to reveal the full-title tooltip.
     await title.tap();

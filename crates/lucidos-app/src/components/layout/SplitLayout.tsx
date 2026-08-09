@@ -1,7 +1,8 @@
 import { useRef, useCallback } from 'preact/hooks';
 import { splitRatio, threadDrawerOpen, threadDrawerWidth, focusedPane, SPLIT_RATIO_KEY } from '../../store/store';
 import { focusPane } from '../../store/actions/pane';
-import { setSplitRatio, computeSnapRatio, beginPaneResize, endPaneResize, DEFAULT_SPLIT_RATIO } from './splitHelpers';
+import { setSplitRatio, clampSplitRatio, beginPaneResize, endPaneResize, DEFAULT_SPLIT_RATIO } from './splitHelpers';
+import { splitBounds } from '../../store/paneMinimums';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import type { ComponentChildren } from 'preact';
 
@@ -28,19 +29,28 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
     target.setPointerCapture(e.pointerId);
     beginPaneResize();
 
-    // Free drag: the divider lands wherever the pointer drops it. Minimum
-    // widths are enforced by the deferred snap on release, not mid-drag.
-    // The 1px floor/ceiling keeps the ratio off exactly 0/1 while dragging:
-    // the collapse states (data-thread-collapsed / data-content-collapsed /
-    // data-thread-drawer-open) flip only at the post-release snap, so the
-    // header icon groups they swap can't dance between hosts as the pointer
-    // wiggles across a pane edge.
+    // CLAMPED drag: the divider stops at each pane's minimum while the pointer
+    // keeps going, so what the user releases is what persists. Nothing corrects
+    // it afterwards (ADR 0056 replaced the deferred snap with this).
+    //
+    // It is also what keeps the collapse states (data-thread-collapsed /
+    // data-content-collapsed / data-thread-drawer-open) still through a drag,
+    // and more firmly than the snap did: those flip at a ratio of exactly 0 or
+    // 1, and the clamp cannot reach either, since both minimums are well inside.
+    // So the header icon groups they swap cannot dance between hosts as the
+    // pointer wiggles across a pane edge, where the snap merely postponed the
+    // flip to release. The 1px floor/ceiling that stood in for this is gone.
+    //
+    // Measured ONCE: the bounds derive from the root font size, which a drag
+    // cannot change, and each read is a forced style recalc on the hot path the
+    // data-pane-resizing kill-list exists to keep smooth. The container's own
+    // width is re-read per move, since the window can resize under the drag.
+    const bounds = splitBounds();
     const onMove = (e: PointerEvent) => {
       if (!dragging.current || !container) return;
       const rect = container.getBoundingClientRect();
       if (rect.width <= 1) return;
-      const chatPx = Math.min(Math.max(e.clientX - rect.left, 1), rect.width - 1);
-      splitRatio.value = chatPx / rect.width;
+      splitRatio.value = clampSplitRatio(e.clientX - rect.left, rect.width, bounds);
     };
 
     const cleanup = () => {
@@ -51,8 +61,7 @@ export function SplitLayout({ threadPane, contentPane }: Props) {
       document.body.style.cursor = '';
       document.body.style.userSelect = '';
       localStorage.setItem(SPLIT_RATIO_KEY, String(splitRatio.value));
-      const snapTo = computeSnapRatio(splitRatio.value, container.offsetWidth);
-      endPaneResize(snapTo === null ? undefined : () => setSplitRatio(snapTo));
+      endPaneResize();
     };
 
     document.body.style.cursor = 'col-resize';

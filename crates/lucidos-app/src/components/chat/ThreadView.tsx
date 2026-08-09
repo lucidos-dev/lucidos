@@ -6,16 +6,16 @@ import { loadThreadEvents, forceRetryThreadEvents } from '../../store/actions/th
 import { checkConnection } from '../../store/actions/connection';
 import { gatewayPickerHref } from '../../utils/basePath';
 import { rebuildCorruptedThreadEvents } from '../../store/actions/thread-sync';
-import { useAutoScroll, renderExchanges, ScrollControls } from './CreateThreadView';
+import { useScrollObservers, renderExchanges, ScrollControls } from './CreateThreadView';
 import { ThreadStatusIcon, threadVisualStatus } from '../shared/ThreadStatusIcon';
 import { ThreadTitleEditor } from './ThreadTitleEditor';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
 import { MobileThreadTitleBar } from '../layout/MobileAppHeader';
 import { computeExchanges, hasContentEvents } from '../../store/thread-events';
-import { awayFromBottom, notAtTop, scrollToBottom, scrollToBottomAnimated, scrollToTop, scrolledUp, hasPendingEventScroll, deepLinkRenderAll } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottomAnimated, scrollToTop, hasPendingEventScroll, isNavigationScroll, deepLinkRenderAll } from './scrollState';
 import { INITIAL_WINDOW, computeRenderFromIndex, hasMoreAbove, expandRenderCount, WINDOW_EXPAND_MARGIN_PX, scrollToTopNeedsRenderAll } from './threadWindow';
-import { useScrollMemory, hasSavedScroll, threadScrollKey, dropStaleSavedScroll } from '../../hooks/useScrollMemory';
+import { useScrollMemory, threadScrollKey } from '../../hooks/useScrollMemory';
 import { useThreadScrollIndicator } from '../../hooks/useThreadScrollIndicator';
 import { useDelayedFlag, useLingeringFlag } from '../../hooks/useDelayedLoading';
 import { ThreadSkeleton } from './ThreadSkeleton';
@@ -444,8 +444,8 @@ export function ThreadView() {
     // Runs before paint (useLayoutEffect) so the user never sees a flash.
     // Animates .thread-view (title + content together) so the whole thread
     // slides in from the bottom while header and prompt stay put.
-    // Applies to ALL .thread-view elements (desktop + mobile render both in the
-    // DOM simultaneously) so the visible copy always gets the animation.
+    // Applies to every mounted .thread-view element. `App` mounts only the
+    // active layout's pane tree, so that is the visible transcript.
     useLayoutEffect(() => {
         if (!shouldReveal || !threadId) return;
         commitReveal(threadId);
@@ -522,14 +522,7 @@ export function ThreadView() {
     // manual scroll. The burst spreads several toggles over a few hundred ms.
     const forceRepaintBurst = () => forceIOSRepaintBurst(areaRef.current);
 
-    // Scroll to bottom when events finish loading for the focused thread.
-    // focusThread() calls scrollToBottom() but its ResizeObserver suppression
-    // expires after ~2 rAFs. If events load asynchronously (longer than that),
-    // the ResizeObserver fires when content renders, sets scrolledUp=true,
-    // and useAutoScroll skips the scroll. This re-triggers scrollToBottom()
-    // once content is actually ready.
-    //
-    // Also force iOS repaint on every threadId change (not just eventsLoaded).
+    // Force iOS repaint on every threadId change (not just eventsLoaded).
     // iOS Safari's compositor caches layer textures inside scroll-snap parents.
     // After many thread switches, it stops repainting already-loaded threads.
     // Triggering on threadId alone covers threads where eventsLoaded was already
@@ -580,58 +573,8 @@ export function ThreadView() {
 
     const savedScrollKey = threadId ? threadScrollKey(threadId) : null;
 
-    // Retire a reading position taken in an older transcript, then mark the user
-    // as scrolled-up synchronously when one survives.
-    //
-    // RETIRE: a saved position is scoped to the transcript it was taken in. Once
-    // the thread has gained TURNS since the save, restoring it parks the reader
-    // in the middle of a thread they opened to see the new part of, which is the
-    // same complaint as an open that fails to reach the end. The revision is the
-    // exchange count, so a streaming turn growing under a parked reader keeps
-    // their position while a new turn retires it. Guarded on `eventsLoaded` and a
-    // non-zero count: before the events land the count is 0, which means "not
-    // rendered yet", never "the thread is empty". This ALSO retires the
-    // positions written before the stamp existed, which is what heals a browser
-    // carrying one from a stranded transcript.
-    //
-    // It runs in a LAYOUT effect so it lands before the passive load effect below
-    // re-reads `hasSavedScroll` and decides whether to scroll to the end: the two
-    // must answer the same question within one open, or the reader lands at
-    // neither position. `focusThread` read the key before this render and skipped
-    // its own scroll-to-bottom; the load effect is what makes good on that.
-    //
-    // MARK: several auto-scroll callers (visualViewport.resize in
-    // MobileSwipeContainer, useHideOnScroll's focusin/focusout) gate on
-    // `wasAtBottom = !scrolledUp.value` and call scrollToBottom() if true. On iOS
-    // PWA those fire repeatedly during initial load and would override
-    // useScrollMemory's restore. Setting scrolledUp early makes wasAtBottom=false
-    // so they skip.
-    useLayoutEffect(() => {
-        if (!savedScrollKey) return;
-        if (eventsLoaded) dropStaleSavedScroll(savedScrollKey, exchanges.length);
-        if (hasSavedScroll(savedScrollKey)) {
-            scrolledUp.value = true;
-        }
-    }, [savedScrollKey, eventsLoaded, exchanges.length]);
-
     useEffect(() => {
         if (threadId) {
-            // Skip auto-scroll when a saved scroll position exists — its 500ms
-            // loop would otherwise overwrite the restore set by useScrollMemory.
-            // The saved key only holds a value when the user was scrolled up
-            // (shouldSave: () => scrolledUp.value), so at-bottom defers here.
-            // This is THE lazy-load auto-scroll: it fires on the eventsLoaded
-            // false→true transition that an UNfocused-thread deep-link triggers.
-            // It goes through scrollToBottom({ auto: true }) so the call DEFERS to
-            // an in-flight notification deep-link claim instead of clearing it —
-            // the claim is held until scrollToEventAndPulse's deadline (or, for an
-            // already-focused thread, until the smooth scroll settles), so this
-            // covers the re-fire when `hasExchanges` flips 0→true a beat after the
-            // deep-link resolves. Deliberately NOT gated on scrolledUp: this
-            // effect's own purpose is to recover the at-bottom snap on a slow load
-            // where a ResizeObserver fire escalated scrolledUp=true — a scrolledUp
-            // gate would defeat that recovery.
-            if (eventsLoaded && !hasSavedScroll(savedScrollKey)) scrollToBottom({ auto: true });
             // Burst (not a single toggle): this is the open path's ONLY repaint
             // for an idle thread — once content is in the DOM no eventsBump tick
             // re-fires the streaming throttle, and the thread may never go to
@@ -741,41 +684,50 @@ export function ThreadView() {
         return () => clearTimeout(timer);
     }, [threadId]);
 
-    useAutoScroll(areaRef, [eventCount, streamingBuffer, pendingCount], true);
+    useScrollObservers(areaRef, true);
 
-    // Restoring sets scrolledUp so useAutoScroll defers to the saved offset
-    // rather than snapping to bottom on the next render.
+    // Scroll memory is the ONLY thing that positions the transcript on open, so
+    // it answers every form of "where does this thread start":
+    //  - a saved offset restores, returning the reader where they left off;
+    //  - a saved LIVE EDGE resumes the standing follow they left armed, so a
+    //    thread they were watching is still being watched on re-entry;
+    //  - no saved position (a first visit) opens at the TOP of what is
+    //    rendered, the way a document opens, via `resetOnEmpty`.
+    // A position is never retired for being old. It used to be, once the thread
+    // had gained a turn, so that the open would fall through to the
+    // auto-scroll-to-bottom and land on the new part. With nothing scrolling to
+    // the bottom, retiring only converts "return the reader" into "send them to
+    // the top", which is the move this whole change exists to stop.
+    // The second half is not optional bookkeeping: `.thread-content` is ONE
+    // element reused across threads, so without the reset a fresh thread would
+    // inherit the offset of the one before it.
     useScrollMemory(
         areaRef,
         savedScrollKey,
         {
             paused: !eventsLoaded,
-            shouldSave: () => scrolledUp.value,
-            onRestored: () => { scrolledUp.value = true; },
-            // Stamp every save with the turn count it was taken at, so the
-            // retire check in the layout effect above can tell "nothing has
-            // happened since" from "there are new turns below you".
-            revision: exchanges.length,
+            resetOnEmpty: true,
+            // The transcript is the one container that can RIDE a position as
+            // well as sit at one, so it is the one that records a standing
+            // follow. A reader who armed the follow here and then visited
+            // another thread comes back to the live edge with the follow armed,
+            // rather than to the pixel offset the transcript had when they left
+            // (with everything the agent produced meanwhile below them). The
+            // content pane and the thread drawer share this hook and do not take
+            // it: the follow is one global, so an ungated recording would stamp
+            // the transcript's request onto whatever they were showing.
+            followsLiveEdge: true,
             // A notification deep-link (toast / push / inbox) owns the scroll
-            // when focusing an UNfocused thread: skip the saved-scroll restore
-            // so it doesn't fire after scrollToEventAndPulse and snap away from
-            // the source event. The claim is held until the deep-link's deadline,
-            // so this is true for the whole resolve window. (Already-focused
-            // threads don't re-run this hook, so they never needed the guard —
-            // which is why the bug only bit unfocused-thread deep-links.)
+            // when focusing an UNfocused thread: skip both the restore and the
+            // top reset so neither fires after scrollToEventAndPulse and snaps
+            // away from the source event. The claim is held until the
+            // deep-link's deadline, so this is true for the whole resolve
+            // window. (Already-focused threads don't re-run this hook, so they
+            // never needed the guard, which is why the bug only bit
+            // unfocused-thread deep-links.)
             shouldRestore: () => !hasPendingEventScroll(),
         },
     );
-
-    // Re-scroll after render: addPendingMessage's scrollToBottom() can race with
-    // ResizeObserver re-setting scrolledUp before Preact commits the DOM update.
-    const prevPendingRef = useRef(pendingCount);
-    useEffect(() => {
-        if (pendingCount > prevPendingRef.current) {
-            scrollToBottom();
-        }
-        prevPendingRef.current = pendingCount;
-    }, [pendingCount]);
 
     // Window expansion: when the user scrolls near the top and older exchanges
     // remain above the rendered tail, reveal another chunk. Captures scroll
@@ -787,6 +739,17 @@ export function ThreadView() {
         if (!el || !threadId) return;
         const onScroll = () => {
             if (pendingExpandRef.current) return;
+            // Only the READER asking for older turns may grow the window. Our
+            // own positioning fires scroll events too, and opening a thread now
+            // lands at the TOP of the rendered slice, which is inside the
+            // margin by construction: without this the open would grow the
+            // window by a chunk on every visit, markdown-parsing it
+            // synchronously on the open path and compounding across re-opens
+            // (renderCountByThread is module-scoped), which is exactly the cost
+            // windowing exists to avoid. The up-chevron is covered too, and
+            // wants to be: it renders the full thread itself before gliding, so
+            // an expansion mid-glide would re-anchor the viewport and stall it.
+            if (isNavigationScroll(el)) return;
             if (el.scrollTop > WINDOW_EXPAND_MARGIN_PX) return;
             const total = exchangesLenRef.current;
             const current = renderCountByThread.get(threadId) ?? INITIAL_WINDOW;
@@ -910,7 +873,14 @@ export function ThreadView() {
                     <div class="thread-scroll-thumb" ref={setIndicatorThumb} />
                 </div>
                 <ScrollControls
-                    showUp={isNotAtTop}
+                    /* `notAtTop` alone is the WRONG question now that a thread
+                       with no saved position opens at the top of the rendered
+                       tail: the reader sits at scrollTop 0 with older turns
+                       above them that are not in the DOM, so the chevron
+                       (whose handler renders the full thread first) hid exactly
+                       when it was the only way to reach them. Offer it whenever
+                       there is anything above, scrolled or windowed out. */
+                    showUp={isNotAtTop || hasMoreAbove(exchanges.length, renderCount)}
                     showDown={isUp}
                     onScrollUp={() => {
                         const current = threadId ? (renderCountByThread.get(threadId) ?? INITIAL_WINDOW) : INITIAL_WINDOW;

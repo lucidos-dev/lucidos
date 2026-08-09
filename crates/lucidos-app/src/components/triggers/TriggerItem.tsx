@@ -6,6 +6,7 @@ import {
   deleteTrigger,
   runTriggerNow,
 } from '../../store/actions/triggers';
+import { chatModelOptions } from '../../store/actions/models';
 import { formatShortDate, formatShortTime } from '../../utils/formatTime';
 import { describeCron } from '../../utils/describeCron';
 import { useSkeleton, SkText, SkBlock } from '../shared/Skeleton';
@@ -35,6 +36,22 @@ export function TriggerItem({ trigger }: Partial<Props>) {
   // trigger. Labelled "Run once", not "Run now": the Thread Queue panel's Run
   // now force-admits an already-queued entry, a different operation.
   const canRunOnce = !!trigger && !trigger.paused && triggerType !== 'event';
+  // Only for a trigger that pins its own model. Show the registry's human label,
+  // falling back to the raw id when the row is gone (disabled or deleted after
+  // the trigger was saved): routing still resolves it, so the row must still
+  // name it. Both derived together and only when there IS a model, so the
+  // tooltip can't be built around a null label.
+  const pinnedModel = trigger?.model
+    ? (() => {
+        const label = chatModelOptions().find(o => o.value === trigger.model)?.label ?? trigger.model;
+        return {
+          label,
+          tooltip: trigger.reasoning_effort
+            ? `Runs on ${label}, reasoning ${trigger.reasoning_effort}`
+            : `Runs on ${label} instead of the default chat model`,
+        };
+      })()
+    : null;
 
   return (
     <div
@@ -70,6 +87,15 @@ export function TriggerItem({ trigger }: Partial<Props>) {
           {trigger?.plugin_id && (
             <span class="label trigger-plugin-chip" data-tooltip={`Installed by the "${trigger.plugin_id}" plugin`}>
               from {trigger.plugin_id}
+            </span>
+          )}
+          {/* Only when the trigger pins its own model. A trigger on the account
+              default earns no chip: that is the common case, and a chip on every
+              row would say nothing. A pinned effort alone is too small a detail
+              for the row, so it stays in the form. */}
+          {pinnedModel && (
+            <span class="label" data-tooltip={pinnedModel.tooltip}>
+              {pinnedModel.label}
             </span>
           )}
         </div>

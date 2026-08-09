@@ -9,7 +9,7 @@
     right: 0.125rem;
     /* Blue "needs attention" accent. Every count / notification badge shares
        this blue — notification bell, the needs-attention filter toggle, mobile
-       unread, the control-panel .brand-badge update count, and the .drawer-badge
+       unread, the brand-label .brand-badge update count, and the .drawer-badge
        changes count. Semantic status badges (git add/modify/delete) keep their
        own colors. */
     background: var(--accent);

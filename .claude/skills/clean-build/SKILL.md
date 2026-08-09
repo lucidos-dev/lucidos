@@ -142,7 +142,7 @@ git ls-files '*.ts' '*.tsx' | xargs grep -c '@ts-expect-error' | grep -v ':0$'
 git ls-files '*.ts' '*.tsx' | xargs grep -l '@ts-expect-error' | grep -vE '\.test\.ts$'
 ```
 
-The currently-accepted categories, counted as of 2026-08-07. Anything not
+The currently-accepted categories, counted as of 2026-08-09. Anything not
 on this list is fair game to remove and re-fix:
 
 - **`#[allow(clippy::too_many_arguments)]`**, 76 sites across 48 files,
@@ -173,21 +173,22 @@ on this list is fair game to remove and re-fix:
   (see `tauri.conf.json`), so the deprecated cross-version call is the
   correct one to keep.
 - **`// @ts-expect-error`, Node APIs available at runtime via Vitest, no
-  `@types/node` in project**, 207 sites across 72 files, every one of them
-  a test file: 70 `*.test.ts` plus two `*.test.tsx`
-  (`components/chat/__tests__/question-card.test.tsx` and
-  `components/chat/__tests__/welcome-onboarding.test.tsx`, both of which
-  read a fixture through `node:fs`). The expectation is real: TS does not
-  know about Node globals, but Vitest provides them. Adding `@types/node`
-  to the project would contaminate the browser type-graph. Only the first
-  site in a file spells the reason out; the rest say `same`, which counts
-  as justified because it points at an explanation in the same file. The
-  `.test.tsx` sites are why the regeneration snippet above filters on
-  `\.test\.ts$` and prints the leftovers: the older wording asserted there
-  were none, and nothing checked it. The count grows with the test suite,
-  so treat a mismatch here as ordinary drift to restate rather than as a
-  finding, and check only that every leftover the snippet prints is still
-  a test file.
+  `@types/node` in project**, 258 sites across 89 files, every one of them
+  a test file: 86 `*.test.ts` plus three `*.test.tsx`
+  (`components/chat/__tests__/question-card.test.tsx`,
+  `components/chat/__tests__/welcome-onboarding.test.tsx` and
+  `components/chat/__tests__/event-wait-surfaces.test.tsx`, all three of
+  which read a fixture through `node:fs`). The expectation is real: TS
+  does not know about Node globals, but Vitest provides them. Adding
+  `@types/node` to the project would contaminate the browser type-graph.
+  Only the first site in a file spells the reason out; the rest say
+  `same`, which counts as justified because it points at an explanation
+  in the same file. The `.test.tsx` sites are why the regeneration
+  snippet above filters on `\.test\.ts$` and prints the leftovers: the
+  older wording asserted there were none, and nothing checked it. The
+  count grows with the test suite, so treat a mismatch here as ordinary
+  drift to restate rather than as a finding, and check only that every
+  leftover the snippet prints is still a test file.
 - **`// eslint-disable-next-line`**, 8 sites across 4 files and 4 rules:
   `react-hooks/exhaustive-deps` in `hooks/useLoadableFetch.ts` (the deps
   list is intentionally narrow), `no-console` five times in

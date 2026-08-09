@@ -101,6 +101,8 @@ describe('submitTrigger scroll reset', () => {
       triggerId: 't1',
       goToReview: false,
       sideEffectGrant: [],
+      model: null,
+      reasoningEffort: null,
     });
 
     expect(ok).toBe(true);
@@ -117,6 +119,8 @@ describe('submitTrigger scroll reset', () => {
       cronExpressions: ['0 0 0 * * *'],
       goToReview: false,
       sideEffectGrant: [],
+      model: null,
+      reasoningEffort: null,
     });
 
     expect(ok).toBe(true);
@@ -134,12 +138,82 @@ describe('submitTrigger scroll reset', () => {
       triggerId: 't1',
       goToReview: false,
       sideEffectGrant: [],
+      model: null,
+      reasoningEffort: null,
     });
 
     expect(ok).toBe(false);
     // Form is still open; the user hasn't navigated, so the saved position
     // must be preserved for the eventual successful save (or cancel).
     expect(localStorage.getItem(SCROLL_KEY)).toBe('500');
+  });
+});
+
+describe('submitTrigger: the trigger model and reasoning effort', () => {
+  beforeEach(() => {
+    localStorage.clear();
+    panelOverlay.value = { type: 'form', form: { type: 'trigger', triggerId: 't1' } };
+    triggers.value = { status: 'loaded', data: [] };
+    historicalTriggers.value = { status: 'loaded', data: [] };
+    mockCreateTrigger.mockReset().mockResolvedValue({ success: true });
+    mockUpdateTrigger.mockReset().mockResolvedValue({ success: true });
+    mockListTriggers.mockReset().mockResolvedValue({ triggers: [] });
+  });
+
+  const intentRun = { type: 'intent', intent: 'summarize' } as const;
+  const base = {
+    name: 'Digest',
+    cronExpressions: ['0 0 8 * * *'],
+    goToReview: false,
+    sideEffectGrant: [],
+  };
+
+  it('sends the pinned pair on create and omits it when Default', async () => {
+    await submitTrigger({
+      ...base, run: intentRun, model: 'gemini-3.5-flash', reasoningEffort: 'low',
+    });
+    expect(mockCreateTrigger.mock.calls[0][0]).toMatchObject({
+      model: 'gemini-3.5-flash',
+      reasoning_effort: 'low',
+    });
+
+    mockCreateTrigger.mockClear();
+    await submitTrigger({ ...base, run: intentRun, model: null, reasoningEffort: null });
+    const body = mockCreateTrigger.mock.calls[0][0];
+    // Omitted, not null: a brand-new trigger has no stored pin to clear, so the
+    // payload stays exactly what it was before the field existed.
+    expect(body.model).toBeUndefined();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it('sends null on update so switching back to Default clears the stored pin', async () => {
+    // Omitting the field would mean "leave unchanged" to the engine, which
+    // would silently keep the old model after the user chose Default.
+    await submitTrigger({
+      ...base, run: intentRun, triggerId: 't1', model: null, reasoningEffort: null,
+    });
+    const body = mockUpdateTrigger.mock.calls[0][1];
+    expect(body.model).toBeNull();
+    expect(body.reasoning_effort).toBeNull();
+  });
+
+  it('forces both to null for a script trigger, which runs no LLM', async () => {
+    // Guards the intent → script switch: the form still holds the model the
+    // user picked while it was an intent trigger, and none of it applies now.
+    await submitTrigger({
+      ...base,
+      run: { type: 'script', path: 'digest/run.py' },
+      triggerId: 't1',
+      goToReview: true,
+      sideEffectGrant: ['email'],
+      model: 'gemini-3.5-flash',
+      reasoningEffort: 'low',
+    });
+    const body = mockUpdateTrigger.mock.calls[0][1];
+    expect(body.model).toBeNull();
+    expect(body.reasoning_effort).toBeNull();
+    expect(body.go_to_review).toBe(false);
+    expect(body.side_effect_grant).toEqual([]);
   });
 });
 

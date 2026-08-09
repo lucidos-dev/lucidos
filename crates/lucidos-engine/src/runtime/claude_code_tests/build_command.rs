@@ -368,14 +368,40 @@ fn build_command_uses_permission_prompt_tool_not_skip_permissions() {
         "permission server must be launched via the absolute bundled `lucidos` path"
     );
     assert_eq!(
-        cfg["mcpServers"]["lucidos_perm"]["args"][0],
-        "mcp-permission-server"
+        cfg["mcpServers"]["lucidos_perm"]["args"],
+        serde_json::json!(["mcp-permission-server", "--permission-only"]),
+        "CC must spawn the server narrowed to `approve`: the shared binary also \
+         serves Codex's `ask_user_question`, which CC would otherwise see as a \
+         duplicate of its native AskUserQuestion and have to ask permission for"
     );
 
     assert!(
         args.iter().any(|a| a == "--strict-mcp-config"),
         "--strict-mcp-config keeps the permission server isolated from the user's global MCP config"
     );
+}
+
+/// Both wire names must stay derived from the mount name, because the second
+/// one is not spelled anywhere CC can correct us: `CC_MCP_ASK_USER_QUESTION_TOOL`
+/// is how a tool CC advertises ARRIVES BACK in `CodingAgentToolCalled`, and the
+/// gates in `runtime::is_user_question_tool` match it by string. Rename the
+/// server without moving it and the question tool silently stops being
+/// recognized, which is the exact failure this constant was added for: the user
+/// gets a permission card in front of the question and a pending step above it.
+///
+/// The mount name itself is pinned against the spawned `--mcp-config` by the
+/// test above, so the chain runs from the real command line to both constants.
+#[test]
+fn the_mcp_tool_names_carry_the_mount_name_cc_spawns() {
+    for tool in [CC_PERMISSION_PROMPT_TOOL, CC_MCP_ASK_USER_QUESTION_TOOL] {
+        assert!(
+            tool.starts_with(&format!("mcp__{CC_PERMISSION_MCP_SERVER}__")),
+            "{tool} must carry the `mcp__{CC_PERMISSION_MCP_SERVER}__` prefix CC prepends"
+        );
+    }
+    // The native tool is CC's own, intercepted by the PreToolUse hook rather
+    // than routed over MCP, so it must NOT wear a prefix.
+    assert!(!CC_NATIVE_ASK_USER_QUESTION_TOOL.contains("mcp__"));
 }
 
 #[test]

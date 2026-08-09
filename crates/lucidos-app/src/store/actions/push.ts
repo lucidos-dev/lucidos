@@ -1,9 +1,11 @@
 import { API, json, mutatingFetch, throwIfNotOk } from '../../api/client';
-import { showToast } from '../store';
-import { getDeviceId } from './devices';
-import { isTauri, isIOS, isStandalone } from '../../utils/platform';
+import { showToast, showConfirm } from '../store';
+import { devices, getDeviceId, toggleDevicePush, disablePushForDevices } from './devices';
+import { isTauri, isIOS, isStandalone, isMobileDeviceUserAgent, thisDeviceIsMobile, describeDeviceUserAgent } from '../../utils/platform';
 import { errorDetail } from '../../utils/errorDetail';
 import { withBase, SCOPE_PATH } from '../../utils/basePath';
+import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../../utils/devServerBundle';
+import type { DeviceInfo } from '../../api/types';
 
 /** Convert a base64url-encoded string to a Uint8Array (for applicationServerKey) */
 function urlBase64ToUint8Array(base64String: string): Uint8Array {
@@ -121,9 +123,11 @@ async function ensurePushSubscription(
  *
  * Self-heals three divergent states that leave the engine pushing into the
  * void while the user sees silence. Two of them leave `devices.push_enabled =
- * true` with no `push_subscriptions` row: (1) the LLM
- * `enable_push_notifications` tool flips the device flag before the browser
- * handshake completes; (2) the browser loses the subscription (cleared site
+ * true` with no `push_subscriptions` row: (1) a device flag written without a
+ * completed browser handshake, which every enable path now refuses to do (see
+ * `setDevicePushEnabled`) but which existing rows can still carry, since the
+ * LLM `enable_push_notifications` tool used to flip the flag regardless;
+ * (2) the browser loses the subscription (cleared site
  * data, SW unregistered). The third leaves a row that looks healthy but is
  * addressed with another workspace incarnation's VAPID key, and is repaired by
  * `ensurePushSubscription`. In all three `Notification.permission` stays
@@ -161,6 +165,9 @@ export async function refreshPushSubscription(registration: ServiceWorkerRegistr
  */
 export async function recoverServiceWorker(): Promise<void> {
   if (!('serviceWorker' in navigator)) return;
+  // A dev-server bundle registered none, so there is nothing wedged to recover
+  // and registering one here would be the very thing the gate exists to prevent.
+  if (isDevServerBundle()) return;
   const existing = await navigator.serviceWorker.getRegistration();
   if (existing) {
     // Notifications shown by this registration would be orphaned once we
@@ -205,7 +212,14 @@ export function pushUnsupportedReason(ctx: {
   hasServiceWorker: boolean;
   hasPushManager: boolean;
   hasNotification: boolean;
+  devServerBundle: boolean;
 }): string | null {
+  // First, and above the secure-origin check, because a preview IS served over
+  // https on localhost: every other message here would be advice the user has
+  // already followed, and following it again would change nothing.
+  if (ctx.devServerBundle) {
+    return DEV_SERVER_SW_REASON;
+  }
   if (!ctx.secureContext) {
     return 'Push needs a secure origin (https or localhost). Open Lucidos over https://, an SSH tunnel to localhost, or tailscale serve — plain http://<host> cannot register notifications.';
   }
@@ -225,6 +239,7 @@ export function pushUnsupportedReasonHere(): string | null {
     hasServiceWorker: 'serviceWorker' in navigator,
     hasPushManager: 'PushManager' in window,
     hasNotification: 'Notification' in window,
+    devServerBundle: isDevServerBundle(),
   });
 }
 
@@ -279,5 +294,88 @@ export async function initPushSubscription(): Promise<boolean> {
   } catch (err) {
     showToast(`Failed to enable push notifications: ${errorDetail(err)}`, 'error');
     return false;
+  }
+}
+
+/** The OTHER devices that are phones/tablets and still have push on. Pure (the
+ *  list is passed in) so the selection rule is testable without the store. */
+export function otherPushEnabledMobileDevices(
+  all: DeviceInfo[],
+  currentDeviceId: string,
+): DeviceInfo[] {
+  return all.filter(
+    (d) => d.id !== currentDeviceId && d.push_enabled && isMobileDeviceUserAgent(d.user_agent),
+  );
+}
+
+/** How a device is named in prose the user reads: what they called it, else what
+ *  its user-agent says it is. */
+function deviceLabel(device: DeviceInfo): string {
+  return device.name || describeDeviceUserAgent(device.user_agent);
+}
+
+/**
+ * Having just turned push on for the phone in the user's hand, offer to turn it
+ * off on their OTHER phones. A notification fans out to every push-enabled
+ * device, so a spare handset, or a reinstalled PWA that minted a fresh device
+ * id, keeps buzzing in a drawer with nobody to read it. Cancelling leaves every
+ * device exactly as it was.
+ *
+ * Offered only FROM a mobile device, and only ABOUT mobile ones: a laptop and a
+ * phone are complementary surfaces, and enabling push on one says nothing about
+ * whether the other should stay quiet.
+ *
+ * The list is read from whatever `loadDevices` last fetched, which
+ * `toggleDevicePush` has just refreshed, so the offer reflects the state after
+ * this device was switched on.
+ */
+async function offerToSilenceOtherMobileDevices(currentDeviceId: string): Promise<void> {
+  if (!thisDeviceIsMobile()) return;
+  const loaded = devices.value;
+  if (loaded.status !== 'loaded') return;
+  // Only offer once THIS device is confirmed on. `toggleDevicePush` swallows a
+  // failed write into a toast and returns normally, so without this check a
+  // failed enable would still ask to silence the other phones, and confirming
+  // would leave the user with no device getting a push at all.
+  if (loaded.data.find((d) => d.id === currentDeviceId)?.push_enabled !== true) return;
+  const others = otherPushEnabledMobileDevices(loaded.data, currentDeviceId);
+  if (others.length === 0) return;
+
+  const ok = await showConfirm(
+    others.length === 1
+      ? 'Your other phone still gets a push for everything too. Turn it off there, so only this device buzzes?'
+      : `Your other ${others.length} mobile devices still get a push for everything too. Turn it off there, so only this device buzzes?`,
+    'Turn off',
+    {
+      title: 'Only notify this device?',
+      cancelLabel: 'Keep them on',
+      details: {
+        groups: [{ header: 'Push will be turned off on', items: others.map(deviceLabel) }],
+      },
+    },
+  );
+  if (!ok) return;
+  await disablePushForDevices(others.map((d) => d.id));
+}
+
+/**
+ * The one way push is turned on or off anywhere in the client: the row in
+ * Settings → Devices, the row in Appearance & Behavior → Notifications, and the
+ * `PushNotificationRequested` prompt the LLM `enable_push_notifications` tool
+ * raises (`thread-sync.ts`). One entry point so the three can never disagree
+ * about what flipping it does.
+ *
+ * Enabling needs this browser's own subscription handshake first, because a
+ * page can only ever create `pushManager.subscribe()` for ITSELF; the device
+ * flag alone would leave the engine pushing to an endpoint that does not exist.
+ * A refused permission (or an unsupported context) leaves the flag untouched,
+ * so the toggle springs back rather than claiming an "on" the OS will not
+ * honour. Disabling is just the flag, and works for any device from anywhere.
+ */
+export async function setDevicePushEnabled(deviceId: string, enabled: boolean): Promise<void> {
+  if (enabled && !(await initPushSubscription())) return;
+  await toggleDevicePush(deviceId, enabled);
+  if (enabled && deviceId === getDeviceId()) {
+    await offerToSilenceOtherMobileDevices(deviceId);
   }
 }

@@ -101,7 +101,7 @@ describe('restart toast survives network reconnect', () => {
     await checkConnection();
 
     // Restart state must survive — the engine didn't restart (no toast; the state
-    // drives the control-panel badge + confirm dialog).
+    // drives the brand badge + confirm dialog).
     expect(restartRequired.value).toBe(true);
     expect(localStorage.getItem(RESTART_LS_KEY)).toBe('true');
   });

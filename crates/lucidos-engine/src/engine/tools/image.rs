@@ -271,7 +271,10 @@ impl LucidosEngine {
         let artifact_path = args
             .get("path")
             .and_then(|v| v.as_str())
-            .ok_or("path is required (e.g. 'artifacts/photo.jpg')")?;
+            // Relative to `data/artifacts/`, matching the tool schema in
+            // `llm/tools/images.rs` and what `write_and_commit` joins onto. An
+            // `artifacts/` prefix here would land at `data/artifacts/artifacts/`.
+            .ok_or("path is required, relative to data/artifacts/ (e.g. 'reports/photo.jpg')")?;
 
         if crate::api::is_path_traversal(artifact_path) {
             return Err("Invalid path (must not contain '..' or start with '/' or '\\')".into());

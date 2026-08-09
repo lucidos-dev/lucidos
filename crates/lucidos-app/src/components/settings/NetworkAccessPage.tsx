@@ -8,6 +8,7 @@ import { toFailed } from '../../store/types';
 import type { Loadable } from '../../store/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+import { Explainer } from '../shared/Explainer';
 import {
   parseBindValue,
   toBindValue,
@@ -98,6 +99,16 @@ export function NetworkAccessPage() {
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="access:network">
         Network access
+        {/* On the SHELL, not inside the loaded branch: the shell renders
+            unconditionally (see the anchor comment above), so the explanation is
+            readable while the config is still loading or has failed. */}
+        <Explainer title="Network access">
+          <p>Controls the address this workspace's engine listens on.</p>
+          <p>
+            Loopback keeps it reachable only from this Mac; binding your Tailscale
+            address exposes it to your tailnet so you can use it from your phone.
+          </p>
+        </Explainer>
       </div>
       {body}
     </div>
@@ -122,11 +133,6 @@ export function NetworkAccessPage() {
 
   return shell(
     <>
-      <p class="settings-section-desc">
-        Controls the address this workspace's engine listens on. Loopback keeps it
-        reachable only from this Mac; binding your Tailscale address exposes it to
-        your tailnet so you can use it from your phone.
-      </p>
 
       {inherited ? (
         <div class="list-rows">

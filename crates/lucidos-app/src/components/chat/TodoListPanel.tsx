@@ -22,7 +22,7 @@ export function todoListIndicatorBody({
   const abandoned = items.filter((i) => i.status === 'abandoned').length;
   const inProgress = items.find((i) => i.status === 'in_progress');
   // Three honest indicator states, stamped as `data-state` and distinguished
-  // by COLOR alone (todo-list.css) over one shared checklist glyph:
+  // by COLOR alone (todo-list.css) over one shared ticked-checkbox glyph:
   //   - in-progress: the agent is actively working an item (accent)
   //   - abandoned: no in-progress item AND at least one item was abandoned (dimmed)
   //   - idle: every non-completed item is gone (all done, or nothing pending)

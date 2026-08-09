@@ -177,6 +177,41 @@ export function responseAbortedSummary(
   return isSwitchTeardownAbort(actor, cause) ? 'Paused by restart' : 'Response interrupted';
 }
 
+/** True when this event is **the user pressing Stop waiting** on a live *thread
+ *  subscription*, as opposed to any of the other ways one ends.
+ *
+ *  The single definition of that fingerprint, because three surfaces key on it
+ *  and must not disagree: grouping opens an exchange for it, the response
+ *  projection then leaves the arming row alone, and the initiator panel renders
+ *  it as the user action it was.
+ *
+ *  Only `user_stop` qualifies. An `agent_stand_down` is the agent retiring a
+ *  watch mid-turn, which belongs as a step inside that turn, and the two
+ *  thread-lifecycle causes ride an archive or a discard that already reads as
+ *  its own thing.
+ *
+ *  Takes the two fields it reads rather than a `ThreadEvent`, so the grouping
+ *  fold can hand it a `StoredEvent` and a test can hand it a literal. Every
+ *  `cause` on the union is a string enum, so the widened type accepts all of
+ *  them. */
+export function isUserStoppedWait(event: { type: string; cause?: string }): boolean {
+  return event.type === 'EventWaitCanceled' && event.cause === 'user_stop';
+}
+
+/** Header label for the turn a user's **Stop waiting** opens.
+ *
+ *  Says what was stopped, in the model's own words, because that is the only
+ *  thing on screen that names the subscription once the clock indicator has
+ *  dropped it. A pre-2026-08-07 `EventWaitCanceled` carries no reason, and the
+ *  line then says the one thing it knows rather than trailing an empty colon.
+ *
+ *  Deliberately the same wording as the step-row variant (`eventWaitStepBody`),
+ *  which is what a NON-user stop still renders: one phrasing for one concept,
+ *  whichever surface it lands on. */
+export function eventWaitStoppedSummary(reason: string | undefined): string {
+  return reason ? `Stopped waiting: ${reason}` : 'Stopped waiting for an event';
+}
+
 /** Header label / preview text for a `ResponseCanceled` turn — always a
  *  user-driven stop on a real in-flight response, so no cause-dependent
  *  branching is needed. Rendered as the turn's header (no actor chip); the
@@ -381,7 +416,11 @@ export type ThreadEvent =
   // `hash` (sha256) is the sole identity downstream consumers use; `mime` /
   // `byte_size` are convenience fields for rendering the upload entry.
   | { type: 'ImageUploaded'; hash: string; mime: string; byte_size: number; actor?: MessageOrigin }
-  | { type: 'TriggerStarted'; trigger_id: string; trigger_name?: string; prompt?: string; invocation?: TriggerInvocation; origin?: MessageOrigin }
+  /** A trigger thread's STARTER event (it has no `MessageReceived`), so
+   *  `model` / `reasoning_effort` are what the per-thread model memory reads
+   *  for such a thread. They record what the fire actually ran on: the
+   *  trigger's own pin when it has one, otherwise the account chat default. */
+  | { type: 'TriggerStarted'; trigger_id: string; trigger_name?: string; prompt?: string; invocation?: TriggerInvocation; origin?: MessageOrigin; model?: string; reasoning_effort?: string }
   | { type: 'TriggerCompleted'; trigger_id: string; trigger_name?: string; result_summary?: string }
   | { type: 'ChangeProposed'; change_id?: string; description?: string; files?: string[]; requires_restart?: boolean; path?: string; diff?: string; origin?: MessageOrigin; commit_sha?: string; incomplete?: boolean }
   | { type: 'ChangeApplied'; change_id?: string; requires_restart?: boolean; client_update?: boolean; commits?: string[]; thread_title?: string; actor?: MessageOrigin; path?: string }
@@ -463,12 +502,13 @@ export type ThreadEvent =
   | { type: 'ImageDescribed'; source_event_id: string; hash: string; description: string; model: string }
   // ── Event-wait lifecycle ──────────────────────────────────────────────
   // The thread subscribed to an event and parked; the engine wakes it on a
-  // match, the deadline, or a user cancel. These DO render: `EventWaitStarted`
-  // becomes a step-level card in the transcript (the CheckpointCard shape,
-  // never an exchange divider, because the wake resumes the SAME exchange),
-  // and the three resolutions flip that card's state by `wait_id`. They also
-  // feed `meta.liveEventWaits`, which backs the always-visible subscription
-  // indicator.
+  // match, the deadline, or a user cancel. These DO render. `EventWaitStarted`
+  // becomes a step-level row in the transcript, never an exchange divider,
+  // because the wake resumes the SAME exchange. A delivery and an expiry
+  // resolve that row in place by `wait_id`, adding the outcome to the same
+  // subject line. A cancel never touches it: see the `EventWaitCanceled` note
+  // below. They also feed `meta.liveEventWaits`, which backs the always-visible
+  // subscription indicator.
   //
   // `was_attached` records whether the delivery filled in the model's own
   // dangling `await_event` tool call (a seamless mid-thought resume) or arrived
@@ -476,12 +516,21 @@ export type ThreadEvent =
   | { type: 'EventWaitStarted'; wait_id: string; tool_use_id: string; on: EventSubscription[]; reason: string; armed_at?: string; expires_at: string; watermark: number }
   | { type: 'EventWaitDelivered'; wait_id: string; event_id: string; event_type: string; payload: unknown; matched_index: number; was_attached: boolean }
   | { type: 'EventWaitExpired'; wait_id: string; was_attached: boolean }
-  // `on` / `reason` are a copy of what was stopped, so the transcript's stop
-  // row is self-contained: a subscription routinely outlives the turn that
-  // armed it, so its `EventWaitStarted` is outside the loaded window by the
-  // time it is stopped. Absent on pre-2026-08-07 rows, which fall back to the
-  // in-window lookup and then to naming nothing.
-  | { type: 'EventWaitCanceled'; wait_id: string; cause: EventWaitCancelCause; on?: EventSubscription[]; reason?: string; was_attached?: boolean };
+  // A stop NEVER rewrites the arming row, whoever stopped it: "Set up an event
+  // wait: X" is a true statement about a moment, and a stop is a different
+  // action at a different moment, routinely hours later. It renders at its own
+  // position instead, as a turn when the user pressed Stop waiting and as a step
+  // for every other cause.
+  //
+  // `on` / `reason` are a copy of what was stopped, which is what makes that
+  // self-contained: a subscription routinely outlives the turn that armed it, so
+  // its `EventWaitStarted` is outside the loaded window by the time it is
+  // stopped. Absent on pre-2026-08-07 rows, which fall back to naming nothing.
+  //
+  // `actor` rides `EventMeta` like every other stamped event. A `user_stop`
+  // opens a turn of its own (see `isUserStoppedWait`), and this is what puts
+  // the device that pressed the button in that turn's origin popover.
+  | { type: 'EventWaitCanceled'; wait_id: string; cause: EventWaitCancelCause; on?: EventSubscription[]; reason?: string; was_attached?: boolean; actor?: MessageOrigin };
 
 /** Every `ThreadEvent['type']` discriminant, as a compile-time-checked object.
  *  The `satisfies Record<ThreadEvent['type'], true>` annotation forces this map

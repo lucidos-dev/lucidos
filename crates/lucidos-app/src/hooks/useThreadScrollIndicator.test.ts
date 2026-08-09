@@ -1,5 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import postcss, { type AtRule, type Container, type Declaration, type Document } from 'postcss';
 // @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
 import { readFileSync, readdirSync } from 'node:fs';
 // @ts-expect-error: same
@@ -8,6 +7,9 @@ import { dirname, resolve, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { INDICATOR_HIDE_DELAY_MS } from './useThreadScrollIndicator';
+// `atRules` is what lets these tests assert WHERE a rule applies, which is the
+// whole point here: the suppression and the replacement have to share one gate.
+import { cssRules } from '../styles/__tests__/css-rule-helpers';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const src = resolve(here, '..');
@@ -173,37 +175,6 @@ describe('the native indicator is only suppressed where a replacement is drawn',
     }
   });
 });
-
-/**
- * Every style rule in the sheet, each carrying the at-rule preludes it is nested
- * inside. `atRules` is what lets a test assert WHERE a rule applies, which is the
- * whole point here: the suppression and the replacement have to share one gate.
- *
- * Parsed with postcss (already a dependency, see
- * styles/__tests__/engine-served-css-parses.test.ts) rather than by counting
- * braces: nesting depth and comment/string handling come for free and correct.
- */
-function cssRules(css: string): Array<{ selector: string; body: string; atRules: string }> {
-  const out: Array<{ selector: string; body: string; atRules: string }> = [];
-  postcss.parse(css).walkRules(rule => {
-    const atRules: string[] = [];
-    for (let node: Container | Document | undefined = rule.parent; node; node = node.parent) {
-      if (node.type === 'atrule') {
-        const at = node as AtRule;
-        atRules.unshift(`@${at.name} ${at.params}`.trim());
-      }
-    }
-    out.push({
-      selector: rule.selector.replace(/\s+/g, ' '),
-      body: rule.nodes
-        .filter((n): n is Declaration => n.type === 'decl')
-        .map(d => `${d.prop}: ${d.value}`)
-        .join('; '),
-      atRules: atRules.join(' '),
-    });
-  });
-  return out;
-}
 
 /** Every `.tsx` under `src`, excluding test files. */
 function tsxFiles(dir: string): string[] {

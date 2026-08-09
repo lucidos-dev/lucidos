@@ -3,11 +3,19 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 vi.mock('../../api/threads', () => ({
   fetchOlderThreads: vi.fn().mockResolvedValue({ threads: [], family_threads: [], has_more: false }),
   fetchArchivedCount: vi.fn().mockResolvedValue(0),
+  // The initial window load, which the resync tests below drive. It carries no
+  // filter params by design, which is exactly why it must not stamp.
+  fetchThreads: vi.fn().mockResolvedValue({
+    saved: [], archive: [], active: [], active_threads: [], composing: [], family_threads: [],
+  }),
+  fetchThreadEvents: vi.fn().mockResolvedValue({ events: [], currentAggregate: null }),
 }));
+vi.mock('../../utils/liveness', () => ({ postClientLog: vi.fn() }));
 
 import { fetchOlderThreads, fetchArchivedCount } from '../../api/threads';
-import { loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, _clearFamilyExtensionIdsForTest } from '../actions/thread-loading';
+import { loadAllThreads, loadOlderThreads, reloadAfterFilterChange, refreshArchivedCount, filterChangedSinceLoad, _clearFamilyExtensionIdsForTest, _clearLoadedFilterSelectionForTest } from '../actions/thread-loading';
 import { threadMap, threadHasMore, threadLoadingMore, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, archiveThreadCount, ALL_CHANNELS } from '../store';
+import { closeThreadFilterPanel, openThreadFilterPanel } from '../threadFilterPanel';
 import { makeOptimisticThreadState } from '../thread-events';
 import type { ThreadState } from '../thread-events';
 import type { ThreadSummary } from '../../api/threads';
@@ -35,6 +43,9 @@ describe('loadOlderThreads', () => {
     threadMap.value = new Map();
     threadHasMore.value = true;
     threadLoadingMore.value = false;
+    // Ahead of the selection writes: pagination reads the *applied* filter, and
+    // an open panel would hold every one of them back.
+    closeThreadFilterPanel();
     threadChannelFilter.value = new Set(ALL_CHANNELS);
     selectedTriggerIds.value = new Set();
     selectedRepoIds.value = new Set();
@@ -78,6 +89,51 @@ describe('loadOlderThreads', () => {
 
     expect(fetchMock).toHaveBeenCalledWith(
       '2026-01-01T00:00:00Z',
+      15,
+      ['coding-agent'],
+      undefined,
+      ['repo-a'],
+      undefined,
+    );
+  });
+
+  it('pages for the selection ON SCREEN while the filter panel covers the list', async () => {
+    // The panel covers the drawer list, so a tick of one of its checkboxes has
+    // changed nothing the user can see yet. Pagination must stay on the applied
+    // selection: fetching for the half-edited one would spend round trips on
+    // rows behind an opaque panel, and would put the cursor in a different
+    // space from the list it is supposed to be extending.
+    threadChannelFilter.value = new Set(['chat']);
+    const map = new Map<string, ThreadState>();
+    map.set('t1', loaded(makeOptimisticThreadState({
+      id: 't1', title: 'T', channel: 'chat', initiator: 'user',
+      eventsLoaded: false,
+    }), '2026-01-01T00:00:00Z'));
+    threadMap.value = map;
+
+    openThreadFilterPanel();
+    threadChannelFilter.value = new Set(['claude_code']);
+    selectedRepoIds.value = new Set(['repo-a']);
+
+    await loadOlderThreads();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      '2026-01-01T00:00:00Z',
+      15,
+      ['chat'],
+      undefined,
+      undefined,
+      undefined,
+    );
+
+    // Closing applies it, and the next page targets what is now on screen.
+    fetchMock.mockClear();
+    threadHasMore.value = true;
+    closeThreadFilterPanel();
+    await loadOlderThreads();
+
+    expect(fetchMock).toHaveBeenCalledWith(
+      expect.any(String),
       15,
       ['coding-agent'],
       undefined,
@@ -377,5 +433,144 @@ describe('loadOlderThreads', () => {
 
     expect(countMock).not.toHaveBeenCalled();
     expect(archiveThreadCount.value).toBe(0);
+  });
+});
+
+describe('filterChangedSinceLoad', () => {
+  beforeEach(() => {
+    fetchMock.mockClear();
+    fetchMock.mockResolvedValue({ threads: [], family_threads: [], has_more: false });
+    countMock.mockClear();
+    countMock.mockResolvedValue(0);
+    threadMap.value = new Map();
+    threadHasMore.value = true;
+    threadLoadingMore.value = false;
+    // Ahead of the selection writes, as in the suite above: an open panel holds
+    // the applied selection, which is the one stamped and compared here.
+    closeThreadFilterPanel();
+    threadChannelFilter.value = new Set(ALL_CHANNELS);
+    selectedTriggerIds.value = new Set();
+    selectedRepoIds.value = new Set();
+    selectedAppIds.value = new Set();
+    _clearFamilyExtensionIdsForTest();
+    _clearLoadedFilterSelectionForTest();
+  });
+
+  it('is true until a window has been fetched at all', () => {
+    expect(filterChangedSinceLoad()).toBe(true);
+  });
+
+  it('goes quiet once a reload has fetched against the current selection', async () => {
+    await reloadAfterFilterChange();
+    expect(filterChangedSinceLoad()).toBe(false);
+  });
+
+  it('reports a selection the loaded window was never fetched against', async () => {
+    await reloadAfterFilterChange();
+    threadChannelFilter.value = new Set(['chat']);
+    expect(filterChangedSinceLoad()).toBe(true);
+  });
+
+  it('keeps reporting it until the reload actually happens, however often it is asked', async () => {
+    // The whole point, and the bug it replaces. The drawer's list renders under
+    // the default `all` status only, while the Filter panel can change the
+    // selection under any of the four status views, with the list unmounted.
+    // The old guard was a `useRef` seeded at mount, so that change was seen by
+    // nobody AND the ref then seeded with the new value, suppressing the
+    // catch-up on the way back: pagination stayed armed for the old cursor
+    // space and the Archive badge kept the old selection's server total. A
+    // store fact survives any number of mounts and reads.
+    await reloadAfterFilterChange();
+    selectedRepoIds.value = new Set(['repo-a']);
+
+    expect(filterChangedSinceLoad()).toBe(true);
+    expect(filterChangedSinceLoad()).toBe(true);
+    expect(filterChangedSinceLoad()).toBe(true);
+
+    await reloadAfterFilterChange();
+    expect(filterChangedSinceLoad()).toBe(false);
+  });
+
+  it('survives a resync: loadAllThreads must not clear a pending change', async () => {
+    // The resync path (`refreshThreadList` from an SSE reconnect or an iOS PWA
+    // wake) refetches the recent window with NO filter params and never
+    // re-arms `threadHasMore`, so it settles nothing about a selection.
+    // Stamping there unconditionally swallowed a filter change made while the
+    // drawer's list was unmounted: the catch-up was suppressed on the way back
+    // AND pagination stayed dead for the new cursor space.
+    await reloadAfterFilterChange();
+    selectedRepoIds.value = new Set(['repo-a']);
+    expect(filterChangedSinceLoad()).toBe(true);
+
+    await loadAllThreads();
+
+    expect(filterChangedSinceLoad(), 'a resync must not settle a selection it never fetched').toBe(true);
+  });
+
+  it('stamps on a cold boot, so the first mount is not a filter change', async () => {
+    // The one thing the initial load IS for here. With no stamp yet, the
+    // drawer's list would treat its first mount as a change and refetch a
+    // window that just landed.
+    expect(filterChangedSinceLoad()).toBe(true);
+    await loadAllThreads();
+    expect(filterChangedSinceLoad()).toBe(false);
+  });
+
+  it('does not stamp what a declined call never fetched', async () => {
+    // `loadOlderThreads` early-returns while another call owns the round trip.
+    // Stamping the INTENT before that await claimed a selection the server was
+    // never asked about, and nothing was left owing the difference.
+    threadLoadingMore.value = true;
+    selectedRepoIds.value = new Set(['repo-b']);
+
+    await reloadAfterFilterChange();
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(filterChangedSinceLoad(), 'a declined fetch settles nothing').toBe(true);
+  });
+
+  it('stamps the selection the page was FETCHED for, not whatever is current when it lands', async () => {
+    // The settle site is on the far side of an await, so the selection can move
+    // while the request is out. Reading the signal there marks the NEW one as
+    // fetched on the strength of the OLD one's answer, which is the same lie as
+    // stamping an intent: nothing is left owing the new selection its reload,
+    // and an empty response writes `threadHasMore = false` onto a cursor space
+    // the server was never asked about.
+    // A narrowing selection, so the no-cursor path falls through to the now()
+    // cursor and a request actually goes out (with no narrowing at all, an
+    // empty map is "nothing left to page" and answers without asking).
+    threadChannelFilter.value = new Set(['chat']);
+    let landPage!: (v: { threads: never[]; family_threads: never[]; has_more: boolean }) => void;
+    fetchMock.mockReturnValueOnce(new Promise((resolve) => { landPage = resolve; }));
+
+    const inFlight = loadOlderThreads();
+    expect(fetchMock, 'the request must be in flight for the race to exist').toHaveBeenCalledTimes(1);
+    // The user moves on while the page for the previous selection is still out.
+    selectedRepoIds.value = new Set(['repo-b']);
+    landPage({ threads: [], family_threads: [], has_more: false });
+    await inFlight;
+
+    expect(filterChangedSinceLoad(), 'the new selection was never fetched, so it still owes a reload').toBe(true);
+    // And the verdict that came with that answer belongs to the old cursor
+    // space too. Disarming here is the durable half of the same race: the
+    // reload the new selection is owed has ALREADY run and declined on
+    // `threadLoadingMore` (this very call), and the drawer's effect does not
+    // fire again until the selection moves, so nothing re-arms it and the list
+    // is left short with its sentinel gone.
+    expect(threadHasMore.value, "pagination must stay armed for the selection that was never paged").toBe(true);
+  });
+
+  it('notices each facet axis on its own', async () => {
+    for (const move of [
+      () => { threadChannelFilter.value = new Set(['trigger']); },
+      () => { selectedTriggerIds.value = new Set(['trig-a']); },
+      () => { selectedRepoIds.value = new Set(['repo-a']); },
+      () => { selectedAppIds.value = new Set(['app-a']); },
+    ]) {
+      await reloadAfterFilterChange();
+      expect(filterChangedSinceLoad()).toBe(false);
+      move();
+      expect(filterChangedSinceLoad()).toBe(true);
+    }
   });
 });

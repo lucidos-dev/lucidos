@@ -250,6 +250,46 @@ export async function clickHeaderAction(page: Page, actionSelector: string, time
   }
 }
 
+/** Is a content-header action OFFERED to the reader, in EITHER placement?
+ *
+ *  The reading counterpart of `clickHeaderAction`, and needed for the sharper
+ *  half of the same problem. A folded action has no header button, so a bare
+ *  `expect('.the-action').toHaveCount(0)` is satisfied by a folded action
+ *  exactly as it is by an absent one: a "this surface does not offer that
+ *  control" assertion written that way stops being able to fail. Both of
+ *  repo-files.spec.ts's went quietly vacuous the day three actions began
+ *  folding whole.
+ *
+ *  Leaves no state behind: the `⋯` menu is only opened when the action has no
+ *  header button, and is closed again through its own trigger before returning. */
+export async function headerActionOffered(page: Page, actionSelector: string, timeout = 10_000): Promise<boolean> {
+  // Settle first, for the reason clickHeaderAction settles: the collapse hook
+  // measures in a layout effect, so before it has run neither placement exists
+  // and every answer here would be a false negative.
+  await page.waitForFunction(({ sel }) => {
+    const anyVisible = (s: string) =>
+      Array.from(document.querySelectorAll(s)).some(el => el.getBoundingClientRect().width > 0);
+    return anyVisible(sel) || anyVisible('.content-header-more');
+  }, { sel: actionSelector }, { timeout }).catch(() => {
+    // Neither placement ever appeared, which IS the answer when a caller is
+    // asking whether an action is offered. Fall through to the reads below.
+  });
+
+  if (await page.locator(`${actionSelector}:visible`).count() > 0) return true;
+  if (!await clickVisibleElement(page, '.content-header-more')) return false;
+  await waitForVisibleElement(page, '.thread-overflow-item', timeout);
+  const offered = await page.locator(`.thread-overflow-item${actionSelector}`).count() > 0;
+  // Close through the trigger rather than Escape: the trigger is the menu's
+  // anchor, so its own handler toggles the menu shut, and nothing else on the
+  // Escape stack is disturbed.
+  await clickVisibleElement(page, '.content-header-more');
+  await page.waitForFunction(
+    () => document.querySelectorAll('.thread-overflow-item').length === 0,
+    undefined, { timeout },
+  );
+  return offered;
+}
+
 /** The id of the thread the app currently has focused, read from the same
  *  `localStorage` key the app persists it under.
  *
@@ -326,23 +366,50 @@ export async function clickVisibleElement(page: Page, selector: string, text?: s
   }, { sel: selector, txt: text });
 }
 
-/** Open the unified Filter dropdown and pick a drawer view by its row label
- *  ("All" | "Needs attention" | "Review" | "Running" | "Drafts"). The View rows
- *  live in the merged dropdown's top section; picking a view applies it and
- *  closes the dropdown. Dual-layout safe — the single Filter button
- *  (`aria-label="Filter threads"`) lives in both the desktop and mobile threads
- *  headers. Throws if the button or row isn't visible. */
+/** Open the unified Filter panel and pick a drawer view by its row label
+ *  ("All" | "Needs attention" | "Review" | "Running" | "Drafts"). The rows live
+ *  in the panel's Status section; picking one applies it and closes the panel.
+ *  The panel renders inside the thread drawer pane, which is the same component
+ *  on both layouts, so this is dual-layout safe: the single Filter button
+ *  (`aria-label="Filter threads"`) lives in both threads headers. Throws if the
+ *  button or row isn't visible. */
 export async function openDrawerView(page: Page, label: string): Promise<void> {
   const opened = await clickVisibleElement(page, 'button[aria-label="Filter threads"]');
   if (!opened) throw new Error('Filter threads button not visible');
-  const picked = await clickVisibleElement(page, '.thread-filter-dropdown .drawer-view-option', label);
+  const picked = await clickVisibleElement(page, '.thread-filter-panel .drawer-view-option', label);
   if (!picked) throw new Error(`Drawer view option "${label}" not visible`);
 }
 
 /** Click compose button to start a new thread (dual-layout safe).
- *  On mobile the compose button navigates to thread pane automatically. */
+ *  On mobile the compose button navigates to thread pane automatically.
+ *
+ *  The two layouts reach it differently: the desktop thread-pane header carries
+ *  New thread as an icon button (`ThreadHeaderActions`), while both mobile
+ *  headers have no room for it and keep it inside the Lucidos (brand) menu as a
+ *  `.brand-menu-item` (`HeaderMark`). Clicking the icon selector alone therefore
+ *  hit nothing at all on mobile, and the caller only found out via the
+ *  compose-view wait below timing out five seconds later.
+ *
+ *  The menu route is gated on the mobile viewport because that is the only place
+ *  the menu HAS that item (`LucidosMenu`'s `actionsInRow` drops the three action
+ *  rows on desktop, where the header row carries them). Running it on desktop
+ *  would open the Lucidos menu, find nothing, and leave it open over the app for
+ *  the rest of the spec. A miss stays non-fatal, as before: the caller may
+ *  already be sitting on the compose view, in which case the waits below pass
+ *  anyway.
+ *
+ *  Same shape of problem as `clickHeaderAction` above, which finds a CONTENT
+ *  header action wherever progressive collapse put it. This one is not routed
+ *  through it: that helper knows the content header's `⋯`, and the two
+ *  placements here are a different header's button and a different menu. */
 export async function newThread(page: Page): Promise<void> {
-  await clickVisibleElement(page, 'button[aria-label="New thread"]');
+  const clicked = await clickVisibleElement(page, 'button[aria-label="New thread"]');
+  if (!clicked && isMobileViewport(page)) {
+    await clickVisibleElement(page, 'button[aria-label^="Lucidos menu"]');
+    if (!await clickVisibleElement(page, '.brand-menu-item', 'New thread')) {
+      await page.keyboard.press('Escape'); // never leave the menu standing open
+    }
+  }
   await ensureOnThreadPane(page);
   // Wait for compose/create view (no existing messages visible)
   await page.waitForFunction((sel) => {

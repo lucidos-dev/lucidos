@@ -12,7 +12,7 @@ export interface NavHistoryItem {
   /** Human label for the destination (thread title / content view title). */
   label: string;
   /** Optional leading glyph identifying the destination's type — a thread-type
-   *  mark (ThreadNav) or a content-pane category icon (PanelNav). */
+   *  mark (ThreadNav) or a content-pane category icon (ContentNav). */
   icon?: ComponentChildren;
   /** Jump to this destination. */
   onSelect: () => void;

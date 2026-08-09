@@ -1527,17 +1527,18 @@ impl LucidosEngine {
                             // stale-resume heuristic below so a working Fable
                             // resume is never misread as a dead session.
                             tool_calls_seen = tool_calls_seen.saturating_add(1);
-                            if crate::engine::agent_session::lifecycle::is_user_question_tool(&name) {
-                                // Question flow — the agent subprocess blocks until the user
+                            if crate::runtime::is_user_question_tool(&name) {
+                                // Question flow: the agent subprocess blocks until the user
                                 // answers and the engine renders the card from the
                                 // `UserQuestionAsked` the internal endpoint emits. CC routes
                                 // here via its PreToolUse hook (`crate::engine::cc_settings` +
-                                // `api/internal.rs::ask_user_question`); Codex via the
-                                // `mcp__lucidos__ask_user_question` MCP tool hitting the same
-                                // endpoint. run_session has nothing to do with this `tool_use`
-                                // event — no emit (a tool-call step would double-surface the
-                                // question), no kill (the subprocess keeps running), no
-                                // session removal.
+                                // `api/internal.rs::ask_user_question`) or via the MCP tool its
+                                // permission server also exposes; Codex via that same MCP tool
+                                // under its own mount name, hitting the same endpoint. All three
+                                // names live in `runtime::is_user_question_tool`. run_session has
+                                // nothing to do with this `tool_use` event: no emit (a tool-call
+                                // step would double-surface the question), no kill (the
+                                // subprocess keeps running), no session removal.
                             } else {
                                 let description = crate::core::describe_cc_tool(&name, &input);
                                 // Safety net: env-side fix (`pg_env_vars` injected

@@ -280,7 +280,7 @@ function renderToast(t: ToastItem, entryDurationMs: number) {
         </div>
       )}
       {(t.action || t.secondaryAction) && (
-        <div class="toast-actions">
+        <div class="toast-actions button-group">
           {t.secondaryAction && (
             <button
               class={`action-btn${t.secondaryAction.variant ? ' action-btn-' + t.secondaryAction.variant : ''}`}

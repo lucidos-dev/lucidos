@@ -25,6 +25,10 @@ export function createTrigger(body: {
   /** Side-effect grant (ADR 0002, Phase 5) — irreversible categories this
    *  trigger may perform unattended. Omit/[] = none granted. */
   side_effect_grant?: SideEffectCategory[];
+  /** Chat model this trigger's intent fires on. Omit for the account default. */
+  model?: string;
+  /** Thinking budget for this trigger's intent fires. Omit for the account default. */
+  reasoning_effort?: string;
 }): Promise<ApiResult> {
   return lucidos.triggers.create(body) as Promise<ApiResult>;
 }
@@ -44,6 +48,12 @@ export function updateTrigger(
     group_id?: string | null;
     /** Full replacement for the side-effect grant; send [] to clear all. */
     side_effect_grant?: SideEffectCategory[];
+    /** Pin the intent to a chat model (string) or clear it back to the account
+     *  default (null). Absent leaves it unchanged. */
+    model?: string | null;
+    /** Pin the intent's thinking budget or clear it back to the account default
+     *  (null). Absent leaves it unchanged. */
+    reasoning_effort?: string | null;
   }
 ): Promise<ApiResult> {
   return lucidos.triggers.update(id, body) as Promise<ApiResult>;

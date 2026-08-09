@@ -98,8 +98,12 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
 - **Lives in:** `engine/event_wait/mod.rs::settle_legacy_attached_event_waits`
   (the query) and `engine/event_wait/dispatcher.rs` (the emit), called once from
   `main.rs` before `refire_unresolved_event_wakes` / `rebuild_event_waits`.
-  Paired with the `waiting_for_event` arm in `ThreadStatus::parse` and the
-  migration `20260806090527_event_wait_status_retired.sql`.
+  Paired with `ThreadStatus::parse`'s unknown-value fallback to `Idle`, which
+  is what reads a stored `waiting_for_event` as what it now means, and the
+  migration `20260806090527_event_wait_status_retired.sql`. That was a named
+  match arm until 2026-08-07, when `parse` was reduced to
+  `try_parse(s).unwrap_or(Idle)` for the `status` filter; the behavior is
+  unchanged and the doc comment on `parse` still explains the value.
 - **Impermanent because:** It exists for threads caught mid-wait by ADR 0049,
   which removed the attached shape. Such a thread has an `await_event`
   `ToolCalled` with no `ToolResult`, which is a provider 400 on its very next
@@ -111,8 +115,10 @@ Diagnostics, scaffolding, and "workaround until upstream fixes X" code.
   a real workspace (it logs `Closed N legacy unpaired await_event call(s)`, so a
   boot that logs nothing for a while is the signal). Then delete the sweep, its
   `main.rs` call, `legacy_attached_settle_tool_result`, the `waiting_for_event`
-  arm in `ThreadStatus::parse`, and the note about it on `AWAIT_EVENT` in
-  `llm/tool_names.rs`. The migration stays: it is applied history.
+  paragraph in `ThreadStatus::parse`'s doc comment, and the note about it on
+  `AWAIT_EVENT` in `llm/tool_names.rs`. Nothing is deleted from `parse` itself:
+  the fallback that handles the value is load-bearing for any unknown column
+  value, not just this one. The migration stays: it is applied history.
 - **Status:** open
 
 ### Batch `data/` writes announce once for the caller, not per file

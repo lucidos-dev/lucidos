@@ -37,11 +37,13 @@ export async function loadWorkspaceDisplayName(): Promise<void> {
     adoptWorkspaceDisplayName(await listWorkspaces());
   } catch (e) {
     // Best-effort startup probe (frontend.md carve-out), deliberately not a
-    // toast: the user did not ask for this, the display falls back to the
-    // engine's own name so nothing is blank or wrong-looking, and the next
-    // control-panel open re-resolves the label through
-    // `adoptWorkspaceDisplayName`. In legacy no-gateway mode this route does not
-    // exist at all, which is a normal condition rather than a failure.
+    // toast: the user did not ask for this, and the display falls back to the
+    // engine's own name so nothing is blank or wrong-looking. This is now the
+    // ONLY caller: the workspace switcher used to re-resolve the label on every
+    // open, and renaming lives on the gateway picker, which the app reloads
+    // through, so the next boot picks the new name up. In legacy no-gateway mode
+    // this route does not exist at all, which is a normal condition rather than
+    // a failure.
     console.warn('[workspace] display label unavailable; using the engine name', e);
   }
 }

@@ -1,8 +1,23 @@
 /* Extends .modal-overlay — top-aligned for search dropdown.
    Compound selector beats .modal-overlay's align-items:center. */
 .modal-overlay.search-everywhere-overlay {
+    /* Hung from the header's bottom edge on the SAME anchor and gap the Lucidos
+       menu uses (`.brand-menu` in styles/header-mark.css), so the two surfaces
+       the header opens start on one line instead of at two eyeballed offsets.
+       `--app-header-bottom` is redefined per breakpoint (global/base.css for
+       desktop, mobile.css for the fixed mobile header), so this one expression
+       follows whichever header is on screen and the mobile block below no
+       longer restates it. Declared as a var because the mobile max-height has
+       to subtract exactly this.
+       On mobile the anchor MOVES while the palette is open, and that is the
+       anchor working rather than a glitch: --mobile-header-height collapses to
+       the safe-area inset when the header slides off for the keyboard, which
+       this palette's own auto-focused input is what triggers. The palette rides
+       up with the header it is hung from and takes the freed height, instead of
+       holding a gap under a header that is no longer there. */
+    --search-everywhere-top: calc(var(--app-header-bottom) + var(--header-surface-gap));
     align-items: flex-start;
-    padding-top: 6rem;
+    padding-top: var(--search-everywhere-top);
     /* Own GPU compositing layer — same rationale as file-search-overlay. */
     will-change: opacity;
     /* Click-through: clicks outside the modal pass to underlying elements
@@ -13,13 +28,12 @@
 
 @media (max-width: 768px) {
     .modal-overlay.search-everywhere-overlay {
-        padding-top: calc(3rem + env(safe-area-inset-top, 0px));
         bottom: auto;
         height: var(--app-height, 100dvh);
     }
 
     .search-everywhere-modal {
-        max-height: calc(var(--app-height, 100dvh) - 3rem - env(safe-area-inset-top, 0px));
+        max-height: calc(var(--app-height, 100dvh) - var(--search-everywhere-top));
     }
 }
 
@@ -77,12 +91,46 @@
     color: var(--text-muted);
 }
 
+/* The seven categories don't fit a phone's width, so the strip pans instead of
+   squeezing them. `overscroll-behavior-x: contain` stops a pan carried past
+   either end from chaining outward, which on iOS is the browser's own
+   back-gesture. The scrollbar is suppressed rather than left to sit on the
+   0.5rem-tall sliver under the tabs: unlike the transcript, this strip carries
+   its own affordance, since the tab clipped at the edge is what says there is
+   more to the right. */
 .search-everywhere-tabs {
     display: flex;
     flex-direction: row;
     gap: 0;
     border-bottom: 1px solid var(--border-color);
     padding: 0 0.5rem;
+    overflow-x: auto;
+    /* Required, not tidiness: `overflow-x: auto` alone computes the other axis
+       to `auto` too, and this strip's content box does not land on a whole
+       pixel at a scaled root (35.19px inside a 35px scrollport at the 112.5%
+       UI scale, measured in both engines). A fraction of a pixel is enough for
+       a touch scroller to be draggable, and dragging a one-line tab strip
+       carries the tabs' bottom padding out of view. */
+    overflow-y: hidden;
+    /* The other half of being a scroll container: a flex item with visible
+       overflow gets an automatic minimum size, and losing it makes this strip
+       freely shrinkable inside the modal's column. `.search-everywhere-results`
+       would take no share of any deficit (`flex: 1` gives it a 0% basis, and
+       shrinkage is weighted by basis), so the whole of it lands here. Measured
+       on an equivalent minimal strip in both engines: 35px down to 8px, the tab
+       squashed to 16px. See search-tab-strip-guard.test.ts. */
+    flex-shrink: 0;
+    overscroll-behavior-x: contain;
+    scrollbar-width: none;
+    /* Keeps that affordance alive when Tab lands on a category the strip had to
+       scroll to: scrollIntoView respects scroll-padding, so it stops a sliver
+       short of the edge and the next tab stays clipped into view instead of the
+       strip looking like it ends at the tab it just revealed. */
+    scroll-padding-inline: 1.5rem;
+}
+
+.search-everywhere-tabs::-webkit-scrollbar {
+    display: none;
 }
 
 .search-everywhere-tab {
@@ -95,6 +143,25 @@
     cursor: pointer;
     border-bottom: 0.125rem solid transparent;
     transition: color var(--duration-fast);
+    /* A flex item shrinks by default, which is what wrapped "Triggers" onto two
+       lines and let the labels compress instead of overflowing. */
+    flex-shrink: 0;
+    white-space: nowrap;
+    /* The focus ring below is an INSET box-shadow, so it takes this radius: a
+       square-cornered tab drew the ring as a hard rectangle. Rounded on all four
+       corners rather than the top two, because the ring is the only thing the
+       radius is for and half of it rounded reads as a mistake. At 0.25rem
+       against the 0.125rem active underline the curve is a taper, not a bow. */
+    border-radius: 0.25rem;
+}
+
+/* The shared --focus-ring band, but `inset`: the strip is a scroll container
+   now and its content box is exactly one tab tall, so the usual outward band
+   would be clipped away top and bottom. The transparent outline is the
+   forced-colors fallback, same as .icon-btn:focus-visible. */
+.search-everywhere-tab:focus-visible {
+    outline: 0.125rem solid transparent;
+    box-shadow: inset var(--focus-ring);
 }
 
 .search-everywhere-tab.active {

@@ -166,12 +166,14 @@ export function focusCallingWindow(): void {
 }
 
 /**
- * Wake the native dock-badge loop for an immediate recompute (Rust
- * `nudge_dock_badge` command). The page calls this from its notification SSE
- * handler so the macOS dock badge updates the instant a notification is read —
- * in-app or from another device — instead of waiting for the desktop poll. The
- * recompute reads the gateway's fresh `unread-total` aggregate, so this carries
- * no count. Best-effort: errors are swallowed (no dock tile in dev / non-macOS).
+ * Wake the native unread-indicator loop for an immediate recompute (Rust
+ * `nudge_dock_badge` command, whose name predates the tray surface). The page
+ * calls this from its notification SSE handler so the macOS count updates the
+ * instant a notification is read, in-app or from another device, instead of
+ * waiting for the desktop poll. The recompute writes the menu-bar tray title
+ * always, and the dock badge as well while a client window is open; it reads the
+ * gateway's fresh `unread-total` aggregate, so this carries no count.
+ * Best-effort: errors are swallowed (neither surface exists in dev / non-macOS).
  * Only call when isTauri() is true. */
 export function nudgeDockBadge(): void {
   invoke('nudge_dock_badge').catch(() => {});

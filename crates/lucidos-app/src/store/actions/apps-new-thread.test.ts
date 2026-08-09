@@ -12,7 +12,8 @@ vi.hoisted(() => {
     get length() { return storage.size; },
     key: (_i: number) => null,
   };
-  // scrollToBottom() (reached via addPendingMessage) needs these.
+  // followSentMessage() (reached via addPendingMessage) resolves the visible
+  // transcript through the document, so these have to exist.
   if (typeof globalThis.document === 'undefined') {
     (globalThis as any).document = {};
   }

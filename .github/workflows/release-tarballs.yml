@@ -232,6 +232,14 @@ jobs:
           done
           echo "OK — all staged binaries respect the ubuntu:22.04 portability floor."
 
+      # retention-days: 1, because this artifact is a short-lived inspection copy
+      # and nothing else reads it: no job anywhere runs download-artifact, and the
+      # attach step below reads dist/headless/ straight from this job's workspace.
+      # The same tarballs land on the release as ASSETS, which are not counted
+      # against the account's Actions storage, so the durable copy is there and
+      # this one only has to outlive the run. Without the key these ~250 MB per
+      # release inherit the repo's 90-day default: eight releases put 1.98 GB
+      # against a 0.5 GB included quota (2026-08-09).
       - name: Upload tarball + checksum as a workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -240,6 +248,7 @@ jobs:
             dist/headless/*.tar.gz
             dist/headless/*.tar.gz.sha256
           if-no-files-found: error
+          retention-days: 1
 
       # ── ATTACH TO THE RELEASE FOR THIS TAG, DRAFT OR PUBLISHED ────────────────
       # This is the step the whole ordering turns on. The Release exists (

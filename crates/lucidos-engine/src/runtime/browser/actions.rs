@@ -390,7 +390,13 @@ impl BrowserRuntime {
             page.wait_for_navigation().await.ok();
         }
 
-        Ok(format!("Typed {} characters into {}", text.len(), selector))
+        // `chars().count()`, not `len()`: the message says characters, and
+        // `len()` is a byte count that over-reports any non-ASCII input.
+        Ok(format!(
+            "Typed {} characters into {}",
+            text.chars().count(),
+            selector
+        ))
     }
 
     /// Execute JavaScript and return the result

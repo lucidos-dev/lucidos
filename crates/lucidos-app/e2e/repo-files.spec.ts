@@ -1,5 +1,5 @@
 import { test, expect, Page } from './fixtures';
-import { navigateToApp, assertHealthy, openFilesPanel, clickVisibleElement, clickHeaderAction } from './helpers';
+import { navigateToApp, assertHealthy, openFilesPanel, clickVisibleElement, clickHeaderAction, headerActionOffered } from './helpers';
 import { WORKSPACE, psql, git, getDbPort } from './db-helpers';
 import { randomUUID } from 'crypto';
 import { writeFileSync } from 'fs';
@@ -340,12 +340,17 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
   test('does not offer the toggle over the whole merged file', async ({ page }, testInfo) => {
     test.skip(testInfo.project.name !== 'chromium', 'the narrow case is covered separately');
     await openHunks(page);
-    await expect(page.locator('.diff-side-by-side-toggle:visible')).toBeVisible();
+    // Offered, not "has a header button": a diff contributes enough context
+    // actions that the header folds the whole set into its `⋯` menu, and a
+    // count over the bare class answers 0 for a folded control exactly as it
+    // does for an absent one, which would leave the assertion below unable to
+    // fail.
+    expect(await headerActionOffered(page, '.diff-side-by-side-toggle')).toBe(true);
 
     // Back to the whole merged file.
     await clickHeaderAction(page, '.diff-whole-file-toggle');
     await expect(page.locator('.repo-file-content:visible')).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('.diff-side-by-side-toggle')).toHaveCount(0);
+    expect(await headerActionOffered(page, '.diff-side-by-side-toggle')).toBe(false);
   });
 
   test('does not offer the toggle on a phone, where two columns do not fit', async ({ page }, testInfo) => {
@@ -353,6 +358,9 @@ test.describe('Repo File Explorer, side-by-side diff', () => {
     await openHunks(page);
 
     await expect(page.locator('.diff-line:visible').first()).toBeVisible();
-    await expect(page.locator('.diff-side-by-side-toggle')).toHaveCount(0);
+    // Both placements, for the reason the desktop case gives: the phone header
+    // folds every context action, so a bare count could never tell "the phone
+    // does not offer two columns" from "the phone put the control in `⋯`".
+    expect(await headerActionOffered(page, '.diff-side-by-side-toggle')).toBe(false);
   });
 });

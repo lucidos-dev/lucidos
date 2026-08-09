@@ -27,7 +27,6 @@ import {
   subscribeToTailscaleServeProgress,
   unsubscribeFromTailscaleServeProgress,
 } from '../store/actions/backgroundActivity';
-import { startScrollVisibilityHandler } from '../components/chat/scrollState';
 import { isTauri } from '../utils/platform';
 import { invoke } from '../utils/tauri';
 import { refreshChangesState, restoreRestartToast } from '../store/actions/chat-changes';
@@ -50,6 +49,7 @@ import { flushUndeliveredComposeDrafts } from '../store/actions/compose';
 import { isKnownAppFrame } from '../utils/appFrame';
 import { handleAppToastMessage } from '../store/actions/app-toast-bridge';
 import { withBase, SCOPE_PATH } from '../utils/basePath';
+import { isDevServerBundle, DEV_SERVER_SW_REASON } from '../utils/devServerBundle';
 
 // Cold-start recovery window: if the very first connect hasn't landed by this
 // point, return to the workspace picker rather than strand the user in a cached
@@ -152,9 +152,6 @@ export function useStartup(): void {
         else stopNativeTap = un;
       })
       .catch(() => { /* best-effort: tap routing is additive; banners still show */ });
-    // Capture wasAtBottom on tab-hide so we can re-pin to the new bottom on
-    // return — covers the streaming-while-tabbed-away → frozen-scroll bug.
-    const stopScrollVisibility = startScrollVisibilityHandler();
     refreshChangesState();
 
     // Global click handler for thread links, external URLs, and copy buttons
@@ -276,7 +273,15 @@ export function useStartup(): void {
         `[Startup] Insecure origin (${location.origin}): service worker + push notifications unavailable. Open Lucidos over https:// or localhost (SSH tunnel / tailscale serve).`,
       );
     }
-    if ('serviceWorker' in navigator) {
+    if (isDevServerBundle()) {
+      // Telemetry carve-out (.claude/rules/frontend.md): runs on every page load
+      // with no user intent, so no toast. A Vite dev server serves unhashed
+      // module URLs and an unstamped sw.js, so a worker here would cache the
+      // preview's own modules and defeat hot reload (utils/devServerBundle.ts).
+      // The user still finds out where it matters: enabling push reports the
+      // same condition through pushUnsupportedReasonHere().
+      console.warn(`[Startup] ${DEV_SERVER_SW_REASON}`);
+    } else if ('serviceWorker' in navigator) {
       // Base-path aware (ADR 0014): behind the gateway the SW is served at
       // /<slug>/sw.js and scoped to /<slug>/, so each workspace is an
       // independent PWA cache + push scope.
@@ -686,7 +691,6 @@ export function useStartup(): void {
       stopDevicePresence();
       nativeTapCanceled = true;
       stopNativeTap?.();
-      stopScrollVisibility();
       document.removeEventListener('click', onGlobalClick);
       document.removeEventListener('visibilitychange', handleVisibilityChange);
       window.removeEventListener('focus', onResumeCoalesced);

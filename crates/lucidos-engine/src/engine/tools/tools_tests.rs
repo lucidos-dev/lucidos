@@ -8,9 +8,12 @@
 
 use super::{
     dismiss_from_context_impl, merge_thread_queue_policy_patch, parent_filter_arg,
-    parse_apply_change_id, parse_source_arg, BACKUP_SETTINGS_NAVIGATED,
+    parse_apply_change_id, parse_source_arg, parse_status_arg, status_filter_arg,
+    BACKUP_SETTINGS_NAVIGATED,
 };
+use crate::core::store::StatusFilter;
 use crate::engine::event_bus::EventBus;
+use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::test_support::{setup_test_db, teardown_test_db};
 use serde_json::json;
@@ -36,6 +39,85 @@ fn parse_source_arg_collapses_blank_inputs() {
     assert_eq!(parse_source_arg(Some(&json!(" , , "))), None);
     assert_eq!(parse_source_arg(Some(&json!(["", "  "]))), None);
     assert_eq!(parse_source_arg(Some(&json!(42))), None);
+}
+
+/// The schema advertises an array, but a model that has just used `source`
+/// will reach for a comma-separated string. Both are the same request.
+#[test]
+fn parse_status_arg_takes_an_array_or_a_comma_separated_string() {
+    let from_array = parse_status_arg(&json!({"status": ["running", "failed"]}))
+        .expect("the advertised array shape");
+    let from_string =
+        parse_status_arg(&json!({"status": "running, failed"})).expect("the string shape");
+    assert_eq!(from_array, from_string);
+    assert_eq!(from_array, [ThreadStatus::Running, ThreadStatus::Failed]);
+}
+
+#[test]
+fn parse_status_arg_is_absent_when_the_model_omits_it() {
+    assert!(parse_status_arg(&json!({}))
+        .expect("no status is valid")
+        .is_empty());
+    assert!(parse_status_arg(&json!({"status": null}))
+        .expect("an explicit null is the same as omitting it")
+        .is_empty());
+}
+
+/// A status the model invented must come back as something it can correct. A
+/// filter that silently matches nothing would have it report an empty
+/// workspace.
+#[test]
+fn parse_status_arg_refuses_a_value_the_model_invented() {
+    let err =
+        parse_status_arg(&json!({"status": ["busy"]})).expect_err("'busy' is not a thread status");
+    assert!(
+        err.starts_with("Error: "),
+        "tool errors are prefixed: {err}"
+    );
+    assert!(err.contains("busy"), "must echo the bad value: {err}");
+    assert!(
+        err.contains("running") && err.contains("waiting_for_user_answer"),
+        "must list what it could have meant: {err}"
+    );
+
+    for empty in [json!({"status": []}), json!({"status": ""})] {
+        let err = parse_status_arg(&empty).expect_err("an empty status must not mean 'no filter'");
+        assert!(err.contains("status"), "{err}");
+    }
+}
+
+/// Two answers to one question, so the model is told to pick one rather than
+/// being handed the intersection of them.
+#[test]
+fn parse_status_arg_refuses_status_alongside_active() {
+    let err = parse_status_arg(&json!({"active": true, "status": ["running"]}))
+        .expect_err("both filters at once must be refused");
+    assert!(err.contains("not both"), "{err}");
+    assert!(
+        err.contains("waiting_for_user_answer"),
+        "the refusal is also where the model learns what the union is: {err}"
+    );
+}
+
+#[test]
+fn status_filter_arg_prefers_explicit_statuses_and_falls_back_to_active() {
+    let statuses = [ThreadStatus::Running];
+    assert!(matches!(
+        status_filter_arg(&json!({"status": ["running"]}), &statuses),
+        StatusFilter::OneOf(_)
+    ));
+    assert!(matches!(
+        status_filter_arg(&json!({"active": true}), &[]),
+        StatusFilter::Active(true)
+    ));
+    assert!(matches!(
+        status_filter_arg(&json!({"active": false}), &[]),
+        StatusFilter::Active(false)
+    ));
+    assert!(matches!(
+        status_filter_arg(&json!({}), &[]),
+        StatusFilter::Any
+    ));
 }
 
 /// Insert a raw thread event directly into the events table, bypassing the

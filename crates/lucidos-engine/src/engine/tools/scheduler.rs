@@ -2,7 +2,9 @@ use super::super::LucidosEngine;
 use crate::engine::event_bus::{BusEvent, SystemEvent};
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::llm::tool_names as tn;
-use crate::triggers::{EventSubscription, TriggerRun};
+use crate::triggers::{
+    normalize_route_setting, validate_trigger_reasoning_effort, EventSubscription, TriggerRun,
+};
 // Lets the never-fires diagnosis and the AND-footgun check read a parsed
 // schedule's day-of-month / month / day-of-week ordinal sets, instead of
 // re-parsing the cron field strings by hand.
@@ -207,6 +209,23 @@ impl LucidosEngine {
                     }
                     event_payload["group_id"] = serde_json::json!(gid);
                 }
+                // Per-trigger model / reasoning effort. Absent (the common case)
+                // leaves the trigger on the account chat defaults, so only an
+                // explicit pick is stamped.
+                if let Some(model) =
+                    normalize_route_setting(args.get("model").and_then(|v| v.as_str()))
+                {
+                    event_payload["model"] = serde_json::json!(model);
+                }
+                match validate_trigger_reasoning_effort(
+                    args.get("reasoning_effort").and_then(|v| v.as_str()),
+                ) {
+                    Ok(Some(effort)) => {
+                        event_payload["reasoning_effort"] = serde_json::json!(effort)
+                    }
+                    Ok(None) => {}
+                    Err(e) => return Ok(format!("Error: {}", e)),
+                }
 
                 self.emit_trigger_write(
                     TriggerWrite::Created,
@@ -371,6 +390,19 @@ impl LucidosEngine {
                         ));
                     }
                 }
+                // model / reasoning_effort: Some(None) = clear back to the
+                // account chat default, Some(Some(s)) = set, None = absent.
+                let new_model: Option<Option<String>> = args
+                    .get("model")
+                    .map(|v| normalize_route_setting(v.as_str()));
+                let new_reasoning_effort: Option<Option<String>> =
+                    match args.get("reasoning_effort") {
+                        Some(v) => match validate_trigger_reasoning_effort(v.as_str()) {
+                            Ok(normalized) => Some(normalized),
+                            Err(e) => return Ok(format!("Error: {}", e)),
+                        },
+                        None => None,
+                    };
 
                 if new_name.is_none()
                     && new_run.is_none()
@@ -380,6 +412,8 @@ impl LucidosEngine {
                     && new_app_id.is_none()
                     && new_go_to_review.is_none()
                     && new_group_id.is_none()
+                    && new_model.is_none()
+                    && new_reasoning_effort.is_none()
                 {
                     return Ok(
                         "Error: At least one field besides trigger_id must be provided".to_string(),
@@ -424,6 +458,14 @@ impl LucidosEngine {
                 if let Some(ref gid) = new_group_id {
                     update_payload["group_id"] = serde_json::json!(gid);
                     updated_fields.push("group_id");
+                }
+                if let Some(ref model) = new_model {
+                    update_payload["model"] = serde_json::json!(model);
+                    updated_fields.push("model");
+                }
+                if let Some(ref effort) = new_reasoning_effort {
+                    update_payload["reasoning_effort"] = serde_json::json!(effort);
+                    updated_fields.push("reasoning_effort");
                 }
 
                 // Ensure trigger still has at least one firing mechanism

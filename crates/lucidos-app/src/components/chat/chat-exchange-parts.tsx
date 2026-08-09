@@ -5,7 +5,7 @@ import { ensureChangeLoaded, revertChange } from '../../store/actions/chat-chang
 import { showEventWhereItLives } from '../../store/actions/event-navigation';
 import { viewChangeDiff } from '../../store/actions/repositories';
 import { checkpointDiffModal, contextViewer, findChangeById, lazyChanges, openImagePopupFromGroup, showToast, stepDetailModal } from '../../store/store';
-import { LUCIDOS_AGENT_LABEL, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
+import { LUCIDOS_AGENT_LABEL, eventWaitStoppedSummary, isThinking, resumeEngineNote, stepStatus } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { BlobImage } from '../shared/BlobImage';
 import type { EventWaitCancelCause, Exchange } from '../../store/thread-events';
@@ -14,7 +14,6 @@ import type { CodingAgent } from '../../api/types';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatFileCount } from '../../utils/formatFileCount';
 import { contextPercent, formatTokens } from '../../utils/formatTokens';
-import { viewportIsMobile } from '../../utils/viewport';
 import { ClaudeIcon, CodexIcon } from '../shared/icons';
 import { highlightEllipsis } from './highlightEllipsis';
 import { getSessionBlobUrlForHash } from './pastedImages';
@@ -464,10 +463,14 @@ function lastLinePreview(text: string, max = 120): string {
 
 /** The context-usage suffix on a step row.
  *
- *  `compact` (mobile) keeps only the percentage. The full
- *  "178k / 1000k (18%)" is wider than a phone's remaining row space, and since
- *  the row is `nowrap` the excess would push the description out rather than
- *  wrap. The percentage is the part that is read at a glance anyway. */
+ *  `compact` keeps only the percentage. The full "178k / 1000k (18%)" is wider
+ *  than a narrow row's remaining space, and since the row is `nowrap` the excess
+ *  would push the description out rather than wrap. The percentage is the part
+ *  that is read at a glance anyway.
+ *
+ *  Which form the user sees is decided in CSS, not here: `InlineStep` renders
+ *  both and a container query on the row picks one (see `.step-context-compact`
+ *  in steps.css). */
 export function contextLabel(
   used: number,
   window: number | null | undefined,
@@ -510,9 +513,20 @@ export function InlineStep({ event }: { event: Extract<ResponseEvent, { type: 's
   const detailText = event.detail || thinkingTail;
 
   const isPending = event.outcome === 'pending';
+  // Both forms go into the DOM and CSS shows exactly one, because what decides
+  // is the ROW's own width, which nothing here can read: the row is as wide as
+  // the thread pane the user dragged the divider to, so a narrow pane on a
+  // desktop crowds the counter exactly the way a phone does. The gate is a
+  // container query on `.inline-step` (steps.css). Measuring in JS instead would
+  // mean re-rendering every step row on every frame of that drag.
   const counter = hasContext && (
     <>
-      {contextLabel(used!, window, event.context_messages, viewportIsMobile.value)}
+      <span class="step-context-full">
+        {contextLabel(used!, window, event.context_messages, false)}
+      </span>
+      <span class="step-context-compact">
+        {contextLabel(used!, window, event.context_messages, true)}
+      </span>
       {trimmed && ' · trimmed'}
     </>
   );
@@ -658,14 +672,17 @@ export function eventWaitStepBody({
   const { outcome, note } = EVENT_WAIT_STEP_STATE[event.state];
   const { icon, className } = stepStatus(outcome);
   const matched = event.matched_event_id;
-  // A row with no reason is a STOP that landed in a later exchange than the one
-  // that armed the subscription, built from an `EventWaitCanceled` written
-  // before it carried what it stopped. It has nothing to name, so it says the
-  // one thing it does know rather than an empty "Set up an event wait: ".
+  // A stop is a different action from an arming and says so. The wording comes
+  // from `eventWaitStoppedSummary` rather than being spelled again here, because
+  // the user's own stop renders as a TURN with that same header (see
+  // `describeInitiator`) and one concept must not acquire two phrasings.
+  // It also handles the reason-less row: a pre-2026-08-07 `EventWaitCanceled`
+  // carries no copy of what it stopped, so the line says the one thing it does
+  // know rather than trailing an empty colon.
   const description =
-    event.state === 'canceled' && !event.reason
-      ? 'Stopped waiting for an event'
-      : `${event.state === 'canceled' ? 'Stopped waiting' : 'Set up an event wait'}: ${event.reason}`;
+    event.state === 'canceled'
+      ? eventWaitStoppedSummary(event.reason)
+      : `Set up an event wait: ${event.reason}`;
   const detail =
     event.state === 'woke' && event.matched_event_type
       ? event.matched_event_type

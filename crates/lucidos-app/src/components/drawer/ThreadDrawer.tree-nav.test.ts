@@ -1,8 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import {
-  leftAction, rightAction, nodeKey, sectionNavKey,
+  leftAction, rightAction, nodeKey, sectionNavKey, handleDrawerKeyDown,
   type DrawerNavNode, type NavCollapseState,
 } from './ThreadDrawer';
+import { openThreadFilterPanel, closeThreadFilterPanel } from '../../store/threadFilterPanel';
 
 // Pure ←/→ tree-navigation logic for the drawer — no signals, no DOM.
 
@@ -108,5 +109,37 @@ describe('rightAction (expand / descend)', () => {
   it('is a no-op on a leaf thread', () => {
     const nodes = [thread('t', 0, null, false, 'current')];
     expect(rightAction(nodes[0], nodes, 0, state())).toEqual({ type: 'none' });
+  });
+});
+
+describe('handleDrawerKeyDown: filter-panel suppression', () => {
+  // The filter panel is a view inside this pane, covering the list, and its rows
+  // are real controls. Their keys bubble out to the pane container, so the
+  // container's list-nav has to stand down while the panel is up: otherwise
+  // Enter on a View row would ALSO open whatever thread the invisible list
+  // happens to have highlighted.
+  const keyEvent = (key: string) => {
+    let prevented = false;
+    const e = { key, preventDefault: () => { prevented = true; } } as unknown as KeyboardEvent;
+    return { e, wasPrevented: () => prevented };
+  };
+
+  afterEach(() => closeThreadFilterPanel());
+
+  it('consumes Enter and the vertical arrows while the panel is closed', () => {
+    for (const key of ['Enter', 'ArrowDown', 'ArrowUp']) {
+      const { e, wasPrevented } = keyEvent(key);
+      handleDrawerKeyDown(e);
+      expect(wasPrevented(), key).toBe(true);
+    }
+  });
+
+  it('acts on nothing while the panel is open', () => {
+    openThreadFilterPanel();
+    for (const key of ['Enter', 'ArrowDown', 'ArrowUp', 'ArrowLeft', 'ArrowRight']) {
+      const { e, wasPrevented } = keyEvent(key);
+      handleDrawerKeyDown(e);
+      expect(wasPrevented(), key).toBe(false);
+    }
   });
 });

@@ -58,7 +58,7 @@ h4, h5, h6 { font-size: var(--font-size-md); }
     font-weight: 400;
     padding: 0.3125rem 0.75rem;
     border-radius: 0.1875rem;
-    transition: background-color 0.15s, color 0.15s;
+    transition: background-color var(--duration-fast), color var(--duration-fast);
 }
 
 @media (hover: hover) {
@@ -238,6 +238,40 @@ html:not([data-theme="light"]) .action-btn-confirm {
     .action-btn-danger:hover {
         background-color: color-mix(in srgb, var(--accent-red) 80%, #fff);
     }
+}
+
+/* A row of buttons BOUND BY ITS CONTAINER. Two defects it exists to prevent,
+   both of which shipped on the "New version available" toast at a 320px
+   viewport (an iPhone in Display Zoom), where "Later" + "Switch to new version"
+   were ~30px wider than the toast:
+
+   1. A plain flex row does not wrap, so buttons too wide for it simply overflow
+      and whichever ancestor hides its overflow slices the last one mid-glyph.
+      `flex-wrap` stacks them onto further rows instead.
+   2. `.action-btn` is `white-space: nowrap` with no width bound, so even alone
+      a long label overflows. `max-width: 100%` resolves against the group,
+      which is the widest a single button may ever be, and the ellipsis puts the
+      truncation inside the label instead of at some ancestor's clip edge.
+
+   `min-width: 3.5rem` on `.action-btn` still applies (a min always beats a
+   max), so ordinary short buttons keep their floor and are unaffected.
+
+   Alignment is deliberately NOT set here: it belongs to the consumer (a toast
+   right-aligns its actions, a form may not). Nor do the buttons stretch to fill
+   the row, because `flex: 1 1 auto` would also stretch them in the common
+   single-row case, changing every button row in the host and in every shipped
+   app. */
+.button-group {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 0.5rem;
+}
+
+.button-group > .action-btn {
+    max-width: 100%;
+    overflow: hidden;
+    text-overflow: ellipsis;
 }
 
 /* Accent link — subtle underline, full on hover. Resets button defaults so
@@ -731,7 +765,7 @@ html:not([data-theme="light"]) .action-btn-confirm {
     height: 100%;
     background: var(--accent);
     border-radius: 0.1875rem;
-    transition: width 0.3s ease;
+    transition: width var(--duration-slow) ease;
 }
 
 .progress-label {

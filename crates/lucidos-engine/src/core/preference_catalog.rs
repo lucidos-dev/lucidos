@@ -87,7 +87,7 @@ pub struct PrefSpec {
 /// Mirrors the OpenAI/Anthropic reasoning tiers in
 /// `crates/lucidos-app/src/store/models.ts` (`REASONING_LEVELS`). The engine
 /// clamps to what each model supports, so the catalog only checks membership.
-const REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
+pub(crate) const REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh", "max"];
 /// Mirrors `ImageModel` in `crates/lucidos-app/src/store/actions/preferences.ts`.
 const IMAGE_MODELS: &[&str] = &[
     "auto",

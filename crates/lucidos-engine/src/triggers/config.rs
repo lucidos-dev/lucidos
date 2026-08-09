@@ -136,6 +136,65 @@ pub struct TriggerConfig {
     /// plugin update re-syncs them by `(plugin_id, slug)`. A user trigger
     /// (`None`) is never touched by a plugin's lifecycle.
     pub plugin_id: Option<String>,
+    /// The **trigger model**: the chat model this trigger's intent fires on.
+    /// `None` (the default) means "use the account `chat_model` preference",
+    /// which is what every trigger did before the field existed, so an absent
+    /// value is the no-change case for existing workspaces. Only consulted on
+    /// the [`TriggerRun::Intent`] path: a script trigger runs no LLM.
+    pub model: Option<String>,
+    /// Reasoning effort for this trigger's intent fires, one of
+    /// [`crate::core::preference_catalog::REASONING_EFFORTS`]. `None` = the
+    /// account `chat_reasoning_effort` preference. Resolved independently of
+    /// [`Self::model`], so a trigger may pin one and leave the other on the
+    /// account default. Intent-only, like `model`.
+    pub reasoning_effort: Option<String>,
+}
+
+/// True if `effort` is a reasoning tier a trigger may pin. Shares the closed set
+/// with the `chat_reasoning_effort` preference so the two vocabularies cannot
+/// drift. Per-*model* availability is deliberately not checked here: the engine
+/// clamps an unsupported tier at call time, and a stored trigger must not break
+/// when a model's supported tiers change under it.
+pub fn is_valid_reasoning_effort(effort: &str) -> bool {
+    crate::core::preference_catalog::REASONING_EFFORTS.contains(&effort)
+}
+
+/// Normalize a submitted or stored trigger model / reasoning effort: trim, and
+/// read blank as "Default" (`None`). Blank is exactly how the form's Default
+/// option travels, and `Some("")` must never be stored: the chat route resolver
+/// reads any `Some` as a genuine override and would hand an empty model id to
+/// the provider.
+///
+/// Deliberately does NOT check the model against the registry, matching the
+/// `chat_model` preference (`PrefValue::Text`) and `ChatRequest.model`. A model
+/// row can be disabled or deleted long after a trigger was saved, routing
+/// already degrades to the prefix heuristic, and a genuinely bad id surfaces as
+/// an ordinary trigger-failure notification rather than a save the user cannot
+/// make.
+pub fn normalize_route_setting(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Normalize a submitted reasoning effort and check membership of the closed
+/// tier set. Unlike the model, this vocabulary is ours, so a typo is a user
+/// error worth rejecting rather than a value to pass through. Shared by the
+/// HTTP handlers and the LLM tool so the two cannot disagree about what a valid
+/// tier is.
+pub fn validate_trigger_reasoning_effort(raw: Option<&str>) -> Result<Option<String>, String> {
+    match normalize_route_setting(raw) {
+        Some(effort) if !is_valid_reasoning_effort(&effort) => Err(format!(
+            "Invalid reasoning_effort '{}': expected one of none, low, medium, high, xhigh, max",
+            effort
+        )),
+        normalized => Ok(normalized),
+    }
+}
+
+/// Read an optional string field from a trigger payload, normalized as above.
+fn read_trimmed_string(payload: &Value, key: &str) -> Option<String> {
+    normalize_route_setting(payload.get(key).and_then(|v| v.as_str()))
 }
 
 /// Convert a human-facing trigger name to a stable kebab-case slug, guaranteeing
@@ -259,6 +318,14 @@ impl TriggerConfig {
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
             .map(String::from);
+        // Absent on every trigger created before the per-trigger model existed,
+        // which reads back as "use the account chat defaults": the behavior
+        // those triggers already had. A stored effort outside the closed set is
+        // dropped rather than honored. The API and the LLM tool both reject one
+        // at the boundary, so this only fires on a hand-edited event row.
+        let model = read_trimmed_string(payload, "model");
+        let reasoning_effort = read_trimmed_string(payload, "reasoning_effort")
+            .filter(|e| is_valid_reasoning_effort(e));
 
         Ok(TriggerConfig {
             id,
@@ -276,6 +343,8 @@ impl TriggerConfig {
             group_id,
             side_effect_grant,
             plugin_id,
+            model,
+            reasoning_effort,
         })
     }
 
@@ -467,6 +536,35 @@ impl TriggerConfig {
         // HTTP layer always sends the whole array on a change, mirroring `on`.
         if payload.get("side_effect_grant").is_some() {
             self.side_effect_grant = parse_side_effect_grant(payload.get("side_effect_grant"));
+        }
+        // model / reasoning_effort: explicit null clears back to the account
+        // chat default, a string sets, absent leaves as-is. The same triple
+        // state as app_id and group_id, so a rename-only update can't wipe the
+        // trigger's model. A string that trims to empty clears too: blank IS
+        // how the form's "Default" option travels.
+        if let Some(v) = payload.get("model") {
+            if v.is_null() {
+                self.model = None;
+            } else if v.is_string() {
+                self.model = read_trimmed_string(payload, "model");
+            }
+        }
+        if let Some(v) = payload.get("reasoning_effort") {
+            if v.is_null() {
+                self.reasoning_effort = None;
+            } else if v.is_string() {
+                match read_trimmed_string(payload, "reasoning_effort") {
+                    // An out-of-set tier is dropped rather than applied, like an
+                    // invalid slug above: a bad event must never wedge the
+                    // in-memory config into sending a tier no provider knows.
+                    Some(e) if !is_valid_reasoning_effort(&e) => log!(
+                        "[Triggers] Ignored invalid reasoning_effort '{}' in TriggerUpdated for {}",
+                        e,
+                        self.id
+                    ),
+                    other => self.reasoning_effort = other,
+                }
+            }
         }
         // plugin_id (ADR 0019): a string sets/updates provenance (plugin update
         // re-sync re-stamps it); absent leaves it as-is. Deliberately NOT

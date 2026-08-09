@@ -20,8 +20,11 @@ test.describe('Overlay makes the UI behind it inert', () => {
   test('opening a backdrop-less popover disables hover/clicks on the UI behind it but keeps the anchor live', async ({ page }) => {
     await navigateToApp(page);
 
-    // A header icon behind the popover. Interactive to begin with.
-    const behind = page.locator('[data-role="search-everywhere-toggle"]:visible').first();
+    // A header icon behind the popover. Interactive to begin with. The thread
+    // drawer toggle rather than the Search everywhere one, because search moved
+    // into the Lucidos mark's menu on mobile and this spec runs on the mobile
+    // projects too; the drawer toggle is on the header of both layouts.
+    const behind = page.locator('.thread-toggle:visible').first();
     const pe = (loc: typeof behind) => loc.evaluate((el) => getComputedStyle(el).pointerEvents);
     expect(await pe(behind)).not.toBe('none');
 

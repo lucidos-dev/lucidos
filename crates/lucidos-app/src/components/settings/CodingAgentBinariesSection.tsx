@@ -5,6 +5,7 @@ import type { AgentBinaryStatus } from '../../api/types';
 import { useLoadableFetch } from '../../hooks/useLoadableFetch';
 import { errorDetail } from '../../utils/errorDetail';
 import { LoadableError } from '../shared/LoadableError';
+import { Explainer } from '../shared/Explainer';
 
 const AGENTS = [
   {
@@ -24,22 +25,33 @@ const AGENTS = [
 type AgentKey = (typeof AGENTS)[number]['key'];
 
 /**
- * Human status line for an agent's current binary resolution. Pure — unit
- * tested in `codingAgentBinaries.test.ts`.
+ * Where this agent's binary resolved from, as a short label. The PATH itself is
+ * deliberately NOT in here: it is shown once, in the input below, so the row
+ * doesn't print the same long string twice. The two states that have no path to
+ * show keep their actionable text (nothing resolved, or the spawn-failure
+ * message naming the preference). Pure, unit tested in
+ * `codingAgentBinaries.test.ts`.
  */
 export function binaryStatusLine(s: AgentBinaryStatus, binary: string): string {
   switch (s.source) {
     case 'override':
-      return s.valid
-        ? `Using configured path ${s.path}`
-        : (s.error ?? `Configured path ${s.path} is invalid`);
+      return s.valid ? 'Configured' : (s.error ?? `Configured path ${s.path} is invalid`);
     case 'detected':
-      return `Auto-detected at ${s.path}`;
+      return 'Auto-detected';
     case 'path':
-      return `Found on PATH at ${s.path}`;
+      return 'Found on PATH';
     case 'not-found':
-      return `Not found — install ${binary} or set a path below`;
+      return `Not found: install ${binary} or set a path below`;
   }
+}
+
+/**
+ * The binary's own version as a display token (`v2.1.224`), or '' when the
+ * engine reported none. Never a placeholder: an unknown version renders as
+ * nothing rather than as "unknown".
+ */
+export function binaryVersionLabel(s: AgentBinaryStatus): string {
+  return s.version ? `v${s.version}` : '';
 }
 
 /** The override currently stored for this status, or '' when auto-detecting. */
@@ -105,15 +117,20 @@ function AgentRow({
   const dirty = trimmed !== stored;
   const broken = status.source === 'override' && !status.valid;
   const missing = status.source === 'not-found';
+  const version = binaryVersionLabel(status);
   return (
     <div class="list-row repo-add-form">
       <div class="list-row-info" style={{ gap: '0.5rem' }}>
         <div class="title">{agent.label}</div>
+        {/* Version and source are two FIELDS: `.list-row-details` is a flex
+            row whose gap IS the separator, so no glue character between them
+            (an explicit one would be double-spaced). */}
         <div
           class={`list-row-details${broken || missing ? ' error' : ''}`}
           data-role="agent-binary-status"
         >
-          {binaryStatusLine(status, agent.binary)}
+          {version && <span data-role="agent-binary-version">{version}</span>}
+          <span>{binaryStatusLine(status, agent.binary)}</span>
         </div>
         {/* Input and its actions share one row so Save/Clear sit level with the
             input (not the title). Both action slots are always rendered, disabled
@@ -123,11 +140,10 @@ function AgentRow({
           <input
             class="device-name-input"
             type="text"
-            placeholder={
-              status.source === 'detected' || status.source === 'path'
-                ? `${status.path} (auto-detected)`
-                : `/path/to/${agent.binary}`
-            }
+            // The resolved path lives here and nowhere else in the row: as the
+            // placeholder while detection owns it, as the value once the user
+            // overrides it. The status line above says only where it came from.
+            placeholder={status.path ?? `/path/to/${agent.binary}`}
             value={input}
             onInput={(e) => setInput((e.target as HTMLInputElement).value)}
           />
@@ -196,12 +212,17 @@ export function CodingAgentBinariesSection() {
     <div class="settings-section">
       <div class="settings-section-title" data-search-anchor="coding-agents:binaries">
         Binaries
+        <Explainer title="Binaries">
+          <p>
+            Which <code>claude</code> / <code>codex</code> binary coding-agent threads run.
+          </p>
+          <p>
+            Auto-detection covers the native installers, Homebrew, and PATH; set an
+            explicit path only if detection picks the wrong binary or fails. Changes
+            apply to new sessions.
+          </p>
+        </Explainer>
       </div>
-      <p class="settings-section-desc">
-        Which <code>claude</code> / <code>codex</code> binary coding-agent threads run. Auto-detection
-        covers the native installers, Homebrew, and PATH; set an explicit path only if detection
-        picks the wrong binary or fails. Changes apply to new sessions.
-      </p>
       {body()}
     </div>
   );

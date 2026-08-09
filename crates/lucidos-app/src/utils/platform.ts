@@ -20,6 +20,45 @@ export function registrationUserAgent(rawUa: string, isDesktopApp: boolean): str
   return isDesktopApp ? `${rawUa} ${DESKTOP_APP_UA_TOKEN}` : rawUa;
 }
 
+/** A REGISTERED device's stored user-agent as a short human label ("Safari on
+ *  iOS"), for a device row and for any prose that has to name a device the user
+ *  is not holding. Lives here beside {@link isMobileDeviceUserAgent} because both
+ *  read the same stored string, and a store action naming a device must not have
+ *  to import from a settings component to do it. */
+export function describeDeviceUserAgent(ua: string | null | undefined): string {
+  if (!ua) return 'Unknown device';
+  const browser = ua.match(/(?:Chrome|Firefox|Safari|Edge|Opera)\/[\d.]+/)?.[0]
+    || ua.match(/(?:Chrome|Firefox|Safari|Edge|Opera)/)?.[0]
+    || 'Unknown browser';
+  const os = ua.includes('iPhone') ? 'iOS'
+    : ua.includes('iPad') ? 'iPadOS'
+    : ua.includes('Mac') ? 'macOS'
+    : ua.includes('Android') ? 'Android'
+    : ua.includes('Windows') ? 'Windows'
+    : ua.includes('Linux') ? 'Linux'
+    : 'Unknown OS';
+  return `${browser} on ${os}`;
+}
+
+/** Is a REGISTERED device's stored user-agent a phone or tablet? Pure, and takes
+ *  the string rather than reading `navigator`, because the caller classifies
+ *  OTHER devices' `devices.user_agent` as often as its own (see
+ *  `otherPushEnabledMobileDevices` in `store/actions/push.ts`).
+ *
+ *  The desktop-app token is checked first: {@link registrationUserAgent} appends
+ *  it to the WKWebView's own UA, which on macOS contains "Macintosh" and would
+ *  fall through to false anyway, but stating it keeps the two functions' contract
+ *  visible in one place.
+ *
+ *  Known blind spot, shared with the engine's `parse_user_agent`: an iPad in
+ *  Safari's desktop mode reports "Macintosh" and reads as a desktop here. There
+ *  is no UA-side fix, so a caller must never treat "not mobile" as a guarantee. */
+export function isMobileDeviceUserAgent(ua: string | null | undefined): boolean {
+  if (!ua) return false;
+  if (ua.includes(DESKTOP_APP_UA_TOKEN)) return false;
+  return /iPhone|iPad|iPod|Android/.test(ua);
+}
+
 /** Pure: does this served context indicate the packaged Tauri desktop shell
  *  BEFORE `desktop::launch()` has navigated the window to the gateway? Until that
  *  navigation the window sits on Tauri's bundled asset scheme (macOS
@@ -72,6 +111,18 @@ export function isIOS(): boolean { return _isIOS; }
  *  inconsistently and which is deprecated. */
 const _isAndroid = /Android/.test(navigator.userAgent);
 export function isAndroid(): boolean { return _isAndroid; }
+
+/** Is the CURRENT client a phone or tablet? Deliberately NOT
+ *  `isMobileDeviceUserAgent(navigator.userAgent)`: for our own client we have a
+ *  signal the stored user-agent of a remote device does not give us, and
+ *  {@link isIOS} already uses it, so this catches an iPad in Safari's desktop
+ *  mode (which reports "Macintosh") where the string test cannot.
+ *
+ *  Use this for the device in the user's hand, and `isMobileDeviceUserAgent`
+ *  for another device's recorded user-agent. */
+export function thisDeviceIsMobile(): boolean {
+  return isIOS() || isAndroid();
+}
 
 /** Check if running as an installed PWA (standalone/fullscreen) — cached */
 // `navigator.standalone` is iOS Safari only and missing from the standard Navigator type.

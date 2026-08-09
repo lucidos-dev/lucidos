@@ -20,6 +20,8 @@
 //!   follows, proving the message array the provider saw was well-formed
 //! * one-shot: a second matching event resolves nothing
 //! * an unrelated event resolving nothing, then Stop waiting cancelling
+//! * the reload snapshot carrying the payloads the transcript renders from,
+//!   which the endpoint's inline payload stripping could silently take away
 //! * the HTTP registration route, the one a coding agent reaches through
 //!   `lucidos await-event`
 //! * a thread-level **Stop** ending the turn and leaving every subscription
@@ -302,6 +304,94 @@ async fn an_unrelated_event_leaves_a_subscribed_thread_subscribed() {
         count_events(&pool, thread_id, "EventWaitDelivered").await,
         0,
         "a cancel is not a delivery: the thread settles rather than resuming"
+    );
+}
+
+/// **The transcript is rebuilt from the snapshot on every reload**, and that
+/// endpoint deliberately strips heavy payloads inline: `ContextCaptured`'s
+/// sections and tools, `ToolResult`'s result, and any base64 an old row inlined.
+/// A stripped `EventWaitStarted` would leave a reloaded transcript with no
+/// record that the thread ever parked, while live SSE still showed one.
+///
+/// That was a live hypothesis when the row turned out to be missing from the
+/// transcript on 2026-08-07 (the cause was two view-layer gates, see
+/// `docs/plans/2026-08-07-the-event-wait-shows-in-the-transcript.md`). Pinning
+/// it here is what lets the next such report start in the view layer instead of
+/// re-deriving that the wire is clean.
+///
+/// Asserts the FIELDS the transcript renders from, not merely the event's
+/// presence: the row names its subscription, its reason and its deadline, and a
+/// stop names what it stopped.
+#[tokio::test]
+async fn the_reload_snapshot_carries_the_event_wait_payloads() {
+    let pool = sqlx::PgPool::connect(&db_url())
+        .await
+        .expect("connect to the e2e workspace database");
+    let event_type = format!("E2eSnapshot{}", Uuid::new_v4().simple());
+    let thread_id = subscribe_a_thread(&pool, &event_type, "api-event-wait-snapshot").await;
+
+    let wait_id = await_event_row(&pool, thread_id, "EventWaitStarted", 5).await["wait_id"]
+        .as_str()
+        .expect("wait_id")
+        .to_string();
+    let resp = http_client()
+        .post(format!(
+            "{}/api/v1/threads/{}/event-waits/{}/cancel",
+            base_url(),
+            thread_id,
+            wait_id
+        ))
+        .send()
+        .await
+        .expect("cancel request failed");
+    assert_eq!(resp.status(), 200, "Stop waiting should cancel the wait");
+    await_event_row(&pool, thread_id, "EventWaitCanceled", 10).await;
+
+    let snapshot: serde_json::Value = http_client()
+        .get(format!(
+            "{}/api/v1/threads/{}/events",
+            base_url(),
+            thread_id
+        ))
+        .send()
+        .await
+        .expect("snapshot request failed")
+        .json()
+        .await
+        .expect("snapshot should be JSON");
+    let rows = snapshot["events"]
+        .as_array()
+        .expect("snapshot carries an events array");
+    let of_type = |t: &str| {
+        rows.iter()
+            .find(|r| r["event_type"] == t)
+            .unwrap_or_else(|| panic!("no {t} in the snapshot; saw {rows:?}"))
+            .clone()
+    };
+
+    let started = of_type("EventWaitStarted");
+    assert_eq!(started["payload"]["wait_id"], wait_id.as_str());
+    assert_eq!(
+        started["payload"]["on"][0]["event_type"],
+        event_type.as_str(),
+        "the row names its subscription"
+    );
+    assert!(
+        started["payload"]["reason"].is_string(),
+        "the row names the model's own reason: {started:?}"
+    );
+    assert!(
+        started["payload"]["expires_at"].is_string(),
+        "the row carries its deadline: {started:?}"
+    );
+
+    let canceled = of_type("EventWaitCanceled");
+    assert_eq!(canceled["payload"]["wait_id"], wait_id.as_str());
+    assert_eq!(canceled["payload"]["cause"], "user_stop");
+    assert_eq!(
+        canceled["payload"]["on"][0]["event_type"],
+        event_type.as_str(),
+        "a stop is self-contained: it says what it stopped"
     );
 }
 

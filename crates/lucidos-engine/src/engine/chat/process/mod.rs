@@ -125,13 +125,17 @@ impl LucidosEngine {
         invocation: TriggerInvocation,
         go_to_review: bool,
         side_effect_grant: Vec<crate::engine::command_guard::SideEffectCategory>,
+        model: Option<&str>,
+        reasoning_effort: Option<&str>,
         external_cancel: Option<CancellationToken>,
     ) -> Result<ProcessResult, Box<dyn std::error::Error + Send + Sync>> {
-        // Chat-pref resolution lives in `process_message_with_steps_internal`
-        // — pass `None` here and let the single canonical resolver apply it.
+        // The trigger's own model / effort when it pinned one, else `None` so
+        // the single canonical resolver in `process_message_with_steps_internal`
+        // applies the account chat preferences. An explicit value here wins
+        // there, which is what makes a pinned trigger a pin.
         self.process_message_with_steps_internal(
             prompt,
-            None,
+            model,
             Some(TriggerContext {
                 trigger_id: trigger_id.to_string(),
                 trigger_name: trigger_name.to_string(),
@@ -140,9 +144,9 @@ impl LucidosEngine {
                 go_to_review,
                 side_effect_grant,
             }),
-            None,
-            None,
-            None,
+            None, // app_context
+            None, // file_context
+            reasoning_effort,
             None,
             None,
             None,

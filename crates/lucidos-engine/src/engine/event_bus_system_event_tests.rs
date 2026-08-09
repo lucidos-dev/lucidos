@@ -272,6 +272,47 @@ fn served_frontend_advanced_is_transient_on_engine_aggregate() {
 }
 
 #[test]
+fn frontend_preview_events_are_transient_and_keyed_by_thread() {
+    // Transient UI signals for the supervised Vite dev server showing a
+    // coding-agent worktree (engine::frontend_preview). On the `engine`
+    // aggregate alongside ServedFrontendAdvanced, but UNLIKE its neighbours they
+    // are keyed by thread: one preview per thread, one slot at a time.
+    let thread_id = uuid::Uuid::parse_str("2951200f-0652-4ee2-baa3-433d608983d8").unwrap();
+    let started = SystemEvent::FrontendPreviewStarted {
+        thread_id,
+        port: 6173,
+        sent_at_ms: 1_700_000_000_000,
+    };
+    assert!(!started.is_persisted());
+    assert_eq!(started.aggregate(), "engine");
+    assert_eq!(started.event_type(), "FrontendPreviewStarted");
+    assert_eq!(started.aggregate_id(), thread_id.to_string());
+    let json = serde_json::to_value(&started).unwrap();
+    assert_eq!(json["type"], "FrontendPreviewStarted");
+    assert_eq!(json["data"]["port"], 6173);
+    assert_eq!(json["data"]["thread_id"], thread_id.to_string());
+    // The port travels, never a URL: only the page knows whether the user is on
+    // localhost or a Tailscale name, so it composes the href itself.
+    assert!(
+        json["data"].get("url").is_none(),
+        "the event must not carry a URL the engine cannot know"
+    );
+
+    let stopped = SystemEvent::FrontendPreviewStopped {
+        thread_id,
+        sent_at_ms: 1_700_000_000_000,
+    };
+    assert!(!stopped.is_persisted());
+    assert_eq!(stopped.aggregate(), "engine");
+    assert_eq!(stopped.event_type(), "FrontendPreviewStopped");
+    assert_eq!(stopped.aggregate_id(), thread_id.to_string());
+    assert_eq!(
+        serde_json::to_value(&stopped).unwrap()["type"],
+        "FrontendPreviewStopped"
+    );
+}
+
+#[test]
 fn engine_build_state_changed_is_transient_on_engine_aggregate() {
     // Transient UI POKE — broadcast to SSE, never written to events. Emitted on
     // every dev background-rebuild state transition so the connected client learns

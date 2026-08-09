@@ -1,5 +1,3 @@
-import { Fragment } from 'preact';
-import type { ComponentChild } from 'preact';
 import { useState, useEffect, useRef } from 'preact/hooks';
 import { NotificationsBell } from '../notifications/NotificationsBell';
 import { activeMenuItem, panelOverlay, panelUrl, filePreviewSource, diffWholeFile, diffWholeFileEffective, diffSideBySide, filePreviewEditing, appPseudoFullscreen, parseRepoPath, appSearchOpen } from '../../store/store';
@@ -13,94 +11,17 @@ import { isTauri, isIOSPwa } from '../../utils/platform';
 import { webviewReload } from '../../utils/tauri';
 import { openFileSearch } from '../files/fileSearchActions';
 import { pushOverlay, removeOverlay } from '../../store/overlayStack';
-import { OverflowMenu, type OverflowMenuContext } from '../shared/OverflowMenu';
-import { useHeaderActionCollapse } from '../../hooks/useHeaderActionCollapse';
+import { CollapsingActions, type HeaderActionSpec } from './headerActions';
+import { useHeaderActionCollapse, type HeaderCollapseTargets } from '../../hooks/useHeaderActionCollapse';
 
-/** One context action as DATA, so the same record renders either as a
- *  full-size header icon button or as a row inside the collapsed ⋯ overflow
- *  menu. `icon` is a thunk — the header and the menu each need their own
- *  vnode. The notifications bell is NOT one of these: it's the always-visible,
- *  never-overflowed anchor and renders separately. */
-export interface HeaderActionSpec {
-  key: string;
-  /** aria-label, tooltip, and the ⋯ menu row text. */
-  label: string;
-  icon: () => ComponentChild;
-  onClick?: (e: MouseEvent) => void;
-  /** Renders an `<a target="_blank">` instead of a button (open-in-tab). */
-  href?: string | null;
-  /** Extra class(es) naming the ACTION, e.g. `app-fullscreen`. Carries no CSS:
-   *  it is how the rest of the app (and the e2e suite) addresses one action, so
-   *  it is stamped on BOTH renderings. Progressive collapse decides placement,
-   *  and an action must stay findable by the same selector wherever it landed.
-   *  A class only on the header button silently disappears the moment a long
-   *  title folds the action into the overflow menu. */
-  extraClass?: string;
-  /** Toggled-on state — adds `filter-active` (apps/plugins search). */
-  active?: boolean;
-  /** Disabled with an explanatory tooltip (diff-pinned refresh). */
-  disabledTooltip?: string;
-}
-
-/** Full-size header rendering — markup identical to the pre-collapse version. */
-function renderHeaderAction(a: HeaderActionSpec): ComponentChild {
-  const cls = `icon-btn header-icon${a.extraClass ? ` ${a.extraClass}` : ''}${a.active ? ' filter-active' : ''}`;
-  if (a.href !== undefined) {
-    return (
-      <a class={cls} href={a.href ?? undefined} target="_blank" rel="noopener noreferrer" aria-label={a.label} data-tooltip={a.label}>
-        {a.icon()}
-      </a>
-    );
-  }
-  if (a.disabledTooltip) {
-    // Override .icon-btn:disabled { pointer-events: none } so the tooltip
-    // (which relies on hover events) can still explain why the button is off.
-    return (
-      <button class={cls} disabled aria-label={a.disabledTooltip} data-tooltip={a.disabledTooltip} style="pointer-events: auto;">
-        {a.icon()}
-      </button>
-    );
-  }
-  return (
-    <button class={cls} onClick={a.onClick} aria-label={a.label} data-tooltip={a.label}>
-      {a.icon()}
-    </button>
-  );
-}
-
-/** Collapsed rendering — a ⋯ menu row with the same label + handler. `ctx.run`
- *  closes the menu before firing (links keep their native navigation — `run`
- *  doesn't preventDefault). */
-function renderMenuAction(a: HeaderActionSpec, ctx: OverflowMenuContext): ComponentChild {
-  const cls = `thread-overflow-item${a.extraClass ? ` ${a.extraClass}` : ''}`;
-  if (a.href !== undefined) {
-    return (
-      <a key={a.key} class={cls} role="menuitem" href={a.href ?? undefined} target="_blank" rel="noopener noreferrer" onClick={ctx.run(() => {})}>
-        {a.icon()}
-        {a.label}
-      </a>
-    );
-  }
-  if (a.disabledTooltip) {
-    // aria-disabled, NOT the disabled attribute: a disabled <button> can't take
-    // focus, and when this row is the FIRST [role="menuitem"] (diff-pinned
-    // refresh collapses first) OverflowMenu's keyboard-open would focus a
-    // no-op target and strand the arrow-key roving outside the panel. An
-    // aria-disabled row stays focusable/perceivable and simply has no onClick.
-    return (
-      <button key={a.key} type="button" class={cls} role="menuitem" aria-disabled="true" data-tooltip={a.disabledTooltip}>
-        {a.icon()}
-        {a.label}
-      </button>
-    );
-  }
-  return (
-    <button key={a.key} type="button" class={cls} role="menuitem" onClick={(e: MouseEvent) => ctx.run(() => a.onClick?.(e))(e)}>
-      {a.icon()}
-      {a.label}
-    </button>
-  );
-}
+/** The content row's three zones. Stable identity so the collapse effect's deps
+ *  do not re-fire every render. */
+const COLLAPSE_TARGETS: HeaderCollapseTargets = {
+  container: '.content-header-elements',
+  leading: '.hamburger-panel',
+  centre: '.header-title-span',
+  anchor: '.notifications-bell',
+};
 
 /** The control that takes the open app out of the shell and into a top-level
  *  page of its own, or null where the platform cannot offer one.
@@ -129,8 +50,16 @@ export function appPopoutAction(): HeaderActionSpec | null {
     : { ...spec, label: 'Open in new tab', href: getAppFrameSrc() };
 }
 
+interface Props {
+  /** Which header this copy belongs to. Both are mounted at once and only one
+   *  is visible, and the two collapse completely differently (see the render
+   *  below), so the copy has to say which it is rather than sniff the DOM for
+   *  an enclosing mobile row. Same shape as `ContentPane`. */
+  layout: 'desktop' | 'mobile';
+}
+
 /** Shared action buttons for the content side of the header (used by both mobile and desktop). */
-export function ContentHeaderActions() {
+export function ContentHeaderActions({ layout }: Props) {
   // Track native fullscreen state. `nativeFullscreenElement` is the one reader
   // of both spellings (store/appFullscreenHost.ts), shared with the overlay
   // layer so the header and the layer can never disagree about what is
@@ -350,29 +279,33 @@ export function ContentHeaderActions() {
     });
   }
 
-  // ── Progressive collapse (both layouts; the hook branches on its host) ──
-  // When the header row runs out of room the LEADING context actions (nearest
-  // the title) move into a ⋯ overflow menu, two first and then one more per
-  // step, until only ⋯ + the bell remain; the title starts ellipsizing only
-  // after that. The ⋯ trigger sits nearest the title. Mobile centres its title
-  // absolutely rather than in a flex zone, so the hook measures that row's
-  // geometry separately and also publishes the title box's width and offset.
+  // ── Collapse ──
+  // Desktop collapses PROGRESSIVELY: when the header row runs out of room the
+  // leading context actions (nearest the title) move into a ⋯ overflow menu,
+  // two first and then one more per step, until only ⋯ + the bell remain; the
+  // title starts ellipsizing only after that.
+  //
+  // Mobile collapses EVERYTHING, at every width and every action count, so the
+  // trailing cluster is always ⋯ + the bell (or the bell alone, for a view with
+  // no context actions). Constant is the point rather than compact: a trailing
+  // cluster whose width tracked the current view's action count moved the
+  // centred nav cluster with it, so the chevrons sat somewhere different on
+  // every content view and somewhere different again from the thread pane. With
+  // it constant, the chevrons are pinned in CSS and the two panes agree. This
+  // is also why mobile collapses a lone action, which the desktop rule
+  // deliberately never does (⋯ replaces it 1:1 and saves nothing).
   const hostRef = useRef<HTMLDivElement>(null);
-  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length);
-  const collapsed = actions.slice(0, collapsedCount);
-  const visible = actions.slice(collapsedCount);
+  // Three or more context actions fold whole, at any width: see
+  // `alwaysCollapseFrom`. Two still ride the row when there is room for them.
+  const collapsedCount = useHeaderActionCollapse(hostRef, actions.length, layout, COLLAPSE_TARGETS, {
+    alwaysCollapseFrom: 3,
+  });
 
   return (
     <div class="content-header-actions" ref={hostRef}>
-      {collapsed.length > 0 && (
-        <OverflowMenu
-          ariaLabel="More actions"
-          extraClass="content-header-more"
-          items={(ctx) => collapsed.map((a) => renderMenuAction(a, ctx))}
-        />
-      )}
-      {visible.map((a) => <Fragment key={a.key}>{renderHeaderAction(a)}</Fragment>)}
-      <NotificationsBell />
+      <CollapsingActions actions={actions} collapsed={collapsedCount} moreClass="content-header-more">
+        <NotificationsBell />
+      </CollapsingActions>
     </div>
   );
 }

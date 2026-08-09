@@ -61,6 +61,27 @@ describe('resolveActiveThreadModel: pending ?? last message ?? account default',
     expect(resolveActiveThreadModel('t-1')).toBe('real-model');
   });
 
+  it("uses a trigger thread's TriggerStarted model, which is its only starter event", () => {
+    // A trigger fire emits TriggerStarted and no MessageReceived at all, so
+    // reading only MessageReceived would show the account model here however
+    // the trigger was pinned. Mirrors the backend's
+    // `IN ('MessageReceived', 'TriggerStarted')`.
+    currentModel.value = 'account-model';
+    reasoningEffort.value = 'account-effort';
+    seedThread('t-trigger', [
+      [1, { type: 'TriggerStarted', model: 'gemini-3.5-flash', reasoning_effort: 'low' }],
+      [2, { type: 'ResponseGenerated' }],
+    ]);
+    expect(resolveActiveThreadModel('t-trigger')).toBe('gemini-3.5-flash');
+    expect(resolveActiveThreadReasoningEffort('t-trigger')).toBe('low');
+  });
+
+  it('a legacy TriggerStarted without a model still falls back to the account default', () => {
+    currentModel.value = 'account-model';
+    seedThread('t-legacy', [[1, { type: 'TriggerStarted', trigger_id: 't-1' }]]);
+    expect(resolveActiveThreadModel('t-legacy')).toBe('account-model');
+  });
+
   it('a pending pick wins over both the last message and the account default', () => {
     currentModel.value = 'account-model';
     seedThread('t-1', [[1, { type: 'MessageReceived', model: 'last-model' }]]);

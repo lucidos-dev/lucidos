@@ -30,7 +30,7 @@ vi.hoisted(() => {
 import { makeThreadState } from './threads-test-helpers';
 import { type ThreadState } from '../thread-events';
 import { fetchThreads } from '../../api/threads';
-import { getResizeMode, notAtTop, scrolledUp } from '../../components/chat/scrollState';
+import { awayFromBottom, isFollowScroll, notAtTop, scrollToBottom, setActiveScrollElement, stopFollowingBottom } from '../../components/chat/scrollState';
 import { drawerOpen } from '../../components/layout/Drawer';
 import { threadScrollKey } from '../../hooks/useScrollMemory';
 import { _resetComposeDraftsForTesting, getDraft } from '../composeDrafts';
@@ -92,56 +92,112 @@ describe('focusThread', () => {
     expect(focusedThreadId.value).toBe('t1');
   });
 
-  it('resets scrolledUp via scrollToBottom — notAtTop left to scroll listener', () => {
-    scrolledUp.value = true;
-    notAtTop.value = true;
-    focusThread('t1');
-    expect(scrolledUp.value).toBe(false);
-    // notAtTop must NOT be manually reset — the scroll listener (syncNotAtTop)
-    // owns it exclusively. Manual resets cause the chevron to disappear when
-    // no scroll event fires (e.g. re-focusing the same thread).
-    expect(notAtTop.value).toBe(true);
-  });
-
-  it('re-focusing the same thread does not hide the scroll-to-top chevron', () => {
-    // Bug: clicking the already-focused thread in the drawer called focusThread()
-    // which reset notAtTop=false. Since scrollTop didn't change (same content),
-    // no scroll event fired, and the chevron never came back.
-    notAtTop.value = true;
-    scrolledUp.value = false;
-    focusThread('t1');
-    focusThread('t1'); // re-focus same thread
-    expect(notAtTop.value).toBe(true);
-  });
-
-  it('suppresses ResizeObserver so content rendering does not set scrolledUp', () => {
-    // Bug: focusThread only set scrolledUp=false but didn't suppress ResizeObserver.
-    // When thread content rendered, ResizeObserver fired (not at bottom) → scrolledUp=true
-    // → useAutoScroll skipped the scroll-to-bottom.
-    // Defer rAF callbacks so suppression flag is still active after focusThread().
-    const origRAF = globalThis.requestAnimationFrame;
-    (globalThis as any).requestAnimationFrame = (_cb: any) => { return 0; };
+  it('does not move the transcript, whatever it finds there', () => {
+    // focusThread used to scroll the transcript to the bottom for any thread
+    // with no saved position, and skip when there was one. It positions nothing
+    // now: `useScrollMemory` owns the opening position on both branches (restore
+    // a saved one, else open at the top via `resetOnEmpty`), so focusThread
+    // cannot disagree with it about where the reader lands.
+    const el = {
+      parentElement: null,
+      scrollTop: 1234,
+      scrollHeight: 9000,
+      clientHeight: 500,
+      getBoundingClientRect: () => ({ width: 400, height: 500 }),
+    } as any;
+    setActiveScrollElement(el);
     try {
-      scrolledUp.value = true;
       focusThread('t1');
-      expect(getResizeMode()).toBe('scroll');
+      expect(el.scrollTop).toBe(1234);
+      expect(focusedThreadId.value).toBe('t1');
+
+      const key = threadScrollKey('tSaved');
+      localStorage.setItem(key, '500');
+      try {
+        focusThread('tSaved');
+        expect(el.scrollTop).toBe(1234);
+      } finally {
+        localStorage.removeItem(key);
+      }
     } finally {
-      (globalThis as any).requestAnimationFrame = origRAF;
+      setActiveScrollElement(null);
     }
   });
 
-  it('skips scroll-to-bottom when target thread has a saved scroll position', () => {
-    // scrollToBottom's first action is `scrolledUp.value = false` —
-    // an unchanged `true` proves it wasn't called.
-    const key = threadScrollKey('tSaved');
-    try {
-      localStorage.setItem(key, '500');
-      scrolledUp.value = true;
-      focusThread('tSaved');
-      expect(scrolledUp.value).toBe(true);
-    } finally {
-      localStorage.removeItem(key);
+  // The standing follow is one global, so the thread being OPENED must not
+  // inherit the one the reader armed in the thread they left. The request
+  // itself is not lost: it is recorded as that thread's reading position and
+  // resumed on re-entry (see `hooks/useScrollMemory.ts`).
+  describe('the standing follow and the thread being opened', () => {
+    function makeTranscript() {
+      return {
+        parentElement: null,
+        scrollTop: 0,
+        scrollHeight: 9000,
+        clientHeight: 500,
+        getBoundingClientRect: () => ({ width: 400, height: 500 }),
+      } as any;
     }
+
+    function withTranscript(run: (el: any) => void) {
+      const el = makeTranscript();
+      setActiveScrollElement(el);
+      try {
+        run(el);
+      } finally {
+        stopFollowingBottom();
+        setActiveScrollElement(null);
+      }
+    }
+
+    it('retires it when the reader opens a DIFFERENT thread', () => {
+      withTranscript((el) => {
+        focusThread('t1');
+        scrollToBottom(); // the reader arms it here
+        expect(isFollowScroll(el)).toBe(true);
+
+        focusThread('t2');
+        expect(isFollowScroll(el)).toBe(false);
+      });
+    });
+
+    it('keeps it when the reader re-taps the thread they are already in', () => {
+      // Not an open at all: nothing is inheriting anything, and the scroll
+      // memory does not re-run on an unchanged key, so a retire here would end
+      // the follow with nothing left to resume it.
+      withTranscript((el) => {
+        focusThread('t1');
+        scrollToBottom();
+
+        focusThread('t1');
+        expect(isFollowScroll(el)).toBe(true);
+      });
+    });
+
+    it('retires it when the reader leaves for the compose view', () => {
+      // The compose view has its own scroll container and registers itself as
+      // the active one, so a follow left armed would ride its growth instead.
+      withTranscript((el) => {
+        focusThread('t1');
+        scrollToBottom();
+
+        unfocusThread();
+        expect(isFollowScroll(el)).toBe(false);
+      });
+    });
+  });
+
+  it('leaves the chevron signals to the scroll listener', () => {
+    // notAtTop and awayFromBottom must NOT be manually reset here: the scroll
+    // listener owns them exclusively. A manual reset makes the chevron vanish
+    // when no scroll event follows, e.g. re-focusing the thread you are already
+    // in, where scrollTop does not change at all.
+    notAtTop.value = true;
+    awayFromBottom.value = true;
+    focusThread('t1');
+    focusThread('t1'); // re-focus the same thread
+    expect(notAtTop.value).toBe(true);
+    expect(awayFromBottom.value).toBe(true);
   });
 
   it('navigates to thread pane on mobile', () => {

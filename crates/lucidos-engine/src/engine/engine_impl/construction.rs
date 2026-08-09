@@ -1221,6 +1221,8 @@ impl LucidosEngine {
             frontend_refresh_generation: std::sync::atomic::AtomicU64::new(0),
             frontend_refresh_task: std::sync::Mutex::new(None),
             frontend_worktree_pin_warned: std::sync::atomic::AtomicBool::new(false),
+            frontend_preview: tokio::sync::Mutex::new(None),
+            frontend_preview_lifecycle: tokio::sync::Mutex::new(()),
             restart_actor: std::sync::Mutex::new(None),
             teardown_actor: std::sync::Mutex::new(None),
             pending_switch_resumes: std::sync::Mutex::new(Vec::new()),

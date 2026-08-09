@@ -11,7 +11,6 @@ import {
 import { loadedOr } from '../types';
 import { applyNow, applyChange, answerThreadQuestion as apiAnswerThreadQuestion, discardCCChanges, sendControlRequest, ApiError } from '../../api/client';
 import type { AnswerKind } from '../thread-events';
-import { scrollToBottom } from '../../components/chat/scrollState';
 import { markThreadRerenderStart, clearThreadRerenderStart } from '../../utils/threadOpenMarks';
 import { currentPerfBaseline } from '../../utils/renderPhaseTimers';
 import { changeToastMessage } from './changeToast';
@@ -51,8 +50,6 @@ export async function endClaudeCodeAndApply(threadId: string): Promise<void> {
   if (applyingNowThreadIds.value.has(threadId)) return; // Already in progress
   if (archivingThreadIds.value.has(threadId)) return; // Can't apply while archiving
   if (discardingCCThreadIds.value.has(threadId)) return; // Can't apply while discarding
-  // Pin to bottom before banner re-renders (height change would set scrolledUp=true)
-  scrollToBottom();
   const next = new Map(applyingNowThreadIds.value);
   next.set(threadId, 'requesting');
   applyingNowThreadIds.value = next;
@@ -108,8 +105,6 @@ export async function handleDiscardCCChanges(threadId: string): Promise<void> {
   if (discardingCCThreadIds.value.has(threadId)) return;
   if (applyingNowThreadIds.value.has(threadId)) return;
   if (archivingThreadIds.value.has(threadId)) return;
-  // Pin to bottom before banner re-renders (height change would set scrolledUp=true)
-  scrollToBottom();
   discardingCCThreadIds.value = new Set([...discardingCCThreadIds.value, threadId]);
   // autoDismissMs is a safety net for the rare zero-pending-changes case
   // where the engine emits no ChangeDiscarded event and the spinner has no
@@ -146,10 +141,6 @@ export async function answerThreadQuestion(
   if (focusedThreadId.value === threadId) {
     markThreadRerenderStart(threadId, { ...currentPerfBaseline(), cause: 'answer' });
   }
-  // Pin to bottom before the QuestionCard re-renders from option buttons to
-  // its answered (height-shrunk) form — otherwise ResizeObserver flips
-  // scrolledUp=true and the streaming continuation never auto-scrolls.
-  scrollToBottom();
   // Optimistically mark the thread as resuming so the answered question-divider
   // doesn't flash "Aborted" while the client's status still reads
   // `waiting_for_user_answer` (see `isRenderedThreadIdle`). Cleared by the

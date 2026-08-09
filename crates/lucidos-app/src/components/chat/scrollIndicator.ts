@@ -55,8 +55,9 @@ export interface ScrollEventContext {
   /** `isUserScrolling()` (utils/scrollActivity.ts): a touch drag, or its
    *  momentum tail, happened within the last `USER_SCROLL_WINDOW_MS`. */
   userScrolling: boolean;
-  /** `getResizeMode() === 'scroll'` (components/chat/scrollState.ts): this event
-   *  came from a programmatic go-to-bottom, including the streaming auto-tail. */
+  /** `isNavigationScroll()` (components/chat/scrollState.ts): this event
+   *  came from one of our own navigations writing scrollTop frame by frame (a
+   *  chevron tap, turn-nav, a deep-link glide), not from the reader. */
   programmaticScroll: boolean;
   /** `isRepaintNudging()` (utils/iosRepaint.ts): the compositor-recovery nudge
    *  writes +/-1px and puts it back a frame later, firing two real scroll events
@@ -84,10 +85,9 @@ export interface IndicatorVisibility {
  * SUMMONING and STAYING LIT are deliberately driven by different signals, and
  * conflating them is a bug this function exists to prevent:
  *
- *  - **Summon on intent.** Only a touch drag brings the indicator up. This is
- *    what keeps a streaming thread quiet: its auto-tail fires a scroll event per
- *    token, and an event-summoned indicator would sit on screen permanently
- *    while the user was doing nothing.
+ *  - **Summon on intent.** Only a touch drag brings the indicator up. An
+ *    event-summoned indicator would sit on screen for any scroll the app made
+ *    on its own, while the user was doing nothing.
  *  - **Stay lit on motion.** Once summoned, ANY real movement keeps it up, touch
  *    or not. The first version restarted the timer only while `userScrolling`
  *    was true, i.e. for 1200ms after the last `touchmove` -- so a hard flick
@@ -97,10 +97,11 @@ export interface IndicatorVisibility {
  *    scroll.
  *
  * Two kinds of movement are excluded from "real", because neither is the user
- * scrolling and both would otherwise hold a once-summoned indicator up forever
- * on a live thread: a programmatic go-to-bottom (the streaming auto-tail), and
- * the iOS compositor-recovery nudge, which fires scroll events on a ~200ms
- * throttle for a movement of one pixel that is immediately undone.
+ * scrolling and both would otherwise hold a once-summoned indicator up on a live
+ * thread: a *navigation scroll* (the app taking the reader somewhere they asked
+ * to go, e.g. a chevron tap or a deep-link glide), and the iOS
+ * compositor-recovery nudge, which fires scroll events on a ~200ms throttle for
+ * a movement of one pixel that is immediately undone.
  *
  * Both exclusions are subordinate to the user, though: a drag that overlaps
  * either one still counts as the user scrolling. Letting an exclusion win over a
@@ -120,10 +121,10 @@ export function nextIndicatorVisibility(
   // `shown` one always has a countdown already running, by the invariant.
   if (ev.repaintNudge && !ev.userScrolling) return { shown, armHideTimer: false };
 
-  // Same subordination for the auto-tail: it only suppresses the countdown when
-  // the user is not also dragging. Without the `!ev.userScrolling` clause, a
-  // drag during streaming summoned the indicator and armed nothing, so it stayed
-  // on screen for good once the scroller went quiet.
+  // Same subordination for a navigation scroll: it only suppresses the countdown
+  // when the user is not also dragging. Without the `!ev.userScrolling` clause, a
+  // finger landing on the transcript mid-glide summoned the indicator and armed
+  // nothing, so it stayed on screen for good once the scroller went quiet.
   const suppressed = ev.programmaticScroll && !ev.userScrolling;
   const nextShown = shown || ev.userScrolling;
   return { shown: nextShown, armHideTimer: nextShown && !suppressed };

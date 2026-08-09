@@ -24,10 +24,10 @@ import { appUpdateNarration, checkForAppUpdate, installAppUpdate, packagedUpdate
 import { cancelAppUpdate } from '../../utils/tauri';
 import { openSettingsSubview } from '../../store/actions/menu';
 import { requestServiceWorkerBuildId, refreshClient } from '../../hooks/sw-update';
-import { isUnstampedBuildId } from '../../utils/buildId';
+import { formatBuildId } from '../../utils/buildId';
+import { clientVersionLabel } from '../../utils/clientVersion';
 import { isNewerVersion } from '../../utils/version';
 import { formatShortTime } from '../../utils/formatTime';
-import { CLIENT_BUILD_ID } from 'virtual:build-id';
 import { BackupSection } from './BackupSection';
 import { DiskUsagePage } from './DiskUsagePage';
 import { MemoryInspector } from './MemoryInspector';
@@ -39,13 +39,6 @@ import { ThreadQueueView } from '../thread-queue/ThreadQueueView';
 /** The SPA origin, read lazily so importing this module never touches the DOM. */
 function getApiUrl(): string {
   return typeof window !== 'undefined' && window.location ? window.location.origin : '';
-}
-
-/** Display form of a stamped build id. The live dev server leaves the
- *  `__LUCIDOS_BUILD_ID__` placeholder (the `lucidos-sw-stamp` plugin is inert
- *  there), which is noise to show verbatim — say "dev" instead. */
-function formatBuildId(id: string): string {
-  return isUnstampedBuildId(id) ? 'dev' : id;
 }
 
 export type SystemPanel = 'overview' | 'thread-queue' | 'backup' | 'memory' | 'disk-usage' | 'environment-variables' | 'debugging';
@@ -145,15 +138,8 @@ export function SystemPage({ panel = 'overview' }: { panel?: SystemPanel }) {
 
   const hasEngineUpdate = engineVer && latestEngineVer && isNewerVersion(latestEngineVer, engineVer);
   const tauriClientVersion = window.__LUCIDOS_APP_VERSION__;
-  // What identifies the CLIENT differs by platform. The Tauri shell updates as a
-  // versioned unit, so its app version is a real client version with a real
-  // updater behind it. The web client has no such version — it is identified by
-  // the build that produced the code executing right now (`CLIENT_BUILD_ID`),
-  // which is exactly what the refresh badge compares against the served build.
-  // Deliberately NOT the engine's CalVer: baking that in froze it at bundle-build
-  // time and drifted from the running engine on every engine-only Apply, showing
-  // two disagreeing numbers no user action could reconcile (see vite.config.ts).
-  const clientVersion = tauriClientVersion ?? formatBuildId(CLIENT_BUILD_ID);
+  // Shared with the Lucidos menu's identity row, which names the same thing.
+  const clientVersion = clientVersionLabel();
   // One derivation, shared with the button's action so the label and what the
   // click does can never disagree.
   const tauriHasUpdate = !!packagedUpdateVersion();

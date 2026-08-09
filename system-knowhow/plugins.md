@@ -262,7 +262,8 @@ A plugin ships a trigger by declaring it in a **`trigger.toml`** at
 (`apps/<id>/manifest.json`). The file is a *trigger definition* (see
 `triggers.md` § "On-disk trigger definition"): `name`, `run`
 (`intent` or `script`), `on` (trigger subscriptions), and the usual optional
-fields (`app_id`, `go_to_review`, `group_id`, `side_effect_grant`). Put any
+fields (`app_id`, `go_to_review`, `group_id`, `side_effect_grant`, and
+`model` / `reasoning_effort` to pin the intent to a specific chat model). Put any
 procedure the trigger needs in `triggers/<slug>/knowhow/`, beside it.
 
 What install does (ADR 0019):

@@ -23,7 +23,7 @@ beforeEach(() => {
 // by the poll-driven engine-new-version toast (engine-update.ts), which fires only
 // once the background rebuild is `ready`. syncRestartToast / addRestartGroup now do
 // bookkeeping only (restartRequired + restartGroups + RESTART_LS_KEY) so the
-// control-panel badge and the restart confirm dialog survive a reload — no toast.
+// brand badge and the restart confirm dialog survive a reload, with no toast.
 describe('restart-required state (no pre-switch toast)', () => {
   it('does NOT show a toast when restartRequired is true', () => {
     restartRequired.value = true;
@@ -133,7 +133,7 @@ describe('restart groups tracking (thread title + commits)', () => {
   });
 
   it('restoreRestartToast restores groups from localStorage for the confirm dialog', () => {
-    // The groups are needed by the ControlPanel / SystemPage restart confirm
+    // The groups are needed by the Lucidos menu / SystemPage restart confirm
     // dialog, so they must rehydrate on reload even though no toast is shown.
     const groups = [
       { threadId: 't1', threadTitle: 'Fix auth', commits: ['feat: OAuth'] },

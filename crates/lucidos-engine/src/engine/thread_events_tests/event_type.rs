@@ -202,6 +202,8 @@ fn thread_event_type_name_extraction() {
                 invocation: None,
                 origin: None,
                 go_to_review: false,
+                model: None,
+                reasoning_effort: None,
             },
             "TriggerStarted",
         ),

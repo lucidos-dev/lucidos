@@ -889,6 +889,8 @@ async fn trigger_continuation_started_keeps_trigger_source_and_flag_false() {
             invocation: None,
             origin: None,
             go_to_review: false,
+            model: None,
+            reasoning_effort: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

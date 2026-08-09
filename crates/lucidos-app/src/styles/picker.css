@@ -625,7 +625,7 @@
   position: absolute;
   top: calc(100% + 0.25rem);
   right: 0;
-  z-index: 20;
+  z-index: var(--z-float);
   min-width: 11rem;
   display: flex;
   flex-direction: column;
@@ -674,7 +674,7 @@
 
 .ws-picker-confirm {
   position: absolute;
-  z-index: 20;
+  z-index: var(--z-float);
   width: 16rem;
   padding: 0.75rem;
   border-radius: 0.625rem;
@@ -853,6 +853,18 @@
   justify-content: center;
   gap: 0.5rem;
   flex-wrap: wrap;
+}
+
+/* On a phone they stop being two ragged pills floating in the middle: each
+   takes the full shell width and they stack, so the tap targets line up with
+   the workspace rows above them. Shrink-to-fit is a desktop affordance here;
+   at this width the shell IS the column, so anything narrower reads as
+   unfinished. */
+@media (max-width: 768px) {
+  .ws-picker-footer-actions {
+    flex-direction: column;
+    align-items: stretch;
+  }
 }
 
 /* ── Restore from backup ─────────────────────────────────────────────────── */

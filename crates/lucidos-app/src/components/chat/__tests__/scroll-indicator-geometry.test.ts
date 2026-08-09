@@ -207,10 +207,10 @@ describe('nextIndicatorVisibility: what keeps the indicator up', () => {
     expect(nextIndicatorVisibility(false, ev())).toEqual({ shown: false, armHideTimer: false });
   });
 
-  it('arms the countdown for a drag that overlaps a streaming auto-tail', () => {
-    // Otherwise the indicator is summoned with nothing to turn it off. Dragging
-    // during streaming leaves getResizeMode() === 'scroll' for up to 500ms after
-    // the last go-to-bottom, so both flags are genuinely true together, and if
+  it('arms the countdown for a drag that overlaps one of our own navigations', () => {
+    // Otherwise the indicator is summoned with nothing to turn it off. A finger
+    // landing on the transcript mid-glide (a chevron tap the reader interrupts,
+    // a deep-link still settling) has both flags genuinely true together, and if
     // the scroller then goes quiet the indicator stays lit for good.
     expect(nextIndicatorVisibility(false, ev({ userScrolling: true, programmaticScroll: true })))
       .toEqual({ shown: true, armHideTimer: true });

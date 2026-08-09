@@ -7,6 +7,12 @@
  *  deliberately the LIGHTER of the two now (a step line, not a boxed card),
  *  because the indicator is where the details live. */
 import { describe, expect, it } from 'vitest';
+// @ts-expect-error: Node APIs available at runtime via Vitest, no @types/node in project
+import { readFileSync } from 'node:fs';
+// @ts-expect-error: same
+import { fileURLToPath } from 'node:url';
+// @ts-expect-error: same
+import { dirname, resolve } from 'node:path';
 import type { ComponentChildren, VNode } from 'preact';
 import { EventDeliveryBody, eventWaitStepBody } from '../chat-exchange-parts';
 import { formatDeliveredPayload } from '../CreateThreadView';
@@ -194,19 +200,52 @@ describe('EventWaitStep', () => {
     expect(vnodeText(pending)).toBe('opening…');
   });
 
-  /** The park is a STEP, not a divider. An attached delivery resumes the same
-   *  exchange, so a park that split the transcript would strand the waiting
-   *  line above a fresh boundary and break the seamless resume the whole
-   *  design exists for. */
-  it('never starts an exchange', () => {
-    for (const type of [
-      'EventWaitStarted',
-      'EventWaitDelivered',
-      'EventWaitExpired',
-      'EventWaitCanceled',
-    ]) {
-      expect(isExchangeStartEvent(type)).toBe(false);
-    }
+  /** The park never splits the transcript, and neither does a resolution that
+   *  WAKES the thread: an attached delivery resumes the same exchange, so a
+   *  boundary would strand the waiting line above it and break the seamless
+   *  resume the whole design exists for.
+   *
+   *  `EventWaitCanceled` is not in this list because a stop is the one
+   *  resolution with no wake, so there is no resume for a boundary to break.
+   *  A user stop IS a boundary; see `eventWaitStopStartsExchange`. */
+  it.each(['EventWaitStarted', 'EventWaitDelivered', 'EventWaitExpired'])(
+    'a %s never starts an exchange',
+    (type) => {
+      expect(isExchangeStartEvent({ type })).toBe(false);
+    },
+  );
+
+  /** A stop has no wake, so there is no resume for a boundary to break, and the
+   *  user's own stop is a thing they did to the thread at a moment. Every other
+   *  cause is somebody acting inside a turn and stays a step there. */
+  it.each([
+    ['user_stop', true],
+    ['agent_stand_down', false],
+    ['thread_archived', false],
+    ['thread_discarded', false],
+  ] as const)('a %s cancel starts an exchange: %s', (cause, starts) => {
+    expect(isExchangeStartEvent({ type: 'EventWaitCanceled', cause })).toBe(starts);
+  });
+
+  /** **Source-scan tripwire for the bug this file's step half exists for.**
+   *
+   *  The row was gated on the "Show steps" toggle, which is off until a user
+   *  turns it on, so a parked thread rendered no `[data-role="event-wait-step"]`
+   *  at all: the event was in the stream and the class was in the bundle with
+   *  nothing on screen. There is no jsdom here, so the render gate cannot be
+   *  driven; the line itself is what gets pinned. `'step'` is read alongside it
+   *  so a scan that stopped matching anything would fail rather than pass. */
+  it('renders the row without consulting the Show steps toggle', () => {
+    const here: string = dirname(fileURLToPath(import.meta.url));
+    const src: string = readFileSync(resolve(here, '../ChatExchange.tsx'), 'utf8');
+    const arm = (kind: string) =>
+      src
+        .split('\n')
+        .find((l: string) => l.includes(`evt.type === '${kind}'`) && l.includes('return <'));
+
+    expect(arm('event_wait')).toBeDefined();
+    expect(arm('event_wait')).not.toContain('showSteps');
+    expect(arm('step')).toContain('showSteps');
   });
 });
 

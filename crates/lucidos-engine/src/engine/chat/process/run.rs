@@ -805,6 +805,11 @@ impl LucidosEngine {
                     &tc.invocation,
                     user_message,
                     tc.go_to_review,
+                    // Already resolved above (trigger pin, else account
+                    // preference), the same values the loop is about to call
+                    // with, so the starter event records the actual run.
+                    model_override,
+                    reasoning_effort,
                 )
             } else {
                 let is_cc = use_coding_agent == Some(true);

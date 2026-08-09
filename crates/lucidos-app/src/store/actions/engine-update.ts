@@ -146,7 +146,7 @@ async function pollEngineVersion(): Promise<void> {
   // mid-build (a prior build wrote it, or it is being rewritten right now), and
   // switching then respawns onto a half-written binary.
   const ready = status.update_available && status.build_state !== 'building';
-  // Badge (engineVersionReady, read by the ControlPanel badge) = readiness ALONE:
+  // Badge (engineVersionReady, read by the brand badge) = readiness ALONE:
   // the persistent "switch available" affordance that survives a dismiss (the
   // user can still switch from the reload badge). On ARRIVAL it appears with the
   // Switch toast from this one `ready` check (INV-C arrival); the two decouple

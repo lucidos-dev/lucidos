@@ -17,30 +17,27 @@ const CC_ONLY_EVENTS: &[&str] = &[
     "UserQuestionAnswered",
 ];
 
-/// Every `ThreadStatus` variant with its wire string, in one place.
+/// Every `ThreadStatus` variant with its wire string, DERIVED from
+/// [`ThreadStatus::ALL`] rather than restated.
 ///
 /// Source for BOTH halves of the contract: the fixture's status dimension and
 /// the generated TS union + `THREAD_STATUSES` list. Keeping them as two
-/// separate literals is how the hardcoded fixture-size assertions went stale.
-/// `all_statuses_covers_the_enum` pins it against `ThreadStatus::parse`.
-const ALL_STATUSES: &[(&str, ThreadStatus)] = &[
-    ("idle", ThreadStatus::Idle),
-    ("running", ThreadStatus::Running),
-    ("waiting", ThreadStatus::Waiting),
-    (
-        "waiting_for_user_answer",
-        ThreadStatus::WaitingForUserAnswer,
-    ),
-    ("paused", ThreadStatus::Paused),
-    ("failed", ThreadStatus::Failed),
-];
+/// separate literals is how the hardcoded fixture-size assertions went stale,
+/// and this used to be a third literal spelling out the same six statuses.
+/// `ThreadStatus::ALL` is now the production enumeration (the status filter's
+/// error messages, the CLI help and the LLM tool schema all advertise it), so
+/// deriving from it means `all_statuses_covers_the_enum`'s count assertion
+/// pins that constant too instead of only this file's copy.
+fn all_statuses() -> [(&'static str, ThreadStatus); 6] {
+    ThreadStatus::ALL.map(|status| (status.as_str(), status))
+}
 
 fn generate_cross_validation_fixture() -> String {
     let thread_types = [
         ("chat", ThreadType::Chat),
         ("claude_code", ThreadType::CodingAgent),
     ];
-    let statuses = ALL_STATUSES;
+    let statuses = all_statuses();
     let sections = [
         ("archived", ArchiveState::Archived),
         ("inbox", ArchiveState::Inbox),
@@ -54,7 +51,7 @@ fn generate_cross_validation_fixture() -> String {
     // has_unsent_draft × is_saved. Adding a `ThreadStatus` variant widens the
     // fixture automatically; do not hardcode the case count here, it drifts.
     for (tt_str, tt) in &thread_types {
-        for (st_str, st) in statuses {
+        for (st_str, st) in &statuses {
             for (sec_str, sec) in &sections {
                 for &pending in &bools {
                     for &dba in &bools {
@@ -89,7 +86,7 @@ fn generate_cross_validation_fixture() -> String {
     // displaySection: the full cross product of sections × statuses × saved ×
     // activeChildren × pending × attentionDescendants.
     for (sec_str, sec) in &sections {
-        for (st_str, st) in statuses {
+        for (st_str, st) in &statuses {
             for &saved in &bools {
                 for &active_children in &bools {
                     for &pending in &bools {
@@ -138,9 +135,9 @@ fn generate_typescript() -> String {
     out.push_str("export type ThreadType = 'chat' | 'claude_code';\n");
     out.push_str("export type ArchiveState = 'archived' | 'inbox';\n");
     out.push_str("export type DisplaySection = 'saved' | 'current' | 'archive';\n");
-    // Both spellings come off ALL_STATUSES, so the union, the runtime list and
+    // Both spellings come off `all_statuses`, so the union, the runtime list and
     // the fixture's status dimension cannot disagree.
-    let status_literals: Vec<String> = ALL_STATUSES
+    let status_literals: Vec<String> = all_statuses()
         .iter()
         .map(|(s, _)| format!("'{}'", s))
         .collect();
@@ -265,36 +262,53 @@ fn generate_typescript() -> String {
 }
 
 // 22c. cross_validation_fixture_is_up_to_date
-/// `ALL_STATUSES` drives the fixture's status dimension AND the generated TS
-/// union, so a `ThreadStatus` variant missing from it silently shrinks the
-/// contract surface rather than failing. Nothing enumerates the enum, so pin it
-/// from the other side: every entry must round-trip through `as_str` / `parse`,
-/// and the count must match the enum's own arm count.
+/// [`ThreadStatus::ALL`] drives the fixture's status dimension, the generated
+/// TS union, the status filter's accepted values, the CLI help and the LLM tool
+/// schema, so an entry that is wrong shrinks or corrupts all five at once. Every
+/// entry must round-trip through `as_str` / `parse` / `try_parse`, and no two
+/// may share a wire string.
+///
+/// What this test does NOT catch, stated plainly because a guard nobody has is
+/// less dangerous than one they think they have: a `ThreadStatus` variant added
+/// to the enum and never added to `ALL`. Nothing here can see it, because every
+/// enumeration available to a test is `ALL` itself. The two forcing functions
+/// are elsewhere and both are the compiler, not this file. Widening `ALL`
+/// without widening `all_statuses`'s return type is a type error, and adding a
+/// variant at all is a non-exhaustive-match error in `ThreadStatus::as_str`,
+/// which is where the instruction to update `ALL` lives. The count assertion
+/// this test used to carry looked like a third guard and was not one: `.len()`
+/// on a `[Self; 6]` is a compile-time constant, so it could never fail.
 #[test]
 fn all_statuses_covers_the_enum() {
-    for (wire, status) in ALL_STATUSES {
+    let mut seen: Vec<&str> = Vec::new();
+    for (wire, status) in all_statuses() {
         assert_eq!(
             status.as_str(),
-            *wire,
-            "ALL_STATUSES wire string disagrees with ThreadStatus::as_str",
+            wire,
+            "ThreadStatus::ALL wire string disagrees with ThreadStatus::as_str",
         );
         assert_eq!(
             ThreadStatus::parse(wire),
-            *status,
+            status,
             "ThreadStatus::parse does not round-trip '{wire}'; a status missing \
              from `parse` falls back to Idle and the projection would silently \
              read the wrong state off the column",
         );
+        assert_eq!(
+            ThreadStatus::try_parse(wire),
+            Some(status),
+            "ThreadStatus::try_parse does not round-trip '{wire}'; a status it \
+             rejects cannot be named by the `status` filter on threads \
+             list / count",
+        );
+        assert!(
+            !seen.contains(&wire),
+            "'{wire}' appears twice in ThreadStatus::ALL; a duplicate widens the \
+             fixture's status dimension with a redundant case and makes the \
+             generated TS union and the tool schema enum list it twice",
+        );
+        seen.push(wire);
     }
-    // Bumped deliberately when a variant is added, which is the prompt to add
-    // it above. `parse`'s catch-all means a missing entry cannot be detected by
-    // round-tripping alone.
-    assert_eq!(
-        ALL_STATUSES.len(),
-        6,
-        "a ThreadStatus variant was added or removed: update ALL_STATUSES (and \
-         this count) so the fixture and the generated TS union cover it",
-    );
 }
 
 #[test]

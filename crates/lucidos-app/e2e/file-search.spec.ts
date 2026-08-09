@@ -1,20 +1,20 @@
 import { test, expect, Page } from './fixtures';
-import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement, ensureOnThreadPane, openFilesPanel, gotoWithRetry } from './helpers';
+import { assertHealthy, waitForVisibleInput, isMobileViewport, blurActiveElement, ensureOnThreadPane, openFilesPanel, gotoWithRetry, clickHeaderAction } from './helpers';
 
-/** Open file search — tap on mobile, click on desktop. Waits for the
- *  signal-driven Preact render to apply the open state before returning,
- *  so callers can immediately assert on overlay/input visibility. */
+/** Open file search from wherever the content header put its action. Waits for
+ *  the signal-driven Preact render to apply the open state before returning,
+ *  so callers can immediately assert on overlay/input visibility.
+ *
+ *  Goes through `clickHeaderAction` rather than the bare `.file-search-btn`:
+ *  the mobile content header folds every context action into its `⋯` menu, so
+ *  on both phone projects the search button has no header rendering at all.
+ *  Where the action sits is the layout's business; opening search is this
+ *  spec's. */
 async function openFileSearch(page: Page): Promise<void> {
   await blurActiveElement(page);
   await page.waitForTimeout(100);
 
-  const btn = page.locator('.file-search-btn:visible').first();
-  await expect(btn).toBeVisible({ timeout: 5_000 });
-  if (isMobileViewport(page)) {
-    await btn.tap();
-  } else {
-    await btn.click();
-  }
+  await clickHeaderAction(page, '.file-search-btn');
   await page.waitForFunction(() => {
     const overlay = document.querySelector('.file-search-overlay');
     return overlay !== null && !overlay.classList.contains('file-search-closed');

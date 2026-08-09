@@ -25,6 +25,10 @@ import {
   type FrontendUpdateDeferredPayload,
   type FrontendUpdateStrandedPayload,
 } from './engine-update';
+import {
+  handleFrontendPreviewStarted,
+  handleFrontendPreviewStopped,
+} from './frontend-preview';
 import { changeToastMessage } from './changeToast';
 import { scheduleServiceWorkerUpdateChecks } from '../../hooks/sw-update';
 import { syncClientUpdateFromBuild } from './client-update';
@@ -36,9 +40,8 @@ import { openCredentialRequest } from './credentials';
 import { openPluginInstallRequest } from './plugin-install';
 import { openPluginUninstallRequest } from './plugin-uninstall';
 import { openEmailConfirmRequest } from './email-confirm';
-import { initPushSubscription } from './push';
-import { getDeviceId, toggleDevicePush } from './devices';
-import { scrollToBottom } from '../../components/chat/scrollState';
+import { setDevicePushEnabled } from './push';
+import { getDeviceId } from './devices';
 import { focusThread } from './threads';
 import { formatThreadLabel } from './thread-label';
 import { refreshRepoView } from './repositories';
@@ -193,6 +196,39 @@ function findChangeDescription(threadId: string, changeId: string): string | und
     }
   }
   return undefined;
+}
+
+/** The id of the `MergeConflictDetected` event for a change, so the conflict
+ *  toast can deep-link to the turn that reports it.
+ *
+ *  `MergeConflictDetected` is an exchange STARTER, so its turn's root carries
+ *  that id as `data-event-id` (see `stampedEventIds`) and the deep-link resolves
+ *  straight onto the "Merging changes from main" panel, with no anchor
+ *  re-targeting needed.
+ *
+ *  Highest seq wins: a Tier-2 to Tier-3 cascade emits two for one change (each
+ *  opening its own initiator panel), and the newer one is the panel carrying the
+ *  resolution the toast is talking about. Ranked by the map's KEY rather than by
+ *  taking the last match, because `thread.events` iterates in insertion order and
+ *  a backfill landing after a live SSE event puts an older seq last.
+ *
+ *  Both emit sites rank through here, so the banner and the "resolved" toast it
+ *  turns into can never point at different panels. `changeId` is optional to
+ *  match `mergeConflictToastKey`: the two conflict events a change-less pair
+ *  would produce share one toast, so they have to share one landing too. */
+function findMergeConflictEventId(threadId: string, changeId: string | undefined): string | undefined {
+  const thread = threadMap.value.get(threadId);
+  if (!thread) return undefined;
+  let found: string | undefined;
+  let foundSeq = -1;
+  for (const [seq, event] of thread.events) {
+    if (seq > foundSeq && event.type === 'MergeConflictDetected'
+        && event.change_id === changeId && event._eventId) {
+      found = event._eventId;
+      foundSeq = seq;
+    }
+  }
+  return found;
 }
 
 export function connectThreadEvents(): void {
@@ -496,12 +532,6 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
       removingQueuedMessageIds.value = next;
     }
   }
-  if (handled.clearedPendingUserMessage && threadId === focusedThreadId.value) {
-    // Server confirmation swaps the optimistic row for the persisted user
-    // event. Keep the focused transcript pinned to that replacement so the
-    // just-sent follow-up does not appear to vanish until work starts.
-    scrollToBottom();
-  }
 
   // Archive race guard. Every persisted SSE event carries the projection
   // snapshot AT EVENT EMIT TIME. When the backend processes a cascade
@@ -696,9 +726,18 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     const conflictKey = mergeConflictToastKey(threadId, event.change_id);
     if (toasts.value.some((t) => t.key === conflictKey)) {
       if (event.type === 'ChangeApplied') {
+        // Same landing as the "resolving automatically" banner it replaces in
+        // place: this is one toast the reader watched change its wording, so
+        // tapping it after the resolution must still open the conflict turn.
+        // Resolved at tap time from the thread's own events, exactly as the
+        // banner below does, so the two can never disagree and no per-toast
+        // state has to be kept alive between the two emits.
+        const changeId = event.change_id;
         showToast(`Merge conflict in ${formatThreadLabel(threadId)} — resolved.`, 'success', {
           key: conflictKey,
-          onClick: () => focusThread(threadId),
+          onClick: () => focusThread(threadId, {
+            targetEventId: findMergeConflictEventId(threadId, changeId) ?? null,
+          }),
           autoDismissMs: TOAST_AUTO_DISMISS_MS,
         });
       } else {
@@ -732,11 +771,12 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     }
   }
 
-  // After apply/discard/revert, scroll to bottom and reveal the app header
-  // on mobile so the user sees the result with full navigation visible.
+  // After apply/discard/revert, reveal the app header on mobile so the result
+  // is readable with full navigation visible. The transcript is NOT moved: the
+  // resolution card lands below whatever the reader is looking at, and the
+  // chevron is how they go to it.
   if (event.type === 'ChangeApplied' || event.type === 'ChangeDiscarded' || event.type === 'ChangeReverted') {
     if (threadId === focusedThreadId.value) {
-      scrollToBottom();
       document.dispatchEvent(new Event('reveal-mobile-header'));
     }
     // Any terminal change event for a thread removes its worktree (Apply
@@ -772,10 +812,21 @@ export function handleThreadEvent(data: Record<string, unknown>): void {
     // Keyed by thread+change so a Tier-2 → Tier-3 cascade (both paths emit
     // MergeConflictDetected for the same change to open their own panels)
     // refreshes a single toast instead of stacking two identical banners.
+    //
+    // The tap deep-links to the conflict event, not just to its thread: the
+    // panel is what the toast is announcing, and a plain focus would land the
+    // reader at the thread's saved scroll with nothing about the conflict on
+    // screen. Ranked through the same helper the "resolved" transition uses so
+    // the one toast cannot change where it goes when it changes its wording;
+    // `handleEvent` stored this frame well above, so the lookup sees it. The
+    // arriving id is the fallback for the frame that carries no `event_id`,
+    // where the tap degrades to a plain focus.
     const label = formatThreadLabel(threadId);
     showToast(`Merge conflict in ${label} — resolving automatically.`, 'warning', {
       key: mergeConflictToastKey(threadId, event.change_id),
-      onClick: () => focusThread(threadId),
+      onClick: () => focusThread(threadId, {
+        targetEventId: findMergeConflictEventId(threadId, event.change_id) ?? eventId ?? null,
+      }),
     });
   }
 
@@ -927,6 +978,18 @@ export function handleGlobalEvent(type: string, data: Record<string, unknown>): 
       // Re-run the honest build-id check so the Refresh badge/toast surface without
       // a manual restart — idempotent + self-correcting, so no payload needed.
       void syncClientUpdateFromBuild();
+      break;
+
+    case 'FrontendPreviewStarted':
+      // Dev-only transient signal: the engine brought up the Vite dev server
+      // showing a coding-agent worktree's frontend (engine::frontend_preview).
+      // The payload carries the PORT, never a URL, because only this page knows
+      // which host the user reached the workspace under.
+      handleFrontendPreviewStarted(data as { thread_id?: string; port?: number });
+      break;
+
+    case 'FrontendPreviewStopped':
+      handleFrontendPreviewStopped(data as { thread_id?: string });
       break;
 
     case 'EngineBuildStateChanged':
@@ -1233,8 +1296,13 @@ function handleTransientSideEffects(event: ThreadEvent | TransientEvent, sourceT
             { variant: 'default' }
           );
           if (!ok) return;
-          await initPushSubscription();
-          await toggleDevicePush(getDeviceId(), true);
+          // The same entry point both settings toggles use. It used to be an
+          // open-coded `initPushSubscription()` whose result was DISCARDED,
+          // followed by the device flag unconditionally: a refused permission
+          // then left `push_enabled = true` with no subscription row, which is
+          // the "engine pushes into the void" divergence `refreshPushSubscription`
+          // exists to repair on the next load.
+          await setDevicePushEnabled(getDeviceId(), true);
         } catch (e) {
           showToast(`Failed to enable push notifications: ${errorDetail(e)}`, 'error');
         }

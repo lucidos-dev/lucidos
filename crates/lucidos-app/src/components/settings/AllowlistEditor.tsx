@@ -7,13 +7,16 @@ import { toFailed, type Loadable } from '../../store/types';
 import { LoadableError } from '../shared/LoadableError';
 import { ListSkeletonOf, SkBlock } from '../shared/Skeleton';
 import { LoadingFade } from '../shared/LoadingFade';
+import { Explainer } from '../shared/Explainer';
 
 interface AllowlistEditorProps {
   /** Section heading (a `settings-section-title`). */
   title: string;
   /** `data-search-anchor` for the section title, so Search Everywhere can land here. */
   anchor: string;
-  /** Help text rendered under the heading. */
+  /** What this allowlist is for, behind the heading's *explainer*. On the
+   *  heading rather than inside the loaded branch, so it stays readable while
+   *  the file is loading and after a failed load. */
   description: ComponentChildren;
   /** Placeholder shown in an empty pattern row. */
   placeholder: string;
@@ -156,7 +159,10 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
   if (loadable.status === 'failed') {
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor={props.anchor}>{props.title}</div>
+        <div class="settings-section-title" data-search-anchor={props.anchor}>
+          {props.title}
+          <Explainer title={props.title}>{props.description}</Explainer>
+        </div>
         <LoadableError noun={props.noun} error={loadable.error} />
       </div>
     );
@@ -166,11 +172,13 @@ export function AllowlistEditor(props: AllowlistEditorProps) {
 
   return (
     <div class="settings-section">
-      <div class="settings-section-title" data-search-anchor={props.anchor}>{props.title}</div>
+      <div class="settings-section-title" data-search-anchor={props.anchor}>
+        {props.title}
+        <Explainer title={props.title}>{props.description}</Explainer>
+      </div>
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="allowlist-rows" row={() => <AllowlistRow />} />}>
         {loadable.status === 'loaded' ? (
           <>
-            <p class="settings-section-desc">{props.description}</p>
             <div class="allowlist-rows">
               {patterns.length === 0 && (
                 <div class="allowlist-empty">No patterns yet. Use the <strong>Always allow</strong> buttons on permission prompts, or add one below.</div>

@@ -68,8 +68,8 @@ const APPLY_RESTART_RULE: &str = "APPLY/RESTART: After your session ends, your c
     DO NOT comment on restart status in your session summary or anywhere else — do not write \
     \"no restart required\", \"restart required\", \"just a code rebuild\", or any equivalent. \
     The button label is the source of truth and the user already sees it. If your intuition \
-    disagrees with the button, your intuition is wrong; the engine's `files_require_restart` \
-    check (in `crates/lucidos-engine/src/engine/git_ops.rs`) is authoritative.";
+    disagrees with the button, your intuition is wrong; `files_require_restart` \
+    (in `crates/lucidos-engine/src/engine/git_ops/restart_detection.rs`) is authoritative.";
 
 /// Hardening reminder shared across all Lucidos-repo CC system prompts. The
 /// /harden skill itself runs the test suites and iterates on failure — keep
@@ -398,9 +398,9 @@ const PERMISSION_CONFIG_RULE: &str = "\n\n\
     The file is read on each subprocess spawn — the next Claude Code session (or `claude_code` tool \
     call) picks it up immediately, no engine restart needed. The currently-running subprocess \
     keeps its frozen `--allowedTools` flag, so a freshly-persisted entry only takes effect on \
-    the next session. The compiled-in default lives at \
-    `crates/lucidos-engine/src/engine/claude_code.rs` (`DEFAULT_CC_ALLOWED_TOOLS`); editing it \
-    only helps fresh installs since existing users keep their seeded file. \
+    the next session. The compiled-in default is at \
+    `crates/lucidos-engine/src/engine/claude_code/mod.rs` (`DEFAULT_CC_ALLOWED_TOOLS`); editing it \
+    only helps fresh installs; existing users keep their seeded file. \
     Bare `Edit`/`Write`/`NotebookEdit` cannot be persisted via the broad button — CC's \
     `acceptEdits` mode routes them through `--permission-prompt-tool` for its protected paths \
     (`.claude/`, `.git/`, which never auto-approve in any mode) and auto-approves them \

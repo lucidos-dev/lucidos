@@ -6,6 +6,7 @@ import { showConfirm, showToast } from '../../store/store';
 import { toFailed, type Loadable } from '../../store/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { Explainer } from '../shared/Explainer';
 import { errorDetail } from '../../utils/errorDetail';
 import { formatTimeAgo } from '../../utils/formatTime';
 import { formatBytes } from '../../utils/formatBytes';
@@ -345,7 +346,16 @@ export function DiskUsagePage() {
       </div>
 
       <div class="settings-section">
-        <div class="settings-section-title">Workspace data</div>
+        <div class="settings-section-title">
+          Workspace data
+          <Explainer title="Workspace data">
+            <p>
+              The workspace's own data directory: artifacts you and the engine produce,
+              the Postgres event store, and your apps &amp; knowhow.
+            </p>
+            <p>Kept across restarts; no automatic cleanup.</p>
+          </Explainer>
+        </div>
         <StatCard
           label="Workspace data uses"
           value={workspaceDataBytes != null ? formatBytes(workspaceDataBytes) : pendingOrDash}
@@ -356,13 +366,19 @@ export function DiskUsagePage() {
             </>
           }
         />
-        <p class="settings-section-desc">
-          The workspace's own data directory — artifacts you and the engine produce, the Postgres event store, and your apps &amp; knowhow. Kept across restarts; no automatic cleanup.
-        </p>
       </div>
 
       <div class="settings-section">
-        <div class="settings-section-title">Worktrees</div>
+        <div class="settings-section-title">
+          Worktrees
+          <Explainer title="Worktrees">
+            <p>Per-thread worktrees Lucidos creates for Claude Code sessions.</p>
+            <p>
+              Clean build artifacts to reclaim space, or remove a worktree entirely
+              when you no longer need its branch.
+            </p>
+          </Explainer>
+        </div>
         <StatCard
           label="Lucidos worktrees use"
           value={formatBytes(totalBytes)}
@@ -372,9 +388,6 @@ export function DiskUsagePage() {
               : `${loadable.data.length} ${loadable.data.length === 1 ? 'worktree' : 'worktrees'}`
           }
         />
-        <p class="settings-section-desc">
-          Per-thread worktrees Lucidos creates for Claude Code sessions. Clean build artifacts to reclaim space, or remove a worktree entirely when you no longer need its branch.
-        </p>
         {loadable.data.length > 0 && (
           <div class="list-rows">
             {loadable.data.map((row, idx) => (

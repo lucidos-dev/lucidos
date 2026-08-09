@@ -15,6 +15,7 @@ import {
   secretIsExpected,
 } from './oauthClientForm';
 import { ConsoleLink } from './providerConsoleHint';
+import { FieldLabel } from '../shared/Explainer';
 import { loadedOr, toFailed } from '../../store/types';
 import type { AuthType, CredentialInfo, CredentialRequest, EmailAccountInfo, Loadable } from '../../store/types';
 import { getCredentialValue, getEmailAccount } from '../../api/client';
@@ -510,14 +511,21 @@ function CredentialFormInner({
               />
             </div>
             <div class="form-group">
-              <label>Env var name <span class="form-hint">(optional)</span></label>
+              <FieldLabel
+                title="Env var name"
+                label={<>Env var name <span class="form-hint">(optional)</span></>}
+              >
+                  <p>
+                    Also injects the secret under this name, in addition to the default{' '}
+                    <code>CRED_&lt;NAME&gt;</code>.
+                  </p>
+              </FieldLabel>
               <input
                 ref={envVarNameRef}
                 type="text"
                 defaultValue={initialEnvVarName}
                 placeholder="MY_API_TOKEN"
               />
-              <div class="form-hint">Also injects the secret under this name, in addition to the default CRED_&lt;NAME&gt;.</div>
             </div>
           </>
         )}
@@ -602,7 +610,19 @@ function CredentialFormInner({
                 have had for free. */}
             {!registryRow && !editing && knownProviders.length > 0 && (
               <div class="form-group">
-                <label>Runs on <span class="form-hint">(optional)</span></label>
+                <FieldLabel
+                  title="Runs on"
+                  label={<>Runs on <span class="form-hint">(optional)</span></>}
+                >
+                    <p>
+                      Pick the service this connection actually signs in to, and its
+                      endpoints fill in below.
+                    </p>
+                    <p>
+                      Use this for a separate, narrowly-scoped connection you want held
+                      apart from your everyday one.
+                    </p>
+                </FieldLabel>
                 <Dropdown
                   options={[
                     { value: '', label: 'A provider Lucidos does not know' },
@@ -611,11 +631,6 @@ function CredentialFormInner({
                   value={basedOn}
                   onChange={applyBaseProvider}
                 />
-                <div class="form-hint">
-                  Pick the service this connection actually signs in to, and its
-                  endpoints fill in below. Use this for a separate, narrowly-scoped
-                  connection you want held apart from your everyday one.
-                </div>
               </div>
             )}
             <div class="form-group">
@@ -636,12 +651,25 @@ function CredentialFormInner({
                   public client, a secret-less redemption by a confidential one)
                   are refused by the provider late, looking nothing like their
                   cause. */}
-              <label>
-                Client Secret{' '}
-                <span class="form-hint">
-                  {expectsSecret ? '(required by this provider)' : '(optional)'}
-                </span>
-              </label>
+              <FieldLabel
+                title="Client Secret"
+                label={
+                  <>
+                    Client Secret{' '}
+                    <span class="form-hint">
+                      {expectsSecret ? '(required by this provider)' : '(optional)'}
+                    </span>
+                  </>
+                }
+              >
+                  <p>
+                    {expectsSecret
+                      ? "This provider's app registrations are confidential clients, so the "
+                        + 'secret is part of the registration rather than an extra.'
+                      : "Leave blank when the provider's app registration is a desktop or native app: "
+                        + 'Lucidos then connects as a public client using PKCE instead of a secret.'}
+                  </p>
+              </FieldLabel>
               <SecretInput
                 inputRef={clientSecretRef}
                 defaultValue={initialFields.clientSecret}
@@ -651,13 +679,6 @@ function CredentialFormInner({
                     : 'Leave blank for a desktop/native app'
                 }
               />
-              <div class="form-hint">
-                {expectsSecret
-                  ? "This provider's app registrations are confidential clients, so the "
-                    + 'secret is part of the registration rather than an extra.'
-                  : "Leave blank when the provider's app registration is a desktop or native app: "
-                    + 'Lucidos then connects as a public client using PKCE instead of a secret.'}
-              </div>
             </div>
             <details
               class="credential-oauth-endpoints"
@@ -681,7 +702,17 @@ function CredentialFormInner({
                 <input ref={userinfoUrlRef} type="url" defaultValue={initialUserinfoUrl} placeholder="https://api.example.com/v1/me" />
               </div>
               <div class="form-group">
-                <label>Userinfo method</label>
+                <FieldLabel title="Userinfo method">
+                    <p>
+                      Leave on GET unless the provider's userinfo endpoint refuses it.
+                      Dropbox's does: <code>users/get_current_account</code> is
+                      POST-only.
+                    </p>
+                    <p>
+                      Getting this wrong costs only the account's name and email, never
+                      the connection.
+                    </p>
+                </FieldLabel>
                 <Dropdown
                   options={[
                     { value: 'GET', label: 'GET' },
@@ -690,45 +721,54 @@ function CredentialFormInner({
                   value={userinfoMethod}
                   onChange={setUserinfoMethod}
                 />
-                <div class="form-hint">
-                  Leave on GET unless the provider's userinfo endpoint refuses it. Dropbox's
-                  does: <code>users/get_current_account</code> is POST-only. Getting this
-                  wrong costs only the account's name and email, never the connection.
-                </div>
               </div>
               <div class="form-group">
-                <label>Authorization parameters <span class="form-hint">(optional)</span></label>
+                <FieldLabel
+                  title="Authorization parameters"
+                  label={<>Authorization parameters <span class="form-hint">(optional)</span></>}
+                >
+                    <p>
+                      Extra parameters added to the authorization URL, which is where a
+                      provider spells "issue a refresh token" its own way.
+                    </p>
+                    <p>
+                      Leave blank for <code>access_type=offline&amp;prompt=consent</code>.
+                      Dropbox instead needs <code>token_access_type=offline</code>, and
+                      without it its token expires in hours with nothing to renew it.
+                    </p>
+                    <p>
+                      Write <code>none</code> to send neither.
+                    </p>
+                </FieldLabel>
                 <input
                   ref={authorizeParamsRef}
                   type="text"
                   defaultValue={initialAuthorizeParams}
                   placeholder="access_type=offline&prompt=consent"
                 />
-                <div class="form-hint">
-                  Extra parameters added to the authorization URL, which is where a provider
-                  spells "issue a refresh token" its own way. Leave blank for
-                  <code>access_type=offline&amp;prompt=consent</code>; Dropbox instead needs
-                  <code>token_access_type=offline</code>, and without it its token expires in
-                  hours with nothing to renew it. Write <code>none</code> to send neither.
-                </div>
               </div>
               <div class="form-group">
                 <label>Default Scopes <span class="form-hint">(optional, space-separated)</span></label>
                 <input ref={scopesRef} type="text" defaultValue={initialScopes} placeholder="read write user.read" />
               </div>
               <div class="form-group">
-                <label>Redirect URI <span class="form-hint">(optional)</span></label>
+                <FieldLabel
+                  title="Redirect URI"
+                  label={<>Redirect URI <span class="form-hint">(optional)</span></>}
+                >
+                    <p>Register this exact URI with the provider.</p>
+                    <p>
+                      Leave blank for the default loopback-IP form; use{' '}
+                      <code>http://localhost:14981/oauth/callback</code> only for a
+                      provider that won't accept the IP literal.
+                    </p>
+                </FieldLabel>
                 <input
                   ref={redirectUriRef}
                   type="url"
                   defaultValue={initialRedirectUri}
                   placeholder="http://127.0.0.1:14981/oauth/callback"
                 />
-                <div class="form-hint">
-                  Register this exact URI with the provider. Leave blank for the default
-                  loopback-IP form; use <code>http://localhost:14981/oauth/callback</code> only
-                  for a provider that won't accept the IP literal.
-                </div>
               </div>
             </details>
           </>

@@ -114,6 +114,8 @@ fn test_trigger_config(id: &str) -> crate::triggers::TriggerConfig {
         group_id: None,
         side_effect_grant: vec![],
         plugin_id: None,
+        model: None,
+        reasoning_effort: None,
     }
 }
 

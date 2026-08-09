@@ -12,7 +12,7 @@
    what, for how much longer" without scrolling.
    ─────────────────────────────────────────────────────────────────────── */
 
-/* Shell geometry, placement, the header strip and the close button all come
+/* Shell geometry, placement, the title bar and the close button all come
    from `.prompt-bar-popover*` in `styles/chat/prompt-bar-popover.css`, which
    the todo indicator beside it uses too. Only the width is this surface's own:
    its rows carry a reason, a subscription, a countdown and a button. Both

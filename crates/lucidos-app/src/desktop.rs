@@ -104,9 +104,10 @@ const ENGINE_HEALTH_TIMEOUT: Duration = Duration::from_secs(120);
 /// crashed/idle service is re-kickstarted while the window waits.
 const HEALTH_ENSURE_CYCLE: Duration = Duration::from_secs(30);
 
-/// How often the desktop process refreshes the dock-icon badge from the gateway's
-/// aggregate unread total (macOS only). Independent of the webview's own polling
-/// so the badge is correct whichever page (picker or a workspace) is loaded.
+/// How often the desktop process refreshes the unread indicator (always the
+/// menu-bar tray title, plus the dock-icon badge while a window is open) from the
+/// gateway's aggregate unread total (macOS only). Independent of the webview's own
+/// polling so the count is correct whichever page (picker or a workspace) is loaded.
 #[cfg(target_os = "macos")]
 const DOCK_BADGE_POLL_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -673,17 +674,17 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
         return;
     }
 
-    // Dock-icon badge: mirror the gateway's aggregate unread total (across running
-    // workspaces) onto the app icon. Its own thread — independent of the
-    // service/health/navigate flow below and of whichever page the webview shows —
-    // so the desktop badge always reflects the TOTAL, not just the active
-    // workspace. macOS only (the dock tile is a macOS concept). The AppKit write
-    // is marshalled to the main thread; the fetch tolerates the gateway not being
-    // up yet (returns None until it answers).
+    // Unread indicator: mirror the gateway's aggregate unread total (across running
+    // workspaces) onto the menu-bar tray title, and onto the Dock badge too while a
+    // window is open. Its own thread (independent of the service/health/navigate
+    // flow below, and of whichever page the webview shows), so the count always
+    // reflects the TOTAL, not just the active workspace. macOS only (both surfaces
+    // are macOS concepts). The AppKit write is marshalled to the main thread; the
+    // fetch tolerates the gateway not being up yet (returns None until it answers).
     //
     // Event-driven AND polled: the loop recomputes the instant it's NUDGED (the
     // active workspace's webview signals `nudge_dock_badge` when a notification SSE
-    // arrives — read in-app or from another device) so the badge updates without
+    // arrives, whether read in-app or from another device) so the count updates without
     // waiting for the next tick; the periodic `DOCK_BADGE_POLL_INTERVAL` tick is
     // the safety net that also catches BACKGROUND-workspace changes (whose SSE this
     // webview never sees).
@@ -698,13 +699,23 @@ pub fn launch(app: &AppHandle, nudge_rx: std::sync::mpsc::Receiver<()>) {
                     // Only touch AppKit when the value actually changed — avoids a
                     // main-thread hop when nothing moved.
                     if last != Some(total) {
-                        last = Some(total);
                         let h = handle.clone();
-                        let _ = handle.run_on_main_thread(move || {
-                            // Routes to the Dock badge (Regular) or the menu-bar
-                            // tray title (menu-bar-only Accessory) per activation state.
+                        let applied = handle.run_on_main_thread(move || {
+                            // Always onto the menu-bar tray title, and onto the
+                            // Dock badge as well while a window is open (Regular);
+                            // menu-bar-only (Accessory) has no Dock tile.
                             crate::apply_unread_indicator(&h, total);
                         });
+                        // Record the value only once the hop is ACCEPTED. Nothing
+                        // reads the tray or the Dock tile back, so `last` is the
+                        // loop's only account of what is on screen: banking a hop
+                        // that never queued would pin both surfaces at a stale count
+                        // that the changed-value guard then refuses to rewrite. An
+                        // unaccepted hop stays unrecorded and the next tick retries.
+                        match applied {
+                            Ok(()) => last = Some(total),
+                            Err(e) => eprintln!("[Tauri] unread indicator not applied: {e}"),
+                        }
                     }
                 }
                 // Wait for the next tick OR a nudge, whichever comes first. Drain

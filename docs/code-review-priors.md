@@ -475,6 +475,55 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   failing rather than as a reading of the SQL.
   (`engine/event_wait/mod.rs`, `engine/event_wait/register.rs`, ADR 0053.)
 
+## Desktop client (Tauri, macOS)
+
+- **`unread_targets` returning `(Option<String>, String)` is a deliberate
+  asymmetry, and collapsing it to two `Option`s reintroduces a shipped bug.** A
+  reviewer will read the tuple as an inconsistency (both halves are "a label or
+  nothing") and propose the tidier `(Option<String>, Option<String>)`. The two
+  surfaces clear by opposite means. The Dock tile clears with AppKit's
+  `setBadgeLabel(None)`, so `None` is the working call there. The menu-bar item
+  clears only by being WRITTEN an empty string: `tray-icon`'s macOS backend
+  (`set_title_inner`, 0.24.1) puts its `setTitle:` call inside `if let Some(..)`
+  and does nothing on the `None` arm, so `tray.set_title(None)` updates the
+  crate's cached `attrs.title` and leaves the old text on the status item
+  forever. That shipped: an install whose unread count fell to zero read bell 0,
+  Dock tile blank, menu bar frozen at 8. Both call sites carry the reasoning
+  inline, and `a_cleared_tray_title_is_an_empty_string_the_tray_will_actually_write`
+  pins it. Re-flag only with evidence that `tray-icon`'s macOS `set_title_inner`
+  handles `None` by clearing the button title.
+  (`lucidos-app/src/lib.rs` `unread_targets` / `apply_unread_indicator`,
+  `lucidos-app/src/notifications.rs` `set_tray_title`.)
+
+- **`calc(<length> / <number>)` is supported in the packaged WKWebView, and a
+  claim that it is not is refuted by the header already shipping it.** A
+  reviewer will see the halving term in the desktop header
+  (`--header-band-lift`) and warn that WKWebView on
+  the declared minimum (macOS 11, Safari 14) rejects division inside `calc()`,
+  making the custom property invalid and silently discarding every rule that
+  consumes it. It does not. Division by a unitless NUMBER is CSS Values Level 3
+  and has been in Safari since 6; what arrived later is Values Level 4 TYPED
+  arithmetic, dividing by a value that itself carries a unit
+  (`calc(10px / 2px)`), which this codebase does not use anywhere. The decisive
+  evidence is local rather than a spec date: `--header-band-lift:
+  calc(var(--titlebar-inset, 0px) / 2)` is the load-bearing term for the whole
+  band-centred header and has shipped in the packaged macOS app since that
+  header landed, so were the construct invalid the bar would already be visibly
+  broken on the only build it applies to. Re-flag only with a typed division
+  (units on BOTH sides), or with an observed failure on a named OS version.
+  (`lucidos-app/src/styles/panels/shell.css`, the desktop `:root` block.)
+
+- **The unread badge loop recording `last` only after `run_on_main_thread`
+  returns `Ok` is not redundant error handling.** A reviewer may read the
+  `match` as ceremony around an infallible call and want the older
+  `let _ = handle.run_on_main_thread(..)` back. Nothing reads the tray title or
+  the Dock tile back, so `last` is the loop's ONLY account of what is on screen,
+  and the `last != Some(total)` guard suppresses every rewrite of a value it
+  believes it already applied. Banking a hop that was never queued therefore
+  pins both surfaces at a stale count permanently rather than for one tick.
+  Re-flag only if something starts reading the applied value back.
+  (`lucidos-app/src/desktop.rs`, the macOS unread-indicator thread in `launch`.)
+
 ## Frontend
 
 - **`sendCompose`'s catch cannot be reached by a failed chat POST, so a reviewer
@@ -651,20 +700,16 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   unchanged for the two split cases: an exchange-START event (scroll the turn,
   pulse its `.initiator-panel`) and every `data-change-id` landing. A reviewer
   proposing to retarget THOSE scrolls at the pulsed panel is still wrong.
-- **The deep-link deadline's recovery scroll does NOT reintroduce the yank that
-  `ad48eadad` removed.** A reviewer reading that commit ("Deadline now cleans up
-  only instead of forcing a scroll-to-bottom; the prior unconditional fallback
-  would yank a user who scrolled to read history during the 4s window") may flag
-  the recovery added on 2026-08-05 as undoing it. It doesn't: what that commit
-  removed was an UNCONDITIONAL snap, and the recovery is gated on exactly the
-  case it named. The scroll runs only when no *user action* was seen since the
-  wait began (`watchUserAction`, `utils/userAction.ts`), so a user who scrolled
-  away is left where they are; only the warning toast fires for them, being the
-  sole remaining signal that the link was dead. The silence the commit left
-  behind was itself the reported bug (a notification tap that resolved nothing
-  looked broken). Re-flag only if the gate stops covering a real scroll gesture,
-  or if the scroll fires on a resolved / superseded claim.
-  (`components/chat/scrollState.ts`.)
+- **RETIRED 2026-08-08 (the deep-link deadline's recovery scroll).** This prior
+  defended a `watchUserAction`-gated scroll to the newest turn when a deep-link's
+  target never rendered. Both the scroll and its gate are gone: the transcript no
+  longer moves on the app's own initiative at all, so a dead link reports through
+  `onUnresolved` and leaves the reader where they are. Kept as a row rather than
+  deleted, because a reviewer reading `ad48eadad` (which removed an
+  unconditional snap) or `2026-08-05`'s recovery (which added a gated one) is
+  reading two live-looking commits about a behaviour that no longer exists. The
+  current rule is in `docs/glossary.md` § Reading position and
+  § Navigation scroll. Flag a NEW recovery scroll here as a regression.
 - **Turn-nav anchors on the marked turn when present, and only falls back to
   `scrollTop + gap` scroll-position stepping when there's no marker.** Turn-nav
   (`components/chat/scrollState.ts`) lands a turn's top `gap` px below the
@@ -904,15 +949,22 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   leading icons — this is the explicit product requirement, not the between-icons
   flanking-spacer variant (which was tried and reverted for reading off-center).**
   `.mobile-header-title` (`styles/mobile.css`) is `position:absolute; left:50%;
-  transform:translate(-50%,-50%); max-width:calc(100% - 10.5rem)` so it sits on
-  the viewport/row axis (like the pane dots + desktop header) regardless of the
-  leading (thread-drawer toggle or hamburger + nav, or filter) and trailing
-  (actions) cluster widths. The
+  transform:translate(-50%,-50%)` plus a symmetric `max-width` reserve, so it
+  sits on the viewport/row axis (like the pane dots + desktop header) regardless
+  of the leading (thread-drawer toggle or hamburger + nav, or filter) and
+  trailing (actions) cluster widths. That reserve is DERIVED from
+  `--header-nav-cluster-width`, not the `calc(100% - 10.5rem)` constant this
+  entry used to quote: the threads row's Lucidos mark sits on the nav cluster's
+  trailing edge now, and a rem constant agrees with a clamped cluster at exactly
+  one ui-scale (they kissed at 150%). Do not "restore" the constant. The
   requirement was stated as *"they should be centered, as long as they don't
   overlap the left-side icons; if centering would overlap, move them right so the
   left edge clears the rightmost left icon."* The symmetric reserve delivers both:
   a short title reads centered; a long one clamps + ellipsizes with its left edge
-  just past the widest leading cluster (~5rem). An in-flow flanking-spacer title
+  just past whatever the reserve is sized to clear. That used to be the widest
+  leading cluster at ~5rem; on the one row still using this class it is the
+  Lucidos mark on the nav cluster's edge, which is further in. An in-flow
+  flanking-spacer title
   (commit `14a512b8b`, reverted) satisfied no-overlap but centered BETWEEN the
   clusters, so it drifted off the row middle whenever the clusters differed in
   width — the "Appearance/Threads not centered" report. **Accepted right-side
@@ -1158,6 +1210,61 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   unhides a window. Re-flag only if the navigate payload gains a per-window
   identity to key on. (`store/actions/oauth.ts`,
   `crates/lucidos-engine/src/engine/tools/credentials.rs`.)
+
+- **The thread filter panel's "Include deleted" checkbox sits INSIDE the
+  radiogroup on purpose** (2026-08-09). ARIA says a `radiogroup` owns radios,
+  so a checkbox and its Explainer partway through the set reads as a
+  conformance break, and both Codex and a fresh reviewer will reach for it. It
+  is the deliberate resolution of a three-way trade-off. The panel is ONE
+  single-select set (four statuses, an "or" rule, then "All statuses"), and the
+  requested reading order puts the modifier directly under that last row so the
+  "By thread types" heading below lands on the thread types it names. Splitting
+  the wrapper into two radiogroups to keep the
+  checkbox out reports one choice as two independent sets, which misleads worse
+  than a foreign child does; CSS `order` keeps the DOM clean but desynchronises
+  tab order from the visuals, which is a real keyboard bug rather than a
+  conformance one. The rows are `<button role="radio">` with no roving
+  tabindex, so the practical AT behaviour is per-row announcement plus Tab,
+  which the interleaved checkbox does not disturb. Re-flag only with a fix that
+  keeps ONE group, the DOM order, and the visual order at once.
+  (`components/layout/ThreadFilterPanel.tsx`.)
+
+- **"Include deleted" being off DOES count toward the "filtered" note, by
+  product decision** (2026-08-09). The mechanical objection is correct and will
+  be re-derived every round: `deletedOptionsHidden` gates which triggers / repos
+  / apps the OPTION LISTS offer, and excludes no thread from the list on screen,
+  so folding it into `narrowed` reports a narrowing the thread list does not
+  have. It was raised with the user before it was built and overruled twice, in
+  those words: a workspace where something deleted is being held back is not
+  showing you all of it, and the row says so. The refinement that answers the
+  mechanical objection came from the same place and is what `deletedOptionsHidden`
+  encodes: the note fires only when something deleted actually EXISTS and is
+  unselected, never on the switch merely sitting at its default, so the default
+  view on a workspace that has never deleted anything stays quiet. The explainer
+  inside the note names this cause in its own paragraph, so the user is never
+  left guessing which setting is responsible. Re-flag only if the note starts
+  firing with nothing deleted, or if "Include deleted" gains the power to hide
+  threads (at which point the two causes stop being distinguishable and the
+  copy needs revisiting). (`components/layout/ThreadFilterPanel.tsx`,
+  `store/threadFilterActive.ts`.)
+
+- **There is no hidden duplicate transcript, so no "the hidden mount steals the
+  shared scroll state" bug.** `App.tsx` mounts ONE layout tree, `SplitLayout`
+  or `MobileSwipeContainer`, gated on `viewportIsMobile`; each renders
+  `ThreadPane` once, and `ThreadPane` renders `<ThreadView/>` or
+  `<CreateThreadView/>` from one ternary. So `.thread-content` exists once, and
+  a finding of the shape "on mobile both the visible and hidden transcript
+  attach, and if the hidden one runs last it claims the global" is describing a
+  mount that was removed (dual-mounting fanned every signal write out to two
+  subtrees). Two things keep inviting it and neither is evidence: the
+  `isElementVisible` gates, which are real but exist for containers laid out at
+  0x0 (a collapsed desktop split, mobile's zero-height `.content-row`), and the
+  phrase "the hidden dual-mount copy" still used around this file as shorthand
+  for an element with no box. Re-flag only if a second simultaneous mount is
+  reintroduced in `App.tsx`, which the header of `scrollState.ts` now states as
+  the premise to check. (`components/chat/scrollState.ts`, `App.tsx`,
+  `components/layout/ThreadPane.tsx`; raised by the Codex reviewer on
+  2026-08-09 against the live-edge reading position.)
 
 ## Scripts (bash)
 
@@ -1748,21 +1855,23 @@ with deeper rationale live in `docs/adr/`; this file is for the smaller
   (`crates/lucidos-app/src/components/settings/NetworkAccessPage.tsx`,
   `SettingsView.tsx` `repositoriesSection`.)
 
-- **`hasRenderableResponseContent` counts a `step` / `event_wait` as drawn even
-  though `renderResponseEvents` gates those on `showSteps`.** Reviews read that
-  as an incomplete mirror: with steps collapsed the renderer returns `null` for
-  them, so a boundary holding only a step would supposedly still open an empty
-  panel. It does not. `getEventToggleState`'s `showStepsToggle` is the same
-  `some(e => e.type === 'step' || e.type === 'event_wait')`, so a step present
-  means the body always renders the "Show steps" button: visible content, and
-  the affordance that reveals the rest. The predicate is about whether a panel
-  is worth opening, not about which of its rows are currently expanded, and
-  threading `showSteps` into it would make an exchange's panel appear and
-  disappear as the user toggles a global preference. The narrower shape the
-  concern usually reaches for, a lone `CodingAgentToolResult`, produces no step
-  at all: that arm only resolves a pending step, it never pushes one. Re-flag
-  only if `showStepsToggle` stops keying on the same predicate, which would make
-  the button genuinely absent.
+- **`hasRenderableResponseContent` counts a `step` as drawn even though
+  `renderResponseEvents` gates it on `showSteps`.** Reviews read that as an
+  incomplete mirror: with steps collapsed the renderer returns `null` for them,
+  so a boundary holding only a step would supposedly still open an empty panel.
+  It does not. `getEventToggleState`'s `showStepsToggle` is the same predicate
+  (`some(isStepMechanics)`), so a step present means the body always renders the
+  "Show steps" button: visible content, and the affordance that reveals the
+  rest. The predicate is about whether a panel is worth opening, not about which
+  of its rows are currently expanded, and threading `showSteps` into it would
+  make an exchange's panel appear and disappear as the user toggles a global
+  preference. The narrower shape the concern usually reaches for, a lone
+  `CodingAgentToolResult`, produces no step at all: that arm only resolves a
+  pending step, it never pushes one. Re-flag only if `showStepsToggle` stops
+  keying on the same predicate, which would make the button genuinely absent.
+  An `event_wait` needs none of this reasoning since 2026-08-08: it is a
+  *transcript marker*, not step mechanics, so no toggle can hide it and it is
+  drawn whenever it is present.
   (`crates/lucidos-app/src/store/thread-events/exchange-render.ts`,
   `store/event-rendering.ts` `getEventToggleState`.)
 

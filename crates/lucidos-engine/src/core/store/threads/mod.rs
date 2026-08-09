@@ -638,15 +638,9 @@ pub struct ThreadSearchResult {
 /// Filters for the script/trigger-facing `list`/`count` query paths.
 /// Mirrors the wire query params of `GET /api/v1/threads/list`,
 /// `lucidos threads list`, and the `list_threads` LLM tool.
-///
-/// `active` semantics — when `Some(true)`, restricts to statuses where
-/// the agentic loop is mid-flow (`running`, `waiting_for_user_answer`).
-/// `waiting` is *not* included: it means the coding agent has stopped and proposed
-/// changes the user must act on — work has paused, the loop isn't
-/// running. `failed` is also excluded — the response is over.
-/// `Some(false)` inverts; `None` is no filter.
 pub struct ThreadSummaryFilters<'a> {
-    pub active: Option<bool>,
+    /// How to narrow by `thread_summaries.status`. See [`StatusFilter`].
+    pub status: StatusFilter<'a>,
     pub sources: Option<&'a [String]>,
     /// Restrict to the direct children of this thread. `None` is no filter.
     ///
@@ -659,17 +653,134 @@ pub struct ThreadSummaryFilters<'a> {
     pub limit: i64,
 }
 
-/// Statuses considered "active" — the agentic loop is mid-flow.
+/// How a `list` / `count` query narrows by thread status.
+///
+/// An enum rather than two independent fields because the two ways of asking
+/// are alternatives, not filters that compose: "the active union" and "exactly
+/// these statuses" are two answers to one question, and a query carrying both
+/// would silently intersect. Every caller-facing surface refuses the
+/// combination with an actionable message; this type is what makes the refusal
+/// exhaustive instead of a check somebody can forget to write.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusFilter<'a> {
+    /// No status narrowing.
+    Any,
+    /// The `active` union: `true` selects [`active_thread_statuses`], `false`
+    /// selects everything else. The oldest of the three and the one every
+    /// existing caller uses, kept bit-for-bit so a patch release breaks nobody.
+    Active(bool),
+    /// Exactly these statuses. This is the precise form: `OneOf(&[Running])`
+    /// answers "is the workspace busy?", which the `Active` union answers
+    /// wrongly, because a thread awaiting a user answer is blocked on the
+    /// human rather than working.
+    OneOf(&'a [ThreadStatus]),
+}
+
+impl StatusFilter<'_> {
+    /// The two bind params the shared SQL predicate takes: the status list
+    /// (`None` disables the clause entirely) and whether to invert it.
+    ///
+    /// Collapsing all three variants onto one `(list, negate)` pair is what
+    /// lets `list_thread_summaries` and `count_thread_summaries` share one
+    /// static predicate instead of branching per variant.
+    pub(crate) fn binds(&self) -> (Option<Vec<&'static str>>, bool) {
+        match self {
+            Self::Any => (None, false),
+            Self::Active(want) => (Some(active_thread_statuses().to_vec()), !want),
+            Self::OneOf(statuses) => (
+                Some(statuses.iter().map(ThreadStatus::as_str).collect()),
+                false,
+            ),
+        }
+    }
+}
+
+/// The `WHERE` fragment [`StatusFilter::binds`] feeds, shared verbatim by the
+/// list and count queries so the two can never disagree about what a filter
+/// selects. `$1` is the status list (NULL disables the clause), `$2` inverts.
+pub(crate) const STATUS_FILTER_SQL: &str = "($1::text[] IS NULL \
+     OR ($2 = FALSE AND t.status = ANY($1)) \
+     OR ($2 = TRUE AND NOT (t.status = ANY($1))))";
+
+/// Statuses considered "active": the agentic loop is mid-flow.
 ///
 /// A thread merely holding an *event wait* does NOT count: a subscription does
 /// not hold its thread's turn, so a thread watching for a release has genuinely
 /// finished its turn and is idle. It surfaces through the subscription
 /// indicator instead.
+///
+/// This is a UNION of two states that answer different questions, which is why
+/// [`StatusFilter::OneOf`] exists: `running` is the workspace working, while
+/// `waiting_for_user_answer` is the workspace stopped and waiting on a person.
+/// A caller asking "is anything still busy?" wants `running` alone.
 pub fn active_thread_statuses() -> [&'static str; 2] {
     [
         ThreadStatus::Running.as_str(),
         ThreadStatus::WaitingForUserAnswer.as_str(),
     ]
+}
+
+/// Parse caller-supplied status filter values into the typed form
+/// [`StatusFilter::OneOf`] takes.
+///
+/// Shared by every input surface (the HTTP query param, the LLM tool arg, and
+/// through them the CLI flag and the SDK option) so one wrong value produces
+/// one wording everywhere. Three things are deliberately errors rather than a
+/// quietly different answer, because a filter that answers a question nobody
+/// asked is the entire bug this filter exists to fix:
+///
+/// - an unrecognized value, which would otherwise select nothing,
+/// - an empty list, which would otherwise select everything,
+/// - a blank item inside an otherwise valid list, which hides a typo.
+pub fn parse_status_filter_values<S: AsRef<str>>(raw: &[S]) -> Result<Vec<ThreadStatus>, String> {
+    let mut out = Vec::with_capacity(raw.len());
+    for value in raw {
+        let value = value.as_ref().trim();
+        if value.is_empty() {
+            return Err(format!(
+                "status has an empty value (a stray comma?). Valid statuses: {}.",
+                status_value_list()
+            ));
+        }
+        match ThreadStatus::try_parse(value) {
+            Some(status) => out.push(status),
+            None => return Err(unknown_status_message(value)),
+        }
+    }
+    if out.is_empty() {
+        return Err(format!(
+            "status needs at least one value. Valid statuses: {}.",
+            status_value_list()
+        ));
+    }
+    Ok(out)
+}
+
+/// Comma-separated form of [`parse_status_filter_values`], for the surfaces
+/// that carry the filter as one string: the HTTP query param, the CLI flag it
+/// forwards, and the string form of the LLM tool arg.
+pub fn parse_status_filter_csv(raw: &str) -> Result<Vec<ThreadStatus>, String> {
+    parse_status_filter_values(&raw.split(',').collect::<Vec<_>>())
+}
+
+/// Comma-separated list of every accepted status value, for help text, tool
+/// schemas and error messages. Sourced from [`ThreadStatus::ALL`] so it cannot
+/// drift from the enum.
+pub fn status_value_list() -> String {
+    ThreadStatus::ALL
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn unknown_status_message(value: &str) -> String {
+    format!(
+        "'{value}' is not a thread status. Valid statuses: {}. \
+         For 'is the workspace busy?' use status=running: a thread \
+         awaiting a user answer is blocked on the human, not working.",
+        status_value_list()
+    )
 }
 
 /// A timeline event rendered inline in a thread view.

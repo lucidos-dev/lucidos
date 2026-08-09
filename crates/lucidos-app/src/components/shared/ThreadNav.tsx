@@ -42,27 +42,43 @@ function threadForwardItems(): NavHistoryItem[] {
   return items;
 }
 
+/** Back and forward as separate exports, because the mobile thread header puts
+ *  the Lucidos mark BETWEEN them (see BrandMenuButton) rather than rendering
+ *  them as an adjacent pair. Same split, and the same reason, as
+ *  `ContentBackButton` / `ContentForwardButton` in ContentNav. */
+export function ThreadBackButton({ showTooltip }: Props) {
+  return (
+    <NavChevron
+      direction="back"
+      buttonClass="thread-nav-btn"
+      disabled={!canGoBackThread.value}
+      onStep={() => threadNavBack()}
+      getItems={threadBackItems}
+      ariaLabel="Previous thread"
+      tooltip={showTooltip ? tooltipWithShortcut('Previous thread', 'historyBack') : undefined}
+    />
+  );
+}
+
+export function ThreadForwardButton({ showTooltip }: Props) {
+  return (
+    <NavChevron
+      direction="forward"
+      buttonClass="thread-nav-btn"
+      disabled={!canGoForwardThread.value}
+      onStep={() => threadNavForward()}
+      getItems={threadForwardItems}
+      ariaLabel="Next thread"
+      tooltip={showTooltip ? tooltipWithShortcut('Next thread', 'historyForward') : undefined}
+    />
+  );
+}
+
 export function ThreadNav({ showTooltip }: Props) {
   return (
     <>
-      <NavChevron
-        direction="back"
-        buttonClass="thread-nav-btn"
-        disabled={!canGoBackThread.value}
-        onStep={() => threadNavBack()}
-        getItems={threadBackItems}
-        ariaLabel="Previous thread"
-        tooltip={showTooltip ? tooltipWithShortcut('Previous thread', 'historyBack') : undefined}
-      />
-      <NavChevron
-        direction="forward"
-        buttonClass="thread-nav-btn"
-        disabled={!canGoForwardThread.value}
-        onStep={() => threadNavForward()}
-        getItems={threadForwardItems}
-        ariaLabel="Next thread"
-        tooltip={showTooltip ? tooltipWithShortcut('Next thread', 'historyForward') : undefined}
-      />
+      <ThreadBackButton showTooltip={showTooltip} />
+      <ThreadForwardButton showTooltip={showTooltip} />
     </>
   );
 }

@@ -1,5 +1,5 @@
-import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, settingsSubviewLabel, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
-import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm } from '../../store/store';
+import { activeMenuItem, panelOverlay, activeInlineForm, panelUrl, panelTitle, settingsSubview, settingsSubviewLabel, settingsSubviewShortLabel, triggers, appsList, parseRepoPath, repoPending, selectedChange, wipPreviewThreadId, threadMap } from '../../store/store';
+import { CODING_AGENT_CHANNEL, type ThreadChannel, type InlineForm, type SettingsNavKey } from '../../store/store';
 import type { NavEntry } from '../../store/actions/navigation';
 import { loadedOr } from '../../store/types';
 import { formatChannel } from '../../utils/formatChannel';
@@ -55,7 +55,22 @@ function previewFileName(path: string): string {
   return repoRelative.split('/').pop() || repoRelative;
 }
 
-export function getContentTitle(): string {
+/** Title of whatever the content pane is showing, in one of two forms.
+ *
+ *  `short` is what the header BAR renders, and the rule for it is: a title WE
+ *  author says the destination's kind and nothing more, because the bar is the
+ *  narrowest surface a title ever appears on. Everything appended to name the
+ *  particular instance (which notification, which change a diff belongs to,
+ *  which thread is previewing an app) belongs to the full form, which the
+ *  title's own tap-tooltip carries and the back/forward history menu renders.
+ *  A name we did NOT author (a file, an app, a web page, a thread) has no short
+ *  form to author, so the ellipsis stays the net underneath.
+ *
+ *  Both forms come out of this one function, on purpose: a new destination
+ *  cannot land in the full form and go missing from the short one. */
+function contentTitle(short: boolean): string {
+  const settingsLabel: (key: SettingsNavKey) => string | undefined =
+    short ? settingsSubviewShortLabel : settingsSubviewLabel;
   const overlay = panelOverlay.value;
   const form = activeInlineForm.value;
   const url = panelUrl.value;
@@ -67,7 +82,9 @@ export function getContentTitle(): string {
     const wipTid = wipPreviewThreadId.value;
     if (wipTid) {
       const wipTitle = threadMap.value.get(wipTid)?.meta.title;
-      if (wipTitle && wipTitle !== PENDING_TITLE_PLACEHOLDER) {
+      // Which thread is previewing it is instance detail: the bar says the app
+      // is showing work in progress, the tooltip says whose.
+      if (wipTitle && wipTitle !== PENDING_TITLE_PLACEHOLDER && !short) {
         return `${overlay.app.name} (WIP by ${wipTitle})`;
       }
       if (wipTitle) return `${overlay.app.name} (WIP)`;
@@ -76,18 +93,34 @@ export function getContentTitle(): string {
   }
   if (overlay?.type === 'file-preview') {
     const fileName = previewFileName(overlay.path);
-    const desc = getDiffDescription();
+    // The change a diff belongs to is a sentence, not a title. The bar names the
+    // file; the tooltip is already the description on its own (see AppHeader,
+    // which prefers `getDiffDescription`), so nothing is lost by dropping it.
+    const desc = short ? null : getDiffDescription();
     if (desc) return `${fileName} — ${desc}`;
     return fileName;
   }
   if (overlay?.type === 'url-preview') return pageTitle || getHostname(url!);
   if (overlay?.type === 'notification-detail') {
-    return overlay.notification.title ? `Notification - ${overlay.notification.title}` : 'Notification';
+    if (short || !overlay.notification.title) return 'Notification';
+    return `Notification - ${overlay.notification.title}`;
   }
   if (!overlay && active === 'settings' && settingsSubview.value !== 'main') {
-    return settingsSubviewLabel(settingsSubview.value) || '';
+    return settingsLabel(settingsSubview.value) || '';
   }
   return menuLabels[active] || '';
+}
+
+/** The full title, for every surface with room for it: the tap-tooltip on the
+ *  header title, and anything else that wants the destination's real name. */
+export function getContentTitle(): string {
+  return contentTitle(false);
+}
+
+/** The title as the header bar renders it: the destination's kind, without the
+ *  detail that names the particular instance. See `contentTitle`. */
+export function getContentTitleShort(): string {
+  return contentTitle(true);
 }
 
 /** Title for an arbitrary captured `NavEntry` — the rows in the back/forward
@@ -117,7 +150,7 @@ export function navEntryTitle(entry: NavEntry): string {
 }
 
 /** Content-pane category for a captured `NavEntry` — drives the icon shown
- *  beside each row in the content back/forward history menu (PanelNav). Mirrors
+ *  beside each row in the content back/forward history menu (ContentNav). Mirrors
  *  `navEntryTitle`'s branching, mapping every destination to one of the
  *  Search Everywhere content categories (plus the content-pane-only ones:
  *  `notifications`, `web`). The bare menu items already share their names with

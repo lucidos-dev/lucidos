@@ -27,17 +27,13 @@ impl LucidosEngine {
         let run_id = uuid::Uuid::new_v4().to_string();
         let staging_dir = self.workspace_path().join(".lucidos/staging").join(&run_id);
 
-        let output = match self
-            .python_runtime
-            .execute_staged(code, env_vars, &staging_dir)
-            .await
-        {
-            Ok(output) => output,
-            Err(e) => {
-                std::fs::remove_dir_all(&staging_dir).ok();
-                return Err(e.to_string().into());
-            }
-        };
+        let output = execute_staged_and_clean_up_on_failure(
+            &self.python_runtime,
+            code,
+            env_vars,
+            &staging_dir,
+        )
+        .await?;
 
         let data_staging = staging_dir.join("data");
         let mut created = Vec::new();
@@ -303,6 +299,36 @@ impl LucidosEngine {
     }
 }
 
+/// Run `code` under the staging redirect. On ANY failure, remove the staging
+/// tree before returning the error, so a run that did not finish cleanly
+/// commits nothing. The error itself always propagates: what gets discarded is
+/// the half-written staged output, never the failure.
+///
+/// This is `run_python`'s atomic-commit invariant, and it has exactly one
+/// failure arm on purpose. A crash, a spawn error and the runtime's hard
+/// execution ceiling all arrive here as the same `Err`, so a script killed
+/// mid-write cannot leave half its output staged for the committer below to
+/// publish, and cannot leave an orphan directory under `.lucidos/staging`
+/// either. A free function rather than a method so the invariant can be
+/// tested against a bare `PythonRuntime`, with no engine, pool or git repo.
+async fn execute_staged_and_clean_up_on_failure(
+    python_runtime: &crate::runtime::PythonRuntime,
+    code: &str,
+    env_vars: Vec<(String, String)>,
+    staging_dir: &std::path::Path,
+) -> Result<String, String> {
+    match python_runtime
+        .execute_staged(code, env_vars, staging_dir)
+        .await
+    {
+        Ok(output) => Ok(output),
+        Err(e) => {
+            std::fs::remove_dir_all(staging_dir).ok();
+            Err(e)
+        }
+    }
+}
+
 /// Publish one staged file onto its real `data/` destination without letting
 /// the staging copy's permission bits become the destination's.
 ///
@@ -374,7 +400,10 @@ fn build_python_background_command(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_python_background_command, commit_staged_file, sh_quote};
+    use super::{
+        build_python_background_command, commit_staged_file,
+        execute_staged_and_clean_up_on_failure, sh_quote,
+    };
     use crate::core::shell::TaskOutcome;
     use crate::engine::tools::bash_background::BackgroundBashRegistry;
     use crate::runtime::python::PythonRuntime;
@@ -449,6 +478,116 @@ mod tests {
             );
         }
         assert_eq!(std::fs::read_to_string(&dst).unwrap(), "hello");
+    }
+
+    /// Build a workspace with one real artifact and a warmed venv whose
+    /// execution ceiling is `ceiling`. Returns the runtime and the workspace
+    /// path so a caller can assert on `data/` afterwards.
+    async fn staging_fixture(ws: &std::path::Path, ceiling: Duration) -> PythonRuntime {
+        std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+        std::fs::write(ws.join("data/artifacts/report.csv"), "original").unwrap();
+        let runtime = PythonRuntime::new(ws.to_path_buf()).unwrap();
+        // Venv creation is not covered by the ceiling, but a cold tempdir can
+        // spend seconds on it, so build it before shortening the budget.
+        runtime.execute("print('warmup')").await.expect("warmup");
+        runtime.with_execution_timeout(ceiling)
+    }
+
+    /// The staging invariant under the hard execution ceiling: a run killed at
+    /// the ceiling takes the same path as a crash, so it commits nothing and
+    /// leaves no orphan tree under `.lucidos/staging`.
+    ///
+    /// This is what kept the 2026-08-07 runaway from touching the workspace
+    /// while it spun for 20 minutes. Now that the engine ends such a run
+    /// itself, the property has to be pinned rather than inherited from the
+    /// fact that nothing ever returned.
+    #[tokio::test]
+    async fn a_timed_out_staged_run_commits_nothing_and_cleans_up() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let runtime = staging_fixture(ws, Duration::from_secs(1)).await;
+
+        let staging = ws.join(".lucidos/staging").join("timed-out-run");
+        let err = execute_staged_and_clean_up_on_failure(
+            &runtime,
+            "open('data/artifacts/report.csv', 'w').write('half written')\n\
+             import time\n\
+             time.sleep(60)",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect_err("the script sleeps past the ceiling");
+
+        assert!(err.contains("timed out"), "got: {err}");
+        assert!(
+            !staging.exists(),
+            "a timed-out run must remove its staging tree: {}",
+            staging.display()
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("data/artifacts/report.csv")).unwrap(),
+            "original",
+            "a timed-out run must not publish its half-written output"
+        );
+    }
+
+    /// The other half of the same contract: a clean run keeps its staging tree,
+    /// because the committer above still has to walk it. A cleanup that fired
+    /// unconditionally would silently drop every artifact run_python writes.
+    #[tokio::test]
+    async fn a_clean_staged_run_keeps_its_tree_for_the_committer() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let runtime = staging_fixture(ws, Duration::from_secs(30)).await;
+
+        let staging = ws.join(".lucidos/staging").join("clean-run");
+        let out = execute_staged_and_clean_up_on_failure(
+            &runtime,
+            "open('data/artifacts/report.csv', 'w').write('fresh'); print('done')",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect("a fast script must still succeed");
+
+        assert_eq!(out.trim(), "done");
+        assert_eq!(
+            std::fs::read_to_string(staging.join("data/artifacts/report.csv")).unwrap(),
+            "fresh",
+            "the staged write must survive for the committer to publish"
+        );
+    }
+
+    /// A crash cleans up the same way a timeout does. Pinned alongside its
+    /// sibling so the single failure arm the two share cannot be split into
+    /// one that cleans and one that does not.
+    #[tokio::test]
+    async fn a_crashed_staged_run_also_cleans_up() {
+        let dir = tempdir().unwrap();
+        let ws = dir.path();
+        let runtime = staging_fixture(ws, Duration::from_secs(30)).await;
+
+        let staging = ws.join(".lucidos/staging").join("crashed-run");
+        let err = execute_staged_and_clean_up_on_failure(
+            &runtime,
+            "open('data/artifacts/report.csv', 'w').write('half written')\n\
+             raise ValueError('kaboom')",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect_err("the script raises");
+
+        assert!(err.contains("ValueError"), "got: {err}");
+        assert!(
+            !staging.exists(),
+            "a crashed run must remove its staging tree"
+        );
+        assert_eq!(
+            std::fs::read_to_string(ws.join("data/artifacts/report.csv")).unwrap(),
+            "original"
+        );
     }
 
     #[test]

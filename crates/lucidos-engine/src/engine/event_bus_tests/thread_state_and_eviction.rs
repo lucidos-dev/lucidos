@@ -20,6 +20,8 @@ async fn trigger_started_creates_active_thread_not_composing() {
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
             go_to_review: false,
+            model: None,
+            reasoning_effort: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),
@@ -78,6 +80,8 @@ async fn trigger_started_does_not_resurrect_discarded_thread() {
             invocation: Some(crate::engine::thread_events::TriggerInvocation::Schedule),
             origin: None,
             go_to_review: false,
+            model: None,
+            reasoning_effort: None,
         },
         meta: EventMeta {
             channel: Some(EventChannel::Trigger),

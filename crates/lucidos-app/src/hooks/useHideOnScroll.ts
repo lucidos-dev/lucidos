@@ -1,7 +1,7 @@
 import { useEffect } from 'preact/hooks';
 import { mobileView, panelOverlay, preferences, type MobileView, type PanelOverlay } from '../store/store';
 import { opensSoftwareKeyboard, getRemPx } from '../utils/dom';
-import { getResizeMode, pinToBottomNow, scrolledUp, isHeaderPinnedForScroll } from '../components/chat/scrollState';
+import { isNavigationScroll, isHeaderPinnedForScroll } from '../components/chat/scrollState';
 import { isMobile } from '../utils/viewport';
 import { isRepaintNudging } from '../utils/iosRepaint';
 import { isUserScrolling } from '../utils/scrollActivity';
@@ -280,12 +280,14 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       const maxScroll = Math.max(0, currentContainer.scrollHeight - currentContainer.clientHeight);
       const scrollTop = Math.min(Math.max(0, rawScrollTop), maxScroll);
 
-      // Programmatic scroll (scrollToBottom) — reset header to visible so
-      // opening a thread shows the mobile header, not hides it. Same for an
-      // in-flight deep-link scroll (isHeaderPinnedForScroll): .chat-exchange's
-      // scroll-margin-top is sized for the visible-header case, so a half-hidden
-      // header mid-scroll would leave the landed event partly covered.
-      if (getResizeMode() === 'scroll' || isHeaderPinnedForScroll()) {
+      // One of OUR OWN navigations is writing scrollTop frame by frame (a
+      // chevron tap, turn-nav, a deep-link glide). Those scroll events are not
+      // the user reading, so reset the header to visible instead of hiding it on
+      // the way down. Same for the window right after a deep-link lands
+      // (isHeaderPinnedForScroll): .chat-exchange's scroll-margin-top is sized
+      // for the visible-header case, so a half-hidden header would leave the
+      // landed event partly covered.
+      if (isNavigationScroll() || isHeaderPinnedForScroll()) {
         prevScrollTop = scrollTop;
         headerOffset = 0;
         applyTransform();
@@ -406,7 +408,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       // device name on an iOS PWA rendered the input under the header).
       if (disabled) return;
       if (keyboardOpen) return; // Already hidden — skip duplicate scroll compensation
-      const wasAtBottom = !scrolledUp.value;
       keyboardOpen = true;
       updateHeaderVar();
       // Compensate scroll: spacer shrinks from cachedHeight to cachedSafeAreaTop,
@@ -416,9 +417,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         currentContainer.scrollTop = Math.max(0, currentContainer.scrollTop - delta);
       }
       applyTransform();
-      // Scroll compensation corrupts scrolledUp via the scroll event it fires.
-      // Restore bottom-pinned state through the keyboard open animation.
-      if (wasAtBottom) pinToBottomNow();
     }
     document.addEventListener('focusin', onFocusIn);
 
@@ -435,7 +433,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
       const next = e.relatedTarget as HTMLElement | null;
       if (next && opensSoftwareKeyboard(next) && !headerRef.current?.contains(next)
           && !next.closest('.mobile-thread-title-row')) return;
-      const wasAtBottom = !scrolledUp.value;
       keyboardOpen = false;
       updateHeaderVar();
       // Mirror onFocusIn: spacer grows back, so add the same delta to scrollTop.
@@ -443,9 +440,6 @@ export function useHideOnScroll(headerRef: { current: HTMLElement | null }) {
         currentContainer.scrollTop += cachedHeight - cachedSafeAreaTop;
       }
       syncToScroll(currentContainer);
-      // Same as onFocusIn: scroll compensation corrupts scrolledUp.
-      // Restore bottom-pinned state through the keyboard close animation.
-      if (wasAtBottom) pinToBottomNow();
     }
     document.addEventListener('focusout', onFocusOut);
 

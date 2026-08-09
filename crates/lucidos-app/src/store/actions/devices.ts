@@ -226,6 +226,34 @@ export async function toggleDevicePush(deviceId: string, enabled: boolean): Prom
   }
 }
 
+/** Turn push OFF for several devices in one go, with a single list reload at the
+ *  end: `toggleDevicePush` in a loop refetches the whole device list once per
+ *  device. Same optimistic flip so every slider moves together.
+ *
+ *  On failure it reconciles against the server rather than reverting its own
+ *  guesses, because a partial failure leaves some devices genuinely off and
+ *  restoring the pre-flip state for all of them would show the user something
+ *  untrue. */
+export async function disablePushForDevices(deviceIds: string[]): Promise<void> {
+  if (deviceIds.length === 0) return;
+  for (const id of deviceIds) patchDevicePush(id, false);
+  // `allSettled`, never `all`: `all` rejects on the FIRST failure while the
+  // other writes are still in flight, so the reload below would read the server
+  // mid-batch and reconcile a device back to "on" that goes off a moment later,
+  // with nothing to correct it until something else reloads the list.
+  const results = await Promise.allSettled(
+    deviceIds.flatMap((id) => [
+      apiSetDevicePush(id, false),
+      setPreference('push_notifications', 'declined', id),
+    ]),
+  );
+  const failure = results.find((r): r is PromiseRejectedResult => r.status === 'rejected');
+  if (failure) {
+    showToast('Failed to turn push off: ' + errorDetail(failure.reason), 'error');
+  }
+  await loadDevices();
+}
+
 /** Remove a device */
 export async function removeDevice(deviceId: string): Promise<void> {
   const ok = await showConfirm('Remove this device? Its push subscription and preferences will be deleted.', 'Remove');

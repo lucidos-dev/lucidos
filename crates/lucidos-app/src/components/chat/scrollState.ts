@@ -2,24 +2,56 @@ import { signal } from '@preact/signals';
 import { prefersReducedMotion } from '../../utils/platform';
 import { isMobile } from '../../utils/viewport';
 import { applyNavFocus, clearNavFocus, navFocusElement } from '../shared/focusMarker';
-import { watchUserAction } from '../../utils/userAction';
 
 /** Shared scroll-position signals for the chat area.
- *  ThreadView and CreateThreadView are mounted twice each (desktop SplitLayout
- *  + mobile MobileSwipeContainer), so writers MUST gate on isElementVisible(el)
- *  before mutating these signals — see makeScrollObservers below. The hidden
- *  duplicate's element has 0×0 dimensions and would otherwise overwrite the
- *  visible instance's correct values (e.g. clearing notAtTop because the hidden
- *  el reports isScrollable=false).
+ *  Writers MUST gate on isElementVisible(el) before mutating these signals, and
+ *  readers before measuring one: a transcript element laid out at 0x0 answers
+ *  every geometric question wrongly (isScrollable=false, so it clears notAtTop),
+ *  and the app's own chrome routinely produces one. A COLLAPSED pane is the
+ *  everyday case, the desktop split at ratio 0 or mobile's `.content-row`, which
+ *  collapses to height 0 rather than display:none so its position:fixed children
+ *  still render. See makeScrollObservers below.
  *
- *  Two thresholds, two purposes:
- *  - `scrolledUp` uses an 80px stickiness window: while inside it, content
- *    growth during streaming still auto-scrolls to bottom and keyboard/header
- *    flows treat the user as bottom-pinned. Crossing the window means the
- *    user has chosen to read history, so auto-scroll backs off.
- *  - `awayFromBottom` flips on the very first pixel of scroll-up so the
- *    scroll-to-bottom chevron appears immediately, independent of stickiness. */
-export const scrolledUp = signal(false);
+ *  This used to say the gate exists because ThreadView and CreateThreadView are
+ *  each mounted twice, once per layout. They are not, and have not been since
+ *  App.tsx started mounting only the visible layout's pane tree (SplitLayout or
+ *  MobileSwipeContainer, gated on viewportIsMobile), because dual-mounting fanned
+ *  every signal write out to both subtrees. `.thread-content` exists once. The
+ *  phrase "the hidden dual-mount copy" survives further down this file and in a
+ *  few neighbours as shorthand for the thing the check actually rejects, an
+ *  element with no box; read it that way rather than as a live second mount.
+ *
+ *  ── The transcript's scroll position belongs to the reader ──────────────────
+ *  Nothing in this module moves the transcript on its own. The app may move it
+ *  ONLY as the direct result of an explicit user action that asks for it, which
+ *  is an exhaustive list: the two chevrons (`scrollToTop` /
+ *  `scrollToBottomAnimated`), sending a message (`followSentMessage`),
+ *  submitting an answer to a question card (`followAnsweredQuestion`), ⌘↑/⌘↓
+ *  turn stepping (`stepThreadTurn`), a notification / Changes deep-link
+ *  (`scrollToEventAndPulse` / `scrollToChangeAndPulse`), and `useScrollMemory`
+ *  returning a reader to the position they left. Everything else leaves the
+ *  reader exactly where they are: a streaming reply, a question or permission
+ *  card ARRIVING, a thread sync, a thread opening.
+ *
+ *  Three of those asks are STANDING rather than one-shot: the down chevron, a
+ *  send and an answer all mean "take me to the live edge and KEEP me there until
+ *  I say otherwise", so they arm the follow described further down, and only the
+ *  reader's own scroll retires it. That is a rule about the DURATION of an ask,
+ *  not an exception to the rule above.
+ *
+ *  This module used to hold the opposite policy, and most of its size was the
+ *  machinery for deciding WHEN to pin: an 80px stickiness window (`scrolledUp`),
+ *  two ResizeObserver modes behind a 500ms suppression window, a 16ms
+ *  re-pinning loop with a frame budget, and a per-caller set of "was the user at
+ *  the bottom" reads. All of it is gone. What survives is the reader's own
+ *  navigation, plus ANCHOR PRESERVATION (holding them on the same content when
+ *  layout shifts around them), which is the opposite of a pin.
+ *
+ *  `awayFromBottom` carries the whole weight of the live edge now: with no pin,
+ *  a reader who has not asked to follow is routinely away from the bottom while
+ *  a reply streams, and the down chevron is their only way back. It flips on the
+ *  first pixel off the bottom and is reconciled on every scroll AND every
+ *  resize. */
 export const awayFromBottom = signal(false);
 export const notAtTop = signal(false);
 /** True while a notification deep-link is resolving a scroll to a specific event
@@ -38,7 +70,7 @@ export const scrolledFromTop = signal(false);
 
 /** The currently-active scroll container element.
  *
- *  Set by useAutoScroll when it attaches listeners to a new element.
+ *  Set by useScrollObservers when it attaches listeners to a new element.
  *  Used by scrollToBottom() instead of document.querySelector('.thread-content')
  *  which is fragile — on mobile both desktop (hidden) and mobile scroll containers
  *  exist in the DOM, and querySelector finds the hidden one first.
@@ -92,58 +124,6 @@ export function getActiveScrollElement(): HTMLElement | null {
   return _activeScrollElement;
 }
 
-/** Suppression mode for ResizeObserver during scroll-to-bottom.
- *
- *  'scroll' — actively scroll to bottom on each resize (content still rendering)
- *  'ignore' — do nothing (suppression expired, normal mode)
- *
- *  Race condition without this: scrollToBottom() scrolls to current bottom,
- *  then new content renders (pending user message), scrollHeight grows,
- *  ResizeObserver fires and sees isAtBottom()===false → sets scrolledUp=true
- *  → auto-scroll effect skips → user never sees the bottom.
- *
- *  Uses time-based window (SUPPRESSION_MS) instead of rAF counting because
- *  mobile devices render content over many more frames than desktop. */
-let _resizeMode: 'scroll' | 'ignore' = 'ignore';
-let _suppressTimer: ReturnType<typeof setTimeout> | null = null;
-const SUPPRESSION_MS = 500;
-const PIN_FRAME_MS = 16;
-
-/** Frames the bottom-pinning loop may still run. Refilled by every
- *  `extendSuppression`, decremented per frame, and a hard stop at 0 even while
- *  `_resizeMode` is still 'scroll'.
- *
- *  It is a BACKSTOP, not the normal exit: the loop's ~16ms frames can only land
- *  slower than the wall clock (never faster), so a live suppression window
- *  always flips `_resizeMode` to 'ignore' first, exactly as before. The budget
- *  only matters when the suppression timer never fires at all, which makes an
- *  unbounded self-rescheduling loop unrepresentable rather than merely unlikely.
- *  That happens whenever the two timers end up on different clocks: a page
- *  suspend/resume dropping one, or a test that swaps in fake timers between the
- *  loop's frames (a flake in the frontend suite, where an already-running real
- *  loop rescheduled itself onto the fake clock and then spun forever inside
- *  `runAllTimersAsync`, since its real suppression timer could not fire there). */
-let _pinFramesLeft = 0;
-
-/** Get current resize mode — 'scroll' means ResizeObserver should scroll
- *  to bottom instead of setting scrolledUp. */
-export function getResizeMode() {
-  return _resizeMode;
-}
-
-/** Extend the suppression window — called from ResizeObserver when in 'scroll'
- *  mode to keep the window alive while content is still rendering. Refills the
- *  pin loop's frame budget with the same window, so extending the suppression
- *  extends both halves together. */
-export function extendSuppression() {
-  _pinFramesLeft = Math.ceil(SUPPRESSION_MS / PIN_FRAME_MS);
-  if (_suppressTimer) clearTimeout(_suppressTimer);
-  _suppressTimer = setTimeout(() => {
-    _resizeMode = 'ignore';
-    _suppressTimer = null;
-  }, SUPPRESSION_MS);
-}
-
 /** Resolve the visible scroll container — re-checks on each call so
  *  layout switches (desktop ↔ mobile) mid-animation don't scroll a stale element. */
 function resolveTarget(): HTMLElement | null {
@@ -151,12 +131,6 @@ function resolveTarget(): HTMLElement | null {
   if (el && !isElementVisible(el)) el = null;
   return el ?? findVisibleThreadContent();
 }
-
-/** Active scroll loop timer — cleared when a new scrollToBottom() call
- *  starts so only the latest invocation drives the loop. Uses setTimeout
- *  (~16ms) because iOS Safari can silently no-op scrollTo(options) during
- *  viewport transitions — direct scrollTop assignment is more reliable. */
-let _scrollTimer: ReturnType<typeof setTimeout> | null = null;
 
 /** The ONE programmatic-scroll animation, driven by requestAnimationFrame (NOT
  *  setTimeout): rAF is vsync-aligned so the motion stays smooth and "alive",
@@ -202,12 +176,489 @@ const SCROLL_FRAME_MS = 1000 / 60; // nominal-frame head start so the first pain
 // easeOutCubic: strong initial velocity, smooth controlled deceleration to a clean stop.
 const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
 
-/** Active chevron-scroll rAF id (animateScroll + the reduced-motion re-assert).
- *  Mutually exclusive with _scrollTimer (scrollToBottom's pin loop) — each
- *  direction cancels the other so a down-tap right after an up-tap wins cleanly. */
+/** Active navigation rAF id (animateScroll + the reduced-motion re-assert). One
+ *  at a time: every entry point cancels the one in flight, so a down-tap right
+ *  after an up-tap wins cleanly. */
 let _scrollAnimRaf: number | null = null;
+/** Whether the tween in flight is the standing follow's own (the send's landing
+ *  glide) rather than a one-off navigation. Set from the marker `animateScroll`
+ *  was handed, so it cannot disagree with who is writing the frames. Read by
+ *  `stopFollowingBottom`, which must stop the follow's motion and no one
+ *  else's. */
+let _followOwnsAnim = false;
 function cancelScrollAnim() {
   if (_scrollAnimRaf !== null) { cancelAnimationFrame(_scrollAnimRaf); _scrollAnimRaf = null; }
+  _followOwnsAnim = false;
+}
+
+/** When one of our own navigations last wrote `scrollTop`, and to WHICH element.
+ *  Every such write goes through `markNavigationScroll`, so these cannot fall out
+ *  of sync with the writes they describe (the same construction, and the same
+ *  reason, as `lastNudgeAt` in utils/iosRepaint.ts).
+ *
+ *  The element is half the answer, not bookkeeping: `useScrollMemory` positions
+ *  three different containers (the transcript, the content pane's body, the
+ *  thread drawer's list) and marks all of them here, while two of the three
+ *  consumers ask only about the transcript. Without the element a content-pane
+ *  restore would claim the transcript's next 64ms of scroll events. */
+let _navScrollAt = -Infinity;
+let _navScrollEl: HTMLElement | null = null;
+
+/** How long after a navigation's last write its scroll event may still arrive.
+ *  A `scrollTop` write does not dispatch its event synchronously: the browser
+ *  fires it at the next rendering opportunity. Four 60Hz frames, matching
+ *  `NUDGE_EVENT_WINDOW_MS` for the identical problem. */
+const NAV_SCROLL_EVENT_WINDOW_MS = 64;
+
+function nowMs(): number {
+  return typeof performance !== 'undefined' && typeof performance.now === 'function'
+    ? performance.now()
+    : Date.now();
+}
+
+/** Write `top` to `el` and record it as OURS, so the scroll event it fires a
+ *  frame later is not mistaken for the reader's (see `isNavigationScroll`).
+ *
+ *  Every navigation write in this module goes through it, and so does
+ *  `useScrollMemory`'s positioning of the transcript on open: a saved-position
+ *  restore and the open-at-the-top reset are the app placing the reader just as
+ *  much as a chevron tap is, and both fire a scroll event that the mobile
+ *  header would otherwise read as the reader scrolling down (hiding it on a
+ *  restore) and the window-expansion would read as the reader asking for older
+ *  turns. */
+export function markNavigationScroll(el: HTMLElement, top: number) {
+  _navScrollAt = nowMs();
+  _navScrollEl = el;
+  el.scrollTop = top;
+}
+
+/** Did one of OUR OWN navigations produce the scroll event being handled?
+ *
+ *  Those events look exactly like the reader's, and two consumers must tell them
+ *  apart: the mobile hide-on-scroll header, which would otherwise slide away
+ *  under a chevron tap or half-cover the event a deep-link just landed on, and
+ *  the mobile scroll indicator, which must not read our own write as the reader
+ *  summoning it.
+ *
+ *  Two terms, and the window is the load-bearing one. A live tween is the easy
+ *  half. The hard half is that a write's scroll event lands a frame or more
+ *  LATER: the instant navigations (`scrollToBottom`, and every reduced-motion
+ *  path) run no tween at all, and even a tween clears its rAF handle on the
+ *  frame it lands, so an "is a tween running" test alone answers false for
+ *  exactly the events it exists to catch, and the header hides on a chevron tap.
+ *
+ *  This replaces the old `getResizeMode() === 'scroll'` read, which covered the
+ *  same events only by accident: the bottom-pin's 500ms suppression window
+ *  happened to be open across them. The question is now asked directly, and
+ *  scoped to the frames it can actually be true for rather than to half a
+ *  second. */
+export function isNavigationScroll(el?: HTMLElement | null): boolean {
+  if (_scrollAnimRaf !== null) return true;
+  if (nowMs() - _navScrollAt >= NAV_SCROLL_EVENT_WINDOW_MS) return false;
+  // A caller that names its element is asking about ITS scroll events, so a
+  // write to some other container is not an answer. A caller that names none
+  // (the mobile header, which follows whichever pane is active) takes any.
+  return !el || _navScrollEl === el;
+}
+
+/* ── The standing request to ride the live edge ──────────────────────────────
+ *  Three reader actions mean "take me to the bottom and KEEP me there" rather
+ *  than "jump once": pressing the down chevron, sending a message, and
+ *  submitting an answer to a question card. All three arm the flag below, and
+ *  while it is armed, content growth writes the reader back to the live edge
+ *  (the growth branch in `makeScrollObservers`' onResize, which is where the old
+ *  force-pin used to live).
+ *
+ *  The answer is here because it IS a send: the reader produced the content at
+ *  the bottom and is owed the reply to it, and which of the three shapes they
+ *  used to produce it (typing, which the engine reroutes as a `FreeText` answer
+ *  and which therefore already came through `followSentMessage`; tapping an
+ *  option; the multi-select Submit) is not something they should be able to feel
+ *  in the scroll. What is NOT a request is the question card ARRIVING, which is
+ *  the agent's doing and moves nobody.
+ *
+ *  Nothing else arms it. Not an SSE sync confirming a pending message, not a
+ *  change applied / discarded / reverted, not granting a permission, not a
+ *  coding-agent action, not a lazy load, not a deep link, not a thread opening.
+ *  Being AT the bottom does not arm it either: a position is not a request, and a
+ *  reader who merely happens to sit at the live edge has asked for nothing.
+ *
+ *  The request BELONGS TO A THREAD and outlives leaving it. The flag here is one
+ *  global, so `focusThread` retires it on every open (a thread the reader just
+ *  opened is not one they asked to follow), and that used to be the end of the
+ *  request: coming back landed on the pixel offset the transcript had when they
+ *  walked away, with everything the agent produced meanwhile below them and
+ *  nothing following. So the request is WRITTEN DOWN per thread, as one of the
+ *  two forms a reading position takes (`hooks/useScrollMemory.ts`), and
+ *  `resumeFollowingBottom` re-arms it on re-entry. That is the same request
+ *  resumed, not a fourth arming point: it can only fire for a thread the reader
+ *  armed, and a reader who merely parked at the bottom saves the offset instead
+ *  and comes back to it following nothing. `isFollowScroll` and `onFollowArmed`
+ *  are the two things the recording side needs; both are below.
+ *
+ *  The condition for following is this flag and NOTHING ELSE. There is no
+ *  proximity term (the retired 80px stickiness window) and no timing term (the
+ *  retired 500ms suppression window); both of those tried to INFER the request
+ *  that the flag now records.
+ *
+ *  `_followEl` / `_followTop` are how the follow's own write is told apart from
+ *  the reader's gesture, which is the only thing that retires the request. A
+ *  follow write is marked as a navigation scroll like every other write the app
+ *  makes, but `isNavigationScroll`'s 64ms window cannot answer THIS question: a
+ *  streaming thread re-marks itself every frame, so a flick landing inside the
+ *  window would read as ours and the reader would fight the follow. The POSITION
+ *  answers it exactly instead. Content growing below the reader changes
+ *  `scrollHeight` and never `scrollTop`, so growth can never look like a
+ *  gesture; every gesture (wheel, scrollbar drag, touch flick, momentum, keys, a
+ *  mobile pane swipe) changes `scrollTop`, so one always does.
+ *
+ *  It is also what retires the follow for a navigation that deliberately puts
+ *  the reader somewhere else (the up chevron, turn stepping, a deep link, a
+ *  saved-scroll restore), with no call site of its own: none of those is a
+ *  follow write, so the first frame of one already reads as leaving. And it is
+ *  what keeps the follow ALIVE across everything that is not a scroll: a card
+ *  resolving, granting a permission, expanding a turn. Those change content
+ *  without moving the reader off the live edge, so `atEdge` alone already
+ *  answers them. */
+let _followingBottom = false;
+let _followEl: HTMLElement | null = null;
+let _followTop = -1;
+
+/** Subscribers notified when the follow is ARMED, and never when it is retired.
+ *  One consumer today: `attachScrollMemory`, which records the request as this
+ *  thread's reading position.
+ *
+ *  The asymmetry is the design, not an omission. A retirement has two causes that
+ *  must be recorded differently, and this side cannot tell them apart: the reader
+ *  scrolling away arrives WITH the scroll event that already records the offset
+ *  they landed on, while `focusThread` retiring on a thread switch must record
+ *  nothing at all, or the thread being LEFT would have its live edge overwritten
+ *  by whatever offset the shared container happens to hold. Broadcasting only the
+ *  arm leaves the second case with no save path to reach.
+ *
+ *  A plain callback set rather than a signal, for the same reason `armFollowBottom`
+ *  is private: an exported writable `followingBottom` signal would be a fourth
+ *  arming point that no source scan could stop, and it would broadcast the
+ *  retirement this deliberately does not. */
+const _followArmedListeners = new Set<() => void>();
+
+/** Subscribe to the arm. Returns the unsubscribe; fires on the unarmed to armed
+ *  transition only, so re-arming an already-armed follow notifies nobody (there
+ *  is nothing new to record). */
+export function onFollowArmed(listener: () => void): () => void {
+  _followArmedListeners.add(listener);
+  return () => { _followArmedListeners.delete(listener); };
+}
+
+/** A send whose own message has not rendered yet, holding the reader's last
+ *  message as it was AT SEND TIME and when the send happened. The optimistic row
+ *  arrives a frame or more after the send while the composer collapsing has
+ *  already fired a resize, so the landing cannot just run on the next growth: it
+ *  waits until a DIFFERENT last user message is present, and moves nobody until
+ *  then. Null when no send is waiting. */
+let _sendLanding: { before: HTMLElement | null; at: number } | null = null;
+
+/** How long that landing waits for the reader's own message before giving up and
+ *  riding the live edge instead.
+ *
+ *  Generous, because it is only ever reached when the message is not
+ *  individually addressable rather than merely late: the second and subsequent
+ *  queued follow-ups fold into a CLOSED `<details class="queued-message-group">`
+ *  (see `CreateThreadView`), whose contents have no box at all, so the message
+ *  the reader just sent has no rect to land on. Giving up on the landing must
+ *  NOT give up on the follow, which is the part the reader actually asked for,
+ *  and the live edge is where their message is either way. Without the deadline
+ *  a pending landing would sit forever and hold the whole follow inert. */
+const SEND_LANDING_DEADLINE_MS = 1000;
+
+/** The ONE at-the-live-edge threshold. 2px of slack absorbs subpixel rounding
+ *  (mobile zoom, device-pixel snapping) and the iOS overscroll bounce without
+ *  making the chevron look stuck. Shared by the chevron's reconcile, the send's
+ *  "are they already there" test and both observers, so they cannot drift.
+ *
+ *  There used to be a second, 80px threshold beside it, the stickiness window
+ *  inside which growth counted as the reader riding the live edge and re-pinned
+ *  them. Riding the live edge is an explicit request now, so one threshold
+ *  answers the one remaining geometric question. */
+function isAtLiveEdge(el: HTMLElement): boolean {
+  return el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
+}
+
+/** Write `top` and record it as the FOLLOW's own, so the scroll event it fires a
+ *  frame later cannot be read as the reader leaving. Goes through
+ *  `markNavigationScroll` like every other write the app makes, so the mobile
+ *  header and the render-window expansion keep standing down for it too. */
+function markFollowScroll(el: HTMLElement, top: number) {
+  markNavigationScroll(el, top);
+  _followEl = el;
+  _followTop = el.scrollTop;
+}
+
+/** Arm the standing follow at the position the caller's own scroll just reached,
+ *  so the trailing scroll event of that scroll cannot retire the request it just
+ *  made. The chevron's two entry points call this; `followSentMessage` builds on
+ *  it. */
+function armFollowBottom() {
+  const el = resolveTarget();
+  armFollowOn(el);
+}
+
+/** The half of `armFollowBottom` that takes its element rather than resolving
+ *  one, for the restore, which holds the container it is positioning and must not
+ *  ask `resolveTarget` for a different one (a thread opening mid-layout-swap can
+ *  answer with the outgoing mount).
+ *
+ *  Notifies only on the unarmed to armed transition, so the recording side is
+ *  told about a request the moment it is made even when arming produces no scroll
+ *  event at all. That case is ordinary rather than exotic: a reader already at the
+ *  live edge who presses the chevron gets a write the browser clamps to where they
+ *  already are, and an idle thread then grows nothing, so no scroll ever carries
+ *  the request anywhere. */
+function armFollowOn(el: HTMLElement | null) {
+  const wasArmed = _followingBottom;
+  _followingBottom = true;
+  _followEl = el;
+  _followTop = el ? el.scrollTop : -1;
+  _sendLanding = null;
+  if (!wasArmed) for (const listener of _followArmedListeners) listener();
+}
+
+/** Resume a standing follow the reader armed in this thread BEFORE they left it:
+ *  write the live edge and arm, so the growth branch carries them from there.
+ *
+ *  Called only by `attachScrollMemory`, on a thread whose recorded reading
+ *  position is the live edge. The write is required and not merely tidy:
+ *  `.thread-content` is one element reused across threads, so on arrival it holds
+ *  the OUTGOING thread's offset, and arming alone would leave the reader there
+ *  until the next growth round. It goes through `markFollowScroll` like every
+ *  other follow write, so the mobile header stands down for it and the render
+ *  window does not read it as the reader asking for older turns.
+ *
+ *  Nothing waits for content here, unlike the offset restore's observer retries.
+ *  An offset can only be honoured once the transcript is tall enough to hold it,
+ *  whereas the live edge is wherever the content currently ends: the write lands
+ *  on today's bottom and the armed follow rides every later arrival to the real
+ *  one. */
+export function resumeFollowingBottom(el: HTMLElement): void {
+  markFollowScroll(el, Math.max(0, el.scrollHeight - el.clientHeight));
+  armFollowOn(el);
+}
+
+/** Is the scroll event being handled the FOLLOW's own write rather than the
+ *  reader's gesture? Armed, and the container still exactly where the follow put
+ *  it (see `isWhereTheFollowLeftIt` for the 1px slack and why position is the
+ *  right question).
+ *
+ *  Exported for the recording side, which must write the live edge for the
+ *  follow's own writes and a plain offset for everything else. It asks the
+ *  POSITION rather than the flag alone on purpose: `.thread-content` carries two
+ *  scroll listeners, the disarm lives in `makeScrollObservers` and the save lives
+ *  in `attachScrollMemory`, and a save that merely asked whether the flag was
+ *  armed would answer differently depending on which of the two ran first. A
+ *  reader's gesture moves `scrollTop` away from the stamp by definition, so this
+ *  answers the same in either order. */
+export function isFollowScroll(el: HTMLElement): boolean {
+  return _followingBottom && isWhereTheFollowLeftIt(el);
+}
+
+/** Retire the standing follow. Called by the disarm in `onScroll` (the reader
+ *  taking the container away from where the follow put it), and exported for the
+ *  one navigation that cannot be read off a scroll: opening a DIFFERENT thread.
+ *  A thread the reader just opened is not one they asked to follow, and a
+ *  restore that happens to land on that thread's saved bottom position writes no
+ *  scroll the disarm could see. See `focusThread`. */
+export function stopFollowingBottom() {
+  // The send's landing glide is the follow's OWN motion, so retiring the follow
+  // retires it. Without this the reader who just scrolled away is dragged back
+  // for the rest of the tween (the disarm would say one thing and the next frame
+  // do another), and a thread opened mid-glide is scrolled with the previous
+  // thread's message as the target. Only the follow's tween: a deep-link or
+  // up-chevron glide belongs to a navigation this has no business cancelling.
+  if (_followOwnsAnim) cancelScrollAnim();
+  _followingBottom = false;
+  _followEl = null;
+  _sendLanding = null;
+}
+
+/** Is the container still exactly where the follow's last write left it? The
+ *  exact reading of "the reader has not moved since", per the block above. 1px
+ *  of slack absorbs a browser re-rounding a fractional position (zoom, device
+ *  pixel ratio) and the iOS repaint nudge's deliberate ±1. */
+function isWhereTheFollowLeftIt(el: HTMLElement): boolean {
+  return _followEl === el && Math.abs(el.scrollTop - _followTop) <= 1;
+}
+
+/** The reader's own newest message: the LAST `.initiator-panel-user`, which is
+ *  the panel a `MessageReceived` turn renders (see `chat-exchange-parts`). The
+ *  optimistic row a send inserts carries it too, so this resolves the just-sent
+ *  message the moment it renders.
+ *
+ *  Strictly the last one, never the last one that happens to be visible: a
+ *  backwards scan for the newest VISIBLE panel would answer with an older
+ *  message whenever the newest has no box, and the send's landing would glide to
+ *  the wrong turn. The case is real, not hypothetical: a second queued follow-up
+ *  folds itself and the first into a closed `<details>` group. So an invisible
+ *  newest panel is reported as "not there yet" and the landing waits it out (see
+ *  `SEND_LANDING_DEADLINE_MS`). The visibility test also rejects the hidden
+ *  dual-mount copy, and is one call rather than a scan. */
+function lastUserMessage(el: HTMLElement): HTMLElement | null {
+  if (typeof el.querySelectorAll !== 'function') return null;
+  const panels = el.querySelectorAll<HTMLElement>('.initiator-panel-user');
+  const last = panels[panels.length - 1];
+  return last && isElementVisible(last) ? last : null;
+}
+
+/** The turn holding the question card `toolUseId`: the `.initiator-panel` around
+ *  it, which is the answer's counterpart to `lastUserMessage`'s panel.
+ *
+ *  The PANEL and not the `.question-body` inside it, for two reasons that agree.
+ *  It is the whole of what the reader produced (the question, their picks, the
+ *  chrome around both) and is what the reply then grows underneath, exactly as it
+ *  does under a sent message. And it is the part that SURVIVES being answered:
+ *  `QuestionBody` swaps its live body for `AnsweredBody`, a different component,
+ *  so Preact unmounts the body node a frame in, while the panel around it is the
+ *  same vnode in the same position and is reused. Anchoring the landing on the
+ *  panel is therefore a resolve-once, exactly like the send's, rather than a
+ *  per-frame re-query. Never the enclosing `.chat-exchange`, which also contains
+ *  the growing reply.
+ *
+ *  Matched on the attribute rather than through a `[data-tool-use-id="…"]`
+ *  selector so no id has to be escaped into CSS syntax. Both the live body and
+ *  the answered one carry the id, so which of the two is in the DOM when this
+ *  runs does not decide whether the card is found. */
+function questionCardTurn(el: HTMLElement, toolUseId: string): HTMLElement | null {
+  if (typeof el.querySelectorAll !== 'function') return null;
+  for (const body of el.querySelectorAll<HTMLElement>('.question-body')) {
+    if (body.getAttribute?.('data-tool-use-id') !== toolUseId) continue;
+    if (!isElementVisible(body)) continue;
+    return (body.closest?.('.initiator-panel') as HTMLElement | null) ?? body;
+  }
+  return null;
+}
+
+/** The reader sent a message: the clearest "show me the live edge" there is,
+ *  since they just produced the content at the bottom and obviously want to see
+ *  it and its answer. Arms the same standing follow the chevron arms, so the
+ *  reply streaming in keeps the live edge in view until they scroll away.
+ *
+ *  It is NOT a blind jump to the bottom, and splits on where they already are:
+ *
+ *   - **At the live edge**: write no scroll at all. They are already there, the
+ *     growth branch keeps them there, and a redundant write on a reader who
+ *     never moved is exactly the unrequested movement this module exists to
+ *     remove (on iOS it would also cancel an in-flight momentum scroll).
+ *   - **Scrolled up**: glide to their own just-sent message, landing its BOTTOM
+ *     edge on the bottom of the viewport, so they see what they wrote with the
+ *     answer growing in underneath it. Anchored on the message ELEMENT, never
+ *     computed from `scrollHeight`: the transcript grows between the send and
+ *     the landing (the working indicator mounting is the usual case) and a
+ *     `scrollHeight` target then lands PAST the message and hides the very thing
+ *     they just wrote.
+ *
+ *  Called by the two send sites, `store/actions/chat.ts`'s `addPendingMessage`
+ *  and `PromptInput`'s `submit`. Both fire for one send from the composer; the
+ *  second keeps the first's baseline, so a render landing between them cannot
+ *  leave the landing waiting for a message that is already there. */
+export function followSentMessage(): void {
+  const el = resolveTarget();
+  const pending = _sendLanding;
+  armFollowBottom();
+  if (!el || isAtLiveEdge(el)) return;
+  _sendLanding = pending ?? { before: lastUserMessage(el), at: nowMs() };
+}
+
+/** The reader submitted an answer to the question card `toolUseId`: the same ask
+ *  as a send, so it takes the same two halves. It arms the same standing follow,
+ *  so the reply resuming underneath keeps the live edge in view until they scroll
+ *  away, and it splits on where they already are exactly as `followSentMessage`
+ *  does: at the live edge it writes no scroll at all (they can see it, and a
+ *  redundant write cancels an iOS momentum scroll), and scrolled up it glides so
+ *  their answered card rests on the bottom of the viewport.
+ *
+ *  Called by the two card-submitted answers: `QuestionCard`'s single-select
+ *  option tap and `PromptInput`'s multi-select Submit. The THIRD way to answer,
+ *  typing into the composer, is a send that the engine reroutes as a `FreeText`
+ *  answer, so it arrives through `followSentMessage` and needs nothing here.
+ *
+ *  Unlike a send, this one needs no deferral: a send waits for its optimistic row
+ *  to render, whereas the card being answered is already on screen (it is what
+ *  the reader just tapped), so the glide starts now. When the card cannot be
+ *  resolved at all, the follow is still armed and the reader still rides the live
+ *  edge, which is the half they actually asked for. */
+export function followAnsweredQuestion(toolUseId: string): void {
+  const el = resolveTarget();
+  armFollowBottom();
+  if (!el || isAtLiveEdge(el)) return;
+  const panel = questionCardTurn(el, toolUseId);
+  if (panel) landOnOwnTurn(el, panel);
+}
+
+/** Glide so `panel`'s BOTTOM edge rests on the container's bottom edge, marking
+ *  every frame as the follow's own. `panel` is the turn the reader just produced:
+ *  their optimistic message row for a send, the answered card's initiator panel
+ *  for an answer. The target is re-read per frame by `animateScroll`, so the
+ *  working indicator mounting under it during the glide is tracked rather than
+ *  overshot. Reduced motion writes it once, as everywhere else in this module. A
+ *  target at or behind the current position writes nothing: the turn is already
+ *  fully in view, and the follow has no business scrolling the reader backwards
+ *  to prove it.
+ *
+ *  A panel that LEAVES the layout mid-glide (the reader opens another thread, a
+ *  second queued follow-up reparents this one into its disclosure group) holds
+ *  the tween on the last target it measured while the panel was still there, so
+ *  the glide finishes where it was heading. Nothing else cancels a tween on a
+ *  thread switch, and a detached node reports an all-zero rect, so without the
+ *  guard the subtraction of the container's bottom edge would make the target a
+ *  whole viewport NEGATIVE and haul the newly-opened thread to its top. The
+ *  floor is the same belt for a rect that is merely surprising. */
+function landOnOwnTurn(el: HTMLElement, panel: HTMLElement): void {
+  let lastTarget = -1;
+  const targetOf = (c: HTMLElement) => {
+    if (panel.isConnected === false
+      || typeof c.getBoundingClientRect !== 'function'
+      || typeof panel.getBoundingClientRect !== 'function') {
+      return lastTarget >= 0 ? lastTarget : c.scrollTop;
+    }
+    lastTarget = Math.max(0, c.scrollTop + (panel.getBoundingClientRect().bottom - c.getBoundingClientRect().bottom));
+    return lastTarget;
+  };
+  if (targetOf(el) <= el.scrollTop) return;
+  if (prefersReducedMotion()) {
+    cancelScrollAnim();
+    markFollowScroll(el, targetOf(el));
+    return;
+  }
+  animateScroll(targetOf, undefined, markFollowScroll);
+}
+
+/** Honour the standing follow on one growth round. Either the reader is waiting
+ *  for their own just-sent message (glide to it, once) or they are riding the
+ *  live edge (write it).
+ *
+ *  Stands down while a navigation tween owns the scroll, including the landing
+ *  glide itself: a tween re-reads its own target every frame, so a live-edge
+ *  write beside it would drag the glide past the message it is landing on. */
+function followTheLiveEdge(el: HTMLElement): void {
+  if (_scrollAnimRaf !== null) return;
+  if (_sendLanding) {
+    const panel = lastUserMessage(el);
+    if (panel && panel !== _sendLanding.before) {
+      _sendLanding = null;
+      landOnOwnTurn(el, panel);
+      return;
+    }
+    // Still the message that was there when they sent, so their own has not
+    // rendered yet: there is nothing to land on, and nowhere to jump meanwhile.
+    // Past the deadline it is not late, it is unaddressable, and the follow the
+    // reader asked for outranks the landing (see SEND_LANDING_DEADLINE_MS): drop
+    // the landing and ride the live edge below.
+    if (nowMs() - _sendLanding.at < SEND_LANDING_DEADLINE_MS) return;
+    _sendLanding = null;
+  }
+  // The MAX offset rather than `scrollHeight`, which the browser would clamp to
+  // the same place: naming the real target keeps the write meaningful instead of
+  // leaning on the clamp, the same reason `scrollToBottomAnimated` targets it.
+  markFollowScroll(el, Math.max(0, el.scrollHeight - el.clientHeight));
 }
 
 /** rAF easeOutCubic scroll of the active container toward a target, shared by
@@ -227,13 +678,22 @@ function cancelScrollAnim() {
  *  - `duration` scales with the initial distance (clamped to [MIN, MAX]_MS), so a
  *    short hop and a long haul share the same deceleration SHAPE, just at different
  *    speeds. The tween ends precisely at the target on the t≥1 frame — no SNAP_PX
- *    cutoff and no end-jump — then `onDone` runs (the down-chevron hands off to
- *    scrollToBottom() for live tailing).
+ *    cutoff and no end-jump. Then `onDone` runs: the down-chevron uses it to
+ *    reconcile the chevron against where the tween actually landed.
  *  - scrollTop is written FRACTIONAL (no Math.round): on a 2x/3x display the
  *    sub-pixel position is what makes the slow final approach read as smooth
- *    instead of stepping integer CSS pixels. */
-function animateScroll(targetOf: (el: HTMLElement) => number, onDone?: () => void) {
+ *    instead of stepping integer CSS pixels.
+ *  - `mark` is how each frame's write is recorded. It defaults to
+ *    `markNavigationScroll`, which is right for a one-off navigation; the send's
+ *    landing passes `markFollowScroll` so its own frames are not read as the
+ *    reader leaving the follow it just armed. */
+function animateScroll(
+  targetOf: (el: HTMLElement) => number,
+  onDone?: () => void,
+  mark: (el: HTMLElement, top: number) => void = markNavigationScroll,
+) {
   cancelScrollAnim();
+  _followOwnsAnim = mark === markFollowScroll;
   let started = false;
   let start = 0;
   let startTime = 0;
@@ -255,12 +715,12 @@ function animateScroll(targetOf: (el: HTMLElement) => number, onDone?: () => voi
     const target = targetOf(cur);
     const t = Math.min(1, (now - startTime) / duration);
     if (t >= 1) {
-      cur.scrollTop = target;
+      mark(cur, target);
       _scrollAnimRaf = null;
       onDone?.();
       return;
     }
-    cur.scrollTop = start + (target - start) * easeOutCubic(t);
+    mark(cur, start + (target - start) * easeOutCubic(t));
     _scrollAnimRaf = requestAnimationFrame(step);
   };
   _scrollAnimRaf = requestAnimationFrame(step);
@@ -294,37 +754,28 @@ function smoothScrollToElement(el: HTMLElement): void {
   if (prefersReducedMotion()) {
     cancelScrollAnim();
     const c = resolveTarget();
-    if (c) c.scrollTop = Math.max(0, targetOf(c));
+    if (c) markNavigationScroll(c, Math.max(0, targetOf(c)));
     return;
   }
   animateScroll(targetOf);
 }
 
 /** Smoothly scroll the active chat container to the VERY top — the up-chevron's
- *  action. Loads three concerns:
+ *  action. Two concerns:
  *
- *  1. **The render-all grow must not pin to the bottom.** The chevron renders the
- *     full (windowed) thread before scrolling, firing the .thread-content
- *     ResizeObserver on a huge content grow. If a recent scrollToBottom() (thread
- *     open, a sent message) left _resizeMode==='scroll', onResize's scroll-mode
- *     branch runs `scrollTop = scrollHeight` and slams us to the BOTTOM — the
- *     intermittent "scroll-to-top lands mid/bottom" flake. Forcing _resizeMode to
- *     'ignore' (and killing the bottom loop + suppression timer) neutralizes it.
- *  2. **Real motion, reliable on iOS.** animateScroll writes scrollTop directly
+ *  1. **Real motion, reliable on iOS.** animateScroll writes scrollTop directly
  *     per rAF frame instead of native smooth scroll, which iOS drops. Reduced-motion
  *     users get an instant jump (with one re-assert to defeat an iOS no-op / late
  *     RO settle) — no animation.
- *  3. **Auto-scroll fought back.** At the top we are definitively scrolled up, so
- *     set scrolledUp/awayFromBottom accordingly (also keeps the down-chevron on).
+ *  2. **The chevron.** At the top we are definitively away from the bottom, so
+ *     set the signal here rather than waiting for the first scroll event, which
+ *     keeps the down-chevron on from the first frame of the glide.
  *
- *  A manual top jump also supersedes any in-flight notification deep-link claim —
- *  its suppression would otherwise keep deferring our writes. */
+ *  A manual top jump also supersedes any in-flight notification deep-link claim:
+ *  the deep-link owns the viewport until it settles, and this is the user saying
+ *  otherwise. */
 export function scrollToTop() {
   clearPendingEventScroll();
-  if (_scrollTimer !== null) { clearTimeout(_scrollTimer); _scrollTimer = null; }
-  _resizeMode = 'ignore';
-  if (_suppressTimer) { clearTimeout(_suppressTimer); _suppressTimer = null; }
-  scrolledUp.value = true;
   awayFromBottom.value = true;
 
   const el = resolveTarget();
@@ -334,10 +785,10 @@ export function scrollToTop() {
   // / a late render-all ResizeObserver settle.
   if (prefersReducedMotion()) {
     cancelScrollAnim();
-    el.scrollTop = 0;
+    markNavigationScroll(el, 0);
     _scrollAnimRaf = requestAnimationFrame(() => {
       const t = resolveTarget();
-      if (t) t.scrollTop = 0;
+      if (t) markNavigationScroll(t, 0);
       _scrollAnimRaf = null;
     });
     return;
@@ -347,168 +798,70 @@ export function scrollToTop() {
 }
 
 /** Smoothly scroll the active chat container to the bottom — the down-chevron's
- *  action. Eases to the (live, re-read each frame) bottom, then hands off to
- *  scrollToBottom() so live streaming keeps the user pinned ("tailing"). Mirrors
- *  scrollToTop's iOS-reliable direct-scrollTop animation. Reduced motion skips
- *  straight to scrollToBottom()'s instant snap + pin. _resizeMode='ignore' during
- *  the ease so onResize's scroll-mode branch can't instant-pin and skip it. */
+ *  action, and the ONLY "take me to the live edge" gesture there is.
+ *
+ *  Eases to the bottom, re-reading the target every frame so a thread that keeps
+ *  streaming during the glide is tracked and the tween lands on the TRUE grown
+ *  bottom rather than on the bottom as it was when tapped.
+ *
+ *  On landing it ARMS the standing follow, because "go to the bottom" means "and
+ *  keep me there until I say otherwise": content arriving a beat later carries
+ *  the reader with it instead of stranding them one tap above the live edge.
+ *  Arming on landing rather than on the tap is deliberate: a tween superseded
+ *  mid-flight by another navigation never reaches `onDone`, so it never leaves a
+ *  follow armed behind the navigation that beat it.
+ *
+ *  Reduced motion skips straight to scrollToBottom()'s instant jump, which arms
+ *  it the same way. */
 export function scrollToBottomAnimated() {
   clearPendingEventScroll();
-  if (_scrollTimer !== null) { clearTimeout(_scrollTimer); _scrollTimer = null; }
   const el = resolveTarget();
   if (!el || prefersReducedMotion()) { scrollToBottom(); return; }
-  _resizeMode = 'ignore';
-  if (_suppressTimer) { clearTimeout(_suppressTimer); _suppressTimer = null; }
   // Target the MAX scroll position (scrollHeight − clientHeight), not scrollHeight,
   // so the ease lands exactly at the bottom instead of clamping flat for the last
-  // clientHeight px. scrollToBottom() in onDone then pins to the live bottom.
-  animateScroll((c) => c.scrollHeight - c.clientHeight, () => scrollToBottom());
+  // clientHeight px.
+  animateScroll(
+    (c) => c.scrollHeight - c.clientHeight,
+    // The landing write may not move the container at all (the tween's last
+    // frame can already be there), and then no scroll event fires to reconcile
+    // the chevron. Settle it here against the real position instead, and arm the
+    // follow from where the tween actually landed.
+    () => { syncAwayFromBottom(); armFollowBottom(); },
+  );
 }
 
-/** Reset scrolledUp, immediately scroll the response area to the bottom,
- *  and keep scrolling at frame rate until the suppression window expires.
+/** Jump the transcript to the bottom in one write: the reduced-motion form of
+ *  the down chevron, and the compose view's chevron (which has no windowed
+ *  render to glide through). Arms the standing follow on arrival, exactly as the
+ *  animated form does.
  *
- *  Called from PromptInput.submit() and sendMessage() — any place where
- *  we KNOW the user wants to be at the bottom and new content is about
- *  to render.
- *
- *  iOS Safari PWA keyboard animations take 300-400ms with many
- *  visualViewport.resize events. The old 2×rAF approach missed most of
- *  the animation. Now we scroll every ~16ms for the full 500ms
- *  suppression window, re-reading scrollHeight each time so layout
- *  changes (keyboard close, content render) are always caught. */
-export function scrollToBottom(opts?: { auto?: boolean }) {
-  // An EXPLICIT go-to-bottom (the default — the chevron, sending a message,
-  // answering a deep-linked question) supersedes any in-flight notification
-  // deep-link claim: e.g. answering a deep-linked question (addPendingMessage →
-  // scrollToBottom) within the ~4s claim window should let the streamed response
-  // tail again. Safe because the deep-link's OWN landing never routes through an
-  // explicit call: focusThread skips scrollToBottom when targetEventId is set,
-  // and scrollToEventAndPulse never calls it.
-  //
-  // An AUTOMATIC go-to-bottom (`auto: true` — the lazy-load `eventsLoaded` snap
-  // that fires when an UNfocused thread's events finally render) must NOT
-  // supersede the claim: it fires during the very load the deep-link is waiting
-  // on. Clearing the claim here would un-guard every other auto-scroll path and
-  // land the user at the bottom instead of the deep-linked event — the
-  // deterministic "cross-thread deep-link doesn't scroll to the event" bug. Defer
-  // to the deep-link entirely; its own resolve owns the scroll target.
-  if (opts?.auto && hasPendingEventScroll()) return;
-  if (!opts?.auto) clearPendingEventScroll();
-  // Cancel any in-flight chevron-scroll animation so a down-scroll started right
-  // after an up-tap isn't dragged back to the top. (The down-chevron's own
-  // animateScroll hands off here via onDone — by then the rAF is already null,
-  // so this is a no-op for that path.)
+ *  An EXPLICIT gesture, and the only kind left, so it supersedes any in-flight
+ *  notification deep-link claim: the deep-link owns the viewport until it
+ *  settles, and this is the user saying otherwise. Nothing in the app calls this
+ *  on the user's behalf any more, so there is no longer an `auto` variant that
+ *  had to defer to the claim instead. A send does not call it either: a send
+ *  arms the same follow but lands on the reader's own message rather than
+ *  jumping to the bottom (see `followSentMessage`). */
+export function scrollToBottom() {
+  clearPendingEventScroll();
+  // Cancel any in-flight navigation so a down-tap right after an up-tap isn't
+  // dragged back toward the top.
   cancelScrollAnim();
-  scrolledUp.value = false;
-  awayFromBottom.value = false;
-  _resizeMode = 'scroll';
 
-  // Immediate scroll
   const target = resolveTarget();
-  if (target) {
-    target.scrollTop = target.scrollHeight;
-  }
-
-  // Cancel any prior loop so only the latest call drives scrolling
-  if (_scrollTimer !== null) clearTimeout(_scrollTimer);
-
-  // Continuous scroll loop, running every ~PIN_FRAME_MS until the suppression
-  // window expires (or its frame budget runs out, whichever comes first: see
-  // `_pinFramesLeft`, the backstop for a suppression timer that never fires).
-  // Re-resolves target each frame in case the visible element changed.
-  const loop = () => {
-    if (_resizeMode !== 'scroll' || _pinFramesLeft <= 0) {
-      // The loop clears awayFromBottom every iteration, so a final-frame
-      // content grow without an onScroll/onResize would leave the chevron
-      // stuck hidden. Reconcile against actual position on exit.
-      const el = resolveTarget();
-      if (el && el.scrollTop + el.clientHeight < el.scrollHeight - 2) {
-        awayFromBottom.value = true;
-      }
-      // Land in the state the suppression timer would have left behind. When
-      // the frame budget is what ended the loop, that timer is gone (dropped by
-      // a suspend, or on a clock that will never run it), so nothing else would
-      // ever flip the mode back: onScroll would stay suppressed and onResize
-      // would keep force-pinning the user to the bottom. In the ordinary exit
-      // the timer already did exactly this, so both lines are no-ops there.
-      _resizeMode = 'ignore';
-      if (_suppressTimer) clearTimeout(_suppressTimer);
-      _suppressTimer = null;
-      _scrollTimer = null;
-      return;
-    }
-    _pinFramesLeft--;
-    scrolledUp.value = false;
-    awayFromBottom.value = false;
-    const el = resolveTarget();
-    if (el) {
-      el.scrollTop = el.scrollHeight;
-    }
-    _scrollTimer = setTimeout(loop, PIN_FRAME_MS);
-  };
-  _scrollTimer = setTimeout(loop, PIN_FRAME_MS);
-
-  extendSuppression();
+  if (target) markNavigationScroll(target, target.scrollHeight);
+  syncAwayFromBottom();
+  armFollowBottom();
 }
 
-/** Re-pin the user to the bottom across a layout shift the user just caused —
- *  typing in the prompt (action buttons grow) or toggling a multi-select
- *  question option (card grows a row). If they were at the bottom, engage
- *  scroll mode so the upcoming ResizeObserver fire is suppressed; if they had
- *  scrolled up, no-op so we don't override their intent.
- *
- *  Note: ANSWERING a question or resolving a permission card instead force-pins
- *  via scrollToBottom() (see answerThreadQuestion / resolveCodingAgentPermission)
- *  — those resume the agent's stream, so we re-activate auto-scroll even when the
- *  user had scrolled up.
- *
- *  Must NOT call scrollToBottom(): handleInput fires this on every keystroke,
- *  and scrollToBottom's 16ms re-pinning loop — sized for async streaming —
- *  then runs continuously at 60fps during typing, doing forced-layout walks
- *  (isElementVisible ancestor traversal + scrollTop write fires scroll
- *  handlers doing more layout reads). Surfaced as severe iOS PWA keystroke
- *  lag in workspaces with many threads.
- *
- *  The preserve-case shift is synchronous (textarea/card resizes this frame),
- *  and useAutoScroll observes .thread-content and each child — the natural
- *  ResizeObserver fire after the shift sees mode='scroll' and pins via
- *  onResize, no active loop required. */
-export function preserveAtBottom() {
-  if (scrolledUp.value) return;
-  awayFromBottom.value = false;
-  _resizeMode = 'scroll';
-  extendSuppression();
-}
-
-/** Loop-free force-pin: mirrors scrollToBottom's pin contract (resets
- *  scrolledUp even when the user had scrolled up) but skips the 16ms
- *  re-pinning loop. Use when the caller fires often enough that the loop
- *  would compound into a forced-layout cascade (visualViewport.resize during
- *  typing) — settling is left to the subsequent .thread-content
- *  ResizeObserver fire, which catches mode='scroll' in onResize. */
-export function pinToBottomNow() {
-  // Defer to an in-flight notification deep-link. This loop-free pin fires from
-  // the iOS visualViewport reflow / header focusout / tab-return paths — none of
-  // which route through the hasPendingEventScroll() gate the other auto-scroll
-  // callers (onResize, useAutoScroll, useScrollMemory, scrollToBottom) honour.
-  // When the PWA foregrounds on a notification tap, that viewport reflow pin
-  // would slam the freshly-landed event to the bottom a beat after the deep-link
-  // scrolled to it — the deterministic "cross-thread deep-link lands at the
-  // bottom on iOS" bug. The claim is held across the smooth scroll (sync resolve)
-  // and the async load + deadline, so this stays deferred for the whole window.
-  if (hasPendingEventScroll()) return;
-  scrolledUp.value = false;
-  awayFromBottom.value = false;
-  _resizeMode = 'scroll';
-  const target = resolveTarget();
-  // Skip the write when the user is already pinned (steady state during
-  // typing): the assignment would re-fire scroll handlers doing forced
-  // layout reads for nothing. 2px slack mirrors isVisuallyAtBottom.
-  if (target && target.scrollTop < target.scrollHeight - target.clientHeight - 2) {
-    target.scrollTop = target.scrollHeight;
-  }
-  extendSuppression();
+/** Reconcile the chevron against where the transcript actually sits. Used by the
+ *  two explicit go-to-bottom entry points, whose own write may leave the
+ *  container unmoved (and therefore fire no scroll event) when it was already
+ *  there. */
+function syncAwayFromBottom() {
+  const el = resolveTarget();
+  if (!el) return;
+  awayFromBottom.value = !isAtLiveEdge(el);
 }
 
 /** Scroll the chat exchange matching a CSS `selector` into view and briefly
@@ -543,24 +896,24 @@ const SCROLL_SETTLE_FALLBACK_MS = 1000;
  *  give-up recovery over a navigation that was still live. Object identity
  *  cannot collide, so "is the claim still mine" is exact.
  *
- *  Plain mutable variable (not a signal) like `_resizeMode` / `_activeScrollElement`:
- *  it's read imperatively inside ThreadView's events-load effect and
- *  useAutoScroll's layout snap, both of which already re-run on the same
- *  eventsLoaded / eventCount changes — nothing needs to react to it changing.
+ *  Plain mutable variable (not a signal) like `_activeScrollElement`: it's read
+ *  imperatively by `useScrollMemory`'s restore gate, which already re-runs on
+ *  the key / paused changes that matter, so nothing needs to react to it.
  *
- *  Why it exists: focusing an UNfocused thread lazily loads its events, and the
- *  scroll-to-bottom that fires on the `eventsLoaded` false→true transition would
- *  otherwise override scrollToEventAndPulse's scroll the instant the
- *  events render — so the deep-link landed at the bottom instead of the event.
- *  (When the thread is already focused the events are already in the DOM,
- *  tryResolve() succeeds synchronously, and no eventsLoaded transition fires —
- *  which is why the bug only showed for unfocused threads.) Mirrors how a saved
- *  scroll position suppresses the same auto-scroll via `hasSavedScroll`. */
+ *  What it still guards, now that no auto-scroll competes for the viewport:
+ *   - `useScrollMemory.shouldRestore`, so focusing an UNfocused thread does not
+ *     land on the saved position instead of the deep-linked event (its restore
+ *     observers fire on the same lazily-loaded render the deep-link is waiting
+ *     for, and would otherwise win by running last);
+ *   - `useScrollMemory`'s no-save reset to the top, for the same reason;
+ *   - the navigation focus marker's settle guard, so this deep-link's own smooth
+ *     scroll cannot dismiss the highlight it just applied.
+ *  It is held until the deadline (or, on a synchronous resolve, until the scroll
+ *  settles) so it covers the whole landing, not just the call. */
 let _pendingEventScrollClaim: object | null = null;
 
 /** True while a notification deep-link is waiting for its target event to
- *  render (or to scroll to it). Auto-scroll-to-bottom callers defer to it so
- *  they don't override the deep-link's scroll. */
+ *  render (or to scroll to it), so a competing scroll defers to it. */
 export function hasPendingEventScroll(): boolean {
   return _pendingEventScrollClaim !== null;
 }
@@ -623,26 +976,16 @@ function scrollToSelectorAndPulse(
   let resolved = false;
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let observer: MutationObserver | null = null;
-  /** Set once the user takes over during the wait (see `watchUserAction`).
-   *  Gates the deadline's fallback scroll only: someone who scrolled away to
-   *  read history while the deep-link resolved must not be yanked to the bottom
-   *  4s later. Armed on the ASYNC path only, below, so the window is exactly
-   *  "since we started waiting". */
-  let userTookOver = false;
-  let stopWatchingUser: (() => void) | null = null;
   /** This call's claim identity. See `_pendingEventScrollClaim`: an object, so
    *  that re-opening the SAME notification within the resolve window is two
    *  distinguishable claims rather than one indistinguishable selector. */
   const claim = {};
 
-  // Claim the deep-link scroll so the auto-scroll-to-bottom paths defer (see
+  // Claim the deep-link scroll so a competing scroll defers (see
   // _pendingEventScrollClaim). The claim is held until the deadline below, and
-  // NOT released the instant the scroll lands, because the same render that
-  // finally shows the event also re-fires ThreadView's events-load effect (on
-  // the hasExchanges 0→N flip) and a late ResizeObserver pin, both of which
-  // would snap to the bottom a beat after the deep-link scroll. Gating those on the
-  // claim (not on scrolledUp) is what lets the events-load effect keep its
-  // separate slow-load scrolledUp recovery.
+  // NOT released the instant the scroll lands: the same render that finally
+  // shows the event is also what wakes useScrollMemory's restore observers, and
+  // they would otherwise land the saved position over the deep-link's.
   _pendingEventScrollClaim = claim;
   // Force ThreadView to render the FULL exchange list so a windowed-out target
   // can render for tryResolve/the MutationObserver to find. Stays true until the
@@ -653,9 +996,8 @@ function scrollToSelectorAndPulse(
   // Release this call's claim, but only if it's still ours. A second deep-link
   // started mid-flight has overwritten the slot with its own claim; its own
   // release handles that one. Without the guard, this call's deadline would
-  // clear the newer claim and let an auto-scroll-to-bottom override it (and,
-  // since the deadline now recovers rather than giving up silently, snap the
-  // user to the bottom and report a failure over a live navigation).
+  // clear the newer claim, un-guarding the saved-scroll restore over a landing
+  // that is still live, and report a failure for a navigation that succeeded.
   const releaseClaim = () => {
     if (_pendingEventScrollClaim === claim) {
       _pendingEventScrollClaim = null;
@@ -672,19 +1014,14 @@ function scrollToSelectorAndPulse(
       clearTimeout(deadlineTimer);
       deadlineTimer = null;
     }
-    if (stopWatchingUser) {
-      stopWatchingUser();
-      stopWatchingUser = null;
-    }
   };
 
   // Hold the claim across the smooth scroll's settle, then release. Used by the
   // SYNCHRONOUS resolve path (the already-focused thread, whose events are
   // already in the DOM): releasing the claim the instant smoothScrollToElement is
   // CALLED is wrong, because the tween lands up to SCROLL_MAX_MS later and a
-  // competing scroll in that window — the in-app panel closing, an iOS
-  // visualViewport reflow — would override the landing and drop the user at the
-  // bottom. Release on the scroll container's `scrollend` (the authoritative
+  // competing scroll in that window would override the landing. Release on the
+  // scroll container's `scrollend` (the authoritative
   // "scroll finished" signal, which our per-frame scrollTop writes still fire when
   // they stop) or, where that's unsupported, a fallback timer — whichever fires
   // first. (The async path already holds the claim until its own deadline, which
@@ -727,11 +1064,6 @@ function scrollToSelectorAndPulse(
       observer = null;
     }
 
-    // The user is now parked on a mid-thread event, not the bottom — pin that
-    // so the next render's auto-scroll defers instead of snapping back down.
-    // (If the event happens to sit at the bottom, the post-scroll onScroll
-    // reconciles scrolledUp against the real position.)
-    scrolledUp.value = true;
     // Mobile only: reveal the app header now and keep it pinned visible through
     // the smooth scroll below, so the event lands under the header + sticky
     // title row (matching .chat-exchange's scroll-margin-top) instead of behind
@@ -763,17 +1095,11 @@ function scrollToSelectorAndPulse(
     // Synchronous resolve — the thread's events were already in the DOM (it was
     // already focused), so no async load follows. Do NOT release the claim
     // synchronously: the deep-link scroll (smoothScrollToElement) is still
-    // settling, and a competing scroll (in-app panel close, iOS visualViewport
-    // reflow) would override the landing. Hold the claim until the scroll settles
-    // so every auto-scroll path keeps deferring across the smooth scroll.
+    // settling, and a competing scroll would override the landing. Hold the
+    // claim until the scroll settles so everything keeps deferring across it.
     holdClaimUntilScrollSettles();
     return;
   }
-
-  // From here on we are WAITING, so start counting the user's own input: a
-  // fallback scroll at the deadline must stand down if they took over. Torn
-  // down by stopWatching (the deadline always runs it, resolved or not).
-  stopWatchingUser = watchUserAction(() => { userTookOver = true; });
 
   // body, not .thread-content: Preact's positional diff can't preserve the
   // loading-branch .thread-content across ThreadView's loading→loaded swap
@@ -802,16 +1128,17 @@ function scrollToSelectorAndPulse(
   //  - The target NEVER rendered: it isn't in this thread, it renders nothing at
   //    all, or the thread was still loading when the window closed. That is a
   //    dead deep-link, and it used to end here in silence, leaving the tap
-  //    looking broken with no feedback whatsoever. Now it lands the user on the
-  //    thread's most recent turn (the transcript's bottom) and tells them the
-  //    event could not be found, via the caller's `onUnresolved` (scrollState
-  //    stays free of the `store` import; see `parseNavigatedTurn`).
+  //    looking broken with no feedback whatsoever. It now tells the user, via
+  //    the caller's `onUnresolved` (scrollState stays free of the `store`
+  //    import; see `parseNavigatedTurn`).
   //
-  // The no-late-yank guarantee the silent give-up was protecting is kept, and
-  // made exact: the fallback SCROLL is suppressed when the user took over during
-  // the wait, so someone who scrolled back to read history is left where they
-  // are. The message still fires in that case, since it is then the only signal
-  // that the link failed.
+  // It reports WITHOUT moving the transcript. The user asked to go to a place;
+  // the place does not exist, and the bottom is not it. (This used to scroll to
+  // the thread's most recent turn, guarded by a `watchUserAction` watcher so a
+  // reader who had scrolled away meanwhile was not yanked 4s later. Both the
+  // recovery scroll and the watcher it needed are gone: leaving the reader where
+  // they are is now the rule rather than the exception, so there is nothing left
+  // to stand down from.)
   //
   // A deep-link superseded mid-flight (`wasOurs` false) reports nothing: the
   // newer one owns the claim, the viewport and the outcome now.
@@ -820,7 +1147,6 @@ function scrollToSelectorAndPulse(
     stopWatching();
     releaseClaim();
     if (resolved || !wasOurs) return;
-    if (!userTookOver) scrollToBottom();
     onUnresolved?.();
   }, EVENT_RESOLVE_DEADLINE_MS);
 }
@@ -831,8 +1157,10 @@ export interface DeepLinkOptions {
    *  expires: a dead link the user has to be told about. The MESSAGE is the
    *  caller's, not this module's, because `scrollState` deliberately stays free
    *  of the heavy `store` import (`showToast` lives there) so its lean importers
-   *  keep working, the same constraint `parseNavigatedTurn` documents. This
-   *  module owns the recovery SCROLL; the caller owns the words. */
+   *  keep working, the same constraint `parseNavigatedTurn` documents.
+   *
+   *  The words are the WHOLE recovery: a dead link leaves the transcript exactly
+   *  where it was. */
   onUnresolved?: () => void;
 }
 
@@ -1009,16 +1337,13 @@ export function pickTurnTarget(
 /** Scroll the visible transcript one turn in `direction` (-1 previous, 1 next),
  *  landing it at the top and marking it with the shared navigation focus marker.
  *  A deliberate jump, so — like `scrollToTop` — it supersedes any in-flight
- *  deep-link claim and cancels the bottom-pin loop. The position signals
- *  (scrolledUp / awayFromBottom) are reconciled against the ACTUAL landing target:
- *  a jump that lands mid-thread marks the user parked (so the next render's
- *  auto-scroll doesn't snap to the bottom and the down chevron stays visible); a
- *  jump that lands at the bottom leaves both false (chevron hidden, auto-scroll
- *  enabled) — otherwise the chevron would stick on when the last turn's clamped
- *  target can't move the already-bottomed container. No-op when no transcript is
- *  visible (thread pane collapsed, or the hidden dual-mount copy) or there's no
- *  turn in `direction`. Desktop moves DOM focus into the (focusable) container so
- *  the native scroll keys follow the jump. */
+ *  deep-link claim. `awayFromBottom` is reconciled against the ACTUAL landing
+ *  target rather than assumed: a jump that lands at the bottom must hide the
+ *  chevron, and the last turn's clamped target often can't move an already
+ *  bottomed container, so no scroll event would arrive to do it. No-op when no
+ *  transcript is visible (thread pane collapsed, or the hidden dual-mount copy)
+ *  or there's no turn in `direction`. Desktop moves DOM focus into the
+ *  (focusable) container so the native scroll keys follow the jump. */
 export function stepThreadTurn(direction: 1 | -1): void {
   const el = resolveTarget();
   if (!el) return;
@@ -1063,11 +1388,8 @@ export function stepThreadTurn(direction: 1 | -1): void {
   const turn = turns[idx];
 
   // We ARE jumping now. A deliberate jump, so — like scrollToTop — supersede any
-  // in-flight deep-link claim and cancel the bottom-pin loop.
+  // in-flight deep-link claim.
   clearPendingEventScroll();
-  if (_scrollTimer !== null) { clearTimeout(_scrollTimer); _scrollTimer = null; }
-  _resizeMode = 'ignore';
-  if (_suppressTimer) { clearTimeout(_suppressTimer); _suppressTimer = null; }
 
   // Absolute target scrollTop that puts the turn's top `gap` px below the container
   // top. Re-read each frame (via animateScroll) so a layout shift during streaming
@@ -1078,21 +1400,15 @@ export function stepThreadTurn(direction: 1 | -1): void {
       ? turn.getBoundingClientRect().top - c.getBoundingClientRect().top + c.scrollTop - gap
       : 0;
 
-  // Reconcile the position signals against the ACTUAL landing target instead of
+  // Reconcile the chevron against the ACTUAL landing target instead of
   // hardcoding "parked mid-thread". The last turn (and any turn near the end) has a
   // landing target at/beyond maxScroll, so the browser clamps the scroll to the
   // bottom — and when we're ALREADY at the bottom the clamped write doesn't move the
   // container, so no scroll event fires and onScroll never reconciles the chevron.
   // Hardcoding awayFromBottom=true there left the down chevron stuck on ("appears
-  // the second time you click down arrow"). Landing at the bottom means NOT parked:
-  // hide the chevron (awayFromBottom=false) and leave auto-scroll enabled
-  // (scrolledUp=false). Anywhere above the bottom, mark the user parked so the next
-  // render's auto-scroll doesn't snap down and the chevron stays visible. (2px slack
-  // mirrors isVisuallyAtBottom.)
+  // the second time you click down arrow"). (2px slack mirrors isVisuallyAtBottom.)
   const maxScroll = Math.max(0, el.scrollHeight - el.clientHeight);
-  const landsAtBottom = targetOf(el) >= maxScroll - 2;
-  scrolledUp.value = !landsAtBottom;
-  awayFromBottom.value = !landsAtBottom;
+  awayFromBottom.value = targetOf(el) < maxScroll - 2;
 
   // Mark the landed turn with the shared navigation focus marker (a background
   // highlight that sticks until the user's next scroll gesture, and for its hold even
@@ -1104,7 +1420,7 @@ export function stepThreadTurn(direction: 1 | -1): void {
 
   if (prefersReducedMotion()) {
     cancelScrollAnim();
-    el.scrollTop = Math.max(0, targetOf(el));
+    markNavigationScroll(el, Math.max(0, targetOf(el)));
     return;
   }
   animateScroll(targetOf);
@@ -1193,102 +1509,10 @@ export function isElementOnScreen(el: HTMLElement): boolean {
     && r.right > bounds.left && r.left < bounds.right;
 }
 
-/** Suppress useAutoScroll for one render so a user-toggled panel collapse /
- *  expand can settle the scroll state without being overridden.
- *
- *  Bug it fixes: in Working mode the response panel's auto-scroll effect
- *  (useAutoScroll) runs on every streaming chunk. When the user clicks
- *  expand, Preact commits a render that bundles the new collapsed=false
- *  state with the latest streaming chunk's state changes. useEffect fires
- *  before ResizeObserver inside that frame, so the auto-scroll sets
- *  el.scrollTop = el.scrollHeight; by the time onResize runs, the user is
- *  already pinned to the new bottom and the chevron escalation never
- *  triggers. Result: expand silently re-snaps you to the bottom and you
- *  cannot tell the panel even grew.
- *
- *  Setting scrolledUp=true here makes useAutoScroll skip; setting
- *  awayFromBottom=true keeps the chevron visible across the render. After
- *  the layout settles, the regular onScroll listener runs (any clamping
- *  fires a scroll event; collapse-from-bottom always clamps) and
- *  reconciles both signals against the actual position — the both-ways
- *  contract in onScroll restores the at-bottom state when the panel
- *  collapse left the user visually at the new bottom. */
-export function preserveOnToggle() {
-  scrolledUp.value = true;
-  awayFromBottom.value = true;
-}
-
-/** Persist auto-scroll intent across tab visibility changes.
- *
- *  Bug it fixes: pinned to the bottom of a streaming response, switch to
- *  another browser tab, come back — scroll position is frozen where it
- *  was and new content piles up below the viewport.
- *
- *  Root cause: while the tab is hidden, browsers throttle layout / rendering
- *  and the `el.scrollTop = el.scrollHeight` write inside useAutoScroll's
- *  deps-effect doesn't realize as an actual scroll. On return, the
- *  ResizeObserver fires for accumulated child growth and onResize sees
- *  scrollTop far below scrollHeight, escalating scrolledUp=true. Future
- *  deps-effect fires then skip auto-scroll, locking the user out of
- *  bottom-pinned mode.
- *
- *  Fix: snapshot wasAtBottom on the first hidden of each hide→visible
- *  cycle, and re-pin via pinToBottomNow() on return if so. Three guards:
- *  - Only capture when a chat scroll element is actually registered
- *    (getActiveScrollElement() !== null). Otherwise — Settings tab, no
- *    thread mounted — scrolledUp's default false would leak a spurious
- *    capture, and the re-pin's extendSuppression() would set
- *    _resizeMode='scroll' globally, overriding the next thread's
- *    useScrollMemory restore if it mounts within the 500ms window.
- *  - First-hide-wins (null sentinel): iOS can double-fire visibilitychange
- *    to hidden during background transitions. If a stray ResizeObserver
- *    fires between the two hidden events and escalates scrolledUp, the
- *    second capture would overwrite the correct one with false.
- *  - pinToBottomNow() over scrollToBottom(): the latter's 500ms 16ms
- *    re-pinning loop would fight an immediate user scroll-up on return.
- *    pinToBottomNow does one write + extendSuppression so a racing RO
- *    fire still pins, but a user gesture is honored from the next frame. */
-let _wasAtBottomOnHide: boolean | null = null;
-let _visibilityCleanup: (() => void) | null = null;
-
-export function startScrollVisibilityHandler(): () => void {
-  stopScrollVisibilityHandler();
-  if (typeof document === 'undefined') return stopScrollVisibilityHandler;
-  const onChange = () => {
-    if (document.visibilityState === 'hidden') {
-      // First-hide-wins per cycle (null = not yet captured this cycle).
-      if (_wasAtBottomOnHide !== null) return;
-      _wasAtBottomOnHide = getActiveScrollElement() !== null && !scrolledUp.value;
-    } else if (document.visibilityState === 'visible') {
-      const shouldRepin = _wasAtBottomOnHide === true;
-      _wasAtBottomOnHide = null;
-      if (shouldRepin) pinToBottomNow();
-    }
-  };
-  document.addEventListener('visibilitychange', onChange);
-  _visibilityCleanup = () => document.removeEventListener('visibilitychange', onChange);
-  return stopScrollVisibilityHandler;
-}
-
-export function stopScrollVisibilityHandler(): void {
-  _visibilityCleanup?.();
-  _visibilityCleanup = null;
-  _wasAtBottomOnHide = null;
-}
-
 /** Build the scroll- and resize-event handlers for a single .thread-content
  *  element. The visibility gate at the top of each handler is required by the
  *  dual-mounting contract documented at the top of this file. */
 export function makeScrollObservers(el: HTMLElement) {
-  function isAtBottom() {
-    return el.scrollTop + el.clientHeight >= el.scrollHeight - 80;
-  }
-  // Tighter threshold for the chevron — flips on the first pixel of
-  // scroll-up. The 2px slack absorbs subpixel rounding (mobile zoom,
-  // device-pixel snapping) without making the chevron look stuck.
-  function isVisuallyAtBottom() {
-    return el.scrollTop + el.clientHeight >= el.scrollHeight - 2;
-  }
   function isAtTop() {
     return el.scrollTop <= 80;
   }
@@ -1364,163 +1588,100 @@ export function makeScrollObservers(el: HTMLElement) {
     // null keeps the reflow correction a no-op, which is the right answer there.
   }
 
-  /** Is the reader riding the newest turn, with nothing of higher priority
-   *  owning the container? Then a resize means the transcript moved under them
-   *  and they must be put back on the bottom.
-   *
-   *  Riding the bottom means "keep me on the newest turn", and that survives any
-   *  resize: re-pin rather than anchor, or a taller transcript would strand the
-   *  reader above the last message. Same 80px stickiness window as every other
-   *  bottom-pin here, so inside it the user has not chosen to read history.
-   *
-   *  A follow is a force-pin, so it defers to an in-flight notification
-   *  deep-link. Tapping a notification with the thread pane collapsed calls
-   *  revealThreadPane(), whose 300ms re-expansion fires this observer on every
-   *  frame while the deep-link is still loading the thread and scrolledUp is
-   *  still false. Pinning there would slam the transcript to the bottom during
-   *  the very load the deep-link is waiting on. */
-  function shouldFollowBottom() {
-    return !scrolledUp.value && !hasPendingEventScroll();
-  }
-
-  /** Put the reader back on the newest turn. One implementation, shared by the
-   *  reflow correction and by onResize's follow branch, so "riding the bottom"
-   *  cannot come to mean two different things depending on which axis moved.
-   *
-   *  The write is skipped when they are already there (the steady state while a
-   *  response streams): re-assigning the same offset changes nothing but does
-   *  re-enter the scroll handlers for a round of forced layout reads. Same 2px
-   *  slack, and same reason, as pinToBottomNow's guard. */
-  function followBottom() {
-    if (!isVisuallyAtBottom()) el.scrollTop = el.scrollHeight;
-    awayFromBottom.value = false;
-  }
-
   /** Put the reader back where the width change moved them. Runs inside the
    *  ResizeObserver callback, i.e. after layout and before paint, so the
-   *  correction is never painted as a jump. A reader who was NOT riding the
-   *  bottom is held still on their anchor instead, which is also what keeps a
-   *  live deep-link's landing intact. */
+   *  correction is never painted as a jump.
+   *
+   *  Every reader is held on their anchor, including one sitting at the very
+   *  bottom. This used to branch: a reader within the 80px stickiness window was
+   *  re-pinned to the bottom instead of anchored, on the reasoning that riding
+   *  the newest turn means "keep me on the newest turn" whatever the layout
+   *  does. That is a bottom-pin wearing anchor preservation's clothes, and it
+   *  fired on a reader who had deliberately scrolled 79px up. Holding the anchor
+   *  is the honest reading of "keep the reader on the same content", and it is
+   *  the same answer for everyone. */
   function restoreAfterReflow() {
-    if (shouldFollowBottom()) {
-      followBottom();
-      return;
-    }
     const child = anchorChild;
     if (!child || child.isConnected === false) return;
     const shift = (child.getBoundingClientRect().top - viewportTop()) - anchorRelTop;
-    if (shift !== 0) el.scrollTop = el.scrollTop + shift;
+    if (shift === 0) return;
+    el.scrollTop = el.scrollTop + shift;
+    // Carry the follow's stamp onto the correction. This is the app holding the
+    // reader on the same content, not the reader leaving, and the scroll event
+    // it fires would otherwise arrive off the live edge at a position the follow
+    // does not recognise, which is both halves of the disarm. The growth branch
+    // usually re-stamps a line later, but not when it stands down for a tween or
+    // a pending send landing, which is exactly when a pane resize retired a
+    // follow nobody retired.
+    if (_followEl === el) _followTop = el.scrollTop;
   }
 
-  // Scroll events: can both set and clear scrolledUp (user gesture or
-  // programmatic scrollTop assignment — both produce real scroll events).
-  // Skip during suppression ('scroll' mode) — scroll events in this window
-  // are from programmatic scrollToBottom() or header scroll compensation
-  // (useHideOnScroll adjusts scrollTop on focusin/focusout), not user intent.
-  // Without this guard, iOS keyboard dismiss causes: focusout → scrollTop
-  // compensation → scroll event → scrolledUp=true → viewport resize handler
-  // skips scrollToBottom() → user loses bottom-pinned state.
+  // Scroll events. Whoever moved the container (a gesture, a chevron, a restore,
+  // the reflow correction), the answer is the same: reconcile the three position
+  // signals against where it now sits, and re-take the reflow anchor. There is
+  // no longer anything to suppress, because nothing infers intent from a scroll.
   //
-  // awayFromBottom is updated unconditionally on scroll — programmatic
-  // scrolls leave the container at the bottom, so the check returns false
-  // and the chevron hides naturally without a special-case branch.
-  // (Content growth that doesn't fire a scroll event is handled by
-  // useEffect snapping back to bottom; see onResize for the shrink case.)
+  // One question IS asked of the scroll, and it is the only place a standing
+  // follow is retired: has the reader taken the container away from where the
+  // follow put it. Both halves are required. Off the live edge alone is not
+  // enough, because a shrink clamps the reader down and the app's own anchor
+  // correction moves them while holding them on the same content; moved alone is
+  // not enough either, because a tween mid-glide is our own. Together they are
+  // true for a wheel, a scrollbar drag, a touch flick and its momentum, a
+  // keypress and a mobile pane swipe, and for a navigation that deliberately
+  // lands the reader elsewhere. They are false for everything that changes
+  // content without moving the reader off the edge, which is why answering a
+  // question, granting a permission or expanding a turn all keep the follow.
   function onScroll() {
     if (!isElementVisible(el)) return;
     syncNotAtTop();
     syncScrolledFromTop();
-    awayFromBottom.value = !isVisuallyAtBottom();
-    if (getResizeMode() !== 'scroll') scrolledUp.value = !isAtBottom(); // only scrolledUp is suppressed
+    const atEdge = isAtLiveEdge(el);
+    awayFromBottom.value = !atEdge;
+    if (_followingBottom && !atEdge && !isWhereTheFollowLeftIt(el)) stopFollowingBottom();
     // The reader has moved, so the reflow anchor has to follow them.
     recordAnchor();
   }
-  // Resize events. What a resize MEANS depends on whether the reader is parked,
-  // and on nothing else:
+  // Resize events. A resize moves the reader toward the bottom for exactly one
+  // reason: they ASKED to ride the live edge and have not taken it back (see
+  // "The standing request to ride the live edge"). For everyone else it moves
+  // nobody, whatever grew and however far off the bottom it leaves them: a
+  // streaming reply, a decoded image, an expanded step, a growing composer all
+  // leave the transcript exactly where it is, and the handler's remaining job is
+  // to reconcile the signals so the chevrons describe the new geometry.
   //
-  // 'scroll' mode: content is rendering after a scrollToBottom() call —
-  //   actively scroll to bottom on each resize and extend the suppression
-  //   window. This keeps us pinned to the bottom as content progressively
-  //   renders (especially important on mobile where rendering is slow). It is a
-  //   FORCE-pin: it re-pins even a parked reader, which is what the deliberate
-  //   go-to-bottom callers (answering a question, resolving a permission card)
-  //   are asking for.
-  //
-  // 'ignore' mode (normal): follow the bottom while the reader rides it, and
-  //   otherwise touch only the chevron. A resize NEVER decides that the reader
-  //   scrolled up: see the follow branch below for why that inference was wrong.
-  //   It never CLEARS scrolledUp either, and that half is older and just as
-  //   load-bearing: a layout change the reader did not make (the textarea
-  //   shrinking after a submit, an idle banner going away) would otherwise read
-  //   as them returning to the bottom and re-arm auto-scroll under someone
-  //   reading history. Neither direction is inferable from geometry, which is
-  //   why nothing in this handler writes that signal at all.
+  // This is where the old force-pin lived, and the two rules that fought over
+  // it: a 'scroll'-mode branch that slammed `scrollTop = scrollHeight` on every
+  // resize inside a 500ms window, and a follow branch that re-pinned any reader
+  // inside the 80px stickiness window. Neither is back. The branch below infers
+  // nothing: it reads the flag the reader's own chevron tap or send set.
   function onResize() {
     if (!isElementVisible(el)) return;
     // A WIDTH change re-wrapped the transcript, so undo the drift it caused
     // before anything below reads the new geometry (see "Reflow anchoring").
-    // Height-only growth, the streaming case, is left to the branches below.
+    // Height-only growth, the streaming case, needs no correction: the content
+    // above the reader is unchanged, so the same scrollTop still shows them the
+    // same thing, and the transcript simply grows below them.
     const width = el.clientWidth;
     if (width !== lastWidth) {
       lastWidth = width;
       restoreAfterReflow();
     }
-    // Sync on resize too — if content shrinks below the viewport,
-    // clear the chevron even if no scroll event fires.
+    // The growth branch. Runs after the reflow correction, so the follow writes
+    // from the corrected position rather than fighting it, and before the signal
+    // reconciles below, so the chevron describes where the follow left the
+    // reader rather than where the growth alone would have.
+    if (_followingBottom) followTheLiveEdge(el);
     syncNotAtTop();
     syncScrolledFromTop();
-    // Suppress the force-pin while a notification deep-link owns the scroll.
-    // Without this, the 'scroll'-mode snap — kept alive across the thread load
-    // by its own extendSuppression() — slams the freshly-loaded thread to the
-    // bottom a beat after scrollToEventAndPulse landed on the event. The claim
-    // is held until that call's deadline, so this stays suppressed for the whole
-    // settle window; a normal scrollToBottom() flow has no claim, so the pin
-    // still works (and skipping extendSuppression here lets the mode decay to
-    // 'ignore' on its own once the deep-link has landed).
-    if (getResizeMode() === 'scroll' && !hasPendingEventScroll()) {
-      el.scrollTop = el.scrollHeight;
-      extendSuppression();
-    } else if (shouldFollowBottom()) {
-      // The reader is riding the newest turn, so the transcript grew (or the
-      // composer took height) UNDER them: keep them on it. Same rule as the
-      // reflow correction above, so a resize means one thing whichever axis
-      // moved, and it holds however long after the open the growth lands.
-      //
-      // This branch used to read "grew, and we are now more than 80px off the
-      // bottom" as "the reader scrolled up" and set scrolledUp. Nothing the
-      // reader did produced that conclusion: the app was inferring intent from
-      // its own layout. Every auto-scroll path then defers to scrolledUp, so
-      // one late grow stranded the transcript above the newest turn for the
-      // rest of the visit, with no gesture able to be blamed and nothing to
-      // recover it. A markdown image is enough on its own, reserving no box
-      // (max-height only, no width/height and no aspect-ratio), so decoding one
-      // adds up to 24rem whenever the fetch happens to land after the pin
-      // window has closed.
-      //
-      // It also contradicted useAutoScroll's layout effect, which snaps to the
-      // bottom whenever !scrolledUp however much content arrived. Two rules
-      // over one event, with the winner decided by whether a Preact render
-      // happened to accompany the growth: the "opening a thread sometimes does
-      // not land at the end" report, and why it was intermittent.
-      //
-      // scrolledUp is now written only by an explicit decision: a scroll event,
-      // a navigation (scrollToTop / turn-nav / a deep-link landing), a panel
-      // toggle (preserveOnToggle, which is what keeps expanding a step showing
-      // the chevron instead of re-pinning), or a saved-scroll restore.
-      followBottom();
-    } else {
-      // Parked, or a deep-link owns the scroll: hold the transcript still and
-      // reconcile only the chevron against where the resize left them. The 80px
-      // window (see top of file) keeps streaming tokens from tripping it on
-      // before the layout effect snaps back.
-      if (!isAtBottom()) awayFromBottom.value = true;
-      // Clear path: if content shrinks so the user is now visually at the
-      // bottom (idle banner removed, step collapsed), hide the chevron
-      // without waiting for a scroll event.
-      if (awayFromBottom.value && isVisuallyAtBottom()) {
-        awayFromBottom.value = false;
-      }
-    }
+    // One unconditional reconcile, both directions. Growth below the fold raises
+    // the chevron on the very next frame, which matters more than it used to:
+    // an unarmed reader at the live edge is left behind by the first token of a
+    // reply and the chevron is their only way back. A shrink that leaves them
+    // visually at the bottom again (an idle banner removed, a step collapsed)
+    // hides it, without waiting for a scroll event that a pure content change
+    // never fires.
+    awayFromBottom.value = !isAtLiveEdge(el);
     // Retake the snapshot last, once the layout above has settled: measuring it
     // any earlier would describe a position the reader is no longer at.
     recordAnchor();

@@ -5,6 +5,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 // @ts-expect-error — same
 import { fileURLToPath } from 'node:url';
+import { cssRules, rulesTargeting } from '../../../styles/__tests__/css-rule-helpers';
 
 const here: string = dirname(fileURLToPath(import.meta.url));
 
@@ -75,6 +76,52 @@ describe('inline step layout (CSS regression)', () => {
     const block = getBlock('.inline-step .step-context');
     expect(block).toContain('white-space: nowrap');
     expect(block).toContain('flex-shrink: 0');
+  });
+
+  // The counter's compact form ("18%") is gated on the width the ROW has, not
+  // on the viewport: a desktop thread pane dragged to its 300px minimum crowds
+  // the row exactly the way a phone does, and the old `viewportIsMobile` gate
+  // could not see it. `InlineStep` renders both forms, so a break in this gate
+  // shows up as BOTH counters on one row (or neither), which is why every half
+  // of it is pinned rather than just the threshold.
+  //
+  // Read with postcss rather than the local first-match `getBlock`: the whole
+  // assertion is about which at-rule a rule is nested inside, and a textual
+  // reader cannot tell the top-level rule from its `@container` copy.
+  describe('the compact counter is width-gated, not device-gated', () => {
+    const row = cssRules(css).find(r => r.selector === '.inline-step' && !r.atRules);
+    const containerName = row?.props.get('container-name');
+    const gate = `@container ${containerName} (max-width: 26rem)`;
+    const inGate = (className: string) =>
+      rulesTargeting(css, className).filter(r => r.atRules === gate);
+    const atTopLevel = (className: string) =>
+      rulesTargeting(css, className).filter(r => !r.atRules);
+
+    it('the row itself is the query container, and it is named', () => {
+      // Unnamed, the query would resolve to the nearest ANCESTOR container
+      // instead (`.repo-preview-split` is the other one in the app) and would
+      // then match on a width that has nothing to do with this row.
+      expect(row?.props.get('container-type')).toBe('inline-size');
+      expect(containerName).toBeTruthy();
+    });
+
+    it('gates on the container, in rem so it tracks the user UI scale', () => {
+      // A px threshold would stop tracking the root font-size, which IS the
+      // scale preference: at 112.5% the counter is wider but the gate wouldn't
+      // move. It is also what makes the phone case (18px root) gate at a
+      // proportionally wider row in CSS px.
+      expect(inGate('step-context-compact')).toHaveLength(1);
+      expect(gate).toMatch(/^@container [\w-]+ \(max-width: [\d.]+rem\)$/);
+    });
+
+    it('shows the full form by default and swaps to the compact one below the gate', () => {
+      expect(atTopLevel('step-context-compact').map(r => r.props.get('display'))).toEqual(['none']);
+      expect(inGate('step-context-compact').map(r => r.props.get('display'))).toEqual(['inline']);
+      // The full form is visible by default, so nothing may hide it outside the
+      // gate; inside it, it is the one that goes.
+      expect(atTopLevel('step-context-full')).toEqual([]);
+      expect(inGate('step-context-full').map(r => r.props.get('display'))).toEqual(['none']);
+    });
   });
 
   // A step killed mid-execution (the turn died before the tool reported a

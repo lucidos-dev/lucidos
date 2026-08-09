@@ -44,6 +44,16 @@
        1.4 is also what `.step-icon` used to declare for itself; with the row on
        1.4 the icon inherits it and that override is gone. */
     line-height: 1.4;
+    /* The row is its own query container, so the counter's compact form can be
+       gated on the width the row ACTUALLY has (see `.step-context-compact`
+       below) rather than on the viewport. The two differ constantly on a
+       desktop: the row is only as wide as the thread pane the split divider was
+       dropped at. Named, so the query cannot silently resolve to some outer
+       container (`.repo-preview-split` is the other one in this app) and match
+       never or always. Safe to contain: the row's width comes from its block
+       parent, never from its contents. */
+    container-type: inline-size;
+    container-name: step-row;
     min-width: 0;
     width: 100%;
     text-align: left;
@@ -201,8 +211,8 @@
 /* The context counter is a fixed-width fact, so it never wraps and never
    shrinks: wrapped, "178k / 1000k (18%)" took three lines on a phone and
    tripled the height of every step row. The row absorbs the width by
-   ellipsizing the description instead, and on mobile the counter itself is
-   rendered as the percentage alone (`contextLabel`). */
+   ellipsizing the description instead, and on a narrow row the counter itself
+   is rendered as the percentage alone (`contextLabel`, gated below). */
 .inline-step .step-context {
     /* Button chrome reset first: the counter is a <button> when a snapshot
        backs it and a <span> when nothing does, and must read as text either
@@ -221,6 +231,34 @@
     font-size: 0.85em;
     white-space: nowrap;
     flex-shrink: 0;
+}
+
+/* Which counter the user sees is a WIDTH question, not a device one: a phone is
+   just the commonest way to end up with a narrow row, and a desktop thread pane
+   dragged down to its 300px minimum crowds the counter the same way. So
+   `InlineStep` renders both forms and the row's own inline size picks one. Both
+   in the DOM is the cheap half of the trade: the alternative is measuring the
+   row in JS, which would re-render every step in the transcript on every frame
+   of a divider drag. `display: none` also keeps the hidden form out of the
+   accessibility tree, so a screen reader reads one counter, not two.
+
+   26rem is where the full form stops paying for itself: it costs roughly 4rem
+   more than the bare percentage, and by then the description is being
+   ellipsized to fund it. In rem, so the gate tracks the user's UI scale (the
+   root font-size IS that scale) and widens in CSS px on the 18px mobile root,
+   where the text it is measuring is bigger too. */
+.inline-step .step-context-compact {
+    display: none;
+}
+
+@container step-row (max-width: 26rem) {
+    .inline-step .step-context-full {
+        display: none;
+    }
+
+    .inline-step .step-context-compact {
+        display: inline;
+    }
 }
 
 /* Trimmed = content was cut to fit the budget. A neutral marker, not a

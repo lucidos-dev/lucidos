@@ -5,11 +5,10 @@ import { loadedOr } from '../../store/types';
 import type { ResponseEvent, App } from '../../store/types';
 import type { CodingAgent } from '../../api/types';
 import type { Exchange, ThreadEvent, MessageOrigin } from '../../store/thread-events';
-import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
+import { ENGINE_LABEL, SYSTEM_ICON, SYSTEM_LABEL, API_CALLER_ICON, API_CALLER_LABEL, LUCIDOS_AGENT_LABEL, abortPromisesAutoResume, exchangeUserMessage, exchangeUserImageHashes, exchangeTimestamp, exchangeResponseTimestamp, exchangeResponseText, exchangeEngineLimitDetail, exchangeSteps, exchangeResponseEvents, exchangeStatus, exchangeError, hasRenderableResponseContent, isEmptyContinuedExchange, isCanceledQuestionDivider, changePanelHasContinuation, findCommandPermissionResolution, findMcpPermissionResolution, findPermissionResolution, findQuestionAnswer, isChangeLifecycleEvent, modeToInitiator, originMode, continuationStartedSummary, responseAbortedSummary, eventWaitStoppedSummary, isUserStoppedWait, RESPONSE_CANCELED_SUMMARY } from '../../store/thread-events';
 import { LucidosGlyph } from '../shared/LucidosMark';
 import { artifacts, appsList, openImagePopupFromGroup, showToast, stepsExpanded, detailsExpanded, collapsedExchanges, toggleExchangeCollapsed, collapsedInitiators, toggleInitiatorCollapsed, toggleMessageRoutePanel } from '../../store/store';
 import { removeQueuedMessage } from '../../store/actions/chat';
-import { preserveOnToggle } from './scrollState';
 import { openFilePreview, openLocalFile } from '../../store/actions/artifacts';
 import { openApp } from '../../store/actions/apps';
 import { withScrollAnchor } from './CreateThreadView';
@@ -292,23 +291,23 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   }
 
   // More/Less and Show steps/Hide steps grow the turn the reader is looking at,
-  // so they mark the reader parked first, exactly as the two collapse toggles
-  // do. `withScrollAnchor` does NOT cover this on its own: it holds the
-  // `.chat-exchange` ROOT still, and everything these two reveal grows BELOW
-  // that root's top, so its offset never moves, the compensating scrollTop write
-  // never happens, and no scroll event follows. The transcript's
-  // ResizeObserver is then the only handler that sees the growth, and it keeps a
-  // reader who is riding the bottom on the bottom, which would scroll the thing
-  // they just opened straight back off the top.
+  // so `withScrollAnchor` holds the `.chat-exchange` ROOT still across the
+  // growth. Everything the two reveal grows BELOW that root's top, so the
+  // reader keeps looking at the same thing and the transcript simply gets
+  // taller underneath them.
+  //
+  // Each toggle used to call `preserveOnToggle()` first, which marked the reader
+  // parked so the transcript's ResizeObserver would not read the growth as "the
+  // reader is riding the bottom" and re-pin them, scrolling the thing they just
+  // opened off the top. No resize re-pins anyone now, so the mark has nothing
+  // left to prevent.
   function toggleDetails() {
-    preserveOnToggle();
     withScrollAnchor(rootRef.current, () => {
       detailsExpanded.value = !detailsExpanded.value;
     });
   }
 
   function toggleSteps() {
-    preserveOnToggle();
     withScrollAnchor(rootRef.current, () => {
       stepsExpanded.value = !stepsExpanded.value;
     });
@@ -505,7 +504,12 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
   // reading "Working" over a stopped engine.
   const isTerminatedContinuation = (isAbortPanel || isCancelPanel)
     && (hasResponse || hasRenderableResponseContent(events));
-  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isCanceledDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
+  // The user's Stop-waiting turn. Nothing resumes out of it (a stop is the one
+  // resolution with no wake), so unlike the abort and cancel boundaries above it
+  // takes no continuation exception: the header line IS the whole turn, and a
+  // response panel under it would be a status badge over an empty body.
+  const isEventWaitStopPanel = isUserStoppedWait(exchange.userEvent);
+  const showResponsePanel = (!isChangePanel || isChangeContinuation) && (!isAbortPanel || isTerminatedContinuation) && (!isCancelPanel || isTerminatedContinuation) && !isEventWaitStopPanel && !isCanceledDivider && !isEmptyContinued && !isQueuedUserMessage && (hasResponse || hasEvents || showStatus);
   let initiatorActions: ComponentChildren | undefined;
   if (isChangePanel) {
     initiatorActions = changeActions(
@@ -537,13 +541,16 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         // side (see `.response-chunk` in chat/response.css).
         return <div key={`t${k}`} class="response-chunk" dangerouslySetInnerHTML={{ __html: visibleTextHtmls.get(evt)! }} />;
       }
+      // `evt.type === 'step'` is `isStepMechanics` spelled inline, for the type
+      // narrowing `InlineStep` needs. It is the ONLY row the toggle hides.
       if (evt.type === 'step' && showSteps) return <InlineStep key={`s${k}`} event={evt} />;
       if (evt.type === 'image') return <GeneratedImage key={`img${k}`} event={evt} />;
       if (evt.type === 'checkpoint') return <CheckpointCard key={`cp${k}`} event={evt} />;
-      // Gated on `showSteps` like any other step, because it now IS one. Hiding
-      // the mechanics loses nothing the user can't reach: the live wait is on
-      // the prompt bar's clock indicator, which is always mounted.
-      if (evt.type === 'event_wait' && showSteps) return <EventWaitStep key={`ew${k}`} event={evt} />;
+      // Ungated, like every other marker. The park is the transcript's only
+      // record that the thread subscribed to something: the clock indicator
+      // holds the LIVE half and drops the wait the moment it resolves, so a
+      // toggle that defaults to off left a resolved wait recorded nowhere.
+      if (evt.type === 'event_wait') return <EventWaitStep key={`ew${k}`} event={evt} />;
       if (evt.type === 'empty') return <div key={`e${k}`} class="response-empty-note">{'The model returned an empty response.'}</div>;
       return null;
     });
@@ -573,10 +580,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
         collapsible={canCollapseInitiator}
         collapsed={isInitiatorCollapsed}
         onToggle={canCollapseInitiator
-          ? () => {
-              preserveOnToggle();
-              toggleInitiatorCollapsed(threadId, exchange.userSeq);
-            }
+          ? () => toggleInitiatorCollapsed(threadId, exchange.userSeq)
           : undefined}
       />
 
@@ -606,10 +610,7 @@ function ChatExchangeImpl({ exchange, streamingBuffer, isLast, isQueued, threadI
           collapsible={canCollapse}
           collapsed={isCollapsed}
           onToggle={canCollapse
-            ? () => {
-                preserveOnToggle();
-                toggleExchangeCollapsed(threadId, exchange.userSeq);
-              }
+            ? () => toggleExchangeCollapsed(threadId, exchange.userSeq)
             : undefined}
         >
           {hasEvents && hasSections ? (
@@ -801,6 +802,7 @@ function initiatorSummary(ev: Exchange['userEvent']): string {
     case 'ChangeReverted':           return 'Change reverted';
     case 'ChangeApplyFailed':        return 'Change failed';
     case 'UserPromptInjected':       return 'Auto-prompt sent';
+    case 'EventWaitCanceled':        return eventWaitStoppedSummary(ev.reason);
     case 'MessageReceived':
       if (ev.origin?.kind === 'api') return 'API message';
       if (modeToInitiator(ev.mode) === 'system') return 'Forwarded message';
@@ -976,6 +978,13 @@ export function describeInitiator(
       // label, and clicking it opens the Initiator info popover (which discloses
       // "You", the device, and the cancel cause).
       return actionInitiator(RESPONSE_CANCELED_SUMMARY);
+    case 'EventWaitCanceled':
+      // Only a user stop reaches here: every other cause stays a step inside
+      // the turn it happened in (see `isExchangeStartEvent`). Same iconless
+      // boundary style as the cancel above, and for the same reason: the action
+      // IS the header, and the chip opens the popover that names the device
+      // that pressed Stop waiting (read off this event's own `actor`).
+      return actionInitiator(summary);
     case 'MissingHardeningDetected':
       return engineInitiator(summary);
     case 'MergeConflictDetected':

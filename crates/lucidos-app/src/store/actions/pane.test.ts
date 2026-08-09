@@ -1,13 +1,12 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import {
   mobileView, threadDrawerOpen, threadDrawerWidth, splitRatio, focusedPane,
-  DEFAULT_DRAWER_WIDTH, MIN_DRAWER_WIDTH, THREAD_DRAWER_WIDTH_KEY,
+  DEFAULT_DRAWER_WIDTH, THREAD_DRAWER_WIDTH_KEY,
   MOBILE_VIEWS, PANE_INDEX, setMobileView, getInitialMobileView, type MobileView,
 } from '../store';
 import { drawerOpen } from '../../components/layout/Drawer';
-import {
-  DEFAULT_SPLIT_RATIO, KEYBOARD_RESIZE_STEP_PX, MIN_THREAD_PANE_PX, MIN_CONTENT_PANE_PX,
-} from '../../components/layout/splitHelpers';
+import { DEFAULT_SPLIT_RATIO, KEYBOARD_RESIZE_STEP_PX } from '../../components/layout/splitHelpers';
+import { minDrawerWidth, minThreadPanePx, minContentPanePx } from '../paneMinimums';
 import {
   navigateToPane, checkPaneConsistency, toggleThreads, focusPane, revealContentPane, revealThreadPane,
   toggleThreadPane, toggleContentPane, stepThreadPaneWidth, stepThreadDrawerWidth, resetPaneLayout,
@@ -213,7 +212,7 @@ describe('toggleThreads', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Element stub for the mocked document.querySelector: offsetWidth for the
- *  step math, classList for setSplitRatio's triggerSnapAnimate. */
+ *  step math, classList for setSplitRatio's triggerPaneAnimate. */
 function fakeEl(offsetWidth: number) {
   return { offsetWidth, classList: { add: () => {}, remove: () => {} } } as unknown as Element;
 }
@@ -474,7 +473,7 @@ describe('stepThreadPaneWidth', () => {
 describe('stepThreadDrawerWidth', () => {
   const ROW = 1600;
   // Visible thread + content panes reserve their minimums against the drawer.
-  const MAX = ROW - MIN_THREAD_PANE_PX - MIN_CONTENT_PANE_PX;
+  const MAX = ROW - minThreadPanePx() - minContentPanePx();
 
   beforeEach(() => {
     resetState();
@@ -495,11 +494,12 @@ describe('stepThreadDrawerWidth', () => {
   });
 
   it('clamps at the drawer minimum instead of closing', () => {
-    threadDrawerWidth.value = MIN_DRAWER_WIDTH + 10;
+    const min = minDrawerWidth();
+    threadDrawerWidth.value = min + 10;
     stepThreadDrawerWidth(-1);
-    expect(threadDrawerWidth.value).toBe(MIN_DRAWER_WIDTH);
+    expect(threadDrawerWidth.value).toBe(min);
     stepThreadDrawerWidth(-1);
-    expect(threadDrawerWidth.value).toBe(MIN_DRAWER_WIDTH);
+    expect(threadDrawerWidth.value).toBe(min);
   });
 
   it('clamps so the visible split panes keep their minimum widths', () => {
@@ -534,6 +534,23 @@ describe('resetPaneLayout', () => {
     expect(splitRatio.value).toBe(DEFAULT_SPLIT_RATIO);
     expect(threadDrawerWidth.value).toBe(DEFAULT_DRAWER_WIDTH);
     expect(localStorage.getItem(THREAD_DRAWER_WIDTH_KEY)).toBe(String(DEFAULT_DRAWER_WIDTH));
+  });
+
+  it('never resets BELOW the drawer floor, which the default can fall under', () => {
+    // The default is a constant while the floor is derived from the root font
+    // size and the desktop build, so the two cross: at a large UI scale, or on
+    // the packaged macOS build (which reserves the traffic lights), the header
+    // row needs more than 300px and a bare reset would put the drawer straight
+    // back under its own floor. Scale the root past that crossing point.
+    vi.stubGlobal('getComputedStyle', () => ({ fontSize: '32px', getPropertyValue: () => '' }));
+    const floor = minDrawerWidth();
+    expect(floor, 'a 32px root must put the floor above the default').toBeGreaterThan(DEFAULT_DRAWER_WIDTH);
+
+    threadDrawerWidth.value = 500;
+    resetPaneLayout();
+    expect(threadDrawerWidth.value).toBe(floor);
+    expect(localStorage.getItem(THREAD_DRAWER_WIDTH_KEY)).toBe(String(floor));
+    vi.unstubAllGlobals();
   });
 
   it('no-ops on mobile', () => {

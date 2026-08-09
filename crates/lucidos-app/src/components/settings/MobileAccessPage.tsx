@@ -17,6 +17,7 @@ import {
   type TailscaleInfo,
 } from '../../utils/tauri';
 import { getNetworkConfig } from '../../api/client';
+import { Explainer } from '../shared/Explainer';
 import type { NetworkConfigResponse } from '../../api/types';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { toFailed } from '../../store/types';
@@ -705,11 +706,16 @@ export function MobileAccessPage() {
     );
     return (
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="access:urls">Connect URLs</div>
-        <p class="settings-section-desc">
-          The engine runs as an always-on background service and is reachable at these addresses.
-          Open one on another device to use Lucidos from your phone.
-        </p>
+        <div class="settings-section-title" data-search-anchor="access:urls">
+          Connect URLs
+          <Explainer title="Connect URLs">
+            <p>
+              The engine runs as an always-on background service and is reachable at
+              these addresses.
+            </p>
+            <p>Open one on another device to use Lucidos from your phone.</p>
+          </Explainer>
+        </div>
         <div class="list-rows">
           <UrlRow label="This Mac" url={connect.localhost_url} hint="localhost" />
           {lan.kind === 'url' && (
@@ -875,16 +881,31 @@ export function MobileAccessPage() {
     <>
       {showMachineHalf && connectUrlsSection()}
 
+      {/* The one static paragraph on this page, so the one thing behind an
+          explainer. Everything else here is a `state.kind` branch of the setup
+          walkthrough: a step the user is mid-way through following, which has to
+          stay on screen while they act on it. The two numbered sections below
+          already say that the machine and the device are separate steps. */}
       <div class="settings-section">
-        <div class="settings-section-title" data-search-anchor="access:tailscale">Tailscale (recommended)</div>
-        <p class="settings-section-desc">
-          Tailscale gives your other devices a private, encrypted HTTPS link to the machine
-          running Lucidos that works off your home network, which is what enables the installable
-          PWA and push notifications. It stays tailnet-private (we use <code>serve</code>, not{' '}
-          <code>funnel</code>), so the engine is never exposed to the public internet. Two things
-          have to be true, and they are independent: the machine is on a tailnet, and the device
-          you want to use has joined it.
-        </p>
+        <div class="settings-section-title" data-search-anchor="access:tailscale">
+          Tailscale (recommended)
+          <Explainer title="Tailscale (recommended)">
+            <p>
+              Tailscale gives your other devices a private, encrypted HTTPS link to the
+              machine running Lucidos that works off your home network, which is what
+              enables the installable PWA and push notifications.
+            </p>
+            <p>
+              It stays tailnet-private (we use <code>serve</code>, not{' '}
+              <code>funnel</code>), so the engine is never exposed to the public
+              internet.
+            </p>
+            <p>
+              Two things have to be true, and they are independent: the machine is on a
+              tailnet, and the device you want to use has joined it.
+            </p>
+          </Explainer>
+        </div>
       </div>
 
       <div class="settings-section">

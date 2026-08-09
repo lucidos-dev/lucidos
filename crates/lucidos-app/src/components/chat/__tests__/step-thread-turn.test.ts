@@ -14,7 +14,6 @@ import {
   stepThreadTurn,
   setActiveScrollElement,
   awayFromBottom,
-  scrolledUp,
 } from '../scrollState';
 
 // ---------------------------------------------------------------------------
@@ -66,7 +65,6 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
 
   beforeEach(() => {
     awayFromBottom.value = false;
-    scrolledUp.value = false;
     // Force reduced motion so the jump is a synchronous scrollTop write (no rAF
     // animation loop to drive/await in the node test env).
     const origMM = globalThis.matchMedia;
@@ -96,8 +94,7 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
 
     stepThreadTurn(1);
 
-    expect(awayFromBottom.value).toBe(false); // chevron hidden
-    expect(scrolledUp.value).toBe(false);     // at the bottom, not parked mid-thread
+    expect(awayFromBottom.value).toBe(false); // chevron hidden: we are at the bottom
   });
 
   it('keeps the chevron when a down-jump lands mid-thread (content still below)', () => {
@@ -110,8 +107,7 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
 
     stepThreadTurn(1);
 
-    expect(awayFromBottom.value).toBe(true); // chevron shown — there is content below
-    expect(scrolledUp.value).toBe(true);     // parked mid-thread
+    expect(awayFromBottom.value).toBe(true); // chevron shown: there is content below
   });
 
   it('reaching the last turn (landed one turn above) lands at the bottom with no chevron', () => {
@@ -126,6 +122,5 @@ describe('stepThreadTurn — down chevron on the last turn', () => {
     stepThreadTurn(1);
 
     expect(awayFromBottom.value).toBe(false);
-    expect(scrolledUp.value).toBe(false);
   });
 });

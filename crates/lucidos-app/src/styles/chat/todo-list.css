@@ -9,7 +9,7 @@
    1.25rem SVG via --icon-size-lg) — see global.css. Pixel-identical to the
    adjacent ImageIcon button since both use the same SVG sizing rule. */
 
-/* Shell geometry, placement, the header strip and the close button all come
+/* Shell geometry, placement, the title bar and the close button all come
    from `.prompt-bar-popover*` in `styles/chat/prompt-bar-popover.css`, which
    the subscription indicator beside it uses too, and which `chat.css` imports
    FIRST so a surface's own width beats the shell's fit cap.
@@ -72,7 +72,7 @@
 }
 
 /* Indicator glanceable signal. All three states render the SAME TodoListIcon
-   checklist glyph, so the button keeps reading as "todo list" whatever the
+   ticked checkbox, so the button keeps reading as "todo list" whatever the
    agent is doing; the state rides on color alone. Shape-switching is what the
    old two-glyph pair did, and its in-progress glyph (a filled dome inside a
    checkbox, an SVG translation of the panel's ◐) read as nothing at all.

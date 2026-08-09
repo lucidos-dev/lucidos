@@ -19,6 +19,7 @@ pub mod db_health;
 pub mod engine_version;
 pub mod event_bus;
 pub mod event_wait;
+pub mod frontend_preview;
 mod frontend_refresh;
 pub(crate) mod git_ops;
 pub mod http;
@@ -424,6 +425,21 @@ pub struct LucidosEngine {
     /// engines each get their own latch. See
     /// `engine::frontend_refresh::warn_once_if_frontend_worktree_pinned`.
     frontend_worktree_pin_warned: std::sync::atomic::AtomicBool,
+    /// Dev-only: the one supervised Vite dev server showing a coding-agent
+    /// worktree's frontend before Apply. One slot per workspace by design (see
+    /// `engine::frontend_preview`). Ephemeral by the statelessness rule: it is a
+    /// process handle, the child dies with this engine, and the on-disk sidecar
+    /// is what lets the NEXT engine reap an orphan rather than a claim to
+    /// restore. A `tokio` mutex because every operation on it awaits (spawn,
+    /// readiness probe, kill, wait).
+    frontend_preview: tokio::sync::Mutex<Option<frontend_preview::RunningPreview>>,
+    /// Serializes a WHOLE start or stop of the frontend preview, which the slot
+    /// mutex above cannot: a start releases the slot between stopping the old
+    /// preview, taking a port, spawning and waiting for readiness, so two
+    /// concurrent starts would both spawn and one child would be overwritten and
+    /// orphaned with nothing left tracking its pid. Separate from the slot rather
+    /// than held across it, because `stop` needs the slot too.
+    frontend_preview_lifecycle: tokio::sync::Mutex<()>,
     /// Device actor stashed at restart-REQUEST time and read by the
     /// graceful-shutdown boundary emit at ACTUAL teardown: the HTTP handler has
     /// the device, the SIGUSR1 signal handler does not. Present → a user asked

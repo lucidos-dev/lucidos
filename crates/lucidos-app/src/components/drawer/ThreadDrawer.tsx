@@ -2,13 +2,16 @@ import type { ComponentChildren } from 'preact';
 import { useRef, useEffect, useLayoutEffect, useCallback, useMemo } from 'preact/hooks';
 import { memo } from 'preact/compat';
 import { signal, useSignalEffect } from '@preact/signals';
-import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane } from '../../store/store';
+import { threadDrawerOpen, threadDrawerWidth, threadMap, focusedThreadId, threadsLoaded, splitRatio, effectiveThreadStatus, getThreadDisplaySection, threadSearchQuery, threadSearchResults, threadHasMore, threadLoadingMore, archiveThreadCount, drawerView, setDrawerView, repositories, focusedPane } from '../../store/store';
+import { appliedThreadFilter } from '../../store/appliedThreadFilter';
 import { resolveScope, resolveCodingAgent } from '../../store/composeSelections';
 import { composeDraftContextName } from '../../store/composeDestination';
 import { threadPassesChannelFilter } from '../../store/threadFilter';
+import { threadFilterPanelOpen, closeThreadFilterPanel } from '../../store/threadFilterPanel';
+import { ThreadFilterPanel } from '../layout/ThreadFilterPanel';
 import { focusPane } from '../../store/actions/pane';
 import { focusThread } from '../../store/actions/threads';
-import { loadOlderThreads, reloadAfterFilterChange, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
+import { loadOlderThreads, reloadAfterFilterChange, filterChangedSinceLoad, ensureThreadInMap, loadThreadEvents } from '../../store/actions/thread-loading';
 import { ThreadStatusIcon, resolveVisualStatus, type VisualStatus } from '../shared/ThreadStatusIcon';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
@@ -369,6 +372,40 @@ export function seedDrawerHighlight(): void {
     requestAnimationFrame(seed);
 }
 
+/** The drawer pane's list-nav keydown handler. Module-level (it reads only
+ *  signals and module functions) so the filter-panel suppression below is
+ *  unit-testable without mounting the pane. */
+export function handleDrawerKeyDown(e: KeyboardEvent): void {
+    // The filter panel covers the list and owns its own controls: an Enter on one
+    // of its rows must not ALSO fire "open the highlighted thread" as the key
+    // bubbles out to this container, and its arrows must not walk a list nobody
+    // can see.
+    if (threadFilterPanelOpen.value) return;
+    // List-nav owns only un-modified arrows/Enter. Any chord with a primary
+    // modifier or Alt is a global shortcut (⌘⇧↵ maximize pane group, ⌘⌥↑↓
+    // history, …), so let it bubble to the document handler instead of stealing
+    // Enter as "select highlighted" / arrows as "move highlight".
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (e.key === 'ArrowDown') {
+        e.preventDefault();
+        moveHighlight(1);
+    } else if (e.key === 'ArrowUp') {
+        e.preventDefault();
+        moveHighlight(-1);
+    } else if (e.key === 'Enter') {
+        e.preventDefault();
+        selectHighlighted();
+    } else if (e.key === 'ArrowLeft') {
+        // Tree collapse: own family → parent's family → section, focusing the
+        // node revealed by each step. Consume the key only when it acts; an
+        // unhandled ← falls through (nothing else binds the horizontal arrows).
+        if (collapseHighlighted()) e.preventDefault();
+    } else if (e.key === 'ArrowRight') {
+        // Tree expand / descend, the inverse of ←.
+        if (expandHighlighted()) e.preventDefault();
+    }
+}
+
 export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) {
     // On mobile, the drawer overlay is disabled — mobile has a dedicated threads
     // pane (pane 0) that keeps dots, header, and content in sync via mobileView.
@@ -382,6 +419,7 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
     const view = drawerView.value;
     // Search overrides the selected view; otherwise the selector decides.
     const activeView = isSearching ? 'search' : view;
+    const filterPanelOpen = threadFilterPanelOpen.value;
 
     const drawerRef = useRef<HTMLDivElement>(null);
     const listRef = useRef<HTMLDivElement>(null);
@@ -404,41 +442,27 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
         else el.removeAttribute('aria-activedescendant');
     });
 
-    const handleKeyDown = useCallback((e: KeyboardEvent) => {
-        // List-nav owns only un-modified arrows/Enter. Any chord with a primary
-        // modifier or Alt is a global shortcut (⌘⇧↵ maximize pane group, ⌘⌥↑↓
-        // history, …) — let it bubble to the document handler instead of stealing
-        // Enter as "select highlighted" / arrows as "move highlight".
-        if (e.metaKey || e.ctrlKey || e.altKey) return;
-        if (e.key === 'ArrowDown') {
-            e.preventDefault();
-            moveHighlight(1);
-        } else if (e.key === 'ArrowUp') {
-            e.preventDefault();
-            moveHighlight(-1);
-        } else if (e.key === 'Enter') {
-            e.preventDefault();
-            selectHighlighted();
-        } else if (e.key === 'ArrowLeft') {
-            // Tree collapse: own family → parent's family → section, focusing the
-            // node revealed by each step. Consume the key only when it acts; an
-            // unhandled ← falls through (nothing else binds the horizontal arrows).
-            if (collapseHighlighted()) e.preventDefault();
-        } else if (e.key === 'ArrowRight') {
-            // Tree expand / descend — the inverse of ←.
-            if (expandHighlighted()) e.preventDefault();
-        }
-    }, []);
-
     useEffect(() => {
         highlightedKey.value = null;
     }, [activeView]);
+
+    // The filter panel is a view OF this pane, so it cannot outlive the pane
+    // being visible. Its open state is a signal and it holds an Escape-registry
+    // entry, so a drawer closed (or a thread side collapsed) with the panel up
+    // would otherwise leave an invisible surface eating the user's next Escape,
+    // and reopening the drawer would land on the filter instead of the list.
+    // Mobile passes `forceVisible`, so this never fires there: the threads pane
+    // keeps whichever view it was showing when the user swiped away, which is
+    // what every other pane does.
+    useEffect(() => {
+        if (!visible) closeThreadFilterPanel();
+    }, [visible]);
 
     return (
         <div ref={drawerRef}
              class={`thread-drawer${visible ? '' : ' thread-drawer-collapsed'}`}
              style={visible ? { width: `${threadDrawerWidth.value}px` } : undefined}
-             onKeyDown={handleKeyDown}
+             onKeyDown={handleDrawerKeyDown}
              onPointerDown={(e) => handleDrawerPointerDown(e.target)}
              role="tree"
              aria-label="Threads"
@@ -455,6 +479,18 @@ export function ThreadDrawer({ forceVisible }: { forceVisible?: boolean } = {}) 
                     : <ThreadList />
                 )}
             </div>
+            {/* The filter panel is a view inside THIS pane, covering the list
+                rather than replacing it, so the list stays mounted underneath.
+                That used to be load-bearing, because the refetch effect's guard
+                was seeded at mount and a change it missed was a change nobody
+                caught up on. It is not any more, twice over: the list renders
+                and pages from the *applied thread filter*, which deliberately
+                does NOT move while the panel covers it, and the guard is
+                `filterChangedSinceLoad()`, which compares against what the
+                loaded window was actually fetched against, so an unmounted list
+                reloads on its next mount. Which is what makes the four STATUS
+                views safe, since those really do replace this list. */}
+            {filterPanelOpen && <ThreadFilterPanel onClose={closeThreadFilterPanel} />}
         </div>
     );
 }
@@ -469,10 +505,15 @@ function ThreadList() {
     const sentinelRef = useRef<HTMLDivElement>(null);
     const hydrated = threadsLoaded.value;
 
-    const filter = threadChannelFilter.value;
+    // The *applied* selection, not the live signals the filter panel's
+    // checkboxes write: while that panel is up it covers this list completely,
+    // so reading it live meant every tick recategorized, rebuilt every row and
+    // refetched behind an opaque panel, delaying the paint of the very checkbox
+    // the user just ticked. See `store/appliedThreadFilter.ts`.
+    const applied = appliedThreadFilter.value;
     // Empty channel filter means "show nothing" — including composing threads.
     // Otherwise the composing drafts would be the only thing visible.
-    const composingList = filter.size === 0 ? [] : composingThreads(threadMap.value);
+    const composingList = applied.channels.size === 0 ? [] : composingThreads(threadMap.value);
 
     // The categorization pipeline (family graph → top-thread filter → section
     // routing → sort) is O(loaded threads) across several passes. It used to run
@@ -483,28 +524,28 @@ function ThreadList() {
     // re-running it per render blocks the main thread and delays click handling
     // (dev-ws input lag, 2026-06-24). Read its real inputs into locals — so the
     // component still SUBSCRIBES to them — and memoize on exactly those, so a
-    // re-render that didn't change them reuses the result. Collapse-filtering and
-    // nesting stay below: they key on `collapsedFamilies` and are cheap over the
-    // already-categorized rendered set.
-    const triggerSelection = selectedTriggerIds.value;
-    const repoSelection = selectedRepoIds.value;
-    const appSelection = selectedAppIds.value;
+    // re-render that didn't change them reuses the result. The four filter sets
+    // arrive as ONE object whose identity changes only when the selection really
+    // moved (`appliedThreadFilter`), which is what lets the whole facet
+    // selection be a single memo key. Collapse-filtering and nesting stay below:
+    // they key on `collapsedFamilies` and are cheap over the already-categorized
+    // rendered set.
     const threadMapValue = threadMap.value;
     const { categorized, familyGraph, decorations } = useMemo<DrawerCategorization>(
         () => hydrated
             ? computeDrawerCategorization(
                 Array.from(threadMapValue.values()),
-                filter,
-                triggerSelection,
-                repoSelection,
-                appSelection,
+                applied.channels,
+                applied.triggerIds,
+                applied.repoIds,
+                applied.appIds,
             )
             : {
                 categorized: { current: [], saved: [], archive: [], statusMap: new Map() },
                 familyGraph: { byId: new Map(), rootByThread: new Map() },
                 decorations: { routedByThread: new Map(), liftedRoots: new Set(), archivedSubThreads: new Set() },
             },
-        [hydrated, threadMapValue, filter, triggerSelection, repoSelection, appSelection],
+        [hydrated, threadMapValue, applied],
     );
     const { current, saved, archive, statusMap } = categorized;
 
@@ -583,7 +624,11 @@ function ThreadList() {
         .join(',');
     useEffect(() => { navNodes.value = navList; }, [navKey]);
 
-    useFlipTransitions(containerRef, portalRef, sectionDefs, filter);
+    // Reset key: the whole applied selection, not just its channel set. A filter
+    // change re-populates the list wholesale, which is not threads moving
+    // between sections, so nothing should fly. Keyed on the channels alone, a
+    // repo / app / trigger sub-selection change animated the swap.
+    useFlipTransitions(containerRef, portalRef, sectionDefs, applied);
 
     // Infinite scroll, part 1 — the fill loop. Keep loading until the sentinel
     // is pushed back out of view (or there's nothing more). This loop is
@@ -641,27 +686,27 @@ function ThreadList() {
     // all archived) — relying on the IntersectionObserver alone strands the user
     // because it only re-fires on a scroll transition. `reloadAfterFilterChange`
     // makes population deterministic; `loadWhileSentinelVisible` then tops the
-    // viewport off. The prevRef guard suppresses the mount run (no fetch on
-    // first render; the initial window load + the observer cover that case).
-    const currentTriggers = selectedTriggerIds.value;
-    const currentRepos = selectedRepoIds.value;
-    const currentApps = selectedAppIds.value;
-    const prevFilterRef = useRef(filter);
-    const prevTriggersRef = useRef(currentTriggers);
-    const prevReposRef = useRef(currentRepos);
-    const prevAppsRef = useRef(currentApps);
+    // viewport off.
+    //
+    // The guard is `filterChangedSinceLoad()`, a STORE fact, not a `useRef`
+    // seeded at mount. This list renders under the default `all` status only,
+    // and the Filter panel can change the selection under the other four, so a
+    // per-instance ref answers the wrong question twice: it misses the change
+    // (nobody is watching) and then seeds with the new value, suppressing the
+    // catch-up on the way back. Comparing against what was actually fetched
+    // makes the mount run correct rather than merely skipped: silent on a
+    // window that already matches, and a full reload on one that does not.
+    //
+    // Keyed on the APPLIED selection, so a run of ticks made while the filter
+    // panel covers this list settles into ONE reload when the panel closes,
+    // rather than a page fetch plus an archived-count fetch plus a fill loop
+    // per tick, all for rows nobody can see.
     useEffect(() => {
-        if (prevFilterRef.current !== filter
-            || prevTriggersRef.current !== currentTriggers
-            || prevReposRef.current !== currentRepos
-            || prevAppsRef.current !== currentApps) {
-            prevFilterRef.current = filter;
-            prevTriggersRef.current = currentTriggers;
-            prevReposRef.current = currentRepos;
-            prevAppsRef.current = currentApps;
-            void reloadAfterFilterChange().then(() => void loadWhileSentinelVisible());
-        }
-    }, [filter, currentTriggers, currentRepos, currentApps]);
+        // Before the first window lands there is nothing to bring up to date,
+        // and the initial load stamps the selection it fetched against.
+        if (!hydrated || !filterChangedSinceLoad()) return;
+        void reloadAfterFilterChange().then(() => void loadWhileSentinelVisible());
+    }, [hydrated, applied]);
 
     const hasMore = threadHasMore.value;
 

@@ -96,6 +96,7 @@ describe('the card carries no hint of its own', () => {
 describe('AnsweredBody — Canceled state', () => {
   it('renders a disabled red Cancel button instead of the orange canceled badge', () => {
     const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
       question: 'q',
       options: [{ id: 'a', label: 'A' }],
       multiSelect: false,
@@ -112,6 +113,7 @@ describe('AnsweredBody — Canceled state', () => {
 
   it('does not render the cancel-as-picked button for a Selected answer', () => {
     const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
       question: 'q',
       options: [{ id: 'a', label: 'A' }, { id: 'b', label: 'B' }],
       multiSelect: false,
@@ -123,6 +125,7 @@ describe('AnsweredBody — Canceled state', () => {
 
   it('does not render the cancel-as-picked button for a FreeText answer', () => {
     const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
       question: 'q',
       options: [],
       multiSelect: false,
@@ -196,6 +199,7 @@ describe('question text — URL linkification', () => {
 
   it('renders the URL as a link in the answered body too', () => {
     const text = vnodeToText(AnsweredBody({
+      toolUseId: 'tool-1',
       question: QUESTION,
       options: [{ id: 'a', label: 'Yes' }],
       multiSelect: false,

@@ -441,7 +441,7 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
         .arg("--permission-mode")
         .arg("acceptEdits")
         .arg("--permission-prompt-tool")
-        .arg("mcp__lucidos_perm__approve")
+        .arg(CC_PERMISSION_PROMPT_TOOL)
         .arg("--mcp-config")
         .arg(permission_mcp_config_json(cli_dir))
         .arg("--strict-mcp-config")
@@ -541,9 +541,46 @@ fn build_command(args: &SpawnArgs<'_>, cli_dir: Option<&Path>) -> tokio::process
     cmd
 }
 
+/// MCP server name Claude Code mounts `lucidos mcp-permission-server` under
+/// (the `mcpServers` key in [`permission_mcp_config_json`]). CC prefixes every
+/// MCP tool with `mcp__<server>__`, so this is also the first half of both wire
+/// names below. Codex mounts the SAME binary under the name `lucidos`, which is
+/// why its question tool has a different wire name
+/// ([`super::CODEX_ASK_USER_QUESTION_TOOL`]) for the same server-side tool.
+const CC_PERMISSION_MCP_SERVER: &str = "lucidos_perm";
+
+/// The tool CC is pointed at with `--permission-prompt-tool`: every gated tool
+/// call arrives here and is forwarded to `/api/v1/internal/permission-prompt`.
+pub const CC_PERMISSION_PROMPT_TOOL: &str = "mcp__lucidos_perm__approve";
+
+/// The question tool as CC sees it. Same server-side `ask_user_question` Codex
+/// calls, under CC's mount name, so it is a THIRD wire name for one flow.
+///
+/// It is reachable because CC's `--mcp-config` advertises every tool the server
+/// lists, and the server lists `approve` and `ask_user_question` both. So a CC
+/// session can raise a QuestionCard through here instead of through its own
+/// native `AskUserQuestion`, and everything keyed on the name has to know it:
+/// see [`super::is_user_question_tool`], which is the one place that decides.
+pub const CC_MCP_ASK_USER_QUESTION_TOOL: &str = "mcp__lucidos_perm__ask_user_question";
+
+/// Claude Code's OWN built-in question tool, intercepted by the PreToolUse hook
+/// in `crate::engine::cc_settings` rather than routed over MCP. Not prefixed,
+/// because it is not an MCP tool.
+pub const CC_NATIVE_ASK_USER_QUESTION_TOOL: &str = "AskUserQuestion";
+
 /// Build the `--mcp-config` JSON for the lucidos permission server. CC spawns
 /// `lucidos mcp-permission-server` over stdio; the server reads `LUCIDOS_THREAD_ID`
 /// + `LUCIDOS_WORKSPACE` from the inherited env to resolve the engine endpoint.
+///
+/// `--permission-only` narrows the server to its `approve` tool. The same
+/// binary also serves Codex's `ask_user_question` (Codex has no question tool
+/// of its own), and CC has no per-server tool filter to hide it with, so
+/// without the flag that tool lands in CC's tool list as a duplicate of its
+/// native `AskUserQuestion`. Calling it then raises a permission card for
+/// `mcp__lucidos_perm__ask_user_question`, because CC routes every MCP tool
+/// through `--permission-prompt-tool`. Asking the user a question is not a
+/// permission-worthy act: the tool simply does not belong to this backend.
+/// See `mcp_permission_server::ToolSet` for the other half of the split.
 ///
 /// `command` is the ABSOLUTE path to the resolved `lucidos` binary
 /// (`resolve_lucidos_binary`), not the bare name — so the MCP server doesn't
@@ -557,9 +594,9 @@ fn permission_mcp_config_json(cli_dir: Option<&Path>) -> String {
         .unwrap_or_else(|_| LUCIDOS_BIN_NAME.to_string());
     serde_json::json!({
         "mcpServers": {
-            "lucidos_perm": {
+            CC_PERMISSION_MCP_SERVER: {
                 "command": command,
-                "args": ["mcp-permission-server"]
+                "args": ["mcp-permission-server", "--permission-only"]
             }
         }
     })

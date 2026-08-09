@@ -30,7 +30,7 @@ import { bumpThreadEvents } from '../threadActivity';
 import { getThreadModelOverride, clearThreadModelOverride } from '../threadModelSelections';
 import { pushThreadNavState, removeThreadNavEntries } from './thread-navigation';
 import { revealThreadPane } from './pane';
-import { scrollToBottom } from '../../components/chat/scrollState';
+import { followSentMessage } from '../../components/chat/scrollState';
 import { setCanceledQuestion, setCanceledWhileAwaiting } from '../../components/chat/prompt-input-helpers';
 import { refreshThreadEvents, forgetThreadEventsFailures } from './thread-loading';
 import { markThreadRerenderStart } from '../../utils/threadOpenMarks';
@@ -360,7 +360,13 @@ function addPendingMessage(
       image_hashes: imageHashes,
     });
     if (focusedThreadId.value === threadId) {
-      scrollToBottom();
+      // The reader just produced the content at the bottom, so take them to it
+      // and keep them there while the answer streams in. Called BEFORE the
+      // threadMap write below, so the optimistic row has not rendered yet and
+      // the landing correctly waits for it rather than resolving the previous
+      // message. This is one of exactly two things that arm the follow; the
+      // other is the down chevron. See `followSentMessage`.
+      followSentMessage();
       // Perf: stamp the open→paint re-render span for the `thread-rerender` mark
       // (a follow-up send on the focused thread re-renders the whole exchange
       // list). ThreadView fires once on the next render. Focused-only — a

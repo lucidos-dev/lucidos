@@ -26,20 +26,18 @@ import { isUserScrolling } from './scrollActivity';
  *       - The nudge is taken ±1 from the LIVE scrollTop at NUDGE time (frame one),
  *         not from a call-time baseline: during streaming the bottom moves between
  *         the call and the frame, and a stale baseline would nudge far above the
- *         grown bottom and latch `scrolledUp` (killing auto-tail). A true ±1 stays
- *         inside the 80px `scrolledUp` stickiness window AND the 2px chevron slack
- *         (scrollState.ts), so it never trips auto-scroll or the chevron. The
- *         restore yields — it puts `scrollTop` back to the value the nudge came
- *         FROM only if our nudge is still the current value, so a concurrent
- *         scroll write (`useScrollMemory`'s saved-position restore on thread open,
- *         `useAutoScroll`'s bottom-pin during streaming) is never clobbered.
+ *         grown bottom and leave the reader parked there. A true ±1 stays inside
+ *         the 2px chevron slack (scrollState.ts), so it never trips the chevron.
+ *         The restore yields: it puts `scrollTop` back to the value the nudge
+ *         came FROM only if our nudge is still the current value, so a concurrent
+ *         scroll write (`useScrollMemory`'s saved-position restore on thread
+ *         open, a chevron tap) is never clobbered.
  *       - The scroll-nudge is skipped entirely while a notification deep-link
  *         scroll claim is in flight (`hasPendingEventScroll()`): the same iOS
  *         resume signals (visibilitychange/pageshow/focus) that fire this repaint
  *         also fire when a notification-tap foregrounds the PWA, exactly as
  *         `scrollToEventAndPulse` is smooth-scrolling to the target event; a nudge
- *         would fight that landing and drop the user mid/top/bottom. Every other
- *         auto-scroll path already defers to the claim; this is the last one.
+ *         would fight that landing and drop the user mid-thread.
  *       - The scroll-nudge is ALSO skipped while a user touch-drag / its momentum
  *         tail is in flight (`isUserScrolling()`): iOS cancels an in-flight
  *         momentum scroll the instant scrollTop is written, so a nudge ticking on
@@ -122,9 +120,9 @@ function writeNudgedScrollTop(el: HTMLElement, top: number) {
 
 /** Undo a toggle's OWN scroll nudge — restore to the value it nudged FROM, iff
  *  `scrollTop` is still the value it nudged TO. If anything else moved it
- *  meanwhile (useScrollMemory's saved-position restore on open, useAutoScroll's
- *  bottom-pin during streaming, a real user scroll), yield and leave it — never
- *  clobber a concurrent writer. No-op until raf1 has actually nudged. */
+ *  meanwhile (useScrollMemory's saved-position restore on open, a chevron tap,
+ *  a real user scroll), yield and leave it: never clobber a concurrent writer.
+ *  No-op until raf1 has actually nudged. */
 function restoreNudge(el: HTMLElement, entry: InFlightToggle) {
   // `nudgedTop` is set only when raf1 actually nudged (nudgeScroll was true), so
   // this is implicitly a no-op for the non-scrollable / deep-link-claim cases.
@@ -195,13 +193,11 @@ export function forceIOSRepaint(el: HTMLElement | null | undefined): (() => void
     // fight scrollToEventAndPulse's landing on iOS resume.
     //
     // Re-baseline from the LIVE scrollTop HERE (nudge time), not at call time:
-    // during streaming, content grows and useAutoScroll re-pins to the new bottom
-    // BETWEEN the call and this frame. A call-time baseline would nudge to
-    // (oldBottom - 1) — now far above the grown bottom — which scrollState's
-    // onScroll reads as scrolled-up and latches scrolledUp=true, permanently
-    // parking auto-scroll (the auto-tail-broken-on-iOS regression). Reading the
-    // live position keeps the nudge a true ±1, inside the 80px scrolledUp window
-    // AND the 2px chevron slack (scrollState.ts), so it never trips auto-scroll.
+    // the reader can move between the call and this frame (a chevron tap, a
+    // scroll), and a call-time baseline would then write a position they have
+    // already left, moving them backwards by however far they got. Reading the
+    // live position keeps the nudge a true ±1, inside the 2px chevron slack
+    // (scrollState.ts), so it moves nobody and trips nothing.
     // Re-check the LIVE scroll state at the write point, not just at burst start:
     // the callers are timer/data-driven and this write is deferred a frame, so a
     // fling that begins in the ~16ms between an idle call and this frame would

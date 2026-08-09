@@ -57,7 +57,7 @@ describe('--mobile-header-offset stays off the document root', () => {
 // Uses string pane identity instead of DOM .closest() traversal.
 function createScrollTracker(
   getActiveElement: () => { tagName: string; pane?: string } | null,
-  getResizeMode: () => 'scroll' | 'ignore' = () => 'ignore',
+  isNavigationScroll: () => boolean = () => false,
   isRepaintNudging: () => boolean = () => false,
   isUserScrolling: () => boolean = () => false,
 ) {
@@ -79,9 +79,10 @@ function createScrollTracker(
   }
 
   function applyScrollDelta(scrollTop: number, scrollHeight: number, clientHeight: number) {
-    // Programmatic scroll (scrollToBottom) — reset header to visible
-    // so opening a thread shows the header, not hides it.
-    if (getResizeMode() === 'scroll') {
+    // One of our own navigations is writing scrollTop frame by frame (a chevron
+    // tap, turn-nav, a deep-link glide). Reset the header to visible rather than
+    // hiding it on the way down: those scroll events are not the reader.
+    if (isNavigationScroll()) {
       const maxScroll = Math.max(0, scrollHeight - clientHeight);
       prevScrollTop = Math.min(Math.max(0, scrollTop), maxScroll);
       headerOffset = 0;
@@ -333,42 +334,46 @@ describe('useHideOnScroll keyboard suppression', () => {
   });
 });
 
-describe('useHideOnScroll programmatic scroll (scrollToBottom)', () => {
+describe('useHideOnScroll during one of our own navigations', () => {
+  // The branch used to read `getResizeMode() === 'scroll'`, which answered this
+  // question only by accident: the bottom-pin's 500ms suppression window
+  // happened to be open across the programmatic scrolls that mattered. It now
+  // asks `isNavigationScroll()`, which is true for a live tween AND for the few
+  // frames after any of our writes, because a scroll event lands after the write
+  // that caused it rather than during it.
   let mockActive: { tagName: string; pane?: string } | null = null;
-  let resizeMode: 'scroll' | 'ignore' = 'ignore';
+  let navigating = false;
 
   beforeEach(() => {
     mockActive = null;
-    resizeMode = 'ignore';
+    navigating = false;
   });
 
-  it('resets header to visible during programmatic scroll (resize mode = scroll)', () => {
-    const tracker = createScrollTracker(() => mockActive, () => resizeMode);
+  it('resets the header to visible while a navigation is gliding', () => {
+    const tracker = createScrollTracker(() => mockActive, () => navigating);
     tracker.switchContainer(0, 'thread');
 
     // User scrolls down — header hides
     tracker.applyScrollDelta(100, 2000, 500);
     expect(tracker.headerOffset).toBe(-48); // fully hidden
 
-    // scrollToBottom() sets resize mode to 'scroll', then scrolls
-    resizeMode = 'scroll';
+    // The down chevron is tapped: its tween writes scrollTop per frame.
+    navigating = true;
     tracker.applyScrollDelta(1500, 2000, 500);
 
     // Header should be reset to visible, not hidden further
     expect(tracker.headerOffset).toBe(0);
   });
 
-  it('resumes normal scroll tracking after programmatic scroll ends', () => {
-    const tracker = createScrollTracker(() => mockActive, () => resizeMode);
+  it('resumes normal scroll tracking once the tween lands', () => {
+    const tracker = createScrollTracker(() => mockActive, () => navigating);
     tracker.switchContainer(0, 'thread');
 
-    // Programmatic scroll to bottom
-    resizeMode = 'scroll';
+    navigating = true;
     tracker.applyScrollDelta(1500, 2000, 500); // scrollTop=1500, maxScroll=1500
     expect(tracker.headerOffset).toBe(0);
 
-    // Suppression expires — back to normal mode
-    resizeMode = 'ignore';
+    navigating = false; // the tween finished
 
     // User scrolls up a bit, then back down — header hides on the down scroll
     tracker.applyScrollDelta(1470, 2000, 500); // scroll up 30px → header stays 0
@@ -376,22 +381,20 @@ describe('useHideOnScroll programmatic scroll (scrollToBottom)', () => {
     expect(tracker.headerOffset).toBe(-30);
   });
 
-  it('header stays visible when opening a thread (full scroll-to-bottom flow)', () => {
-    const tracker = createScrollTracker(() => mockActive, () => resizeMode);
+  it('keeps the header visible across a multi-frame glide', () => {
+    const tracker = createScrollTracker(() => mockActive, () => navigating);
 
-    // Thread opened — scrollToBottom triggers
-    resizeMode = 'scroll';
+    navigating = true;
     tracker.switchContainer(0, 'thread');
 
-    // Content renders, scroll events fire as content grows
+    // Each frame of the tween fires a scroll event.
     tracker.applyScrollDelta(500, 1000, 500);
     expect(tracker.headerOffset).toBe(0); // visible
 
     tracker.applyScrollDelta(1500, 2000, 500);
     expect(tracker.headerOffset).toBe(0); // still visible
 
-    // Suppression ends
-    resizeMode = 'ignore';
+    navigating = false;
 
     // User scrolls up then down — header hides on down scroll
     tracker.applyScrollDelta(1470, 2000, 500);
@@ -420,7 +423,7 @@ describe('useHideOnScroll iOS repaint nudge suppression', () => {
   function trackerWithNudge() {
     return createScrollTracker(
       () => mockActive,
-      () => 'ignore',
+      () => false, // no navigation of our own in flight
       () => nudging,
       () => userScrolling,
     );

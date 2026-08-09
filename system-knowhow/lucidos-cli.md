@@ -252,17 +252,23 @@ $ lucidos events count --type ToolResult --since 2026-05-18T00:00:00Z
 
 `byte_total` is `SUM(octet_length(payload::text))` — the raw payload byte sum, a reliable proxy for the token cost of a corresponding `lucidos events query` call. Use this before `query` on busy workspaces to budget which types to drill into (the recurring `workspace-learning` recipe failure that motivated this CLI was a `query --type ToolResult --limit 300` call returning 2.3 MB and blowing the next-turn prompt cap).
 
-### `lucidos threads list [--active] [--source <list>] [--limit N] [--parent <uuid> | --my-children]`
+### `lucidos threads list [--active | --status <list>] [--source <list>] [--limit N] [--parent <uuid> | --my-children]`
 
 List thread summaries from the parent workspace. Outputs the raw JSON array on stdout, newest-first by `last_activity`. Each row is a full `ThreadSummary` — the same shape returned by the `list_threads` LLM tool and by `lucidos.threads.list()` in the JS SDK, and the same shape the projection stores in `thread_summaries`.
 
 ```bash
-$ lucidos threads list --active --limit 5 | jq '.[].title'
+$ lucidos threads list --status running --limit 5 | jq '.[].title'
 "Plan dinner"
 "Refactor settings dialog"
 ```
 
-- `--active` restricts to threads where the agentic loop is mid-flow: status `running` or `waiting_for_user_answer`. Status `waiting` is **not** active: it means the coding-agent thread has stopped and proposed changes the user must act on (the loop has paused). Status `failed` is also excluded (the response is over, whether it errored or was interrupted with nobody resuming it), and so is `paused`: the user's own version switch interrupted that turn, and the engine resumes it by itself without the loop being mid-flow right now.
+#### Picking between `--status` and `--active`
+
+**`--status running` is what "is the workspace busy?" means.** `--active` is the **union** of `running` and `waiting_for_user_answer`, and those two are opposites: `running` is the workspace working, while `waiting_for_user_answer` is the workspace stopped and waiting on a person. A thread parked on an unanswered question is in the union while being the opposite of busy, and it is the state most likely to coincide with work piling up unnoticed, so an idle detector gated on `--active` never fires while anybody is being asked something.
+
+- `--status <list>` restricts to exactly the statuses you name, out of `idle`, `running`, `waiting`, `waiting_for_user_answer`, `paused`, `failed`. These are the same values each returned row's `status` field carries, so you can filter on what you read; the kebab spelling `waiting-for-user-answer` is accepted too. Repeatable (`--status running --status failed`) and comma-separated (`--status running,failed`) are the same request. An unrecognized or empty value is an error listing the valid ones, never a silently empty list.
+- `--active` selects the union above. Kept exactly as it was for existing callers; reach for it when you genuinely want "the loop is mid-flow in either direction", such as a badge counting threads the user has something invested in. Passing it together with `--status` is refused: they are two answers to one question.
+- The `--active` union contains only those two statuses. It never contains `waiting` (the coding-agent thread has stopped and proposed changes the user must act on, so the loop has paused), `failed` (the response is over, whether it errored or was interrupted with nobody resuming it), or `paused` (the user's own version switch interrupted that turn and the engine resumes it by itself). `--status` reaches all three by name, which is the only way to ask for them.
 - `--source` is a comma-separated list of `chat`, `trigger`, `coding-agent`. Legacy `claude_code` is also accepted. Omit for all sources.
 - `--limit` clamps to `1..=1000` server-side, default 100.
 - `--parent <uuid>` restricts to that thread's **direct** children only, never its grandchildren. A malformed uuid is a 400, never a silently unfiltered list.
@@ -270,24 +276,31 @@ $ lucidos threads list --active --limit 5 | jq '.[].title'
 
 ```bash
 # Which of my own children are still working, and what are they called?
-$ lucidos threads list --my-children --active | jq -r '.[] | "\(.status)\t\(.title)\t\(.thread_id)"'
+$ lucidos threads list --my-children --status running | jq -r '.[] | "\(.status)\t\(.title)\t\(.thread_id)"'
+
+# Which of them are stuck waiting on me?
+$ lucidos threads list --my-children --status waiting_for_user_answer | jq -r '.[].title'
 ```
 
 Use this from a script that needs to react to thread state — e.g. "is anything still running before I fire this trigger?" — without reconstructing it from raw `query_events`. The projection already tracks per-thread status; the list endpoint is just a read off it.
 
-### `lucidos threads count [--active] [--source <list>] [--parent <uuid> | --my-children]`
+### `lucidos threads count [--active | --status <list>] [--source <list>] [--parent <uuid> | --my-children]`
 
-Count thread summaries matching the same filters as `list`, including the two child filters. Outputs `{"count": N}` on stdout.
+Count thread summaries matching the same filters as `list`, including `--status` and the two child filters. Outputs `{"count": N}` on stdout.
 
 ```bash
-# How many active threads in the workspace?
-$ lucidos threads count --active
-{"count":3}
-
-# Is anything still running? (shell-friendly form)
-$ if [ "$(lucidos threads count --active | jq .count)" -eq 0 ]; then
+# Is anything still running? (the idle-detector form)
+$ if [ "$(lucidos threads count --status running | jq .count)" -eq 0 ]; then
 >   echo "Workspace is idle."
 > fi
+
+# How many threads are parked on a question I have not answered?
+$ lucidos threads count --status waiting_for_user_answer
+{"count":1}
+
+# The union, for a badge that counts both: working AND asking.
+$ lucidos threads count --active
+{"count":3}
 ```
 
 Cheaper than materialising the full list just to read `.length` on big workspaces.
@@ -606,6 +619,8 @@ $ lucidos triggers update --id <uuid> --paused true
 $ lucidos triggers delete --id <uuid>
 # Fire an existing trigger once, right now, outside its schedule
 $ lucidos triggers run --id <uuid>
+# Pin an intent trigger to its own model and thinking budget
+$ lucidos triggers update --id <uuid> --model gemini-3.5-flash --reasoning-effort low
 ```
 
 `--cron-expressions` entries are validated on `create` and `update`. Within one
@@ -618,7 +633,8 @@ preview back rather than assuming the schedule means what you intended;
 `system-knowhow/triggers.md` § "Writing cron expressions" has the recipes.
 
 `create`/`update` accept `--name`, `--run`, `--cron-expressions`, `--on`,
-`--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`, `--slug`;
+`--app-id`, `--go-to-review`, `--group-id`, `--side-effect-grant`, `--slug`,
+`--model`, `--reasoning-effort`;
 `update`/`delete`/`run` take `--id <uuid>`. The chat agent's in-process
 equivalent is the grouped `triggers` tool (`action: create | list | update |
 delete | pause | resume | run`). Pause/resume are tool-only there; the CLI
@@ -895,6 +911,34 @@ lucidos planned state
 ```
 
 `mark` / `approve` resolve repo_root / branch / HEAD from `$PWD`'s git worktree (like `lucidos hardened mark`). Pass exactly one of `--plan` / `--simple`. **`mark --plan` records `proposed` (awaiting approval); it does NOT satisfy the gate.** The agent must present the plan and ask for approval **with its question tool** (`AskUserQuestion` on Claude Code, `ask_user_question` on Codex; options `Approve` / `Request changes`), never in prose: approval is a DECISION question the agent is blocked on, and asked in prose it leaves the thread idle until the user types "approve" by hand. That option pair is a **floor**, not a fixed shape: the question tool needs at least two options, so `Request changes` fills the second slot only when the plan offers no real fork. When it offers one (a narrower scope, one layer instead of two), that fork takes the slot and `Request changes` is dropped rather than carried as a third option, where it would mean only "I will type what I want changed". Only after the user approves does the agent run `lucidos planned approve` to flip `proposed`→`planned` (gate-satisfying); a fork answer is an approval too, so the agent revises the plan file to that variant, re-commits, and then flips it. If the user requests changes instead, revise the plan file, re-commit, and ask again the same way (the marker stays `proposed`). `mark --simple` records `acknowledged_simple` directly, since local fixes need no approval. `planned` and `acknowledged_simple` satisfy every gate; `proposed` and the absence of a marker both block. App coding-agent threads and external repos are exempt (the gate is a no-op there). Normally you don't call `mark --plan` / `approve` by hand (the `implementation-plan` skill drives them), but `mark --simple` is the agent's escape hatch for a change too small to plan. (`lucidos cc-plan-gate` is the hidden PreToolUse hook that enforces this; it is not invoked directly.)
+
+### `lucidos frontend-preview start [--thread-id <uuid>]` / `lucidos frontend-preview stop` / `lucidos frontend-preview status`
+
+Start, stop, or inspect the **frontend preview**: a Vite dev server the engine supervises inside a coding-agent worktree, on its own port, so a TypeScript or CSS change is visible in the real app **before Apply**. Wraps `POST /api/v1/frontend-preview/start` / `/stop` and `GET /api/v1/frontend-preview`. Development only, and refused on a packaged install.
+
+```bash
+# Inside a coding-agent worktree: preview THIS thread's branch. --thread-id
+# defaults to $LUCIDOS_THREAD_ID, which every coding-agent subprocess carries.
+lucidos frontend-preview start
+# → Frontend preview running for thread <uuid> at https://localhost:6173/
+
+# Point it at a different thread's worktree (there is one slot, so this replaces
+# whatever was running).
+lucidos frontend-preview start --thread-id 2951200f-0652-4ee2-baa3-433d608983d8
+
+lucidos frontend-preview status
+lucidos frontend-preview stop
+```
+
+**Why the CLI rather than starting `vite` yourself:** when a coding-agent turn ends, the engine kills the session's whole process group, so a dev server the agent started dies with the message. The engine owns the process precisely so the preview outlives the turn and the user can look at it afterwards.
+
+**One slot per workspace.** `start` on another thread moves the preview rather than adding a second one.
+
+`start` refuses, by name, when the thread has no worktree, when the worktree is not a Lucidos-source one (an app or external-repo thread has no frontend to preview), or when its dependencies were never provisioned. It answers only once Vite is actually serving, so the printed URL is live when you paste it into a reply.
+
+**The printed URL uses the host the CLI reached the engine on**, which from inside the worktree is `localhost`. That is right for the host machine and wrong for a phone: the engine builds the URL from the caller's `Host`, and the in-app control (the coding-agent control menu's *Frontend preview* section) builds it from the page's own location instead, so a user on a tailnet gets a link that resolves. Prefer pointing the user at that control over pasting a `localhost` URL. It also carries the device id, which the CLI has no way to know, and without it the preview renders with none of that device's scoped preferences.
+
+The preview registers **no service worker** and cannot do push: a dev server emits unhashed module URLs a worker would cache past a hot update. See ADR 0055 for the whole design.
 
 ### `lucidos knowhow list`
 

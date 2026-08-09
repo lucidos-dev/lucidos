@@ -10,6 +10,7 @@
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import { toasts, focusedThreadId, threadMap } from '../store';
 import { makeOptimisticThreadState } from '../thread-events';
+import { focusThread } from '../actions/threads';
 
 // focusThread imports React/Preact-coupled modules (scrollState, navigation)
 // that aren't usable in this unit test — stub it so the toast onClick is
@@ -113,6 +114,39 @@ describe('MergeConflictDetected SSE toast', () => {
     expect(matches).toHaveLength(1);
   });
 
+  it('taps through to the conflict event, not just to its thread', () => {
+    // The banner announces the conflict panel, so a plain focus would land the
+    // reader at the thread's saved scroll with nothing about the conflict on
+    // screen. MergeConflictDetected starts its own exchange, so its own id is
+    // what the turn stamps as data-event-id.
+    seedThread('thread-A', 'Convert Filter Icon to Close Button');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 1,
+      event_id: 'mcd-1',
+      event: { type: 'MergeConflictDetected', change_id: 'c-1', files: ['x.rs'] },
+      created: '2026-01-01T00:00:00Z',
+    });
+
+    toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1')!.onClick!();
+    expect(focusThread).toHaveBeenCalledWith('thread-A', { targetEventId: 'mcd-1' });
+  });
+
+  it('degrades to a plain focus when the frame carries no event id', () => {
+    seedThread('thread-A', 'Some Thread');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 1,
+      event: { type: 'MergeConflictDetected', change_id: 'c-1', files: ['x.rs'] },
+      created: '2026-01-01T00:00:00Z',
+    });
+
+    toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1')!.onClick!();
+    expect(focusThread).toHaveBeenCalledWith('thread-A', { targetEventId: null });
+  });
+
   it('emits a separate toast for a different change in the same thread', () => {
     seedThread('thread-A', 'Some Thread');
 
@@ -146,6 +180,7 @@ describe('MergeConflictDetected toast resolution', () => {
     handleThreadEvent({
       thread_id: threadId,
       seq: 1,
+      event_id: `mcd-${changeId}`,
       event: { type: 'MergeConflictDetected', change_id: changeId, files: ['x.rs'] },
       created: '2026-01-01T00:00:00Z',
     });
@@ -173,6 +208,88 @@ describe('MergeConflictDetected toast resolution', () => {
     expect(after!.message).toContain('resolved');
     expect(after!.message).not.toContain('resolving automatically');
     expect(after!.type).toBe('success');
+  });
+
+  it('keeps the deep link when the toast transitions to "resolved"', () => {
+    // One toast the reader watched change its wording, so its tap must keep
+    // going to the same place.
+    seedThread('thread-A', 'Convert Filter Icon to Close Button');
+    raiseConflict('thread-A', 'c-1');
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event: { type: 'ChangeApplied', change_id: 'c-1' },
+      created: '2026-01-01T00:00:10Z',
+    });
+
+    toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1')!.onClick!();
+    expect(focusThread).toHaveBeenCalledWith('thread-A', { targetEventId: 'mcd-c-1' });
+  });
+
+  it('resolves to the NEWEST conflict panel when a cascade emitted two', () => {
+    // Tier-2 then Tier-3 both emit for the same change, each opening its own
+    // panel. The later one is the panel carrying the resolution.
+    //
+    // The middle event arrives LAST, as a backfill landing behind a live SSE
+    // one: `thread.events` iterates in insertion order, so taking the last
+    // match rather than the highest seq would send the tap backwards.
+    seedThread('thread-A', 'Some Thread');
+    raiseConflict('thread-A', 'c-1');
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 3,
+      event_id: 'mcd-later',
+      event: { type: 'MergeConflictDetected', change_id: 'c-1', files: ['x.rs'] },
+      created: '2026-01-01T00:00:05Z',
+    });
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event_id: 'mcd-backfilled',
+      event: { type: 'MergeConflictDetected', change_id: 'c-1', files: ['x.rs'] },
+      created: '2026-01-01T00:00:02Z',
+    });
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 4,
+      event: { type: 'ChangeApplied', change_id: 'c-1' },
+      created: '2026-01-01T00:00:10Z',
+    });
+
+    toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1')!.onClick!();
+    expect(focusThread).toHaveBeenCalledWith('thread-A', { targetEventId: 'mcd-later' });
+  });
+
+  it('the banner and the toast it becomes land on the same panel', () => {
+    // One banner whose wording changes under the reader. If the two emits
+    // ranked duplicate conflict events differently, the same toast would
+    // silently change where it goes at the moment it says it is done.
+    seedThread('thread-A', 'Some Thread');
+    raiseConflict('thread-A', 'c-1');
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 2,
+      event_id: 'mcd-later',
+      event: { type: 'MergeConflictDetected', change_id: 'c-1', files: ['x.rs'] },
+      created: '2026-01-01T00:00:05Z',
+    });
+
+    toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1')!.onClick!();
+    const banner = vi.mocked(focusThread).mock.lastCall;
+
+    handleThreadEvent({
+      thread_id: 'thread-A',
+      seq: 3,
+      event: { type: 'ChangeApplied', change_id: 'c-1' },
+      created: '2026-01-01T00:00:10Z',
+    });
+    toasts.value.find(t => t.key === 'merge-conflict-thread-A-c-1')!.onClick!();
+    const resolved = vi.mocked(focusThread).mock.lastCall;
+
+    expect(banner).toEqual(['thread-A', { targetEventId: 'mcd-later' }]);
+    expect(resolved).toEqual(banner);
   });
 
   it('dismisses the conflict toast when the change apply fails', () => {

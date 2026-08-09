@@ -1,6 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
 
-import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, scrolledUp, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement } from '../scrollState';
+import { scrollToEventAndPulse, scrollToChangeAndPulse, hasPendingEventScroll, clearPendingEventScroll, scrollToBottom, isEventInViewport, isHeaderPinnedForScroll, setActiveScrollElement } from '../scrollState';
 import { hasNavFocus, clearNavFocus, NAV_FOCUS_FADE_MS, NAV_FOCUS_HOLD_MS, NAV_FOCUS_RAMP_MS } from '../../shared/focusMarker';
 
 /** The deep-link now scrolls via the shared animateScroll engine (a rAF tween
@@ -190,10 +190,12 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   // Regression: tapping a notification that targets a specific event in a
   // thread that is NOT already focused used to land at the thread bottom
   // instead of the event. Focusing an unfocused thread lazily loads its
-  // events; the scroll-to-bottom that fires on the eventsLoaded false→true
-  // transition (ThreadView + useAutoScroll) overrode the deep-link scroll the
-  // moment the events rendered. The fix exposes a "pending event scroll"
-  // flag those callers consult to defer until scrollToEventAndPulse lands.
+  // events, and the scroll-to-bottom that fired on the eventsLoaded false→true
+  // transition overrode the deep-link scroll the moment they rendered. The fix
+  // was a "pending event scroll" claim those callers consult. Those particular
+  // callers are gone, but the claim is not: `useScrollMemory`'s restore (and
+  // its open-at-the-top reset) wake on that same render and would win the same
+  // way, so the landing is still held until the deep-link settles.
   let restore: (() => void) | null = null;
   let container: any;
 
@@ -234,18 +236,14 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   it('resolves synchronously when the event is already in the DOM (focused-thread path) — HOLDS the claim across the smooth-scroll settle, then releases', () => {
     const visibleEl = makeVisibleEl();
     restore = installFakeDom({ dataEventMatches: [visibleEl] });
-    scrolledUp.value = false;
 
     scrollToEventAndPulse('e-7');
 
     // The claim is NOT released synchronously — the deep-link tween is still
-    // settling, and a competing scroll (panel close, iOS viewport reflow)
-    // in that window would override the landing. It's held until scrollend / the
-    // fallback timer so every auto-scroll path keeps deferring across the scroll.
+    // settling, and a competing scroll (a saved-position restore waking on the
+    // same render, a panel close) in that window would override the landing.
+    // It's held until scrollend / the fallback timer.
     expect(hasPendingEventScroll()).toBe(true);
-    // Parked on a mid-thread event → pinned so the next render's auto-scroll
-    // defers instead of snapping back to the bottom.
-    expect(scrolledUp.value).toBe(true);
     // Resolved before ever observing — no need to wait for lazily-loaded events.
     expect(moObservations).toHaveLength(0);
 
@@ -260,47 +258,14 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
     expect(hasPendingEventScroll()).toBe(false);
   });
 
-  it('an AUTOMATIC scroll-to-bottom during the lazy load does NOT clear the claim, and the target still resolves + pulses when it renders (cross-thread/unfocused path)', () => {
-    restore = installFakeDom({}); // target not in the DOM yet (unfocused thread)
-    scrolledUp.value = false;
-
-    scrollToEventAndPulse('e-7');
-    expect(hasPendingEventScroll()).toBe(true);
-    expect(moObservations).toHaveLength(1);
-
-    // The eventsLoaded false→true transition fires the lazy-load auto-scroll
-    // WHILE the deep-link is still waiting for its target to render. As an
-    // automatic scroll it must DEFER to the claim — not clear it (the regression:
-    // clearing here un-guarded every other auto-scroll path and landed the user
-    // at the bottom). Repeated fires during a slow load must all be no-ops.
-    scrollToBottom({ auto: true });
-    scrollToBottom({ auto: true });
-    expect(hasPendingEventScroll()).toBe(true); // claim survived the auto-scrolls
-
-    // Events finally render: the target card appears and is visible.
-    const visibleEl = makeVisibleEl();
-    (globalThis.document as any).querySelectorAll = (sel: string) =>
-      sel.startsWith('[data-event-id') ? [visibleEl] : [];
-    fireMutation([makeTargetNode()]);
-
-    // The deep-link still lands on (and pins) the event — the auto-scrolls never
-    // stole the target.
-    vi.advanceTimersByTime(800); // run the tween
-    expect(container.scrollTop).toBe(3000);
-    expect(scrolledUp.value).toBe(true);
-    expect(hasPendingEventScroll()).toBe(true); // held until the deadline
-
-    vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
-    expect(hasPendingEventScroll()).toBe(false);
-  });
-
-  it('stays pending while the lazily-loaded event has not rendered (unfocused-thread path), scrolls + pins on resolve, and HOLDS the claim until the deadline', () => {
+  it('stays pending while the lazily-loaded event has not rendered (unfocused-thread path), lands on resolve, and HOLDS the claim until the deadline', () => {
     restore = installFakeDom({}); // target not in the DOM yet
-    scrolledUp.value = false;
 
     scrollToEventAndPulse('e-7');
-    // This is the flag ThreadView/useAutoScroll consult to defer their
-    // scroll-to-bottom so it can't override the upcoming deep-link scroll.
+    // This is the flag `useScrollMemory` consults to defer its restore (and its
+    // open-at-the-top reset) so neither can override the upcoming deep-link
+    // scroll. It used to guard a fleet of auto-scroll-to-bottom callers too,
+    // which no longer exist.
     expect(hasPendingEventScroll()).toBe(true);
     expect(moObservations).toHaveLength(1);
 
@@ -312,10 +277,9 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
 
     vi.advanceTimersByTime(800); // run the tween → lands on the event
     expect(container.scrollTop).toBe(3000);
-    expect(scrolledUp.value).toBe(true);
-    // The claim is HELD past the scroll — the same render that revealed the
-    // event also re-fires the events-load effect + a late resize pin, which the
-    // claim must keep suppressed. It releases only at the deadline.
+    // The claim is HELD past the scroll: the same render that revealed the
+    // event is what wakes the saved-scroll restore observers, which the claim
+    // must keep suppressed. It releases only at the deadline.
     expect(hasPendingEventScroll()).toBe(true);
 
     vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
@@ -333,9 +297,11 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
     expect(hasPendingEventScroll()).toBe(false);
   });
 
-  it('scrollToBottom() supersedes an in-flight claim (e.g. answering a deep-linked question)', () => {
-    // An explicit go-to-bottom (sending a follow-up while a deep-link claim is
-    // still held) must release the claim so the streamed response can tail.
+  it('scrollToBottom() supersedes an in-flight claim (the down chevron, tapped mid-resolve)', () => {
+    // The chevron is the reader saying "take me to the live edge", which
+    // overrides a landing they are no longer waiting for. It is now the ONLY
+    // caller of scrollToBottom, so there is no automatic variant that has to
+    // defer to the claim instead.
     restore = installFakeDom({}); // target never appears → claim stays pending
     scrollToEventAndPulse('e-7');
     expect(hasPendingEventScroll()).toBe(true);
@@ -356,18 +322,19 @@ describe('scrollToEventAndPulse — deep-link scroll suppression', () => {
   });
 });
 
-describe('deep-link deadline: recovery when the target never renders', () => {
+describe('deep-link deadline: a dead link reports without moving the transcript', () => {
   // The deadline used to expire in silence: claim released, nothing scrolled,
   // nothing said. A notification tap that hit an event this thread doesn't show
-  // therefore looked simply broken. Now the deadline lands the user on the
-  // thread's most recent turn and reports the dead link through the caller's
-  // `onUnresolved` (the words live in `store/actions/threads.ts`, which owns the
-  // toast; scrollState stays free of the `store` import).
+  // therefore looked simply broken. It reports the dead link through the
+  // caller's `onUnresolved` (the words live in `store/actions/threads.ts`, which
+  // owns the toast; scrollState stays free of the `store` import).
   //
-  // The guarantee the silent give-up was protecting survives, sharpened: the
-  // recovery SCROLL stands down for a user who took over during the wait, so
-  // nobody reading history gets yanked 4s later. The report fires either way,
-  // being the only remaining signal that the link failed.
+  // The report is the WHOLE recovery. It used to also scroll to the thread's
+  // most recent turn, guarded by a `watchUserAction` watcher so a reader who had
+  // scrolled away meanwhile was not yanked 4s later. The user asked to go to a
+  // place; the place does not exist, and the bottom is not it. So the scroll is
+  // gone, and with it the watcher it needed: leaving the reader where they are
+  // is the rule now, not the exception.
   let restore: (() => void) | null = null;
   let container: any;
   let onUnresolved: Mock<() => void>;
@@ -387,10 +354,6 @@ describe('deep-link deadline: recovery when the target never renders', () => {
     restore = null;
   });
 
-  /** The bottom of the fake container: `scrollToBottom` writes scrollHeight, so
-   *  this value is the assertion for "landed on the most recent turn". */
-  const BOTTOM = 10000;
-
   function makeVisibleEl(absTop = 3000) {
     return {
       parentElement: null,
@@ -405,7 +368,7 @@ describe('deep-link deadline: recovery when the target never renders', () => {
     lastMoCallback?.([{ addedNodes: [node], type: 'childList' } as unknown as MutationRecord], {} as MutationObserver);
   }
 
-  it('lands on the most recent turn and reports the failure when the user stayed put', () => {
+  it('reports the failure and leaves the transcript exactly where it was', () => {
     restore = installFakeDom({}); // target never appears
 
     scrollToEventAndPulse('e-7', { onUnresolved });
@@ -413,7 +376,7 @@ describe('deep-link deadline: recovery when the target never renders', () => {
 
     vi.advanceTimersByTime(5000); // past EVENT_RESOLVE_DEADLINE_MS (4000)
 
-    expect(container.scrollTop).toBe(BOTTOM);
+    expect(container.scrollTop).toBe(0); // this used to land on the bottom
     expect(onUnresolved).toHaveBeenCalledTimes(1);
     // No pulse: there is no specific element to highlight, and marking the last
     // turn would claim the deep-link landed on it.
@@ -421,13 +384,12 @@ describe('deep-link deadline: recovery when the target never renders', () => {
     expect(hasPendingEventScroll()).toBe(false);
   });
 
-  it('reports the failure but leaves the scroll alone once the user has scrolled away', () => {
+  it('leaves a reader who scrolled away during the wait exactly where they went', () => {
+    // The case the retired `watchUserAction` guard existed for. It now holds
+    // without a guard, because the deadline moves nobody at all.
     restore = installFakeDom({}); // target never appears
 
     scrollToEventAndPulse('e-7', { onUnresolved });
-    // The user scrolls back to read history during the 4s window. A real scroll
-    // gesture is what distinguishes them from the app's own scrollTop writes.
-    document.dispatchEvent(new Event('wheel'));
     container.scrollTop = 1234;
 
     vi.advanceTimersByTime(5000);
@@ -436,7 +398,7 @@ describe('deep-link deadline: recovery when the target never renders', () => {
     expect(onUnresolved).toHaveBeenCalledTimes(1); // still told, since nothing else says so
   });
 
-  it('a synchronous resolve neither reports nor runs the fallback', () => {
+  it('a synchronous resolve does not report', () => {
     restore = installFakeDom({ dataEventMatches: [makeVisibleEl()] });
 
     scrollToEventAndPulse('e-7', { onUnresolved });
@@ -446,7 +408,7 @@ describe('deep-link deadline: recovery when the target never renders', () => {
     expect(onUnresolved).not.toHaveBeenCalled();
   });
 
-  it('an observer resolve neither reports nor runs the fallback, though its deadline still fires', () => {
+  it('an observer resolve does not report, though its deadline still fires', () => {
     restore = installFakeDom({}); // not in the DOM yet: the async path
 
     scrollToEventAndPulse('e-7', { onUnresolved });
@@ -477,7 +439,7 @@ describe('deep-link deadline: recovery when the target never renders', () => {
     // Nothing re-arms it: later timer work must not produce a second recovery.
     vi.advanceTimersByTime(20000);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
-    expect(container.scrollTop).toBe(BOTTOM);
+    expect(container.scrollTop).toBe(0);
   });
 
   it('re-tapping the SAME notification mid-wait does not let the older deadline recover over it', () => {
@@ -498,23 +460,21 @@ describe('deep-link deadline: recovery when the target never renders', () => {
     // second call's now, and that navigation is still live.
     vi.advanceTimersByTime(1500); // t=4500
     expect(onUnresolved).not.toHaveBeenCalled();
-    expect(container.scrollTop).toBe(0);
     expect(hasPendingEventScroll()).toBe(true);
 
-    // The SECOND call's own deadline (t=3000+4000) is what recovers, once.
+    // The SECOND call's own deadline (t=3000+4000) is what reports, once.
     vi.advanceTimersByTime(3000); // t=7500
     expect(onUnresolved).toHaveBeenCalledTimes(1);
-    expect(container.scrollTop).toBe(BOTTOM);
     expect(hasPendingEventScroll()).toBe(false);
   });
 
-  it('the change deep-link gets the same recovery, off the same deadline', () => {
+  it('the change deep-link reports the same way, off the same deadline', () => {
     restore = installFakeDom({}); // no matching turn in this thread
 
     scrollToChangeAndPulse('c-1', { onUnresolved });
     vi.advanceTimersByTime(5000);
 
-    expect(container.scrollTop).toBe(BOTTOM);
+    expect(container.scrollTop).toBe(0);
     expect(onUnresolved).toHaveBeenCalledTimes(1);
   });
 });

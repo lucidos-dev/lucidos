@@ -62,11 +62,18 @@ describe('client version source', () => {
     );
   });
 
-  it('SystemPage derives the web client version from CLIENT_BUILD_ID', () => {
-    const page = readFileSync(resolve(here, 'SystemPage.tsx'), 'utf-8');
-    expect(page).toContain("from 'virtual:build-id'");
+  it('the client version derives from CLIENT_BUILD_ID, in one place', () => {
+    // One derivation, read by the System page's Client row. The Lucidos menu's
+    // identity row names the product instead (the umbrella release, see
+    // `utils/lucidosVersion.ts`), which is pinned by its own suite.
+    const util = readFileSync(resolve(SRC, 'utils/clientVersion.ts'), 'utf-8');
+    expect(util).toContain("from 'virtual:build-id'");
     // Tauri keeps its real app version (a versioned shell with a real updater);
     // the web fallback is the loaded bundle's build id.
-    expect(page).toMatch(/clientVersion\s*=\s*tauriClientVersion\s*\?\?\s*formatBuildId\(CLIENT_BUILD_ID\)/);
+    expect(util).toMatch(/window\.__LUCIDOS_APP_VERSION__/);
+    expect(util).toMatch(/formatBuildId\(CLIENT_BUILD_ID\)/);
+
+    const page = readFileSync(resolve(here, 'SystemPage.tsx'), 'utf-8');
+    expect(page).toMatch(/clientVersion\s*=\s*clientVersionLabel\(\)/);
   });
 });

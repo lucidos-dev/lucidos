@@ -4,6 +4,7 @@ import { openProviderSettings } from '../../store/actions/menu';
 import { applySuggestion, startSetupInterview } from '../../store/actions/compose';
 import { composeHandlers } from './promptFocus';
 import { llmConfigured } from '../../store/store';
+import { viewportIsMobile } from '../../utils/viewport';
 import { ChevronLeftIcon, ChevronRightIcon } from '../shared/icons';
 
 /** The MIT-license disclaimer shown at the foot of every welcome variant. */
@@ -74,9 +75,14 @@ export function ProviderSetupWelcome() {
  *  an interview that cannot reach a model is worse than no button.
  *
  *  Dismissing the welcome hides this with it, which is what "Don't show this
- *  again" says. The durable way back is the header's help button
- *  (`SetupInterviewButton`), which is never dismissed. */
+ *  again" says, so the hint has to name a durable way back while it can still be
+ *  read. That way back differs by viewport, and the hint says whichever is true
+ *  here: desktop keeps the header's help button (`SetupInterviewButton`), which
+ *  is never dismissed, while mobile has no such button and reaches the interview
+ *  by asking. Keyed off `viewportIsMobile`, the same signal that decides which
+ *  header is mounted, so the copy cannot drift from the affordance. */
 export function SetupInterviewWelcome() {
+  const onMobile = viewportIsMobile.value;
   return (
     <div class="welcome-setup-interview">
       <button
@@ -90,7 +96,8 @@ export function SetupInterviewWelcome() {
         A few questions about what you want help with, at work or outside it:
         personal admin, training, learning, whatever fits. Then I build the apps
         and automations to match, right here in your workspace. You can start
-        this again any time from the <span aria-hidden="true">?</span> button, or
+        this again any time
+        {onMobile ? ' ' : <> from the <span aria-hidden="true">?</span> button, or </>}
         by just asking me to set you up.
       </p>
     </div>

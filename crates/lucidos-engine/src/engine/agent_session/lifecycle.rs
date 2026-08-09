@@ -305,19 +305,6 @@ pub(super) fn is_silent_resume(user_text_empty: bool, has_images: bool) -> bool 
     user_text_empty && !has_images
 }
 
-/// Tool names whose `AgentEvent::ToolUse` must NOT emit a
-/// `CodingAgentToolCalled`: the question flow renders its own card from the
-/// `UserQuestionAsked` event the internal endpoint emits, so a tool-call step
-/// on top would surface the same question twice. Two names, one per backend:
-/// CC's native `AskUserQuestion` (intercepted by its PreToolUse hook) and
-/// Codex's MCP-routed `mcp__lucidos__ask_user_question` (served by `lucidos
-/// mcp-permission-server`). The ToolUse still increments `tools_in_flight`
-/// at the call site — the watchdog must stay disarmed while the user takes
-/// their time answering.
-pub(super) fn is_user_question_tool(name: &str) -> bool {
-    name == "AskUserQuestion" || name == crate::runtime::CODEX_ASK_USER_QUESTION_TOOL
-}
-
 /// User-facing error message for the empty-response branch of `classify_result`.
 /// Surfaces an OOM-killed bash (exit 137), a SIGTERM'd subprocess (exit 143), or
 /// any other path where the backend produces a Result with no real assistant

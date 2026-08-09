@@ -105,6 +105,11 @@ async fn shutdown_signal(
     // Close browser to avoid orphaned Chrome processes
     engine.shutdown_browser().await;
 
+    // Same reason, for the frontend preview's Vite: it is in its own process
+    // group, so nothing else on this path reaches it, and a leaked one holds its
+    // port against the successor engine's preview.
+    engine.stop_frontend_preview().await;
+
     // Shutdown the scheduler
     if let Err(e) = scheduler.lock().await.shutdown().await {
         log!("[Shutdown] Error shutting down scheduler: {}", e);
@@ -1003,6 +1008,10 @@ async fn run() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // packaged / headless. See
     // `docs/plans/2026-07-03-cross-workspace-frontend-only-refresh.md`.
     let _served_frontend_sync = shared_engine.spawn_served_frontend_sync();
+    // Dev-only: reap a frontend preview a SIGKILLed predecessor left running (its
+    // child outlives the engine that spawned it), then watch for its worktree
+    // being reclaimed. No-op in packaged. See `engine::frontend_preview`.
+    shared_engine.init_frontend_preview();
     // Keep `/api/v1/health`'s `database_reachable` honest. An engine outlives its
     // database (quitting Docker Desktop is the everyday case in dev), and without
     // this the endpoint would keep reporting a healthy engine while every other

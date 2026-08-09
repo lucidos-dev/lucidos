@@ -68,9 +68,9 @@ vi.mock('./menu', () => ({
   openSettingsSubview: vi.fn(),
 }));
 vi.mock('./navigation', () => ({ pushNavState: vi.fn(), replaceNavState: vi.fn() }));
-vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
-vi.mock('./devices', () => ({ getDeviceId: vi.fn(), toggleDevicePush: vi.fn(), pendingDeviceRegistration: vi.fn() }));
-vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
+vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
+vi.mock('./devices', () => ({ getDeviceId: vi.fn(), pendingDeviceRegistration: vi.fn() }));
+vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 vi.mock('./repositories', () => ({ refreshRepoView: vi.fn(), openEncodedRepoFilePreview: vi.fn(() => false) }));
 vi.mock('./entityReferences', () => ({ processSSEForReferences: vi.fn() }));

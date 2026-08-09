@@ -6,9 +6,14 @@
  *  helpers own the window arithmetic so it's unit-tested independently of the
  *  component. */
 
-/** How many trailing exchanges to render on first open of a thread. The user
- *  lands at the bottom, so only the tail is visible; older ones materialize on
- *  scroll-up. */
+/** How many trailing exchanges to render on first open of a thread.
+ *
+ *  A thread with no saved position opens at the TOP of this slice (see
+ *  ThreadView's `resetOnEmpty`), so the window is what the reader can reach by
+ *  scrolling DOWN without waiting on anything; older exchanges materialize as
+ *  they scroll up past `WINDOW_EXPAND_MARGIN_PX`. It used to say "the user
+ *  lands at the bottom", which stopped being true when the transcript stopped
+ *  scrolling itself there. */
 export const INITIAL_WINDOW = 20;
 
 /** How many more to reveal each time the user scrolls near the top. */

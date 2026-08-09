@@ -20,7 +20,7 @@ import {
 import { seedDrawerHighlight, openHighlightedThreadActions, toggleFocusedThreadFamily } from '../components/drawer/ThreadDrawer';
 import { handlePaneTab, reconcilePaneFocus } from '../components/layout/paneFocus';
 import { historyBack, historyForward } from '../store/actions/focused-pane-history';
-import { stepThreadTurn, parseNavigatedTurn, preserveOnToggle } from '../components/chat/scrollState';
+import { stepThreadTurn, parseNavigatedTurn } from '../components/chat/scrollState';
 import { navFocusElement, applyNavFocus } from '../components/shared/focusMarker';
 
 function startNewThread() {
@@ -34,8 +34,7 @@ function startNewThread() {
  *  marker — the ⌘↑/⌘↓-highlighted `.chat-exchange`. The Enter counterpart to
  *  clicking a turn's response/initiator header: it folds the response body when the
  *  turn has one, else the initiator panel (a response-less divider / change turn).
- *  Preserves scroll position across the height change (`preserveOnToggle`, matching
- *  the header-click path) and RE-ASSERTS the marker so it survives the Enter
+ *  RE-ASSERTS the marker so it survives the Enter
  *  keydown's clear (any keydown retires the marker's ref) and repeated Enter presses stay
  *  visible and reversible. Lives here (not in `scrollState`) so `scrollState` stays
  *  free of the heavy `store` import — see `parseNavigatedTurn`'s doc. Returns false
@@ -50,7 +49,6 @@ function toggleNavigatedTurnCollapsed(): boolean {
     el.dataset.collapseKind ?? null,
   );
   if (!parsed) return false;
-  preserveOnToggle();
   if (parsed.kind === 'response') toggleExchangeCollapsed(parsed.threadId, parsed.userSeq);
   else toggleInitiatorCollapsed(parsed.threadId, parsed.userSeq);
   // Re-stick the marker: this runs from the Enter keydown's bubble phase, after

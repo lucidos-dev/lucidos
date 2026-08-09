@@ -1,20 +1,33 @@
 use super::*;
+use crate::runtime::is_user_question_tool;
 
-/// Both backends' question tools must suppress the `CodingAgentToolCalled`
-/// emit — the `UserQuestionAsked` event renders the card; a tool-call step
-/// on top double-surfaces the question. Every other tool (including OTHER
-/// lucidos MCP tools like the permission `approve`) must keep emitting, or
-/// its step silently vanishes from the timeline.
+/// Every question tool must suppress the `CodingAgentToolCalled` emit: the
+/// `UserQuestionAsked` event renders the card, and a tool-call step on top
+/// double-surfaces the question. Every other tool (including OTHER lucidos MCP
+/// tools like the permission `approve`) must keep emitting, or its step
+/// silently vanishes from the timeline.
+///
+/// THREE names, not two. CC reaches the MCP question tool under its own mount
+/// name as well as calling its native one, and that third name was missing:
+/// the step it emitted sat pending above the card until the user answered.
 #[test]
 fn question_tools_are_suppressed_other_tools_are_not() {
-    assert!(is_user_question_tool("AskUserQuestion"));
-    assert!(is_user_question_tool("mcp__lucidos__ask_user_question"));
+    assert!(is_user_question_tool(
+        crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL
+    ));
+    assert!(is_user_question_tool(
+        crate::runtime::CC_MCP_ASK_USER_QUESTION_TOOL
+    ));
+    assert!(is_user_question_tool(
+        crate::runtime::CODEX_ASK_USER_QUESTION_TOOL
+    ));
     for name in [
         "Bash",
         "Edit",
         "command_execution",
         "file_change",
         "mcp__lucidos__approve",
+        crate::runtime::CC_PERMISSION_PROMPT_TOOL,
         "mcp__other__ask_user_question",
     ] {
         assert!(

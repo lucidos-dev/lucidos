@@ -10,6 +10,18 @@
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
+// A Vitest run IS a Vite dev-server bundle, so the live `isDevServerBundle()`
+// reports true here and every flow below would short-circuit on the frontend
+// preview's no-service-worker gate. These tests exercise the PRODUCTION path, so
+// the predicate is pinned false; the gate itself is covered by the pure
+// `pushUnsupportedReason` cases at the bottom of this file and by
+// `utils/devServerBundle.test.ts`. `importOriginal` keeps the real message
+// string, which one of those cases asserts on.
+vi.mock('../../utils/devServerBundle', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../utils/devServerBundle')>()),
+  isDevServerBundle: () => false,
+}));
+
 const originalFetch = globalThis.fetch;
 
 /** Generate a real 65-byte uncompressed VAPID point (0x04 || X(32) || Y(32))
@@ -406,11 +418,29 @@ describe('pushUnsupportedReason', () => {
     hasServiceWorker: true,
     hasPushManager: true,
     hasNotification: true,
+    devServerBundle: false,
   };
 
   it('returns null when the context fully supports push', async () => {
     const { pushUnsupportedReason } = await import('./push');
     expect(pushUnsupportedReason(ALL_OK)).toBeNull();
+  });
+
+  it('the frontend preview wins over every other reason, because it is https already', async () => {
+    // A preview is served over https on localhost, so `secureContext` is true
+    // and the origin advice would be advice the user has already followed. It
+    // registers no service worker by design (utils/devServerBundle.ts), so the
+    // "not supported in this browser" message would blame the wrong thing too.
+    const { pushUnsupportedReason } = await import('./push');
+    const reason = pushUnsupportedReason({
+      ...ALL_OK,
+      devServerBundle: true,
+      hasServiceWorker: false,
+      secureContext: false,
+    });
+    expect(reason).toMatch(/preview/i);
+    expect(reason).not.toMatch(/secure origin/i);
+    expect(reason).not.toMatch(/not supported in this browser/i);
   });
 
   it('insecure origin wins over missing APIs and names the fix, not the browser', async () => {
@@ -423,6 +453,7 @@ describe('pushUnsupportedReason', () => {
       hasServiceWorker: false,
       hasPushManager: false,
       hasNotification: true,
+      devServerBundle: false,
     });
     expect(reason).toMatch(/secure origin/i);
     expect(reason).toMatch(/https/);

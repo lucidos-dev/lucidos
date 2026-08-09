@@ -21,7 +21,7 @@ import { openAppById } from '../../store/actions/apps';
 import { pushNavState } from '../../store/actions/navigation';
 import { getDraft } from '../../store/composeDrafts';
 import { ComposeDestinationRow } from './ComposeDestinationRow';
-import { scrollToBottom, preserveAtBottom } from './scrollState';
+import { followAnsweredQuestion, followSentMessage } from './scrollState';
 import { CaptureIcon, ImageIcon, CameraIcon, FileIcon, CloseIcon, ClearIcon, GlobeIcon, SendArrowIcon, StopIcon } from '../shared/icons';
 import { BlobImage } from '../shared/BlobImage';
 import { CodingAgentControlMenu, codingAgentMenuOpenRequest } from './CodingAgentControlMenu';
@@ -262,8 +262,7 @@ export function PromptInput() {
 
   function autoResize() {
     const el = inputRef.current;
-    if (!el) return;
-    if (resizeTextarea(el)) preserveAtBottom();
+    if (el) resizeTextarea(el);
   }
 
   function handleKeyDown(e: KeyboardEvent) {
@@ -367,7 +366,6 @@ export function PromptInput() {
       // A queued send still flips the button to the optimistic Cancel — settle.
       armCancelSettle();
       queueUploadSend(threadId, { useCodingAgent, context });
-      preserveAtBottom();
       return;
     }
     el.value = '';
@@ -383,7 +381,13 @@ export function PromptInput() {
     } else {
       el.style.height = 'auto';
     }
-    scrollToBottom();
+    // Take the reader to what they just wrote and keep them at the live edge
+    // while it is answered. Here as well as in `addPendingMessage` because this
+    // is the composer's own tap and it must not wait on the awaited send below;
+    // the second call is a no-op refresh of the same request (see
+    // `followSentMessage`). A reader already at the live edge is not scrolled
+    // at all, only armed.
+    followSentMessage();
     if (isMobile()) el.blur();
 
     // This constructive tap is about to morph the same button into the
@@ -431,12 +435,6 @@ export function PromptInput() {
 
   function handleInput() {
     autoResize();
-    // Typing the first character flips hasContent → the action row swaps
-    // section buttons for Send, often changing prompt-actions-row
-    // height even when the textarea itself didn't grow. Pin the user to the
-    // bottom across the upcoming re-render so onResize can't escalate
-    // scrolledUp=true on the layout shift.
-    preserveAtBottom();
     const el = inputRef.current;
     if (!el) return;
     const val = el.value;
@@ -746,13 +744,17 @@ export function PromptInput() {
     // Once answered, pendingMultiQ clears and the row falls to the lone Cancel —
     // settle so a repeat tap can't abort the resuming turn. See armCancelSettle.
     armCancelSettle();
-    preserveAtBottom();
     const answer: AnswerKind = {
       kind: 'MultiSelected',
       option_ids: ids,
       ...(text.length > 0 ? { text } : {}),
     };
     setPendingAnswer(pendingMultiQ.toolUseId, answer);
+    // Same ask as the composer's Send: take the reader to what they just
+    // answered and hold them at the live edge while the agent resumes. Before
+    // the awaited answer below, because this is the button's own tap. A reader
+    // already at the live edge is not scrolled at all, only armed.
+    followAnsweredQuestion(pendingMultiQ.toolUseId);
     if (el) {
       el.value = '';
       el.style.height = 'auto';

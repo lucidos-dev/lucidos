@@ -371,6 +371,7 @@ jobs:
           name: install-log-${{ matrix.os }}
           path: ${{ runner.temp }}/install.log
           if-no-files-found: ignore
+          retention-days: 7
 
   # ── DMG VERIFY ───────────────────────────────────────────────────────────────
   # Gates the signed/notarized DMG. THREE ways in, because the artifact does not
@@ -723,6 +724,7 @@ jobs:
             ${{ runner.temp }}/uninstall.log
             ${{ runner.temp }}/journal.log
           if-no-files-found: ignore
+          retention-days: 7
 
   # ── FRONT DOOR (the LIVE lucidos.dev origin) ─────────────────────────────────
   # WHY THIS EXISTS — do not delete it as "redundant with smoke".

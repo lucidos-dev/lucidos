@@ -36,13 +36,15 @@ describe('answerThreadQuestion', () => {
     apiAnswerThreadQuestion.mockResolvedValue(true);
   });
 
-  it('pins to bottom before sending so the answered card height-shrink does not unstick scroll', async () => {
+  it('sends the answer without moving the transcript', async () => {
+    // This used to pin to the bottom before the POST, so the answered card's
+    // height-shrink could not unstick the tail and the resumed stream would
+    // follow. Answering is not a request to go to the live edge: the resumed
+    // stream grows below the reader, and the chevron is how they follow it.
     await answerThreadQuestion('t1', 'tool-use-1', { kind: 'Selected', option_id: 'opt-a' });
 
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
-    const scrollOrder = scrollToBottom.mock.invocationCallOrder[0];
-    const apiOrder = apiAnswerThreadQuestion.mock.invocationCallOrder[0];
-    expect(scrollOrder).toBeLessThan(apiOrder);
+    expect(apiAnswerThreadQuestion).toHaveBeenCalledTimes(1);
+    expect(scrollToBottom).not.toHaveBeenCalled();
   });
 
   it('optimistically marks the thread answering before the request, and does NOT clear on success', async () => {
@@ -71,12 +73,12 @@ describe('answerThreadQuestion', () => {
     expect(clearThreadRerenderStart).toHaveBeenCalledWith('t1');
   });
 
-  it('still pins to bottom on API failure, clears the flag, and shows the error toast at the bottom', async () => {
+  it('clears the flag and shows the error toast on API failure, still without scrolling', async () => {
     apiAnswerThreadQuestion.mockRejectedValueOnce(new ApiError(500, 'boom'));
     const ok = await answerThreadQuestion('t1', 'tool-use-1', { kind: 'Selected', option_id: 'opt-a' });
 
     expect(ok).toBe(false);
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
+    expect(scrollToBottom).not.toHaveBeenCalled();
     expect(clearThreadAnswering).toHaveBeenCalledWith('t1');
     expect(clearThreadRerenderStart).toHaveBeenCalledWith('t1');
     expect(showToast).toHaveBeenCalledTimes(1);

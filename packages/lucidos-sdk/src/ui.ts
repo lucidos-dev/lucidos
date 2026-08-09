@@ -304,6 +304,60 @@ function inIOSStandalone(): boolean {
 
 const HTTP_SCHEME_RE = /^https?:\/\//i;
 
+/**
+ * The live style remote, iframe realm.
+ *
+ * A fourth copy of the same validator, alongside `utils/styleOverrides.ts`
+ * (app realm), the `index.html` FOUC block (boot realm) and
+ * `api/sdk_prefs.rs` (iframe first paint). The SDK is a separate package and
+ * cannot import the app's copy, exactly as it cannot import its font map, so
+ * this mirrors the existing theme/font/scale arrangement rather than inventing
+ * a new one. The rules must stay identical in all four: the preference is
+ * writable by any app and by the chat agent, so it is an untrusted path into
+ * inline style, and a rule relaxed in one realm is a hole in all of them.
+ */
+const OVERRIDE_NAME_RE = /^--[a-z][a-z0-9-]*$/;
+const OVERRIDE_VALUE_BANNED_RE = /[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i;
+const MAX_OVERRIDES = 200;
+const MAX_OVERRIDE_VALUE_LENGTH = 120;
+
+/** Names this module currently has written, so one dropped from the map gets
+ *  removed rather than left stuck at its last value on a live re-apply. */
+let appliedOverrideNames: string[] = [];
+
+function applyStyleOverrides(raw: string | null | undefined): void {
+  let map: Record<string, unknown> = {};
+  if (raw) {
+    try {
+      const parsed: unknown = JSON.parse(raw);
+      if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+        map = parsed as Record<string, unknown>;
+      }
+    } catch {
+      // A corrupt map must not cost the app its theme; fall through to empty,
+      // which also clears anything a previous apply had set.
+    }
+  }
+  const root = document.documentElement;
+  const applied: string[] = [];
+  let n = 0;
+  for (const [name, value] of Object.entries(map)) {
+    if (n >= MAX_OVERRIDES) break;
+    if (!OVERRIDE_NAME_RE.test(name)) continue;
+    if (typeof value !== 'string') continue;
+    const trimmed = value.trim();
+    if (!trimmed || trimmed.length > MAX_OVERRIDE_VALUE_LENGTH) continue;
+    if (OVERRIDE_VALUE_BANNED_RE.test(trimmed)) continue;
+    root.style.setProperty(name, trimmed);
+    applied.push(name);
+    n++;
+  }
+  for (const name of appliedOverrideNames) {
+    if (!applied.includes(name)) root.style.removeProperty(name);
+  }
+  appliedOverrideNames = applied;
+}
+
 export const ui = {
   /** Fetch user preferences and apply theme, font, scale as CSS variables. */
   async applyPreferences(): Promise<void> {
@@ -360,6 +414,14 @@ export const ui = {
         document.documentElement.style.setProperty('--user-ui-scale', `${snapped}%`);
       }
     }
+
+    // The live style remote's custom property overrides. LAST, because the
+    // three applies above write properties (--bg-primary, --font-ui,
+    // --user-ui-scale) the remote is allowed to override, and inline properties
+    // are last-write-wins. This is the LIVE half of the same map sdk-prefs.js
+    // seeds at first paint: without it, a value retuned in the shell reaches
+    // every open app iframe only on its next reload.
+    applyStyleOverrides(prefs['style_overrides'] || wsLocalGet('lucidos-style-overrides'));
 
     // Cache the external-link target for openExternal, which must resolve it
     // WITHOUT awaiting (see EXTERNAL_LINK_TARGET_CACHE).

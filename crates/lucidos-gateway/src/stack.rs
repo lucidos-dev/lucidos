@@ -231,10 +231,20 @@ pub fn spawn_engine(
     }
 
     let child = cmd.spawn()?;
-    let _ = std::fs::write(
-        resolved_dir.join(".lucidos/engine.pid"),
-        child.id().to_string(),
-    );
+    // Not fatal (the engine is already up and serving), but not silent either:
+    // without the pidfile a re-adopting gateway cannot tell this engine is alive
+    // (`engine_process_alive` reads it for any stack with no `Child` handle) and
+    // `reclaim_stale_engine` cannot free its port on the next respawn. Both
+    // failures surface far from here, so name the cause where it happens.
+    let pidfile = resolved_dir.join(".lucidos/engine.pid");
+    if let Err(e) = std::fs::write(&pidfile, child.id().to_string()) {
+        crate::log!(
+            "[Gateway] could not write {} for '{}': {e} \
+             (re-adoption and stale-engine reclaim will not see this engine)",
+            pidfile.display(),
+            ws.id
+        );
+    }
     Ok(child)
 }
 
@@ -297,9 +307,73 @@ pub fn pid_is_live(_pid: u32) -> bool {
     true
 }
 
+/// Wait on a process this gateway forked but holds no [`Child`] for, off the
+/// caller's thread, so it cannot linger as a zombie.
+///
+/// **Signalling an engine is not reaping it.** The gateway normally reaps
+/// through the `Child` it got from [`spawn_engine`], but it does not always HAVE
+/// one: `reload_gateway` re-execs the gateway image *in place*, so the pid is
+/// unchanged and every engine the previous image spawned is still a child of
+/// this process, while every `Child` handle died with the image. The fresh image
+/// re-adopts those engines with `engine: None`, and from then on their teardown
+/// runs through [`reclaim_stale_engine`], which only knows a pid. Without this
+/// wait the engine exits and stays `<defunct>` for the gateway's whole lifetime:
+/// the one path that would `waitpid` it ([`pid_is_live`]) runs only while the
+/// stack is still in the supervisor's map with no handle, which stops being true
+/// the moment a stop drops the stack or a respawn stores a fresh `Child`.
+/// Nineteen such zombies had accumulated over a two-day uptime on 2026-08-09.
+///
+/// A dedicated thread rather than the caller's, because an engine's graceful
+/// drain takes ~10s and the callers are the supervisor and control requests. A
+/// plain `std::thread` rather than `spawn_blocking` so this stays callable from
+/// any context, including a sync helper reached outside a tokio runtime.
+///
+/// Blocking `waitpid` is safe for a pid that is NOT ours: it returns `ECHILD`
+/// immediately rather than waiting, so a re-adopted engine that a *previous*
+/// gateway process spawned costs only the thread. It is scoped to the single
+/// pid, so it can never consume another child's exit status, the same discipline
+/// [`pid_is_live`] documents. It inherits the pid-recycling exposure the `kill`
+/// in [`reclaim_stale_engine`] already carries (a pidfile can name a pid the OS
+/// has since reused), and is the strictly milder half of that pair: the worst
+/// case is collecting one of our own probe children's exit status, against the
+/// signal's worst case of stopping it.
+#[cfg(unix)]
+pub fn reap_forked_pid(pid: u32) {
+    // Same guard as `pid_is_live`: `waitpid(0, ...)` means "any child in MY
+    // process group", which could steal the exit status an engine's `Child`
+    // handle is waiting for.
+    if pid == 0 {
+        return;
+    }
+    std::thread::spawn(move || {
+        let mut status: libc::c_int = 0;
+        loop {
+            // SAFETY: an explicit pid, and a stack local we own for the status.
+            // Blocks until that one pid exits, or returns ECHILD at once if it
+            // is not our child.
+            let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) };
+            if waited >= 0 {
+                return;
+            }
+            // A signal arriving mid-wait must not abandon the reap; anything
+            // else (ECHILD) means there is nothing of ours left to collect.
+            if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                return;
+            }
+        }
+    });
+}
+
+#[cfg(not(unix))]
+pub fn reap_forked_pid(_pid: u32) {}
+
 /// Send SIGUSR1 (the engine's graceful-stop signal — it ignores SIGTERM) to a
 /// stale engine recorded in the pidfile, so a respawn doesn't collide on the
-/// loopback port. Best-effort.
+/// loopback port, and reap it if it turns out to be our own child.
+///
+/// This is the teardown path for an engine the gateway holds no [`Child`] for,
+/// and the reap is not optional: see [`reap_forked_pid`] for why such an engine
+/// is so often still a child of this process. Best-effort throughout.
 pub fn reclaim_stale_engine(resolved_dir: &Path) {
     #[cfg(unix)]
     if let Some(pid) = read_pidfile(resolved_dir) {
@@ -308,6 +382,10 @@ pub fn reclaim_stale_engine(resolved_dir: &Path) {
         unsafe {
             libc::kill(pid as libc::pid_t, libc::SIGUSR1);
         }
+        // Started BEFORE the sleep, not after, so the wait is already in place
+        // when the engine exits, and because the pidfile is overwritten by the
+        // very next spawn: this is the last moment the pid is known.
+        reap_forked_pid(pid);
         // Give it a moment to release the port.
         std::thread::sleep(Duration::from_millis(300));
     }

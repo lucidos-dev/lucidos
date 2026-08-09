@@ -215,10 +215,13 @@
     }
 }
 
-/* Markdown rules inherited from .markdown-content in global.css */
+/* Markdown rules inherited from .markdown-content in global.css. Size + leading
+   are kept in step with .response-content (chat/response.css): a notification
+   body is the same kind of prose as a thread message, and the two are read one
+   after the other when a notification hands off into its thread. */
 .notification-detail-body {
     padding: var(--space-lg);
-    font-size: var(--font-size-md);
+    font-size: var(--font-size-sm);
     color: var(--text-primary);
     line-height: 1.5;
     min-width: 0;

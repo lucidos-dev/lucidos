@@ -3,11 +3,12 @@ import type { ComponentChildren } from 'preact';
 import { credentials } from '../../store/store';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
 import { findProviderCredential } from './providerCredential';
+import { Explainer } from '../shared/Explainer';
 
 /** Shared block for a provider that authenticates with a single API key stored
  *  as an `api_key` credential (OpenAI, OpenRouter). The secret is write-only —
  *  once set we show "configured", never the value. Renders only the provider
- *  rows + note; the enclosing "Providers" `settings-section` is owned by
+ *  rows; the enclosing "Providers" `settings-section` is owned by
  *  `SettingsView`. Providers with extra knobs (Anthropic's auth kind, Local's
  *  base URL) keep their own components. */
 export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, note }: {
@@ -17,7 +18,10 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
   /** Row label, e.g. "OpenAI (direct)". */
   label: string;
   placeholder: string;
-  /** Provider-specific explanatory note rendered under the rows. */
+  /** Provider-specific explanation, behind the provider row's *explainer*
+   *  rather than a paragraph under the rows: it is static reference material
+   *  read once, and the Providers page is otherwise a stack of such
+   *  paragraphs with the actual fields lost between them. */
   note: ComponentChildren;
 }) {
   const credLoadable = credentials.value;
@@ -42,6 +46,7 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
       <div class="settings-row">
         <span class="settings-row-label">
           {label}
+          <Explainer title={label}>{note}</Explainer>
           {/* `.list-row-details` is `display: flex`, so this span is a block box
               inside the label's line and renders UNDER it. A manual "·" glue
               would therefore be stranded at the start of that new line, the
@@ -77,7 +82,6 @@ export function ApiKeyProviderSettings({ service, baseUrl, label, placeholder, n
           {existing ? 'Update' : 'Save'}
         </button>
       </div>
-      <div class="settings-row-note">{note}</div>
     </>
   );
 }

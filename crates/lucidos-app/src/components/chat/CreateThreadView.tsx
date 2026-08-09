@@ -4,7 +4,6 @@ import {
   activeExchanges,
   activeStreamingBuffer,
   threadsLoaded,
-  mobileView,
   focusedThreadId,
   threadMap,
   isRenderedThreadIdle,
@@ -14,7 +13,7 @@ import {
   promptAnimating,
 } from '../../store/store';
 import { welcomeSuggestionsDismissed } from '../../store/actions/preferences';
-import { scrolledUp, awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers, hasPendingEventScroll } from './scrollState';
+import { awayFromBottom, notAtTop, scrollToBottom, setActiveScrollElement, getActiveScrollElement, isElementVisible, makeScrollObservers } from './scrollState';
 import { ChatExchange } from './ChatExchange';
 import { ChevronUpIcon, ChevronDownIcon } from '../shared/icons';
 import { WelcomeMessage } from './WelcomeMessage';
@@ -256,20 +255,12 @@ export function renderExchanges(
       <details
         class="queued-message-group"
         key={`queued-${queuedOrder.join('-')}`}
-        onToggle={(e) => {
-          // Expanding the group reveals the queued bubbles below the active
-          // turn — at the bottom of the thread. Snap to the bottom so they're
-          // actually in view instead of off-screen under the fold.
-          //
-          // Defer to the next frame: the native <details> reflow that unfolds
-          // the bubbles can land AFTER this toggle event fires, so a synchronous
-          // scroll measures the pre-expand height and stops short (the
-          // "doesn't scroll on reopen" glitch). By the next frame the expanded
-          // height is settled, so scrollToBottom()'s first read is correct; its
-          // re-pin loop then absorbs any remaining reflow.
-          if (!(e.currentTarget as HTMLDetailsElement).open) return;
-          requestAnimationFrame(() => scrollToBottom());
-        }}
+        /* Expanding the group unfolds the queued bubbles below the active turn,
+           at the bottom of the thread. It used to snap the transcript down to
+           them; it no longer does. A disclosure is not the "take me to the live
+           edge" gesture, and growing content under the reader is exactly what
+           must not move them (see scrollState's header). The chevron rises on
+           the growth, which is the way down. */
       >
         <summary class="queued-message-group-summary">
           <span class="queued-message-group-label">{`Queued (${queuedCount})`}</span>
@@ -314,8 +305,10 @@ export function renderExchanges(
 // We freeze the container (`overflow:hidden`) during DOM changes so the browser
 // can't touch scrollTop, then compensate and unfreeze.
 //
-// IMPORTANT: There are two .thread-content elements (desktop SplitLayout + mobile
-// MobileSwipeContainer). We find the correct one via `anchor.closest()`, not by ID.
+// The scroll container is found via `anchor.closest('.thread-content')` rather
+// than by id: ids are banned on pane chrome (see .claude/rules/frontend-css.md),
+// and walking up from the anchor cannot pick the wrong element even while a
+// layout swap is committing.
 
 /** Keep `anchor` visually pinned while `fn` mutates the DOM. */
 export function withScrollAnchor(anchor: Element | null | undefined, fn: () => void) {
@@ -379,14 +372,23 @@ export function withScrollAnchor(anchor: Element | null | undefined, fn: () => v
   requestAnimationFrame(restore);
 }
 
-/** Auto-scroll to bottom when new exchanges arrive or streaming updates happen.
+/** Wire a transcript element to the shared scroll signals: attach the scroll +
+ *  resize observers (`makeScrollObservers`) and register it as the active scroll
+ *  target so the chevrons and deep links know which transcript to move.
+ *
+ *  It was `useAutoScroll`, and it carried a layout effect that snapped the
+ *  container to the bottom on every content arrival. That was the app's main
+ *  bottom-pin, so it is gone, and with it the `deps` array that told it when
+ *  content had arrived: nothing here reacts to content any more. The name
+ *  follows, since a hook called `useAutoScroll` that does not auto-scroll would
+ *  mislead every future reader of the two call sites.
  *
  *  Listener setup tracks the actual DOM element via a ref, not just the `ready`
  *  boolean. If the element changes (e.g. component unmount/remount during SSE
  *  reconnection), listeners are detached from the old element and reattached to
  *  the new one on the next render. This prevents "dead listener" bugs where
  *  scroll events go to a detached DOM node. */
-export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unknown[], ready: boolean) {
+export function useScrollObservers(ref: preact.RefObject<HTMLDivElement>, ready: boolean) {
   const listenerRef = useRef<{ el: HTMLDivElement; cleanup: () => void } | null>(null);
 
   // Check on every render whether the target element has changed.
@@ -422,8 +424,8 @@ export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unkno
     mo.observe(el, { childList: true });
     observeChildren();
 
-    // Register as the active scroll target so scrollToBottom() targets
-    // the correct element (not a hidden desktop duplicate on mobile).
+    // Register as the active scroll target so scrollToBottom() moves the
+    // transcript the user can actually see, never one laid out at zero size.
     if (isElementVisible(el)) {
       setActiveScrollElement(el);
     }
@@ -450,25 +452,6 @@ export function useAutoScroll(ref: preact.RefObject<HTMLDivElement>, deps: unkno
     notAtTop.value = false;
     awayFromBottom.value = false;
   }, []);
-
-  // Layout effect, not passive: it must snap to the bottom synchronously at
-  // commit — BEFORE the browser delivers the ResizeObserver callback for the
-  // same DOM growth. A passive effect runs after paint (and after onResize), so
-  // when a >80px chunk lands while the user is following (e.g. CC resuming after
-  // an Approve, once the 500ms suppression window has lapsed), onResize would
-  // see the user below the new bottom and escalate scrolledUp=true first,
-  // parking this snap and killing tailing on its own. Snapping first makes
-  // onResize see isAtBottom() and leave scrolledUp alone. Only fires on real
-  // content arrival (deps = events/streaming), never on local panel toggles, so
-  // the panel-expand "show the chevron" behaviour is untouched.
-  useLayoutEffect(() => {
-    const el = ref.current;
-    // Defer while a notification deep-link is resolving a scroll to a specific
-    // event — snapping to the bottom here would override its scrollIntoView the
-    // moment an unfocused thread's lazily-loaded events render.
-    if (!el || scrolledUp.value || hasPendingEventScroll()) return;
-    el.scrollTop = el.scrollHeight;
-  }, deps);
 }
 
 /** Whether the welcome surface (`WelcomeMessage`) shows on the empty compose
@@ -531,14 +514,13 @@ export function CreateThreadView() {
   }, [animating, showWelcome, welcomeRevealed]);
 
   // hasContent: true exactly when the thread-content div will be in the DOM.
-  // useAutoScroll depends on this — if we only pass `loaded`, the effect runs
-  // when threadsLoaded becomes true but the div might not exist yet (no
+  // useScrollObservers depends on this. If we only pass `loaded`, the effect
+  // runs when threadsLoaded becomes true but the div might not exist yet (no
   // exchanges, no welcome). Later when exchanges arrive, the effect never
   // re-runs → no scroll listener → button broken.
   const hasContent = loaded && (showWelcome || !isEmpty);
 
-  // Auto-scroll to bottom when exchanges change or mobile view changes
-  useAutoScroll(areaRef, [exchanges, streamingBuffer, mobileView.value], hasContent);
+  useScrollObservers(areaRef, hasContent);
 
   return (
     <div class="thread-content-wrap">

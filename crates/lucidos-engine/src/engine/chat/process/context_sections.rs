@@ -11,7 +11,7 @@ use uuid::Uuid;
 
 use super::super::recursion_guard::MAX_THREAD_DEPTH;
 
-/// The nine per-turn context-section strings produced by
+/// The ten per-turn context-section strings produced by
 /// [`LucidosEngine::build_chat_context_sections`]. Empty strings mean the
 /// section does not apply this turn (callers filter them out).
 pub(super) struct ChatContextSections {

@@ -14,6 +14,8 @@ import { errorDetail } from '../../utils/errorDetail';
 import { focusIfNeeded } from './promptFocus';
 import { Overlay } from '../shared/Overlay';
 import { availableReasoningOptions, reconcileReasoningEffort } from './codingAgentOptions';
+import { FrontendPreviewSection } from './FrontendPreviewSection';
+import { loadFrontendPreview } from '../../store/actions/frontend-preview';
 
 // Signal for PromptInput to request opening the menu with a filter
 // Set to a string (the filter text) to open, consumed by the component
@@ -196,6 +198,10 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
     // Reset retry counter — each manual open gets fresh retries
     retryCountRef.current = 0;
     loadCommands();
+    // Read the preview slot on open rather than at startup: it is dev-only and
+    // one slot per workspace, so the menu opening is both the cheapest and the
+    // freshest moment to learn what is running. SSE keeps it live from there.
+    if (threadId) void loadFrontendPreview();
   }
 
   useEffect(() => {
@@ -261,9 +267,10 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
   // Must use useSignalEffect (not useEffect) — @preact/signals can optimize
   // away re-renders when a signal doesn't affect DOM output, which prevents
   // useEffect deps from being re-evaluated.
-  // Visibility check: both SplitLayout and MobileSwipeContainer render this
-  // component simultaneously. Only the visible instance should consume the
-  // request — the hidden one has a zero-size bounding rect.
+  // Layout check: `App` mounts only the active layout's pane tree (desktop XOR
+  // mobile), so exactly one instance of this menu exists. It can still be
+  // unlaid-out on the frame the request arrives (zero-size bounding rect), and
+  // the menu anchors its overlay to that box, so wait for a real one.
   useSignalEffect(() => {
     const req = codingAgentMenuOpenRequest.value;
     if (req !== null) {
@@ -601,6 +608,13 @@ export function CodingAgentControlMenu({ threadId, composeThreadId, codingAgent 
               {sections.length === 0 && (
                 <div class="control-empty">No matching commands</div>
               )}
+              {/* Only on a live thread (the compose view has no worktree yet),
+                  and only when nothing is being filtered, since this section is
+                  not a command and would survive every search term. A thread
+                  whose worktree has no frontend is not filtered out here: the
+                  engine refuses by name, which is a better answer than a
+                  missing button. */}
+              {threadId && !q && <FrontendPreviewSection threadId={threadId} />}
             </div>
           ) : hasOptions ? (
             <div class="control-list" tabIndex={0} ref={optionsListRef}>

@@ -110,6 +110,32 @@ pub enum ThreadStatus {
 }
 
 impl ThreadStatus {
+    /// Every status, in the order a human would read them: idle, then the
+    /// three ways a turn can still be open, then the two verdicts.
+    ///
+    /// The single source for five surfaces: the `status` filter's accepted
+    /// values on `threads list` / `count`, the value list its error messages
+    /// and the CLI help print, the `status` enum in the `threads` LLM tool
+    /// schema, and (through `thread_lifecycle_tests::contract`) the
+    /// cross-validation fixture's status dimension and the generated TS union.
+    ///
+    /// **A variant missing from here is missing from all five**, and no test
+    /// can catch that, because every enumeration a test could use IS this
+    /// array. The array's own length is a compile-time constant, so it fails
+    /// nothing either. `as_str` below is the one place the compiler stops you,
+    /// which is why the instruction is repeated there.
+    pub const ALL: [Self; 6] = [
+        Self::Idle,
+        Self::Running,
+        Self::Waiting,
+        Self::WaitingForUserAnswer,
+        Self::Paused,
+        Self::Failed,
+    ];
+
+    /// Adding a variant makes this match non-exhaustive, which is the compile
+    /// error that brings you here. Add it to [`Self::ALL`] in the same edit
+    /// (and widen the array): nothing downstream will tell you if you don't.
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Idle => "idle",
@@ -121,29 +147,39 @@ impl ThreadStatus {
         }
     }
 
+    /// Strict inverse of `as_str`: `None` for anything that is not one of the
+    /// six current statuses. This is the parser for *caller-supplied* values
+    /// (the `status` filter on threads list / count), where an unrecognized
+    /// value must become a visible error rather than quietly selecting
+    /// something. Contrast [`Self::parse`], which reads the projection's own
+    /// column and is deliberately lenient.
+    ///
+    /// Accepts the kebab spelling of each value as well as the snake_case one
+    /// the column stores, so `waiting-for-user-answer` (the repo's kebab-case
+    /// convention for public parameter values) and `waiting_for_user_answer`
+    /// (what every returned row's `status` field prints) select the same rows.
+    /// Only that one value has a separator at all.
+    pub fn try_parse(s: &str) -> Option<Self> {
+        let normalized = s.trim().to_ascii_lowercase().replace('-', "_");
+        Self::ALL
+            .into_iter()
+            .find(|status| status.as_str() == normalized)
+    }
+
     /// Parse the snake_case wire form persisted in `thread_summaries.status`.
     /// Mirrors `as_str` exactly; unknown values fall back to Idle
-    /// (defensive — the column is only written by the projection itself, so a
+    /// (defensive: the column is only written by the projection itself, so a
     /// surprise value would indicate manual DB tampering, not a bug to crash on).
     ///
     /// `waiting_for_event` is the one value that reaches this from real data
     /// without being tampering: it was a status until 2026-08-06, when a
     /// subscription stopped holding the turn (see
     /// `docs/plans/2026-08-06-every-event-wait-is-detached.md`). The migration
-    /// rewrites the stored rows; the arm is here so a row written by an older
-    /// engine against a shared database still reads as what it now means, which
-    /// is `Idle`. It is listed explicitly rather than left to the catch-all so
-    /// the intent survives the next person reading this match.
+    /// rewrites the stored rows; the fallback is what makes a row written by an
+    /// older engine against a shared database still read as what it now means,
+    /// which is `Idle`.
     pub fn parse(s: &str) -> Self {
-        match s {
-            "running" => Self::Running,
-            "waiting" => Self::Waiting,
-            "waiting_for_user_answer" => Self::WaitingForUserAnswer,
-            "paused" => Self::Paused,
-            "failed" => Self::Failed,
-            "waiting_for_event" => Self::Idle,
-            _ => Self::Idle,
-        }
+        Self::try_parse(s).unwrap_or(Self::Idle)
     }
 }
 
@@ -289,9 +325,17 @@ pub fn classify_event(event_type: &str) -> Option<EventClass> {
         // Event-wait lifecycle. Registration is Activity, not ActionRequired:
         // the thread subscribed to something the SYSTEM will deliver, so it must
         // never read as needing the user. The three resolutions are Activity for
-        // the same reason `UserQuestionAnswered` is: they are steps, not the
-        // start of a new exchange. The delivery's own `UserPromptInjected` is
-        // the Start event that opens the woken turn.
+        // the same reason `UserQuestionAnswered` is: none of them opens a fresh
+        // round of work. A delivery and an expiry resume the turn that parked,
+        // and the delivery's own `UserPromptInjected` is the Start event that
+        // opens the woken turn; a cancel resumes nothing at all.
+        //
+        // Not the same axis as how the transcript GROUPS them. This class drives
+        // the section and status machinery; the frontend decides its own exchange
+        // boundaries, and it opens one for a `user_stop` cancel so the person who
+        // pressed Stop waiting sees their own action where they took it
+        // (`isExchangeStartEvent`). Activity is still right here: a stop starts no
+        // work and moves the thread nowhere.
         "EventWaitStarted" | "EventWaitDelivered" | "EventWaitExpired" | "EventWaitCanceled" => {
             EventClass::Activity
         }

@@ -95,6 +95,15 @@ html {
        Mobile redefines this in mobile.css: its header is fixed at the viewport
        top instead, so the anchor there is the measured header height alone. */
     --app-header-bottom: calc(var(--titlebar-inset, 0px) + var(--app-header-height) + var(--app-banner-height, 0px));
+    /* The breathing room a surface HUNG FROM the header leaves below that edge,
+       so it reads as coming out of the row it was opened from rather than as
+       welded to it. The other half of the anchor above, and it lives beside it
+       for the same reason: a surface that picks its own gap starts on a
+       different line from every other one. Two users today, the Lucidos menu
+       (.brand-menu, styles/header-mark.css) and the Search everywhere palette
+       (components/search/SearchEverywhere.css). It was --brand-menu-gap while
+       the menu was the only one. */
+    --header-surface-gap: 0.5rem;
     /* Height of the app-shell banner that sits between the desktop header and
        the panes (Settings-less chrome such as the backup reminder), published
        live by the banner's own ResizeObserver and absent when no banner is up.

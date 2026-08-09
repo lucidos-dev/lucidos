@@ -1,4 +1,5 @@
-import { threadMap, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, threadChannelFilter, selectedTriggerIds, selectedRepoIds, selectedAppIds, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
+import { threadMap, focusedThreadId, setFocusedThread, showToast, removeToast, connectionStatus, threadsLoaded, generatedTitleIds, threadHasMore, threadLoadingMore, archiveThreadCount, ALL_CHANNELS, filterFacets, codingAgentSessionVersion, engineRestarting, archivingThreadIds, CODING_AGENT_CHANNEL, toasts, THREAD_EVENTS_LOAD_TOAST_KEY, THREAD_EVENTS_REFRESH_TOAST_KEY, THREAD_EVENTS_FETCH_CONCURRENCY, threadChannelToFilterSource, type ThreadFilterSource } from '../store';
+import { appliedThreadFilter, type ThreadFilterSelection } from '../appliedThreadFilter';
 import { threadPassesChannelFilter } from '../threadFilter';
 import { handleEvent, isChannelDefiningEvent, PENDING_TITLE_PLACEHOLDER, applyAggregateToMeta, createdKey, type ThreadAggregate, type ThreadState, type ThreadEvent, type ThreadMeta, type ThreadStatus } from '../thread-events';
 import { bumpThreadEvents } from '../threadActivity';
@@ -417,6 +418,15 @@ async function loadAllThreadsInner(): Promise<void> {
   applyDraftBatch(draftBatch);
   threadMap.value = new Map(map);
   threadsLoaded.value = true;
+  // Cold boot only, and the condition is load-bearing. This call fetches the
+  // recent window with NO filter params and never re-arms `threadHasMore`, so
+  // it settles nothing about a selection: it is here purely so the drawer's
+  // first mount is not treated as a filter change. Stamping unconditionally
+  // would let any RESYNC (an SSE reconnect, an iOS PWA wake, both of which
+  // reach here through `refreshThreadList`) swallow a filter change made while
+  // the list was unmounted, leaving pagination armed for the old cursor space
+  // with nothing left to notice (see `filterChangedSinceLoad`).
+  if (loadedFilterSelection === null) stampLoadedFilterSelection(appliedThreadFilter.value);
   // Collapsed Archive badge total. The inline `archive_count` is the UNFILTERED
   // pile size — correct for the common no-filter drawer and instant (no extra
   // round-trip). When a drawer filter is active (it persists across reloads via
@@ -1164,11 +1174,74 @@ export async function reloadAfterFilterChange(): Promise<void> {
   // Re-fetch the filter-scoped Archive badge total so it reflects the new
   // selection immediately (stable, server-sourced — not the loaded count).
   void refreshArchivedCount();
+  // No stamp here, deliberately: `loadOlderThreads` stamps what it actually
+  // fetched. Stamping the INTENT before the await records a lie whenever the
+  // call declines, which it does on `threadLoadingMore` while a previous
+  // selection's request is still in flight: toggling a second facet inside that
+  // round trip would leave the stamp claiming the second while only the first
+  // was ever fetched, and nothing would owe the difference.
   await loadOlderThreads();
 }
 
+/** The selection the loaded thread window was last FETCHED against. Set only
+ *  where a fetch settles the question for a selection, which is what makes it
+ *  safe to read as "nothing is owed": `loadOlderThreads` after the server
+ *  answers (rows, duplicates or exhausted alike) and at each of its
+ *  answered-without-asking branches, plus the initial window load on a cold
+ *  boot.
+ *
+ *  The *applied thread filter*, not the live signals, so this is stamped and
+ *  compared against the same selection the drawer is displaying and the cursor
+ *  is paging. Its identity changes exactly when the selection's CONTENTS change
+ *  (`appliedThreadFilter` compares contents before it replaces the object), so
+ *  one identity comparison is the whole check. */
+let loadedFilterSelection: ThreadFilterSelection | null = null;
+
+/** Takes the selection RATHER than reading the signal, because the settle sites
+ *  are on the far side of an await and the signal can have moved since the
+ *  request went out. Stamping what it says there records the wrong thing in the
+ *  same shape as stamping an intent: a page fetched for A landing after the user
+ *  picked B would mark B as fetched, and nothing would owe B its reload, its
+ *  archived count, or its first page (worse on an empty response, which also
+ *  writes `threadHasMore = false` onto B's untouched cursor space). Pass the
+ *  selection the request was issued for. */
+function stampLoadedFilterSelection(selection: ThreadFilterSelection): void {
+  loadedFilterSelection = selection;
+}
+
+/** True when the drawer filter has moved since the loaded window was fetched,
+ *  so `reloadAfterFilterChange` still owes it a re-arm and a first page.
+ *
+ *  A STORE fact, not a per-component one, and that distinction is the bug it
+ *  exists for. The drawer's list only mounts under the default `all` status
+ *  (`ThreadDrawer` renders `AttentionList` / `ReviewList` / `RunningList` /
+ *  `DraftsList` instead for the other four), while the Filter panel can change
+ *  the selection under any of them. The reaction used to compare against a
+ *  `useRef` seeded at mount, which answers "did the filter change while I was
+ *  watching": a change made under a status view was seen by nobody, and the
+ *  ref then seeded with the NEW value, so the catch-up was suppressed on the
+ *  way back too. Pagination stayed armed for the old cursor space and the
+ *  Archive badge kept the old selection's server total. Comparing against what
+ *  was actually fetched answers the right question from any mount.
+ *
+ *  It also answers it from any moment, which is the half a mount-independent
+ *  marker still would not give: a claim taken when the reload is REQUESTED goes
+ *  quiet even though `loadOlderThreads` can decline (a previous selection's
+ *  round trip still in flight) or fail outright, leaving nothing owing a
+ *  selection the server was never asked about. */
+export function filterChangedSinceLoad(): boolean {
+  return loadedFilterSelection !== appliedThreadFilter.value;
+}
+
+/** Test seam: forget which selection the window was fetched against. */
+export function _clearLoadedFilterSelectionForTest(): void {
+  loadedFilterSelection = null;
+}
+
 /** Channel/facet filter params for the older-threads + archived-count APIs,
- *  read from the live drawer-filter signals. `sources` is undefined when every
+ *  read from the *applied thread filter*: the selection the drawer list is
+ *  actually showing, which holds still while the thread filter panel covers it
+ *  (see `store/appliedThreadFilter.ts`). `sources` is undefined when every
  *  channel is selected (no narrowing); each facet array is undefined when its
  *  selection is empty. Shared by `loadOlderThreads` (pagination cursor space)
  *  and `refreshArchivedCount` (badge total) so both target the identical set. */
@@ -1178,16 +1251,13 @@ export function currentThreadFilterParams(): {
   repoIds: string[] | undefined;
   appIds: string[] | undefined;
 } {
-  const filter = threadChannelFilter.value;
-  const isFiltered = filter.size < ALL_CHANNELS.length;
-  const triggerIdSet = selectedTriggerIds.value;
-  const repoIdSet = selectedRepoIds.value;
-  const appIdSet = selectedAppIds.value;
+  const applied = appliedThreadFilter.value;
+  const isFiltered = applied.channels.size < ALL_CHANNELS.length;
   return {
-    sources: isFiltered ? [...filter].map(threadChannelToFilterSource) : undefined,
-    triggerIds: triggerIdSet.size > 0 ? [...triggerIdSet] : undefined,
-    repoIds: repoIdSet.size > 0 ? [...repoIdSet] : undefined,
-    appIds: appIdSet.size > 0 ? [...appIdSet] : undefined,
+    sources: isFiltered ? [...applied.channels].map(threadChannelToFilterSource) : undefined,
+    triggerIds: applied.triggerIds.size > 0 ? [...applied.triggerIds] : undefined,
+    repoIds: applied.repoIds.size > 0 ? [...applied.repoIds] : undefined,
+    appIds: applied.appIds.size > 0 ? [...applied.appIds] : undefined,
   };
 }
 
@@ -1204,7 +1274,7 @@ export function currentThreadFilterParams(): {
  *  transient miss must not pop a toast (per the frontend telemetry carve-out). */
 export async function refreshArchivedCount(): Promise<void> {
   // Empty channel filter = nothing shown by intent → the archive is empty.
-  if (threadChannelFilter.value.size === 0) {
+  if (appliedThreadFilter.value.channels.size === 0) {
     archiveThreadCount.value = 0;
     return;
   }
@@ -1220,21 +1290,23 @@ export async function refreshArchivedCount(): Promise<void> {
  *  Passes channel + trigger-id filters to the API so pagination targets only
  *  matching threads. */
 export async function loadOlderThreads(): Promise<void> {
+  // Neither of these settles anything for the current selection: a concurrent
+  // call owns the round trip, or pagination is simply off. So no stamp, and
+  // whatever owed a reload still owes it (see `filterChangedSinceLoad`).
   if (threadLoadingMore.value || !threadHasMore.value) return;
-  // Empty filter = nothing visible by intent; never fetch.
-  if (threadChannelFilter.value.size === 0) {
+  const applied = appliedThreadFilter.value;
+  // Empty filter = nothing visible by intent; never fetch. That IS the answer
+  // for this selection, so it stamps like a landed page.
+  if (applied.channels.size === 0) {
     threadHasMore.value = false;
+    stampLoadedFilterSelection(applied);
     return;
   }
   threadLoadingMore.value = true;
 
   try {
     const map = threadMap.value;
-    const filter = threadChannelFilter.value;
     const { sources, triggerIds, repoIds, appIds } = currentThreadFilterParams();
-    const triggerIdSet = selectedTriggerIds.value;
-    const repoIdSet = selectedRepoIds.value;
-    const appIdSet = selectedAppIds.value;
 
     let oldestTime: string | null = null;
     for (const t of map.values()) {
@@ -1250,10 +1322,10 @@ export async function loadOlderThreads(): Promise<void> {
       // arbitrarily old. Letting one drive the cursor would jump natural
       // pagination over every intervening thread.
       if (familyExtensionIds.has(t.meta.id)) continue;
-      // Same predicate the display uses, so the cursor is the oldest loaded
-      // thread that actually matches the active filter (channel + trigger +
-      // repo/app union) — never drifts from what's shown.
-      if (!threadPassesChannelFilter(t, filter, triggerIdSet, repoIdSet, appIdSet)) continue;
+      // Same predicate AND the same *applied thread filter* the display reads,
+      // so the cursor is the oldest loaded thread that actually matches what is
+      // on screen (channel + trigger + repo/app union), never drifting from it.
+      if (!threadPassesChannelFilter(t, applied.channels, applied.triggerIds, applied.repoIds, applied.appIds)) continue;
       // Cursor on created_at — the column the backend `get_older_threads`
       // pages by — so the cursor axis matches the Archive sort axis (else
       // pagination skips or repeats rows). Same fallback chain as `byCreated`.
@@ -1270,14 +1342,31 @@ export async function loadOlderThreads(): Promise<void> {
       // to the now()-cursor so the server can find matches deeper in history.
       if (!sources && !triggerIds && !repoIds && !appIds) {
         threadHasMore.value = false;
+        stampLoadedFilterSelection(applied);
         return;
       }
       oldestTime = new Date().toISOString();
     }
 
     const response = await fetchOlderThreads(oldestTime, 15, sources, triggerIds, repoIds, appIds);
+    // The server has answered for THESE params. Every way out below (rows,
+    // all-duplicates, exhausted) is a settled answer, so the stamp goes here
+    // rather than being repeated at each of them. It stamps `applied`, captured
+    // before the await, since the selection may have moved on while this was in
+    // flight and this answer says nothing about the new one.
+    stampLoadedFilterSelection(applied);
+    // `threadHasMore` describes the CURRENT cursor space, so only an answer
+    // that is still about the current selection may write it. A page fetched
+    // for A landing after the user moved to B would otherwise disarm
+    // pagination for a cursor space the server was never asked about, and
+    // nothing re-arms it: the reload B is owed has already run and declined on
+    // `threadLoadingMore` (this very call), and the drawer's effect does not
+    // fire again until the selection moves. B is left short with its sentinel
+    // gone. The rows themselves are kept either way, being threads in the map
+    // rather than a verdict about a query.
+    const stillCurrent = appliedThreadFilter.value === applied;
     if (response.threads.length === 0) {
-      threadHasMore.value = false;
+      if (stillCurrent) threadHasMore.value = false;
       return;
     }
 
@@ -1302,11 +1391,11 @@ export async function loadOlderThreads(): Promise<void> {
     // If server returned results but all were duplicates, treat as exhausted
     // to prevent infinite fetch loops with the same cursor.
     if (added === 0) {
-      threadHasMore.value = false;
+      if (stillCurrent) threadHasMore.value = false;
       return;
     }
 
-    threadHasMore.value = response.has_more;
+    if (stillCurrent) threadHasMore.value = response.has_more;
     threadMap.value = new Map(map);
   } catch (err) {
     showToast(`Failed to load more threads: ${errorDetail(err)}`, 'error');

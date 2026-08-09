@@ -266,12 +266,14 @@ impl GatewayState {
     }
 
     /// The scheme the spawned engine serves on its port (`https` for a dev engine
-    /// with TLS, else `http`). Used to build proxy targets + health probes.
+    /// with TLS, else `http`). Used to build proxy targets + health probes. The
+    /// literals come from `net_config` rather than being spelled here, so this
+    /// side of the hop cannot drift from the rule that decided `engine_tls`.
     fn engine_scheme(&self) -> &'static str {
         if self.inner.engine_tls {
-            "https"
+            net_config::SCHEME_HTTPS
         } else {
-            "http"
+            net_config::SCHEME_HTTP
         }
     }
 
@@ -743,12 +745,38 @@ impl GatewayState {
         };
 
         self.set_route(&ws.id, ws.port);
-        self.inner
+        self.install_stack(&ws.id, stack).await;
+        crate::log!("[Gateway] workspace '{}' engine on :{}", ws.id, ws.port);
+    }
+
+    /// Put a stack in the map under `id`, tearing down whatever engine that slot
+    /// already held.
+    ///
+    /// A bare `insert` returns the displaced value and drops it, and dropping a
+    /// `StackRuntime` neither stops nor reaps its engine: a
+    /// `std::process::Child` does neither on drop. The displaced engine would
+    /// keep running on the same port as the one just spawned AND become an
+    /// unreapable zombie the moment it exits. No caller reaches this with an
+    /// occupied slot today (`lazy_start` guards on `contains_key`, create and
+    /// restore allocate a fresh id), which is exactly why the guarantee belongs
+    /// here rather than in each caller's memory.
+    ///
+    /// The map lock is released before the stack lock, the ordering every other
+    /// map-then-stack site uses (the supervisor holds stack then map).
+    async fn install_stack(&self, id: &str, stack: StackRuntime) {
+        let displaced = self
+            .inner
             .stacks
             .lock()
             .await
-            .insert(ws.id.clone(), Arc::new(AsyncMutex::new(stack)));
-        crate::log!("[Gateway] workspace '{}' engine on :{}", ws.id, ws.port);
+            .insert(id.to_string(), Arc::new(AsyncMutex::new(stack)));
+        if let Some(old) = displaced {
+            crate::log!(
+                "[Gateway] '{}' already had a running stack, stopping the displaced engine",
+                id
+            );
+            stop_engine_process(&mut *old.lock().await);
+        }
     }
 
     /// Record a failed provisioning attempt for `id` and report whether the
@@ -1154,11 +1182,7 @@ impl GatewayState {
                     last_unread: None,
                 };
                 self.set_route(&ws.id, ws.port);
-                self.inner
-                    .stacks
-                    .lock()
-                    .await
-                    .insert(ws.id.clone(), Arc::new(AsyncMutex::new(stack)));
+                self.install_stack(&ws.id, stack).await;
                 crate::log!("[Gateway] restored '{}' engine on :{}", ws.id, ws.port);
             }
             Err(e) => {
@@ -1921,11 +1945,21 @@ fn engine_process_alive(s: &mut StackRuntime) -> bool {
 
 /// Stop a stack's engine process (SIGUSR1 — the engine ignores SIGTERM), reaping
 /// it off-thread so the supervisor isn't blocked by the engine's graceful drain.
+///
+/// **Both arms reap, and that is the invariant.** The gateway is the parent of
+/// every engine it spawns, and a signal is not a wait: an engine torn down
+/// without one stays `<defunct>` until the gateway itself exits. Which arm runs
+/// says only whether we still hold the `Child`, never whether the process is
+/// ours. It usually still is even in the `None` arm, because `reload_gateway`
+/// re-execs in place and keeps the pid (see [`stack::reap_forked_pid`], which is
+/// what `reclaim_stale_engine` calls). Any new teardown path must go through one
+/// of these two.
 fn stop_engine_process(s: &mut StackRuntime) {
     match s.engine.take() {
         Some(mut child) => {
             // If the child already exited, do NOT signal its PID — the OS may
-            // have recycled it to an unrelated process. Just drop it.
+            // have recycled it to an unrelated process. `try_wait` has reaped it
+            // by returning `Ok(Some(_))`, so dropping the handle leaks nothing.
             if matches!(child.try_wait(), Ok(Some(_))) {
                 return;
             }
@@ -1935,7 +1969,10 @@ fn stop_engine_process(s: &mut StackRuntime) {
                 libc::kill(child.id() as libc::pid_t, libc::SIGUSR1);
             }
             // Reap without blocking the supervisor (graceful drain can take ~10s).
-            tokio::task::spawn_blocking(move || {
+            // A plain thread rather than `spawn_blocking`, matching the handle-less
+            // arm's `reap_forked_pid`: one reap mechanism, and no tokio-runtime
+            // context required of a sync helper.
+            std::thread::spawn(move || {
                 let _ = child.wait();
             });
         }
@@ -2083,7 +2120,17 @@ pub async fn run() -> Result<(), BoxError> {
     // A dev engine (non-loopback) keeps the inherited TLS cert and serves https
     // on its own port for direct access (ADR 0014 §4), so the gateway must proxy
     // + probe it over https. A packaged engine serves plain http on loopback.
-    let engine_tls = !engine_loopback && std::env::var_os("LUCIDOS_TLS_CERT").is_some();
+    //
+    // Resolved through `net_config::serves_tls`, the same both-present-and-
+    // non-empty rule the ENGINE applies to decide what it actually serves. A cert
+    // with no key (or either set to the empty string, which is how a script
+    // spells "unset") leaves the engine on http while a cert-only test here put
+    // the gateway on https, and the loopback hop then failed to connect.
+    let engine_tls = !engine_loopback
+        && net_config::serves_tls(
+            std::env::var("LUCIDOS_TLS_CERT").ok().as_deref(),
+            std::env::var("LUCIDOS_TLS_KEY").ok().as_deref(),
+        );
     // The gateway fronts every workspace API and its own destructive control
     // plane. Resolve its bind with a loopback-first precedence (see
     // `net_config`): an explicit `LUCIDOS_GATEWAY_BIND_ADDR` → `LUCIDOS_GATEWAY_
@@ -2887,6 +2934,172 @@ fn raise_fd_limit() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── Reaping a stopped engine ─────────────────────────────────────────────
+    //
+    // The gateway is the parent of every engine it spawns, so a teardown that
+    // SIGNALS without WAITING leaves a `<defunct>` process behind for the
+    // gateway's whole lifetime. Both arms of `stop_engine_process` are exercised
+    // against a real fork, because a zombie is a property of the process table
+    // and no test that stubs the process layer can produce one. Observed
+    // 2026-08-09: nineteen defunct engines under a two-day gateway uptime, all
+    // from the handle-less arm.
+
+    /// A throwaway workspace dir, named per-test + per-process so parallel tests
+    /// (and parallel suites) never share one.
+    #[cfg(unix)]
+    fn reap_scratch_dir(label: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "lucidos-gw-reap-{}-{}-{:?}",
+            label,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(dir.join(".lucidos")).unwrap();
+        dir
+    }
+
+    /// Block until `pid` has left the process table ENTIRELY, rather than merely
+    /// exited. `ps` prints a state for a zombie (`Z`) and nothing at all for a
+    /// reaped pid, which is the whole distinction under test. Deliberately never
+    /// calls `waitpid` itself, since that would perform the reap it is checking
+    /// for. Polled rather than slept: these tests share a machine with the rest
+    /// of the suite, so a fixed delay long enough to be reliable under load is
+    /// one every run pays.
+    ///
+    /// An unspawnable `ps` PANICS rather than reading as "gone". The empty
+    /// string means the pid is absent, so defaulting to it on an `Err` would
+    /// make a broken probe report a clean process table, i.e. pass the very
+    /// tests it is supposed to be observing. (The sibling `wait_until_defunct`
+    /// in stack.rs can default: there empty means "not defunct yet", which
+    /// fails safe.)
+    #[cfg(unix)]
+    fn wait_until_reaped(pid: u32) -> bool {
+        for _ in 0..400 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "state=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps must run: without it this helper cannot observe the process table");
+            let state = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            if state.is_empty() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        false
+    }
+
+    /// A minimal stack pointed at `dir`. Only `engine` and `resolved_dir` matter
+    /// to `stop_engine_process`; the rest is filler.
+    #[cfg(unix)]
+    fn reap_test_stack(engine: Option<std::process::Child>, dir: PathBuf) -> StackRuntime {
+        StackRuntime {
+            ws: Workspace {
+                id: "reap-test".into(),
+                name: "Reap Test".into(),
+                dir: dir.to_string_lossy().into_owned(),
+                port: 5199,
+                database_url: None,
+                autostart: false,
+            },
+            resolved_dir: dir,
+            pg: PgHandle::External,
+            engine,
+            health: Health::Booting,
+            restart_attempts: 0,
+            health_misses: 0,
+            last_spawn: None,
+            last_error: None,
+            last_unread: None,
+        }
+    }
+
+    /// A stand-in engine: our own child, killed by the same SIGUSR1 the real one
+    /// stops on (the default disposition terminates it).
+    #[cfg(unix)]
+    fn spawn_stand_in_engine() -> std::process::Child {
+        std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep")
+    }
+
+    /// The arm that already worked: we hold the `Child`, so the wait rides it.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_an_engine_we_hold_the_handle_for_reaps_it() {
+        let dir = reap_scratch_dir("handle");
+        let child = spawn_stand_in_engine();
+        let pid = child.id();
+        let mut s = reap_test_stack(Some(child), dir.clone());
+
+        stop_engine_process(&mut s);
+
+        assert!(
+            wait_until_reaped(pid),
+            "an engine stopped through its Child handle is still in the process \
+             table (pid {pid})"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The 2026-08-09 leak. `reload_gateway` re-execs the gateway image in
+    /// place, so the pid is unchanged and the engine is STILL our child, while
+    /// the `Child` handle died with the old image. The fresh image re-adopts it
+    /// with `engine: None` and only the pidfile, which used to mean the teardown
+    /// signalled it and walked away.
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_re_adopted_engine_reaps_it_too() {
+        let dir = reap_scratch_dir("readopted");
+        let child = spawn_stand_in_engine();
+        let pid = child.id();
+        std::fs::write(dir.join(".lucidos/engine.pid"), pid.to_string()).unwrap();
+        // Exactly what `execv` does to the handle: dropped without a wait, while
+        // the process itself carries on as our child.
+        drop(child);
+
+        let mut s = reap_test_stack(None, dir.clone());
+        stop_engine_process(&mut s);
+
+        assert!(
+            wait_until_reaped(pid),
+            "a re-adopted engine was signalled but never waited on, so pid {pid} \
+             is now a zombie for the gateway's lifetime"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A pid that is NOT our child must not hold the reaping thread, and must
+    /// not stall the caller. `waitpid` answers `ECHILD` at once for one, which is
+    /// what makes a BLOCKING wait safe to aim at a pidfile a previous gateway
+    /// process wrote. The fixture is a child we have already reaped ourselves,
+    /// so the pid is genuinely not ours and the SIGUSR1 that precedes the wait
+    /// can reach nothing (ESRCH).
+    #[cfg(unix)]
+    #[test]
+    fn reclaiming_a_pid_that_is_not_our_child_returns_promptly() {
+        let dir = reap_scratch_dir("foreign");
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        child.wait().expect("reap the fixture");
+        std::fs::write(dir.join(".lucidos/engine.pid"), pid.to_string()).unwrap();
+
+        let started = Instant::now();
+        stack::reclaim_stale_engine(&dir);
+
+        // Comfortably above the function's own 300ms port-release pause and
+        // comfortably below "it blocked on a wait that will never return".
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "reclaiming a pid that is not our child must not block: took {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     // ── Retrying an optional bind ────────────────────────────────────────────
 

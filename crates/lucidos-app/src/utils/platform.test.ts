@@ -1,5 +1,25 @@
 import { describe, it, expect } from 'vitest';
-import { registrationUserAgent, DESKTOP_APP_UA_TOKEN, isTauriPreGatewayEntryFor } from './platform';
+import {
+  registrationUserAgent,
+  DESKTOP_APP_UA_TOKEN,
+  isTauriPreGatewayEntryFor,
+  isMobileDeviceUserAgent,
+  describeDeviceUserAgent,
+} from './platform';
+
+/** Registration user-agents as the engine actually stores them. */
+const UA = {
+  iphone:
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Mobile/15E148 Safari/604.1',
+  ipad:
+    'Mozilla/5.0 (iPad; CPU OS 18_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.5 Safari/604.1',
+  android:
+    'Mozilla/5.0 (Linux; Android 15; Pixel 9) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Mobile Safari/537.36',
+  macChrome:
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+  macSafari:
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Safari/605.1.15',
+} as const;
 
 describe('registrationUserAgent', () => {
   const SAFARI_UA =
@@ -15,6 +35,49 @@ describe('registrationUserAgent', () => {
     const ua = registrationUserAgent(SAFARI_UA, false);
     expect(ua).toBe(SAFARI_UA);
     expect(ua.includes(DESKTOP_APP_UA_TOKEN)).toBe(false);
+  });
+});
+
+describe('isMobileDeviceUserAgent', () => {
+  it('recognizes phones and tablets', () => {
+    expect(isMobileDeviceUserAgent(UA.iphone)).toBe(true);
+    expect(isMobileDeviceUserAgent(UA.ipad)).toBe(true);
+    expect(isMobileDeviceUserAgent(UA.android)).toBe(true);
+  });
+
+  it('is false for desktop browsers', () => {
+    expect(isMobileDeviceUserAgent(UA.macChrome)).toBe(false);
+    expect(isMobileDeviceUserAgent(UA.macSafari)).toBe(false);
+  });
+
+  it('is false for the native desktop app, whatever its embedded UA claims', () => {
+    // The WKWebView's own UA is indistinguishable from Safari, so the product
+    // token is the only thing that identifies the desktop client. Gate on it
+    // before the pattern, or a future non-Mac desktop build could read as mobile.
+    expect(isMobileDeviceUserAgent(registrationUserAgent(UA.macSafari, true))).toBe(false);
+    expect(isMobileDeviceUserAgent(`${UA.iphone} ${DESKTOP_APP_UA_TOKEN}`)).toBe(false);
+  });
+
+  it('treats a device with no recorded user-agent as not mobile', () => {
+    // `devices.user_agent` is nullable (legacy rows, a registration race). The
+    // callers act ON a true (turning push off elsewhere), so an unknown device
+    // must fall on the do-nothing side.
+    expect(isMobileDeviceUserAgent(null)).toBe(false);
+    expect(isMobileDeviceUserAgent(undefined)).toBe(false);
+    expect(isMobileDeviceUserAgent('')).toBe(false);
+  });
+});
+
+describe('describeDeviceUserAgent', () => {
+  it('names the browser and the OS', () => {
+    expect(describeDeviceUserAgent(UA.iphone)).toBe('Safari/604.1 on iOS');
+    expect(describeDeviceUserAgent(UA.android)).toBe('Chrome/140.0.0.0 on Android');
+    expect(describeDeviceUserAgent(UA.macChrome)).toBe('Chrome/140.0.0.0 on macOS');
+  });
+
+  it('falls back to a whole label rather than an empty string', () => {
+    expect(describeDeviceUserAgent(null)).toBe('Unknown device');
+    expect(describeDeviceUserAgent('something/1.0')).toBe('Unknown browser on Unknown OS');
   });
 });
 

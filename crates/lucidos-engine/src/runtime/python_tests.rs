@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 use tempfile::tempdir;
 
 #[tokio::test]
@@ -555,6 +556,249 @@ async fn execute_kills_subprocess_when_future_dropped() {
         "subprocess survived the dropped future and overwrote the marker — \
          kill_on_drop(true) is missing on the Python Command, or tokio is \
          not delivering SIGKILL on Child drop"
+    );
+}
+
+// ── the hard execution ceiling ─────────────────────────────────────────
+//
+// Regression coverage for the 2026-08-07 incident: the synchronous python
+// path had no timeout at all, so a fixture generator with a runaway loop
+// spun at 100% CPU for 20 minutes until the user noticed and killed the OS
+// process by hand. `run_bash` had bounded its child since forever, and so
+// had the `.sh` half of the very same scheduled-script path; only python
+// was unbounded, while three sibling tool descriptions and the
+// `running-python` knowhow all promised a 300s ceiling that did not exist.
+//
+// Every test here injects a short ceiling via `with_execution_timeout`. The
+// real one is 300s and a suite that waited it out is a suite nobody runs.
+
+/// Longer than any injected ceiling in this file by a wide margin, so a run
+/// that returns quickly can only have been killed, never have finished.
+const RUNAWAY_SLEEP_SECS: u64 = 60;
+
+/// Create a runtime whose venv is already built, then shorten its ceiling.
+/// Venv creation is deliberately NOT covered by the timeout, but on a cold
+/// tempdir it can take seconds, and a test measuring the ceiling must not be
+/// measuring that instead.
+async fn warmed_runtime(workspace: &std::path::Path, ceiling: Duration) -> PythonRuntime {
+    let runtime = PythonRuntime::new(workspace.to_path_buf()).unwrap();
+    runtime.execute("print('warmup')").await.expect("warmup");
+    runtime.with_execution_timeout(ceiling)
+}
+
+/// The ceiling the rest of the system quotes. `llm/tools/exec.rs` states it in
+/// three tool descriptions and `system-knowhow/running-python.md` puts it in
+/// the pick-your-tool table; a change here that leaves those alone puts the
+/// docs back to describing a mechanism that does not exist.
+#[test]
+fn the_default_ceiling_is_the_300s_the_docs_promise() {
+    let dir = tempdir().unwrap();
+    let runtime = PythonRuntime::new(dir.path().to_path_buf()).unwrap();
+    assert_eq!(
+        runtime.execution_timeout,
+        Duration::from_secs(300),
+        "run_python's sync ceiling is documented as 300s in llm/tools/exec.rs \
+         and system-knowhow/running-python.md"
+    );
+    assert_eq!(
+        EXECUTION_TIMEOUT_SECS,
+        crate::llm::tools::MAX_TIMEOUT_SECS,
+        "the python ceiling reads the one bash constant, it does not restate it"
+    );
+}
+
+/// The headline property: a script that outruns the ceiling comes back as an
+/// ordinary `Err`, promptly, instead of hanging the turn. The message has to
+/// name the ceiling and point at the escape hatch, because this error is the
+/// exact moment an agent needs to learn `run_python_background` exists.
+#[tokio::test]
+async fn sync_execution_is_bounded_by_the_hard_ceiling() {
+    let dir = tempdir().unwrap();
+    let runtime = warmed_runtime(dir.path(), Duration::from_secs(1)).await;
+
+    let started = std::time::Instant::now();
+    let err = runtime
+        .execute(&format!(
+            "import time\ntime.sleep({RUNAWAY_SLEEP_SECS})\nprint('ran to completion')"
+        ))
+        .await
+        .expect_err("a script that outruns the ceiling must fail");
+    let elapsed = started.elapsed();
+
+    assert!(
+        err.contains("timed out after 1s"),
+        "the error must name the ceiling it hit: {err}"
+    );
+    assert!(
+        err.contains("run_python_background"),
+        "the error must point at the escape hatch for longer work: {err}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(RUNAWAY_SLEEP_SECS / 2),
+        "the ceiling did not cut the run short, it took {elapsed:?}"
+    );
+}
+
+/// The property that matters most and is the likeliest to regress silently:
+/// the OS child is really dead, not orphaned to keep burning CPU after the
+/// engine has already told the agent the call failed. `kill_on_drop(true)` on
+/// the Command is what delivers it, and only because `Command::output()` owns
+/// the spawned Child inside the future the timeout drops.
+///
+/// The witness is a marker file. The script writes "alive" immediately, sleeps
+/// past the ceiling, then writes "survived". A child that outlived the expiry
+/// overwrites it; a killed one cannot. We read the marker after the script's
+/// own sleep would have elapsed, so a survivor has had its chance.
+#[tokio::test]
+async fn the_execution_timeout_kills_the_python_child() {
+    let dir = tempdir().unwrap();
+    let runtime = warmed_runtime(dir.path(), Duration::from_secs(3)).await;
+
+    let marker = dir.path().join("marker.txt");
+    let marker_str = marker.to_string_lossy().replace('\\', "\\\\");
+    let code = format!(
+        "open('{m}', 'w').write('alive')\nimport time\ntime.sleep(6)\nopen('{m}', 'w').write('survived')",
+        m = marker_str,
+    );
+
+    let err = runtime
+        .execute(&code)
+        .await
+        .expect_err("the script sleeps past the ceiling");
+    assert!(err.contains("timed out"), "got: {err}");
+
+    // Past the script's own sleep, measured from its start: by now a surviving
+    // child would have reached step 3.
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    let content = std::fs::read_to_string(&marker).expect(
+        "marker should exist: the interpreter had a 3s ceiling to reach step 1. \
+         Its absence means the child never started, so this run proves nothing",
+    );
+    assert_eq!(
+        content, "alive",
+        "the python child survived the expiry and kept running: kill_on_drop(true) \
+         is missing from the Command, or the timeout is not dropping the future \
+         that owns the Child"
+    );
+}
+
+/// `run_python`'s staging invariant survives a timeout. A killed script has
+/// written whatever it wrote into the staging tree, never into `data/`, so the
+/// real artifact is byte-identical afterwards. This is why the incident left
+/// the workspace untouched, and it must not become an accident.
+#[tokio::test]
+async fn a_timed_out_staged_run_leaves_data_untouched() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+    std::fs::write(ws.join("data/artifacts/report.csv"), "original").unwrap();
+    let runtime = warmed_runtime(ws, Duration::from_secs(1)).await;
+
+    let staging = ws.join(".lucidos/staging/timed-out-run");
+    let err = runtime
+        .execute_staged(
+            &format!(
+                "open('data/artifacts/report.csv', 'w').write('half written')\n\
+                 import time\n\
+                 time.sleep({RUNAWAY_SLEEP_SECS})"
+            ),
+            vec![],
+            &staging,
+        )
+        .await
+        .expect_err("the script sleeps past the ceiling");
+
+    assert!(err.contains("timed out"), "got: {err}");
+    assert_eq!(
+        std::fs::read_to_string(ws.join("data/artifacts/report.csv")).unwrap(),
+        "original",
+        "a killed script must not have touched the real data/ file"
+    );
+}
+
+/// An in-place script gets the same ceiling. An unbounded trigger script is
+/// the same hazard as an unbounded `run_python`, and the `.sh` branch of the
+/// very same `execute_script` dispatch (engine_impl/scripts.rs) has spent a
+/// 300s budget all along, so leaving `.py` unbounded was an asymmetry rather
+/// than a decision.
+#[tokio::test]
+async fn an_in_place_script_gets_the_ceiling_too() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = warmed_runtime(&ws, Duration::from_secs(1)).await;
+
+    let script = write_trigger_script(
+        &ws,
+        "runaway-watch",
+        &format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})\n"),
+    );
+
+    let err = runtime
+        .execute_file_with_env(&script, vec![])
+        .await
+        .expect_err("an in-place script must be bounded too");
+    assert!(err.contains("timed out after 1s"), "got: {err}");
+}
+
+/// The wrapper must be invisible on the happy path: a script well inside the
+/// ceiling still succeeds, still returns its stdout, and still stages its
+/// `data/` write for the committer.
+#[tokio::test]
+async fn a_fast_script_still_succeeds_and_still_stages() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path();
+    std::fs::create_dir_all(ws.join("data/artifacts")).unwrap();
+    let runtime = warmed_runtime(ws, Duration::from_secs(30)).await;
+
+    let staging = ws.join(".lucidos/staging/fast-run");
+    let out = runtime
+        .execute_staged(
+            "open('data/artifacts/report.csv', 'w').write('a,b\\n1,2'); print('done')",
+            vec![],
+            &staging,
+        )
+        .await
+        .expect("a fast script must still succeed");
+
+    assert_eq!(out.trim(), "done");
+    assert!(
+        staging.join("data/artifacts/report.csv").exists(),
+        "the write must still be staged for the committer"
+    );
+    assert!(!ws.join("data/artifacts/report.csv").exists());
+}
+
+/// The run's exhaust dir explains itself after a timeout. Without the note it
+/// holds neither `stdout.txt` nor `stderr.txt`, which looks exactly like a
+/// spawn that never happened.
+#[tokio::test]
+async fn a_timeout_leaves_a_note_in_the_exhaust_dir() {
+    let dir = tempdir().unwrap();
+    let ws = dir.path().canonicalize().unwrap();
+    let runtime = warmed_runtime(&ws, Duration::from_secs(1)).await;
+
+    runtime
+        .execute(&format!("import time\ntime.sleep({RUNAWAY_SLEEP_SECS})"))
+        .await
+        .expect_err("the script sleeps past the ceiling");
+
+    let notes: Vec<String> = std::fs::read_dir(ws.join(".lucidos/exhaust"))
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter_map(|e| std::fs::read_to_string(e.path().join("stderr.txt")).ok())
+        .filter(|s| s.contains("timed out"))
+        .collect();
+    assert_eq!(
+        notes.len(),
+        1,
+        "exactly one run dir should carry the timeout note, got: {notes:?}"
+    );
+    assert!(
+        notes[0].starts_with("[lucidos]"),
+        "the note must be marked engine-written, since every other line in \
+         that file is the child's own stderr: {:?}",
+        notes[0]
     );
 }
 

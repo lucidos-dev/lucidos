@@ -1100,3 +1100,164 @@ fn next_runs_is_empty_when_paused_or_dead() {
         .next_runs(3)
         .is_empty());
 }
+
+// --- Per-trigger model + reasoning effort -----------------------------------
+
+/// Minimal event-driven trigger payload with the given extra fields merged in,
+/// so each model/effort case states only what it is about.
+fn created_with(extra: serde_json::Value) -> TriggerConfig {
+    let mut payload = json!({
+        "trigger_id": "t-model", "name": "Model Trigger", "schedule": [], "timezone": "UTC",
+        "run": { "type": "intent", "intent": "summarize my day" },
+        "on": [{ "event_type": "DayEnded" }],
+    });
+    for (k, v) in extra.as_object().expect("extra must be an object") {
+        payload[k] = v.clone();
+    }
+    TriggerConfig::from_created_payload(&payload).unwrap()
+}
+
+/// The no-change case for every trigger that predates the field: absent reads
+/// back as None, which the fire path turns into "use the account chat default".
+#[test]
+fn created_without_model_or_effort_defaults_to_none() {
+    let config = created_with(json!({}));
+    assert_eq!(config.model, None);
+    assert_eq!(config.reasoning_effort, None);
+}
+
+#[test]
+fn created_with_model_and_effort_carries_both() {
+    let config = created_with(json!({ "model": "claude-sonnet-5", "reasoning_effort": "low" }));
+    assert_eq!(config.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+}
+
+/// The two fields are independent: pinning one must not pin the other, or a
+/// trigger that only wanted a cheaper model would also freeze its effort.
+#[test]
+fn created_with_only_one_of_the_pair_leaves_the_other_none() {
+    let model_only = created_with(json!({ "model": "gemini-3.5-flash" }));
+    assert_eq!(model_only.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(model_only.reasoning_effort, None);
+
+    let effort_only = created_with(json!({ "reasoning_effort": "max" }));
+    assert_eq!(effort_only.model, None);
+    assert_eq!(effort_only.reasoning_effort.as_deref(), Some("max"));
+}
+
+/// A blank or whitespace-only value is Default, never a stored empty string:
+/// `Some("")` would read as a genuine override and send an empty model id to
+/// the provider.
+#[test]
+fn blank_model_or_effort_reads_as_default() {
+    let config = created_with(json!({ "model": "   ", "reasoning_effort": "" }));
+    assert_eq!(config.model, None);
+    assert_eq!(config.reasoning_effort, None);
+}
+
+/// Only a hand-edited event row can carry an out-of-set tier (the API and the
+/// LLM tool both reject one), and it is dropped rather than honored.
+#[test]
+fn out_of_set_reasoning_effort_is_dropped_on_read() {
+    let config = created_with(json!({ "reasoning_effort": "maximum" }));
+    assert_eq!(config.reasoning_effort, None);
+}
+
+#[test]
+fn valid_reasoning_efforts_are_exactly_the_preference_set() {
+    for tier in ["none", "low", "medium", "high", "xhigh", "max"] {
+        assert!(is_valid_reasoning_effort(tier), "{tier} should be valid");
+    }
+    for bad in ["maximum", "HIGH", "off", "", " high"] {
+        assert!(!is_valid_reasoning_effort(bad), "{bad:?} should be invalid");
+    }
+}
+
+/// Absent leaves as-is, explicit null clears back to Default, a string sets.
+/// The absent case is the load-bearing one: a rename-only update must not wipe
+/// the trigger's model.
+#[test]
+fn apply_update_model_and_effort_triple_state() {
+    let mut config = created_with(json!({ "model": "claude-sonnet-5", "reasoning_effort": "low" }));
+
+    // Absent: unchanged.
+    config.apply_update(&json!({ "trigger_id": "t-model", "name": "Renamed" }));
+    assert_eq!(config.model.as_deref(), Some("claude-sonnet-5"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("low"));
+
+    // String: set.
+    config.apply_update(&json!({ "model": "gemini-3.5-flash", "reasoning_effort": "high" }));
+    assert_eq!(config.model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(config.reasoning_effort.as_deref(), Some("high"));
+
+    // Null: cleared back to the account default.
+    config.apply_update(&json!({ "model": null, "reasoning_effort": null }));
+    assert_eq!(config.model, None);
+    assert_eq!(config.reasoning_effort, None);
+}
+
+/// A blank string on update means the user chose Default in the form, so it
+/// clears rather than storing "".
+#[test]
+fn apply_update_blank_model_clears_it() {
+    let mut config = created_with(json!({ "model": "claude-sonnet-5" }));
+    config.apply_update(&json!({ "model": "  " }));
+    assert_eq!(config.model, None);
+}
+
+#[test]
+fn apply_update_ignores_an_out_of_set_effort() {
+    let mut config = created_with(json!({ "reasoning_effort": "high" }));
+    config.apply_update(&json!({ "reasoning_effort": "maximum" }));
+    assert_eq!(
+        config.reasoning_effort.as_deref(),
+        Some("high"),
+        "a bad tier must be dropped, not applied and not silently cleared"
+    );
+}
+
+/// Blank is how the form's "Default" option travels, so it must normalize to
+/// None at the write boundary rather than round-tripping as a stored "".
+#[test]
+fn normalize_route_setting_reads_blank_as_default() {
+    assert_eq!(normalize_route_setting(None), None);
+    assert_eq!(normalize_route_setting(Some("")), None);
+    assert_eq!(normalize_route_setting(Some("   ")), None);
+    assert_eq!(
+        normalize_route_setting(Some("  claude-sonnet-5  ")).as_deref(),
+        Some("claude-sonnet-5")
+    );
+}
+
+/// The model id space is open (any provider string is allowed), so this helper
+/// must not reject an id it does not recognise.
+#[test]
+fn normalize_route_setting_does_not_judge_the_model_id() {
+    assert_eq!(
+        normalize_route_setting(Some("some-future-model")).as_deref(),
+        Some("some-future-model")
+    );
+}
+
+#[test]
+fn validate_trigger_reasoning_effort_accepts_the_tiers_and_default() {
+    assert_eq!(validate_trigger_reasoning_effort(None), Ok(None));
+    assert_eq!(validate_trigger_reasoning_effort(Some("  ")), Ok(None));
+    for tier in ["none", "low", "medium", "high", "xhigh", "max"] {
+        assert_eq!(
+            validate_trigger_reasoning_effort(Some(tier)),
+            Ok(Some(tier.to_string()))
+        );
+    }
+}
+
+#[test]
+fn validate_trigger_reasoning_effort_rejects_an_unknown_tier() {
+    let err = validate_trigger_reasoning_effort(Some("maximum")).unwrap_err();
+    assert!(err.contains("maximum"), "error names the bad value: {err}");
+    assert!(
+        err.contains("none, low, medium, high, xhigh, max"),
+        "error lists the accepted tiers: {err}"
+    );
+}

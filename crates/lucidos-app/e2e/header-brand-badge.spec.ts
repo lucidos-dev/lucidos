@@ -1,26 +1,20 @@
 /**
- * The header brand badge (the background-activity spinner / the update-ready
- * "!") rides above the "Lucidos" baseline like a superscript, and it gets there
- * through a bottom MARGIN, never a paint-time `position: relative; top:` offset.
- * Two separate bugs came from that distinction, one per viewport, and both are
- * pinned here.
+ * The header brand badge (the background-activity spinner, the update-ready
+ * "!") rides the Lucidos mark's top-trailing corner, and does so on every
+ * viewport: the desktop `[Lucidos • workspace]` label it used to superscript is
+ * gone, so the icon convention is the only shape left.
  *
- * DESKTOP: the badge's host, `.pane-header-brand-label`, pairs
- * `overflow-x: clip` (its horizontal non-overlap guarantee at narrow pane
- * widths) with `overflow-y: visible`. The packaged macOS webview does not honour
- * that pairing: it clips both axes as soon as one of them is `clip`. A lifted
- * `top` put the badge partly outside the box, so it rendered whole in Chromium
- * and in Playwright's WebKit but reached the Tauri app with its top sliced flat
- * off, which is invisible to every engine this suite can drive. What IS
- * engine-independent is that the badge no longer overflows the box at all,
- * because `align-items: center` centers a flex item's MARGIN box and leaves the
- * border box inside the line.
+ * Out of flow is the load-bearing part, not the prettier part. The mark is
+ * centred (in the mobile nav cluster, and in the desktop brand box), so an
+ * in-flow badge widens its slot and slides the mark sideways for exactly as long
+ * as an engine build or an update is pending: a mark that moves for reasons the
+ * user cannot see.
  *
- * MOBILE: `mobile.css` re-corners every `.badge` for the smaller mobile icon
- * buttons, and being equal-specificity and later in import order it used to win
- * the brand badge's `top` too. Once the lift became a margin, that leftover
- * paint-time offset stacked on it and the badge climbed half a step. The `top`
- * reset is doubled up (`.badge.brand-badge`) to win on specificity instead.
+ * Overlaying it costs one thing back, which is the second half of the contract:
+ * the ready-state badge is a plain span with no handler, and a positioned
+ * element is a hit target whether or not anything listens, so on the mark's
+ * corner it swallowed the tap (the mark is its SIBLING, not its ancestor, so
+ * there was nothing to bubble to). It is click-through here.
  *
  * The badge only renders while background activity is in flight, so a probe
  * carrying its classes is spliced into the live header and read off the same
@@ -30,63 +24,77 @@ import { test, expect } from './fixtures';
 import { assertHealthy, navigateToApp } from './helpers';
 
 test.describe('Header brand badge', () => {
-  test('rides high on a margin, not on an offset that escapes its box', async ({ page }) => {
+  test('rides the mark it belongs to, out of flow and click-through', async ({ page }) => {
     await assertHealthy(page);
     await navigateToApp(page);
 
     // One polled block: the header renders a copy per layout, so it waits for
     // the one with real width and measures against that same laid-out frame.
     const handle = await page.waitForFunction(() => {
-      const label = [...document.querySelectorAll<HTMLElement>('.pane-header-brand-label')]
+      const host = [...document.querySelectorAll<HTMLElement>('.brand-mark-slot')]
         .reverse()
         .find((el) => el.getBoundingClientRect().width > 0);
-      if (!label) return null;
+      if (!host) return null;
+      const mark = host.querySelector<HTMLElement>('.brand-mark, .brand-mark-row');
+      if (!mark) return null;
 
+      const widthBefore = host.getBoundingClientRect().width;
       const probe = document.createElement('span');
       probe.className = 'badge brand-badge';
       probe.textContent = '!';
-      label.appendChild(probe);
+      host.appendChild(probe);
       const p = probe.getBoundingClientRect();
-      const l = label.getBoundingClientRect();
+      const m = mark.getBoundingClientRect();
+      // Read every computed value BEFORE the probe leaves the document: the
+      // declaration is live, so a detached element answers "" to all of it.
       const cs = getComputedStyle(probe);
-      // `auto` on a relatively positioned box is 0; engines disagree on which of
-      // the two the resolved value reports, so read both as the same thing.
-      const topOffset = cs.top === 'auto' ? 0 : parseFloat(cs.top);
-      const marginBottom = parseFloat(cs.marginBottom);
+      const position = cs.position;
+      const pointerEvents = cs.pointerEvents;
       probe.remove();
       if (p.height === 0) return null;
 
+      // How much of the badge lands on the mark. "Beside it" scores 0, however
+      // close beside; an offset corner nudge still scores most of the box. A
+      // pair of edge comparisons would pass a badge floating anywhere above the
+      // mark, which is the same "somewhere up there" the old margin lift was.
+      const over = (a: DOMRect, b: DOMRect): number =>
+        Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left)) *
+        Math.max(0, Math.min(a.bottom, b.bottom) - Math.max(a.top, b.top));
+
       return {
-        probeTop: p.top,
-        labelTop: l.top,
-        topOffset,
-        marginBottom,
-        // Positive = the badge sits above the label's centre line, which is the
-        // superscript lift itself.
-        lift: (l.top + l.bottom) / 2 - (p.top + p.bottom) / 2,
+        position,
+        pointerEvents,
+        widthBefore,
+        widthAfter: host.getBoundingClientRect().width,
+        onMarkFraction: p.width * p.height > 0 ? over(p, m) / (p.width * p.height) : 0,
+        // Which corner of the mark it took, read off the centres.
+        above: (p.top + p.bottom) / 2 < (m.top + m.bottom) / 2,
+        trailing: (p.left + p.right) / 2 > (m.left + m.right) / 2,
       };
     });
     const m = await handle.jsonValue();
 
-    // The mobile regression: a leftover paint-time offset stacking on the margin.
+    // Out of flow, so the centred mark cannot be pushed sideways by a badge
+    // appearing and disappearing under it.
+    expect(m.position, 'the badge must not take a flex slot beside the mark').toBe('absolute');
     expect(
-      m.topOffset,
-      `brand badge carries a ${m.topOffset}px paint-time top offset on top of its margin lift`,
-    ).toBe(0);
+      m.widthAfter - m.widthBefore,
+      `the badge widened the mark's slot by ${m.widthAfter - m.widthBefore}px, which moves the mark off its axis`,
+    ).toBeLessThan(0.5);
 
-    // The desktop regression: a paint-time lift put the badge's top ABOVE the
-    // label's, where an engine that clips both axes cropped it flat.
+    // ...and it lands ON the mark, in its top-right corner.
     expect(
-      m.probeTop - m.labelTop,
-      `badge top ${m.probeTop} sits ${m.labelTop - m.probeTop}px above its clipping host's top ${m.labelTop}`,
-    ).toBeGreaterThanOrEqual(-0.5);
+      m.onMarkFraction,
+      `only ${Math.round(m.onMarkFraction * 100)}% of the badge is on the mark; it is sitting beside it`,
+    ).toBeGreaterThan(0.5);
+    expect(m.above, 'the badge must take the mark\'s TOP corner').toBe(true);
+    expect(m.trailing, 'the badge must take the mark\'s trailing corner').toBe(true);
 
-    // ...and it is still a superscript, lifted by exactly half its bottom
-    // margin, which is what centring the margin box buys.
-    expect(m.lift, 'badge no longer rides above the title baseline').toBeGreaterThan(0);
-    expect(m.lift, 'badge lift no longer comes from its bottom margin').toBeCloseTo(
-      m.marginBottom / 2,
-      1,
-    );
+    // The probe carries the READY badge's classes, i.e. the plain span with no
+    // handler. Overlaid on the mark it is a hit target that swallows taps on
+    // that corner, and what is under it is the mark's BUTTON, a sibling, so the
+    // tap has nothing to bubble to and the menu never opens.
+    expect(m.pointerEvents, 'the badge with no handler must not eat taps on the mark')
+      .toBe('none');
   });
 });

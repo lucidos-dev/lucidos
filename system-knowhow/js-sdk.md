@@ -42,7 +42,7 @@ What each piece does — include only what you need:
 |---|---|---|
 | `<title>` | Tab title | (always include — browsers require it) |
 | `<script src="/api/v1/sdk-prefs.js"></script>` | Synchronous prefs script — reads the user's theme/font/scale from `localStorage` (shared with the parent shell via same-origin sandboxing) and sets `data-theme`, `--bg-primary`, and `--font-ui` on `<html>` (plus `--user-ui-scale` when the user has set one) *before* any subsequent stylesheet evaluates. Eliminates the flash-of-default-theme between iframe load and `applyPreferences()`. **Place as early in `<head>` as possible — before `sdk-iframe.css`, before any other `<link rel="stylesheet">`, and before any inline `<style>` that reads theme vars.** Inlining `--bg-primary` directly (not just `data-theme`) is what makes the body's `background: var(--bg-primary, …)` paint correctly even when stylesheets are loaded asynchronously (JS-injected, dynamic `import()`, dev-mode bundlers like Vite that ship CSS as JS modules). | App doesn't use `sdk-iframe.css` (no FOUC to fix) |
-| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`) — use these class names and the app's buttons/lists/etc. render identically to the host shell. The body inherits the root font-size (the user's UI scale), matching Lucidos. | App ships its own complete stylesheet and doesn't want Lucidos theming |
+| `<link rel="stylesheet" href="/api/v1/sdk-iframe.css">` | Theme tokens (`--bg-primary`, `--accent`, etc.), dark/light variables, default body/input/scrollbar styling, **and Lucidos's shared component classes** (`.action-btn` + `.action-btn-confirm`/`.action-btn-danger`, `.button-group`, `.icon-btn`, `.label`, `.title`, `.segmented-control`/`.segmented-btn`, `.list-row*`, `.markdown-content`, `.progress-bar`, `.empty-state`, `.accent-link`). Use these class names and the app's buttons/lists/etc. render identically to the host shell. The body inherits the root font-size (the user's UI scale), matching Lucidos. | App ships its own complete stylesheet and doesn't want Lucidos theming |
 | `<script src="/api/v1/sdk-iframe-audio.js"></script>` | Monkey-patches `AudioContext` so app code reuses a gesture-unlocked instance, survives iOS PWA background cycles. **Must be in `<head>` before any code that creates an `AudioContext`.** | App doesn't play audio |
 | `<script src="/api/v1/sdk.js"></script>` | The `lucidos.*` API. Also installs two iframe-only side effects: a link interceptor (`target="_blank"` links resolve in-frame; external `http(s)://` links route through `lucidos.ui.openExternal()`) and a keyboard-shortcut forwarder (host shortcuts like focus/hide a pane, narrow/widen, new thread, search, and Escape keep working while the app has focus, because iframe keydowns otherwise never reach the host). Only modifier-bearing chords and Escape are forwarded; plain typing stays in the app. | App doesn't use `lucidos.*` |
 | `lucidos.ui.applyPreferences()` | Reads the user's theme/font/scale (resolving a `system` preference to the live OS light/dark) and sets `data-theme` + CSS vars on `<html>`. Pairs with `sdk-iframe.css` to apply the right palette. | **Don't skip if you include `sdk-iframe.css`** — without it the app ignores the user's light/system setting and stays on the default dark palette. Skip only when opting out of Lucidos theming entirely. |
@@ -181,6 +181,7 @@ file). The class names are the contract:
 |---|---|
 | `.action-btn` (+ `.action-btn-confirm` green, `.action-btn-danger` red) | The filled primary CTA button — blue, with the confirm/danger variants additive (`class="action-btn action-btn-danger"`) |
 | `.action-btn-secondary` | A neutral, outlined secondary button for a lower-emphasis action beside a primary CTA — additive: `class="action-btn action-btn-secondary"`. **Use this instead of hand-rolling an off-palette outlined button.** |
+| `.button-group` | Wrap a **row of buttons** in this instead of a bare flex row. It keeps the row bound by its container: buttons that do not fit stack onto a second row rather than overflowing, and a single button whose label is wider than the row ellipsizes instead of being sliced by whatever ancestor hides its overflow. Set your own `justify-content` on the same element (the class deliberately sets none) and the buttons keep their natural widths. |
 | `.icon-btn` | A small borderless icon button (wrap an SVG sized via `--icon-size-sm`) |
 | `.accent-link` | An inline text link/button in the accent color |
 | `.label` | A small uppercase badge |
@@ -632,6 +633,11 @@ interface Trigger {
   // Side-effect grant — irreversible categories this trigger may perform
   // unattended. Omitted when empty (= no grant).
   side_effect_grant?: SideEffectCategory[];
+  // Chat model this trigger's intent fires on, and its thinking budget. Both
+  // omitted when the trigger follows the account default (Settings → Models →
+  // Chat & triggers). Intent triggers only: a script trigger runs no LLM.
+  model?: string;
+  reasoning_effort?: string;
 }
 
 interface CreateTrigger {
@@ -644,6 +650,10 @@ interface CreateTrigger {
   /** Side-effect grant — irreversible categories this trigger may perform
    *  unattended. Omit / `[]` = none granted (the safe default). */
   side_effect_grant?: SideEffectCategory[];
+  /** Pin the intent to a chat model and a thinking budget
+   *  (`none|low|medium|high|xhigh|max`). Omit either for the account default. */
+  model?: string | null;
+  reasoning_effort?: string | null;
 }
 
 interface UpdateTrigger {
@@ -659,6 +669,10 @@ interface UpdateTrigger {
   group_id?: string | null;
   /** Full replacement for the side-effect grant; pass `[]` to clear all. */
   side_effect_grant?: SideEffectCategory[];
+  /** Pin the intent's model / thinking budget (string), clear it back to the
+   *  account default (null), or leave it unchanged (absent). */
+  model?: string | null;
+  reasoning_effort?: string | null;
 }
 
 interface ApiResult {
@@ -933,15 +947,25 @@ lucidos.threads.count(opts?: Omit<ThreadsListOptions, 'limit'>): Promise<number>
 
 Same canonical surface as the `lucidos threads list` / `lucidos threads count` CLI and the `list_threads` / `count_threads` LLM tools. Use this when an app needs to render or react to thread state (counts, status indicators) without subscribing to the full SSE stream.
 
+**`active` is a union, `status` is precise.** `active: true` selects `running` OR `waiting_for_user_answer`, and those two are opposites: `running` is the workspace working, `waiting_for_user_answer` is the workspace stopped and waiting on a person. An app asking "is anything busy?" wants `status: 'running'`; an app rendering "N threads I have something invested in" wants `active: true`. Passing both is a 400.
+
 ### Types
 
 ```ts
 interface ThreadsListOptions {
-  /** true → only threads where the agentic loop is mid-flow
-   *  (status 'running' or 'waiting_for_user_answer'). false → invert.
-   *  Omit → no filter. Note: 'waiting' is NOT active — it means the coding agent has
-   *  stopped and proposed changes the user must act on. */
+  /** The UNION of 'running' and 'waiting_for_user_answer'. true selects it,
+   *  false inverts it, omitting it filters nothing. For "is the workspace
+   *  busy?" pass status: 'running' instead: a thread awaiting a user answer is
+   *  blocked on the human, not working. 'waiting' is in neither, and means the
+   *  coding agent stopped and proposed changes the user must act on.
+   *  Mutually exclusive with status. */
   active?: boolean;
+  /** Comma-separated status filter naming exactly the statuses to keep, in the
+   *  same spelling each row's `status` field carries: 'idle', 'running',
+   *  'waiting', 'waiting_for_user_answer', 'paused', 'failed'. The precise form
+   *  of `active`, and mutually exclusive with it. An unrecognized or empty
+   *  value is a 400, never a silently empty or unfiltered result. */
+  status?: string;
   /** Comma-separated source filter: 'chat', 'trigger', 'coding-agent'.
    *  Legacy 'claude_code' is also accepted. */
   source?: string;
@@ -988,6 +1012,9 @@ interface ThreadSummary {
    *  changes). Drives REVIEW bubbling up the ancestor chain. */
   attention_descendant_count: number;
   /** 'idle' | 'running' | 'waiting' | 'paused' | 'failed' | 'waiting_for_user_answer'.
+   *  The same values the `status` filter above accepts, so you can filter on
+   *  what you read. `running` is the workspace working; `waiting_for_user_answer`
+   *  is it stopped and waiting on a person (the `active` union covers both).
    *  `paused` = the user's own version switch interrupted the turn and the engine
    *  is resuming it, so nothing is being asked of anyone. Any OTHER interruption
    *  (a crash, or a switch whose resume the boot could not deliver) is `failed`
@@ -1030,7 +1057,9 @@ interface ThreadSummary {
 | Want to … | Use |
 |---|---|
 | Render a list of threads in an app UI | `lucidos.threads.list()` |
-| Show "N active threads" badge | `lucidos.threads.count({ active: true })` |
+| Ask "is the workspace busy?" | `lucidos.threads.count({ status: 'running' })` |
+| Show "N threads need me" | `lucidos.threads.count({ status: 'waiting_for_user_answer' })` |
+| Show "N active threads" badge (working AND asking) | `lucidos.threads.count({ active: true })` |
 | Render one thread's children (a fan-out board) | `lucidos.threads.list({ parent: id })` |
 | React to thread state changes in real time | Subscribe to `lucidos.sse` instead |
 | Spawn a new thread from an app | `lucidos.ui.startThread({ prompt })` |
@@ -1055,7 +1084,17 @@ lucidos.ui.enhanceSelects(root?: ParentNode): SelectInstance[]
 
 `applyPreferences()` fetches user preferences and applies theme, font, and scale as CSS variables (resolving a `system` theme to the live OS light/dark). Call once on app load, and style your app with the theme variables (§ Theme variables, under Setup) so it follows the user's appearance — don't hardcode colors. For each setting it prefers the server value, then the value the synchronous `sdk-prefs.js` script already applied from the parent shell's `localStorage`, and only then a default — so a device with no server-scoped value (e.g. only `ui-scale` stored, no `theme`) keeps the user's appearance instead of resetting to dark.
 
-`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts when the user toggles light/dark — or when the OS appearance changes under a `system` preference — without a reload.
+`applyPreferences()` also applies the user's **style overrides**: the
+`style_overrides` preference holds a map of CSS custom property to value, which
+it writes onto `<html>` after theme, font and scale (so an override of one of
+those wins). That is what keeps an app's chrome matching a host the user has
+retuned. Only custom properties are honoured, and a value containing `;`, `{`,
+`}`, `<`, `>`, `@`, a backslash, `url(`, `image-set(`, `expression(` or a
+comment opener is dropped, because the map is writable by any app and must not
+be able to inject a declaration or fetch from another origin. Nothing is
+required of an app beyond calling `applyPreferences()`.
+
+`watchPreferences()` subscribes to live preference changes (SSE `PreferencesChanged`) and re-applies them automatically. Call it once alongside `applyPreferences()` so the app reacts without a reload: when the user toggles light/dark, when the OS appearance changes under a `system` preference, or when a value is retuned from the Style Remote.
 
 `navigate()` sends a navigation request to the Lucidos frontend via SSE. `target`
 and `params` (`NavigateParams` = `NavigateUi` minus `target`) are typed against the

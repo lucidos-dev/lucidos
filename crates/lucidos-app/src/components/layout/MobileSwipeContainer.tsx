@@ -5,7 +5,6 @@ import { MOBILE_PANE_CONFIGS } from './MobileAppHeader';
 import { EdgeSwipeZones } from './EdgeSwipeZones';
 import { isTextInput, isInteractiveTarget, opensSoftwareKeyboard } from '../../utils/dom';
 import { SwipeTouch } from '../../utils/swipe';
-import { scrolledUp, pinToBottomNow } from '../chat/scrollState';
 
 export { SwipeTouch } from '../../utils/swipe';
 
@@ -421,15 +420,13 @@ export function MobileSwipeContainer() {
     });
 
     const onResize = () => {
-      // Capture before layout changes — once --app-height updates and
-      // ResizeObserver fires, scrolledUp may flip to true.
-      const wasAtBottom = !scrolledUp.value;
+      // The keyboard opening or closing changes --app-height, which shortens or
+      // lengthens the transcript's viewport. The reader is left exactly where
+      // they are: the content above them has not moved, so the same scrollTop
+      // still shows them the same thing. (This used to re-pin a bottom reader
+      // to the new bottom; see scrollState's header for why nothing does that
+      // any more.)
       setHeight(currentAppHeight());
-      // pinToBottomNow() sets ResizeObserver suppression to 'scroll',
-      // so the observer scrolls to bottom instead of marking scrolledUp.
-      if (wasAtBottom) {
-        pinToBottomNow();
-      }
     };
     const onOrientationChange = () => {
       setHeight(currentAppHeight());
@@ -466,7 +463,6 @@ export function MobileSwipeContainer() {
     // Reset lastSetHeight so the CSS write happens even when innerHeight
     // matches the cached value.
     const onWake = () => {
-      const wasAtBottom = !scrolledUp.value;
       const vvLooksShrunk = vv.height < window.innerHeight - 100;
       const active = document.activeElement;
       if (vvLooksShrunk && active instanceof HTMLElement && opensSoftwareKeyboard(active)) {
@@ -474,7 +470,6 @@ export function MobileSwipeContainer() {
       }
       lastSetHeight = -1;
       setHeight(currentAppHeight());
-      if (wasAtBottom) pinToBottomNow();
     };
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') onWake();

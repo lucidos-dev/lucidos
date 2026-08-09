@@ -45,38 +45,16 @@ const EXT_TO_LANG: Record<string, string> = {
   sh: 'bash', bash: 'bash', zsh: 'bash',
   sql: 'sql', css: 'css',
   yaml: 'yaml', yml: 'yaml', toml: 'ini',
-  json: 'json', xml: 'xml', html: 'xml',
+  // `htm` alongside `html`: CODE_EXTS is derived from these keys and gates
+  // highlighting in RepoFilePreview / DiffView, so omitting it rendered a .htm
+  // file as plain escaped text while the identical .html file was highlighted.
+  json: 'json', xml: 'xml', html: 'xml', htm: 'xml',
   graphql: 'javascript',
   vue: 'xml', svelte: 'xml',
 };
 
 /** File extensions that support syntax highlighting. */
 export const CODE_EXTS = Object.keys(EXT_TO_LANG);
-
-/**
- * Syntax-highlight a code string. Accepts raw (unescaped) code.
- * Returns HTML with highlight.js span elements.
- */
-export function syntaxHighlightCode(code: string, ext: string): string {
-  const lang = EXT_TO_LANG[ext];
-  if (!lang) return escapeHtml(code);
-  try {
-    return hljs.highlight(code, { language: lang, ignoreIllegals: true }).value;
-  } catch {
-    return escapeHtml(code);
-  }
-}
-
-/**
- * Syntax-highlight JSON. Accepts raw (unescaped) JSON string.
- */
-export function syntaxHighlightJson(json: string): string {
-  try {
-    return hljs.highlight(json, { language: 'json', ignoreIllegals: true }).value;
-  } catch {
-    return escapeHtml(json);
-  }
-}
 
 /**
  * Highlight a full file and split into individual lines,

@@ -17,8 +17,8 @@ describe('restart-required state from ChangeApplied requires_restart', () => {
   // handler sets restartRequired and calls syncRestartToast(). Post single-surface
   // decision, this surfaces NO toast — the engine "New version available → Switch"
   // toast is owned by the poll (engine-update.ts) once the rebuild is `ready`. The
-  // persisted state (restartRequired + RESTART_LS_KEY) drives the control-panel
-  // badge + restart confirm dialog and must survive a reload.
+  // persisted state (restartRequired + RESTART_LS_KEY) drives the brand badge
+  // + restart confirm dialog and must survive a reload.
 
   it('persists restartRequired and shows no toast', () => {
     restartRequired.value = true;

@@ -1,5 +1,5 @@
 import { hasHoverPointer } from '../../utils/platform';
-import { isElementOnScreen, isElementVisible, scrolledUp } from './scrollState';
+import { isElementOnScreen, isElementVisible } from './scrollState';
 import { getVisiblePromptInput } from './promptFocus';
 
 /** Keyboard navigation for **choice cards**: a live user question card or a live
@@ -69,9 +69,9 @@ export function nextChoiceIndex(
  *  steal focus from something the user is doing, mirroring `focusIfNeeded` and
  *  `shouldReconcilePaneFocus`: a touch-only device has no keyboard to serve, a
  *  non-empty prompt means they are composing a free-text answer, a non-idle
- *  active element means they are using some other control, and a scrolled-up
- *  transcript means the card is off-screen (a focused choice there would be an
- *  invisible Enter target). Pure, for unit testing.
+ *  active element means they are using some other control. Whether the card is
+ *  actually on screen is asked separately and precisely, by `isElementOnScreen`
+ *  in `seedChoiceCardFocus`. Pure, for unit testing.
  *
  *  `hoverPointer` is `hasHoverPointer()`, NOT `isMobile()`: the question is
  *  whether a keyboard exists to press the seeded choice with, and `isMobile()`
@@ -84,9 +84,8 @@ export function shouldSeedChoiceFocus(opts: {
   hoverPointer: boolean;
   promptHasText: boolean;
   activeIsIdle: boolean;
-  scrolledUp: boolean;
 }): boolean {
-  return opts.hoverPointer && !opts.promptHasText && opts.activeIsIdle && !opts.scrolledUp;
+  return opts.hoverPointer && !opts.promptHasText && opts.activeIsIdle;
 }
 
 function choiceButtons(root: HTMLElement): HTMLElement[] {
@@ -175,14 +174,20 @@ export function claimSeedForCard(cardId: string): boolean {
  *  card's mount effect, passing the card's stable id (`tool_use_id` for a
  *  question, `request_id` for a permission request).
  *
- *  Three guards, doing three different jobs. `claimSeedForCard` bounds this to
- *  the card's arrival. `scrolledUp` carries INTENT: the user has chosen to read
- *  history, so a card arriving at the bottom must not hijack the arrow keys
- *  they are reading with. `isElementOnScreen` proves the FACT that the choice is
- *  on screen, independent of a signal that reflects whichever scroll element was
- *  last observed and can lag a thread switch. None subsumes another, and
- *  dropping the last is what left the sibling thread-entry path able to focus a
- *  card below the fold.
+ *  Two guards, doing two different jobs. `claimSeedForCard` bounds this to the
+ *  card's arrival, and `isElementOnScreen` proves the choice is actually
+ *  visible, so we never arm an Enter the reader cannot see.
+ *
+ *  There was a third, a position SIGNAL (`scrolledUp`, the 80px stickiness
+ *  window) standing for "the reader has chosen to read history, do not hijack
+ *  their arrow keys". It went with the bottom-pin that maintained it. Carrying
+ *  it over to `awayFromBottom` would have been worse than dropping it: nothing
+ *  scrolls to a card now, so the card's own arrival puts the reader off the
+ *  bottom, the resize handler sets `awayFromBottom` before this effect runs, and
+ *  `claimSeedForCard` has already latched the id. Every card in a scrollable
+ *  thread would decline its one chance at focus, permanently. `isElementOnScreen`
+ *  answers the real question, and answers it about the choice rather than about
+ *  the transcript.
  *
  *  `preventScroll` then keeps the (already-in-view) focus move from nudging the
  *  scroll manager, matching `focusIfNeeded`. */
@@ -192,7 +197,6 @@ export function seedChoiceCardFocus(root: HTMLElement | null, cardId: string): v
     hoverPointer: hasHoverPointer(),
     promptHasText: promptHasText(),
     activeIsIdle: activeElementIsIdle(),
-    scrolledUp: scrolledUp.value,
   })) return;
   const choice = defaultChoice(root);
   if (choice && isElementOnScreen(choice)) choice.focus({ preventScroll: true });

@@ -1,21 +1,15 @@
 import type { ComponentType } from 'preact';
-import { ConnectionStatus } from './ConnectionStatus';
-import { unfocusThread } from '../../store/actions/threads';
-import { composeHandlers } from '../chat/promptFocus';
 import { scrolledFromTop } from '../chat/scrollState';
-import { ComposeIcon, SearchIcon } from '../shared/icons';
+import { SearchIcon } from '../shared/icons';
 import { PinThreadButton } from '../shared/PinThreadButton';
 import { ThreadOverflowMenu } from '../shared/ThreadOverflowMenu';
-import { ThreadNav } from '../shared/ThreadNav';
+import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
-import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
-import { SetupInterviewButton } from '../shared/SetupInterviewButton';
-import { HamburgerButton, ContentBackButton, ContentForwardButton } from './PanelNav';
+import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, BrandBadge, toggleControlPanelAtClick } from './ControlPanel';
-import { ThreadFilterDropdown, viewIcon } from './ThreadFilterDropdown';
-import { getContentTitle, getDiffDescription } from './headerHelpers';
-import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, drawerView, attentionThreadCount, type MobileView } from '../../store/store';
+import { BrandMenuButton } from './HeaderMark';
+import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
+import { threadSearchQuery, mobileView, MOBILE_VIEWS, focusedThreadId, threadMap, type MobileView } from '../../store/store';
 import { navigateToPane } from '../../store/actions/pane';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
 import { ThreadTitleEditor } from '../chat/ThreadTitleEditor';
@@ -43,16 +37,10 @@ export const MOBILE_PANE_CONFIGS: Record<MobileView, MobilePaneConfig> = {
 
 /** Mobile threads header — search and filter for the threads pane */
 function MobileThreadsHeader() {
-  const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
+  // Glyph, active highlight and the attention-only badge all come from the
+  // shared hook, so this row and the desktop one cannot drift.
+  const { filterOpen, toggleFilter, filterButtonActive, FilterButtonIcon, filterButtonBadge,
           searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
-
-  // The unified Filter control is active when a non-default drawer view is
-  // selected OR a channel filter is set. The needs-attention badge rides on the
-  // same button (attention-only).
-  const filterButtonActive = drawerView.value !== 'all' || filterActive;
-  const attentionCount = attentionThreadCount.value;
-  // The button glyph reflects the selected view (funnel for `all`).
-  const ViewIcon = viewIcon(drawerView.value);
 
   return (
     <div class={`mobile-threads-header${searchOpen ? ' search-active' : ''}`}>
@@ -74,35 +62,53 @@ function MobileThreadsHeader() {
             </svg>
           </button>
         </div>
-        {/* Single unified Filter control — opens the merged View + Show
-            dropdown (see ThreadFilterDropdown). Packed left in the same slot the
-            channel filter + view selector used to share. */}
+        {/* Single unified Filter control: it toggles the merged Status +
+            Thread type panel, which renders down in the threads pane itself
+            (see ThreadFilterPanel / ThreadDrawer). Packed left in the same slot
+            the channel filter + view selector used to share. It is also the
+            panel's only way out, which is what the X glyph says while the panel
+            is up (see useThreadsHeaderState). */}
         <div class="view-selector-slot">
           <button
-            ref={toggleRef}
             class={`icon-btn header-icon${filterButtonActive ? ' view-selector-active' : ''}`}
-            onClick={() => setFilterOpen(!filterOpen)}
+            onClick={toggleFilter}
             aria-label="Filter threads"
-            aria-haspopup="menu"
             aria-expanded={filterOpen}
           >
-            <ViewIcon />
-            {attentionCount > 0 && <span class="badge">{attentionCount}</span>}
+            <FilterButtonIcon />
+            {filterButtonBadge > 0 && <span class="badge">{filterButtonBadge}</span>}
           </button>
-          {filterOpen && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
         </div>
         {/* Title is absolutely centered on the row middle (see
-            .mobile-header-title); the spacer pins the trailing icons right. */}
-        <span class="pane-header-title mobile-header-title">Threads</span>
+            .mobile-header-title); the spacer pins the trailing icons right. It
+            says what the pane is showing: the list, or the filter panel that has
+            taken it over (ThreadFilterPanel carries no title row of its own).
+            Just "Filters", matching the desktop row: the pane is already the
+            Threads pane. */}
+        <span class="pane-header-title mobile-header-title">
+          {filterOpen ? 'Filters' : 'Threads'}
+        </span>
         <div class="pane-header-spacer" />
-        <SetupInterviewButton />
-        <button
-          class="icon-btn header-icon brand-compose-btn"
-          {...composeHandlers(() => unfocusThread())}
-          aria-label="New thread"
-        >
-          <ComposeIcon />
-        </button>
+        {/* No SetupInterviewButton on either mobile header, deliberately: the
+            setup interview is a once-or-twice thing, and a permanent icon for it
+            costs a phone's scarcest row more than it is worth. Mobile reaches it
+            from the welcome CTA (SetupInterviewWelcome) or by asking in the
+            chat, which is what the welcome's hint says on this viewport. */}
+        {/* The same menu as the thread pane, so it is reachable from here too,
+            but dressed as a member of an icon run rather than as the thread
+            pane's centred mark: `placement="row"` puts it on
+            `.icon-btn.header-icon`, the class Search beside it uses, which is
+            what keeps the two on one rhythm.
+
+            It is POSITIONED by the same fixed-width centred cluster the other
+            two rows hang their chevrons off, pinned to that cluster's trailing
+            edge, so it lands on the forward chevron's column rather than
+            wherever the trailing run's width happened to leave it. The mark is
+            the one control on all three mobile rows, and it was the one moving
+            as the user swiped between them. Search keeps the trailing edge. */}
+        <div class="header-nav-cluster header-mark-end-cluster">
+          <BrandMenuButton placement="row" />
+        </div>
         <button
           class="icon-btn header-icon"
           {...openSearchHandlers}
@@ -115,80 +121,85 @@ function MobileThreadsHeader() {
   );
 }
 
-/** Mobile thread header (brand mode). The leading control is the same thread
- *  drawer toggle desktop puts here (ThreadToggleButton: same glyph, and
- *  `toggleThreads` navigates to the threads pane on mobile), so the
- *  needs-attention badge that rides it is visible from the conversation rather
- *  than only from the threads pane's own Filter button. The hamburger keeps its
- *  place on this row but moves to the far TRAILING edge, mirroring the toggle
- *  across the row: both drawers stay one tap from the conversation, and the menu
- *  drawer slides out from under it on the right (drawerSideFor in Drawer.tsx).
- *  Pane navigation is otherwise swipe-only; the dot indicator remains as a
- *  tappable cue. */
+/** Mobile thread header. The row is built around a CENTRED cluster of back
+ *  chevron, Lucidos mark, forward chevron, with one drawer affordance at each
+ *  edge.
+ *
+ *  The mark is three controls in one: the brand, the connection light, and the
+ *  menu carrying New thread, Search everywhere and Workspaces. Those three used
+ *  to be a compose button, a search button and the brand label, which is what
+ *  makes room for the nav chevrons to move off the leading edge and flank the
+ *  mark where a thumb reaches them.
+ *
+ *  Both edges keep their drawer: the thread drawer toggle leads (so the
+ *  needs-attention badge riding it stays visible from the conversation, per
+ *  `threadToggleBadgeCount`) and the hamburger trails, mirroring it across the
+ *  row so the menu drawer slides out from under it on the right (drawerSideFor
+ *  in Drawer.tsx). Pane navigation is otherwise swipe-only; the dot indicator
+ *  remains as a tappable cue. */
 function MobileThreadHeader() {
   return (
     <div class="mobile-thread-header">
       <div class="mobile-header-row">
         <ThreadToggleButton />
-        <div class="mobile-nav-slot"><ThreadNav /></div>
-        {/* Brand is absolutely centered on the row middle (see
-            .mobile-header-title); the spacer pins the trailing icons right. */}
-        <span class="pane-header-brand mobile-header-title">
-          <span
-            class="pane-header-brand-label"
-            data-role="control-panel-toggle"
-            onClick={(e) => {
-              if (e.target === e.currentTarget) return;
-              toggleControlPanelAtClick(e);
-            }}
-          >
-            <span class="pane-header-title">Lucidos</span>
-            <BrandBadge />
-            <ConnectionStatus />
-          </span>
-          <ControlPanel layout="mobile" />
-        </span>
         <div class="pane-header-spacer" />
-        {/* No SetupInterviewButton here, deliberately. This row is the one that
-            is out of space: the brand is absolutely centered and shrink-to-
-            content, and a fourth trailing icon beside compose + search + menu
-            pushes the brand into the cluster at 375px (measured, not guessed:
-            e2e/mobile-threads-title-alignment.spec.ts fails on the overlap).
-            Mobile reaches the setup interview from the Threads header above,
-            which has room and is where "start something new" already lives. */}
-        <button
-          class="icon-btn header-icon brand-compose-btn"
-          {...composeHandlers(() => unfocusThread())}
-          aria-label="New thread"
-        >
-          <ComposeIcon />
-        </button>
-        <SearchEverywhereButton />
+        {/* Absolutely centred on the row middle rather than between the two
+            edge clusters, so the mark sits on the viewport axis (the same rule
+            the title followed, see .mobile-header-title in mobile.css). Unlike
+            a title this cluster cannot shrink, so its clearance from both edges
+            is a fixed-width guarantee, pinned by
+            e2e/mobile-threads-title-alignment.spec.ts. */}
+        <div class="header-nav-cluster">
+          <ThreadBackButton />
+          <BrandMenuButton />
+          <ThreadForwardButton />
+        </div>
         <HamburgerButton />
       </div>
     </div>
   );
 }
 
-/** Mobile content header — same as desktop content side */
+/** Mobile content header. Repeats the thread row's shape one pane over, and
+ *  literally so: the cluster is the same fixed-width centred box, so the two
+ *  chevrons land on the same two points of the screen as the thread pane's and
+ *  navigation does not move under the thumb when the user swipes between panes.
+ *
+ *  The title is the cluster's one shrinking member, so a long one ellipsises
+ *  between the chevrons rather than pushing either into an edge control. With
+ *  no title the cluster is just the two chevrons, in the same places. What
+ *  makes the fixed span possible is `ContentHeaderActions` always collapsing to
+ *  the overflow menu plus the bell: a trailing cluster of constant width.
+ *
+ *  That span is around a dozen characters, so a destination WE name renders its
+ *  authored short form (`SettingsNavItem.short`) rather than ellipsising a name
+ *  we could have written shorter. The ellipsis stays underneath for the names
+ *  we do not author: files, apps, web pages, threads. Either way the tap
+ *  tooltip carries the full title. */
 function MobileContentHeader() {
-  const title = getContentTitle();
+  const title = getContentTitleShort();
+  const titleFull = getContentTitle();
   const diffDesc = getDiffDescription();
 
   return (
     <div class="mobile-content-header">
       <div class="mobile-header-row">
         <HamburgerButton />
-        <div class="mobile-nav-slot">
+        <div class="pane-header-spacer" />
+        <div class="header-nav-cluster header-title-cluster">
           <ContentBackButton />
+          {title && (
+            <span
+              class="pane-header-title mobile-content-title"
+              data-tooltip={diffDesc || titleFull}
+              data-tooltip-tap
+            >
+              {title}
+            </span>
+          )}
           <ContentForwardButton />
         </div>
-        {/* Title is absolutely centered on the row middle (see
-            .mobile-header-title); the spacer pins the trailing actions right
-            (and keeps them right-aligned when there's no title). */}
-        {title && <span class="pane-header-title mobile-header-title mobile-content-title" data-tooltip={diffDesc || title} data-tooltip-tap>{title}</span>}
-        <div class="pane-header-spacer" />
-        <ContentHeaderActions />
+        <ContentHeaderActions layout="mobile" />
       </div>
     </div>
   );

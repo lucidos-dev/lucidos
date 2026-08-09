@@ -366,7 +366,8 @@ export function useDismissOnOutside(
   // opens a window where the popover is already visible (and dismissible) but no
   // listener is live yet. Any click landing in that gap — a synthetic
   // HTMLElement.click() from a keyboard shortcut or an e2e driver — is missed and
-  // the popover wedges open (the thread-filter-dropdown WebKit e2e flake). Pairs
+  // the popover wedges open (the WebKit e2e flake the thread filter hit back
+  // when it was still an anchored dropdown; it is a pane panel now). Pairs
   // with the synthetic-click fallback in makeDismissHandlers: the fallback only
   // helps once the listener exists, so the listener must exist from frame zero.
   useLayoutEffect(() => {

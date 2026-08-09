@@ -310,6 +310,25 @@ pub enum SystemEvent {
     ServedFrontendAdvanced {
         sent_at_ms: i64,
     },
+    /// The supervised Vite dev server showing a coding-agent worktree's frontend
+    /// came up (`engine::frontend_preview`). Carries the **port**, never a URL:
+    /// the same workspace is reached at `localhost` from the laptop and at a
+    /// Tailscale name from the phone, and only the page knows which of those the
+    /// user is on, so it composes the href from its own `location`. Transient
+    /// (never persisted, a pure UI signal like `ServedFrontendAdvanced`) and
+    /// dev-only by construction (`start_frontend_preview` refuses when packaged).
+    FrontendPreviewStarted {
+        thread_id: uuid::Uuid,
+        port: u16,
+        sent_at_ms: i64,
+    },
+    /// The frontend preview stopped: explicitly, because its worktree was
+    /// reclaimed, or because another thread took the single slot. Transient and
+    /// dev-only for the same reasons as `FrontendPreviewStarted`.
+    FrontendPreviewStopped {
+        thread_id: uuid::Uuid,
+        sent_at_ms: i64,
+    },
     /// The engine's dev background-rebuild `build_state` transitioned
     /// (`idle`|`building`|`ready`|`failed`) — emitted from `trigger_background_rebuild`
     /// at build start (`building`) and completion (`ready`/`failed`, latest
@@ -1058,6 +1077,8 @@ impl SystemEvent {
             Self::FrontendUpdateDeferred { .. } => "FrontendUpdateDeferred",
             Self::FrontendUpdateStranded { .. } => "FrontendUpdateStranded",
             Self::ServedFrontendAdvanced { .. } => "ServedFrontendAdvanced",
+            Self::FrontendPreviewStarted { .. } => "FrontendPreviewStarted",
+            Self::FrontendPreviewStopped { .. } => "FrontendPreviewStopped",
             Self::EngineBuildStateChanged { .. } => "EngineBuildStateChanged",
             Self::DomainEvent { .. } => "DomainEvent",
             Self::ArtifactCreated { .. } => "ArtifactCreated",
@@ -1156,6 +1177,8 @@ impl SystemEvent {
         "FrontendUpdateDeferred",
         "FrontendUpdateStranded",
         "ServedFrontendAdvanced",
+        "FrontendPreviewStarted",
+        "FrontendPreviewStopped",
         "EngineBuildStateChanged",
         "DomainEvent",
         "ArtifactCreated",
@@ -1305,6 +1328,8 @@ impl SystemEvent {
             | Self::FrontendUpdateDeferred { .. }
             | Self::FrontendUpdateStranded { .. }
             | Self::ServedFrontendAdvanced { .. }
+            | Self::FrontendPreviewStarted { .. }
+            | Self::FrontendPreviewStopped { .. }
             | Self::EngineBuildStateChanged { .. } => "engine",
             Self::EmailSent { .. } => "email",
             Self::ProxyModulesReloaded { .. } => "proxy_modules",
@@ -1410,6 +1435,10 @@ impl SystemEvent {
             Self::ApplyAllBatchStarted { batch_id, .. }
             | Self::ApplyAllBatchCompleted { batch_id, .. } => batch_id.to_string(),
             Self::EngineSupervisorRespawned { supervisor_pid, .. } => supervisor_pid.to_string(),
+            // The preview is engine-level, but WHICH thread's worktree it shows
+            // is its identity: one preview per thread, one slot at a time.
+            Self::FrontendPreviewStarted { thread_id, .. }
+            | Self::FrontendPreviewStopped { thread_id, .. } => thread_id.to_string(),
             Self::EmailSent { account, .. } => account.clone(),
             Self::ThreadQueued { entry_id, .. }
             | Self::ThreadQueueAdmitted { entry_id, .. }

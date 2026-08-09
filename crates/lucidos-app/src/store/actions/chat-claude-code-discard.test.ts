@@ -27,7 +27,7 @@ vi.mock('../../api/client', () => ({
   sendControlRequest: vi.fn(),
   ApiError: class extends Error {},
 }));
-vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
+vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 vi.mock('./changeToast', () => ({ changeToastMessage }));
 vi.mock('./threads', () => ({ focusThread: vi.fn() }));
 

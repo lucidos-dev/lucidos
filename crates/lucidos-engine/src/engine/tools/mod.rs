@@ -26,6 +26,7 @@ pub(crate) mod todo;
 mod web;
 
 use super::LucidosEngine;
+use crate::engine::thread_lifecycle::ThreadStatus;
 use crate::engine::thread_queue::{CapacityPolicy, OverflowPolicy};
 use crate::llm::tool_names as tn;
 
@@ -789,7 +790,8 @@ impl LucidosEngine {
         args: &serde_json::Value,
         caller_thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        let active = args.get("active").and_then(|v| v.as_bool());
+        let statuses = parse_status_arg(args)?;
+        let status = status_filter_arg(args, &statuses);
         let sources = parse_source_arg(args.get("source"));
         let parent = parent_filter_arg(args, caller_thread_id);
         let limit = args
@@ -800,14 +802,14 @@ impl LucidosEngine {
         match self
             .event_store
             .list_thread_summaries(crate::core::store::ThreadSummaryFilters {
-                active,
+                status,
                 sources: sources.as_deref(),
                 parent,
                 limit,
             })
             .await
         {
-            // Compact JSON — every tool that returns a JSON array does the
+            // Compact JSON: every tool that returns a JSON array does the
             // same (see `query_events`, `count_threads`). Pretty-printing
             // would inflate output tokens ~30% with no parsing benefit for
             // the LLM.
@@ -824,13 +826,14 @@ impl LucidosEngine {
         args: &serde_json::Value,
         caller_thread_id: uuid::Uuid,
     ) -> ToolOutcome {
-        let active = args.get("active").and_then(|v| v.as_bool());
+        let statuses = parse_status_arg(args)?;
+        let status = status_filter_arg(args, &statuses);
         let sources = parse_source_arg(args.get("source"));
         let parent = parent_filter_arg(args, caller_thread_id);
         match self
             .event_store
             .count_thread_summaries(crate::core::store::ThreadSummaryFilters {
-                active,
+                status,
                 sources: sources.as_deref(),
                 parent,
                 limit: 0,
@@ -1249,6 +1252,65 @@ fn parse_source_arg(raw: Option<&serde_json::Value>) -> Option<Vec<String>> {
         None
     } else {
         Some(out)
+    }
+}
+
+/// Parse the `status` arg accepted by `list_threads` / `count_threads`, and
+/// refuse it alongside `active`.
+///
+/// Accepts the array the schema advertises or a comma-separated string, the
+/// same two shapes `parse_source_arg` takes, because a model that has seen one
+/// of these tools will reach for either. Unlike `parse_source_arg` this returns
+/// a `Result`: a status value the model invented must come back as a tool error
+/// it can correct, not as a filter that silently matches nothing.
+fn parse_status_arg(args: &serde_json::Value) -> Result<Vec<ThreadStatus>, String> {
+    let Some(raw) = args.get("status").filter(|v| !v.is_null()) else {
+        return Ok(Vec::new());
+    };
+    if args.get("active").and_then(|v| v.as_bool()).is_some() {
+        return Err(format!(
+            "Error: pass either active or status, not both. active is the union \
+             (running, waiting_for_user_answer); status names exactly the statuses \
+             you want, out of {}. For 'is the workspace busy?' use status: \
+             [\"running\"], since a thread awaiting a user answer is blocked on the \
+             human, not working.",
+            crate::core::store::status_value_list()
+        ));
+    }
+    let values: Vec<String> = if let Some(s) = raw.as_str() {
+        s.split(',').map(str::to_string).collect()
+    } else if let Some(arr) = raw.as_array() {
+        arr.iter()
+            .map(|v| match v.as_str() {
+                Some(s) => s.to_string(),
+                // Not silently skipped: a non-string item is a malformed call,
+                // and dropping it would answer a narrower question than asked.
+                None => v.to_string(),
+            })
+            .collect()
+    } else {
+        return Err(format!(
+            "Error: status takes a list of statuses (or a comma-separated string), \
+             one or more of {}.",
+            crate::core::store::status_value_list()
+        ));
+    };
+    crate::core::store::parse_status_filter_values(&values).map_err(|e| format!("Error: {e}"))
+}
+
+/// Resolve the parsed `status` list and the `active` boolean into the single
+/// store filter. Kept separate from [`parse_status_arg`] because
+/// `StatusFilter::OneOf` borrows the parsed vector.
+fn status_filter_arg<'a>(
+    args: &serde_json::Value,
+    statuses: &'a [ThreadStatus],
+) -> crate::core::store::StatusFilter<'a> {
+    if !statuses.is_empty() {
+        crate::core::store::StatusFilter::OneOf(statuses)
+    } else if let Some(want) = args.get("active").and_then(|v| v.as_bool()) {
+        crate::core::store::StatusFilter::Active(want)
+    } else {
+        crate::core::store::StatusFilter::Any
     }
 }
 

@@ -18,11 +18,14 @@ export interface ThreadSummary {
   total_children_count: number;
   /** 'idle' | 'running' | 'waiting' | 'paused' | 'failed' |
    *  'waiting_for_user_answer'.
-   *  Active = 'running' | 'waiting_for_user_answer' (the agentic loop is
-   *  mid-flow). `waiting` is NOT active — it means the coding agent has stopped and
-   *  proposed changes the user must act on; the loop has paused. Neither is
-   *  `paused`, which means an engine restart interrupted the turn: it either
-   *  resumes on its own or offers the user a Continue button. */
+   *  Active is the UNION 'running' | 'waiting_for_user_answer', which groups two
+   *  opposite situations: 'running' is the workspace working, while
+   *  'waiting_for_user_answer' is the workspace stopped and waiting on a person.
+   *  Filter on 'running' alone to ask whether anything is busy. `waiting` is in
+   *  neither: it means the coding agent has stopped and proposed changes the
+   *  user must act on. Neither is `paused`, which means an engine restart
+   *  interrupted the turn: it either resumes on its own or offers the user a
+   *  Continue button. */
   status: string;
   coding_agent_has_diff: boolean;
   coding_agent_proposed: boolean;
@@ -43,11 +46,21 @@ export interface ThreadSummary {
 }
 
 export interface ThreadsListOptions {
-  /** When true, return only threads whose `status` indicates the agentic
-   *  loop is still running (`running` / `waiting_for_user_answer`).
-   *  `waiting` is NOT active — it means the coding agent has stopped and proposed
-   *  changes the user must act on; the loop has paused. */
+  /** The UNION of `running` and `waiting_for_user_answer`. `true` selects it,
+   *  `false` inverts it, omitting it filters nothing.
+   *
+   *  For "is the workspace busy?" pass `status: 'running'` instead: a thread
+   *  awaiting a user answer is blocked on the human, not working, so it is in
+   *  this union while being the opposite of busy. `waiting` is in neither: it
+   *  means the coding agent has stopped and proposed changes the user must act
+   *  on. Mutually exclusive with `status`. */
   active?: boolean;
+  /** Comma-separated status filter naming exactly the statuses to keep, in the
+   *  same spelling each returned row's `status` field carries: `idle`,
+   *  `running`, `waiting`, `waiting_for_user_answer`, `paused`, `failed`. The
+   *  precise form of `active`, and mutually exclusive with it. An unrecognized
+   *  or empty value is a 400, never a silently empty or unfiltered result. */
+  status?: string;
   /** Comma-separated source filter (`chat`, `trigger`, `coding-agent`).
    *  Legacy `claude_code` is also accepted. */
   source?: string;
@@ -65,6 +78,13 @@ function buildListQuery(opts?: ThreadsListOptions): string {
   if (!opts) return '';
   const params = new URLSearchParams();
   if (opts.active !== undefined) params.set('active', String(opts.active));
+  // `!== undefined`, not truthiness: an empty `status` is a 400 by contract,
+  // and dropping it here would answer "everything" to a caller whose filter
+  // came out blank, which is the exact silent broadening this filter exists to
+  // prevent. `source` keeps its truthiness check on purpose: a blank `source`
+  // collapses to "no filter" server-side (`parse_source_filter`), so there the
+  // two agree.
+  if (opts.status !== undefined) params.set('status', opts.status);
   if (opts.source) params.set('source', opts.source);
   if (opts.limit !== undefined) params.set('limit', String(opts.limit));
   if (opts.parent) params.set('parent', opts.parent);

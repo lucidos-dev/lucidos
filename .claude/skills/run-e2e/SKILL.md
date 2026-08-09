@@ -25,6 +25,13 @@ rather than stack. So if `./scripts/e2e.sh` exits non-zero with an
 lock doing its job — investigate/clean up the prior run; do NOT retry-loop to
 force a launch.
 
+**Waiting for the lock is free, so never sleep on it.** Subscribe with
+`lucidos await-event --on E2ELockReleased` and end your turn; the engine
+re-opens the thread when the holder releases. The `e2e-lock-wait` skill has the
+full rules, including how to pick the timeout and the two cases where nothing
+will wake you. A `sleep`/retry loop around the entry script is the anti-pattern
+it exists to replace.
+
 ## Four phases
 
 1. **API** — `cargo test -p lucidos-e2e --test api`.

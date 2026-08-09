@@ -118,6 +118,11 @@ const SETTINGS_SEARCH_INDEX: SettingsSearchEntry[] = [
   { id: 'appearance:ui-scale', label: 'UI scale', subview: 'appearance', path: 'Settings → Appearance & Behavior → Typography', anchor: 'appearance:ui-scale' },
   { id: 'appearance:mobile', label: 'Mobile', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:mobile', mobileOnly: true },
   { id: 'appearance:mobile-header-sticky', label: 'Keep header visible', subview: 'appearance', path: 'Settings → Appearance & Behavior → Mobile', anchor: 'appearance:mobile-header-sticky', mobileOnly: true },
+  // The current device's push switch, the same one its row in Devices carries.
+  // Both entries are kept: someone hunting "notifications" means the device they
+  // are holding, someone hunting "devices" means the fleet.
+  { id: 'appearance:notifications', label: 'Notifications', subview: 'appearance', path: 'Settings → Appearance & Behavior', anchor: 'appearance:notifications', keywords: 'notifications push alerts banners this device' },
+  { id: 'appearance:push-notifications', label: 'Push notifications', subview: 'appearance', path: 'Settings → Appearance & Behavior → Notifications', anchor: 'appearance:push-notifications', keywords: 'push notifications enable disable this device alerts banners buzz' },
   // No entry for the Links SECTION itself: it renders only when one of the two
   // rows below does, and `visible` ANDs its flags, so a section entry could not
   // express "iOS PWA OR Tauri" without a one-off predicate. The rows carry the

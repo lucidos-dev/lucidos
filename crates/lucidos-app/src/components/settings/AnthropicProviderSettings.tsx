@@ -4,6 +4,7 @@ import { Dropdown } from '../shared/Dropdown';
 import { submitNewCredential, deleteCredential } from '../../store/actions/credentials';
 import type { AuthType } from '../../store/types';
 import { findProviderCredential } from './providerCredential';
+import { Explainer } from '../shared/Explainer';
 
 const ANTHROPIC_SERVICE = 'anthropic';
 const ANTHROPIC_BASE_URL = 'https://api.anthropic.com';
@@ -52,6 +53,18 @@ export function AnthropicProviderSettings() {
       <div class="settings-row">
         <span class="settings-row-label">
           Anthropic (direct)
+          <Explainer title="Anthropic (direct)">
+            <p>
+              Direct Anthropic serves models on the <strong>anthropic</strong> provider
+              (e.g. Fable 5). Stored here, the secret is used instead of the{' '}
+              <strong>ANTHROPIC_API_KEY</strong> launch environment variable, which stays
+              as a fallback when nothing is set here.
+            </p>
+            <p>
+              OAuth subscription tokens are short-lived: if requests start failing with a
+              401, re-paste a fresh token here.
+            </p>
+          </Explainer>
           {/* `.list-row-details` is `display: flex`, so this span is a block box
               inside the label's line and renders UNDER it. A manual "·" glue
               would therefore be stranded at the start of that new line, the
@@ -92,13 +105,6 @@ export function AnthropicProviderSettings() {
         >
           {existing ? 'Update' : 'Save'}
         </button>
-      </div>
-      <div class="settings-row-note">
-        Direct Anthropic serves models on the <strong>anthropic</strong> provider (e.g. Fable 5).
-        Stored here, the secret is used instead of the <strong>ANTHROPIC_API_KEY</strong> launch
-        environment variable, which stays as a fallback when nothing is set here. OAuth
-        subscription tokens are short-lived: if requests start failing with a 401, re-paste a
-        fresh token here.
       </div>
     </>
   );

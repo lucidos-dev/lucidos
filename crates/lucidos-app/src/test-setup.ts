@@ -43,6 +43,17 @@ if (typeof globalThis.document === 'undefined') {
     },
   };
 }
+// There is no layout engine here, so nothing can be measured. Store modules
+// still read the root font size at load (the thread drawer's width floor is
+// derived from it), and an undefined global throws at import rather than
+// degrading. The stub answers the browser default; the pure
+// `computeMinDrawerWidth` is where the arithmetic is exercised at other roots.
+if (typeof (globalThis as any).getComputedStyle === 'undefined') {
+  (globalThis as any).getComputedStyle = () => ({
+    fontSize: '16px',
+    getPropertyValue: () => '',
+  });
+}
 function makeStorage(): Storage {
   const store: Record<string, string> = {};
   return {

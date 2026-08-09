@@ -20,6 +20,23 @@
        anchor flips exactly when the header layout it describes does. */
     :root {
         --app-header-bottom: var(--mobile-header-height, calc(2.75rem + env(safe-area-inset-top, 0px)));
+        /* The one height every mobile header row takes, whichever pane it
+           belongs to (see .mobile-header-row). The value is the tallest control
+           any of them carries, the Lucidos mark's tap target. */
+        --mobile-header-row-height: var(--header-mark-tap);
+        /* What the eye reads as the row's content: the drawn glyph run. The
+           buttons around each glyph are larger, and the mark's tap target is
+           larger still AND tunable, so neither is what the bar's breathing room
+           below the row can be measured from. See .mobile-dot-indicator. */
+        --mobile-header-glyph-box: var(--icon-size-lg);
+        /* The button around each of those glyphs. Named because two rules need
+           to agree on it: the buttons themselves, and the centred title's
+           reserve, which has to clear whichever button is nearest it. */
+        --mobile-header-icon-box: 1.75rem;
+        /* The pane dots, and the equal breathing room kept above and below
+           them. */
+        --mobile-dot-size: 0.3125rem;
+        --mobile-dot-gap: 0.375rem;
     }
 
     /* iOS long-press near container edges auto-selects the nearest block
@@ -447,41 +464,77 @@
        .thread-content (scroll container) so it swipes with the pane. */
     .app-header[data-mobile-view="content"] .mobile-content-header { display: flex; }
 
-    /* Row inside each mobile header — holds icons + title */
+    /* Row inside each mobile header (icons + title).
+
+       A fixed HEIGHT, not a min-height, so all three rows are the same height
+       by construction rather than by coincidence. Under a min-height each row
+       was as tall as its own tallest IN-FLOW control, and the threads row alone
+       carried the Lucidos mark in flow while the thread pane's sat in the
+       absolutely-positioned .header-nav-cluster and contributed nothing. So the
+       threads row stood 0.1rem taller than the other two, visibly, and the
+       header changed height as the user swiped between panes, taking everything
+       anchored to --mobile-header-height with it. Every row's mark is in a
+       cluster now, which makes the three agree on their own; the fixed height
+       is what stops the next in-flow control from splitting them again.
+       Sized off the tallest control so nothing had to shrink to agree; a taller
+       control added later must raise this token with it. */
     .mobile-header-row {
         display: flex;
         align-items: center;
         width: 100%;
-        min-height: 2rem;
+        height: var(--mobile-header-row-height);
         gap: 0.25rem;
         position: relative;
     }
 
-    /* TRUE-centered on the row's middle (like the pane dots + the desktop
-       header) — absolute so it sits on the viewport axis regardless of the
-       leading (hamburger + nav / filter) and trailing (actions) cluster widths,
-       NOT midway between them (an in-flow title centers between the clusters, so
-       it drifts off the viewport middle whenever the two clusters differ in
-       width — the off-center look this replaces). A symmetric `max-width` reserve
-       keeps the centered box clear of BOTH clusters: at its widest the box spans
-       (reserve/2) in from each edge, so a long title clamps + ellipsizes with its
-       left edge just past the widest leading cluster instead of crossing it.
-       10.5rem (5.25rem/side) is sized for THIS row's leading cluster — hamburger
-       + the single Filter button, ending at ~4.25rem. The thread header's cluster
-       is wider (it carries the two nav chevrons too) and overrides below; keeping
-       the shared default narrow is deliberate, since every extra rem of reserve
-       is a rem the centered title loses to truncation on rows that never needed
-       it. pointer-events:none passes taps through to the clusters beneath (the
-       brand's visible children + the content title re-enable them below). The
-       single trailing .pane-header-spacer (flex:1) pins the clusters to the row
-       edges; search-active hides all non-searchbar children via the
+    /* The threads row's "Threads" title, and the only user of this class left:
+       the thread and content rows carry a centred nav CLUSTER instead
+       (styles/header-mark.css), which is centred the same way for the same
+       reason but sized by its own span.
+
+       TRUE-centered on the row's middle (like the pane dots and the desktop
+       header), absolute so it sits on the viewport axis regardless of the
+       leading (filter) and trailing (search) cluster widths, NOT midway
+       between them: an in-flow title centers between the clusters, so it drifts
+       off the viewport middle whenever the two differ in width, which is the
+       off-center look this replaces. A symmetric `max-width` reserve keeps the
+       centered box clear of what flanks it, so a long title clamps and
+       ellipsizes at that edge instead of crossing it.
+
+       The binding neighbour is this row's Lucidos MARK, which no longer rides
+       the trailing icon run: it sits on the nav cluster's trailing edge, the
+       forward chevron's column on the other two panes. So the reserve is
+       derived from that cluster rather than from a constant rem, and it is one
+       subtraction of it: the title may span the cluster less a mark's button
+       and its clearance at each end. A rem constant would only agree with the
+       mark at one ui-scale, since the cluster's own width is clamped against
+       the row (at 150% the pair used to kiss). Clearing the mark clears the
+       row's own edges with it, on the clamp's middle arm for free: there the
+       cluster keeps --header-nav-edge-reserve (4rem) at each end, wider than
+       the Filter button leading it and the Search button trailing it. On the
+       min-span arm the ends keep only (row - 6.3rem)/2, which is the same
+       regime where the other two rows' chevrons reach their own edge controls,
+       and it is what --header-nav-min-span's note is about.
+
+       The title pays for the mark being further in: past ~137.5% ui-scale on a
+       375px phone the reserve is narrower than the word, so "Threads" starts
+       ellipsising where the old constant still fit it. That is honest rather
+       than a miss, the mark really is there, and it is the same thing the
+       content row's title does at those scales.
+
+       pointer-events:none passes taps through to the clusters beneath. The
+       single trailing .pane-header-spacer (flex:1) pins the in-flow clusters to
+       the row edges; search-active hides all non-searchbar children via the
        .mobile-header-row rule below. */
     .mobile-header-title {
         position: absolute;
         left: 50%;
         top: 50%;
         transform: translate(-50%, -50%);
-        max-width: calc(100% - 10.5rem);
+        max-width: calc(
+            var(--header-nav-cluster-width)
+            - 2 * (var(--mobile-header-icon-box) + var(--header-nav-gap))
+        );
         text-align: center;
         overflow: hidden;
         text-overflow: ellipsis;
@@ -493,45 +546,17 @@
         pointer-events: auto;
     }
 
-    /* Brand: keep overflow visible so the update badge (a relative, upward-nudged
-       dot over "Lucidos") isn't clipped. Bound the inner label to the centered
-       box so a long workspace name TRUNCATES within it (the .workspace-name-label
-       already ellipsizes) rather than spilling past the box over the leading
-       icons — the brand's own no-overlap guarantee.
-
-       Wider reserve than the shared default, because THIS row's leading cluster
-       is wider: thread-drawer toggle + the two nav chevrons, ending at 5.75rem (measured;
-       constant across ui-scale and both engines, since every part of it is
-       rem-sized). The shared 10.5rem only insets to 5.25rem, so the no-overlap
-       guarantee inverted exactly when it engaged — a brand long enough to hit
-       the clamp painted 0.5rem under the chevrons. 12rem lands the clamped edge
-       at 6rem, one row gap (0.25rem) clear, and matches the
-       `.mobile-content-title` pre-measure fallback below. The 6rem per side has
-       to clear this row's TRAILING cluster too, now that the hamburger sits at
-       that edge (menu drawer, mirroring the thread-drawer toggle at the leading
-       edge): compose + search + menu span 5.75rem in from the row's right edge
-       (3 buttons at 1.75rem, 2 gaps at 0.25rem), the same one-row-gap clearance
-       the leading side gets. Both sides are tight now, so a fourth button on
-       either one needs the reserve widened;
-       `e2e/mobile-threads-title-alignment.spec.ts` pins both edges. Scoped to
-       the brand so
-       the Threads row (just the one Filter button) keeps its full title
-       width. */
-    .pane-header-brand.mobile-header-title {
-        overflow: visible;
-        max-width: calc(100% - 12rem);
-    }
-
-    .pane-header-brand.mobile-header-title .pane-header-brand-label {
-        max-width: 100%;
-        min-width: 0;
-    }
+    /* No `.pane-header-brand` rules here any more. That was the mobile thread
+       row's "Lucidos" label with its wider reserve, and the row carries the
+       Lucidos MARK in the centred nav cluster instead now (see
+       styles/header-mark.css). `.pane-header-brand` still exists, but only as
+       desktop markup (AppHeader.tsx), which no mobile rule should be sizing. */
 
     /* Mobile header slot — square so hamburger/nav/search line up. Drawer
      * rows are sized separately in drawer.css. */
     .mobile-header-row .icon-btn.header-icon {
-        width: 1.75rem;
-        height: 1.75rem;
+        width: var(--mobile-header-icon-box);
+        height: var(--mobile-header-icon-box);
     }
 
     /* Title-bar copy/pin: height matches the title text (~1.14rem) so the
@@ -559,23 +584,9 @@
         padding: 0.375rem;
     }
 
-    .mobile-nav-slot {
-        display: flex;
-        align-items: center;
-        flex-shrink: 0;
-        gap: 0.25rem;
-    }
-
     /* The threads Filter button just packs to the left edge; the title is
        absolutely centered on the row middle (see .mobile-header-title), so the
        titles line up across panes with no fixed leading-width reservation. */
-
-    .mobile-nav-slot .content-back-btn,
-    .mobile-nav-slot .content-forward-btn,
-    .mobile-nav-slot .thread-nav-btn {
-        width: 1.375rem;
-        height: 1.75rem;
-    }
 
     /* The absolutely-centered title is pointer-events:none, so lift the content
        action cluster into its own stacking context: if a long content title
@@ -588,39 +599,20 @@
     }
 
     .mobile-content-title {
-        /* Box geometry MEASURED in JS: useHeaderActionCollapse's mobile branch
-           publishes `--mobile-content-title-max` and `--mobile-content-title-shift`
-           on `.mobile-header-row` (the title reads both via inheritance). A
-           constant rem reserve cannot clear the trailing cluster
-           (refresh/open/fullscreen/notifications, plus file toggles) at every
-           ui-scale, because the cluster is rem-sized while the viewport is a fixed
-           device width, so the safe centered width shifts with scale AND with how
-           many actions the content view carries. The hook first collapses the
-           nearest-title actions into the ⋮ overflow menu to widen this box so the
-           full title shows centered; failing that it slides the box off centre
-           (the shift) into whichever side has slack, since the symmetric reserve
-           is sized off the NEARER cluster and a view with no context actions
-           strands the whole trailing half; only when even the full span between
-           the clusters can't host it does this clamp truncate the title rather
-           than let it paint under the icons. The fallback (pre-measure /
-           a display:none layout copy) keeps the old reserve and no shift.
-           Inherits overflow/ellipsis from .mobile-header-title.
+        /* No width of its own: the title is the one shrinkable member of the
+           fixed-width `.header-title-cluster` (styles/header-mark.css), so the
+           span between the chevrons IS its bound and flexbox applies it.
 
-           Positioned edge-to-edge with auto margins rather than inheriting that
-           rule's `left: 50%`: an absolutely positioned box with `left` set and
-           `right: auto` shrink-to-fits against the containing block MINUS `left`,
-           so a row-centered title silently caps at HALF the row. The symmetric
-           reserve never reached that cap; a shifted box spanning most of the row
-           does, and would have re-truncated exactly the title this shift exists
-           to show. Auto margins centre it on the row middle identically, then the
-           shift offsets it (overriding the shared translate, which is why the
-           -50% Y half is repeated here). */
-        left: 0;
-        right: 0;
-        width: fit-content;
-        margin-inline: auto;
-        transform: translate(var(--mobile-content-title-shift, 0px), -50%);
-        max-width: var(--mobile-content-title-max, calc(100% - 12rem));
+           This used to be a JS-measured box. The hook read the row, folded
+           trailing actions into the overflow menu until the full title fit, and
+           published `--mobile-content-title-max` plus a `--mobile-content-title-shift`
+           that slid the box into whichever side had slack. All of that existed
+           because a variable-width title faced a variable-width trailing
+           cluster and a constant rem reserve cannot clear one at every
+           ui-scale. Both variables are gone: the cluster always collapses to
+           the overflow menu plus the bell (ContentHeaderActions), and the
+           chevrons are pinned to a clamped span, so the bound is expressible in
+           CSS and the measurement was deleted with the properties it published. */
         /* Bare text node (no element child for `.mobile-header-title > *` to
            re-enable), so re-enable pointer events here — the tap tooltip
            (data-tooltip-tap) reveals the full truncated title. Safe: the action
@@ -804,7 +796,11 @@
         pointer-events: auto;
     }
 
-    :root[data-keyboard-active] .mobile-dot-indicator {
+    /* The DOTS as well as the band: the band is `pointer-events: none` in its
+       own right now (it overlaps the row's buttons), so the dots re-enable
+       theirs, and an ancestor-only rule here would no longer reach them. */
+    :root[data-keyboard-active] .mobile-dot-indicator,
+    :root[data-keyboard-active] .mobile-dot {
         pointer-events: none;
     }
 
@@ -890,10 +886,24 @@
     .edge-swipe-left  { left: 0; width: 2.5rem; }
     .edge-swipe-right { right: 0; width: 1.25rem; }
 
-    /* Use ::before pseudo-elements as flex-child spacers instead of padding-top
-       so the header space is a real element in the layout flow. */
+    /* The mobile header is position:fixed over the panes, so EVERY scroll
+       container a pane shows has to reserve its height itself. Use ::before
+       pseudo-elements as flex-child spacers instead of padding-top so the
+       header space is a real element in the layout flow.
+
+       `.thread-filter-panel` is on this list because it COVERS
+       `.thread-drawer-list` (see ThreadFilterPanel) rather than rendering
+       inside it, so it inherits nothing from the list's spacer and its first
+       row lands behind the header without one. The panel is the scroller
+       itself, so its spacer is its first scrolling child, exactly as the
+       list's is. (It briefly was not: it spent a day as a flex column with a
+       pinned Close footer and an inner scrolling body, which is why this
+       paragraph has been rewritten twice. The footer is gone; the header's
+       Filter button is the way out.) Any future view that covers a pane the
+       same way joins this list. */
     .mobile-swipe-pane .content-pane-body::before,
     .mobile-swipe-pane .thread-drawer-list::before,
+    .mobile-swipe-pane .thread-filter-panel::before,
     .mobile-swipe-pane .thread-content::before {
         content: '';
         display: block;
@@ -1221,15 +1231,52 @@
         display: flex;
         justify-content: center;
         align-items: center;
-        gap: 0.375rem;
-        margin-top: -0.25rem;
-        padding-bottom: 0.375rem;
+        gap: var(--mobile-dot-gap);
         width: 100%;
+        /* Equal breathing room above and below the dots, DERIVED rather than
+           hand-tuned. The band is pulled up over two things: the header column's
+           own row gap, and the air the row keeps below its glyph run. That air
+           is half the difference between the row's height and the glyphs in it,
+           and the row is as tall as the Lucidos mark's TAP TARGET, which is a
+           style-remote tunable much larger than any glyph. So the old
+           `-0.25rem / 0.375rem` pair was only balanced at the mark's shipped
+           size: retuned to 2.6rem it left 13.5px above the dots against 7.5px
+           below, and made the bar that much taller for nothing.
+
+           The pull puts the band's top edge on the glyph run's bottom edge, so
+           the two gaps below are the whole of what separates the dots from what
+           the user sees above them. */
+        margin-top: calc(
+            -1 * var(--pane-header-gap)
+            - (var(--mobile-header-row-height) - var(--mobile-header-glyph-box)) / 2
+        );
+        padding: var(--mobile-dot-gap) 0;
+        /* The band now overlaps the row's bottom, and the centred nav cluster in
+           that row is absolutely positioned, so it would paint over the middle
+           dot AND take its tap. Its own stacking context puts the dots back on
+           top. Same move .mobile-header-row .content-header-actions makes below,
+           for the same reason.
+
+           It costs the mark the bottom sliver of its own tap target, in the
+           one-dot-wide column the middle dot occupies. That is the right way
+           round: the mark's DRAWN glyph ends well above the dots, since its tap
+           target is deliberately larger than the glyph and is tunable on top of
+           that, and the alternative is a middle dot that cannot be tapped at
+           all. */
+        position: relative;
+        z-index: 1;
+        /* …and the rest of the band, which is full-width and empty, must NOT
+           take anything: raised over the row, its box covers the bottom few
+           pixels of every icon button in it, and a transparent div is a hit
+           target all the same. Measured: a tap on the drawer toggle's bottom
+           edge landed on this element. Only the dots are targets. */
+        pointer-events: none;
     }
 
     .mobile-dot {
-        width: 0.3125rem;
-        height: 0.3125rem;
+        pointer-events: auto;
+        width: var(--mobile-dot-size);
+        height: var(--mobile-dot-size);
         border-radius: 50%;
         border: none;
         padding: 0;

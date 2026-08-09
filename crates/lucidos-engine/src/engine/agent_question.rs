@@ -1024,11 +1024,36 @@ async fn resume_chat_after_answer(
             .unwrap_or(sub_tool_use_id);
         let mut answer_kinds: Vec<serde_json::Value> = Vec::new();
         let mut i = 0usize;
-        while let Ok(Some(a)) =
-            lookup_existing_answer(engine.pool(), thread_id, &synth_question_id(outer, i)).await
-        {
-            answer_kinds.push(a);
-            i += 1;
+        loop {
+            match lookup_existing_answer(engine.pool(), thread_id, &synth_question_id(outer, i))
+                .await
+            {
+                Ok(Some(a)) => {
+                    answer_kinds.push(a);
+                    i += 1;
+                }
+                Ok(None) => break,
+                // A DB error is NOT "no more sub-answers". `lookup_existing_answer`
+                // propagates precisely so a transient failure cannot be read as
+                // "no prior answer", and this used to be a `while let Ok(Some(..))`
+                // that collapsed the two: `build_hook_answers` then fills every
+                // index past the truncation with `(canceled)`, so the resumed model
+                // is told the user abandoned questions they had actually answered.
+                // Nothing above can retry (this path returns `()`), so stop and say
+                // so loudly rather than mislabel the answers silently.
+                Err(e) => {
+                    log!(
+                        "[Question] Sub-answer lookup failed for {} at index {}: {}. \
+                         Resuming with the {} answer(s) found so far; any later \
+                         question will read as (canceled) to the model",
+                        outer,
+                        i,
+                        e,
+                        answer_kinds.len()
+                    );
+                    break;
+                }
+            }
         }
         let answers_map = build_hook_answers(&answer_kinds, &questions);
         let result_str =
@@ -1097,10 +1122,13 @@ pub(crate) async fn emit_resume_marker_for_cc_answer(
     thread_id: Uuid,
     answer: &AnswerKind,
     actor: Option<MessageOrigin>,
-    // Which backend is processing the answer — CC via its PreToolUse hook,
-    // Codex via the `mcp__lucidos__ask_user_question` MCP tool. The marker
-    // must stamp the real backend or a Codex thread's Thinking placeholder
-    // would attribute the next turn to Claude Code.
+    // Which backend is processing the answer: CC via its PreToolUse hook or
+    // via the MCP tool its permission server also exposes, Codex via that same
+    // tool under its own mount name. The marker must stamp the real backend or
+    // a Codex thread's Thinking placeholder would attribute the next turn to
+    // Claude Code. The route does not decide the backend, which is why this is
+    // a parameter: all three names in `runtime::is_user_question_tool` reach
+    // the same endpoint.
     coding_agent: crate::runtime::CodingAgent,
 ) -> bool {
     if matches!(answer, AnswerKind::Canceled) {

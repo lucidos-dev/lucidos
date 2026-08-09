@@ -72,14 +72,14 @@ vi.mock('../../api/client', () => ({
 vi.mock('./notifications', () => ({ handleNotificationSSE: vi.fn() }));
 vi.mock('./chat-changes', () => ({ syncRestartToast: vi.fn(), addRestartGroup: vi.fn() }));
 vi.mock('./preferences', () => ({ loadPreferences: vi.fn() }));
-vi.mock('./push', () => ({ initPushSubscription: vi.fn() }));
+vi.mock('./push', () => ({ setDevicePushEnabled: vi.fn() }));
 // Default device id for this page; device-scoping tests vary the event's actor
 // against it. `./devices` is pulled in during the static import phase (via
 // `../store`), so the mock fn must be vi.hoisted — a plain const isn't
 // initialized yet when the hoisted factory runs.
 const { getDeviceId } = vi.hoisted(() => ({ getDeviceId: vi.fn(() => 'this-device') }));
-vi.mock('./devices', () => ({ getDeviceId, toggleDevicePush: vi.fn(), pendingDeviceRegistration: vi.fn() }));
-vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom: vi.fn() }));
+vi.mock('./devices', () => ({ getDeviceId, pendingDeviceRegistration: vi.fn() }));
+vi.mock('../../components/chat/scrollState', () => ({ followSentMessage: vi.fn(), stopFollowingBottom: vi.fn() }));
 // Mirrors the real predicate: a repo-encoded path is handled here, anything
 // else declines so the 'file' branch falls back to openFilePreview.
 const openEncodedRepoFilePreview = vi.fn((path: string) => path.startsWith('repo:'));

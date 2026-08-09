@@ -455,10 +455,30 @@
     border-radius: 0.375rem;
     padding: 0.5rem 0.875rem;
     min-height: 2.5rem;
-    /* Cap height so a long message can't grow past the viewport;
-       the body scrolls inside. `--app-height` keeps iOS Safari honest
-       when the keyboard pushes the visual viewport up. */
-    max-height: calc(var(--app-height, 100dvh) - 6rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    /* Cap height; the body scrolls inside (see .toast-body) and the actions row
+       + close X are siblings of it, so [Open] stays reachable without scrolling
+       to find it.
+
+       A toast is a SUMMARY with somewhere to go, never the place a long body is
+       read: for a notification the full text is one [Open] away in the content
+       pane, and for everything else the toast is the whole message and is short.
+       So the absolute 14rem leads (roughly six lines of body plus the actions
+       row), and the viewport term is only a ceiling under it, for a short screen
+       or an open keyboard. The viewport term ALONE is what shipped the bug: at
+       `100dvh - 6rem` a single Mac-memory-watchdog notification (which embeds a
+       `ps` command and a full metrics dump) rendered ~87% tall on a 390pt phone,
+       from under the header down to the composer. Desktop had the identical rule
+       and the identical unbounded growth; the cap is deliberately shared rather
+       than made a mobile override, because "a toast is a summary" is not a
+       phone-specific claim.
+
+       `--app-height` keeps iOS Safari honest when the keyboard pushes the visual
+       viewport up. Same min(absolute, viewport) shape as the prompt-bar popover
+       in chat/prompt-bar-popover.css. */
+    max-height: min(
+        14rem,
+        calc(var(--app-height, 100dvh) - 6rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px))
+    );
     color: var(--text-primary);
     font-size: var(--font-size-md);
     width: calc(100% - 2rem);
@@ -578,10 +598,11 @@
     margin-right: 1.375rem;
 }
 
+/* Layout comes from `.button-group` (shared-components.css), which wraps the
+   buttons onto a second row rather than letting them overflow the toast and be
+   clipped by its `overflow: hidden`. Only the alignment is the toast's own. */
 .toast-actions {
-    display: flex;
     justify-content: flex-end;
-    gap: 0.5rem;
 }
 
 .toast-close {

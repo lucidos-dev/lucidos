@@ -4,8 +4,9 @@ use crate::core::PreferenceStore;
 use crate::engine::command_guard::SideEffectCategory;
 use crate::engine::trigger_writes::TriggerWrite;
 use crate::triggers::{
-    is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
-    EventSubscription, TriggerConfig, TriggerRun, TriggerRunStatus,
+    is_valid_trigger_slug, normalize_route_setting, slugify_trigger_name_with_fallback,
+    validate_script_extension, validate_trigger_reasoning_effort, EventSubscription, TriggerConfig,
+    TriggerRun, TriggerRunStatus,
 };
 
 #[derive(Serialize)]
@@ -65,6 +66,14 @@ pub struct TriggerInfo {
     /// panel's "from \<plugin\>" chip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub plugin_id: Option<String>,
+    /// The **trigger model** this trigger's intent fires on. Absent = the
+    /// account `chat_model` preference (the "Default" option in the form).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort for this trigger's intent fires. Absent = the account
+    /// `chat_reasoning_effort` preference.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 impl TriggerInfo {
@@ -101,6 +110,8 @@ impl TriggerInfo {
             group_id: config.group_id.clone(),
             side_effect_grant: config.side_effect_grant.clone(),
             plugin_id: config.plugin_id.clone(),
+            model: config.model.clone(),
+            reasoning_effort: config.reasoning_effort.clone(),
         }
     }
 }
@@ -162,6 +173,17 @@ pub struct CreateTriggerCronRequest {
     /// irreversible side-effect. Unknown category strings 4xx via serde.
     #[serde(default)]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The **trigger model** this trigger's intent fires on. Omitted, null, or
+    /// blank = the account `chat_model` preference, which is what every trigger
+    /// did before the field existed. Not checked against the model registry:
+    /// see [`normalize_route_setting`].
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Reasoning effort for this trigger's intent fires. Omitted, null, or blank
+    /// = the account `chat_reasoning_effort` preference. Must be one of
+    /// `none|low|medium|high|xhigh|max`; anything else is a 400.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -181,10 +203,7 @@ pub struct UpdateTriggerCronRequest {
     #[serde(default)]
     pub on: Option<Vec<EventSubscription>>,
     /// None = field absent (don't change), Some(None) = explicitly null (clear), Some(Some(v)) = set.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_nullable::<String, _>"
-    )]
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub app_id: Option<Option<String>>,
     #[serde(default)]
     pub go_to_review: Option<bool>,
@@ -195,26 +214,22 @@ pub struct UpdateTriggerCronRequest {
     /// None = field absent (don't change), Some(None) = explicitly null (clear),
     /// Some(Some(v)) = set. The handler validates `v` against the in-memory
     /// trigger-group registry.
-    #[serde(
-        default,
-        deserialize_with = "deserialize_optional_nullable::<String, _>"
-    )]
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
     pub group_id: Option<Option<String>>,
     /// Full replacement for the **side-effect grant** (ADR 0002, Phase 5). None =
     /// field absent (don't change), Some(empty) = clear all grants, Some(non-empty)
     /// = replace with the new set. Unknown category strings 4xx via serde.
     #[serde(default)]
     pub side_effect_grant: Option<Vec<SideEffectCategory>>,
-}
-
-/// Deserialize a field that can be absent, null, or a value.
-/// Absent → None, null → Some(None), value → Some(Some(value))
-fn deserialize_optional_nullable<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-    T: Deserialize<'de>,
-{
-    Ok(Some(Option::<T>::deserialize(deserializer)?))
+    /// None = field absent (don't change), Some(None) = explicitly null (back to
+    /// the account `chat_model` preference), Some(Some(v)) = set. A blank string
+    /// clears too: blank is how the form's "Default" option travels.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub model: Option<Option<String>>,
+    /// Same triple state as [`Self::model`], validated against
+    /// `none|low|medium|high|xhigh|max`.
+    #[serde(default, deserialize_with = "crate::api::deserialize_some")]
+    pub reasoning_effort: Option<Option<String>>,
 }
 
 /// Validate a slug submitted in a `TriggerUpdated` request. Trims whitespace
@@ -401,6 +416,17 @@ pub(super) async fn create_trigger(
         payload["side_effect_grant"] = serde_json::to_value(&request.side_effect_grant)
             .expect("SideEffectCategory serialization is infallible");
     }
+    // Model / reasoning effort: only stamped when the user picked something
+    // other than Default, so a trigger on the account defaults keeps exactly the
+    // payload it had before the fields existed.
+    if let Some(model) = normalize_route_setting(request.model.as_deref()) {
+        payload["model"] = serde_json::json!(model);
+    }
+    match validate_trigger_reasoning_effort(request.reasoning_effort.as_deref()) {
+        Ok(Some(effort)) => payload["reasoning_effort"] = serde_json::json!(effort),
+        Ok(None) => {}
+        Err(e) => return ApiResult::err(e),
+    }
 
     // Through the trigger write chokepoint, not `emit_user_system`: the
     // registry must hold the new trigger before this 200 lands, or the
@@ -541,6 +567,18 @@ pub(super) async fn update_trigger(
     if let Some(ref grant) = request.side_effect_grant {
         update_payload["side_effect_grant"] =
             serde_json::to_value(grant).expect("SideEffectCategory serialization is infallible");
+    }
+    // Model / reasoning effort: same null-vs-absent semantics as app_id, so a
+    // rename-only save leaves the trigger's model alone while an explicit null
+    // (or the form's blank Default) clears it back to the account preference.
+    if let Some(v) = &request.model {
+        update_payload["model"] = serde_json::json!(normalize_route_setting(v.as_deref()));
+    }
+    if let Some(v) = &request.reasoning_effort {
+        match validate_trigger_reasoning_effort(v.as_deref()) {
+            Ok(normalized) => update_payload["reasoning_effort"] = serde_json::json!(normalized),
+            Err(e) => return ApiResult::err(e),
+        }
     }
 
     // Ensure trigger still has at least one firing mechanism after update

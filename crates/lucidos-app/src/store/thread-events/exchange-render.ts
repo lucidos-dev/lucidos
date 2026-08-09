@@ -3,7 +3,7 @@ import { hasVisibleText, isMeaningfulText, mergeAdjacentTextEvents } from '../ev
 import { AWAIT_EVENT_TOOL, describeWaitSubscription } from './event-waits';
 import { describeCCTool, describeEngineTool, exchangeHasCCContent, exchangeResponseText, exchangeUserMessage, fullCommandForCCTool, fullCommandForEngineTool } from './exchange';
 import { toolUseIdOf } from './exchange-grouping';
-import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isSwitchTeardownAbort } from './thread-event-types';
+import { IDLE_ENGINE_RESTART_INTERRUPT_REASON, isSwitchTeardownAbort, isUserStoppedWait } from './thread-event-types';
 import type { ExchangeStatus } from '../exchange-status';
 import type { ContextAssembledData, ContextCapture, ContextSection, ResponseEvent, Step, StepOutcome } from '../types';
 import type { Exchange } from './exchange';
@@ -747,35 +747,22 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
         break;
       }
       case 'EventWaitDelivered':
-      case 'EventWaitExpired':
-      case 'EventWaitCanceled': {
-        // Flip the card this resolves, matched by wait_id. A resolution can
-        // arrive in a LATER exchange than the row that armed it, since a
-        // subscription outlives its turn, in which case there is nothing here
-        // to flip.
+      case 'EventWaitExpired': {
+        // Both of these RESOLVE the arming row in place, matched by wait_id:
+        // same subject line, now carrying its outcome (and, for a delivery, the
+        // event that matched plus the jump to it). They enrich the row rather
+        // than relabelling it, which is why they are allowed to touch it at all.
         //
-        // A delivery and an expiry both wake the thread, so each already reads
-        // as its own turn further down and needs nothing more. A STOP is the
-        // one resolution with no wake, so when its row is not here it gets one
-        // of its own, at this position: that is the difference between the user
-        // seeing what was stopped at the moment it was stopped and seeing
-        // nothing at all. Exactly one row either way, so an arm-then-stop
-        // inside one exchange does not double up.
+        // Either can arrive in a LATER exchange than the row that armed it,
+        // since a subscription outlives its turn, in which case there is nothing
+        // here to resolve and nothing more to draw: both WAKE the thread, so the
+        // wake already reads as its own turn further down.
         const e = event as {
           wait_id: string;
           event_type?: string;
           event_id?: string;
-          on?: EventSubscription[];
-          reason?: string;
-          cause?: EventWaitCancelCause;
         };
-        const state =
-          event.type === 'EventWaitDelivered'
-            ? 'woke'
-            : event.type === 'EventWaitExpired'
-              ? 'timed_out'
-              : 'canceled';
-        let flipped = false;
+        const state = event.type === 'EventWaitDelivered' ? 'woke' : 'timed_out';
         for (const prior of events) {
           if (prior.type === 'event_wait' && prior.wait_id === e.wait_id) {
             prior.state = state;
@@ -783,27 +770,45 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
               prior.matched_event_type = e.event_type;
               prior.matched_event_id = e.event_id;
             }
-            if (state === 'canceled') prior.cause = e.cause;
-            flipped = true;
             break;
           }
         }
-        if (!flipped && state === 'canceled') {
-          events.push({
-            type: 'event_wait',
-            wait_id: e.wait_id,
-            // Self-contained on the event since 2026-08-07. An older row
-            // carries neither, and the row then names no subscription rather
-            // than inventing one.
-            subscription: e.on ? describeWaitSubscription(e.on) : '',
-            reason: e.reason ?? '',
-            // The deadline died with the subscription, so there is nothing to
-            // count down to. The row renders its note, not a countdown.
-            expires_at: '',
-            state: 'canceled',
-            cause: e.cause,
-          });
-        }
+        break;
+      }
+      case 'EventWaitCanceled': {
+        // **A stop never rewrites the arming row.** "Set up an event wait: X" is
+        // a true statement about a moment, and a stop is a different action at a
+        // different moment, routinely hours later. Flipping the row in place
+        // relabelled it "Stopped waiting: X" and left that struck line sitting
+        // above the agent's own "I'm now watching for X" prose, with nothing
+        // anywhere saying when the watch actually ended (reported 2026-08-07).
+        //
+        // Where the stop DOES appear depends on who stopped it. A user stop is a
+        // boundary and renders as its own turn (see `isExchangeStartEvent`), so
+        // it draws no row here at all. Every other cause is somebody acting
+        // inside a turn, most sharply the agent standing its own watch down, and
+        // gets a row at the position it happened.
+        if (isUserStoppedWait(event)) break;
+        const e = event as {
+          wait_id: string;
+          on?: EventSubscription[];
+          reason?: string;
+          cause?: EventWaitCancelCause;
+        };
+        events.push({
+          type: 'event_wait',
+          wait_id: e.wait_id,
+          // Self-contained on the event since 2026-08-07. An older row carries
+          // neither, and the row then names no subscription rather than
+          // inventing one.
+          subscription: e.on ? describeWaitSubscription(e.on) : '',
+          reason: e.reason ?? '',
+          // The deadline died with the subscription, so there is nothing to
+          // count down to. The row renders its note, not a countdown.
+          expires_at: '',
+          state: 'canceled',
+          cause: e.cause,
+        });
         break;
       }
       case 'CommandCheckpointReverted': {
@@ -917,10 +922,12 @@ export function exchangeResponseEvents(exchange: Exchange, _isLast = true, threa
  *  deciding whether a panel is worth showing wants this; a caller asking
  *  whether the turn produced events wants `length`.
  *
- *  A `step` / `event_wait` counts as drawn even though `renderResponseEvents`
- *  gates those on the `showSteps` toggle: with one present, the body always
- *  renders the "Show steps" button (`getEventToggleState`'s `showStepsToggle` is
- *  that same `some(...)`), so the panel is neither empty nor a dead end. */
+ *  An `event_wait` counts as drawn because it IS drawn: it is a marker, not step
+ *  mechanics (`isStepMechanics`), so no toggle can hide it. A `step` counts even
+ *  though `renderResponseEvents` gates it on the `showSteps` toggle, because one
+ *  present means the body renders the "Show steps" button that reveals it
+ *  (`getEventToggleState`'s `showStepsToggle` is that same predicate), so the
+ *  panel is neither empty nor a dead end. */
 export function hasRenderableResponseContent(events: ResponseEvent[]): boolean {
   return events.some(e => e.type !== 'text' || isMeaningfulText(e));
 }
@@ -1657,6 +1664,18 @@ export function exchangeStatus(exchange: Exchange, streamingBuffer: string, isLa
   // Only the LAST queued exchange shows "Queued" — earlier ones were superseded
   // by a newer message and are handled by the empty-non-last rule below
   // (→ 'done', renders as "Done ✓").
+  // A user stop is a boundary that states its own outcome, and nothing continues
+  // out of it: the wait is gone and the engine settles the thread rather than
+  // resuming anything. Terminal by construction, so it never spins "Requesting"
+  // while the thread is still `running` for an unrelated turn, and never falls
+  // through to the stale detector's "Aborted" once it settles.
+  //
+  // Placed AFTER the terminal-verdict arms above rather than first, defensively.
+  // Grouping deliberately does not make this boundary `current` (see
+  // `isExchangeStartEvent`), so it should hold no steps at all; if a future
+  // routing path ever lands a real `ResponseFailed` or abort in it, that
+  // terminal reports itself rather than being swallowed by this line.
+  if (isUserStoppedWait(exchange.userEvent)) return 'done';
   if (hasPriorActive && !hasSteps && !isCC && isLast) return 'queued';
   // CC idle → done. WaitingBanner handles the "can interact" state separately.
   if (isCCWaiting) return 'done';

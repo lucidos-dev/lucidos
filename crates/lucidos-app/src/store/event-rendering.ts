@@ -38,18 +38,33 @@ export function hasVisibleLiveStep(showSteps: boolean, collapsed: boolean, visib
   return showSteps && !collapsed && visibleEvents.some(e => e.type === 'step' && e.outcome === 'pending');
 }
 
-/** Determine which toggles (More/Less, Show/Hide steps) to show for an exchange.
+/** True when a rendered row is step **mechanics**: one line of the tool-by-tool
+ *  log of how a turn did its work. Everything else a turn emits is a *transcript
+ *  marker* (`docs/glossary.md`): a section break, a generated image, a command
+ *  checkpoint with its Undo, an *event wait* row, the empty-response note. Each
+ *  records that a thing happened at a point in the transcript, rather than a
+ *  detail of how.
  *
- *  The event-wait row counts as a step here because it renders as one and is
- *  gated on the same `showSteps` flag. A turn whose only action was parking on
- *  an event has no `'step'` of its own (the row replaced it), so without this
- *  the row was hidden by the default-collapsed steps with no toggle to reveal
- *  it: the turn read as empty. */
+ *  The distinction is what the two hiding mechanisms are FOR, so both read it
+ *  here rather than each carrying its own list. "Show steps" hides mechanics;
+ *  the collapsed (Less) view drops mechanics and earlier prose to leave the
+ *  final answer. Hiding a marker is a different thing entirely: the fact goes
+ *  with it, and none of these is reachable anywhere else once it is gone.
+ *
+ *  The event-wait row is the case that proved it. It was classed as a step, so
+ *  it was hidden by a default-off toggle AND dropped by a collapse that kept
+ *  only two of the markers, and a parked thread showed no evidence anywhere in
+ *  the transcript that it had parked. */
+export function isStepMechanics(event: ResponseEvent): boolean {
+  return event.type === 'step';
+}
+
+/** Determine which toggles (More/Less, Show/Hide steps) to show for an exchange. */
 export function getEventToggleState(events: ResponseEvent[]): {
   showMoreToggle: boolean;
   showStepsToggle: boolean;
 } {
-  const hasSteps = events.some(e => e.type === 'step' || e.type === 'event_wait');
+  const hasSteps = events.some(isStepMechanics);
   const meaningfulTextCount = events.filter(isMeaningfulText).length;
   const showMoreToggle = hasSteps && meaningfulTextCount >= 2;
   const showStepsToggle = hasSteps;
@@ -57,8 +72,9 @@ export function getEventToggleState(events: ResponseEvent[]): {
 }
 
 /** Determine which events are visible when the exchange is collapsed.
- *  Keeps events from the last text block onwards, plus section_break and
- *  image events (lifecycle markers that must always be visible). */
+ *  Keeps events from the last text block onwards, plus every marker before it
+ *  (see `isStepMechanics`): the collapse drops the mechanics and the superseded
+ *  prose, never the record that something happened. */
 export function getCollapsedVisibleEvents(events: ResponseEvent[]): {
   visibleEvents: ResponseEvent[];
   needsFallback: boolean;
@@ -73,7 +89,7 @@ export function getCollapsedVisibleEvents(events: ResponseEvent[]): {
   let visibleEvents: ResponseEvent[];
   if (lastTextIdx >= 0) {
     const preserved = events.slice(0, lastTextIdx).filter(
-      e => e.type === 'section_break' || e.type === 'image'
+      e => e.type !== 'text' && !isStepMechanics(e)
     );
     visibleEvents = [...preserved, ...events.slice(lastTextIdx)];
   } else {

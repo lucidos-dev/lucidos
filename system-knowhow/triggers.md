@@ -193,6 +193,38 @@ A `send_notification` does **not** answer this question — notifications and re
 
 If the user's request doesn't clearly land in one of the rows above, **ask** — see Question 5 below. The flag is snapshotted onto each run when it fires; toggling it later only affects future runs.
 
+## Which model the run uses: `model` and `reasoning_effort`
+
+An intent trigger fires on the account chat defaults (Settings → Models →
+Chat & triggers) unless it says otherwise. Set `model` to pin it to a specific
+chat model and `reasoning_effort` to pin its thinking budget
+(`none|low|medium|high|xhigh|max`); omit either, or send null, to go back to the
+account default. The two are independent: pinning the model leaves the effort on
+the account setting, and the reverse.
+
+Script triggers have no model. They run no LLM, so both fields are ignored there
+and the form hides them.
+
+| User phrasing | What to set |
+|---|---|
+| "use something cheap for this", "it's just a digest" | a low-cost model, often with a low `reasoning_effort` |
+| "this one needs to be thorough", "use the best model" | the stronger model, and usually a higher `reasoning_effort` |
+| nothing about models | omit both, so the trigger follows the account default |
+
+Only pin a model when the user asked for one. A pinned trigger stops following
+the account default, so a workspace-wide model change no longer reaches it,
+which is the point when it is deliberate and a surprise when it is not.
+
+The model id is **not checked against the registry when you save**, the same as
+the `chat_model` preference: a model can be disabled or deleted long after the
+trigger was written. A wrong id therefore fails at fire time, as a normal
+trigger-failure notification, not at save time. Use `manage_models(action='list')`
+to see the real ids.
+
+The model and effort a run actually used are recorded on its `TriggerStarted`
+event, so the trigger's thread shows what it ran on and a follow-up there
+continues on the same model rather than snapping to the account default.
+
 ### Notification routing (`app_id`, `tap`, `event_id`)
 
 Three independent fields control the notification:
@@ -457,7 +489,8 @@ Don't claim "I'll delete it after it runs" without doing one of the above — se
 **The scheduler never reads this file.** `data/triggers/<slug>/trigger.toml` is a
 **derived read-model** of the trigger's definition, mirroring the durable subset
 of its config (`name`, `slug`, `schedule`, `timezone`, `run`, `on`, `app_id`,
-`go_to_review`, `group_id`, `side_effect_grant`). The engine maintains it from
+`go_to_review`, `group_id`, `side_effect_grant`, `model`, `reasoning_effort`).
+A trigger on the account chat defaults omits the last two. The engine maintains it from
 the trigger events — written on create/update, removed on delete, fully rebuilt
 from events on boot (ADR 0019). Runtime/identity fields (`id`, `last_run`,
 `last_run_status`, `paused`) are deliberately omitted. It is **not

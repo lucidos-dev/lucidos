@@ -10,9 +10,9 @@ export function focusIfNeeded(el: HTMLElement | null | undefined): void {
 }
 
 /** The currently focused prompt textarea, or null if focus is elsewhere.
- *  Reads document.activeElement directly — querying for the visible
- *  prompt-input then comparing races during viewport transitions when both
- *  SplitLayout and MobileSwipeContainer copies are briefly mounted. */
+ *  Reads document.activeElement directly rather than locating the visible
+ *  prompt-input and comparing: focus is exactly the question being asked, so the
+ *  active element answers it without depending on layout or measurement. */
 function activePromptInput(): HTMLElement | null {
   const el = document.activeElement as HTMLElement | null;
   return el?.dataset?.role === 'prompt-input' ? el : null;
@@ -26,11 +26,12 @@ export function isComposeFocusedHere(threadId: string): boolean {
 }
 
 /**
- * Find the visible prompt textarea. Both desktop (SplitLayout) and mobile
- * (MobileSwipeContainer) render PromptInput, creating two elements with
- * data-role="prompt-input". On mobile the desktop one is inside
- * `.content-row { display: none }` and has a 0x0 rect. We query all and
- * pick the one with non-zero dimensions.
+ * Find the visible prompt textarea. `App` mounts only the active layout's pane
+ * tree (SplitLayout on desktop, MobileSwipeContainer on mobile), so there is
+ * normally a single `data-role="prompt-input"` element. It can still be laid
+ * out at zero size (a collapsed thread pane, or a pane not measured yet), which
+ * is not the same as being the one to focus, so query them all, prefer one with
+ * real dimensions, and fall back to the last match.
  */
 export function getVisiblePromptInput(): HTMLElement | null {
   const els = document.querySelectorAll<HTMLElement>('[data-role="prompt-input"]');

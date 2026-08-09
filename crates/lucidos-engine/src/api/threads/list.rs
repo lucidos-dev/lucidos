@@ -11,7 +11,9 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::api::AppState;
-use crate::core::store::{EventStore, FilterFacets, ThreadSummary, ThreadSummaryFilters};
+use crate::core::store::{
+    EventStore, FilterFacets, StatusFilter, ThreadSummary, ThreadSummaryFilters,
+};
 
 #[derive(Deserialize)]
 pub struct ListThreadsQuery {
@@ -205,11 +207,25 @@ pub(in crate::api) async fn list_threads(
 /// and the args on the `list_threads` LLM tool.
 #[derive(Deserialize)]
 pub struct ListThreadSummariesQuery {
-    /// `true` → only threads whose status indicates the agentic loop is
-    /// mid-flow (`running`, `waiting_for_user_answer`). `false` → invert.
-    /// Omitted → no filter.
+    /// The UNION of `running` and `waiting_for_user_answer`. `true` selects it,
+    /// `false` inverts it, omitting it filters nothing.
+    ///
+    /// For "is the workspace busy?", use `status=running` instead: a thread
+    /// awaiting a user answer is blocked on the human, not working, so it is in
+    /// this union while being the opposite of busy. `waiting` is in neither: it
+    /// means the coding agent stopped and proposed changes the user must act on.
+    ///
+    /// Mutually exclusive with `status`, which is the precise form of the same
+    /// question.
     #[serde(default)]
     pub active: Option<bool>,
+    /// Comma-separated status filter, naming exactly the statuses to keep, in
+    /// the same spelling every returned row's `status` field carries (the
+    /// kebab form `waiting-for-user-answer` is accepted too). Mutually
+    /// exclusive with `active`. An unrecognized or empty value is a 400, never
+    /// a silently empty or unfiltered result.
+    #[serde(default)]
+    pub status: Option<String>,
     /// Comma-separated source filter: `chat`, `trigger`, `coding-agent`
     /// (`claude_code` is accepted as a legacy alias).
     #[serde(default)]
@@ -224,6 +240,50 @@ pub struct ListThreadSummariesQuery {
     /// caller's own id, from its ambient `thread_id`.
     #[serde(default)]
     pub parent: Option<String>,
+}
+
+/// Resolve the `active` / `status` query params into the single filter the
+/// store takes.
+///
+/// Sending both is a 400 rather than an intersection: they are two answers to
+/// one question, and quietly ANDing them would produce an empty result for
+/// `active=true&status=idle` and a redundant one for `active=true&status=running`,
+/// neither of which is what the caller asked. The message names the way out
+/// because the likely reason a caller reached for both is that `active` did not
+/// mean what they expected.
+fn parse_status_filter(
+    q: &ListThreadSummariesQuery,
+) -> Result<Vec<crate::engine::thread_lifecycle::ThreadStatus>, (StatusCode, String)> {
+    match (q.active, q.status.as_deref()) {
+        (Some(_), Some(_)) => Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Pass either active or status, not both. active is the union \
+                 (running, waiting_for_user_answer); status names exactly the \
+                 statuses you want, out of {}.",
+                crate::core::store::status_value_list()
+            ),
+        )),
+        (_, Some(raw)) => crate::core::store::parse_status_filter_csv(raw)
+            .map_err(|e| (StatusCode::BAD_REQUEST, e)),
+        (_, None) => Ok(Vec::new()),
+    }
+}
+
+/// Build the store filter from the already-validated pieces. Kept separate
+/// from [`parse_status_filter`] because `StatusFilter::OneOf` borrows the
+/// parsed vector, which has to outlive the query.
+fn status_filter<'a>(
+    active: Option<bool>,
+    statuses: &'a [crate::engine::thread_lifecycle::ThreadStatus],
+) -> StatusFilter<'a> {
+    if !statuses.is_empty() {
+        StatusFilter::OneOf(statuses)
+    } else if let Some(want) = active {
+        StatusFilter::Active(want)
+    } else {
+        StatusFilter::Any
+    }
 }
 
 /// Parse the `parent` query param. A malformed uuid is a 400 rather than a
@@ -277,12 +337,13 @@ pub(in crate::api) async fn list_thread_summaries(
 ) -> Result<Json<Vec<ThreadSummary>>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
     let parent = parse_parent_filter(&q.parent)?;
+    let statuses = parse_status_filter(&q)?;
     let limit = q.limit.unwrap_or(100).clamp(1, 1000);
     let summaries = state
         .engine
         .event_store()
         .list_thread_summaries(ThreadSummaryFilters {
-            active: q.active,
+            status: status_filter(q.active, &statuses),
             sources: sources.as_deref(),
             parent,
             limit,
@@ -340,14 +401,15 @@ pub(in crate::api) async fn count_thread_summaries(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let sources = parse_source_filter(&q.source);
     let parent = parse_parent_filter(&q.parent)?;
+    let statuses = parse_status_filter(&q)?;
     let count = state
         .engine
         .event_store()
         // The count handler reuses `ThreadSummaryFilters` for signature
-        // symmetry with the list handler — `limit` is irrelevant for a
+        // symmetry with the list handler: `limit` is irrelevant for a
         // COUNT(*) and the store helper ignores it.
         .count_thread_summaries(ThreadSummaryFilters {
-            active: q.active,
+            status: status_filter(q.active, &statuses),
             sources: sources.as_deref(),
             parent,
             limit: 0,
@@ -512,7 +574,22 @@ pub(in crate::api) async fn get_filter_facets(
 
 #[cfg(test)]
 mod tests {
-    use super::parse_source_filter;
+    use super::{
+        parse_source_filter, parse_status_filter, status_filter, ListThreadSummariesQuery,
+    };
+    use crate::core::store::StatusFilter;
+    use crate::engine::thread_lifecycle::ThreadStatus;
+    use axum::http::StatusCode;
+
+    fn query(active: Option<bool>, status: Option<&str>) -> ListThreadSummariesQuery {
+        ListThreadSummariesQuery {
+            active,
+            status: status.map(str::to_string),
+            source: None,
+            limit: None,
+            parent: None,
+        }
+    }
 
     #[test]
     fn parse_source_filter_normalizes_coding_agent_filter_value() {
@@ -532,5 +609,101 @@ mod tests {
     fn parse_source_filter_collapses_blank_to_none() {
         let raw = Some(" , ".to_string());
         assert_eq!(parse_source_filter(&raw), None);
+    }
+
+    #[test]
+    fn no_filter_params_narrows_nothing() {
+        let statuses = parse_status_filter(&query(None, None)).expect("no filter is valid");
+        assert!(matches!(status_filter(None, &statuses), StatusFilter::Any));
+    }
+
+    /// The union is what every pre-existing caller sends, and it has to keep
+    /// resolving to the same filter it always did.
+    #[test]
+    fn active_alone_still_resolves_to_the_union() {
+        for want in [true, false] {
+            let statuses =
+                parse_status_filter(&query(Some(want), None)).expect("active alone is valid");
+            match status_filter(Some(want), &statuses) {
+                StatusFilter::Active(got) => assert_eq!(got, want),
+                _ => panic!("active={want} must resolve to the union filter"),
+            }
+        }
+    }
+
+    #[test]
+    fn status_alone_resolves_to_exactly_those_statuses() {
+        let statuses =
+            parse_status_filter(&query(None, Some("running,failed"))).expect("a valid status list");
+        match status_filter(None, &statuses) {
+            StatusFilter::OneOf(got) => {
+                assert_eq!(got, [ThreadStatus::Running, ThreadStatus::Failed]);
+            }
+            _ => panic!("an explicit status list must not fall back to the union"),
+        }
+    }
+
+    /// The whole point of the filter: `status=running` must not drag in the
+    /// question-parked thread that `active=true` would.
+    #[test]
+    fn running_is_reachable_without_waiting_for_user_answer() {
+        let statuses = parse_status_filter(&query(None, Some("running"))).expect("valid");
+        assert_eq!(statuses, [ThreadStatus::Running]);
+        assert!(!statuses.contains(&ThreadStatus::WaitingForUserAnswer));
+    }
+
+    /// Two answers to one question. Silently ANDing them would make
+    /// `active=true&status=idle` an empty result that looks like "nothing
+    /// matched" rather than "you asked two things".
+    #[test]
+    fn active_and_status_together_is_refused() {
+        let (code, msg) = parse_status_filter(&query(Some(true), Some("running")))
+            .expect_err("both filters at once must be refused");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("not both"), "must say what is wrong: {msg}");
+        assert!(
+            msg.contains("waiting_for_user_answer"),
+            "must spell out what the union actually is: {msg}"
+        );
+    }
+
+    /// A typo that silently returned zero rows would read as "the workspace is
+    /// quiet", which is the exact failure this filter exists to prevent.
+    #[test]
+    fn an_unknown_status_is_refused_with_the_valid_values() {
+        let (code, msg) = parse_status_filter(&query(None, Some("runnign")))
+            .expect_err("a typo must not select nothing");
+        assert_eq!(code, StatusCode::BAD_REQUEST);
+        assert!(msg.contains("runnign"), "must echo the bad value: {msg}");
+        assert!(
+            msg.contains("running") && msg.contains("idle"),
+            "must list the valid values: {msg}"
+        );
+    }
+
+    /// An empty `status=` must not read as "no filter", which would answer a
+    /// question the caller did not ask with the whole workspace.
+    #[test]
+    fn an_empty_status_is_refused_rather_than_ignored() {
+        for raw in ["", "  ", "running,"] {
+            let (code, msg) = parse_status_filter(&query(None, Some(raw)))
+                .err()
+                .unwrap_or_else(|| panic!("status={raw:?} must be refused, not read as no filter"));
+            assert_eq!(code, StatusCode::BAD_REQUEST);
+            assert!(
+                msg.contains("running"),
+                "the refusal must list the valid values: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_kebab_spelling_selects_the_same_status() {
+        let kebab = parse_status_filter(&query(None, Some("waiting-for-user-answer")))
+            .expect("kebab spelling is accepted");
+        let snake = parse_status_filter(&query(None, Some("waiting_for_user_answer")))
+            .expect("the wire spelling is accepted");
+        assert_eq!(kebab, snake);
+        assert_eq!(kebab, [ThreadStatus::WaitingForUserAnswer]);
     }
 }

@@ -12,8 +12,9 @@ pub mod summary;
 /// re-export keeps trigger code reading in trigger terms.
 pub use crate::core::event_subscription::EventSubscription;
 pub use config::{
-    is_valid_trigger_slug, slugify_trigger_name_with_fallback, validate_script_extension,
-    TriggerConfig, TriggerRun, TriggerRunStatus,
+    is_valid_reasoning_effort, is_valid_trigger_slug, normalize_route_setting,
+    slugify_trigger_name_with_fallback, validate_script_extension,
+    validate_trigger_reasoning_effort, TriggerConfig, TriggerRun, TriggerRunStatus,
 };
 pub use groups::{
     find_group_by_name_ci, replay_trigger_group_events, TriggerGroup, TriggerGroupEventRow,
@@ -80,6 +81,8 @@ mod tests {
             group_id: None,
             side_effect_grant: vec![],
             plugin_id: None,
+            model: None,
+            reasoning_effort: None,
         }
     }
 
@@ -222,6 +225,8 @@ mod tests {
             group_id: None,
             side_effect_grant: vec![],
             plugin_id: None,
+            model: None,
+            reasoning_effort: None,
         };
         configs.insert("cron-only".into(), cron_trigger);
 

@@ -901,9 +901,13 @@ impl ClientAuth {
 /// evening it was set up and never again.
 ///
 /// So the value is credential data, one per registration, documented per
-/// provider in `system-knowhow/oauth-providers.md`. No provider name appears in
-/// this module (CLAUDE.md § "No provider-specific instructions in code"); the
-/// registry that knows them is knowhow the agent reads.
+/// provider in `system-knowhow/oauth-providers.md`. No provider-specific
+/// BEHAVIOR is coded here (CLAUDE.md § "No provider-specific instructions in
+/// code"): the flow sends whatever the credential stores, and the registry that
+/// knows the per-provider spellings is knowhow the agent reads. The names above
+/// are illustration, not dispatch. The one place this module still branches on a
+/// provider is the pre-existing [`provider_for_url`] host map, which is a
+/// deliberate exception and is not extended.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct AuthorizeParams(Vec<(String, String)>);
 

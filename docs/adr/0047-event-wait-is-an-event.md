@@ -114,6 +114,15 @@ exchange-start event on the frontend, so using it as the detached anchor makes
 the wake render as the new turn it genuinely is, with no new event type and no
 payload-aware exception in the exchange grouper.
 
+That last clause is about the DELIVERY path and stays true of it. The grouper
+did acquire one payload-aware exception later, on 2026-08-08, and it is a
+different question: a `EventWaitCanceled` whose `cause` is `user_stop` opens an
+exchange, so the person who pressed **Stop waiting** sees their own action where
+they took it rather than as a relabelling of the arming row hours above. Nothing
+resumes out of a stop, so the seamless-resume property this section is defending
+is not in play; every resolution that DOES wake the thread is still grouped
+exactly as described here. See `docs/glossary.md` § Event wait.
+
 **Re-arming a subscription is not re-running a turn.** Worth stating because the
 crash-safety gate in CLAUDE.md says a crashed engine keeps the manual Continue
 affordance rather than auto-resuming. That rule is about work that was RUNNING

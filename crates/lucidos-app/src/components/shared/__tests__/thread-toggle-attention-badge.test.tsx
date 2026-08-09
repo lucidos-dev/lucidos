@@ -11,7 +11,7 @@
  * must NOT badge, or the same number is claimed twice side by side.
  *
  * These tests invoke the components directly and walk the returned VNode tree
- * without descending into nested function components (ThreadNav, ControlPanel,
+ * without descending into nested function components (ThreadNav, HeaderMark,
  * ...), which use render-time hooks. Both components under test are hook-free at
  * their own level, so direct invocation is safe. The badge's semantics
  * (attention-only, excluding review / running) live in
@@ -23,7 +23,7 @@ import {
   ThreadToggleButton, threadListVisible, threadToggleBadgeCount,
 } from '../ThreadToggleButton';
 import { MOBILE_PANE_CONFIGS } from '../../layout/MobileAppHeader';
-import { HamburgerButton } from '../../layout/PanelNav';
+import { HamburgerButton } from '../../layout/ContentNav';
 import { mobileView, threadDrawerOpen, threadMap } from '../../../store/store';
 import { viewportIsMobile } from '../../../utils/viewport';
 import type { ThreadState, ThreadStatus } from '../../../store/thread-events';

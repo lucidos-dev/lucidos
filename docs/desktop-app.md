@@ -740,7 +740,12 @@ class of difference caused:
   `GET /api/v1/coding-agents/binaries` reports the live per-agent resolution
   (override / detected / path / not-found) for that Settings section — only
   explicit overrides persist; detection is recomputed per request so a brew
-  upgrade self-heals.
+  upgrade self-heals. It also runs `<binary> --version` on each resolution
+  that is valid (never on a `not-found` agent or an invalid override), parsing
+  the bare token out of whatever the CLI prints, so the row shows which
+  version is installed. Both agents are probed concurrently and the probe is
+  bounded (5s, `kill_on_drop`); any failure is logged and reported as an
+  absent `version`, never as a placeholder or a failed request.
 - **Bare `psql` works in coding-agent sessions.** `spawn_env::apply_lucidos_env`
   prepends `LUCIDOS_PG_BIN_DIR` (the bundled relocatable PG's `bin/`) to the
   subprocess PATH, matching what `workspace_script_env_vars` already did for

@@ -77,6 +77,33 @@ export function parseOptionValue(v: string): ComposeDestination {
   return { kind: 'lucidos-agent' };
 }
 
+/** The REPOSITORY a coding scope names, as a display string: the Lucidos source
+ *  is its registered repo name, an external repo is looked up in the registry,
+ *  an app has no repository at all (its thread is named by its folder, see
+ *  `composeDraftContextName`).
+ *
+ *  Two callers, and they have to agree or the row's chip blinks: the draft row
+ *  paints this while composing, and `sendCompose` binds it onto the promoted
+ *  thread's `meta.repoName` so the started row paints the same string from the
+ *  first frame. The bound value is a stand-in for the engine's `cc_repo_name`,
+ *  which arrives a round trip later and then wins (both `upsertThread` and
+ *  `applyAggregateToMeta` overwrite `repoName` when the server sends one), so a
+ *  repo renamed since the constant was written self-corrects rather than
+ *  sticking.
+ *
+ *  Undefined for an external repo until the registry loads. Both lists are
+ *  eager-loaded at startup, so that is a cold-start gap only. */
+export function scopeRepoName(
+  scope: Scope,
+  repos: readonly { id: string; name: string }[],
+): string | undefined {
+  switch (scope.kind) {
+    case 'lucidos': return LUCIDOS_SOURCE_REPO_NAME;
+    case 'external': return repos.find(r => r.id === scope.repoId)?.name || undefined;
+    case 'app': return undefined;
+  }
+}
+
 /** The repo/app context-name chip for a compose draft, mirroring
  *  `threadContextName` (which reads a started thread's bound `meta`) but taking
  *  the draft's resolved compose `Scope` (per-draft `resolveScope`, passed in by
@@ -84,22 +111,17 @@ export function parseOptionValue(v: string): ComposeDestination {
  *  undefined for a chat draft: a Lucidos thread carries no context chip, same as
  *  a started chat thread.
  *
- *  Resolution matches what started threads show: the Lucidos source → "Lucidos"
- *  (its repo name), an app → the app id (started app threads chip the id via
- *  `appIdFromFolder`, not the name), an external repo → its name from the repos
- *  list (undefined until the list loads — both lists are eager-loaded at
- *  startup, so this is only a cold-start gap). */
+ *  Resolution matches what started threads show: an app → the app id (started
+ *  app threads chip the id via `appIdFromFolder`, not the name), anything else
+ *  → the repository name (see `scopeRepoName`). */
 export function composeDraftContextName(
   mode: ComposeChannelMode,
   scope: Scope,
   repos: readonly { id: string; name: string }[],
 ): string | undefined {
   if (mode !== 'claude_code') return undefined;
-  switch (scope.kind) {
-    case 'lucidos': return LUCIDOS_SOURCE_REPO_NAME;
-    case 'app': return scope.appId;
-    case 'external': return repos.find(r => r.id === scope.repoId)?.name || undefined;
-  }
+  if (scope.kind === 'app') return scope.appId;
+  return scopeRepoName(scope, repos);
 }
 
 /** One-line consequence caption for the current destination — the compose

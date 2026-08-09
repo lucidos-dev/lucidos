@@ -705,11 +705,22 @@ html[data-theme="dark"] .split-button.open::before {
 /* History rows pair a leading type glyph (thread type for ThreadNav, content
  * category for PanelNav) with the destination label. Scoped to the history
  * menu so other `.dropdown-option` callers keep their plain block layout: the
- * icon holds a fixed column and the label flexes + ellipsizes beside it. */
+ * icon holds a fixed column and the label flexes + ellipsizes beside it.
+ *
+ * Set at --font-size-md rather than the picker-sized --font-size-xs the base
+ * `.dropdown-option` carries: these rows are destinations to read (thread and
+ * content titles), not a list of short setting values, so they match the
+ * .thread-row-title of the drawer list they navigate. The padding comes up with
+ * the type for the same reason: the base 0.25rem/0.5rem was set around 11px
+ * text, and left alone it puts a 13px title 4px from its neighbour above. The
+ * menu scrolls past `.dropdown-menu`'s max-height, so the taller rows cost
+ * reach, not entries. */
 .nav-history-menu .dropdown-option {
     display: flex;
     align-items: center;
     gap: 0.5rem;
+    padding: var(--space-sm) var(--space-md);
+    font-size: var(--font-size-md);
 }
 
 .nav-history-menu .dropdown-option .dropdown-option-label {
@@ -935,4 +946,119 @@ html[data-theme="dark"] .split-button.open::before {
     padding: 1rem 1rem 0.75rem;
     text-align: center;
     font-size: var(--font-size-md);
+}
+
+/* ── Explainer: the info icon and the dialog it opens ────────────────────────
+   The one affordance replacing paragraphs of muted prose that used to sit
+   permanently under the controls they describe (components/shared/Explainer.tsx,
+   docs/glossary.md § explainer). HOST-ONLY: it is built on <Overlay>, whose
+   machinery no app iframe has, so these classes are deliberately NOT in
+   shared-components.css and never reach /api/v1/sdk-iframe.css.
+
+   The dialog is deliberately the SAME chrome as .confirm-dialog (surface,
+   border, radius, shadow, and the --app-height-aware height cap that lets long
+   copy scroll inside rather than spill past the viewport on iOS). One dialog
+   look for the app; only the body typography differs, because an explainer's
+   copy is JSX with code spans and lists while a confirm's is one string. */
+.explainer-btn {
+    /* Rides .icon-btn for colour, hover, focus ring and svg sizing. Overrides
+       are only about sitting INSIDE a line of label text: no padding to push
+       the label away, and a small gap before it. `vertical-align: middle`
+       centres the glyph against the cap height of the label it follows.
+       `position: relative` is the anchor for the hit expander below. */
+    display: inline-flex;
+    position: relative;
+    padding: 0;
+    margin-left: 0.375rem;
+    vertical-align: middle;
+    color: var(--text-muted);
+}
+
+/* The glyph is --icon-size-sm (14px) and carries no padding, because padding
+   here would grow the line box of the label text it sits in and push settings
+   rows apart. That leaves a 14px target for a finger, and this is the primary
+   affordance on a phone. So the hit area is expanded by a transparent
+   pseudo-element instead, which is outside the box model and changes no layout:
+   14px + 2x8px = 30px. Deliberately not larger: the expander paints over
+   whatever is beside the icon, and on a checkbox row that is the label text the
+   reader taps to toggle, so every extra pixel is taken from that. */
+.explainer-btn::after {
+    content: '';
+    position: absolute;
+    inset: -0.5rem;
+}
+
+@media (hover: hover) {
+    .explainer-btn:hover {
+        /* .icon-btn's hover paints a background pad, which around a bare inline
+           glyph reads as a stray chip mid-sentence. Brighten the glyph instead. */
+        background: none;
+        color: var(--text-primary);
+    }
+}
+
+.explainer-dialog {
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-color);
+    border-radius: 0.5rem;
+    padding: 1.25rem 1.5rem;
+    max-width: 27.5rem;
+    width: 90%;
+    /* Same cap as .confirm-dialog: --app-height is set by MobileSwipeContainer
+       so iOS Safari shrinks correctly when the keyboard opens (raw 100vh does
+       not). The body scrolls inside it. */
+    max-height: calc(var(--app-height, 100dvh) - 4rem - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px));
+    display: flex;
+    flex-direction: column;
+    box-shadow: var(--shadow-md);
+}
+
+.explainer-title {
+    color: var(--text-primary);
+    font-size: var(--font-size-lg);
+    font-weight: 600;
+    margin: 0 0 var(--space-md);
+}
+
+/* The scrolling part: a long explainer keeps its title and its Close button
+   pinned while the copy scrolls, rather than the whole dialog outgrowing the cap. */
+.explainer-body {
+    color: var(--text-primary);
+    font-size: var(--font-size-md);
+    line-height: 1.5;
+    overflow-y: auto;
+    min-height: 0;
+}
+
+.explainer-body p {
+    margin: 0 0 var(--space-md);
+}
+
+.explainer-body p:last-child,
+.explainer-body ul:last-child {
+    margin-bottom: 0;
+}
+
+.explainer-body ul {
+    margin: 0 0 var(--space-md);
+    padding-left: 1.25rem;
+}
+
+.explainer-body li {
+    margin-bottom: var(--space-xs);
+}
+
+.explainer-body code {
+    font-family: var(--font-mono);
+    font-size: var(--font-size-sm);
+    background: var(--bg-tertiary);
+    padding: 0.0625rem 0.25rem;
+    border-radius: 0.1875rem;
+}
+
+.explainer-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin-top: 1.25rem;
+    flex-shrink: 0;
 }

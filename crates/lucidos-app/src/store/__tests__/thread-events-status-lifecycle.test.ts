@@ -736,7 +736,7 @@ describe('synthesizeContextCapture — legacy event projection', () => {
 
 describe('ChildThreadCompleted as exchange-starter', () => {
   it('is recognized as an exchange-starter', () => {
-    expect(isExchangeStartEvent('ChildThreadCompleted')).toBe(true);
+    expect(isExchangeStartEvent({ type: 'ChildThreadCompleted' })).toBe(true);
   });
 });
 

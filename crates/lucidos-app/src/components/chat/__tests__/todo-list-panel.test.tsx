@@ -38,7 +38,7 @@ function componentTypes(node: ComponentChildren): ComponentType[] {
 const NOOP = () => {};
 
 // ──────────────────────────────────────────────────────────────────────────
-// Indicator: hidden when no items, otherwise ONE checklist SVG icon (no
+// Indicator: hidden when no items, otherwise ONE ticked-checkbox SVG icon (no
 // count) whatever the state. The SVG is pixel-identical to the adjacent
 // ImageIcon because both inherit `.icon-btn.header-icon svg` sizing
 // (--icon-size-lg). State is carried by `data-state` and rendered as COLOR
@@ -120,11 +120,12 @@ describe('todoListIndicatorBody', () => {
     expect(text).toContain('1 of 3 done, 2 abandoned');
   });
 
-  it('renders the SAME checklist glyph in every state, so only the color differs', () => {
-    // The state must never switch the shape. The pair this replaced drew a
-    // checkbox for idle and a filled dome inside a checkbox for in-progress,
-    // and the second one read as nothing recognizable at 1.25rem. Whatever
-    // the agent is doing, the button has to keep saying "todo list".
+  it('renders the SAME ticked-checkbox glyph in every state, so only the color differs', () => {
+    // The state must never switch the shape. The pair this test was written
+    // against drew this same checkbox for idle and a filled dome inside a
+    // checkbox for in-progress, and the second one read as nothing
+    // recognizable at 1.25rem. Whatever the agent is doing, the button has to
+    // keep saying "todo list".
     const byState: Record<string, TodoItem[]> = {
       idle: [{ content: 'a', active_form: 'doing a', status: 'pending' }],
       'in-progress': [{ content: 'a', active_form: 'doing a', status: 'in_progress' }],

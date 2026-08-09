@@ -368,26 +368,25 @@ impl EventStore {
 
     /// Read-side helper for the script/trigger/LLM "list threads" surface.
     /// Returns newest-first by `last_activity`. `limit` is clamped by the
-    /// caller (HTTP layer / LLM tool) to 1..=1000. See [`ThreadSummaryFilters`]
-    /// for the `active` semantics.
+    /// caller (HTTP layer / LLM tool) to 1..=1000. See [`StatusFilter`] for
+    /// what the status narrowing means.
     pub async fn list_thread_summaries(
         &self,
         filters: ThreadSummaryFilters<'_>,
     ) -> Result<Vec<ThreadSummary>, Box<dyn std::error::Error + Send + Sync>> {
-        let active_statuses = active_thread_statuses();
+        let (statuses, negate) = filters.status.binds();
         let sql = format!(
-            "SELECT {} FROM thread_summaries t \
-             WHERE ($1::bool IS NULL \
-                    OR ($1 = TRUE AND t.status = ANY($2)) \
-                    OR ($1 = FALSE AND NOT (t.status = ANY($2)))) \
+            "SELECT {cols} FROM thread_summaries t \
+             WHERE {status} \
                AND ($3::text[] IS NULL OR t.source = ANY($3)) \
                AND ($5::uuid IS NULL OR t.parent_thread_id = $5) \
              ORDER BY t.last_activity DESC LIMIT $4",
-            THREAD_COLS.as_str(),
+            cols = THREAD_COLS.as_str(),
+            status = STATUS_FILTER_SQL,
         );
         let rows = sqlx::query_as::<_, ThreadRow>(&sql)
-            .bind(filters.active)
-            .bind(&active_statuses[..])
+            .bind(statuses)
+            .bind(negate)
             .bind(filters.sources)
             .bind(filters.limit)
             .bind(filters.parent)
@@ -399,27 +398,30 @@ impl EventStore {
     /// Same filters as [`Self::list_thread_summaries`], but returns the
     /// count only. Cheaper than fetching N rows just to take `.len()` on
     /// big workspaces. Reuses [`ThreadSummaryFilters`] for signature
-    /// symmetry with the list helper — `limit` is irrelevant for `COUNT(*)`
+    /// symmetry with the list helper: `limit` is irrelevant for `COUNT(*)`
     /// and is ignored here.
+    ///
+    /// The status predicate is [`STATUS_FILTER_SQL`], shared verbatim with the
+    /// list query, so a count can never disagree with the rows it is counting.
     pub async fn count_thread_summaries(
         &self,
         filters: ThreadSummaryFilters<'_>,
     ) -> Result<i64, Box<dyn std::error::Error + Send + Sync>> {
-        let active_statuses = active_thread_statuses();
-        let (count,): (i64,) = sqlx::query_as(
+        let (statuses, negate) = filters.status.binds();
+        let sql = format!(
             "SELECT COUNT(*)::bigint FROM thread_summaries t \
-             WHERE ($1::bool IS NULL \
-                    OR ($1 = TRUE AND t.status = ANY($2)) \
-                    OR ($1 = FALSE AND NOT (t.status = ANY($2)))) \
+             WHERE {status} \
                AND ($3::text[] IS NULL OR t.source = ANY($3)) \
                AND ($4::uuid IS NULL OR t.parent_thread_id = $4)",
-        )
-        .bind(filters.active)
-        .bind(&active_statuses[..])
-        .bind(filters.sources)
-        .bind(filters.parent)
-        .fetch_one(&self.pool)
-        .await?;
+            status = STATUS_FILTER_SQL,
+        );
+        let (count,): (i64,) = sqlx::query_as(&sql)
+            .bind(statuses)
+            .bind(negate)
+            .bind(filters.sources)
+            .bind(filters.parent)
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count)
     }
 

@@ -174,6 +174,32 @@ fn truthy(value: &str) -> bool {
     matches!(value.trim(), "1" | "true" | "yes" | "on")
 }
 
+// ---------------------------------------------------------------------------
+// Wire scheme (http vs https): the gateway's copy of the ONE rule.
+// ---------------------------------------------------------------------------
+//
+// A Lucidos process serves TLS iff BOTH `LUCIDOS_TLS_CERT` and `LUCIDOS_TLS_KEY`
+// point at non-empty paths. This mirrors `lucidos_engine::net_config`'s
+// `tls_scheme_from` exactly, and it has to: the gateway decides what scheme to
+// PROXY and HEALTH-PROBE a spawned engine on, while that engine decides what it
+// SERVES with the engine-side copy. A rule that differs here by so much as a
+// missing key is a scheme mismatch on a loopback hop, which is the recurring
+// `error sending request for url` bug (ADR 0014, `.claude/rules/rust.md`
+// § "Intra-host scheme"). Duplicated rather than shared because the gateway
+// links no engine code (ADR 0014 §1), so keep the two in step.
+
+/// Plain-HTTP scheme literal.
+pub const SCHEME_HTTP: &str = "http";
+/// TLS scheme literal.
+pub const SCHEME_HTTPS: &str = "https";
+
+/// Does a process configured with this cert/key pair serve TLS? True only when
+/// BOTH are present and non-empty: a set-but-empty value is how a launch script
+/// spells "unset", and treating it as TLS is what makes the two sides disagree.
+pub fn serves_tls(cert: Option<&str>, key: Option<&str>) -> bool {
+    matches!((cert, key), (Some(c), Some(k)) if !c.trim().is_empty() && !k.trim().is_empty())
+}
+
 /// Validate a user-supplied bind value for the control endpoint (server-side
 /// mirror of the picker's client-side validation).
 pub fn validate_bind_input(value: &str) -> Result<(), String> {
@@ -400,6 +426,24 @@ mod tests {
     fn parse_network_toml_defaults() {
         assert_eq!(parse_network_toml(""), NetworkToml::default());
         assert_eq!(parse_network_toml("garbage = = ="), NetworkToml::default());
+    }
+
+    /// The gateway's copy of the scheme rule must agree with the engine's
+    /// `tls_scheme_from` in every case, including the two that used to differ
+    /// here: a cert with no key, and a set-but-empty value. Disagreeing means
+    /// the gateway proxies https to an engine serving http.
+    #[test]
+    fn serves_tls_requires_both_cert_and_key_non_empty() {
+        assert!(serves_tls(Some("/c.pem"), Some("/k.pem")));
+        // A cert alone is NOT TLS: the engine needs both, so it would serve http.
+        assert!(!serves_tls(Some("/c.pem"), None));
+        assert!(!serves_tls(None, Some("/k.pem")));
+        assert!(!serves_tls(None, None));
+        // Set-but-empty (or whitespace) is how a script spells "unset".
+        assert!(!serves_tls(Some(""), Some("/k.pem")));
+        assert!(!serves_tls(Some("/c.pem"), Some("  ")));
+        // The two literals the caller picks between are the ones a peer speaks.
+        assert_eq!((SCHEME_HTTP, SCHEME_HTTPS), ("http", "https"));
     }
 
     #[test]

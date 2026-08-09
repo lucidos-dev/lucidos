@@ -2,15 +2,25 @@
  * Shared reader for the CSS source scans. Several suites pin a geometry
  * contract by asserting on the declarations a rule actually carries (the
  * below-header anchor, the per-pane toast columns, the transcript fades), and
- * each had grown its own byte-identical copy of these two functions.
+ * each had grown its own byte-identical copy of the two string functions.
  *
- * postcss is the right tool when a scan needs EVERY rule in a sheet, or the
- * at-rules a rule is nested inside (`hooks/useThreadScrollIndicator.test.ts`
- * parses that way, and `engine-served-css-parses.test.ts` uses it as the parse
- * gate for the engine-served sheet). These two are for the far commoner case:
- * one rule you can name, and a handful of its declarations.
+ * Two tools here, and picking the wrong one is the trap this header exists for.
+ *
+ * `block` + `decl` resolve the FIRST TEXTUAL match, which is right for the
+ * common case: one rule you can name, and a handful of its declarations. It is
+ * wrong the moment a sheet can override that rule elsewhere, because a first
+ * match reads neither an `@media` copy below it nor a compound selector that
+ * beats it on specificity, and both look like a passing scan.
+ *
+ * `cssRules` + `rulesTargeting` parse with postcss instead, and are the tool
+ * when the assertion is about a rule NOT being overridden anywhere, or about
+ * the at-rules a rule is nested inside. Nesting depth, comments and strings
+ * come out correct for free rather than by counting braces.
+ * (`engine-served-css-parses.test.ts` uses postcss directly, as a parse gate
+ * rather than a reader.)
  */
 import { expect } from 'vitest';
+import postcss, { type AtRule, type Container, type Declaration, type Document } from 'postcss';
 
 /** Body of the first rule/at-rule block whose header matches `needle`, starting
  *  the search at `from`. Brace-matched, so a nested block (a `:root` inside a
@@ -31,4 +41,79 @@ export function block(css: string, needle: string, from = 0): string {
 export function decl(body: string, prop: string): string | null {
   const m = body.match(new RegExp(`(?:^|[;{]|\\*/)\\s*${prop}:\\s*([^;]+);`));
   return m ? m[1].replace(/\s+/g, ' ').trim() : null;
+}
+
+/** One style rule, with the at-rule preludes it is nested inside. */
+export interface CssRule {
+  /** The rule's own selector list, whitespace-collapsed. */
+  selector: string;
+  /** `@media …` ancestors, outermost first, space-joined; empty at top level. */
+  atRules: string;
+  /** Declarations in source order as `prop: value`, joined by `; `. */
+  body: string;
+  /** The same declarations keyed by property, last one within the rule winning. */
+  props: Map<string, string>;
+}
+
+/** Every style rule in the sheet, in source order. */
+export function cssRules(css: string): CssRule[] {
+  const out: CssRule[] = [];
+  postcss.parse(css).walkRules(rule => {
+    const at: string[] = [];
+    for (let node: Container | Document | undefined = rule.parent; node; node = node.parent) {
+      if (node.type === 'atrule') {
+        const a = node as AtRule;
+        at.unshift(`@${a.name} ${a.params}`.trim());
+      }
+    }
+    const decls = rule.nodes.filter((n): n is Declaration => n.type === 'decl');
+    out.push({
+      selector: rule.selector.replace(/\s+/g, ' '),
+      atRules: at.join(' '),
+      body: decls.map(d => `${d.prop}: ${d.value}`).join('; '),
+      props: new Map(decls.map(d => [d.prop, d.value.replace(/\s+/g, ' ').trim()])),
+    });
+  });
+  return out;
+}
+
+/**
+ * Top-level combinators replaced by spaces, so the subject split below can be
+ * a plain space split. Depth-aware, so `:is(.a > .b)` keeps its inner
+ * combinator and `[class~="x"]` keeps its `~`.
+ */
+function flattenCombinators(selector: string): string {
+  let depth = 0;
+  let out = '';
+  for (const ch of selector) {
+    if (ch === '(' || ch === '[') depth++;
+    else if (ch === ')' || ch === ']') depth--;
+    out += depth === 0 && (ch === '>' || ch === '+' || ch === '~') ? ' ' : ch;
+  }
+  return out;
+}
+
+/**
+ * Every rule that styles the ELEMENT carrying `className`, in source order.
+ *
+ * The subject of a selector is its last compound, so this keeps
+ * `.a .target`, `.target.state` and a bare `.target` (all of which style the
+ * element) and drops `.target .child` (which styles a descendant) and
+ * `.target::-webkit-scrollbar` (which styles a pseudo-element, not the box).
+ * That distinction is the whole point: a scan asserting "nothing re-enables X"
+ * has to see the compound and descendant-combinator forms that outrank the
+ * bare rule, and must not trip over rules aimed at children.
+ *
+ * Split with postcss's own list tokenizers rather than `String.split`, which
+ * cannot tell a selector-list comma from one inside `:is(.a, .b)`.
+ */
+export function rulesTargeting(css: string, className: string): CssRule[] {
+  const token = new RegExp(`\\.${className.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![\\w-])`);
+  return cssRules(css).filter(rule =>
+    postcss.list.comma(rule.selector).some(one => {
+      const compounds = postcss.list.space(flattenCombinators(one));
+      const subject = compounds[compounds.length - 1] ?? '';
+      return !subject.includes('::') && token.test(subject);
+    }),
+  );
 }

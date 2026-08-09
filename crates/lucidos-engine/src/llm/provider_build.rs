@@ -242,6 +242,15 @@ const OPENAI_FALLBACK_SEARCH_MODEL: &str = "gpt-5.5";
 /// model id is meaningless to the search provider: handing OpenRouter's
 /// `z-ai/glm-5.2` to Anthropic's Messages API is a hard rejection, which would
 /// make the advertised fallback fail every time it was actually needed.
+///
+/// The reused chat model has its `[1m]` suffix stripped. That suffix is a
+/// Lucidos convention selecting the 1M-context beta, not part of any real model
+/// id: the chat path strips it in `build_claude_request` and sends the beta as a
+/// header instead. The one-shot search call has no such opt-in, so leaving the
+/// suffix on sends `claude-fable-5[1m]` (a seeded, direct-Anthropic builtin)
+/// verbatim to `/v1/messages`, which rejects it and drops the backend out of the
+/// chain. Routing is resolved on the FULL id, because that is how the registry
+/// rows are keyed.
 fn search_model_for(
     registry: &crate::llm::model_registry::ModelRegistry,
     provider: crate::llm::ProviderKind,
@@ -249,7 +258,9 @@ fn search_model_for(
     fallback: &str,
 ) -> String {
     if crate::llm::model_registry::provider_kind_for(registry, chat_model) == provider {
-        chat_model.to_string()
+        crate::llm::anthropic_wire::parse_context_suffix(chat_model)
+            .0
+            .to_string()
     } else {
         fallback.to_string()
     }
@@ -935,6 +946,38 @@ mod tests {
                 OPENAI_FALLBACK_SEARCH_MODEL
             ),
             "gpt-5.6-sol"
+        );
+    }
+
+    /// …but the `[1m]` suffix comes off first. It is a Lucidos marker for the
+    /// 1M-context beta, not part of a real model id, and the one-shot search
+    /// call has no beta to attach it to. `claude-fable-5[1m]` is a seeded
+    /// builtin that routes to direct Anthropic, so before this the whole
+    /// Anthropic search backend 404'd out of the chain for anyone using it.
+    #[test]
+    fn search_model_strips_the_lucidos_only_1m_suffix() {
+        let registry = crate::llm::model_registry::empty();
+        // `claude-fable*` routes to Anthropic through the prefix heuristic, so
+        // this is the reuse branch, suffix and all.
+        assert_eq!(
+            search_model_for(
+                &registry,
+                crate::llm::ProviderKind::Anthropic,
+                "claude-fable-5[1m]",
+                ANTHROPIC_FALLBACK_SEARCH_MODEL
+            ),
+            "claude-fable-5",
+            "the [1m] marker must never reach a provider API"
+        );
+        // A bare id is untouched.
+        assert_eq!(
+            search_model_for(
+                &registry,
+                crate::llm::ProviderKind::Anthropic,
+                "claude-fable-5",
+                ANTHROPIC_FALLBACK_SEARCH_MODEL
+            ),
+            "claude-fable-5"
         );
     }
 

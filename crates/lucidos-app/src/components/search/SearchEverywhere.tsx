@@ -152,6 +152,7 @@ export function SearchEverywhere() {
   const [recents, setRecents] = useState<SearchResultItem[]>([]);
   const inputRef = useRef<HTMLInputElement>(null);
   const resultsRef = useRef<HTMLDivElement>(null);
+  const tabsRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Delay the inline search spinner (300ms) so quick searches don't flash it.
@@ -234,6 +235,22 @@ export function SearchEverywhere() {
       inputRef.current.focus();
     }
   }, [isOpen]);
+
+  // Keep the active category visible in the horizontally scrolling tab strip.
+  // Tab / Shift+Tab cycles the categories, and past the second or third one the
+  // next tab is off the right edge on a phone, so the keystroke would otherwise
+  // change a category the user cannot see. `block: 'nearest'` keeps it from
+  // scrolling anything vertically.
+  //
+  // `isOpen` is a dependency because reopening is the OTHER way the strip and
+  // the active tab fall out of sync: only `close()` resets the category, and
+  // the two toggle paths (the header button, the keybinding) don't go through
+  // it, so a palette reopened after Tabbing to Triggers still has that
+  // category while the remounted strip is back at scrollLeft 0.
+  useEffect(() => {
+    const el = tabsRef.current?.querySelector('[data-role="search-tab-active"]');
+    el?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }, [category, isOpen]);
 
   // Scroll selected result into view
   useEffect(() => {
@@ -376,11 +393,12 @@ export function SearchEverywhere() {
             <CloseIcon />
           </button>
         </div>
-        <div class="search-everywhere-tabs">
+        <div class="search-everywhere-tabs" ref={tabsRef}>
           {CATEGORIES.map(cat => (
             <button
               key={cat.id}
               class={`search-everywhere-tab${cat.id === category ? ' active' : ''}`}
+              data-role={cat.id === category ? 'search-tab-active' : undefined}
               onClick={() => setCategory(cat.id)}
             >
               {cat.id === 'all' && !query ? 'Recent' : cat.label}

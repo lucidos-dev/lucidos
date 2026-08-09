@@ -452,3 +452,212 @@ async fn get_filter_facets_resolves_repo_names_including_deleted() {
 
     teardown_test_db(&db).await;
 }
+
+// ---------------------------------------------------------------------------
+// Status filter. `active` groups `running` with `waiting_for_user_answer`,
+// which are opposite answers to "is the workspace busy?": one is working, the
+// other is stopped and waiting on a person. These cover the precise form.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_status_filter_accepts_the_values_rows_actually_carry() {
+    let parsed = parse_status_filter_csv("running, waiting_for_user_answer ")
+        .expect("the wire spelling is what rows print");
+    assert_eq!(
+        parsed,
+        [ThreadStatus::Running, ThreadStatus::WaitingForUserAnswer]
+    );
+}
+
+/// The repo spells public parameter values in kebab-case, while the `status`
+/// field on every returned row is snake_case. Accepting both means a caller
+/// following either convention is right.
+#[test]
+fn parse_status_filter_accepts_the_kebab_spelling_too() {
+    assert_eq!(
+        parse_status_filter_csv("waiting-for-user-answer").expect("kebab is accepted"),
+        parse_status_filter_csv("waiting_for_user_answer").expect("snake is accepted")
+    );
+    assert_eq!(
+        parse_status_filter_csv("RUNNING").expect("case is not load-bearing"),
+        [ThreadStatus::Running]
+    );
+}
+
+/// Three shapes that must be errors rather than a quietly different answer: a
+/// typo would select nothing, an empty filter would select everything, and a
+/// stray comma hides either.
+#[test]
+fn parse_status_filter_refuses_what_it_cannot_honour() {
+    for raw in ["runnign", "", "  ", "running,", "running,,failed"] {
+        let err = parse_status_filter_csv(raw)
+            .expect_err("must not answer a question the caller did not ask");
+        assert!(
+            err.contains("running"),
+            "every refusal lists the valid values: {err}"
+        );
+    }
+}
+
+#[test]
+fn status_filter_binds_collapse_all_three_variants_onto_one_predicate() {
+    assert_eq!(StatusFilter::Any.binds(), (None, false));
+    assert_eq!(
+        StatusFilter::Active(true).binds(),
+        (Some(vec!["running", "waiting_for_user_answer"]), false)
+    );
+    assert_eq!(
+        StatusFilter::Active(false).binds(),
+        (Some(vec!["running", "waiting_for_user_answer"]), true)
+    );
+    assert_eq!(
+        StatusFilter::OneOf(&[ThreadStatus::Running]).binds(),
+        (Some(vec!["running"]), false)
+    );
+}
+
+async fn insert_thread_with_status(pool: &PgPool, title: &str, status: ThreadStatus) -> Uuid {
+    let id = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO thread_summaries \
+            (thread_id, title, source, message_count, last_activity, has_response, status) \
+         VALUES ($1, $2, 'chat', 0, NOW(), TRUE, $3)",
+    )
+    .bind(id)
+    .bind(title)
+    .bind(status.as_str())
+    .execute(pool)
+    .await
+    .expect("insert thread_summaries");
+    id
+}
+
+fn filters(status: StatusFilter<'_>) -> ThreadSummaryFilters<'_> {
+    ThreadSummaryFilters {
+        status,
+        sources: None,
+        parent: None,
+        limit: 1000,
+    }
+}
+
+/// The whole change, at the layer that decides it. A caller asking "is
+/// anything busy?" must not be handed the thread parked on a question: that
+/// thread is blocked on a human, and it is the state most likely to coincide
+/// with work piling up unannounced.
+#[tokio::test]
+async fn running_and_awaiting_a_user_are_selectable_apart_and_together() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    let running = insert_thread_with_status(&pool, "Working", ThreadStatus::Running).await;
+    let parked =
+        insert_thread_with_status(&pool, "Parked", ThreadStatus::WaitingForUserAnswer).await;
+    let proposed = insert_thread_with_status(&pool, "Proposed", ThreadStatus::Waiting).await;
+    insert_thread_with_status(&pool, "Done", ThreadStatus::Idle).await;
+
+    let ids = |summaries: Vec<ThreadSummary>| -> Vec<String> {
+        let mut out: Vec<String> = summaries.into_iter().map(|s| s.thread_id).collect();
+        out.sort();
+        out
+    };
+    let sorted = |mut v: Vec<Uuid>| -> Vec<String> {
+        let mut out: Vec<String> = v.drain(..).map(|id| id.to_string()).collect();
+        out.sort();
+        out
+    };
+
+    let busy = store
+        .list_thread_summaries(filters(StatusFilter::OneOf(&[ThreadStatus::Running])))
+        .await
+        .expect("list running");
+    assert_eq!(
+        ids(busy),
+        sorted(vec![running]),
+        "status=running is the workspace working, and nothing else"
+    );
+
+    let awaiting = store
+        .list_thread_summaries(filters(StatusFilter::OneOf(&[
+            ThreadStatus::WaitingForUserAnswer,
+        ])))
+        .await
+        .expect("list awaiting");
+    assert_eq!(
+        ids(awaiting),
+        sorted(vec![parked]),
+        "status=waiting_for_user_answer must exclude the thread that is working"
+    );
+
+    let union = store
+        .list_thread_summaries(filters(StatusFilter::Active(true)))
+        .await
+        .expect("list active");
+    assert_eq!(
+        ids(union),
+        sorted(vec![running, parked]),
+        "active=true is unchanged: still both, and still not the proposed thread"
+    );
+
+    let both_named = store
+        .list_thread_summaries(filters(StatusFilter::OneOf(&[
+            ThreadStatus::Running,
+            ThreadStatus::WaitingForUserAnswer,
+        ])))
+        .await
+        .expect("list both statuses");
+    assert_eq!(
+        ids(both_named),
+        sorted(vec![running, parked]),
+        "naming both statuses reproduces the union exactly"
+    );
+
+    let review = store
+        .list_thread_summaries(filters(StatusFilter::OneOf(&[ThreadStatus::Waiting])))
+        .await
+        .expect("list waiting");
+    assert_eq!(
+        ids(review),
+        sorted(vec![proposed]),
+        "`waiting` is reachable on its own, and is in neither activity group"
+    );
+
+    teardown_test_db(&db).await;
+}
+
+/// A count is what an idle detector calls, and it cannot be corrected
+/// client-side, so it has to agree with the list for every filter shape.
+#[tokio::test]
+async fn count_agrees_with_list_for_every_status_filter_shape() {
+    let (pool, db) = setup_test_db().await;
+    let store = EventStore::new(pool.clone());
+
+    insert_thread_with_status(&pool, "Working", ThreadStatus::Running).await;
+    insert_thread_with_status(&pool, "Parked", ThreadStatus::WaitingForUserAnswer).await;
+    insert_thread_with_status(&pool, "Done", ThreadStatus::Idle).await;
+
+    for status in [
+        StatusFilter::Any,
+        StatusFilter::Active(true),
+        StatusFilter::Active(false),
+        StatusFilter::OneOf(&[ThreadStatus::Running]),
+        StatusFilter::OneOf(&[ThreadStatus::WaitingForUserAnswer]),
+        StatusFilter::OneOf(&[ThreadStatus::Idle, ThreadStatus::Running]),
+    ] {
+        let counted = store
+            .count_thread_summaries(filters(status))
+            .await
+            .expect("count");
+        let listed = store
+            .list_thread_summaries(filters(status))
+            .await
+            .expect("list")
+            .len() as i64;
+        assert_eq!(
+            counted, listed,
+            "count and list must apply the same predicate for {status:?}"
+        );
+    }
+
+    teardown_test_db(&db).await;
+}

@@ -1,6 +1,6 @@
 use super::register::ARMING_LOOKBACK_SECS;
 use super::*;
-use crate::engine::event_bus::EventBus;
+use crate::engine::event_bus::{BusEvent, EventBus};
 use crate::test_support::{seed_thread_event, setup_test_db, teardown_test_db};
 use serde_json::json;
 

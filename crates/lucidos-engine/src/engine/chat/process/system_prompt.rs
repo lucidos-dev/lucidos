@@ -1022,7 +1022,17 @@ mod tests {
     /// 202 characters of headroom. The ratchet is deliberately tight: a pass
     /// that reclaims space lowers this line in the same change, or the space
     /// it reclaimed is silently spent by the next thing that grows.
-    const ALWAYS_LOADED_BUDGET_CHARS: usize = 103_200;
+    ///
+    /// Raised to 103,650 for the *trigger model*: the grouped `triggers` tool
+    /// gained `model` and `reasoning_effort` on create/update, 408 characters
+    /// of which 202 is frozen shape (the null-union on both, and the six-value
+    /// effort enum). The capability is not UI-only by choice: "run that digest
+    /// on a cheap model" has to work from the prompt (`.claude/rules/philosophy.md`
+    /// rule 2, prompt-first), and the schema is the only surface that tells the
+    /// agent the parameter exists. Nothing was trimmed to pay for it because
+    /// the base measured 103,195 against the 103,200 line, i.e. there was no
+    /// slack left to reclaim. Measured total is 103,603, leaving 47 characters.
+    const ALWAYS_LOADED_BUDGET_CHARS: usize = 103_650;
 
     /// The hand-written flat tool schemas the chat agent is offered.
     ///
@@ -1173,12 +1183,16 @@ mod tests {
         ),
         (
             "triggers",
-            2_550,
+            2_950,
             "seven actions, each contributing its own summary line and its own \
              `(requires: …)` clause, plus the create schema's union shapes for \
              `cron` and `on`. system-knowhow/triggers.md deliberately does NOT \
              restate the cron format, it defers to this schema, so the format \
-             spec cannot move out",
+             spec cannot move out. Raised from 2,550 by the *trigger model*: \
+             `model` and `reasoning_effort` add 202 characters of frozen shape \
+             before a word of prose (a null-union each, and the six-value \
+             effort enum), and they are declared once, on create, because the \
+             union across operations is first-wins",
         ),
         (
             "navigate_ui",

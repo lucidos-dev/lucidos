@@ -1,56 +1,62 @@
-import { splitRatio, MIN_DRAWER_WIDTH, SPLIT_RATIO_KEY } from '../../store/store';
+import { splitRatio, SPLIT_RATIO_KEY } from '../../store/store';
+import type { SplitBounds } from '../../store/paneMinimums';
 
 export const DEFAULT_SPLIT_RATIO = 0.4;
 
-/** Minimum usable pane widths. A divider drag can land anywhere; on release
- *  a pane narrower than its minimum snaps to exactly that width — or
- *  collapses entirely when below half of it. The content pane's minimum is
- *  higher: its header (panel-nav + title + action icons ≈ 310px worst case)
- *  and typical content need more room than a chat column. */
-export const MIN_THREAD_PANE_PX = 300;
-export const MIN_CONTENT_PANE_PX = 360;
+/* The pane minimums themselves live in `store/paneMinimums.ts`: they are
+   derived from the root font size, so reading them is a DOM read, and every
+   helper in this module is pure by contract. Callers measure, these compute. */
 
 /** Mirror of var(--duration-slow) in styles/global/base.css — the duration
  *  every pane/header geometry transition runs at. TS timers that must
  *  outlive those transitions derive from this; update the two together. */
 export const PANE_TRANSITION_MS = 300;
 
-/** Pause between releasing a divider and the snap-to-minimum/hidden
- *  animation, so the layout visibly settles where the user dropped it
- *  before correcting itself. */
-const SNAP_DELAY_MS = 400;
-
 /** While a divider drag is live. CSS keys off this to disable the header /
  *  drawer geometry transitions so all three panels and their header regions
  *  track the pointer 1:1 instead of easing 300ms behind it. */
 const RESIZING_ATTR = 'data-pane-resizing';
 
-let snapTimer: ReturnType<typeof setTimeout> | null = null;
-let pendingSnap: (() => void) | null = null;
-
-/** Where a released split divider should snap to, or null to stay put.
- *  Sides are checked thread-pane first; on a window too narrow to fit two
- *  minimum panes the side the user squeezed wins and the other stays small. */
-export function computeSnapRatio(ratio: number, totalPx: number): number | null {
-  if (totalPx <= 0) return null;
-  const threadPx = ratio * totalPx;
-  const contentPx = totalPx - threadPx;
-  if (threadPx <= 0 || contentPx <= 0) return null; // already fully collapsed
-  if (threadPx < MIN_THREAD_PANE_PX / 2) return 0;
-  // Clamp: a container narrower than one minimum pane (drawer dragged very
-  // wide) would otherwise produce a ratio > 1 — out of the [0, 1] domain the
-  // layout persists and renders from.
-  if (threadPx < MIN_THREAD_PANE_PX) return Math.min(MIN_THREAD_PANE_PX / totalPx, 1);
-  if (contentPx < MIN_CONTENT_PANE_PX / 2) return 1;
-  if (contentPx < MIN_CONTENT_PANE_PX) return Math.max((totalPx - MIN_CONTENT_PANE_PX) / totalPx, 0);
-  return null;
+/** Clamp a divider position to a range that may be EMPTY, which is the whole
+ *  reason this is a named function rather than a `Math.min(Math.max(...))`.
+ *
+ *  `lo` is what the leading pane needs and `hi` what is left after the trailing
+ *  pane takes its own minimum, so `hi < lo` means the container cannot hold both
+ *  at once. A bare min-then-max would silently answer `hi` there, handing the
+ *  space to the trailing pane; this keeps the LEADING pane whole instead and
+ *  lets the trailing one take what remains. Deterministic either way, which a
+ *  drag needs and the old release-time snap never had to decide, since a free
+ *  drop was legal by definition.
+ *
+ *  Reachable in a real configuration, not just in theory: the three pane floors
+ *  are derived from the root font size and stop summing under a 1280px screen
+ *  somewhere past 150% ui-scale (see store/paneMinimums.ts). */
+export function clampToRange(value: number, lo: number, hi: number): number {
+  if (hi < lo) return lo;
+  return Math.min(Math.max(value, lo), hi);
 }
 
-/** Where a released thread drawer should settle: hidden, its minimum width,
- *  or null to stay where the user dropped it. */
-export function computeDrawerSnap(width: number, minWidth: number): 'close' | 'min' | null {
-  if (width >= minWidth) return null;
-  return width < minWidth / 2 ? 'close' : 'min';
+/** Where a dragged split divider lands: the pointer, clamped so neither pane
+ *  goes below its minimum. Returns a ratio strictly INSIDE (0, 1).
+ *
+ *  A clamp, NOT a free drop plus a release-time correction. The divider stops at
+ *  the wall while the pointer keeps going, so the width the user releases is the
+ *  width that persists.
+ *
+ *  Strictly inside is the load-bearing half, and it is guaranteed here rather
+ *  than derived: ADR 0056's whole argument for allowing a mid-drag clamp is that
+ *  a collapse-state flip is UNREACHABLE during a drag, and those attributes flip
+ *  at a ratio of exactly 0 or 1. The pane-minimum clamp alone does not give that.
+ *  When the container cannot hold both minimums, `clampToRange` hands back the
+ *  leading pane's minimum, which can exceed the container: a drawer width
+ *  persisted from a wider window can leave the split at 520px against a 525px
+ *  thread minimum at 175% ui-scale, and 525/520 rounds down to exactly 1, which
+ *  collapses the content pane under the pointer. The final 1px inset is what the
+ *  drag handlers used to carry by hand and is the reason it existed. */
+export function clampSplitRatio(pointerPx: number, totalPx: number, bounds: SplitBounds): number {
+  if (totalPx <= 2) return DEFAULT_SPLIT_RATIO;
+  const threadPx = clampToRange(pointerPx, bounds.minThreadPx, totalPx - bounds.minContentPx);
+  return clampToRange(threadPx, 1, totalPx - 1) / totalPx;
 }
 
 /** Next ratio for a thread-pane visibility toggle: collapsed (0) restores the
@@ -69,91 +75,80 @@ export function toggleContentPaneRatio(ratio: number): number {
  *  per press. */
 export const KEYBOARD_RESIZE_STEP_PX = 80;
 
-/** Where a keyboard step lands the split divider, or null for a no-op.
- *  Unlike the deferred snap after a drag, a step clamps immediately: it never
- *  collapses a pane and never leaves one below its minimum — collapse belongs
- *  to the pane toggles. Stepping back into a fully-collapsed pane reopens it
- *  at its minimum width (the clamp floor/ceiling). */
-export function computeStepRatio(ratio: number, totalPx: number, deltaPx: number): number | null {
+/** Where a keyboard step lands the split divider, or null for a no-op. Same
+ *  clamp as a drag (`clampSplitRatio`), which is the point: one wall, whichever
+ *  way the user moves the divider. It never collapses a pane, and stepping back
+ *  into a fully-collapsed one reopens it at its minimum width.
+ *
+ *  Keeps its own no-op cases, which a drag has no equivalent of: a collapsed
+ *  pane is a settled state, so a step pushing further out stays put rather than
+ *  re-expanding, and a container too narrow for both minimums answers null
+ *  instead of `clampToRange`'s pick, since there is no gesture in flight that
+ *  has to land somewhere. */
+export function computeStepRatio(
+  ratio: number, totalPx: number, deltaPx: number, bounds: SplitBounds,
+): number | null {
   if (totalPx <= 0) return null;
-  // A collapsed pane is a settled state: a step pushing further out stays put.
   if (deltaPx > 0 && ratio >= 1) return null;
   if (deltaPx < 0 && ratio <= 0) return null;
-  const floor = MIN_THREAD_PANE_PX;
-  const ceil = totalPx - MIN_CONTENT_PANE_PX;
-  if (ceil < floor) return null; // container can't fit both minimums
-  const threadPx = Math.min(Math.max(ratio * totalPx + deltaPx, floor), ceil);
-  const nextRatio = threadPx / totalPx;
+  if (totalPx - bounds.minContentPx < bounds.minThreadPx) return null;
+  const nextRatio = clampSplitRatio(ratio * totalPx + deltaPx, totalPx, bounds);
   return nextRatio === ratio ? null : nextRatio;
 }
 
 /** Where a keyboard step lands the thread drawer width, or null for a no-op.
- *  `maxPx` is the widest the drawer may go — the caller measures the row and
- *  reserves the visible split panes' minimums. Clamps immediately and never
- *  closes the drawer (that's the toggle's job). */
-export function computeDrawerStepWidth(width: number, deltaPx: number, maxPx: number): number | null {
-  if (maxPx < MIN_DRAWER_WIDTH) return null;
-  const next = Math.min(Math.max(width + deltaPx, MIN_DRAWER_WIDTH), maxPx);
+ *  `minPx` is the drawer's floor and `maxPx` the widest it may go: the caller
+ *  measures both (the floor is derived from the root font size and the desktop
+ *  build, the ceiling from the row less the visible split panes' minimums), so
+ *  this stays pure like every other computation in this module. Clamps
+ *  immediately and never closes the drawer (that's the toggle's job). */
+export function computeDrawerStepWidth(
+  width: number, deltaPx: number, minPx: number, maxPx: number,
+): number | null {
+  if (maxPx < minPx) return null;
+  const next = Math.min(Math.max(width + deltaPx, minPx), maxPx);
   return next === width ? null : next;
 }
 
-/** Call on divider pointerdown. Switches the layout into 1:1
- *  pointer-tracking mode. A snap still pending from a previous release is
- *  applied NOW rather than discarded — a below-minimum pane must never
- *  outlive the gesture that created it. The flush runs after the resizing
- *  attribute is set, so it lands instantly instead of animating under the
- *  new drag. */
+/** Call on divider pointerdown: switch the layout into 1:1 pointer-tracking
+ *  mode. Nothing else to do now that a drag is clamped rather than corrected
+ *  afterwards, so there is no pending correction to flush. */
 export function beginPaneResize(): void {
-  const flush = pendingSnap;
-  cancelPendingSnap();
   document.documentElement.setAttribute(RESIZING_ATTR, '');
-  flush?.();
 }
 
-/** Call on divider release. Transitions come back on immediately; `snap`
- *  (if given) runs after SNAP_DELAY_MS so the correction animates as a
- *  distinct settling step rather than fighting the drop. */
-export function endPaneResize(snap?: () => void): void {
+/** Call on divider release: transitions come back on. The layout is already
+ *  where it belongs, since the drag could not leave it anywhere else. */
+export function endPaneResize(): void {
   document.documentElement.removeAttribute(RESIZING_ATTR);
-  if (!snap) return;
-  pendingSnap = snap;
-  snapTimer = setTimeout(() => {
-    snapTimer = null;
-    pendingSnap = null;
-    snap();
-  }, SNAP_DELAY_MS);
 }
 
-/** Drop any scheduled snap and leave the layout where it is. Safe to call
- *  when nothing is pending. For explicit layout overrides (setSplitRatio)
- *  the discard is correct — the override supersedes the correction. */
-export function cancelPendingSnap(): void {
-  pendingSnap = null;
-  if (snapTimer) { clearTimeout(snapTimer); snapTimer = null; }
-}
+let paneAnimateTimer: ReturnType<typeof setTimeout> | null = null;
 
-let snapAnimateTimer: ReturnType<typeof setTimeout> | null = null;
-
-/** Add a brief CSS transition for snap animations. The timeout outlives the
- *  PANE_TRANSITION_MS transition so the class never drops mid-flight. Rapid
- *  repeated calls (a held keyboard-resize chord) reset the timer instead of
- *  stacking removals — an earlier call's removal must not fire mid-way
- *  through the latest call's transition and cut it short. */
-function triggerSnapAnimate() {
+/** Add a brief CSS transition for an explicit ratio change: a pane toggle, a
+ *  maximize, a keyboard step, a layout reset. NOT for a drag, which tracks the
+ *  pointer 1:1 and turns these transitions off (RESIZING_ATTR above).
+ *
+ *  Named for the animation rather than for the deferred snap it used to serve:
+ *  a drag is clamped now and corrects nothing on release, so "snap" described
+ *  no caller left. The timeout outlives the PANE_TRANSITION_MS transition so the
+ *  class never drops mid-flight, and rapid repeated calls (a held keyboard-resize
+ *  chord) reset the timer instead of stacking removals, since an earlier call's
+ *  removal must not fire mid-way through the latest call's transition. */
+function triggerPaneAnimate() {
   const container = document.querySelector('.split-layout') as HTMLElement | null;
   if (!container) return;
-  container.classList.add('snap-animate');
-  if (snapAnimateTimer) clearTimeout(snapAnimateTimer);
-  snapAnimateTimer = setTimeout(() => {
-    snapAnimateTimer = null;
-    container.classList.remove('snap-animate');
+  container.classList.add('pane-animate');
+  if (paneAnimateTimer) clearTimeout(paneAnimateTimer);
+  paneAnimateTimer = setTimeout(() => {
+    paneAnimateTimer = null;
+    container.classList.remove('pane-animate');
   }, PANE_TRANSITION_MS + 100);
 }
 
 /** Update splitRatio with animations and persist to localStorage */
 export function setSplitRatio(newRatio: number) {
-  cancelPendingSnap();
-  triggerSnapAnimate();
+  triggerPaneAnimate();
   splitRatio.value = newRatio;
   localStorage.setItem(SPLIT_RATIO_KEY, String(newRatio));
 }

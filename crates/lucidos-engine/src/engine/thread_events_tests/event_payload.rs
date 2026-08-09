@@ -233,6 +233,8 @@ fn trigger_started_with_details() {
         invocation: Some(TriggerInvocation::Schedule),
         origin: None,
         go_to_review: false,
+        model: None,
+        reasoning_effort: None,
     };
     let payload = event.to_payload(&EventMeta::NONE);
     assert_eq!(payload["trigger_id"], "t-1");
@@ -255,6 +257,8 @@ fn trigger_started_event_invocation_serializes_event_type_and_id() {
         }),
         origin: None,
         go_to_review: false,
+        model: None,
+        reasoning_effort: None,
     };
     let payload = event.to_payload(&EventMeta::NONE);
     assert_eq!(payload["invocation"]["kind"], "Event");

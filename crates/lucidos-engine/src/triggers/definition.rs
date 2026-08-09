@@ -56,6 +56,15 @@ pub struct TriggerDefinition {
     pub plugin_id: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub side_effect_grant: Vec<SideEffectCategory>,
+    /// The **trigger model** this trigger's intent fires on. Omitted (None) =
+    /// the account `chat_model` preference. Scalar, so it must stay above the
+    /// table fields below.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Reasoning effort for this trigger's intent fires. Omitted (None) = the
+    /// account `chat_reasoning_effort` preference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
     // Table / array-of-tables fields LAST (TOML ordering constraint):
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub on: Vec<EventSubscription>,
@@ -75,6 +84,8 @@ impl TriggerDefinition {
             go_to_review: c.go_to_review,
             plugin_id: c.plugin_id.clone(),
             side_effect_grant: c.side_effect_grant.clone(),
+            model: c.model.clone(),
+            reasoning_effort: c.reasoning_effort.clone(),
             on: c.on.clone(),
             run: c.run.clone(),
         }
@@ -98,6 +109,8 @@ impl TriggerDefinition {
             "group_id": self.group_id,
             "side_effect_grant": self.side_effect_grant,
             "plugin_id": plugin_id,
+            "model": self.model,
+            "reasoning_effort": self.reasoning_effort,
         })
     }
 

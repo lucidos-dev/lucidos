@@ -159,6 +159,12 @@ pub enum TriggersCmd {
         /// Kebab-case slug, the directory segment for per-trigger knowhow. Derived from name.
         #[arg(long)]
         slug: Option<String>,
+        /// Chat model id this trigger's intent runs on. Omit or null for the account default.
+        #[arg(long)]
+        model: Option<String>,
+        /// Thinking budget for this trigger's intent runs. Omit or null for the account default.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
     /// Every trigger with its schedule, subscriptions and what it runs.
     List,
@@ -197,6 +203,12 @@ pub enum TriggersCmd {
         /// Kebab-case slug, the directory segment for per-trigger knowhow. Derived from name.
         #[arg(long)]
         slug: Option<String>,
+        /// Chat model id this trigger's intent runs on. Omit or null for the account default.
+        #[arg(long)]
+        model: Option<String>,
+        /// Thinking budget for this trigger's intent runs. Omit or null for the account default.
+        #[arg(long)]
+        reasoning_effort: Option<String>,
     },
     /// Delete a trigger; it orphans the run history, so prefer update for tweaks.
     Delete {
@@ -225,6 +237,8 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             group_id,
             side_effect_grant,
             slug,
+            model,
+            reasoning_effort,
         } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
             let mut body = serde_json::Map::new();
@@ -267,6 +281,12 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             if let Some(v) = slug {
                 body.insert("slug".into(), serde_json::json!(v));
             }
+            if let Some(v) = model {
+                body.insert("model".into(), serde_json::json!(v));
+            }
+            if let Some(v) = reasoning_effort {
+                body.insert("reasoning_effort".into(), serde_json::json!(v));
+            }
             let req = client()?.post(&url).json(&serde_json::Value::Object(body));
             send_and_print("POST", &url, req)
         }
@@ -287,6 +307,8 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             group_id,
             side_effect_grant,
             slug,
+            model,
+            reasoning_effort,
         } => {
             let url = format!("{}/api/v1/triggers", ws.base_url());
             let mut query: Vec<(&str, String)> = Vec::new();
@@ -337,6 +359,12 @@ pub fn dispatch_triggers(ws: &Workspace, cmd: TriggersCmd) -> Result<(), BoxErro
             }
             if let Some(v) = slug {
                 body.insert("slug".into(), serde_json::json!(v));
+            }
+            if let Some(v) = model {
+                body.insert("model".into(), serde_json::json!(v));
+            }
+            if let Some(v) = reasoning_effort {
+                body.insert("reasoning_effort".into(), serde_json::json!(v));
             }
             let req = client()?
                 .put(&url)

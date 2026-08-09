@@ -4,12 +4,13 @@ import {
   MOBILE_VIEWS, PANE_INDEX, PANE_COUNT, type MobileView,
   focusedPane, type FocusedPane,
 } from '../store';
+import { minDrawerWidth, minThreadPanePx, minContentPanePx, splitBounds } from '../paneMinimums';
 import { forceCloseDrawer } from '../../components/layout/Drawer';
 import {
-  setSplitRatio, DEFAULT_SPLIT_RATIO, cancelPendingSnap,
+  setSplitRatio, DEFAULT_SPLIT_RATIO,
   computeStepRatio, computeDrawerStepWidth,
   toggleThreadPaneRatio, toggleContentPaneRatio,
-  KEYBOARD_RESIZE_STEP_PX, MIN_THREAD_PANE_PX, MIN_CONTENT_PANE_PX,
+  KEYBOARD_RESIZE_STEP_PX,
 } from '../../components/layout/splitHelpers';
 import { isMobile } from '../../utils/viewport';
 import { focusPaneMainControl, reconcilePaneFocus } from '../../components/layout/paneFocus';
@@ -278,9 +279,9 @@ export function toggleMaximizeFocusedPaneGroup(): void {
 }
 
 /** Keyboard resize: move the split divider by one KEYBOARD_RESIZE_STEP_PX step.
- *  +1 widens the thread pane, -1 narrows it. Unlike a divider drag there is no
- *  deferred snap — the step clamps to the pane minimums immediately and never
- *  collapses a pane (collapse belongs to the toggles). Desktop-only. */
+ *  +1 widens the thread pane, -1 narrows it. Clamps to the same pane minimums a
+ *  drag does and never collapses a pane (collapse belongs to the toggles).
+ *  Desktop-only. */
 export function stepThreadPaneWidth(direction: 1 | -1): void {
   if (isMobile()) return;
   const layout = document.querySelector('.split-layout') as HTMLElement | null;
@@ -288,38 +289,45 @@ export function stepThreadPaneWidth(direction: 1 | -1): void {
     splitRatio.value,
     layout?.offsetWidth ?? 0,
     direction * KEYBOARD_RESIZE_STEP_PX,
+    splitBounds(),
   );
   if (next !== null) setSplitRatio(next);
 }
 
 /** Keyboard resize for the thread drawer: ±KEYBOARD_RESIZE_STEP_PX, clamped to
- *  [MIN_DRAWER_WIDTH, row width minus the visible split panes' minimums].
+ *  [minDrawerWidth(), row width minus the visible split panes' minimums].
  *  No-op while the drawer is hidden (closed, or thread pane collapsed). */
 export function stepThreadDrawerWidth(direction: 1 | -1): void {
   if (isMobile()) return;
   if (!threadDrawerOpen.value || splitRatio.value <= 0) return;
   const row = document.querySelector('.content-row') as HTMLElement | null;
-  const reserved = MIN_THREAD_PANE_PX + (splitRatio.value >= 1 ? 0 : MIN_CONTENT_PANE_PX);
+  const reserved = minThreadPanePx() + (splitRatio.value >= 1 ? 0 : minContentPanePx());
   const next = computeDrawerStepWidth(
     threadDrawerWidth.value,
     direction * KEYBOARD_RESIZE_STEP_PX,
+    minDrawerWidth(),
     (row?.offsetWidth ?? 0) - reserved,
   );
   if (next === null) return;
-  // A snap still pending from a drag release must not overwrite the explicit step.
-  cancelPendingSnap();
   threadDrawerWidth.value = next;
   localStorage.setItem(THREAD_DRAWER_WIDTH_KEY, String(next));
 }
 
 /** Restore the default desktop layout: split at DEFAULT_SPLIT_RATIO, thread
  *  drawer at its default width. The drawer's open/closed state is the user's
- *  choice and stays untouched. */
+ *  choice and stays untouched.
+ *
+ *  The default is a constant while the drawer's floor is derived, and the two
+ *  cross: at a large UI scale (or on the packaged macOS build, which reserves
+ *  the traffic lights) the row needs more than 300px, so a bare reset would put
+ *  the drawer straight back under its own floor and overflow the header until
+ *  something else clamped it. */
 export function resetPaneLayout(): void {
   if (isMobile()) return;
   setSplitRatio(DEFAULT_SPLIT_RATIO);
-  threadDrawerWidth.value = DEFAULT_DRAWER_WIDTH;
-  localStorage.setItem(THREAD_DRAWER_WIDTH_KEY, String(DEFAULT_DRAWER_WIDTH));
+  const width = Math.max(DEFAULT_DRAWER_WIDTH, minDrawerWidth());
+  threadDrawerWidth.value = width;
+  localStorage.setItem(THREAD_DRAWER_WIDTH_KEY, String(width));
 }
 
 /** Check whether the current pane state is consistent.

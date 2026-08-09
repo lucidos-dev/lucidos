@@ -97,6 +97,8 @@ fn build_trigger_started_event_preserves_config_id_verbatim() {
         &TriggerInvocation::Schedule,
         "Run the check.",
         false,
+        None,
+        None,
     );
     assert_eq!(meta.channel, Some(EventChannel::Trigger));
     let ThreadEvent::TriggerStarted {
@@ -122,6 +124,32 @@ fn build_trigger_started_event_preserves_config_id_verbatim() {
     };
     assert_eq!(origin_id, config_id);
     assert_eq!(origin_name.as_deref(), Some("Job Listing Check"));
+}
+
+/// The starter event of a trigger thread records the model / effort the run
+/// ACTUALLY used, because it is the only place the per-thread model memory can
+/// read them from (a trigger thread has no `MessageReceived`).
+#[test]
+fn build_trigger_started_event_records_the_resolved_model_and_effort() {
+    let (event, _meta) = build_trigger_started_event(
+        "t-1",
+        "Daily Digest",
+        &TriggerInvocation::Schedule,
+        "Summarize today.",
+        false,
+        Some("gemini-3.5-flash"),
+        Some("low"),
+    );
+    let ThreadEvent::TriggerStarted {
+        model,
+        reasoning_effort,
+        ..
+    } = event
+    else {
+        panic!("expected TriggerStarted");
+    };
+    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(reasoning_effort.as_deref(), Some("low"));
 }
 
 #[tokio::test(start_paused = true)]
@@ -1027,6 +1055,109 @@ async fn chat_route_reuses_thread_last_model_over_preference() {
 
     assert_eq!(model.as_deref(), Some("thread-model"));
     assert_eq!(effort.as_deref(), Some("low"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A trigger thread's starter event is `TriggerStarted`, never
+/// `MessageReceived`, so the per-thread memory has to read it too. Without this
+/// a Continue on a trigger thread pinned to a cheap model would jump back to
+/// the account model, and the in-thread picker would have been showing the
+/// wrong one the whole time.
+#[tokio::test]
+async fn follow_up_on_a_trigger_thread_reuses_the_fire_model() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
+        .await
+        .unwrap();
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+        .await
+        .unwrap();
+    let tid = uuid::Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO events (id, aggregate, aggregate_id, event_type, payload, created, thread_id) \
+         VALUES ($1, 'thread', $2, 'TriggerStarted', $3, now(), $4)",
+    )
+    .bind(uuid::Uuid::new_v4())
+    .bind(tid.to_string())
+    .bind(serde_json::json!({
+        "trigger_id": "t-1",
+        "model": "gemini-3.5-flash",
+        "reasoning_effort": "low",
+    }))
+    .bind(tid)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let (model, effort) = resolve_route_overrides(&pool, None, Some(tid), None, None, None).await;
+
+    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(effort.as_deref(), Some("low"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// A trigger fire is a brand-new thread (`thread_id = None`) whose model /
+/// effort come from the trigger itself. The pinned value must beat the account
+/// preference, or a trigger deliberately moved to a cheap model would keep
+/// burning the account's chat model.
+#[tokio::test]
+async fn trigger_route_prefers_the_triggers_own_model_and_effort() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
+        .await
+        .unwrap();
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+        .await
+        .unwrap();
+
+    let (model, effort) = resolve_route_overrides(
+        &pool,
+        None,
+        None,
+        None,
+        Some("gemini-3.5-flash"),
+        Some("low"),
+    )
+    .await;
+
+    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(effort.as_deref(), Some("low"));
+    pool.close().await;
+    teardown_test_db(&db_name).await;
+}
+
+/// The two fields resolve independently, so a trigger that pins only the model
+/// still inherits the account effort, and one that pins only the effort still
+/// inherits the account model. Pinning one must never freeze the other.
+#[tokio::test]
+async fn trigger_route_resolves_model_and_effort_independently() {
+    let (pool, db_name) = setup_test_db().await;
+    crate::test_support::seed_preference(&pool, PREF_CHAT_MODEL, "account-model")
+        .await
+        .unwrap();
+    crate::test_support::seed_preference(&pool, PREF_CHAT_REASONING_EFFORT, "high")
+        .await
+        .unwrap();
+
+    let (model, effort) =
+        resolve_route_overrides(&pool, None, None, None, Some("gemini-3.5-flash"), None).await;
+    assert_eq!(model.as_deref(), Some("gemini-3.5-flash"));
+    assert_eq!(
+        effort.as_deref(),
+        Some("high"),
+        "account effort still applies"
+    );
+
+    let (model, effort) = resolve_route_overrides(&pool, None, None, None, None, Some("max")).await;
+    assert_eq!(
+        model.as_deref(),
+        Some("account-model"),
+        "account model still applies"
+    );
+    assert_eq!(effort.as_deref(), Some("max"));
+
     pool.close().await;
     teardown_test_db(&db_name).await;
 }

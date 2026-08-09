@@ -159,23 +159,19 @@ export function EventWaitClockIcon({ className }: { className?: string }) {
 
 /** The todo indicator's ONE glyph, for every state it can be in.
  *
- *  A checklist: two ticked rows and one still-open row, echoing the ✓ / ○
- *  markers the panel itself uses. Idle, in-progress and abandoned differ only
- *  in COLOR (see `styles/chat/todo-list.css`), never in shape, so the button
- *  keeps saying "todo list" at a glance.
+ *  A ticked checkbox: two strokes, echoing the ✓ the panel's completed rows
+ *  use. Idle, in-progress and abandoned differ only in COLOR (see
+ *  `styles/chat/todo-list.css`), never in shape, so the button keeps saying
+ *  "todo list" at a glance.
  *
- *  The open row's circle carries its own thinner stroke on purpose: at the
- *  1.25rem the indicator renders, `stroke-width="2"` closes a circle this
- *  small into a blob and it stops reading as an unticked row. */
+ *  A denser checklist (two ticked rows plus an open circle) was tried here and
+ *  dropped: at the 1.25rem the indicator renders, six strokes crowd into a
+ *  smudge, while a box and a tick still read. Keep this glyph sparse. */
 export function TodoListIcon({ className }: { className?: string }) {
   return (
     <svg class={className} viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-      <path d="M3 6l2 2 4-4"/>
-      <path d="M3 12l2 2 4-4"/>
-      <circle cx="5" cy="18" r="2.4" stroke-width="1.5"/>
-      <path d="M13 6h8"/>
-      <path d="M13 12h8"/>
-      <path d="M13 18h8"/>
+      <rect x="3" y="3" width="18" height="18" rx="2" ry="2"/>
+      <polyline points="8 12 11 15 16 9"/>
     </svg>
   );
 }
@@ -311,9 +307,9 @@ export function MenuIcon() {
   );
 }
 
-// Unified thread-drawer Filter control — the funnel-style stacked lines. One
-// button opens the merged View + Show dropdown (see ThreadFilterDropdown); also
-// the "All" view's row icon inside that dropdown.
+// Unified thread-drawer Filter control: the funnel-style stacked lines. One
+// button toggles the merged Status + Thread type panel (see ThreadFilterPanel);
+// also the "All statuses" row icon inside that panel.
 export function FilterIcon() {
   return (
     <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
@@ -501,6 +497,40 @@ export function PauseIcon() {
     <svg viewBox="0 0 12 16" fill="currentColor" stroke="none" aria-hidden="true">
       <rect x="0" y="0" width="4.5" height="16" rx="1" />
       <rect x="7.5" y="0" width="4.5" height="16" rx="1" />
+    </svg>
+  );
+}
+
+// Power: the restart control in the Lucidos menu. A power symbol rather than
+// another circular arrow, because the row it sits under is Refresh and the two
+// must not read as the same action twice: one reloads the client, this one
+// stops and starts the workspace's engine.
+export function PowerIcon() {
+  return (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+      <path d="M12 3v9" />
+      <path d="M6.4 6.4a8 8 0 1 0 11.2 0" />
+    </svg>
+  );
+}
+
+// The Lucidos mark: three rounded squares and a four-point spark, the same
+// geometry as `public/favicon.svg` and the installed PWA icon. Kept as paths
+// with no tile behind them, so a caller can put it on the brand gradient
+// (BrandMark's default) or paint it flat in a single colour (the thread
+// drawer's muted variant) without two copies of the artwork.
+//
+// `fill: currentColor` rather than the favicon's hardcoded white, because the
+// muted variant is exactly the same shape in a different colour.
+export function LucidosMarkIcon() {
+  return (
+    <svg viewBox="0 0 100 100" fill="currentColor" stroke="none" aria-hidden="true">
+      <g transform="translate(13 13) scale(0.74)">
+        <rect x="17" y="17" width="29" height="29" rx="7" />
+        <rect x="17" y="54" width="29" height="29" rx="7" />
+        <rect x="54" y="54" width="29" height="29" rx="7" />
+        <path d="M68.5 12 C71 25 74 28.5 87 31 C74 33.5 71 37 68.5 50 C66 37 63 33.5 50 31 C63 28.5 66 25 68.5 12 Z" />
+      </g>
     </svg>
   );
 }

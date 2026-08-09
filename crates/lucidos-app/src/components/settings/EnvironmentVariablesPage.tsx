@@ -173,6 +173,10 @@ export function EnvironmentVariablesPage() {
       <LoadingFade showSkeleton={showLoading} skeleton={<ListSkeletonOf containerClass="list-rows" row={() => <EnvVarRow />} />}>
         {loadable.status === 'loaded' ? (
           <>
+            {/* Kept at rest rather than moved behind an explainer: this page
+                renders no section title and no label an info icon could sit on,
+                so hiding this sentence would leave the list with nothing naming
+                what it is. */}
             <p class="settings-section-desc">
               User-managed environment variables made available to agent scripts and tools.
             </p>

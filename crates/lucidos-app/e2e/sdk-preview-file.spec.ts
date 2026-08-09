@@ -2,7 +2,7 @@ import { test, expect } from './fixtures';
 import { mkdirSync, writeFileSync, rmSync } from 'fs';
 import { resolve } from 'path';
 import { WORKSPACE, git } from './db-helpers';
-import { gotoWithRetry, ensureMobileView } from './helpers';
+import { gotoWithRetry, ensureMobileView, clickHeaderAction } from './helpers';
 
 const APP_ID = 'e2e-sdk-preview-test';
 const APP_DIR = resolve(WORKSPACE, 'data/apps', APP_ID);
@@ -249,7 +249,11 @@ test.describe('SDK lucidos.ui.previewFile: a file preview over the app', () => {
       // rendered for the content view; the app pane being on screen is not the
       // same thing as the header showing that pane's actions.
       await ensureMobileView(page, 'content');
-      await page.locator('.icon-btn.app-fullscreen:visible').click();
+      // An app-UI overlay contributes three context actions (refresh, open in
+      // a tab, fullscreen), and three fold whole into the `⋯` menu at any
+      // width, so the toggle has no header button on ANY project here.
+      // `clickHeaderAction` finds it in either placement.
+      await clickHeaderAction(page, '.app-fullscreen');
       const panel = page.locator('[data-role="app-ui-panel"]:visible');
       await expect(async () => {
         const state = await panel.evaluate((el) => ({

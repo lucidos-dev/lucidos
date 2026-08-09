@@ -6,9 +6,13 @@ import {
   selectedRepoIds,
   selectedAppIds,
   threadChannelFilter,
+  setThreadChannelFilter,
+  THREAD_CHANNEL_FILTER_KEY,
   ALL_CHANNELS,
+  historicalTriggers,
+  setIncludeDeletedFilterOptions,
 } from './store';
-import { threadFilterActive } from './threadFilterActive';
+import { threadFilterActive, deletedOptionsHidden } from './threadFilterActive';
 import { makeTrigger } from './__tests__/fixtures';
 
 describe('threadFilterActive', () => {
@@ -143,5 +147,75 @@ describe('threadFilterActive', () => {
     next.delete('trigger');
     threadChannelFilter.value = next;
     expect(threadFilterActive.value).toBe(true);
+  });
+});
+
+describe('setThreadChannelFilter', () => {
+  beforeEach(() => {
+    localStorage.clear();
+  });
+
+  it('writes the signal AND localStorage, so a filter survives a reload', () => {
+    // The persisting writer every channel write goes through (`toggleChannel`),
+    // matching the three selected-id setters. Setting the signal directly is the
+    // bug it exists to make impossible: the filter would look applied and then
+    // vanish on the next boot.
+    setThreadChannelFilter(new Set(['chat']));
+
+    expect(threadChannelFilter.value).toEqual(new Set(['chat']));
+    expect(JSON.parse(localStorage.getItem(THREAD_CHANNEL_FILTER_KEY)!)).toEqual(['chat']);
+  });
+});
+
+describe('deletedOptionsHidden', () => {
+  beforeEach(() => {
+    // Loaded-but-empty registries: the option lists return [] until they load,
+    // so a test about deleted options has to get past that gate first.
+    triggers.value = { status: 'loaded', data: [] };
+    repositories.value = { status: 'loaded', data: [] };
+    historicalTriggers.value = { status: 'not-loaded' };
+    selectedTriggerIds.value = new Set();
+    selectedRepoIds.value = new Set();
+    selectedAppIds.value = new Set();
+    setIncludeDeletedFilterOptions(false);
+  });
+
+  it('is false when nothing has ever been deleted, however the switch is set', () => {
+    // The whole point: "Include deleted" off EXCLUDES nothing on a workspace
+    // with no deleted trigger, repo or app, so the filter panel must not call
+    // the list filtered. A setting at less than its widest is not a filter; one
+    // that holds something back is.
+    expect(deletedOptionsHidden.value).toBe(false);
+    setIncludeDeletedFilterOptions(true);
+    expect(deletedOptionsHidden.value).toBe(false);
+  });
+
+  it('is true when a deleted option exists and the switch is off', () => {
+    // A historical trigger absent from the live registry is a deleted option.
+    historicalTriggers.value = {
+      status: 'loaded',
+      data: [{ id: 'gone', name: 'Gone', last_activity: '2026-05-01T00:00:00Z' }],
+    };
+    expect(deletedOptionsHidden.value).toBe(true);
+  });
+
+  it('is false once the switch is on, since nothing is held back then', () => {
+    historicalTriggers.value = {
+      status: 'loaded',
+      data: [{ id: 'gone', name: 'Gone', last_activity: '2026-05-01T00:00:00Z' }],
+    };
+    setIncludeDeletedFilterOptions(true);
+    expect(deletedOptionsHidden.value).toBe(false);
+  });
+
+  it('is false for a SELECTED deleted option, which always stays visible', () => {
+    // Selected deleted entries are never hidden (that is what keeps the filter
+    // clearable), so they are not something the switch is holding back.
+    historicalTriggers.value = {
+      status: 'loaded',
+      data: [{ id: 'gone', name: 'Gone', last_activity: '2026-05-01T00:00:00Z' }],
+    };
+    selectedTriggerIds.value = new Set(['gone']);
+    expect(deletedOptionsHidden.value).toBe(false);
   });
 });

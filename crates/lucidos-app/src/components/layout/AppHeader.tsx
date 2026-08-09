@@ -1,44 +1,34 @@
 import { useState, useRef, useEffect, useCallback } from 'preact/hooks';
-import { ConnectionStatus } from './ConnectionStatus';
-import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView, recoveryProgress, drawerView, attentionThreadCount } from '../../store/store';
+import { panelOverlay, panelUrl, splitRatio, threadDrawerOpen, threadSearchQuery, mobileView } from '../../store/store';
 import { useHideOnScroll } from '../../hooks/useHideOnScroll';
 import { useWindowDragRegion } from '../../hooks/useWindowDragRegion';
 import { ThreadToggleButton } from '../shared/ThreadToggleButton';
-import { ComposeIcon, SearchIcon } from '../shared/icons';
-import { ThreadNav } from '../shared/ThreadNav';
-import { SearchEverywhereButton } from '../shared/SearchEverywhereButton';
-import { SetupInterviewButton } from '../shared/SetupInterviewButton';
-import { unfocusThread } from '../../store/actions/threads';
+import { SearchIcon } from '../shared/icons';
+import { ThreadBackButton, ThreadForwardButton } from '../shared/ThreadNav';
 import { openUrl } from '../../store/actions/artifacts';
 import { navigateToPane, resolveSwipePane, focusPane } from '../../store/actions/pane';
 import { focusPromptNow } from '../chat/promptFocus';
 import { MobileAppHeader } from './MobileAppHeader';
 import { BackupReminderBanner } from './BackupReminderBanner';
 import { SwipeTouch } from '../../utils/swipe';
-import { PanelNav } from './PanelNav';
+import { HamburgerButton, ContentBackButton, ContentForwardButton } from './ContentNav';
 import { ContentHeaderActions } from './ContentHeaderActions';
-import { ControlPanel, BrandBadge, toggleControlPanelAtClick } from './ControlPanel';
-import { ThreadFilterDropdown, viewIcon } from './ThreadFilterDropdown';
-import { getContentTitle, getDiffDescription } from './headerHelpers';
-import { resolveHeaderDblClick } from './headerDblClick';
+import { ThreadHeaderActions } from './ThreadHeaderActions';
+import { BrandMenuButton } from './HeaderMark';
+import { WorkspaceNameLabel } from './WorkspaceNameLabel';
+import { getContentTitle, getContentTitleShort, getDiffDescription } from './headerHelpers';
+import { headerDblClickRegion, resolveHeaderDblClick } from './headerDblClick';
 import { createDblClickGate } from '../../utils/dblClickGate';
 import { useThreadsHeaderState } from '../../hooks/useThreadsHeaderState';
 import { isMobile } from '../../utils/viewport';
 import { isTextInput } from '../../utils/dom';
-import { tooltipWithShortcut } from '../../store/actions/keybindings';
 
 function ThreadsHeader() {
-  const { filterOpen, setFilterOpen, toggleRef, closeFilter, filterActive,
+  // The Filter button's whole appearance (glyph, active highlight, and the
+  // attention-only badge, which is 0 while the panel is open) comes from the
+  // shared hook, since the mobile header renders the same control.
+  const { filterOpen, toggleFilter, filterButtonActive, FilterButtonIcon, filterButtonBadge,
           searchOpen, searchInputRef, onSearchInput, onSearchKeyDown, closeSearch, openSearchHandlers } = useThreadsHeaderState();
-
-  // The unified Filter control is active when a non-default drawer view is
-  // selected OR a channel filter is set. The needs-attention badge rides on the
-  // same button (attention-only — review/running/drafts stay per-row counts in
-  // the menu).
-  const filterButtonActive = drawerView.value !== 'all' || filterActive;
-  const attentionCount = attentionThreadCount.value;
-  // The button glyph reflects the selected view (funnel for `all`).
-  const ViewIcon = viewIcon(drawerView.value);
 
   // Header regions set the focused pane on `click`, NOT `pointerdown`: in the
   // Tauri build the whole header is a window-drag region (useWindowDragRegion),
@@ -69,22 +59,28 @@ function ThreadsHeader() {
           </svg>
         </button>
       </div>
+      {/* The button only toggles: the panel itself renders down in the drawer
+          pane (see ThreadDrawer), so it is not `aria-haspopup` chrome anymore.
+          It is also the panel's only way out, which is what the X glyph says
+          while the panel is up (see useThreadsHeaderState). */}
       <div class="view-selector-slot">
         <button
-          ref={toggleRef}
           class={`icon-btn header-icon threads-header-btn${filterButtonActive ? ' view-selector-active' : ''}`}
-          onClick={() => setFilterOpen(!filterOpen)}
+          onClick={toggleFilter}
           aria-label="Filter threads"
-          aria-haspopup="menu"
           aria-expanded={filterOpen}
           data-tooltip="Filter threads"
         >
-          <ViewIcon />
-          {attentionCount > 0 && <span class="badge">{attentionCount}</span>}
+          <FilterButtonIcon />
+          {filterButtonBadge > 0 && <span class="badge">{filterButtonBadge}</span>}
         </button>
-        {filterOpen && <ThreadFilterDropdown onClose={closeFilter} toggleRef={toggleRef} />}
       </div>
-      <span class="threads-header-title">Threads</span>
+      {/* The pane's title says what the pane is showing: the list, or the filter
+          panel that has taken it over (ThreadFilterPanel, which carries no title
+          row of its own so this one is not repeated two rows down). Just
+          "Filters": the pane is already the Threads pane, and the drawer is the
+          only thing on screen the filter could be filtering. */}
+      <span class="threads-header-title">{filterOpen ? 'Filters' : 'Threads'}</span>
       <button
         class="icon-btn header-icon threads-header-btn"
         {...openSearchHandlers}
@@ -97,15 +93,16 @@ function ThreadsHeader() {
   );
 }
 
+/** The brand label used to need a carve-out here: it opened the Lucidos menu
+ *  from any of its visible children, while its own empty centring space had to
+ *  keep behaving like a header gap. The mark owns that job now and is a real
+ *  `<button>`, which the `closest` line already covers, and the workspace name
+ *  beside it is a plain label, so the whole box is either a control or a gap
+ *  with nothing in between. */
 function isInteractive(el: HTMLElement): boolean {
   const tag = el.tagName;
   if (tag === 'BUTTON' || tag === 'A' || tag === 'INPUT' || tag === 'SELECT') return true;
   if (el.closest('button, a, input, select, .hamburger-panel, .thread-toggle')) return true;
-  // Visible children of brand-label open the control panel; the brand-label
-  // itself stretches with flex:1 to center them, so its empty space should
-  // still toggle full-width on dblclick like any other header gap.
-  const brandLabel = el.closest('[data-role="control-panel-toggle"]');
-  if (brandLabel && el !== brandLabel) return true;
   return false;
 }
 
@@ -114,7 +111,7 @@ function isInteractive(el: HTMLElement): boolean {
  *  that side, and lighting the wash without moving DOM focus left the user
  *  typing into nothing. Clicks on a control are that control's (isInteractive),
  *  so they keep only the pane focus: Search Everywhere opens an overlay with its
- *  own input, the brand label opens the control panel, and the compose button
+ *  own input, the mark opens the Lucidos menu, and the compose button
  *  focuses the prompt itself from inside the touch gesture. Desktop only, like
  *  the pane-focus half: on mobile this tap would raise the keyboard over the
  *  conversation the user is reading. */
@@ -143,17 +140,24 @@ function onHeaderDblClick(e: MouseEvent) {
   const header = (e.currentTarget as HTMLElement).getBoundingClientRect();
   const ratio = splitRatio.value;
 
-  // Account for thread drawer offset + drawer divider when calculating the split point,
-  // matching the CSS formula: divider-x = co + ddo + sr * (100% - co - ddo)
+  // The DOM reads; the attribution itself is pure (headerDblClickRegion), which
+  // is also where the drawer segment is ruled out as a surface that answers.
   const styles = getComputedStyle(document.documentElement);
-  const co = parseFloat(styles.getPropertyValue('--content-offset') || '0');
-  const ddo = threadDrawerOpen.value ? parseFloat(styles.getPropertyValue('--divider-width') || '0') : 0;
+  const drawerWidthPx = parseFloat(styles.getPropertyValue('--content-offset') || '0');
+  const drawerDividerPx = threadDrawerOpen.value
+    ? parseFloat(styles.getPropertyValue('--divider-width') || '0')
+    : 0;
 
-  const splitX = header.left + co + ddo + ratio * (header.width - co - ddo);
+  const region = headerDblClickRegion({
+    x: e.clientX,
+    headerLeft: header.left,
+    headerWidth: header.width,
+    drawerWidthPx,
+    drawerDividerPx,
+    ratio,
+  });
 
-  const clickedThreadSide = e.clientX < splitX;
-
-  resolveHeaderDblClick({ clickedThreadSide, ratio });
+  resolveHeaderDblClick({ region, ratio });
 }
 
 /** On mobile, let horizontal swipes on the header navigate between panes.
@@ -213,7 +217,12 @@ export function AppHeader() {
   const url = panelUrl.value;
   const showUrlPreview = panelOverlay.value?.type === 'url-preview';
 
-  const headerTitle = getContentTitle();
+  // The bar renders the short form and the tooltip carries the full name, so a
+  // shorthand never hides what the destination is really called. The content
+  // header shrinks with the split, so this is the same narrow surface the phone
+  // has, just reached by dragging the divider instead.
+  const headerTitle = getContentTitleShort();
+  const headerTitleFull = getContentTitle();
   const diffDesc = getDiffDescription();
   const showContentTitle = !!headerTitle;
 
@@ -277,91 +286,86 @@ export function AppHeader() {
                 focus — see ThreadsHeader. */}
             <div class="collapsed-thread-actions" onClick={onThreadHeaderClick}>
               <ThreadToggleButton />
-              <ThreadNav showTooltip />
             </div>
             {/* Focus on click, not pointerdown, so a window drag never shifts
                 focus — see ThreadsHeader. */}
             <span class="pane-header-brand" onClick={onThreadHeaderClick}>
               <div class="thread-nav-group">
                 <ThreadToggleButton />
-                <ThreadNav showTooltip />
               </div>
-              <span
-                class="pane-header-brand-label"
-                data-role="control-panel-toggle"
-                onClick={(e) => {
-                  // brand-label is absolutely centered on the pane; ignore clicks
-                  // on the empty space around the visible children.
-                  if (e.target === e.currentTarget) return;
-                  toggleControlPanelAtClick(e);
-                }}
-              >
-                <span class="pane-header-title">Lucidos</span>
-                <BrandBadge />
-                <ConnectionStatus />
+              {/* The Lucidos mark, absolutely centred on the pane: brand,
+                  connection light and menu in one control, the same one both
+                  mobile headers carry. It replaced a `[Lucidos * workspace]`
+                  wordmark; the name survives beside it, as a plain label that
+                  hides itself when the pane is too narrow to hold it.
+                  The thread chevrons FLANK it, which is the arrangement both
+                  mobile headers use: history is about the thing in the middle,
+                  so it reads better bracketing the brand than lined up in the
+                  leading cluster with the drawer toggle, which is about the
+                  pane beside it. */}
+              <span class="pane-header-brand-label">
+                <ThreadBackButton showTooltip />
+                {/* One flex item, so the space-between that pins the chevrons
+                    to the span's ends leaves the brand whole in the middle
+                    instead of pushing the name off the mark. It is also the box
+                    WorkspaceNameLabel measures itself against. */}
+                <span class="pane-header-brand-center">
+                  <BrandMenuButton placement="brand" />
+                  <WorkspaceNameLabel />
+                </span>
+                <ThreadForwardButton showTooltip />
               </span>
-              {/* Right-side actions grouped so the centered brand-label can float
-                  over the pane's true middle (space-between pins this cluster to
-                  the right edge). Compose sits next to Search, mirroring the
-                  mobile thread header. */}
-              <span class="pane-header-brand-actions">
-                <ControlPanel layout="desktop" />
-                <SetupInterviewButton showTooltip />
-                <button
-                  class="icon-btn header-icon brand-compose-btn"
-                  onClick={() => unfocusThread()}
-                  aria-label="New thread"
-                  data-tooltip={tooltipWithShortcut('New thread', 'newThread')}
-                >
-                  <ComposeIcon />
-                </button>
-                <SearchEverywhereButton showTooltip />
-                {recoveryProgress.value && (
-                  <span
-                    class="recovery-indicator"
-                    data-tooltip={`Resuming sessions: ${recoveryProgress.value.completed}/${recoveryProgress.value.total}`}
-                  >
-                    <svg class="recovery-spinner" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
-                      <path d="M8 2a6 6 0 1 1-4.24 1.76" stroke-linecap="round" />
-                    </svg>
-                  </span>
-                )}
-              </span>
+              {/* Right-side actions, pinned to the region's trailing edge by the
+                  brand's space-between while the label floats over the pane's
+                  true middle. They fold into a ⋯ menu as the split narrows, see
+                  ThreadHeaderActions. */}
+              <ThreadHeaderActions />
             </span>
           </div>
           {/* Focus on click, not pointerdown, so a window drag never shifts
               focus — see ThreadsHeader. */}
           <div class="content-header-elements" onClick={() => focusPane('content')}>
-            <PanelNav />
+            <HamburgerButton />
+            {/* Same arrangement as the thread pane one row over, and as both
+                mobile headers: the chevrons bracket the title rather than
+                sitting in the leading cluster, so history reads as belonging to
+                what is on screen. The title is the group's one shrinking
+                member, and the group is a FIXED SPAN, so the chevrons hold
+                their places as the user navigates between destinations with
+                wildly different title lengths. */}
             <span class="pane-header-content-title">
-              {showContentTitle && (
-                showUrlPreview && editingUrl ? (
-                  <input
-                    ref={urlInputRef}
-                    class="panel-url-input"
-                    type="text"
-                    value={urlDraft}
-                    onInput={(e) => setUrlDraft((e.target as HTMLInputElement).value)}
-                    onKeyDown={(e) => {
-                      if (e.key === 'Enter') submitUrl();
-                      if (e.key === 'Escape') cancelEditingUrl();
-                    }}
-                    onBlur={cancelEditingUrl}
-                  />
-                ) : showUrlPreview ? (
-                  <span
-                    class="panel-url-title"
-                    onClick={startEditingUrl}
-                    data-tooltip={url!}
-                  >
-                    {headerTitle}
-                  </span>
-                ) : (
-                  <span class="pane-header-title-text" data-tooltip={diffDesc || headerTitle} data-tooltip-tap>{headerTitle}</span>
-                )
-              )}
+              <span class="header-title-span">
+                <ContentBackButton />
+                {showContentTitle && (
+                  showUrlPreview && editingUrl ? (
+                    <input
+                      ref={urlInputRef}
+                      class="panel-url-input"
+                      type="text"
+                      value={urlDraft}
+                      onInput={(e) => setUrlDraft((e.target as HTMLInputElement).value)}
+                      onKeyDown={(e) => {
+                        if (e.key === 'Enter') submitUrl();
+                        if (e.key === 'Escape') cancelEditingUrl();
+                      }}
+                      onBlur={cancelEditingUrl}
+                    />
+                  ) : showUrlPreview ? (
+                    <span
+                      class="panel-url-title"
+                      onClick={startEditingUrl}
+                      data-tooltip={url!}
+                    >
+                      {headerTitle}
+                    </span>
+                  ) : (
+                    <span class="pane-header-title-text" data-tooltip={diffDesc || headerTitleFull} data-tooltip-tap>{headerTitle}</span>
+                  )
+                )}
+                <ContentForwardButton />
+              </span>
             </span>
-            <ContentHeaderActions />
+            <ContentHeaderActions layout="desktop" />
           </div>
         </div>
 

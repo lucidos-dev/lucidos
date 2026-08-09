@@ -174,7 +174,7 @@ describe('restart progress toast survives a reload (in-flight marker)', () => {
   it('cold start with only a PENDING restart (no in-flight marker) restores state, not a toast', () => {
     // No in-flight marker — a restart is merely pending, not underway. There is no
     // pre-switch toast anymore; restore re-arms restartRequired so the
-    // control-panel badge + restart confirm dialog reappear. The engine "New
+    // brand badge + restart confirm dialog reappear. The engine "New
     // version available → Switch" toast is owned by the poll (engine-update.ts).
     localStorage.setItem(RESTART_LS_KEY, 'true');
     engineRestarting.value = false;

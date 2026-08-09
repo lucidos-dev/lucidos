@@ -199,6 +199,39 @@
           }
         }
 
+        // The live style remote's first-paint seed. Custom property overrides
+        // come from a preference, which only lands after the app boots, so
+        // without this a tuned value paints untuned for a frame and then jumps,
+        // the same flash the scale snap above exists to avoid.
+        //
+        // LAST in this block on purpose: the three applies above write
+        // properties (--bg-primary, --user-ui-scale, --font-ui) the remote is
+        // allowed to override, so the overrides go on top.
+        //
+        // The name and value rules MUST match utils/styleOverrides.ts and
+        // api/sdk_prefs.rs; styleOverrides.test.ts scans this block for them.
+        try {
+          if (/[?&]style-reset(?:[=&]|$)/.test(location.search)) {
+            // The escape hatch out of a value that made the UI unusable, so it
+            // runs before anything is painted and needs nothing to be legible.
+            localStorage.removeItem(wsKey('lucidos-style-overrides'));
+          } else {
+            var so = JSON.parse(localStorage.getItem(wsKey('lucidos-style-overrides')) || '{}');
+            var soCount = 0;
+            for (var soName in so) {
+              if (soCount >= 200) break;
+              if (!/^--[a-z][a-z0-9-]*$/.test(soName)) continue;
+              var soVal = so[soName];
+              if (typeof soVal !== 'string') continue;
+              soVal = soVal.trim();
+              if (!soVal || soVal.length > 120) continue;
+              if (/[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i.test(soVal)) continue;
+              d.style.setProperty(soName, soVal);
+              soCount++;
+            }
+          }
+        } catch (e) { /* a corrupt map must never break FOUC */ }
+
         // Always-on theme-flash telemetry: POST breadcrumbs to engine.log so
         // we can grep for the transition that preceded a reported flash. The
         // bug we're hunting (iOS WKWebView matchMedia returning a stale

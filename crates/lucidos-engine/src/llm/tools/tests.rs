@@ -263,6 +263,41 @@ fn ask_user_question_per_question_schema_matches_cc() {
     );
 }
 
+/// `run_python` was for a long time the only one of the four exec tools whose
+/// description named no limit, while its three siblings all pointed at
+/// "run_python's 300s sync ceiling" that the python path did not actually
+/// enforce. The mechanism exists now (`runtime::python`), so the tool that
+/// owns it has to say so: an agent that only learns about the ceiling by
+/// being killed at it has already burned the turn.
+#[test]
+fn run_python_states_its_hard_ceiling_and_the_escape_hatch() {
+    let tools = get_default_tools();
+    let tool = tools
+        .iter()
+        .find(|t| t.name == tn::RUN_PYTHON)
+        .expect("run_python must be in get_default_tools()");
+    let desc = tool.description.as_str();
+
+    assert!(
+        desc.contains(&format!("{}s", super::MAX_TIMEOUT_SECS)),
+        "the description must name the ceiling it enforces: {desc:?}"
+    );
+    assert!(
+        desc.contains("run_python_background"),
+        "the description must name the tool to use for longer work: {desc:?}"
+    );
+    // `timeout_secs` is deliberately NOT on this tool: the ceiling is fixed,
+    // and advertising a knob the handler ignores is worse than silence.
+    let props = tool
+        .parameters
+        .get("properties")
+        .expect("run_python must declare properties");
+    assert!(
+        props.get("timeout_secs").is_none(),
+        "run_python's ceiling is fixed, so it must not advertise timeout_secs"
+    );
+}
+
 /// `run_python_background` mirrors `run_bash_background`'s task_id /
 /// drain / kill contract, but lifts the venv + `packages` auto-install
 /// from `run_python`. Pin its registration + schema shape so a refactor

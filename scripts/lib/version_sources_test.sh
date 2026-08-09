@@ -94,7 +94,7 @@ echo "test: no unmanaged release-version literal anywhere else in the tree"
 # behaviour a guard must never have. A temp file + `wc -l` works everywhere.
 HITS_FILE="$(mktemp -t version-sources-hits)"
 STALE_FILE="$(mktemp -t version-sources-stale)"
-trap 'rm -f "$HITS_FILE" "$STALE_FILE"' EXIT
+trap 'rm -f "$HITS_FILE" "$HITS_FILE".all "$HITS_FILE".raw "$STALE_FILE"' EXIT
 
 # `git grep` exits 1 on "no matches" — the CLEAN case — so its status is
 # captured in a condition context rather than left to trip errexit in a caller
@@ -118,7 +118,15 @@ if git grep -nIwE '[0-9]+\.[0-9]+\.[0-9]+' -- \
 elif [ ! -f "$HITS_FILE".all ]; then
   fail "the version scan could not run — treating that as a failure, not a clean tree"
 fi
-grep -wE "$RELEASE_VERSION" "$HITS_FILE".all > "$HITS_FILE" 2>/dev/null || true
+grep -wE "$RELEASE_VERSION" "$HITS_FILE".all > "$HITS_FILE".raw 2>/dev/null || true
+# A dependency RANGE in a package manifest is someone else's version, the same
+# class as .github/dependabot.yml above. "esbuild": "^0.25.0" collided with the
+# 0.25.0 release, and nothing about that range tracks ours. Only the caret and
+# tilde forms are dropped, and only in a package.json, so a BARE literal is
+# still caught: a manifest's own "version" field, an exact dependency pin, and
+# the number written anywhere else in the tree all still fail this test.
+grep -vE '^[^:]*package\.json:[0-9]+:.*"[~^]'"$RELEASE_VERSION"'"' \
+    "$HITS_FILE".raw > "$HITS_FILE" 2>/dev/null || true
 hit_count="$(wc -l < "$HITS_FILE" | tr -d '[:space:]')"
 if [ "$hit_count" -eq 0 ]; then
   pass "no file hardcodes the current release version ($RELEASE_VERSION)"

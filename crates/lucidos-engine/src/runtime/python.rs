@@ -1,6 +1,28 @@
 use crate::core::sanitize_for_jsonb;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
+
+/// Hard wall-clock ceiling for ONE synchronous Python child, shared by the
+/// `run_python` tool (via `execute_staged`) and by an in-place script run
+/// (`execute_file_with_env`).
+///
+/// Deliberately read from `llm::tools::MAX_TIMEOUT_SECS` rather than restated,
+/// because that constant is already the documented number: three sibling tool
+/// descriptions in `llm/tools/exec.rs` and `system-knowhow/running-python.md`
+/// all quote "run_python's 300s sync ceiling". Until this was wired the
+/// promise was fiction. The synchronous python path had no timeout at all, so
+/// a script with an infinite loop ran at 100% CPU until a human noticed and
+/// killed the OS process by hand. `run_bash` (`engine::tools::bash`) and the
+/// scheduled `.sh` path (`engine_impl::scripts`) already spend exactly this
+/// budget, enforced exactly this way.
+///
+/// The ceiling covers the CHILD only. `ensure_venv` and `ensure_packages` are
+/// awaited before the spawn, so a cold first-run venv creation or a large pip
+/// install never eats a script's budget. Neither of those is bounded here on
+/// purpose: a legitimate `torch` install routinely outruns 300s, and killing
+/// it would break setup rather than a runaway.
+const EXECUTION_TIMEOUT_SECS: u64 = crate::llm::tools::MAX_TIMEOUT_SECS;
 
 /// Python bootstrap module dropped into the venv's `site-packages/` as
 /// `_lucidos_agent_origin.py` by `PythonRuntime::install_agent_origin_shim`,
@@ -105,6 +127,11 @@ pub struct PythonRuntime {
     exhaust_path: PathBuf,
     venv_path: PathBuf,
     python_bin: PathBuf,
+    /// Hard ceiling every synchronous child is bounded by, see
+    /// [`EXECUTION_TIMEOUT_SECS`]. A field rather than a call-site argument
+    /// because both callers get the same budget; a caller that ever needs a
+    /// different one threads it in here rather than opting out.
+    execution_timeout: Duration,
 }
 
 impl PythonRuntime {
@@ -148,7 +175,17 @@ impl PythonRuntime {
             exhaust_path,
             venv_path,
             python_bin,
+            execution_timeout: Duration::from_secs(EXECUTION_TIMEOUT_SECS),
         })
+    }
+
+    /// Shorten the hard ceiling. Test-only: the regression coverage for the
+    /// timeout has to prove the child dies, and waiting 300 real seconds per
+    /// assertion is not a suite anyone runs.
+    #[cfg(test)]
+    pub(crate) fn with_execution_timeout(mut self, timeout: Duration) -> Self {
+        self.execution_timeout = timeout;
+        self
     }
 
     /// Path to the venv-rooted Python interpreter. The file only exists
@@ -345,6 +382,17 @@ impl PythonRuntime {
     /// `script_path` is either the exhaust copy written by `run_script` or an
     /// on-disk script run in place (`execute_file_with_env`) — the spawn is the
     /// same either way, only the provenance of the file differs.
+    ///
+    /// Bounded by `self.execution_timeout` ([`EXECUTION_TIMEOUT_SECS`]). Both
+    /// callers get the ceiling: an unbounded trigger script is the same hazard
+    /// as an unbounded `run_python`, and the `.sh` half of the very same
+    /// scheduled-script dispatch has spent a 300s budget all along.
+    ///
+    /// An expiry is shaped into the ordinary `Err` a crash produces, so the
+    /// agent reads a normal failed tool result instead of watching a turn hang.
+    /// Every caller therefore takes its existing failure path unchanged, which
+    /// is what keeps `run_python`'s staging invariant intact: a timed-out run
+    /// removes its staging tree and commits nothing, exactly like a crash.
     async fn spawn_python(
         &self,
         script_path: &std::path::Path,
@@ -355,20 +403,40 @@ impl PythonRuntime {
         cmd.arg(script_path)
             .current_dir(&self.workspace_path)
             .stdin(std::process::Stdio::null())
-            // Without kill_on_drop, dropping this command future on cancel
-            // (the agent loop's run_tool_with_cancel wrapper) leaves the
-            // python child orphaned — a hung urlopen() / time.sleep() keeps
-            // running in the background while the engine logs nothing about
-            // it. With it, the OS sends SIGKILL when the future drops, so a
-            // user clicking Stop reliably reaps the subprocess.
+            // Three things can drop this command future:
+            // 1. The agent loop's run_tool_with_cancel wrapper on user cancel.
+            // 2. The timeout below, when the hard ceiling fires.
+            // 3. Engine shutdown.
+            // Without kill_on_drop all three leave the python child orphaned:
+            // a hung urlopen() / time.sleep() / spin loop keeps running in the
+            // background while the engine logs nothing about it. With it, the
+            // OS sends SIGKILL when the future drops, so each path reliably
+            // reaps the subprocess. `Command::output()` owns the spawned Child
+            // inside the future it returns, so dropping that future drops the
+            // Child, which is what triggers the kill.
+            //
+            // Scope of that kill, stated because the ceiling below leans on
+            // it: SIGKILL reaches the INTERPRETER, not a process tree the
+            // script started itself. A script that shells out via
+            // `subprocess.Popen` leaves those grandchildren running, because
+            // they are not in a group we signal. That is the uniform contract
+            // of every exec path here (`run_bash`, `run_bash_background`, the
+            // scheduled `.sh` branch and this one all rely on kill_on_drop
+            // alone), so fixing it belongs in all four at once, on
+            // `spawn_env::{isolate_in_process_group, kill_child_process_group_now}`,
+            // the facility the coding-agent spawns already use. Fixing it here
+            // alone would also only cover the timeout: `kill_on_drop` still
+            // signals the leader on the cancel and shutdown paths, so a
+            // group-aware teardown needs a Drop guard, not a call on one arm.
             .kill_on_drop(true);
         for (key, value) in &env_vars {
             cmd.env(key, value);
         }
-        let output = cmd
-            .output()
-            .await
-            .map_err(|e| format!("Failed to execute Python: {}", e))?;
+        let output = match tokio::time::timeout(self.execution_timeout, cmd.output()).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(e)) => return Err(format!("Failed to execute Python: {}", e)),
+            Err(_) => return Err(self.on_execution_timeout(run_dir)),
+        };
 
         let stdout = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stdout));
         let stderr = sanitize_for_jsonb(&String::from_utf8_lossy(&output.stderr));
@@ -389,6 +457,45 @@ impl PythonRuntime {
             let trimmed = truncate_python_error(&stderr);
             Err(format!("Python error:\n{}", trimmed))
         }
+    }
+
+    /// Build the error a hard-ceiling expiry returns, and leave a note in the
+    /// run's exhaust dir so the audit trail says why it holds no output.
+    ///
+    /// The child is already being SIGKILLed by the time this runs (the
+    /// `Command::output()` future was dropped on the way in), and its stdout
+    /// and stderr went with it. Draining partial output would mean replacing
+    /// `output()` with piped handles plus reader tasks feeding shared buffers,
+    /// which is real restructuring for very little: CPython block-buffers
+    /// stdout when it is not a tty, so a script that hangs before filling the
+    /// 8 KB buffer has flushed nothing to capture. `run_bash` makes the same
+    /// trade at the same seam.
+    ///
+    /// The message names the ceiling and the escape hatch, because the moment
+    /// an agent hits this wall is exactly when it needs to know
+    /// `run_python_background` exists.
+    fn on_execution_timeout(&self, run_dir: &std::path::Path) -> String {
+        let message = format!(
+            "Python script timed out after {}s, the hard ceiling for synchronous execution. \
+             The script was killed and wrote no output. Move work that needs longer to \
+             run_python_background, which runs up to {}s.",
+            self.execution_timeout.as_secs(),
+            crate::llm::tools::BG_MAX_TIMEOUT_SECS,
+        );
+        log!("[Python] {}", message);
+        // Marked as engine-written: every other line in this file is the
+        // child's own stderr, and an empty run dir would leave a reader with
+        // no way to tell a timeout from a spawn that never happened.
+        if let Err(e) = fs::write(
+            run_dir.join("stderr.txt"),
+            format!("[lucidos] {}\n", message),
+        ) {
+            log!(
+                "[Python] Failed to write timeout note to stderr debug log: {}",
+                e
+            );
+        }
+        message
     }
 
     fn workspace_str_escaped(&self) -> String {

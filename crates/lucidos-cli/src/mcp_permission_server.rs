@@ -11,6 +11,12 @@
 //! `/api/v1/internal/ask-user-question` — the same blocking endpoint CC's
 //! PreToolUse hook uses — and returns the user's answer as the tool result, so
 //! the Codex turn continues in place once the user clicks the QuestionCard.
+//!
+//! The two backends therefore need DISJOINT tool sets, and each hides the
+//! other's tool by a different mechanism. Codex filters client-side with
+//! `enabled_tools`. Claude Code has no per-server filter, so it passes
+//! `--permission-only` and the server itself stops advertising
+//! `ask_user_question` ([`ToolSet`]).
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -18,6 +24,38 @@ use std::io::{BufRead, Write};
 
 use crate::http::permission_prompt_client;
 use crate::workspace::{resolve_from_env, BoxError};
+
+const TOOL_APPROVE: &str = "approve";
+const TOOL_ASK_USER_QUESTION: &str = "ask_user_question";
+
+/// Which of this server's tools the spawning backend may see and call.
+///
+/// `ask_user_question` exists for **Codex**, which has no question tool of its
+/// own. Claude Code does: its native `AskUserQuestion` is intercepted by the
+/// `ask-user-question-hook` PreToolUse hook and renders the same QuestionCard.
+/// Advertising the MCP duplicate to CC broke twice over: CC has no way to
+/// auto-approve an MCP tool call, so merely asking the user a question first
+/// raised a permission card for `mcp__lucidos_perm__ask_user_question`; and
+/// `agent_session::lifecycle::is_user_question_tool` only suppresses the
+/// tool-call step for the two intended names, so the question also
+/// double-surfaced as a step plus a card.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolSet {
+    /// Everything the server implements. Codex's set, narrowed on its side to
+    /// `ask_user_question` by `enabled_tools`.
+    All,
+    /// `approve` only, for Claude Code.
+    PermissionOnly,
+}
+
+impl ToolSet {
+    fn advertises(self, tool: &str) -> bool {
+        match self {
+            ToolSet::All => true,
+            ToolSet::PermissionOnly => tool == TOOL_APPROVE,
+        }
+    }
+}
 
 #[derive(Deserialize)]
 struct JsonRpcRequest {
@@ -52,7 +90,7 @@ struct PermissionResponseBody {
     reason: Option<String>,
 }
 
-pub fn run() -> Result<(), BoxError> {
+pub fn run(tools: ToolSet) -> Result<(), BoxError> {
     let workspace = resolve_from_env()?;
     let thread_id = std::env::var("LUCIDOS_THREAD_ID")
         .map_err(|_| "LUCIDOS_THREAD_ID env var required for permission-prompt server")?;
@@ -89,7 +127,7 @@ pub fn run() -> Result<(), BoxError> {
             }
         };
 
-        if let Some(resp) = handle(&req, &client, &base_url, &thread_id) {
+        if let Some(resp) = handle(&req, &client, &base_url, &thread_id, tools) {
             writeln!(stdout, "{}", serde_json::to_string(&resp)?)?;
             stdout.flush()?;
         }
@@ -102,6 +140,7 @@ fn handle(
     client: &reqwest::blocking::Client,
     base_url: &str,
     thread_id: &str,
+    tools: ToolSet,
 ) -> Option<JsonRpcResponse> {
     let id = req.id.clone()?;
     let result = match req.method.as_str() {
@@ -110,55 +149,15 @@ fn handle(
             "capabilities": { "tools": {} },
             "serverInfo": { "name": "lucidos-perm", "version": env!("CARGO_PKG_VERSION") }
         })),
-        "tools/list" => Ok(serde_json::json!({
-            "tools": [{
-                "name": "approve",
-                "description": "Surfaces a permission prompt to the Lucidos user",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "tool_name": { "type": "string" },
-                        "input": { "type": "object" },
-                        "tool_use_id": { "type": "string" }
-                    },
-                    "required": ["tool_name", "input", "tool_use_id"]
-                }
-            }, {
-                "name": "ask_user_question",
-                "description": "Ask the Lucidos user one question and block until they answer. \
-                    The Lucidos UI renders the options as clickable buttons. Use whenever you \
-                    need the user's decision instead of guessing.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "question": {
-                            "type": "string",
-                            "description": "Full question text shown on the card"
-                        },
-                        "options": {
-                            "type": "array",
-                            "items": { "type": "string" },
-                            "description": "2-4 short answer labels; omit for free-text. \
-                                NEVER include an \"Other\" / \"Something else\" / \"Let me type \
-                                it\" label: there is no text-entry option, so tapping one just \
-                                sends you that label back as the answer. The user can always \
-                                type a reply in the prompt instead, or cancel the question."
-                        },
-                        "multi_select": {
-                            "type": "boolean",
-                            "description": "Allow picking several options"
-                        }
-                    },
-                    "required": ["question"]
-                }
-            }]
-        })),
+        "tools/list" => Ok(serde_json::json!({ "tools": tool_definitions(tools) })),
         "tools/call" => match req.params.get("name").and_then(|v| v.as_str()) {
             // CC's --permission-prompt-tool designation strips the server/tool
             // prefix before dispatch, so legacy callers arrive with no name —
             // route those to approve for back-compat.
-            Some("approve") | None => call_approve(&req.params, client, base_url, thread_id),
-            Some("ask_user_question") => {
+            Some(TOOL_APPROVE) | None => call_approve(&req.params, client, base_url, thread_id),
+            // An unadvertised tool is unreachable, not merely hidden: a model
+            // that guessed the name falls through to the unknown-tool error.
+            Some(TOOL_ASK_USER_QUESTION) if tools.advertises(TOOL_ASK_USER_QUESTION) => {
                 call_ask_user_question(&req.params, client, base_url, thread_id)
             }
             Some(other) => Err(format!("Unknown tool: {}", other)),
@@ -180,6 +179,58 @@ fn handle(
             error: Some(serde_json::json!({ "code": -32603, "message": msg })),
         },
     })
+}
+
+/// The `tools/list` payload for `tools`, in a stable order (`approve` first).
+fn tool_definitions(tools: ToolSet) -> Vec<Value> {
+    let mut out = Vec::new();
+    if tools.advertises(TOOL_APPROVE) {
+        out.push(serde_json::json!({
+            "name": TOOL_APPROVE,
+            "description": "Surfaces a permission prompt to the Lucidos user",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "tool_name": { "type": "string" },
+                    "input": { "type": "object" },
+                    "tool_use_id": { "type": "string" }
+                },
+                "required": ["tool_name", "input", "tool_use_id"]
+            }
+        }));
+    }
+    if tools.advertises(TOOL_ASK_USER_QUESTION) {
+        out.push(serde_json::json!({
+            "name": TOOL_ASK_USER_QUESTION,
+            "description": "Ask the Lucidos user one question and block until they answer. \
+                The Lucidos UI renders the options as clickable buttons. Use whenever you \
+                need the user's decision instead of guessing.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description": "Full question text shown on the card"
+                    },
+                    "options": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "2-4 short answer labels; omit for free-text. \
+                            NEVER include an \"Other\" / \"Something else\" / \"Let me type \
+                            it\" label: there is no text-entry option, so tapping one just \
+                            sends you that label back as the answer. The user can always \
+                            type a reply in the prompt instead, or cancel the question."
+                    },
+                    "multi_select": {
+                        "type": "boolean",
+                        "description": "Allow picking several options"
+                    }
+                },
+                "required": ["question"]
+            }
+        }));
+    }
+    out
 }
 
 fn call_approve(
@@ -357,7 +408,7 @@ mod tests {
             method: "initialize".to_string(),
             params: Value::Null,
         };
-        let resp = handle(&req, &dummy_client(), "http://unused", "tid").unwrap();
+        let resp = handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).unwrap();
         let result = resp.result.unwrap();
         assert_eq!(result["protocolVersion"], "2025-06-18");
         assert_eq!(result["serverInfo"]["name"], "lucidos-perm");
@@ -370,7 +421,7 @@ mod tests {
             method: "tools/list".to_string(),
             params: Value::Null,
         };
-        let resp = handle(&req, &dummy_client(), "http://unused", "tid").unwrap();
+        let resp = handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).unwrap();
         let tools = &resp.result.unwrap()["tools"];
         assert_eq!(tools[0]["name"], "approve");
         assert_eq!(tools[0]["inputSchema"]["required"][0], "tool_name");
@@ -379,6 +430,68 @@ mod tests {
         // and Codex silently loses its question path.
         assert_eq!(tools[1]["name"], "ask_user_question");
         assert_eq!(tools[1]["inputSchema"]["required"][0], "question");
+    }
+
+    /// Claude Code has its own `AskUserQuestion` tool, hooked to the same
+    /// QuestionCard. Advertising the MCP duplicate to CC made asking the user
+    /// a question raise a permission card for
+    /// `mcp__lucidos_perm__ask_user_question` (CC cannot auto-approve an MCP
+    /// tool), and double-surfaced the question as a tool-call step beside the
+    /// card. CC's spawn passes `--permission-only`; this is what that means.
+    #[test]
+    fn permission_only_hides_the_question_tool_from_claude_code() {
+        let req = JsonRpcRequest {
+            id: Some(Value::from(2)),
+            method: "tools/list".to_string(),
+            params: Value::Null,
+        };
+        let resp = handle(
+            &req,
+            &dummy_client(),
+            "http://unused",
+            "tid",
+            ToolSet::PermissionOnly,
+        )
+        .unwrap();
+        let tools = resp.result.unwrap()["tools"].clone();
+        let names: Vec<&str> = tools
+            .as_array()
+            .expect("tools must be an array")
+            .iter()
+            .map(|t| t["name"].as_str().expect("every tool is named"))
+            .collect();
+        assert_eq!(
+            names,
+            vec!["approve"],
+            "CC must see the permission tool and nothing else"
+        );
+    }
+
+    /// Hidden means unreachable, not just undocumented: CC's model could still
+    /// emit the name from an older transcript on `--resume`.
+    #[test]
+    fn permission_only_refuses_a_question_tool_call() {
+        let req = JsonRpcRequest {
+            id: Some(Value::from(9)),
+            method: "tools/call".to_string(),
+            params: serde_json::json!({
+                "name": "ask_user_question",
+                "arguments": { "question": "Deploy now?" }
+            }),
+        };
+        let resp = handle(
+            &req,
+            &dummy_client(),
+            "http://unused",
+            "tid",
+            ToolSet::PermissionOnly,
+        )
+        .unwrap();
+        assert!(resp.result.is_none());
+        assert!(resp.error.unwrap()["message"]
+            .as_str()
+            .unwrap()
+            .contains("ask_user_question"));
     }
 
     /// Codex reads this schema, not the engine's system prompt, when deciding
@@ -392,7 +505,7 @@ mod tests {
             method: "tools/list".to_string(),
             params: Value::Null,
         };
-        let resp = handle(&req, &dummy_client(), "http://unused", "tid").unwrap();
+        let resp = handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).unwrap();
         let options_desc = resp.result.unwrap()["tools"][1]["inputSchema"]["properties"]["options"]
             ["description"]
             .as_str()
@@ -414,7 +527,7 @@ mod tests {
             method: "tools/call".to_string(),
             params: serde_json::json!({ "name": "frobnicate", "arguments": {} }),
         };
-        let resp = handle(&req, &dummy_client(), "http://unused", "tid").unwrap();
+        let resp = handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).unwrap();
         assert!(resp.result.is_none());
         let err = resp.error.unwrap();
         assert!(
@@ -435,7 +548,7 @@ mod tests {
                 "arguments": { "question": "   " }
             }),
         };
-        let resp = handle(&req, &dummy_client(), "http://unused", "tid").unwrap();
+        let resp = handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).unwrap();
         let err = resp.error.unwrap();
         assert!(err["message"].as_str().unwrap().contains("question"));
     }
@@ -479,7 +592,7 @@ mod tests {
             method: "notifications/initialized".to_string(),
             params: Value::Null,
         };
-        assert!(handle(&req, &dummy_client(), "http://unused", "tid").is_none());
+        assert!(handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).is_none());
     }
 
     #[test]
@@ -489,7 +602,7 @@ mod tests {
             method: "totally/unknown".to_string(),
             params: Value::Null,
         };
-        let resp = handle(&req, &dummy_client(), "http://unused", "tid").unwrap();
+        let resp = handle(&req, &dummy_client(), "http://unused", "tid", ToolSet::All).unwrap();
         assert!(resp.result.is_none());
         let err = resp.error.unwrap();
         assert_eq!(err["code"], -32603);

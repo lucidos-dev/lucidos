@@ -2,26 +2,33 @@ import { describe, it, expect, beforeEach, vi } from 'vitest';
 
 const postMcpConsent = vi.fn(async () => {});
 const postCommandConsent = vi.fn(async () => {});
-const scrollToBottom = vi.fn();
 
 vi.mock('../../api/client', () => ({ postMcpConsent, postCommandConsent }));
-vi.mock('../../components/chat/scrollState', () => ({ scrollToBottom }));
 
 const { resolveCodingAgentPermission, resolveCommandPermission } = await import('./permissions');
 
+/** Resolving a permission card posts the consent and nothing else.
+ *
+ *  These assertions are inverted from what they were. All three cards used to
+ *  force the transcript to the bottom BEFORE the POST, so that the agent's
+ *  resumed stream would tail; the tests pinned the ordering of the two. The
+ *  scroll is gone (the app does not decide where the reader looks), so the
+ *  ordering has nothing to order.
+ *
+ *  Its absence is pinned by a source scan rather than here. This file mocked
+ *  `scrollState` and asserted the mock was never called, which could not fail
+ *  once `permissions.ts` stopped importing the module at all: an unimported mock
+ *  is never applied. The scan in
+ *  `components/chat/__tests__/scroll-follow-the-live-edge.test.ts` reads every
+ *  module under `store/actions` and fails on any unsanctioned reach for the live
+ *  edge, this one included, which is a guard that can actually go red. */
 describe('resolveCodingAgentPermission', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('force-scrolls to the bottom BEFORE POSTing consent so the resumed stream tails', async () => {
+  it('POSTs consent without moving the transcript', async () => {
     await resolveCodingAgentPermission('req-1', true, 'session');
 
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
     expect(postMcpConsent).toHaveBeenCalledWith('req-1', true, 'session');
-    const scrollOrder = scrollToBottom.mock.invocationCallOrder[0];
-    const consentOrder = postMcpConsent.mock.invocationCallOrder[0];
-    // Scroll must fire before the await so scrolledUp=false + resize-mode=scroll
-    // are set before the answered-state re-render's ResizeObserver fires.
-    expect(scrollOrder).toBeLessThan(consentOrder);
   });
 
   it('forwards a bare allow (no persist scope)', async () => {
@@ -29,25 +36,20 @@ describe('resolveCodingAgentPermission', () => {
     expect(postMcpConsent).toHaveBeenCalledWith('req-2', true, undefined);
   });
 
-  it('still pins before a rejected POST and propagates the error to the caller', async () => {
+  it('propagates a rejected POST to the caller, still without scrolling', async () => {
+    // The card's decide() rolls back its optimistic state and toasts.
     postMcpConsent.mockRejectedValueOnce(new Error('boom'));
     await expect(resolveCodingAgentPermission('req-3', false)).rejects.toThrow('boom');
-    // Pin happens before the throw — the card's decide() rolls back + toasts.
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
   });
 });
 
 describe('resolveCommandPermission', () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it('force-scrolls to the bottom BEFORE POSTing command consent', async () => {
+  it('POSTs command consent, and only that', async () => {
     await resolveCommandPermission('req-4', true, 'narrow');
 
-    expect(scrollToBottom).toHaveBeenCalledTimes(1);
     expect(postCommandConsent).toHaveBeenCalledWith('req-4', true, 'narrow');
     expect(postMcpConsent).not.toHaveBeenCalled();
-    const scrollOrder = scrollToBottom.mock.invocationCallOrder[0];
-    const consentOrder = postCommandConsent.mock.invocationCallOrder[0];
-    expect(scrollOrder).toBeLessThan(consentOrder);
   });
 });

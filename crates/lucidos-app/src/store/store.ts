@@ -1,5 +1,6 @@
 import { signal, computed } from '@preact/signals';
 import { hydratePinnedAppsFromStorage } from './actions/pinnedApps';
+import { minDrawerWidth } from './paneMinimums';
 import type {
   ThreadQueueResponse,
   MenuItem,
@@ -194,6 +195,24 @@ export type SettingsNavKey = Exclude<SettingsSubview, 'main'>;
 export interface SettingsNavItem {
   key: SettingsNavKey;
   label: string;
+  /** The header bar's form of `label`, when the full name does not fit there.
+   *  The bar is the narrowest place a category name is ever shown: on a phone
+   *  the title is one shrinkable member of a fixed-width cluster between two
+   *  chevrons (see `.header-title-cluster`, styles/header-mark.css), which
+   *  leaves it around a dozen characters, fewer at a raised UI scale.
+   *
+   *  Authored, never derived. A measured font-shrink was the alternative and is
+   *  rejected: a title that changes size from screen to screen makes the bar
+   *  jitter as the user navigates, and this header already carried a JS
+   *  measurement once (see `--mobile-content-title-max` in styles/mobile.css)
+   *  that was deleted for the complexity. Both the iOS and Material top-bar
+   *  conventions say the same thing: write a short title rather than scale a
+   *  long one, which is what a separate short back-button title exists for.
+   *
+   *  Only the bar reads it. The Settings home list, Search Everywhere, the
+   *  back/forward history menu and the title's own tap-tooltip all keep the
+   *  full `label`, so the shorthand never becomes the category's real name. */
+  short?: string;
 }
 /** Home-list grouping for the top-level Settings rows. Presentational only: a
  *  group is a heading above its rows, NOT a navigation level, so every category
@@ -211,7 +230,7 @@ export const SETTINGS_SYSTEM_SUBPANEL_ITEMS: SettingsNavItem[] = [
   { key: 'backup', label: 'Backup' },
   { key: 'memory', label: 'Memory' },
   { key: 'disk-usage', label: 'Disk Usage' },
-  { key: 'environment-variables', label: 'Environment Variables' },
+  { key: 'environment-variables', label: 'Environment Variables', short: 'Env Vars' },
   { key: 'debugging', label: 'Debugging' },
 ];
 
@@ -240,7 +259,7 @@ export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   // Binary paths + registered repositories: everything a coding-agent thread
   // needs configured, in one place. Both halves used to live apart (paths under
   // System → Overview, repositories as their own top-level row).
-  { key: 'coding-agents', label: 'Coding Agents', group: 'Assistant' },
+  { key: 'coding-agents', label: 'Coding Agents', short: 'Agents', group: 'Assistant' },
   { key: 'accounts', label: 'Accounts', group: 'Workspace' },
   // Language + timezone: workspace-wide user preferences, and among the most
   // looked-for settings there are. Previously buried under System → Overview.
@@ -258,12 +277,24 @@ export const SETTINGS_NAV_ITEMS: SettingsHomeNavItem[] = [
   // repo's own ampersand precedent: "Chat & triggers" is anchored `models:chat`.
   // Keeping `appearance` also keeps every persisted search recent, the LLM's
   // `settings_view` value and the SDK type stable across this restructure.
-  { key: 'appearance', label: 'Appearance & Behavior', group: 'This device' },
-  { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', group: 'This device' },
+  { key: 'appearance', label: 'Appearance & Behavior', short: 'Appearance', group: 'This device' },
+  { key: 'keyboard-shortcuts', label: 'Keyboard Shortcuts', short: 'Shortcuts', group: 'This device' },
 ];
 
+function settingsNavItem(key: Exclude<SettingsSubview, 'main'>): SettingsNavItem | undefined {
+  return [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].find(item => item.key === key);
+}
+
+/** The category's full name, for every surface with room for it. */
 export function settingsSubviewLabel(key: Exclude<SettingsSubview, 'main'>): string | undefined {
-  return [...SETTINGS_NAV_ITEMS, ...SETTINGS_SYSTEM_SUBPANEL_ITEMS].find(item => item.key === key)?.label;
+  return settingsNavItem(key)?.label;
+}
+
+/** The category's name as the header bar shows it: the authored `short` when
+ *  there is one, the full label otherwise. See `SettingsNavItem.short`. */
+export function settingsSubviewShortLabel(key: Exclude<SettingsSubview, 'main'>): string | undefined {
+  const item = settingsNavItem(key);
+  return item && (item.short ?? item.label);
 }
 
 /** Where a subview key retired by the 2026-08-05 restructure now lives. The
@@ -481,19 +512,34 @@ export function setDrawerView(view: DrawerView): void {
   else localStorage.setItem(ALT_VIEW_KEY, view);
 }
 export const DEFAULT_DRAWER_WIDTH = 300;
-// Floor: the drawer header's icon row needs 216px (5 × 2.25rem buttons +
-// 5 × 0.25rem gaps + 1rem padding at 16px/rem). 260 keeps the row intact
-// plus enough of the centered title to stay readable.
-export const MIN_DRAWER_WIDTH = 260;
 export const THREAD_DRAWER_WIDTH_KEY = 'lucidos-thread-drawer-width';
-// Clamp at load: widths persisted under an older, smaller minimum would
-// otherwise render an overflowing header until the next drag snaps them up.
+
+// Clamp at load: a width persisted under a smaller root font size (or on the
+// other desktop build) would otherwise render an overflowing header until the
+// next drag corrects it. The floor itself lives in store/paneMinimums.ts,
+// alongside the two split-pane floors it has to be weighed against.
 export const threadDrawerWidth = signal(
   Math.max(
-    MIN_DRAWER_WIDTH,
+    minDrawerWidth(),
     Number(localStorage.getItem(THREAD_DRAWER_WIDTH_KEY)) || DEFAULT_DRAWER_WIDTH,
   )
 );
+
+/** Re-apply the floor after something moved it. The floor is derived from the
+ *  root font size, so a UI-scale change can leave a settled drawer below it;
+ *  `applyUiScale` calls this for the same reason it re-measures the scrollbar
+ *  gutter. Widening persists, so the next reload starts from the corrected
+ *  width rather than re-correcting every boot.
+ *
+ *  Stays HERE rather than moving to paneMinimums.ts with the floor it reads:
+ *  it mutates `threadDrawerWidth`, and that module is imported by this one's
+ *  init, so the import back would be a boot-time cycle. */
+export function clampThreadDrawerWidth(): void {
+  const min = minDrawerWidth();
+  if (threadDrawerWidth.value >= min) return;
+  threadDrawerWidth.value = min;
+  localStorage.setItem(THREAD_DRAWER_WIDTH_KEY, String(min));
+}
 export const focusedThreadId = signal<string | null>(
   localStorage.getItem(FOCUSED_THREAD_KEY)
 );
@@ -559,6 +605,15 @@ function restoreThreadChannelFilter(): Set<ThreadChannel> {
 }
 
 export const threadChannelFilter = signal<Set<ThreadChannel>>(restoreThreadChannelFilter());
+
+/** The persisting writer for the channel selection, matching
+ *  `setSelectedTriggerIds` / `setSelectedRepoIds` / `setSelectedAppIds` below.
+ *  Every write goes through here so no caller can set the signal and forget the
+ *  localStorage half, which is how a filter survives a reload. */
+export function setThreadChannelFilter(next: Set<ThreadChannel>): void {
+  threadChannelFilter.value = next;
+  localStorage.setItem(THREAD_CHANNEL_FILTER_KEY, JSON.stringify([...next]));
+}
 
 export function threadChannelToFilterSource(channel: ThreadChannel): ThreadFilterSource {
   switch (channel) {
@@ -1954,7 +2009,7 @@ export const updateAvailable = signal(false);
 // --- New engine version ready to switch onto (dev background rebuild) ---
 // Set by the version-status poll (store/actions/engine-update.ts) when a newer
 // engine binary is on disk. Drives the "New version available → Switch to new
-// version" toast + the control-panel badge. Distinct from `updateAvailable` (the
+// version" toast + the brand badge. Distinct from `updateAvailable` (the
 // client-bundle refresh) and `restartRequired` (a restart-requiring change was
 // applied): this is the honest "the rebuilt engine is READY to switch to" signal.
 export const engineVersionReady = signal(false);
@@ -1973,10 +2028,10 @@ export const engineBuilding = signal(false);
 
 /** Whether a new engine version is actually READY to switch onto — the honest
  *  "ready for the switch" signal that agrees with the background-build scheme.
- *  Lives here (not in a component) so BOTH the control-panel badge/reload-glyph
+ *  Lives here (not in a component) so BOTH the brand badge / Refresh row
  *  AND the restart progress-toast wording (chat-changes.ts `initiateEngineRestart`)
  *  derive from the SAME predicate — the toast must never disagree with the badge —
- *  without a chat-changes ↔ ControlPanel import cycle (same reasoning as
+ *  without a chat-changes ↔ HeaderMark import cycle (same reasoning as
  *  NEW_VERSION_TOAST_KEY below).
  *
  *  In **dev** this is `engineVersionReady` alone: Apply is non-disruptive and

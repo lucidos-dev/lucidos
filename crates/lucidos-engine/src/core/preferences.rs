@@ -483,11 +483,17 @@ impl PreferenceStore {
     }
 
     /// Read the model + reasoning effort a thread last ran with — the values
-    /// stamped on the thread's most recent `MessageReceived` that carried them.
+    /// stamped on the thread's most recent starter event that carried them.
     /// This is the per-thread memory: a follow-up with no explicit override
     /// reuses these instead of snapping back to the account default. Resolved
     /// per field independently (a legacy message with only one set still
     /// contributes that field), newest-first by `sequence`.
+    ///
+    /// Both starter kinds count. A chat turn starts with `MessageReceived`; a
+    /// **trigger** fire starts with `TriggerStarted` and emits no
+    /// `MessageReceived` at all, so reading only the former would make a
+    /// trigger thread report the account default however the trigger was
+    /// pinned, and a human follow-up there would silently switch models.
     ///
     /// `exclude_event_id` drops the in-flight turn's own `MessageReceived` when
     /// it was pre-emitted upstream (`pre_emitted_origin` == `events.id`), so we
@@ -498,16 +504,16 @@ impl PreferenceStore {
         thread_id: Uuid,
         exclude_event_id: Option<Uuid>,
     ) -> (Option<String>, Option<String>) {
-        // `MessageReceived` thread-event payloads are flat (see
-        // `ThreadEvent::to_payload`), so `payload->>'model'` reads the field
-        // directly. `aggregate_id` is text; bind the thread id as its string.
+        // Starter thread-event payloads are flat (see `ThreadEvent::to_payload`),
+        // so `payload->>'model'` reads the field directly on both variants.
+        // `aggregate_id` is text; bind the thread id as its string.
         let row = sqlx::query_as::<_, (Option<String>, Option<String>)>(
             r#"
             SELECT
               (SELECT payload->>'model'
                  FROM events
                 WHERE aggregate_id = $1
-                  AND event_type = 'MessageReceived'
+                  AND event_type IN ('MessageReceived', 'TriggerStarted')
                   AND payload->>'model' IS NOT NULL
                   AND payload->>'model' <> ''
                   AND ($2::uuid IS NULL OR id <> $2)
@@ -516,7 +522,7 @@ impl PreferenceStore {
               (SELECT payload->>'reasoning_effort'
                  FROM events
                 WHERE aggregate_id = $1
-                  AND event_type = 'MessageReceived'
+                  AND event_type IN ('MessageReceived', 'TriggerStarted')
                   AND payload->>'reasoning_effort' IS NOT NULL
                   AND payload->>'reasoning_effort' <> ''
                   AND ($2::uuid IS NULL OR id <> $2)

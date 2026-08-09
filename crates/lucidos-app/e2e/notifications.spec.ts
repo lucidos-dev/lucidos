@@ -302,16 +302,14 @@ test.describe('Notification deep-link to an event in an unfocused thread', () =>
     // observer-driven restore.) Without the fix the bottom-most deep-link target
     // never enters the viewport.
     //
-    // The `:999` is the position's REVISION stamp (the turn count it was taken
-    // at), and it is what keeps this test exercising its regression: a reading
-    // position is retired once the thread has gained turns since the save, and
-    // an UNSTAMPED value is retired on sight (see `savedScrollIsStale`). A bare
-    // '100' would therefore be dropped before useScrollMemory ever read it, so
-    // nothing would race the deep-link and the assertion below would pass for
-    // the wrong reason. A revision far above this thread's 16 turns says "this
-    // position is current", so the restore still competes.
+    // A bare offset, not the `100:999` this used to seed. The suffix was a
+    // REVISION stamp that kept the position from being retired for being older
+    // than the thread; positions are no longer retired at all, so the stamp is
+    // inert and seeding one would only suggest a mechanism that is gone.
+    // `parseSavedScroll` still reads an old stamped value offset-first, which is
+    // why a browser carrying one keeps its place across the change.
     await page.evaluate((tid) => {
-      localStorage.setItem(`lucidos-scroll-thread-${tid}`, '100:999');
+      localStorage.setItem(`lucidos-scroll-thread-${tid}`, '100');
     }, threadId);
 
     await postNotification(page, {

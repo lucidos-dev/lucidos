@@ -1,4 +1,4 @@
-import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent } from '../store';
+import { preferences, showToast, removeToast, notificationsFilter, currentModel, reasoningEffort, selectedCodingAgent, clampThreadDrawerWidth } from '../store';
 import type { CodingAgent } from '../../api/types';
 import { toFailed } from '../types';
 import { getPreferences, setPreference, isTransientFetchError } from '../../api/client';
@@ -9,6 +9,11 @@ import { REASONING_LEVELS, clampReasoningEffort, DEFAULT_CHAT_MODEL } from '../m
 import { isIOS, isIOSPwa, isTauri } from '../../utils/platform';
 import { publishScrollbarGutter } from '../../utils/scrollbarGutter';
 import { setTitlebarColor } from '../../utils/tauri';
+import {
+  STYLE_OVERRIDES_KEY, STYLE_OVERRIDES_STORAGE_KEY, STYLE_RESET_PARAM,
+  isValidOverrideName, isValidOverrideValue, parseStyleOverrides,
+  serializeStyleOverrides, styleResetRequested,
+} from '../../utils/styleOverrides';
 
 export type Theme = 'light' | 'dark' | 'system';
 export type FontFamily = 'monospace' | 'system' | 'inter' | 'jetbrains-mono' | 'ibm-plex-mono' | 'fira-code';
@@ -305,6 +310,12 @@ export function applyUiScale(scale: number): void {
   // Re-measure, or the composer stops lining up with the transcript at any scale
   // other than the one that was live at boot.
   publishScrollbarGutter();
+  // Same reason, other quantity: the thread drawer's floor is what its header
+  // row needs, and that row is rem-authored too, so scaling up can leave a
+  // settled drawer narrower than its own header.
+  clampThreadDrawerWidth();
+  // This just wrote --user-ui-scale inline, which the remote may be overriding.
+  reapplyStyleOverrides();
 }
 
 export function currentUiScale(): number {
@@ -378,6 +389,9 @@ export function applyTheme(theme: Theme): void {
 
   syncSystemThemeListener(theme);
   lastAppliedTheme = theme;
+  // This just wrote --bg-primary inline and swapped the token block wholesale,
+  // so any override of a themed token has to be re-asserted on top.
+  reapplyStyleOverrides();
 }
 
 // iOS WKWebView fires prefers-color-scheme change events with wrong values
@@ -429,6 +443,8 @@ export function applyFontFamily(font: FontFamily): void {
   const features = FONT_FEATURES[font] || FONT_FEATURES_DEFAULT;
   document.documentElement.style.setProperty('--font-features-text', features.text);
   document.documentElement.style.setProperty('--font-features-code', features.code);
+  // This just wrote --font-ui and the two feature properties inline.
+  reapplyStyleOverrides();
 }
 
 export function currentFontFamily(): FontFamily {
@@ -437,6 +453,133 @@ export function currentFontFamily(): FontFamily {
 
 export function setFontFamily(font: FontFamily): Promise<void> {
   return savePreference('font-family', font, () => applyFontFamily(font), true);
+}
+
+// --- Style overrides (the live style remote) ---
+
+/** The custom property names currently written onto `<html>` by this module.
+ *  Kept so a name DROPPED from the map is `removeProperty`'d rather than left
+ *  stuck at its last value: an inline property outlives the map that set it,
+ *  so "clear" would otherwise only take effect on the next reload. */
+let appliedOverrideNames: string[] = [];
+
+/** Write the map onto the root element, removing any name that has since left
+ *  it. Validation happens here as well as at parse time, because a caller can
+ *  hand a map straight in. */
+export function applyStyleOverrides(map: Record<string, string>): void {
+  const root = document.documentElement;
+  // Apply first and record what ACTUALLY landed, then remove anything that was
+  // applied before and is not in that set. Keying the removal on the incoming
+  // map instead would leave a stale value stuck: a name whose new value fails
+  // validation is still `in map`, so it would be skipped by both loops and keep
+  // painting its previous value, from a function that promises to validate.
+  const applied: string[] = [];
+  for (const [name, value] of Object.entries(map)) {
+    if (!isValidOverrideName(name) || !isValidOverrideValue(value)) continue;
+    root.style.setProperty(name, value);
+    applied.push(name);
+  }
+  for (const name of appliedOverrideNames) {
+    if (!applied.includes(name)) root.style.removeProperty(name);
+  }
+  appliedOverrideNames = applied;
+  localStorage.setItem(STYLE_OVERRIDES_STORAGE_KEY, serializeStyleOverrides(map));
+  // A retuned --font-size-* or spacing token moves the root font size's
+  // consumers, and the scrollbar gutter is measured in px off rem-authored
+  // chrome. Same reason applyUiScale re-measures.
+  publishScrollbarGutter();
+  // Same reason again: --user-ui-scale is itself overridable, and the thread
+  // drawer's floor is what its rem-authored header row needs.
+  clampThreadDrawerWidth();
+}
+
+/** Re-assert the overrides after something else has written the same
+ *  properties inline. `applyTheme` writes `--bg-primary`, `applyUiScale` writes
+ *  `--user-ui-scale`, `applyFontFamily` writes `--font-ui`: each is a property
+ *  the remote is allowed to override, and each of those three calls this at the
+ *  end so the override keeps winning. Without it a system-theme flip silently
+ *  reverts a tuned background. */
+export function reapplyStyleOverrides(): void {
+  if (appliedOverrideNames.length === 0) return;
+  const root = document.documentElement;
+  const map = currentStyleOverrides();
+  for (const [name, value] of Object.entries(map)) {
+    root.style.setProperty(name, value);
+  }
+}
+
+export function currentStyleOverrides(): Record<string, string> {
+  if (preferences.value.status !== 'loaded') {
+    return parseStyleOverrides(localStorage.getItem(STYLE_OVERRIDES_STORAGE_KEY));
+  }
+  return parseStyleOverrides(preferences.value.data[STYLE_OVERRIDES_KEY]);
+}
+
+/** Set or clear one custom property. `null` removes it. Device-scoped, like
+ *  theme / font / scale: tuning on the phone must not retune the desktop. */
+export function setStyleOverride(name: string, value: string | null): Promise<void> {
+  const next = { ...currentStyleOverrides() };
+  if (value === null) delete next[name];
+  else next[name] = value;
+  const serialized = serializeStyleOverrides(next);
+  return savePreference(STYLE_OVERRIDES_KEY, serialized, () => applyStyleOverrides(next), true);
+}
+
+export function clearStyleOverrides(): Promise<void> {
+  return savePreference(STYLE_OVERRIDES_KEY, '{}', () => applyStyleOverrides({}), true);
+}
+
+/** Apply whatever the loaded preferences say, honouring the `?style-reset`
+ *  escape hatch. Called at the END of `loadPreferences`, after theme / scale /
+ *  font, so an override of one of their properties wins.
+ *
+ *  Never throws. This is DECORATION running inside the load of everything the
+ *  app needs to function: letting it escape would turn one bad custom property
+ *  into a `failed` preferences state, which blanks the user's model, theme,
+ *  reasoning effort and coding agent. The carve-out in `.claude/rules/frontend.md`
+ *  applies (no user intent on this line, and it self-recovers): every token
+ *  simply keeps its stylesheet value, the next `PreferencesChanged` re-runs
+ *  this, and a genuinely wrong value has two user-facing routes out, the
+ *  Settings row and `?style-reset`. */
+/** Whether `?style-reset` has already been honoured in this document.
+ *
+ *  The reset MUST run at most once per page load. `loadPreferences` re-runs on
+ *  every `PreferencesChanged`, and the clear is itself a preference write that
+ *  emits one, so a URL still carrying the parameter would drive an endless
+ *  write/SSE/reload loop: clear, fan out, reload, see the parameter, clear
+ *  again. The parameter is also stripped from the URL below, so a later reload
+ *  of the same tab does not silently wipe values tuned since. */
+let styleResetHonoured = false;
+
+function applyStyleOverridesFromPreferences(): void {
+  try {
+    // `window.location` is absent in non-DOM environments, and a missing
+    // search string must not be what decides whether preferences load.
+    const search = typeof window !== 'undefined' ? (window.location?.search ?? '') : '';
+    if (!styleResetHonoured && styleResetRequested(search)) {
+      styleResetHonoured = true;
+      dropStyleResetParam();
+      // Fire-and-forget with a caught rejection: the reset must clear the LOCAL
+      // paint immediately even if the engine is unreachable, which is a
+      // plausible state for someone who just made their UI unusable.
+      void clearStyleOverrides().catch((e) => console.warn('[style-remote] reset write failed', e));
+      return;
+    }
+    applyStyleOverrides(currentStyleOverrides());
+  } catch (e) {
+    console.warn('[style-remote] applying overrides failed', e);
+  }
+}
+
+/** Take `?style-reset` out of the address bar once it has been honoured, so a
+ *  refresh, a restored tab or a shared link does not keep clearing overrides.
+ *  Only the query parameter is touched: the path and the hash carry the app's
+ *  own routing. */
+function dropStyleResetParam(): void {
+  if (typeof window === 'undefined' || !window.history?.replaceState) return;
+  const url = new URL(window.location.href);
+  url.searchParams.delete(STYLE_RESET_PARAM);
+  window.history.replaceState(null, '', `${url.pathname}${url.search}${url.hash}`);
 }
 
 // --- Image model ---
@@ -600,6 +743,9 @@ export async function loadPreferences(): Promise<void> {
     reasoningEffort.value = clampReasoningEffort(currentChatReasoningEffort(), currentModel.value);
     notificationsFilter.value = currentNotificationsFilter();
     selectedCodingAgent.value = currentCodingAgentDefault();
+    // LAST, deliberately: the three applies above write properties the remote
+    // is allowed to override, so the overrides go on top of them.
+    applyStyleOverridesFromPreferences();
   } catch (e) {
     preferences.value = toFailed(e);
   }

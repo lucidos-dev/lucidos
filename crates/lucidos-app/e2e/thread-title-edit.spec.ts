@@ -341,10 +341,42 @@ test.describe('Thread title editing — mobile', () => {
       return container ? container.scrollHeight > container.clientHeight : false;
     }, undefined, { timeout: 5_000 });
 
-    // Scroll down in the thread content to trigger header hide
+    // Park the reader at the top FIRST, so what follows is a real scroll down.
+    // Sending a message arms the standing follow (scrollState.ts), and while it
+    // is armed content growth writes the reader back to the live edge, so the
+    // filler above already left us at the bottom and a scroll to where we
+    // already are produces no delta for hide-on-scroll to act on. Moving
+    // scrollTop ourselves is also what retires the follow, since it is not a
+    // follow write.
     await page.evaluate(() => {
       const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
-      if (container) container.scrollTop = container.scrollHeight;
+      if (container) container.scrollTop = 0;
+    });
+    await page.waitForFunction(() => {
+      const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
+      const header = document.querySelector('.app-header');
+      return !!container && container.scrollTop === 0
+        && !!header && header.getBoundingClientRect().bottom > 0;
+    }, undefined, { timeout: 5_000 });
+
+    // Scroll down the way a drag does, in spaced steps, NOT in one write.
+    // `useHideOnScroll` skips any scroll event that arrives inside the app's own
+    // 64ms navigation-scroll window (`isNavigationScroll`), and landing at the
+    // top can open that window: a single jump to the bottom is a SINGLE event,
+    // so if it lands inside the window it is swallowed and no later event ever
+    // comes, leaving the header up with the reader already at the live edge. A
+    // real drag emits events across hundreds of ms and cannot be lost that way,
+    // and each step here is spaced past the window for the same reason.
+    await page.evaluate(async () => {
+      const container = document.querySelector('.mobile-swipe-pane .thread-content.visible');
+      if (!container) return;
+      const step = Math.max(80, Math.floor(container.clientHeight / 2));
+      for (let i = 0; i < 40; i++) {
+        const before = container.scrollTop;
+        container.scrollTop = before + step;
+        if (container.scrollTop === before) break;
+        await new Promise(r => setTimeout(r, 80));
+      }
     });
 
     // Wait for header to hide (translateY should be negative)

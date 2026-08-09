@@ -9,14 +9,21 @@ How the chat agent runs Python in a workspace, and which mistakes are silent con
 
 ## Pick the right tool
 
-| Tool | When | Sync ceiling |
-|------|------|--------------|
-| `run_python` | Quick scripts: data prep, plotting, file conversion, one-off transforms. Returns stdout synchronously when the script finishes. | 300 s |
-| `run_python_background` | Anything that may run longer than ~30 s — backtests, model training, large data sweeps, batch downloads. Returns a `task_id` immediately; drain with `bash_output(task_id, wait_secs=…)`. | watchdog (default 1 h, max 12 h) |
+| Tool | When | Ceiling |
+|------|------|---------|
+| `run_python` | Quick scripts: data prep, plotting, file conversion, one-off transforms. Returns stdout synchronously when the script finishes. | 300 s hard, not adjustable |
+| `run_python_background` | Anything that may run longer than ~30 s: backtests, model training, large data sweeps, batch downloads. Returns a `task_id` immediately; drain with `bash_output(task_id, wait_secs=…)`. | watchdog `timeout_secs` (default 600 s, max 3600 s) |
 | `bash_output(task_id, wait_secs?)` | The drain tool for the two above AND for `run_bash_background`. Pass `wait_secs` to BLOCK server-side for that many seconds, or until the task finishes. | up to 120 s per call |
 | `bash_kill(task_id)` | Cancel a running background task. No-op if already finished. | — |
 
 Decision rule: if you'd reach for `time.sleep` inside `run_python`, you almost certainly want `run_python_background` plus a `bash_output(task_id, wait_secs=N)` instead. The single most common context-waster in chat threads is hand-rolling polling loops.
+
+`run_python`'s 300 s sync ceiling is enforced, not advisory. At it the
+interpreter is SIGKILLed and the call comes back as a failed tool result
+naming the ceiling. There is no `timeout_secs` on `run_python` to raise, so a
+script you can't confidently size belongs in `run_python_background` from the
+start. A killed run commits nothing: its `data/` writes were only ever staged,
+so you lose the work but never half of it.
 
 ## The drain pattern — never poll with `time.sleep`
 
@@ -191,5 +198,11 @@ These all look reasonable in isolation; they fail the same way every time and wa
 `run_python` (the sync foreground tool) auto-trims long tracebacks before returning: keeps the first and last `File "..."` frame and the final `ExceptionClass: message` line, drops the middle. The full traceback is on disk at `.lucidos/exhaust/<run_id>/stderr.txt` for debugging.
 
 `run_python_background` does NOT auto-trim — its stderr flows through `bash_output` raw, which is fine for short outputs but means a verbose chained import error can dump many KB of frames into your context. When you spawn a backtest / long script you expect MIGHT crash with a multi-thousand-line traceback, wrap the body in your own `try / except` and re-raise a short fingerprint: `print(f"FAIL: {type(e).__name__}: {e}", file=sys.stderr); raise`. The full traceback still lands on disk at `.lucidos/exhaust/<task_id>/stderr.txt`.
+
+A `run_python` call that hits the 300 s ceiling fails with `Python script
+timed out after 300s`. That is not a crash to diagnose and never a script to
+retry as-is: the code was fine, the budget was not. Move it to
+`run_python_background` (or cut the work down) rather than running it again
+and spending another 300 s on the same wall.
 
 The trimmed (or short) form is enough to act on — diagnose the exception class + the user-frame line, fix the script, retry once. Don't retry with sys.path / chdir variants in the hope that one sticks; check what's importable first.

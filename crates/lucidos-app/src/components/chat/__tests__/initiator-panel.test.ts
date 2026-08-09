@@ -166,6 +166,35 @@ describe('describeInitiator — label is WHO, summary is WHAT', () => {
     expect(desc.label).toBe('Response interrupted');
   });
 
+  /** The user's **Stop waiting**, in the same iconless boundary style as the
+   *  cancel below it and for the same reason: a person did something to this
+   *  thread, and the action IS the header. The header names what was stopped,
+   *  because once the clock indicator drops the wait this line is the only
+   *  place the subscription is named at all. */
+  it('EventWaitCanceled (user stop): iconless action label naming what was stopped', () => {
+    const ex = exchangeWith({
+      type: 'EventWaitCanceled',
+      wait_id: 'w1',
+      cause: 'user_stop',
+      reason: "tonight's E2E suite to pass",
+      actor: { kind: 'device', device_id: 'd-1', label: 'iOS Safari PWA' },
+    });
+    const desc = describeInitiator(ex, '', [], 'tid');
+    expect(desc.icon).toBeNull();
+    expect(desc.label).toBe("Stopped waiting: tonight's E2E suite to pass");
+    expect(desc.summary).toBeUndefined();
+    // The chip stays clickable: the popover is where the device that pressed
+    // the button is disclosed, off this event's own `actor`.
+    expect(desc.actorClickable).not.toBe(false);
+  });
+
+  /** A pre-2026-08-07 row carries no reason, so the line says the one thing it
+   *  knows rather than trailing an empty colon. */
+  it('EventWaitCanceled (user stop, legacy row): names no subscription it cannot name', () => {
+    const ex = exchangeWith({ type: 'EventWaitCanceled', wait_id: 'w1', cause: 'user_stop' });
+    expect(describeInitiator(ex, '', [], 'tid').label).toBe('Stopped waiting for an event');
+  });
+
   it('ResponseCanceled: no chip — "Response canceled" IS the header label, no summary, no icon', () => {
     // The cancel boundary drops the actor chip: the label is the header text and
     // clicking it opens the Initiator info popover. icon is null so ActorChipBody

@@ -1,9 +1,11 @@
 import { useState, useEffect, useRef } from 'preact/hooks';
-import { activeInlineForm, triggers, triggerGroups, showToast } from '../../store/store';
+import { activeInlineForm, triggers, triggerGroups, showToast, chatModels, currentModel, reasoningEffort } from '../../store/store';
 import {
   closeTriggerForm,
   submitTrigger,
 } from '../../store/actions/triggers';
+import { chatModelOptions, loadChatModels } from '../../store/actions/models';
+import { availableReasoningLevels, clampReasoningEffort, REASONING_LEVELS } from '../../store/models';
 import { createTriggerGroup } from '../../store/actions/triggerGroups';
 import { deriveTriggerType, toFailed } from '../../store/types';
 import type { EventSubscription, SideEffectCategory, TriggerInfo, TriggerRun, Loadable } from '../../store/types';
@@ -13,6 +15,7 @@ import { fetchEventTypes } from '../../api/client';
 import { resizeTextarea, useFontMetricsResize } from '../chat/promptResize';
 import { useDelayedLoading } from '../../hooks/useDelayedLoading';
 import { LoadableError } from '../shared/LoadableError';
+import { Explainer, FieldLabel } from '../shared/Explainer';
 import { PROSE_TEXT_ATTRS } from '../../utils/noAutofill';
 
 const NEW_GROUP_SENTINEL = '__new_group__';
@@ -61,7 +64,12 @@ export function TriggerDetails() {
     }
     const trigger = triggers.value.data.find((t) => t.id === editingId);
     if (!trigger) {
-      return <MissingTriggerCloser />;
+      // key={editingId} forces a remount when activeInlineForm flips from
+      // missing-A to missing-B in successive renders: without it, Preact reuses
+      // the instance and the empty-deps useEffect never re-fires for B, leaving
+      // the form open on a trigger that no longer exists. Same guard as
+      // AppUiEditModal's MissingAppCloser.
+      return <MissingTriggerCloser key={editingId} />;
     }
     return <TriggerFormInner key={editingId} editingId={editingId} existingTrigger={trigger} />;
   }
@@ -156,6 +164,19 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on ? [...prev.filter(c => c !== cat), cat] : prev.filter(c => c !== cat)
     );
   };
+  // '' is the Default option: the trigger inherits the account chat model /
+  // effort, which is what a trigger without a pin has always done. Kept as ''
+  // rather than null so the <Dropdown> value round-trips as a plain string.
+  const [model, setModel] = useState<string>(existingTrigger?.model ?? '');
+  const [triggerEffort, setTriggerEffort] = useState<string>(existingTrigger?.reasoning_effort ?? '');
+  // The picker reads the DB-backed registry; kick a load if nothing has yet
+  // (loadChatModels single-flights via setLoadingIfFresh). Until it lands,
+  // chatModelOptions() falls back to the static list, so the field is never
+  // empty. Same guard as the in-thread Lucidos control menu.
+  useEffect(() => {
+    if (chatModels.value.status === 'not-loaded') void loadChatModels();
+  }, []);
+
   const [groupId, setGroupId] = useState<string>(existingTrigger?.group_id ?? '');
   // null = inline-create field hidden; string = visible with current draft.
   const [newGroupDraft, setNewGroupDraft] = useState<string | null>(null);
@@ -261,15 +282,17 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
       on = built;
     }
 
-    // go_to_review / side_effect_grant only apply to the intent path — a script
-    // trigger ignores both, so persist their inert defaults rather than stale
-    // form state carried over from an intent → script switch.
-    const isIntent = run.type === 'intent';
+    // go_to_review / side_effect_grant / model / reasoning_effort apply only to
+    // the intent path; `submitTrigger` gates all four on `run.type` so a script
+    // trigger can't persist state left over from an intent → script switch.
     await submitTrigger({
       name, run, cronExpressions: finalCrons, triggerId: editingId,
-      on, showEvent, goToReview: isIntent ? goToReview : false,
+      on, showEvent, goToReview,
       groupId: groupId || null,
-      sideEffectGrant: isIntent ? sideEffectGrant : [],
+      sideEffectGrant,
+      // '' is the Default option; null is how it reaches the engine.
+      model: model || null,
+      reasoningEffort: triggerEffort || null,
     });
   }
 
@@ -327,6 +350,40 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
     setNewGroupDraft(null);
   }
 
+  // Default first, then the same registry-backed list the chat picker offers
+  // (enabled models whose provider is configured). The Default row names the
+  // account model so the user can see what they are inheriting, mirroring the
+  // coding-agent menu's "(currently ...)" annotation.
+  const modelOptions: { value: string; label: string }[] = (() => {
+    const options = chatModelOptions();
+    const accountLabel =
+      options.find(o => o.value === currentModel.value)?.label ?? currentModel.value;
+    return [{ value: '', label: `Default (${accountLabel})` }, ...options];
+  })();
+
+  // Which tiers to offer depends on the model this trigger will actually run
+  // on: its own pin when it has one, otherwise the account model.
+  const effectiveModel = model || currentModel.value;
+  const effortOptions: { value: string; label: string }[] = (() => {
+    const accountLabel =
+      REASONING_LEVELS.find(l => l.value === reasoningEffort.value)?.label ?? reasoningEffort.value;
+    return [
+      { value: '', label: `Default (${accountLabel})` },
+      ...availableReasoningLevels(effectiveModel),
+    ];
+  })();
+
+  /** Switching the model can drop a tier the new one doesn't support, so snap a
+   *  pinned effort the way the account picker does (`setCurrentModel`). A
+   *  Default effort stays Default: it follows the account setting, which the
+   *  engine clamps per model at call time. */
+  function handleModelChange(next: string) {
+    setModel(next);
+    if (triggerEffort) {
+      setTriggerEffort(clampReasoningEffort(triggerEffort, next || currentModel.value));
+    }
+  }
+
   const groupsLoadable = triggerGroups.value;
   const groupOptions: { value: string; label: string }[] = (() => {
     const opts: { value: string; label: string }[] = [{ value: '', label: '(No group)' }];
@@ -356,7 +413,13 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
           </div>
 
           <div class="form-group">
-            <label>Group</label>
+            <FieldLabel title="Group">
+                <p>Optional folder shown in the triggers panel.</p>
+                <p>
+                  Group related triggers, e.g. steps of a workflow connected by{' '}
+                  <code>emit_event</code> to <code>on_event</code>.
+                </p>
+            </FieldLabel>
             <Dropdown
               class="trigger-group-select"
               value={groupId}
@@ -379,9 +442,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                 }}
               />
             )}
-            <div class="form-hint">
-              Optional folder shown in the triggers panel. Group related triggers (e.g. steps of a workflow connected by emit_event → on_event).
-            </div>
           </div>
 
           <div class="form-group">
@@ -467,7 +527,12 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
 
           {showEvent && (
             <div class="form-group">
-              <label>Event Subscriptions</label>
+              <FieldLabel title="Event Subscriptions">
+                  <p>
+                    Each subscription's condition only filters that event: different
+                    events can carry different payloads.
+                  </p>
+              </FieldLabel>
               {eventTypesLoadable.status === 'failed' && (
                 <div class="form-error">Failed to load event types: {eventTypesLoadable.error}</div>
               )}
@@ -517,9 +582,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                   Add event
                 </button>
               </div>
-              <div class="form-hint">
-                Each subscription's condition only filters that event — different events can carry different payloads.
-              </div>
             </div>
           )}
 
@@ -560,24 +622,32 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
             </div>
           ) : (
             <div class="form-group">
-              <label>Script Path</label>
+              {/* Script triggers are threadless (there is no run thread to
+                  open), so point at how to observe them instead. Only when
+                  editing an existing trigger: a brand-new one has no runs yet,
+                  and a falsy child leaves FieldLabel a plain label. */}
+              <FieldLabel title="Watching this trigger's runs" label="Script Path">
+                {editingId && (
+                  <>
+                    <p>
+                      Each run is recorded as events, and the trigger's row shows the
+                      last run's OK/failed status.
+                    </p>
+                    <p>
+                      For more on this trigger's runs (what it found, when, why a run
+                      failed) ask the Lucidos Agent, e.g. “what has{' '}
+                      {existingTrigger?.name || 'this trigger'} been finding?”, or
+                      build an app on its events.
+                    </p>
+                  </>
+                )}
+              </FieldLabel>
               <input
                 type="text"
                 value={scriptPath}
                 onInput={(e) => setScriptPath((e.target as HTMLInputElement).value)}
                 placeholder="e.g. oura/run.py"
               />
-              {/* Script triggers are threadless — there's no run thread to open —
-                  so point at how to observe them. Only when editing an existing
-                  trigger (a brand-new one has no runs yet). */}
-              {editingId && (
-                <div class="form-hint">
-                  Each run is recorded as events, and the trigger's row shows the last run's OK/failed status.
-                  For more on this trigger's runs — what it found, when, why a run failed — ask the
-                  Lucidos Agent (e.g. “what has {existingTrigger?.name || 'this trigger'} been finding?”)
-                  or build an app on its events.
-                </div>
-              )}
             </div>
           )}
 
@@ -587,6 +657,32 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
           {runType === 'intent' && (
             <>
               <div class="form-group">
+                <FieldLabel title="Model">
+                    <p>What this trigger's unattended runs use.</p>
+                    <p>
+                      The default follows Settings → Models → Chat &amp; triggers, so
+                      pick a model here only when this trigger should differ, e.g.
+                      something cheap for a routine digest or something stronger for a
+                      weekly analysis.
+                    </p>
+                </FieldLabel>
+                <Dropdown
+                  value={model}
+                  onChange={handleModelChange}
+                  options={modelOptions}
+                />
+              </div>
+
+              <div class="form-group">
+                <label>Reasoning</label>
+                <Dropdown
+                  value={triggerEffort}
+                  onChange={setTriggerEffort}
+                  options={effortOptions}
+                />
+              </div>
+
+              <div class="form-group">
                 <label class="form-checkbox-row">
                   <input
                     type="checkbox"
@@ -594,14 +690,29 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                     onChange={(e) => setGoToReview((e.target as HTMLInputElement).checked)}
                   />
                   <span>Send to Review on completion</span>
+                  <Explainer title="Send to Review on completion">
+                    <p>By default, runs land in Archive.</p>
+                    <p>
+                      Turn this on for triggers whose output you're meant to read:
+                      daily summaries, alerts, scheduled reports.
+                    </p>
+                  </Explainer>
                 </label>
-                <div class="form-hint">
-                  By default, runs land in Archive. Turn this on for triggers whose output you're meant to read — daily summaries, alerts, scheduled reports.
-                </div>
               </div>
 
               <div class="form-group">
-                <label>Allowed side-effects</label>
+                <FieldLabel title="Allowed side-effects">
+                    <p>Only used when command safety is on (Settings → Permissions).</p>
+                    <p>
+                      This trigger runs unattended, so it can't be asked to approve a
+                      risky command. Grant only the irreversible side-effects its intent
+                      genuinely needs: anything else is blocked and the run fails.
+                    </p>
+                    <p>
+                      Leave all off if it only reads, computes, or writes inside the
+                      workspace.
+                    </p>
+                </FieldLabel>
                 <div class="form-checkbox-list">
                   {SIDE_EFFECT_CATEGORIES.map((cat) => (
                     <label class="form-checkbox-row" key={cat.value}>
@@ -615,9 +726,6 @@ function TriggerFormInner({ editingId, existingTrigger }: { editingId?: string; 
                       <span>{cat.label}</span>
                     </label>
                   ))}
-                </div>
-                <div class="form-hint">
-                  Only used when command safety is on (Settings → Permissions). This trigger runs unattended, so it can't be asked to approve a risky command. Grant only the irreversible side-effects its intent genuinely needs: anything else is blocked and the run fails. Leave all off if it only reads, computes, or writes inside the workspace.
                 </div>
               </div>
             </>

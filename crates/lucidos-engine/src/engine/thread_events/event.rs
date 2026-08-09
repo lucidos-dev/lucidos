@@ -572,6 +572,19 @@ pub enum ThreadEvent {
         /// to false for backward compat with pre-flag DB rows.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         go_to_review: bool,
+        /// The model this fire actually ran on, resolved from the trigger's own
+        /// pin or the account chat preference. `TriggerStarted` is a trigger
+        /// thread's STARTER event (it has no `MessageReceived`), so this is
+        /// where the *per-thread model memory* reads from: without it the
+        /// thread's in-thread picker would show the account model while the run
+        /// used a different one, and a human follow-up would silently switch.
+        /// `None` on legacy rows persisted before the field existed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
+        /// The reasoning effort this fire actually ran with. Same role and same
+        /// legacy-`None` caveat as [`Self::TriggerStarted::model`].
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reasoning_effort: Option<String>,
     },
     TriggerCompleted {
         #[serde(alias = "task_id")]

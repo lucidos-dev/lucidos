@@ -207,18 +207,38 @@ export function focusPaneMainControl(pane: FocusedPane): void {
   focusPaneSurface(pane, true);
 }
 
-/** Move real DOM focus to the first visible focusable element within `el` — the
+/** Which of a landed element's focusables a navigation should hand focus to:
+ *  the first one that is not an **explainer** icon, or the first of any kind
+ *  when that is all there is.
+ *
+ *  An explainer is chrome ABOUT a control, never the control (see
+ *  `components/shared/Explainer.tsx`), and it sits inside the row's LABEL, so a
+ *  row carrying one puts the icon ahead of the setting in DOM order. Taking the
+ *  first focusable there lands a Search Everywhere jump on the info button: the
+ *  row is right, but Enter opens a dialog instead of operating the setting the
+ *  user searched for. The fallback matters because a container whose only
+ *  focusable IS its explainer should still take focus rather than none.
+ *
+ *  Pure and exported for the unit test, the caller below needing a real DOM. */
+export function navigationFocusTarget<T extends { classList: { contains(c: string): boolean } }>(
+  focusables: T[],
+): T | undefined {
+  return focusables.find((el) => !el.classList.contains('explainer-btn')) ?? focusables[0];
+}
+
+/** Move real DOM focus to the control a navigation landed on within `el`, the
  *  element-scoped analog of `focusPaneMainControl`, for navigation that lands on
  *  a specific control rather than a whole pane (e.g. a Search Everywhere jump to
- *  a Settings row focusing that row's dropdown). No-op when `el` has no visible
- *  focusable child — a section-title anchor — which is the "(if any)" case.
+ *  a Settings row focusing that row's dropdown). Which focusable counts as the
+ *  control is `navigationFocusTarget` above. No-op when `el` has no visible
+ *  focusable child (a section-title anchor), which is the "(if any)" case.
  *  Desktop-only (mobile auto-focus pops the on-screen keyboard) and deferred one
  *  frame so a just-rendered target is laid out; `preventScroll` so it never
  *  fights a concurrent `scrollIntoView`. */
 export function focusFirstFocusableWithin(el: HTMLElement): void {
   if (isMobile()) return;
   requestAnimationFrame(() => {
-    visibleFocusables(el)[0]?.focus({ preventScroll: true });
+    navigationFocusTarget(visibleFocusables(el))?.focus({ preventScroll: true });
   });
 }
 

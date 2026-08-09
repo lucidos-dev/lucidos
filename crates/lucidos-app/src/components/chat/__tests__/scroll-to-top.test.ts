@@ -6,9 +6,9 @@ import {
   scrollToBottom,
   scrollToBottomAnimated,
   setActiveScrollElement,
-  getResizeMode,
-  scrolledUp,
+  makeScrollObservers,
   awayFromBottom,
+  stopFollowingBottom,
 } from '../scrollState';
 
 // The chevron scroll is rAF-driven (vsync-aligned, time-based easeOutCubic). Fake
@@ -16,9 +16,9 @@ import {
 describe('scrollToTop (rAF easeOutCubic)', () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    scrolledUp.value = false;
     awayFromBottom.value = false;
     setActiveScrollElement(null);
+    stopFollowingBottom();
   });
   afterEach(() => {
     vi.clearAllTimers();
@@ -26,10 +26,9 @@ describe('scrollToTop (rAF easeOutCubic)', () => {
     setActiveScrollElement(null);
   });
 
-  it('marks scrolled-up state synchronously so auto-scroll-to-bottom defers and the down-chevron shows', () => {
+  it('shows the down-chevron synchronously, from the first frame of the glide', () => {
     setActiveScrollElement(mockScrollEl({ scrollTop: 4000 }));
     scrollToTop();
-    expect(scrolledUp.value).toBe(true);
     expect(awayFromBottom.value).toBe(true);
   });
 
@@ -80,15 +79,17 @@ describe('scrollToTop (rAF easeOutCubic)', () => {
     expect(el.scrollTop).toBe(0);
   });
 
-  it('forces resize mode to ignore even mid scroll-to-bottom, so a render-all grow cannot pin back to bottom', () => {
+  it('reaches the top even straight after a go-to-bottom', () => {
+    // The up-chevron renders the full windowed thread before scrolling, and the
+    // huge ResizeObserver grow that follows used to hit the bottom-pin's
+    // suppression window and slam the glide back down (the intermittent
+    // "scroll-to-top lands mid/bottom" flake). Nothing pins on a resize now, so
+    // the two directions cannot fight; the up-tap simply wins.
     const el = mockScrollEl({ scrollTop: 4000, scrollHeight: 5000, clientHeight: 500 });
     setActiveScrollElement(el);
 
     scrollToBottom();
-    expect(getResizeMode()).toBe('scroll');
-
     scrollToTop();
-    expect(getResizeMode()).toBe('ignore'); // set synchronously
     vi.advanceTimersByTime(1500);
     expect(el.scrollTop).toBe(0);
   });
@@ -114,9 +115,11 @@ describe('scrollToTop (rAF easeOutCubic)', () => {
 describe('scrollToBottomAnimated', () => {
   beforeEach(() => {
     vi.useFakeTimers();
-    scrolledUp.value = true; // user has scrolled up (the only time the down-chevron shows)
-    awayFromBottom.value = true;
+    awayFromBottom.value = true; // the reader is off the live edge, so the chevron shows
     setActiveScrollElement(null);
+    // The standing follow a chevron tap arms is module state, so retire whatever
+    // the previous case left armed (the same call `focusThread` makes).
+    stopFollowingBottom();
   });
   afterEach(() => {
     vi.clearAllTimers();
@@ -124,7 +127,7 @@ describe('scrollToBottomAnimated', () => {
     setActiveScrollElement(null);
   });
 
-  it('eases toward the bottom, then hands off to live tailing', () => {
+  it('eases to the bottom and hides the chevron on landing', () => {
     const el = mockScrollEl({ scrollTop: 0, scrollHeight: 5000, clientHeight: 500 });
     setActiveScrollElement(el);
 
@@ -134,12 +137,50 @@ describe('scrollToBottomAnimated', () => {
     expect(el.scrollTop).toBeGreaterThan(0);
 
     vi.advanceTimersByTime(1500);
-    // Handed off to scrollToBottom(): pinned to the live bottom + tailing engaged.
-    // (scrolledUp=false is the tailing signal; _resizeMode has since decayed from
-    // 'scroll' back to 'ignore' as scrollToBottom's 500ms suppression window
-    // expired — that's expected, not a missed handoff.)
-    expect(el.scrollTop).toBe(5000);
-    expect(scrolledUp.value).toBe(false);
+    // Lands on the maximum offset (scrollHeight - clientHeight), which IS the
+    // bottom, and reconciles the chevron there. It used to hand off to a 500ms
+    // pin loop for live tailing; tailing now rides the standing follow the
+    // landing arms instead, which no loop and no timer participates in.
+    expect(el.scrollTop).toBe(4500);
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('lands on the TRUE bottom of content that grew during the glide', () => {
+    // The target is re-read every frame, so a thread still streaming while the
+    // tween runs is tracked rather than the tween landing on the bottom as it
+    // was when the chevron was tapped.
+    const el = mockScrollEl({ scrollTop: 0, scrollHeight: 5000, clientHeight: 500 });
+    setActiveScrollElement(el);
+
+    scrollToBottomAnimated();
+    vi.advanceTimersByTime(100);
+    el.scrollHeight = 9000; // three more turns arrive mid-glide
+
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(8500); // 9000 - 500, not 4500
+    expect(awayFromBottom.value).toBe(false);
+  });
+
+  it('keeps following once it lands, because the tap asked to ride the live edge', () => {
+    const el = mockScrollEl({ scrollTop: 0, scrollHeight: 5000, clientHeight: 500 });
+    const { onResize } = makeScrollObservers(el as any);
+    setActiveScrollElement(el);
+
+    scrollToBottomAnimated();
+    vi.advanceTimersByTime(1500);
+    expect(el.scrollTop).toBe(4500);
+
+    // A beat later the reply streams on. The landing ARMS the standing follow,
+    // so growth carries the reader with it instead of stranding them one tap
+    // above the live edge. It is not the old pin: the condition is the flag the
+    // tap set, not a proximity window, and a reader who never tapped is left
+    // alone by the identical growth (scroll-follow-the-live-edge.test.ts).
+    el.scrollHeight = 6000;
+    onResize();
+    vi.advanceTimersByTime(1500);
+
+    expect(el.scrollTop).toBe(5500);
+    expect(awayFromBottom.value).toBe(false);
   });
 
   it('reduced motion snaps straight to the bottom (scrollToBottom) with no ease', () => {
@@ -153,8 +194,7 @@ describe('scrollToBottomAnimated', () => {
       const el = mockScrollEl({ scrollTop: 0, scrollHeight: 5000, clientHeight: 500 });
       setActiveScrollElement(el);
       scrollToBottomAnimated();
-      expect(el.scrollTop).toBe(5000); // synchronous snap
-      expect(getResizeMode()).toBe('scroll');
+      expect(el.scrollTop).toBe(5000); // synchronous snap, no eased frames
     } finally {
       (window as any).matchMedia = realMatchMedia;
     }
@@ -170,6 +210,6 @@ describe('scrollToBottomAnimated', () => {
 
     scrollToBottomAnimated();
     vi.advanceTimersByTime(1500);
-    expect(el.scrollTop).toBe(5000); // went to the bottom, not dragged back to 0
+    expect(el.scrollTop).toBe(4500); // went to the bottom, not dragged back to 0
   });
 });

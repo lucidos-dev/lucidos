@@ -1,4 +1,12 @@
 .thread-drawer {
+    /* The pane's CONTENT COLUMN: the x every row's text starts at, whether the
+       pane is showing the thread list or the filter panel that covers it. One
+       token because those two have to land on the same column (a filter row
+       0.375rem in above a thread name 1.25rem in read as two surfaces, not as
+       one pane showing something else), and because a nested row derives its
+       indent from it. Everything that uses it lives inside `.thread-drawer`, so
+       it needs no fallback; nothing outside the pane may claim it. */
+    --drawer-row-inset: 1.25rem;
     width: var(--thread-drawer-width, 18.75rem);
     flex-shrink: 0;
     background: var(--bg-primary);
@@ -34,39 +42,147 @@
 
 /* Filter active indicator — no color override; count badge shows state */
 
-/* Filter dropdown */
-.thread-filter-dropdown {
+/* Filter panel: a VIEW INSIDE THIS PANE (see ThreadFilterPanel), covering the
+   thread list while it is up, on both layouts. The desktop drawer column and the
+   mobile threads pane are the same component, so `inset: 0` against
+   `.thread-drawer` (position: relative above) lands it correctly on each without
+   a media query. It deliberately wears the pane's OWN background and no card
+   chrome (no border, radius, shadow or min-width), since that chrome is exactly
+   what made the previous anchored dropdown read as something floating over the
+   app rather than as the pane showing something else.
+
+   z-index must clear every POSITIONED layer inside the list, not just the list
+   itself. `.thread-drawer-list` is not a stacking context (it cannot become one:
+   `.flip-portal` is fixed inside it and has to escape all app chrome), so a
+   row's own z-index competes directly with the panel's. The list tops out at 2
+   (`.family-disclosure`, the sub-thread chevron + count badge; the family rail
+   and the status dot are 1), so the panel sits at 3. At 1 it lost to the
+   disclosure, and every sub-thread's chevron and badge floated over the filters,
+   which is exactly the trap of reading "the panel covers the list" as one layer
+   against one layer. A row FLYING between sections is a different thing and does
+   cross the panel on purpose: it is cloned into `.flip-portal`,
+   which is fixed at nearly the fullscreen layer on purpose so a flying thread
+   clears all app chrome. Rare and sub-second, and never on the user's own facet
+   toggles, since the filter is the hook's reset key. It carries neither a title
+   row nor a footer: the pane header above says "Filters" while this is up, and
+   the same header's Filter button is the way out, wearing an X while the panel
+   is open (Escape closes it too).
+
+   With nothing docked above or below it, the panel IS the pane's scroller while
+   it is up, which is what lets it take `.thread-drawer-list`'s own padding
+   below: the same list geometry, showing filters instead of threads. A block
+   scroller, not a flex column, for the same reason the list is one: flex
+   children shrink to fit rather than overflow, so a long filter list in a
+   column would compress instead of scroll. */
+.thread-filter-panel {
     position: absolute;
-    top: 100%;
-    left: 0;
-    z-index: var(--z-dropdown);
-    background: var(--bg-secondary);
-    border: 1px solid var(--border-color);
-    border-radius: 0.5rem;
-    padding: 0.5rem;
-    min-width: 22rem;
-    max-width: calc(100vw - 1rem);
-    box-shadow: var(--shadow-md);
-    max-height: calc(100dvh - 6rem);
+    inset: 0;
+    z-index: 3;
+    background: var(--bg-primary);
     overflow-y: auto;
     overscroll-behavior: contain;
+    /* Mirrors `.thread-drawer-list` exactly: breathing room above the first
+       section heading, a hair below the last row. */
+    padding-top: 0.75rem;
+    padding-bottom: 0.25rem;
 }
 
+/* The panel's two section headings, "Status" and "By thread types". Deliberately
+   the drawer's own lifecycle headers' shape (`.thread-drawer .list-section-title`:
+   uppercase, bold, primary, --font-size-md), because the panel is a view inside
+   that pane and a heading has to read as a heading at a glance. The old caption
+   was a muted --font-size-xs line, which let "View" and "Show" read as labels ON
+   the rows under them rather than as a heading OVER them. Same padding as those
+   headers too, so they start on the same x as a section heading in the list this
+   panel covers. */
 .thread-filter-title {
-    font-size: var(--font-size-xs);
-    font-weight: 600;
+    /* Flex so "By thread types" can carry its checkmark beside the words. On
+       the text-only "Status" heading this changes nothing: a lone text node in
+       a flex row lays out exactly as it does in a block. */
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: var(--font-size-md);
+    font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.05em;
-    color: var(--text-secondary);
-    padding: 0.125rem 0.375rem 0.375rem;
+    color: var(--text-primary);
+    padding: 0.5rem 1rem 0.375rem var(--drawer-row-inset);
 }
 
+/* The mark on "By thread types" while a type is narrowing, beside the accent
+   rather than instead of it. Its own class rather than the rows'
+   `.drawer-view-check`: that one is the single-select "you are here" marker and
+   is sized off `.drawer-view-option svg`, which never matches inside a heading.
+   Same glyph size, so the two read as one mark whichever line it is on. */
+.thread-filter-title-check {
+    display: inline-flex;
+    align-items: center;
+    flex-shrink: 0;
+}
+
+.thread-filter-title-check svg {
+    width: var(--icon-size-md);
+    height: var(--icon-size-md);
+}
+
+/* "By thread types" while a type is ticked, paired with the checkmark above.
+   Points the "filtered" note on the All statuses row at THIS section as its
+   cause, so the two never disagree. Still not a SELECTION: the single-select
+   set's own mark is on that row, since the types narrow it rather than competing
+   with it. */
+.thread-filter-title-active {
+    color: var(--accent);
+}
+
+/* A heading dims with the section it heads when a status view bypasses it,
+   matching `.thread-filter-types-dimmed`. Opacity ONLY, deliberately not a color
+   override: the accent above has to survive the dim, because the types stay
+   pickable here and a ticked one must still read as ticked. Dimmed-blue is the
+   state this section actually is in, set but not shaping the list on screen. */
+.thread-filter-title-dimmed {
+    opacity: 0.45;
+}
+
+/* The two halves are ALTERNATIVES, not a stack: picking a status bypasses the
+   thread-type filter, which is what greys the channel rows out. So the rule
+   between them carries the word, instead of leaving the user to infer the
+   relationship from a section going grey on them. It sits INSIDE the radiogroup,
+   dividing two branches of one single-select set rather than separating two
+   controls. Its top margin is the gap the drawer puts between two sections
+   (`.drawer-section + .drawer-section`); the horizontal inset matches the
+   section headings' trailing padding, so the hairline stops where their box
+   does rather than running to the pane edge. */
+.thread-filter-or {
+    display: flex;
+    align-items: center;
+    gap: var(--space-sm);
+    margin: 0.75rem 1rem var(--space-sm);
+    font-size: var(--font-size-2xs);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--text-muted);
+}
+
+.thread-filter-or::before,
+.thread-filter-or::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: var(--border-color);
+}
+
+/* Filter rows sit on the pane's content column (`--drawer-row-inset`, the same
+   token `.thread-row` and the list's section headers take their left padding
+   from) and 0.5rem from the trailing edge, with the hover band running full
+   width to the pane's edges instead of floating inset with a radius. The panel
+   covers that list, so a row here and a row there have to land on the same
+   grid. */
 .thread-filter-option {
     display: flex;
     align-items: center;
     gap: 0.5rem;
-    padding: 0.375rem;
-    border-radius: 0.25rem;
+    padding: 0.375rem 0.5rem 0.375rem var(--drawer-row-inset);
     font-size: var(--font-size-md);
     color: var(--text-primary);
     cursor: pointer;
@@ -76,8 +192,19 @@
     background: var(--bg-hover);
 }
 
+/* "Include deleted" while a status view is active. It sits inside the
+   radiogroup, between the branch's two rows, so it is outside the group below
+   and can't inherit that section's dim: it carries its own, matching it. Opacity
+   only and nothing else, like the section it matches: the row stays fully
+   operable, dim says "not shaping this list", never "not available". */
+.thread-filter-option-dimmed {
+    opacity: 0.45;
+}
+
+/* One indent step deeper, the same 1rem step the drawer's nested sub-threads
+   take per level (`--thread-depth` in `.thread-row`). */
 .thread-filter-option-child {
-    padding-left: 1.5rem;
+    padding-left: calc(var(--drawer-row-inset) + 1rem);
     font-size: var(--font-size-sm);
 }
 
@@ -119,53 +246,40 @@
     font-style: italic;
 }
 
-/* Divider between the unified Filter dropdown's View and Show sections. */
-.thread-filter-divider {
-    height: 1px;
-    background: var(--border-color);
-    margin: 0.375rem 0.25rem;
-}
+/* The channel rows, dimmed while a non-`all` status bypasses them. The
+   "Include deleted" modifier dims alongside from outside, via
+   `.thread-filter-option-dimmed`, since it lives up in the radiogroup.
 
-/* Show (channel) section — a `<fieldset>` so a non-`all` view natively disables
-   every nested checkbox. Reset the fieldset's default chrome; grey + block the
-   whole section (header dims in lockstep, see `.thread-filter-title-disabled`)
-   when a non-`all` view is active. */
-.thread-filter-show {
-    border: none;
-    margin: 0;
-    padding: 0;
-    min-inline-size: 0;
-}
-
-.thread-filter-show:disabled {
-    opacity: 0.45;
-    pointer-events: none;
-}
-
-.thread-filter-title-disabled {
+   Opacity and nothing else. NO `pointer-events: none` and no `disabled` on the
+   controls: the picks are live in every view and apply the moment the user takes
+   "All statuses", so the dim reports that this section is not shaping the list
+   on screen, and must not also take the section away. */
+.thread-filter-types-dimmed {
     opacity: 0.45;
 }
 
-/* Muted caption under the Show header when the channel filter is unavailable
-   (a non-`all` view bypasses it). Replaces the old disabled-button tooltip. */
+/* Muted caption under the channel section's header while a non-`all` status
+   bypasses it, saying so and saying what the knobs below still do. */
 .thread-filter-section-note {
     font-size: var(--font-size-xs);
     font-style: italic;
     color: var(--text-secondary);
-    padding: 0 0.375rem 0.375rem;
+    /* Left inset matches the heading it sits under. */
+    padding: 0 1rem 0.375rem var(--drawer-row-inset);
 }
 
-/* The unified Filter dropdown's View rows (single-select, one button per view)
-   render inside `.thread-filter-dropdown`, above the divider + Show section. */
+/* Every row of the Filter panel's single-select set: the four statuses above the
+   "or" rule and "All statuses" below it. Same column and same full-width band as
+   the `.thread-filter-option` channel rows further down, and as the thread rows
+   the panel covers. */
 .drawer-view-option {
     display: flex;
     align-items: center;
     gap: 0.5rem;
     width: 100%;
-    padding: 0.375rem 0.5rem;
+    padding: 0.375rem 0.5rem 0.375rem var(--drawer-row-inset);
     border: none;
     background: none;
-    border-radius: 0.25rem;
     font-size: var(--font-size-md);
     /* A <button> doesn't inherit the document font, so without this the View rows
        render in the UA default font while the <label>-based Show rows below pick
@@ -178,6 +292,25 @@
 
 .drawer-view-option:hover {
     background: var(--bg-hover);
+}
+
+/* "filtered" after the All statuses label, with its explainer icon: what is
+   being shown differs from all of it. An annotation rather than part of the
+   name, so it takes the `(deleted)` suffix's treatment (smaller, italic) while
+   inheriting the row's colour, which is the accent when the row is the active
+   one. No parentheses: the type alone reads as an aside.
+
+   It CARRIES the explainer icon, which is why the row it sits in is a
+   `div[role="radio"]` and not the `<button>` its siblings are: a button cannot
+   contain another one. Flex so the icon centres against the text rather than
+   sitting on its baseline. */
+.drawer-view-suffix {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.125rem;
+    font-size: 0.75em;
+    font-style: italic;
+    flex-shrink: 0;
 }
 
 .drawer-view-option-active {
@@ -258,7 +391,7 @@
      * `--thread-row-pad-left` is the row's left padding — i.e. where the thread-
      * name text starts. Shared so the bottom-edge divider `::after` below can
      * begin at the same x (lines the divider's left up with the title text). */
-    --thread-row-pad-left: calc(1.25rem + var(--thread-depth, 0) * 1rem);
+    --thread-row-pad-left: calc(var(--drawer-row-inset) + var(--thread-depth, 0) * 1rem);
     padding-left: var(--thread-row-pad-left);
     /* Right padding gives the action icons breathing room inside the row. */
     padding-right: 0.5rem;
@@ -369,8 +502,8 @@
 
 /* Archived sub-thread cue: this thread's own natural section is Archive, but
  * its family routed to Current / Pinned, so it renders under a parent that
- * still has live work. Render it disabled at the drawer's own disabled opacity
- * (0.45, the value the filter panel's disabled controls already use) so a
+ * still has live work. Render it dimmed at the drawer's own dim opacity
+ * (0.45, the value the filter panel's dimmed controls already use) so a
  * sub-thread the user has already archived can't be mistaken for pending work.
  * Dimmer than the lifted-parent cue above, which says "I'm here because of a
  * child", not "I'm already put away" (and which owns the root row, so the two
@@ -951,13 +1084,13 @@ html[data-theme="dark"] .thread-row .message-channel-tag.channel-error {
    base 0.6875rem) than the base `.list-section-title`. `--text-primary`
    (not literal black) keeps dark mode inverting correctly. Covers the
    collapsible lifecycle headers plus the Drafts / Results headers, which all
-   render inside `.thread-drawer`. Left padding matches `.thread-row`'s
-   `padding-left` (1.25rem at depth 0) so the header label starts where the
-   thread-name text starts, clearing the absolutely-positioned status-dot
-   column to its left. */
+   render inside `.thread-drawer`. Left padding is the pane's content column
+   (`--drawer-row-inset`, which `.thread-row` also derives its `padding-left`
+   from) so the header label starts where the thread-name text starts, clearing
+   the absolutely-positioned status-dot column to its left. */
 .thread-drawer .list-section-title {
     background: none;
-    padding: 0.5rem 1rem 0.375rem 1.25rem;
+    padding: 0.5rem 1rem 0.375rem var(--drawer-row-inset);
     /* No right inset — matches `.thread-row` (which also runs full width). The
        keyboard-highlight band painted on a focused header
        (`.list-section-title-highlighted`) runs to the drawer's right edge (or up
@@ -1357,17 +1490,18 @@ textarea.thread-title-edit-input {
         display: none;
     }
 
-    /* Anchored to a tiny parent at the screen's right edge — on mobile,
-       break out and span the viewport so contents stay visible. */
-    .thread-filter-dropdown {
-        position: fixed;
-        top: calc(var(--mobile-header-height, 2.75rem) + 0.25rem);
-        left: 0.5rem;
-        right: 0.5rem;
-        min-width: 0;
-        max-width: none;
-        max-height: calc(100dvh - var(--mobile-header-height, 2.75rem) - 1rem);
-    }
+    /* The filter panel needs no geometry override here: it fills
+       `.thread-drawer`, which IS the threads pane on mobile, so the desktop
+       `inset: 0` already spans the phone. The old anchored dropdown needed a
+       `position: fixed` breakout because it hung off a tiny header slot at the
+       screen's edge.
+
+       What spanning the phone does NOT give it is clearance from the fixed
+       mobile header, which overlays the panes: the panel is its own scroll
+       container, so it carries the shared `::before` header spacer alongside
+       the drawer list and the transcript (mobile.css, the
+       `.mobile-swipe-pane …::before` group). Without it the Status rows at the
+       panel's top sat behind the header. */
 
 }
 
@@ -1382,4 +1516,11 @@ textarea.thread-title-edit-input {
     .thread-title-shimmer {
         animation: none;
     }
+}
+
+/* The row already separates its items with its own `gap`, so the explainer's
+   base `margin-left` (for the ordinary case of an icon following inline text)
+   would double it here. The row owns its gap, so the row owns the correction. */
+.thread-filter-option > .explainer-btn {
+    margin-left: 0;
 }

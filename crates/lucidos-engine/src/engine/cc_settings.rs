@@ -41,7 +41,13 @@ pub(crate) fn build_cc_settings_json() -> String {
         "hooks": {
             "PreToolUse": [
                 {
-                    "matcher": "AskUserQuestion",
+                    // CC's NATIVE question tool only. The MCP one it can also
+                    // reach (`CC_MCP_ASK_USER_QUESTION_TOOL`) needs no hook: it
+                    // calls the same internal endpoint over MCP itself. Both
+                    // names are in `runtime::is_user_question_tool`, which is
+                    // about what the ENGINE does with the resulting tool_use;
+                    // this matcher is about which tool CC has to stop for.
+                    "matcher": crate::runtime::CC_NATIVE_ASK_USER_QUESTION_TOOL,
                     "hooks": [{
                         "type": "command",
                         "command": "lucidos ask-user-question-hook",

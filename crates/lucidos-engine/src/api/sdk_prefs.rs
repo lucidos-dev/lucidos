@@ -93,6 +93,33 @@ const SDK_PREFS_JS: &str = r##"(function() {
       d.style.setProperty("--user-ui-scale", snapped + "%");
     }
   }
+  // The live style remote's custom property overrides. An app iframe has to
+  // apply the same map as the shell around it, for the same reason it applies
+  // the same theme: a value tuned in the host and not in the iframe shows as
+  // app chrome that does not match the app it is inside.
+  //
+  // LAST on purpose: the applies above write properties (--bg-primary,
+  // --user-ui-scale, --font-ui) the remote is allowed to override.
+  //
+  // The name and value rules MUST match `utils/styleOverrides.ts` and the
+  // index.html FOUC block. The `?style-reset` branch those two carry is
+  // deliberately absent here: the shell removes the key before the iframe
+  // loads, so there is nothing left for this realm to clear.
+  try {
+    var so = JSON.parse(localStorage.getItem(wsKey("lucidos-style-overrides")) || "{}");
+    var soCount = 0;
+    for (var soName in so) {
+      if (soCount >= 200) break;
+      if (!/^--[a-z][a-z0-9-]*$/.test(soName)) continue;
+      var soVal = so[soName];
+      if (typeof soVal !== "string") continue;
+      soVal = soVal.trim();
+      if (!soVal || soVal.length > 120) continue;
+      if (/[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i.test(soVal)) continue;
+      d.style.setProperty(soName, soVal);
+      soCount++;
+    }
+  } catch (e) { /* a corrupt map must never break FOUC */ }
 })();"##;
 
 /// GET /api/v1/sdk-prefs.js — synchronous prefs script driven by localStorage.
@@ -228,6 +255,55 @@ mod tests {
         // IIFE keeps locals out of the iframe's global scope.
         assert!(SDK_PREFS_JS.starts_with("(function()"));
         assert!(SDK_PREFS_JS.ends_with("})();"));
+    }
+
+    #[test]
+    fn script_applies_style_overrides_scoped_per_workspace() {
+        // The live style remote reaches app iframes too, or a tuned token shows
+        // in the shell and not in the app inside it.
+        assert!(SDK_PREFS_JS.contains("localStorage.getItem(wsKey(\"lucidos-style-overrides\"))"));
+        assert!(SDK_PREFS_JS.contains("d.style.setProperty(soName, soVal)"));
+    }
+
+    #[test]
+    fn style_override_validator_matches_the_other_two_realms() {
+        // This validator is mirrored in `crates/lucidos-app/src/utils/styleOverrides.ts`
+        // (the app realm) and the index.html FOUC block (the boot realm). All
+        // three apply the map, so a rule relaxed in one realm and not the others
+        // is a hole: the preference is writable by any app via the SDK and by
+        // the chat agent over HTTP, so it is an untrusted path into inline
+        // style. `styleOverrides.test.ts` scans the other two for these same
+        // literals.
+        assert!(
+            SDK_PREFS_JS.contains("/^--[a-z][a-z0-9-]*$/"),
+            "only a custom property may be set"
+        );
+        assert!(
+            SDK_PREFS_JS.contains(r"/[;{}<>@\\]|url\s*\(|image-set\s*\(|expression\s*\(|\/\*/i"),
+            "the banned-value pattern must match the other two realms exactly"
+        );
+        assert!(SDK_PREFS_JS.contains("soCount >= 200"), "entry cap");
+        assert!(
+            SDK_PREFS_JS.contains("soVal.length > 120"),
+            "value length cap"
+        );
+    }
+
+    #[test]
+    fn style_overrides_are_applied_after_theme_font_and_scale() {
+        // Order is load-bearing: the remote is allowed to override --bg-primary,
+        // --font-ui and --user-ui-scale, and inline properties are last-write-
+        // wins, so the override block has to come after all three.
+        let overrides = SDK_PREFS_JS
+            .find("lucidos-style-overrides")
+            .expect("override block");
+        for earlier in ["--bg-primary", "--font-ui", "lucidos-ui-scale"] {
+            let at = SDK_PREFS_JS.find(earlier).expect("earlier apply");
+            assert!(
+                at < overrides,
+                "{earlier} must be applied before the style overrides"
+            );
+        }
     }
 
     #[test]

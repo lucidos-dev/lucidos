@@ -19,162 +19,95 @@ if (typeof globalThis.queueMicrotask === 'undefined') {
 
 import { mockScrollEl } from './scroll-test-helpers';
 import { composeHandlers } from '../promptFocus';
-import { awayFromBottom, extendSuppression, getResizeMode, makeScrollObservers, notAtTop, preserveOnToggle, scrollToBottom, scrolledUp, setActiveScrollElement, startScrollVisibilityHandler, stopScrollVisibilityHandler } from '../scrollState';
+import { awayFromBottom, makeScrollObservers, notAtTop, scrollToBottom, setActiveScrollElement, stopFollowingBottom } from '../scrollState';
 
-describe('scrollToBottom continuous rAF loop', () => {
+describe('scrollToBottom is one write, not a tail', () => {
   beforeEach(() => {
-    scrolledUp.value = false;
+    stopFollowingBottom();
+    awayFromBottom.value = false;
     vi.useFakeTimers();
   });
   afterEach(() => {
     setActiveScrollElement(null);
+    vi.clearAllTimers();
     vi.useRealTimers();
   });
 
-  it('keeps scrolling on every frame during suppression window', () => {
+  it('goes to the bottom as it is NOW, with no timer dragging the reader after it', () => {
+    // This describe used to be "scrollToBottom continuous rAF loop" and asserted
+    // the opposite at four checkpoints: content grew, and a 16ms loop dragged
+    // the reader after it for the whole 500ms suppression window. Following the
+    // live edge is a real behaviour again, but it is driven by the resize
+    // observer honouring the flag this tap armed (see
+    // scroll-follow-the-live-edge.test.ts), never by a timer. So growth with no
+    // resize behind it moves nobody, however long the clock runs.
     const el = mockScrollEl({ scrollTop: 0, scrollHeight: 2000 });
     setActiveScrollElement(el);
 
     scrollToBottom();
-    expect(el.scrollTop).toBe(2000); // immediate scroll
+    expect(el.scrollTop).toBe(2000);
 
-    // Simulate content growing at different points during animation
-    el.scrollHeight = 2100;
-    vi.advanceTimersByTime(50); // ~3 frames
-    expect(el.scrollTop).toBe(2100); // rAF loop caught the new height
-
-    el.scrollHeight = 2300;
-    vi.advanceTimersByTime(100); // ~6 more frames
-    expect(el.scrollTop).toBe(2300);
-
-    el.scrollHeight = 2500;
-    vi.advanceTimersByTime(200); // ~12 more frames
-    expect(el.scrollTop).toBe(2500);
-
-    // After suppression expires, loop stops
-    vi.advanceTimersByTime(200); // past 500ms total
-    expect(getResizeMode()).toBe('ignore');
-
-    // Scrolling no longer happens
-    el.scrollHeight = 3000;
-    vi.advanceTimersByTime(50);
-    expect(el.scrollTop).toBe(2500); // unchanged
+    for (const height of [2100, 2300, 2500]) {
+      el.scrollHeight = height;
+      vi.advanceTimersByTime(100);
+      expect(el.scrollTop).toBe(2000); // left exactly where the tap put them
+    }
   });
 
-  it('re-resolves target element on each frame', () => {
+  it('resolves the target at call time, so a later element swap is not chased', () => {
     const elA = mockScrollEl({ scrollTop: 0, scrollHeight: 1000 });
     const elB = mockScrollEl({ scrollTop: 0, scrollHeight: 2000 });
 
-    // Start with element A
     setActiveScrollElement(elA);
     scrollToBottom();
     expect(elA.scrollTop).toBe(1000);
 
-    // Mid-animation, active element switches to B (e.g. layout change)
+    // A layout switch mid-window used to hand the running loop the new element.
     setActiveScrollElement(elB);
-    vi.advanceTimersByTime(100);
+    vi.advanceTimersByTime(500);
+    expect(elB.scrollTop).toBe(0);
 
-    // rAF loop should now be scrolling element B
+    // The chevron on the new element still works, of course.
+    scrollToBottom();
     expect(elB.scrollTop).toBe(2000);
   });
 
-  it('new scrollToBottom call cancels previous loop', () => {
+  it('a second tap goes to the newer bottom', () => {
     const el = mockScrollEl({ scrollTop: 0, scrollHeight: 1000 });
     setActiveScrollElement(el);
 
-    // First call starts a loop
     scrollToBottom();
     expect(el.scrollTop).toBe(1000);
 
-    // Content grows, second call replaces the loop
     el.scrollHeight = 2000;
     scrollToBottom();
     expect(el.scrollTop).toBe(2000);
-
-    // Only one loop should be running — advance and check
-    el.scrollHeight = 3000;
-    vi.advanceTimersByTime(100);
-    expect(el.scrollTop).toBe(3000);
-  });
-
-  it('scrolledUp stays false throughout the entire loop', () => {
-    const el = mockScrollEl({ scrollTop: 0, scrollHeight: 2000 });
-    setActiveScrollElement(el);
-
-    scrollToBottom();
-
-    // Check at multiple points during the 500ms window
-    const checkpoints = [50, 100, 150, 200, 300, 400];
-    let elapsed = 0;
-    for (const target of checkpoints) {
-      vi.advanceTimersByTime(target - elapsed);
-      elapsed = target;
-      expect(scrolledUp.value).toBe(false);
-    }
-  });
-
-  it('reconciles awayFromBottom on loop exit when content grew past the last scroll', () => {
-    // Browser-accurate clamping is load-bearing: without it, `scrollTop =
-    // scrollHeight` leaves scrollTop higher than max and the post-grow
-    // off-bottom state is invisible to the reconciler.
-    const el = {
-      _scrollTop: 1500,
-      get scrollTop() { return this._scrollTop; },
-      set scrollTop(v: number) {
-        const max = Math.max(0, this.scrollHeight - this.clientHeight);
-        this._scrollTop = Math.min(v, max);
-      },
-      scrollHeight: 2000,
-      clientHeight: 500,
-      getBoundingClientRect: () => ({ width: 400, height: 600 }),
-    } as any;
-    setActiveScrollElement(el);
-
-    scrollToBottom();
-    expect(el.scrollTop).toBe(1500);
-    expect(awayFromBottom.value).toBe(false);
-
-    vi.advanceTimersByTime(480);
-    expect(el.scrollTop).toBe(1500);
-    expect(awayFromBottom.value).toBe(false);
-    expect(getResizeMode()).toBe('scroll');
-
-    // Grow content between the loop's last in-window iteration and exit.
-    // Real-world cause: a child whose container box stayed the same so RO
-    // didn't fire — the rAF loop was the only thing keeping us pinned.
-    vi.advanceTimersByTime(16);
-    el.scrollHeight = 2400;
-    vi.advanceTimersByTime(20);
-
-    expect(getResizeMode()).toBe('ignore');
-    expect(el.scrollTop).toBe(1500);
-    expect(awayFromBottom.value).toBe(true);
   });
 });
 
 // ---------------------------------------------------------------------------
 // notAtTop contract: scrollToBottom() does NOT update notAtTop. The scroll
-// listener handles it — updating notAtTop BEFORE the suppression guard so it
-// always reflects the true DOM scroll position. This makes impossible states
-// impossible: any programmatic scrollTop assignment fires a scroll event,
-// which the listener processes regardless of suppression mode.
+// listener handles it, so notAtTop always reflects the true DOM scroll
+// position: any programmatic scrollTop assignment fires a scroll event, which
+// the listener processes.
 //
 // These tests verify scrollToBottom()'s side of the contract: it must NOT
 // touch notAtTop, leaving that entirely to the scroll listener.
 // ---------------------------------------------------------------------------
 describe('scrollToBottom does not touch notAtTop (scroll listener owns it)', () => {
   beforeEach(() => {
-    scrolledUp.value = false;
+    stopFollowingBottom();
     notAtTop.value = false;
     vi.useFakeTimers();
   });
   afterEach(() => {
     setActiveScrollElement(null);
+    vi.clearAllTimers();
     vi.useRealTimers();
   });
 
   it('does not set notAtTop even when scrolled far from top', () => {
-    // Tall content — scrollToBottom() will set scrollTop=2000, but
+    // Tall content: scrollToBottom() will set scrollTop=2000, but
     // it must NOT update notAtTop. The scroll event listener does that.
     const el = mockScrollEl({ scrollTop: 0, scrollHeight: 2000 });
     setActiveScrollElement(el);
@@ -184,41 +117,24 @@ describe('scrollToBottom does not touch notAtTop (scroll listener owns it)', () 
 
     // scrollTop was set (scroll happened)
     expect(el.scrollTop).toBe(2000);
-    // But notAtTop was NOT touched by scrollToBottom — it stays false
-    // In real browser: the scrollTop assignment fires a scroll event,
-    // and the listener (not suppressed for notAtTop) sets it to true.
+    // But notAtTop was NOT touched by scrollToBottom, so it stays false.
+    // In a real browser the scrollTop assignment fires a scroll event, and the
+    // listener sets it to true.
     expect(notAtTop.value).toBe(false);
   });
 
   it('does not clear notAtTop when content fits in viewport', () => {
     // If notAtTop was somehow true and content is short,
-    // scrollToBottom() must not clear it — that's the listener's job.
+    // scrollToBottom() must not clear it: that's the listener's job.
     const el = mockScrollEl({ scrollTop: 0, scrollHeight: 50 });
     setActiveScrollElement(el);
     notAtTop.value = true;
 
     scrollToBottom();
 
-    // scrollToBottom() didn't touch notAtTop — it's still true
-    // (scroll event listener would set it to false when it fires)
+    // scrollToBottom() didn't touch notAtTop, so it's still true
+    // (the scroll event listener would set it to false when it fires).
     expect(notAtTop.value).toBe(true);
-  });
-
-  it('continuous scroll loop also does not touch notAtTop', () => {
-    const el = mockScrollEl({ scrollTop: 0, scrollHeight: 50 });
-    setActiveScrollElement(el);
-    notAtTop.value = false;
-
-    scrollToBottom();
-
-    // Content grows
-    el.scrollHeight = 2000;
-    vi.advanceTimersByTime(50);
-
-    // Loop scrolled to bottom
-    expect(el.scrollTop).toBe(2000);
-    // But notAtTop still untouched by scrollToBottom/loop
-    expect(notAtTop.value).toBe(false);
   });
 });
 
@@ -281,14 +197,15 @@ describe('composeHandlers focuses before action', () => {
 // the chevron should appear because the just-rendered body extends below
 // the viewport, but it stays hidden.
 //
-// Root cause: useAutoScroll's effect runs on every render where
-// eventCount/streamingBuffer/pendingCount changes — during streaming that's
-// effectively every frame. The expand click commits a render that includes
-// (a) the new collapsed=false state and (b) the latest streaming chunk's
-// state changes. useEffect runs before ResizeObserver in the same frame, so
-// the auto-scroll fires first, sets el.scrollTop = el.scrollHeight, and by
-// the time onResize runs the user is already pinned to the (new) bottom.
-// onResize sees isAtBottom=true, the chevron stays hidden.
+// Root cause: the transcript had two bottom-pins racing over the same expand.
+// `useAutoScroll`'s layout effect ran on every render where
+// eventCount/streamingBuffer/pendingCount changed, which during streaming was
+// effectively every frame, and the expand click committed a render carrying
+// both the new collapsed=false state and the latest chunk. The effect ran
+// before the ResizeObserver in that frame, snapped scrollTop to scrollHeight,
+// and by the time onResize looked the reader was already back at the bottom
+// with the chevron hidden. Neither pin exists now, so the cases below assert
+// the plain answer: the reader stays on what they opened.
 // ---------------------------------------------------------------------------
 describe('response-panel collapse → expand re-shows the scroll-to-bottom chevron', () => {
   /** Browser-accurate scroll element: assigning scrollTop above max clamps it
@@ -337,118 +254,80 @@ describe('response-panel collapse → expand re-shows the scroll-to-bottom chevr
     return el;
   }
 
-  /** useAutoScroll's effect: runs every time eventCount/streamingBuffer/
-   *  pendingCount changes, scrolls to bottom unless scrolledUp is set. */
-  function autoScrollEffect(el: any) {
-    if (scrolledUp.value) return;
-    el.scrollTop = el.scrollHeight;
-  }
-
   beforeEach(() => {
-    // Drain any leftover suppression so _resizeMode starts at 'ignore'.
-    // Stale state from prior tests: a previous beforeEach may have switched
-    // away from fake timers without firing the suppression-clearing setTimeout,
-    // leaving _resizeMode='scroll' globally. Without this drain, onResize takes
-    // the scroll-mode branch (scroll-to-bottom + return) instead of the chevron
-    // escalation branch and the test flakes by execution order.
-    vi.useFakeTimers();
-    extendSuppression();           // schedules a fresh setTimeout under fake time
-    vi.advanceTimersByTime(600);   // fires it → _resizeMode = 'ignore'
-    vi.useRealTimers();
+    stopFollowingBottom();
     awayFromBottom.value = false;
-    scrolledUp.value = false;
     notAtTop.value = false;
     setActiveScrollElement(null);
   });
   afterEach(() => { setActiveScrollElement(null); });
 
-  it('non-streaming: the toggle shows the chevron and holds the reader still', () => {
-    // Baseline: the same collapse → expand with no auto-scroll racing it.
+  it('the toggle shows the chevron and holds the reader still', () => {
+    // Collapse then expand, from the bottom. The reader stays on the turn they
+    // opened, and the chevron comes up for the content now below them.
     //
-    // The toggle marks the reader parked ITSELF, via preserveOnToggle, on both
-    // the pointer path (ChatExchange) and the keyboard one, which is what makes
-    // the chevron this test's subject rather than a side effect. onResize
-    // deliberately no longer infers "the reader scrolled up" from the expand's
-    // growth (see its follow branch): an inference from the app's own layout
-    // could not tell this expand apart from a markdown image decoding late, and
-    // it stranded the transcript above the newest turn for the rest of the
-    // visit when it got that wrong.
+    // This needed an explicit `preserveOnToggle()` before each click, which
+    // marked the reader parked so the bottom-pin would not read the expand's
+    // growth as "still riding the live edge" and scroll the thing they just
+    // opened off the top. Nothing pins now, so holding still is the default and
+    // the toggles carry no scroll bookkeeping at all.
     const el = makeClampingEl({ scrollTop: 1000, scrollHeight: 1500, clientHeight: 500 });
     const { onScroll, onResize } = makeScrollObservers(el);
     el.addEventListener('scroll', onScroll);
 
-    preserveOnToggle();
     el.scrollHeight = 700;  // collapse
     onResize();
     expect(awayFromBottom.value).toBe(false);
+    const afterCollapse = el.scrollTop;
 
-    preserveOnToggle();
     el.scrollHeight = 1500; // expand
     onResize();
 
     expect(awayFromBottom.value).toBe(true);
-    expect(scrolledUp.value).toBe(true);
     // Held where they were: the expand is read, not scrolled past.
+    expect(el.scrollTop).toBe(afterCollapse);
     expect(el.scrollTop).toBeLessThan(el.scrollHeight - el.clientHeight);
   });
 
-  it('streaming-mode: chevron must appear after expand even when auto-scroll races onResize', () => {
-    // Reproduces the working-mode regression. Sequence inside a single
-    // render frame on expand: useEffect (auto-scroll) → ResizeObserver.
-    // If we don't suppress the auto-scroll, the user is snapped back to
-    // the bottom before onResize can escalate the chevron.
+  it('an expand during streaming still shows the chevron, with nothing racing it', () => {
+    // The working-mode regression this describe was written for. The race was
+    // between `useAutoScroll`'s layout effect (which snapped to the bottom on
+    // every streamed chunk) and the ResizeObserver: whichever ran last decided
+    // whether the reader saw what they had just expanded. Neither snaps now, so
+    // there is no race left to lose, and streamed growth arriving alongside the
+    // expand changes nothing.
     const el = makeClampingEl({ scrollTop: 1000, scrollHeight: 1500, clientHeight: 500 });
     setActiveScrollElement(el);
     const { onScroll, onResize } = makeScrollObservers(el);
     el.addEventListener('scroll', onScroll);
 
-    // Streaming has been keeping the user pinned — auto-scroll fires every
-    // frame because new TextStreamed events keep arriving.
-    autoScrollEffect(el);
-    expect(el.scrollTop).toBe(1000); // already at bottom
+    el.scrollHeight = 700;  // collapse
+    onResize();
+    const afterCollapse = el.scrollTop;
 
-    // Click 1: collapse the last response panel. ChatExchange re-renders;
-    // the body div is removed.
-    preserveOnToggle();
-    el.scrollHeight = 700;  // post-render layout
-    autoScrollEffect(el);   // useEffect from latest streaming chunk
-    onResize();             // ResizeObserver after layout
-
-    // Click 2: expand. ChatExchange re-renders; the body re-appears with
-    // all the text accumulated during the collapse window.
-    preserveOnToggle();
-    el.scrollHeight = 1500; // post-render layout
-    autoScrollEffect(el);   // useEffect from latest streaming chunk —
-                            // MUST be suppressed by preserveOnToggle
+    el.scrollHeight = 1500; // expand, plus a chunk that streamed meanwhile
+    onResize();
+    el.scrollHeight = 1900;
     onResize();
 
-    // The chevron must be visible now: the body content extends well below
-    // the user's anchor. Without preserveOnToggle, autoScrollEffect would
-    // have snapped scrollTop to 1000 and onResize would see isAtBottom=true.
     expect(awayFromBottom.value).toBe(true);
-    expect(scrolledUp.value).toBe(true);
-    // And the user is still anchored where they were — auto-scroll did NOT
-    // sneakily pin them to the new bottom.
-    expect(el.scrollTop).toBeLessThan(el.scrollHeight - el.clientHeight);
+    expect(el.scrollTop).toBe(afterCollapse);
   });
 
-  it('preserveOnToggle: collapse from at-bottom does not strand scrolledUp=true', () => {
-    // After collapse, the user IS at the bottom of the now-shrunk content
-    // (browser clamping). preserveOnToggle's defensive scrolledUp=true must
-    // be reconciled back to false by the post-toggle scroll event so the
-    // next streaming chunk auto-scrolls normally.
+  it('a collapse that leaves the reader at the new bottom hides the chevron', () => {
+    // After the collapse the reader IS at the bottom of the now-shrunk content,
+    // because the browser clamps. The chevron must come back down: it used to
+    // need the post-toggle scroll event to undo `preserveOnToggle`'s defensive
+    // mark, and now onResize reconciles it directly.
     const el = makeClampingEl({ scrollTop: 1000, scrollHeight: 1500, clientHeight: 500 });
     setActiveScrollElement(el);
     const { onScroll, onResize } = makeScrollObservers(el);
     el.addEventListener('scroll', onScroll);
+    awayFromBottom.value = true;
 
-    preserveOnToggle();
-    el.scrollHeight = 700; // collapse — browser clamp fires onScroll
+    el.scrollHeight = 700; // collapse: the browser clamp fires onScroll
     onResize();
 
-    // Browser-clamp scroll event ran onScroll, which is the both-ways path:
-    // user is at the new bottom → scrolledUp cleared, awayFromBottom cleared.
-    expect(scrolledUp.value).toBe(false);
     expect(awayFromBottom.value).toBe(false);
   });
 });
@@ -457,7 +336,7 @@ describe('response-panel collapse → expand re-shows the scroll-to-bottom chevr
 // Dual-mounting visibility gate: ThreadView/CreateThreadView render twice (one
 // in SplitLayout for desktop, one in MobileSwipeContainer for mobile). Both
 // instances attach scroll/resize listeners that share the same notAtTop /
-// awayFromBottom / scrolledUp signals. The hidden duplicate's element has 0×0
+// awayFromBottom signals. The hidden duplicate's element has 0×0
 // dimensions — its handlers see "not scrollable" and "at bottom" and would
 // clobber the visible instance's correct values. makeScrollObservers gates all
 // signal writes on isElementVisible(el) so only the visible copy can mutate.
@@ -489,9 +368,9 @@ describe('makeScrollObservers — hidden duplicate must not override signals', (
   }
 
   beforeEach(() => {
+    stopFollowingBottom();
     notAtTop.value = false;
     awayFromBottom.value = false;
-    scrolledUp.value = false;
   });
 
   it('hidden el onResize does not clear notAtTop set by visible el', () => {
@@ -551,211 +430,65 @@ describe('makeScrollObservers — hidden duplicate must not override signals', (
 });
 
 // ---------------------------------------------------------------------------
-// Tab visibility: auto-scroll must survive tabbing away during streaming.
+// Tab visibility: leaving the tab and coming back must not move the transcript.
 //
-// User-reported regression: pinned to the bottom of a streaming response,
-// switch to another browser tab, come back — scroll position is frozen
-// where it was and new content piles up below the viewport without the
-// auto-scroll catching up.
+// This block was the largest single pin in the module and had nine tests behind
+// it. Pinned to the bottom of a streaming response, tabbing away and back left
+// the position frozen while content piled up below, so `startScrollVisibilityHandler`
+// snapshotted "was the reader at the bottom" on the first hide of each cycle and
+// re-pinned them on return. The handler, its first-hide-wins sentinel and its
+// cold-start guard are all gone: freezing the position IS the contract now, and
+// the reader comes back to exactly the thread they left.
 //
-// Root cause: while the tab is hidden, browsers throttle layout / rendering
-// and `el.scrollTop = el.scrollHeight` inside useAutoScroll's deps-effect
-// doesn't realize as an actual scroll. On return, the ResizeObserver fires
-// for the accumulated child growth and onResize sees scrollTop is far below
-// scrollHeight, escalating scrolledUp=true. Future deps-effect fires then
-// skip auto-scroll, locking the user out of bottom-pinned mode.
-//
-// Fix: capture wasAtBottom (snapshot of !scrolledUp.value) when the tab
-// goes hidden, and re-pin via scrollToBottom() on return if so. The
-// scrollToBottom() 500ms suppression window prevents any racing RO fire
-// from escalating scrolledUp back to true.
+// What survives is the tripwire. Nothing in the module may register a
+// visibilitychange listener that moves the transcript, and a resume is not an
+// explicit user action asking to go anywhere.
 // ---------------------------------------------------------------------------
-describe('tab visibility — auto-scroll persists across hidden/visible cycles', () => {
+describe('tab visibility does not move the transcript', () => {
   function setVisibility(state: 'hidden' | 'visible') {
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: state });
     document.dispatchEvent(new Event('visibilitychange'));
   }
 
   beforeEach(() => {
-    scrolledUp.value = false;
+    stopFollowingBottom();
     awayFromBottom.value = false;
-    vi.useFakeTimers();
     Object.defineProperty(document, 'visibilityState', { configurable: true, value: 'visible' });
   });
-  afterEach(() => {
-    stopScrollVisibilityHandler();
-    vi.advanceTimersByTime(600); // drain any pending suppression timer
-    setActiveScrollElement(null);
-    vi.useRealTimers();
-  });
+  afterEach(() => { setActiveScrollElement(null); });
 
-  it('returns to bottom after hidden→visible if user was at bottom when hiding', () => {
-    startScrollVisibilityHandler();
+  it('leaves a reader who was at the live edge exactly where they were', () => {
     const el = mockScrollEl({ scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
     setActiveScrollElement(el);
-    // User is at the bottom: scrollTop+clientHeight = 1000 = scrollHeight.
+    // At the bottom: scrollTop + clientHeight = 1000 = scrollHeight.
 
     setVisibility('hidden');
-    // Content streams in while tab is hidden — scrollHeight grows but the
-    // hidden-tab layout throttling means scrollTop stays at its old value.
-    el.scrollHeight = 2000;
-
+    el.scrollHeight = 2000; // the reply streamed on while the tab was hidden
     setVisibility('visible');
 
-    // Handler captured wasAtBottom=true on hide → re-pins on return.
-    expect(el.scrollTop).toBe(2000);
-    expect(scrolledUp.value).toBe(false);
-    // Suppression engaged so a subsequent RO fire can't escalate.
-    expect(getResizeMode()).toBe('scroll');
-  });
-
-  it('does NOT re-pin if user had scrolled up before hiding', () => {
-    startScrollVisibilityHandler();
-    const el = mockScrollEl({ scrollTop: 200, scrollHeight: 1000, clientHeight: 500 });
-    setActiveScrollElement(el);
-    scrolledUp.value = true; // user was reading history
-
-    setVisibility('hidden');
-    el.scrollHeight = 2000;
-
-    setVisibility('visible');
-
-    // Captured wasAtBottom=false → preserves user's reading position.
-    expect(el.scrollTop).toBe(200);
-    expect(scrolledUp.value).toBe(true);
-  });
-
-  it('re-pin survives a racing onResize that would otherwise escalate scrolledUp', () => {
-    // Reproduces the exact lock-out: RO fires on resume (before or after
-    // visibilitychange fires) and would normally escalate scrolledUp=true,
-    // killing future auto-scrolls. The 500ms suppression set by
-    // scrollToBottom() must guard the re-pin against this race.
-    startScrollVisibilityHandler();
-    const el = mockScrollEl({ scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
-    setActiveScrollElement(el);
-
-    setVisibility('hidden');
-    el.scrollHeight = 3000;
-
-    setVisibility('visible');
-    // Suppression engaged → RO sees mode='scroll' and scrolls instead of
-    // setting scrolledUp.
-    expect(getResizeMode()).toBe('scroll');
-
-    // Simulate the racing RO fire that mirrors makeScrollObservers.onResize.
-    if (getResizeMode() === 'scroll') {
-      el.scrollTop = el.scrollHeight;
-      extendSuppression();
-    } else if (el.scrollTop + el.clientHeight < el.scrollHeight - 80) {
-      scrolledUp.value = true;
-    }
-
-    expect(scrolledUp.value).toBe(false);
-    expect(el.scrollTop).toBe(3000);
-  });
-
-  it('handles repeated hide/show cycles correctly', () => {
-    startScrollVisibilityHandler();
-    const el = mockScrollEl({ scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
-    setActiveScrollElement(el);
-
-    // Cycle 1: at bottom → hide → grow → show → re-pin
-    setVisibility('hidden');
-    el.scrollHeight = 1500;
-    setVisibility('visible');
-    expect(el.scrollTop).toBe(1500);
-
-    // Drain suppression before next cycle
-    vi.advanceTimersByTime(600);
-
-    // Cycle 2: scroll up → hide → show → no re-pin
-    scrolledUp.value = true;
-    el.scrollTop = 100;
-    setVisibility('hidden');
-    el.scrollHeight = 2000;
-    setVisibility('visible');
-    expect(el.scrollTop).toBe(100);
-    expect(scrolledUp.value).toBe(true);
-
-    vi.advanceTimersByTime(600);
-
-    // Cycle 3: scroll back to bottom → hide → grow → show → re-pin again
-    scrolledUp.value = false;
-    el.scrollTop = el.scrollHeight - el.clientHeight; // user scrolled to bottom
-    setVisibility('hidden');
-    el.scrollHeight = 3000;
-    setVisibility('visible');
-    expect(el.scrollTop).toBe(3000);
-    expect(scrolledUp.value).toBe(false);
-  });
-
-  it('stop handler tears down the listener', () => {
-    startScrollVisibilityHandler();
-    const el = mockScrollEl({ scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
-    setActiveScrollElement(el);
-
-    setVisibility('hidden');
-    stopScrollVisibilityHandler();
-    el.scrollHeight = 2000;
-    setVisibility('visible');
-
-    // Listener was removed → no re-pin happens
     expect(el.scrollTop).toBe(500);
   });
 
-  it('does not break when no active scroll element is set', () => {
-    startScrollVisibilityHandler();
-    // No setActiveScrollElement call
+  it('leaves a reader who was in history exactly where they were', () => {
+    const el = mockScrollEl({ scrollTop: 200, scrollHeight: 1000, clientHeight: 500 });
+    setActiveScrollElement(el);
 
     setVisibility('hidden');
+    el.scrollHeight = 2000;
     setVisibility('visible');
 
-    // Should not throw, no state changes
-    expect(scrolledUp.value).toBe(false);
+    expect(el.scrollTop).toBe(200);
   });
 
-  it('does NOT engage scroll mode when no active element exists on hide (cold start)', () => {
-    // User is on Settings or a non-thread view — no .thread-content registered.
-    // scrolledUp defaults to false, so a naive `!scrolledUp.value` capture
-    // would set wasAtBottom=true and on resume call pinToBottomNow(), which
-    // sets _resizeMode='scroll' globally for 500ms. If the user opens a thread
-    // inside that window, the thread's RO sees mode='scroll' and snaps to
-    // bottom, overriding any saved scroll position useScrollMemory would
-    // otherwise restore. The active-element guard prevents the capture.
-    startScrollVisibilityHandler();
-    // No setActiveScrollElement — there's no chat view mounted.
-    scrolledUp.value = false; // default
-
-    setVisibility('hidden');
-    setVisibility('visible');
-
-    // No spurious mode leak — _resizeMode stays 'ignore'.
-    expect(getResizeMode()).toBe('ignore');
-  });
-
-  it('first-hide-wins: double hidden fire does not lose the original capture', () => {
-    // iOS can fire visibilitychange to hidden multiple times during background
-    // transitions. If a stray ResizeObserver fires between the two hidden
-    // events and escalates scrolledUp=true, the second capture would store
-    // wasAtBottom=false and the eventual visible→re-pin would no-op,
-    // re-surfacing the original bug. First-hide-wins via the null sentinel
-    // protects against this.
-    startScrollVisibilityHandler();
+  it('survives repeated hide/show cycles without drifting', () => {
     const el = mockScrollEl({ scrollTop: 500, scrollHeight: 1000, clientHeight: 500 });
     setActiveScrollElement(el);
-    scrolledUp.value = false; // at bottom
 
-    setVisibility('hidden'); // first hide → captures wasAtBottom=true
-    // Simulate the stray RO escalation that triggered the original bug:
-    scrolledUp.value = true;
-    setVisibility('hidden'); // second hide → MUST NOT overwrite the capture
-    // Tab becomes visible — the original capture should still drive re-pin.
-    el.scrollHeight = 2500;
-    setVisibility('visible');
-
-    // pinToBottomNow ignored the post-capture scrolledUp=true because the
-    // first-hide capture saved the user's true intent.
-    expect(el.scrollTop).toBe(2500);
-    expect(scrolledUp.value).toBe(false);
+    for (const height of [1500, 2000, 3000]) {
+      setVisibility('hidden');
+      el.scrollHeight = height;
+      setVisibility('visible');
+      expect(el.scrollTop).toBe(500);
+    }
   });
 });

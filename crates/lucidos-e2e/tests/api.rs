@@ -139,3 +139,9 @@ mod embedding_model_status_test;
 
 #[path = "api_support/follow_up_test.rs"]
 mod follow_up_test;
+
+#[path = "api_support/coding_agent_binaries_test.rs"]
+mod coding_agent_binaries_test;
+
+#[path = "api_support/frontend_preview_test.rs"]
+mod frontend_preview_test;

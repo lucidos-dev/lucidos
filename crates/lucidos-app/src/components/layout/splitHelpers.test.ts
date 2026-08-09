@@ -1,84 +1,124 @@
 import { describe, it, expect } from 'vitest';
 import {
-  computeSnapRatio,
-  computeDrawerSnap,
+  clampToRange,
+  clampSplitRatio,
   computeStepRatio,
   computeDrawerStepWidth,
   KEYBOARD_RESIZE_STEP_PX,
-  MIN_THREAD_PANE_PX,
-  MIN_CONTENT_PANE_PX,
 } from './splitHelpers';
-import { MIN_DRAWER_WIDTH } from '../../store/store';
+import { minDrawerWidth, minThreadPanePx, minContentPanePx } from '../../store/paneMinimums';
 
 const TOTAL = 1000;
+// The pane floors are derived from the root font size now (paneMinimums.ts), so
+// read them rather than restating the retired 300 / 360 constants. The harness
+// answers a 16px root, where they ARE 300 and 360.
+const MIN_THREAD = minThreadPanePx();
+const MIN_CONTENT = minContentPanePx();
+const BOUNDS = { minThreadPx: MIN_THREAD, minContentPx: MIN_CONTENT };
 
-describe('computeSnapRatio — deferred snap after a free divider drag', () => {
-  it('stays put when both panes are at or above their minimums', () => {
-    expect(computeSnapRatio(0.5, TOTAL)).toBeNull();
-    expect(computeSnapRatio(MIN_THREAD_PANE_PX / TOTAL, TOTAL)).toBeNull();
-    expect(computeSnapRatio((TOTAL - MIN_CONTENT_PANE_PX) / TOTAL, TOTAL)).toBeNull();
+describe('clampToRange', () => {
+  it('clamps inside a normal range', () => {
+    expect(clampToRange(50, 10, 90)).toBe(50);
+    expect(clampToRange(5, 10, 90)).toBe(10);
+    expect(clampToRange(200, 10, 90)).toBe(90);
   });
 
-  it('collapses the thread pane below half its minimum', () => {
-    expect(computeSnapRatio((MIN_THREAD_PANE_PX / 2 - 1) / TOTAL, TOTAL)).toBe(0);
-  });
-
-  it('snaps the thread pane up to its minimum between half-min and min', () => {
-    expect(computeSnapRatio((MIN_THREAD_PANE_PX / 2) / TOTAL, TOTAL)).toBe(MIN_THREAD_PANE_PX / TOTAL);
-    expect(computeSnapRatio((MIN_THREAD_PANE_PX - 1) / TOTAL, TOTAL)).toBe(MIN_THREAD_PANE_PX / TOTAL);
-  });
-
-  it('collapses the content pane below half its minimum', () => {
-    const ratio = (TOTAL - MIN_CONTENT_PANE_PX / 2 + 1) / TOTAL;
-    expect(computeSnapRatio(ratio, TOTAL)).toBe(1);
-  });
-
-  it('snaps the content pane up to its minimum between half-min and min', () => {
-    const ratio = (TOTAL - MIN_CONTENT_PANE_PX + 1) / TOTAL;
-    expect(computeSnapRatio(ratio, TOTAL)).toBe((TOTAL - MIN_CONTENT_PANE_PX) / TOTAL);
-  });
-
-  it('leaves fully collapsed panes alone — release at the edge is a settled state', () => {
-    expect(computeSnapRatio(0, TOTAL)).toBeNull();
-    expect(computeSnapRatio(1, TOTAL)).toBeNull();
-  });
-
-  it('is a no-op while the container has no width yet', () => {
-    expect(computeSnapRatio(0.5, 0)).toBeNull();
-  });
-
-  it('prefers the thread side when the window cannot fit two minimum panes', () => {
-    // total < thread-min + content-min: snapping thread to its minimum
-    // necessarily leaves content small.
-    const total = MIN_THREAD_PANE_PX + 100;
-    expect(computeSnapRatio(0.5, total)).toBe(MIN_THREAD_PANE_PX / total);
-  });
-
-  it('clamps the snap target to 1 when the container is narrower than one minimum pane', () => {
-    // Drawer dragged very wide → split container < MIN. MIN / total would be
-    // > 1, outside the persisted/rendered [0, 1] ratio domain.
-    const total = MIN_THREAD_PANE_PX - 50;
-    const ratio = (MIN_THREAD_PANE_PX / 2 + 10) / total; // above half-min, below min
-    expect(computeSnapRatio(ratio, total)).toBe(1);
+  it('keeps the LEADING side whole when the range is empty', () => {
+    // hi < lo: the container cannot hold both minimums. A bare
+    // min-then-max would answer `hi` and hand the space to the trailing pane.
+    expect(clampToRange(0, 300, 200)).toBe(300);
+    expect(clampToRange(1000, 300, 200)).toBe(300);
   });
 });
 
-describe('computeDrawerSnap — deferred snap for the thread drawer', () => {
-  const MIN = 260;
-
-  it('stays put at or above the minimum', () => {
-    expect(computeDrawerSnap(MIN, MIN)).toBeNull();
-    expect(computeDrawerSnap(400, MIN)).toBeNull();
+describe('clampSplitRatio: a dragged split divider stops at the wall', () => {
+  it('follows the pointer between the two minimums', () => {
+    expect(clampSplitRatio(500, TOTAL, BOUNDS)).toBe(0.5);
+    expect(clampSplitRatio(MIN_THREAD, TOTAL, BOUNDS)).toBe(MIN_THREAD / TOTAL);
   });
 
-  it('snaps to the minimum between half-min and min', () => {
-    expect(computeDrawerSnap(MIN / 2, MIN)).toBe('min');
-    expect(computeDrawerSnap(MIN - 1, MIN)).toBe('min');
+  it('stops at the thread pane minimum however far past it the pointer goes', () => {
+    expect(clampSplitRatio(MIN_THREAD - 1, TOTAL, BOUNDS)).toBe(MIN_THREAD / TOTAL);
+    expect(clampSplitRatio(0, TOTAL, BOUNDS)).toBe(MIN_THREAD / TOTAL);
+    expect(clampSplitRatio(-9999, TOTAL, BOUNDS)).toBe(MIN_THREAD / TOTAL);
   });
 
-  it('closes below half the minimum', () => {
-    expect(computeDrawerSnap(MIN / 2 - 1, MIN)).toBe('close');
-    expect(computeDrawerSnap(0, MIN)).toBe('close');
+  it('stops at the content pane minimum at the other end', () => {
+    const ceil = (TOTAL - MIN_CONTENT) / TOTAL;
+    expect(clampSplitRatio(TOTAL - MIN_CONTENT + 1, TOTAL, BOUNDS)).toBe(ceil);
+    expect(clampSplitRatio(TOTAL, TOTAL, BOUNDS)).toBe(ceil);
+    expect(clampSplitRatio(9999, TOTAL, BOUNDS)).toBe(ceil);
+  });
+
+  it('NEVER reaches 0 or 1, which is what keeps a collapse unreachable mid-drag', () => {
+    for (const px of [-9999, -1, 0, 1, TOTAL / 2, TOTAL - 1, TOTAL, 9999]) {
+      const r = clampSplitRatio(px, TOTAL, BOUNDS);
+      expect(r, `pointer ${px}`).toBeGreaterThan(0);
+      expect(r, `pointer ${px}`).toBeLessThan(1);
+    }
+  });
+
+  it('holds that guarantee even when the container is SMALLER than a minimum', () => {
+    // The case the pane-minimum clamp alone gets wrong, and it is reachable: a
+    // drawer width persisted from a wider window can leave the split at 520px
+    // while a 175% root puts the thread minimum at 525. `clampToRange` hands
+    // back 525, and 525/520 rounds to exactly 1, collapsing the content pane
+    // under the pointer. ADR 0056's whole argument depends on this not happening.
+    const bounds = { minThreadPx: 525, minContentPx: 630 };
+    for (const total of [520, 400, 100, 10, 3]) {
+      for (const px of [-500, 0, total / 2, total, 5000]) {
+        const r = clampSplitRatio(px, total, bounds);
+        expect(r, `total ${total}, pointer ${px}`).toBeGreaterThan(0);
+        expect(r, `total ${total}, pointer ${px}`).toBeLessThan(1);
+      }
+    }
+  });
+
+  it('answers the default for a container too small for "inside" to mean anything', () => {
+    for (const total of [0, 1, 2]) {
+      expect(clampSplitRatio(1, total, BOUNDS), `total ${total}`).toBe(0.4);
+    }
+  });
+
+  it('degrades deterministically when the container cannot fit both minimums', () => {
+    // 175% ui-scale on a narrow split: thread 525 + content 630 against 800.
+    const total = 800;
+    const bounds = { minThreadPx: 525, minContentPx: 630 };
+    for (const px of [-100, 0, 400, 800, 5000]) {
+      const r = clampSplitRatio(px, total, bounds);
+      expect(r, `pointer ${px}`).toBeGreaterThanOrEqual(0);
+      expect(r, `pointer ${px}`).toBeLessThanOrEqual(1);
+      expect(Number.isFinite(r), `pointer ${px}`).toBe(true);
+    }
+    // The leading pane keeps its minimum; the trailing one takes what is left.
+    expect(clampSplitRatio(0, total, bounds)).toBe(525 / total);
+  });
+
+  it('answers the default rather than NaN before the container has a width', () => {
+    expect(clampSplitRatio(100, 0, BOUNDS)).toBe(0.4);
+  });
+});
+
+describe('the drawer divider drag, which clamps through the same two helpers', () => {
+  it('stops at the drawer floor and at the thread pane ceiling', () => {
+    // DrawerDivider clamps the pointer into [its floor, row - threadMin - content].
+    expect(clampToRange(300, 200, 500)).toBe(300);
+    expect(clampToRange(-9999, 200, 500)).toBe(200);
+    expect(clampToRange(9999, 200, 500)).toBe(500);
+  });
+
+  it('keeps the split off ZERO when the row cannot hold the drawer AND both panes', () => {
+    // The empty-range case from the drawer's side: the ceiling drops below the
+    // floor, the drawer holds its floor, and the space left for the split can
+    // come out at or below the content pane's held width. The remainder the
+    // divider hands to `clampSplitRatio` is then <= 0, which used to write a
+    // ratio of exactly 0 and collapse the thread pane under the pointer.
+    const bounds = { minThreadPx: 525, minContentPx: 630 };
+    for (const remainder of [0, -1, -400]) {
+      const r = clampSplitRatio(remainder, 900, bounds);
+      expect(r, `remainder ${remainder}`).toBeGreaterThan(0);
+      expect(r, `remainder ${remainder}`).toBeLessThan(1);
+    }
   });
 });
 
@@ -86,39 +126,39 @@ describe('computeStepRatio — keyboard resize of the split divider', () => {
   const STEP = KEYBOARD_RESIZE_STEP_PX;
 
   it('steps the divider by the given delta in both directions', () => {
-    expect(computeStepRatio(0.5, TOTAL, STEP)).toBe((500 + STEP) / TOTAL);
-    expect(computeStepRatio(0.5, TOTAL, -STEP)).toBe((500 - STEP) / TOTAL);
+    expect(computeStepRatio(0.5, TOTAL, STEP, BOUNDS)).toBe((500 + STEP) / TOTAL);
+    expect(computeStepRatio(0.5, TOTAL, -STEP, BOUNDS)).toBe((500 - STEP) / TOTAL);
   });
 
   it('clamps immediately at the thread-pane minimum instead of collapsing', () => {
-    const nearMin = (MIN_THREAD_PANE_PX + 10) / TOTAL;
-    expect(computeStepRatio(nearMin, TOTAL, -STEP)).toBe(MIN_THREAD_PANE_PX / TOTAL);
+    const nearMin = (MIN_THREAD + 10) / TOTAL;
+    expect(computeStepRatio(nearMin, TOTAL, -STEP, BOUNDS)).toBe(MIN_THREAD / TOTAL);
     // Already at the minimum: nothing to do.
-    expect(computeStepRatio(MIN_THREAD_PANE_PX / TOTAL, TOTAL, -STEP)).toBeNull();
+    expect(computeStepRatio(MIN_THREAD / TOTAL, TOTAL, -STEP, BOUNDS)).toBeNull();
   });
 
   it('clamps immediately at the content-pane minimum instead of collapsing', () => {
-    const ceil = (TOTAL - MIN_CONTENT_PANE_PX) / TOTAL;
-    const nearCeil = (TOTAL - MIN_CONTENT_PANE_PX - 10) / TOTAL;
-    expect(computeStepRatio(nearCeil, TOTAL, STEP)).toBe(ceil);
-    expect(computeStepRatio(ceil, TOTAL, STEP)).toBeNull();
+    const ceil = (TOTAL - MIN_CONTENT) / TOTAL;
+    const nearCeil = (TOTAL - MIN_CONTENT - 10) / TOTAL;
+    expect(computeStepRatio(nearCeil, TOTAL, STEP, BOUNDS)).toBe(ceil);
+    expect(computeStepRatio(ceil, TOTAL, STEP, BOUNDS)).toBeNull();
   });
 
   it('reopens a collapsed pane at its minimum when stepping back in', () => {
-    // Thread pane collapsed; widening reopens it at MIN_THREAD_PANE_PX.
-    expect(computeStepRatio(0, TOTAL, STEP)).toBe(MIN_THREAD_PANE_PX / TOTAL);
+    // Thread pane collapsed; widening reopens it at MIN_THREAD.
+    expect(computeStepRatio(0, TOTAL, STEP, BOUNDS)).toBe(MIN_THREAD / TOTAL);
     // Content pane collapsed; narrowing the thread pane reopens content at its minimum.
-    expect(computeStepRatio(1, TOTAL, -STEP)).toBe((TOTAL - MIN_CONTENT_PANE_PX) / TOTAL);
+    expect(computeStepRatio(1, TOTAL, -STEP, BOUNDS)).toBe((TOTAL - MIN_CONTENT) / TOTAL);
   });
 
   it('treats a collapsed pane as settled against steps pushing further out', () => {
-    expect(computeStepRatio(0, TOTAL, -STEP)).toBeNull();
-    expect(computeStepRatio(1, TOTAL, STEP)).toBeNull();
+    expect(computeStepRatio(0, TOTAL, -STEP, BOUNDS)).toBeNull();
+    expect(computeStepRatio(1, TOTAL, STEP, BOUNDS)).toBeNull();
   });
 
   it('is a no-op while the container has no width or cannot fit both minimums', () => {
-    expect(computeStepRatio(0.5, 0, STEP)).toBeNull();
-    expect(computeStepRatio(0.5, MIN_THREAD_PANE_PX + MIN_CONTENT_PANE_PX - 1, STEP)).toBeNull();
+    expect(computeStepRatio(0.5, 0, STEP, BOUNDS)).toBeNull();
+    expect(computeStepRatio(0.5, MIN_THREAD + MIN_CONTENT - 1, STEP, BOUNDS)).toBeNull();
   });
 });
 
@@ -126,22 +166,26 @@ describe('computeDrawerStepWidth — keyboard resize of the thread drawer', () =
   const STEP = KEYBOARD_RESIZE_STEP_PX;
   const MAX = 900;
 
+  // The floor is a CALLER measurement now (derived from the root font size and
+  // the desktop build), passed in like maxPx so this module stays pure math.
+  const MIN = minDrawerWidth();
+
   it('steps the width by the given delta in both directions', () => {
-    expect(computeDrawerStepWidth(400, STEP, MAX)).toBe(400 + STEP);
-    expect(computeDrawerStepWidth(400, -STEP, MAX)).toBe(400 - STEP);
+    expect(computeDrawerStepWidth(400, STEP, MIN, MAX)).toBe(400 + STEP);
+    expect(computeDrawerStepWidth(400, -STEP, MIN, MAX)).toBe(400 - STEP);
   });
 
-  it('clamps at the drawer minimum instead of closing', () => {
-    expect(computeDrawerStepWidth(MIN_DRAWER_WIDTH + 10, -STEP, MAX)).toBe(MIN_DRAWER_WIDTH);
-    expect(computeDrawerStepWidth(MIN_DRAWER_WIDTH, -STEP, MAX)).toBeNull();
+  it('clamps at the given minimum instead of closing', () => {
+    expect(computeDrawerStepWidth(MIN + 10, -STEP, MIN, MAX)).toBe(MIN);
+    expect(computeDrawerStepWidth(MIN, -STEP, MIN, MAX)).toBeNull();
   });
 
   it('clamps at maxPx', () => {
-    expect(computeDrawerStepWidth(MAX - 10, STEP, MAX)).toBe(MAX);
-    expect(computeDrawerStepWidth(MAX, STEP, MAX)).toBeNull();
+    expect(computeDrawerStepWidth(MAX - 10, STEP, MIN, MAX)).toBe(MAX);
+    expect(computeDrawerStepWidth(MAX, STEP, MIN, MAX)).toBeNull();
   });
 
   it('is a no-op when the row cannot host even a minimum-width drawer', () => {
-    expect(computeDrawerStepWidth(300, STEP, MIN_DRAWER_WIDTH - 1)).toBeNull();
+    expect(computeDrawerStepWidth(300, STEP, MIN, MIN - 1)).toBeNull();
   });
 });

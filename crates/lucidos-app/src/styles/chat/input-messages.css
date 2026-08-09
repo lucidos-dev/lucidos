@@ -373,7 +373,7 @@
     min-width: 12rem;
     height: 20rem;
     overflow-y: auto;
-    z-index: 100;
+    z-index: var(--z-dropdown);
 }
 
 /* The Lucidos Agent picker (LucidosControlMenu) reuses the coding-agent
@@ -465,6 +465,30 @@
 }
 
 .control-option-desc {
+    font-size: var(--font-size-xs);
+    color: var(--text-secondary);
+}
+
+/* The frontend preview's direct actions. Buttons rather than `.control-item`
+   rows, because they act on a supervised process here and now, while every
+   other row in this menu selects a command to send to the agent session. */
+.control-preview-row {
+    display: flex;
+    gap: var(--space-sm);
+    padding: 0.25rem 0.625rem;
+}
+
+/* `.action-btn` is an <a> here as well as a <button>, and the anchor needs the
+   button's own box back: link defaults would leave it baseline-aligned and
+   underlined next to its sibling. */
+.control-preview-row .action-btn {
+    display: inline-flex;
+    align-items: center;
+    text-decoration: none;
+}
+
+.control-preview-hint {
+    padding: 0.125rem 0.625rem 0.375rem;
     font-size: var(--font-size-xs);
     color: var(--text-secondary);
 }

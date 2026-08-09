@@ -45,7 +45,8 @@ vi.mock('./thread-navigation', () => ({
 }));
 
 vi.mock('../../components/chat/scrollState', () => ({
-  scrollToBottom: vi.fn(),
+  followSentMessage: vi.fn(),
+  stopFollowingBottom: vi.fn(),
 }));
 
 vi.mock('./thread-loading', () => ({
@@ -67,7 +68,11 @@ import {
   selectedScope,
   selectedCodingAgent,
   connectionStatus,
+  repositories,
+  type Scope,
 } from '../store';
+import { composeDraftContextName, LUCIDOS_SOURCE_REPO_NAME } from '../composeDestination';
+import { threadContextName } from '../../components/drawer/threadRowInfo';
 import { sendMessage } from './chat';
 import { sendCompose } from './compose';
 import { patchComposeSelection, _resetComposeSelectionsForTesting } from '../composeSelections';
@@ -306,6 +311,92 @@ describe('sendCompose carries dropdown scope through to chat body (real flow)', 
     expect(body.use_coding_agent).toBe(true);
     expect(body.repo_id).toBeUndefined();
     expect(body.folder).toBeUndefined();
+  });
+});
+
+/** The drawer row's context chip must not blink across the promotion. A draft
+ *  row names its destination from the draft's own scope
+ *  (`composeDraftContextName`); the started row names it from the bound meta
+ *  (`threadContextName`). Both are on screen in the same place, one frame
+ *  apart, so if the promotion drops a name it already resolved, the chip
+ *  vanishes until the engine answers with `cc_repo_name` and then reappears.
+ *  Each case asserts the two functions agree, not a literal, so the chip is
+ *  pinned to continuity rather than to today's copy. */
+describe('promotion keeps the destination chip the draft was already showing', () => {
+  const REPOS = [
+    { id: 'external-repo-uuid', name: 'example-repo', path: '/tmp/example-repo' },
+    { id: 'lucidos-repo-uuid', name: LUCIDOS_SOURCE_REPO_NAME, path: '/tmp/lucidos' },
+  ];
+
+  beforeEach(() => {
+    repositories.value = { status: 'loaded', data: REPOS };
+  });
+
+  function chipAfterSend(threadId: string): string | undefined {
+    return threadContextName(threadMap.value.get(threadId)!.meta);
+  }
+
+  it('a Lucidos-source coding draft keeps its "Lucidos" chip', async () => {
+    const draftId = 'lucidos-source-draft';
+    focusedThreadId.value = draftId;
+    putThread(draftId, { state: 'composing', channel: 'claude_code' });
+    setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+    patchComposeSelection(draftId, { scope: { kind: 'lucidos' } });
+
+    const draftChip = composeDraftContextName('claude_code', { kind: 'lucidos' }, REPOS);
+    await sendCompose(draftId, { useCodingAgent: true });
+
+    expect(draftChip).toBe(LUCIDOS_SOURCE_REPO_NAME);
+    expect(chipAfterSend(draftId)).toBe(draftChip);
+  });
+
+  it('an external-repo coding draft keeps the registry name', async () => {
+    const draftId = 'external-source-draft';
+    focusedThreadId.value = draftId;
+    putThread(draftId, { state: 'composing', channel: 'claude_code' });
+    setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+    const scope: Scope = { kind: 'external', repoId: 'external-repo-uuid' };
+    patchComposeSelection(draftId, { scope });
+
+    const draftChip = composeDraftContextName('claude_code', scope, REPOS);
+    await sendCompose(draftId, { useCodingAgent: true });
+
+    expect(draftChip).toBe('example-repo');
+    expect(chipAfterSend(draftId)).toBe(draftChip);
+  });
+
+  it('an app coding draft keeps the app id, and never files it as a repo name', async () => {
+    const draftId = 'app-source-draft';
+    focusedThreadId.value = draftId;
+    putThread(draftId, { state: 'composing', channel: 'claude_code' });
+    setDraft(draftId, { text: 'fix it', image_hashes: [], mode: 'claude_code' });
+    const scope: Scope = { kind: 'app', appId: 'habit-tracker' };
+    patchComposeSelection(draftId, { scope });
+
+    const draftChip = composeDraftContextName('claude_code', scope, REPOS);
+    await sendCompose(draftId, { useCodingAgent: true });
+
+    expect(draftChip).toBe('habit-tracker');
+    expect(chipAfterSend(draftId)).toBe(draftChip);
+    // The app id names a folder, not a repository. Writing it to repoName would
+    // make the chip right by accident and the Info row's "Repository" wrong on
+    // purpose.
+    expect(threadMap.value.get(draftId)!.meta.repoName).toBeUndefined();
+  });
+
+  it('a chat draft binds no repo name, so the started row stays chipless', async () => {
+    const draftId = 'chat-source-draft';
+    focusedThreadId.value = draftId;
+    putThread(draftId, { state: 'composing', channel: 'chat' });
+    setDraft(draftId, { text: 'hi', image_hashes: [], mode: null });
+    // A repo scope left over from an earlier coding pick must not follow a chat
+    // send onto the promoted thread.
+    patchComposeSelection(draftId, { scope: { kind: 'external', repoId: 'external-repo-uuid' } });
+
+    await sendCompose(draftId, { useCodingAgent: false });
+
+    expect(chipAfterSend(draftId)).toBeUndefined();
+    expect(threadMap.value.get(draftId)!.meta.repoName).toBeUndefined();
   });
 });
 

@@ -546,6 +546,24 @@ const TRIGGER_SIDE_EFFECT_GRANT_ARG: Arg = Arg {
     description:
         "Irreversible side-effect categories this trigger may perform unattended, e.g. [\"email\"].",
 };
+const TRIGGER_MODEL_ARG: Arg = Arg {
+    name: "model",
+    ty: ArgType::Str,
+    enum_values: &[],
+    required: false,
+    loc: ArgIn::Body,
+    description:
+        "Chat model id this trigger's intent runs on. Omit or null for the account default.",
+};
+const TRIGGER_REASONING_EFFORT_ARG: Arg = Arg {
+    name: "reasoning_effort",
+    ty: ArgType::Str,
+    enum_values: &["none", "low", "medium", "high", "xhigh", "max"],
+    required: false,
+    loc: ArgIn::Body,
+    description:
+        "Thinking budget for this trigger's intent runs. Omit or null for the account default.",
+};
 const TRIGGER_SLUG_ARG: Arg = Arg {
     name: "slug",
     ty: ArgType::Str,
@@ -566,8 +584,15 @@ const TRIGGER_CREATE_LLM_SCHEMA: &str = r#"{
   "on": {"description":"Each { event_type: 'X', condition?: {…} }, operators $eq/$ne/$lt/$lte/$gt/$gte/$in. A string, an array, or null.","anyOf":[{"type":"null"},{"type":"string"},{"type":"array","items":{"anyOf":[{"type":"string"},{"type":"object","properties":{"event_type":{"type":"string"},"condition":{"type":"object"}},"required":["event_type"]}]}}]},
   "app_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Owning app directory name; notifications deep-link there. Null for standalone."},
   "go_to_review": {"type":"boolean","description":"Threads this trigger spawns land in REVIEW, not ARCHIVE. Default false."},
-  "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."}
+  "group_id": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Trigger-group id, organizational only. Null for ungrouped."},
+  "model": {"anyOf":[{"type":"null"},{"type":"string"}],"description":"Chat model id for the intent, e.g. 'claude-sonnet-5'. Null = account default (on update, clears a pin). Set only if asked."},
+  "reasoning_effort": {"anyOf":[{"type":"null"},{"type":"string","enum":["none","low","medium","high","xhigh","max"]}],"description":"Thinking budget for the intent. Null = account default (on update, clears a pin)."}
 }"#;
+// `model` / `reasoning_effort` are deliberately NOT repeated here. Properties
+// are unioned across a domain's operations first-wins (see `build_llm_tool`), so
+// a second copy under the same name is dropped before the model ever sees it,
+// and only the create schema's wording would ship. Update's null-clears
+// semantics is stated there instead.
 const TRIGGER_UPDATE_LLM_SCHEMA: &str = r#"{
   "trigger_id": {"type":"string","description":"UUID of the trigger to act on."},
   "paused": {"type":"boolean","description":"Pause/resume inside a multi-field update; prefer the standalone actions."}
@@ -589,6 +614,8 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_GROUP_ID_ARG,
             TRIGGER_SIDE_EFFECT_GRANT_ARG,
             TRIGGER_SLUG_ARG,
+            TRIGGER_MODEL_ARG,
+            TRIGGER_REASONING_EFFORT_ARG,
         ],
         cli_name: "create",
         sdk_name: "create",
@@ -631,6 +658,8 @@ const TRIGGERS_OPS: &[Operation] = &[
             TRIGGER_GROUP_ID_ARG,
             TRIGGER_SIDE_EFFECT_GRANT_ARG,
             TRIGGER_SLUG_ARG,
+            TRIGGER_MODEL_ARG,
+            TRIGGER_REASONING_EFFORT_ARG,
         ],
         cli_name: "update",
         sdk_name: "update",
@@ -1536,14 +1565,19 @@ const ENV_VARS_DOMAIN: Domain = Domain {
 // false. See engine/tools/mod.rs + llm/tools/threads.rs.
 // ---------------------------------------------------------------------------
 
+// The `status` enum in both schemas below is spelled out rather than composed,
+// because `llm_schema` is a `const` JSON literal. It is pinned to
+// `ThreadStatus::ALL` by `threads_status_enum_matches_the_thread_status_enum`.
 const THREADS_LIST_LLM_SCHEMA: &str = r#"{
-  "active": {"type":"boolean","description":"Restrict to threads mid-flow (running or waiting_for_user_answer); false inverts, omitting means no filter. 'waiting' is NOT active: the coding agent stopped and proposed a change."},
+  "active": {"type":"boolean","description":"UNION of running and waiting_for_user_answer; false inverts. For 'is the workspace busy?' use status ['running']: a thread awaiting an answer is blocked on the human, not working."},
+  "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Exactly these, the values each row's status carries. Precise form of active; passing both errors."},
   "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent' (legacy 'claude_code' accepted). Omit for all."},
-  "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children, not grandchildren; resolved from the calling thread, so no id. How you recover a child's thread_id, see which are still working, and spot one parked on a question."},
+  "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children, not grandchildren; resolved from the calling thread, so no id. How you recover a child's thread_id."},
   "limit": {"type":"integer","description":"1-1000, default 100."}
 }"#;
 const THREADS_COUNT_LLM_SCHEMA: &str = r#"{
-  "active": {"type":"boolean","description":"Count only threads mid-flow (running or waiting_for_user_answer); false inverts. Omit for the total."},
+  "active": {"type":"boolean","description":"UNION of running and waiting_for_user_answer; false inverts. Omit for the total. Nonzero does NOT mean work is in flight: for 'is anything still running?' use status ['running']."},
+  "status": {"type":"array","items":{"type":"string","enum":["idle","running","waiting","waiting_for_user_answer","paused","failed"]},"description":"Count exactly these; passing both errors."},
   "source": {"type":"string","description":"Comma-separated 'chat', 'trigger', 'coding-agent'. Omit for all."},
   "my_children": {"type":"boolean","description":"Restrict to this thread's DIRECT children; resolved from the calling thread, so no id."}
 }"#;
@@ -1566,7 +1600,7 @@ const THREADS_OPS: &[Operation] = &[
     },
     Operation {
         action: "count",
-        summary: "Same filters as 'list', returning { count: N }: the cheap 'is anything still running?' check.",
+        summary: "Same filters as 'list', returning { count: N }.",
         method: Method::Get,
         path: "/threads/count",
         args: &[],
@@ -2284,6 +2318,57 @@ pub fn llm_tools() -> Vec<ToolDefinition> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// The schema enum is what the model picks values from, and the parser
+    /// validates against `ThreadStatus::ALL`. If they drift, the model is
+    /// offered a value the engine then refuses, or a real status becomes
+    /// unaskable. Both schemas are checked because the two are separate
+    /// literals.
+    #[test]
+    fn threads_status_enum_matches_the_thread_status_enum() {
+        let values = crate::engine::thread_lifecycle::ThreadStatus::ALL
+            .iter()
+            .map(|s| format!("\"{}\"", s.as_str()))
+            .collect::<Vec<_>>()
+            .join(",");
+        let expected = format!("\"enum\":[{values}]");
+        for (action, schema) in [
+            ("list", THREADS_LIST_LLM_SCHEMA),
+            ("count", THREADS_COUNT_LLM_SCHEMA),
+        ] {
+            assert!(
+                schema.contains(&expected),
+                "the threads '{action}' status property must offer exactly \
+                 ThreadStatus::ALL, expected to find {expected}"
+            );
+        }
+    }
+
+    /// A caller reading only the tool schema has to be able to tell that
+    /// `active` is a union, and which half answers "is the workspace busy?".
+    /// Getting that wrong is what hid four pending changes for three hours on
+    /// 2026-08-07.
+    #[test]
+    fn threads_active_descriptions_state_the_union_and_point_at_running() {
+        for (action, schema) in [
+            ("list", THREADS_LIST_LLM_SCHEMA),
+            ("count", THREADS_COUNT_LLM_SCHEMA),
+        ] {
+            let parsed: serde_json::Value =
+                serde_json::from_str(schema).expect("schema is valid JSON");
+            let active = parsed["active"]["description"]
+                .as_str()
+                .expect("active is documented");
+            assert!(
+                active.contains("UNION") && active.contains("waiting_for_user_answer"),
+                "threads '{action}' must say what active actually groups: {active}"
+            );
+            assert!(
+                active.contains("status ['running']"),
+                "threads '{action}' must name the filter a busy check wants: {active}"
+            );
+        }
+    }
 
     #[test]
     fn notifications_domain_is_declared() {
